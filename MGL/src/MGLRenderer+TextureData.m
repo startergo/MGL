@@ -891,13 +891,21 @@ static bool td_read_buffer_info(GLMContext ctx, bool depth, bool stencil, GLenum
     @autoreleasepool { return [TDR(ctx) texdataReadBufferInfo:(depth || stencil) internalformat:ifmt width:w height:h]; }
 }
 
+static void *td_buffer_contents(GLMContext ctx, Buffer *buf)
+{
+    (void)ctx;
+    if (buf->data.mtl_data)
+        return [(__bridge id<MTLBuffer>)buf->data.mtl_data contents];
+    return (void *)buf->data.buffer_data;
+}
+
 @implementation MGLRenderer (TextureDataBinding)
 
 - (void) bindExtTexdataFuncsToGLMContext: (GLMContext) glm_ctx
 {
     static struct MGLExtMetal_texdata hooks = {
         td_upload, td_download, td_download_decoded, td_realize, td_copy_from_read_fb,
-        td_copy_image, td_generate_mipmaps, td_release, td_read_buffer_info
+        td_copy_image, td_generate_mipmaps, td_release, td_read_buffer_info, td_buffer_contents
     };
 
     glm_ctx->mtl_funcs.ext_texdata = &hooks;

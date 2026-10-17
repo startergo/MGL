@@ -81,6 +81,8 @@ struct MGLExtMetal_texdata {
     void (*release)(GLMContext ctx, Texture *tex);
     /* information about the current read buffer: internal format, size; false if none */
     bool (*read_buffer_info)(GLMContext ctx, bool depth, bool stencil, GLenum *internalformat, GLuint *w, GLuint *h);
+    /* CPU address of a buffer object's storage (MTLBuffer contents when it has one) */
+    void *(*buffer_contents)(GLMContext ctx, Buffer *buf);
 };
 
 /* ---- C helpers shared with MGLRenderer+TextureData.m ---- */

@@ -1155,6 +1155,14 @@ static TDPixelStore pixelStore(GLMContext ctx, bool unpack)
     return ps;
 }
 
+/* CPU storage of a buffer object (the Metal buffer contents once it has one) */
+static uint8_t *bufferBase(GLMContext ctx, Buffer *buf)
+{
+    if (TDM(ctx) && TDM(ctx)->buffer_contents)
+        return (uint8_t *)TDM(ctx)->buffer_contents(ctx, buf);
+    return (uint8_t *)buf->data.buffer_data;
+}
+
 /* resolve a client pointer for reading (unpack) or writing (pack); with a PBO
  * bound `ptr` is an offset. Returns GL_NO_ERROR or the error to raise. */
 static GLenum resolveClientPtr(GLMContext ctx, bool unpack, const void *ptr, size_t extent, size_t elem_align,
@@ -1178,13 +1186,14 @@ static GLenum resolveClientPtr(GLMContext ctx, bool unpack, const void *ptr, siz
         return GL_INVALID_OPERATION;
     if (elem_align > 1 && (offset % elem_align) != 0)
         return GL_INVALID_OPERATION;
-    if (!pbo->data.buffer_data)
+    uint8_t *base = bufferBase(ctx, pbo);
+    if (!base)
     {
         *out = NULL;
         return extent ? GL_INVALID_OPERATION : GL_NO_ERROR;
     }
 
-    *out = (uint8_t *)pbo->data.buffer_data + offset;
+    *out = base + offset;
     return GL_NO_ERROR;
 }
 
@@ -1194,8 +1203,8 @@ static void pboWrittenRange(GLMContext ctx, Buffer *pbo, const uint8_t *dst, siz
 {
     if (!pbo)
         return;
-    size_t offset = (size_t)(dst - (const uint8_t *)pbo->data.buffer_data);
-    if (ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->write_buffer)
+    size_t offset = (size_t)(dst - bufferBase(ctx, pbo));
+    if (pbo->data.mtl_data && ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->write_buffer)
         ctx->mtl_funcs.ext_fb->write_buffer(ctx, pbo, offset, size, dst);
     else
         pbo->data.dirty_bits |= DIRTY_BUFFER_DATA;
