@@ -387,6 +387,38 @@ void mglEndConditionalRender(GLMContext ctx)
     S->cond_fixed = false;
 }
 
+/* gpuaudit: is any query active whose CPU counter is fed from the per-draw counts in
+ * queries_pre_draw()?  When none is, the draw path does not need the vertex/instance
+ * counts of an indirect command and can hand the command buffer straight to Metal
+ * without reading it (occlusion / time-elapsed / compute queries are not affected). */
+bool mgl_queries_counting_active(GLMContext ctx)
+{
+    static const int cpu_counted[] = {
+        MGL_QB_VERTICES_SUBMITTED,
+        MGL_QB_PRIMITIVES_SUBMITTED,
+        MGL_QB_VERTEX_SHADER_INVOCATIONS,
+        MGL_QB_TESS_CONTROL_SHADER_PATCHES,
+        MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS,
+        MGL_QB_GEOMETRY_SHADER_INVOCATIONS,
+        MGL_QB_GEOMETRY_SHADER_PRIMITIVES_EMITTED,
+        MGL_QB_CLIPPING_INPUT_PRIMITIVES,
+        MGL_QB_CLIPPING_OUTPUT_PRIMITIVES,
+    };
+    struct MGLExtState_queries *S = QS(ctx);
+    if (!S)
+        return false;
+
+    for (size_t i = 0; i < sizeof(cpu_counted) / sizeof(cpu_counted[0]); i++)
+        if (S->active[cpu_counted[i]])
+            return true;
+
+    for (int stream = 0; stream < MGL_QUERY_MAX_VERTEX_STREAMS; stream++)
+        if (S->active[MGL_QB_PRIMITIVES_GENERATED + stream])
+            return true;
+
+    return false;
+}
+
 bool mgl_queries_render_allowed(GLMContext ctx)
 {
     struct MGLExtState_queries *S = QS(ctx);
