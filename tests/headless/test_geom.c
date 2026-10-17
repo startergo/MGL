@@ -86,6 +86,8 @@ static void px(int x, int y, GLubyte *out)
 static bool is_green(GLubyte *p) { return p[0] < 32 && p[1] > 200 && p[2] < 32; }
 static bool is_black(GLubyte *p) { return p[0] < 8 && p[1] < 8 && p[2] < 8; }
 static bool is_yellow(GLubyte *p) { return p[0] > 200 && p[1] > 200 && p[2] < 32; }
+static bool is_greenish(GLubyte *p) { return p[0] < 32 && p[1] > 200; }
+static bool is_green_mid(GLubyte *p) { return p[0] < 32 && p[1] > 100 && p[1] < 200; }
 
 /* count pixels in a 7x7 block around (x,y) matching `match` */
 static int count_block(int x, int y, bool (*match)(GLubyte *))
@@ -406,6 +408,477 @@ TEST(link_error_no_varying)
     glDeleteProgram(p);
 }
 
+
+/* ------------------------------------------------------------------ more coverage */
+
+static const char *tri_fs =
+    "#version 450 core\n"
+    "layout(location=0) out vec4 color;\n"
+    "void main(){ color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+TEST(end_primitive_splitting)
+{
+    /* two separate strips from one input triangle */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 6) out;\n"
+        "void main(){\n"
+        "  gl_Position = vec4(-0.9, -0.4, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(-0.1, -0.4, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(-0.9,  0.4, 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "  gl_Position = vec4( 0.1, -0.4, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4( 0.9, -0.4, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4( 0.9,  0.4, 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, tri_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glUseProgram(p);
+    clear_black();
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+
+    EXPECT_TRUE(count_block(30, 100, is_green) > 20);
+    EXPECT_TRUE(count_block(170, 100, is_green) > 20);
+    EXPECT_TRUE(count_block(100, 100, is_green) == 0);
+    glDeleteProgram(p);
+}
+
+TEST(amplification_max_vertices)
+{
+    /* one input point becomes three side-by-side triangles */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 9) out;\n"
+        "layout(location=0) out float col;\n"
+        "void main(){\n"
+        "  for (int k = 0; k < 3; k++) {\n"
+        "    float x = -0.9 + float(k) * 0.7;\n"
+        "    gl_Position = vec4(x, -0.4, 0.0, 1.0); col = float(k) * 0.5; EmitVertex();\n"
+        "    gl_Position = vec4(x + 0.6, -0.4, 0.0, 1.0); col = float(k) * 0.5; EmitVertex();\n"
+        "    gl_Position = vec4(x, 0.4, 0.0, 1.0); col = float(k) * 0.5; EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "  }\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in float col;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0, 1.0, col, 1.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLint mv = 0;
+    glGetProgramiv(p, GL_GEOMETRY_VERTICES_OUT, &mv);
+    EXPECT_EQ_INT(mv, 9);
+
+    glUseProgram(p);
+    clear_black();
+    static const float one[2] = { 0.0f, 0.0f };
+    setup(2, one);
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+
+    /* each amplified triangle is (x,-0.4),(x+0.6,-0.4),(x,0.4): at the vertical middle it
+     * spans [x, x+0.3] */
+    EXPECT_TRUE(count_block(20, 100, is_greenish) > 20);
+    EXPECT_TRUE(count_block(95, 100, is_greenish) > 20);
+    EXPECT_TRUE(count_block(165, 100, is_greenish) > 20);
+    EXPECT_TRUE(count_block(60, 100, is_black) > 20);
+    glDeleteProgram(p);
+}
+
+TEST(triangles_adjacency_input)
+{
+    /* the even vertices form the triangle, the odd ones are adjacent */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles_adjacency) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) out float adj;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = gl_in[i * 2].gl_Position;\n"
+        "    adj = gl_in[i * 2 + 1].gl_Position.x + 0.5;\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in float adj;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(adj, adj, adj, 1.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glUseProgram(p);
+    clear_black();
+    /* triangle (-1,-1),(1,-1),(0,1) with adjacency x = 0.2, 0.4, 0.6 */
+    static const float v[12] = { -1.0f, -1.0f,   0.2f, 0.0f,
+                                  1.0f, -1.0f,   0.4f, 0.0f,
+                                  0.0f,  1.0f,   0.6f, 0.0f };
+    setup(12, v);
+    glDrawArrays(GL_TRIANGLES_ADJACENCY, 0, 6);
+    EXPECT_NO_GL_ERROR();
+
+    /* the triangle is drawn flat-shaded with the last adjacency vertex (0.6 + 0.5) */
+    GLubyte c[4] = {0,0,0,0};
+    px(100, 150, c);
+    printf("tri adjacency pixel = %d,%d,%d\n", c[0], c[1], c[2]);
+    EXPECT_TRUE(c[0] > 200 && c[1] > 200);
+    glDeleteProgram(p);
+}
+
+TEST(indexed_and_instanced)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in vec2 v_pos[];\n"
+        "layout(location=0) out float inst;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; inst = v_pos[0].y; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in float inst;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0, inst, 0.0, 1.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec2 v_pos;\n"
+        "void main(){ v_pos = vec2(0.0, 0.5); gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint vao2 = 0, vbo2 = 0, ebo = 0;
+    static const float verts[8] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 0.0f, 0.0f };
+    static const GLushort idx[3] = { 0, 1, 2 };
+    static const GLushort idx2[3] = { 1, 2, 0 };
+
+    setup(8, verts);
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glBindVertexArray(vao);
+
+    glUseProgram(p);
+
+    clear_black();
+    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, NULL);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(count_block(60, 120, is_green_mid) > 10);
+
+    /* base vertex */
+    clear_black();
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx2, idx2, GL_STATIC_DRAW);
+    glDrawElementsBaseVertex(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, NULL, 1);
+    EXPECT_NO_GL_ERROR();
+
+    /* instanced: every instance writes the same triangle */
+    clear_black();
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 3, 4);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(count_block(60, 120, is_green_mid) > 10);
+
+    glDeleteBuffers(1, &ebo);
+    glDeleteProgram(p);
+}
+
+TEST(indirect_draws)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, tri_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glUseProgram(p);
+
+    GLuint buf = 0;
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, buf);
+    {
+        const GLuint args[4] = { 3, 1, 0, 0 };     /* count, primcount, first, baseinstance */
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof args, args, GL_STATIC_DRAW);
+    }
+    clear_black();
+    glDrawArraysIndirect(GL_TRIANGLES, NULL);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(count_block(100, 150, is_green) > 10);
+
+    /* indexed indirect */
+    GLuint ebo = 0;
+    static const GLushort idx[3] = { 0, 1, 2 };
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    {
+        const GLuint args[5] = { 3, 1, 0, 0, 0 };  /* count, inst, first, basevertex, baseinst */
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof args, args, GL_STATIC_DRAW);
+    }
+    clear_black();
+    glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, NULL);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(count_block(100, 150, is_green) > 10);
+
+    glDeleteBuffers(1, &buf);
+    glDeleteBuffers(1, &ebo);
+    glDeleteProgram(p);
+}
+
+TEST(layered_rendering)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void main(){\n"
+        "  gl_Layer = 1;\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, tri_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint tex = 0, fbo = 0, rfbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, 200, 200, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    glUseProgram(p);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+
+    glGenFramebuffers(1, &rfbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, rfbo);
+    GLubyte c[4] = {0,0,0,0};
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 0);
+    glFinish();
+    glReadPixels(100, 150, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    printf("layer0 = %d,%d,%d  ", c[0], c[1], c[2]);
+    EXPECT_TRUE(is_black(c));
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 1);
+    glFinish();
+    glReadPixels(100, 150, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+    printf("layer1 = %d,%d,%d\n", c[0], c[1], c[2]);
+    EXPECT_TRUE(is_green(c));
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteFramebuffers(1, &rfbo);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+}
+
+TEST(viewport_index)
+{
+    /* two viewports side by side; the geometry picks the right one */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void main(){\n"
+        "  gl_ViewportIndex = 1;\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, tri_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glUseProgram(p);
+    glViewportIndexedf(0, 0.0f, 0.0f, 100.0f, 200.0f);
+    glViewportIndexedf(1, 100.0f, 0.0f, 100.0f, 200.0f);
+    clear_black();
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+
+    /* viewport 1 covers x in [100,200] */
+    EXPECT_TRUE(count_block(150, 100, is_green) > 20);
+    EXPECT_TRUE(count_block(50, 100, is_green) == 0);
+    glViewport(0, 0, 200, 200);
+    glDeleteProgram(p);
+}
+
+TEST(separable_pipeline_with_gs)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint pv = glCreateProgram(), pg = glCreateProgram(), pf = glCreateProgram(), pipe = 0;
+    GLint ok = 0;
+    GLuint sv = compile(GL_VERTEX_SHADER, vs);
+    GLuint sg = compile(GL_GEOMETRY_SHADER, gs);
+    GLuint sf = compile(GL_FRAGMENT_SHADER, tri_fs);
+
+    glProgramParameteri(pv, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glProgramParameteri(pg, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glProgramParameteri(pf, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glAttachShader(pv, sv);
+    glAttachShader(pg, sg);
+    glAttachShader(pf, sf);
+    glLinkProgram(pv);
+    glGetProgramiv(pv, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_TRUE);
+    glLinkProgram(pg);
+    glGetProgramiv(pg, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+    glLinkProgram(pf);
+    glGetProgramiv(pf, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_TRUE);
+
+    glUseProgram(0);
+    glGenProgramPipelines(1, &pipe);
+    glBindProgramPipeline(pipe);
+    glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, pv);
+    glUseProgramStages(pipe, GL_GEOMETRY_SHADER_BIT, pg);
+    glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, pf);
+    EXPECT_NO_GL_ERROR();
+
+    clear_black();
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(count_block(100, 150, is_green) > 10);
+
+    glBindProgramPipeline(0);
+    glDeleteProgramPipelines(1, &pipe);
+    glDeleteProgram(pv); glDeleteProgram(pg); glDeleteProgram(pf);
+    glDeleteShader(sv); glDeleteShader(sg); glDeleteShader(sf);
+}
+
+TEST(primitive_queries)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, tri_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glUseProgram(p);
+    setup(8, quad);
+
+    GLuint q1 = 0, q2 = 0, q3 = 0;
+    GLint v1 = -1, v2 = -1, v3 = -1;
+    glGenQueries(1, &q1);
+    glGenQueries(1, &q2);
+    glGenQueries(1, &q3);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, q1);
+    glBeginQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED, q2);
+    glBeginQuery(GL_GEOMETRY_SHADER_INVOCATIONS, q3);
+    clear_black();
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
+    glEndQuery(GL_GEOMETRY_SHADER_INVOCATIONS);
+    EXPECT_NO_GL_ERROR();
+
+    glGetQueryObjectiv(q1, GL_QUERY_RESULT, &v1);
+    glGetQueryObjectiv(q2, GL_QUERY_RESULT, &v2);
+    glGetQueryObjectiv(q3, GL_QUERY_RESULT, &v3);
+    printf("primitives generated=%d emitted=%d invocations=%d\n", v1, v2, v3);
+    EXPECT_EQ_INT(v1, 2);
+    EXPECT_EQ_INT(v2, 2);
+    EXPECT_EQ_INT(v3, 2);
+
+    glDeleteQueries(1, &q1);
+    glDeleteQueries(1, &q2);
+    glDeleteQueries(1, &q3);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -417,5 +890,14 @@ int main(void)
     RUN(simple_varying_from_gs);
     RUN(draw_mode_mismatch);
     RUN(link_error_no_varying);
+    RUN(end_primitive_splitting);
+    RUN(amplification_max_vertices);
+    RUN(triangles_adjacency_input);
+    RUN(indexed_and_instanced);
+    RUN(indirect_draws);
+    RUN(layered_rendering);
+    RUN(viewport_index);
+    RUN(separable_pipeline_with_gs);
+    RUN(primitive_queries);
     return mgl_test_summary();
 }

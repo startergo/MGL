@@ -23,14 +23,15 @@
 #include "mgl_ext_xfb.h"
 #include "MGLRenderer_Private.h"
 
-/* private renderer methods used here (declared for the compiler; implemented by the
- * buffers domain category) */
-@interface MGLRenderer (GeometryDraw)
+/* the raster pass is a separate method so the pass-through vertex function can be swapped
+ * in for it and restored afterwards */
+@interface MGLRenderer (Geometry)
 - (bool) geomDraw: (MGLGeomDraw *) d;
-- (void) extBufEnsureCommandBuffer;
-- (bool) extBufEnsure: (Buffer *) buf;
+- (bool) geomRasterPass: (MGLGeomDraw *) d;
 @end
 
+/* private renderer methods used here (declared for the compiler; implemented by the
+ * buffers domain category) */
 #define GEOM()   ((struct MGLExtState_geom *)ctx->state.ext_geom)
 #define BUF()    (ctx->mtl_funcs.ext_buffers)
 
@@ -148,8 +149,9 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
 {
     NSError *error = nil;
     Shader *gs = program->shader_slots[_GEOMETRY_SHADER];
+    const char *kernel_msl = gp->kernel_msl ? gp->kernel_msl : program->spirv[_GEOMETRY_SHADER].msl_str;
 
-    if (!gs || !program->spirv[_GEOMETRY_SHADER].msl_str)
+    if (!gs || !kernel_msl)
     {
         NSLog(@"MGL geom: the geometry kernel was not generated (program %u)", program->name);
         return false;
@@ -162,8 +164,9 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
 
         void *lib = NULL, *fn = NULL;
         char *err = NULL;
-        if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, program->spirv[_GEOMETRY_SHADER].msl_str,
-                                                    program->spirv[_GEOMETRY_SHADER].entry_point,
+        if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, kernel_msl,
+                                                    gp->kernel_entry ? gp->kernel_entry
+                                                                     : program->spirv[_GEOMETRY_SHADER].entry_point,
                                                     &lib, &fn, &err))
         {
             NSLog(@"MGL geom: geometry kernel compile failed: %@", err ? [NSString stringWithUTF8String: err] : @"?");
@@ -260,6 +263,21 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
 
 /* ---- the whole draw ---- */
 
+/* the topology class the raster pass needs: Metal requires inputPrimitiveTopology when the
+ * vertex function writes render_target_array_index / viewport_array_index, and it must match
+ * the geometry stage's output primitive type */
+static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspecified;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+- (void) geomConfigureTopology: (MTLRenderPipelineDescriptor *) pd
+{
+    if (!pd) return;
+    if (gGeomTopology != MTLPrimitiveTopologyClassUnspecified)
+        pd.inputPrimitiveTopology = gGeomTopology;
+}
+#pragma clang diagnostic pop
+
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
     MGLGeomProgram *gp = d->gp;
@@ -339,7 +357,11 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
     }
 
     /* ---- 1. vertex capture pass ---- */
-    [self extBufEnsureCommandBuffer];
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+    {
+        [self newCommandBuffer];
+        ctx->state.dirty_bits = DIRTY_ALL;
+    }
     if (!_currentCommandBuffer)
     {
         NSLog(@"MGL geom: no command buffer");
@@ -422,7 +444,8 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
             {
                 Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
                 if (!b) continue;
-                if (!b->data.mtl_data && ![self extBufEnsure: b]) continue;
+                if (!b->data.mtl_data) [self bindMTLBuffer: b];
+                if (!b->data.mtl_data) continue;
                 [enc setVertexBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
                               offset: 0
                              atIndex: (NSUInteger)i];
@@ -513,6 +536,72 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
         return true;
 
+    /* the geometry stage picks the output topology; Metal requires inputPrimitiveTopology
+     * when the vertex function writes render_target_array_index / viewport_array_index */
+    gGeomTopology = (gp->out_has_layer || gp->out_has_vp)
+                    ? (gp->out_type == GL_POINTS ? MTLPrimitiveTopologyClassPoint
+                       : gp->out_type == GL_LINE_STRIP ? MTLPrimitiveTopologyClassLine
+                                                       : MTLPrimitiveTopologyClassTriangle)
+                    : MTLPrimitiveTopologyClassUnspecified;
+
+    if (!gp->draw_function)
+    {
+        NSLog(@"MGL geom: the pass-through vertex function is not compiled");
+        return false;
+    }
+
+    /* stand the pass-through function in for the vertex stage while the raster pipeline is
+     * built (restored afterwards: the vertex program can still be used on its own) */
+    {
+        Shader *vs = program->shader_slots[_VERTEX_SHADER];
+        char *saved_msl = NULL, *saved_entry = NULL;
+        void *saved_fn = NULL;
+        const char *saved_slot_entry = NULL;
+        bool swapped = false;
+
+        if (vs)
+        {
+            saved_fn = vs->mtl_data.function;
+            saved_slot_entry = vs->entry_point;
+            vs->mtl_data.function = gp->draw_function;
+            vs->entry_point = gp->draw_entry;
+            swapped = true;
+        }
+        if (program->spirv[_VERTEX_SHADER].msl_str)
+        {
+            saved_msl = program->spirv[_VERTEX_SHADER].msl_str;
+            saved_entry = program->spirv[_VERTEX_SHADER].entry_point;
+            program->spirv[_VERTEX_SHADER].msl_str = gp->draw_msl;
+            program->spirv[_VERTEX_SHADER].entry_point = gp->draw_entry;
+        }
+
+        ctx->state.dirty_bits |= DIRTY_PROGRAM;
+
+        bool ok = [self geomRasterPass: d];
+
+        if (vs)
+        {
+            vs->mtl_data.function = saved_fn;
+            vs->entry_point = saved_slot_entry;
+        }
+        if (saved_msl)
+        {
+            program->spirv[_VERTEX_SHADER].msl_str = saved_msl;
+            program->spirv[_VERTEX_SHADER].entry_point = saved_entry;
+        }
+        else if (swapped)
+        {
+            program->spirv[_VERTEX_SHADER].msl_str = NULL;
+            program->spirv[_VERTEX_SHADER].entry_point = NULL;
+        }
+
+        return ok;
+    }
+}
+
+- (bool) geomRasterPass: (MGLGeomDraw *) d
+{
+    MGLGeomProgram *gp = d->gp;
     if (!BUF()->begin_draw(ctx)) return false;
 
     {
@@ -522,17 +611,6 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
                              : gp->out_type == GL_LINE_STRIP ? MTLPrimitiveTypeLine
                                                              : MTLPrimitiveTypeTriangle;
         if (!_currentRenderEncoder) return false;
-
-        if (getenv("MGL_GEOM_DEBUG"))
-        {
-            Shader *v = program->shader_slots[_VERTEX_SHADER];
-            id<MTLFunction> vf = v ? (__bridge id<MTLFunction>)v->mtl_data.function : nil;
-            if (program->spirv[_FRAGMENT_SHADER].msl_str)
-                NSLog(@"MGL geom: FRAGMENT MSL:\n%s", program->spirv[_FRAGMENT_SHADER].msl_str);
-            NSLog(@"MGL geom: raster pass vertex function = %@ (entry %s), pipeline=%@",
-                  vf, program->spirv[_VERTEX_SHADER].entry_point ? program->spirv[_VERTEX_SHADER].entry_point : "?",
-                  _pipelineState);
-        }
 
         [_currentRenderEncoder setVertexBuffer: gOutv offset: 0 atIndex: MGL_GEOM_MSL_DRAW];
 
@@ -545,6 +623,8 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
 
         BUF()->end_draw(ctx);
     }
+
+    gGeomTopology = MTLPrimitiveTopologyClassUnspecified;
 
     return true;
 }

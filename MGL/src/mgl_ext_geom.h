@@ -84,6 +84,8 @@ typedef struct MGLGeomProgram {
     Program  *program;      /* owner (link-time program; NULL when the entry is free) */
     GLuint    name;
     bool      linked;       /* the emulation is built and usable */
+    bool      deferred;     /* separable program: built from the pipeline at first draw */
+    void    *gs_exec;      /* the geometry stage executable Shader (identity across pipelines) */
     char     *fail;
 
     GLenum    in_type;      /* GL_POINTS / GL_LINES / GL_LINES_ADJACENCY / GL_TRIANGLES / GL_TRIANGLES_ADJACENCY */
@@ -111,6 +113,7 @@ typedef struct MGLGeomProgram {
     char   *capture_msl, *capture_entry;
     char   *draw_msl, *draw_entry;
     void   *capture_function, *capture_library;     /* retained MTLFunction / MTLLibrary */
+    void   *draw_function, *draw_library;           /* pass-through raster vertex function */
 } MGLGeomProgram;
 
 /* per-draw input of the routing helper: the sanitized index list used by the capture pass */

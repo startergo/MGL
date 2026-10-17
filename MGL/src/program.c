@@ -1117,7 +1117,7 @@ static void finish_reflection(MGLProgramObj *dst, ReflectAcc *acc)
 }
 
 /* stage combinations this backend can execute */
-static bool check_stage_mask(GLuint mask, char **log)
+static bool check_stage_mask(GLuint mask, char **log, bool separable)
 {
     if (mask == 0)
     {
@@ -1141,7 +1141,7 @@ static bool check_stage_mask(GLuint mask, char **log)
                                 "(the Metal geometry emulation consumes the vertex stage output directly)\n");
             return false;
         }
-        if (!(mask & SHADER_MASK_BIT(_VERTEX_SHADER)))
+        if (!(mask & SHADER_MASK_BIT(_VERTEX_SHADER)) && !separable)
         {
             mgl_append_info_log(log, "ERROR: a program containing a geometry shader must contain a vertex shader\n");
             return false;
@@ -1175,7 +1175,7 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         mask |= SHADER_MASK_BIT(s->glm_type);
     }
 
-    if (!ok || !check_stage_mask(mask, log))
+    if (!ok || !check_stage_mask(mask, log, obj ? obj->separable == GL_TRUE : false))
         return false;
 
     glsl_program = glslang_program_create();
@@ -1284,7 +1284,7 @@ static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramOb
         mask |= SHADER_MASK_BIT(s->glm_type);
     }
 
-    if (!ok || !check_stage_mask(mask, log))
+    if (!ok || !check_stage_mask(mask, log, obj ? obj->separable == GL_TRUE : false))
         return false;
 
     for (int i = 0; i < obj->num_attached && ok; i++)
@@ -1341,7 +1341,7 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
     }
     else
     {
-        ok = check_stage_mask(mask, &log);
+        ok = check_stage_mask(mask, &log, obj ? obj->separable == GL_TRUE : false);
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
             if (mask & SHADER_MASK_BIT(stage))
                 ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log);

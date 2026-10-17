@@ -617,8 +617,8 @@ static MGLGeomProgram *geom_prog_slot(GLMContext ctx, Program *p, bool create)
 
     if (!g || !p || !p->name) return NULL;
 
-    /* key by program name: run_link builds every executable in a scratch object, so the
-     * Program pointer differs between the compile hook and the post-link hook */
+    /* run_link builds every executable in a scratch object, so the Program pointer differs
+     * between the compile hook and the post-link hook: fall back to the name */
     for (int i = 0; i < MGL_GEOM_MAX_PROGRAMS; i++)
     {
         MGLGeomProgram *gp = &g->progs[i];
@@ -646,6 +646,10 @@ static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_function);
     if (gp->capture_library && ctx->mtl_funcs.ext_program)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_library);
+    if (gp->draw_function && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);
+    if (gp->draw_library && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_library);
     free(gp->kernel_msl);
     free(gp->kernel_entry);
     free(gp->final_entry);
@@ -1560,7 +1564,10 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     if (gp->out_has_clip) sb_put(&b, "float mgl_gs_clip[%u];\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "float mgl_gs_cull[%u];\n", gp->out_clip_size);
     sb_put(&b, "int mgl_gs_prim_in;\nint mgl_gs_invoc;\n");
-    sb_put(&b, "uint mgl_written, mgl_strip_start, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream;\n\n");
+    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream;\n");
+    /* the vertices of the strip in emit order: threads interleave (one per primitive per
+     * invocation), so the reserved slots are not consecutive */
+    sb_put(&b, "uint mgl_strip_v[%u];\n\n", gp->max_vertices ? gp->max_vertices : 1);
 
 
     /* the rewritten geometry shader may call the emit helpers: declare them first */
@@ -1578,28 +1585,25 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "void mgl_gs_emit_vertex();\n");
     sb_put(&b, "void mgl_gs_end_primitive();\n\n");
     /* load one input primitive */
-    sb_put(&b, "void mgl_load_inputs(uint pi, uint inst)\n{\n");
-    sb_put(&b, "    for (uint k = 0u; k < %uu; k++) {\n", gp->in_verts);
-    sb_put(&b, "        uint r = (mgl_prim[pi * %uu + k] + inst * mgl_hdr[6]) * %uu;\n", gp->in_verts, gp->in_words);
+    sb_put(&b, "void mgl_load_inputs(uint mgl_pi, uint mgl_inst)\n{\n");
+    sb_put(&b, "    for (uint mgl_k = 0u; mgl_k < %uu; mgl_k++) {\n", gp->in_verts);
+    sb_put(&b, "        uint mgl_r = (mgl_prim[mgl_pi * %uu + mgl_k] + mgl_inst * mgl_hdr[6]) * %uu;\n", gp->in_verts, gp->in_words);
     if (gp->in_has_pos)
-        sb_put(&b, "        mgl_in[k].mgl_gs_pos = vec4(uintBitsToFloat(mgl_vsout[r + %u]), uintBitsToFloat(mgl_vsout[r + %u]),"
-                   " uintBitsToFloat(mgl_vsout[r + %u]), uintBitsToFloat(mgl_vsout[r + %u]));\n",
+        sb_put(&b, "        mgl_in[mgl_k].mgl_gs_pos = vec4(uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]),"
+                   " uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]));\n",
                gp->in_pos_off + 0, gp->in_pos_off + 1, gp->in_pos_off + 2, gp->in_pos_off + 3);
     if (gp->in_has_psize)
-        sb_put(&b, "        mgl_in[k].mgl_gs_psize = uintBitsToFloat(mgl_vsout[r + %u]);\n", gp->in_psize_off);
+        sb_put(&b, "        mgl_in[mgl_k].mgl_gs_psize = uintBitsToFloat(mgl_vsout[mgl_r + %u]);\n", gp->in_psize_off);
     if (gp->in_has_clip)
         for (GLuint i = 0; i < gp->in_clip_size; i++)
-            sb_put(&b, "        mgl_in[k].mgl_gs_clip[%u] = uintBitsToFloat(mgl_vsout[r + %u]);\n", i, gp->in_clip_off + i);
+            sb_put(&b, "        mgl_in[mgl_k].mgl_gs_clip[%u] = uintBitsToFloat(mgl_vsout[mgl_r + %u]);\n", i, gp->in_clip_off + i);
     if (gp->in_has_cull)
         for (GLuint i = 0; i < gp->in_clip_size; i++)
-            sb_put(&b, "        mgl_in[k].mgl_gs_cull[%u] = uintBitsToFloat(mgl_vsout[r + %u]);\n", i, gp->in_cull_off + i);
+            sb_put(&b, "        mgl_in[mgl_k].mgl_gs_cull[%u] = uintBitsToFloat(mgl_vsout[mgl_r + %u]);\n", i, gp->in_cull_off + i);
     for (int i = 0; i < gp->n_in; i++)
     {
-        char open[80], close[8];
-        snprintf(open, sizeof(open), "mgl_vsout[r");
-        snprintf(close, sizeof(close), "]");
         sb_put(&b, "        ");
-        gen_varying_load(&b, &gp->in_v[i], "mgl_vsout[r", "]", "k");
+        gen_varying_load(&b, &gp->in_v[i], "mgl_vsout[mgl_r", "]", "mgl_k");
     }
     sb_put(&b, "    }\n}\n\n");
 
@@ -1635,7 +1639,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    uint slot = atomicAdd(mgl_ctl[0], 1u);\n");
     sb_put(&b, "    if (slot >= mgl_hdr[3]) { mgl_ctl[3] = 1u; return; }\n");
     sb_put(&b, "    mgl_store_output(slot);\n");
-    sb_put(&b, "    if (mgl_strip_n == 0u) mgl_strip_start = slot;\n");
+    sb_put(&b, "    mgl_strip_v[mgl_strip_n] = slot;\n");
     sb_put(&b, "    mgl_strip_n++; mgl_written++; mgl_seq++;\n");
     sb_put(&b, "    mgl_stream = s;\n");
     sb_put(&b, "}\n\n");
@@ -1655,17 +1659,17 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "        else {\n");
     if (out_type_code == 0)
     {
-        sb_put(&b, "            for (uint i = 0u; i < n; i++) mgl_idx[base + i] = mgl_strip_start + i;\n");
+        sb_put(&b, "            for (uint i = 0u; i < n; i++) mgl_idx[base + i] = mgl_strip_v[i];\n");
     }
     else if (out_type_code == 1)
     {
-        sb_put(&b, "            for (uint i = 0u; i + 1u < n; i++) { mgl_idx[base + i * 2u] = mgl_strip_start + i;"
-                   " mgl_idx[base + i * 2u + 1u] = mgl_strip_start + i + 1u; }\n");
+        sb_put(&b, "            for (uint i = 0u; i + 1u < n; i++) { mgl_idx[base + i * 2u] = mgl_strip_v[i];"
+                   " mgl_idx[base + i * 2u + 1u] = mgl_strip_v[i + 1u]; }\n");
     }
     else
     {
         sb_put(&b, "            for (uint i = 0u; i + 2u < n; i++) {\n");
-        sb_put(&b, "                uint a = mgl_strip_start + i, b2 = mgl_strip_start + i + 1u, c = mgl_strip_start + i + 2u;\n");
+        sb_put(&b, "                uint a = mgl_strip_v[i], b2 = mgl_strip_v[i + 1u], c = mgl_strip_v[i + 2u];\n");
         sb_put(&b, "                if ((i & 1u) == 0u) { mgl_idx[base + i * 3u] = a; mgl_idx[base + i * 3u + 1u] = b2; mgl_idx[base + i * 3u + 2u] = c; }\n");
         sb_put(&b, "                else { mgl_idx[base + i * 3u] = b2; mgl_idx[base + i * 3u + 1u] = a; mgl_idx[base + i * 3u + 2u] = c; }\n");
         sb_put(&b, "            }\n");
@@ -1678,22 +1682,22 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "void mgl_gs_end_primitive() { mgl_gs_end_stream_primitive(0u); }\n\n");
 
     sb_put(&b, "void main()\n{\n");
-    sb_put(&b, "    uint t = gl_GlobalInvocationID.x;\n");
-    sb_put(&b, "    uint invocations = mgl_hdr[2];\n");
-    sb_put(&b, "    if (invocations == 0u) return;\n");
-    sb_put(&b, "    uint p = t / invocations;\n");
-    sb_put(&b, "    uint inv = t - p * invocations;\n");
-    sb_put(&b, "    if (p >= mgl_hdr[0] * mgl_hdr[1]) return;\n");
-    sb_put(&b, "    uint inst = p / mgl_hdr[0];\n");
-    sb_put(&b, "    uint pi = p - inst * mgl_hdr[0];\n");
-    sb_put(&b, "    mgl_load_inputs(pi, inst);\n");
-    sb_put(&b, "    mgl_gs_prim_in = int(pi);\n    mgl_gs_invoc = int(inv);\n");
-    sb_put(&b, "    mgl_tag = p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u;\n");
+    sb_put(&b, "    uint mgl_t = gl_GlobalInvocationID.x;\n");
+    sb_put(&b, "    uint mgl_invocations = mgl_hdr[2];\n");
+    sb_put(&b, "    if (mgl_invocations == 0u) return;\n");
+    sb_put(&b, "    uint mgl_p = mgl_t / mgl_invocations;\n");
+    sb_put(&b, "    uint mgl_inv = mgl_t - mgl_p * mgl_invocations;\n");
+    sb_put(&b, "    if (mgl_p >= mgl_hdr[0] * mgl_hdr[1]) return;\n");
+    sb_put(&b, "    uint mgl_inst = mgl_p / mgl_hdr[0];\n");
+    sb_put(&b, "    uint mgl_pi = mgl_p - mgl_inst * mgl_hdr[0];\n");
+    sb_put(&b, "    mgl_load_inputs(mgl_pi, mgl_inst);\n");
+    sb_put(&b, "    mgl_gs_prim_in = int(mgl_pi);\n    mgl_gs_invoc = int(mgl_inv);\n");
+    sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u;\n");
     sb_put(&b, "    mgl_gs_pos = vec4(0.0);\n");
     if (gp->out_has_psize) sb_put(&b, "    mgl_gs_psize = 1.0;\n");
     if (gp->out_has_layer) sb_put(&b, "    mgl_gs_layer = 0;\n");
     if (gp->out_has_vp) sb_put(&b, "    mgl_gs_vp = 0;\n");
-    if (gp->out_has_prim) sb_put(&b, "    mgl_gs_prim_out = int(pi);\n");
+    if (gp->out_has_prim) sb_put(&b, "    mgl_gs_prim_out = int(mgl_pi);\n");
     if (gp->out_has_clip) sb_put(&b, "    for (int i = 0; i < %u; i++) mgl_gs_clip[i] = 0.0;\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "    for (int i = 0; i < %u; i++) mgl_gs_cull[i] = 0.0;\n", gp->out_clip_size);
     for (int i = 0; i < gp->n_out; i++)
@@ -1807,6 +1811,37 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
 }
 
 /* ------------------------------------------------------------------ link */
+
+/* assign the word offsets of the emulation records (shared by the capture variant, the
+ * geometry kernel and the pass-through vertex function) */
+static void geom_layout(MGLGeomProgram *gp)
+{
+    int i;
+
+    /* input record layout */
+    {
+        GLuint off = 0;
+        gp->in_pos_off = off; off += 4;
+        if (gp->in_has_psize) { gp->in_psize_off = off; off += 1; }
+        if (gp->in_has_clip) { gp->in_clip_off = off; off += gp->in_clip_size; }
+        if (gp->in_has_cull) { gp->in_cull_off = off; off += gp->in_clip_size; }
+        for (i = 0; i < gp->n_in; i++) { gp->in_v[i].offset = off; off += gp->in_v[i].words; }
+        gp->in_words = off;
+    }
+    /* output record layout */
+    {
+        GLuint off = 2;     /* tag + sequence */
+        gp->out_pos_off = off; off += 4;
+        if (gp->out_has_psize) { gp->out_psize_off = off; off += 1; }
+        if (gp->out_has_layer) { gp->out_layer_off = off; off += 1; }
+        if (gp->out_has_vp) { gp->out_vp_off = off; off += 1; }
+        if (gp->out_has_prim) { gp->out_prim_off = off; off += 1; }
+        if (gp->out_has_clip) { gp->out_clip_off = off; off += gp->out_clip_size; }
+        if (gp->out_has_cull) { gp->out_cull_off = off; off += gp->out_clip_size; }
+        for (i = 0; i < gp->n_out; i++) { gp->out_v[i].offset = off; off += gp->out_v[i].words; }
+        gp->out_words = off;
+    }
+}
 
 static const char *geom_gs_source(GLMContext ctx, MGLProgramObj *obj)
 {
@@ -1923,6 +1958,24 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     if (!geom_reflect_stage(m, true, gp->in_v, &gp->n_in, log)) goto done;
     if (!geom_reflect_stage(m, false, gp->out_v, &gp->n_out, log)) goto done;
 
+    /* the entry names are needed even when the emulation is deferred */
+    gp->kernel_entry = xstrdup("mgl_geom_gs");
+    gp->capture_entry = xstrdup("main0");
+    gp->draw_entry = xstrdup("main0");
+
+    /* a separable geometry-only program has no vertex stage of its own: the reflection and
+     * the record layout are kept (so the program queries work), the emulation is built at
+     * the first draw, when the pipeline contributes the vertex stage.  The layout uses the
+     * default clip distance size here; geom_build() refines it once the vertex stage is
+     * known. */
+    geom_layout(gp);
+    gp->deferred = !program->shader_slots[_VERTEX_SHADER];
+    if (gp->deferred)
+    {
+        ok = true;
+        goto done;
+    }
+
     /* builtins: driven by what the shader source mentions */
     {
         const char *src = geom_gs_source(ctx, obj);
@@ -1979,32 +2032,10 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
             gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
                                 (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
             free(vs_dec);
+        /* the clip size of the real vertex stage is only known now */
+        geom_layout(gp);
         }
         free(decompiled);
-    }
-
-    /* input record layout */
-    {
-        GLuint off = 0;
-        gp->in_pos_off = off; off += 4;
-        if (gp->in_has_psize) { gp->in_psize_off = off; off += 1; }
-        if (gp->in_has_clip) { gp->in_clip_off = off; off += gp->in_clip_size; }
-        if (gp->in_has_cull) { gp->in_cull_off = off; off += gp->in_clip_size; }
-        for (i = 0; i < gp->n_in; i++) { gp->in_v[i].offset = off; off += gp->in_v[i].words; }
-        gp->in_words = off;
-    }
-    /* output record layout */
-    {
-        GLuint off = 2;     /* tag + sequence */
-        gp->out_pos_off = off; off += 4;
-        if (gp->out_has_psize) { gp->out_psize_off = off; off += 1; }
-        if (gp->out_has_layer) { gp->out_layer_off = off; off += 1; }
-        if (gp->out_has_vp) { gp->out_vp_off = off; off += 1; }
-        if (gp->out_has_prim) { gp->out_prim_off = off; off += 1; }
-        if (gp->out_has_clip) { gp->out_clip_off = off; off += gp->out_clip_size; }
-        if (gp->out_has_cull) { gp->out_cull_off = off; off += gp->out_clip_size; }
-        for (i = 0; i < gp->n_out; i++) { gp->out_v[i].offset = off; off += gp->out_v[i].words; }
-        gp->out_words = off;
     }
 
     /* total output component limit */
@@ -2060,10 +2091,6 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         spv_free(vm);
     }
 
-    gp->kernel_entry = xstrdup("mgl_geom_gs");
-    gp->capture_entry = xstrdup("main0");
-    gp->draw_entry = xstrdup("main0");
-
     ok = true;
 
 done:
@@ -2077,48 +2104,83 @@ done:
 }
 
 /* patch a `[[user(locnN)]]` attribute of an MSL struct member into a Metal builtin
- * attribute (used to forward gl_Layer / gl_ViewportIndex) */
-static bool msl_promote_attribute(char *msl, const char *member, const char *attr)
+ * attribute (used to forward gl_Layer / gl_ViewportIndex).  Returns a newly allocated
+ * string (the caller frees the original), or NULL if the member was not found. */
+static char *msl_promote_attribute(const char *msl, const char *member, const char *attr)
 {
-    char *p = strstr(msl, member);
-    char *u;
-    size_t alen = strlen(attr);
+    const char *p = strstr(msl, member);
+    const char *u, *close;
+    char *out;
+    size_t head, tail;
 
-    if (!p) return false;
+    if (!p) return NULL;
     u = strstr(p, "user(locn");
-    if (!u || u - p > 96) return false;
-    {
-        char *close = strchr(u, ')');
-        if (!close) return false;
-        /* replace [u, close] with attr */
-        size_t len = (size_t)(close - u);
-        if (len < alen)
-        {
-            size_t diff = alen - len;
-            size_t tail = strlen(close) + 1;
-            char *n = realloc(msl, strlen(msl) + diff + 1);
-            if (!n) return false;
-            /* realloc may move: recompute */
-            size_t off = (size_t)(close - msl);
-            msl = n;
-            memmove(msl + off + diff, msl + off, tail);
-        }
-        else if (len > alen)
-        {
-            size_t off = (size_t)(close - msl) + 1;
-            memmove(u + alen, u + len, strlen(u + len) + 1);
-            (void)off;
-        }
-        memcpy(u, attr, alen);
-        return true;
-    }
+    if (!u || (size_t)(u - p) > 96) return NULL;
+    close = strchr(u, ')');
+    if (!close) return NULL;
+    close++;                        /* include the ')' */
+
+    head = (size_t)(u - msl);
+    tail = strlen(close);
+    out = xmalloc(head + strlen(attr) + tail + 1);
+    memcpy(out, msl, head);
+    memcpy(out + head, attr, strlen(attr));
+    memcpy(out + head + strlen(attr), close, tail + 1);
+    return out;
 }
 
 /* post link: translate the three emulation shaders to MSL, replace the program's vertex
  * stage with the pass-through function */
-void mgl_geom_post_link(GLMContext ctx, Program *program)
+/* SPIRV-Cross passes loose (explicit-location) uniforms of the default block as
+ * `constant T&` arguments of the entry point, but a user function (our renamed shader
+ * main) takes them as `thread const T&` — which Metal rejects.  Turn those parameters
+ * into value parameters. */
+static bool msl_value_parameters(char *msl, const char *entry)
 {
-    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+    char *def = strstr(msl, entry);
+    char *p, *close;
+    size_t removed = 0;
+
+    if (!def) return false;
+    p = strchr(def, '(');
+    if (!p) return false;
+
+    /* find the end of the parameter list */
+    close = p + 1;
+    while (*close && *close != ')') close++;
+    if (!*close) return false;
+
+    /* rewrite "thread const T& name" as "T name" inside the list */
+    p = p + 1;
+    while (p < close)
+    {
+        if (!strncmp(p, "thread const ", 13))
+        {
+            char *amp = p + 13;
+            while (amp < close && *amp != '&' && *amp != ',') amp++;
+            if (amp < close && *amp == '&')
+            {
+                size_t tail = strlen(amp) + 1;
+                /* drop the "thread const " qualifier */
+                memmove(p, p + 13, strlen(p + 13) + 1);
+                close -= 13;
+                amp -= 13;
+                /* drop the '&' */
+                memmove(amp, amp + 1, tail);
+                close -= 1;
+                removed += 14;
+                continue;
+            }
+        }
+        p++;
+    }
+    return removed > 0;
+}
+
+/* build (or rebuild) the emulation for one geometry stage; `program` is the program that
+ * owns the vertex + geometry stages (a linked program, or a pipeline's composite) */
+static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+{
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
     char *gs_src = NULL, *vs_src = NULL, *glsl, *msl;
     uint32_t *ir = NULL;
@@ -2127,11 +2189,12 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
     int pins_gl[8], pins_msl[8];
 
 #define GEOM_FAIL(...)  do { geom_fail(ctx, gp, __VA_ARGS__); \
-                             obj->link_status = false; goto done; } while (0)
-    char *err_unused = NULL; (void)err_unused;
+                             if (!gp->deferred) obj->link_status = false; goto done; } while (0)
 
     if (!gp || !obj) return;
     if (!program->shader_slots[_GEOMETRY_SHADER]) return;
+
+    gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
 
     if (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER])
         GEOM_FAIL("tessellation before a geometry shader is not supported "
@@ -2174,6 +2237,8 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
                             SpvExecutionModelVertex, pins_gl, pins_msl, 1);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
+    /* the renamed vertex main is called from the generated entry point */
+    msl_value_parameters(msl, "mgl_geom_vs_main(");
     gp->capture_msl = msl;
     geom_dump("capture.msl", msl);
     gp->vid_absolute = strstr(msl, "[[base_vertex]]") == NULL;
@@ -2223,6 +2288,7 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
             memcpy(e, "kernel void mgl_geom_gs(", strlen("kernel void mgl_geom_gs("));
         }
     }
+    msl_value_parameters(msl, "mgl_gs_main(");
     gp->kernel_msl = msl;
     geom_dump("kernel.msl", msl);
 
@@ -2248,15 +2314,19 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
     if (!msl) GEOM_FAIL("pass-through vertex function MSL failed: %s", log ? log : "?");
 
     /* gl_Layer / gl_ViewportIndex become Metal rasterization controls */
-    if (gp->out_has_layer && !msl_promote_attribute(msl, "mgl_out_layer", "render_target_array_index"))
+    if (gp->out_has_layer)
     {
+        char *n = msl_promote_attribute(msl, "mgl_out_layer", "render_target_array_index");
+        if (!n) { free(msl); GEOM_FAIL("could not forward gl_Layer to render_target_array_index"); }
         free(msl);
-        GEOM_FAIL("could not forward gl_Layer to render_target_array_index");
+        msl = n;
     }
-    if (gp->out_has_vp && !msl_promote_attribute(msl, "mgl_out_vp", "viewport_array_index"))
+    if (gp->out_has_vp)
     {
+        char *n = msl_promote_attribute(msl, "mgl_out_vp", "viewport_array_index");
+        if (!n) { free(msl); GEOM_FAIL("could not forward gl_ViewportIndex to viewport_array_index"); }
         free(msl);
-        GEOM_FAIL("could not forward gl_ViewportIndex to viewport_array_index");
+        msl = n;
     }
 
     /* the rstate clip-space fixup belongs to the last stage before rasterization */
@@ -2269,47 +2339,43 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
         }
     }
 
+    /* a point size is only meaningful for point output; some Metal implementations reject a
+     * pipeline whose vertex function writes point_size together with an explicit
+     * inputPrimitiveTopology (which layered / viewport-indexed output needs) */
+    if (gp->out_type != GL_POINTS)
+    {
+        char *psz = strstr(msl, "[[point_size]]");
+        if (psz)
+        {
+            size_t len = strlen("[[point_size]]");
+            memmove(psz, psz + len, strlen(psz + len) + 1);
+        }
+    }
+
     gp->draw_msl = msl;
     geom_dump("draw.msl", msl);
     gp->linked = true;
 
-    /* install the pass-through function as the program's vertex stage */
+    /* compile the pass-through function: it stands in for the vertex stage during the
+     * raster pass.  A pipeline's composite is rebuilt from the stage programs on every
+     * draw, so the substitution is made per draw rather than once at link time */
     if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
     {
         void *lib = NULL, *fn = NULL;
         char *err = NULL;
 
-        if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, gp->draw_entry, &lib, &fn, &err))
+        if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, gp->draw_entry, &lib, &fn, &err))
         {
-            Shader *vs = program->shader_slots[_VERTEX_SHADER];
-
-            free(program->spirv[_VERTEX_SHADER].msl_str);
-            free(program->spirv[_VERTEX_SHADER].entry_point);
-            program->spirv[_VERTEX_SHADER].msl_str = xstrdup(msl);
-            program->spirv[_VERTEX_SHADER].entry_point = xstrdup(gp->draw_entry);
-
-            if (vs)
-            {
-                if (vs->mtl_data.function) ctx->mtl_funcs.ext_program->release_obj(ctx, vs->mtl_data.function);
-                if (vs->mtl_data.library) ctx->mtl_funcs.ext_program->release_obj(ctx, vs->mtl_data.library);
-                vs->mtl_data.function = fn;
-                vs->mtl_data.library = lib;
-                vs->entry_point = xstrdup(gp->draw_entry);
-            }
-            else
-            {
-                ctx->mtl_funcs.ext_program->release_obj(ctx, fn);
-                ctx->mtl_funcs.ext_program->release_obj(ctx, lib);
-            }
-
-            program->dirty_bits |= DIRTY_PROGRAM;
-            ctx->state.dirty_bits |= DIRTY_PROGRAM;
-        }
-        else
-        {
+            free(err);
             GEOM_FAIL("pass-through vertex function Metal compile failed: %s", err ? err : "?");
         }
+        if (gp->draw_library) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_library);
+        if (gp->draw_function) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);
+        gp->draw_library = lib;
+        gp->draw_function = fn;
     }
+    else
+        GEOM_FAIL("no Metal compile hook available");
 
 #undef GEOM_FAIL
 
@@ -2320,11 +2386,51 @@ done:
     free(log);
 }
 
+/* post-link hook: the emulation is built here unless the program has no vertex stage of
+ * its own (a separable geometry-only program gets it from the pipeline at draw time) */
+void mgl_geom_post_link(GLMContext ctx, Program *program)
+{
+    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+    MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
+
+    if (!gp || !obj) return;
+    if (!program->shader_slots[_GEOMETRY_SHADER]) return;
+
+    gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
+    gp->deferred = !program->shader_slots[_VERTEX_SHADER];
+    if (gp->deferred) return;               /* separable: built at first draw */
+
+    geom_build(ctx, gp, program);
+}
+
+/* make sure the emulation exists for the program that is about to draw */
+static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+{
+    if (!gp || !program) return false;
+    if (gp->linked) return true;
+    if (!program->shader_slots[_VERTEX_SHADER]) return false;
+
+    /* a relink of the geometry program (glUseProgramStages relinks its stage programs)
+     * leaves the slot reflected-empty: redo it from the program's own geometry stage */
+    if ((!gp->out_type || !gp->out_words) && ctx->state.program_pipeline)
+    {
+        Program *gs = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_GEOMETRY_SHADER];
+        if (gs && gs->spirv[_GEOMETRY_SHADER].ir)
+            mgl_geom_compile_stage(ctx, gs, MGL_PROGRAM_OBJ(gs), _GEOMETRY_SHADER,
+                                   gs->spirv[_GEOMETRY_SHADER].ir, gs->spirv[_GEOMETRY_SHADER].size,
+                                   "main", NULL);
+    }
+
+    gp->deferred = false;
+    geom_build(ctx, gp, program);
+    return gp->linked;
+}
+
 bool mgl_geom_link_failed(GLMContext ctx, Program *program, const char **reason)
 {
     MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
     if (!program->shader_slots[_GEOMETRY_SHADER]) return false;
-    if (!gp || gp->linked) return false;
+    if (!gp || gp->linked || gp->deferred) return false;
     if (reason) *reason = gp->fail ? gp->fail : "geometry stage failed";
     return true;
 }
@@ -2388,9 +2494,14 @@ MGLGeomProgram *mgl_geom_current(GLMContext ctx)
     }
     if (ctx->state.program_pipeline)
     {
-        Program *c = mgl_program_pipeline_composite(ctx);
-        gp = geom_for_program(ctx, c);
-        if (gp) return gp;
+        /* a pipeline resolves through the program that owns the geometry stage (the
+         * composite it builds for the renderer is a fresh object every time) */
+        Program *gs = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_GEOMETRY_SHADER];
+        if (gs)
+        {
+            gp = geom_for_program(ctx, gs);
+            if (gp) return gp;
+        }
     }
     return NULL;
 }
@@ -2547,11 +2658,12 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     MGLGeomProgram *gp;
     MGLGeomDraw d;
     GLenum gs_in;
-    uint32_t *seq = NULL;
+    uint32_t *seq = NULL, *indices = NULL;
     uint64_t nseq = 0, nprims;
     uint32_t *prims = NULL;
     uint32_t restart = 0xffffffffu;
     uint32_t vmin = 0xffffffffu, vmax = 0;
+    GLsizei index_count = 0;
     GLuint i;
 
     if (!mgl_geom_present(ctx)) return;
@@ -2559,7 +2671,9 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     gp = mgl_geom_current(ctx);
     if (!gp) return;
 
-    if (!gp->linked)
+    if (!gp->linked && !geom_ensure(ctx, gp,
+                                    ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
+                                                                : ctx->state.program))
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
@@ -2573,20 +2687,30 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     }
     gs_in = gp->in_type;
 
-    /* build the vertex sequence */
+    /* build the vertex sequence and (for indexed draws) the capture index list: primitive
+     * restart entries are removed from the capture draw */
     if (indexed)
     {
-        seq = geom_index_list(ctx, type, offset, count, &restart);
-        if (!seq)
+        uint32_t *raw = geom_index_list(ctx, type, offset, count, &restart);
+        if (!raw)
         {
             ERROR_RETURN(GL_OUT_OF_MEMORY);
             return;
         }
-        nseq = (uint64_t)count;
+        seq = xmalloc(sizeof(uint32_t) * (size_t)(count > 0 ? count : 1));
+        indices = xmalloc(sizeof(uint32_t) * (size_t)(count > 0 ? count : 1));
+        for (GLsizei i = 0; i < count; i++)
+        {
+            seq[i] = raw[i];
+            if (raw[i] != restart) indices[index_count++] = raw[i];
+        }
+        free(raw);
+        nseq = (uint64_t)index_count;
     }
     else
     {
         nseq = (uint64_t)count;
+        index_count = 0;
         seq = xmalloc(sizeof(uint32_t) * (size_t)nseq);
         for (i = 0; i < (GLuint)nseq; i++) seq[i] = (uint32_t)(first + (GLint)i);
     }
@@ -2594,14 +2718,14 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     /* the vertex range the capture pass must cover */
     for (i = 0; i < (GLuint)nseq; i++)
     {
-        if (seq[i] == restart) continue;
         if (seq[i] < vmin) vmin = seq[i];
         if (seq[i] > vmax) vmax = seq[i];
     }
     if (vmin == 0xffffffffu)
     {
         free(seq);
-        return;     /* nothing to draw (all restart) */
+        free(indices);
+        return;     /* nothing to draw */
     }
     if (indexed) vmin += (uint32_t)basevertex, vmax += (uint32_t)basevertex;
 
@@ -2620,6 +2744,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
         if (!nprims)
         {
             free(seq);
+            free(indices);
             return;
         }
 
@@ -2627,6 +2752,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
         if (!prims)
         {
             free(seq);
+            free(indices);
             ERROR_RETURN(GL_OUT_OF_MEMORY);
             return;
         }
@@ -2674,13 +2800,18 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     if (!METAL() || !METAL()->draw)
     {
         free(prims);
+        free(indices);
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
 
+    d.indices = indices;
+    d.index_count = index_count;
+
     METAL()->draw(ctx, &d);
 
     free(prims);
+    free(indices);
 }
 
 /* ------------------------------------------------------------------ init / queries */
