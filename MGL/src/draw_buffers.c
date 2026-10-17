@@ -41,6 +41,7 @@
 #include "mgl_buffers_err.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: cached index rewrites / restart scans */
+#include "mgl_ext_tess.h"
 #include "mgl_ext_xfb.h"
 
 #define MTLX() (ctx->mtl_funcs.ext_buffers)
@@ -451,15 +452,6 @@ static int build_emulated(GLenum mode, const VertexSource *src, GLsizei count, I
     }
 }
 
-static void warn_patches_once(void)
-{
-    static bool warned = false;
-    if (!warned)
-    {
-        warned = true;
-        fprintf(stderr, "MGL: GL_PATCHES draws need tessellation, which MGL cannot translate to Metal; draw skipped\n");
-    }
-}
 
 /* CPU pointer to element indices (after making GPU writes visible) */
 static const uint8_t *element_pointer(GLMContext ctx, Buffer *ebuf, size_t offset, GLsizei count, GLenum type)
@@ -654,7 +646,14 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
 
     if (mode == GL_PATCHES)
     {
-        warn_patches_once();
+        /* tess domain: GL_PATCHES is executed by the tessellation pipeline
+           (MGLRenderer+Tessellation.m); it needs an active tessellation evaluation shader */
+        if (!mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
+                                   basevertex, (GLint)baseinstance))
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return;
+        }
         return;
     }
 
@@ -830,6 +829,13 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
 {
     if (count <= 0 || instances <= 0)
         return;
+
+    /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active */
+    if (mode != GL_PATCHES && mgl_tess_active_program(ctx))
+    {
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return;
+    }
 
     if (!mgl_ext_pre_draw(ctx, mode, count, instances))
         return;
