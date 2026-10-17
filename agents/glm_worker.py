@@ -225,6 +225,13 @@ def create_with_retry(client, **kwargs):
         try:
             return client.messages.create(**kwargs)
         except Exception as e:  # noqa: BLE001  (rate limits, overload, network)
+            msg = str(e)
+            # Z.AI 1113 = account has no balance / resource package: retrying cannot help
+            if "1113" in msg or "Insufficient balance" in msg or "invalid api key" in msg.lower() \
+                    or getattr(e, "status_code", None) in (401, 403):
+                raise SystemExit(f"FATAL provider error, not retrying: {msg[:200]}\n"
+                                 "Fix the account/key, then re-run agents/run_glm_domains.sh <domains> "
+                                 "(workers resume from their saved transcripts).")
             if attempt == 7:
                 raise
             print(f"  API error ({type(e).__name__}: {str(e)[:160]}); retry in {delay}s", flush=True)
