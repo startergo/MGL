@@ -55,20 +55,103 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
 // Calls every category method named ext<Domain><suffix> (single object argument).
+//
+// gpuaudit: the resolved methods are memoised per (class, suffix).  Method lists of a
+// class are fixed once the class is realised, and this runs on every draw / render pass /
+// commit, so the objc runtime enumeration (class_copyMethodList + sel_getName + strncmp
+// over every method of MGLRenderer) is paid exactly once per suffix instead of per draw
+// (it was ~25% of the CPU cost of a draw call).
+typedef struct {
+    Class cls;
+    const char *suffix;
+    unsigned int count;
+    SEL *sels;
+    void (**imps)(id, SEL, id);
+} MGLExtHookCache;
+
+static MGLExtHookCache g_ext_hook_cache[8];
+
+static MGLExtHookCache *extHookCacheFind(Class cls, const char *suffix)
+{
+    for (int i = 0; i < (int)(sizeof(g_ext_hook_cache) / sizeof(g_ext_hook_cache[0])); i++)
+        if (g_ext_hook_cache[i].imps && g_ext_hook_cache[i].cls == cls &&
+            strcmp(g_ext_hook_cache[i].suffix, suffix) == 0)
+            return &g_ext_hook_cache[i];
+    return NULL;
+}
+
+static MGLExtHookCache *extHookCacheAdd(Class cls, const char *suffix, unsigned int count,
+                                        SEL *sels, void (**imps)(id, SEL, id))
+{
+    // on success the cache takes ownership of sels/imps; on failure the caller frees them
+    for (int i = 0; i < (int)(sizeof(g_ext_hook_cache) / sizeof(g_ext_hook_cache[0])); i++)
+    {
+        if (g_ext_hook_cache[i].imps)
+            continue;
+
+        g_ext_hook_cache[i].cls = cls;
+        g_ext_hook_cache[i].suffix = suffix;        // literal, lives for the process
+        g_ext_hook_cache[i].count = count;
+        g_ext_hook_cache[i].sels = sels;
+        g_ext_hook_cache[i].imps = imps;
+        return &g_ext_hook_cache[i];
+    }
+
+    return NULL;
+}
+
 static void mglCallExtHooks(id self, const char *suffix, id arg)
 {
-    unsigned int n = 0;
-    Method *methods = class_copyMethodList([self class], &n);
-    size_t sl = strlen(suffix);
-    for (unsigned int i = 0; i < n; i++) {
-        const char *sel = sel_getName(method_getName(methods[i]));
-        size_t l = strlen(sel);
-        if (strncmp(sel, "ext", 3) == 0 && l > sl && strcmp(sel + l - sl, suffix) == 0) {
-            void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))method_getImplementation(methods[i]);
-            imp(self, method_getName(methods[i]), arg);
+    Class cls = [self class];
+    MGLExtHookCache *c = extHookCacheFind(cls, suffix);
+
+    if (!c)
+    {
+        unsigned int n = 0;
+        Method *methods = class_copyMethodList(cls, &n);
+        size_t sl = strlen(suffix);
+
+        SEL *sels = (n ? (SEL *)malloc(n * sizeof(SEL)) : NULL);
+        void (**imps)(id, SEL, id) = (n ? (void (**)(id, SEL, id))malloc(n * sizeof(void (*)(id, SEL, id))) : NULL);
+        unsigned int used = 0;
+
+        if (sels && imps)
+        {
+            for (unsigned int i = 0; i < n; i++) {
+                const char *sel = sel_getName(method_getName(methods[i]));
+                size_t l = strlen(sel);
+                if (strncmp(sel, "ext", 3) == 0 && l > sl && strcmp(sel + l - sl, suffix) == 0) {
+                    sels[used] = method_getName(methods[i]);
+                    imps[used] = (void (*)(id, SEL, id))method_getImplementation(methods[i]);
+                    used++;
+                }
+            }
+        }
+
+        free(methods);
+
+        if (!sels || !imps)
+        {
+            free(sels);
+            free(imps);
+            return;     // no methods at all: nothing to call
+        }
+
+        c = extHookCacheAdd(cls, suffix, used, sels, imps);
+
+        if (!c)
+        {
+            // cache full: call what was found directly (list is rebuilt next time)
+            for (unsigned int i = 0; i < used; i++)
+                imps[i](self, sels[i], arg);
+            free(sels);
+            free(imps);
+            return;
         }
     }
-    free(methods);
+
+    for (unsigned int i = 0; i < c->count; i++)
+        c->imps[i](self, c->sels[i], arg);
 }
 
 // Main class performing the rendering
