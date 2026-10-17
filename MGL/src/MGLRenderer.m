@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -69,152 +70,8 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
 
 MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
 {
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUCharNormalized;
-                    case 2: return MTLVertexFormatUChar2Normalized;
-                    case 3: return MTLVertexFormatUChar3Normalized;
-                    case 4: return MTLVertexFormatUChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUChar;
-                    case 2: return MTLVertexFormatUChar2;
-                    case 3: return MTLVertexFormatUChar3;
-                    case 4: return MTLVertexFormatUChar4;
-                }
-            }
-            break;
-
-        case GL_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatCharNormalized;
-                    case 2: return MTLVertexFormatChar2Normalized;
-                    case 3: return MTLVertexFormatChar3Normalized;
-                    case 4: return MTLVertexFormatChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatChar;
-                    case 2: return MTLVertexFormatChar2;
-                    case 3: return MTLVertexFormatChar3;
-                    case 4: return MTLVertexFormatChar4;
-                }
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatUShort2Normalized;
-                    case 3: return MTLVertexFormatUShort3Normalized;
-                    case 4: return MTLVertexFormatUShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatUShort2;
-                    case 3: return MTLVertexFormatUShort3;
-                    case 4: return MTLVertexFormatUShort4;
-                }
-            }
-            break;
-
-        case GL_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatShort2Normalized;
-                    case 3: return MTLVertexFormatShort3Normalized;
-                    case 4: return MTLVertexFormatShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatShort2;
-                    case 3: return MTLVertexFormatShort3;
-                    case 4: return MTLVertexFormatShort4;
-                }
-            }
-            break;
-
-            case GL_HALF_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatHalf;
-                    case 2: return MTLVertexFormatHalf2;
-                    case 3: return MTLVertexFormatHalf3;
-                    case 4: return MTLVertexFormatHalf4;
-                }
-                break;
-
-            case GL_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatFloat;
-                    case 2: return MTLVertexFormatFloat2;
-                    case 3: return MTLVertexFormatFloat3;
-                    case 4: return MTLVertexFormatFloat4;
-                }
-                break;
-
-            case GL_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatInt;
-                    case 2: return MTLVertexFormatInt2;
-                    case 3: return MTLVertexFormatInt3;
-                    case 4: return MTLVertexFormatInt4;
-                }
-                break;
-
-            case GL_UNSIGNED_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUInt;
-                    case 2: return MTLVertexFormatUInt2;
-                    case 3: return MTLVertexFormatUInt3;
-                    case 4: return MTLVertexFormatUInt4;
-                }
-                break;
-
-            case GL_RGB10:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-
-            case GL_UNSIGNED_INT_10_10_10_2:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-        }
-
-    return MTLVertexFormatInvalid;
+    // vattrib: full GL -> Metal vertex format table lives in MGLRenderer+VertexAttrib.m
+    return mglVertexFormatForAttrib(type, (GLint)size, normalized, false);
 }
 
 #pragma mark debug code
@@ -335,7 +192,6 @@ void logDirtyBits(GLMContext ctx)
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
 {
     int count;
-    int mapped_buffers;
     struct {
         int spvc_type;
         int gl_buffer_type;
@@ -413,95 +269,9 @@ void logDirtyBits(GLMContext ctx)
     // bind vao attribs to buffers (attribs can share the same buffer)
     if (stage == _VERTEX_SHADER)
     {
-        int vao_buffer_start;
-
-        count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STAGE_INPUT];
-        mapped_buffers = 0;
-
-        // vao buffers start after the uniforms and shader buffers
-        vao_buffer_start = buffer_map->count;
-        // CRITICAL SECURITY FIX: Check array bounds instead of using assert()
-        if (buffer_map->count >= ctx->state.max_vertex_attribs) {
-            NSLog(@"MGL SECURITY ERROR: buffer_map count %d exceeds max_vertex_attribs %d",
-                  buffer_map->count, ctx->state.max_vertex_attribs);
+        // vattrib: one Metal vertex buffer per GL vertex buffer binding (MGLRenderer+VertexAttrib.m)
+        if ([self vattribMapVertexBuffers: buffer_map] == false)
             return false;
-        }
-        buffer_map->buffers[vao_buffer_start].buf = NULL;
-
-        // create attribute map
-        //
-        // we need to cache this mapping, its called on each draw command
-        //
-        for(int att=0;att<ctx->state.max_vertex_attribs; att++)
-        {
-            if (VAO_STATE(enabled_attribs) & (0x1 << att))
-            {
-                // CRITICAL SECURITY FIX: Check buffer instead of using assert()
-                if (!VAO_ATTRIB_STATE(att).buffer) {
-                    NSLog(@"MGL SECURITY ERROR: NULL buffer for enabled vertex attribute %d", att);
-                    return false;
-                }
-
-                // check all the buffers for metal objects
-                Buffer *gl_buffer;
-                Buffer *map_buffer;
-
-                gl_buffer = VAO_ATTRIB_STATE(att).buffer;
-
-                // check start for map... then check
-                map_buffer = buffer_map->buffers[vao_buffer_start].buf;
-
-                // empty slot map it here, only works on first buffer..
-                if (map_buffer == NULL)
-                {
-                    // map the buffer object to a metal vertex index
-                    assert(buffer_map->count < ctx->state.max_vertex_attribs);
-                    buffer_map->buffers[vao_buffer_start].attribute_mask |= (0x1 << att);
-                    buffer_map->buffers[vao_buffer_start].buf = gl_buffer;
-                    buffer_map->count++;
-
-                    mapped_buffers++;
-                }
-                else
-                {
-                    bool found_buffer = false;
-
-                    // find vao attrib with same buffer
-                    for (int map=vao_buffer_start;
-                         (found_buffer == false) && map<buffer_map->count;
-                         map++)
-                    {
-                        // we need to check name and target, not pointers..
-                        // FIX ME: I think we don't need a target as all attribs should be an array_buffer
-                        if ((map_buffer->name == gl_buffer->name) &&
-                            (map_buffer->target == gl_buffer->target))
-                        {
-                            // include it the list of attributes
-                            buffer_map->buffers[map].attribute_mask |= (0x1 << att);
-                            found_buffer = true;
-                            mapped_buffers++;
-                            break;
-                        }
-                    }
-
-                    if (found_buffer == false)
-                    {
-                        // map the next buffer object to a metal vertex index
-                        assert(buffer_map->count < ctx->state.max_vertex_attribs);
-                        buffer_map->buffers[buffer_map->count].attribute_mask = (0x1 << att);
-                        buffer_map->buffers[buffer_map->count].buf = gl_buffer;
-                        buffer_map->count++;
-
-                        mapped_buffers++;
-                    }
-                }
-            }
-
-            if ((VAO_STATE(enabled_attribs) >> (att+1)) == 0)
-                break;
-        }
-
-        assert(mapped_buffers == count);
     }
     else if (stage == _COMPUTE_SHADER)
     {
@@ -3597,65 +3367,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 #pragma mark vertex descriptor
 - (MTLVertexDescriptor *)generateVertexDescriptor
 {
-    MTLVertexDescriptor *vertexDescriptor = [[MTLVertexDescriptor alloc] init];
-    assert(vertexDescriptor);
-
-    [vertexDescriptor reset]; // ??? debug
-
-    // we can bind a new vertex descriptor without creating a new renderbuffer
-    for(int i=0;i<ctx->state.max_vertex_attribs; i++)
-    {
-        if (VAO_STATE(enabled_attribs) & (0x1 << i))
-        {
-            MTLVertexFormat format;
-
-            if (VAO_ATTRIB_STATE(i).buffer == NULL)
-            {
-                NSLog(@"Error: Invalid VAO defined enabled but no buffer bound\n");
-                return NULL;
-            }
-
-            format = glTypeSizeToMtlType(VAO_ATTRIB_STATE(i).type,
-                                         VAO_ATTRIB_STATE(i).size,
-                                         VAO_ATTRIB_STATE(i).normalized);
-
-            if (format == MTLVertexFormatInvalid)
-            {
-                NSLog(@"Error: unable to map gl type / size / normalize to format\n");
-                return false;
-            }
-
-            int mapped_buffer_index;
-
-            mapped_buffer_index = [self getVertexBufferIndexWithAttributeSet: i];
-
-            vertexDescriptor.attributes[i].bufferIndex = mapped_buffer_index;
-            vertexDescriptor.attributes[i].offset = ctx->state.vao->attrib[i].relativeoffset;
-            vertexDescriptor.attributes[i].format = format;
-
-            vertexDescriptor.layouts[mapped_buffer_index].stride = VAO_ATTRIB_STATE(i).stride;
-
-            if (ctx->state.vao->attrib[i].divisor)
-            {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = ctx->state.vao->attrib[i].divisor;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerInstance;
-            }
-            else
-            {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = 1;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerVertex;
-            }
-        }
-
-        // early out
-        if ((VAO_STATE(enabled_attribs) >> (i+1)) == 0)
-            break;
-    }
-
-    // clear all dirty bits as they have been translated into a vertex descriptor
-    ctx->state.vao->dirty_bits = 0;
-
-    return vertexDescriptor;
+    // vattrib: GL vertex array state -> MTLVertexDescriptor (MGLRenderer+VertexAttrib.m)
+    return [self vattribGenerateVertexDescriptor];
 }
 
 #pragma mark utility funcs for processGLState
