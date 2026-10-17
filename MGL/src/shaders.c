@@ -77,6 +77,10 @@ glslang_stage_t getGLSLStage(GLuint type)
     return 0;
 }
 
+/* scratch copy used to rewrite legacy #version lines (released by glReleaseShaderCompiler) */
+static char *modified_src = NULL;
+static size_t modified_src_size = 0;
+
 void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t *input)
 {
     input->language = GLSLANG_SOURCE_GLSL;
@@ -124,9 +128,6 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
         input->client_version = GLSLANG_TARGET_OPENGL_450;
     }
 
-    /* For legacy GLSL versions, replace #version directive in source copy */
-    static char *modified_src = NULL;
-    static size_t modified_src_size = 0;
 
     if (original_version < 330) {
         fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
@@ -353,6 +354,34 @@ GLuint mglCreateShader(GLMContext ctx, GLenum type)
     return shader;
 }
 
+/*
+ * glReleaseShaderCompiler: free the legacy-source scratch buffer now and tear down glslang's
+ * process-wide state (built-in symbol tables, pools). That teardown is only safe once no
+ * compiled glslang shader object exists, so with live shaders it is deferred until the last
+ * one is deleted. The next compile or link re-initializes glslang (lazy_init_compiler).
+ */
+void mgl_shader_release_compiler_resources(GLMContext ctx)
+{
+    struct MGLExtState_program *st = STATE(ext_program);
+
+    free(modified_src);
+    modified_src = NULL;
+    modified_src_size = 0;
+
+    if (!st || st->compiler_released)
+        return;
+
+    if (st->live_glslang_shaders > 0)
+    {
+        st->release_pending = GL_TRUE;
+        return;
+    }
+
+    glslang_finalize_process();
+    st->compiler_released = GL_TRUE;
+    st->release_pending = GL_FALSE;
+}
+
 static void release_glslang_shader(GLMContext ctx, Shader *ptr)
 {
     if (ptr->compiled_glsl_shader)
@@ -360,7 +389,11 @@ static void release_glslang_shader(GLMContext ctx, Shader *ptr)
         glslang_shader_delete(ptr->compiled_glsl_shader);
         ptr->compiled_glsl_shader = NULL;
         if (STATE(ext_program) && STATE(ext_program)->live_glslang_shaders > 0)
+        {
             STATE(ext_program)->live_glslang_shaders--;
+            if (STATE(ext_program)->live_glslang_shaders == 0 && STATE(ext_program)->release_pending)
+                mgl_shader_release_compiler_resources(ctx);
+        }
     }
 }
 
@@ -534,10 +567,15 @@ void mglShaderSource(GLMContext ctx, GLuint shader, GLsizei count, const GLchar 
 
 static void lazy_init_compiler(GLMContext ctx)
 {
-    if (STATE(ext_program) && STATE(ext_program)->compiler_released)
+    if (STATE(ext_program))
     {
-        glslang_initialize_process();
-        STATE(ext_program)->compiler_released = GL_FALSE;
+        /* a new compile cancels a deferred release */
+        STATE(ext_program)->release_pending = GL_FALSE;
+        if (STATE(ext_program)->compiler_released)
+        {
+            glslang_initialize_process();
+            STATE(ext_program)->compiler_released = GL_FALSE;
+        }
     }
 }
 
