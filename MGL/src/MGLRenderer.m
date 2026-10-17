@@ -4962,7 +4962,7 @@ void mtlMultiDrawElements(GLMContext glm_ctx, GLenum mode, const GLsizei *count,
         offset = (char *)indices[i] - (char *)NULL;
 
         [_currentRenderEncoder drawIndexedPrimitives:primitiveType indexCount:count[i] indexType:indexType
-                                     indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:count[i] baseVertex:basevertex[i] baseInstance:1];
+                                     indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:1 baseVertex:basevertex[i] baseInstance:0];
     }
 }
 
