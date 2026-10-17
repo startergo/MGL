@@ -890,6 +890,8 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3,1,0)) != SPVC_SUCCESS ||
         /* texext: samplerBuffer/imageBuffer -> MSL texture_buffer (bound as MTLTextureTypeTextureBuffer) */
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) != SPVC_SUCCESS ||
+        /* texdata: 1D textures are realized as 2D Metal textures (Metal 1D textures cannot be mipmapped) */
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE) != SPVC_SUCCESS ||
         spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIRV-Cross MSL options rejected\n", stage_label(stage));

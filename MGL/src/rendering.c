@@ -29,6 +29,7 @@
 
 #include "pixel_utils.h"
 #include "glm_context.h"
+#include "mgl_ext_texdata.h"
 #include "mgl_ext_queries.h"
 
 #include "mgl_ext_fb.h"
@@ -422,6 +423,9 @@ void mglPixelStorei(GLMContext ctx, GLenum pname, GLint param)
             break;
 
         default:
+            /* texdata: *_COMPRESSED_BLOCK_WIDTH/HEIGHT/DEPTH/SIZE */
+            if (mgl_texdata_pixel_store(ctx, pname, param))
+                break;
             ERROR_RETURN(GL_INVALID_ENUM);
             break;
     }
