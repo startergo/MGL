@@ -523,6 +523,19 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         objc_setAssociatedObject(func, &kComputePSOKey, pso, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
+    // the resource reflection helpers read ctx->state.program: present a pipeline's compute
+    // program there while this dispatch is encoded
+    Program *saved_program = ctx->state.program;
+    ctx->state.program = program;
+    bool ok = [self extBufEncodeDispatch: program pso: pso x: x y: y z: z indirect: indirect offset: offset];
+    ctx->state.program = saved_program;
+
+    return ok;
+}
+
+- (bool) extBufEncodeDispatch: (Program *) program pso: (id<MTLComputePipelineState>) pso
+                            x: (GLuint) x y: (GLuint) y z: (GLuint) z indirect: (Buffer *) indirect offset: (size_t) offset
+{
     if (![self mapGLBuffersToMTLBufferMap: &ctx->state.compute_buffer_map_list stage: _COMPUTE_SHADER])
         return false;
 
