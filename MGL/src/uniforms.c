@@ -72,8 +72,15 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                     size_t di = u->st[s].offset + (size_t)e * u->st[s].array_stride + (size_t)c * u->st[s].matrix_stride +
                                 (size_t)r * u->st[s].scalar_size;
                     if (di + u->st[s].scalar_size > ip->dub_size[s]) continue;
-                    if (u->st[s].scalar_size == 1) dst[di] = (*(const uint32_t *)(src + si)) ? 1 : 0;
-                    else memcpy(dst + di, src + si, u->st[s].scalar_size);
+                    if (u->kind == MGLI_K_DOUBLE && u->st[s].scalar_size == 4) {
+                        /* GPU stores fp32 (Metal has no fp64): convert from the double shadow */
+                        float f = (float)*(const double *)(src + si);
+                        memcpy(dst + di, &f, 4);
+                    } else if (u->st[s].scalar_size == 1) {
+                        dst[di] = (*(const uint32_t *)(src + si)) ? 1 : 0;
+                    } else {
+                        memcpy(dst + di, src + si, u->st[s].scalar_size);
+                    }
                 }
         b->data.dirty_bits |= DIRTY_BUFFER_DATA;
     }

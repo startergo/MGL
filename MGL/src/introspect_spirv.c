@@ -47,10 +47,13 @@ enum { T_NONE = 0, T_VOID, T_BOOL, T_INT, T_FLOAT, T_VECTOR, T_MATRIX, T_ARRAY, 
 
 typedef struct { uint32_t *w; uint32_t len; uint8_t dead; uint8_t owned; } SInst;
 
+typedef struct { uint32_t key, id; } KV;
+
 typedef struct {
     int kind;
     uint32_t width, sign, elem, count, storage;
     uint32_t dim, depth, arrayed, ms, sampled;
+    uint32_t len; /* array length constant id (OpTypeArray) */
     uint32_t *mem; uint32_t nmem;
 } SType;
 
@@ -151,7 +154,7 @@ static SMod *mod_parse(const uint32_t *words, size_t nwords)
             case SpvOpTypeSampler: if (ID_OK(w[1])) m->t[w[1]].kind = T_SAMPLER; break;
             case SpvOpTypeSampledImage: if (ID_OK(w[1])) { m->t[w[1]].kind = T_SAMPLED_IMAGE; m->t[w[1]].elem = w[2]; } break;
             case SpvOpTypeArray:
-                if (ID_OK(w[1])) { m->t[w[1]].kind = T_ARRAY; m->t[w[1]].elem = w[2];
+                if (ID_OK(w[1])) { m->t[w[1]].kind = T_ARRAY; m->t[w[1]].elem = w[2]; m->t[w[1]].len = w[3];
                     m->t[w[1]].count = (ID_OK(w[3]) && m->isconst[w[3]]) ? m->cval[w[3]] : 1; }
                 break;
             case SpvOpTypeRuntimeArray: if (ID_OK(w[1])) { m->t[w[1]].kind = T_RARRAY; m->t[w[1]].elem = w[2]; m->t[w[1]].count = 0; } break;
@@ -496,10 +499,13 @@ static void scalar_info(const SMod *m, uint32_t t, int *kind, int *cols, int *ro
 
 typedef struct {
     uint32_t var;        /* original variable id */
-    uint32_t type;       /* pointee type */
+    uint32_t type;       /* pointee type (as declared) */
+    uint32_t gtype;      /* GPU storage type: bool->int, fp64->fp32 (== type unless rewritten) */
     uint32_t member;     /* member index in the default block */
     uint32_t offset;
     int      explicit_loc;
+    uint8_t *leaf;       /* per leaf uniform (walk_default order): LEAF_WAS_* */
+    int      nleaf;
     char     name[256];
 } DubMember;
 
@@ -651,16 +657,156 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
 
 #pragma mark - SPIR-V transform
 
+
+static void mgrow(SMod *m, uint32_t id); /* id tables grow when types are inserted */
+
 static uint32_t find_or_add_type_int(SMod *m, Inserts *ins, uint32_t *next_id)
 {
     for (uint32_t i = 1; i <= m->bound; i++) if (m->t[i].kind == T_INT && m->t[i].width == 32 && m->t[i].sign == 1) return i;
     uint32_t id = (*next_id)++;
     uint32_t o[3] = { id, 32, 1 };
     ins_op(&ins->globals, SpvOpTypeInt, 3, o);
+    mgrow(m, id);
+    m->t[id].kind = T_INT; m->t[id].width = 32; m->t[id].sign = 1;
     return id;
 }
 
-typedef struct { uint32_t key, id; } KV;
+static uint32_t find_or_add_type_float(SMod *m, Inserts *ins, uint32_t *next_id)
+{
+    for (uint32_t i = 1; i <= m->bound; i++) if (m->t[i].kind == T_FLOAT && m->t[i].width == 32) return i;
+    uint32_t id = (*next_id)++;
+    uint32_t o[2] = { id, 32 };
+    ins_op(&ins->globals, SpvOpTypeFloat, 2, o);
+    mgrow(m, id);
+    m->t[id].kind = T_FLOAT; m->t[id].width = 32;
+    return id;
+}
+
+/* MSL cannot lay `bool` out in buffers (natural alignment 0) and has no fp64 at all, so
+ * default-block members get their storage type rewritten:  bool/bvec -> int/ivec,
+ * double/dvec/dmat -> float/vec/mat (values are converted in the CPU-side shadow buffer).
+ * The ORIGINAL type is remembered per leaf so GL introspection still reports GL_BOOL/GL_DOUBLE. */
+
+enum { LEAF_AS_IS = 0, LEAF_WAS_BOOL = 1, LEAF_WAS_DOUBLE = 2 };
+
+static uint8_t leaf_kind_of(const SMod *m, uint32_t t)
+{
+    t = strip_arrays(m, t);
+    if (t > m->bound) return LEAF_AS_IS;
+    const SType *ty = &m->t[t];
+    if (ty->kind == T_BOOL) return LEAF_WAS_BOOL;
+    if (ty->kind == T_FLOAT) return ty->width == 64 ? LEAF_WAS_DOUBLE : LEAF_AS_IS;
+    if (ty->kind == T_VECTOR) {
+        const SType *e = &m->t[ty->elem];
+        if (e->kind == T_BOOL) return LEAF_WAS_BOOL;
+        return (e->kind == T_FLOAT && e->width == 64) ? LEAF_WAS_DOUBLE : LEAF_AS_IS;
+    }
+    if (ty->kind == T_MATRIX) {
+        const SType *e = &m->t[m->t[ty->elem].elem];
+        return (e->kind == T_FLOAT && e->width == 64) ? LEAF_WAS_DOUBLE : LEAF_AS_IS;
+    }
+    return LEAF_AS_IS;
+}
+
+
+/* enumerate leaf uniforms in the exact order walk_default() creates them */
+static void record_leaf_kinds(const SMod *m, uint32_t t, uint8_t **out, int *n)
+{
+    const SType *ty = &m->t[t];
+    if (ty->kind == T_ARRAY || ty->kind == T_RARRAY) {
+        uint32_t et = ty->elem;
+        int base = m->t[et].kind != T_ARRAY && m->t[et].kind != T_RARRAY;
+        if (base && m->t[et].kind != T_STRUCT) {
+            *out = realloc(*out, (size_t)(*n + 1)); (*out)[(*n)++] = leaf_kind_of(m, et);
+            return;
+        }
+        for (uint32_t i = 0; i < (ty->count ? ty->count : 1); i++) record_leaf_kinds(m, et, out, n);
+        return;
+    }
+    if (ty->kind == T_STRUCT) {
+        for (uint32_t i = 0; i < ty->nmem; i++) record_leaf_kinds(m, ty->mem[i], out, n);
+        return;
+    }
+    *out = realloc(*out, (size_t)(*n + 1)); (*out)[(*n)++] = leaf_kind_of(m, t);
+}
+
+/* grow the id-indexed tables so freshly inserted types are usable by msl_layout()/get_dec() */
+static void mgrow(SMod *m, uint32_t id)
+{
+    if (id < m->bound) return;
+    uint32_t nb = m->bound + 1;
+    while (nb <= id) nb *= 2;
+    size_t old = m->bound + 1;
+    m->t = realloc(m->t, nb * sizeof(SType));
+    memset(m->t + old, 0, (nb - old) * sizeof(SType));
+    m->bound = nb - 1;
+}
+
+/* insert a copy of type `t` with bool -> int and fp64 -> fp32 leaves; returns the new type id
+ * (or `t` when nothing changed).  Inserted types are registered in the module model so layout
+ * computation sees them. */
+static uint32_t map_gpu_type(SMod *m, Inserts *ins, uint32_t *next_id, uint32_t t,
+                             uint32_t int_t, uint32_t float_t, KV **cache, int *ncache)
+{
+    if (t > m->bound || !int_t) return t;
+    for (int i = 0; i < *ncache; i++) if ((*cache)[i].key == t) return (*cache)[i].id;
+    uint32_t r = t;
+    SType *ty = &m->t[t];
+    if (ty->kind == T_BOOL) r = int_t;
+    else if (ty->kind == T_FLOAT && ty->width == 64 && float_t) r = float_t;
+    else if (ty->kind == T_VECTOR || ty->kind == T_MATRIX) {
+        uint32_t e = map_gpu_type(m, ins, next_id, ty->elem, int_t, float_t, cache, ncache);
+        ty = &m->t[t]; /* recursion may have grown (realloc'd) the type table */
+        if (e != ty->elem) {
+            r = (*next_id)++;
+            uint32_t o[3] = { r, e, ty->count };
+            ins_op(&ins->globals, ty->kind == T_VECTOR ? SpvOpTypeVector : SpvOpTypeMatrix, 3, o);
+            mgrow(m, r);
+            m->t[r] = *ty; m->t[r].elem = e;
+        }
+    } else if (ty->kind == T_ARRAY || ty->kind == T_RARRAY) {
+        uint32_t e = map_gpu_type(m, ins, next_id, ty->elem, int_t, float_t, cache, ncache);
+        ty = &m->t[t]; /* recursion may have grown (realloc'd) the type table */
+        if (e != ty->elem) {
+            uint32_t len = ty->len, kind = ty->kind;
+            r = (*next_id)++;
+            if (kind == T_ARRAY) { uint32_t o[3] = { r, e, len }; ins_op(&ins->globals, SpvOpTypeArray, 3, o); }
+            else { uint32_t o[2] = { r, e }; ins_op(&ins->globals, SpvOpTypeRuntimeArray, 2, o); }
+            mgrow(m, r);
+            m->t[r] = *ty; m->t[r].elem = e;
+        }
+    } else if (ty->kind == T_STRUCT && ty->nmem) {
+        uint32_t nmem = ty->nmem;
+        uint32_t *nm = alloca(nmem * sizeof(uint32_t));
+        int any = 0;
+        for (uint32_t i = 0; i < nmem; i++) {
+            nm[i] = map_gpu_type(m, ins, next_id, m->t[t].mem[i], int_t, float_t, cache, ncache);
+            any |= nm[i] != m->t[t].mem[i];
+        }
+        if (any) {
+            ty = &m->t[t];
+            r = (*next_id)++;
+            uint32_t *o = alloca((nmem + 1) * sizeof(uint32_t));
+            o[0] = r;
+            for (uint32_t i = 0; i < nmem; i++) o[i + 1] = nm[i];
+            ins_op(&ins->globals, SpvOpTypeStruct, (int)nmem + 1, o);
+            mgrow(m, r);
+            m->t[r] = *ty; m->t[r].nmem = nmem;
+            m->t[r].mem = malloc((nmem + 1) * sizeof(uint32_t));
+            memcpy(m->t[r].mem, nm, nmem * sizeof(uint32_t));
+            /* keep names: reflection reads them back from the patched module */
+            ins_string_op(&ins->names, SpvOpName, 1, &r, id_name(m, t));
+            for (uint32_t i = 0; i < nmem; i++) {
+                uint32_t o2[2] = { r, i };
+                ins_string_op(&ins->names, SpvOpMemberName, 2, o2, member_name(m, t, i));
+            }
+        }
+    }
+    *cache = realloc(*cache, (size_t)(*ncache + 1) * sizeof(KV));
+    (*cache)[*ncache] = (KV){ t, r }; (*ncache)++;
+    return r;
+}
+
 
 static uint32_t kv_get(KV *kv, int n, uint32_t key) { for (int i = 0; i < n; i++) if (kv[i].key == key) return kv[i].id; return 0; }
 
@@ -690,12 +836,111 @@ void mgli_free_inits(MGLIProgram *ip)
 }
 
 /* rewrite one stage; returns patched words (malloc) */
+/* zero of any type (for int != 0 style bool conversion) */
+static uint32_t null_const(SMod *m, Inserts *ins, uint32_t *next_id, uint32_t t)
+{
+    uint32_t id = (*next_id)++;
+    uint32_t o[2] = { t, id };
+    ins_op(&ins->globals, SpvOpConstantNull, 2, o);
+    (void)m;
+    return id;
+}
+
+/* produce an id of type `to` from `val` of type `from`, where from/to differ only in
+ * bool<->int or fp64<->fp32 storage mapping of the leaves */
+static uint32_t conv_val(SMod *m, WBuf *body, uint32_t *next_id, Inserts *ins, uint32_t val, uint32_t from, uint32_t to)
+{
+    if (from == to || to > m->bound || from > m->bound) return val;
+    const SType *tt = &m->t[to];
+    if (tt->kind == T_BOOL || (tt->kind == T_VECTOR && m->t[tt->elem].kind == T_BOOL)) {
+        uint32_t r = (*next_id)++;
+        uint32_t z = null_const(m, ins, next_id, from);
+        wb_push(body, (5u << 16) | SpvOpINotEqual); wb_push(body, to); wb_push(body, r); wb_push(body, val); wb_push(body, z);
+        return r;
+    }
+    if (tt->kind == T_FLOAT || tt->kind == T_VECTOR) { /* fp64 <- fp32 */
+        uint32_t r = (*next_id)++;
+        wb_push(body, (4u << 16) | SpvOpFConvert); wb_push(body, to); wb_push(body, r); wb_push(body, val);
+        return r;
+    }
+    if (tt->kind == T_MATRIX) { /* dmat <- fmat: convert column by column */
+        uint32_t fc = m->t[from].elem, tc2 = m->t[to].elem;
+        uint32_t *cols = alloca(m->t[to].count * sizeof(uint32_t));
+        for (uint32_t c = 0; c < m->t[to].count; c++) {
+            uint32_t e = (*next_id)++;
+            wb_push(body, (5u << 16) | SpvOpCompositeExtract); wb_push(body, fc); wb_push(body, e); wb_push(body, val); wb_push(body, c);
+            cols[c] = conv_val(m, body, next_id, ins, e, fc, tc2);
+        }
+        uint32_t r = (*next_id)++;
+        wb_push(body, ((2u + m->t[to].count) << 16) | SpvOpCompositeConstruct); wb_push(body, to); wb_push(body, r);
+        for (uint32_t c = 0; c < m->t[to].count; c++) wb_push(body, cols[c]);
+        return r;
+    }
+    if (tt->kind == T_STRUCT && tt->nmem) {
+        uint32_t *mems = alloca(tt->nmem * sizeof(uint32_t));
+        for (uint32_t i = 0; i < tt->nmem; i++) {
+            uint32_t fm = m->t[from].mem[i];
+            uint32_t e = (*next_id)++;
+            wb_push(body, (5u << 16) | SpvOpCompositeExtract); wb_push(body, fm); wb_push(body, e); wb_push(body, val); wb_push(body, i);
+            mems[i] = conv_val(m, body, next_id, ins, e, fm, tt->mem[i]);
+        }
+        uint32_t r = (*next_id)++;
+        wb_push(body, ((2u + tt->nmem) << 16) | SpvOpCompositeConstruct); wb_push(body, to); wb_push(body, r);
+        for (uint32_t i = 0; i < tt->nmem; i++) wb_push(body, mems[i]);
+        return r;
+    }
+    { /* defensive: same-shape copy (arrays cannot be loaded from uniforms in GLSL) */
+        uint32_t r = (*next_id)++;
+        wb_push(body, (4u << 16) | SpvOpCopyObject); wb_push(body, to); wb_push(body, r); wb_push(body, val);
+        return r;
+    }
+}
+
+/* like conv_val but writes into a chosen result id (the id the original instruction used) */
+static void emit_conv(SMod *m, WBuf *body, uint32_t *next_id, Inserts *ins, uint32_t val, uint32_t from, uint32_t to, uint32_t out)
+{
+    uint32_t r = conv_val(m, body, next_id, ins, val, from, to);
+    if (r != out) {
+        wb_push(body, (4u << 16) | SpvOpCopyObject); wb_push(body, to); wb_push(body, out); wb_push(body, r);
+    }
+}
+
+/* Metal has no fp64: edit every 64-bit float type in place to 32 bits and replace double
+ * constants with float constants emitted at the same position (def-before-use is preserved) */
+static void lower_doubles(SMod *m, uint32_t **repls)
+{
+    for (size_t i = 1; i < m->first_func; i++) {
+        if (m->in[i].dead || !m->in[i].w) continue;
+        uint32_t *w = m->in[i].w, op = w[0] & 0xffff, wc = m->in[i].len;
+        if (op == SpvOpTypeFloat && wc == 3 && w[2] == 64) {
+            w[2] = 32;
+            if (w[1] <= m->bound) m->t[w[1]].width = 32;
+        } else if ((op == SpvOpConstant || op == SpvOpSpecConstant) && wc == 5 && w[1] <= m->bound && m->t[w[1]].kind == T_FLOAT) {
+            union { double d; uint64_t u; } v;
+            v.u = (uint64_t)w[3] | ((uint64_t)w[4] << 32);
+            float f = (float)v.d;
+            uint32_t bits;
+            memcpy(&bits, &f, 4);
+            m->in[i].dead = 1;
+            uint32_t *r = malloc(4 * sizeof(uint32_t));
+            r[0] = (4u << 16) | op; r[1] = w[1]; r[2] = w[2]; r[3] = bits;
+            repls[i] = r;
+            if (w[2] <= m->bound) m->cval[w[2]] = bits; /* keep the module model in sync */
+        }
+    }
+}
+
 static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t *out_n)
 {
     SMod *m = sc->m;
     Inserts ins; memset(&ins, 0, sizeof ins);
     uint32_t next_id = m->bound;
-    uint8_t *laid = zalloc(m->bound + 1);
+    uint32_t laid_n = m->bound + 1;
+    uint8_t *laid = zalloc(laid_n);
+    uint32_t **repls = zalloc(m->n * sizeof(uint32_t *)); /* fp64->fp32 constant replacements */
+    uint32_t int_t = 0, float_t = 0;
+    KV *tc = NULL; int ntc = 0; /* mapped type cache */
+    KV *mpt = NULL; int nmpt = 0; /* rewritten access-chain result id -> mapped pointee type */
 
     /* 1. interface locations */
     for (int i = 0; i < sc->nlocs; i++) {
@@ -714,18 +959,28 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
         if (m->isvar[v] && m->vglobal[v] && m->vsc[v] == SpvStorageClassUniformConstant && !is_opaque(m, pointee(m, m->vtype[v])))
             sc->ndub++;
     bool pack = sc->ndub > 0 && !sc->no_pack;
-    if (pack) {
-        sc->dub = zalloc(sc->ndub * sizeof(DubMember));
+    sc->dub = zalloc(sc->ndub * sizeof(DubMember));
+    {
         uint32_t k = 0;
         for (uint32_t v = 1; v <= m->bound; v++)
             if (m->isvar[v] && m->vglobal[v] && m->vsc[v] == SpvStorageClassUniformConstant && !is_opaque(m, pointee(m, m->vtype[v]))) {
                 DubMember *d = &sc->dub[k];
                 d->var = v; d->type = pointee(m, m->vtype[v]); d->member = k;
+                d->gtype = d->type;
                 uint32_t l; d->explicit_loc = get_dec(m, v, -1, SpvDecorationLocation, &l) ? (int)l : -1;
                 snprintf(d->name, sizeof d->name, "%s", id_name(m, v));
                 old_of[v] = k + 1;
                 k++;
             }
+        /* GL-level leaf types (bool/double) recorded before any GPU-side rewriting */
+        for (uint32_t k = 0; k < sc->ndub; k++)
+            record_leaf_kinds(m, sc->dub[k].type, &sc->dub[k].leaf, &sc->dub[k].nleaf);
+    }
+    /* Metal has no fp64: rewrite every double in the module to float (values stay doubles in
+     * the CPU-side shadow and are converted on upload; GL introspection still reports the
+     * original types via the recorded leaf kinds) */
+    lower_doubles(m, repls);
+    if (pack) {
         /* verify every use is a load or an access chain (otherwise keep the original module) */
         uint8_t *ptrs = zalloc(next_id + 1);
         for (uint32_t i = 0; i < sc->ndub; i++) ptrs[sc->dub[i].var] = 1;
@@ -749,16 +1004,25 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
         free(ptrs);
         if (!pack) {
             fprintf(stderr, "MGL introspect: stage %d: default uniforms used through pointers, keeping per-uniform buffers\n", stage);
-            free(sc->dub); sc->dub = NULL; sc->ndub = 0;
             memset(old_of, 0, (m->bound + 1) * 4);
         }
     }
 
-    uint32_t dub_struct = 0, dub_ptr = 0, dub_var = 0, int_t = 0;
+    uint32_t dub_struct = 0, dub_ptr = 0, dub_var = 0;
     KV *consts = NULL; int nconsts = 0;
     KV *uptr = NULL; int nuptr = 0;
     if (pack) {
         int_t = find_or_add_type_int(m, &ins, &next_id);
+        /* MSL cannot lay out bools in buffers: storage type of bool/bvec members becomes int */
+        float_t = find_or_add_type_float(m, &ins, &next_id);
+        for (uint32_t k = 0; k < sc->ndub; k++)
+            sc->dub[k].gtype = map_gpu_type(m, &ins, &next_id, sc->dub[k].type, int_t, float_t, &tc, &ntc);
+        free(tc); tc = NULL; ntc = 0;
+        if (m->bound + 1 > laid_n) {
+            laid = realloc(laid, m->bound + 1);
+            memset(laid + laid_n, 0, m->bound + 1 - laid_n);
+            laid_n = m->bound + 1;
+        }
         /* member index constants */
         consts = zalloc(sc->ndub * sizeof(KV));
         for (uint32_t k = 0; k < sc->ndub; k++) {
@@ -771,8 +1035,8 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
         /* layout */
         uint32_t off = 0;
         for (uint32_t k = 0; k < sc->ndub; k++) {
-            ensure_layout(m, &ins, sc->dub[k].type, laid);
-            uint32_t s, a; msl_layout(m, sc->dub[k].type, &s, &a);
+            ensure_layout(m, &ins, sc->dub[k].gtype, laid);
+            uint32_t s, a; msl_layout(m, sc->dub[k].gtype, &s, &a);
             if (a < 4) a = 4;
             off = align_up(off, a);
             sc->dub[k].offset = off;
@@ -783,7 +1047,7 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
         {
             uint32_t *o = malloc((sc->ndub + 1) * 4);
             o[0] = dub_struct;
-            for (uint32_t k = 0; k < sc->ndub; k++) o[k + 1] = sc->dub[k].type;
+            for (uint32_t k = 0; k < sc->ndub; k++) o[k + 1] = sc->dub[k].gtype;
             ins_op(&ins.globals, SpvOpTypeStruct, (int)sc->ndub + 1, o);
             free(o);
         }
@@ -806,7 +1070,7 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
                 ip->inits[stage][ip->ninits[stage]].wide = wide;
                 ip->ninits[stage]++;
             }
-            uint32_t base = strip_arrays(m, sc->dub[k].type);
+            uint32_t base = strip_arrays(m, sc->dub[k].gtype);
             if (m->t[base].kind == T_MATRIX) {
                 uint32_t cs, ca; msl_layout(m, m->t[base].elem, &cs, &ca);
                 new_dec(m, &ins, dub_struct, (int32_t)k, SpvDecorationColMajor, 0, 0);
@@ -848,16 +1112,39 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
             uint32_t *w = m->in[i].w, op = w[0] & 0xffff, wc = m->in[i].len;
             if (op == SpvOpLoad && w[3] <= m->bound && old_of[w[3]]) {
                 uint32_t mem = old_of[w[3]] - 1;
-                uint32_t pt = UPTR(sc->dub[mem].type);
+                uint32_t g = sc->dub[mem].gtype;
+                uint32_t pt = UPTR(g);
                 uint32_t nid = next_id++;
                 uint32_t ac[5] = { (5u << 16) | SpvOpAccessChain, pt, nid, dub_var, kv_get(consts, nconsts, mem) };
                 wb_inst(&body, ac, 5);
-                wb_push(&body, w[0]); wb_push(&body, w[1]); wb_push(&body, w[2]); wb_push(&body, nid);
-                for (uint32_t a = 4; a < wc; a++) wb_push(&body, w[a]);
+                if (g != w[1]) {
+                    /* member storage type was rewritten: load the GPU type, convert back */
+                    uint32_t t = next_id++;
+                    wb_push(&body, (4u << 16) | SpvOpLoad); wb_push(&body, g); wb_push(&body, t); wb_push(&body, nid);
+                    for (uint32_t a = 4; a < wc; a++) wb_push(&body, w[a]);
+                    emit_conv(m, &body, &next_id, &ins, t, g, w[1], w[2]);
+                } else {
+                    wb_push(&body, w[0]); wb_push(&body, w[1]); wb_push(&body, w[2]); wb_push(&body, nid);
+                    for (uint32_t a = 4; a < wc; a++) wb_push(&body, w[a]);
+                }
                 continue;
             }
+            if (op == SpvOpLoad && w[3] <= m->bound && kv_get(mpt, nmpt, w[3])) {
+                /* load through a rewritten access chain whose pointee was mapped */
+                uint32_t g = kv_get(mpt, nmpt, w[3]);
+                if (g != w[1]) {
+                    uint32_t t = next_id++;
+                    wb_push(&body, (4u << 16) | SpvOpLoad); wb_push(&body, g); wb_push(&body, t); wb_push(&body, w[3]);
+                    for (uint32_t a = 4; a < wc; a++) wb_push(&body, w[a]);
+                    emit_conv(m, &body, &next_id, &ins, t, g, w[1], w[2]);
+                    continue;
+                }
+            }
             if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && w[3] <= m->bound && (old_of[w[3]] || retyped[w[3]])) {
-                uint32_t pt = UPTR(pointee(m, w[1]));
+                uint32_t p = pointee(m, w[1]);
+                uint32_t mp = map_gpu_type(m, &ins, &next_id, p, int_t, float_t, &tc, &ntc);
+                uint32_t pt = UPTR(mp);
+                if (mp != p) { mpt = realloc(mpt, (size_t)(nmpt + 1) * sizeof(KV)); mpt[nmpt++] = (KV){ w[2], mp }; }
                 if (w[2] <= m->bound) retyped[w[2]] = 1;
                 if (old_of[w[3]]) {
                     uint32_t mem = old_of[w[3]] - 1;
@@ -942,7 +1229,10 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
             }
             break;
         }
-        if (m->in[i].dead || moved[i]) continue;
+        if (m->in[i].dead || moved[i]) {
+            if (repls[i]) wb_inst(&out, repls[i], repls[i][0] >> 16);
+            continue;
+        }
         uint32_t *w = m->in[i].w, op = w[0] & 0xffff;
         if (op == SpvOpEntryPoint && pack && m->version >= 0x10400) {
             /* drop removed interface ids, add the default block */
@@ -964,6 +1254,8 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
 
     sc->dub_var = dub_var;
     free(order); free(moved); free(retyped); free(body.w); free(consts); free(uptr); free(old_of); free(laid);
+    for (size_t i = 0; i < m->n; i++) free(repls[i]);
+    free(repls); free(mpt); free(tc);
     free(ins.names.w); free(ins.decs.w); free(ins.globals.w);
     (void)ctx;
     *out_n = out.n;
@@ -994,9 +1286,28 @@ static int add_uniform(MGLIProgram *ip, const char *name, int *created)
 }
 
 /* walk a default-block / opaque uniform variable and create GL uniforms for its leaves */
-static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *name, uint32_t t, uint32_t offset,
-                         int explicit_loc, int *loc_cursor, uint32_t spv_id, int res_type, int *elem_cursor, int hidden_prefix)
+/* the GL type a rewritten leaf had originally (bool/bvecN, double/dvecN/dmatNxM) */
+static GLenum leaf_gl_type(uint8_t kind, uint32_t cols, uint32_t rows)
 {
+    static const GLenum bv[4] = { GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4 };
+    static const GLenum dv[4] = { GL_DOUBLE, GL_DOUBLE_VEC2, GL_DOUBLE_VEC3, GL_DOUBLE_VEC4 };
+    static const GLenum dm[3][3] = { { GL_DOUBLE_MAT2, GL_DOUBLE_MAT2x3, GL_DOUBLE_MAT2x4 },
+                                     { GL_DOUBLE_MAT3x2, GL_DOUBLE_MAT3, GL_DOUBLE_MAT3x4 },
+                                     { GL_DOUBLE_MAT4x2, GL_DOUBLE_MAT4x3, GL_DOUBLE_MAT4 } };
+    if (kind == LEAF_WAS_BOOL) return (rows >= 1 && rows <= 4) ? bv[rows - 1] : GL_BOOL;
+    if (kind == LEAF_WAS_DOUBLE) {
+        if (cols > 1) return (cols >= 2 && cols <= 4 && rows >= 2 && rows <= 4) ? dm[cols - 2][rows - 2] : GL_DOUBLE;
+        return (rows >= 1 && rows <= 4) ? dv[rows - 1] : GL_DOUBLE;
+    }
+    return GL_NONE;
+}
+
+static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *name, uint32_t t, uint32_t offset,
+                         int explicit_loc, int *loc_cursor, uint32_t spv_id, int res_type, int *elem_cursor, int hidden_prefix,
+                         const uint8_t *lk, int *lki)
+{
+    /* lk[] remembers, per leaf uniform in walk order, whether its GL type was rewritten for
+     * the GPU (bool->int, double->float): introspection still reports GL_BOOL/GL_DOUBLE */
     const SType *ty = &m->t[t];
     if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) ) {
         uint32_t base = m->t[ty->elem].kind == T_ARRAY ? 0 : 1;
@@ -1012,6 +1323,7 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             if (created) {
                 u->type = gl_type_of(m, et); u->size = (GLint)(ty->count ? ty->count : 1);
                 scalar_info(m, et, &u->kind, &u->cols, &u->rows);
+                if (lk && *lki < 8192) { uint8_t k2 = lk[(*lki)++]; if (k2) { u->type = leaf_gl_type(k2, u->cols, u->rows); u->kind = k2 == LEAF_WAS_BOOL ? MGLI_K_BOOL : MGLI_K_DOUBLE; } }
                 u->opaque_class = is_opaque(m, et) ? (m->t[strip_arrays(m, et)].kind == T_IMAGE && m->t[strip_arrays(m, et)].sampled == 2 ? 2 : 1) : 0;
                 if (u->opaque_class) u->kind = MGLI_K_INT;
                 u->hidden = hidden_prefix;
@@ -1023,14 +1335,15 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             u->st[stage].offset = offset; u->st[stage].array_stride = stride;
             uint32_t b = strip_arrays(m, et);
             if (m->t[b].kind == T_MATRIX) { uint32_t cs, ca; msl_layout(m, m->t[b].elem, &cs, &ca); u->st[stage].matrix_stride = align_up(cs, ca); }
-            u->st[stage].scalar_size = u->opaque_class ? 4 : (u->kind == MGLI_K_BOOL ? 1 : (u->kind == MGLI_K_DOUBLE ? 8 : 4));
+            /* GPU storage: 4 bytes per scalar (int for bool, float for double) */
+            u->st[stage].scalar_size = 4;
             u->st[stage].spv_id = spv_id; u->st[stage].res_type = res_type; u->st[stage].elem_base = *elem_cursor;
             *elem_cursor += (int)(ty->count ? ty->count : 1);
             return;
         }
         for (uint32_t i = 0; i < (ty->count ? ty->count : 1); i++) {
             char nm[512]; snprintf(nm, sizeof nm, "%s[%u]", name, i);
-            walk_default(ip, m, stage, nm, et, offset + i * stride, explicit_loc, loc_cursor, spv_id, res_type, elem_cursor, hidden_prefix);
+            walk_default(ip, m, stage, nm, et, offset + i * stride, explicit_loc, loc_cursor, spv_id, res_type, elem_cursor, hidden_prefix, lk, lki);
         }
         return;
     }
@@ -1038,7 +1351,7 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
         for (uint32_t i = 0; i < ty->nmem; i++) {
             char nm[512]; snprintf(nm, sizeof nm, "%s.%s", name, member_name(m, t, i));
             uint32_t mo = 0; get_dec(m, t, (int32_t)i, SpvDecorationOffset, &mo);
-            walk_default(ip, m, stage, nm, ty->mem[i], offset + mo, explicit_loc, loc_cursor, spv_id, res_type, elem_cursor, hidden_prefix);
+            walk_default(ip, m, stage, nm, ty->mem[i], offset + mo, explicit_loc, loc_cursor, spv_id, res_type, elem_cursor, hidden_prefix, lk, lki);
         }
         return;
     }
@@ -1047,6 +1360,7 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
     if (created) {
         u->type = gl_type_of(m, t); u->size = 1;
         scalar_info(m, t, &u->kind, &u->cols, &u->rows);
+        if (lk && *lki < 8192) { uint8_t k2 = lk[(*lki)++]; if (k2) { u->type = leaf_gl_type(k2, u->cols, u->rows); u->kind = k2 == LEAF_WAS_BOOL ? MGLI_K_BOOL : MGLI_K_DOUBLE; } }
         u->opaque_class = is_opaque(m, t) ? (m->t[t].kind == T_IMAGE && m->t[t].sampled == 2 ? 2 : 1) : 0;
         if (u->opaque_class) u->kind = MGLI_K_INT;
         u->hidden = hidden_prefix;
@@ -1057,7 +1371,8 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
     u->st[stage].present = 1;
     u->st[stage].offset = offset; u->st[stage].array_stride = 0;
     if (ty->kind == T_MATRIX) { uint32_t cs, ca; msl_layout(m, ty->elem, &cs, &ca); u->st[stage].matrix_stride = align_up(cs, ca); }
-    u->st[stage].scalar_size = u->opaque_class ? 4 : (u->kind == MGLI_K_BOOL ? 1 : (u->kind == MGLI_K_DOUBLE ? 8 : 4));
+    /* GPU storage: 4 bytes per scalar (int for bool, float for double) */
+    u->st[stage].scalar_size = 4;
     u->st[stage].spv_id = spv_id; u->st[stage].res_type = res_type; u->st[stage].elem_base = *elem_cursor;
     *elem_cursor += 1;
 }
@@ -1329,12 +1644,12 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
     const SMod *m = s->r;
     (void)src;
     /* default block members */
-    for (uint32_t k = 0; k < s->ndub; k++) {
+    for (uint32_t k = 0; k < s->ndub && s->dub_var; k++) {
         if (!s->dub_active[k]) continue;
         DubMember *d = &s->dub[k];
         uint32_t mt = m->t[strip_arrays(m, pointee(m, m->vtype[s->dub_var]))].mem[k];
-        int cursor = 0, elem = 0;
-        walk_default(ip, m, stage, d->name, mt, d->offset, d->explicit_loc, &cursor, 0, -1, &elem, name_is_hidden(d->name));
+        int cursor = 0, elem = 0, lki = 0;
+        walk_default(ip, m, stage, d->name, mt, d->offset, d->explicit_loc, &cursor, 0, -1, &elem, name_is_hidden(d->name), d->leaf, &lki);
     }
     /* opaque uniforms + UBO + SSBO + atomic counters */
     for (uint32_t v = 1; v <= m->bound; v++) {
@@ -1342,12 +1657,24 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         uint32_t t = pointee(m, m->vtype[v]);
         uint32_t st = strip_arrays(m, t);
         if (m->vsc[v] == SpvStorageClassUniformConstant) {
-            if (!is_opaque(m, t)) continue; /* not packed (fallback): handled as per-uniform buffers */
+            if (!is_opaque(m, t)) {
+                /* fallback path (uniform pointers escaped the packer): still reflect the
+                 * uniform so GL queries and glUniform* work against the CPU shadow */
+                if (s->dub_var) continue;
+                int cursor = 0, elem = 0, lki = 0;
+                const uint8_t *lk = NULL;
+                for (uint32_t q = 0; q < s->ndub; q++) if (s->dub[q].var == v) lk = s->dub[q].leaf;
+                walk_default(ip, m, stage, id_name(m, v), t, 0, -1, &cursor, v, -1, &elem, 0, lk, &lki);
+                continue;
+            }
             uint32_t l; int el = get_dec(m, v, -1, SpvDecorationLocation, &l) ? (int)l : -1;
             int cursor = 0, elem = 0;
             int rt = m->t[st].kind == T_IMAGE && m->t[st].sampled == 2 ? SPVC_RESOURCE_TYPE_STORAGE_IMAGE :
                      (m->t[st].kind == T_IMAGE ? SPVC_RESOURCE_TYPE_SEPARATE_IMAGE : SPVC_RESOURCE_TYPE_SAMPLED_IMAGE);
-            walk_default(ip, m, stage, id_name(m, v), t, 0, el, &cursor, v, rt, &elem, 0);
+            int lki = 0;
+            const uint8_t *lk = NULL;
+            for (uint32_t q = 0; q < s->ndub; q++) if (s->dub[q].var == v) lk = s->dub[q].leaf;
+            walk_default(ip, m, stage, id_name(m, v), t, 0, el, &cursor, v, rt, &elem, 0, lk, &lki);
             continue;
         }
         if (m->vsc[v] == SpvStorageClassAtomicCounter) {
@@ -1605,8 +1932,25 @@ uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage
         if (out) {
             dump_words(out, n, program, stage, attempt ? "patched_nopack" : "patched");
             if (!msl_accepts(out, n, stage)) { free(out); out = NULL; }
-            else *out_words = n;
+            else {
+                *out_words = n;
+                /* leaf kinds survive to the post-link reflection (StageCtx is freed below) */
+                int total = 0;
+                for (uint32_t k = 0; k < sc[stage].ndub; k++) total += sc[stage].dub[k].nleaf;
+                free(ip->dub_leaf[stage]);
+                ip->dub_leaf[stage] = malloc((size_t)(total ? total : 1));
+                ip->dub_leaf_n[stage] = total;
+                int o = 0;
+                
+                for (uint32_t k = 0; k < sc[stage].ndub; k++) {
+
+                    memcpy(ip->dub_leaf[stage] + o, sc[stage].dub[k].leaf, (size_t)sc[stage].dub[k].nleaf);
+                    o += sc[stage].dub[k].nleaf;
+                }
+                
+            }
         }
+        for (uint32_t k = 0; k < sc[stage].ndub; k++) free(sc[stage].dub[k].leaf);
         mod_free(sc[stage].m);
         free(sc[stage].dub); free(sc[stage].locs);
     }
@@ -1645,10 +1989,21 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
             sc[s].dub = zalloc((ty->nmem + 1) * sizeof(DubMember));
             for (uint32_t k = 0; k < ty->nmem; k++) {
                 DubMember *d = &sc[s].dub[k];
-                d->type = ty->mem[k]; d->member = k;
+                d->type = ty->mem[k]; d->member = k; d->gtype = ty->mem[k];
                 get_dec(r, st, (int32_t)k, SpvDecorationOffset, &d->offset);
                 uint32_t l; d->explicit_loc = get_dec(r, st, (int32_t)k, SpvDecorationLocation, &l) ? (int)l : -1;
                 snprintf(d->name, sizeof d->name, "%s", member_name(r, st, k));
+            }
+            /* attach the GL-level leaf kinds recorded at patch time (bool/double) */
+            {
+                int o = 0;
+                for (uint32_t k = 0; k < ty->nmem; k++) {
+                    uint8_t *cnt = NULL; int nc = 0;
+                    record_leaf_kinds(r, sc[s].dub[k].type, &cnt, &nc);
+                    free(cnt);sc[s].dub[k].nleaf = nc;
+                    sc[s].dub[k].leaf = (o + nc <= ip->dub_leaf_n[s]) ? ip->dub_leaf[s] + o : NULL;
+                    o += nc;
+                }
             }
             uint32_t sz, al; msl_layout(r, st, &sz, &al);
             sc[s].dub_size = align_up(sz ? sz : 16, 16);

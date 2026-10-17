@@ -147,6 +147,11 @@ typedef struct MGLIProgram {
     uint32_t dub_size[MGLI_STAGES];
     int      dub_res_index[MGLI_STAGES]; /* index in spirv_resources_list[stage][UNIFORM_CONSTANT], -1 */
 
+    /* GL-level leaf kinds (bool/double) of the default-block members, recorded at patch time:
+     * the GPU stores int/float, introspection still reports GL_BOOL/GL_DOUBLE */
+    uint8_t *dub_leaf[MGLI_STAGES];
+    int      dub_leaf_n[MGLI_STAGES];
+
     /* constant initializers of default-block uniforms, captured when the stage is patched */
     struct { char *name; uint32_t *vals; int nvals; int wide; } *inits[MGLI_STAGES];
     int      ninits[MGLI_STAGES];

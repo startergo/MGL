@@ -52,6 +52,7 @@ static void free_link_tables(MGLIProgram *ip)
     for (int i = 0; i < ip->nuniforms; i++) { free(ip->uniforms[i].name); free(ip->uniforms[i].shadow); }
     free(ip->uniforms); ip->uniforms = NULL; ip->nuniforms = 0;
     free(ip->locs); ip->locs = NULL; ip->nlocs = 0;
+    /* dub_leaf[] is patch-time data; it must survive the per-link free (it is freed in reset_record) */
     for (int i = 0; i < ip->nubos; i++) { free(ip->ubos[i].name); free(ip->ubos[i].members); }
     free(ip->ubos); ip->ubos = NULL; ip->nubos = 0;
     for (int i = 0; i < ip->nssbos; i++) { free(ip->ssbos[i].name); free(ip->ssbos[i].members); }
@@ -67,6 +68,7 @@ static void free_link_tables(MGLIProgram *ip)
     for (int i = 0; i < ip->nabufs; i++) free(ip->abufs[i].members);
     free(ip->abufs); ip->abufs = NULL; ip->nabufs = 0;
     for (int s = 0; s < MGLI_STAGES; s++) mgli_free_stage_sub(&ip->sub[s]);
+    /* dub_leaf[] is patch-time data and outlives the per-link table free (freed in reset_record) */
     ip->nxfb = 0;
     for (int s = 0; s < MGLI_STAGES; s++) ip->dub_res_index[s] = -1;
     ip->linked = 0;
@@ -75,6 +77,7 @@ static void free_link_tables(MGLIProgram *ip)
 static void reset_record(MGLIProgram *ip)
 {
     free_link_tables(ip);
+    for (int s = 0; s < MGLI_STAGES; s++) { free(ip->dub_leaf[s]); ip->dub_leaf[s] = NULL; ip->dub_leaf_n[s] = 0; }
     for (int i = 0; i < ip->nattrib_binds; i++) free(ip->attrib_binds[i].name);
     free(ip->attrib_binds); ip->attrib_binds = NULL; ip->nattrib_binds = 0;
     for (int i = 0; i < ip->nfrag_binds; i++) free(ip->frag_binds[i].name);
