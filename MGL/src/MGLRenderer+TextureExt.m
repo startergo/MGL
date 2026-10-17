@@ -164,8 +164,6 @@ static struct MGLExtMetal_texext s_texext_metal_funcs = {
         tex->dirty_bits = 0;
         tex->complete = true;
     }
-    else
-        NSLog(@"MGL texext: no Metal texture for texture %u (target 0x%x kind %d)", tex->name, tex->target, info ? info->kind : -1);
 
     return texture;
 }
@@ -408,10 +406,7 @@ static struct MGLExtMetal_texext s_texext_metal_funcs = {
     [self bindMTLTexture: root];
     id<MTLTexture> rt = (__bridge id<MTLTexture>)(root->mtl_data);
     if (!rt)
-    {
-        NSLog(@"MGL texext: view root %u has no Metal texture", root->name);
         return nil;
-    }
 
     MTLPixelFormat fmt = (MTLPixelFormat)mtlFormatForGLInternalFormat(tex->internalformat);
     if (fmt == MTLPixelFormatInvalid)

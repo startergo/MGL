@@ -128,6 +128,21 @@ TEST(buffer_texture_fetch)
     EXPECT_IDX_PIXEL(fs, 3, 255, 255, 255, 255, 2);
     EXPECT_IDX_PIXEL(fs, 4, 0, 0, 0, 0, 0);      /* out of range fetch returns 0 */
 
+    /* whole-image check: each pixel column fetches texel x % 4 */
+    {
+        const char *fs4 = "#version 450 core\n"
+            "layout(binding=0) uniform samplerBuffer tb;\n"
+            "layout(location=0) out vec4 color;\n"
+            "void main(){ color = texelFetch(tb, int(gl_FragCoord.x) % 4); }\n";
+        GLuint p4 = mgl_make_program(k_vs, fs4);
+        if (p4) {
+            glClear(GL_COLOR_BUFFER_BIT);
+            draw_fullscreen(p4);
+            for (int x = 0; x < 8; x++)
+                EXPECT_PIXEL(x, 3, texels[x % 4][0], texels[x % 4][1], texels[x % 4][2], texels[x % 4][3], 2);
+        }
+    }
+
     /* texture follows the buffer's storage: reallocate with new contents */
     const GLubyte texels2[4][4] = { {0,0,255,255}, {0,0,255,255}, {255,0,255,255}, {0,255,255,255} };
     glBufferData(GL_TEXTURE_BUFFER, sizeof texels2, texels2, GL_STATIC_DRAW);
