@@ -28,6 +28,7 @@
 #include "spirv.h"
 
 #include "glm_context.h"
+#include "mgl_ext.h"
 #include "shaders.h"
 #include "buffers.h"
 
@@ -725,6 +726,8 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         return;
     }
 
+    mgl_ext_pre_link(ctx, pptr);
+
     for (int stage=0; stage<_MAX_SHADER_TYPES; stage++)
     {
         pptr->spirv[stage].msl_str = 0;
@@ -741,6 +744,8 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     } else {
         fprintf(stderr, "WARNING: Metal functions not initialized, skipping mtlBindProgram\n");
     }
+
+    mgl_ext_post_link(ctx, pptr);
 
     //ERROR_CHECK_RETURN(pptr->mtl_data, GL_INVALID_OPERATION);
 }
