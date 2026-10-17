@@ -14,6 +14,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_fb.h"
+#include "mgl_ext_gpuaudit.h"   /* gpuaudit: PBO readback on the GPU */
 #include "mgl_ext_queries.h"
 
 #define FB_ERROR(_e_)   do { ERROR_RETURN(_e_); return; } while (0)
@@ -657,6 +658,19 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
 
     if (!fbm(ctx) || !fbm(ctx)->read)
         FB_ERROR(GL_INVALID_OPERATION);
+
+    /* gpuaudit: a read into a PIXEL_PACK_BUFFER whose layout the Metal side can serve
+     * with a single texture->buffer blit never touches the CPU (no decode loop, no
+     * pack loop, no waitUntilCompleted); everything else keeps the path below.
+     * Mismatched layouts, partial rectangles, sRGB and packed formats all decline. */
+    if (pbo)
+    {
+        struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
+        if (gpm && gpm->read_pixels_to_buffer &&
+            gpm->read_pixels_to_buffer(ctx, fbo, aspect, attachment, x, y, width, height,
+                                       format, type, pbo, pbo_offset, lay.stride, lay.skip))
+            return;
+    }
 
     size_t npix = (size_t)width * (size_t)height;
     void *color = NULL;

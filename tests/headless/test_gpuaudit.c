@@ -391,6 +391,110 @@ TEST(index_cache_provoking_state)
     EXPECT_NO_GL_ERROR();
 }
 
+/* ------------------------------------------- F6: glReadPixels into a PIXEL_PACK_BUFFER */
+
+TEST(read_pixels_into_pbo_gpu)
+{
+    /* offscreen RGBA8 framebuffer with a known gradient */
+    GLuint fbo, tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    GLubyte img[64 * 64 * 4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++)
+        {
+            int i = (y * 64 + x) * 4;
+            img[i] = (GLubyte)(x * 4);
+            img[i + 1] = (GLubyte)(y * 4);
+            img[i + 2] = 0x40;
+            img[i + 3] = 0xFF;
+        }
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    glFinish();
+
+    GLuint pbo;
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 64 * 64 * 4, NULL, GL_STREAM_READ);
+
+    GLint before = g_stat(MGL_GPUAUDIT_PBO_READBACKS);
+    glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PBO_READBACKS) == before + 1);   /* GPU blit taken */
+
+    /* map and compare byte for byte */
+    GLubyte *m = (GLubyte *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 64 * 64 * 4, GL_MAP_READ_BIT);
+    int bad = 0;
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++)
+        {
+            int i = (y * 64 + x) * 4;
+            if (m[i] != (GLubyte)(x * 4) || m[i + 1] != (GLubyte)(y * 4) ||
+                m[i + 2] != 0x40 || m[i + 3] != 0xFF)
+                bad++;
+        }
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    EXPECT_EQ_INT(bad, 0);
+
+    /* pack alignment applies to the destination rows: width 61 pixels = 244 bytes,
+     * padded to 248 by GL_PACK_ALIGNMENT 8 */
+    glPixelStorei(GL_PACK_ALIGNMENT, 8);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 64 * 248, NULL, GL_STREAM_READ);
+    glReadPixels(0, 0, 61, 64, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    EXPECT_NO_GL_ERROR();
+    m = (GLubyte *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 64 * 248, GL_MAP_READ_BIT);
+    bad = 0;
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 61; x++)
+        {
+            int i = y * 248 + x * 4;
+            if (m[i] != (GLubyte)(x * 4) || m[i + 1] != (GLubyte)(y * 4)) bad++;
+        }
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    EXPECT_EQ_INT(bad, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    /* skip rows/space are honoured (row stride of an 8-pixel read = 32 bytes) */
+    glPixelStorei(GL_PACK_SKIP_ROWS, 3);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 5);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 64 * 248, NULL, GL_STREAM_READ);
+    glReadPixels(0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+    EXPECT_NO_GL_ERROR();
+    m = (GLubyte *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 64 * 248, GL_MAP_READ_BIT);
+    bad = 0;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++)
+        {
+            int i = (y + 3) * 32 + (x + 5) * 4;
+            if (m[i] != (GLubyte)(x * 4) || m[i + 1] != (GLubyte)(y * 4)) bad++;
+        }
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    EXPECT_EQ_INT(bad, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+
+    /* reads the blit cannot serve keep working through the CPU path */
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    GLubyte sub[8 * 8 * 4];
+    glReadPixels(4, 4, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, sub);
+    EXPECT_EQ_INT(sub[0], 16);      /* x = 4 */
+    EXPECT_EQ_INT(sub[1], 16);      /* y = 4 */
+    EXPECT_NO_GL_ERROR();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteBuffers(1, &pbo);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+}
+
 /* ------------------------------------------------------------ F2: pipeline cache */
 
 TEST(pipeline_state_cache)
@@ -516,6 +620,7 @@ int main(void)
     RUN(index_cache_invalidated_on_reupload);
     RUN(index_cache_provoking_state);
     RUN(gpu_buffer_clear);
+    RUN(read_pixels_into_pbo_gpu);
     RUN(cpu_buffer_clear_still_correct);
     RUN(pipeline_state_cache);
     RUN(timings);

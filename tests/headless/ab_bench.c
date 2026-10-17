@@ -91,6 +91,53 @@ int main(int argc, char **argv)
             snprintf(label, sizeof(label), "drawArrays FAN64 x%d", iters);
             break;
         }
+        case 7: {  /* same as 3 but submit-only (the CPU cost of the draw) */
+            glEnable(GL_PRIMITIVE_RESTART);
+            glPrimitiveRestartIndex(0xFFFFFFFFu);
+            size_t n = 512 * 1024;
+            uint32_t *big = malloc(n * 4);
+            for (size_t i = 0; i < n; i++) big[i] = (uint32_t)(i % 1000);
+            GLuint b2;
+            glGenBuffers(1, &b2);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b2);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * 4, big, GL_STATIC_DRAW);
+            for (int i = 0; i < 2; i++) glDrawElements(GL_TRIANGLES, (GLsizei)n, GL_UNSIGNED_INT, 0);
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++)
+                glDrawElements(GL_TRIANGLES, (GLsizei)n, GL_UNSIGNED_INT, 0);
+            t = now_s() - t0;
+            glFinish();
+            snprintf(label, sizeof(label), "1M-index restart submits x%d", iters);
+            glDisable(GL_PRIMITIVE_RESTART);
+            break;
+        }
+        case 8: {  /* clear of a GPU-resident buffer, submit only */
+            /* the cleared buffer is itself the vertex source of a draw, so it is
+             * GPU-resident (has an MTLBuffer) before the clears start */
+            GLuint b4, va;
+            glGenBuffers(1, &b4);
+            glBindBuffer(GL_ARRAY_BUFFER, b4);
+            glBufferData(GL_ARRAY_BUFFER, 16 << 20, NULL, GL_STATIC_DRAW);
+            glGenVertexArrays(1, &va);
+            glBindVertexArray(va);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glFinish();
+
+            float c[4] = { 1.0f, 0.5f, 0.25f, 1.0f };
+            glClearBufferData(GL_ARRAY_BUFFER, GL_RGBA32F, GL_RGBA, GL_FLOAT, c);   /* promote */
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++)
+                glClearBufferData(GL_ARRAY_BUFFER, GL_RGBA32F, GL_RGBA, GL_FLOAT, c);
+            t = now_s() - t0;
+            glFinish();
+            snprintf(label, sizeof(label), "16MB RGBA32F clear submits x%d", iters);
+            glBindVertexArray(va);
+            break;
+        }
         case 3: {  /* restart-enabled indexed draws: index scan */
             glEnable(GL_PRIMITIVE_RESTART);
             glPrimitiveRestartIndex(0xFFFFFFFFu);

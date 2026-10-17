@@ -2,7 +2,7 @@
 # ab_run.sh — interleaved A/B timing (medians) of build/ab_old vs build/ab_new
 set -u
 runs=${1:-5}
-modes="0:2000 1:1000 2:1000 3:3 4:2000 5:3 6:3"
+modes="3:20 7:20 8:20 6:3"
 for spec in $modes; do
   m=${spec%%:*}; n=${spec##*:}
   for rep in $(seq $runs); do

@@ -1232,12 +1232,12 @@ bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintpt
             writeDestComponent(&texel_bytes[c * dst_b], kind, dst_b, rgba[c]);
     }
 
-    mgl_buffers_prepare_cpu_write(ctx, ptr, offset == 0 && size == ptr->size);
-
     /* gpuaudit: the clear itself runs on the GPU (blit fill / staged copies) — the CPU
-     * never walks the range and no synchronisation is needed.  Only buffers that are
-     * already GPU-resident take this path: promoting a CPU-only buffer would mean a
-     * full-copy allocation that costs more than the clear it saves. */
+     * never walks the range, so it must not be made to wait for (or renamed because of)
+     * queued GPU work either: the fill is encoded on the same queue and ordered after
+     * it.  Only buffers that are already GPU-resident take this path: promoting a
+     * CPU-only buffer would mean a full-copy allocation that costs more than the clear
+     * it saves. */
     struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
     if (gpm && gpm->fill_buffer && ptr->data.mtl_data &&
         gpm->fill_buffer(ctx, ptr, offset, size, texel_bytes, (int)texel))
@@ -1245,6 +1245,8 @@ bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintpt
         mgl_gpuaudit_invalidate(ctx, ptr);   /* contents changed */
         return true;
     }
+
+    mgl_buffers_prepare_cpu_write(ctx, ptr, offset == 0 && size == ptr->size);
 
     uint8_t *dst = (uint8_t *)ptr->data.buffer_data + offset;
     for (size_t i = 0; i < (size_t)size; i += texel)
