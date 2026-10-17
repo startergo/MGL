@@ -457,6 +457,78 @@ TEST(error_cases)
     EXPECT_NO_GL_ERROR();
 }
 
+TEST(more_statistics)
+{
+    GLuint q[4];
+    glGenQueries(4, q);
+    const long long full = g_full;
+
+    /* SAMPLES_PASSED and FRAGMENT_SHADER_INVOCATIONS active at the same time */
+    glBeginQuery(GL_SAMPLES_PASSED, q[0]);
+    glBeginQuery(GL_FRAGMENT_SHADER_INVOCATIONS, q[1]);
+    draw_full();
+    glEndQuery(GL_SAMPLES_PASSED);
+    draw_full();                                    /* only counted by q[1] */
+    glEndQuery(GL_FRAGMENT_SHADER_INVOCATIONS);
+
+    glBeginQueryIndexed(GL_PRIMITIVES_GENERATED, 2, q[2]);
+    GLint cur = 0;
+    glGetQueryIndexediv(GL_PRIMITIVES_GENERATED, 2, GL_CURRENT_QUERY, &cur);
+    EXPECT_EQ_INT(cur, q[2]);
+    glGetQueryIndexediv(GL_PRIMITIVES_GENERATED, 0, GL_CURRENT_QUERY, &cur);
+    EXPECT_EQ_INT(cur, 0);
+    glEndQueryIndexed(GL_PRIMITIVES_GENERATED, 2);
+
+    glBeginQuery(GL_CLIPPING_INPUT_PRIMITIVES, q[3]);
+    glDrawArrays(GL_LINE_STRIP, 9, 5);              /* 4 lines */
+    glDrawArrays(GL_POINTS, 0, 7);                  /* 7 points */
+    glEndQuery(GL_CLIPPING_INPUT_PRIMITIVES);
+
+    EXPECT_EQ_INT(result64(q[0]), full);
+    EXPECT_EQ_INT(result64(q[1]), 2 * full);
+    EXPECT_EQ_INT(result64(q[2]), 0);
+    EXPECT_EQ_INT(result64(q[3]), 11);
+
+    GLuint v = 0;
+    glGetQueryObjectuiv(q[3], GL_QUERY_RESULT_NO_WAIT, &v);
+    EXPECT_EQ_INT(v, 11);
+    EXPECT_NO_GL_ERROR();
+    glDeleteQueries(4, q);
+}
+
+TEST(compute_invocations)
+{
+    const char *cs = "#version 450 core\n"
+        "layout(local_size_x=4, local_size_y=2, local_size_z=1) in;\n"
+        "layout(std430, binding=0) buffer B { uint v[]; };\n"
+        "void main(){ v[gl_LocalInvocationIndex] = 1u; }\n";
+    GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(sh, 1, &cs, NULL);
+    glCompileShader(sh);
+    GLuint p = glCreateProgram();
+    glAttachShader(p, sh);
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);
+    if (!ok) return;
+    GLuint ssbo;
+    glGenBuffers(1, &ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 64, NULL, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+    glUseProgram(p);
+
+    GLuint q;
+    glGenQueries(1, &q);
+    glBeginQuery(GL_COMPUTE_SHADER_INVOCATIONS, q);
+    glDispatchCompute(3, 1, 1);
+    glEndQuery(GL_COMPUTE_SHADER_INVOCATIONS);
+    EXPECT_EQ_INT(result64(q), 24);
+    glDeleteQueries(1, &q);
+    glUseProgram(g_prog);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     setup();
@@ -468,5 +540,9 @@ int main(void)
     RUN(query_buffer_objects);
     RUN(conditional_render);
     RUN(error_cases);
+    RUN(more_statistics);
+    /* compute programs currently assert in program.c (parseSPIRVShaderToMetal); opt-in */
+    if (getenv("MGL_TEST_COMPUTE"))
+        RUN(compute_invocations);
     return mgl_test_summary();
 }
