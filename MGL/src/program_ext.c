@@ -1261,16 +1261,9 @@ void mglSpecializeShader(GLMContext ctx, GLuint shader, const GLchar *pEntryPoin
 
 void mglReleaseShaderCompiler(GLMContext ctx)
 {
-    struct MGLExtState_program *st = STATE(ext_program);
-
-    /* glslang's process-wide state (built-in symbol tables) can only be torn down while
-     * no compiled glslang shader object is alive; otherwise this hint is a no-op.
-     * The compiler is re-initialized lazily by the next compile or link. */
-    if (!st || st->compiler_released || st->live_glslang_shaders > 0)
-        return;
-
-    glslang_finalize_process();
-    st->compiler_released = GL_TRUE;
+    /* frees compiler scratch memory and glslang's process state (deferred while compiled
+     * shader objects are alive); later compiles transparently re-initialize the compiler */
+    mgl_shader_release_compiler_resources(ctx);
 }
 
 void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision)

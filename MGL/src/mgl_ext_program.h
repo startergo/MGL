@@ -80,6 +80,7 @@ void mgl_program_register_programiv_hook(mgl_programiv_hook fn);
 struct MGLExtState_program {
     int         live_glslang_shaders;   /* compiled glslang shader objects alive */
     GLboolean   compiler_released;      /* glslang process state finalized by ReleaseShaderCompiler */
+    GLboolean   release_pending;        /* finalize once the last compiled glslang shader is gone */
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_program; filled by MGLRenderer+Program.m. */
@@ -105,6 +106,7 @@ void     mgl_program_invalidate_pipelines(GLMContext ctx);
 Shader  *mgl_shader_new_internal(GLMContext ctx, GLuint glm_type);
 void     mgl_shader_unref(GLMContext ctx, Shader *shader);
 GLenum   mgl_shader_gl_type(GLuint glm_type);
+void     mgl_shader_release_compiler_resources(GLMContext ctx);
 void     mgl_set_info_log(char **dst, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void     mgl_append_info_log(char **dst, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void     mgl_copy_info_log(const char *log, GLsizei bufSize, GLsizei *length, GLchar *out);
