@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "mgl_ext_program.h"
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -3888,6 +3889,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (bool) processGLState: (bool) draw_command
 {
+    MGL_PIPELINE_PROGRAM_SCOPE(ctx);    // program domain: bound program pipeline stages when no program is current
     // REMOVED: Thread synchronization was causing deadlocks
     // The issue is not thread contention but Metal object corruption
 
@@ -4472,6 +4474,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 -(void)mtlDispatchCompute:(GLMContext)glm_ctx groupsX:(GLuint)groups_x groupsY:(GLuint)groups_y groupsZ:(GLuint)groups_z
 {
+    MGL_PIPELINE_PROGRAM_SCOPE(glm_ctx);    // program domain: compute stage of the bound program pipeline
     // end encoding on current render encoder
     [self endRenderEncoding];
 
@@ -4488,28 +4491,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     if (ptr->local_workgroup_size.x || ptr->local_workgroup_size.y || ptr->local_workgroup_size.z)
     {
-        GLuint mod_x, mod_y, mod_z;
         GLuint size_x, size_y, size_z;
 
-        mod_x = groups_x % ptr->local_workgroup_size.x;
-        mod_y = groups_y % ptr->local_workgroup_size.y;
-        mod_z = groups_z % ptr->local_workgroup_size.z;
-
-        size_x = groups_x / ptr->local_workgroup_size.x;
-        size_y = groups_y / ptr->local_workgroup_size.y;
-        size_z = groups_z / ptr->local_workgroup_size.z;
-
-        if (mod_x || mod_y || mod_z)
-        {
-            if (mod_x)
-                size_x++;
-
-            if (mod_y)
-                size_y++;
-
-            if (mod_z)
-                size_z++;
-        }
+        // GL num_groups are work group counts (not invocation counts)
+        size_x = groups_x;
+        size_y = groups_y;
+        size_z = groups_z;
 
         numThreadgroups = MTLSizeMake(size_x, size_y, size_z);
         threadsPerThreadgroup = MTLSizeMake(ptr->local_workgroup_size.x,
@@ -4638,6 +4625,8 @@ void mtlDispatchComputeIndirect(GLMContext glm_ctx, GLintptr indirect)
         }
 
         [self commitCommandBufferWithAGXRecovery:_currentCommandBuffer];
+        if (finish)
+            [_currentCommandBuffer waitUntilCompleted];    // glFinish: GPU results visible to the CPU
     } @catch (NSException *exception) {
         NSLog(@"MGL ERROR: Command buffer commit failed: %@", exception);
 

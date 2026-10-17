@@ -20,6 +20,7 @@
 
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_program.h"
 
 // these cast a void ptr to a type and value
 #define RET_BOOL(__value__) *((GLboolean *)data) = (GLboolean)__value__; break;
@@ -437,6 +438,9 @@ void mglGetInteger64i_v(GLMContext ctx, GLenum target, GLuint index, GLint64 *da
 
 const GLubyte  *mglGetStringi(GLMContext ctx, GLenum name, GLuint index)
 {
+    if (name == GL_SPIR_V_EXTENSIONS)
+        return mgl_program_spirv_extension(ctx, index);    // program domain
+
     switch(index)
     {
         case GL_VENDOR: return (const GLubyte *)"Mike Larson";
