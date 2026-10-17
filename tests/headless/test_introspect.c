@@ -402,7 +402,7 @@ TEST(ssbo_reflection_and_binding)
     GLenum vp[6] = { GL_OFFSET, GL_ARRAY_SIZE, GL_ARRAY_STRIDE, GL_TOP_LEVEL_ARRAY_SIZE, GL_TOP_LEVEL_ARRAY_STRIDE, GL_BLOCK_INDEX };
     GLint vv[6];
     glGetProgramResourceiv(p, GL_BUFFER_VARIABLE, vi, 6, vp, 6, NULL, vv);
-    EXPECT_EQ_INT(vv[0], 64); EXPECT_EQ_INT(vv[1], 0); EXPECT_EQ_INT(vv[2], 4); EXPECT_EQ_INT(vv[3], 1); EXPECT_EQ_INT(vv[5], 0);
+    EXPECT_EQ_INT(vv[0], 80); EXPECT_EQ_INT(vv[1], 0); EXPECT_EQ_INT(vv[2], 4); EXPECT_EQ_INT(vv[3], 1); EXPECT_EQ_INT(vv[5], 0);
     glGetProgramResourceiv(p, GL_BUFFER_VARIABLE, pi, 6, vp, 6, NULL, vv);
     EXPECT_EQ_INT(vv[0], 32); EXPECT_EQ_INT(vv[3], 2); EXPECT_EQ_INT(vv[4], 32);
     EXPECT_NO_GL_ERROR();
@@ -420,14 +420,14 @@ TEST(ssbo_reflection_and_binding)
     glDispatchCompute(1, 1, 1); glMemoryBarrier(GL_ALL_BARRIER_BITS); glFinish();
     GLuint out[32] = { 0 };
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sb[1]); glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof out, out);
-    EXPECT_EQ_INT(out[0], 21); EXPECT_EQ_INT(out[17], 42);
+    EXPECT_EQ_INT(out[0], 21); EXPECT_EQ_INT(out[21], 42);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sb[0]); glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof out, out);
     EXPECT_EQ_INT(out[0], 0);
     glShaderStorageBlockBinding(p, bi, 1);
     glUniform1ui(0, 5u);
     glDispatchCompute(1, 1, 1); glMemoryBarrier(GL_ALL_BARRIER_BITS); glFinish();
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, sb[0]); glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof out, out);
-    EXPECT_EQ_INT(out[0], 5); EXPECT_EQ_INT(out[17], 10);
+    EXPECT_EQ_INT(out[0], 5); EXPECT_EQ_INT(out[21], 10);
     EXPECT_NO_GL_ERROR();
     glShaderStorageBlockBinding(p, 7, 0); EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glUseProgram(0);

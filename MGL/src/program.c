@@ -970,6 +970,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             r->name = strdup(rname);
             r->set = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
             r->binding = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            r->msl_binding = r->binding; /* refined with the real Metal index after MSL emission */
             r->location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
 
             switch (res_type)
@@ -1047,6 +1048,25 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     if (getenv("MGL_DUMP_MSL"))
         fprintf(stderr, "MGL: program %u %s stage MSL:\n%s\n", ptr->name, stage_label(stage), result);
     ptr->spirv[stage].entry_point = strdup(msl_entry);
+
+    /* Metal argument indices are only known after the MSL is emitted: patch the recorded
+     * resources with SPIRV-Cross's automatic bindings (texture slots differ from GL units) */
+    for (int res_type = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER; res_type < SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE && res_type < _MAX_SPIRV_RES; res_type++)
+    {
+        SpirvResourceList *rl = &ptr->spirv_resources_list[stage][res_type];
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources resources = NULL;
+        if (spvc_compiler_create_shader_resources(compiler, &resources) != SPVC_SUCCESS) break;
+        spvc_resources_get_resource_list_for_type(resources, res_type, &list, &count);
+        for (size_t i = 0; i < count && i < rl->count; i++)
+        {
+            if (list[i].id != rl->list[i]._id) continue;
+            unsigned msl_b = spvc_compiler_msl_get_automatic_resource_binding(compiler, list[i].id);
+            if (msl_b > 0 && msl_b < 31)
+                rl->list[i].msl_binding = msl_b;
+        }
+    }
 
     /* executable stage object read by the renderer */
     {

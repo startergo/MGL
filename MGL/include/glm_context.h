@@ -389,6 +389,7 @@ typedef struct SpirvResource_t {
     GLuint  set;
     GLuint  binding;
     GLuint  location;
+    GLuint  msl_binding; /* Metal argument index SPIRV-Cross chose (differs from the GL unit for textures) */
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {
