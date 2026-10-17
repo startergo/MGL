@@ -168,6 +168,11 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 - (void) endRenderEncoding;
 - (void) emergencyResetMetalState;
 - (bool) processGLState: (bool) draw_command;
+
+/* tess domain (MGLRenderer+Tessellation.m): true when the current program/pipeline has
+ * a tessellation evaluation shader — the render pipeline's vertex function is then the
+ * (rewritten) TES and the vertex stage runs as a compute kernel before the render pass */
+- (bool) extTessActive;
 - (bool) bindBuffersToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 - (bool) bindTexturesToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 -(bool)processCompute:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
