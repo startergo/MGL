@@ -28,6 +28,7 @@
 @interface MGLRenderer (Geometry)
 - (bool) geomDraw: (MGLGeomDraw *) d;
 - (bool) geomRasterPass: (MGLGeomDraw *) d;
+- (bool) geomCanAssembleGPU;
 @end
 
 /* private renderer methods used here (declared for the compiler; implemented by the
@@ -42,16 +43,183 @@ static id<MTLBuffer> gVsout;        /* capture header + captured VS records */
 static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
+static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
+static id<MTLComputePipelineState> gPrepPso;
 static id<MTLComputePipelineState> gFinPso;
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
 /* stringise a macro value for the embedded MSL */
 #define MGL_GEOM_STR2(x) #x
 #define MGL_GEOM_STR(x) MGL_GEOM_STR2(x)
+
+/* the input block of the prep kernel: everything the assembly needs, 16 words */
+#define MGL_GEOM_PREP_IN_WORDS 16
+#define MGL_GEOM_WG            64
+#define MGL_GEOM_PREP_BYTES    (64 * sizeof(uint32_t))
+
+/* the prep kernel builds, in one workgroup, everything the rest of the emulation needs from
+ * the draw command and the element buffer:
+ *   - the capture index list (primitive restart removed)
+ *   - the input primitive slot list for the geometry kernel
+ *   - the vertex range of the capture pass (min/max)
+ *   - the geometry kernel's dispatch size and the capture pass's indirect draw arguments
+ *
+ * The algorithm follows Mesa's poly_unroll_geometry (poly/cl/restart.h): the workgroup scans
+ * the index buffer in tiles, splits at primitive restart and emits the primitives of every
+ * restart-free run. */
+static const char *kGeomPrepMSL =
+    "#include <metal_stdlib>\n"
+    "#include <simd/simd.h>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct mgl_geom_prep_in { uint v[" MGL_GEOM_STR(MGL_GEOM_PREP_IN_WORDS) "]; };\n"
+    "\n"
+    "#define WG " MGL_GEOM_STR(MGL_GEOM_WG) "\n"
+    "\n"
+    "kernel void mgl_geom_prep(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                          const device uchar* cmd [[buffer(1)]],\n"
+    "                          const device uchar* indices [[buffer(2)]],\n"
+    "                          device uint* prim [[buffer(3)]],\n"
+    "                          device uint* cap [[buffer(4)]],\n"
+    "                          device uint* hdr [[buffer(5)]],\n"
+    "                          device uint* ctl [[buffer(6)]],\n"
+    "                          device uint* prep [[buffer(7)]],\n"
+    "                          uint tid [[thread_index_in_threadgroup]])\n"
+    "{\n"
+    "    /* in: mode, count, first, indexed, basevertex, instances, invocations, restart,\n"
+    "     *     k (input vertices), provoking_first, index size, cmd layout,\n"
+    "     *     cap index words, cap prim words, reserved, reserved */\n"
+    "    uint mode = c.v[0], count = c.v[1], first = c.v[2], indexed = c.v[3];\n"
+    "    uint basevertex = c.v[4], instances = c.v[5], restart = c.v[7];\n"
+    "    uint k = c.v[8], provoking_first = c.v[9], idx_size = c.v[10], layout = c.v[11];\n"
+    "    uint cap_idx = c.v[12], cap_prim = c.v[13];\n"
+    "    threadgroup uint tgr[WG];\n"
+    "\n"
+    "    /* the draw command: a staging buffer for direct draws, the user's indirect buffer\n"
+    "     * otherwise */\n"
+    "    if (layout != 0u) {\n"
+    "        const device uint* u = (const device uint*)cmd;\n"
+    "        if (layout == 1u) { count = u[0]; instances = u[1]; first = u[2]; }\n"
+    "        else              { count = u[0]; instances = u[1]; first = u[2]; basevertex = u[3]; }\n"
+    "        if (count == 0u || instances == 0u) { if (tid == 0u) { prep[0] = 0u; prep[4] = 0u; hdr[0] = 0u; } return; }\n"
+    "    }\n"
+    "\n"
+    "    uint vmin = 0xffffffffu, vmax = 0;\n"
+    "    uint out_prims = 0, out_idx = 0;\n"
+    "\n"
+    "    /* the vertex index at position i (arrays derive it, indexed draws load it) */\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : (uint)(first + (int)(_i)))\n"
+    "\n"
+    "    uint needle = 0;\n"
+    "    while (needle < count) {\n"
+    "        /* find the next restart (or the end) in tiles of WG */\n"
+    "        uint next_restart = needle;\n"
+    "        for (;;) {\n"
+    "            uint i = next_restart + tid;\n"
+    "            bool r = i >= count || (indexed && MGL_IDX(i) == restart);\n"
+    "            tgr[tid] = r ? tid : 0xffffffffu;\n"
+    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "            if (tid == 0u) {\n"
+    "                uint m = 0xffffffffu;\n"
+    "                for (uint j = 0; j < WG; j++) if (tgr[j] < m) m = tgr[j];\n"
+    "                tgr[0] = m;\n"
+    "            }\n"
+    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "            uint m = tgr[0];\n"
+    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "            if (m != 0xffffffffu) { next_restart += m; break; }\n"
+    "            next_restart += WG;\n"
+    "        }\n"
+    "\n"
+    "        uint subcount = next_restart - needle;\n"
+    "        uint subprims = 0u;\n"
+    "        switch (mode) {\n"
+    "            case 0u: subprims = subcount; break;                                   /* points */\n"
+    "            case 1u: subprims = subcount / 2u; break;                              /* lines */\n"
+    "            case 2u: subprims = subcount >= 2u ? subcount - 1u : 0u; break;         /* line strip */\n"
+    "            case 3u: subprims = subcount >= 2u ? subcount : 0u; break;              /* line loop */\n"
+    "            case 4u: subprims = subcount / 4u; break;                               /* lines adjacency */\n"
+    "            case 5u: subprims = subcount >= 4u ? subcount - 3u : 0u; break;         /* line strip adj */\n"
+    "            case 6u: subprims = subcount / 3u; break;                               /* triangles */\n"
+    "            case 7u: subprims = subcount >= 3u ? subcount - 2u : 0u; break;         /* triangle strip */\n"
+    "            case 8u: subprims = subcount >= 3u ? subcount - 2u : 0u; break;         /* triangle fan */\n"
+    "            case 9u: subprims = subcount / 6u; break;                               /* triangles adj */\n"
+    "            case 10u: subprims = subcount >= 6u ? (subcount - 4u) / 2u : 0u; break; /* tri strip adj */\n"
+    "            default: subprims = 0u; break;\n"
+    "        }\n"
+    "\n"
+    "        for (uint p = tid; p < subprims; p += WG) {\n"
+    "            for (uint v = 0u; v < k; v++) {\n"
+    "                uint id;\n"
+    "                switch (mode) {\n"
+    "                    case 0u: id = p; break;                                  /* points */\n"
+    "                    case 1u: case 2u: case 4u: case 5u: id = p + v; break;   /* line-ish */\n"
+    "                    case 3u: id = (p + v < subcount) ? p + v : 0u; break;    /* line loop */\n"
+    "                    case 6u: case 9u: id = p * k + v; break;                 /* tri list / tri adj */\n"
+    "                    case 10u: id = p * 2u + v; break;                        /* tri strip adj */\n"
+    "                    case 8u:                                              /* triangle fan */\n"
+    "                        if (provoking_first) id = (v == 2u) ? 0u : p + v + 1u;\n"
+    "                        else                  id = (v == 0u) ? 0u : p + v;\n"
+    "                        break;\n"
+    "                    default: {                                             /* triangle strip */\n"
+    "                        if ((p & 1u) == 0u) id = p + v;\n"
+    "                        else if (provoking_first) id = (v == 0u) ? p + 2u : p + v - 1u;\n"
+    "                        else                     id = (v == 0u) ? p + 1u : (v == 1u ? p : p + 2u);\n"
+    "                        break;\n"
+    "                    }\n"
+    "                }\n"
+    "                uint vtx = MGL_IDX(needle + id);\n"
+    "                if (out_prims + p < cap_prim)\n"
+    "                    prim[(out_prims + p) * k + v] = vtx + basevertex;\n"
+    "            }\n"
+    "        }\n"
+    "        /* every vertex of the run is captured, not only the ones the primitives use */\n"
+    "        for (uint i = tid; i < subcount; i += WG) {\n"
+    "            uint vtx = MGL_IDX(needle + i);\n"
+    "            if (out_idx + i < cap_idx) cap[out_idx + i] = vtx;\n"
+    "            if (vtx < vmin) vmin = vtx;\n"
+    "            if (vtx > vmax) vmax = vtx;\n"
+    "        }\n"
+    "\n"
+    "        out_prims += subprims;\n"
+    "        out_idx += subcount;\n"
+    "        needle = next_restart + 1u;\n"
+    "    }\n"
+    "#undef MGL_IDX\n"
+    "\n"
+    "    /* reduce the vertex range across the workgroup (only thread 0 writes the results) */\n"
+    "    tgr[tid] = vmin;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    if (tid == 0u) { for (uint j = 1u; j < WG; j++) if (tgr[j] < vmin) vmin = tgr[j]; }\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    tgr[tid] = vmax;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    if (tid == 0u) { for (uint j = 1u; j < WG; j++) if (tgr[j] > vmax) vmax = tgr[j]; }\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    if (tid != 0u) return;\n"
+    "\n"
+    "    if (vmin == 0xffffffffu) { vmin = 0u; vmax = 0u; }\n"
+    "    prep[0] = out_prims;\n"
+    "    prep[1] = out_idx;\n"
+    "    prep[2] = vmax;\n"
+    "    prep[3] = vmin;\n"
+    "    prep[4] = (uint)(((uint64_t)out_prims * instances * c.v[6]) / WG + 1u);   /* threadgroups */\n"
+    "    prep[7] = out_idx;                     /* capture indexCount    */\n"
+    "    prep[8] = instances;                   /* capture instanceCount */\n"
+    "    prep[9] = 0u;                          /* capture startIndex    */\n"
+    "    prep[10] = indexed ? basevertex : 0u;  /* capture baseVertex    */\n"
+    "    prep[11] = 0u;                         /* capture baseInstance  */\n"
+    "    hdr[0] = out_prims;\n"
+    "    hdr[1] = instances;\n"
+    "    hdr[6] = vmax - vmin + 1u;\n"
+    "    hdr[12] = vmin;\n"
+    "    ctl[0] = vmin + (indexed ? basevertex : 0u);   /* capture header: vstart */\n"
+    "    ctl[1] = vmax - vmin + 1u;                     /* capture header: vcount */\n"
+    "}\n";
 
 /* the counters + indirect arguments live in one buffer; two tiny program-independent
  * kernels manage them (zeroing before the geometry kernel, filling the draw arguments
@@ -79,7 +247,7 @@ static const char *kGeomCtlMSL =
 
 static bool geomCtlPipelines(id<MTLDevice> device)
 {
-    if (gInitPso && gFinPso) return true;
+    if (gInitPso && gFinPso && gPrepPso) return true;
 
     NSError *error = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomCtlMSL]
@@ -95,7 +263,25 @@ static bool geomCtlPipelines(id<MTLDevice> device)
 
     gInitPso = [device newComputePipelineStateWithFunction: initfn error: &error];
     gFinPso = [device newComputePipelineStateWithFunction: finfn error: &error];
-    return gInitPso && gFinPso;
+    if (!gInitPso || !gFinPso) return false;
+
+    /* the prep kernel lives in its own library (it declares its own input struct) */
+    id<MTLLibrary> plib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomPrepMSL]
+                                               options: nil error: &error];
+    if (!plib)
+    {
+        NSLog(@"MGL geom: prep kernel library failed: %@", error);
+        return false;
+    }
+    id<MTLFunction> prepfn = [plib newFunctionWithName: @"mgl_geom_prep"];
+    if (!prepfn) return false;
+    gPrepPso = [device newComputePipelineStateWithFunction: prepfn error: &error];
+    if (!gPrepPso)
+    {
+        NSLog(@"MGL geom: prep pipeline failed: %@", error);
+        return false;
+    }
+    return true;
 }
 
 
@@ -116,8 +302,8 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 
 static void geomReleaseStatics(void)
 {
-    gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil;
-    gGsPso = nil; gInitPso = nil; gFinPso = nil;
+    gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil;
+    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
     gPrimBytes = gVsoutBytes = gOutvBytes = gIdxBytes = 0;
@@ -127,6 +313,12 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
 {
     MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
     return [r geomDraw: d];
+}
+
+static bool geomCanAssembleGPUC(GLMContext glm_ctx)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    return [r geomCanAssembleGPU];
 }
 
 @implementation MGLRenderer (Geometry)
@@ -141,6 +333,7 @@ static bool geomDrawC(GLMContext glm_ctx, MGLGeomDraw *d)
         glm_ctx->mtl_funcs.ext_geom = m;
     }
     m->draw = geomDrawC;
+    m->can_assemble_gpu = geomCanAssembleGPUC;
 }
 
 /* ---- compute pipelines of the geometry kernel ---- */
@@ -278,13 +471,29 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 }
 #pragma clang diagnostic pop
 
+/* can the primitive assembly run on the GPU? It needs the element buffer as a device
+ * buffer (a client-side index pointer has to be assembled on the CPU) */
+- (bool) geomCanAssembleGPU
+{
+    Buffer *eb;
+
+    if (!gPrepPso) return false;
+    if (!ctx->state.vao) return true;
+    eb = ctx->state.vao->element_array.buffer;
+    if (!eb) return false;
+    if (!eb->data.mtl_data) [self bindMTLBuffer: eb];
+    return eb->data.mtl_data != NULL;
+}
+
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
     MGLGeomProgram *gp = d->gp;
     Program *program = d->program;
-    size_t vs_records = (size_t)d->vcount * (size_t)(d->instances > 0 ? d->instances : 1);
-    uint64_t threads = (uint64_t)d->prims_count * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations;
-    size_t outv_cap, idx_cap, prim_bytes, vsout_bytes;
+    const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
+    uint64_t threads = (uint64_t)(d->prims_count ? d->prims_count : 1)
+                       * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations;
+    uint32_t bound = d->count_bound ? d->count_bound : (d->count > 0 ? (uint32_t)d->count : 1);
+    size_t outv_cap, idx_cap, prim_bytes, vsout_bytes, cap_idx, cap_prim;
     uint32_t *hdr;
     uint64_t serial;
 
@@ -295,21 +504,49 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     /* ---- sizing ---- */
     {
         size_t max_out = MGL_GEOM_BUDGET_BYTES / (gp->out_words * sizeof(uint32_t));
-        outv_cap = (size_t)threads * (gp->max_vertices ? gp->max_vertices : 1);
+        /* with GPU assembly the primitive count is only known on the GPU: dispatch (and
+         * size) by the mode's worst case, the kernel returns early past the real count */
+        uint64_t bound_threads = gpu_assembly
+                                 ? mgl_geom_worst_prims(d->mode, bound)
+                                   * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations
+                                 : threads;
+        outv_cap = (size_t)bound_threads * (gp->max_vertices ? gp->max_vertices : 1);
         if (outv_cap > max_out) outv_cap = max_out;
         if (!outv_cap) outv_cap = 1;
         idx_cap = outv_cap * 3;
+        threads = bound_threads;
     }
-    prim_bytes = (MGL_GEOM_HDR_WORDS + (size_t)(d->indexed ? d->count : 0) +
-                  (size_t)d->prims_count * gp->in_verts) * sizeof(uint32_t);
-    vsout_bytes = (8 + vs_records * gp->in_words) * sizeof(uint32_t);
+
+    if (gpu_assembly)
+    {
+        /* the prep kernel writes the lists: size the regions by the mode's worst case */
+        cap_idx = (size_t)bound;
+        cap_prim = (size_t)mgl_geom_worst_prims(d->mode, bound);
+        if (!cap_idx) cap_idx = 1;
+        if (!cap_prim) cap_prim = 1;
+    }
+    else
+    {
+        cap_idx = (size_t)(d->indexed ? d->index_count : 0);
+        cap_prim = (size_t)d->prims_count;
+    }
+
+    /* the capture pass writes one record per (vertex, instance); with GPU assembly the
+     * vertex range is only known on the GPU, so size by the index count */
+    prim_bytes = (MGL_GEOM_HDR_WORDS + cap_idx + cap_prim * gp->in_verts) * sizeof(uint32_t);
+    vsout_bytes = (8 + (gpu_assembly
+                        ? (size_t)bound * (size_t)(d->instances > 0 ? d->instances : 1)
+                        : (size_t)d->vcount * (size_t)(d->instances > 0 ? d->instances : 1))
+                       * gp->in_words) * sizeof(uint32_t);
 
     gOutv = geomBuffer(_device, gOutv, outv_cap * gp->out_words * sizeof(uint32_t), &gOutvBytes);
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
-    if (!gOutv || !gIdx || !gCtl) { geomReleaseStatics(); return false; }
+    gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES, NULL);
+    if (!gOutv || !gIdx || !gCtl || !gPrep) { geomReleaseStatics(); return false; }
 
-    /* wait for an earlier command buffer that still reads the primitive buffer */
+    /* wait for an earlier command buffer that still reads the primitive buffer: before a new
+     * one is started (waiting afterwards would commit the one being encoded) */
     serial = BUF()->current_serial(ctx);
     if (gPrim && gPrimSerial[gPrimNext])
         BUF()->wait_serial(ctx, gPrimSerial[gPrimNext]);
@@ -320,15 +557,14 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 
     if (![self geomPipelines: gp program: program]) return false;
 
-    /* ---- CPU-side upload: header, capture index list, input primitive slots ---- */
+    /* ---- CPU-side upload: header, prep inputs, and (for the CPU path) the lists ---- */
     {
-        size_t index_words = (size_t)(d->indexed ? d->count : 0);
-        size_t prim_words = (size_t)d->prims_count * gp->in_verts;
+        size_t index_words = (size_t)(!gpu_assembly && d->indexed ? d->index_count : 0);
+        size_t prim_words = (size_t)(!gpu_assembly ? d->prims_count * gp->in_verts : 0);
 
         hdr = (uint32_t *)gPrim.contents;
         memset(hdr, 0, MGL_GEOM_HDR_WORDS * sizeof(uint32_t));
-        hdr[0] = (uint32_t)d->prims_count;
-        hdr[1] = (uint32_t)d->instances;
+        hdr[1] = (uint32_t)(d->instances > 0 ? d->instances : 1);
         hdr[2] = (uint32_t)gp->invocations;
         hdr[3] = (uint32_t)outv_cap;
         hdr[4] = (uint32_t)idx_cap;
@@ -340,23 +576,64 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         hdr[10] = (uint32_t)gp->out_words;
         hdr[11] = (uint32_t)d->baseinstance;
 
-        if (index_words)
-            memcpy(hdr + MGL_GEOM_HDR_WORDS, d->indices, index_words * sizeof(uint32_t));
-        memcpy(hdr + MGL_GEOM_HDR_WORDS + index_words, d->prims, prim_words * sizeof(uint32_t));
+        if (gpu_assembly)
+        {
+            /* the capture index list and the primitive slots come from the prep kernel:
+             * only the inputs are uploaded, never the element buffer contents */
+            uint32_t *in = (uint32_t *)gPrep.contents;
+            memset(in, 0, MGL_GEOM_PREP_BYTES);
+            in[0] = (uint32_t)mgl_geom_mode_code(d->mode);
+            in[1] = (uint32_t)d->count;
+            in[2] = (uint32_t)d->first;
+            in[3] = d->indexed ? 1u : 0u;
+            in[4] = (uint32_t)d->basevertex;
+            in[5] = (uint32_t)(d->instances > 0 ? d->instances : 1);
+            in[6] = (uint32_t)gp->invocations;
+            in[7] = d->restart;
+            in[8] = (uint32_t)gp->in_verts;
+            in[9] = d->provoking_first ? 1u : 0u;
+            in[10] = d->type == GL_UNSIGNED_BYTE ? 1u : d->type == GL_UNSIGNED_SHORT ? 2u : 4u;
+            in[11] = (uint32_t)d->cmd_layout;
+            in[12] = (uint32_t)cap_idx;
+            in[13] = (uint32_t)cap_prim;
+
+            /* the staging command the prep kernel reads when the draw is not indirect */
+            if (!d->cmd_buffer)
+            {
+                uint32_t *cmd = in + MGL_GEOM_PREP_IN_WORDS;
+                cmd[0] = (uint32_t)d->count;
+                cmd[1] = (uint32_t)d->first;
+                cmd[2] = (uint32_t)d->basevertex;
+                cmd[3] = (uint32_t)(d->instances > 0 ? d->instances : 1);
+            }
+        }
+        else
+        {
+            hdr[0] = (uint32_t)d->prims_count;
+            hdr[12] = d->indexed ? (uint32_t)((uint32_t)d->vstart - (uint32_t)d->basevertex)
+                                 : (uint32_t)d->vstart;
+            if (index_words)
+                memcpy(hdr + MGL_GEOM_HDR_WORDS, d->indices, index_words * sizeof(uint32_t));
+            memcpy(hdr + MGL_GEOM_HDR_WORDS + index_words, d->prims, prim_words * sizeof(uint32_t));
+        }
         gPrimSerial[gPrimNext] = serial;
         gPrimNext = (gPrimNext + 1) % MGL_GEOM_PRIM_RING;
     }
 
-    /* capture variant header lives in its own buffer */
+    /* capture variant header lives in its own buffer; with GPU assembly the prep kernel
+     * fills in the vertex range */
     {
         uint32_t *ch = (uint32_t *)gVsout.contents;
-        ch[0] = gp->vid_absolute ? (uint32_t)d->vstart : 0;
-        ch[1] = (uint32_t)d->vcount;
+        ch[0] = !gpu_assembly && gp->vid_absolute ? (uint32_t)d->vstart : 0;
+        ch[1] = (uint32_t)(!gpu_assembly ? d->vcount : 0);
         ch[2] = gp->iid_absolute ? (uint32_t)d->baseinstance : 0;
         ch[3] = (uint32_t)gp->in_words;
     }
 
-    /* ---- 1. vertex capture pass ---- */
+    /* the whole emulation is encoded into one command buffer: close whatever encoder is open
+     * and make sure the buffer can still take encoders (the ring wait above may have
+     * committed it) */
+    [self endRenderEncoding];
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
     {
         [self newCommandBuffer];
@@ -368,9 +645,51 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         return false;
     }
 
-    /* the capture pass has its own encoder: the previous render encoder must be closed */
-    [self endRenderEncoding];
+    /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
+    if (gpu_assembly)
+    {
+        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+        Buffer *eb = d->indexed ? (ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL) : NULL;
+        bool have_eb = false;
 
+        if (!enc) return false;
+        if (eb)
+        {
+            if (!eb->data.mtl_data) [self bindMTLBuffer: eb];
+            have_eb = eb->data.mtl_data != NULL;
+            if (have_eb) mgl_buffers_mark_gpu_use(ctx, eb, true);
+        }
+
+        [enc pushDebugGroup: @"MGL geometry prep"];
+        [enc setComputePipelineState: gPrepPso];
+        [enc setBuffer: gPrep offset: 0 atIndex: 0];                                   /* inputs */
+        {
+            /* the draw command: the user's indirect buffer, or the staging words in gPrep */
+            id<MTLBuffer> cmd = gPrep;
+            size_t cmd_off = MGL_GEOM_PREP_IN_WORDS * sizeof(uint32_t);
+            if (d->cmd_buffer)
+            {
+                cmd = (__bridge id<MTLBuffer>)d->cmd_buffer;
+                cmd_off = d->cmd_offset;
+            }
+            [enc setBuffer: cmd offset: cmd_off atIndex: 1];
+        }
+        [enc setBuffer: have_eb ? (__bridge id<MTLBuffer>)eb->data.mtl_data : gPrep
+                            offset: have_eb ? d->offset : 0
+                           atIndex: 2];
+        [enc setBuffer: gPrim offset: (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t) atIndex: 3];
+        [enc setBuffer: gPrim offset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t) atIndex: 4];
+        [enc setBuffer: gPrim offset: 0 atIndex: 5];
+        [enc setBuffer: gVsout offset: 0 atIndex: 6];
+        [enc setBuffer: gPrep offset: 32 * sizeof(uint32_t) atIndex: 7];
+
+        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake(MGL_GEOM_WG, 1, 1)];
+        [enc popDebugGroup];
+        [enc endEncoding];
+    }
+
+    /* ---- 1. vertex capture pass ---- */
     {
         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
         MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
@@ -458,7 +777,17 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         ctx->state.program = saved_program;
         [enc setVertexBuffer: gVsout offset: 0 atIndex: MGL_GEOM_MSL_VSOUT];
 
-        if (d->indexed)
+        if (gpu_assembly)
+        {
+            /* the prep kernel wrote the draw arguments (index count, instances, bases) */
+            [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
+                             indexType: MTLIndexTypeUInt32
+                           indexBuffer: gPrim
+                     indexBufferOffset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
+                        indirectBuffer: gPrep
+                  indirectBufferOffset: (32 + 7) * sizeof(uint32_t)];
+        }
+        else if (d->indexed)
         {
             [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
                              indexCount: (NSUInteger)d->index_count
