@@ -1007,6 +1007,12 @@ static void framebufferTextureCommon(GLMContext ctx, Framebuffer *fbo, GLenum at
     if (!checkAttachmentEnum(ctx, attachment))
         return;
 
+    /* textarget is validated even when detaching */
+    if ((kind == 1 && textarget != GL_TEXTURE_1D) || (kind == 3 && textarget != GL_TEXTURE_3D) ||
+        (kind == 2 && !(textarget == GL_TEXTURE_2D || textarget == GL_TEXTURE_RECTANGLE ||
+                        textarget == GL_TEXTURE_2D_MULTISAMPLE || isCubeMapTarget(ctx, textarget))))
+        FB_ERROR(GL_INVALID_ENUM);
+
     if (texture == 0)
     {
         setAttachment(ctx, fbo, attachment, GL_NONE, 0, NULL, 0, 0, false);
