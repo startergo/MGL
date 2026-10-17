@@ -19,6 +19,7 @@
  */
 
 #include "glm_context.h"
+#include "mgl_ext_queries.h"
 
 
 void mglDispatchCompute(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z)
@@ -28,6 +29,13 @@ void mglDispatchCompute(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y
     ERROR_CHECK_RETURN(num_groups_z < ctx->state.var.max_compute_work_group_size[2], GL_INVALID_VALUE);
 
     ctx->mtl_funcs.mtlDispatchCompute(ctx, num_groups_x, num_groups_y, num_groups_z);
+
+    // GL_COMPUTE_SHADER_INVOCATIONS (queries domain)
+    if (ctx->state.program)
+        mgl_queries_note_dispatch(ctx, (uint64_t)num_groups_x * num_groups_y * num_groups_z *
+                                  ctx->state.program->local_workgroup_size.x *
+                                  ctx->state.program->local_workgroup_size.y *
+                                  ctx->state.program->local_workgroup_size.z);
 }
 
 void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)

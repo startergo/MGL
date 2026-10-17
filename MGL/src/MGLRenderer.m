@@ -45,6 +45,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+RenderState.h"
+#import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -70,152 +71,8 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
 
 MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
 {
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUCharNormalized;
-                    case 2: return MTLVertexFormatUChar2Normalized;
-                    case 3: return MTLVertexFormatUChar3Normalized;
-                    case 4: return MTLVertexFormatUChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUChar;
-                    case 2: return MTLVertexFormatUChar2;
-                    case 3: return MTLVertexFormatUChar3;
-                    case 4: return MTLVertexFormatUChar4;
-                }
-            }
-            break;
-
-        case GL_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatCharNormalized;
-                    case 2: return MTLVertexFormatChar2Normalized;
-                    case 3: return MTLVertexFormatChar3Normalized;
-                    case 4: return MTLVertexFormatChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatChar;
-                    case 2: return MTLVertexFormatChar2;
-                    case 3: return MTLVertexFormatChar3;
-                    case 4: return MTLVertexFormatChar4;
-                }
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatUShort2Normalized;
-                    case 3: return MTLVertexFormatUShort3Normalized;
-                    case 4: return MTLVertexFormatUShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatUShort2;
-                    case 3: return MTLVertexFormatUShort3;
-                    case 4: return MTLVertexFormatUShort4;
-                }
-            }
-            break;
-
-        case GL_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatShort2Normalized;
-                    case 3: return MTLVertexFormatShort3Normalized;
-                    case 4: return MTLVertexFormatShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatShort2;
-                    case 3: return MTLVertexFormatShort3;
-                    case 4: return MTLVertexFormatShort4;
-                }
-            }
-            break;
-
-            case GL_HALF_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatHalf;
-                    case 2: return MTLVertexFormatHalf2;
-                    case 3: return MTLVertexFormatHalf3;
-                    case 4: return MTLVertexFormatHalf4;
-                }
-                break;
-
-            case GL_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatFloat;
-                    case 2: return MTLVertexFormatFloat2;
-                    case 3: return MTLVertexFormatFloat3;
-                    case 4: return MTLVertexFormatFloat4;
-                }
-                break;
-
-            case GL_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatInt;
-                    case 2: return MTLVertexFormatInt2;
-                    case 3: return MTLVertexFormatInt3;
-                    case 4: return MTLVertexFormatInt4;
-                }
-                break;
-
-            case GL_UNSIGNED_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUInt;
-                    case 2: return MTLVertexFormatUInt2;
-                    case 3: return MTLVertexFormatUInt3;
-                    case 4: return MTLVertexFormatUInt4;
-                }
-                break;
-
-            case GL_RGB10:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-
-            case GL_UNSIGNED_INT_10_10_10_2:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-        }
-
-    return MTLVertexFormatInvalid;
+    // vattrib: full GL -> Metal vertex format table lives in MGLRenderer+VertexAttrib.m
+    return mglVertexFormatForAttrib(type, (GLint)size, normalized, false);
 }
 
 #pragma mark debug code
@@ -336,7 +193,6 @@ void logDirtyBits(GLMContext ctx)
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
 {
     int count;
-    int mapped_buffers;
     struct {
         int spvc_type;
         int gl_buffer_type;
@@ -414,95 +270,9 @@ void logDirtyBits(GLMContext ctx)
     // bind vao attribs to buffers (attribs can share the same buffer)
     if (stage == _VERTEX_SHADER)
     {
-        int vao_buffer_start;
-
-        count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STAGE_INPUT];
-        mapped_buffers = 0;
-
-        // vao buffers start after the uniforms and shader buffers
-        vao_buffer_start = buffer_map->count;
-        // CRITICAL SECURITY FIX: Check array bounds instead of using assert()
-        if (buffer_map->count >= ctx->state.max_vertex_attribs) {
-            NSLog(@"MGL SECURITY ERROR: buffer_map count %d exceeds max_vertex_attribs %d",
-                  buffer_map->count, ctx->state.max_vertex_attribs);
+        // vattrib: one Metal vertex buffer per GL vertex buffer binding (MGLRenderer+VertexAttrib.m)
+        if ([self vattribMapVertexBuffers: buffer_map] == false)
             return false;
-        }
-        buffer_map->buffers[vao_buffer_start].buf = NULL;
-
-        // create attribute map
-        //
-        // we need to cache this mapping, its called on each draw command
-        //
-        for(int att=0;att<ctx->state.max_vertex_attribs; att++)
-        {
-            if (VAO_STATE(enabled_attribs) & (0x1 << att))
-            {
-                // CRITICAL SECURITY FIX: Check buffer instead of using assert()
-                if (!VAO_ATTRIB_STATE(att).buffer) {
-                    NSLog(@"MGL SECURITY ERROR: NULL buffer for enabled vertex attribute %d", att);
-                    return false;
-                }
-
-                // check all the buffers for metal objects
-                Buffer *gl_buffer;
-                Buffer *map_buffer;
-
-                gl_buffer = VAO_ATTRIB_STATE(att).buffer;
-
-                // check start for map... then check
-                map_buffer = buffer_map->buffers[vao_buffer_start].buf;
-
-                // empty slot map it here, only works on first buffer..
-                if (map_buffer == NULL)
-                {
-                    // map the buffer object to a metal vertex index
-                    assert(buffer_map->count < ctx->state.max_vertex_attribs);
-                    buffer_map->buffers[vao_buffer_start].attribute_mask |= (0x1 << att);
-                    buffer_map->buffers[vao_buffer_start].buf = gl_buffer;
-                    buffer_map->count++;
-
-                    mapped_buffers++;
-                }
-                else
-                {
-                    bool found_buffer = false;
-
-                    // find vao attrib with same buffer
-                    for (int map=vao_buffer_start;
-                         (found_buffer == false) && map<buffer_map->count;
-                         map++)
-                    {
-                        // we need to check name and target, not pointers..
-                        // FIX ME: I think we don't need a target as all attribs should be an array_buffer
-                        if ((map_buffer->name == gl_buffer->name) &&
-                            (map_buffer->target == gl_buffer->target))
-                        {
-                            // include it the list of attributes
-                            buffer_map->buffers[map].attribute_mask |= (0x1 << att);
-                            found_buffer = true;
-                            mapped_buffers++;
-                            break;
-                        }
-                    }
-
-                    if (found_buffer == false)
-                    {
-                        // map the next buffer object to a metal vertex index
-                        assert(buffer_map->count < ctx->state.max_vertex_attribs);
-                        buffer_map->buffers[buffer_map->count].attribute_mask = (0x1 << att);
-                        buffer_map->buffers[buffer_map->count].buf = gl_buffer;
-                        buffer_map->count++;
-
-                        mapped_buffers++;
-                    }
-                }
-            }
-
-            if ((VAO_STATE(enabled_attribs) >> (att+1)) == 0)
-                break;
-        }
-
-        assert(mapped_buffers == count);
     }
     else if (stage == _COMPUTE_SHADER)
     {
@@ -730,59 +500,8 @@ void logDirtyBits(GLMContext ctx)
 
 - (void)swizzleTexDesc:(MTLTextureDescriptor *)tex_desc forTex:(Texture*)tex
 {
-    unsigned channel_r, channel_g, channel_b, channel_a;
-
-    channel_r = channel_g = channel_b = channel_a = 0;
-
-    switch(tex->params.swizzle_r)
-    {
-        case GL_RED: channel_r = MTLTextureSwizzleRed; break;
-        case GL_GREEN: channel_r = MTLTextureSwizzleGreen; break;
-        case GL_BLUE: channel_r = MTLTextureSwizzleBlue; break;
-        case GL_ALPHA: channel_r = MTLTextureSwizzleAlpha; break;
-        default: // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown swizzle value in swizzleTexDesc at line %d", __LINE__);
-            channel_r = MTLTextureSwizzleRed; // Safe default
-            break;
-    }
-
-    switch(tex->params.swizzle_g)
-    {
-        case GL_RED: channel_g = MTLTextureSwizzleRed; break;
-        case GL_GREEN: channel_g = MTLTextureSwizzleGreen; break;
-        case GL_BLUE: channel_g = MTLTextureSwizzleBlue; break;
-        case GL_ALPHA: channel_g = MTLTextureSwizzleAlpha; break;
-        default: // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown swizzle value in swizzleTexDesc at line %d", __LINE__);
-            channel_g = MTLTextureSwizzleGreen; // Safe default
-            break;
-    }
-
-    switch(tex->params.swizzle_b)
-    {
-        case GL_RED: channel_b = MTLTextureSwizzleRed; break;
-        case GL_GREEN: channel_b = MTLTextureSwizzleGreen; break;
-        case GL_BLUE: channel_b = MTLTextureSwizzleBlue; break;
-        case GL_ALPHA: channel_b = MTLTextureSwizzleAlpha; break;
-        default: // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown swizzle value in swizzleTexDesc at line %d", __LINE__);
-            channel_b = MTLTextureSwizzleBlue; // Safe default
-            break;
-    }
-
-    switch(tex->params.swizzle_a)
-    {
-        case GL_RED: channel_a = MTLTextureSwizzleRed; break;
-        case GL_GREEN: channel_a = MTLTextureSwizzleGreen; break;
-        case GL_BLUE: channel_a = MTLTextureSwizzleBlue; break;
-        case GL_ALPHA: channel_a = MTLTextureSwizzleAlpha; break;
-        default: // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown swizzle value in swizzleTexDesc at line %d", __LINE__);
-            channel_a = MTLTextureSwizzleAlpha; // Safe default
-            break;
-    }
-
-    tex_desc.swizzle = MTLTextureSwizzleChannelsMake(channel_r, channel_g, channel_b, channel_a);
+    // GL_TEXTURE_SWIZZLE_* (incl. GL_ZERO / GL_ONE); see MGLRenderer+TextureParams.m
+    tex_desc.swizzle = [self texparamSwizzleForParams:&tex->params];
 }
 
 - (id<MTLTexture>) createMTLTextureFromGLTexture:(Texture *) tex
@@ -988,10 +707,9 @@ void logDirtyBits(GLMContext ctx)
         return NULL;
     }
 
-    if (tex->params.swizzled)
-    {
-        [self swizzleTexDesc:tex_desc forTex:tex];
-    }
+    // swizzle / level range / stencil texturing are applied with texture views at
+    // bind time (texparam: -texparamTextureForTex:base:), not baked in here
+    [self texparamPrepareTextureDescriptor:tex_desc forTex:tex];
 
     id<MTLTexture> texture;
 
@@ -1959,217 +1677,8 @@ void logDirtyBits(GLMContext ctx)
 
 - (id<MTLSamplerState>) createMTLSamplerForTexParam:(TextureParameter *)tex_param target:(GLuint)target
 {
-    MTLSamplerDescriptor *samplerDescriptor;
-
-    samplerDescriptor = [MTLSamplerDescriptor new];
-    assert(samplerDescriptor);
-
-    switch(tex_param->min_filter)
-    {
-        case GL_NEAREST:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
-            break;
-
-        case GL_LINEAR:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
-            break;
-
-        case GL_NEAREST_MIPMAP_NEAREST:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
-            samplerDescriptor.mipFilter = MTLSamplerMipFilterNearest;
-            break;
-
-        case GL_LINEAR_MIPMAP_NEAREST:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
-            samplerDescriptor.mipFilter = MTLSamplerMipFilterNearest;
-            break;
-
-        case GL_NEAREST_MIPMAP_LINEAR:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
-            samplerDescriptor.mipFilter = MTLSamplerMipFilterLinear;
-            break;
-
-        case GL_LINEAR_MIPMAP_LINEAR:
-            samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
-            samplerDescriptor.mipFilter = MTLSamplerMipFilterLinear;
-            break;
-
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
-            break;
-    }
-
-    switch(tex_param->mag_filter)
-    {
-        case GL_NEAREST:
-            samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
-            break;
-
-        case GL_LINEAR:
-            samplerDescriptor.magFilter = MTLSamplerMinMagFilterLinear;
-            break;
-
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
-            break;
-    }
-
-    //     @property (nonatomic) NSUInteger maxAnisotropy;
-    if (tex_param->max_anisotropy > 1.0)
-    {
-        samplerDescriptor.maxAnisotropy = tex_param->max_anisotropy;
-    }
-
-    //    @property (nonatomic) MTLSamplerAddressMode sAddressMode;
-    //    @property (nonatomic) MTLSamplerAddressMode tAddressMode;
-    //    @property (nonatomic) MTLSamplerAddressMode rAddressMode;
-    for (int i=0; i<3; i++)
-    {
-        MTLSamplerAddressMode mode = 0;
-        GLenum type = 0;
-
-        switch(i)
-        {
-            case 0: type = tex_param->wrap_s; break;
-            case 1: type = tex_param->wrap_t; break;
-            case 2: type = tex_param->wrap_r; break;
-        }
-
-        switch(type)
-        {
-            case GL_CLAMP_TO_EDGE:
-                mode = MTLSamplerAddressModeClampToEdge;
-                break;
-
-            case GL_CLAMP_TO_BORDER:
-                mode = MTLSamplerAddressModeClampToBorderColor;
-                break;
-
-            case GL_MIRRORED_REPEAT:
-                mode = MTLSamplerAddressModeMirrorRepeat;
-                break;
-
-            case GL_REPEAT:
-                mode = MTLSamplerAddressModeRepeat;
-                break;
-
-            case GL_MIRROR_CLAMP_TO_EDGE:
-                mode = MTLSamplerAddressModeMirrorClampToEdge;
-                break;
-
-    //        case GL_CLAMP_TO_ZERO_MGL_EXT:
-    //            mode = MTLSamplerAddressModeClampToZero;
-    //            break;
-
-            default:
-                // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
-                break;
-        }
-
-        switch(i)
-        {
-            case 0: samplerDescriptor.sAddressMode = mode; break;
-            case 1: samplerDescriptor.tAddressMode = mode; break;
-            case 2: samplerDescriptor.rAddressMode = mode; break;
-        }
-    }
-
-    if ((tex_param->border_color[0] == 0.0) &&
-        (tex_param->border_color[1] == 0.0) &&
-        (tex_param->border_color[2] == 0.0))
-    {
-        if (tex_param->border_color[3] == 0.0)
-        {
-            samplerDescriptor.borderColor = MTLSamplerBorderColorTransparentBlack;
-        }
-        else if (tex_param->border_color[3] == 1.0)
-        {
-            samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueBlack;
-        }
-    }
-    else    if ((tex_param->border_color[0] == 1.0) &&
-                (tex_param->border_color[1] == 1.0) &&
-                (tex_param->border_color[2] == 1.0) &&
-                (tex_param->border_color[3] == 1.0))
-    {
-        samplerDescriptor.borderColor = MTLSamplerBorderColorOpaqueWhite;
-    }
-    else
-    {
-        // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
-    }
-
-    if (target == GL_TEXTURE_RECTANGLE)
-    {
-        if ((tex_param->wrap_s == GL_CLAMP_TO_EDGE) &&
-            (tex_param->wrap_t == GL_CLAMP_TO_EDGE) &&
-            (tex_param->wrap_r == GL_CLAMP_TO_EDGE))
-        {
-            samplerDescriptor.normalizedCoordinates = false;
-        }
-        else
-        {
-            DEBUG_PRINT("Non-normalized coordinates should only be used with 1D and 2D textures with the ClampToEdge wrap mode, otherwise the results of sampling are undefined.");
-        }
-    }
-
-    // @property (nonatomic) BOOL lodAverage API_AVAILABLE(ios(9.0), macos(11.0), macCatalyst(14.0));
-
-
-    // @property (nonatomic) MTLCompareFunction compareFunction API_AVAILABLE(macos(10.11), ios(9.0));
-    switch(tex_param->compare_func)
-    {
-        case GL_LEQUAL:
-            samplerDescriptor.compareFunction = MTLCompareFunctionLessEqual;
-            break;
-
-        case GL_GEQUAL:
-            samplerDescriptor.compareFunction = MTLCompareFunctionGreaterEqual;
-            break;
-
-        case GL_LESS:
-            samplerDescriptor.compareFunction = MTLCompareFunctionLess;
-            break;
-
-        case GL_GREATER:
-            samplerDescriptor.compareFunction = MTLCompareFunctionGreater;
-            break;
-
-        case GL_EQUAL:
-            samplerDescriptor.compareFunction = MTLCompareFunctionEqual;
-            break;
-
-        case GL_NOTEQUAL:
-            samplerDescriptor.compareFunction = MTLCompareFunctionNotEqual;
-            break;
-
-        case GL_ALWAYS:
-            samplerDescriptor.compareFunction = MTLCompareFunctionAlways;
-            break;
-
-        case GL_NEVER:
-            samplerDescriptor.compareFunction = MTLCompareFunctionNever;
-            break;
-
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return NULL;
-            break;
-    }
-
-    id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor:samplerDescriptor];
-    assert(sampler);
-
-    return sampler;
+    // GL sampler state -> MTLSamplerState (texparam domain, MGLRenderer+TextureParams.m)
+    return [self texparamCreateSampler:tex_param target:target];
 }
 
 - (bool) bindTexturesToCurrentRenderEncoder
@@ -2206,40 +1715,11 @@ void logDirtyBits(GLMContext ctx)
                 texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
                 assert(texture);
 
-                id<MTLSamplerState> sampler;
-
-                // late binding of texture samplers.. but its better than scanning all texture_samplers
-                // texture samplers take priority over texture parameters
-                if(STATE(texture_samplers[spirv_binding]))
-                {
-                    Sampler *gl_sampler;
-
-                    gl_sampler = STATE(texture_samplers[spirv_binding]);
-
-                    // delete existing sampler if dirty
-                    if (gl_sampler->dirty_bits)
-                    {
-                        if (gl_sampler->mtl_data)
-                        {
-                            CFBridgingRelease(gl_sampler->mtl_data);
-                            gl_sampler->mtl_data = NULL;
-                        }
-                    }
-
-                    if (gl_sampler->mtl_data == NULL)
-                    {
-                        gl_sampler->mtl_data = (void *)CFBridgingRetain([self createMTLSamplerForTexParam:&gl_sampler->params target:ptr->target]);
-                        gl_sampler->dirty_bits = 0;
-                    }
-
-                    sampler = (__bridge id<MTLSamplerState>)(gl_sampler->mtl_data);
-                    assert(sampler);
-                }
-                else
-                {
-                    sampler = (__bridge id<MTLSamplerState>)(ptr->params.mtl_data);
-                    assert(sampler);
-                }
+                // sampler objects bound to the unit override the texture's sampler state;
+                // swizzle / base+max level / stencil mode select a texture view (texparam)
+                id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
+                texture = [self texparamTextureForTex:ptr base:texture];
+                assert(sampler);
 
                 [_currentRenderEncoder setFragmentTexture:texture atIndex:spirv_binding];
                 [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:spirv_binding];
@@ -3503,65 +2983,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 #pragma mark vertex descriptor
 - (MTLVertexDescriptor *)generateVertexDescriptor
 {
-    MTLVertexDescriptor *vertexDescriptor = [[MTLVertexDescriptor alloc] init];
-    assert(vertexDescriptor);
-
-    [vertexDescriptor reset]; // ??? debug
-
-    // we can bind a new vertex descriptor without creating a new renderbuffer
-    for(int i=0;i<ctx->state.max_vertex_attribs; i++)
-    {
-        if (VAO_STATE(enabled_attribs) & (0x1 << i))
-        {
-            MTLVertexFormat format;
-
-            if (VAO_ATTRIB_STATE(i).buffer == NULL)
-            {
-                NSLog(@"Error: Invalid VAO defined enabled but no buffer bound\n");
-                return NULL;
-            }
-
-            format = glTypeSizeToMtlType(VAO_ATTRIB_STATE(i).type,
-                                         VAO_ATTRIB_STATE(i).size,
-                                         VAO_ATTRIB_STATE(i).normalized);
-
-            if (format == MTLVertexFormatInvalid)
-            {
-                NSLog(@"Error: unable to map gl type / size / normalize to format\n");
-                return false;
-            }
-
-            int mapped_buffer_index;
-
-            mapped_buffer_index = [self getVertexBufferIndexWithAttributeSet: i];
-
-            vertexDescriptor.attributes[i].bufferIndex = mapped_buffer_index;
-            vertexDescriptor.attributes[i].offset = ctx->state.vao->attrib[i].relativeoffset;
-            vertexDescriptor.attributes[i].format = format;
-
-            vertexDescriptor.layouts[mapped_buffer_index].stride = VAO_ATTRIB_STATE(i).stride;
-
-            if (ctx->state.vao->attrib[i].divisor)
-            {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = ctx->state.vao->attrib[i].divisor;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerInstance;
-            }
-            else
-            {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = 1;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerVertex;
-            }
-        }
-
-        // early out
-        if ((VAO_STATE(enabled_attribs) >> (i+1)) == 0)
-            break;
-    }
-
-    // clear all dirty bits as they have been translated into a vertex descriptor
-    ctx->state.vao->dirty_bits = 0;
-
-    return vertexDescriptor;
+    // vattrib: GL vertex array state -> MTLVertexDescriptor (MGLRenderer+VertexAttrib.m)
+    return [self vattribGenerateVertexDescriptor];
 }
 
 #pragma mark utility funcs for processGLState
@@ -4266,39 +3689,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
                     assert(texture);
 
-                    id<MTLSamplerState> sampler;
-
-                    // late binding of texture samplers.. but its better than scanning the entire texture_samplers
-                    if(STATE(texture_samplers[spirv_binding]))
-                    {
-                        Sampler *gl_sampler;
-
-                        gl_sampler = STATE(texture_samplers[spirv_binding]);
-
-                        // delete existing sampler if dirty
-                        if (gl_sampler->dirty_bits)
-                        {
-                            if (gl_sampler->mtl_data)
-                            {
-                                CFBridgingRelease(gl_sampler->mtl_data);
-                                gl_sampler->mtl_data = NULL;
-                            }
-                        }
-
-                        if (gl_sampler->mtl_data == NULL)
-                        {
-                            gl_sampler->mtl_data = (void *)CFBridgingRetain([self createMTLSamplerForTexParam:&gl_sampler->params target:ptr->target]);
-                            gl_sampler->dirty_bits = 0;
-                        }
-
-                        sampler = (__bridge id<MTLSamplerState>)(gl_sampler->mtl_data);
-                        assert(sampler);
-                    }
-                    else
-                    {
-                        sampler = (__bridge id<MTLSamplerState>)(ptr->params.mtl_data);
-                        assert(sampler);
-                    }
+                    id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
+                    if (gl_texture_type == _TEXTURE)
+                        texture = [self texparamTextureForTex:ptr base:texture];
+                    assert(sampler);
 
                     [computeCommandEncoder setTexture:texture atIndex:spirv_binding];
                     [computeCommandEncoder setSamplerState: sampler atIndex:spirv_binding];
