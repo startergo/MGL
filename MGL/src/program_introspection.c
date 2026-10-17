@@ -27,6 +27,7 @@
 #include "programs.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_program.h"
 
 Program *findProgram(GLMContext ctx, GLuint program);
 Shader *findShader(GLMContext ctx, GLuint shader);
@@ -133,7 +134,7 @@ static void introspect_pre_link(GLMContext ctx, Program *ptr)
     MGLIProgram *ip = mgli_get(ctx, ptr->name);
     if (!ip) return;
     ip->prog = ptr;
-    free_link_tables(ip);
+    mgli_free_inits(ip);
 }
 
 static MGLIShaderRec *find_shader_rec(GLMContext ctx, Shader *sh)
@@ -148,7 +149,10 @@ static void build_subroutines(GLMContext ctx, MGLIProgram *ip, Program *ptr)
         MGLIStageSub *d = &ip->sub[s];
         mgli_free_stage_sub(d);
         if (!ptr->shader_slots[s]) continue;
-        MGLIShaderRec *r = find_shader_rec(ctx, ptr->shader_slots[s]);
+        MGLIShaderRec *r = NULL;
+        MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+        for (int a = 0; a < po->num_attached && !r; a++)
+            if (po->attached[a] && (int)po->attached[a]->glm_type == s) r = find_shader_rec(ctx, po->attached[a]);
         if (!r || (!r->sub.nfuncs && !r->sub.nunis)) continue;
         d->nfuncs = r->sub.nfuncs;
         d->funcs = calloc((size_t)d->nfuncs + 1, sizeof(MGLISubFunc));
@@ -201,9 +205,7 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
     ip->linked = 1;
     for (int s = 0; s < MGLI_STAGES; s++) if (ip->sub[s].nunis) write_selectors(ctx, ip, s);
 
-    /* rebuild the Metal functions from the regenerated MSL */
-    ptr->dirty_bits |= DIRTY_PROGRAM;
-    if (ctx->mtl_funcs.mtlBindProgram) ctx->mtl_funcs.mtlBindProgram(ctx, ptr);
+    /* the stage MSL was generated from the patched SPIR-V (mgl_introspect_patch_stage) */
     ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE | DIRTY_TEX_BINDING;
 }
 
@@ -211,6 +213,8 @@ Buffer *mgl_introspect_default_uniform_buffer(GLMContext ctx, Program *program, 
 {
     if (!program || stage < 0 || stage >= MGLI_STAGES) return NULL;
     MGLIProgram *ip = find_by_ptr(ctx, program);
+    if (!ip && ctx->state.program_pipeline && program == mgl_program_pipeline_composite(ctx))
+        ip = find_by_ptr(ctx, ctx->state.program_pipeline->stage_programs[stage]); /* separable pipeline */
     if (!ip || !ip->linked || ip->dub_res_index[stage] != index) return NULL;
     return ip->dub[stage];
 }
@@ -240,6 +244,7 @@ void mgl_ext_init_introspect(GLMContext ctx)
     ext(ctx);
     mgl_ext_register_pre_link(introspect_pre_link);
     mgl_ext_register_post_link(introspect_post_link);
+    mgl_program_register_programiv_hook(mgl_introspect_get_programiv);
 }
 
 bool mgl_ext_get_introspect(GLMContext ctx, GLenum pname, GLuint type, void *data)
@@ -265,7 +270,7 @@ bool mgl_introspect_get_programiv(GLMContext ctx, Program *program, GLenum pname
 {
     if (!program || !params) return false;
     MGLIProgram *ip = mgli_get(ctx, program->name);
-    if (!ip) return false;
+    if (!ip || !ip->linked) return false;
     switch (pname) {
         case GL_ACTIVE_UNIFORMS: { GLint n = 0; for (int i = 0; i < ip->nuniforms; i++) n += !ip->uniforms[i].hidden; *params = n; return true; }
         case GL_ACTIVE_UNIFORM_MAX_LENGTH: *params = max_len_uniforms(ip); return true;
@@ -363,10 +368,9 @@ void mglGetAttachedShaders(GLMContext ctx, GLuint program, GLsizei maxCount, GLs
 {
     if (maxCount < 0) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     if (!mgli_program_checked(ctx, program, false)) return;
-    Program *p = findProgram(ctx, program);
+    MGLProgramObj *po = MGL_PROGRAM_OBJ(findProgram(ctx, program));
     GLsizei n = 0;
-    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
-        if (p->shader_slots[s] && n < maxCount) { if (shaders) shaders[n] = p->shader_slots[s]->name; n++; }
+    for (int i = 0; i < po->num_attached && n < maxCount; i++) { if (shaders) shaders[n] = po->attached[i]->name; n++; }
     if (count) *count = n;
 }
 

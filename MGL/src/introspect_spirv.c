@@ -36,8 +36,9 @@
 #include "glm_context.h"
 #include "buffers.h"
 #include "mgl_ext_introspect.h"
+#include "mgl_ext_program.h"
+#include <ctype.h>
 
-char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage);
 
 #pragma mark - module model
 
@@ -510,6 +511,8 @@ typedef struct {
     uint8_t  *dub_active;      /* [ndub] members actually accessed */
     /* location assignments to apply: var -> loc / index */
     struct { uint32_t var; uint32_t loc; int index; } *locs; int nlocs;
+    MGLIProgram *ip;
+    int       no_pack;
 } StageCtx;
 
 static void stage_set_loc(StageCtx *s, uint32_t var, uint32_t loc, int index)
@@ -658,6 +661,31 @@ typedef struct { uint32_t key, id; } KV;
 
 static uint32_t kv_get(KV *kv, int n, uint32_t key) { for (int i = 0; i < n; i++) if (kv[i].key == key) return kv[i].id; return 0; }
 
+static void flatten_const(const SMod *m, uint32_t cid, uint32_t **vals, int *n, int *wide, int depth)
+{
+    if (cid > m->bound || !m->isconst[cid] || depth > 16) return;
+    uint32_t *w = m->in[m->cinst[cid]].w; uint32_t wc = m->in[m->cinst[cid]].len;
+    uint32_t op = w[0] & 0xffff;
+    if (m->isconst[cid] == 1) {
+        const SType *ty = &m->t[m->ctype[cid]];
+        int k = (ty->kind == T_FLOAT || ty->kind == T_INT) && ty->width == 64 ? 2 : 1;
+        if (k == 2) *wide = 1;
+        *vals = realloc(*vals, (size_t)(*n + k) * 4);
+        if (op == SpvOpConstant) { (*vals)[(*n)++] = w[3]; if (k == 2) (*vals)[(*n)++] = wc > 4 ? w[4] : 0; }
+        else { (*vals)[(*n)++] = m->cval[cid]; if (k == 2) (*vals)[(*n)++] = 0; }
+        return;
+    }
+    for (uint32_t a = 3; a < wc; a++) flatten_const(m, w[a], vals, n, wide, depth + 1);
+}
+
+void mgli_free_inits(MGLIProgram *ip)
+{
+    for (int s = 0; s < MGLI_STAGES; s++) {
+        for (int i = 0; i < ip->ninits[s]; i++) { free(ip->inits[s][i].name); free(ip->inits[s][i].vals); }
+        free(ip->inits[s]); ip->inits[s] = NULL; ip->ninits[s] = 0;
+    }
+}
+
 /* rewrite one stage; returns patched words (malloc) */
 static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t *out_n)
 {
@@ -682,7 +710,7 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
     for (uint32_t v = 1; v <= m->bound; v++)
         if (m->isvar[v] && m->vglobal[v] && m->vsc[v] == SpvStorageClassUniformConstant && !is_opaque(m, pointee(m, m->vtype[v])))
             sc->ndub++;
-    bool pack = sc->ndub > 0;
+    bool pack = sc->ndub > 0 && !sc->no_pack;
     if (pack) {
         sc->dub = zalloc(sc->ndub * sizeof(DubMember));
         uint32_t k = 0;
@@ -763,6 +791,18 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
             uint32_t o[2] = { dub_struct, k };
             ins_string_op(&ins.names, SpvOpMemberName, 2, o, sc->dub[k].name);
             new_dec(m, &ins, dub_struct, (int32_t)k, SpvDecorationOffset, 1, sc->dub[k].offset);
+            if (sc->dub[k].explicit_loc >= 0) new_dec(m, &ins, dub_struct, (int32_t)k, SpvDecorationLocation, 1, (uint32_t)sc->dub[k].explicit_loc);
+            if (sc->ip && m->vinit[sc->dub[k].var]) {
+                uint32_t *vals = NULL; int nv = 0, wide = 0;
+                flatten_const(m, m->vinit[sc->dub[k].var], &vals, &nv, &wide, 0);
+                MGLIProgram *ip = sc->ip;
+                ip->inits[stage] = realloc(ip->inits[stage], (size_t)(ip->ninits[stage] + 1) * sizeof(*ip->inits[stage]));
+                ip->inits[stage][ip->ninits[stage]].name = strdup(sc->dub[k].name);
+                ip->inits[stage][ip->ninits[stage]].vals = vals;
+                ip->inits[stage][ip->ninits[stage]].nvals = nv;
+                ip->inits[stage][ip->ninits[stage]].wide = wide;
+                ip->ninits[stage]++;
+            }
             uint32_t base = strip_arrays(m, sc->dub[k].type);
             if (m->t[base].kind == T_MATRIX) {
                 uint32_t cs, ca; msl_layout(m, m->t[base].elem, &cs, &ca);
@@ -1413,28 +1453,6 @@ static void assign_uniform_locations(MGLIProgram *ip)
     }
 }
 
-/* evaluate a constant initializer into a uniform's shadow */
-static void apply_initializer(const SMod *m, uint32_t cid, MGLIUniform *u, int *cursor)
-{
-    if (cid > m->bound || !m->isconst[cid]) return;
-    int n = u->size * u->cols * u->rows;
-    if (m->isconst[cid] == 1) {
-        if (*cursor >= n) return;
-        uint32_t ct = m->ctype[cid];
-        const SType *ty = &m->t[ct];
-        if (u->kind == MGLI_K_DOUBLE) {
-            double d = 0;
-            if (ty->kind == T_FLOAT && ty->width == 64) { uint32_t *w = m->in[m->cinst[cid]].w; uint64_t bits = w[3] | ((uint64_t)w[4] << 32); memcpy(&d, &bits, 8); }
-            ((double *)u->shadow)[*cursor] = d;
-        } else {
-            ((uint32_t *)u->shadow)[*cursor] = m->cval[cid];
-        }
-        (*cursor)++;
-        return;
-    }
-    uint32_t *w = m->in[m->cinst[cid]].w; uint32_t wc = m->in[m->cinst[cid]].len;
-    for (uint32_t a = 3; a < wc; a++) apply_initializer(m, w[a], u, cursor);
-}
 
 #pragma mark - link entry
 
@@ -1464,13 +1482,104 @@ static void dump_words(const uint32_t *w, size_t n, Program *ptr, int stage, con
     FILE *f = fopen(path, "wb"); if (f) { fwrite(w, 4, n, f); fclose(f); }
 }
 
-static void free_resource_lists(Program *ptr, int stage)
+
+/* is `name` declared with layout(location) as an `in`/`out` variable in the GLSL source? */
+static bool src_explicit_location(const char *src, const char *name, const char *dir)
 {
-    for (int j = 0; j < _MAX_SPIRV_RES; j++) {
-        SpirvResourceList *l = &ptr->spirv_resources_list[stage][j];
-        if (l->list) { for (GLuint k = 0; k < l->count; k++) free((void *)l->list[k].name); free(l->list); }
-        l->list = NULL; l->count = 0;
+    if (!src) return true;
+    size_t n = strlen(src);
+    char *b = malloc(n + 1);
+    /* strip comments */
+    size_t o = 0;
+    for (size_t i = 0; i < n; ) {
+        if (src[i] == '/' && src[i + 1] == '/') { while (i < n && src[i] != '\n') i++; continue; }
+        if (src[i] == '/' && src[i + 1] == '*') { i += 2; while (i < n && !(src[i] == '*' && src[i + 1] == '/')) i++; i += 2; continue; }
+        b[o++] = src[i++];
     }
+    b[o] = 0;
+    bool found = false, expl = false;
+    char *st = b;
+    for (char *c = b; ; c++) {
+        if (*c == ';' || *c == '{' || *c == '}' || *c == 0) {
+            char save = *c; *c = 0;
+            /* tokens */
+            bool has_dir = false, has_loc = false; char last[256] = "";
+            for (char *t = st; *t; ) {
+                if (isalnum((unsigned char)*t) || *t == '_') {
+                    char *e = t; while (isalnum((unsigned char)*e) || *e == '_') e++;
+                    size_t l = (size_t)(e - t);
+                    if (l == strlen(dir) && !strncmp(t, dir, l)) has_dir = true;
+                    if (l == 8 && !strncmp(t, "location", 8)) has_loc = true;
+                    if (l < sizeof last) { memcpy(last, t, l); last[l] = 0; }
+                    t = e;
+                } else if (*t == '[') { while (*t && *t != ']') t++; }
+                else t++;
+            }
+            if (has_dir && !strcmp(last, name)) { found = true; expl = has_loc; }
+            *c = save;
+            if (!save) break;
+            st = c + 1;
+        }
+    }
+    free(b);
+    return found ? expl : true;
+}
+
+static const char *stage_source(GLMContext ctx, Program *program, int stage)
+{
+    Program *real = findProgram(ctx, program->name);
+    if (!real) return NULL;
+    MGLProgramObj *o = MGL_PROGRAM_OBJ(real);
+    for (int i = 0; i < o->num_attached; i++)
+        if (o->attached[i] && (int)o->attached[i]->glm_type == stage) return o->attached[i]->src;
+    return NULL;
+}
+
+uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage, const uint32_t *words,
+                                     size_t nwords, size_t *out_words)
+{
+    if (!program || stage < 0 || stage >= MGLI_STAGES) return NULL;
+    MGLIProgram *ip = mgli_get(ctx, program->name);
+    if (!ip) return NULL;
+    StageCtx sc[MGLI_STAGES];
+    uint32_t *out = NULL;
+    for (int attempt = 0; attempt < 2 && !out; attempt++) {
+        memset(sc, 0, sizeof sc);
+        sc[stage].m = mod_parse(words, nwords);
+        if (!sc[stage].m) return NULL;
+        sc[stage].present = 1;
+        sc[stage].ip = ip;
+        sc[stage].no_pack = attempt;
+        /* locations glslang's map_io invented are not "explicit": bindings may override them */
+        const char *src = stage_source(ctx, program, stage);
+        SMod *m = sc[stage].m;
+        if (src && (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER)) {
+            uint32_t want = stage == _VERTEX_SHADER ? SpvStorageClassInput : SpvStorageClassOutput;
+            for (uint32_t v = 1; v <= m->bound; v++) {
+                if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != want || is_builtin_var(m, v)) continue;
+                if (!get_dec(m, v, -1, SpvDecorationLocation, NULL)) continue;
+                if (!src_explicit_location(src, id_name(m, v), stage == _VERTEX_SHADER ? "in" : "out")) {
+                    kill_decs(m, v, -1, SpvDecorationLocation);
+                    kill_decs(m, v, -1, SpvDecorationIndex);
+                }
+            }
+        }
+        assign_interface_locations(sc, ip);
+        /* initializers are captured again by transform_stage */
+        for (int i = 0; i < ip->ninits[stage]; i++) { free(ip->inits[stage][i].name); free(ip->inits[stage][i].vals); }
+        ip->ninits[stage] = 0;
+        size_t n = 0;
+        dump_words(words, nwords, program, stage, "orig");
+        out = transform_stage(ctx, &sc[stage], stage, &n);
+        if (out) {
+            dump_words(out, n, program, stage, attempt ? "patched_nopack" : "patched");
+            if (!msl_accepts(out, n, stage)) { free(out); out = NULL; }
+            else *out_words = n;
+        }
+        mod_free(sc[stage].m);
+        free(sc[stage].dub); free(sc[stage].locs);
+    }
+    return out;
 }
 
 bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
@@ -1482,8 +1591,8 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
 
     for (int s = 0; s < MGLI_STAGES; s++) {
         if (!ptr->shader_slots[s] || !ptr->spirv[s].ir || !ptr->spirv[s].size) continue;
-        sc[s].m = mod_parse(ptr->spirv[s].ir, ptr->spirv[s].size);
-        if (!sc[s].m) { fprintf(stderr, "MGL introspect: stage %d: cannot parse SPIR-V\n", s); continue; }
+        sc[s].r = mod_parse(ptr->spirv[s].ir, ptr->spirv[s].size);
+        if (!sc[s].r) { fprintf(stderr, "MGL introspect: stage %d: cannot parse SPIR-V\n", s); continue; }
         sc[s].present = 1;
         ip->stage_mask |= 1u << s;
         if (s != _COMPUTE_SHADER) { if (ip->first_stage < 0) ip->first_stage = s; ip->last_stage = s; }
@@ -1491,37 +1600,29 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
     if (ip->stage_mask & (1u << _COMPUTE_SHADER)) { ip->first_stage = ip->last_stage = _COMPUTE_SHADER; }
     if (!ip->stage_mask) return false;
 
-    assign_interface_locations(sc, ip);
-
     for (int s = 0; s < MGLI_STAGES; s++) {
         if (!sc[s].present) continue;
-        size_t n = 0;
-        dump_words(ptr->spirv[s].ir, ptr->spirv[s].size, ptr, s, "orig");
-        uint32_t *words = transform_stage(ctx, &sc[s], s, &n);
-        if (!words) continue;
-        dump_words(words, n, ptr, s, "patched");
-        if (!msl_accepts(words, n, s)) {
-            /* keep the original module; reflection still runs on it (no default block) */
-            free(words);
-            free(sc[s].dub); sc[s].dub = NULL; sc[s].ndub = 0; sc[s].dub_var = 0;
-            n = ptr->spirv[s].size;
-            words = malloc(n * 4); memcpy(words, ptr->spirv[s].ir, n * 4);
+        SMod *r = sc[s].r;
+        /* the default uniform block built by mgl_introspect_patch_stage */
+        for (uint32_t v = 1; v <= r->bound && !sc[s].dub_var; v++)
+            if (r->isvar[v] && r->vglobal[v] && r->vsc[v] == SpvStorageClassUniform && !strcmp(id_name(r, v), "mgl_DefaultUniforms"))
+                sc[s].dub_var = v;
+        if (sc[s].dub_var) {
+            uint32_t st = pointee(r, r->vtype[sc[s].dub_var]);
+            SType *ty = &r->t[st];
+            sc[s].ndub = ty->nmem;
+            sc[s].dub = zalloc((ty->nmem + 1) * sizeof(DubMember));
+            for (uint32_t k = 0; k < ty->nmem; k++) {
+                DubMember *d = &sc[s].dub[k];
+                d->type = ty->mem[k]; d->member = k;
+                get_dec(r, st, (int32_t)k, SpvDecorationOffset, &d->offset);
+                uint32_t l; d->explicit_loc = get_dec(r, st, (int32_t)k, SpvDecorationLocation, &l) ? (int)l : -1;
+                snprintf(d->name, sizeof d->name, "%s", member_name(r, st, k));
+            }
+            uint32_t sz, al; msl_layout(r, st, &sz, &al);
+            sc[s].dub_size = align_up(sz ? sz : 16, 16);
         }
-        free(ptr->spirv[s].ir);
-        ptr->spirv[s].ir = words;
-        ptr->spirv[s].size = n;
-        sc[s].r = mod_parse(words, n);
-        if (!sc[s].r) { sc[s].present = 0; continue; }
-        compute_active(&sc[s], words, n);
-
-        /* regenerate MSL with the patched SPIR-V (program.c owns compiler options) */
-        free(ptr->spirv[s].msl_str); ptr->spirv[s].msl_str = NULL;
-        free(ptr->spirv[s].entry_point); ptr->spirv[s].entry_point = NULL;
-        if (ptr->shader_slots[s]->entry_point) { free((void *)ptr->shader_slots[s]->entry_point); ptr->shader_slots[s]->entry_point = NULL; }
-        free_resource_lists(ptr, s);
-        if (ptr->spirv[s].mtl_function) { CFRelease(ptr->spirv[s].mtl_function); ptr->spirv[s].mtl_function = NULL; }
-        if (ptr->spirv[s].mtl_library) { CFRelease(ptr->spirv[s].mtl_library); ptr->spirv[s].mtl_library = NULL; }
-        ptr->spirv[s].msl_str = parseSPIRVShaderToMetal(ctx, ptr, s);
+        compute_active(&sc[s], ptr->spirv[s].ir, ptr->spirv[s].size);
 
         /* the default block is served from MGLIProgram.dub[s]: move it to the uniform-constant list */
         ip->dub_res_index[s] = -1;
@@ -1530,16 +1631,16 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
             SpirvResourceList *uc = &ptr->spirv_resources_list[s][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
             for (GLuint k = 0; k < ub->count; k++) {
                 if (ub->list[k]._id != sc[s].dub_var) continue;
-                SpirvResource r = ub->list[k];
+                SpirvResource res = ub->list[k];
                 memmove(&ub->list[k], &ub->list[k + 1], (ub->count - k - 1) * sizeof(SpirvResource));
                 ub->count--;
                 uc->list = realloc(uc->list, (uc->count + 1) * sizeof(SpirvResource));
                 memmove(&uc->list[1], &uc->list[0], uc->count * sizeof(SpirvResource));
-                uc->list[0] = r;
+                uc->list[0] = res;
                 uc->count++;
-                ip->dub_res_index[s] = 0;
                 break;
             }
+            for (GLuint k = 0; k < uc->count; k++) if (uc->list[k]._id == sc[s].dub_var) ip->dub_res_index[s] = (int)k;
             ip->dub_size[s] = sc[s].dub_size;
             Buffer *b = ip->dub[s] ? ip->dub[s] : newBuffer(ctx, GL_UNIFORM_BUFFER, 0);
             initBufferData(ctx, b, sc[s].dub_size, NULL, true);
@@ -1569,26 +1670,25 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
         for (int s = 0; s < MGLI_STAGES; s++) {
             if (!u->st[s].present || !sc[s].r) continue;
             if (u->opaque_class) {
-                /* default unit: layout(binding) */
-                uint32_t b = 0;
+                uint32_t b = 0; /* default unit: layout(binding) */
                 if (get_dec(sc[s].r, u->st[s].spv_id, -1, SpvDecorationBinding, &b))
                     for (int e = 0; e < u->size; e++) ((uint32_t *)u->shadow)[e] = b + (uint32_t)(u->st[s].elem_base + e);
-            } else {
-                /* constant initializer of the original variable */
-                for (uint32_t k = 0; k < sc[s].ndub; k++) {
-                    size_t ln = strlen(sc[s].dub[k].name);
-                    if (!strcmp(sc[s].dub[k].name, u->name) || (!strncmp(sc[s].dub[k].name, u->name, ln) && !strcmp(u->name + ln, "[0]"))) {
-                        uint32_t init = sc[s].m->vinit[sc[s].dub[k].var];
-                        if (init) { int cur = 0; apply_initializer(sc[s].m, init, u, &cur); }
-                    }
-                }
+                continue;
+            }
+            for (int k = 0; k < ip->ninits[s]; k++) {
+                size_t ln = strlen(ip->inits[s][k].name);
+                if (strcmp(ip->inits[s][k].name, u->name) && !(!strncmp(ip->inits[s][k].name, u->name, ln) && !strcmp(u->name + ln, "[0]"))) continue;
+                size_t bytes = (size_t)ip->inits[s][k].nvals * 4;
+                if (bytes > ss) bytes = ss;
+                if ((u->kind == MGLI_K_DOUBLE) == (ip->inits[s][k].wide != 0)) memcpy(u->shadow, ip->inits[s][k].vals, bytes);
             }
         }
         mgli_upload_uniform(ctx, ip, u);
     }
+    mgli_free_inits(ip);
 
     for (int s = 0; s < MGLI_STAGES; s++) {
-        mod_free(sc[s].m); mod_free(sc[s].r);
+        mod_free(sc[s].r);
         free(sc[s].dub); free(sc[s].active); free(sc[s].dub_active); free(sc[s].locs);
     }
     return true;

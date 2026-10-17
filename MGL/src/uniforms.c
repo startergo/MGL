@@ -41,6 +41,7 @@
 #include "buffers.h"
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
+#include "mgl_ext_program.h"
 
 #pragma mark - storage
 
@@ -174,7 +175,7 @@ void mgli_get_uniform(GLMContext ctx, const char *func, GLuint program, GLint lo
 
 static MGLIProgram *current_program(GLMContext ctx, const char *func)
 {
-    Program *p = ctx->state.program;
+    Program *p = mgl_program_uniform_target(ctx); /* current program, else the pipeline's active program */
     if (!p) { mgli_set_error(ctx, func, GL_INVALID_OPERATION); return NULL; }
     MGLIProgram *ip = NULL;
     for (MGLIProgram *it = ctx->state.ext_introspect ? ctx->state.ext_introspect->programs : NULL; it; it = it->next)
@@ -416,6 +417,19 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
     MGLIBlock *b = &ip->ubos[uniformBlockIndex];
     b->binding = (GLint)uniformBlockBinding;
     mgli_apply_block_binding(ctx, ip, b, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER);
+}
+
+bool checkUniformParams(GLMContext ctx, GLint location)
+{
+    Program* ptr = mgl_program_uniform_target(ctx);    // current program, else pipeline's active program
+    
+    ERROR_CHECK_RETURN_VALUE(ptr, GL_INVALID_OPERATION, false)
+
+    ERROR_CHECK_RETURN_VALUE(location >= 0, GL_INVALID_OPERATION, false)
+        
+    ERROR_CHECK_RETURN_VALUE(location < MAX_BINDABLE_BUFFERS, GL_INVALID_OPERATION, false)
+
+    return true;
 }
 
 #pragma mark glUniform* (current program)

@@ -146,6 +146,10 @@ typedef struct MGLIProgram {
     Buffer  *dub[MGLI_STAGES];
     uint32_t dub_size[MGLI_STAGES];
     int      dub_res_index[MGLI_STAGES]; /* index in spirv_resources_list[stage][UNIFORM_CONSTANT], -1 */
+
+    /* constant initializers of default-block uniforms, captured when the stage is patched */
+    struct { char *name; uint32_t *vals; int nvals; int wide; } *inits[MGLI_STAGES];
+    int      ninits[MGLI_STAGES];
 } MGLIProgram;
 
 /* GL-side state, reachable as ctx->state.ext_introspect; allocate in mgl_ext_init_introspect(). */
@@ -176,6 +180,12 @@ bool mgl_introspect_get_programiv(GLMContext ctx, Program *program, GLenum pname
  * Used by MGLRenderer mapGLBuffersToMTLBufferMap. */
 Buffer *mgl_introspect_default_uniform_buffer(GLMContext ctx, Program *program, int stage, int index);
 
+/* SPIR-V patch applied by program.c compile_stage() before MSL translation (introspect_spirv.c):
+ * default uniform block, attribute / fragment output locations, buffer ordering.
+ * Returns malloc'd words (caller frees) or NULL to keep the module unchanged. */
+uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage, const uint32_t *words,
+                                     size_t nwords, size_t *out_words);
+
 /* Shader source to hand to glslang (subroutine-rewritten copy or shader->src).  Called by
  * mglCompileShader (shaders.c). */
 const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader);
@@ -203,6 +213,7 @@ int  mgli_uniform_index(MGLIProgram *ip, const char *name);
 /* SPIR-V helpers (introspect_spirv.c) */
 struct MGLSpvModule;
 bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip);
+void mgli_free_inits(MGLIProgram *ip);
 
 /* subroutine source rewrite (introspect_subroutine.c) */
 char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out);
