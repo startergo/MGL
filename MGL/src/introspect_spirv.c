@@ -1438,6 +1438,32 @@ static void apply_initializer(const SMod *m, uint32_t cid, MGLIUniform *u, int *
 
 #pragma mark - link entry
 
+/* compile the patched module once with SPIRV-Cross MSL; false (and a log line) if it is rejected */
+static bool msl_accepts(const uint32_t *words, size_t n, int stage)
+{
+    spvc_context c = NULL; spvc_parsed_ir ir = NULL; spvc_compiler comp = NULL; spvc_compiler_options opt = NULL;
+    const char *res = NULL;
+    bool ok = spvc_context_create(&c) == SPVC_SUCCESS &&
+              spvc_context_parse_spirv(c, words, n, &ir) == SPVC_SUCCESS &&
+              spvc_context_create_compiler(c, SPVC_BACKEND_MSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) == SPVC_SUCCESS &&
+              spvc_compiler_create_compiler_options(comp, &opt) == SPVC_SUCCESS &&
+              spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS &&
+              spvc_compiler_install_compiler_options(comp, opt) == SPVC_SUCCESS &&
+              spvc_compiler_compile(comp, &res) == SPVC_SUCCESS && res;
+    if (!ok) fprintf(stderr, "MGL introspect: stage %d: patched SPIR-V rejected by SPIRV-Cross (%s), using the original module\n",
+                     stage, c ? spvc_context_get_last_error_string(c) : "no context");
+    if (c) spvc_context_destroy(c);
+    return ok;
+}
+
+static void dump_words(const uint32_t *w, size_t n, Program *ptr, int stage, const char *tag)
+{
+    const char *dir = getenv("MGL_INTROSPECT_DUMP");
+    if (!dir) return;
+    char path[1024]; snprintf(path, sizeof path, "%s/prog%u_stage%d_%s.spv", dir, ptr->name, stage, tag);
+    FILE *f = fopen(path, "wb"); if (f) { fwrite(w, 4, n, f); fclose(f); }
+}
+
 static void free_resource_lists(Program *ptr, int stage)
 {
     for (int j = 0; j < _MAX_SPIRV_RES; j++) {
@@ -1470,8 +1496,17 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
     for (int s = 0; s < MGLI_STAGES; s++) {
         if (!sc[s].present) continue;
         size_t n = 0;
+        dump_words(ptr->spirv[s].ir, ptr->spirv[s].size, ptr, s, "orig");
         uint32_t *words = transform_stage(ctx, &sc[s], s, &n);
         if (!words) continue;
+        dump_words(words, n, ptr, s, "patched");
+        if (!msl_accepts(words, n, s)) {
+            /* keep the original module; reflection still runs on it (no default block) */
+            free(words);
+            free(sc[s].dub); sc[s].dub = NULL; sc[s].ndub = 0; sc[s].dub_var = 0;
+            n = ptr->spirv[s].size;
+            words = malloc(n * 4); memcpy(words, ptr->spirv[s].ir, n * 4);
+        }
         free(ptr->spirv[s].ir);
         ptr->spirv[s].ir = words;
         ptr->spirv[s].size = n;

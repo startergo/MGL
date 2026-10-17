@@ -599,7 +599,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     spvc_compiler_compile(compiler_msl, &result);
     DEBUG_PRINT("\n%s\n", result);
 
-    str_ret = strdup(result);
+    str_ret = result ? strdup(result) : NULL; /* compile failure: caller reports it */
 
     // Frees all memory we allocated so far.
     spvc_context_destroy(context);
