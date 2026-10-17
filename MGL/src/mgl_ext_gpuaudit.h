@@ -28,6 +28,16 @@
 #define MGL_GA_SCAN_CACHE  8      /* cached primitive-restart scan answers */
 #define MGL_GA_SERIAL_CACHE 64    /* Buffer* -> content generation */
 
+/* snapshot of the GL state that can change a rewrite decision or the rewritten list:
+   the restart index (and whether restart is on at all), the provoking-vertex
+   convention, and the bound program (flat-varying detection is per program). */
+typedef struct MGLIndexKeyState {
+    uint32_t  restart_index;
+    uint8_t   restart_on;
+    uint8_t   lastpv;
+    void     *program;
+} MGLIndexKeyState;
+
 /* one cached "this draw needs an index rewrite: yes/no" answer */
 typedef struct MGLScanCacheEnt {
     Buffer   *ebuf;             /* element buffer (NULL = never valid) */
@@ -35,7 +45,7 @@ typedef struct MGLScanCacheEnt {
     uint32_t  offset;           /* byte offset of the index range */
     GLenum    mode, type;
     GLsizei   count;
-    uint32_t  restart_index;    /* GL restart value in effect (0 if restart off) */
+    MGLIndexKeyState state;     /* GL state snapshot the answer was computed under */
     uint8_t   needed;           /* 1: rewrite needed, 0: not */
     uint64_t  lru;
 } MGLScanCacheEnt;
@@ -48,8 +58,7 @@ typedef struct MGLIndexCacheEnt {
     GLenum    mode, type;       /* GL draw parameters the list was built from */
     GLsizei   count;
     GLint     first;            /* arrays only */
-    uint32_t  restart_index;
-    uint8_t   lastpv;           /* provoking-vertex rotation was active */
+    MGLIndexKeyState state;     /* GL state snapshot the list was built under */
     uint8_t   adjacency;        /* adjacency-mode emulation */
     /* result */
     GLenum    out_mode, out_type;
@@ -130,24 +139,24 @@ void mgl_gpuaudit_invalidate_all(GLMContext ctx);             /* drop every cach
 
 /* --- primitive-restart scan cache ---------------------------------------- */
 /* returns -1 when unknown: the caller must scan. Otherwise 1 (rewrite needed)
- * or 0 (not needed) for exactly this draw's index range. */
+ * or 0 (not needed) for exactly this draw's index range and GL state. */
 int mgl_gpuaudit_scan_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode, GLenum type,
-                             GLsizei count, uint32_t restart_index);
+                             GLsizei count, MGLIndexKeyState state);
 void mgl_gpuaudit_scan_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode, GLenum type,
-                             GLsizei count, uint32_t restart_index, int needed);
+                             GLsizei count, MGLIndexKeyState state, int needed);
 
 /* --- rewritten index list cache ------------------------------------------ */
 /* look up a cached rewritten list for exactly this draw; returns the entry
  * (borrowed) with out_mode/out_type/out_count/mtl_buffer filled in, or NULL. */
 MGLIndexCacheEnt *mgl_gpuaudit_index_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode,
                                             GLenum type, GLsizei count, GLint first,
-                                            uint32_t restart_index, int lastpv, int adjacency);
-/* store a rewritten list.  `data` is always consumed (freed) by this call; the
- * returned entry owns a private MTLBuffer copy of it, or NULL when the list was
- * not cached — then the caller must draw from its own copy of the indices. */
+                                            MGLIndexKeyState state, int adjacency);
+/* store a rewritten list.  On success the cache owns an MTLBuffer copy of `data`
+ * and the returned entry is ready to draw from; on failure it returns NULL and
+ * `data` is untouched, so the caller keeps drawing from its own copy. */
 MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode,
                                            GLenum type, GLsizei count, GLint first,
-                                           uint32_t restart_index, int lastpv, int adjacency,
+                                           MGLIndexKeyState state, int adjacency,
                                            void *data, GLenum out_mode, GLenum out_type, GLsizei out_count);
 
 /* hook the caches need: is this buffer's CPU view safe to cache (not mapped)? */

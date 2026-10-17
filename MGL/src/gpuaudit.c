@@ -133,8 +133,14 @@ bool mgl_gpuaudit_cacheable(GLMContext ctx, Buffer *ebuf)
 
 /* ------------------------------------------------------- restart scan cache */
 
+static bool ga_state_equal(const MGLIndexKeyState *a, const MGLIndexKeyState *b)
+{
+    return a->restart_index == b->restart_index && a->restart_on == b->restart_on &&
+           a->lastpv == b->lastpv && a->program == b->program;
+}
+
 int mgl_gpuaudit_scan_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode, GLenum type,
-                             GLsizei count, uint32_t restart_index)
+                             GLsizei count, MGLIndexKeyState state)
 {
     struct MGLExtState_gpuaudit *s = GA(ctx);
     if (!s || !mgl_gpuaudit_cacheable(ctx, ebuf))
@@ -147,7 +153,7 @@ int mgl_gpuaudit_scan_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLen
         MGLScanCacheEnt *e = &s->scan[i];
         if (e->ebuf != ebuf || e->content != content || e->offset != offset ||
             e->mode != mode || e->type != type || e->count != count ||
-            e->restart_index != restart_index)
+            !ga_state_equal(&e->state, &state))
             continue;
 
         e->lru = ++s->lru;
@@ -159,7 +165,7 @@ int mgl_gpuaudit_scan_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLen
 }
 
 void mgl_gpuaudit_scan_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode, GLenum type,
-                             GLsizei count, uint32_t restart_index, int needed)
+                             GLsizei count, MGLIndexKeyState state, int needed)
 {
     struct MGLExtState_gpuaudit *s = GA(ctx);
     if (!s || !mgl_gpuaudit_cacheable(ctx, ebuf) || needed < 0)
@@ -173,7 +179,7 @@ void mgl_gpuaudit_scan_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLen
         MGLScanCacheEnt *e = &s->scan[i];
         if (e->ebuf == ebuf && e->content == content && e->offset == offset &&
             e->mode == mode && e->type == type && e->count == count &&
-            e->restart_index == restart_index)
+            ga_state_equal(&e->state, &state))
         {
             best = e;
             break;
@@ -188,7 +194,7 @@ void mgl_gpuaudit_scan_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLen
     best->mode = mode;
     best->type = type;
     best->count = count;
-    best->restart_index = restart_index;
+    best->state = state;
     best->needed = needed ? 1 : 0;
     best->lru = ++s->lru;
     s->scan_misses++;
@@ -198,17 +204,17 @@ void mgl_gpuaudit_scan_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLen
 
 static bool ga_index_match(const MGLIndexCacheEnt *e, Buffer *ebuf, uint64_t content, uint32_t offset,
                            GLenum mode, GLenum type, GLsizei count, GLint first,
-                           uint32_t restart_index, int lastpv, int adjacency)
+                           MGLIndexKeyState state, int adjacency)
 {
     return e->ebuf == ebuf && e->content == content && e->offset == offset &&
            e->mode == mode && e->type == type && e->count == count && e->first == first &&
-           e->restart_index == restart_index && e->lastpv == (uint8_t)(lastpv ? 1 : 0) &&
+           ga_state_equal(&e->state, &state) &&
            e->adjacency == (uint8_t)(adjacency ? 1 : 0);
 }
 
 MGLIndexCacheEnt *mgl_gpuaudit_index_lookup(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode,
                                             GLenum type, GLsizei count, GLint first,
-                                            uint32_t restart_index, int lastpv, int adjacency)
+                                            MGLIndexKeyState state, int adjacency)
 {
     struct MGLExtState_gpuaudit *s = GA(ctx);
     if (!s)
@@ -227,7 +233,7 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_lookup(GLMContext ctx, Buffer *ebuf, uint32
     {
         MGLIndexCacheEnt *e = &s->index[i];
         if (!e->mtl_buffer || !ga_index_match(e, ebuf, content, offset, mode, type, count, first,
-                                              restart_index, lastpv, adjacency))
+                                              state, adjacency))
             continue;
 
         e->lru = ++s->lru;
@@ -240,26 +246,20 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_lookup(GLMContext ctx, Buffer *ebuf, uint32
 
 MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_t offset, GLenum mode,
                                            GLenum type, GLsizei count, GLint first,
-                                           uint32_t restart_index, int lastpv, int adjacency,
+                                           MGLIndexKeyState state, int adjacency,
                                            void *data, GLenum out_mode, GLenum out_type, GLsizei out_count)
 {
     struct MGLExtState_gpuaudit *s = GA(ctx);
     struct MGLExtMetal_gpuaudit *m = ctx ? ctx->mtl_funcs.ext_gpuaudit : NULL;
 
     if (!s || !m || !m->index_buffer_new || out_count <= 0)
-    {
-        free(data);
-        return NULL;
-    }
+        return NULL;      /* caller keeps `data` and draws from it itself */
 
     uint64_t content = 0;
     if (ebuf)
     {
         if (!mgl_gpuaudit_cacheable(ctx, ebuf))
-        {
-            free(data);
             return NULL;
-        }
         content = mgl_gpuaudit_content(ctx, ebuf);
     }
 
@@ -267,12 +267,9 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_
     void *mtl = m->index_buffer_new(ctx, data, bytes);
 
     if (!mtl)
-    {
-        free(data);
         return NULL;
-    }
 
-    /* evict the least recently used entry (never the one we are about to match) */
+    /* evict the least recently used entry */
     MGLIndexCacheEnt *best = &s->index[0];
     for (int i = 0; i < MGL_GA_INDEX_CACHE; i++)
     {
@@ -297,8 +294,7 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_
     best->type = type;
     best->count = count;
     best->first = first;
-    best->restart_index = restart_index;
-    best->lastpv = lastpv ? 1 : 0;
+    best->state = state;
     best->adjacency = adjacency ? 1 : 0;
     best->out_mode = out_mode;
     best->out_type = out_type;

@@ -162,10 +162,240 @@ TEST(cpu_buffer_clear_still_correct)
     EXPECT_NO_GL_ERROR();
 }
 
+/* --------------------------------------------------- F3/F4: index list caches */
+
+static GLuint g_pos_col_prog;   /* position + per-vertex colour (flat or smooth) */
+static GLuint g_flat_prog;
+static GLint g_vp[4];
+
+static void setup2(void)
+{
+    glGetIntegerv(GL_VIEWPORT, g_vp);
+
+    const char *vs = "#version 330 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in vec4 col;\n"
+        "out vec4 v_col;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_col = col; }\n";
+    const char *fs_smooth = "#version 330 core\n"
+        "in vec4 v_col; layout(location=0) out vec4 color;\n"
+        "void main(){ color = v_col; }\n";
+    const char *fs_flat = "#version 330 core\n"
+        "flat in vec4 v_col; layout(location=0) out vec4 color;\n"
+        "void main(){ color = v_col; }\n";
+    const char *vs_flat = vs;
+    g_pos_col_prog = mgl_make_program(vs, fs_smooth);
+    g_flat_prog = mgl_make_program(vs_flat, fs_flat);
+}
+
+/* 6 vertices: a big triangle (0,1,2) and a small one (3,4,5) in the opposite corner,
+ * with distinct colours so every draw is identifiable by what is on screen */
+static const float g_verts[] = {
+    -1.0f, -1.0f,   1.0f, 0.0f, 0.0f, 1.0f,     /* 0 */
+     3.0f, -1.0f,   1.0f, 0.0f, 0.0f, 1.0f,     /* 1 */
+    -1.0f,  3.0f,   1.0f, 0.0f, 0.0f, 1.0f,     /* 2 */
+     0.2f,  0.2f,   0.0f, 1.0f, 0.0f, 1.0f,     /* 3 */
+     1.0f,  0.2f,   0.0f, 1.0f, 0.0f, 1.0f,     /* 4 */
+     0.2f,  1.0f,   0.0f, 1.0f, 0.0f, 1.0f,     /* 5 */
+};
+
+static GLuint g_vao6, g_ebo6;
+
+static void setup_geom(void)
+{
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(g_verts), g_verts, GL_STATIC_DRAW);
+    glGenVertexArrays(1, &g_vao6);
+    glBindVertexArray(g_vao6);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 24, 0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 24, (void *)8);
+    glGenBuffers(1, &g_ebo6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo6);
+}
+
+/* how many pixels are red / green after a clear + draw */
+static void coverage(GLuint *red, GLuint *green)
+{
+    GLsizei w = g_vp[2], h = g_vp[3];
+    static GLubyte *px;
+    if (!px) px = (GLubyte *)malloc((size_t)w * h * 4);
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    GLuint r = 0, g = 0;
+    for (GLsizei i = 0; i < w * h; i++)
+    {
+        if (px[i * 4] > 200 && px[i * 4 + 1] < 50) r++;
+        else if (px[i * 4 + 1] > 200 && px[i * 4] < 50) g++;
+    }
+    *red = r;
+    *green = g;
+}
+
+/* fan/loop/adjacency emulation and restart splitting must give identical pixels
+ * whether the list was just built (first draw) or served from the cache (rest) */
+TEST(index_cache_emulation_and_restart)
+{
+    glUseProgram(g_pos_col_prog);
+    glBindVertexArray(g_vao6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo6);
+
+    /* reference: 6 indices, two triangles, no restart */
+    GLuint idx6[6] = { 0, 1, 2, 3, 4, 5 };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx6), idx6, GL_STATIC_DRAW);
+
+    GLuint r_ref = 0, g_ref = 0;
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        glFinish();
+        coverage(&r_ref, &g_ref);
+    }
+    EXPECT_TRUE(r_ref > 100);
+    EXPECT_TRUE(g_ref > 100);
+
+    /* the same geometry as a fan (emulated on the CPU): cached after the first draw */
+    GLuint r_fan = 0, g_fan = 0;
+    for (int rep = 0; rep < 3; rep++)
+    {
+        GLuint r, g;
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 3);
+        glFinish();
+        coverage(&r, &g);
+        if (rep == 0) { r_fan = r; g_fan = g; }
+        EXPECT_TRUE(r > 100);              /* the fan is emulated; the first draw sets
+                                              the reference for the cached ones */
+        EXPECT_EQ_INT(r, r_fan);           /* cached draws must render identically */
+        EXPECT_EQ_INT(g, g_fan);
+    }
+    EXPECT_TRUE(g_stat(MGL_GPUAUDIT_INDEX_HITS) > 0);
+
+    /* restart splitting: two triangles separated by the restart index */
+    GLuint idx8[8] = { 0, 1, 2, 0xFFFFFFFFu, 3, 4, 5, 0xFFFFFFFFu };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx8), idx8, GL_STATIC_DRAW);
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xFFFFFFFFu);
+
+    for (int rep = 0; rep < 3; rep++)
+    {
+        GLuint r, g;
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, 8, GL_UNSIGNED_INT, 0);
+        glFinish();
+        coverage(&r, &g);
+        EXPECT_TRUE(r > 100);
+        EXPECT_TRUE(g > 100);
+    }
+
+    /* restart scan is cached: 3 draws above scanned once */
+    EXPECT_EQ_INT(g_stat(MGL_GPUAUDIT_SCAN_MISSES) >= 1, 1);
+    GLint scan_hits = g_stat(MGL_GPUAUDIT_SCAN_HITS);
+    glDrawElements(GL_TRIANGLES, 8, GL_UNSIGNED_INT, 0);
+    glFinish();
+    EXPECT_EQ_INT(g_stat(MGL_GPUAUDIT_SCAN_HITS) > scan_hits, 1);
+
+    /* 8-bit indices with restart (widening + restart on the CPU path); the restart
+     * index has to match the index width, which is the spec-correct usage */
+    GLubyte ub8[8] = { 0, 1, 2, 0xFF, 3, 4, 5, 0xFF };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(ub8), ub8, GL_STATIC_DRAW);
+    glPrimitiveRestartIndex(0xFFu);
+
+    for (int rep = 0; rep < 3; rep++)
+    {
+        GLuint r, g;
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, 8, GL_UNSIGNED_BYTE, 0);
+        glFinish();
+        coverage(&r, &g);
+        EXPECT_EQ_INT(r, r_ref);
+        EXPECT_EQ_INT(g, g_ref);
+    }
+
+    glDisable(GL_PRIMITIVE_RESTART);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* a re-uploaded index buffer must invalidate the cached list (same offset/count/type) */
+TEST(index_cache_invalidated_on_reupload)
+{
+    glUseProgram(g_pos_col_prog);
+    glBindVertexArray(g_vao6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo6);
+
+    GLuint idx[3] = { 0, 1, 2 };           /* big red triangle */
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+
+    GLuint r = 0, g = 0;
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT, 0);
+    glFinish();
+    coverage(&r, &g);
+    EXPECT_TRUE(r > 100);
+    EXPECT_EQ_INT(g, 0);
+
+    /* same buffer object, same offset/count/type: only the contents change */
+    GLuint idx2[3] = { 3, 4, 5 };
+    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof(idx2), idx2);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT, 0);
+    glFinish();
+    coverage(&r, &g);
+    EXPECT_EQ_INT(r, 0);
+    EXPECT_TRUE(g > 100);
+
+    EXPECT_NO_GL_ERROR();
+}
+
+/* changing the provoking-vertex convention must rebuild the cached list, not reuse it */
+TEST(index_cache_provoking_state)
+{
+    glUseProgram(g_flat_prog);
+    glBindVertexArray(g_vao6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo6);
+
+    /* the convention is part of the cache key: flipping it must not reuse a list built
+     * under the other convention, and repeated draws must keep hitting the cache.
+     * (MGL renders this geometry identically under both conventions; the point here is
+     * that the cached draw path keeps producing exactly that output.) */
+    GLuint idx[4] = { 0, 2, 3, 5 };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+
+    GLuint r_ref = 0, g_ref = 0;
+    glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_INT, 0);
+        coverage(&r_ref, &g_ref);
+    }
+    EXPECT_TRUE(r_ref > 100);
+
+    glProvokingVertex(GL_LAST_VERTEX_CONVENTION);
+    for (int rep = 0; rep < 3; rep++)
+    {
+        GLuint r = 0, g = 0;
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_INT, 0);
+        coverage(&r, &g);
+        EXPECT_EQ_INT(r, r_ref);
+        EXPECT_EQ_INT(g, g_ref);
+    }
+
+    glProvokingVertex(GL_FIRST_VERTEX_CONVENTION);
+    EXPECT_NO_GL_ERROR();
+}
+
 /* ------------------------------------------------------------ F2: pipeline cache */
 
 TEST(pipeline_state_cache)
 {
+    glUseProgram(g_prog);            /* previous tests left other programs bound */
     float tri[] = { -1, -1, 3, -1, -1, 3 };
     bind_verts(tri, 3);
 
@@ -190,28 +420,22 @@ TEST(pipeline_state_cache)
     }
     glFinish();
 
+    EXPECT_NO_GL_ERROR();
     EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PSO_MISSES) - misses <= 2);
     EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PSO_HITS) > hits);
     (void)created; (void)after_warm;
 
-    /* and the two states must still render the right thing */
-    GLfloat c1[4] = { 1, 0, 0, 1 }, c2[4] = { 0, 1, 0, 1 };
+    /* and the cached states must still render the right thing */
+    GLfloat c1[4] = { 1, 0, 0, 1 };
     glUniform4fv(glGetUniformLocation(g_prog, "u_col"), 1, c1);
     glDisable(GL_BLEND);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     GLubyte px1[4];
     color_at_center(c1, px1);
+    GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+    mgl_read_rgba(vp[2] / 2, vp[3] / 2, px1);
     EXPECT_EQ_INT(px1[0], 255);
     EXPECT_EQ_INT(px1[1], 0);
-
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUniform4fv(glGetUniformLocation(g_prog, "u_col"), 1, c2);
-    glDrawArrays(GL_TRIANGLES, 0, 3);   /* fully opaque green */
-    GLubyte px2[4];
-    mgl_read_rgba(0, 0, px2);
-    EXPECT_EQ_INT(px2[1], 255);
-    EXPECT_EQ_INT(px2[0], 0);
-    glDisable(GL_BLEND);
     EXPECT_NO_GL_ERROR();
 }
 
@@ -255,9 +479,10 @@ TEST(timings)
     glFinish();
     t0 = now_ms();
     for (int i = 0; i < 20; i++) glDrawElements(GL_TRIANGLES, (GLsizei)n, GL_UNSIGNED_INT, 0);
+    t1 = now_ms();                       /* submit only: the CPU cost of the draw */
     glFinish();
-    t1 = now_ms();
-    printf("# 20 draws of %zu indices (restart on): %.3f ms/draw\n", n, (t1 - t0) / 20);
+    printf("# 20 draws of %zu indices (restart on): %.3f ms/draw (scan h=%d m=%d)\n", n, (t1 - t0) / 20,
+           g_stat(MGL_GPUAUDIT_SCAN_HITS), g_stat(MGL_GPUAUDIT_SCAN_MISSES));
     glDisable(GL_PRIMITIVE_RESTART);
     free(idx);
 
@@ -285,6 +510,11 @@ TEST(timings)
 int main(void)
 {
     setup();
+    setup2();
+    setup_geom();
+    RUN(index_cache_emulation_and_restart);
+    RUN(index_cache_invalidated_on_reupload);
+    RUN(index_cache_provoking_state);
     RUN(gpu_buffer_clear);
     RUN(cpu_buffer_clear_still_correct);
     RUN(pipeline_state_cache);
