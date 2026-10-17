@@ -29,10 +29,22 @@ def get_provider() -> str:
     return p
 
 
-def get_client():
+def glm_keys():
+    """Z.AI keys in rotation order: ANTHROPIC_AUTH_TOKEN, then ANTHROPIC_AUTH_TOKEN_2 .. _9."""
+    names = ["ANTHROPIC_AUTH_TOKEN"] + [f"ANTHROPIC_AUTH_TOKEN_{i}" for i in range(2, 10)]
+    keys = []
+    for n in names:
+        v = (os.environ.get(n) or "").strip()
+        if v and v not in keys:
+            keys.append(v)
+    return keys
+
+
+def get_client(key_index: int = 0):
     from anthropic import Anthropic  # imported lazily so --help / --no-llm work without the SDK
     provider = get_provider()
-    token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    keys = glm_keys()
+    token = keys[key_index] if key_index < len(keys) else os.environ.get("ANTHROPIC_AUTH_TOKEN")
     key = os.environ.get("ANTHROPIC_API_KEY")
     if provider == PROVIDER_GLM:
         api_key = token or key

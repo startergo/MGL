@@ -219,13 +219,33 @@ def compact(messages: list) -> None:
             return
 
 
+_KEY = {"i": 0, "client": None}
+
+
+def _rotate_key():
+    """Switch to the next Z.AI key (ANTHROPIC_AUTH_TOKEN_2 ...); False when none is left."""
+    if llm_client.get_provider() != "glm":
+        return False
+    nxt = _KEY["i"] + 1
+    if nxt >= len(llm_client.glm_keys()):
+        return False
+    _KEY["i"], _KEY["client"] = nxt, llm_client.get_client(nxt)
+    print(f"  switched to Z.AI key #{nxt + 1}", flush=True)
+    return True
+
+
 def create_with_retry(client, **kwargs):
+    if _KEY["client"] is None:
+        _KEY["client"] = client
     delay = 5
-    for attempt in range(8):
+    for attempt in range(12):
         try:
-            return client.messages.create(**kwargs)
+            return _KEY["client"].messages.create(**kwargs)
         except Exception as e:  # noqa: BLE001  (rate limits, overload, network)
             msg = str(e)
+            # usage window exhausted (1308) or no balance (1113) on this key: try the next key
+            if ("1308" in msg or "1113" in msg or "Insufficient balance" in msg) and _rotate_key():
+                continue
             # Z.AI 1113 = account has no balance / resource package: retrying cannot help
             if "1113" in msg or "Insufficient balance" in msg or "invalid api key" in msg.lower() \
                     or getattr(e, "status_code", None) in (401, 403):
@@ -242,8 +262,10 @@ def create_with_retry(client, **kwargs):
                 if 0 < wait <= 6 * 3600:
                     print(f"  usage limit (1308); sleeping {int(wait)}s until {reset.isoformat()}", flush=True)
                     time.sleep(wait)
+                    if _KEY["i"]:          # back to the first key once its window has reset
+                        _KEY["i"], _KEY["client"] = 0, llm_client.get_client(0)
                     continue
-            if attempt == 7:
+            if attempt == 11:
                 raise
             print(f"  API error ({type(e).__name__}: {str(e)[:160]}); retry in {delay}s", flush=True)
             time.sleep(delay)
