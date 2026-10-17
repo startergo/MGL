@@ -61,6 +61,12 @@ static NSMutableDictionary *tVsPsoCache;    /* VS kernel PSO, per program+VAO */
 static NSMutableDictionary *tTcsPsoCache;   /* TCS kernel PSO, per program    */
 static id<MTLComputePipelineState> tGatherPso;
 
+/* grown-out scratch buffers stay alive for the lifetime of the process: a command
+ * buffer still in flight may reference them, and Metal requires a resource to outlive
+ * every encoder that used it */
+static id<MTLBuffer> tRetired[16];
+static int tNumRetired;
+
 static bool tessBufferEnsure(id<MTLDevice> device, id<MTLBuffer> __strong *buf, size_t bytes)
 {
     if (*buf && (*buf).length >= bytes)
@@ -71,6 +77,8 @@ static bool tessBufferEnsure(id<MTLDevice> device, id<MTLBuffer> __strong *buf, 
     id<MTLBuffer> nb = [device newBufferWithLength: bytes options: MTLResourceStorageModeShared];
     if (!nb)
         return false;
+    if (*buf && tNumRetired < 16)
+        tRetired[tNumRetired++] = *buf;
     *buf = nb;
     return true;
 }
@@ -865,6 +873,10 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         {
             /* no TCS: the default levels are CPU-known constants; control points pass
                through from the vertex kernel output */
+            if (!tessBufferEnsure(_device, &tFactors, (size_t)total_patches * 12 + 16) ||
+                !tessBufferEnsure(_device, &tPatchData,
+                                  (size_t)total_patches * tp->tes_patch_in_size + 16))
+                return false;
             uint16_t *hf = (uint16_t *)tFactors.contents;
             for (int p = 0; p < total_patches; p++)
             {
@@ -915,28 +927,29 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             {
                 NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw) factors=%lu bytes cp=%lu bytes",
                       cp_count, total_patches, (unsigned long)tFactors.length, (unsigned long)cp_source.length);
-                if (getenv("MGL_TESS_DUMP_TES") && total_patches > 1)
-                {
-                    const char *msl = prog_tes->spirv[_TESS_EVALUATION_SHADER].msl_str;
-                    FILE *f = fopen("/tmp/cur_tes.metal", "w");
-                    if (f && msl) { fputs(msl, f); fclose(f); }
-                    f = fopen("/tmp/cur_fs.metal", "w");
-                    msl = ctx->state.program ? ctx->state.program->spirv[_FRAGMENT_SHADER].msl_str : NULL;
-                    if (f && msl) { fputs(msl, f); fclose(f); }
-                    unsetenv("MGL_TESS_DUMP_TES");     /* dump only the first tess draw */
-                }
             }
 
-            /* one drawPatches for every patch of the draw (instances included): the
-             * control point / patch data / factor buffers are laid out per patch */
+            /* One drawPatches per patch: a single drawPatches with patchCount = N (and
+             * patchStart > 0) rasterises only patch 0 through the full MGL pipeline
+             * (VS/TCS compute kernels -> render encoder) on this AGX driver, although
+             * isolated Metal probes render every patch. Rebinding the control point /
+             * patch data / factor buffers at each patch's offset works for every patch.
+             * [[patch_id]] then reads 0, so gl_PrimitiveID in the TES is 0 for every
+             * patch (documented gap). */
+            for (int p = 0; p < total_patches; p++)
             {
-                int maxp = total_patches;
-                if (getenv("MGL_TESS_MAXPATCHES"))
-                    maxp = atoi(getenv("MGL_TESS_MAXPATCHES"));
-                if (maxp > total_patches) maxp = total_patches;
+                [enc setVertexBuffer: cp_source
+                              offset: (size_t)p * (size_t)cp_count * cp_stride
+                             atIndex: MGL_TESS_VD_CP];
+                [enc setVertexBuffer: patch_buf
+                              offset: (size_t)p * (tp->has_tcs ? patch_record : tp->tes_patch_in_size)
+                             atIndex: MGL_TESS_VD_PATCH];
+                [enc setTessellationFactorBuffer: tFactors
+                                          offset: (size_t)p * 12
+                                  instanceStride: 0];
                 [enc drawPatches: (NSUInteger)cp_count
                       patchStart: 0
-                       patchCount: (NSUInteger)maxp
+                       patchCount: 1
                  patchIndexBuffer: nil
            patchIndexBufferOffset: 0
                     instanceCount: 1
