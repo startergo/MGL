@@ -26,6 +26,7 @@
 #include "programs.h"
 #include "buffers.h"
 #include "glm_context.h"
+#include "mgl_ext_program.h"
 
 
 #pragma mark uniforms
@@ -173,7 +174,7 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
 
 bool checkUniformParams(GLMContext ctx, GLint location)
 {
-    Program* ptr = ctx->state.program;
+    Program* ptr = mgl_program_uniform_target(ctx);    // current program, else pipeline's active program
     
     ERROR_CHECK_RETURN_VALUE(ptr, GL_INVALID_OPERATION, false)
 

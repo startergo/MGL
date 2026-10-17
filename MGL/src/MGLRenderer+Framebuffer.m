@@ -24,6 +24,10 @@
 #import "MGLRenderer+Framebuffer.h"
 #include "mgl_ext_fb.h"
 
+// render-state per-index setters (state_ext.c)
+void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h);
+void mgl_rstate_set_all_scissors(GLMContext ctx, GLint x, GLint y, GLint w, GLint h);
+
 static inline MGLRenderer *FBR(GLMContext c) { return (__bridge MGLRenderer *)c->mtl_funcs.mtlObj; }
 static inline struct MGLExtMetal_fb *FBM(GLMContext c) { return c->mtl_funcs.ext_fb; }
 
@@ -457,6 +461,12 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     for (GLint s = 2; s <= 8; s *= 2)
         if ([_device supportsTextureSampleCount:s]) best = s;
     m->max_samples = best;
+
+    /* sample limits reported by glGet follow what Metal can actually allocate */
+    STATE_VAR(max_framebuffer_samples) = best;
+    STATE_VAR(max_color_texture_samples) = best;
+    STATE_VAR(max_depth_texture_samples) = best;
+    STATE_VAR(max_integer_samples) = best;
 }
 
 - (GLuint) fbRoundSamples:(GLuint)samples
@@ -525,6 +535,9 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     STATE(viewport[2]) = w; STATE(viewport[3]) = h;
     STATE_VAR(scissor_box[0]) = 0; STATE_VAR(scissor_box[1]) = 0;
     STATE_VAR(scissor_box[2]) = w; STATE_VAR(scissor_box[3]) = h;
+    // rstate keeps per-index viewport/scissor arrays; seed all 16 with the default size
+    mgl_rstate_set_all_viewports(ctx, 0.0f, 0.0f, (GLfloat)w, (GLfloat)h);
+    mgl_rstate_set_all_scissors(ctx, 0, 0, (GLint)w, (GLint)h);
     STATE(dirty_bits) |= DIRTY_RENDER_STATE;
 }
 
@@ -876,6 +889,9 @@ typedef struct FBClearValues {
 
 static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
 {
+    /* state.c keeps the mask in color_writemask only while use_color_mask is set */
+    if (!ctx->state.caps.use_color_mask[i])
+        return MTLColorWriteMaskAll;
     GLboolean *m = ctx->state.var.color_writemask[i];
     return (m[0] ? MTLColorWriteMaskRed : 0) | (m[1] ? MTLColorWriteMaskGreen : 0) |
            (m[2] ? MTLColorWriteMaskBlue : 0) | (m[3] ? MTLColorWriteMaskAlpha : 0);
