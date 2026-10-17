@@ -196,6 +196,7 @@ uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
 }
 
 struct MslStruct;
+static bool tess_cp_record_name(const char *msl, char *out, size_t out_len);
 static bool msl_patch_in_name(const char *msl, char *out, size_t out_len);
 static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *out, size_t out_len);
 static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out);
@@ -1356,6 +1357,48 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
         /* the baked control point count of [[patch(domain, N)]] */
         tp->hw_cp_count = tp->has_tcs ? tp->tcs_out_vertices : 3;
+
+        /* control point RECORD layout: the TCS's input struct (= the VS kernel output)
+         * has every member; the TES may only read a subset, so the render descriptor
+         * must use the full record's offsets, matched by attribute index */
+        {
+            const char *msl2 = program->spirv[tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER].msl_str;
+            struct MslStruct rec;
+            char recname[160];
+
+            bool okname = tess_cp_record_name(msl2, recname, sizeof recname);
+            bool okparse = okname && msl_parse_struct(msl2, recname, &rec);
+            if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL tess: cp record: stage=%d name=%s ok=%d/%d count=%d size=%zu\n",
+                        tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER,
+                        okname ? recname : "(none)", okname, okparse, rec.count, rec.size);
+            if (okparse)
+            {
+                tp->num_cp_record = rec.count;
+                tp->cp_record_full_size = rec.size;
+                for (int i = 0; i < rec.count && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
+                    tp->cp_record[i] = rec.members[i];
+            }
+
+            /* the TES may read a subset of the control point record: remap each member's
+             * offset to the full record's layout, matched by the varying NAME (interface
+             * names are identical across the stages; "gl_Position" for the builtin) */
+            for (int i = 0; i < tp->num_tes_cp; i++)
+            {
+                for (int j = 0; j < tp->num_cp_record; j++)
+                {
+                    if (!strcmp(tp->cp_record[j].name, tp->tes_cp[i].name) &&
+                        tp->cp_record[j].size == tp->tes_cp[i].size)
+                    {
+                        tp->tes_cp[i].offset = tp->cp_record[j].offset;
+                        break;
+                    }
+                }
+                if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL tess: cp member %s -> record offset %zu\n",
+                            tp->tes_cp[i].name, tp->tes_cp[i].offset);
+            }
+        }
     }
 }
 
@@ -1444,6 +1487,46 @@ static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *
     out[t1 - t0] = 0;
     return true;
 }
+
+
+/* name of the control point record struct: the TCS's spvIn element type, or the VS
+ * kernel's spvOut element type */
+static bool tess_cp_record_name(const char *msl, char *out, size_t out_len)
+{
+    const char *mark = strstr(msl, "device ");
+    const char *star = NULL;
+    char word[128];
+    const char *b, *e;
+
+    while (mark)
+    {
+        /* device TYPE* spvIn / device TYPE* spvOut */
+        if (!strncmp(mark + 7, "const ", 6))
+            mark = strstr(mark + 1, "device ");
+        star = strchr(mark, '*');
+        if (star && star - mark < 120)
+        {
+            const char *after = star + 1;
+            while (*after == ' ') after++;
+            if (!strncmp(after, "spvIn", 5) || !strncmp(after, "spvOut", 6))
+            {
+                b = mark + 7;
+                if (!strncmp(b, "const ", 6)) b += 6;
+                e = star;
+                while (e > b && *(e - 1) == ' ') e--;
+                if (e > b && (size_t)(e - b) < out_len)
+                {
+                    snprintf(out, out_len, "%.*s", (int)(e - b), b);
+                    return true;
+                }
+            }
+        }
+        mark = strstr(mark + 1, "device ");
+        (void)word;
+    }
+    return false;
+}
+
 
 /* find the "<name>_patchOut" struct of a TCS (any name) */
 static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out)

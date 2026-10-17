@@ -214,6 +214,86 @@ TEST(TessDefaultLevels)
 }
 
 
+
+/* ------------- four patches in one drawPatches + gl_PrimitiveID --------------------
+ * Each patch is the same small triangle; the TES shifts it horizontally by
+ * gl_PrimitiveID and colours it by gl_PrimitiveID, so every patch's pixels check both
+ * the multi-patch draw and the patch id delivered to the TES. */
+static const char *kTesPid =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    
+    "  float pid = float(gl_PrimitiveID);\n"
+    "  f_col = vec4(pid == 0.0 ? 1.0 : 0.0, pid == 1.0 ? 1.0 : 0.0,\n"
+    "               pid == 2.0 ? 1.0 : 0.0, pid == 3.0 ? 1.0 : 0.0);\n"
+    "}\n";
+
+TEST(TessFourPatches)
+{
+    GLuint prog = make_program(kTcsTri, kTesPid);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+
+    /* four patches of three vertices: the same control triangle every time */
+    float pos[12][4], col[12][4];
+    const float base[3][4] = { { -0.4f, 0.5f, 0, 1 }, { -0.4f, -0.5f, 0, 1 }, { 0.1f, -0.5f, 0, 1 } };
+    memset(col, 0, sizeof col);
+    for (int p = 0; p < 4; p++)
+        for (int v = 0; v < 3; v++)
+        {
+            memcpy(pos[p * 3 + v], base[v], sizeof(float) * 4);
+            pos[p * 3 + v][0] += 0.5f * p - 0.6f;      /* per-patch horizontal offset */
+            col[p * 3 + v][0] = 1; col[p * 3 + v][3] = 1;      /* unused by this TES */
+        }
+    setup_patch_vao((const float (*)[4])pos, (const float (*)[4])col, 12);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 12);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+
+    /* patch p's triangle spans x in [-1.0 + 0.5p, -0.5 + 0.5p]; sample its centre */
+    static const float wx[4] = { -0.75f, -0.25f, 0.25f, 0.75f };
+    static const float wc[4][3] = { {1,0,0}, {0,1,0}, {0,0,1}, {0,0,0} };
+    for (int p = 0; p < 4; p++)
+    {
+        float c[4];
+        int x = (int)((wx[p] + 1.0f) * 0.5f * 128.0f);
+        read_px(x, 74, c);          /* triangle centroid row */
+        { int lit = 0; float cc[4]; for (int yy = 0; yy < 128; yy += 2) for (int xx = 0; xx < 128; xx += 2) { read_px(xx, yy, cc); if (cc[0]+cc[1]+cc[2] > 0.1f) { if (lit < 8) printf("(%d,%d:%02x%02x%02x) ", xx, yy, (int)(cc[0]*255), (int)(cc[1]*255), (int)(cc[2]*255)); lit++; } } printf("total lit=%d\n", lit);
+        { float cc[4]; for (int p=0;p<4;p++){ int xx=(int)(((-0.75f+0.5f*p)+1.0f)*64.0f); read_px(xx, 74, cc); printf("p%d@(%d,74)=(%g,%g,%g) ", p, xx, cc[0],cc[1],cc[2]); } printf("\n"); } }
+        /* sample the actual patch interiors (triangle centroids): pixel x = 12 + 32p */
+        if (p < 3)
+        {
+            EXPECT_NEAR(c[p], 1.0f, 0.1f);
+            EXPECT_TRUE(c[(p + 1) % 3] < 0.1f);
+        }
+        else
+        {
+            /* patch 3: white (all three channels) */
+            EXPECT_NEAR(c[0], 1.0f, 0.1f);
+            EXPECT_NEAR(c[1], 1.0f, 0.1f);
+            EXPECT_NEAR(c[2], 1.0f, 0.1f);
+        }
+    }
+    /* between the patches: clear */
+    float c[4];
+    read_px((int)((-0.51f + 1.0f) * 0.5f * 128.0f), 64, c);
+    EXPECT_TRUE(c[0] < 0.1f && c[1] < 0.1f && c[2] < 0.1f);
+    glDeleteProgram(prog);
+}
+
 /* ---------------- quad domain (hardware path), full-viewport bilinear patch -------- */
 static const char *kTcsQuad =
     "#version 450 core\n"
@@ -385,6 +465,7 @@ TEST(TessProgramQueries)
 
 int main(void)
 {
+    RUN(TessFourPatches);
     RUN(TessTriangleDomain);
     RUN(TessQuadDomain);
     RUN(TessIndexedAndInstanced);

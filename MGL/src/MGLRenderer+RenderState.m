@@ -471,6 +471,9 @@ static bool rs_mode_is_polygon(GLenum m)
         {
             id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[vstage] stage:vstage];
             if (vf) desc.vertexFunction = vf;
+            /* DEBUG: unspecialized TES */
+            if (getenv("MGL_TESS_NOSPEC") && vstage == _TESS_EVALUATION_SHADER)
+                desc.vertexFunction = (__bridge id<MTLFunction>)program->shader_slots[vstage]->mtl_data.function;
         }
         id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];
         if (ff) desc.fragmentFunction = ff;

@@ -95,6 +95,9 @@ typedef struct MGLTessProgram_t {
     size_t  cp_record_size;     /* bytes per control point (TES 'main0_in') */
     MGLTessPatchMember tes_cp[MGL_TESS_MAX_PATCH_MEMBERS];
     int     num_tes_cp;
+    MGLTessPatchMember cp_record[MGL_TESS_MAX_PATCH_MEMBERS];  /* full record layout (VS/TCS output) */
+    int     num_cp_record;
+    size_t  cp_record_full_size;   /* stride of one control point record */
 
     /* per-patch data: written by the TCS kernel (or defaults) and read by the TES */
     MGLTessPatchMember tcs_patch_out[MGL_TESS_MAX_PATCH_MEMBERS];

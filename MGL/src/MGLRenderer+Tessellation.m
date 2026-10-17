@@ -632,6 +632,9 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     GLsizei patches, total_patches;
     size_t cp_record = tp->cp_record_size;
     size_t patch_record = tp->tcs_patch_out_size ? tp->tcs_patch_out_size : 16;
+    /* the control point record stride: the FULL TCS/VS output record (the TES may
+     * only read a subset of it; its offsets were remapped at link time) */
+    size_t cp_stride = tp->cp_record_full_size ? tp->cp_record_full_size : cp_record;
     uint32_t minv = 0, maxv = 0;
     TessVSPlan plan;
     id<MTLCommandBuffer> compute_cb;
@@ -645,7 +648,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     GLsizei vfirst = first;
     id<MTLBuffer> cp_source;
 
-    if (!tp || !va || cp_record == 0)
+    if (!tp || !va || cp_stride == 0)
         return false;
 
     if (patch_verts_in < 1)
@@ -698,7 +701,8 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     /* ---- 2. compute phase (VS kernel, optional gather, optional TCS kernel) ---- */
     [self endRenderEncoding];
 
-    if (need_readback && !use_hardware)
+    bool debug_wait = getenv("MGL_TESS_DEBUG") && use_hardware;
+    if ((need_readback && !use_hardware) || debug_wait)
         compute_cb = [_commandQueue commandBuffer];
     else
     {
@@ -745,10 +749,10 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     /* gather kernel (indexed): linear control-point stream per index occurrence */
     if (indexed)
     {
-        uint32_t gparams[3] = { (uint32_t)(cp_record / 4), 0, (uint32_t)(count * instances) };
+        uint32_t gparams[3] = { (uint32_t)(cp_stride / 4), 0, (uint32_t)(count * instances) };
         NSUInteger groups = ((NSUInteger)(count * instances) + 63) / 64;
 
-        if (!tessBufferEnsure(_device, &tTcsCp, (size_t)count * instances * cp_record + 16))
+        if (!tessBufferEnsure(_device, &tTcsCp, (size_t)count * instances * cp_stride + 16))
         {
             [cenc endEncoding];
             return false;
@@ -778,7 +782,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             return false;
         }
         if (!tessBufferEnsure(_device, &tTcsOut,
-                              (size_t)total_patches * tp->tcs_out_vertices * cp_record + 16) ||
+                              (size_t)total_patches * tp->tcs_out_vertices * cp_stride + 16) ||
             !tessBufferEnsure(_device, &tTcsPatch, (size_t)total_patches * patch_record + 16) ||
             !tessBufferEnsure(_device, &tFactors, (size_t)total_patches * 12 + 16) ||
             !tessBufferEnsure(_device, &tTcsParams, 16))
@@ -823,6 +827,32 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     }
 
     [cenc endEncoding];
+
+    if (debug_wait)
+    {
+        [compute_cb commit];
+        [compute_cb waitUntilCompleted];
+        if (compute_cb.error)
+            NSLog(@"MGL tess: compute cb error %@", compute_cb.error);
+        {
+            uint16_t *hf = (uint16_t *)tFactors.contents;
+            for (int p = 0; p < total_patches && p < 6; p++)
+                NSLog(@"MGL tess: dbg factors[%d]=%d %d %d / %d", p, hf[p*6], hf[p*6+1], hf[p*6+2], hf[p*6+4]);
+            float *cp = (float *)cp_source.contents;
+            for (int i = 0; i < total_patches * (tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in) && i < 12; i++)
+                NSLog(@"MGL tess: dbg cp[%d] col=(%g,%g,%g,%g) pos=(%g,%g,%g,%g)", i,
+                      cp[i*8], cp[i*8+1], cp[i*8+2], cp[i*8+3], cp[i*8+4], cp[i*8+5], cp[i*8+6], cp[i*8+7]);
+            {
+                int n = indexed ? (int)vcount : count;
+                float *vo = (float *)tVSOut.contents;
+                for (int i = 0; i < n && i < 12; i++)
+                    NSLog(@"MGL tess: dbg vsout[%d]=(%g,%g,%g,%g)", i, vo[i*8], vo[i*8+1], vo[i*8+2], vo[i*8+3]);
+            }
+            uint32_t *ip = (uint32_t *)tTcsParams.contents;
+            NSLog(@"MGL tess: dbg tcs params = %u %u (total_patches %d)", ip[0], ip[1], total_patches);
+        }
+        _currentCommandBuffer = [_commandQueue commandBuffer];
+    }
 
     /* ---- 3a. hardware tessellation path (triangles / quads): the TCS kernel wrote the
      * factors on the GPU; the render pass feeds them to drawPatches directly. No
@@ -882,32 +912,36 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             [enc setTessellationFactorBuffer: tFactors offset: 0 instanceStride: 0];
 
             if (getenv("MGL_TESS_DEBUG"))
-                NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw)", cp_count, total_patches);
-
-            /* AGX driver note: drawPatches only rasterises patch 0 of a multi-patch
-             * draw (verified with a standalone probe: patchCount>1 and patchStart>0
-             * render nothing). Emit one drawPatches per patch, rebinding the control
-             * point / factor / patch-data buffers at each patch's offset. */
-            for (int p = 0; p < total_patches; p++)
             {
-                [enc setVertexBuffer: cp_source
-                              offset: (size_t)p * (size_t)cp_count * cp_record
-                             atIndex: MGL_TESS_VD_CP];
-                [enc setVertexBuffer: patch_buf
-                              offset: (size_t)p * (tp->has_tcs ? patch_record : tp->tes_patch_in_size)
-                             atIndex: MGL_TESS_VD_PATCH];
-                [enc setTessellationFactorBuffer: tFactors
-                                          offset: (size_t)p * 12
-                                  instanceStride: 0];
+                NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw) factors=%lu bytes cp=%lu bytes",
+                      cp_count, total_patches, (unsigned long)tFactors.length, (unsigned long)cp_source.length);
+                if (getenv("MGL_TESS_DUMP_TES") && total_patches > 1)
+                {
+                    const char *msl = prog_tes->spirv[_TESS_EVALUATION_SHADER].msl_str;
+                    FILE *f = fopen("/tmp/cur_tes.metal", "w");
+                    if (f && msl) { fputs(msl, f); fclose(f); }
+                    f = fopen("/tmp/cur_fs.metal", "w");
+                    msl = ctx->state.program ? ctx->state.program->spirv[_FRAGMENT_SHADER].msl_str : NULL;
+                    if (f && msl) { fputs(msl, f); fclose(f); }
+                    unsetenv("MGL_TESS_DUMP_TES");     /* dump only the first tess draw */
+                }
+            }
+
+            /* one drawPatches for every patch of the draw (instances included): the
+             * control point / patch data / factor buffers are laid out per patch */
+            {
+                int maxp = total_patches;
+                if (getenv("MGL_TESS_MAXPATCHES"))
+                    maxp = atoi(getenv("MGL_TESS_MAXPATCHES"));
+                if (maxp > total_patches) maxp = total_patches;
                 [enc drawPatches: (NSUInteger)cp_count
                       patchStart: 0
-                       patchCount: 1
+                       patchCount: (NSUInteger)maxp
                  patchIndexBuffer: nil
            patchIndexBufferOffset: 0
                     instanceCount: 1
                      baseInstance: 0];
             }
-
             ctx->state.dirty_bits = DIRTY_ALL;
         }
         return true;
@@ -1501,13 +1535,19 @@ static MTLVertexFormat tessMemberFormat(const char *type)
     {
         MGLTessPatchMember *m = &tp->tes_cp[i];
         MTLVertexFormat fmt = tessMemberFormat(m->type);
+        size_t offset = m->offset;
+
         if (fmt == MTLVertexFormatInvalid || m->attr < 0)
             continue;
+
+        /* offsets were remapped to the full record layout (by GL location) at link time */
         vd.attributes[m->attr].format = fmt;
-        vd.attributes[m->attr].offset = (NSUInteger)m->offset;
+        vd.attributes[m->attr].offset = (NSUInteger)offset;
         vd.attributes[m->attr].bufferIndex = MGL_TESS_VD_CP;
     }
-    vd.layouts[MGL_TESS_VD_CP].stride = (NSUInteger)(tp->cp_record_size ? tp->cp_record_size : 16);
+    /* stride: the FULL control point record (TCS/VS output), even if the TES reads a subset */
+    vd.layouts[MGL_TESS_VD_CP].stride = (NSUInteger)(tp->cp_record_full_size ?
+        tp->cp_record_full_size : (tp->cp_record_size ? tp->cp_record_size : 16));
     vd.layouts[MGL_TESS_VD_CP].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
     vd.layouts[MGL_TESS_VD_CP].stepRate = 1;
 
