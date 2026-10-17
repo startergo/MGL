@@ -16,137 +16,150 @@
  * vertex_buffers.c
  * MGL
  *
+ * Vertex buffer bindings of vertex array objects (GL 4.6 §10.3.1 BindVertexBuffer(s),
+ * VertexArrayVertexBuffer(s)).
  */
 
-#include <assert.h>
 #include <strings.h>
 
 #include "glm_context.h"
+#include "mgl_ext_vattrib.h"
+
+#define VA_ERROR(_e_) do { ctx->error_func(ctx, __FUNCTION__, (_e_)); return; } while (0)
 
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
-extern int isVAO(GLMContext ctx, GLuint vao);
-extern VertexArray *getVAO(GLMContext ctx, GLuint vao);
-extern void mglGenVertexArrays(GLMContext ctx, GLsizei n, GLuint *arrays);
+extern Buffer *getBuffer(GLMContext ctx, GLenum target, GLuint buffer);
+extern VertexArray *lookupVAO(GLMContext ctx, GLuint vao);
 
-bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
+/* resolve a buffer name for a vertex buffer binding; false if not a valid name */
+static bool resolveBuffer(GLMContext ctx, GLuint buffer, Buffer **out)
 {
-    VertexArray *vao;
+    if (buffer == 0)
+    {
+        *out = NULL;
+        return true;
+    }
 
-    if (vaobj)
-    {
-        vao = getVAO(ctx, vaobj);
-        // no such vao
-        ERROR_CHECK_RETURN_VALUE(vao, GL_INVALID_VALUE, false);
-    }
-    else
-    {
-        vao = ctx->state.vao;
-        // no vao bound
-        ERROR_CHECK_RETURN_VALUE(vao, GL_INVALID_VALUE, false);
-    }
+    Buffer *buf = findBuffer(ctx, buffer);
+
+    // a name returned by GenBuffers that has not been bound yet: create its object now
+    if (buf == NULL && buffer < STATE(buffer_table).current_name)
+        buf = getBuffer(ctx, GL_ARRAY_BUFFER, buffer);
+
+    *out = buf;
+
+    return buf != NULL;
+}
+
+static void setBinding(GLMContext ctx, VertexArray *vao, GLuint bindingindex, Buffer *buf, GLintptr offset, GLsizei stride)
+{
+    MGLVertexArrayFull *va = mgl_va_full(vao);
+    MGLVertexBinding *b = &va->binding[bindingindex];
+
+    b->buffer = buf;
+    b->buffer_name = buf ? buf->name : 0;
+    b->offset = offset;
+    b->stride = stride;
+
+    for (GLuint i = 0; i < MAX_ATTRIBS; i++)
+        if (va->fmt[i].binding == bindingindex)
+            mgl_va_sync_attrib(vao, i);
+
+    vao->dirty_bits |= DIRTY_VAO_BUFFER_BASE | DIRTY_VAO_ATTRIB;
+
+    if (vao == ctx->state.vao)
+        ctx->state.dirty_bits |= DIRTY_VAO;
+}
+
+static void bindVertexBufferTo(GLMContext ctx, VertexArray *vao, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
+{
+    if (bindingindex >= MGL_VA_MAX_BINDINGS) VA_ERROR(GL_INVALID_VALUE);
+    if (offset < 0 || stride < 0 || stride > MGL_VA_MAX_STRIDE) VA_ERROR(GL_INVALID_VALUE);
 
     Buffer *buf;
-    buf = findBuffer(ctx, buffer);
-    ERROR_CHECK_RETURN_VALUE(buf, GL_INVALID_VALUE, false);
+    if (!resolveBuffer(ctx, buffer, &buf)) VA_ERROR(GL_INVALID_OPERATION);
 
-    // AGX Driver Compatibility: Store buffer binding information
-    // Find all attributes that use this binding index and update their buffer pointer and stride
-    for (int i = 0; i < ctx->state.max_vertex_attribs; i++)
+    setBinding(ctx, vao, bindingindex, buf, offset, stride);
+}
+
+static void bindVertexBuffersTo(GLMContext ctx, VertexArray *vao, GLuint first, GLsizei count,
+                                const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
+{
+    if (count < 0) VA_ERROR(GL_INVALID_VALUE);
+    if ((GLuint64)first + (GLuint64)count > MGL_VA_MAX_BINDINGS) VA_ERROR(GL_INVALID_OPERATION);
+
+    for (GLsizei i = 0; i < count; i++)
     {
-        if (vao->attrib[i].buffer_bindingindex == bindingindex)
+        GLuint bindingindex = first + i;
+
+        if (buffers == NULL)
         {
-            vao->attrib[i].buffer = buf;
-            vao->attrib[i].stride = stride;
+            // unbind every binding in the range, offsets/strides are ignored
+            setBinding(ctx, vao, bindingindex, NULL, 0, 16);
+            continue;
         }
+
+        // an error for one binding leaves it unchanged; the others are still updated
+        if (offsets[i] < 0 || strides[i] < 0 || strides[i] > MGL_VA_MAX_STRIDE)
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_VALUE);
+            continue;
+        }
+
+        Buffer *buf;
+        if (!resolveBuffer(ctx, buffers[i], &buf))
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            continue;
+        }
+
+        setBinding(ctx, vao, bindingindex, buf, offsets[i], strides[i]);
+    }
+}
+
+/* kept for callers of the old helper: vaobj 0 means the bound VAO */
+bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
+{
+    VertexArray *vao = vaobj ? lookupVAO(ctx, vaobj) : ctx->state.vao;
+
+    if (vao == NULL)
+    {
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return false;
     }
 
-    vao->dirty_bits |= DIRTY_VAO_BUFFER_BASE;
+    GLenum before = ctx->state.error;
+    bindVertexBufferTo(ctx, vao, bindingindex, buffer, offset, stride);
 
-    return true;
+    return ctx->state.error == before;
 }
 
 void mglBindVertexBuffer(GLMContext ctx, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
 {
-    ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(bindingindex < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
-    bindVertexBuffer(ctx, 0, bindingindex, buffer, offset, stride);
+    bindVertexBufferTo(ctx, VAO(), bindingindex, buffer, offset, stride);
 }
 
 void mglBindVertexBuffers(GLMContext ctx, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
 {
-    ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(first + count < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(buffers, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
-    for(int i=0; i<count; i++)
-    {
-        GLuint bindingindex;
-        GLuint buffer;
-
-        bindingindex = first + i;
-        buffer = buffers[i];
-
-        bindVertexBuffer(ctx, 0, bindingindex, buffer, offsets[i], strides[i]);
-    }
+    bindVertexBuffersTo(ctx, VAO(), first, count, buffers, offsets, strides);
 }
-
-
-/*
-glBindVertexBuffer and glVertexArrayVertexBuffer bind the buffer named buffer
-to the vertex buffer binding point whose index is given by bindingindex.
-glBindVertexBuffer modifies the binding of the currently bound vertex array
-object, whereas glVertexArrayVertexBuffer allows the caller to specify ID of
-the vertex array object with an argument named vaobj, for which the binding
-should be modified. offset and stride specify the offset of the first element
-within the buffer and the distance between elements within the buffer,
-respectively, and are both measured in basic machine units. bindingindex
-must be less than the value of GL_MAX_VERTEX_ATTRIB_BINDINGS. offset and
-stride must be greater than or equal to zero. If buffer is zero, then any
-buffer currently bound to the specified binding point is unbound.
-
-If buffer is not the name of an existing buffer object, the GL first creates
-a new state vector, initialized with a zero-sized memory buffer and comprising
-all the state and with the same initial values as in case of glBindBuffer.
-buffer is then attached to the specified bindingindex of the vertex array object.
- */
 
 void mglVertexArrayVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
 {
-    if (vaobj)
-    {
-        ERROR_CHECK_RETURN(isVAO(ctx, vaobj), GL_INVALID_OPERATION);
-    }
-    else
-    {
-        ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    }
+    VertexArray *vao = lookupVAO(ctx, vaobj);
+    if (vao == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
-    ERROR_CHECK_RETURN(bindingindex < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
-
-    bindVertexBuffer(ctx, vaobj, bindingindex, buffer, offset, stride);
+    bindVertexBufferTo(ctx, vao, bindingindex, buffer, offset, stride);
 }
 
 void mglVertexArrayVertexBuffers(GLMContext ctx, GLuint vaobj, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
 {
-    ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(first + count < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(buffers, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    VertexArray *vao = lookupVAO(ctx, vaobj);
+    if (vao == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
-    for(int i=0; i<count; i++)
-    {
-        GLuint bindingindex;
-        GLuint buffer;
-
-        bindingindex = first + i;
-        buffer = buffers[i];
-
-        bindVertexBuffer(ctx, vaobj, bindingindex, buffer, offsets[i], strides[i]);
-    }
+    bindVertexBuffersTo(ctx, vao, first, count, buffers, offsets, strides);
 }
-
-

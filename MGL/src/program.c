@@ -29,6 +29,7 @@
 
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "buffers.h"
 
@@ -434,6 +435,9 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_VERSION) failed\n");
         ERROR_RETURN(GL_INVALID_OPERATION);
     }
+
+    // texext: samplerBuffer/imageBuffer -> MSL texture_buffer (bound as MTLTextureTypeTextureBuffer)
+    spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE);
 
     //ERROR_CHECK_RETURN(spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_GLSL_VERSION, 4.5) == SPVC_SUCCESS, GL_INVALID_OPERATION);
     // ERROR_CHECK_RETURN(spvc_compiler_install_compiler_options(compiler_msl, options) == SPVC_SUCCESS, GL_INVALID_OPERATION);
@@ -852,7 +856,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
     switch (pname) {
         case GL_LINK_STATUS:
             /* If we got here after mglLinkProgram, linking succeeded */
-            *params = GL_TRUE;
+            *params = mgl_xfb_link_failed(ctx, pptr, NULL) ? GL_FALSE : GL_TRUE; // xfb: varying resolution can fail the link
             break;
         case GL_DELETE_STATUS:
             *params = GL_FALSE;  /* Programs are not deleted by default */
@@ -890,6 +894,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             }
             break;
         default:
+            if (mgl_xfb_get_programiv(ctx, pptr, pname, params)) break; // xfb: TRANSFORM_FEEDBACK_* pnames
             fprintf(stderr, "mglGetProgramiv: unhandled pname 0x%x\n", pname);
             *params = 0;
             break;

@@ -23,6 +23,7 @@
 #include <assert.h>
 
 #include "error.h"
+#include "mgl_ext_debug.h"
 
 
 GLenum  mglGetError(GLMContext ctx)
@@ -43,6 +44,10 @@ GLenum  mglGetError(GLMContext ctx)
 void error_func(GLMContext ctx, const char *func, GLenum error)
 {
     fprintf(stderr, "MGL GL Error in %s: 0x%x (%d)\n", func, error, error);
+
+    /* KHR_debug: every error generates a GL_DEBUG_TYPE_ERROR message, even when
+       an earlier error is still pending in the sticky error flag */
+    mgl_debug_report_error(ctx, func, error);
 
     if (ctx->state.error)
         return;
