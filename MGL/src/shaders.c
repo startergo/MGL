@@ -261,7 +261,7 @@ Shader *newShader(GLMContext ctx, GLenum type, GLuint shader)
 
     obj = (MGLShaderObj *)calloc(1, sizeof(MGLShaderObj));
     if (!obj) {
-        STATE(error) = GL_OUT_OF_MEMORY;
+        ERROR_RETURN(GL_OUT_OF_MEMORY);
         return NULL;
     }
 

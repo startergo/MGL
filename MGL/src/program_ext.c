@@ -15,6 +15,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "spirv.h"
 
@@ -893,6 +894,13 @@ void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const
         return;
     }
 
+    /* reloading the current program while transform feedback captures */
+    if (ctx->state.program == ptr && mgl_xfb_capturing(ctx))
+    {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
+
     if (length < 0)
     {
         ERROR_RETURN(GL_INVALID_VALUE);
@@ -1364,6 +1372,22 @@ bool mgl_ext_get_program(GLMContext ctx, GLenum pname, GLuint type, void *data)
     {
         case GL_NUM_SPIR_V_EXTENSIONS:
             mgl_get_store(type, data, 0, (double)NUM_SPIRV_EXTENSIONS);
+            return true;
+        case GL_NUM_PROGRAM_BINARY_FORMATS:
+        case GL_NUM_SHADER_BINARY_FORMATS:
+            mgl_get_store(type, data, 0, 1.0);
+            return true;
+        case GL_PROGRAM_BINARY_FORMATS:
+            mgl_get_store(type, data, 0, (double)MGL_PROGRAM_BINARY_FORMAT);
+            return true;
+        case GL_SHADER_BINARY_FORMATS:
+            mgl_get_store(type, data, 0, (double)GL_SHADER_BINARY_FORMAT_SPIR_V);
+            return true;
+        case GL_CURRENT_PROGRAM:
+            mgl_get_store(type, data, 0, ctx->state.program ? (double)ctx->state.program->name : 0.0);
+            return true;
+        case GL_PROGRAM_PIPELINE_BINDING:
+            mgl_get_store(type, data, 0, STATE(program_pipeline) ? (double)STATE(program_pipeline)->name : 0.0);
             return true;
     }
 

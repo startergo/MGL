@@ -112,6 +112,7 @@ Program *findProgram(GLMContext ctx, GLuint program);
 bool     mgl_program_link_spirv_stages(GLMContext ctx, Program *program, const uint32_t *const *words,
                                        const size_t *word_counts, const char *const *entries,
                                        GLuint stage_mask);
+bool     mgl_program_check_xfb_link(GLMContext ctx, Program *program);
 bool     mgl_program_validate_samplers(GLMContext ctx, Program *const *programs, int count, char **log);
 
 /* renderer scope: while resolving GL state, substitute the pipeline composite for

@@ -9,12 +9,12 @@ tracking + queries + spec error checking and record the gap in your report.
 
 ## Where you work
 
-* Repo on the Mac: `/Users/macbookpro/MGL`. **Your worktree:** `/Users/macbookpro/MGL/wt/<domain>`
+* Repo on the Mac: `$MGL_PROJECT_DIR` (the main checkout; your task message gives the concrete path). **Your worktree:** `$MGL_PROJECT_DIR/wt/<domain>`
   on branch `gl46/<domain>`. Work ONLY inside your worktree.
 * Run commands on the Mac with `mcp__remote-devices__serena__execute_shell_command`
   (pass `cwd` = your worktree). NEVER call serena `activate_project` (shared by all agents).
 * Read/edit files with shell (`sed -n`, `python3` read-modify-write scripts) or serena
-  file tools using paths **relative to /Users/macbookpro/MGL** (e.g. `wt/queries/MGL/src/queries.c`).
+  file tools using paths **relative to the project root** (e.g. `wt/queries/MGL/src/queries.c`).
   Your own Read/Write/Edit tools act on a different machine — don't use them for repo files.
   When rewriting a file with python, always read it fresh in the same script.
 * Build: `make -j8 lib 2>&1 | grep -E 'error|warning: implicit' ; echo rc=${PIPESTATUS[0]}`

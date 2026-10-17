@@ -35,6 +35,7 @@
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "buffers.h"
 
@@ -125,7 +126,7 @@ Program *newProgram(GLMContext ctx, GLuint program)
     ptr = (MGLProgramObj *)calloc(1, sizeof(MGLProgramObj));
     if (!ptr)
     {
-        STATE(error) = GL_OUT_OF_MEMORY;
+        ERROR_RETURN(GL_OUT_OF_MEMORY);
         return NULL;
     }
 
@@ -642,6 +643,188 @@ static void msl_entry_name(int stage, GLuint program, char *out, size_t len)
     }
 }
 
+/* growable SPIR-V word buffer */
+typedef struct { uint32_t *w; size_t n, cap; bool oom; } WordBuf;
+
+static void wb_push(WordBuf *b, uint32_t v)
+{
+    if (b->n == b->cap)
+    {
+        size_t ncap = b->cap ? b->cap * 2 : 1024;
+        uint32_t *nw = (uint32_t *)realloc(b->w, ncap * sizeof(uint32_t));
+        if (!nw) { b->oom = true; return; }
+        b->w = nw;
+        b->cap = ncap;
+    }
+    b->w[b->n++] = v;
+}
+
+static void wb_push_n(WordBuf *b, const uint32_t *w, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        wb_push(b, w[i]);
+}
+
+/*
+ * Prepare a GL SPIR-V module for SPIRV-Cross MSL:
+ *  - freeze specialization constants (SpecializeShader / constant_id defaults are already in
+ *    the module): OpSpecConstant* → OpConstant*, SpecId decorations dropped, so MSL gets plain
+ *    constants instead of Metal function constants that would need MTLFunctionConstantValues;
+ *  - vertex stage: GL's gl_InstanceID excludes the base instance but Metal's [[instance_id]]
+ *    includes it, so every load of the InstanceId builtin becomes (InstanceId - BaseInstance).
+ *    gl_VertexID (VertexId) is left alone: GL and Metal [[vertex_id]] both include base vertex.
+ * Returns a malloc'd module, or NULL on malformed input / OOM.
+ */
+static uint32_t *spirv_prepare_for_msl(const uint32_t *in, size_t n, int stage, size_t *out_n)
+{
+    static const char draw_params_ext[] = "SPV_KHR_shader_draw_parameters";
+    uint32_t bound, inst_var = 0, base_var = 0, inst_ptr_type = 0, inst_type = 0;
+    bool has_cap = false, has_ext = false, add_base = false, cap_section_done = false;
+    WordBuf b = {0};
+    size_t pos;
+
+    if (n < 5 || in[0] != SpvMagicNumber)
+        return NULL;
+    bound = in[3];
+
+    /* pass 1: find the InstanceId / BaseInstance builtins */
+    for (pos = 5; pos < n; )
+    {
+        uint32_t op = in[pos] & 0xFFFF, wc = in[pos] >> 16;
+        if (wc == 0 || pos + wc > n)
+            return NULL;
+        if (op == SpvOpDecorate && wc >= 4 && in[pos + 2] == SpvDecorationBuiltIn)
+        {
+            if (in[pos + 3] == SpvBuiltInInstanceId) inst_var = in[pos + 1];
+            if (in[pos + 3] == SpvBuiltInBaseInstance) base_var = in[pos + 1];
+        }
+        else if (op == SpvOpCapability && wc == 2 && in[pos + 1] == SpvCapabilityDrawParameters)
+            has_cap = true;
+        else if (op == SpvOpExtension && wc >= 2 && !strncmp((const char *)&in[pos + 1], draw_params_ext, (wc - 1) * 4))
+            has_ext = true;
+        pos += wc;
+    }
+
+    if (stage == _VERTEX_SHADER && inst_var)
+    {
+        for (pos = 5; pos < n; pos += in[pos] >> 16)
+            if ((in[pos] & 0xFFFF) == SpvOpVariable && (in[pos] >> 16) >= 4 && in[pos + 2] == inst_var)
+                inst_ptr_type = in[pos + 1];
+        for (pos = 5; pos < n; pos += in[pos] >> 16)
+            if ((in[pos] & 0xFFFF) == SpvOpTypePointer && (in[pos] >> 16) == 4 && in[pos + 1] == inst_ptr_type)
+                inst_type = in[pos + 3];
+        if (inst_ptr_type && inst_type)
+        {
+            if (!base_var) { base_var = bound++; add_base = true; }
+        }
+        else
+            inst_var = 0;
+    }
+    else
+        inst_var = 0;
+
+    wb_push_n(&b, in, 5);
+
+    /* pass 2: rewrite */
+    for (pos = 5; pos < n; )
+    {
+        uint32_t op = in[pos] & 0xFFFF, wc = in[pos] >> 16;
+        const uint32_t *ins = &in[pos];
+
+        if (!cap_section_done && op != SpvOpCapability)
+        {
+            cap_section_done = true;
+            if (inst_var && !has_cap)
+            {
+                wb_push(&b, (2u << 16) | SpvOpCapability);
+                wb_push(&b, SpvCapabilityDrawParameters);
+            }
+            if (inst_var && !has_ext)
+            {
+                uint32_t sw[8] = {0};
+                memcpy(sw, draw_params_ext, sizeof(draw_params_ext));
+                wb_push(&b, ((1u + 8u) << 16) | SpvOpExtension);
+                wb_push_n(&b, sw, 8);
+            }
+        }
+
+        switch (op)
+        {
+            case SpvOpDecorate:
+                if (wc >= 4 && ins[2] == SpvDecorationSpecId)
+                    break;                                      /* frozen: drop SpecId */
+                wb_push_n(&b, ins, wc);
+                if (add_base && wc >= 4 && ins[1] == inst_var && ins[2] == SpvDecorationBuiltIn)
+                {
+                    wb_push(&b, (4u << 16) | SpvOpDecorate);
+                    wb_push(&b, base_var);
+                    wb_push(&b, SpvDecorationBuiltIn);
+                    wb_push(&b, SpvBuiltInBaseInstance);
+                }
+                break;
+
+            case SpvOpSpecConstantTrue:
+                wb_push(&b, (wc << 16) | SpvOpConstantTrue); wb_push_n(&b, ins + 1, wc - 1); break;
+            case SpvOpSpecConstantFalse:
+                wb_push(&b, (wc << 16) | SpvOpConstantFalse); wb_push_n(&b, ins + 1, wc - 1); break;
+            case SpvOpSpecConstant:
+                wb_push(&b, (wc << 16) | SpvOpConstant); wb_push_n(&b, ins + 1, wc - 1); break;
+            case SpvOpSpecConstantComposite:
+                wb_push(&b, (wc << 16) | SpvOpConstantComposite); wb_push_n(&b, ins + 1, wc - 1); break;
+
+            case SpvOpEntryPoint:
+                if (add_base && wc >= 3 && ins[1] == SpvExecutionModelVertex)
+                {
+                    wb_push(&b, ((wc + 1) << 16) | SpvOpEntryPoint);
+                    wb_push_n(&b, ins + 1, wc - 1);
+                    wb_push(&b, base_var);                       /* interface list */
+                }
+                else
+                    wb_push_n(&b, ins, wc);
+                break;
+
+            case SpvOpVariable:
+                wb_push_n(&b, ins, wc);
+                if (add_base && wc >= 4 && ins[2] == inst_var)
+                {
+                    wb_push(&b, (4u << 16) | SpvOpVariable);
+                    wb_push(&b, inst_ptr_type);
+                    wb_push(&b, base_var);
+                    wb_push(&b, SpvStorageClassInput);
+                }
+                break;
+
+            case SpvOpLoad:
+                if (inst_var && wc >= 4 && ins[3] == inst_var)
+                {
+                    uint32_t raw = bound++, basev = bound++;
+                    wb_push(&b, ins[0]); wb_push(&b, ins[1]); wb_push(&b, raw); wb_push_n(&b, ins + 3, wc - 3);
+                    wb_push(&b, (4u << 16) | SpvOpLoad); wb_push(&b, inst_type); wb_push(&b, basev); wb_push(&b, base_var);
+                    wb_push(&b, (5u << 16) | SpvOpISub); wb_push(&b, inst_type); wb_push(&b, ins[2]); wb_push(&b, raw); wb_push(&b, basev);
+                }
+                else
+                    wb_push_n(&b, ins, wc);
+                break;
+
+            default:
+                wb_push_n(&b, ins, wc);
+                break;
+        }
+
+        pos += wc;
+    }
+
+    if (b.oom)
+    {
+        free(b.w);
+        return NULL;
+    }
+
+    b.w[3] = bound;
+    *out_n = b.n;
+    return b.w;
+}
+
 /*
  * Translate one stage's SPIR-V module into the executable of dst:
  * SPIRV-Cross reflection + MSL, then a Metal library/function (errors go to *log).
@@ -658,6 +841,8 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     SpvExecutionModel model = stage_model(stage);
     const char *result = NULL;
     char msl_entry[128];
+    uint32_t *prepared = NULL;
+    size_t prepared_words = 0;
     bool ok = false;
 
     if (!words || nwords < 5 || words[0] != SpvMagicNumber)
@@ -677,14 +862,22 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     memcpy(ptr->spirv[stage].ir, words, nwords * sizeof(uint32_t));
     dst->stage_entry[stage] = strdup(entry);
 
+    prepared = spirv_prepare_for_msl(words, nwords, stage, &prepared_words);
+    if (!prepared)
+    {
+        mgl_append_info_log(log, "ERROR: %s stage: malformed SPIR-V instruction stream\n", stage_label(stage));
+        return false;
+    }
+
     if (spvc_context_create(&context) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: SPIRV-Cross context creation failed\n");
+        free(prepared);
         return false;
     }
     spvc_context_set_error_callback(context, spvc_log_cb, log);
 
-    if (spvc_context_parse_spirv(context, words, nwords, &ir) != SPVC_SUCCESS ||
+    if (spvc_context_parse_spirv(context, prepared, prepared_words, &ir) != SPVC_SUCCESS ||
         spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIR-V module could not be parsed\n", stage_label(stage));
@@ -695,6 +888,8 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         spvc_compiler_create_compiler_options(compiler, &options) != SPVC_SUCCESS ||
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) != SPVC_SUCCESS ||
         spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3,1,0)) != SPVC_SUCCESS ||
+        /* texext: samplerBuffer/imageBuffer -> MSL texture_buffer (bound as MTLTextureTypeTextureBuffer) */
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) != SPVC_SUCCESS ||
         spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIRV-Cross MSL options rejected\n", stage_label(stage));
@@ -874,6 +1069,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
 done:
     spvc_context_destroy(context);
+    free(prepared);
     return ok;
 }
 
@@ -1127,6 +1323,21 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
     return ok;
 }
 
+/* the xfb domain resolves captured varyings in its post-link hook; a failure there fails the link */
+bool mgl_program_check_xfb_link(GLMContext ctx, Program *program)
+{
+    const char *xlog = NULL;
+    MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
+
+    if (!mgl_xfb_link_failed(ctx, program, &xlog))
+        return true;
+
+    obj->link_status = GL_FALSE;
+    mgl_append_info_log(&obj->info_log, "%s%s", xlog ? xlog : "ERROR: transform feedback varyings could not be resolved",
+                        (xlog && xlog[0] && xlog[strlen(xlog) - 1] == '\n') ? "" : "\n");
+    return false;
+}
+
 void mglLinkProgram(GLMContext ctx, GLuint program)
 {
     Program *pptr;
@@ -1135,10 +1346,20 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     if (!pptr)
         return;
 
+    /* relinking the current program while transform feedback captures */
+    if (ctx->state.program == pptr && mgl_xfb_capturing(ctx))
+    {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
+
     mgl_ext_pre_link(ctx, pptr);
 
     if (run_link(ctx, MGL_PROGRAM_OBJ(pptr), LINK_FROM_ATTACHED, NULL, NULL, NULL, 0))
+    {
         mgl_ext_post_link(ctx, pptr);
+        mgl_program_check_xfb_link(ctx, pptr);
+    }
 }
 
 /* link from final per-stage SPIR-V (program binaries); runs the link hooks */
@@ -1152,7 +1373,10 @@ bool mgl_program_link_spirv_stages(GLMContext ctx, Program *program, const uint3
     ok = run_link(ctx, MGL_PROGRAM_OBJ(program), LINK_FROM_EXECUTABLES, words, word_counts, entries, stage_mask);
 
     if (ok)
+    {
         mgl_ext_post_link(ctx, program);
+        ok = mgl_program_check_xfb_link(ctx, program);
+    }
 
     return ok;
 }
@@ -1173,6 +1397,13 @@ void mglUseProgram(GLMContext ctx, GLuint program)
             ERROR_RETURN(GL_INVALID_OPERATION);
             return;
         }
+    }
+
+    /* the current program cannot change while transform feedback captures */
+    if (mgl_xfb_capturing(ctx) && ctx->state.program != pptr)
+    {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     old = ctx->state.program;
@@ -1262,7 +1493,8 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             *params = pptr->delete_status ? GL_TRUE : GL_FALSE;
             break;
         case GL_LINK_STATUS:
-            *params = obj->link_status ? GL_TRUE : GL_FALSE;
+            /* xfb: varying resolution can fail the link after the stages compiled */
+            *params = (obj->link_status && !mgl_xfb_link_failed(ctx, pptr, NULL)) ? GL_TRUE : GL_FALSE;
             break;
         case GL_VALIDATE_STATUS:
             *params = obj->validate_status ? GL_TRUE : GL_FALSE;
@@ -1313,13 +1545,12 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
         case GL_PROGRAM_BINARY_LENGTH:
             *params = mgl_program_binary_length(ctx, pptr);
             break;
-        /* defaults until the transform feedback domain answers through a programiv hook */
         case GL_TRANSFORM_FEEDBACK_BUFFER_MODE:
-            *params = GL_INTERLEAVED_ATTRIBS;
-            break;
         case GL_TRANSFORM_FEEDBACK_VARYINGS:
         case GL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH:
-            *params = 0;
+            if (mgl_xfb_get_programiv(ctx, pptr, pname, params))    /* xfb domain */
+                break;
+            *params = (pname == GL_TRANSFORM_FEEDBACK_BUFFER_MODE) ? GL_INTERLEAVED_ATTRIBS : 0;
             break;
         /* geometry / tessellation programs never link on Metal (see check_stage_mask),
          * so these queries always hit the "no such stage linked" error */
