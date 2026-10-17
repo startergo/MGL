@@ -140,8 +140,7 @@ typedef struct MGLIProgram {
     MGLIAtomicBuffer *abufs; int nabufs;
     MGLIStageSub sub[MGLI_STAGES];
 
-    /* transform feedback varyings recorded for queries (from the xfb domain if it exports them) */
-    char   **xfb_names; int nxfb; GLenum xfb_mode;
+    int      nxfb;  /* transform feedback varyings (from mgl_xfb_program_info, refreshed per query) */
 
     /* per-stage default uniform block (one Buffer per stage, see renderer buffer map) */
     Buffer  *dub[MGLI_STAGES];
@@ -169,7 +168,6 @@ extern "C" {
 /* glGetProgramiv pnames owned by introspection: GL_ACTIVE_UNIFORMS, GL_ACTIVE_UNIFORM_MAX_LENGTH,
  * GL_ACTIVE_ATTRIBUTES, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, GL_ACTIVE_UNIFORM_BLOCKS,
  * GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH, GL_ACTIVE_ATOMIC_COUNTER_BUFFERS,
- * GL_TRANSFORM_FEEDBACK_VARYINGS / _MAX_LENGTH / _BUFFER_MODE (when known).
  * Returns true if pname was handled (program.c's mglGetProgramiv should call this). */
 bool mgl_introspect_get_programiv(GLMContext ctx, Program *program, GLenum pname, GLint *params);
 
@@ -184,11 +182,6 @@ const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader);
 
 /* Attribute location lookup (mglGetAttribLocation in program.c forwards here). */
 GLint mgl_introspect_get_attrib_location(GLMContext ctx, GLuint program, const GLchar *name);
-
-/* transform feedback varyings (weak; the xfb domain may provide a strong definition):
- * returns true and fills count/names/mode if varyings were specified for the program. */
-bool mgl_xfb_get_program_varyings(GLMContext ctx, GLuint program, GLsizei *count,
-                                  const char *const **names, GLenum *buffer_mode);
 
 /* ---- internal (introspect domain files) ---------------------------------------------------- */
 MGLIProgram *mgli_find(GLMContext ctx, GLuint program);

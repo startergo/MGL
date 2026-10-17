@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "mgl_ext_introspect.h"
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
@@ -244,6 +245,22 @@ void logDirtyBits(GLMContext ctx)
                 spirv_binding = [self getProgramBinding:stage type:spvc_type index: i];
 
                 buf = buffers[spirv_binding].buf;
+
+                // introspect: default-block uniforms live in a per-program, per-stage buffer
+                if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
+                {
+                    Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stage, i);
+                    if (dub)
+                    {
+                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
+                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
+                        buffer_map->buffers[buffer_map->count].buf = dub;
+                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->count++;
+                        buffers_to_be_mapped--;
+                        continue;
+                    }
+                }
 
                 if (buf)
                 {

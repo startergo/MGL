@@ -25,6 +25,7 @@
 
 #include "shaders.h"
 #include "glm_context.h"
+#include "mgl_ext_introspect.h"
 
 const glslang_resource_t* glslang_default_resource(void);
 
@@ -428,7 +429,7 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
 
     ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
 
-    initGLSLInput(ctx, ptr->type, ptr->src, &glsl_input);
+    initGLSLInput(ctx, ptr->type, mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
 
     glsl_shader = glslang_shader_create(&glsl_input);
     if (glsl_shader == NULL)
@@ -464,6 +465,9 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
         fprintf(stderr, "[MGL] Enabling auto-map locations for legacy GLSL %d shader\n", shader_version);
     }
+    /* introspect: GL assigns uniform/interface locations at link time (introspect_spirv.c);
+     * without this, 3.30+ shaders with loose uniforms lacking layout(location) fail to compile */
+    options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
     glslang_shader_set_options(glsl_shader, options);
 
     err = glslang_shader_preprocess(glsl_shader, &glsl_input);

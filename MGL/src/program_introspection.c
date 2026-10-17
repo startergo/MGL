@@ -26,6 +26,7 @@
 #include "shaders.h"
 #include "programs.h"
 #include "mgl_ext_introspect.h"
+#include "mgl_ext_xfb.h"
 
 Program *findProgram(GLMContext ctx, GLuint program);
 Shader *findShader(GLMContext ctx, GLuint shader);
@@ -65,8 +66,7 @@ static void free_link_tables(MGLIProgram *ip)
     for (int i = 0; i < ip->nabufs; i++) free(ip->abufs[i].members);
     free(ip->abufs); ip->abufs = NULL; ip->nabufs = 0;
     for (int s = 0; s < MGLI_STAGES; s++) mgli_free_stage_sub(&ip->sub[s]);
-    for (int i = 0; i < ip->nxfb; i++) free(ip->xfb_names[i]);
-    free(ip->xfb_names); ip->xfb_names = NULL; ip->nxfb = 0;
+    ip->nxfb = 0;
     for (int s = 0; s < MGLI_STAGES; s++) ip->dub_res_index[s] = -1;
     ip->linked = 0;
 }
@@ -201,27 +201,10 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
     ip->linked = 1;
     for (int s = 0; s < MGLI_STAGES; s++) if (ip->sub[s].nunis) write_selectors(ctx, ip, s);
 
-    const char *const *names = NULL; GLsizei n = 0; GLenum mode = GL_INTERLEAVED_ATTRIBS;
-    if (mgl_xfb_get_program_varyings(ctx, ptr->name, &n, &names, &mode) && n > 0 && names) {
-        ip->xfb_names = calloc((size_t)n, sizeof(char *));
-        for (GLsizei i = 0; i < n; i++) ip->xfb_names[i] = strdup(names[i] ? names[i] : "");
-        ip->nxfb = n; ip->xfb_mode = mode;
-    }
-
     /* rebuild the Metal functions from the regenerated MSL */
     ptr->dirty_bits |= DIRTY_PROGRAM;
     if (ctx->mtl_funcs.mtlBindProgram) ctx->mtl_funcs.mtlBindProgram(ctx, ptr);
     ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE | DIRTY_TEX_BINDING;
-}
-
-__attribute__((weak)) bool mgl_xfb_get_program_varyings(GLMContext ctx, GLuint program, GLsizei *count,
-                                                        const char *const **names, GLenum *buffer_mode)
-{
-    (void)ctx; (void)program;
-    if (count) *count = 0;
-    if (names) *names = NULL;
-    if (buffer_mode) *buffer_mode = GL_INTERLEAVED_ATTRIBS;
-    return false;
 }
 
 Buffer *mgl_introspect_default_uniform_buffer(GLMContext ctx, Program *program, int stage, int index)
@@ -278,13 +261,6 @@ static GLint max_len_uniforms(MGLIProgram *ip)
 
 static bool vertex_inputs(MGLIProgram *ip) { return ip->first_stage == _VERTEX_SHADER; }
 
-static GLint xfb_max_len(MGLIProgram *ip)
-{
-    GLint m = 0;
-    for (int i = 0; i < ip->nxfb; i++) { GLint l = (GLint)strlen(ip->xfb_names[i]) + 1; if (l > m) m = l; }
-    return m;
-}
-
 bool mgl_introspect_get_programiv(GLMContext ctx, Program *program, GLenum pname, GLint *params)
 {
     if (!program || !params) return false;
@@ -305,8 +281,6 @@ bool mgl_introspect_get_programiv(GLMContext ctx, Program *program, GLenum pname
             *params = m; return true;
         }
         case GL_ACTIVE_ATOMIC_COUNTER_BUFFERS: *params = ip->nabufs; return true;
-        case GL_TRANSFORM_FEEDBACK_VARYINGS: if (!ip->nxfb) return false; *params = ip->nxfb; return true;
-        case GL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: if (!ip->nxfb) return false; *params = xfb_max_len(ip); return true;
         default: return false;
     }
 }
@@ -525,88 +499,52 @@ static bool valid_iface(GLenum iface)
     }
 }
 
-/* transform feedback: buffers derived from the recorded varyings */
+/* transform feedback varyings come from the xfb domain (mgl_xfb_program_info) */
+static const MGLXfbProgram *g_xfb; /* set by xfb_sync for the query in progress */
+
+static void xfb_sync(GLMContext ctx, MGLIProgram *ip)
+{
+    const MGLXfbProgram *x = ip->prog ? mgl_xfb_program_info(ctx, ip->prog) : NULL;
+    g_xfb = (x && x->linked && !x->link_failed) ? x : NULL;
+    ip->nxfb = g_xfb ? (int)g_xfb->count : 0;
+}
+
 static int xfb_buffer_count(MGLIProgram *ip)
 {
-    if (!ip->nxfb) return 0;
-    if (ip->xfb_mode == GL_SEPARATE_ATTRIBS) return ip->nxfb;
-    int n = 1;
-    for (int i = 0; i < ip->nxfb; i++) if (!strcmp(ip->xfb_names[i], "gl_NextBuffer")) n++;
+    (void)ip;
+    if (!g_xfb) return 0;
+    int n = 0; for (int b = 0; b < MGL_XFB_MAX_BUFFERS; b++) if (g_xfb->buffer_mask & (1u << b)) n++;
     return n;
 }
 
-static GLint gl_type_bytes(GLenum t)
+/* resource index -> TF buffer binding */
+static int xfb_buffer_binding(int index)
 {
-    switch (t) {
-        case GL_FLOAT: case GL_INT: case GL_UNSIGNED_INT: case GL_BOOL: return 4;
-        case GL_FLOAT_VEC2: case GL_INT_VEC2: case GL_UNSIGNED_INT_VEC2: case GL_BOOL_VEC2: case GL_DOUBLE: return 8;
-        case GL_FLOAT_VEC3: case GL_INT_VEC3: case GL_UNSIGNED_INT_VEC3: case GL_BOOL_VEC3: return 12;
-        case GL_FLOAT_VEC4: case GL_INT_VEC4: case GL_UNSIGNED_INT_VEC4: case GL_BOOL_VEC4: case GL_DOUBLE_VEC2: case GL_FLOAT_MAT2: return 16;
-        case GL_DOUBLE_VEC3: case GL_FLOAT_MAT2x3: case GL_FLOAT_MAT3x2: return 24;
-        case GL_DOUBLE_VEC4: case GL_FLOAT_MAT2x4: case GL_FLOAT_MAT4x2: case GL_DOUBLE_MAT2: return 32;
-        case GL_FLOAT_MAT3: return 36;
-        case GL_FLOAT_MAT3x4: case GL_FLOAT_MAT4x3: case GL_DOUBLE_MAT2x3: case GL_DOUBLE_MAT3x2: return 48;
-        case GL_FLOAT_MAT4: case GL_DOUBLE_MAT2x4: case GL_DOUBLE_MAT4x2: return 64;
-        case GL_DOUBLE_MAT3: return 72;
-        case GL_DOUBLE_MAT3x4: case GL_DOUBLE_MAT4x3: return 96;
-        case GL_DOUBLE_MAT4: return 128;
-        default: return 4;
-    }
+    int n = 0;
+    for (int b = 0; g_xfb && b < MGL_XFB_MAX_BUFFERS; b++) if (g_xfb->buffer_mask & (1u << b)) { if (n == index) return b; n++; }
+    return -1;
 }
 
 typedef struct { GLenum type; GLint size, offset, buffer; } XfbInfo;
 
-static void xfb_lookup(MGLIProgram *ip, const char *n, GLenum *t, GLint *sz)
-{
-    *t = GL_NONE; *sz = 0;
-    for (int v = 0; v < ip->nvtx_outputs; v++)
-        if (name_matches_var(ip->vtx_outputs[v].name, n)) { *t = ip->vtx_outputs[v].type; *sz = ip->vtx_outputs[v].size; return; }
-    const char *lb = strrchr(n, '[');
-    if (lb) {
-        char base[512]; size_t bl = (size_t)(lb - n);
-        if (bl + 4 < sizeof base) {
-            memcpy(base, n, bl); strcpy(base + bl, "[0]");
-            for (int v = 0; v < ip->nvtx_outputs; v++) if (!strcmp(ip->vtx_outputs[v].name, base)) { *t = ip->vtx_outputs[v].type; *sz = 1; return; }
-        }
-    }
-}
-
-static GLint xfb_bytes(MGLIProgram *ip, const char *n)
-{
-    if (!strncmp(n, "gl_SkipComponents", 17)) { int c = atoi(n + 17); return 4 * (c > 0 ? c : 1); }
-    if (!strcmp(n, "gl_NextBuffer")) return 0;
-    GLenum t; GLint sz; xfb_lookup(ip, n, &t, &sz);
-    return gl_type_bytes(t) * (sz ? sz : 1);
-}
-
 static XfbInfo xfb_info(MGLIProgram *ip, int i)
 {
-    XfbInfo x = { GL_NONE, 0, 0, 0 };
-    GLint off = 0, buf = 0;
-    for (int k = 0; k <= i; k++) {
-        const char *n = ip->xfb_names[k];
-        if (ip->xfb_mode == GL_SEPARATE_ATTRIBS) { buf = k; off = 0; }
-        if (!strcmp(n, "gl_NextBuffer")) {
-            if (ip->xfb_mode != GL_SEPARATE_ATTRIBS) { buf++; off = 0; }
-            if (k == i) { x.buffer = buf; x.offset = -1; }
-            continue;
-        }
-        if (k == i) { xfb_lookup(ip, n, &x.type, &x.size); x.offset = off; x.buffer = buf; }
-        off += xfb_bytes(ip, n);
-    }
+    (void)ip;
+    XfbInfo x = { GL_NONE, 0, -1, 0 };
+    if (!g_xfb || i < 0 || (GLuint)i >= g_xfb->count) return x;
+    const MGLXfbVarying *v = &g_xfb->vars[i];
+    x.type = v->type; x.size = v->size; x.buffer = (GLint)v->buffer;
+    x.offset = strcmp(v->name, "gl_NextBuffer") ? (GLint)v->offset : -1;
     return x;
 }
 
-static GLint xfb_buffer_stride(MGLIProgram *ip, int b)
+static const char *xfb_name(int i) { return (g_xfb && (GLuint)i < g_xfb->count) ? g_xfb->vars[i].name : ""; }
+
+static GLint xfb_buffer_stride(MGLIProgram *ip, int index)
 {
-    GLint stride = 0;
-    for (int i = 0; i < ip->nxfb; i++) {
-        XfbInfo x = xfb_info(ip, i);
-        if (x.buffer != b || x.offset < 0) continue;
-        GLint end = x.offset + xfb_bytes(ip, ip->xfb_names[i]);
-        if (end > stride) stride = end;
-    }
-    return stride;
+    (void)ip;
+    int b = xfb_buffer_binding(index);
+    return b >= 0 ? (GLint)g_xfb->stride[b] : 0;
 }
 
 static int resource_count(MGLIProgram *ip, GLenum iface)
@@ -649,7 +587,7 @@ static const char *resource_name(MGLIProgram *ip, GLenum iface, int index)
         case GL_UNIFORM_BLOCK: return ip->ubos[index].name;
         case GL_PROGRAM_INPUT: return ip->inputs[index].name;
         case GL_PROGRAM_OUTPUT: return ip->outputs[index].name;
-        case GL_TRANSFORM_FEEDBACK_VARYING: return ip->xfb_names[index];
+        case GL_TRANSFORM_FEEDBACK_VARYING: return xfb_name(index);
         case GL_BUFFER_VARIABLE: return ip->bvars[index].name;
         case GL_SHADER_STORAGE_BLOCK: return ip->ssbos[index].name;
         default: return "";
@@ -660,6 +598,7 @@ void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInte
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return;
+    xfb_sync(ctx, ip);
     if (!valid_iface(programInterface)) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return; }
     int u, st = subroutine_iface(programInterface, &u);
     int n = resource_count(ip, programInterface);
@@ -678,9 +617,9 @@ void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInte
                 case GL_SHADER_STORAGE_BLOCK: for (int i = 0; i < ip->nssbos; i++) if (ip->ssbos[i].member_count > v) v = ip->ssbos[i].member_count; break;
                 case GL_ATOMIC_COUNTER_BUFFER: for (int i = 0; i < ip->nabufs; i++) if (ip->abufs[i].member_count > v) v = ip->abufs[i].member_count; break;
                 case GL_TRANSFORM_FEEDBACK_BUFFER:
-                    for (int b = 0; b < xfb_buffer_count(ip); b++) {
-                        GLint c = 0;
-                        for (int i = 0; i < ip->nxfb; i++) { XfbInfo x = xfb_info(ip, i); if (x.buffer == b && x.offset >= 0 && strncmp(ip->xfb_names[i], "gl_", 3)) c++; }
+                    for (int bi = 0; bi < xfb_buffer_count(ip); bi++) {
+                        GLint c = 0; int b = xfb_buffer_binding(bi);
+                        for (int i = 0; i < ip->nxfb; i++) { XfbInfo x = xfb_info(ip, i); if (x.buffer == b && x.offset >= 0 && strncmp(xfb_name(i), "gl_", 3)) c++; }
                         if (c > v) v = c;
                     }
                     break;
@@ -700,6 +639,7 @@ GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum progra
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return GL_INVALID_INDEX;
+    xfb_sync(ctx, ip);
     if (!valid_iface(programInterface) || programInterface == GL_ATOMIC_COUNTER_BUFFER || programInterface == GL_TRANSFORM_FEEDBACK_BUFFER) {
         mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return GL_INVALID_INDEX;
     }
@@ -726,6 +666,7 @@ void mglGetProgramResourceName(GLMContext ctx, GLuint program, GLenum programInt
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return;
+    xfb_sync(ctx, ip);
     if (!valid_iface(programInterface) || programInterface == GL_ATOMIC_COUNTER_BUFFER || programInterface == GL_TRANSFORM_FEEDBACK_BUFFER) {
         mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return;
     }
@@ -756,6 +697,7 @@ void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInter
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return;
+    xfb_sync(ctx, ip);
     if (!valid_iface(programInterface)) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return; }
     if (propCount <= 0 || count < 0 || !props) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     GLenum I = programInterface;
@@ -821,7 +763,7 @@ void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInter
                 if (I == GL_UNIFORM_BLOCK) PUSH(ip->ubos[idx].binding);
                 else if (I == GL_SHADER_STORAGE_BLOCK) PUSH(ip->ssbos[idx].binding);
                 else if (I == GL_ATOMIC_COUNTER_BUFFER) PUSH(ip->abufs[idx].binding);
-                else if (I == GL_TRANSFORM_FEEDBACK_BUFFER) PUSH(idx);
+                else if (I == GL_TRANSFORM_FEEDBACK_BUFFER) PUSH(xfb_buffer_binding(idx));
                 else ok = false;
                 break;
             case GL_BUFFER_DATA_SIZE:
@@ -839,7 +781,7 @@ void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInter
                 else if (I == GL_TRANSFORM_FEEDBACK_BUFFER) {
                     for (int i = 0; i < ip->nxfb && ntmp < 1024; i++) {
                         XfbInfo x = xfb_info(ip, i);
-                        if (x.buffer == idx && x.offset >= 0 && strncmp(ip->xfb_names[i], "gl_", 3)) tmp[ntmp++] = i;
+                        if (x.buffer == xfb_buffer_binding(idx) && x.offset >= 0 && strncmp(xfb_name(i), "gl_", 3)) tmp[ntmp++] = i;
                     }
                     mem = tmp; nm = ntmp;
                 }

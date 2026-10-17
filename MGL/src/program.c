@@ -29,6 +29,7 @@
 
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "buffers.h"
@@ -805,47 +806,8 @@ void mglUseProgram(GLMContext ctx, GLuint program)
 
 GLint  mglGetAttribLocation(GLMContext ctx, GLuint program, const GLchar *name)
 {
-	if (isProgram(ctx, program) == GL_FALSE)
-	{
-		ERROR_RETURN(GL_INVALID_OPERATION); // also may be GL_INVALID_VALUE ????
-
-		return -1;
-	}
-
-	Program *ptr;
-
-	ptr = getProgram(ctx, program);
-	assert(program);
-
-	if (ptr->linked_glsl_program == NULL)
-	{
-		ERROR_RETURN(GL_INVALID_OPERATION);
-
-		return -1;
-	}
-
-	for (int stage=_VERTEX_SHADER; stage<_MAX_SHADER_TYPES; stage++)
-	{
-		int count;
-
-		count = ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STAGE_INPUT].count;
-
-		for (int i=0; i<count; i++)
-		{
-			const char *str = ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].name;
-
-			if (!strcmp(str, name))
-			{
-				GLuint location;
-
-				location = ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].location;
-
-				return location;
-			}
-		}
-	}
-	
-	return -1;
+    /* reflection tables are owned by the introspect domain */
+    return mgl_introspect_get_attrib_location(ctx, program, name);
 }
 
 void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params)
