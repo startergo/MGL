@@ -37,6 +37,7 @@
 #include "mgl_ext_program.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_tess.h"
 #include "shaders.h"
 #include "buffers.h"
 
@@ -337,6 +338,9 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
 
     if (obj->in_table)
         deleteHashElement(&STATE(program_table), ptr->name);
+
+    /* tess: drop per-program tessellation metadata */
+    mgl_ext_delete_program_tess(ctx, ptr);
 
     free(obj);
 }
@@ -831,7 +835,8 @@ static uint32_t *spirv_prepare_for_msl(const uint32_t *in, size_t n, int stage, 
  * SPIRV-Cross reflection + MSL, then a Metal library/function (errors go to *log).
  */
 static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const uint32_t *words,
-                          size_t nwords, const char *entry, ReflectAcc *acc, char **log)
+                          size_t nwords, const char *entry, ReflectAcc *acc, char **log,
+                          bool tess_pipeline)
 {
     Program *ptr = &dst->base;
     spvc_context context = NULL;
@@ -841,6 +846,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     spvc_resources resources = NULL;
     SpvExecutionModel model = stage_model(stage);
     const char *result = NULL;
+    char *tess_owned = NULL;
     char msl_entry[128];
     uint32_t *prepared = NULL;
     size_t prepared_words = 0;
@@ -876,6 +882,19 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         mgl_append_info_log(log, "ERROR: %s stage: malformed SPIR-V instruction stream\n", stage_label(stage));
         return false;
+    }
+
+    /* tess: isoline tessellation is emulated on the quad domain (see mgl_ext_tess.h) */
+    if (stage == _TESS_EVALUATION_SHADER)
+    {
+        size_t tess_words = 0;
+        uint32_t *tess_ir = mgl_tess_prepare_spirv(prepared, prepared_words, &tess_words);
+        if (tess_ir)
+        {
+            free(prepared);
+            prepared = tess_ir;
+            prepared_words = tess_words;
+        }
     }
 
     if (spvc_context_create(&context) != SPVC_SUCCESS)
@@ -919,6 +938,35 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         if (spvc_compiler_rename_entry_point(compiler, cleansed ? cleansed : entry, msl_entry, model) != SPVC_SUCCESS)
         {
             mgl_append_info_log(log, "ERROR: %s stage: cannot rename entry point \"%s\"\n", stage_label(stage), entry);
+            goto done;
+        }
+    }
+
+    /* tess: the vertex stage of a tessellation pipeline becomes a compute kernel writing
+       its outputs to a buffer; the TCS becomes a multi-patch compute kernel */
+    if (stage == _VERTEX_SHADER && tess_pipeline)
+    {
+        if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_VS_OUT_BUF) != SPVC_SUCCESS ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: tessellation MSL options rejected\n", stage_label(stage));
+            goto done;
+        }
+    }
+    else if (stage == _TESS_CONTROL_SHADER)
+    {
+        if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_MULTI_PATCH_WORKGROUP, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_INPUT_BUFFER_INDEX, MGL_TESS_TCS_IN) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_OUT) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_PATCH_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_PATCH_OUT) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_TESS_FACTOR_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_FACTORS) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_INDIRECT_PARAMS_BUFFER_INDEX, MGL_TESS_TCS_PARAMS) != SPVC_SUCCESS ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: tessellation MSL options rejected\n", stage_label(stage));
             goto done;
         }
     }
@@ -1044,6 +1092,18 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         goto done;
     }
 
+    /* tess: rewrite the generated MSL of the tessellation stages (tessellation.c) */
+    if (stage == _TESS_CONTROL_SHADER || stage == _TESS_EVALUATION_SHADER ||
+        (stage == _VERTEX_SHADER && tess_pipeline))
+    {
+        char *tess_msl = mgl_tess_rewrite_stage_msl(ctx, stage, tess_pipeline, result);
+        if (tess_msl)
+        {
+            result = tess_msl;     /* the spvc context owns the original string */
+            tess_owned = tess_msl;
+        }
+    }
+
     ptr->spirv[stage].msl_str = strdup(result);
     if (getenv("MGL_DUMP_MSL"))
         fprintf(stderr, "MGL: program %u %s stage MSL:\n%s\n", ptr->name, stage_label(stage), result);
@@ -1101,6 +1161,7 @@ done:
     spvc_context_destroy(context);
     free(prepared);
     free(patched);
+    free(tess_owned);
     return ok;
 }
 
@@ -1141,10 +1202,12 @@ static bool check_stage_mask(GLuint mask, char **log)
         return false;
     }
 
-    if (mask & (SHADER_MASK_BIT(_TESS_CONTROL_SHADER) | SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
+    if ((mask & SHADER_MASK_BIT(_TESS_CONTROL_SHADER)) && !(mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
     {
-        mgl_append_info_log(log, "ERROR: tessellation shaders are not supported by the MGL Metal backend "
-                            "(Metal tessellation needs a compute-kernel patch pipeline that is not implemented)\n");
+        /* GL 4.6 §7.3: a program fails to link if it contains a tessellation control
+           shader but no tessellation evaluation shader */
+        mgl_append_info_log(log, "ERROR: program contains a tessellation control shader "
+                            "but no tessellation evaluation shader\n");
         return false;
     }
 
@@ -1227,7 +1290,8 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             break;
         }
 
-        ok = compile_stage(ctx, dst, stage, glslang_program_SPIRV_get_ptr(glsl_program), size, "main", acc, log);
+        ok = compile_stage(ctx, dst, stage, glslang_program_SPIRV_get_ptr(glsl_program), size, "main", acc, log,
+                           (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
 
         /* executable stages keep the GLSL source / type of the shader they came from
          * (the xfb domain re-translates the vertex stage from source for capture) */
@@ -1284,7 +1348,8 @@ static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramOb
     {
         Shader *s = obj->attached[i];
         MGLShaderObj *so = MGL_SHADER_OBJ(s);
-        ok = compile_stage(ctx, dst, s->glm_type, so->spirv, so->spirv_words, so->spirv_entry, acc, log);
+        ok = compile_stage(ctx, dst, s->glm_type, so->spirv, so->spirv_words, so->spirv_entry, acc, log,
+                           (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
     }
 
     return ok;
@@ -1337,7 +1402,8 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
         ok = check_stage_mask(mask, &log);
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
             if (mask & SHADER_MASK_BIT(stage))
-                ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log);
+                ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log,
+                              (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
     }
 
     if (ok)
@@ -1628,7 +1694,11 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            *params = 0;
+        {
+            /* tess domain: recorded from the TCS SPIR-V execution modes at link */
+            MGLTessProgram *tp = mgl_tess_program(ctx, pptr);
+            *params = tp ? tp->tcs_out_vertices : 3;
+        }
             break;
         case GL_TESS_GEN_MODE:
         case GL_TESS_GEN_SPACING:
@@ -1639,7 +1709,32 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            *params = 0;
+        {
+            MGLTessProgram *tp = mgl_tess_program(ctx, pptr);
+            if (!tp)
+            {
+                ERROR_RETURN(GL_INVALID_OPERATION);
+                return;
+            }
+            switch (pname)
+            {
+                case GL_TESS_GEN_MODE:
+                    *params = tp->domain == MGL_TESS_DOMAIN_TRIANGLES ? GL_TRIANGLES :
+                              (tp->domain == MGL_TESS_DOMAIN_QUADS ? GL_QUADS : GL_ISOLINES);
+                    break;
+                case GL_TESS_GEN_SPACING:
+                    *params = tp->spacing == MGL_TESS_SPACING_EQUAL ? GL_EQUAL :
+                              (tp->spacing == MGL_TESS_SPACING_FRACTIONAL_EVEN ? GL_FRACTIONAL_EVEN :
+                               GL_FRACTIONAL_ODD);
+                    break;
+                case GL_TESS_GEN_VERTEX_ORDER:
+                    *params = tp->vertex_order_ccw ? GL_CCW : GL_CW;
+                    break;
+                default:
+                    *params = tp->point_mode ? GL_TRUE : GL_FALSE;
+                    break;
+            }
+        }
             break;
         default:
             ERROR_RETURN(GL_INVALID_ENUM);

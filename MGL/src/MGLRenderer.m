@@ -46,6 +46,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "MGLRenderer_Private.h"
 #import "mgl_ext_introspect.h"
 #import "mgl_ext_program.h"
+#import "mgl_ext_tess.h"
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
@@ -284,7 +285,11 @@ void logDirtyBits(GLMContext ctx)
 
 - (bool) mapBuffersToMTL
 {
-    if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage:_VERTEX_SHADER] == false)
+    // tess: with a tessellation program the render pipeline's vertex stage is the
+    // evaluation shader, so the vertex-stage buffer map comes from its resources
+    int vertex_stage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+
+    if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage:vertex_stage] == false)
         return false;
 
     if ([self mapGLBuffersToMTLBufferMap: &ctx->state.fragment_buffer_map_list stage:_FRAGMENT_SHADER] == false)
@@ -1691,7 +1696,8 @@ void logDirtyBits(GLMContext ctx)
 - (bool) bindTexturesToCurrentRenderEncoder
 {
     // sampled textures of the vertex and fragment stages (texdata); unbound units are skipped
-    static const int stages[2] = { _VERTEX_SHADER, _FRAGMENT_SHADER };
+    // tess: the vertex-stage textures are the evaluation shader's (tess domain)
+    int stages[2] = { [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER, _FRAGMENT_SHADER };
 
     for (int st = 0; st < 2; st++)
     {
@@ -2292,7 +2298,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
     _currentRenderEncoder.label = @"GL Render Encoder";
     mglCallExtHooks(self, "RenderEncoderCreated:", _currentRenderEncoder);
-
     // apply all state that isn't included in a renderPassDescriptor into the render encoder
     [self updateCurrentRenderEncoder];
 
@@ -2648,13 +2653,36 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     program = ctx->state.program;
     vertex_shader = program->shader_slots[_VERTEX_SHADER];
     fragment_shader = program->shader_slots[_FRAGMENT_SHADER];
-    assert(vertex_shader);
-    assert(fragment_shader);
+    if (!vertex_shader || !fragment_shader)
+    {
+        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u lacks stages (vs=%@ fs=%@ tess=%@)",
+              program->name, vertex_shader, fragment_shader, program->shader_slots[_TESS_EVALUATION_SHADER]);
+        return NULL;
+    }
 
     vertexFunction = (__bridge id<MTLFunction>)(vertex_shader->mtl_data.function);
     fragmentFunction = (__bridge id<MTLFunction>)(fragment_shader->mtl_data.function);
     assert(vertexFunction);
     assert(fragmentFunction);
+
+    // tess: the evaluation shader is the (rewritten) vertex function of the pipeline —
+    // the vertex stage runs as a compute kernel before the render pass
+    if (vertexFunction.functionType == MTLFunctionTypeKernel)
+    {
+        Shader *tes = program->shader_slots[_TESS_EVALUATION_SHADER];
+        MGLTessProgram *tp = mgl_tess_active_program(ctx);
+
+        if (tp && tp->plain_function &&
+            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode))
+            vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;  /* emulated TES */
+        else if (tes && tes->mtl_data.function)
+            vertexFunction = (__bridge id<MTLFunction>)(tes->mtl_data.function);
+        else
+        {
+            NSLog(@"MGL ERROR: tess program has no evaluation shader function for the pipeline");
+            return NULL;
+        }
+    }
 
     // Configure a pipeline descriptor that is used to create a pipeline state.
     pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -3133,7 +3161,31 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
             }
 
-            pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
+            // tess: the post-tessellation TES takes its inputs through a vertex descriptor
+            // with PerPatchControlPoint / PerPatch stepping (MGLRenderer+Tessellation.m).
+            // The emulated (plain-vertex) TES variant used for isolines / point_mode has
+            // no stage_in and must not get tessellation pipeline state.
+            if ([self extTessActive])
+            {
+                MGLTessProgram *tp = mgl_tess_active_program(ctx);
+                bool emulated = tp && tp->plain_function &&
+                                (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode);
+                if (!emulated)
+                {
+                    MTLVertexDescriptor *tvd = [self extTessVertexDescriptor];
+                    if (tvd)
+                    {
+                        pipelineStateDescriptor.vertexDescriptor = tvd;
+                        [self extTessConfigurePipeline: pipelineStateDescriptor];
+                    }
+                    else
+                        pipelineStateDescriptor.vertexDescriptor = nil;
+                }
+                else
+                    pipelineStateDescriptor.vertexDescriptor = nil;
+            }
+            else
+                pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
 
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
             NSError *error;
@@ -3150,7 +3202,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     NSLog(@"MGL INFO: AGX virtualization detected - using safe synchronous compilation");
                 }
 
+                NSLog(@"MGL tess: pipeline: tessActive=%d vfn=%@ ffn=%@ vd=%@",
+                          (int)[self extTessActive],
+                          pipelineStateDescriptor.vertexFunction.name,
+                          pipelineStateDescriptor.fragmentFunction.name,
+                          pipelineStateDescriptor.vertexDescriptor);
+
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
+                NSLog(@"MGL tess: newRenderPipelineState returned %@ err=%@", _pipelineState, error);
+                fflush(stderr);
 
                 if (!_pipelineState) {
                     NSLog(@"MGL ERROR: Pipeline creation failed: %@", error);
