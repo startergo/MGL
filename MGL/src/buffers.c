@@ -36,6 +36,8 @@
 #include "glm_context.h"
 #include "buffers.h"
 #include "mgl_ext_buffers.h"
+#include "mgl_ext_vattrib.h"
+#include "mgl_ext_xfb.h"
 #include "mgl_buffers_err.h"
 
 #pragma mark Utility Functions
@@ -515,9 +517,12 @@ static void setGenericBinding(GLMContext ctx, GLenum target, Buffer *ptr)
             *var = ptr ? ptr->name : 0;
     }
 
-    if (target == GL_ELEMENT_ARRAY_BUFFER && VAO())
+    // vattrib: the element array buffer binding is vertex array object state
+    if (target == GL_ELEMENT_ARRAY_BUFFER)
     {
-        STATE(dirty_bits) |= DIRTY_VAO;
+        mgl_va_element_buffer_bound(ctx, ptr);
+        if (VAO())
+            STATE(dirty_bits) |= DIRTY_VAO;
     }
 }
 
@@ -567,6 +572,18 @@ static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
         {
             vao->element_array.buffer = NULL;
             touched = true;
+        }
+
+        // vattrib: vertex buffer bindings of the full VAO record
+        MGLVertexArrayFull *va = mgl_va_full(vao);
+        for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+        {
+            if (va->binding[b].buffer == ptr)
+            {
+                va->binding[b].buffer = NULL;
+                va->binding[b].buffer_name = 0;
+                touched = true;
+            }
         }
 
         if (touched)
@@ -762,9 +779,12 @@ void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffe
     ERROR_CHECK_RETURN(index < maxBindingsForTarget(ctx, target), GL_INVALID_VALUE);
 
     if (buffer)
-    {
         ERROR_CHECK_RETURN(isBufferName(ctx, buffer), GL_INVALID_OPERATION);
 
+    if (!mgl_xfb_validate_bind_buffer(ctx, target, index, buffer, 0, 0, false)) return; // xfb: TF binding rules
+
+    if (buffer)
+    {
         ptr = getBuffer(ctx, target, buffer);
         ERROR_CHECK_RETURN(ptr, GL_OUT_OF_MEMORY);
 
@@ -795,6 +815,12 @@ void mglBindBufferRange(GLMContext ctx, GLenum target, GLuint index, GLuint buff
                 ERROR_CHECK_RETURN((size % 4) == 0, GL_INVALID_VALUE);
         }
 
+    }
+
+    if (!mgl_xfb_validate_bind_buffer(ctx, target, index, buffer, offset, size, true)) return; // xfb: TF binding rules
+
+    if (buffer)
+    {
         ptr = getBuffer(ctx, target, buffer);
         ERROR_CHECK_RETURN(ptr, GL_OUT_OF_MEMORY);
 
@@ -842,6 +868,11 @@ static void bindBuffersRangeInternal(GLMContext ctx, GLenum target, GLuint first
             if (ptr->target == 0)
                 ptr->target = target;
         }
+
+        if (target == GL_TRANSFORM_FEEDBACK_BUFFER &&
+            !mgl_xfb_validate_bind_buffer(ctx, target, first + i, name, (range && ptr) ? offsets[i] : 0,
+                                          (range && ptr) ? sizes[i] : 0, range && ptr))
+            continue; // xfb: TF binding rules (error already raised)
 
         setIndexedBinding(ctx, target, first + i, ptr, (range && ptr) ? offsets[i] : 0,
                           (range && ptr) ? sizes[i] : 0, range && ptr);

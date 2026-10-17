@@ -30,6 +30,7 @@
 #include "utils.h"
 #include "glm_context.h"
 #include "mgl_ext_texdata.h"
+#include "mgl_ext_texparam.h"
 
 extern void *getBufferData(GLMContext ctx, Buffer *ptr);
 
@@ -95,27 +96,8 @@ Texture *newTexObj(GLMContext ctx, GLenum target)
     ptr->target = target;
     ptr->index = index;
 
-    float black_color[] = {0,0,0,0};
-
-    ptr->params.depth_stencil_mode = GL_DEPTH_COMPONENT;
-    ptr->params.base_level = 0;
-    memcpy(ptr->params.border_color, black_color, 4 * sizeof(float));
-    ptr->params.compare_func = GL_NEVER;
-    ptr->params.compare_mode = GL_ALWAYS;
-    ptr->params.lod_bias = 0.0;
-    ptr->params.min_filter = GL_NEAREST;
-    ptr->params.mag_filter = GL_NEAREST;
-    ptr->params.max_anisotropy = 0.0;
-    ptr->params.min_lod = -1000;
-    ptr->params.max_lod = 1000;
-    ptr->params.max_level = 1000;
-    ptr->params.swizzle_r = GL_RED;
-    ptr->params.swizzle_g = GL_GREEN;
-    ptr->params.swizzle_b = GL_BLUE;
-    ptr->params.swizzle_a = GL_ALPHA;
-    ptr->params.wrap_s = GL_REPEAT;
-    ptr->params.wrap_t = GL_REPEAT;
-    ptr->params.wrap_r = GL_REPEAT;
+    // GL 4.6 default texture/sampler state (owned by texparam, tex_param.c)
+    mglTexParamInitDefaults(&ptr->params, target);
 
     return ptr;
 }
@@ -2356,45 +2338,18 @@ void mglGetCompressedTextureImage(GLMContext ctx, GLuint texture, GLint level, G
     fprintf(stderr, "MGL WARNING: glGetCompressedTextureImage called (stub)\n");
 }
 
+extern void mglTexParamGetTextureLevelParameteriv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLint *params);
+extern void mglTexParamGetTextureLevelParameterfv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLfloat *params);
+
+// level queries are implemented by the texparam domain (texture_query.c)
 void mglGetTextureLevelParameteriv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLint *params)
 {
-    Texture *tex = getTex(ctx, texture, 0);
-    if (!tex) {
-        *params = 0;
-        return;
-    }
-    
-    GLsizei width = tex->width >> level;
-    GLsizei height = tex->height >> level;
-    if (width < 1) width = 1;
-    if (height < 1) height = 1;
-    
-    switch (pname) {
-        case GL_TEXTURE_WIDTH:
-            *params = width;
-            break;
-        case GL_TEXTURE_HEIGHT:
-            *params = height;
-            break;
-        case GL_TEXTURE_DEPTH:
-            *params = tex->depth >> level;
-            if (*params < 1) *params = 1;
-            break;
-        case GL_TEXTURE_INTERNAL_FORMAT:
-            *params = tex->internalformat;
-            break;
-        default:
-            fprintf(stderr, "MGL: glGetTextureLevelParameteriv pname=0x%x not implemented\n", pname);
-            *params = 0;
-            break;
-    }
+    mglTexParamGetTextureLevelParameteriv(ctx, texture, level, pname, params);
 }
 
 void mglGetTextureLevelParameterfv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLfloat *params)
 {
-    GLint iparams;
-    mglGetTextureLevelParameteriv(ctx, texture, level, pname, &iparams);
-    *params = (GLfloat)iparams;
+    mglTexParamGetTextureLevelParameterfv(ctx, texture, level, pname, params);
 }
 
 void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)

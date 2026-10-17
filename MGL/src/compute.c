@@ -24,6 +24,7 @@
 #include "glm_context.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_buffers_err.h"
+#include "mgl_ext_queries.h"
 
 static bool computeProgramActive(GLMContext ctx)
 {
@@ -52,7 +53,15 @@ void mglDispatchCompute(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y
 
     ERROR_CHECK_RETURN(ctx->mtl_funcs.ext_buffers && ctx->mtl_funcs.ext_buffers->dispatch, GL_INVALID_OPERATION);
 
-    ctx->mtl_funcs.ext_buffers->dispatch(ctx, num_groups_x, num_groups_y, num_groups_z, NULL, 0);
+    if (!ctx->mtl_funcs.ext_buffers->dispatch(ctx, num_groups_x, num_groups_y, num_groups_z, NULL, 0))
+        return;
+
+    // GL_COMPUTE_SHADER_INVOCATIONS (queries domain)
+    if (ctx->state.program)
+        mgl_queries_note_dispatch(ctx, (uint64_t)num_groups_x * num_groups_y * num_groups_z *
+                                  ctx->state.program->local_workgroup_size.x *
+                                  ctx->state.program->local_workgroup_size.y *
+                                  ctx->state.program->local_workgroup_size.z);
 }
 
 void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
