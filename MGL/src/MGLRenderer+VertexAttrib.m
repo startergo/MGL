@@ -20,6 +20,8 @@
  */
 
 #import "MGLRenderer_Private.h"
+// gpuaudit: cached shadow attribute streams (CPU format conversion off the draw path)
+#include "mgl_ext_gpuaudit.h"
 #import "mgl_ext_vattrib.h"
 
 #define F4(_a_, _b_, _c_, _d_) switch (n) { case 1: return _a_; case 2: return _b_; case 3: return _c_; case 4: return _d_; } break
@@ -418,6 +420,16 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     if (base && start >= 0 && start + elem <= size)
         n = (b->stride == 0) ? 1 : (size_t)((size - start - elem) / b->stride) + 1;
 
+    /* gpuaudit: the converted stream only depends on the source bytes and the layout,
+     * so it is cached as an MTLBuffer keyed on the buffer's content generation instead
+     * of being rebuilt (calloc + per-element conversion + newBufferWithBytes) per draw */
+    void *cached = mgl_gpuaudit_shadow_lookup(ctx, b->buffer, start, b->stride, f->type, f->size, kind);
+    if (cached)
+    {
+        [enc setVertexBuffer: (__bridge id<MTLBuffer>)cached offset: 0 atIndex: index];
+        return;
+    }
+
     size_t count = n ? n : 1;
     GLuint *out = (GLuint *)calloc(count, 16);
     if (!out)
@@ -434,6 +446,14 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     }
 
     size_t len = count * 16;
+
+    void *stored = mgl_gpuaudit_shadow_store(ctx, b->buffer, start, b->stride, f->type, f->size, kind, out, len);
+    if (stored)
+    {
+        [enc setVertexBuffer: (__bridge id<MTLBuffer>)stored offset: 0 atIndex: index];
+        free(out);
+        return;
+    }
 
     if (len <= 4096)
     {

@@ -87,11 +87,13 @@ extern "C" {
 #endif
 /* compute dispatch counter (COMPUTE_SHADER_INVOCATIONS); called by mglDispatchCompute*. */
 void mgl_queries_note_dispatch(GLMContext ctx, uint64_t invocations);
+void mgl_queries_note_tess(GLMContext ctx, uint64_t tes_invocations, uint64_t tessellated_primitives);
 /* transform feedback: primitives actually written to stream and primitives that were needed
  * (needed > written ⇒ overflow).  For the 'xfb' domain. */
 void mgl_queries_note_xfb_primitives(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
 /* false while conditional rendering discards rendering (for Clear*, BlitFramebuffer, ...). */
 bool mgl_queries_render_allowed(GLMContext ctx);
+bool mgl_queries_counting_active(GLMContext ctx);   /* gpuaudit: no CPU reads of indirect commands */
 #ifdef __cplusplus
 }
 #endif

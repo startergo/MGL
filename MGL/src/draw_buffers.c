@@ -40,6 +40,9 @@
 #include "mgl_ext_buffers.h"
 #include "mgl_buffers_err.h"
 #include "mgl_ext_rstate.h"
+#include "mgl_ext_gpuaudit.h"   /* gpuaudit: cached index rewrites / restart scans */
+#include "mgl_ext_queries.h"   /* gpuaudit: multi-draw indirect without CPU command reads */
+#include "mgl_ext_tess.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom.h"
 
@@ -452,15 +455,6 @@ static int build_emulated(GLenum mode, const VertexSource *src, GLsizei count, I
     }
 }
 
-static void warn_patches_once(void)
-{
-    static bool warned = false;
-    if (!warned)
-    {
-        warned = true;
-        fprintf(stderr, "MGL: GL_PATCHES draws need tessellation, which MGL cannot translate to Metal; draw skipped\n");
-    }
-}
 
 /* CPU pointer to element indices (after making GPU writes visible) */
 static const uint8_t *element_pointer(GLMContext ctx, Buffer *ebuf, size_t offset, GLsizei count, GLenum type)
@@ -477,15 +471,115 @@ static const uint8_t *element_pointer(GLMContext ctx, Buffer *ebuf, size_t offse
     return (const uint8_t *)ebuf->data.buffer_data + offset;
 }
 
+/* gpuaudit: same range validation as element_pointer() but without syncing the CPU
+ * view - a fully native draw never reads the bytes, so it must not be stalled by
+ * GPU-written element buffers either */
+static bool element_range_ok(Buffer *ebuf, size_t offset, GLsizei count, GLenum type)
+{
+    if (!ebuf || !ebuf->data.buffer_data)
+        return false;
+
+    size_t bytes = (size_t)count * getTypeSize(type);
+    if (offset > (size_t)ebuf->size || bytes > (size_t)ebuf->size - offset)
+        return false;
+
+    return true;
+}
+
+/* gpuaudit: snapshot of every GL state that decides whether a rewrite happens or
+ * changes the rewritten list: the restart index, the provoking-vertex convention and
+ * the bound program (flat-varying detection).  Part of every cache key below. */
+static MGLIndexKeyState index_key_state(GLMContext ctx, bool restart, uint32_t restart_index)
+{
+    MGLIndexKeyState st;
+    memset(&st, 0, sizeof(st));
+    st.restart_index = restart_index;
+    st.restart_on = restart ? 1 : 0;
+    st.lastpv = (ctx->state.ext_rstate && ctx->state.ext_rstate->provoking_vertex == GL_LAST_VERTEX_CONVENTION) ? 1 : 0;
+    st.program = ctx->state.program;
+    return st;
+}
+
+/* gpuaudit: does this draw need an index rewrite?  mgl_rstate_index_rewrite_needed()
+ * scans the whole index range on the CPU; the answer only depends on the buffer
+ * contents, the draw parameters and the state snapshot, so it is cached and only the
+ * first draw after a real change pays the scan. */
+static bool index_rewrite_needed(GLMContext ctx, GLenum mode, GLenum type, const uint8_t *cpu, GLsizei count,
+                                 Buffer *ebuf, size_t offset, MGLIndexKeyState st)
+{
+    int cached = mgl_gpuaudit_scan_lookup(ctx, ebuf, (uint32_t)offset, mode, type, count, st);
+    if (cached >= 0)
+        return cached != 0;
+
+    bool r = mgl_rstate_index_rewrite_needed(ctx, mode, type, cpu, count);
+    mgl_gpuaudit_scan_store(ctx, ebuf, (uint32_t)offset, mode, type, count, st, r);
+    return r;
+}
+
+/* gpuaudit: serve an emulated / rewritten / widened draw from the cached index list
+ * (an MTLBuffer built once).  Returns false when this draw is not cached. */
+static bool draw_cached_index_list(GLMContext ctx, DrawBatch *batch, Buffer *ebuf, uint32_t offset,
+                                   GLenum mode, GLenum type, GLsizei count, GLint first,
+                                   MGLIndexKeyState st, int adjacency, GLsizei instances,
+                                   GLint basevertex, GLuint baseinstance)
+{
+    struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
+    if (!gpm || !gpm->draw_indexed_mtl)
+        return false;
+
+    MGLIndexCacheEnt *e = mgl_gpuaudit_index_lookup(ctx, ebuf, offset, mode, type, count, first, st, adjacency);
+    if (!e)
+        return false;
+
+    int prim = native_prim(e->out_mode);
+    if (prim < 0)
+        return false;      /* emulated strips with restart sentinels never get here */
+
+    if (batch_begin(ctx, batch))
+        gpm->draw_indexed_mtl(ctx, prim, e->out_type, e->mtl_buffer, 0, e->out_count,
+                              instances, basevertex, baseinstance);
+    return true;
+}
+
+/* gpuaudit: draw a just-produced (and freshly cached) index list from its MTLBuffer;
+ * returns false when the list was not cached - then draw from `fallback` instead */
+static bool draw_stored_index_list(GLMContext ctx, DrawBatch *batch, int prim,
+                                   MGLIndexCacheEnt *e, GLsizei instances, GLint basevertex,
+                                   GLuint baseinstance)
+{
+    struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
+    if (!e || !gpm || !gpm->draw_indexed_mtl || prim < 0)
+        return false;
+
+    if (batch_begin(ctx, batch))
+        gpm->draw_indexed_mtl(ctx, prim, e->out_type, e->mtl_buffer, 0, e->out_count,
+                              instances, basevertex, baseinstance);
+    return true;
+}
+
 static bool is_adjacency(GLenum mode)
 {
     return mode == GL_LINES_ADJACENCY || mode == GL_LINE_STRIP_ADJACENCY ||
            mode == GL_TRIANGLES_ADJACENCY || mode == GL_TRIANGLE_STRIP_ADJACENCY;
 }
 
+/* gpuaudit: provenance of a CPU index list handed to draw_index_list; when set, the
+ * widened / emulated list is cached as an MTLBuffer so the next identical draw needs
+ * no CPU work at all (see mgl_ext_gpuaudit.h) */
+typedef struct IndexListOrigin {
+    Buffer         *ebuf;
+    uint32_t        offset;
+    GLenum          src_mode, src_type;
+    GLsizei         src_count;
+    GLint           first;
+    MGLIndexKeyState state;
+    uint8_t         adjacency;
+} IndexListOrigin;
+
 /* draw a (CPU) index list of a GL mode: native modes directly, the rest emulated */
 static void draw_index_list(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, const void *indices, GLsizei count,
-                            GLsizei instances, GLint basevertex, GLuint baseinstance, bool restart, uint32_t restart_index)
+                            GLsizei instances, GLint basevertex, GLuint baseinstance, bool restart, uint32_t restart_index,
+                            const IndexListOrigin *origin)
 {
     int prim = native_prim(mode);
 
@@ -510,8 +604,15 @@ static void draw_index_list(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenu
         for (GLsizei k = 0; k < count; k++)
             wide[k] = vs_is_restart(&src, k) ? 0xFFFF : (uint16_t)vs_get(&src, k);
 
-        if (batch_begin(ctx, batch))
-            MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_SHORT, NULL, 0, wide, count, instances, basevertex, baseinstance);
+        MGLIndexCacheEnt *e = origin
+            ? mgl_gpuaudit_index_store(ctx, origin->ebuf, origin->offset, origin->src_mode, origin->src_type,
+                                       origin->src_count, origin->first, origin->state, origin->adjacency,
+                                       wide, mode, GL_UNSIGNED_SHORT, count)
+            : NULL;
+
+        if (!draw_stored_index_list(ctx, batch, prim, e, instances, basevertex, baseinstance))
+            if (batch_begin(ctx, batch))
+                MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_SHORT, NULL, 0, wide, count, instances, basevertex, baseinstance);
 
         free(wide);
         return;
@@ -520,9 +621,19 @@ static void draw_index_list(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenu
     IndexList list = { 0 };
     prim = build_emulated(mode, &src, count, &list);
 
-    if (list.count && batch_begin(ctx, batch))
-        MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count,
-                             instances, basevertex, baseinstance);
+    if (list.count)
+    {
+        MGLIndexCacheEnt *e = origin
+            ? mgl_gpuaudit_index_store(ctx, origin->ebuf, origin->offset, origin->src_mode, origin->src_type,
+                                       origin->src_count, origin->first, origin->state, origin->adjacency,
+                                       list.data, mode, GL_UNSIGNED_INT, (GLsizei)list.count)
+            : NULL;
+
+        if (!draw_stored_index_list(ctx, batch, prim, e, instances, basevertex, baseinstance))
+            if (batch_begin(ctx, batch))
+                MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count,
+                                     instances, basevertex, baseinstance);
+    }
 
     free(list.data);
 }
@@ -538,7 +649,14 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
 
     if (mode == GL_PATCHES)
     {
-        warn_patches_once();
+        /* tess domain: GL_PATCHES is executed by the tessellation pipeline
+           (MGLRenderer+Tessellation.m); it needs an active tessellation evaluation shader */
+        if (!mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
+                                   basevertex, (GLint)baseinstance))
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return;
+        }
         return;
     }
 
@@ -547,15 +665,26 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
 
     if (!indexed)
     {
+        MGLIndexKeyState st = index_key_state(ctx, false, 0);
+
         if (!adjacency && mgl_rstate_arrays_rewrite_needed(ctx, mode))
         {
+            /* gpuaudit: the generated list depends only on (mode, first, count, state);
+             * cache it so a repeated draw does not rebuild it */
+            if (draw_cached_index_list(ctx, batch, NULL, 0, mode, 0, count, first, st, 0,
+                                       instances, 0, baseinstance))
+                return;
+
             GLenum out_mode = mode;
             GLsizei out_count = 0;
             void *idx = mgl_rstate_generate_array_indices(ctx, mode, first, count, &out_mode, &out_count);
 
             if (idx)
             {
-                draw_index_list(ctx, batch, out_mode, GL_UNSIGNED_INT, idx, out_count, instances, 0, baseinstance, false, 0);
+                MGLIndexCacheEnt *e = mgl_gpuaudit_index_store(ctx, NULL, 0, mode, 0, count, first, st, 0,
+                                                               idx, out_mode, GL_UNSIGNED_INT, out_count);
+                if (!draw_stored_index_list(ctx, batch, native_prim(out_mode), e, instances, 0, baseinstance))
+                    draw_index_list(ctx, batch, out_mode, GL_UNSIGNED_INT, idx, out_count, instances, 0, baseinstance, false, 0, NULL);
                 free(idx);
                 return;
             }
@@ -568,32 +697,66 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
             return;
         }
 
+        /* gpuaudit: line loop / fan / adjacency emulation for array draws is cached the
+         * same way (the list only depends on the draw parameters) */
+        if (draw_cached_index_list(ctx, batch, NULL, 0, mode, 0, count, first, st, adjacency,
+                                   instances, 0, baseinstance))
+            return;
+
         IndexList list = { 0 };
         VertexSource src = { NULL, 0, first, false, 0 };
         prim = build_emulated(mode, &src, count, &list);
 
-        if (list.count && batch_begin(ctx, batch))
-            MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count, instances, 0, baseinstance);
+        if (list.count)
+        {
+            MGLIndexCacheEnt *e = mgl_gpuaudit_index_store(ctx, NULL, 0, mode, 0, count, first, st, adjacency,
+                                                           list.data, mode, GL_UNSIGNED_INT, (GLsizei)list.count);
+            if (!draw_stored_index_list(ctx, batch, prim, e, instances, 0, baseinstance))
+                if (batch_begin(ctx, batch))
+                    MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count, instances, 0, baseinstance);
+        }
 
         free(list.data);
         return;
     }
 
     Buffer *ebuf = VAO_STATE(element_array.buffer);
-    const uint8_t *cpu = element_pointer(ctx, ebuf, offset, count, type);
 
-    if (!cpu)
+    uint32_t restart_index = 0;
+    bool restart = restart_enabled(ctx, type, &restart_index);
+    MGLIndexKeyState st = index_key_state(ctx, restart, restart_index);
+
+    /* gpuaudit: a fully native draw (native primitive mode, 16/32-bit indices) never
+     * reads the index bytes on the CPU, so it cannot be stalled by GPU-written element
+     * buffers; only 8-bit indices, emulated modes, adjacency and restart need the CPU
+     * view (mgl_rstate_index_rewrite_needed / draw_index_list below). */
+    bool need_cpu = adjacency || prim < 0 || type == GL_UNSIGNED_BYTE || restart;
+    const uint8_t *cpu = NULL;
+
+    if (need_cpu)
     {
-        // index range outside the element buffer
+        cpu = element_pointer(ctx, ebuf, offset, count, type);
+
+        if (!cpu)
+        {
+            // index range outside the element buffer
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return;
+        }
+    }
+    else if (!element_range_ok(ebuf, offset, count, type))
+    {
         ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return;
     }
 
-    uint32_t restart_index = 0;
-    bool restart = restart_enabled(ctx, type, &restart_index);
-
-    if (!adjacency && mgl_rstate_index_rewrite_needed(ctx, mode, type, cpu, count))
+    if (need_cpu && !adjacency && index_rewrite_needed(ctx, mode, type, cpu, count, ebuf, offset, st))
     {
+        /* gpuaudit: repeated draws reuse the rewritten list, cached as an MTLBuffer */
+        if (draw_cached_index_list(ctx, batch, ebuf, (uint32_t)offset, mode, type, count, 0, st, 0,
+                                   instances, basevertex, baseinstance))
+            return;
+
         GLenum out_mode = mode, out_type = type;
         GLsizei out_count = 0;
         void *idx = mgl_rstate_rewrite_indices(ctx, mode, type, cpu, count, &out_mode, &out_type, &out_count);
@@ -601,9 +764,16 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
         if (idx)
         {
             // restart has been resolved by the rewrite (Metal restart value for strips)
-            uint32_t mrv = out_type == GL_UNSIGNED_INT ? 0xFFFFFFFFu : 0xFFFFu;
-            draw_index_list(ctx, batch, out_mode, out_type, idx, out_count, instances, basevertex, baseinstance,
-                            native_prim(out_mode) < 0 && restart, mrv);
+            MGLIndexCacheEnt *e = mgl_gpuaudit_index_store(ctx, ebuf, (uint32_t)offset, mode, type, count, 0,
+                                                           st, 0, idx, out_mode, out_type, out_count);
+
+            if (!draw_stored_index_list(ctx, batch, native_prim(out_mode), e, instances, basevertex, baseinstance))
+            {
+                uint32_t mrv = out_type == GL_UNSIGNED_INT ? 0xFFFFFFFFu : 0xFFFFu;
+                draw_index_list(ctx, batch, out_mode, out_type, idx, out_count, instances, basevertex, baseinstance,
+                                native_prim(out_mode) < 0 && restart, mrv, NULL);
+            }
+
             free(idx);
             return;
         }
@@ -616,7 +786,23 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
         return;
     }
 
-    draw_index_list(ctx, batch, mode, type, cpu, count, instances, basevertex, baseinstance, restart, restart_index);
+    /* 8-bit widening / primitive emulation: served from the cache when possible */
+    if (draw_cached_index_list(ctx, batch, ebuf, (uint32_t)offset, mode, type, count, 0, st, adjacency,
+                               instances, basevertex, baseinstance))
+        return;
+
+    IndexListOrigin origin;
+    memset(&origin, 0, sizeof(origin));
+    origin.ebuf = ebuf;
+    origin.offset = (uint32_t)offset;
+    origin.src_mode = mode;
+    origin.src_type = type;
+    origin.src_count = count;
+    origin.state = st;
+    origin.adjacency = adjacency ? 1 : 0;
+
+    draw_index_list(ctx, batch, mode, type, cpu, count, instances, basevertex, baseinstance,
+                    restart, restart_index, &origin);
 }
 
 /* hand a draw to the transform feedback capture wrappers (xfb domain), which capture and
@@ -646,6 +832,13 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
 {
     if (count <= 0 || instances <= 0)
         return;
+
+    /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active */
+    if (mode != GL_PATCHES && mgl_tess_active_program(ctx))
+    {
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return;
+    }
 
     if (!mgl_ext_pre_draw(ctx, mode, count, instances))
         return;
@@ -870,7 +1063,11 @@ static bool read_indirect(GLMContext ctx, Buffer *buf, size_t offset, uint32_t *
     return true;
 }
 
-static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, Buffer *ibuf, size_t offset)
+/* `need_counts`: only an active CPU-counted pipeline-statistics query wants the
+ * vertex/instance counts of the command (gpuaudit).  When it does not and Metal can
+ * run the draw straight from the app's buffer, the command is never read on the CPU. */
+static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, Buffer *ibuf,
+                          size_t offset, bool need_counts)
 {
     uint32_t cmd[5] = { 0, 0, 0, 0, 0 };
     int words = type ? 5 : 4;
@@ -884,8 +1081,10 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
                   !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
                          : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
-    // read the command when CPU-visible (always when the CPU path needs it)
-    bool known = read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok);
+    // read the command when CPU-visible; when nothing needs the counts and Metal can
+    // take the command buffer directly, skip the read entirely (gpuaudit)
+    bool known = (gpu_ok && !need_counts) ? false
+                                             : read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok || need_counts);
 
     if (!known && !gpu_ok)
         return;
@@ -903,6 +1102,9 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
         // counts are produced on the GPU and not visible yet
         return;
     }
+
+    if (gpu_ok && !known && ctx->state.ext_gpuaudit)
+        ctx->state.ext_gpuaudit->indirect_noread++;
 
     if (gpu_ok)
     {
@@ -983,9 +1185,14 @@ void mgl_buffers_multi_draw_indirect(GLMContext ctx, GLenum mode, GLenum type, c
             drawcount = (GLsizei)n;   // clamped to maxdrawcount
     }
 
+    /* gpuaudit: the vertex/instance counts of each command are only needed by a
+     * CPU-counted pipeline-statistics query (transform feedback capture forces the CPU
+     * path anyway); otherwise the commands are handed to Metal unread. */
+    bool need_counts = mgl_queries_counting_active(ctx) || mgl_xfb_capturing(ctx);
+
     DrawBatch batch = { 0 };
     for (GLsizei i = 0; i < drawcount; i++)
-        exec_indirect(ctx, &batch, mode, type, ibuf, offset + step * (size_t)i);
+        exec_indirect(ctx, &batch, mode, type, ibuf, offset + step * (size_t)i, need_counts);
     batch_end(ctx, &batch);
 }
 
@@ -1007,7 +1214,7 @@ static void single_indirect(GLMContext ctx, GLenum mode, GLenum type, const void
     ERROR_CHECK_RETURN((uint64_t)offset + cmd_size <= (uint64_t)ibuf->size, GL_INVALID_OPERATION);
 
     DrawBatch batch = { 0 };
-    exec_indirect(ctx, &batch, mode, type, ibuf, offset);
+    exec_indirect(ctx, &batch, mode, type, ibuf, offset, true);
     batch_end(ctx, &batch);
 }
 

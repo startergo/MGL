@@ -225,11 +225,28 @@ def create_with_retry(client, **kwargs):
         try:
             return client.messages.create(**kwargs)
         except Exception as e:  # noqa: BLE001  (rate limits, overload, network)
+            msg = str(e)
+            # Z.AI 1113 = account has no balance / resource package: retrying cannot help
+            if "1113" in msg or "Insufficient balance" in msg or "invalid api key" in msg.lower() \
+                    or getattr(e, "status_code", None) in (401, 403):
+                raise SystemExit(f"FATAL provider error, not retrying: {msg[:200]}\n"
+                                 "Fix the account/key, then re-run agents/run_glm_domains.sh <domains> "
+                                 "(workers resume from their saved transcripts).")
             if attempt == 7:
                 raise
             print(f"  API error ({type(e).__name__}: {str(e)[:160]}); retry in {delay}s", flush=True)
             time.sleep(delay)
             delay = min(delay * 2, 120)
+
+
+def take_inbox(state_dir):
+    """Supervisor messages: text dropped in <worktree>/.agent/inbox.md is delivered once."""
+    f = state_dir / "inbox.md"
+    if not f.exists():
+        return ""
+    text = f.read_text().strip()
+    f.rename(state_dir / f"inbox.delivered.{int(time.time())}.md")
+    return text
 
 
 def main():
@@ -257,8 +274,10 @@ def main():
     system = SYSTEM_TEMPLATE.format(domain=args.domain, brief=brief, task=task)
     if args.resume and transcript.exists():
         messages = json.loads(transcript.read_text())
+        note = take_inbox(state_dir)
         messages.append({"role": "user", "content": "Continue the task from where you left off. "
-                         "Check `git status` and `git log --oneline -5` first."})
+                         "Check `git status` and `git log --oneline -5` first."
+                         + ("\n\nMESSAGE FROM THE SUPERVISOR (takes priority over earlier plans):\n" + note if note else "")})
         log(logf, f"resume ({len(messages)} messages)")
     else:
         messages = [{"role": "user", "content": "Start the task. Begin by reading the relevant code."}]
@@ -290,6 +309,10 @@ def main():
                 out = f"ERROR: {type(e).__name__}: {e}"
             log(logf, f"turn {turn} {name} {brief_inp} -> {out[:200].replace(chr(10), ' | ')}")
             results.append({"type": "tool_result", "tool_use_id": c["id"], "content": out})
+        note = take_inbox(state_dir)
+        if note:
+            results.append({"type": "text", "text": "MESSAGE FROM THE SUPERVISOR (takes priority over earlier plans):\n" + note})
+            log(logf, f"turn {turn} inbox delivered: {note[:200]}")
         messages.append({"role": "user", "content": results})
         transcript.write_text(json.dumps(messages, default=str))
     log(logf, f"stopped: reached --max-turns {args.max_turns} (resume with --resume)")

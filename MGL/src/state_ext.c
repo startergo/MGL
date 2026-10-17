@@ -661,14 +661,23 @@ static void rs_post_link(GLMContext ctx, struct Program_t *program)
 
     if (!program) return;
 
+    /* the clip-space fixup belongs to the LAST pre-rasterization stage: with a
+     * tessellation program that is the evaluation shader (the vertex stage runs as
+     * a compute kernel and works in patch space) — the same rule covers a future
+     * geometry-shader stage */
+    int last_pre_raster = _VERTEX_SHADER;
+    if (program->spirv[_TESS_EVALUATION_SHADER].msl_str) last_pre_raster = _TESS_EVALUATION_SHADER;
+
     for (int stage = _VERTEX_SHADER; stage <= _FRAGMENT_SHADER; stage++) {
-        if (stage != _VERTEX_SHADER && stage != _FRAGMENT_SHADER) continue;
+        if (stage != _VERTEX_SHADER && stage != _FRAGMENT_SHADER && stage != _TESS_EVALUATION_SHADER) continue;
+        if (stage == _VERTEX_SHADER && last_pre_raster != _VERTEX_SHADER)
+            continue;       /* the vertex stage is a tessellation compute kernel: no fixup */
         Spirv *sp = &program->spirv[stage];
         Shader *sh = program->shader_slots[stage];
         if (!sh || !sp->msl_str) continue;
         const char *entry = sp->entry_point ? sp->entry_point : sh->entry_point;
-        char *patched = stage == _VERTEX_SHADER ? mgl_rstate_patch_vertex_msl(sp->msl_str, entry)
-                                                : mgl_rstate_patch_fragment_msl(sp->msl_str, entry);
+        char *patched = stage == _FRAGMENT_SHADER ? mgl_rstate_patch_fragment_msl(sp->msl_str, entry)
+                                                  : mgl_rstate_patch_vertex_msl(sp->msl_str, entry);
         if (!patched) continue;
         if (getenv("MGL_RSTATE_DUMP_MSL")) fprintf(stderr, "MGL rstate patched MSL:\n%s\n", patched);
         free(sp->msl_str);

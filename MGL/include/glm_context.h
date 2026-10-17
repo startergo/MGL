@@ -389,6 +389,7 @@ typedef struct SpirvResource_t {
     GLuint  set;
     GLuint  binding;
     GLuint  location;
+    GLuint  msl_binding; /* Metal argument index SPIRV-Cross chose (differs from the GL unit for textures) */
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {
@@ -630,6 +631,7 @@ typedef struct {
     struct MGLExtState_buffers *ext_buffers;
     struct MGLExtState_geom *ext_geom;
     struct MGLExtState_tess *ext_tess;
+    struct MGLExtState_gpuaudit *ext_gpuaudit;
 
     // put at end, big chunk of yuck
     GLMParams   var;
@@ -721,6 +723,7 @@ struct GLMMetalFuncs {
     struct MGLExtMetal_buffers *ext_buffers;
     struct MGLExtMetal_geom *ext_geom;
     struct MGLExtMetal_tess *ext_tess;
+    struct MGLExtMetal_gpuaudit *ext_gpuaudit;
 } ;
 
 typedef struct GLMContextRec_t {
