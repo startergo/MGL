@@ -24,6 +24,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
+#include "hash_table.h"
 
 TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *findTransformFeedback(GLMContext ctx, GLuint name);
@@ -1859,6 +1860,11 @@ void mgl_ext_init_xfb(GLMContext ctx)
         ctx->state.ext_xfb = calloc(1, sizeof(struct MGLExtState_xfb));
         if (!ctx->state.ext_xfb) return;
     }
+    /* glm_context.c does not create the transform feedback name table; an empty table makes
+     * insertHashElement loop forever and getNewName hand out 0 */
+    if (STATE(transform_feedback_table).size == 0)
+        initHashTable(&STATE(transform_feedback_table), 32);
+
     XFB()->default_obj.name = 0;
     XFB()->default_obj.created = true;
     XFB()->default_obj.primitive_mode = GL_POINTS;
