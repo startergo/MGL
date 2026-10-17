@@ -37,6 +37,7 @@
 #include "mgl_ext_program.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_geom.h"
 #include "mgl_ext_tess.h"
 #include "shaders.h"
 #include "buffers.h"
@@ -1086,6 +1087,31 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    if (stage == _GEOMETRY_SHADER)
+    {
+        /* SPIRV-Cross has no geometry → MSL backend.  The reflection above is kept (so
+         * uniform / texture / atomic introspection is unchanged); the geometry domain
+         * builds the emulation for this stage: the geometry kernel (which becomes this
+         * stage's executable), a vertex capture variant and the pass-through raster
+         * function that replaces the vertex stage at post-link. */
+        if (!mgl_geom_compile_stage(ctx, ptr, dst, stage, prepared, prepared_words, entry, log))
+            goto done;
+
+        {
+            Shader *exec = mgl_shader_new_internal(ctx, stage);
+            if (!exec)
+            {
+                mgl_append_info_log(log, "ERROR: out of memory\n");
+                goto done;
+            }
+            exec->entry_point = strdup(msl_entry);
+            ptr->shader_slots[stage] = exec;
+        }
+        dst->linked_mask |= SHADER_MASK_BIT(stage);
+        ok = true;
+        goto done;
+    }
+
     if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS || !result)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIR-V → MSL translation failed\n", stage_label(stage));
@@ -1181,7 +1207,7 @@ static void finish_reflection(MGLProgramObj *dst, ReflectAcc *acc)
 }
 
 /* stage combinations this backend can execute */
-static bool check_stage_mask(GLuint mask, char **log)
+static bool check_stage_mask(GLuint mask, char **log, bool separable)
 {
     if (mask == 0)
     {
@@ -1197,9 +1223,19 @@ static bool check_stage_mask(GLuint mask, char **log)
 
     if (mask & SHADER_MASK_BIT(_GEOMETRY_SHADER))
     {
-        mgl_append_info_log(log, "ERROR: geometry shaders are not supported by the MGL Metal backend "
-                            "(Metal has no geometry stage and no geometry emulation is implemented)\n");
-        return false;
+        /* emulated by the geometry domain: the stage becomes a compute kernel; the
+         * combination with tessellation is rejected by mgl_geom_post_link */
+        if (mask & (SHADER_MASK_BIT(_TESS_CONTROL_SHADER) | SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
+        {
+            mgl_append_info_log(log, "ERROR: a geometry shader after tessellation stages is not supported "
+                                "(the Metal geometry emulation consumes the vertex stage output directly)\n");
+            return false;
+        }
+        if (!(mask & SHADER_MASK_BIT(_VERTEX_SHADER)) && !separable)
+        {
+            mgl_append_info_log(log, "ERROR: a program containing a geometry shader must contain a vertex shader\n");
+            return false;
+        }
     }
 
     if ((mask & SHADER_MASK_BIT(_TESS_CONTROL_SHADER)) && !(mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
@@ -1231,7 +1267,7 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         mask |= SHADER_MASK_BIT(s->glm_type);
     }
 
-    if (!ok || !check_stage_mask(mask, log))
+    if (!ok || !check_stage_mask(mask, log, obj ? obj->separable == GL_TRUE : false))
         return false;
 
     glsl_program = glslang_program_create();
@@ -1341,7 +1377,7 @@ static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramOb
         mask |= SHADER_MASK_BIT(s->glm_type);
     }
 
-    if (!ok || !check_stage_mask(mask, log))
+    if (!ok || !check_stage_mask(mask, log, obj ? obj->separable == GL_TRUE : false))
         return false;
 
     for (int i = 0; i < obj->num_attached && ok; i++)
@@ -1399,7 +1435,7 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
     }
     else
     {
-        ok = check_stage_mask(mask, &log);
+        ok = check_stage_mask(mask, &log, obj ? obj->separable == GL_TRUE : false);
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
             if (mask & SHADER_MASK_BIT(stage))
                 ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log,
@@ -1482,6 +1518,7 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     {
         mgl_ext_post_link(ctx, pptr);
         mgl_program_check_xfb_link(ctx, pptr);
+        mgl_program_check_geom_link(ctx, pptr);
     }
 }
 
@@ -1498,7 +1535,7 @@ bool mgl_program_link_spirv_stages(GLMContext ctx, Program *program, const uint3
     if (ok)
     {
         mgl_ext_post_link(ctx, program);
-        ok = mgl_program_check_xfb_link(ctx, program);
+        ok = mgl_program_check_xfb_link(ctx, program) && mgl_program_check_geom_link(ctx, program);
     }
 
     return ok;
@@ -1675,8 +1712,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
                 break;
             *params = (pname == GL_TRANSFORM_FEEDBACK_BUFFER_MODE) ? GL_INTERLEAVED_ATTRIBS : 0;
             break;
-        /* geometry / tessellation programs never link on Metal (see check_stage_mask),
-         * so these queries always hit the "no such stage linked" error */
+        /* geometry programs: the geom domain answers from its reflection */
         case GL_GEOMETRY_VERTICES_OUT:
         case GL_GEOMETRY_INPUT_TYPE:
         case GL_GEOMETRY_OUTPUT_TYPE:
@@ -1686,7 +1722,8 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            *params = 0;
+            if (!mgl_geom_get_programiv(ctx, pptr, pname, params))
+                *params = 0;
             break;
         case GL_TESS_CONTROL_OUTPUT_VERTICES:
             if (!obj->link_status || !(obj->linked_mask & SHADER_MASK_BIT(_TESS_CONTROL_SHADER)))

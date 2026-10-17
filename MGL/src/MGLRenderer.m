@@ -2782,6 +2782,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
     [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
+    // blend state, vertex descriptor, depth/stencil formats are bound by their domains
+    [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
+
+    // the geometry domain needs the topology class set when its pass-through vertex
+    // function writes render_target_array_index / viewport_array_index (gl_Layer /
+    // gl_ViewportIndex), which Metal requires
+    [self geomConfigureTopology: pipelineStateDescriptor];
+
     return pipelineStateDescriptor;
 }
 
