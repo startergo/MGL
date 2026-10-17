@@ -3973,8 +3973,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER;
+
+            // the previous encoder may have been ended by a flush / readback
+            if (_currentRenderEncoder == NULL)
+            {
+                RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+            }
         }
-        else if (ctx->state.dirty_bits & DIRTY_RENDER_STATE)
+        else if ((ctx->state.dirty_bits & DIRTY_RENDER_STATE) || _currentRenderEncoder == NULL)
         {
             if (_currentRenderEncoder == NULL)
             {
@@ -4129,6 +4135,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
     else // if (ctx->state.dirty_bits)
     {
+        // the previous encoder may have been ended by a flush / readback
+        if (_currentRenderEncoder == NULL)
+        {
+            RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+        }
+
         // buffer data can be changed but the bindings remain in place.. so we need to update the data if this is the case
         // like a uniform or buffer sub data call
         
