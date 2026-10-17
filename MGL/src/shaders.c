@@ -634,6 +634,10 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     /* introspect: GL assigns uniform/interface locations at link time (introspect_spirv.c);
      * without this, 3.30+ shaders with loose uniforms lacking layout(location) fail to compile */
     options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
+    /* GL-legal shaders may declare UBO/SSBO/atomic/sampler uniforms without layout(binding);
+     * glslang refuses to compile those for SPIR-V unless it can auto-map bindings.  The invented
+     * numbers are detected and replaced with the GL default (binding 0) at link (introspect_spirv.c). */
+    options |= GLSLANG_SHADER_AUTO_MAP_BINDINGS;
     glslang_shader_set_options(glsl_shader, options);
 
     if (!glslang_shader_preprocess(glsl_shader, &glsl_input) ||

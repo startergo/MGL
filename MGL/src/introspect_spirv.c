@@ -295,6 +295,9 @@ static void kill_decs(SMod *m, uint32_t id, int32_t mem, uint32_t d)
 
 static uint32_t align_up(uint32_t v, uint32_t a) { return a ? (v + a - 1) / a * a : v; }
 
+/* declared with layout(<qual>) in the GLSL source? (defined near the link entry) */
+static bool src_explicit_qual(const char *src, const char *name, const char *dir, const char *qual);
+
 static uint32_t scalar_bytes(const SMod *m, uint32_t t)
 {
     if (m->t[t].kind == T_BOOL) return 1;
@@ -1321,10 +1324,10 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
 
 static bool name_is_hidden(const char *n) { return !strncmp(n, "_mgl_sr_", 8); }
 
-static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, int *loc_cursors_dummy)
+static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *src)
 {
     const SMod *m = s->r;
-    (void)loc_cursors_dummy;
+    (void)src;
     /* default block members */
     for (uint32_t k = 0; k < s->ndub; k++) {
         if (!s->dub_active[k]) continue;
@@ -1351,6 +1354,8 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, int *loc_curs
             uint32_t binding = 0, off = 0;
             get_dec(m, v, -1, SpvDecorationBinding, &binding);
             get_dec(m, v, -1, SpvDecorationOffset, &off);
+            /* glslang auto-mapped bindings are not explicit: GL defaults every atomic counter to binding 0 */
+            if (binding && !src_explicit_qual(src, id_name(m, v), "uniform", "binding")) binding = 0;
             int ab = -1;
             for (int i = 0; i < ip->nabufs; i++) if (ip->abufs[i].binding == (GLint)binding) ab = i;
             if (ab < 0) {
@@ -1385,6 +1390,8 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, int *loc_curs
         const char *bname = id_name(m, st);
         const char *iname = id_name(m, v);
         uint32_t binding = 0; get_dec(m, v, -1, SpvDecorationBinding, &binding);
+        /* glslang auto-mapped bindings are not explicit: GL defaults un-bound blocks to binding point 0 */
+        if (binding && !src_explicit_qual(src, bname, ubo ? "uniform" : "buffer", "binding")) binding = 0;
         uint32_t nel = m->t[t].kind == T_ARRAY ? m->t[t].count : 0;
         for (uint32_t e = 0; e < (nel ? nel : 1); e++) {
             char nm[512];
@@ -1410,8 +1417,9 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, int *loc_curs
     }
 }
 
-/* assign locations to default-block / opaque uniforms (explicit first, then by order) */
-static void assign_uniform_locations(MGLIProgram *ip)
+/* assign locations to default-block / opaque uniforms (explicit first, then by order).
+ * Fails (GL link error) when two different default-block uniforms end up on the same location. */
+static bool assign_uniform_locations(MGLIProgram *ip)
 {
     int maxloc = 0;
     for (int i = 0; i < ip->nuniforms; i++) {
@@ -1449,8 +1457,16 @@ static void assign_uniform_locations(MGLIProgram *ip)
     for (int i = 0; i < ip->nuniforms; i++) {
         MGLIUniform *u = &ip->uniforms[i];
         if (u->location < 0) continue;
-        for (int k = 0; k < u->size; k++) { ip->locs[u->location + k].uniform = i; ip->locs[u->location + k].element = k; }
+        for (int k = 0; k < u->size; k++) {
+            if (ip->locs[u->location + k].uniform >= 0 && ip->locs[u->location + k].uniform != i) {
+                free(ip->locs); ip->locs = NULL; ip->nlocs = 0;
+                return false; /* GL 4.6: linking fails on colliding explicit uniform locations */
+            }
+            ip->locs[u->location + k].uniform = i;
+            ip->locs[u->location + k].element = k;
+        }
     }
+    return true;
 }
 
 
@@ -1483,10 +1499,11 @@ static void dump_words(const uint32_t *w, size_t n, Program *ptr, int stage, con
 }
 
 
-/* is `name` declared with layout(location) as an `in`/`out` variable in the GLSL source? */
-static bool src_explicit_location(const char *src, const char *name, const char *dir)
+/* is `name` declared with layout(qual) as an `in`/`out`/`uniform`/`buffer` variable in the GLSL source? */
+static bool src_explicit_qual(const char *src, const char *name, const char *dir, const char *qual)
 {
     if (!src) return true;
+    size_t ql = strlen(qual);
     size_t n = strlen(src);
     char *b = malloc(n + 1);
     /* strip comments */
@@ -1503,19 +1520,19 @@ static bool src_explicit_location(const char *src, const char *name, const char 
         if (*c == ';' || *c == '{' || *c == '}' || *c == 0) {
             char save = *c; *c = 0;
             /* tokens */
-            bool has_dir = false, has_loc = false; char last[256] = "";
+            bool has_dir = false, has_qual = false; char last[256] = "";
             for (char *t = st; *t; ) {
                 if (isalnum((unsigned char)*t) || *t == '_') {
                     char *e = t; while (isalnum((unsigned char)*e) || *e == '_') e++;
                     size_t l = (size_t)(e - t);
                     if (l == strlen(dir) && !strncmp(t, dir, l)) has_dir = true;
-                    if (l == 8 && !strncmp(t, "location", 8)) has_loc = true;
+                    if (l == ql && !strncmp(t, qual, l)) has_qual = true;
                     if (l < sizeof last) { memcpy(last, t, l); last[l] = 0; }
                     t = e;
                 } else if (*t == '[') { while (*t && *t != ']') t++; }
                 else t++;
             }
-            if (has_dir && !strcmp(last, name)) { found = true; expl = has_loc; }
+            if (has_dir && !strcmp(last, name)) { found = true; expl = has_qual; }
             *c = save;
             if (!save) break;
             st = c + 1;
@@ -1523,6 +1540,12 @@ static bool src_explicit_location(const char *src, const char *name, const char 
     }
     free(b);
     return found ? expl : true;
+}
+
+/* is `name` declared with layout(location) as an `in`/`out` variable in the GLSL source? */
+static bool src_explicit_location(const char *src, const char *name, const char *dir)
+{
+    return src_explicit_qual(src, name, dir, "location");
 }
 
 static const char *stage_source(GLMContext ctx, Program *program, int stage)
@@ -1550,14 +1573,22 @@ uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage
         sc[stage].present = 1;
         sc[stage].ip = ip;
         sc[stage].no_pack = attempt;
-        /* locations glslang's map_io invented are not "explicit": bindings may override them */
+        /* locations glslang's map_io invented are not "explicit": bindings may override them.
+         * The same is true for uniforms: glslang numbers every loose uniform, but in GL only
+         * layout(location=N) counts — invented numbers must not leak into the location table. */
         const char *src = stage_source(ctx, program, stage);
         SMod *m = sc[stage].m;
-        if (src && (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER)) {
-            uint32_t want = stage == _VERTEX_SHADER ? SpvStorageClassInput : SpvStorageClassOutput;
+        if (src) {
             for (uint32_t v = 1; v <= m->bound; v++) {
-                if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != want || is_builtin_var(m, v)) continue;
-                if (!get_dec(m, v, -1, SpvDecorationLocation, NULL)) continue;
+                if (!m->isvar[v] || !m->vglobal[v] || !get_dec(m, v, -1, SpvDecorationLocation, NULL)) continue;
+                if (m->vsc[v] == SpvStorageClassUniformConstant) {
+                    if (!src_explicit_location(src, id_name(m, v), "uniform"))
+                        kill_decs(m, v, -1, SpvDecorationLocation);
+                    continue;
+                }
+                if (!(stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER)) continue;
+                uint32_t want = stage == _VERTEX_SHADER ? SpvStorageClassInput : SpvStorageClassOutput;
+                if (m->vsc[v] != want || is_builtin_var(m, v)) continue;
                 if (!src_explicit_location(src, id_name(m, v), stage == _VERTEX_SHADER ? "in" : "out")) {
                     kill_decs(m, v, -1, SpvDecorationLocation);
                     kill_decs(m, v, -1, SpvDecorationIndex);
@@ -1652,14 +1683,17 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
     }
 
     /* reflection */
-    for (int s = 0; s < MGLI_STAGES; s++) if (sc[s].present && sc[s].r) reflect_stage(ip, &sc[s], s, NULL);
+    for (int s = 0; s < MGLI_STAGES; s++) if (sc[s].present && sc[s].r) reflect_stage(ip, &sc[s], s, stage_source(ctx, ptr, s));
     if (ip->first_stage >= 0 && sc[ip->first_stage].r)
         reflect_io(ip, sc[ip->first_stage].r, ip->first_stage, sc[ip->first_stage].active, true, &ip->inputs, &ip->ninputs);
     if (ip->last_stage >= 0 && ip->last_stage != _COMPUTE_SHADER && sc[ip->last_stage].r)
         reflect_io(ip, sc[ip->last_stage].r, ip->last_stage, sc[ip->last_stage].active, false, &ip->outputs, &ip->noutputs);
     for (int s = _GEOMETRY_SHADER; s >= _VERTEX_SHADER; s--)
         if (sc[s].present && sc[s].r) { reflect_io(ip, sc[s].r, s, sc[s].active, false, &ip->vtx_outputs, &ip->nvtx_outputs); break; }
-    assign_uniform_locations(ip);
+    if (!assign_uniform_locations(ip)) {
+        fprintf(stderr, "MGL introspect: program %u: colliding explicit uniform locations\n", ip->prog ? ip->prog->name : 0);
+        return false;
+    }
 
     /* uniform storage + initializers + initial opaque bindings */
     for (int i = 0; i < ip->nuniforms; i++) {
@@ -1670,9 +1704,11 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
         for (int s = 0; s < MGLI_STAGES; s++) {
             if (!u->st[s].present || !sc[s].r) continue;
             if (u->opaque_class) {
-                uint32_t b = 0; /* default unit: layout(binding) */
-                if (get_dec(sc[s].r, u->st[s].spv_id, -1, SpvDecorationBinding, &b))
-                    for (int e = 0; e < u->size; e++) ((uint32_t *)u->shadow)[e] = b + (uint32_t)(u->st[s].elem_base + e);
+                uint32_t b = 0; /* default unit: layout(binding), else texture unit 0 */
+                const char *src = stage_source(ctx, ptr, s);
+                if (get_dec(sc[s].r, u->st[s].spv_id, -1, SpvDecorationBinding, &b) &&
+                    src && !src_explicit_qual(src, u->name, "uniform", "binding")) b = 0;
+                for (int e = 0; e < u->size; e++) ((uint32_t *)u->shadow)[e] = b + (uint32_t)(u->st[s].elem_base + e);
                 continue;
             }
             for (int k = 0; k < ip->ninits[s]; k++) {
