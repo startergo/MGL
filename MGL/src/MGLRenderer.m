@@ -51,6 +51,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "MGLRenderer+Framebuffer.h"
 #import "MGLRenderer+TextureData.h"
 #import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
+#import "MGLRenderer+Gpuaudit.h" // gpuaudit: render pipeline state cache (draw-path CPU cost)
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -3218,6 +3219,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
             pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
 
+            // gpuaudit: pipeline states are cached by descriptor content (MGLRenderer+Gpuaudit.m);
+            // a hit skips the descriptor walk and newRenderPipelineStateWithDescriptor entirely
+            id<MTLRenderPipelineState> gpuauditCached = [self gpuauditPipelineForDescriptor: pipelineStateDescriptor];
+            if (gpuauditCached)
+            {
+                _pipelineState = gpuauditCached;
+            }
+            else
+            {
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
             NSError *error;
 
@@ -3310,6 +3320,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 return false;
             } else {
                 NSLog(@"MGL INFO: Pipeline state created successfully");
+                // gpuaudit: remember this configuration so the next identical one is a lookup
+                [self gpuauditStorePipeline: _pipelineState forDescriptor: pipelineStateDescriptor];
+            }
             }
 
             ctx->state.dirty_bits &= ~(DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO);

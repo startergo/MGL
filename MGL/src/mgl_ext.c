@@ -18,6 +18,7 @@ void mgl_ext_init_all(GLMContext ctx)
     mgl_ext_init_buffers(ctx);
     mgl_ext_init_geom(ctx);
     mgl_ext_init_tess(ctx);
+    mgl_ext_init_gpuaudit(ctx);
 }
 
 bool mgl_ext_get(GLMContext ctx, GLenum pname, GLuint type, void *data)
@@ -35,7 +36,8 @@ bool mgl_ext_get(GLMContext ctx, GLenum pname, GLuint type, void *data)
         || mgl_ext_get_texext(ctx, pname, type, data)
         || mgl_ext_get_buffers(ctx, pname, type, data)
         || mgl_ext_get_geom(ctx, pname, type, data)
-        || mgl_ext_get_tess(ctx, pname, type, data);
+        || mgl_ext_get_tess(ctx, pname, type, data)
+        || mgl_ext_get_gpuaudit(ctx, pname, type, data);
 }
 
 #define MGL_EXT_MAX_HOOKS 16
