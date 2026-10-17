@@ -232,6 +232,17 @@ def create_with_retry(client, **kwargs):
                 raise SystemExit(f"FATAL provider error, not retrying: {msg[:200]}\n"
                                  "Fix the account/key, then re-run agents/run_glm_domains.sh <domains> "
                                  "(workers resume from their saved transcripts).")
+            # Z.AI 1308 = plan usage window exhausted ("will reset at YYYY-MM-DD HH:MM:SS", server time
+            # UTC+8 by default, GLM_RESET_TZ_OFFSET to override): sleep until the reset, then retry
+            m = re.search(r"reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", msg)
+            if "1308" in msg and m:
+                tz = datetime.timezone(datetime.timedelta(hours=float(os.environ.get("GLM_RESET_TZ_OFFSET", "8"))))
+                reset = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
+                wait = (reset - datetime.datetime.now(datetime.timezone.utc)).total_seconds() + 120
+                if 0 < wait <= 6 * 3600:
+                    print(f"  usage limit (1308); sleeping {int(wait)}s until {reset.isoformat()}", flush=True)
+                    time.sleep(wait)
+                    continue
             if attempt == 7:
                 raise
             print(f"  API error ({type(e).__name__}: {str(e)[:160]}); retry in {delay}s", flush=True)
