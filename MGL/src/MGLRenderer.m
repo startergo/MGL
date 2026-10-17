@@ -118,79 +118,59 @@ void logDirtyBits(GLMContext ctx)
 #pragma mark buffer objects
 - (void) bindMTLBuffer:(Buffer *) ptr
 {
-    MTLResourceOptions options;
+    // 'buffers' domain: the MTLBuffer ALIASES the GL data store (Buffer.data.buffer_data),
+    // so CPU and GPU see one copy; CPU/GPU ordering is handled in MGLRenderer+Draw.m
+    if (ptr->data.mtl_data)
+        return;
 
-    options = MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeManaged;
+    MTLResourceOptions options = MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeManaged;
 
-    // ways we will only write to this
-    if ((ptr->storage_flags & GL_MAP_READ_BIT) == 0)
+    if ((ptr->storage_flags & GL_MAP_READ_BIT) == 0 && ptr->storage_flags)
     {
         options |= MTLResourceCPUCacheModeWriteCombined;
     }
 
-    if (ptr->storage_flags & GL_CLIENT_STORAGE_BIT)
-    {
-        id<MTLBuffer> buffer = [_device newBufferWithBytesNoCopy: (void *)(ptr->data.buffer_data)
-                                                     length: ptr->size // allocate only size since this is what will be transferred
-                                                    options: options
-                                                deallocator: ^(void *pointer, NSUInteger length)
-                                                {
-                                                    kern_return_t err;
-                                                    err = vm_deallocate((vm_map_t) mach_task_self(),
-                                                                        (vm_address_t) pointer,
-                                                                        length);
-                                                    assert(err == 0);
-                                                }];
+    size_t length = ptr->data.buffer_size;
+    if (length == 0)
+        length = ((size_t)(ptr->size > 0 ? ptr->size : 1) + 4095) & ~(size_t)4095;
 
-        ptr->data.mtl_data = (void *)CFBridgingRetain(buffer);
+    id<MTLBuffer> buffer;
+
+    if ((ptr->storage_flags & GL_CLIENT_STORAGE_BIT) && ptr->data.buffer_data)
+    {
+        // wrap the page aligned vm allocation without copying
+        buffer = [_device newBufferWithBytesNoCopy: (void *)(ptr->data.buffer_data)
+                                            length: length
+                                           options: options
+                                       deallocator: ^(void *pointer, NSUInteger len)
+                                       {
+                                           vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) pointer, len);
+                                       }];
+    }
+    else if (ptr->data.buffer_data)
+    {
+        buffer = [_device newBufferWithBytes:(void *)ptr->data.buffer_data length:length options:options];
+
+        if (buffer)
+        {
+            vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) ptr->data.buffer_data, ptr->data.buffer_size);
+        }
     }
     else
     {
-        id<MTLBuffer> buffer;
-        
-        // a backing can allocated initially, delete it and point the
-        // backing data to the MTL buffer
-        if (ptr->data.buffer_data)
-        {
-            // check the GL allocated size, not the vm_allocated size as these are page aligned
-            if (ptr->size > 4095)
-            {
-                buffer = [_device newBufferWithBytes:(void *)ptr->data.buffer_data
-                                                            length:ptr->data.buffer_size
-                                                           options:options];
-                assert(buffer);
-
-                kern_return_t err;
-                err = vm_deallocate((vm_map_t) mach_task_self(),
-                                    (vm_address_t) ptr->data.buffer_data,
-                                    ptr->data.buffer_size);
-                assert(err == 0);
-
-                ptr->data.buffer_data = (vm_address_t)buffer.contents;
-            }
-            else
-            {
-                // AGX Driver Compatibility: For small buffers, still create a Metal buffer to avoid NULL assertion
-                buffer = [_device newBufferWithBytes:(void *)ptr->data.buffer_data
-                                              length:ptr->size
-                                             options:options];
-                assert(buffer);
-
-                // Don't deallocate the original buffer for small sizes to maintain compatibility
-                ptr->data.mtl_data = (void *)CFBridgingRetain(buffer);
-            }
-        }
-        else
-        {
-            buffer = [_device newBufferWithLength: ptr->size // allocate by size
-                                                        options: options];
-            assert(buffer);
-
-            ptr->data.buffer_data = (vm_address_t)NULL;
-        }
-
-        ptr->data.mtl_data = (void *)CFBridgingRetain(buffer);
+        buffer = [_device newBufferWithLength: length options: options];
     }
+
+    if (!buffer)
+    {
+        NSLog(@"MGL ERROR: bindMTLBuffer failed to allocate %zu bytes for buffer %u", length, ptr->name);
+        return;
+    }
+
+    ptr->data.buffer_data = (vm_address_t)buffer.contents;
+    ptr->data.buffer_size = length;
+    ptr->data.mtl_data = (void *)CFBridgingRetain(buffer);
+    ptr->data.dirty_bits &= ~DIRTY_BUFFER_ADDR;
 }
 
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
@@ -298,7 +278,7 @@ void logDirtyBits(GLMContext ctx)
 - (bool) updateDirtyBuffer:(Buffer *)ptr
 {
     // buffers less than 4k will be uploaded using setVertexBytes
-    if (ptr->size < 4096)
+    if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
     {
         ptr->data.dirty_bits &= ~DIRTY_BUFFER_ADDR;
         
@@ -423,9 +403,9 @@ void logDirtyBits(GLMContext ctx)
         assert(ptr);
 
         // for buffers less than 4k we should use this call
-        if (ptr->size < 4096)
+        if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
-            assert(ptr->data.mtl_data == NULL);
+            if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
             [_currentRenderEncoder setVertexBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:i];
             
@@ -463,9 +443,9 @@ void logDirtyBits(GLMContext ctx)
 
         assert(ptr);
         
-        if (ptr->size < 4096)
+        if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
-            assert(ptr->data.mtl_data == NULL);
+            if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
             [_currentRenderEncoder setFragmentBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:i];
             
@@ -4982,7 +4962,7 @@ void mtlMultiDrawElements(GLMContext glm_ctx, GLenum mode, const GLsizei *count,
         offset = (char *)indices[i] - (char *)NULL;
 
         [_currentRenderEncoder drawIndexedPrimitives:primitiveType indexCount:count[i] indexType:indexType
-                                     indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:count[i] baseVertex:basevertex[i] baseInstance:1];
+                                     indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:1 baseVertex:basevertex[i] baseInstance:0];
     }
 }
 
