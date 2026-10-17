@@ -340,7 +340,12 @@ GLuint mglCreateShader(GLMContext ctx, GLenum type)
             return 0;
     }
 
+    /* shaders and programs share one GL namespace */
     shader = getNewName(&STATE(shader_table));
+    if (shader < STATE(program_table).current_name)
+        shader = STATE(program_table).current_name;
+    STATE(shader_table).current_name = shader + 1;
+    STATE(program_table).current_name = shader + 1;
 
     if (!getShader(ctx, type, shader))
         return 0;

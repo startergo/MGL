@@ -194,7 +194,12 @@ GLuint mglCreateProgram(GLMContext ctx)
 {
     GLuint program;
 
+    /* shaders and programs share one GL namespace */
     program = getNewName(&STATE(program_table));
+    if (program < STATE(shader_table).current_name)
+        program = STATE(shader_table).current_name;
+    STATE(program_table).current_name = program + 1;
+    STATE(shader_table).current_name = program + 1;
 
     if (!getProgram(ctx, program))
         return 0;

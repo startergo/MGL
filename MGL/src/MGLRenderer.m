@@ -4478,6 +4478,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // end encoding on current render encoder
     [self endRenderEncoding];
 
+    // after glFinish the current command buffer is committed; compute needs a fresh one
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        RETURN_ON_FAILURE([self newCommandBuffer]);
+
     id <MTLComputeCommandEncoder> computeCommandEncoder = [_currentCommandBuffer computeCommandEncoder];
     assert(computeCommandEncoder);
 
