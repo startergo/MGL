@@ -49,6 +49,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
+#import "MGLRenderer+TextureData.h"
 #import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
 
@@ -1689,48 +1690,46 @@ void logDirtyBits(GLMContext ctx)
 
 - (bool) bindTexturesToCurrentRenderEncoder
 {
-    GLuint count;
+    // sampled textures of the vertex and fragment stages (texdata); unbound units are skipped
+    static const int stages[2] = { _VERTEX_SHADER, _FRAGMENT_SHADER };
 
-    // iterate shader storage buffers
-    count = [self getProgramBindingCount: _FRAGMENT_SHADER type: SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
-    if (count)
+    for (int st = 0; st < 2; st++)
     {
-        int textures_to_be_mapped = count;
+        int stage = stages[st];
+        GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
 
-        // something is very wrong..
-        assert(textures_to_be_mapped < TEXTURE_UNITS);
-
-        for (int i=0; textures_to_be_mapped > 0; i++)
+        for (GLuint i = 0; i < count; i++)
         {
-            RETURN_FALSE_ON_FAILURE(i < count);
+            GLuint spirv_binding = [self getProgramBinding:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index: i];
 
-            GLuint spirv_binding;
-            Texture *ptr;
+            if (spirv_binding >= TEXTURE_UNITS)
+                continue;
 
-            spirv_binding = [self getProgramBinding:_FRAGMENT_SHADER type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index: i];
+            Texture *ptr = STATE(active_textures[spirv_binding]);
+            if (!ptr)
+                continue;
 
-            ptr = STATE(active_textures[spirv_binding]);
+            RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
+            if (!ptr->mtl_data)
+                continue;
 
-            if (ptr)
+            id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
+
+            // sampler objects bound to the unit override the texture's sampler state;
+            // swizzle / base+max level / stencil mode select a texture view (texparam)
+            id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
+            texture = [self texparamTextureForTex:ptr base:texture];
+            assert(sampler);
+
+            if (stage == _VERTEX_SHADER)
             {
-                id<MTLTexture> texture;
-
-                RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
-                assert(ptr->mtl_data);
-
-                texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
-                assert(texture);
-
-                // sampler objects bound to the unit override the texture's sampler state;
-                // swizzle / base+max level / stencil mode select a texture view (texparam)
-                id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
-                texture = [self texparamTextureForTex:ptr base:texture];
-                assert(sampler);
-
+                [_currentRenderEncoder setVertexTexture:texture atIndex:spirv_binding];
+                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:spirv_binding];
+            }
+            else
+            {
                 [_currentRenderEncoder setFragmentTexture:texture atIndex:spirv_binding];
                 [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:spirv_binding];
-
-                textures_to_be_mapped--;
             }
         }
     }
@@ -1838,6 +1837,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 - (bool)bindMTLTexture:(Texture *)tex
 {
     [self texextValidateTexture: tex]; // texext: buffer reallocated / view root recreated
+
+    // texdata: realization / uploads of regular textures (MGLRenderer+TextureData.m)
+    if ([self texdataBindMTLTexture: tex])
+        return true;
 
     if (tex->dirty_bits)
     {

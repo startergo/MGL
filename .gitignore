@@ -20,3 +20,6 @@ agents/__pycache__/
 agents/output/
 agents/.env
 agents/**/__pycache__/
+wt/*/agent.log
+wt/*/agent_report.md
+wt/*/.agent/

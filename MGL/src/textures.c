@@ -16,25 +16,59 @@
  * textures.c
  * MGL
  *
+ * GL 4.6 texture objects, image specification, pixel transfer, compressed
+ * images, copies, readback and clears ('texdata' domain).  GPU work is done by
+ * MGLRenderer+TextureData.m through ctx->mtl_funcs.ext_texdata; the storage
+ * model is described in mgl_ext_texdata.h.
  */
 
-#include <mach/mach_vm.h>
-#include <mach/mach_init.h>
-#include <mach/vm_map.h>
-
 #include <stdio.h>
-
-#include <Accelerate/Accelerate.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "pixel_utils.h"
 #include "utils.h"
 #include "glm_context.h"
 #include "mgl_ext_texdata.h"
 #include "mgl_ext_texparam.h"
+#include "mgl_ext_fb.h"
 
-extern void *getBufferData(GLMContext ctx, Buffer *ptr);
+#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
+#endif
 
-bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels);
+/* error helpers that really return (ERROR_RETURN in glm_context.h does not) */
+#define TD_ERR(e)        do { ctx->error_func(ctx, __FUNCTION__, (e)); return; } while (0)
+#define TD_ERRV(e, v)    do { ctx->error_func(ctx, __FUNCTION__, (e)); return (v); } while (0)
+#define TD_CHECK(c, e)   do { if (!(c)) TD_ERR(e); } while (0)
+
+#define TDS(ctx)  ((ctx)->state.ext_texdata)
+#define TDM(ctx)  ((ctx)->mtl_funcs.ext_texdata)
+
+enum { TD_PROXY_1D, TD_PROXY_2D, TD_PROXY_3D, TD_PROXY_RECT, TD_PROXY_1D_ARRAY, TD_PROXY_2D_ARRAY,
+       TD_PROXY_CUBE, TD_PROXY_CUBE_ARRAY, TD_NUM_PROXIES };
+
+/* ------------------------------------------------------------------------ */
+/* limits                                                                   */
+/* ------------------------------------------------------------------------ */
+
+static GLuint limitOr(GLuint v, GLuint dflt) { return (v == 0 || v > (1u << 15)) ? dflt : v; }
+static GLuint maxTexSize(GLMContext ctx)   { return limitOr(STATE_VAR(max_texture_size), 16384); }
+static GLuint max3DSize(GLMContext ctx)    { return limitOr(STATE_VAR(max_3d_texture_size), 2048); }
+static GLuint maxCubeSize(GLMContext ctx)  { return limitOr(STATE_VAR(max_cube_map_texture_size), 16384); }
+static GLuint maxLayers(GLMContext ctx)    { return limitOr(STATE_VAR(max_array_texture_layers), 2048); }
+static GLuint maxRectSize(GLMContext ctx)  { return limitOr(STATE_VAR(max_rectangle_texture_size), 16384); }
+static GLuint maxUnits(GLMContext ctx)
+{
+    GLuint n = STATE_VAR(max_combined_texture_image_units);
+    return (n == 0 || n > TEXTURE_UNITS) ? TEXTURE_UNITS : n;
+}
+
+static GLuint log2u(GLuint v) { GLuint r = 0; while (v > 1) { v >>= 1; r++; } return r; }
+
+/* ------------------------------------------------------------------------ */
+/* targets                                                                  */
+/* ------------------------------------------------------------------------ */
 
 GLuint textureIndexFromTarget(GLMContext ctx, GLenum target)
 {
@@ -52,23 +86,86 @@ GLuint textureIndexFromTarget(GLMContext ctx, GLenum target)
         case GL_TEXTURE_2D_MULTISAMPLE: return _TEXTURE_2D_MULTISAMPLE;
         case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: return _TEXTURE_2D_MULTISAMPLE_ARRAY;
         case GL_RENDERBUFFER: return _RENDERBUFFER;
-
-        default:
-            assert(0);
+        default: break;
     }
 
-    assert(0);
-
+    (void)ctx;
     return _MAX_TEXTURE_TYPES;
 }
 
+static GLenum targetFromIndex(GLuint index)
+{
+    static const struct { GLuint i; GLenum t; } map[] = {
+        { _TEXTURE_BUFFER_TARGET, GL_TEXTURE_BUFFER }, { _TEXTURE_1D, GL_TEXTURE_1D }, { _TEXTURE_2D, GL_TEXTURE_2D },
+        { _TEXTURE_3D, GL_TEXTURE_3D }, { _TEXTURE_RECTANGLE, GL_TEXTURE_RECTANGLE },
+        { _TEXTURE_1D_ARRAY, GL_TEXTURE_1D_ARRAY }, { _TEXTURE_2D_ARRAY, GL_TEXTURE_2D_ARRAY },
+        { _TEXTURE_CUBE_MAP, GL_TEXTURE_CUBE_MAP }, { _TEXTURE_CUBE_MAP_ARRAY, GL_TEXTURE_CUBE_MAP_ARRAY },
+        { _TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_2D_MULTISAMPLE },
+        { _TEXTURE_2D_MULTISAMPLE_ARRAY, GL_TEXTURE_2D_MULTISAMPLE_ARRAY }, { _RENDERBUFFER, GL_RENDERBUFFER },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (map[i].i == index) return map[i].t;
+    return 0;
+}
+
+static bool isCubeFace(GLenum target)
+{
+    return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;
+}
+
+static bool isArrayTarget(GLenum target)
+{
+    return target == GL_TEXTURE_1D_ARRAY || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_CUBE_MAP_ARRAY ||
+           target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
+}
+
+GLuint mgl_texdata_num_faces(Texture *tex)
+{
+    return tex->target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
+}
+
+static int proxyIndex(GLenum target)
+{
+    switch (target)
+    {
+        case GL_PROXY_TEXTURE_1D: return TD_PROXY_1D;
+        case GL_PROXY_TEXTURE_2D: return TD_PROXY_2D;
+        case GL_PROXY_TEXTURE_3D: return TD_PROXY_3D;
+        case GL_PROXY_TEXTURE_RECTANGLE: return TD_PROXY_RECT;
+        case GL_PROXY_TEXTURE_1D_ARRAY: return TD_PROXY_1D_ARRAY;
+        case GL_PROXY_TEXTURE_2D_ARRAY: return TD_PROXY_2D_ARRAY;
+        case GL_PROXY_TEXTURE_CUBE_MAP: return TD_PROXY_CUBE;
+        case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY: return TD_PROXY_CUBE_ARRAY;
+        default: return -1;
+    }
+}
+
+static GLenum proxyTexTarget(GLenum proxy)
+{
+    switch (proxy)
+    {
+        case GL_PROXY_TEXTURE_1D: return GL_TEXTURE_1D;
+        case GL_PROXY_TEXTURE_2D: return GL_TEXTURE_2D;
+        case GL_PROXY_TEXTURE_3D: return GL_TEXTURE_3D;
+        case GL_PROXY_TEXTURE_RECTANGLE: return GL_TEXTURE_RECTANGLE;
+        case GL_PROXY_TEXTURE_1D_ARRAY: return GL_TEXTURE_1D_ARRAY;
+        case GL_PROXY_TEXTURE_2D_ARRAY: return GL_TEXTURE_2D_ARRAY;
+        case GL_PROXY_TEXTURE_CUBE_MAP: return GL_TEXTURE_CUBE_MAP;
+        case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY: return GL_TEXTURE_CUBE_MAP_ARRAY;
+        default: return 0;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* objects                                                                  */
+/* ------------------------------------------------------------------------ */
+
 Texture *currentTexture(GLMContext ctx, GLuint index)
 {
-    GLuint active_texture;
+    if (index >= _MAX_TEXTURE_TYPES)
+        return NULL;
 
-    active_texture = STATE(active_texture);
-
-    return STATE(texture_units[active_texture].textures[index]);
+    return STATE(texture_units[STATE(active_texture)].textures[index]);
 }
 
 Texture *newTexObj(GLMContext ctx, GLenum target)
@@ -77,24 +174,21 @@ Texture *newTexObj(GLMContext ctx, GLenum target)
     GLuint index;
 
     index = textureIndexFromTarget(ctx, target);
-    if (index == _MAX_TEXTURE_TYPES)
+    if (index == _MAX_TEXTURE_TYPES && proxyIndex(target) < 0)
     {
-        assert(0);
+        ERROR_RETURN_VALUE(GL_INVALID_ENUM, NULL);
     }
 
-    ptr = (Texture *)malloc(sizeof(Texture));
-    // CRITICAL SECURITY FIX: Check malloc result instead of using assert()
-    if (!ptr) {
-        fprintf(stderr, "MGL SECURITY ERROR: Failed to allocate memory for texture\n");
-        STATE(error) = GL_OUT_OF_MEMORY;
-        return NULL;
+    ptr = (Texture *)calloc(1, sizeof(Texture));
+    if (!ptr)
+    {
+        ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, NULL);
     }
-
-    bzero(ptr, sizeof(Texture));
 
     ptr->name = TEX_OBJ_RES_NAME;
     ptr->target = target;
     ptr->index = index;
+    ptr->access = GL_READ_ONLY;
 
     // GL 4.6 default texture/sampler state (owned by texparam, tex_param.c)
     mglTexParamInitDefaults(&ptr->params, target);
@@ -105,21 +199,15 @@ Texture *newTexObj(GLMContext ctx, GLenum target)
 Texture *newTexture(GLMContext ctx, GLenum target, GLuint texture)
 {
     Texture *ptr;
-    GLuint index;
-
-    index = textureIndexFromTarget(ctx, target);
-    if (index == _MAX_TEXTURE_TYPES)
-    {
-        assert(0);
-    }
 
     ptr = newTexObj(ctx, target);
-
-    ptr->name = texture;
+    if (ptr)
+        ptr->name = texture;
 
     return ptr;
 }
 
+/* create the object for a generated name on first bind */
 static Texture *getTexture(GLMContext ctx, GLenum target, GLuint texture)
 {
     Texture *ptr;
@@ -129,6 +217,8 @@ static Texture *getTexture(GLMContext ctx, GLenum target, GLuint texture)
     if (!ptr)
     {
         ptr = newTexture(ctx, target, texture);
+        if (!ptr)
+            return NULL;
 
         insertHashElement(&STATE(texture_table), texture, ptr);
     }
@@ -136,27 +226,35 @@ static Texture *getTexture(GLMContext ctx, GLenum target, GLuint texture)
     return ptr;
 }
 
-static int isTexture(GLMContext ctx, GLuint texture)
-{
-    Texture *ptr;
-
-    ptr = (Texture *)searchHashTable(&STATE(texture_table), texture);
-
-    if (ptr)
-        return 1;
-
-    return 0;
-}
-
 Texture *findTexture(GLMContext ctx, GLuint texture)
 {
-    Texture *ptr;
+    if (texture == 0)
+        return NULL;
 
-    ptr = (Texture *)searchHashTable(&STATE(texture_table), texture);
-
-    return ptr;
+    return (Texture *)searchHashTable(&STATE(texture_table), texture);
 }
 
+static Texture *defaultTexture(GLMContext ctx, GLuint index)
+{
+    struct MGLExtState_texdata *td = TDS(ctx);
+    GLenum target;
+
+    if (index >= _MAX_TEXTURE_TYPES || !td)
+        return NULL;
+
+    if (td->defaults[index] == NULL)
+    {
+        target = targetFromIndex(index);
+        if (!target)
+            return NULL;
+        td->defaults[index] = newTexObj(ctx, target);
+    }
+
+    return td->defaults[index];
+}
+
+/* bound texture for a target on the active unit (name 0 -> default object),
+ * or the named texture (DSA, target ignored) */
 Texture *getTex(GLMContext ctx, GLuint name, GLenum target)
 {
     GLuint index;
@@ -164,159 +262,269 @@ Texture *getTex(GLMContext ctx, GLuint name, GLenum target)
 
     if (name == 0)
     {
+        if (isCubeFace(target))
+            target = GL_TEXTURE_CUBE_MAP;
+
+        if (proxyIndex(target) >= 0)
+            return mgl_texparam_proxy_texture(ctx, target);
+
         index = textureIndexFromTarget(ctx, target);
-        assert(index != _MAX_TEXTURE_TYPES);
+        if (index == _MAX_TEXTURE_TYPES)
+            return NULL;
 
         ptr = currentTexture(ctx, index);
-        
-        // Create default texture if none exists for this target
-        if (!ptr) {
-            GLuint active_texture = STATE(active_texture);
-            ptr = newTexObj(ctx, target);
-            assert(ptr);
-            STATE(texture_units[active_texture].textures[index]) = ptr;
-            fprintf(stderr, "MGL: Created default texture for target 0x%x\n", target);
-        }
-    }
-    else
-    {
-        ptr = findTexture(ctx, name);
-        assert(ptr);
-        
-        target = ptr->target;
+        if (!ptr)
+            ptr = defaultTexture(ctx, index);
 
-        index = textureIndexFromTarget(ctx, target);
-        assert(index != _MAX_TEXTURE_TYPES);
+        return ptr;
     }
 
-    return ptr;
+    return findTexture(ctx, name);
 }
 
 bool checkInternalFormatForMetal(GLMContext ctx, GLuint internalformat)
 {
-    // see if we can actually use this internal format
-    GLenum mtl_format;
-    mtl_format = mtlFormatForGLInternalFormat(internalformat);
+    (void)ctx;
+    return mtlFormatForGLInternalFormat(internalformat) != MTLPixelFormatInvalid;
+}
 
-    if (mtl_format == MTLPixelFormatInvalid)
+/* ------------------------------------------------------------------------ */
+/* side info                                                                */
+/* ------------------------------------------------------------------------ */
+
+TDTexInfo *mgl_texdata_find_info(GLMContext ctx, Texture *tex)
+{
+    struct MGLExtState_texdata *td = TDS(ctx);
+
+    if (!td || !tex || tex->dirty_on_gpu == 0 || tex->dirty_on_gpu > td->num_infos)
+        return NULL;
+
+    TDTexInfo *info = td->infos[tex->dirty_on_gpu - 1];
+    return (info && info->used) ? info : NULL;
+}
+
+TDTexInfo *mgl_texdata_info(GLMContext ctx, Texture *tex)
+{
+    struct MGLExtState_texdata *td = TDS(ctx);
+    TDTexInfo *info;
+
+    info = mgl_texdata_find_info(ctx, tex);
+    if (info)
+        return info;
+
+    if (!td || !tex)
+        return NULL;
+
+    GLuint slot = td->num_infos;
+    for (GLuint i = td->free_hint; i < td->num_infos; i++)
     {
-        // Only warn once per format to reduce log spam during capability probing
-        static unsigned warned_formats[64] = {0};
-        static int warned_count = 0;
-        int already_warned = 0;
-        for (int i = 0; i < warned_count && i < 64; i++) {
-            if (warned_formats[i] == internalformat) { already_warned = 1; break; }
-        }
-        if (!already_warned && warned_count < 64) {
-            warned_formats[warned_count++] = internalformat;
-            // Only warn for standard GL format ranges (not internal Mesa/Gallium enums)
-            // Skip 0x2xxx (GL get parameters), 0x8Dxx-0x9xxx (internal enums)
-            if (internalformat >= 0x8040 && internalformat < 0x8D70) {
-                fprintf(stderr, "MGL: checkInternalFormatForMetal - internalformat 0x%x has no Metal equivalent\n", internalformat);
-            }
-        }
-        return false;
+        if (td->infos[i] == NULL || !td->infos[i]->used) { slot = i; break; }
     }
 
-    return true;
+    if (slot == td->num_infos)
+    {
+        if (td->num_infos == td->cap_infos)
+        {
+            GLuint ncap = td->cap_infos ? td->cap_infos * 2 : 64;
+            TDTexInfo **n = (TDTexInfo **)realloc(td->infos, ncap * sizeof(TDTexInfo *));
+            if (!n)
+                return NULL;
+            memset(n + td->cap_infos, 0, (ncap - td->cap_infos) * sizeof(TDTexInfo *));
+            td->infos = n;
+            td->cap_infos = ncap;
+        }
+        td->num_infos++;
+    }
+
+    if (!td->infos[slot])
+    {
+        td->infos[slot] = (TDTexInfo *)calloc(1, sizeof(TDTexInfo));
+        if (!td->infos[slot])
+            return NULL;
+    }
+
+    info = td->infos[slot];
+    memset(info, 0, sizeof(TDTexInfo));
+    info->used = GL_TRUE;
+    tex->dirty_on_gpu = slot + 1;
+    td->free_hint = slot + 1;
+
+    return info;
+}
+
+static void freeInfo(GLMContext ctx, Texture *tex)
+{
+    struct MGLExtState_texdata *td = TDS(ctx);
+    TDTexInfo *info = mgl_texdata_find_info(ctx, tex);
+
+    if (info)
+    {
+        for (int f = 0; f < 6; f++)
+            for (int l = 0; l < TD_MAX_LEVELS; l++)
+                free(info->orig[f][l]);
+        memset(info, 0, sizeof(TDTexInfo));
+        if (tex->dirty_on_gpu - 1 < td->free_hint)
+            td->free_hint = tex->dirty_on_gpu - 1;
+    }
+    tex->dirty_on_gpu = 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* binding                                                                  */
+/* ------------------------------------------------------------------------ */
+
+static GLuint texBindingName(Texture *tex)
+{
+    return (tex && tex->name != TEX_OBJ_RES_NAME) ? tex->name : 0;
+}
+
+/* keep the legacy GL_TEXTURE_BINDING_* state variables in sync with the active unit */
+static void updateBindingVars(GLMContext ctx)
+{
+    TextureUnit *u = &STATE(texture_units[STATE(active_texture)]);
+
+    STATE_VAR(texture_binding_1d) = texBindingName(u->textures[_TEXTURE_1D]);
+    STATE_VAR(texture_binding_2d) = texBindingName(u->textures[_TEXTURE_2D]);
+    STATE_VAR(texture_binding_3d) = texBindingName(u->textures[_TEXTURE_3D]);
+    STATE_VAR(texture_binding_cube_map) = texBindingName(u->textures[_TEXTURE_CUBE_MAP]);
+    STATE_VAR(texture_binding_1d_array) = texBindingName(u->textures[_TEXTURE_1D_ARRAY]);
+    STATE_VAR(texture_binding_2d_array) = texBindingName(u->textures[_TEXTURE_2D_ARRAY]);
+    STATE_VAR(texture_binding_rectangle) = texBindingName(u->textures[_TEXTURE_RECTANGLE]);
+    STATE_VAR(texture_binding_buffer) = texBindingName(u->textures[_TEXTURE_BUFFER_TARGET]);
+    STATE_VAR(texture_binding_2d_multisample) = texBindingName(u->textures[_TEXTURE_2D_MULTISAMPLE]);
+    STATE_VAR(texture_binding_2d_multisample_array) = texBindingName(u->textures[_TEXTURE_2D_MULTISAMPLE_ARRAY]);
+}
+
+/* the sampler path uses one texture per unit (active_textures[]): the most
+ * recently bound non-null target binding of that unit */
+static void bindTextureToUnit(GLMContext ctx, GLuint unit, GLuint index, Texture *ptr)
+{
+    TextureUnit *u = &STATE(texture_units[unit]);
+    Texture *old = u->textures[index];
+
+    u->textures[index] = ptr;
+
+    if (ptr)
+    {
+        STATE(active_textures[unit]) = ptr;
+    }
+    else if (STATE(active_textures[unit]) == old)
+    {
+        Texture *other = NULL;
+        for (int i = 0; i < _MAX_TEXTURE_TYPES; i++)
+            if (u->textures[i] && i != _RENDERBUFFER) { other = u->textures[i]; break; }
+        STATE(active_textures[unit]) = other;
+    }
+
+    GLuint mask_index = unit / 32;
+    GLuint mask = 0x1u << (unit % 32);
+
+    if (STATE(active_textures[unit]))
+        STATE(active_texture_mask[mask_index]) |= mask;
+    else
+        STATE(active_texture_mask[mask_index]) &= ~mask;
+
+    STATE(dirty_bits) |= DIRTY_TEX | DIRTY_TEX_BINDING;
+}
+
+static bool isGeneratedTextureName(GLMContext ctx, GLuint name)
+{
+    return name != TEX_OBJ_RES_NAME && name < STATE(texture_table.current_name);
 }
 
 #pragma mark basic tex calls bind / delete / gen...
 void mglGenTextures(GLMContext ctx, GLsizei n, GLuint *textures)
 {
-    assert(textures);
+    TD_CHECK(n >= 0, GL_INVALID_VALUE);
+
+    if (!textures)
+        return;
 
     while(n--)
     {
-        *textures++ = getNewName(&STATE(texture_table));
+        GLuint name = getNewName(&STATE(texture_table));
 
         // TEX_OBJ_RES_NAME has special name.. skip it
-        if (STATE(texture_table.current_name) == TEX_OBJ_RES_NAME)
-            getNewName(&STATE(texture_table));
+        if (name == TEX_OBJ_RES_NAME)
+            name = getNewName(&STATE(texture_table));
+
+        *textures++ = name;
+    }
+}
+
+static bool validObjectTarget(GLenum target)
+{
+    switch (target)
+    {
+        case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D: case GL_TEXTURE_1D_ARRAY:
+        case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_RECTANGLE: case GL_TEXTURE_CUBE_MAP:
+        case GL_TEXTURE_CUBE_MAP_ARRAY: case GL_TEXTURE_BUFFER: case GL_TEXTURE_2D_MULTISAMPLE:
+        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+            return true;
+        default:
+            return false;
     }
 }
 
 void mglCreateTextures(GLMContext ctx, GLenum target, GLsizei n, GLuint *textures)
 {
+    TD_CHECK(validObjectTarget(target), GL_INVALID_ENUM);
+    TD_CHECK(n >= 0, GL_INVALID_VALUE);
+
+    if (!textures)
+        return;
+
     mglGenTextures(ctx, n, textures);
 
-    while(n--)
+    for (GLsizei i = 0; i < n; i++)
     {
-        // create a texture object
-        assert(getTexture(ctx, target, *textures++));
+        if (!getTexture(ctx, target, textures[i]))
+            TD_ERR(GL_OUT_OF_MEMORY);
     }
 }
 
 void mglBindTexture(GLMContext ctx, GLenum target, GLuint texture)
 {
-    GLuint active_texture;
-    GLint index;
+    GLuint index;
     Texture *ptr;
 
+    TD_CHECK(validObjectTarget(target), GL_INVALID_ENUM);
+
     index = textureIndexFromTarget(ctx, target);
-    if (index == _MAX_TEXTURE_TYPES)
-    {
-        assert(0);
-    }
 
     if (texture)
     {
-        ptr = getTexture(ctx, target, texture);
-        assert(ptr);
+        ptr = findTexture(ctx, texture);
+
+        if (ptr)
+        {
+            // a texture object can only ever be bound to the target it was created with
+            TD_CHECK(ptr->target == target, GL_INVALID_OPERATION);
+        }
+        else
+        {
+            TD_CHECK(isGeneratedTextureName(ctx, texture), GL_INVALID_OPERATION);
+
+            ptr = getTexture(ctx, target, texture);
+            TD_CHECK(ptr, GL_OUT_OF_MEMORY);
+        }
     }
     else
     {
         ptr = NULL;
     }
 
-    active_texture = STATE(active_texture);
-
-    GLuint mask_index = active_texture / 32;
-    GLuint mask = (0x1 << active_texture);
-
-    if (ptr)
-    {
-        STATE(active_texture_mask[mask_index]) |= mask;
-    }
-    else
-    {
-        STATE(active_texture_mask[mask_index]) &= ~mask;
-    }
-
-    STATE(active_textures[active_texture]) = ptr;
-    STATE(texture_units[active_texture].textures[index]) = ptr;
-    STATE(dirty_bits) |= DIRTY_TEX;
+    bindTextureToUnit(ctx, STATE(active_texture), index, ptr);
+    updateBindingVars(ctx);
 }
 
 void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum internalformat)
 {
-    Texture *ptr;
+    Texture *ptr = NULL;
 
-    // ERROR_CHECK_RETURN(unit < TEXTURE_UNITS, GL_INVALID_VALUE);
-    if (unit >= TEXTURE_UNITS) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: unit >= TEXTURE_UNITS (%d)\n", unit);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    ptr = getTex(ctx, texture, 0);
-
-    // ERROR_CHECK_RETURN(ptr, GL_INVALID_VALUE);
-    if (!ptr) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: texture %d not found\n", texture);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    // ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-    if (level < 0) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: level < 0 (%d)\n", level);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    // ERROR_CHECK_RETURN(layered >= 0, GL_INVALID_VALUE);
-    if (layered < 0) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: layered < 0 (%d)\n", layered);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
+    TD_CHECK(unit < TEXTURE_UNITS, GL_INVALID_VALUE);
+    TD_CHECK(level >= 0, GL_INVALID_VALUE);
+    TD_CHECK(layer >= 0, GL_INVALID_VALUE);
 
     switch(access)
     {
@@ -326,30 +534,20 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
             break;
 
         default:
-            fprintf(stderr, "MGL Error: mglBindImageTexture: invalid access 0x%x\n", access);
-            ERROR_RETURN(GL_INVALID_ENUM);
+            TD_ERR(GL_INVALID_ENUM);
     }
 
-    // ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_ENUM);
-    if (!checkInternalFormatForMetal(ctx, internalformat)) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: invalid internalformat 0x%x\n", internalformat);
-        ERROR_RETURN(GL_INVALID_ENUM);
+    if (texture == 0)
+    {
+        bzero(&ctx->state.image_units[unit], sizeof(ImageUnit));
+        ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+        return;
     }
 
-    // ERROR_CHECK_RETURN(ptr->internalformat == internalformat, GL_INVALID_VALUE);
-    if (ptr->internalformat != internalformat) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: internalformat mismatch (tex=0x%x req=0x%x)\n", ptr->internalformat, internalformat);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
+    ptr = findTexture(ctx, texture);
+    TD_CHECK(ptr, GL_INVALID_VALUE);
 
-    // ERROR_CHECK_RETURN(level < ptr->num_levels, GL_INVALID_VALUE);
-    if (level >= ptr->num_levels) {
-        fprintf(stderr, "MGL Error: mglBindImageTexture: level >= num_levels (%d >= %d)\n", level, ptr->num_levels);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    
-    ImageUnit unit_params;
+    TD_CHECK(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_VALUE);
 
     if (ptr->access != access)
     {
@@ -357,6 +555,9 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
         ptr->access = access;
     }
 
+    ImageUnit unit_params;
+
+    unit_params.unit = unit;
     unit_params.texture = texture;
     unit_params.level = level;
     unit_params.layered = layered;
@@ -370,157 +571,2593 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
     ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
 }
 
-void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
+static void detachFromFramebuffer(GLMContext ctx, Framebuffer *fbo, Texture *tex)
 {
-    while(n--)
+    if (!fbo)
+        return;
+
+    for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
     {
-        GLuint name;
-
-        name = *textures++;
-
-        Texture *tex;
-
-        tex = findTexture(ctx, name);
-
-        if(tex)
+        FBOAttachment *a = &fbo->color_attachments[i];
+        if (a->textarget != GL_RENDERBUFFER && a->buf.tex == tex && a->texture)
         {
-            for(int i=0; i<TEXTURE_UNITS; i++)
-            {
-                if(ctx->state.active_textures[i] == tex)
-                {
-                    ctx->state.active_textures[i] = NULL;
-
-                    ctx->state.dirty_bits |= DIRTY_TEX_BINDING;
-                }
-            }
-
-            for(int i=0; i<TEXTURE_UNITS; i++)
-            {
-                if(ctx->state.image_units[i].texture == name)
-                {
-                    bzero(&ctx->state.image_units[i], sizeof(ImageUnit));
-
-                    ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
-                }
-            }
-
-            if (tex->mtl_data)
-            {
-                ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_data);
-            }
+            memset(a, 0, sizeof(FBOAttachment));
+            fbo->color_attachment_bitfield &= ~(0x1u << i);
+            fbo->dirty_bits |= DIRTY_FBO_TEX;
         }
     }
+
+    if (fbo->depth.textarget != GL_RENDERBUFFER && fbo->depth.buf.tex == tex && fbo->depth.texture)
+    {
+        memset(&fbo->depth, 0, sizeof(FBOAttachment));
+        fbo->dirty_bits |= DIRTY_FBO_TEX;
+    }
+
+    if (fbo->stencil.textarget != GL_RENDERBUFFER && fbo->stencil.buf.tex == tex && fbo->stencil.texture)
+    {
+        memset(&fbo->stencil, 0, sizeof(FBOAttachment));
+        fbo->dirty_bits |= DIRTY_FBO_TEX;
+    }
+}
+
+static bool attachedToAnyFramebuffer(GLMContext ctx, Texture *tex)
+{
+    HashTable *t = &STATE(framebuffer_table);
+
+    for (GLuint n = 0; n < t->size; n++)
+    {
+        Framebuffer *fbo = (Framebuffer *)t->keys[n].data;
+        if (!fbo)
+            continue;
+        for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
+            if (fbo->color_attachments[i].texture && fbo->color_attachments[i].textarget != GL_RENDERBUFFER &&
+                fbo->color_attachments[i].buf.tex == tex)
+                return true;
+        if (fbo->depth.texture && fbo->depth.textarget != GL_RENDERBUFFER && fbo->depth.buf.tex == tex)
+            return true;
+        if (fbo->stencil.texture && fbo->stencil.textarget != GL_RENDERBUFFER && fbo->stencil.buf.tex == tex)
+            return true;
+    }
+
+    return false;
+}
+
+static void freeTextureStorage(GLMContext ctx, Texture *tex)
+{
+    if (TDM(ctx) && TDM(ctx)->release)
+        TDM(ctx)->release(ctx, tex);
+    else if (tex->mtl_data)
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_data);
+    tex->mtl_data = NULL;
+
+    for (int face = 0; face < 6; face++)
+    {
+        if (!tex->faces[face].levels)
+            continue;
+        for (int l = 0; l < TD_MAX_LEVELS; l++)
+            mgl_texdata_free_shadow(ctx, tex, face, l);
+        free(tex->faces[face].levels);
+        tex->faces[face].levels = NULL;
+    }
+
+    freeInfo(ctx, tex);
+}
+
+void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
+{
+    TD_CHECK(n >= 0, GL_INVALID_VALUE);
+
+    if (!textures)
+        return;
+
+    while(n--)
+    {
+        GLuint name = *textures++;
+        Texture *tex = findTexture(ctx, name);
+
+        if (!tex)
+            continue;
+
+        // unbind from every texture unit (all targets)
+        for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+        {
+            for (GLuint i = 0; i < _MAX_TEXTURE_TYPES; i++)
+            {
+                if (STATE(texture_units[u].textures[i]) == tex)
+                    bindTextureToUnit(ctx, u, i, NULL);
+            }
+            if (STATE(active_textures[u]) == tex)
+            {
+                STATE(active_textures[u]) = NULL;
+                STATE(active_texture_mask[u / 32]) &= ~(0x1u << (u % 32));
+            }
+        }
+
+        for (int i = 0; i < TEXTURE_UNITS; i++)
+        {
+            if (ctx->state.image_units[i].texture == name)
+            {
+                bzero(&ctx->state.image_units[i], sizeof(ImageUnit));
+                ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+            }
+        }
+
+        // detach from the bound framebuffers
+        detachFromFramebuffer(ctx, STATE(framebuffer), tex);
+        detachFromFramebuffer(ctx, STATE(readbuffer), tex);
+
+        deleteHashElement(&STATE(texture_table), name);
+
+        // an object still attached to an unbound framebuffer stays alive (GL 4.6 5.1.3)
+        if (!attachedToAnyFramebuffer(ctx, tex))
+        {
+            freeTextureStorage(ctx, tex);
+            free(tex);
+        }
+        else
+        {
+            tex->name = TEX_OBJ_RES_NAME;
+        }
+    }
+
+    updateBindingVars(ctx);
+    STATE(dirty_bits) |= DIRTY_TEX_BINDING;
 }
 
 GLboolean mglIsTexture(GLMContext ctx, GLuint texture)
 {
-    return isTexture(ctx, texture);
+    return findTexture(ctx, texture) != NULL ? GL_TRUE : GL_FALSE;
 }
 
 void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
-    fprintf(stderr, "MGL: glBindImageTextures called first=%u count=%d\n", first, count);
-    // Bind multiple image textures
-    for (GLsizei i = 0; i < count; i++) {
+    TD_CHECK(count >= 0, GL_INVALID_VALUE);
+    TD_CHECK((GLuint)first + (GLuint)count <= TEXTURE_UNITS, GL_INVALID_OPERATION);
+
+    for (GLsizei i = 0; i < count; i++)
+    {
         GLuint tex_name = textures ? textures[i] : 0;
-        if (tex_name != 0) {
-            Texture *tex = findTexture(ctx, tex_name);
-            if (tex) {
-                mglBindImageTexture(ctx, first + i, tex_name, 0, GL_FALSE, 0, tex->access ? tex->access : GL_READ_ONLY, tex->internalformat);
-            }
+
+        if (tex_name == 0)
+        {
+            bzero(&ctx->state.image_units[first + i], sizeof(ImageUnit));
+            ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+            continue;
         }
+
+        Texture *tex = findTexture(ctx, tex_name);
+        if (!tex)
+        {
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            continue;
+        }
+
+        // GL 4.6 8.26: level 0, layered, READ_WRITE, the texture's internal format
+        mglBindImageTexture(ctx, first + i, tex_name, 0, GL_TRUE, 0, GL_READ_WRITE, tex->internalformat);
     }
 }
 
 void mglActiveTexture(GLMContext ctx, GLenum texture)
 {
-    texture -= GL_TEXTURE0;
+    TD_CHECK(texture >= GL_TEXTURE0 && texture - GL_TEXTURE0 < maxUnits(ctx), GL_INVALID_ENUM);
 
-    if (texture > STATE_VAR(max_combined_texture_image_units))
-    {
-        ERROR_RETURN(GL_INVALID_INDEX);
-    }
-
-    STATE(active_texture) = texture;
+    STATE(active_texture) = texture - GL_TEXTURE0;
+    updateBindingVars(ctx);
     ctx->state.dirty_bits |= DIRTY_TEX_BINDING;
 }
 
 void mglBindTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
-    for (int i=0; i < count; i++)
+    TD_CHECK(count >= 0, GL_INVALID_VALUE);
+    TD_CHECK((GLuint)first + (GLuint)count <= maxUnits(ctx), GL_INVALID_OPERATION);
+
+    for (GLsizei i = 0; i < count; i++)
     {
-        GLuint texture;
+        GLuint unit = first + i;
+        GLuint texture = textures ? textures[i] : 0;
 
-        if (textures == NULL)
+        if (texture == 0)
         {
-            texture = 0;
+            for (GLuint idx = 0; idx < _MAX_TEXTURE_TYPES; idx++)
+                if (STATE(texture_units[unit].textures[idx]))
+                    bindTextureToUnit(ctx, unit, idx, NULL);
+            continue;
         }
-        else
+
+        Texture *ptr = findTexture(ctx, texture);
+        if (!ptr || ptr->index >= _MAX_TEXTURE_TYPES)
         {
-            texture = textures[i];
+            // error for this entry only, the others are still bound
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            continue;
         }
 
-        STATE(active_texture) = first + i - GL_TEXTURE0;
-
-        if (texture != 0)
-        {
-            Texture *ptr;
-            GLenum target;
-
-            ptr = findTexture(ctx, textures[i]);
-            assert(ptr);
-
-            target = ptr->target;
-
-            mglBindTexture(ctx, target, textures[i]);
-        }
-        else
-        {
-            for(GLenum target=0; target<_MAX_TEXTURE_TYPES; target++)
-            {
-                mglBindTexture(ctx, target, 0);
-            }
-        }
+        bindTextureToUnit(ctx, unit, ptr->index, ptr);
     }
 
+    updateBindingVars(ctx);
 }
 
 void mglBindTextureUnit(GLMContext ctx, GLuint unit, GLuint texture)
 {
-    // bind texture without changing the current active unit
-    // my guess
+    TD_CHECK(unit < maxUnits(ctx), GL_INVALID_VALUE);
 
-    Texture *ptr;
-    GLenum target;
+    if (texture == 0)
+    {
+        for (GLuint idx = 0; idx < _MAX_TEXTURE_TYPES; idx++)
+            if (STATE(texture_units[unit].textures[idx]))
+                bindTextureToUnit(ctx, unit, idx, NULL);
+        updateBindingVars(ctx);
+        return;
+    }
 
-    ptr = findTexture(ctx, texture);
-    assert(ptr);
+    Texture *ptr = findTexture(ctx, texture);
+    TD_CHECK(ptr && ptr->index < _MAX_TEXTURE_TYPES, GL_INVALID_OPERATION);
 
-    unit = unit - GL_TEXTURE0;
-    assert(unit < TEXTURE_UNITS);
-
-    target = ptr->target;
-
-    STATE(texture_units[unit].textures[target]) = ptr;
+    bindTextureToUnit(ctx, unit, ptr->index, ptr);
+    updateBindingVars(ctx);
 }
 
-void generateMipmaps(GLMContext ctx, GLuint texture, GLenum target)
+/* ------------------------------------------------------------------------ */
+/* levels                                                                   */
+/* ------------------------------------------------------------------------ */
+
+static bool ensureLevels(GLMContext ctx, Texture *tex)
 {
-    Texture *ptr;
+    for (int face = 0; face < 6; face++)
+    {
+        if (tex->faces[face].levels)
+            continue;
+        tex->faces[face].levels = (TextureLevel *)calloc(TD_MAX_LEVELS, sizeof(TextureLevel));
+        if (!tex->faces[face].levels)
+        {
+            ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, false);
+        }
+    }
+    return true;
+}
 
-    ptr = getTex(ctx, texture, target);
+static inline TextureLevel *texLevel(Texture *tex, GLuint face, GLuint level)
+{
+    if (face >= 6 || !tex->faces[face].levels || level >= TD_MAX_LEVELS)
+        return NULL;
+    /* renderbuffer textures (framebuffers.c) carry a single level */
+    if (tex->target == GL_RENDERBUFFER && (face || level))
+        return NULL;
+    return &tex->faces[face].levels[level];
+}
 
-    ERROR_CHECK_RETURN(ptr, GL_INVALID_OPERATION);
+/* GL level internal format (stored in the otherwise unused TextureLevel.mtl_format) */
+static inline GLenum levelFormat(Texture *tex, GLuint face, GLuint level)
+{
+    TextureLevel *l = texLevel(tex, face, level);
+    if (l && tex->target == GL_RENDERBUFFER)
+        return l->complete ? (l->mtl_format ? l->mtl_format : tex->internalformat) : 0;
+    return (l && l->complete) ? l->mtl_format : 0;
+}
 
-    // level 0 needs to be filled out for mipmap geneation
-    ERROR_CHECK_RETURN(ptr->faces[0].levels[0].complete, GL_INVALID_OPERATION);
+/* Metal geometry of a GL level: 1D-array layers become slices */
+void mgl_texdata_level_geometry(Texture *tex, GLuint face, GLuint level, GLuint *w, GLuint *h, GLuint *d)
+{
+    TextureLevel *l = texLevel(tex, face, level);
 
-    ptr->mipmapped = true;
-    ptr->genmipmaps = true;
+    if (!l || !l->complete)
+    {
+        *w = *h = *d = 0;
+        return;
+    }
 
-    ptr->dirty_bits |= DIRTY_TEXTURE_LEVEL;
+    *w = l->width;
+    if (tex->target == GL_TEXTURE_1D_ARRAY)
+    {
+        *h = 1;
+        *d = l->height;
+    }
+    else
+    {
+        *h = l->height;
+        *d = l->depth;
+    }
+}
 
-    ctx->mtl_funcs.mtlGenerateMipmaps(ctx, ptr);
+const TDFormat *mgl_texdata_storage_format(GLenum internalformat)
+{
+    return tdStorageFormat(tdFormatInfo(internalformat));
+}
+
+static size_t shadowBytes(const TDFormat *sf, GLuint w, GLuint h, GLuint d, size_t *row, size_t *img, size_t *stencil_off)
+{
+    *row = tdStorageRowBytes(sf, (int)w);
+    *img = tdStorageImageBytes(sf, (int)w, (int)h);
+    size_t depth_plane = *img * d;
+    *stencil_off = depth_plane;
+    if (sf->kind == TDK_D32FS8)
+        return depth_plane + (size_t)w * h * d;
+    return depth_plane;
+}
+
+static void storageFromBlock(const TDFormat *sf, void *p, GLuint w, GLuint h, GLuint d, TDStorage *st)
+{
+    size_t row, img, soff;
+    shadowBytes(sf, w, h, d, &row, &img, &soff);
+    st->data = p;
+    st->row_pitch = row;
+    st->image_pitch = img;
+    if (sf->kind == TDK_D32FS8)
+    {
+        st->stencil = (uint8_t *)p + soff;
+        st->s_row_pitch = w;
+        st->s_image_pitch = (size_t)w * h;
+    }
+    else
+    {
+        st->stencil = NULL;
+        st->s_row_pitch = st->s_image_pitch = 0;
+    }
+}
+
+bool mgl_texdata_shadow(GLMContext ctx, Texture *tex, GLuint face, GLuint level, bool alloc, TDStorage *st)
+{
+    TextureLevel *l = texLevel(tex, face, level);
+    GLuint w, h, d;
+    size_t row, img, soff, size;
+
+    if (!l || !l->complete)
+        return false;
+
+    const TDFormat *sf = mgl_texdata_storage_format(l->mtl_format);
+    if (!sf)
+        return false;
+
+    mgl_texdata_level_geometry(tex, face, level, &w, &h, &d);
+    size = shadowBytes(sf, w, h, d, &row, &img, &soff);
+
+    if (!l->data)
+    {
+        if (!alloc)
+            return false;
+        void *p = calloc(1, size ? size : 1);
+        if (!p)
+        {
+            ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, false);
+        }
+        l->data = (vm_address_t)p;
+        l->data_size = size;
+    }
+
+    l->pitch = row;
+    storageFromBlock(sf, (void *)l->data, w, h, d, st);
+    return true;
+}
+
+void mgl_texdata_free_shadow(GLMContext ctx, Texture *tex, GLuint face, GLuint level)
+{
+    TextureLevel *l = texLevel(tex, face, level);
+    (void)ctx;
+
+    if (l && l->data)
+    {
+        free((void *)l->data);
+        l->data = 0;
+        l->data_size = 0;
+    }
+}
+
+static GLuint fullChainLevels(Texture *tex, GLuint w, GLuint h, GLuint d)
+{
+    GLuint m = w;
+    if (tex->target == GL_TEXTURE_RECTANGLE || tex->target == GL_RENDERBUFFER)
+        return 1;
+    if (tex->target != GL_TEXTURE_1D && tex->target != GL_TEXTURE_1D_ARRAY && h > m) m = h;
+    if (tex->target == GL_TEXTURE_3D && d > m) m = d;
+    return log2u(m) + 1;
+}
+
+/* dimensions of level `level` given level 0 dims (GL geometry) */
+static void mipDims(Texture *tex, GLuint level, GLuint w0, GLuint h0, GLuint d0, GLuint *w, GLuint *h, GLuint *d)
+{
+    *w = MAX(1, w0 >> level);
+    *h = (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY) ? h0 : MAX(1, h0 >> level);
+    *d = (tex->target == GL_TEXTURE_3D) ? MAX(1, d0 >> level) : d0;
+}
+
+static void updateTexSummary(Texture *tex)
+{
+    GLuint highest = 0;
+    bool any = false;
+    GLuint faces = mgl_texdata_num_faces(tex);
+
+    if (tex->immutable_storage)
+        return;
+
+    for (GLuint f = 0; f < faces; f++)
+        for (GLuint l = 0; l < TD_MAX_LEVELS; l++)
+            if (tex->faces[f].levels && tex->faces[f].levels[l].complete)
+            {
+                any = true;
+                if (l + 1 > highest) highest = l + 1;
+            }
+
+    tex->num_levels = any ? highest : 0;
+
+    // base dims: from level 0 if defined, else derived from the lowest level
+    for (GLuint l = 0; l < TD_MAX_LEVELS; l++)
+    {
+        for (GLuint f = 0; f < faces; f++)
+        {
+            if (!tex->faces[f].levels || !tex->faces[f].levels[l].complete)
+                continue;
+            TextureLevel *lv = &tex->faces[f].levels[l];
+            bool lin = (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY);
+            tex->width = lv->width << l;
+            tex->height = lin ? lv->height : lv->height << l;
+            tex->depth = tex->target == GL_TEXTURE_3D ? lv->depth << l : lv->depth;
+            tex->internalformat = lv->mtl_format;
+            tex->mipmap_levels = MAX(fullChainLevels(tex, tex->width, tex->height, tex->depth), highest);
+            tex->is_array = isArrayTarget(tex->target);
+            return;
+        }
+    }
+
+    tex->width = tex->height = tex->depth = 0;
+    tex->mipmap_levels = 0;
+}
+
+/* (re)define a level; content becomes undefined unless written afterwards */
+static bool defineLevel(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLenum ifmt, GLuint w, GLuint h, GLuint d)
+{
+    if (!ensureLevels(ctx, tex))
+        return false;
+
+    TextureLevel *l = texLevel(tex, face, level);
+    TDTexInfo *info = mgl_texdata_info(ctx, tex);
+
+    if (!l)
+    {
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, false);
+    }
+
+    mgl_texdata_free_shadow(ctx, tex, face, level);
+
+    if (info)
+    {
+        info->on_gpu[face] &= ~(1u << level);
+        if (info->orig[face][level])
+        {
+            free(info->orig[face][level]);
+            info->orig[face][level] = NULL;
+            info->orig_size[face][level] = 0;
+        }
+    }
+
+    l->complete = (w && h && d) ? GL_TRUE : GL_FALSE;
+    l->width = l->complete ? w : 0;
+    l->height = l->complete ? h : 0;
+    l->depth = l->complete ? d : 0;
+    l->mtl_format = l->complete ? ifmt : 0;
+    l->pitch = 0;
+
+    updateTexSummary(tex);
+
+    tex->dirty_bits |= DIRTY_TEXTURE_LEVEL;
+    STATE(dirty_bits) |= DIRTY_TEX;
+
+    return true;
+}
+
+static void undefineAllLevels(GLMContext ctx, Texture *tex)
+{
+    for (int f = 0; f < 6; f++)
+        for (int l = 0; l < TD_MAX_LEVELS; l++)
+            if (tex->faces[f].levels && tex->faces[f].levels[l].complete)
+                defineLevel(ctx, tex, f, l, 0, 0, 0, 0);
+}
+
+/* Shape of the MTLTexture to realize for a texture (Metal geometry). */
+bool mgl_texdata_shape(GLMContext ctx, Texture *tex, TDShape *shape)
+{
+    GLuint faces = mgl_texdata_num_faces(tex);
+    GLuint base = TD_MAX_LEVELS, bf = 0;
+
+    (void)ctx;
+    memset(shape, 0, sizeof(*shape));
+
+    if (!tex->faces[0].levels)
+        return false;
+
+    for (GLuint l = 0; l < TD_MAX_LEVELS && base == TD_MAX_LEVELS; l++)
+        for (GLuint f = 0; f < faces; f++)
+            if (tex->faces[f].levels[l].complete) { base = l; bf = f; break; }
+
+    if (base == TD_MAX_LEVELS)
+        return false;
+
+    TextureLevel *bl = &tex->faces[bf].levels[base];
+    bool lin = (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY);
+    GLuint w0 = bl->width << base;
+    GLuint h0 = lin ? bl->height : bl->height << base;
+    GLuint d0 = (tex->target == GL_TEXTURE_3D) ? bl->depth << base : bl->depth;
+    GLenum ifmt = bl->mtl_format;
+    GLuint levels;
+
+    if (tex->immutable_storage)
+    {
+        levels = tex->num_levels;
+    }
+    else
+    {
+        GLuint maxl = MIN(fullChainLevels(tex, w0, h0, d0), TD_MAX_LEVELS);
+        levels = base + 1;
+        for (GLuint l = base + 1; l < maxl; l++)
+        {
+            bool ok = false;
+            for (GLuint f = 0; f < faces; f++)
+            {
+                TextureLevel *lv = &tex->faces[f].levels[l];
+                if (!lv->complete)
+                {
+                    ok = false;
+                    break;
+                }
+                GLuint ew, eh, ed;
+                mipDims(tex, l, w0, h0, d0, &ew, &eh, &ed);
+                ok = (lv->width == ew && lv->height == eh && lv->depth == ed && lv->mtl_format == ifmt);
+                if (!ok)
+                    break;
+            }
+            if (!ok)
+                break;
+            levels = l + 1;
+        }
+    }
+
+    shape->target = tex->target;
+    shape->internalformat = ifmt;
+    shape->width = w0;
+    if (tex->target == GL_TEXTURE_1D_ARRAY)
+    {
+        shape->height = 1;
+        shape->depth = h0;
+    }
+    else
+    {
+        shape->height = h0;
+        shape->depth = d0;
+    }
+    shape->levels = levels;
+
+    return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* pixel store and pixel buffer objects                                     */
+/* ------------------------------------------------------------------------ */
+
+static TDPixelStore pixelStore(GLMContext ctx, bool unpack)
+{
+    PixelStore *p = unpack ? &STATE(unpack) : &STATE(pack);
+    struct MGLExtState_texdata *td = TDS(ctx);
+    TDPixelStore ps;
+    int *cb = td ? (unpack ? td->unpack_cb : td->pack_cb) : NULL;
+
+    ps.swap_bytes = p->swap_bytes;
+    ps.lsb_first = p->lsb_first;
+    ps.row_length = p->row_length;
+    ps.image_height = p->image_height;
+    ps.skip_rows = p->skip_rows;
+    ps.skip_pixels = p->skip_pixels;
+    ps.skip_images = p->skip_images;
+    ps.alignment = p->alignment ? p->alignment : 4;
+    ps.cb_width = cb ? cb[0] : 0;
+    ps.cb_height = cb ? cb[1] : 0;
+    ps.cb_depth = cb ? cb[2] : 0;
+    ps.cb_size = cb ? cb[3] : 0;
+    return ps;
+}
+
+/* CPU storage of a buffer object (the Metal buffer contents once it has one) */
+static uint8_t *bufferBase(GLMContext ctx, Buffer *buf)
+{
+    if (TDM(ctx) && TDM(ctx)->buffer_contents)
+        return (uint8_t *)TDM(ctx)->buffer_contents(ctx, buf);
+    return (uint8_t *)buf->data.buffer_data;
+}
+
+/* resolve a client pointer for reading (unpack) or writing (pack); with a PBO
+ * bound `ptr` is an offset. Returns GL_NO_ERROR or the error to raise. */
+static GLenum resolveClientPtr(GLMContext ctx, bool unpack, const void *ptr, size_t extent, size_t elem_align,
+                               uint8_t **out, Buffer **pbo_out)
+{
+    Buffer *pbo = STATE(buffers[unpack ? _PIXEL_UNPACK_BUFFER : _PIXEL_PACK_BUFFER]);
+
+    if (pbo_out) *pbo_out = pbo;
+
+    if (!pbo)
+    {
+        *out = (uint8_t *)ptr;
+        return GL_NO_ERROR;
+    }
+
+    size_t offset = (size_t)ptr;
+
+    if (pbo->mapped)
+        return GL_INVALID_OPERATION;
+    if (pbo->size < 0 || offset > (size_t)pbo->size || extent > (size_t)pbo->size - offset)
+        return GL_INVALID_OPERATION;
+    if (elem_align > 1 && (offset % elem_align) != 0)
+        return GL_INVALID_OPERATION;
+    uint8_t *base = bufferBase(ctx, pbo);
+    if (!base)
+    {
+        *out = NULL;
+        return extent ? GL_INVALID_OPERATION : GL_NO_ERROR;
+    }
+
+    *out = base + offset;
+    return GL_NO_ERROR;
+}
+
+/* a pack operation wrote [dst, dst+size) of the CPU copy of a pixel pack buffer:
+ * propagate it to the Metal buffer (fb domain hook) */
+static void pboWrittenRange(GLMContext ctx, Buffer *pbo, const uint8_t *dst, size_t size)
+{
+    if (!pbo)
+        return;
+    size_t offset = (size_t)(dst - bufferBase(ctx, pbo));
+    if (pbo->data.mtl_data && ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->write_buffer)
+        ctx->mtl_funcs.ext_fb->write_buffer(ctx, pbo, offset, size, dst);
+    else
+        pbo->data.dirty_bits |= DIRTY_BUFFER_DATA;
+}
+
+static size_t typeAlign(GLenum type)
+{
+    switch (type)
+    {
+        case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT:
+        case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_5_6_5_REV: case GL_UNSIGNED_SHORT_4_4_4_4:
+        case GL_UNSIGNED_SHORT_4_4_4_4_REV: case GL_UNSIGNED_SHORT_5_5_5_1: case GL_UNSIGNED_SHORT_1_5_5_5_REV:
+            return 2;
+        case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT: case GL_UNSIGNED_INT_8_8_8_8:
+        case GL_UNSIGNED_INT_8_8_8_8_REV: case GL_UNSIGNED_INT_10_10_10_2: case GL_UNSIGNED_INT_2_10_10_10_REV:
+        case GL_UNSIGNED_INT_24_8: case GL_UNSIGNED_INT_10F_11F_11F_REV: case GL_UNSIGNED_INT_5_9_9_9_REV:
+        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+            return 4;
+        default:
+            return 1;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* data path: storage-layout regions to/from a level                        */
+/* ------------------------------------------------------------------------ */
+
+static bool levelOnGPU(GLMContext ctx, Texture *tex, GLuint face, GLuint level)
+{
+    TDTexInfo *info = mgl_texdata_find_info(ctx, tex);
+    return info && info->realized && tex->mtl_data && (info->on_gpu[face] & (1u << level)) && level < info->shape.levels;
+}
+
+/* copy a region between a tight buffer and a full-level buffer at (x,y,z) */
+static void copyStorageRegion(const TDFormat *sf, const TDStorage *tight, const TDStorage *full, const TDRegion *r,
+                              bool to_full, bool depth_plane, bool stencil_plane)
+{
+    size_t bx, by, rowbytes, rows;
+
+    if (sf->flags & TDF_COMPRESSED)
+    {
+        bx = (size_t)r->x / sf->block_w * sf->block_bytes;
+        by = (size_t)r->y / sf->block_h;
+        rowbytes = tdStorageRowBytes(sf, r->w);
+        rows = ((size_t)r->h + sf->block_h - 1) / sf->block_h;
+    }
+    else
+    {
+        bx = (size_t)r->x * sf->bpp;
+        by = (size_t)r->y;
+        rowbytes = (size_t)r->w * sf->bpp;
+        rows = (size_t)r->h;
+    }
+
+    if (depth_plane)
+    {
+        for (GLsizei z = 0; z < r->d; z++)
+            for (size_t y = 0; y < rows; y++)
+            {
+                uint8_t *f = (uint8_t *)full->data + (size_t)(r->z + z) * full->image_pitch + (by + y) * full->row_pitch + bx;
+                uint8_t *t = (uint8_t *)tight->data + (size_t)z * tight->image_pitch + y * tight->row_pitch;
+                if (to_full) memcpy(f, t, rowbytes); else memcpy(t, f, rowbytes);
+            }
+    }
+
+    if (stencil_plane && sf->kind == TDK_D32FS8 && tight->stencil && full->stencil)
+    {
+        for (GLsizei z = 0; z < r->d; z++)
+            for (GLsizei y = 0; y < r->h; y++)
+            {
+                uint8_t *f = (uint8_t *)full->stencil + (size_t)(r->z + z) * full->s_image_pitch + (size_t)(r->y + y) * full->s_row_pitch + r->x;
+                uint8_t *t = (uint8_t *)tight->stencil + (size_t)z * tight->s_image_pitch + (size_t)y * tight->s_row_pitch;
+                if (to_full) memcpy(f, t, (size_t)r->w); else memcpy(t, f, (size_t)r->w);
+            }
+    }
+}
+
+/* write a tightly packed storage-layout region (Metal geometry) into a level */
+static bool writeRegion(GLMContext ctx, Texture *tex, const TDRegion *r, const TDStorage *src, bool depth, bool stencil)
+{
+    const TDFormat *sf = mgl_texdata_storage_format(levelFormat(tex, r->face, r->level));
+
+    if (!sf)
+        return false;
+    if (r->w <= 0 || r->h <= 0 || r->d <= 0)
+        return true;
+
+    if (sf->kind != TDK_D32FS8)
+        depth = stencil = true;
+
+    if (levelOnGPU(ctx, tex, r->face, r->level) && TDM(ctx) && TDM(ctx)->upload)
+    {
+        TDM(ctx)->upload(ctx, tex, r, src, depth, stencil);
+        return true;
+    }
+
+    TDStorage full;
+    if (!mgl_texdata_shadow(ctx, tex, r->face, r->level, true, &full))
+        return false;
+
+    copyStorageRegion(sf, src, &full, r, true, depth, stencil);
+
+    tex->dirty_bits |= DIRTY_TEXTURE_DATA;
+    STATE(dirty_bits) |= DIRTY_TEX;
+    return true;
+}
+
+/* read a region (Metal geometry) of a level into a tight storage-layout buffer */
+static bool readRegion(GLMContext ctx, Texture *tex, const TDRegion *r, const TDStorage *dst)
+{
+    const TDFormat *sf = mgl_texdata_storage_format(levelFormat(tex, r->face, r->level));
+    TDStorage full;
+
+    if (!sf)
+        return false;
+
+    if (mgl_texdata_shadow(ctx, tex, r->face, r->level, false, &full))
+    {
+        copyStorageRegion(sf, dst, &full, r, false, true, true);
+        return true;
+    }
+
+    if (!TDM(ctx) || !TDM(ctx)->download)
+        return false;
+
+    if (!levelOnGPU(ctx, tex, r->face, r->level))
+    {
+        // the level has neither CPU data nor GPU data yet: realize it (undefined content)
+        if (TDM(ctx)->realize && !TDM(ctx)->realize(ctx, tex))
+            return false;
+        if (mgl_texdata_shadow(ctx, tex, r->face, r->level, false, &full))
+        {
+            copyStorageRegion(sf, dst, &full, r, false, true, true);
+            return true;
+        }
+        if (!levelOnGPU(ctx, tex, r->face, r->level))
+        {
+            // level outside the realizable shape (e.g. inconsistent mip): no data was ever written
+            size_t row, img, soff;
+            size_t n = shadowBytes(sf, r->w, r->h, r->d, &row, &img, &soff);
+            memset(dst->data, 0, n);
+            return true;
+        }
+    }
+
+    return TDM(ctx)->download(ctx, tex, r, dst);
+}
+
+/* tight storage buffer for a region (Metal geometry) */
+static void *allocStorage(const TDFormat *sf, GLsizei w, GLsizei h, GLsizei d, TDStorage *st)
+{
+    size_t row, img, soff;
+    size_t size = shadowBytes(sf, (GLuint)w, (GLuint)h, (GLuint)d, &row, &img, &soff);
+    void *p = calloc(1, size ? size : 1);
+
+    if (!p)
+        return NULL;
+
+    storageFromBlock(sf, p, (GLuint)w, (GLuint)h, (GLuint)d, st);
+    return p;
+}
+
+/* GL region -> Metal region (1D arrays: y/height are layers) */
+static TDRegion glRegion(Texture *tex, GLuint face, GLuint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d)
+{
+    TDRegion r;
+    r.face = face;
+    r.level = level;
+    if (tex->target == GL_TEXTURE_1D_ARRAY)
+    {
+        r.x = x; r.y = 0; r.z = y;
+        r.w = w; r.h = 1; r.d = h;
+    }
+    else
+    {
+        r.x = x; r.y = y; r.z = z;
+        r.w = w; r.h = h; r.d = d;
+    }
+    return r;
+}
+
+/* storage of a GL-geometry region: a 1D array region (w x h layers) is laid out
+ * like a 2D image, which is byte-identical to h slices of one row each */
+static void glToMetalStorage(Texture *tex, TDStorage *st)
+{
+    if (tex->target == GL_TEXTURE_1D_ARRAY)
+    {
+        st->image_pitch = st->row_pitch;
+        st->s_image_pitch = st->s_row_pitch;
+    }
+}
+
+/* upload client pixels into a GL region of a level */
+static void uploadClient(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                         GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                         GLenum format, GLenum type, const uint8_t *src, bool is3d)
+{
+    const TDFormat *sf = mgl_texdata_storage_format(levelFormat(tex, face, level));
+    TDPixelStore ps = pixelStore(ctx, true);
+    size_t off, row, img;
+    TDStorage st;
+
+    if (!sf || !src || w <= 0 || h <= 0 || d <= 0 || (sf->flags & TDF_COMPRESSED))
+        return;
+
+    tdClientLayout(&ps, format, type, w, h, d, is3d, &off, &row, &img);
+
+    if (!allocStorage(sf, w, h, d, &st))
+        TD_ERR(GL_OUT_OF_MEMORY);
+
+    bool wd = true, ws = true;
+    tdUnpack(sf, src + off, row, img, format, type, ps.swap_bytes, w, h, d, &st, &wd, &ws);
+    glToMetalStorage(tex, &st);
+
+    TDRegion r = glRegion(tex, face, level, x, y, z, w, h, d);
+    bool ok = writeRegion(ctx, tex, &r, &st, wd, ws);
+    free(st.data);
+    if (!ok)
+        TD_ERR(GL_OUT_OF_MEMORY);
+}
+
+/* ------------------------------------------------------------------------ */
+/* TexImage                                                                 */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    GLenum   tex_target;    /* object target (cube faces -> GL_TEXTURE_CUBE_MAP) */
+    GLuint   face;
+    bool     proxy;
+} TDTarget;
+
+static bool texImageTarget(GLenum target, int dims, TDTarget *t)
+{
+    t->face = 0;
+    t->proxy = false;
+
+    if (dims == 1)
+    {
+        switch (target)
+        {
+            case GL_TEXTURE_1D: t->tex_target = target; return true;
+            case GL_PROXY_TEXTURE_1D: t->tex_target = GL_TEXTURE_1D; t->proxy = true; return true;
+            default: return false;
+        }
+    }
+
+    if (dims == 2)
+    {
+        if (isCubeFace(target))
+        {
+            t->tex_target = GL_TEXTURE_CUBE_MAP;
+            t->face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
+            return true;
+        }
+        switch (target)
+        {
+            case GL_TEXTURE_2D: case GL_TEXTURE_1D_ARRAY: case GL_TEXTURE_RECTANGLE:
+                t->tex_target = target; return true;
+            case GL_PROXY_TEXTURE_2D: case GL_PROXY_TEXTURE_1D_ARRAY: case GL_PROXY_TEXTURE_RECTANGLE:
+            case GL_PROXY_TEXTURE_CUBE_MAP:
+                t->tex_target = proxyTexTarget(target); t->proxy = true; return true;
+            default: return false;
+        }
+    }
+
+    switch (target)
+    {
+        case GL_TEXTURE_3D: case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP_ARRAY:
+            t->tex_target = target; return true;
+        case GL_PROXY_TEXTURE_3D: case GL_PROXY_TEXTURE_2D_ARRAY: case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY:
+            t->tex_target = proxyTexTarget(target); t->proxy = true; return true;
+        default: return false;
+    }
+}
+
+static GLuint maxLevelForTarget(GLMContext ctx, GLenum tt)
+{
+    switch (tt)
+    {
+        case GL_TEXTURE_3D: return log2u(max3DSize(ctx));
+        case GL_TEXTURE_CUBE_MAP: case GL_TEXTURE_CUBE_MAP_ARRAY: return log2u(maxCubeSize(ctx));
+        case GL_TEXTURE_RECTANGLE: return 0;
+        default: return MIN(log2u(maxTexSize(ctx)), TD_MAX_LEVELS - 1);
+    }
+}
+
+/* size limit check (GL geometry); returns GL_NO_ERROR or GL_INVALID_VALUE */
+static GLenum checkSize(GLMContext ctx, GLenum tt, GLint level, GLsizei w, GLsizei h, GLsizei d)
+{
+    GLuint m = maxTexSize(ctx);
+    unsigned long long lw = (unsigned long long)w << level, lh = (unsigned long long)h << level, ld = (unsigned long long)d << level;
+
+    if (w < 0 || h < 0 || d < 0)
+        return GL_INVALID_VALUE;
+
+    switch (tt)
+    {
+        case GL_TEXTURE_1D:
+            if (lw > m) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_1D_ARRAY:
+            if (lw > m || (GLuint)h > maxLayers(ctx)) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_2D:
+            if (lw > m || lh > m) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_RECTANGLE:
+            if ((GLuint)w > maxRectSize(ctx) || (GLuint)h > maxRectSize(ctx)) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_CUBE_MAP:
+            if (lw > maxCubeSize(ctx) || lh > maxCubeSize(ctx) || w != h) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_CUBE_MAP_ARRAY:
+            if (lw > maxCubeSize(ctx) || lh > maxCubeSize(ctx) || w != h || (d % 6) != 0 || (GLuint)d > maxLayers(ctx) * 6)
+                return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_2D_ARRAY:
+            if (lw > m || lh > m || (GLuint)d > maxLayers(ctx)) return GL_INVALID_VALUE;
+            break;
+        case GL_TEXTURE_3D:
+            if (lw > max3DSize(ctx) || lh > max3DSize(ctx) || ld > max3DSize(ctx)) return GL_INVALID_VALUE;
+            break;
+    }
+    return GL_NO_ERROR;
+}
+
+static bool depthFormatAllowedOnTarget(GLenum tt)
+{
+    return tt != GL_TEXTURE_3D;
+}
+
+static bool compressedAllowedOnTarget(const TDFormat *f, GLenum tt)
+{
+    switch (tt)
+    {
+        case GL_TEXTURE_2D: case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP: case GL_TEXTURE_CUBE_MAP_ARRAY:
+            return true;
+        case GL_TEXTURE_3D:
+            /* BPTC is the only core family that allows 3D (Table 8.17) */
+            return f->internalformat == GL_COMPRESSED_RGBA_BPTC_UNORM || f->internalformat == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM ||
+                   f->internalformat == GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT || f->internalformat == GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT;
+        default:
+            return false;
+    }
+}
+
+/* proxy state lives in texparam's proxy objects (queried by GetTexLevelParameter) */
+static void setProxy(GLMContext ctx, Texture *proxy, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d, bool ok)
+{
+    if (!proxy || !ensureLevels(ctx, proxy))
+        return;
+
+    GLuint faces = (proxy->target == GL_TEXTURE_CUBE_MAP) ? 6 : 1;
+    for (GLuint f = 0; f < faces; f++)
+    {
+        TextureLevel *l = texLevel(proxy, f, level);
+        if (!l) continue;
+        l->complete = ok;
+        l->width = ok ? w : 0;
+        l->height = ok ? h : 0;
+        l->depth = ok ? d : 0;
+        l->mtl_format = ok ? ifmt : 0;
+    }
+    if (level == 0 || ok)
+        proxy->internalformat = ok ? ifmt : 0;
+    if (level == 0)
+    {
+        proxy->width = ok ? w : 0;
+        proxy->height = ok ? h : 0;
+        proxy->depth = ok ? d : 0;
+    }
+    proxy->mipmap_levels = TD_MAX_LEVELS;
+    proxy->num_levels = 0;
+    for (GLuint l = 0; l < TD_MAX_LEVELS; l++)
+        if (proxy->faces[0].levels[l].complete)
+            proxy->num_levels = l + 1;
+}
+
+static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint internalformat,
+                     GLsizei width, GLsizei height, GLsizei depth, GLint border,
+                     GLenum format, GLenum type, const void *pixels)
+{
+    TDTarget t;
+    GLenum err;
+
+    TD_CHECK(texImageTarget(target, dims, &t), GL_INVALID_ENUM);
+    TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, t.tex_target), GL_INVALID_VALUE);
+
+    err = tdValidateFormatType(format, type);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    GLenum ifmt = tdResolveInternalFormat(internalformat, format, type);
+    TD_CHECK(ifmt != 0, GL_INVALID_VALUE);
+    const TDFormat *f = tdFormatInfo(ifmt);
+
+    TD_CHECK(border == 0, GL_INVALID_VALUE);
+
+    err = checkSize(ctx, t.tex_target, level, width, height, depth);
+    if (err != GL_NO_ERROR)
+    {
+        if (t.proxy && width >= 0 && height >= 0 && depth >= 0)
+        {
+            setProxy(ctx, mgl_texparam_proxy_texture(ctx, target), level, ifmt, width, height, depth, false);
+            return;
+        }
+        TD_ERR(err);
+    }
+
+    err = tdCheckFormatCompat(f, format, type, false);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    if (f->flags & (TDF_DEPTH | TDF_STENCIL))
+        TD_CHECK(depthFormatAllowedOnTarget(t.tex_target), GL_INVALID_OPERATION);
+
+    if (f->flags & TDF_COMPRESSED)
+    {
+        TD_CHECK(compressedAllowedOnTarget(f, t.tex_target), GL_INVALID_OPERATION);
+        /* the GL would have to compress the client data; MGL has no BC/ETC encoder */
+        TD_CHECK(pixels == NULL && STATE(buffers[_PIXEL_UNPACK_BUFFER]) == NULL, GL_INVALID_OPERATION);
+    }
+
+    if (t.proxy)
+    {
+        setProxy(ctx, mgl_texparam_proxy_texture(ctx, target), level, ifmt, width, height, depth, true);
+        return;
+    }
+
+    Texture *tex = getTex(ctx, 0, t.tex_target);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(!tex->immutable_storage, GL_INVALID_OPERATION);
+
+    /* validate the source before changing anything */
+    uint8_t *src = NULL;
+    if (width && height && depth && (pixels || STATE(buffers[_PIXEL_UNPACK_BUFFER])))
+    {
+        TDPixelStore ps = pixelStore(ctx, true);
+        size_t extent = tdClientLayout(&ps, format, type, width, height, depth, dims == 3, NULL, NULL, NULL);
+        err = resolveClientPtr(ctx, true, pixels, extent, typeAlign(type), &src, NULL);
+        TD_CHECK(err == GL_NO_ERROR, err);
+    }
+
+    if (!defineLevel(ctx, tex, t.face, level, ifmt, width, height, depth))
+        return;
+
+    if (!tex->access)
+        tex->access = GL_READ_ONLY;
+
+    if (src)
+        uploadClient(ctx, tex, t.face, level, 0, 0, 0, width, height, depth, format, type, src, dims == 3);
+}
+
+/* used by framebuffers.c for renderbuffer storage */
+bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLboolean is_array, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels, GLboolean proxy)
+{
+    GLenum ifmt = tdResolveInternalFormat(internalformat, format, type);
+
+    (void)is_array; (void)proxy;
+
+    if (!tex || ifmt == 0)
+    {
+        ERROR_RETURN_VALUE(GL_INVALID_ENUM, false);
+    }
+
+    if (!defineLevel(ctx, tex, face, level, ifmt, width, height, depth))
+        return false;
+
+    if (pixels)
+        uploadClient(ctx, tex, face, level, 0, 0, 0, width, height, depth, format, type, (const uint8_t *)pixels, depth > 1);
+
+    return true;
+}
+
+void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
+{
+    texImage(ctx, target, 1, level, internalformat, width, 1, 1, border, format, type, pixels);
+}
+
+void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
+{
+    texImage(ctx, target, 2, level, internalformat, width, height, 1, border, format, type, pixels);
+}
+
+void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels)
+{
+    texImage(ctx, target, 3, level, internalformat, width, height, depth, border, format, type, pixels);
+}
+
+/* ------------------------------------------------------------------------ */
+/* TexSubImage                                                              */
+/* ------------------------------------------------------------------------ */
+
+/* checks a GL-geometry sub region against a level; returns error */
+static GLenum checkSubRegion(Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d)
+{
+    TextureLevel *l = texLevel(tex, face, level);
+
+    if (w < 0 || h < 0 || d < 0)
+        return GL_INVALID_VALUE;
+    if (!l || !l->complete)
+        return GL_INVALID_OPERATION;
+    if (x < 0 || y < 0 || z < 0)
+        return GL_INVALID_VALUE;
+    if ((GLuint)x + (GLuint)w > l->width || (GLuint)y + (GLuint)h > l->height || (GLuint)z + (GLuint)d > l->depth)
+        return GL_INVALID_VALUE;
+    return GL_NO_ERROR;
+}
+
+static void texSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLint level,
+                        GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                        GLenum format, GLenum type, const void *pixels)
+{
+    GLenum err;
+
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+
+    err = tdValidateFormatType(format, type);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
+    TD_CHECK(f, GL_INVALID_OPERATION);
+
+    err = tdCheckFormatCompat(f, format, type, false);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    /* uncompressed data into a compressed texture would need an encoder */
+    TD_CHECK(!(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+
+    if (w == 0 || h == 0 || d == 0)
+        return;
+
+    TDPixelStore ps = pixelStore(ctx, true);
+    size_t extent = tdClientLayout(&ps, format, type, w, h, d, dims == 3, NULL, NULL, NULL);
+    uint8_t *src = NULL;
+
+    err = resolveClientPtr(ctx, true, pixels, extent, typeAlign(type), &src, NULL);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    if (!src)
+        return;
+
+    uploadClient(ctx, tex, face, level, x, y, z, w, h, d, format, type, src, dims == 3);
+}
+
+static bool subImageTarget(GLenum target, int dims, GLenum *tt, GLuint *face)
+{
+    *face = 0;
+    *tt = target;
+    if (dims == 1)
+        return target == GL_TEXTURE_1D;
+    if (dims == 2)
+    {
+        if (isCubeFace(target)) { *tt = GL_TEXTURE_CUBE_MAP; *face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X; return true; }
+        return target == GL_TEXTURE_2D || target == GL_TEXTURE_1D_ARRAY || target == GL_TEXTURE_RECTANGLE;
+    }
+    return target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_CUBE_MAP_ARRAY;
+}
+
+/* DSA target check for Texture*SubImage* */
+static bool dsaTargetOk(Texture *tex, int dims)
+{
+    switch (dims)
+    {
+        case 1: return tex->target == GL_TEXTURE_1D;
+        case 2: return tex->target == GL_TEXTURE_2D || tex->target == GL_TEXTURE_1D_ARRAY || tex->target == GL_TEXTURE_RECTANGLE;
+        default: return tex->target == GL_TEXTURE_3D || tex->target == GL_TEXTURE_2D_ARRAY ||
+                        tex->target == GL_TEXTURE_CUBE_MAP_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP;
+    }
+}
+
+void mglTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 1, &tt, &face), GL_INVALID_ENUM);
+    texSubImage(ctx, getTex(ctx, 0, tt), face, 1, level, xoffset, 0, 0, width, 1, 1, format, type, pixels);
+}
+
+void mglTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 1), GL_INVALID_ENUM);
+    texSubImage(ctx, tex, 0, 1, level, xoffset, 0, 0, width, 1, 1, format, type, pixels);
+}
+
+void mglTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 2, &tt, &face), GL_INVALID_ENUM);
+    texSubImage(ctx, getTex(ctx, 0, tt), face, 2, level, xoffset, yoffset, 0, width, height, 1, format, type, pixels);
+}
+
+void mglTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 2), GL_INVALID_ENUM);
+    texSubImage(ctx, tex, 0, 2, level, xoffset, yoffset, 0, width, height, 1, format, type, pixels);
+}
+
+void mglTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 3, &tt, &face), GL_INVALID_ENUM);
+    texSubImage(ctx, getTex(ctx, 0, tt), face, 3, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
+}
+
+void mglTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 3), GL_INVALID_ENUM);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        /* the faces are consecutive images of the client data (GL 4.6 8.6) */
+        GLenum err = tdValidateFormatType(format, type);
+        TD_CHECK(err == GL_NO_ERROR, err);
+        TD_CHECK(zoffset >= 0 && depth >= 0 && zoffset + depth <= 6, GL_INVALID_VALUE);
+        TDPixelStore ps = pixelStore(ctx, true);
+        size_t img;
+        tdClientLayout(&ps, format, type, width, height, depth, true, NULL, NULL, &img);
+        PixelStore saved = STATE(unpack);
+        for (GLsizei i = 0; i < depth; i++)
+        {
+            GLenum before = STATE(error);
+            /* the image offset is applied here */
+            STATE(unpack).skip_images = 0;
+            STATE(unpack).image_height = 0;
+            const uint8_t *p = (const uint8_t *)pixels + (size_t)(i + saved.skip_images) * img;
+            texSubImage(ctx, tex, zoffset + i, 2, level, xoffset, yoffset, 0, width, height, 1, format, type, p);
+            STATE(unpack) = saved;
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    texSubImage(ctx, tex, 0, 3, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
+}
+
+/* ------------------------------------------------------------------------ */
+/* TexStorage                                                               */
+/* ------------------------------------------------------------------------ */
+
+static bool storageTarget(GLenum target, int dims, GLenum *tt, bool *proxy)
+{
+    *proxy = false;
+    switch (dims)
+    {
+        case 1:
+            if (target == GL_TEXTURE_1D) { *tt = target; return true; }
+            if (target == GL_PROXY_TEXTURE_1D) { *tt = GL_TEXTURE_1D; *proxy = true; return true; }
+            return false;
+        case 2:
+            switch (target)
+            {
+                case GL_TEXTURE_2D: case GL_TEXTURE_1D_ARRAY: case GL_TEXTURE_RECTANGLE: case GL_TEXTURE_CUBE_MAP:
+                    *tt = target; return true;
+                case GL_PROXY_TEXTURE_2D: case GL_PROXY_TEXTURE_1D_ARRAY: case GL_PROXY_TEXTURE_RECTANGLE: case GL_PROXY_TEXTURE_CUBE_MAP:
+                    *tt = proxyTexTarget(target); *proxy = true; return true;
+                default: return false;
+            }
+        default:
+            switch (target)
+            {
+                case GL_TEXTURE_3D: case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP_ARRAY:
+                    *tt = target; return true;
+                case GL_PROXY_TEXTURE_3D: case GL_PROXY_TEXTURE_2D_ARRAY: case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY:
+                    *tt = proxyTexTarget(target); *proxy = true; return true;
+                default: return false;
+            }
+    }
+}
+
+static void texStorage(GLMContext ctx, Texture *tex, GLenum tt, GLenum proxy_target, GLsizei levels, GLenum internalformat,
+                       GLsizei width, GLsizei height, GLsizei depth)
+{
+    TD_CHECK(tdFormatInfo(internalformat) != NULL, GL_INVALID_ENUM);
+    TD_CHECK(width >= 1 && height >= 1 && depth >= 1 && levels >= 1, GL_INVALID_VALUE);
+
+    const TDFormat *f = tdFormatInfo(internalformat);
+
+    if (tt == GL_TEXTURE_CUBE_MAP)
+        TD_CHECK(width == height, GL_INVALID_VALUE);
+    if (tt == GL_TEXTURE_CUBE_MAP_ARRAY)
+        TD_CHECK(width == height && (depth % 6) == 0, GL_INVALID_VALUE);
+
+    GLenum err = checkSize(ctx, tt, 0, width, height, depth);
+    if (err != GL_NO_ERROR)
+    {
+        if (proxy_target)
+        {
+            setProxy(ctx, mgl_texparam_proxy_texture(ctx, proxy_target), 0, internalformat, width, height, depth, false);
+            return;
+        }
+        TD_ERR(err);
+    }
+
+    GLuint maxl;
+    switch (tt)
+    {
+        case GL_TEXTURE_1D: case GL_TEXTURE_1D_ARRAY: maxl = log2u(width) + 1; break;
+        case GL_TEXTURE_3D: maxl = log2u(MAX(width, MAX(height, depth))) + 1; break;
+        case GL_TEXTURE_RECTANGLE: maxl = 1; break;
+        default: maxl = log2u(MAX(width, height)) + 1; break;
+    }
+    TD_CHECK((GLuint)levels <= maxl && levels <= TD_MAX_LEVELS, GL_INVALID_OPERATION);
+
+    if (f->flags & TDF_COMPRESSED)
+        TD_CHECK(compressedAllowedOnTarget(f, tt), GL_INVALID_OPERATION);
+    if (f->flags & (TDF_DEPTH | TDF_STENCIL))
+        TD_CHECK(depthFormatAllowedOnTarget(tt), GL_INVALID_OPERATION);
+
+    if (proxy_target)
+    {
+        Texture *p = mgl_texparam_proxy_texture(ctx, proxy_target);
+        for (GLsizei l = 0; l < levels && p; l++)
+        {
+            GLuint w, h, d;
+            mipDims(p, l, width, height, depth, &w, &h, &d);
+            setProxy(ctx, p, l, internalformat, w, h, d, true);
+        }
+        return;
+    }
+
+    TD_CHECK(tex && tex->name != TEX_OBJ_RES_NAME && tex->name != 0, GL_INVALID_OPERATION);
+    TD_CHECK(!tex->immutable_storage, GL_INVALID_OPERATION);
+
+    undefineAllLevels(ctx, tex);
+
+    GLuint faces = mgl_texdata_num_faces(tex);
+    for (GLuint face = 0; face < faces; face++)
+    {
+        for (GLsizei l = 0; l < levels; l++)
+        {
+            GLuint w, h, d;
+            mipDims(tex, l, width, height, depth, &w, &h, &d);
+            if (!defineLevel(ctx, tex, face, l, internalformat, w, h, d))
+                return;
+        }
+    }
+
+    tex->immutable_storage = GL_TRUE;
+    tex->num_levels = levels;
+    tex->mipmap_levels = levels;
+    tex->width = width;
+    tex->height = height;
+    tex->depth = depth;
+    tex->internalformat = internalformat;
+    tex->is_array = isArrayTarget(tt);
+    if (!tex->access)
+        tex->access = GL_READ_ONLY;
+
+    /* create the Metal texture now (the content stays undefined) */
+    if (TDM(ctx) && TDM(ctx)->realize)
+        TDM(ctx)->realize(ctx, tex);
+}
+
+void mglTexStorage1D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width)
+{
+    GLenum tt; bool proxy;
+    TD_CHECK(storageTarget(target, 1, &tt, &proxy), GL_INVALID_ENUM);
+    texStorage(ctx, proxy ? NULL : getTex(ctx, 0, tt), tt, proxy ? target : 0, levels, internalformat, width, 1, 1);
+}
+
+void mglTexStorage2D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    GLenum tt; bool proxy;
+    TD_CHECK(storageTarget(target, 2, &tt, &proxy), GL_INVALID_ENUM);
+    texStorage(ctx, proxy ? NULL : getTex(ctx, 0, tt), tt, proxy ? target : 0, levels, internalformat, width, height, 1);
+}
+
+void mglTexStorage3D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
+{
+    GLenum tt; bool proxy;
+    TD_CHECK(storageTarget(target, 3, &tt, &proxy), GL_INVALID_ENUM);
+    texStorage(ctx, proxy ? NULL : getTex(ctx, 0, tt), tt, proxy ? target : 0, levels, internalformat, width, height, depth);
+}
+
+void mglTextureStorage1D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(tex->target == GL_TEXTURE_1D, GL_INVALID_OPERATION);
+    texStorage(ctx, tex, tex->target, 0, levels, internalformat, width, 1, 1);
+}
+
+void mglTextureStorage2D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(tex->target == GL_TEXTURE_2D || tex->target == GL_TEXTURE_1D_ARRAY || tex->target == GL_TEXTURE_RECTANGLE ||
+             tex->target == GL_TEXTURE_CUBE_MAP, GL_INVALID_OPERATION);
+    texStorage(ctx, tex, tex->target, 0, levels, internalformat, width, height, 1);
+}
+
+void mglTextureStorage3D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(tex->target == GL_TEXTURE_3D || tex->target == GL_TEXTURE_2D_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP_ARRAY,
+             GL_INVALID_OPERATION);
+    texStorage(ctx, tex, tex->target, 0, levels, internalformat, width, height, depth);
+}
+
+/* ------------------------------------------------------------------------ */
+/* compressed images                                                        */
+/* ------------------------------------------------------------------------ */
+
+static bool etcFallback(const TDFormat *f)
+{
+    return f && (f->flags & TDF_ETC) && tdStorageFormat(f) != f;
+}
+
+/* store tightly packed compressed blocks of a GL region (x,y block aligned) */
+static bool storeCompressed(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                            GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, const uint8_t *blocks)
+{
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
+    const TDFormat *sf = tdStorageFormat(f);
+
+    if (!f || !sf)
+        return false;
+
+    size_t row = tdStorageRowBytes(f, w), img = tdStorageImageBytes(f, w, h);
+    TDRegion r = glRegion(tex, face, level, x, y, z, w, h, d);
+
+    if (etcFallback(f))
+    {
+        /* keep the original blocks for GetCompressedTexImage, decode on the CPU */
+        TDTexInfo *info = mgl_texdata_info(ctx, tex);
+        TextureLevel *l = texLevel(tex, face, level);
+        size_t lrow = tdStorageRowBytes(f, l->width), limg = tdStorageImageBytes(f, l->width, l->height);
+        size_t lsize = limg * l->depth;
+
+        if (!info)
+            return false;
+        if (!info->orig[face][level])
+        {
+            info->orig[face][level] = calloc(1, lsize ? lsize : 1);
+            if (!info->orig[face][level])
+                return false;
+            info->orig_size[face][level] = lsize;
+        }
+
+        uint8_t *o = (uint8_t *)info->orig[face][level];
+        size_t bx = (size_t)x / f->block_w * f->block_bytes, by = (size_t)y / f->block_h;
+        size_t brows = ((size_t)h + f->block_h - 1) / f->block_h;
+        for (GLsizei zz = 0; zz < d; zz++)
+            for (size_t yy = 0; yy < brows; yy++)
+                memcpy(o + (size_t)(z + zz) * limg + (by + yy) * lrow + bx, blocks + (size_t)zz * img + yy * row, row);
+
+        TDStorage st;
+        if (!allocStorage(sf, w, h, d, &st))
+            return false;
+        for (GLsizei zz = 0; zz < d; zz++)
+            tdDecodeETC(f, blocks + (size_t)zz * img, w, h, (uint8_t *)st.data + (size_t)zz * st.image_pitch, st.row_pitch);
+        bool ok = writeRegion(ctx, tex, &r, &st, true, true);
+        free(st.data);
+        return ok;
+    }
+
+    TDStorage st = { (void *)blocks, row, img, NULL, 0, 0 };
+    return writeRegion(ctx, tex, &r, &st, true, true);
+}
+
+/* gather client compressed data into tight blocks */
+static uint8_t *gatherCompressed(const TDFormat *f, const uint8_t *src, size_t off, size_t row_stride, size_t img_stride,
+                                 GLsizei w, GLsizei h, GLsizei d)
+{
+    size_t row = tdStorageRowBytes(f, w), img = tdStorageImageBytes(f, w, h);
+    size_t brows = ((size_t)h + f->block_h - 1) / f->block_h;
+    uint8_t *t = (uint8_t *)malloc(img * (size_t)d + 1);
+
+    if (!t)
+        return NULL;
+    for (GLsizei z = 0; z < d; z++)
+        for (size_t y = 0; y < brows; y++)
+            memcpy(t + (size_t)z * img + y * row, src + off + (size_t)z * img_stride + y * row_stride, row);
+    return t;
+}
+
+static void compressedTexImage(GLMContext ctx, GLenum target, int dims, GLint level, GLenum internalformat,
+                               GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data)
+{
+    TDTarget t;
+    GLenum err;
+
+    TD_CHECK(texImageTarget(target, dims, &t), GL_INVALID_ENUM);
+
+    const TDFormat *f = tdFormatInfo(internalformat);
+    TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_ENUM);
+    TD_CHECK(compressedAllowedOnTarget(f, t.tex_target), dims == 1 ? GL_INVALID_ENUM : GL_INVALID_OPERATION);
+    TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, t.tex_target), GL_INVALID_VALUE);
+    TD_CHECK(border == 0, GL_INVALID_VALUE);
+    TD_CHECK(imageSize >= 0, GL_INVALID_VALUE);
+
+    err = checkSize(ctx, t.tex_target, level, width, height, depth);
+    if (err != GL_NO_ERROR)
+    {
+        if (t.proxy && width >= 0 && height >= 0 && depth >= 0)
+        {
+            setProxy(ctx, mgl_texparam_proxy_texture(ctx, target), level, internalformat, width, height, depth, false);
+            return;
+        }
+        TD_ERR(err);
+    }
+
+    TD_CHECK((size_t)imageSize == tdCompressedSize(f, width, height, depth), GL_INVALID_VALUE);
+
+    if (t.proxy)
+    {
+        setProxy(ctx, mgl_texparam_proxy_texture(ctx, target), level, internalformat, width, height, depth, true);
+        return;
+    }
+
+    Texture *tex = getTex(ctx, 0, t.tex_target);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(!tex->immutable_storage, GL_INVALID_OPERATION);
+
+    TDPixelStore ps = pixelStore(ctx, true);
+    size_t off, rs, is;
+    size_t extent = tdCompressedClientLayout(&ps, f, width, height, depth, dims == 3, NULL, &off, &rs, &is);
+    uint8_t *src = NULL;
+
+    if (data || STATE(buffers[_PIXEL_UNPACK_BUFFER]))
+    {
+        err = resolveClientPtr(ctx, true, data, extent, 1, &src, NULL);
+        TD_CHECK(err == GL_NO_ERROR, err);
+    }
+
+    if (!defineLevel(ctx, tex, t.face, level, internalformat, width, height, depth))
+        return;
+
+    if (!src || !width || !height || !depth)
+        return;
+
+    uint8_t *blocks = gatherCompressed(f, src, off, rs, is, width, height, depth);
+    TD_CHECK(blocks, GL_OUT_OF_MEMORY);
+    bool ok = storeCompressed(ctx, tex, t.face, level, 0, 0, 0, width, height, depth, blocks);
+    free(blocks);
+    TD_CHECK(ok, GL_OUT_OF_MEMORY);
+}
+
+void mglCompressedTexImage3D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data)
+{
+    compressedTexImage(ctx, target, 3, level, internalformat, width, height, depth, border, imageSize, data);
+}
+
+void mglCompressedTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data)
+{
+    compressedTexImage(ctx, target, 2, level, internalformat, width, height, 1, border, imageSize, data);
+}
+
+void mglCompressedTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const void *data)
+{
+    /* no GL 4.6 compressed format supports 1D textures (Table 8.17) */
+    compressedTexImage(ctx, target, 1, level, internalformat, width, 1, 1, border, imageSize, data);
+}
+
+static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLint level,
+                                  GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                                  GLenum format, GLsizei imageSize, const void *data)
+{
+    GLenum err;
+
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+
+    const TDFormat *f = tdFormatInfo(format);
+    TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_ENUM);
+
+    TextureLevel *l = texLevel(tex, face, level);
+    TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
+    TD_CHECK(l->mtl_format == format, GL_INVALID_OPERATION);
+    TD_CHECK(dims != 1, GL_INVALID_OPERATION);
+
+    err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    TD_CHECK((x % f->block_w) == 0 && (y % f->block_h) == 0, GL_INVALID_OPERATION);
+    TD_CHECK((w % f->block_w) == 0 || (GLuint)(x + w) == l->width, GL_INVALID_OPERATION);
+    TD_CHECK((h % f->block_h) == 0 || (GLuint)(y + h) == l->height, GL_INVALID_OPERATION);
+    TD_CHECK(imageSize >= 0 && (size_t)imageSize == tdCompressedSize(f, w, h, d), GL_INVALID_VALUE);
+
+    if (!w || !h || !d)
+        return;
+
+    TDPixelStore ps = pixelStore(ctx, true);
+    size_t off, rs, is;
+    size_t extent = tdCompressedClientLayout(&ps, f, w, h, d, dims == 3, NULL, &off, &rs, &is);
+    uint8_t *src = NULL;
+
+    err = resolveClientPtr(ctx, true, data, extent, 1, &src, NULL);
+    TD_CHECK(err == GL_NO_ERROR, err);
+    if (!src)
+        return;
+
+    uint8_t *blocks = gatherCompressed(f, src, off, rs, is, w, h, d);
+    TD_CHECK(blocks, GL_OUT_OF_MEMORY);
+    bool ok = storeCompressed(ctx, tex, face, level, x, y, z, w, h, d, blocks);
+    free(blocks);
+    TD_CHECK(ok, GL_OUT_OF_MEMORY);
+}
+
+void mglCompressedTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 3, &tt, &face), GL_INVALID_ENUM);
+    compressedTexSubImage(ctx, getTex(ctx, 0, tt), face, 3, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+}
+
+void mglCompressedTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 2, &tt, &face), GL_INVALID_ENUM);
+    compressedTexSubImage(ctx, getTex(ctx, 0, tt), face, 2, level, xoffset, yoffset, 0, width, height, 1, format, imageSize, data);
+}
+
+void mglCompressedTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 1, &tt, &face), GL_INVALID_ENUM);
+    compressedTexSubImage(ctx, getTex(ctx, 0, tt), face, 1, level, xoffset, 0, 0, width, 1, 1, format, imageSize, data);
+}
+
+void mglCompressedTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 1), GL_INVALID_ENUM);
+    compressedTexSubImage(ctx, tex, 0, 1, level, xoffset, 0, 0, width, 1, 1, format, imageSize, data);
+}
+
+void mglCompressedTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 2), GL_INVALID_ENUM);
+    compressedTexSubImage(ctx, tex, 0, 2, level, xoffset, yoffset, 0, width, height, 1, format, imageSize, data);
+}
+
+void mglCompressedTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 3), GL_INVALID_ENUM);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        const TDFormat *f = tdFormatInfo(format);
+        TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_ENUM);
+        TD_CHECK(zoffset >= 0 && depth >= 0 && zoffset + depth <= 6, GL_INVALID_VALUE);
+        TD_CHECK(imageSize >= 0 && (size_t)imageSize == tdCompressedSize(f, width, height, depth), GL_INVALID_VALUE);
+        size_t face_size = tdCompressedSize(f, width, height, 1);
+        for (GLsizei i = 0; i < depth; i++)
+        {
+            GLenum before = STATE(error);
+            const uint8_t *p = (const uint8_t *)data + (size_t)i * face_size;
+            compressedTexSubImage(ctx, tex, zoffset + i, 2, level, xoffset, yoffset, 0, width, height, 1, format, (GLsizei)face_size, p);
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    compressedTexSubImage(ctx, tex, 0, 3, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+}
+
+/* read tight compressed blocks of a GL region */
+static bool fetchCompressed(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLint x, GLint y, GLint z,
+                            GLsizei w, GLsizei h, GLsizei d, uint8_t *out)
+{
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
+    if (!f)
+        return false;
+    size_t row = tdStorageRowBytes(f, w), img = tdStorageImageBytes(f, w, h);
+
+    if (etcFallback(f))
+    {
+        TDTexInfo *info = mgl_texdata_find_info(ctx, tex);
+        TextureLevel *l = texLevel(tex, face, level);
+        size_t lrow = tdStorageRowBytes(f, l->width), limg = tdStorageImageBytes(f, l->width, l->height);
+        size_t bx = (size_t)x / f->block_w * f->block_bytes, by = (size_t)y / f->block_h;
+        size_t brows = ((size_t)h + f->block_h - 1) / f->block_h;
+        const uint8_t *o = info ? (const uint8_t *)info->orig[face][level] : NULL;
+        for (GLsizei zz = 0; zz < d; zz++)
+            for (size_t yy = 0; yy < brows; yy++)
+            {
+                if (o) memcpy(out + (size_t)zz * img + yy * row, o + (size_t)(z + zz) * limg + (by + yy) * lrow + bx, row);
+                else memset(out + (size_t)zz * img + yy * row, 0, row);
+            }
+        return true;
+    }
+
+    TDRegion r = glRegion(tex, face, level, x, y, z, w, h, d);
+    TDStorage st = { out, row, img, NULL, 0, 0 };
+    return readRegion(ctx, tex, &r, &st);
+}
+
+static void getCompressed(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z,
+                          GLsizei w, GLsizei h, GLsizei d, GLsizei bufSize, void *pixels, bool whole, bool is3d)
+{
+    GLenum err;
+
+    TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+    TextureLevel *l = texLevel(tex, face, level);
+    TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
+
+    const TDFormat *f = tdFormatInfo(l->mtl_format);
+    TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+
+    if (whole)
+    {
+        x = y = z = 0;
+        w = l->width; h = l->height; d = l->depth;
+    }
+    else
+    {
+        err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+        TD_CHECK(err == GL_NO_ERROR, err);
+        TD_CHECK((x % f->block_w) == 0 && (y % f->block_h) == 0, GL_INVALID_OPERATION);
+        TD_CHECK((w % f->block_w) == 0 || (GLuint)(x + w) == l->width, GL_INVALID_OPERATION);
+        TD_CHECK((h % f->block_h) == 0 || (GLuint)(y + h) == l->height, GL_INVALID_OPERATION);
+    }
+
+    if (!w || !h || !d)
+        return;
+
+    TDPixelStore ps = pixelStore(ctx, false);
+    size_t off, rs, is;
+    size_t extent = tdCompressedClientLayout(&ps, f, w, h, d, is3d, NULL, &off, &rs, &is);
+
+    if (bufSize >= 0 && !STATE(buffers[_PIXEL_PACK_BUFFER]))
+        TD_CHECK(extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+
+    uint8_t *dst = NULL;
+    Buffer *pbo = NULL;
+    err = resolveClientPtr(ctx, false, pixels, extent, 1, &dst, &pbo);
+    TD_CHECK(err == GL_NO_ERROR, err);
+    if (!dst)
+        return;
+
+    size_t row = tdStorageRowBytes(f, w), img = tdStorageImageBytes(f, w, h);
+    size_t brows = ((size_t)h + f->block_h - 1) / f->block_h;
+    uint8_t *blocks = (uint8_t *)malloc(img * (size_t)d + 1);
+    TD_CHECK(blocks, GL_OUT_OF_MEMORY);
+
+    if (!fetchCompressed(ctx, tex, face, level, x, y, z, w, h, d, blocks))
+    {
+        free(blocks);
+        TD_ERR(GL_INVALID_OPERATION);
+    }
+
+    for (GLsizei zz = 0; zz < d; zz++)
+        for (size_t yy = 0; yy < brows; yy++)
+            memcpy(dst + off + (size_t)zz * is + yy * rs, blocks + (size_t)zz * img + yy * row, row);
+
+    free(blocks);
+    pboWrittenRange(ctx, pbo, dst, extent);
+}
+
+static bool getImageTarget(GLenum target, GLenum *tt, GLuint *face)
+{
+    *face = 0;
+    *tt = target;
+    if (isCubeFace(target)) { *tt = GL_TEXTURE_CUBE_MAP; *face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X; return true; }
+    switch (target)
+    {
+        case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D: case GL_TEXTURE_1D_ARRAY:
+        case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP_ARRAY: case GL_TEXTURE_RECTANGLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool getTargetIs3D(GLenum tt)
+{
+    return tt == GL_TEXTURE_3D || tt == GL_TEXTURE_2D_ARRAY || tt == GL_TEXTURE_CUBE_MAP_ARRAY || tt == GL_TEXTURE_CUBE_MAP;
+}
+
+void mglGetCompressedTexImage(GLMContext ctx, GLenum target, GLint level, void *img)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(getImageTarget(target, &tt, &face), GL_INVALID_ENUM);
+    Texture *tex = getTex(ctx, 0, tt);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    getCompressed(ctx, tex, face, level, 0, 0, 0, 0, 0, 0, -1, img, true, getTargetIs3D(tt));
+}
+
+void mglGetnCompressedTexImage(GLMContext ctx, GLenum target, GLint lod, GLsizei bufSize, void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(getImageTarget(target, &tt, &face), GL_INVALID_ENUM);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+    Texture *tex = getTex(ctx, 0, tt);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    getCompressed(ctx, tex, face, lod, 0, 0, 0, 0, 0, 0, bufSize, pixels, true, getTargetIs3D(tt));
+}
+
+void mglGetCompressedTextureImage(GLMContext ctx, GLuint texture, GLint level, GLsizei bufSize, void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        /* all six faces, as consecutive images */
+        TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+        TextureLevel *l = texLevel(tex, 0, level);
+        TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
+        for (GLuint f = 0; f < 6; f++)
+        {
+            TextureLevel *lf = texLevel(tex, f, level);
+            TD_CHECK(lf && lf->complete && lf->width == l->width && lf->mtl_format == l->mtl_format, GL_INVALID_OPERATION);
+        }
+        const TDFormat *fmt = tdFormatInfo(l->mtl_format);
+        TD_CHECK(fmt && (fmt->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+        TDPixelStore ps = pixelStore(ctx, false);
+        size_t off, rs, is;
+        size_t extent = tdCompressedClientLayout(&ps, fmt, l->width, l->height, 6, true, NULL, &off, &rs, &is);
+        if (!STATE(buffers[_PIXEL_PACK_BUFFER]))
+            TD_CHECK(extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+        for (GLuint f = 0; f < 6; f++)
+        {
+            GLenum before = STATE(error);
+            getCompressed(ctx, tex, f, level, 0, 0, 0, 0, 0, 0, -1, (uint8_t *)pixels + (size_t)f * is, true, true);
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
+             tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+    getCompressed(ctx, tex, 0, level, 0, 0, 0, 0, 0, 0, bufSize, pixels, true, getTargetIs3D(tex->target));
+}
+
+void mglGetCompressedTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLsizei bufSize, void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+    TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
+             tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        TD_CHECK(zoffset >= 0 && depth >= 0 && zoffset + depth <= 6, GL_INVALID_VALUE);
+        TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+        TextureLevel *l = texLevel(tex, zoffset < 6 ? zoffset : 0, level);
+        TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
+        const TDFormat *fmt = tdFormatInfo(l->mtl_format);
+        TD_CHECK(fmt && (fmt->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+        TDPixelStore ps = pixelStore(ctx, false);
+        size_t off, rs, is;
+        size_t extent = tdCompressedClientLayout(&ps, fmt, width, height, depth, true, NULL, &off, &rs, &is);
+        if (!STATE(buffers[_PIXEL_PACK_BUFFER]))
+            TD_CHECK(extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+        for (GLsizei i = 0; i < depth; i++)
+        {
+            GLenum before = STATE(error);
+            getCompressed(ctx, tex, zoffset + i, level, xoffset, yoffset, 0, width, height, 1, -1,
+                          (uint8_t *)pixels + (size_t)i * is, false, true);
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    getCompressed(ctx, tex, 0, level, xoffset, yoffset, zoffset, width, height, depth, bufSize, pixels, false,
+                  getTargetIs3D(tex->target));
+}
+
+/* ------------------------------------------------------------------------ */
+/* GetTexImage                                                              */
+/* ------------------------------------------------------------------------ */
+
+static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z,
+                        GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type, GLsizei bufSize, void *pixels,
+                        bool whole, bool is3d, size_t dst_skip)
+{
+    GLenum err;
+
+    TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, tex->target), GL_INVALID_VALUE);
+
+    err = tdValidateFormatType(format, type);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    TextureLevel *l = texLevel(tex, face, level);
+    if (!l || !l->complete)
+    {
+        /* an undefined image reads as nothing; region reads still validate the region */
+        TD_CHECK(whole, GL_INVALID_VALUE);
+        return;
+    }
+
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
+    TD_CHECK(f, GL_INVALID_OPERATION);
+
+    err = tdCheckFormatCompat(f, format, type, true);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    if (whole)
+    {
+        x = y = z = 0;
+        w = l->width; h = l->height; d = l->depth;
+    }
+    else
+    {
+        err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+        TD_CHECK(err == GL_NO_ERROR, err);
+    }
+
+    if (!w || !h || !d)
+        return;
+
+    TDPixelStore ps = pixelStore(ctx, false);
+    size_t off, rs, is;
+    size_t extent = tdClientLayout(&ps, format, type, w, h, d, is3d, &off, &rs, &is);
+
+    if (bufSize >= 0 && !STATE(buffers[_PIXEL_PACK_BUFFER]))
+        TD_CHECK(dst_skip + extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+
+    uint8_t *dst = NULL;
+    Buffer *pbo = NULL;
+    err = resolveClientPtr(ctx, false, (const uint8_t *)pixels + dst_skip, extent, typeAlign(type), &dst, &pbo);
+    TD_CHECK(err == GL_NO_ERROR, err);
+    if (!dst)
+        return;
+
+    const TDFormat *sf = tdStorageFormat(f);
+    TDRegion r = glRegion(tex, face, level, x, y, z, w, h, d);
+
+    if (sf->flags & TDF_COMPRESSED)
+    {
+        /* decompress on the GPU into RGBA32F, then pack */
+        size_t texels = (size_t)w * h * d;
+        float *rgba = (float *)malloc(texels * 16 + 16);
+        TD_CHECK(rgba, GL_OUT_OF_MEMORY);
+        if (!TDM(ctx) || !TDM(ctx)->download_decoded || !TDM(ctx)->download_decoded(ctx, tex, &r, rgba))
+        {
+            free(rgba);
+            TD_ERR(GL_INVALID_OPERATION);
+        }
+        TDFormat dec = *tdFormatInfo(GL_RGBA32F);
+        dec.base = f->base;
+        TDStorage st = { rgba, (size_t)w * 16, (size_t)w * h * 16, NULL, 0, 0 };
+        tdPack(&dec, &st, w, h, d, format, type, ps.swap_bytes, dst + off, rs, is);
+        free(rgba);
+        pboWrittenRange(ctx, pbo, dst, extent);
+        return;
+    }
+
+    TDStorage st;
+    if (!allocStorage(sf, r.w, r.h, r.d, &st))
+        TD_ERR(GL_OUT_OF_MEMORY);
+
+    if (!readRegion(ctx, tex, &r, &st))
+    {
+        free(st.data);
+        TD_ERR(GL_INVALID_OPERATION);
+    }
+
+    /* the tight storage of a 1D-array region (h layers of one row) is a w x h image */
+    tdPack(sf, &st, w, h, d, format, type, ps.swap_bytes, dst + off, rs, is);
+    free(st.data);
+    pboWrittenRange(ctx, pbo, dst, extent);
+}
+
+void mglGetTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(getImageTarget(target, &tt, &face), GL_INVALID_ENUM);
+    Texture *tex = getTex(ctx, 0, tt);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    getTexImage(ctx, tex, face, level, 0, 0, 0, 0, 0, 0, format, type, -1, pixels, true, getTargetIs3D(tt), 0);
+}
+
+void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(getImageTarget(target, &tt, &face), GL_INVALID_ENUM);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+    Texture *tex = getTex(ctx, 0, tt);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    getTexImage(ctx, tex, face, level, 0, 0, 0, 0, 0, 0, format, type, bufSize, pixels, true, getTargetIs3D(tt), 0);
+}
+
+void mglGetTextureImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+    TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
+             tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+        TextureLevel *l = texLevel(tex, 0, level);
+        if (!l || !l->complete)
+            return;
+        GLenum err = tdValidateFormatType(format, type);
+        TD_CHECK(err == GL_NO_ERROR, err);
+        TDPixelStore ps = pixelStore(ctx, false);
+        size_t off, rs, is;
+        size_t extent = tdClientLayout(&ps, format, type, l->width, l->height, 6, true, &off, &rs, &is);
+        if (!STATE(buffers[_PIXEL_PACK_BUFFER]))
+            TD_CHECK(extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+        for (GLuint f = 0; f < 6; f++)
+        {
+            GLenum before = STATE(error);
+            getTexImage(ctx, tex, f, level, 0, 0, 0, l->width, l->height, 1, format, type, -1, pixels, false, true, (size_t)f * is);
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    getTexImage(ctx, tex, 0, level, 0, 0, 0, 0, 0, 0, format, type, bufSize, pixels, true, getTargetIs3D(tex->target), 0);
+}
+
+void mglGetTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
+    TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
+             tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        TD_CHECK(zoffset >= 0 && depth >= 0 && zoffset + depth <= 6, GL_INVALID_VALUE);
+        GLenum err = tdValidateFormatType(format, type);
+        TD_CHECK(err == GL_NO_ERROR, err);
+        TDPixelStore ps = pixelStore(ctx, false);
+        size_t off, rs, is;
+        size_t extent = tdClientLayout(&ps, format, type, width, height, depth, true, &off, &rs, &is);
+        if (!STATE(buffers[_PIXEL_PACK_BUFFER]))
+            TD_CHECK(extent <= (size_t)bufSize, GL_INVALID_OPERATION);
+        for (GLsizei i = 0; i < depth; i++)
+        {
+            GLenum before = STATE(error);
+            getTexImage(ctx, tex, zoffset + i, level, xoffset, yoffset, 0, width, height, 1, format, type, -1, pixels,
+                        false, true, (size_t)i * is);
+            if (before == GL_NO_ERROR && STATE(error) != GL_NO_ERROR)
+                return;
+        }
+        return;
+    }
+
+    getTexImage(ctx, tex, 0, level, xoffset, yoffset, zoffset, width, height, depth, format, type, bufSize, pixels,
+                false, getTargetIs3D(tex->target), 0);
+}
+
+/* ------------------------------------------------------------------------ */
+/* CopyTexImage / CopyTexSubImage                                           */
+/* ------------------------------------------------------------------------ */
+
+static GLenum readFramebufferCheck(GLMContext ctx)
+{
+    if (STATE(readbuffer) && mgl_fb_status(ctx, STATE(readbuffer)) != GL_FRAMEBUFFER_COMPLETE)
+        return GL_INVALID_FRAMEBUFFER_OPERATION;
+    return GL_NO_ERROR;
+}
+
+/* class compatibility between the read buffer and a destination format */
+static GLenum copyCompat(GLMContext ctx, const TDFormat *df, bool *depth, bool *stencil)
+{
+    GLenum src_ifmt = 0;
+    GLuint sw = 0, sh = 0;
+
+    *depth = (df->flags & TDF_DEPTH) != 0;
+    *stencil = (df->flags & TDF_STENCIL) != 0;
+
+    if (df->flags & TDF_COMPRESSED)
+        return GL_INVALID_OPERATION;
+
+    if (!TDM(ctx) || !TDM(ctx)->read_buffer_info ||
+        !TDM(ctx)->read_buffer_info(ctx, *depth, *stencil, &src_ifmt, &sw, &sh))
+        return GL_INVALID_OPERATION;
+
+    const TDFormat *sf = tdFormatInfo(src_ifmt);
+    if (!sf)
+        return GL_NO_ERROR;   /* default framebuffer formats we do not describe: normalized color */
+
+    if (((sf->flags & TDF_INTEGER) != 0) != ((df->flags & TDF_INTEGER) != 0))
+        return GL_INVALID_OPERATION;
+    if ((df->flags & TDF_INTEGER) && sf->comp_type != df->comp_type)
+        return GL_INVALID_OPERATION;
+    return GL_NO_ERROR;
+}
+
+static void copyTexSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
+                            GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    GLenum err;
+
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+
+    err = checkSubRegion(tex, face, level, xoffset, yoffset, zoffset, width, height, 1);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    err = readFramebufferCheck(ctx);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    const TDFormat *df = tdFormatInfo(levelFormat(tex, face, level));
+    TD_CHECK(df, GL_INVALID_OPERATION);
+
+    bool depth, stencil;
+    err = copyCompat(ctx, df, &depth, &stencil);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    if (!width || !height)
+        return;
+
+    TDRegion r = glRegion(tex, face, level, xoffset, yoffset, zoffset, width, height, 1);
+    TD_CHECK(TDM(ctx) && TDM(ctx)->copy_from_read_fb, GL_INVALID_OPERATION);
+    err = TDM(ctx)->copy_from_read_fb(ctx, tex, &r, x, y, width, height, depth, stencil);
+    TD_CHECK(err == GL_NO_ERROR, err);
+}
+
+static void copyTexImage(GLMContext ctx, GLenum target, int dims, GLint level, GLenum internalformat,
+                         GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
+{
+    TDTarget t;
+    GLenum err;
+
+    TD_CHECK(texImageTarget(target, dims, &t) && !t.proxy && t.tex_target != GL_TEXTURE_RECTANGLE + 0x10000, GL_INVALID_ENUM);
+    TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, t.tex_target), GL_INVALID_VALUE);
+    TD_CHECK(border == 0, GL_INVALID_VALUE);
+
+    GLenum ifmt = tdResolveInternalFormat(internalformat, 0, 0);
+    TD_CHECK(ifmt != 0, GL_INVALID_VALUE);
+    const TDFormat *f = tdFormatInfo(ifmt);
+    TD_CHECK(!(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+
+    err = checkSize(ctx, t.tex_target, level, width, height, 1);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    err = readFramebufferCheck(ctx);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    bool depth, stencil;
+    err = copyCompat(ctx, f, &depth, &stencil);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    Texture *tex = getTex(ctx, 0, t.tex_target);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(!tex->immutable_storage, GL_INVALID_OPERATION);
+
+    if (!defineLevel(ctx, tex, t.face, level, ifmt, width, height, 1))
+        return;
+
+    if (!width || !height)
+        return;
+
+    copyTexSubImage(ctx, tex, t.face, level, 0, 0, 0, x, y, width, height);
+}
+
+void mglCopyTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border)
+{
+    copyTexImage(ctx, target, 1, level, internalformat, x, y, width, 1, border);
+}
+
+void mglCopyTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
+{
+    copyTexImage(ctx, target, 2, level, internalformat, x, y, width, height, border);
+}
+
+void mglCopyTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 1, &tt, &face), GL_INVALID_ENUM);
+    copyTexSubImage(ctx, getTex(ctx, 0, tt), face, level, xoffset, 0, 0, x, y, width, 1);
+}
+
+void mglCopyTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 2, &tt, &face), GL_INVALID_ENUM);
+    copyTexSubImage(ctx, getTex(ctx, 0, tt), face, level, xoffset, yoffset, 0, x, y, width, height);
+}
+
+void mglCopyTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    GLenum tt; GLuint face;
+    TD_CHECK(subImageTarget(target, 3, &tt, &face), GL_INVALID_ENUM);
+    copyTexSubImage(ctx, getTex(ctx, 0, tt), face, level, xoffset, yoffset, zoffset, x, y, width, height);
+}
+
+void mglCopyTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 1), GL_INVALID_OPERATION);
+    copyTexSubImage(ctx, tex, 0, level, xoffset, 0, 0, x, y, width, 1);
+}
+
+void mglCopyTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 2), GL_INVALID_OPERATION);
+    copyTexSubImage(ctx, tex, 0, level, xoffset, yoffset, 0, x, y, width, height);
+}
+
+void mglCopyTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(dsaTargetOk(tex, 3), GL_INVALID_OPERATION);
+
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        TD_CHECK(zoffset >= 0 && zoffset < 6, GL_INVALID_VALUE);
+        copyTexSubImage(ctx, tex, zoffset, level, xoffset, yoffset, 0, x, y, width, height);
+        return;
+    }
+
+    copyTexSubImage(ctx, tex, 0, level, xoffset, yoffset, zoffset, x, y, width, height);
+}
+
+/* ------------------------------------------------------------------------ */
+/* ClearTexImage / ClearTexSubImage                                         */
+/* ------------------------------------------------------------------------ */
+
+static void clearTex(GLMContext ctx, GLuint texture, GLint level, GLint x, GLint y, GLint z,
+                     GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type, const void *data, bool whole)
+{
+    GLenum err;
+    Texture *tex = findTexture(ctx, texture);
+
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    TD_CHECK(tex->target != GL_TEXTURE_BUFFER, GL_INVALID_OPERATION);
+    TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+
+    err = tdValidateFormatType(format, type);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    GLuint face0 = 0, nfaces = 1;
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+    {
+        if (whole) { nfaces = 6; }
+        else
+        {
+            TD_CHECK(z >= 0 && d >= 0 && z + d <= 6, GL_INVALID_OPERATION);
+            face0 = z; nfaces = d; z = 0; d = 1;
+        }
+    }
+
+    TextureLevel *l = texLevel(tex, face0 < 6 ? face0 : 0, level);
+    TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
+
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face0 < 6 ? face0 : 0, level));
+    TD_CHECK(f && !(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+
+    err = tdCheckFormatCompat(f, format, type, false);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    for (GLuint fi = face0; fi < face0 + nfaces; fi++)
+    {
+        TextureLevel *lf = texLevel(tex, fi, level);
+        TD_CHECK(lf && lf->complete, GL_INVALID_OPERATION);
+        GLint cx = x, cy = y, cz = z;
+        GLsizei cw = w, ch = h, cd = d;
+        if (whole)
+        {
+            cx = cy = cz = 0;
+            cw = lf->width; ch = lf->height; cd = lf->depth;
+        }
+        TD_CHECK(cw >= 0 && ch >= 0 && cd >= 0, GL_INVALID_OPERATION);
+        TD_CHECK(cx >= 0 && cy >= 0 && cz >= 0 && (GLuint)(cx + cw) <= lf->width && (GLuint)(cy + ch) <= lf->height &&
+                 (GLuint)(cz + cd) <= lf->depth, GL_INVALID_OPERATION);
+        if (!cw || !ch || !cd)
+            continue;
+
+        const TDFormat *sf = tdStorageFormat(f);
+        uint8_t texel[32] = { 0 };
+        uint8_t stexel[4] = { 0 };
+        TDStorage one = { texel, sizeof(texel), sizeof(texel), stexel, 1, 1 };
+        bool wd = true, ws = true;
+
+        if (data)
+            tdUnpack(sf, data, 0, 0, format, type, false, 1, 1, 1, &one, &wd, &ws);
+
+        TDRegion r = glRegion(tex, fi, level, cx, cy, cz, cw, ch, cd);
+        TDStorage st;
+        if (!allocStorage(sf, r.w, r.h, r.d, &st))
+            TD_ERR(GL_OUT_OF_MEMORY);
+
+        size_t texels = (size_t)r.w * r.h * r.d;
+        uint8_t *p = (uint8_t *)st.data;
+        for (size_t i = 0; i < texels; i++)
+            memcpy(p + i * sf->bpp, texel, sf->bpp);
+        if (st.stencil)
+            memset(st.stencil, stexel[0], texels);
+
+        bool ok = writeRegion(ctx, tex, &r, &st, wd, ws);
+        free(st.data);
+        TD_CHECK(ok, GL_OUT_OF_MEMORY);
+    }
+}
+
+void mglClearTexImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, const void *data)
+{
+    clearTex(ctx, texture, level, 0, 0, 0, 0, 0, 0, format, type, data, true);
+}
+
+void mglClearTexSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *data)
+{
+    clearTex(ctx, texture, level, xoffset, yoffset, zoffset, width, height, depth, format, type, data, false);
+}
+
+/* ------------------------------------------------------------------------ */
+/* CopyImageSubData                                                         */
+/* ------------------------------------------------------------------------ */
+
+static GLenum imageObject(GLMContext ctx, GLuint name, GLenum target, Texture **out)
+{
+    *out = NULL;
+
+    if (target == GL_RENDERBUFFER)
+    {
+        Renderbuffer *rbo = name ? (Renderbuffer *)searchHashTable(&STATE(renderbuffer_table), name) : NULL;
+        if (!rbo || !rbo->tex)
+            return GL_INVALID_VALUE;
+        *out = rbo->tex;
+        return GL_NO_ERROR;
+    }
+
+    if (!validObjectTarget(target) || target == GL_TEXTURE_BUFFER)
+        return GL_INVALID_ENUM;
+
+    Texture *tex = findTexture(ctx, name);
+    if (!tex || tex->target != target)
+        return GL_INVALID_VALUE;
+
+    *out = tex;
+    return GL_NO_ERROR;
+}
+
+static GLuint texelBits(const TDFormat *f)
+{
+    if (f->flags & TDF_COMPRESSED)
+        return (GLuint)f->block_bytes * 8;
+    if (f->internalformat == GL_RGB9_E5)
+        return 32;
+    return (GLuint)f->bits[0] + f->bits[1] + f->bits[2] + f->bits[3] + f->bits[4] + f->bits[5];
+}
+
+void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)
+{
+    Texture *st, *dt;
+    GLenum err;
+
+    err = imageObject(ctx, srcName, srcTarget, &st);
+    TD_CHECK(err == GL_NO_ERROR, err);
+    err = imageObject(ctx, dstName, dstTarget, &dt);
+    TD_CHECK(err == GL_NO_ERROR, err);
+
+    TD_CHECK(srcWidth >= 0 && srcHeight >= 0 && srcDepth >= 0, GL_INVALID_VALUE);
+    TD_CHECK(srcLevel >= 0 && srcLevel < TD_MAX_LEVELS && dstLevel >= 0 && dstLevel < TD_MAX_LEVELS, GL_INVALID_VALUE);
+
+    /* cube maps: z selects the face */
+    GLuint sface0 = 0, dface0 = 0;
+    bool scube = st->target == GL_TEXTURE_CUBE_MAP, dcube = dt->target == GL_TEXTURE_CUBE_MAP;
+    if (scube) { TD_CHECK(srcZ >= 0 && srcZ + srcDepth <= 6, GL_INVALID_VALUE); sface0 = srcZ; }
+    if (dcube) { TD_CHECK(dstZ >= 0 && dstZ + srcDepth <= 6, GL_INVALID_VALUE); dface0 = dstZ; }
+
+    TextureLevel *sl = texLevel(st, sface0 < 6 ? sface0 : 0, srcLevel);
+    TextureLevel *dl = texLevel(dt, dface0 < 6 ? dface0 : 0, dstLevel);
+    TD_CHECK(sl && sl->complete && dl && dl->complete, GL_INVALID_VALUE);
+
+    const TDFormat *sf = tdFormatInfo(levelFormat(st, sface0 < 6 ? sface0 : 0, srcLevel));
+    const TDFormat *df = tdFormatInfo(levelFormat(dt, dface0 < 6 ? dface0 : 0, dstLevel));
+    TD_CHECK(sf && df, GL_INVALID_OPERATION);
+
+    bool sc = (sf->flags & TDF_COMPRESSED) != 0, dc = (df->flags & TDF_COMPRESSED) != 0;
+
+    /* compatibility (GL 4.6 18.3.2) */
+    if ((sf->flags | df->flags) & (TDF_DEPTH | TDF_STENCIL))
+        TD_CHECK(sf->internalformat == df->internalformat, GL_INVALID_OPERATION);
+    else if (sc && dc)
+        TD_CHECK(sf->block_bytes == df->block_bytes && sf->block_w == df->block_w && sf->block_h == df->block_h, GL_INVALID_OPERATION);
+    else
+        TD_CHECK(texelBits(sf) == texelBits(df), GL_INVALID_OPERATION);
+
+    /* raw texel bytes must also match in the Metal storage */
+    const TDFormat *ss = tdStorageFormat(sf), *ds = tdStorageFormat(df);
+    if (!sc && !dc)
+        TD_CHECK(ss->bpp == ds->bpp, GL_INVALID_OPERATION);
+    else if (sc && !dc && !etcFallback(sf))
+        TD_CHECK(ds->bpp == sf->block_bytes, GL_INVALID_OPERATION);
+    else if (!sc && dc && !etcFallback(df))
+        TD_CHECK(ss->bpp == df->block_bytes, GL_INVALID_OPERATION);
+
+    /* destination extent in destination texels */
+    GLsizei dw = srcWidth, dh = srcHeight;
+    if (sc && !dc) { dw = (srcWidth + sf->block_w - 1) / sf->block_w; dh = (srcHeight + sf->block_h - 1) / sf->block_h; }
+    if (!sc && dc) { dw = srcWidth * df->block_w; dh = srcHeight * df->block_h; }
+
+    /* regions in range and block aligned */
+    GLint sz = scube ? 0 : srcZ, dz = dcube ? 0 : dstZ;
+    err = checkSubRegion(st, sface0, srcLevel, srcX, srcY, sz, srcWidth, srcHeight, scube ? 1 : srcDepth);
+    TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    err = checkSubRegion(dt, dface0, dstLevel, dstX, dstY, dz, dw, dh, dcube ? 1 : srcDepth);
+    TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+
+    if (sc)
+    {
+        TD_CHECK(srcX % sf->block_w == 0 && srcY % sf->block_h == 0, GL_INVALID_VALUE);
+        TD_CHECK(srcWidth % sf->block_w == 0 || (GLuint)(srcX + srcWidth) == sl->width, GL_INVALID_VALUE);
+        TD_CHECK(srcHeight % sf->block_h == 0 || (GLuint)(srcY + srcHeight) == sl->height, GL_INVALID_VALUE);
+    }
+    if (dc)
+    {
+        TD_CHECK(dstX % df->block_w == 0 && dstY % df->block_h == 0, GL_INVALID_VALUE);
+        TD_CHECK(dw % df->block_w == 0 || (GLuint)(dstX + dw) == dl->width, GL_INVALID_VALUE);
+        TD_CHECK(dh % df->block_h == 0 || (GLuint)(dstY + dh) == dl->height, GL_INVALID_VALUE);
+    }
+
+    if (!srcWidth || !srcHeight || !srcDepth)
+        return;
+
+    GLsizei layers = srcDepth;
+    bool per_face = scube || dcube;
+    bool cpu = etcFallback(sf) || etcFallback(df) || !TDM(ctx) || !TDM(ctx)->copy_image;
+
+    for (GLsizei i = 0; i < (per_face ? layers : 1); i++)
+    {
+        GLuint sface = scube ? sface0 + i : 0, dface = dcube ? dface0 + i : 0;
+        GLint szz = scube ? 0 : (per_face ? srcZ + i : srcZ);
+        GLint dzz = dcube ? 0 : (per_face ? dstZ + i : dstZ);
+        GLsizei n = per_face ? 1 : layers;
+
+        TDRegion sr = glRegion(st, sface, srcLevel, srcX, srcY, szz, srcWidth, srcHeight, n);
+        TDRegion dr = glRegion(dt, dface, dstLevel, dstX, dstY, dzz, dw, dh, n);
+
+        if (!cpu && TDM(ctx)->copy_image(ctx, st, &sr, dt, &dr))
+            continue;
+
+        /* CPU path (ETC decoded on the CPU, or a level outside the realized shape): raw bytes */
+        uint8_t *raw;
+        if (sc)
+        {
+            size_t bytes = tdCompressedSize(sf, srcWidth, srcHeight, n);
+            raw = (uint8_t *)malloc(bytes + 1);
+            TD_CHECK(raw, GL_OUT_OF_MEMORY);
+            fetchCompressed(ctx, st, sface, srcLevel, srcX, srcY, szz, srcWidth, srcHeight, n, raw);
+        }
+        else
+        {
+            TDStorage tmp;
+            raw = (uint8_t *)allocStorage(ss, sr.w, sr.h, sr.d, &tmp);
+            TD_CHECK(raw, GL_OUT_OF_MEMORY);
+            readRegion(ctx, st, &sr, &tmp);
+        }
+
+        if (dc)
+        {
+            storeCompressed(ctx, dt, dface, dstLevel, dstX, dstY, dzz, dw, dh, n, raw);
+        }
+        else
+        {
+            TDStorage tmp;
+            storageFromBlock(ds, raw, dr.w, dr.h, dr.d, &tmp);
+            writeRegion(ctx, dt, &dr, &tmp, true, true);
+        }
+        free(raw);
+    }
+}
+
+/* exported for MGLRenderer+TextureData.m (CPU conversion paths) */
+bool mgl_texdata_write_region(GLMContext ctx, Texture *tex, const TDRegion *r, const TDStorage *src, bool depth, bool stencil)
+{
+    return writeRegion(ctx, tex, r, src, depth, stencil);
+}
+
+/* ------------------------------------------------------------------------ */
+/* mipmaps                                                                  */
+/* ------------------------------------------------------------------------ */
+
+static void generateMipmap(GLMContext ctx, Texture *tex, GLenum bad_target_error)
+{
+    switch (tex->target)
+    {
+        case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D: case GL_TEXTURE_1D_ARRAY:
+        case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP: case GL_TEXTURE_CUBE_MAP_ARRAY:
+            break;
+        default:
+            TD_ERR(bad_target_error);
+    }
+
+    GLuint base = tex->params.base_level;
+    GLuint faces = mgl_texdata_num_faces(tex);
+    TextureLevel *bl = texLevel(tex, 0, base);
+
+    TD_CHECK(base < TD_MAX_LEVELS && bl && bl->complete, GL_INVALID_OPERATION);
+
+    for (GLuint f = 1; f < faces; f++)
+    {
+        TextureLevel *l = texLevel(tex, f, base);
+        TD_CHECK(l && l->complete && l->width == bl->width && l->height == bl->height && l->mtl_format == bl->mtl_format,
+                 GL_INVALID_OPERATION);
+    }
+
+    const TDFormat *f = tdFormatInfo(bl->mtl_format);
+    TD_CHECK(f && (f->flags & TDF_RENDERABLE) && (f->flags & TDF_FILTERABLE) &&
+             !(f->flags & (TDF_INTEGER | TDF_DEPTH | TDF_STENCIL | TDF_COMPRESSED)), GL_INVALID_OPERATION);
+
+    bool lin = (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY);
+    GLuint m = bl->width;
+    if (!lin) m = MAX(m, bl->height);
+    if (tex->target == GL_TEXTURE_3D) m = MAX(m, bl->depth);
+
+    GLuint q = base + log2u(m);
+    if (q > tex->params.max_level) q = tex->params.max_level;
+    if (q >= TD_MAX_LEVELS) q = TD_MAX_LEVELS - 1;
+    if (tex->immutable_storage && tex->num_levels && q > tex->num_levels - 1) q = tex->num_levels - 1;
+
+    if (q <= base)
+        return;
+
+    if (!tex->immutable_storage)
+    {
+        GLuint w0 = bl->width << base, h0 = lin ? bl->height : bl->height << base;
+        GLuint d0 = tex->target == GL_TEXTURE_3D ? bl->depth << base : bl->depth;
+        for (GLuint face = 0; face < faces; face++)
+            for (GLuint l = base + 1; l <= q; l++)
+            {
+                GLuint w, h, d;
+                mipDims(tex, l, w0, h0, d0, &w, &h, &d);
+                TextureLevel *lv = texLevel(tex, face, l);
+                if (lv->complete && lv->width == w && lv->height == h && lv->depth == d && lv->mtl_format == bl->mtl_format)
+                    continue;
+                if (!defineLevel(ctx, tex, face, l, bl->mtl_format, w, h, d))
+                    return;
+            }
+    }
+
+    tex->mipmapped = true;
+    tex->genmipmaps = true;
+
+    TD_CHECK(TDM(ctx) && TDM(ctx)->generate_mipmaps && TDM(ctx)->generate_mipmaps(ctx, tex, base, q), GL_OUT_OF_MEMORY);
 }
 
 void mglGenerateMipmap(GLMContext ctx, GLenum target)
@@ -537,1811 +3174,28 @@ void mglGenerateMipmap(GLMContext ctx, GLenum target)
             break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            TD_ERR(GL_INVALID_ENUM);
     }
 
-    generateMipmaps(ctx, 0, target);
+    Texture *tex = getTex(ctx, 0, target);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    generateMipmap(ctx, tex, GL_INVALID_ENUM);
 }
 
 void mglGenerateTextureMipmap(GLMContext ctx, GLuint texture)
 {
-    generateMipmaps(ctx, texture, 0);
+    Texture *tex = findTexture(ctx, texture);
+    TD_CHECK(tex, GL_INVALID_OPERATION);
+    generateMipmap(ctx, tex, GL_INVALID_OPERATION);
 }
 
-static size_t page_size_align(size_t size)
-{
-    if (size & (4096-1))
-    {
-        size_t pad_size = 0;
-
-        pad_size = 4096 - (size & (4096-1));
-
-        size += pad_size;
-    }
-
-    return size;
-}
-
-void invalidateTexture(GLMContext ctx, Texture *tex)
-{
-    if (tex->mtl_data)
-    {
-        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_data);
-    }
-
-    for(int face=0; face<_CUBE_MAP_MAX_FACE; face++)
-    {
-        for(int i=0; i<tex->num_levels; i++)
-        {
-            if (tex->faces[face].levels[i].complete)
-            {
-                if (tex->faces[face].levels[i].data)
-                {
-                    vm_deallocate(mach_host_self(), tex->faces[face].levels[i].data, tex->faces[face].levels[i].data);
-                }
-            }
-        }
-    }
-
-    for(int i=0; i<6; i++)
-    {
-        if (tex->faces[i].levels)
-            free(tex->faces[i].levels);
-    }
-
-    bzero(tex, sizeof(Texture));
-}
-
-void initBaseTexLevel(GLMContext ctx, Texture *tex, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth)
-{
-    tex->mipmapped = 0;
-    tex->mipmap_levels = ilog2(MAX(width, height)) + 1;
-
-    for(int face=0; face<_CUBE_MAP_MAX_FACE; face++)
-    {
-        // CRITICAL SECURITY FIX: Prevent integer overflow in mipmap allocation
-        if (tex->mipmap_levels > SIZE_MAX / sizeof(TextureLevel)) {
-            fprintf(stderr, "MGL SECURITY ERROR: Mipmap levels %d would cause allocation overflow\n", tex->mipmap_levels);
-            // CRITICAL FIX: Handle gracefully instead of crashing
-            STATE(error) = GL_OUT_OF_MEMORY;
-            return;
-        }
-
-        tex->faces[face].levels = (TextureLevel *)calloc(tex->mipmap_levels, sizeof(TextureLevel));
-        if (!tex->faces[face].levels) {
-            fprintf(stderr, "MGL SECURITY ERROR: calloc failed for face %d with %d levels\n", face, tex->mipmap_levels);
-            // CRITICAL FIX: Handle gracefully instead of crashing
-            STATE(error) = GL_OUT_OF_MEMORY;
-            return;
-        }
-    }
-
-    tex->internalformat = internalformat;
-    tex->width = width;
-    tex->height = height;
-    tex->depth = depth;
-    tex->complete = false;
-
-    for(int face=0; face<_CUBE_MAP_MAX_FACE; face++)
-    {
-        for(int i=0; i<tex->mipmap_levels; i++)
-        {
-            tex->faces[face].levels[i].complete = false;
-        }
-    }
-}
-
-bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type)
-{
-    GLuint base_width, base_height;
-
-    if (level >= tex->mipmap_levels)
-    {
-        return false;
-    }
-
-    if (tex->target == GL_TEXTURE_2D)
-    {
-        if (level != 0)
-        {
-            base_width = tex->width;
-            base_height = tex->height;
-
-            while(level--)
-            {
-                base_width >>= 1;
-                base_height >>= 1;
-            }
-
-            if (width != base_width || height != base_height)
-            {
-                return false;
-            }
-        }
-    }
-
-    if (internalformat)
-    {
-        // internal formats don't jive
-        if (internalformat != tex->internalformat)
-        {
-            return false;
-        }
-    }
-    else
-    {
-        GLuint temp_internalformat;
-
-        // check if we are expected to convert data
-        temp_internalformat = internalFormatForGLFormatType(format, type);
-
-        if (temp_internalformat != tex->internalformat)
-        {
-            return false;
-        }
-    }
-
-    if (checkInternalFormatForMetal(ctx, internalformat))
-    {
-        return false;
-    }
-
-    return true;
-}
-
-bool verifyInternalFormatAndFormatType(GLMContext ctx, GLint internalformat, GLenum format, GLenum type)
-{
-    switch(internalformat)
-    {
-        // unsized formats
-        case GL_DEPTH_COMPONENT:
-        case GL_DEPTH_STENCIL:
-        case GL_RED:
-        case GL_RG:
-        case GL_RGB:
-        case GL_RGBA:
-            break;
-
-        // sized formats
-        case GL_R8:
-        case GL_R8_SNORM:
-        case GL_R16:
-        case GL_R16_SNORM:
-        case GL_RG8:
-        case GL_RG8_SNORM:
-        case GL_RG16:
-        case GL_RG16_SNORM:
-        case GL_R3_G3_B2:
-        case GL_RGB4:
-        case GL_RGB5:
-        case GL_RGB8:
-        case GL_RGB8_SNORM:
-        case GL_RGB10:
-        case GL_RGB12:
-        case GL_RGB16_SNORM:
-        case GL_RGBA2:
-        case GL_RGBA4:
-        case GL_RGB5_A1:
-        case GL_RGBA8:
-        case GL_RGBA8_SNORM:
-        case GL_RGB10_A2:
-        case GL_RGB10_A2UI:
-        case GL_RGBA12:
-        case GL_RGBA16:
-        case GL_SRGB8:
-        case GL_SRGB8_ALPHA8:
-        case GL_R16F:
-        case GL_RG16F:
-        case GL_RGB16F:
-        case GL_RGBA16F:
-        case GL_R32F:
-        case GL_RG32F:
-        case GL_RGB32F:
-        case GL_RGBA32F:
-        case GL_R11F_G11F_B10F:
-        case GL_RGB9_E5:
-        case GL_R8I:
-        case GL_R8UI:
-        case GL_R16I:
-        case GL_R16UI:
-        case GL_R32I:
-        case GL_R32UI:
-        case GL_RG8I:
-        case GL_RG8UI:
-        case GL_RG16I:
-        case GL_RG16UI:
-        case GL_RG32I:
-        case GL_RG32UI:
-        case GL_RGB8I:
-        case GL_RGB8UI:
-        case GL_RGB16I:
-        case GL_RGB16UI:
-        case GL_RGB32I:
-        case GL_RGB32UI:
-        case GL_RGBA8I:
-        case GL_RGBA8UI:
-        case GL_RGBA16I:
-        case GL_RGBA16UI:
-        case GL_RGBA32I:
-        case GL_RGBA32UI:
-        // Missing SNORM/UI formats used by virgl
-        case 0x9014: // GL_ALPHA8_SNORM
-        case 0x9016: // GL_LUMINANCE8_ALPHA8_SNORM
-        case 0x9018: // GL_ALPHA16_SNORM
-        case 0x901a: // GL_LUMINANCE16_ALPHA16_SNORM
-        case 0x8d7e: // GL_ALPHA8UI_EXT
-            break;
-
-        // compressed types
-        case GL_COMPRESSED_RED:
-        case GL_COMPRESSED_RG:
-        case GL_COMPRESSED_RGB:
-        case GL_COMPRESSED_RGBA:
-        case GL_COMPRESSED_SRGB:
-        case GL_COMPRESSED_SRGB_ALPHA:
-        case GL_COMPRESSED_RED_RGTC1:
-        case GL_COMPRESSED_SIGNED_RED_RGTC1:
-        case GL_COMPRESSED_RG_RGTC2:
-        case GL_COMPRESSED_SIGNED_RG_RGTC2:
-        case GL_COMPRESSED_RGBA_BPTC_UNORM:
-        case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
-        case GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT:
-        case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT:
-            break;
-
-        // Legacy alpha/luminance formats (deprecated but still used)
-        case 0x803c: // GL_ALPHA8
-        case 0x803e: // GL_ALPHA16
-        case 0x8040: // GL_LUMINANCE8
-        case 0x8042: // GL_LUMINANCE16
-        case 0x8045: // GL_LUMINANCE8_ALPHA8
-        case 0x8048: // GL_LUMINANCE16_ALPHA16
-        case 0x8816: // GL_ALPHA16F_ARB
-        case 0x8818: // GL_LUMINANCE16F_ARB
-        case 0x8819: // GL_LUMINANCE_ALPHA16F_ARB
-        case 0x881c: // GL_ALPHA32F_ARB
-        case 0x881e: // GL_LUMINANCE32F_ARB
-        case 0x881f: // GL_LUMINANCE_ALPHA32F_ARB
-            break;
-
-        // ASTC compressed formats
-        case 0x93b0: // GL_COMPRESSED_RGBA_ASTC_4x4_KHR
-        case 0x93b1: // GL_COMPRESSED_RGBA_ASTC_5x4_KHR
-        case 0x93b2: // GL_COMPRESSED_RGBA_ASTC_5x5_KHR
-        case 0x93b3: // GL_COMPRESSED_RGBA_ASTC_6x5_KHR
-        case 0x93b4: // GL_COMPRESSED_RGBA_ASTC_6x6_KHR
-        case 0x93b5: // GL_COMPRESSED_RGBA_ASTC_8x5_KHR
-        case 0x93b6: // GL_COMPRESSED_RGBA_ASTC_8x6_KHR
-        case 0x93b7: // GL_COMPRESSED_RGBA_ASTC_8x8_KHR
-        case 0x93b8: // GL_COMPRESSED_RGBA_ASTC_10x5_KHR
-        case 0x93b9: // GL_COMPRESSED_RGBA_ASTC_10x6_KHR
-        case 0x93ba: // GL_COMPRESSED_RGBA_ASTC_10x8_KHR
-        case 0x93bb: // GL_COMPRESSED_RGBA_ASTC_10x10_KHR
-        case 0x93bc: // GL_COMPRESSED_RGBA_ASTC_12x10_KHR
-        case 0x93bd: // GL_COMPRESSED_RGBA_ASTC_12x12_KHR
-        case 0x93d0: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR
-        case 0x93d1: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR
-        case 0x93d2: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR
-        case 0x93d3: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR
-        case 0x93d4: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR
-        case 0x93d5: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR
-        case 0x93d6: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR
-        case 0x93d7: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR
-        case 0x93d8: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR
-        case 0x93d9: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR
-        case 0x93da: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR
-        case 0x93db: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR
-        case 0x93dc: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR
-        case 0x93dd: // GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR
-            break;
-
-        // ETC2/EAC compressed formats
-        case 0x9270: // GL_COMPRESSED_R11_EAC
-        case 0x9271: // GL_COMPRESSED_SIGNED_R11_EAC
-        case 0x9272: // GL_COMPRESSED_RG11_EAC
-        case 0x9273: // GL_COMPRESSED_SIGNED_RG11_EAC
-        case 0x9274: // GL_COMPRESSED_RGB8_ETC2
-        case 0x9275: // GL_COMPRESSED_SRGB8_ETC2
-        case 0x9276: // GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2
-        case 0x9277: // GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2
-        case 0x9278: // GL_COMPRESSED_RGBA8_ETC2_EAC
-        case 0x9279: // GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC
-            break;
-
-        // S3TC/DXT compressed formats
-        case 0x83f0: // GL_COMPRESSED_RGB_S3TC_DXT1_EXT
-        case 0x83f1: // GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
-        case 0x83f2: // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
-        case 0x83f3: // GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
-        case 0x8c4c: // GL_COMPRESSED_SRGB_S3TC_DXT1_EXT
-        case 0x8c4d: // GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
-        case 0x8c4e: // GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT
-        case 0x8c4f: // GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
-            break;
-
-        // Additional integer formats (alternate enum values used by some implementations)
-        case 0x8d72: // alternate GL_RGBA8I
-        case 0x8d75: // alternate GL_RGB8I
-        case 0x8d78: // alternate GL_RGBA8UI
-        case 0x8d7a: // alternate GL_RGB8UI
-        case 0x8d7b: // GL_ALPHA8I_EXT
-        // case 0x8d7e: // alternate GL_RGBA32UI - Duplicate of GL_ALPHA8UI_EXT
-        case 0x8d80: // alternate GL_RGB32UI
-        case 0x8d81: // GL_ALPHA32I_EXT
-        case 0x8d84: // alternate GL_RGBA16I
-        case 0x8d86: // alternate GL_RGB16I
-        case 0x8d87: // GL_ALPHA16I_EXT
-        case 0x8d8a: // alternate GL_RGBA32I
-        case 0x8d8c: // alternate GL_RGB32I
-        case 0x8d8d: // GL_ALPHA32I_EXT
-        case 0x8d90: // alternate GL_RGBA16UI
-        case 0x8d92: // alternate GL_RGB16UI
-        case 0x8d93: // GL_ALPHA16UI_EXT
-            break;
-
-        // SNORM formats
-        case 0x8f9b: // GL_SIGNED_NORMALIZED
-        case 0x8fbd: // GL_RGB10_A2UI (alternate)
-        case 0x8fbe: // GL_RGBA16_SNORM
-            break;
-
-        // Depth/stencil special formats
-        // case 0x9014: // GL_DEPTH_COMPONENT16_NONLINEAR_NV - Duplicate of GL_ALPHA8_SNORM
-        // case 0x9016: // GL_TEXTURE_2D_MULTISAMPLE - Duplicate of GL_LUMINANCE8_ALPHA8_SNORM
-        // case 0x9018: // GL_TEXTURE_2D_MULTISAMPLE_ARRAY - Duplicate of GL_ALPHA16_SNORM
-        // case 0x901a: // GL_PROXY_TEXTURE_2D_MULTISAMPLE_ARRAY - Duplicate of GL_LUMINANCE16_ALPHA16_SNORM
-            break;
-
-        case GL_DEPTH_COMPONENT16:
-        case GL_DEPTH_COMPONENT24:
-        case GL_DEPTH_COMPONENT32:
-        case GL_DEPTH_COMPONENT32F:
-            ERROR_CHECK_RETURN_VALUE(format == GL_DEPTH_COMPONENT, GL_INVALID_OPERATION, false);
-            break;
-            
-        case GL_DEPTH24_STENCIL8:
-        case GL_DEPTH32F_STENCIL8:
-            ERROR_CHECK_RETURN_VALUE(format == GL_DEPTH_STENCIL, GL_INVALID_OPERATION, false);
-            break;
-            
-        case GL_STENCIL_INDEX8:
-            ERROR_CHECK_RETURN_VALUE(format == GL_STENCIL_INDEX, GL_INVALID_OPERATION, false);
-            break;
-            
-        case GL_RGB565:
-            break;
-
-        default:
-            // Log warning but don't error - many formats work even if not explicitly listed
-            fprintf(stderr, "MGL WARNING: verifyInternalFormat unknown internalformat 0x%x\n", internalformat);
-            break;
-    }
-
-    switch(format)
-    {
-        case GL_RED:
-        case GL_RG:
-        case GL_RGB:
-        case GL_BGR:
-        case GL_RGBA:
-        case GL_BGRA:
-        case GL_RED_INTEGER:
-        case GL_RG_INTEGER:
-        case GL_RGB_INTEGER:
-        case GL_BGR_INTEGER:
-        case GL_RGBA_INTEGER:
-        case GL_BGRA_INTEGER:
-        case GL_STENCIL_INDEX:
-        case GL_DEPTH_COMPONENT:
-        case GL_DEPTH_STENCIL:
-        // Legacy formats (deprecated but still used by virglrenderer)
-        case 0x1906: // GL_ALPHA
-        case 0x1909: // GL_LUMINANCE
-        case 0x190a: // GL_LUMINANCE_ALPHA
-        case 0x8000: // GL_COLOR_INDEX (legacy)
-        case 0x8d97: // GL_ALPHA_INTEGER
-        case 0x8d9c: // GL_LUMINANCE_INTEGER_EXT
-        case 0x8d9d: // GL_LUMINANCE_ALPHA_INTEGER_EXT
-            break;
-
-        default:
-            // Allow unknown formats with warning - virglrenderer may use nonstandard values
-            fprintf(stderr, "MGL WARNING: verifyFormat unknown format 0x%x, allowing\n", format);
-            break;
-    }
-
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-        case GL_BYTE:
-        case GL_UNSIGNED_SHORT:
-        case GL_SHORT:
-        case GL_UNSIGNED_INT:
-        case GL_INT:
-        case GL_FLOAT:
-        case GL_HALF_FLOAT:
-            break;
-
-        case GL_UNSIGNED_BYTE_3_3_2:
-        case GL_UNSIGNED_BYTE_2_3_3_REV:
-        case GL_UNSIGNED_SHORT_5_6_5:
-        case GL_UNSIGNED_SHORT_5_6_5_REV:
-            ERROR_CHECK_RETURN_VALUE(format == GL_RGB,GL_INVALID_OPERATION, false);
-            break;
-
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
-        case GL_UNSIGNED_SHORT_5_5_5_1:
-        case GL_UNSIGNED_SHORT_1_5_5_5_REV:
-        case GL_UNSIGNED_INT_8_8_8_8:
-        case GL_UNSIGNED_INT_8_8_8_8_REV:
-        case GL_UNSIGNED_INT_10_10_10_2:
-        case GL_UNSIGNED_INT_2_10_10_10_REV:
-            // Allow RGBA, BGRA, and integer variants (RGBA_INTEGER, RGB_INTEGER, BGRA_INTEGER)
-            ERROR_CHECK_RETURN_VALUE((format == GL_RGBA || format == GL_BGRA || 
-                                      format == GL_RGBA_INTEGER || format == GL_RGB_INTEGER ||
-                                      format == GL_BGRA_INTEGER), GL_INVALID_OPERATION, false);
-            break;
-            
-        case GL_UNSIGNED_INT_24_8:
-            ERROR_CHECK_RETURN_VALUE(format == GL_DEPTH_STENCIL, GL_INVALID_OPERATION, false);
-            break;
-            
-        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
-            ERROR_CHECK_RETURN_VALUE(format == GL_DEPTH_STENCIL, GL_INVALID_OPERATION, false);
-            break;
-        
-        // Packed float types for special formats
-        case 0x8c3b: // GL_UNSIGNED_INT_10F_11F_11F_REV
-        case 0x8c3e: // GL_UNSIGNED_INT_5_9_9_9_REV
-            break;
-            
-        default:
-            fprintf(stderr, "MGL WARNING: verifyInternalFormat unknown type 0x%x\n", type);
-            break;
-    }
-
-    return true;
-}
-
-void unpackTexture(GLMContext ctx, Texture *tex, GLuint face, GLuint level, void *src_data, void *dst_data, size_t src_pitch, size_t pixel_size, size_t xoffset, size_t yoffset, size_t zoffset, size_t width, size_t height, size_t depth)
-{
-    GLubyte *src, *dst;
-    size_t dst_pitch;
-
-    src = (GLubyte *)src_data;
-    dst = (GLubyte *)dst_data;
-
-    assert(tex);
-    dst_pitch = tex->faces[face].levels[level].pitch;
-    assert(dst_pitch);
-
-    if (xoffset || yoffset || zoffset)
-    {
-        size_t xoffset_bytes = xoffset * pixel_size; // num pixels
-        size_t yoffset_bytes = yoffset * dst_pitch; // num lines (rows * bytes_per_row)
-        size_t zoffset_bytes = zoffset * dst_pitch * height; // num planes
-
-        dst += xoffset_bytes;
-        dst += yoffset_bytes;
-        dst += zoffset_bytes;
-    }
-
-    if (depth > 1)
-    {
-        // 3d texture
-        for(int y=0; y<depth; y++)
-        {
-            memcpy(dst, src, dst_pitch);
-            src += src_pitch;
-            dst += dst_pitch;
-        }
-    }
-    else if (height > 1)
-    {
-        // 2d texture
-        size_t copy_size = width * pixel_size;
-        
-        for(int y=0; y<height; y++)
-        {
-            memcpy(dst, src, copy_size);
-            src += src_pitch;
-            dst += dst_pitch;
-        }
-    }
-    else
-    {
-        // 1d texture
-        memcpy(dst, src, width * pixel_size);
-    }
-}
-
-#pragma mark texImage 1D/2D/3D
-// Forward declaration
-bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels);
-
-bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLboolean is_array, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels, GLboolean proxy)
-{
-    // all the levels are created on a tex storage call.. if we get here we should just assert
-    if (tex->immutable_storage)
-    {
-        // Compatibility: Treat glTexImage* on immutable texture as glTexSubImage*
-        // This allows guests to update content using glTexImage* which is common in some drivers
-        // We pass 0 for offsets. texSubImage will handle validation.
-        return texSubImage(ctx, tex, face, level, 0, 0, 0, width, height, depth, format, type, pixels);
-    }
-    
-    if (level == 0)
-    {
-        if (internalformat == 0)
-        {
-            internalformat = internalFormatForGLFormatType(format, type);
-
-            if (internalformat == 0)
-            {
-                ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-            }
-        }
-        else if (pixels)
-        {
-            GLuint temp_format;
-
-            // check if format type can be copied directly to the internal format
-            temp_format = internalFormatForGLFormatType(format, type);
-
-            // MGL doesn't support pixel format conversion
-            // If mismatch, use the format that matches the incoming data
-            if (temp_format != internalformat)
-            {
-                internalformat = temp_format;
-            }
-        }
-
-        // see if we can actually use this internal format
-        if (checkInternalFormatForMetal(ctx, internalformat) == false)
-        {
-            ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-        }
-
-        if (tex->mipmap_levels == 0)
-        {
-            // uninitialized tex
-            initBaseTexLevel(ctx, tex, internalformat, width, height, depth);
-        }
-        else if (width != tex->width || height != tex->height || internalformat != tex->internalformat)
-        {
-            // invalidate texture because the base level width / height / internal format are being changed...
-            invalidateTexture(ctx, tex);
-
-            initBaseTexLevel(ctx, tex, internalformat, width, height, depth);
-        }
-    }
-    else if (checkTexLevelParams(ctx, tex, level, internalformat, width, height, depth, format, type) == false)
-    {
-        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-    }
-
-    if (STATE(buffers[_PIXEL_UNPACK_BUFFER]))
-    {
-        Buffer *ptr;
-
-        ptr = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
-
-        ERROR_CHECK_RETURN(ptr->mapped == false, GL_INVALID_OPERATION);
-
-        GLubyte *buffer_data;
-        buffer_data = getBufferData(ctx, ptr);
-
-        // if a pixel buffer is the src, pixels is the offset
-        // need to check offset against size
-        size_t offset;
-        offset = (size_t)pixels;
-
-        pixels = &buffer_data[offset];
-    }
-
-    tex->num_levels = MAX(tex->num_levels, level + 1);
-    tex->faces[face].levels[level].width = width;
-    tex->faces[face].levels[level].height = height;
-    tex->faces[face].levels[level].depth = depth;
-
-    kern_return_t err;
-    vm_address_t texture_data;
-    size_t pixel_size;
-    size_t internal_size;
-    size_t texture_size;
-    size_t src_pitch;
-
-    pixel_size = sizeForInternalFormat(internalformat, format, type);
-    ERROR_CHECK_RETURN_VALUE(pixel_size, GL_INVALID_ENUM, false);
-
-    assert(width);
-    assert(height);
-    assert(depth);
-
-    tex->faces[face].levels[level].pitch = pixel_size * width;
-
-    if (depth > 1)
-    {
-        // 3d texture
-        internal_size = pixel_size * width * height * depth;
-    }
-    else if (height > 1)
-    {
-        // 2d texture
-        internal_size = pixel_size * width * height;
-    }
-    else
-    {
-        // 1d texture
-        internal_size = pixel_size * width;
-    }
-
-    texture_size = page_size_align(internal_size);
-    assert(texture_size);
-
-    switch(mtlFormatForGLInternalFormat(internalformat))
-    {
-        case MTLPixelFormatDepth16Unorm:
-        case MTLPixelFormatDepth32Float:
-        case MTLPixelFormatDepth24Unorm_Stencil8:
-        case MTLPixelFormatDepth32Float_Stencil8:
-            tex->mtl_requires_private_storage = true;
-            break;
-
-        default:
-            tex->mtl_requires_private_storage = false;
-            break;
-    }
-
-    if (tex->mtl_requires_private_storage == false)
-    {
-        // Allocate directly from VM
-        err = vm_allocate((vm_map_t) mach_task_self(),
-                          (vm_address_t*) &texture_data,
-                          texture_size,
-                          VM_FLAGS_ANYWHERE);
-        assert(err == 0);
-        assert(texture_data);
-
-        tex->faces[face].levels[level].data_size = texture_size;
-        tex->faces[face].levels[level].data = (vm_address_t)texture_data;
-
-        if (pixels)
-        {
-            GLsizei src_size;
-
-            src_size = width * sizeForFormatType(format, type);
-
-            if (ctx->state.unpack.row_length)
-            {
-                size_t alignment;
-
-                if (ctx->state.unpack.row_length < width) {
-                    ERROR_RETURN_VALUE(GL_INVALID_VALUE, false);
-                }
-
-                alignment = ctx->state.unpack.alignment;
-                if (alignment)
-                {
-                    /* row_length is in pixels, so multiply by pixel_size to get bytes per row */
-                    size_t row_bytes = ctx->state.unpack.row_length * pixel_size;
-                    if (row_bytes >= alignment)
-                    {
-                        src_pitch = row_bytes;
-                        assert(src_pitch);
-                    }
-                    else if (depth > 1)
-                    {
-                        // 3d texture
-                        src_pitch = alignment / src_size;
-
-                        src_pitch = src_pitch * src_size * ctx->state.unpack.row_length * height;
-
-                        src_pitch = src_pitch / alignment;
-                        assert(src_pitch);
-                    }
-                    else
-                    {
-                        src_pitch = alignment / src_size;
-
-                        src_pitch = src_pitch * src_size * ctx->state.unpack.row_length;
-
-                        src_pitch = src_pitch / alignment;
-                        assert(src_pitch);
-                    }
-                }
-                else
-                {
-                    src_pitch = src_size * ctx->state.unpack.row_length;
-                    assert(src_pitch);
-                }
-            }
-            else
-            {
-                src_pitch = tex->faces[face].levels[level].pitch;
-                assert(src_pitch);
-            }
-
-            // unpack from pixel buffer
-            if (STATE(buffers[_PIXEL_UNPACK_BUFFER]))
-            {
-                Buffer *ptr;
-
-                ptr = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
-
-                ERROR_CHECK_RETURN(ptr->mapped == false, GL_INVALID_OPERATION);
-
-                GLubyte *buffer_data;
-                buffer_data = getBufferData(ctx, ptr);
-
-                // if a pixel buffer is the src, pixels is the offset
-                // need to check offset against size
-                size_t offset;
-                offset = (size_t)pixels;
-
-                pixels = &buffer_data[offset];
-            }
-
-            unpackTexture(ctx, tex, face, level, (void *)pixels, (void *)texture_data, src_pitch, pixel_size, 0, 0, 0, width, height, depth);
-
-            tex->dirty_bits |= DIRTY_TEXTURE_DATA;
-        };
-    }
-
-    tex->faces[face].levels[level].complete = true;
-
-    tex->dirty_bits |= DIRTY_TEXTURE_LEVEL;
-    STATE(dirty_bits) |= DIRTY_TEX;
-
-    return true;
-}
-
-void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-    bool proxy;
-
-    proxy = false;
-
-    switch(target)
-    {
-        case GL_TEXTURE_1D:
-            break;
-
-        case GL_PROXY_TEXTURE_1D:
-            proxy = true;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-
-    // verifyFormatType sets the error
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    tex->access = GL_READ_ONLY;
-
-    createTextureLevel(ctx, tex, 0, level, false, internalformat, width, 1, 1, format, type, (void *)pixels, proxy);
-}
-
-void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-    GLuint face;
-    GLboolean is_array;
-    GLboolean proxy;
-
-    fprintf(stderr, "MGL: mglTexImage2D called - target=0x%x, level=%d, internalformat=0x%x, width=%d, height=%d, format=0x%x, type=0x%x\n",
-            target, level, internalformat, width, height, format, type);
-
-    face = 0;
-    is_array = false;
-    proxy = false;
-
-    switch(target)
-    {
-        case GL_TEXTURE_2D:
-            break;
-
-        case GL_PROXY_TEXTURE_2D:
-        case GL_PROXY_TEXTURE_CUBE_MAP:
-            proxy = true;
-            break;
-
-        case GL_PROXY_TEXTURE_1D_ARRAY:
-            is_array = true;
-            proxy = true;
-            break;
-
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
-            face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
-            break;
-
-        case GL_PROXY_TEXTURE_RECTANGLE:
-            proxy = true;
-            ERROR_CHECK_RETURN(level==0, GL_INVALID_OPERATION);
-            break;
-
-        case GL_TEXTURE_RECTANGLE:
-            ERROR_CHECK_RETURN(level==0, GL_INVALID_OPERATION);
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-
-    // verifyFormatType sets the error
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    tex->access = GL_READ_ONLY;
-
-    createTextureLevel(ctx, tex, face, level, is_array, internalformat, width, height, 1, format, type, (void *)pixels, proxy);
-}
-
-void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-    GLboolean is_array;
-    GLboolean proxy;
-
-    is_array = false;
-    proxy = false;
-
-    switch(target)
-    {
-        case GL_TEXTURE_3D:
-            break;
-
-        case GL_PROXY_TEXTURE_3D:
-            proxy = true;
-            break;
-
-        case GL_TEXTURE_2D_ARRAY:
-        case GL_PROXY_TEXTURE_2D_ARRAY:
-            is_array = true;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-
-    // verifyFormatType sets the error
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(depth >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    tex->access = GL_READ_ONLY;
-
-    createTextureLevel(ctx, tex, 0, level, is_array, internalformat, width, height, depth, format, type, (void *)pixels, proxy);
-}
-
-#pragma mark texSubImage
-bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, void *pixels)
-{
-    // Debug: Log large texture uploads (VM framebuffer size)
-    if (width >= 640 && height >= 400) {
-        fprintf(stderr, "MGL DEBUG: texSubImage tex_id=%u %dx%d at (%d,%d) pixels=%p\n",
-                tex ? tex->name : 0, width, height, xoffset, yoffset, pixels);
-    }
-    
-    // ERROR_CHECK_RETURN_VALUE(tex != NULL, GL_INVALID_OPERATION, false);
-    if (tex == NULL) {
-        fprintf(stderr, "MGL Error: texSubImage: tex is NULL\n");
-        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-    }
-
-    // ERROR_CHECK_RETURN_VALUE(level <= tex->num_levels, GL_INVALID_OPERATION, false);
-    if (level > tex->num_levels) {
-        fprintf(stderr, "MGL Error: texSubImage: level %d > num_levels %d\n", level, tex->num_levels);
-        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-    }
-    
-    if (!tex->faces[face].levels) {
-        fprintf(stderr, "MGL Error: texSubImage: levels is NULL\n");
-        ERROR_CHECK_RETURN_VALUE(false, GL_INVALID_OPERATION, false);
-    }
-    
-    // ERROR_CHECK_RETURN_VALUE(tex->faces[face].levels[level].complete, GL_INVALID_OPERATION, false);
-    if (!tex->faces[face].levels[level].complete) {
-        fprintf(stderr, "MGL Error: texSubImage: level %d not complete\n", level);
-        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
-    }
-
-    // unpack from pixel buffer
-    if (STATE(buffers[_PIXEL_UNPACK_BUFFER]))
-    {
-        Buffer *ptr;
-
-        ptr = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
-
-        // ERROR_CHECK_RETURN(ptr->mapped == false, GL_INVALID_OPERATION);
-        if (ptr->mapped) {
-            fprintf(stderr, "MGL Error: texSubImage: pixel unpack buffer is mapped\n");
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        GLubyte *buffer_data;
-        buffer_data = getBufferData(ctx, ptr);
-
-        // if a pixel buffer is the src, pixels is the offset
-        // need to check offset against size
-        size_t offset;
-        offset = (size_t)pixels;
-
-        pixels = &buffer_data[offset];
-    }
-
-    // no src data.. return
-    ERROR_CHECK_RETURN(pixels, GL_INVALID_OPERATION);
-
-    size_t pixel_size;
-    size_t src_size;
-    size_t src_pitch;
-
-    pixel_size = sizeForFormatType(format, type);
-    src_size = width * pixel_size;
-
-    if (ctx->state.unpack.row_length)
-    {
-        size_t alignment;
-
-        // ERROR_CHECK_RETURN((ctx->state.unpack.row_length >> level) >= width, GL_INVALID_VALUE);
-        // Fix: row_length applies to the source data for the current level, do not shift by level
-        if (ctx->state.unpack.row_length < width) {
-             ERROR_RETURN_VALUE(GL_INVALID_VALUE, false);
-        }
-
-        alignment = ctx->state.unpack.alignment;
-        if (alignment)
-        {
-            if (src_size >= alignment)
-            {
-                size_t row_bytes = (ctx->state.unpack.row_length >> level) * pixel_size;
-                src_pitch = row_bytes;
-                assert(src_pitch);
-            }
-            else if (depth > 1)
-            {
-                // 3d texture
-                src_pitch = alignment / src_size;
-
-                src_pitch = src_pitch * src_size * ctx->state.unpack.row_length * height;
-
-                src_pitch = src_pitch / alignment;
-                assert(src_pitch);
-            }
-            else
-            {
-                src_pitch = alignment / src_size;
-
-                src_pitch = src_pitch * src_size * ctx->state.unpack.row_length;
-
-                src_pitch = src_pitch / alignment;
-                assert(src_pitch);
-            }
-        }
-        else
-        {
-            size_t row_bytes = (ctx->state.unpack.row_length >> level) * pixel_size;
-            src_pitch = row_bytes;
-            assert(src_pitch);
-        }
-    }
-    else
-    {
-        src_pitch = src_size;
-        assert(src_pitch);
-    }
-
-    void *texture_data;
-
-    texture_data = (void *)tex->faces[face].levels[level].data;
-    
-    unpackTexture(ctx, tex, face, level, pixels, texture_data, src_pitch, pixel_size, xoffset, yoffset, zoffset, width, height, depth);
-
-    // use a blit command to update data
-    do
-    {
-        Buffer *buf;
-
-        buf = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
-
-        if (buf == NULL)
-            continue;
-
-        if (tex->mtl_data == NULL)
-            continue;
-
-        size_t src_offset;
-        size_t src_image_size;
-        size_t src_size;
-
-        src_offset = (size_t)0;
-
-        src_image_size = src_pitch * height;
-
-        src_size = src_image_size * depth;
-
-        ctx->mtl_funcs.mtlTexSubImage(ctx, tex, buf, src_offset, src_pitch, src_image_size, src_size, zoffset, level, width, height, depth, xoffset, yoffset, zoffset);
-
-        return true;
-    } while(false);
-
-    // use process gl to upload texture data
-    tex->dirty_bits |= DIRTY_TEXTURE_DATA;
-    
-    return true;
-}
-
-#pragma mark texSubImage1D
-void texSubImage1D(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
-{
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, tex->internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(width + xoffset <= tex->width, GL_INVALID_VALUE);
-
-    texSubImage(ctx, tex, face, level, xoffset, 0, 0, width, 1, 1, format, type, (void *)pixels);
-}
-
-void mglTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-
-    switch(target)
-    {
-        case GL_TEXTURE_1D:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texSubImage1D(ctx, tex, 0, level, xoffset, width, format, type, pixels);
-}
-
-void mglTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-
-    tex = getTex(ctx, texture, 0);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-   texSubImage1D(ctx, tex, 0, level, xoffset, width, format, type, pixels);
-}
-
-#pragma mark texSubImage2D
-bool texSubImage2D(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
-{
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, tex->internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(width + xoffset <= tex->width, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height + yoffset <= tex->height, GL_INVALID_VALUE);
-
-    texSubImage(ctx, tex, face, level, xoffset, yoffset, 0, width, height, 1, format, type, (void *)pixels);
-
-    return true;
-}
-
-void mglTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-    GLuint face;
-
-    face = 0;
-
-    switch(target)
-    {
-        case GL_TEXTURE_2D:
-        case GL_TEXTURE_1D_ARRAY:
-        case GL_TEXTURE_RECTANGLE:
-            break;
-
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_X:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_X:
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_Y:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
-        case GL_TEXTURE_CUBE_MAP_POSITIVE_Z:
-        case GL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
-            face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    tex = getTex(ctx, 0, target);
-
-    if (!tex) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    texSubImage2D(ctx, tex, face, level, xoffset, yoffset, width, height, format, type, pixels);
-}
-
-void mglTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-
-    tex = getTex(ctx, texture, 0);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texSubImage2D(ctx, tex, 0, level, xoffset, yoffset, width, height, format, type, pixels);
-}
-
-#pragma mark texSubImage3D
-void texSubImage3D(GLMContext ctx, Texture *tex, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
-{
-
-    ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, tex->internalformat, format, type), 0);
-
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(depth >= 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(width + xoffset <= tex->width, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height + yoffset <= tex->height, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(depth + zoffset <= tex->depth, GL_INVALID_VALUE);
-
-    texSubImage(ctx, tex, 0, level, xoffset, yoffset, zoffset, width, height, depth, format, type, (void *)pixels);
-}
-
-void mglTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-
-    switch(target)
-    {
-        case GL_TEXTURE_3D:
-        case GL_TEXTURE_2D_ARRAY:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texSubImage3D(ctx, tex, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
-}
-
-void mglTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
-{
-    Texture *tex;
-
-    tex = getTex(ctx, texture, 0);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texSubImage3D(ctx, tex, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
-}
-
-#pragma mark TexStorage
-
-void texStorage(GLMContext ctx, Texture *tex, GLuint faces, GLsizei levels, GLboolean is_array, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean proxy)
-{
-    tex->access = GL_READ_ONLY;
-
-    for(int face=0; face<faces; face++)
-    {
-        GLuint level_width, level_height;
-
-        level_width = width;
-        level_height = height;
-
-        for(int level=0; level<levels; level++)
-        {
-            createTextureLevel(ctx, tex, face, level, is_array, internalformat, level_width, level_height, depth, 0, 0, NULL, proxy);
-
-            level_width >>= 1;
-            level_height >>= 1;
-            
-            // Mipmap dimensions must be at least 1
-            if (level_width == 0) level_width = 1;
-            if (level_height == 0) level_height = 1;
-        }
-    }
-
-    // mark it immutable
-    tex->immutable_storage = BUFFER_IMMUTABLE_STORAGE_FLAG;
-
-    // bind it to metal
-    ctx->mtl_funcs.mtlBindTexture(ctx, tex);
-
-    ERROR_CHECK_RETURN(tex->mtl_data, GL_OUT_OF_MEMORY);
-}
-
-void mglTexStorage1D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width)
-{
-    Texture *tex;
-    GLboolean proxy;
-
-    proxy = false;
-
-    switch(target)
-    {
-        case GL_TEXTURE_1D:
-            break;
-
-        case GL_PROXY_TEXTURE_1D:
-            proxy = true;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texStorage(ctx, tex, 1, levels, false, internalformat, width, 1, 1, proxy);
-}
-
-void mglTextureStorage1D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width)
-{
-    Texture *tex;
-
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, texture, 0);
-
-    ERROR_CHECK_RETURN(tex != NULL, GL_INVALID_OPERATION);
-
-    texStorage(ctx, tex, 1, levels, false, internalformat, width, 1, 1, false);
-}
-
-void mglTexStorage2D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
-{
-    Texture *tex;
-    GLboolean is_array;
-    GLboolean proxy;
-    GLuint num_faces;
-
-    is_array = false;
-    proxy = false;
-    num_faces = 1;
-
-    switch(target)
-    {
-        case GL_TEXTURE_2D:
-        case GL_TEXTURE_RECTANGLE:
-            break;
-
-        case GL_PROXY_TEXTURE_2D:
-        case GL_PROXY_TEXTURE_RECTANGLE:
-            proxy = true;
-            break;
-
-        case GL_TEXTURE_CUBE_MAP:
-            num_faces = 6;
-            proxy = true;
-            break;
-
-        case GL_PROXY_TEXTURE_CUBE_MAP:
-            num_faces = 6;
-            proxy = true;
-            break;
-
-        case GL_TEXTURE_1D_ARRAY:
-            is_array = true;
-            break;
-
-        case GL_PROXY_TEXTURE_1D_ARRAY:
-            is_array = true;
-            proxy = true;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-    
-    fprintf(stderr, "MGL: mglTexStorage2D target=0x%x levels=%d internalformat=0x%x %dx%d tex=%p\n",
-            target, levels, internalformat, width, height, tex);
-    fflush(stderr);
-
-    texStorage(ctx, tex, num_faces, levels, is_array, internalformat, width, height, 1, proxy);
-}
-
-void mglTextureStorage2D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
-{
-    Texture *tex;
-
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, texture, 0);
-
-    texStorage(ctx, tex, 1, levels, false, internalformat, width, height, 1, false);
-}
-
-void mglTexStorage3D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
-{
-    Texture *tex;
-    GLboolean is_array;
-    GLboolean proxy;
-
-    is_array = false;
-    proxy = false;
-
-    switch(target)
-    {
-        case GL_TEXTURE_3D:
-            break;
-
-        case GL_PROXY_TEXTURE_3D:
-            proxy = true;
-            break;
-
-        case GL_TEXTURE_2D_ARRAY:
-        case GL_TEXTURE_CUBE_MAP_ARRAY:
-            is_array = true;
-            break;
-
-        case GL_PROXY_TEXTURE_2D_ARRAY:
-        case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY:
-            is_array = true;
-            proxy = true;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(checkMaxLevels(levels, width, height, depth), GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(depth > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, 0, target);
-
-    ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
-
-    texStorage(ctx, tex, 1, levels, is_array, internalformat, width, height, depth, proxy);
-}
-
-void mglTextureStorage3D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
-{
-    Texture *tex;
-
-    ERROR_CHECK_RETURN(levels > 0, GL_INVALID_VALUE);
-
-    ERROR_CHECK_RETURN(checkInternalFormatForMetal(ctx, internalformat), GL_INVALID_OPERATION);
-
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(depth > 0, GL_INVALID_VALUE);
-
-    tex = getTex(ctx, texture, 0);
-
-    createTextureLevel(ctx, tex, 0, 0, false, internalformat, width, height, depth, 0, 0, NULL, false);
-}
-
-#pragma mark clear tex image
-void mglClearTexImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, const void *data)
-{
-    fprintf(stderr, "MGL: glClearTexImage called - texture=%u level=%d\n", texture, level);
-    
-    Texture *tex = getTex(ctx, texture, 0);
-    if (!tex) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    // For now, use texSubImage to clear - fill with the clear data
-    GLsizei width = tex->width >> level;
-    GLsizei height = tex->height >> level;
-    if (width < 1) width = 1;
-    if (height < 1) height = 1;
-    
-    // If data is NULL, clear to zero
-    if (data == NULL) {
-        size_t pixel_size = sizeForFormatType(format, type);
-
-        // CRITICAL SECURITY FIX: Prevent integer overflow in texture clear allocation
-        if (width > SIZE_MAX / height / pixel_size) {
-            fprintf(stderr, "MGL SECURITY ERROR: Texture clear allocation would overflow: %dx%dx%zu\n", width, height, pixel_size);
-            STATE(error) = GL_OUT_OF_MEMORY;
-            return;
-        }
-
-        size_t size = width * height * pixel_size;
-        void *clear_data = calloc(1, size);
-        if (clear_data) {
-            texSubImage(ctx, tex, 0, level, 0, 0, 0, width, height, 1, format, type, clear_data);
-            free(clear_data);
-        }
-    } else {
-        // Fill entire texture with the provided clear value
-        size_t pixel_size = sizeForFormatType(format, type);
-
-        // CRITICAL SECURITY FIX: Prevent integer overflow in texture fill allocation
-        if (width > SIZE_MAX / height / pixel_size) {
-            fprintf(stderr, "MGL SECURITY ERROR: Texture fill allocation would overflow: %dx%dx%zu\n", width, height, pixel_size);
-            STATE(error) = GL_OUT_OF_MEMORY;
-            return;
-        }
-
-        size_t size = width * height * pixel_size;
-        void *fill_data = malloc(size);
-        if (fill_data) {
-            // Replicate the clear value across the entire buffer
-            for (size_t i = 0; i < width * height; i++) {
-                memcpy((char*)fill_data + i * pixel_size, data, pixel_size);
-            }
-            texSubImage(ctx, tex, 0, level, 0, 0, 0, width, height, 1, format, type, fill_data);
-            free(fill_data);
-        }
-    }
-}
-
-void mglClearTexSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *data)
-{
-    fprintf(stderr, "MGL: glClearTexSubImage called - texture=%u %dx%dx%d at (%d,%d,%d)\n",
-            texture, width, height, depth, xoffset, yoffset, zoffset);
-    
-    Texture *tex = getTex(ctx, texture, 0);
-    if (!tex) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    size_t pixel_size = sizeForFormatType(format, type);
-
-    // CRITICAL SECURITY FIX: Prevent integer overflow in texture subimage allocation
-    if (width > SIZE_MAX / height / depth / pixel_size) {
-        fprintf(stderr, "MGL SECURITY ERROR: Texture subimage allocation would overflow: %dx%dx%dx%zu\n", width, height, depth, pixel_size);
-        STATE(error) = GL_OUT_OF_MEMORY;
-        return;
-    }
-
-    size_t size = width * height * depth * pixel_size;
-    
-    if (data == NULL) {
-        void *clear_data = calloc(1, size);
-        if (clear_data) {
-            texSubImage(ctx, tex, 0, level, xoffset, yoffset, zoffset, width, height, depth, format, type, clear_data);
-            free(clear_data);
-        }
-    } else {
-        void *fill_data = malloc(size);
-        if (fill_data) {
-            for (size_t i = 0; i < width * height * depth; i++) {
-                memcpy((char*)fill_data + i * pixel_size, data, pixel_size);
-            }
-            texSubImage(ctx, tex, 0, level, xoffset, yoffset, zoffset, width, height, depth, format, type, fill_data);
-            free(fill_data);
-        }
-    }
-}
-
-#pragma mark compressed tex image
-void mglCompressedTexImage3D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexImage3D called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexImage2D called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexImage1D called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexSubImage3D called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexSubImage2D called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data)
-{
-    // Stub - compressed textures not fully supported yet
-    fprintf(stderr, "MGL WARNING: glCompressedTexSubImage1D called (stub) - compressed textures not supported\n");
-}
-
-#pragma mark copy tex
-void mglCopyTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border)
-{
-    // Stub - not commonly used
-    fprintf(stderr, "MGL WARNING: glCopyTexImage1D called (stub)\n");
-}
-
-void mglCopyTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
-{
-    fprintf(stderr, "MGL: glCopyTexImage2D called - target=0x%x level=%d %dx%d\n", target, level, width, height);
-    
-    // Get or create texture
-    Texture *tex = getTex(ctx, 0, target);
-    if (!tex) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    // Initialize texture storage if needed
-    if (tex->mipmap_levels == 0) {
-        initBaseTexLevel(ctx, tex, internalformat, width, height, 1);
-    }
-    
-    // Copy from framebuffer to texture
-    ctx->mtl_funcs.mtlCopyTexSubImage(ctx, tex, level, 0, 0, x, y, width, height);
-}
-
-void mglCopyTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width)
-{
-    fprintf(stderr, "MGL: glCopyTexSubImage1D called (stub)\n");
-    // Stub - 1D textures rarely used
-}
-
-void mglCopyTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    fprintf(stderr, "MGL: glCopyTexSubImage2D called - target=0x%x %dx%d at (%d,%d) from (%d,%d)\n",
-            target, width, height, xoffset, yoffset, x, y);
-    
-    // Get the bound texture
-    Texture *tex = getTex(ctx, 0, target);
-    if (!tex) {
-        fprintf(stderr, "MGL ERROR: glCopyTexSubImage2D - no texture bound\n");
-        return;
-    }
-    
-    // This copies from the current read framebuffer to the texture
-    // For now, use the Metal blit function
-    ctx->mtl_funcs.mtlCopyTexSubImage(ctx, tex, level, xoffset, yoffset, x, y, width, height);
-}
-
-void mglCopyTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    fprintf(stderr, "MGL: glCopyTexSubImage3D called - stub, only 2D copy supported\n");
-    // For now just do 2D copy, ignoring zoffset
-    Texture *tex = getTex(ctx, 0, target);
-    if (tex) {
-        ctx->mtl_funcs.mtlCopyTexSubImage(ctx, tex, level, xoffset, yoffset, x, y, width, height);
-    }
-}
-
-void mglCopyTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width)
-{
-    fprintf(stderr, "MGL: glCopyTextureSubImage1D called (stub)\n");
-}
-
-void mglCopyTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    fprintf(stderr, "MGL: glCopyTextureSubImage2D called - texture=%u %dx%d\n", texture, width, height);
-    Texture *tex = getTex(ctx, texture, 0);
-    if (tex) {
-        ctx->mtl_funcs.mtlCopyTexSubImage(ctx, tex, level, xoffset, yoffset, x, y, width, height);
-    }
-}
-
-void mglCopyTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    fprintf(stderr, "MGL: glCopyTextureSubImage3D called (stub)\n");
-    Texture *tex = getTex(ctx, texture, 0);
-    if (tex) {
-        ctx->mtl_funcs.mtlCopyTexSubImage(ctx, tex, level, xoffset, yoffset, x, y, width, height);
-    }
-}
-
-#pragma mark get tex image
-
-void mglGetTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, void *pixels)
-{
-    fprintf(stderr, "MGL: glGetTexImage called - target=0x%x level=%d format=0x%x type=0x%x\n",
-            target, level, format, type);
-    
-    Texture *tex = getTex(ctx, 0, target);
-    if (!tex) {
-        fprintf(stderr, "MGL ERROR: glGetTexImage - no texture bound\n");
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    if (!tex->mtl_data) {
-        fprintf(stderr, "MGL ERROR: glGetTexImage - texture has no Metal data\n");
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    if (level >= tex->num_levels) {
-        fprintf(stderr, "MGL ERROR: glGetTexImage - invalid level %d (max %d)\n", level, tex->num_levels);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-    
-    // Calculate dimensions for this level
-    GLsizei width = tex->width >> level;
-    GLsizei height = tex->height >> level;
-    if (width < 1) width = 1;
-    if (height < 1) height = 1;
-    
-    // Calculate bytes per row
-    size_t pixel_size = sizeForFormatType(format, type);
-    GLuint bytesPerRow = width * pixel_size;
-    GLuint bytesPerImage = bytesPerRow * height;
-    
-    fprintf(stderr, "MGL: glGetTexImage - reading %dx%d, bytesPerRow=%u\n", width, height, bytesPerRow);
-    
-    // Use the Metal function to read the texture
-    ctx->mtl_funcs.mtlGetTexImage(ctx, tex, pixels, bytesPerRow, bytesPerImage, 0, 0, width, height, level, 0);
-}
-
-void mglGetTextureImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
-{
-    fprintf(stderr, "MGL: glGetTextureImage called - texture=%u level=%d\n", texture, level);
-    
-    Texture *tex = getTex(ctx, texture, 0);
-    if (!tex) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    if (!tex->mtl_data) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    GLsizei width = tex->width >> level;
-    GLsizei height = tex->height >> level;
-    if (width < 1) width = 1;
-    if (height < 1) height = 1;
-    
-    size_t pixel_size = sizeForFormatType(format, type);
-    GLuint bytesPerRow = width * pixel_size;
-    GLuint bytesPerImage = bytesPerRow * height;
-    
-    if (bytesPerImage > bufSize) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    ctx->mtl_funcs.mtlGetTexImage(ctx, tex, pixels, bytesPerRow, bytesPerImage, 0, 0, width, height, level, 0);
-}
-
-void mglGetTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
-{
-    fprintf(stderr, "MGL: glGetTextureSubImage called - texture=%u\n", texture);
-    
-    Texture *tex = getTex(ctx, texture, 0);
-    if (!tex || !tex->mtl_data) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-    
-    size_t pixel_size = sizeForFormatType(format, type);
-    GLuint bytesPerRow = width * pixel_size;
-    GLuint bytesPerImage = bytesPerRow * height;
-    
-    ctx->mtl_funcs.mtlGetTexImage(ctx, tex, pixels, bytesPerRow, bytesPerImage, xoffset, yoffset, width, height, level, zoffset);
-}
-
-void mglGetCompressedTexImage(GLMContext ctx, GLenum target, GLint level, void *img)
-{
-    fprintf(stderr, "MGL WARNING: glGetCompressedTexImage called (stub) - compressed textures not supported\n");
-}
-
-void mglGetnCompressedTexImage(GLMContext ctx, GLenum target, GLint lod, GLsizei bufSize, void *pixels)
-{
-    fprintf(stderr, "MGL WARNING: glGetnCompressedTexImage called (stub) - compressed textures not supported\n");
-}
-
-void mglGetCompressedTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLsizei bufSize, void *pixels)
-{
-    fprintf(stderr, "MGL WARNING: glGetCompressedTextureSubImage called (stub) - compressed textures not supported\n");
-}
-
-void mglCompressedTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data)
-{
-    fprintf(stderr, "MGL WARNING: glCompressedTextureSubImage1D called (stub)\n");
-}
-
-void mglCompressedTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data)
-{
-    fprintf(stderr, "MGL WARNING: glCompressedTextureSubImage2D called (stub)\n");
-}
-
-void mglCompressedTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
-{
-    fprintf(stderr, "MGL WARNING: glCompressedTextureSubImage3D called (stub)\n");
-}
-
-void mglGetCompressedTextureImage(GLMContext ctx, GLuint texture, GLint level, GLsizei bufSize, void *pixels)
-{
-    fprintf(stderr, "MGL WARNING: glGetCompressedTextureImage called (stub)\n");
-}
+/* ------------------------------------------------------------------------ */
+/* level queries are implemented by the texparam domain (texture_query.c)   */
+/* ------------------------------------------------------------------------ */
 
 extern void mglTexParamGetTextureLevelParameteriv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLint *params);
 extern void mglTexParamGetTextureLevelParameterfv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLfloat *params);
 
-// level queries are implemented by the texparam domain (texture_query.c)
 void mglGetTextureLevelParameteriv(GLMContext ctx, GLuint texture, GLint level, GLenum pname, GLint *params)
 {
     mglTexParamGetTextureLevelParameteriv(ctx, texture, level, pname, params);
@@ -2352,48 +3206,72 @@ void mglGetTextureLevelParameterfv(GLMContext ctx, GLuint texture, GLint level, 
     mglTexParamGetTextureLevelParameterfv(ctx, texture, level, pname, params);
 }
 
-void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)
-{
-	fprintf(stderr, "MGL: glCopyImageSubData src=%u dst=%u %dx%dx%d\n",
-	        srcName, dstName, srcWidth, srcHeight, srcDepth);
-	
-	// Find source and destination textures
-	Texture *srcTex = findTexture(ctx, srcName);
-	Texture *dstTex = findTexture(ctx, dstName);
-	
-	if (!srcTex || !dstTex) {
-		fprintf(stderr, "MGL ERROR: CopyImageSubData - texture not found src=%p dst=%p\n",
-		        srcTex, dstTex);
-		return;
-	}
-	
-	if (!srcTex->mtl_data || !dstTex->mtl_data) {
-		fprintf(stderr, "MGL ERROR: CopyImageSubData - no Metal data src=%p dst=%p\n",
-		        srcTex->mtl_data, dstTex->mtl_data);
-		return;
-	}
-	
-	// Use Metal blit to copy texture regions
-	ctx->mtl_funcs.mtlCopyImageSubData(ctx, srcTex, srcLevel, srcX, srcY, srcZ,
-	                                    dstTex, dstLevel, dstX, dstY, dstZ,
-	                                    srcWidth, srcHeight, srcDepth);
-}
-
-void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
-{
-	// TODO: Implement
-	(void)ctx;
-}
-
-#pragma mark - domain 'texdata' hooks
+/* ------------------------------------------------------------------------ */
+/* domain 'texdata' hooks                                                   */
+/* ------------------------------------------------------------------------ */
 
 void mgl_ext_init_texdata(GLMContext ctx)
 {
-    (void)ctx;
+    if (!ctx->state.ext_texdata)
+        ctx->state.ext_texdata = (struct MGLExtState_texdata *)calloc(1, sizeof(struct MGLExtState_texdata));
+}
+
+bool mgl_texdata_pixel_store(GLMContext ctx, GLenum pname, GLint param)
+{
+    struct MGLExtState_texdata *td = TDS(ctx);
+
+    if (!td)
+        return false;
+
+    switch (pname)
+    {
+        case GL_UNPACK_COMPRESSED_BLOCK_WIDTH:  td->unpack_cb[0] = param; return true;
+        case GL_UNPACK_COMPRESSED_BLOCK_HEIGHT: td->unpack_cb[1] = param; return true;
+        case GL_UNPACK_COMPRESSED_BLOCK_DEPTH:  td->unpack_cb[2] = param; return true;
+        case GL_UNPACK_COMPRESSED_BLOCK_SIZE:   td->unpack_cb[3] = param; return true;
+        case GL_PACK_COMPRESSED_BLOCK_WIDTH:    td->pack_cb[0] = param; return true;
+        case GL_PACK_COMPRESSED_BLOCK_HEIGHT:   td->pack_cb[1] = param; return true;
+        case GL_PACK_COMPRESSED_BLOCK_DEPTH:    td->pack_cb[2] = param; return true;
+        case GL_PACK_COMPRESSED_BLOCK_SIZE:     td->pack_cb[3] = param; return true;
+        default: return false;
+    }
 }
 
 bool mgl_ext_get_texdata(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
-    (void)ctx; (void)pname; (void)type; (void)data;
-    return false;
+    struct MGLExtState_texdata *td = TDS(ctx);
+    double v;
+
+    switch (pname)
+    {
+        case GL_UNPACK_COMPRESSED_BLOCK_WIDTH:  v = td ? td->unpack_cb[0] : 0; break;
+        case GL_UNPACK_COMPRESSED_BLOCK_HEIGHT: v = td ? td->unpack_cb[1] : 0; break;
+        case GL_UNPACK_COMPRESSED_BLOCK_DEPTH:  v = td ? td->unpack_cb[2] : 0; break;
+        case GL_UNPACK_COMPRESSED_BLOCK_SIZE:   v = td ? td->unpack_cb[3] : 0; break;
+        case GL_PACK_COMPRESSED_BLOCK_WIDTH:    v = td ? td->pack_cb[0] : 0; break;
+        case GL_PACK_COMPRESSED_BLOCK_HEIGHT:   v = td ? td->pack_cb[1] : 0; break;
+        case GL_PACK_COMPRESSED_BLOCK_DEPTH:    v = td ? td->pack_cb[2] : 0; break;
+        case GL_PACK_COMPRESSED_BLOCK_SIZE:     v = td ? td->pack_cb[3] : 0; break;
+        case GL_UNPACK_SWAP_BYTES:   v = STATE(unpack.swap_bytes); break;
+        case GL_UNPACK_LSB_FIRST:    v = STATE(unpack.lsb_first); break;
+        case GL_UNPACK_ROW_LENGTH:   v = STATE(unpack.row_length); break;
+        case GL_UNPACK_IMAGE_HEIGHT: v = STATE(unpack.image_height); break;
+        case GL_UNPACK_SKIP_ROWS:    v = STATE(unpack.skip_rows); break;
+        case GL_UNPACK_SKIP_PIXELS:  v = STATE(unpack.skip_pixels); break;
+        case GL_UNPACK_SKIP_IMAGES:  v = STATE(unpack.skip_images); break;
+        case GL_UNPACK_ALIGNMENT:    v = STATE(unpack.alignment); break;
+        case GL_PACK_SWAP_BYTES:     v = STATE(pack.swap_bytes); break;
+        case GL_PACK_LSB_FIRST:      v = STATE(pack.lsb_first); break;
+        case GL_PACK_ROW_LENGTH:     v = STATE(pack.row_length); break;
+        case GL_PACK_IMAGE_HEIGHT:   v = STATE(pack.image_height); break;
+        case GL_PACK_SKIP_ROWS:      v = STATE(pack.skip_rows); break;
+        case GL_PACK_SKIP_PIXELS:    v = STATE(pack.skip_pixels); break;
+        case GL_PACK_SKIP_IMAGES:    v = STATE(pack.skip_images); break;
+        case GL_PACK_ALIGNMENT:      v = STATE(pack.alignment); break;
+        default:
+            return false;
+    }
+
+    mgl_get_store(type, data, 0, v);
+    return true;
 }
