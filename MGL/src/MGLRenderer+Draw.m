@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "mgl_ext_buffers.h"
+#include "mgl_ext_xfb.h"
 
 typedef struct MGLDrawPriv_t {
     struct MGLExtMetal_buffers pub;     // must be first: ctx->mtl_funcs.ext_buffers points here
@@ -867,19 +868,33 @@ static void c_mtl_dispatch_indirect(GLMContext c, GLintptr indirect)
         [RENDERER(c) extBufDispatchX: 0 y: 0 z: 0 indirect: b offset: (size_t)indirect];
 }
 
-/* legacy direct draw hooks (used by other domains, e.g. transform feedback draws):
- * route them through the validated GL entry points */
-extern void mglDrawArrays(GLMContext ctx, GLenum mode, GLint first, GLsizei count);
-extern void mglDrawArraysInstanced(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
-extern void mglDrawArraysInstancedBaseInstance(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance);
-extern void mglDrawElements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, const void *indices);
-extern void mglDrawElementsInstanced(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount);
-
-static void c_mtl_draw_arrays(GLMContext c, GLenum mode, GLint first, GLsizei count) { mglDrawArrays(c, mode, first, count); }
-static void c_mtl_draw_arrays_instanced(GLMContext c, GLenum mode, GLint first, GLsizei count, GLsizei inst) { mglDrawArraysInstanced(c, mode, first, count, inst); }
-static void c_mtl_draw_arrays_bi(GLMContext c, GLenum mode, GLint first, GLsizei count, GLsizei inst, GLuint bi) { mglDrawArraysInstancedBaseInstance(c, mode, first, count, inst, bi); }
-static void c_mtl_draw_elements(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices) { mglDrawElements(c, mode, count, type, indices); }
-static void c_mtl_draw_elements_instanced(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst) { mglDrawElementsInstanced(c, mode, count, type, indices, inst); }
+/* raw draw entry points behind mtl_funcs.mtlDraw*: the GL entry points (draw_buffers.c) have
+ * already validated and run the pre-draw hook; the transform feedback capture wrappers call
+ * these after capturing */
+#define RAW(...) mgl_buffers_raw_draw(__VA_ARGS__)
+static void c_mtl_draw_arrays(GLMContext c, GLenum mode, GLint first, GLsizei count)
+{ RAW(c, mode, false, 0, 0, first, count, 1, 0, 0); }
+static void c_mtl_draw_arrays_instanced(GLMContext c, GLenum mode, GLint first, GLsizei count, GLsizei inst)
+{ RAW(c, mode, false, 0, 0, first, count, inst, 0, 0); }
+static void c_mtl_draw_arrays_bi(GLMContext c, GLenum mode, GLint first, GLsizei count, GLsizei inst, GLuint bi)
+{ RAW(c, mode, false, 0, 0, first, count, inst, 0, bi); }
+static void c_mtl_draw_elements(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, 1, 0, 0); }
+static void c_mtl_draw_range_elements(GLMContext c, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, 1, 0, 0); }
+static void c_mtl_draw_elements_instanced(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, inst, 0, 0); }
+static void c_mtl_draw_elements_bv(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLint bv)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, 1, bv, 0); }
+static void c_mtl_draw_range_elements_bv(GLMContext c, GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint bv)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, 1, bv, 0); }
+static void c_mtl_draw_elements_inst_bv(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst, GLint bv)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, inst, bv, 0); }
+static void c_mtl_draw_elements_inst_bi(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst, GLuint bi)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, inst, 0, bi); }
+static void c_mtl_draw_elements_inst_bv_bi(GLMContext c, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst, GLint bv, GLuint bi)
+{ RAW(c, mode, true, type, (size_t)(uintptr_t)indices, 0, count, inst, bv, bi); }
+#undef RAW
 
 - (void) bindExtBuffersFuncsToGLMContext: (GLMContext) glm_ctx
 {
@@ -921,11 +936,21 @@ static void c_mtl_draw_elements_instanced(GLMContext c, GLenum mode, GLsizei cou
     glm_ctx->mtl_funcs.mtlWaitForSync = c_mtl_wait_for_sync;
     glm_ctx->mtl_funcs.mtlDispatchCompute = c_mtl_dispatch;
     glm_ctx->mtl_funcs.mtlDispatchComputeIndirect = c_mtl_dispatch_indirect;
-    glm_ctx->mtl_funcs.mtlDrawArrays = c_mtl_draw_arrays;
-    glm_ctx->mtl_funcs.mtlDrawArraysInstanced = c_mtl_draw_arrays_instanced;
-    glm_ctx->mtl_funcs.mtlDrawArraysInstancedBaseInstance = c_mtl_draw_arrays_bi;
-    glm_ctx->mtl_funcs.mtlDrawElements = c_mtl_draw_elements;
-    glm_ctx->mtl_funcs.mtlDrawElementsInstanced = c_mtl_draw_elements_instanced;
+    // raw draws: when the xfb domain already wrapped mtl_funcs, install below its wrappers
+    struct MGLExtMetal_xfb *xfb = glm_ctx->mtl_funcs.ext_xfb;
+    struct GLMMetalFuncs *draw_funcs = (xfb && xfb->orig.mtlDrawArrays) ? &xfb->orig : &glm_ctx->mtl_funcs;
+
+    draw_funcs->mtlDrawArrays = c_mtl_draw_arrays;
+    draw_funcs->mtlDrawArraysInstanced = c_mtl_draw_arrays_instanced;
+    draw_funcs->mtlDrawArraysInstancedBaseInstance = c_mtl_draw_arrays_bi;
+    draw_funcs->mtlDrawElements = c_mtl_draw_elements;
+    draw_funcs->mtlDrawRangeElements = c_mtl_draw_range_elements;
+    draw_funcs->mtlDrawElementsInstanced = c_mtl_draw_elements_instanced;
+    draw_funcs->mtlDrawElementsBaseVertex = c_mtl_draw_elements_bv;
+    draw_funcs->mtlDrawRangeElementsBaseVertex = c_mtl_draw_range_elements_bv;
+    draw_funcs->mtlDrawElementsInstancedBaseVertex = c_mtl_draw_elements_inst_bv;
+    draw_funcs->mtlDrawElementsInstancedBaseInstance = c_mtl_draw_elements_inst_bi;
+    draw_funcs->mtlDrawElementsInstancedBaseVertexBaseInstance = c_mtl_draw_elements_inst_bv_bi;
 }
 
 @end

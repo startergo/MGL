@@ -332,7 +332,7 @@ static bool buffers_get_indexed(GLMContext ctx, GLenum pname, GLuint index, GLui
     max = (slot == 2) ? 8 : (slot == 3) ? 4 : MAX_BINDABLE_BUFFERS;
     if (index >= max)
     {
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_VALUE);
+        ctx->error_func(ctx, "mglGetIntegeri_v", GL_INVALID_VALUE);
         return true;
     }
 

@@ -96,6 +96,9 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 void mgl_buffers_forget(GLMContext ctx, Buffer *buf);
 MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create);
 uint32_t *mgl_buffers_range_mask(GLMContext ctx, int slot);
+/* one draw without pre-draw / xfb hooks (called back by the xfb capture wrappers) */
+void mgl_buffers_raw_draw(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
+                          GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);
 /* MultiDraw*Indirect[Count] core (draw_buffers.c); type == 0 -> arrays */
 void mgl_buffers_multi_draw_indirect(GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLsizei drawcount,
                                      GLsizei stride, bool use_count, GLintptr count_offset);

@@ -39,6 +39,8 @@
 #include "mgl_ext.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_buffers_err.h"
+#include "mgl_ext_rstate.h"
+#include "mgl_ext_xfb.h"
 
 #define MTLX() (ctx->mtl_funcs.ext_buffers)
 
@@ -473,50 +475,29 @@ static const uint8_t *element_pointer(GLMContext ctx, Buffer *ebuf, size_t offse
     return (const uint8_t *)ebuf->data.buffer_data + offset;
 }
 
-/* one GL draw (after validation). indexed: offset is a byte offset into the element buffer */
-static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexed, GLenum type, size_t offset,
-                      GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+static bool is_adjacency(GLenum mode)
 {
-    if (count <= 0 || instances <= 0)
-        return;
+    return mode == GL_LINES_ADJACENCY || mode == GL_LINE_STRIP_ADJACENCY ||
+           mode == GL_TRIANGLES_ADJACENCY || mode == GL_TRIANGLE_STRIP_ADJACENCY;
+}
 
-    if (!mgl_ext_pre_draw(ctx, mode, count, instances))
-        return;
-
-    if (mode == GL_PATCHES)
-    {
-        warn_patches_once();
-        return;
-    }
-
+/* draw a (CPU) index list of a GL mode: native modes directly, the rest emulated */
+static void draw_index_list(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, const void *indices, GLsizei count,
+                            GLsizei instances, GLint basevertex, GLuint baseinstance, bool restart, uint32_t restart_index)
+{
     int prim = native_prim(mode);
-    Buffer *ebuf = indexed ? VAO_STATE(element_array.buffer) : NULL;
 
-    if (prim >= 0 && (!indexed || type != GL_UNSIGNED_BYTE))
+    if (count <= 0)
+        return;
+
+    if (prim >= 0 && type != GL_UNSIGNED_BYTE)
     {
-        if (!batch_begin(ctx, batch))
-            return;
-
-        if (indexed)
-            MTLX()->draw_indexed(ctx, prim, type, ebuf, offset, NULL, count, instances, basevertex, baseinstance);
-        else
-            MTLX()->draw_arrays(ctx, prim, first, count, instances, baseinstance);
-
+        if (batch_begin(ctx, batch))
+            MTLX()->draw_indexed(ctx, prim, type, NULL, 0, indices, count, instances, basevertex, baseinstance);
         return;
     }
 
-    VertexSource src = { NULL, type, first, false, 0 };
-
-    if (indexed)
-    {
-        src.indices = element_pointer(ctx, ebuf, offset, count, type);
-        if (!src.indices)
-        {
-            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-            return;
-        }
-        src.restart = restart_enabled(ctx, type, &src.restart_index);
-    }
+    VertexSource src = { (const uint8_t *)indices, type, 0, restart, restart_index };
 
     if (prim >= 0)
     {
@@ -538,12 +519,143 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     prim = build_emulated(mode, &src, count, &list);
 
     if (list.count && batch_begin(ctx, batch))
-    {
         MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count,
-                             instances, indexed ? basevertex : 0, baseinstance);
-    }
+                             instances, basevertex, baseinstance);
 
     free(list.data);
+}
+
+/* one GL draw without hooks: primitive restart / provoking vertex / uint8 rewrites
+ * (rstate helpers), primitive type emulation, Metal draw. offset: byte offset into the
+ * element buffer for indexed draws. */
+static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexed, GLenum type, size_t offset,
+                          GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+{
+    if (count <= 0 || instances <= 0)
+        return;
+
+    if (mode == GL_PATCHES)
+    {
+        warn_patches_once();
+        return;
+    }
+
+    int prim = native_prim(mode);
+    bool adjacency = is_adjacency(mode);
+
+    if (!indexed)
+    {
+        if (!adjacency && mgl_rstate_arrays_rewrite_needed(ctx, mode))
+        {
+            GLenum out_mode = mode;
+            GLsizei out_count = 0;
+            void *idx = mgl_rstate_generate_array_indices(ctx, mode, first, count, &out_mode, &out_count);
+
+            if (idx)
+            {
+                draw_index_list(ctx, batch, out_mode, GL_UNSIGNED_INT, idx, out_count, instances, 0, baseinstance, false, 0);
+                free(idx);
+                return;
+            }
+        }
+
+        if (prim >= 0)
+        {
+            if (batch_begin(ctx, batch))
+                MTLX()->draw_arrays(ctx, prim, first, count, instances, baseinstance);
+            return;
+        }
+
+        IndexList list = { 0 };
+        VertexSource src = { NULL, 0, first, false, 0 };
+        prim = build_emulated(mode, &src, count, &list);
+
+        if (list.count && batch_begin(ctx, batch))
+            MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count, instances, 0, baseinstance);
+
+        free(list.data);
+        return;
+    }
+
+    Buffer *ebuf = VAO_STATE(element_array.buffer);
+    const uint8_t *cpu = element_pointer(ctx, ebuf, offset, count, type);
+
+    if (!cpu)
+    {
+        // index range outside the element buffer
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return;
+    }
+
+    uint32_t restart_index = 0;
+    bool restart = restart_enabled(ctx, type, &restart_index);
+
+    if (!adjacency && mgl_rstate_index_rewrite_needed(ctx, mode, type, cpu, count))
+    {
+        GLenum out_mode = mode, out_type = type;
+        GLsizei out_count = 0;
+        void *idx = mgl_rstate_rewrite_indices(ctx, mode, type, cpu, count, &out_mode, &out_type, &out_count);
+
+        if (idx)
+        {
+            // restart has been resolved by the rewrite (Metal restart value for strips)
+            uint32_t mrv = out_type == GL_UNSIGNED_INT ? 0xFFFFFFFFu : 0xFFFFu;
+            draw_index_list(ctx, batch, out_mode, out_type, idx, out_count, instances, basevertex, baseinstance,
+                            native_prim(out_mode) < 0 && restart, mrv);
+            free(idx);
+            return;
+        }
+    }
+
+    if (prim >= 0 && type != GL_UNSIGNED_BYTE)
+    {
+        if (batch_begin(ctx, batch))
+            MTLX()->draw_indexed(ctx, prim, type, ebuf, offset, NULL, count, instances, basevertex, baseinstance);
+        return;
+    }
+
+    draw_index_list(ctx, batch, mode, type, cpu, count, instances, basevertex, baseinstance, restart, restart_index);
+}
+
+/* hand a draw to the transform feedback capture wrappers (xfb domain), which capture and
+ * then call the raw draw back through mtl_funcs (MGLRenderer+Draw.m -> mgl_buffers_raw_draw) */
+static void route_xfb(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
+                      GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+{
+    if (indexed)
+        ctx->mtl_funcs.mtlDrawElementsInstancedBaseVertexBaseInstance(ctx, mode, count, type, (const void *)(uintptr_t)offset,
+                                                                      instances, basevertex, baseinstance);
+    else
+        ctx->mtl_funcs.mtlDrawArraysInstancedBaseInstance(ctx, mode, first, count, instances, baseinstance);
+}
+
+void mgl_buffers_raw_draw(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
+                          GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+{
+    DrawBatch batch = { 0 };
+
+    exec_draw_raw(ctx, &batch, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+    batch_end(ctx, &batch);
+}
+
+/* one GL draw (after validation): pre-draw hook, transform feedback, raw draw */
+static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexed, GLenum type, size_t offset,
+                      GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+{
+    if (count <= 0 || instances <= 0)
+        return;
+
+    if (!mgl_ext_pre_draw(ctx, mode, count, instances))
+        return;
+
+    if (mgl_xfb_capturing(ctx))
+    {
+        batch_end(ctx, batch);
+        route_xfb(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+        return;
+    }
+
+    exec_draw_raw(ctx, batch, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
 }
 
 static void draw_arrays_common(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLsizei instances, GLuint baseinstance)
@@ -752,12 +864,17 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
     uint32_t cmd[5] = { 0, 0, 0, 0, 0 };
     int words = type ? 5 : 4;
     int prim = native_prim(mode);
-    bool native = prim >= 0 && type != GL_UNSIGNED_BYTE;
+    bool capturing = mgl_xfb_capturing(ctx);
 
-    // emulated paths need the command on the CPU; native ones only for the hook
-    bool known = read_indirect(ctx, ibuf, offset, cmd, words, !native);
+    // the GPU can consume the command directly unless the draw needs CPU-side work
+    bool gpu_ok = prim >= 0 && type != GL_UNSIGNED_BYTE && !capturing && mode != GL_PATCHES &&
+                  !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
+                         : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
-    if (!known && !native)
+    // read the command when CPU-visible (always when the CPU path needs it)
+    bool known = read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok);
+
+    if (!known && !gpu_ok)
         return;
 
     if (known)
@@ -765,7 +882,7 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
         if (!mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1]))
             return;
 
-        if (cmd[0] == 0 || cmd[1] == 0)
+        if (cmd[0] == 0 || cmd[1] == 0 || cmd[0] > INT32_MAX || cmd[1] > INT32_MAX)
             return;
     }
     else if (!mgl_ext_pre_draw(ctx, mode, 0, 0))
@@ -774,65 +891,27 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
         return;
     }
 
-    if (mode == GL_PATCHES)
+    if (gpu_ok)
     {
-        warn_patches_once();
+        if (batch_begin(ctx, batch))
+            MTLX()->draw_indirect(ctx, prim, ibuf, offset, type, type ? VAO_STATE(element_array.buffer) : NULL);
         return;
     }
 
-    if (native)
-    {
-        if (!batch_begin(ctx, batch))
-            return;
+    GLsizei count = (GLsizei)cmd[0], inst = (GLsizei)cmd[1];
+    size_t first_byte = type ? (size_t)cmd[2] * getTypeSize(type) : 0;
+    GLint first = type ? 0 : (GLint)cmd[2];
+    GLint basevertex = type ? (GLint)cmd[3] : 0;
+    GLuint baseinstance = type ? cmd[4] : cmd[3];
 
-        MTLX()->draw_indirect(ctx, prim, ibuf, offset, type, type ? VAO_STATE(element_array.buffer) : NULL);
+    if (capturing)
+    {
+        batch_end(ctx, batch);
+        route_xfb(ctx, mode, type != 0, type, first_byte, first, count, inst, basevertex, baseinstance);
         return;
     }
 
-    // CPU emulation with the command's parameters (pre-draw hook already called)
-    if (type)
-    {
-        GLsizei count = (GLsizei)cmd[0], inst = (GLsizei)cmd[1];
-        size_t first_byte = (size_t)cmd[2] * getTypeSize(type);
-        GLint basevertex = (GLint)cmd[3];
-        GLuint baseinstance = cmd[4];
-
-        Buffer *ebuf = VAO_STATE(element_array.buffer);
-        VertexSource src = { element_pointer(ctx, ebuf, first_byte, count, type), type, 0, false, 0 };
-        if (!src.indices)
-        {
-            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-            return;
-        }
-        src.restart = restart_enabled(ctx, type, &src.restart_index);
-
-        if (prim >= 0)
-        {
-            uint16_t *wide = (uint16_t *)malloc(count * sizeof(uint16_t));
-            if (!wide) return;
-            for (GLsizei k = 0; k < count; k++)
-                wide[k] = vs_is_restart(&src, k) ? 0xFFFF : (uint16_t)vs_get(&src, k);
-            if (batch_begin(ctx, batch))
-                MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_SHORT, NULL, 0, wide, count, inst, basevertex, baseinstance);
-            free(wide);
-            return;
-        }
-
-        IndexList list = { 0 };
-        prim = build_emulated(mode, &src, count, &list);
-        if (list.count && batch_begin(ctx, batch))
-            MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count, inst, basevertex, baseinstance);
-        free(list.data);
-    }
-    else
-    {
-        VertexSource src = { NULL, 0, (GLint)cmd[2], false, 0 };
-        IndexList list = { 0 };
-        prim = build_emulated(mode, &src, (GLsizei)cmd[0], &list);
-        if (list.count && batch_begin(ctx, batch))
-            MTLX()->draw_indexed(ctx, prim, GL_UNSIGNED_INT, NULL, 0, list.data, (GLsizei)list.count, (GLsizei)cmd[1], 0, cmd[3]);
-        free(list.data);
-    }
+    exec_draw_raw(ctx, batch, mode, type != 0, type, first_byte, first, count, inst, basevertex, baseinstance);
 }
 
 void mgl_buffers_multi_draw_indirect(GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLsizei drawcount,
