@@ -29,6 +29,7 @@
 #include "buffers.h"
 #include "pixel_utils.h"
 #include "mgl_safety.h"
+#include "mgl_ext_xfb.h"
 
 // Used to recover from a corrupted context pointer (e.g. small non-NULL values like 0x2f)
 extern void mgl_lazy_init(void);
@@ -564,6 +565,8 @@ void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffe
 
     ERROR_CHECK_RETURN(isBuffer(ctx, buffer), GL_INVALID_VALUE);
 
+    if (!mgl_xfb_validate_bind_buffer(ctx, target, index, buffer, 0, 0, false)) return; // xfb: TF binding rules
+
     buffer_index = bufferIndexFromTarget(ctx, target);
 
     if (buffer)
@@ -631,6 +634,8 @@ void mglBindBufferRange(GLMContext ctx, GLenum target, GLuint index, GLuint buff
         fprintf(stderr, "MGL Error: mglBindBufferRange: size <= 0 (%ld)\n", size);
         ERROR_RETURN(GL_INVALID_VALUE);
     }
+
+    if (!mgl_xfb_validate_bind_buffer(ctx, target, index, buffer, offset, size, true)) return; // xfb: TF binding rules
 
     buffer_index = bufferIndexFromTarget(ctx, target);
 
