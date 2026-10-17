@@ -1158,6 +1158,15 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         return false;
     }
 
+    /* assigns locations for legacy (< 330) shaders compiled with AUTO_MAP_LOCATIONS */
+    if (!glslang_program_map_io(glsl_program))
+    {
+        const char *info = glslang_program_get_info_log(glsl_program);
+        mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
+        glslang_program_delete(glsl_program);
+        return false;
+    }
+
     for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
     {
         const char *msgs;
