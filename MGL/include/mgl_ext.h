@@ -42,6 +42,10 @@ struct MGLExtState_texext;
 struct MGLExtMetal_texext;
 struct MGLExtState_buffers;
 struct MGLExtMetal_buffers;
+struct MGLExtState_geom;
+struct MGLExtMetal_geom;
+struct MGLExtState_tess;
+struct MGLExtMetal_tess;
 
 /* glGet value types (match get.c) */
 enum { MGL_GET_BOOL = 0, MGL_GET_INT = 1, MGL_GET_FLOAT = 2, MGL_GET_DOUBLE = 3, MGL_GET_INT64 = 4 };
@@ -85,6 +89,10 @@ void mgl_ext_init_texext(GLMContext ctx);
 bool mgl_ext_get_texext(GLMContext ctx, GLenum pname, GLuint type, void *data);
 void mgl_ext_init_buffers(GLMContext ctx);
 bool mgl_ext_get_buffers(GLMContext ctx, GLenum pname, GLuint type, void *data);
+void mgl_ext_init_geom(GLMContext ctx);
+bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data);
+void mgl_ext_init_tess(GLMContext ctx);
+bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLuint type, void *data);
 
 
 /* ---- cross-domain hook registries -------------------------------------------

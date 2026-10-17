@@ -628,6 +628,8 @@ typedef struct {
     struct MGLExtState_texdata *ext_texdata;
     struct MGLExtState_texext *ext_texext;
     struct MGLExtState_buffers *ext_buffers;
+    struct MGLExtState_geom *ext_geom;
+    struct MGLExtState_tess *ext_tess;
 
     // put at end, big chunk of yuck
     GLMParams   var;
@@ -717,6 +719,8 @@ struct GLMMetalFuncs {
     struct MGLExtMetal_texdata *ext_texdata;
     struct MGLExtMetal_texext *ext_texext;
     struct MGLExtMetal_buffers *ext_buffers;
+    struct MGLExtMetal_geom *ext_geom;
+    struct MGLExtMetal_tess *ext_tess;
 } ;
 
 typedef struct GLMContextRec_t {
