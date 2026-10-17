@@ -491,19 +491,35 @@ static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
     {
         if (program_has_stage(ctx, _TESS_CONTROL_SHADER))
             count_active(S, MGL_QB_TESS_CONTROL_SHADER_PATCHES, prims);
-        count_active(S, MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS, prims * 3);
+        /* TES invocations and the generated/clipped primitive counts depend on the
+           tessellation factors: the tess domain reports the exact numbers after
+           tessellating (mgl_queries_note_tess) */
+    }
+    else
+    {
+        count_active(S, MGL_QB_CLIPPING_INPUT_PRIMITIVES, prims);
+        count_active(S, MGL_QB_CLIPPING_OUTPUT_PRIMITIVES, prims);
+        /* without a geometry shader every primitive goes to vertex stream 0 */
+        count_active(S, MGL_QB_PRIMITIVES_GENERATED + 0, prims);
     }
     if (has_gs)
     {
         count_active(S, MGL_QB_GEOMETRY_SHADER_INVOCATIONS, prims);
         count_active(S, MGL_QB_GEOMETRY_SHADER_PRIMITIVES_EMITTED, prims);
     }
-    count_active(S, MGL_QB_CLIPPING_INPUT_PRIMITIVES, prims);
-    count_active(S, MGL_QB_CLIPPING_OUTPUT_PRIMITIVES, prims);
-    /* without a geometry shader every primitive goes to vertex stream 0 */
-    count_active(S, MGL_QB_PRIMITIVES_GENERATED + 0, prims);
 
     return true;
+}
+
+void mgl_queries_note_tess(GLMContext ctx, uint64_t tes_invocations, uint64_t tessellated_primitives)
+{
+    struct MGLExtState_queries *S = QS(ctx);
+    if (!S)
+        return;
+    count_active(S, MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS, tes_invocations);
+    count_active(S, MGL_QB_CLIPPING_INPUT_PRIMITIVES, tessellated_primitives);
+    count_active(S, MGL_QB_CLIPPING_OUTPUT_PRIMITIVES, tessellated_primitives);
+    count_active(S, MGL_QB_PRIMITIVES_GENERATED + 0, tessellated_primitives);
 }
 
 void mgl_queries_note_dispatch(GLMContext ctx, uint64_t invocations)
