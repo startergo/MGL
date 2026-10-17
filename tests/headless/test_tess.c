@@ -299,6 +299,51 @@ TEST(TessFourPatches)
     glDeleteProgram(prog);
 }
 
+/* ------------- PSO cache stress: recompiled programs must never reuse a stale PSO -------
+ * 50 programs, each with a different TES body (colour), linked, drawn, checked, deleted.
+ * A PSO cache keyed on recycled MTLFunction addresses returns the first program's
+ * pipeline and every later iteration renders the wrong colour. */
+TEST(TessPSOCacheStress)
+{
+    char tes[512];
+    for (int i = 0; i < 50; i++)
+    {
+        float r = (i % 5) / 4.0f, g = ((i / 5) % 5) / 4.0f, b = ((i / 25) % 5) / 4.0f;
+        snprintf(tes, sizeof tes,
+            "#version 450 core\n"
+            "layout(triangles, equal_spacing, ccw) in;\n"
+            "layout(location=0) out vec4 f_col;\n"
+            "void main() {\n"
+            "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+            "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+            "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+            "  f_col = vec4(%f, %f, %f, 1.0);\n"
+            "}\n", r, g, b);
+        {
+            GLuint prog = make_program(kTcsTri, tes);
+            GLint link = 0;
+            glGetProgramiv(prog, GL_LINK_STATUS, &link);
+            EXPECT_EQ_INT(link, GL_TRUE);
+            glUseProgram(prog);
+            setup_patch_vao(kTriPos, kTriCol, 3);
+            glPatchParameteri(GL_PATCH_VERTICES, 3);
+            glClearColor(0, 0, 0, 1);
+            glClearDepth(1.0);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDrawArrays(GL_PATCHES, 0, 3);
+            EXPECT_NO_GL_ERROR();
+            glFinish();
+            /* this TES writes a constant colour: the pixel is exactly (r, g, b) */
+            float c[4];
+            read_px(64, 64, c);
+            EXPECT_NEAR(c[0], r, 0.02f);
+            EXPECT_NEAR(c[1], g, 0.02f);
+            EXPECT_NEAR(c[2], b, 0.02f);
+            glDeleteProgram(prog);
+        }
+    }
+}
+
 /* ---------------- quad domain (hardware path), full-viewport bilinear patch -------- */
 static const char *kTcsQuad =
     "#version 450 core\n"
@@ -477,6 +522,7 @@ int main(void)
      * TessIndexedAndInstanced covers multi-patch geometry. Re-enable with
      * MGL_TESS_UNSTABLE=1 while isolating (see the tess report). */
     if (getenv("MGL_TESS_UNSTABLE")) RUN(TessFourPatches);
+    RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
     RUN(TessQuadDomain);
     RUN(TessIndexedAndInstanced);

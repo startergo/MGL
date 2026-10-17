@@ -49,8 +49,21 @@ typedef struct {
 static_assert(sizeof(MGLGAFBTarget) == 40, "MGLRenderer+Framebuffer.m FBTarget layout changed");
 
 /* gpuaudit renderer state, kept as an associated object (nothing is stored in ivars) */
+/* A cache entry retains the functions the pipeline was built from. The key hashes
+ * function *addresses*, so when a function is released and a new one is allocated at
+ * the same address (tess recompiles its TES variants), the key alone would return a
+ * stale PSO. Comparing the retained objects makes address reuse safe: a different
+ * function object is a miss even when the key matches. */
+@interface MGLGAPSOEntry : NSObject
+@property (nonatomic, strong) id<MTLRenderPipelineState> ps;
+@property (nonatomic, strong) id<MTLFunction> vf, ff;
+@end
+
+@implementation MGLGAPSOEntry
+@end
+
 @interface MGLGPACache : NSObject
-@property (nonatomic, strong) NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *psos;
+@property (nonatomic, strong) NSMutableDictionary<NSData *, MGLGAPSOEntry *> *psos;
 @property (nonatomic, strong) NSMutableArray<NSData *> *psoOrder;
 @property (nonatomic, strong) id<MTLComputePipelineState> xfbScatter;
 @property (nonatomic, strong) id<MTLBuffer> xfbPrims;
@@ -71,7 +84,8 @@ typedef struct __attribute__((packed)) {
     uint32_t depthPF, stencilPF;
     uint32_t maxVertexAmplificationCount;
     uint8_t  alphaToCoverage, alphaToOne, rasterEnabled;
-    uint32_t tess[5];                         /* factor format, winding, partition, max factor, step function */
+    uint32_t tess[7];                         /* factor format, winding, partition, max factor,
+                                                 step function, factor scale enabled, cp index type */
     struct { uint32_t pf; uint32_t writeMask; uint8_t blending;
              uint32_t sRGB, dRGB, opRGB, sA, dA, opA; } col[8];
     struct { uint32_t format; uint32_t offset; uint32_t bufferIndex; } attr[31];
@@ -99,6 +113,8 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
     k.tess[2] = (uint32_t)d.tessellationPartitionMode;
     k.tess[3] = (uint32_t)d.maxTessellationFactor;
     k.tess[4] = (uint32_t)d.tessellationFactorStepFunction;
+    k.tess[5] = d.tessellationFactorScaleEnabled ? 1 : 0;
+    k.tess[6] = (uint32_t)d.tessellationControlPointIndexType;
 
     for (int i = 0; i < 8; i++)
     {
@@ -153,12 +169,14 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
     if (!desc || !ctx->state.ext_gpuaudit)
         return nil;
 
-    id<MTLRenderPipelineState> ps = [self gpuauditCache].psos[gaPSOKey(desc)];
-    if (ps)
+    MGLGAPSOEntry *e = [self gpuauditCache].psos[gaPSOKey(desc)];
+    if (e && (e.vf != desc.vertexFunction || e.ff != desc.fragmentFunction))
+        e = nil;       /* same key, different functions: the key address was recycled */
+    if (e)
         ctx->state.ext_gpuaudit->pso_hits++;
     else
         ctx->state.ext_gpuaudit->pso_misses++;
-    return ps;
+    return e.ps;
 }
 
 - (void) gpuauditStorePipeline:(id<MTLRenderPipelineState>)ps forDescriptor:(MTLRenderPipelineDescriptor *)desc
@@ -171,7 +189,15 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
     NSData *key = gaPSOKey(desc);
 
     if (c.psos[key])
+    {
+        /* refresh the retained functions: a same-key entry may exist with recycled
+         * addresses, and the newly built PSO is the one that matches this descriptor */
+        MGLGAPSOEntry *old = c.psos[key];
+        old.ps = ps;
+        old.vf = desc.vertexFunction;
+        old.ff = desc.fragmentFunction;
         return;
+    }
 
     if (c.psoOrder.count >= kMax)
     {
@@ -180,7 +206,11 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
         [c.psos removeObjectForKey:old];
     }
 
-    c.psos[key] = ps;
+    MGLGAPSOEntry *e = [[MGLGAPSOEntry alloc] init];
+    e.ps = ps;
+    e.vf = desc.vertexFunction;
+    e.ff = desc.fragmentFunction;
+    c.psos[key] = e;
     [c.psoOrder addObject:key];
 }
 

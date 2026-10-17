@@ -32,6 +32,19 @@
 
 #define MAX_ATTRIB_SLOTS 16
 
+/* A kernel PSO cache entry retains the MTLFunction it was built from: keys use object
+ * addresses, and a freed program/function whose address is reallocated (programs are
+ * created and deleted every frame in real applications) must never hit a stale PSO —
+ * that returned e.g. a 3-control-point TCS kernel for a 4-control-point program. */
+@interface MGLTessPsoEntry : NSObject
+@property (nonatomic, strong) id<MTLComputePipelineState> pso;
+@property (nonatomic, strong) id<MTLFunction> fn;
+@property (nonatomic, assign) void *program;   /* for the VS cache's extra dimension */
+@end
+
+@implementation MGLTessPsoEntry
+@end
+
 @implementation MGLRenderer (Tessellation)
 
 /* ------------------------------------------------------------------ scratch state
@@ -59,6 +72,30 @@ static id<MTLComputePipelineState> tCountPso, tEmitPso, tArgsPso;
 
 static NSMutableDictionary *tVsPsoCache;    /* VS kernel PSO, per program+VAO */
 static NSMutableDictionary *tTcsPsoCache;   /* TCS kernel PSO, per program    */
+
+
+static MGLTessPsoEntry *tessPsoLookup(NSMutableDictionary *cache, NSString *key,
+                                      Program *program, id<MTLFunction> fn)
+{
+    MGLTessPsoEntry *e = cache[key];
+    if (e && (e.program != (void *)program || e.fn != fn))
+        e = nil;       /* same key, recycled addresses */
+    return e;
+}
+
+static void tessPsoStore(NSMutableDictionary *cache, NSString *key, Program *program,
+                         id<MTLFunction> fn, id<MTLComputePipelineState> pso)
+{
+    MGLTessPsoEntry *e = cache[key];
+    if (!e)
+    {
+        e = [[MGLTessPsoEntry alloc] init];
+        cache[key] = e;
+    }
+    e.pso = pso;
+    e.fn = fn;
+    e.program = (void *)program;
+}
 static id<MTLComputePipelineState> tGatherPso;
 
 /* grown-out scratch buffers stay alive for the lifetime of the process: a command
@@ -388,9 +425,9 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     key = tessVSKey(ctx, program, plan);
     if (tVsPsoCache)
     {
-        pso = tVsPsoCache[key];
-        if (pso)
-            return pso;
+        MGLTessPsoEntry *e = tessPsoLookup(tVsPsoCache, key, program, fn);
+        if (e)
+            return e.pso;
     }
 
     desc = [[MTLComputePipelineDescriptor alloc] init];
@@ -503,7 +540,7 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     }
     if (!tVsPsoCache)
         tVsPsoCache = [[NSMutableDictionary alloc] init];
-    tVsPsoCache[key] = pso;
+    tessPsoStore(tVsPsoCache, key, program, fn, pso);
     return pso;
 }
 
@@ -516,9 +553,11 @@ static id<MTLComputePipelineState> tessTcsPSO(GLMContext ctx, id<MTLDevice> devi
         return nil;
     if (tTcsPsoCache)
     {
-        pso = tTcsPsoCache[[NSString stringWithFormat: @"%p", (void *)program]];
-        if (pso)
-            return pso;
+        MGLTessPsoEntry *e = tessPsoLookup(tTcsPsoCache,
+                                           [NSString stringWithFormat: @"%p", (void *)program],
+                                           program, fn);
+        if (e)
+            return e.pso;
     }
 
     NSError *err = nil;
@@ -530,7 +569,8 @@ static id<MTLComputePipelineState> tessTcsPSO(GLMContext ctx, id<MTLDevice> devi
     }
     if (!tTcsPsoCache)
         tTcsPsoCache = [[NSMutableDictionary alloc] init];
-    tTcsPsoCache[[NSString stringWithFormat: @"%p", (void *)program]] = pso;
+    tessPsoStore(tTcsPsoCache, [NSString stringWithFormat: @"%p", (void *)program],
+                 program, fn, pso);
     return pso;
 }
 
@@ -746,8 +786,8 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             return false;
         }
         [cenc setBuffer: tVSOut offset: 0 atIndex: MGL_TESS_VS_OUT_BUF];
-        memcpy(tVsParams.contents, params, sizeof params);
-        [cenc setBuffer: tVsParams offset: 0 atIndex: MGL_TESS_VS_PARAMS];
+        /* inline: a shared CPU-rewritten buffer races draws still in flight */
+        [cenc setBytes: params length: sizeof params atIndex: MGL_TESS_VS_PARAMS];
         [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)vcount, (NSUInteger)instances, 1)
               threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
     }
@@ -806,8 +846,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         [cenc setBuffer: tTcsOut offset: 0 atIndex: MGL_TESS_TCS_OUT];
         [cenc setBuffer: tTcsPatch offset: 0 atIndex: MGL_TESS_TCS_PATCH_OUT];
         [cenc setBuffer: tFactors offset: 0 atIndex: MGL_TESS_TCS_FACTORS];
-        memcpy(tTcsParams.contents, iparams, sizeof iparams);
-        [cenc setBuffer: tTcsParams offset: 0 atIndex: MGL_TESS_TCS_PARAMS];
+        [cenc setBytes: iparams length: sizeof iparams atIndex: MGL_TESS_TCS_PARAMS];
         [cenc dispatchThreadgroups: MTLSizeMake(threads, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
         cp_source = tTcsOut;
@@ -1109,10 +1148,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             [enc setVertexBuffer: tPatchData offset: 0 atIndex: MGL_TESS_TES_PATCH];
             {
                 uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
-                if (!tessBufferEnsure(_device, &tTesParams, 16))
-                    return false;
-                memcpy(tTesParams.contents, tes_params, sizeof tes_params);
-                [enc setVertexBuffer: tTesParams offset: 0 atIndex: MGL_TESS_TES_PARAMS];
+                [enc setVertexBytes: tes_params length: sizeof tes_params atIndex: MGL_TESS_TES_PARAMS];
             }
 
             if (tp->point_mode)
