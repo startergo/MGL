@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "glm_context.h"
+#include "mgl_ext_vattrib.h"
 #include "buffers.h"
 #include "pixel_utils.h"
 #include "mgl_safety.h"
@@ -535,6 +536,10 @@ void mglBindBuffer(GLMContext ctx, GLenum target, GLuint buffer)
         STATE(buffers[index]) = ptr;
         STATE(dirty_bits) |= DIRTY_BUFFER;
     }
+
+    // vattrib: the element array buffer binding is vertex array object state
+    if (target == GL_ELEMENT_ARRAY_BUFFER)
+        mgl_va_element_buffer_bound(ctx, ptr);
 }
 
 void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffer)
