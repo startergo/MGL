@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+RenderState.h"
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -2705,106 +2706,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (void) updateCurrentRenderEncoder
 {
-    if (ctx->state.caps.depth_test ||
-        ctx->state.caps.stencil_test)
-    {
-        MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-
-        // mtl maps directly to gl
-        if (ctx->state.caps.depth_test)
-        {
-            MTLCompareFunction depthCompareFunction;
-
-            depthCompareFunction = ctx->state.var.depth_func - GL_NEVER;
-            dsDesc.depthCompareFunction = depthCompareFunction;
-
-            dsDesc.depthWriteEnabled = ctx->state.var.depth_writemask;
-        }
-
-        if (ctx->state.caps.stencil_test)
-        {
-            // mtl maps directly to gl
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *frontSDesc = [[MTLStencilDescriptor alloc] init];
-
-                frontSDesc.stencilCompareFunction = ctx->state.var.stencil_func - GL_NEVER;
-                frontSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_fail ];
-                frontSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_fail];
-                frontSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_pass];
-                frontSDesc.writeMask = ctx->state.var.stencil_writemask;
-                frontSDesc.readMask = ctx->state.var.stencil_value_mask;    // ????
-
-                dsDesc.frontFaceStencil = frontSDesc;
-            }
-
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *backSDesc = [[MTLStencilDescriptor alloc] init];
-
-                backSDesc.stencilCompareFunction = ctx->state.var.stencil_back_func - GL_NEVER;
-                backSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_fail ];
-                backSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_fail];
-                backSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_pass];
-                backSDesc.writeMask = ctx->state.var.stencil_back_writemask;
-                backSDesc.readMask = ctx->state.var.stencil_back_value_mask;    // ????
-
-                dsDesc.backFaceStencil = backSDesc;
-            }
-        }
-
-        id <MTLDepthStencilState> dsState = [_device
-                                  newDepthStencilStateWithDescriptor:dsDesc];
-
-        [_currentRenderEncoder setDepthStencilState: dsState];
-    }
-
-    if (ctx->state.caps.scissor_test)
-    {
-        MTLScissorRect rect;
-
-        rect.x = ctx->state.var.scissor_box[0];
-        rect.y = ctx->state.var.scissor_box[1];
-        rect.width = ctx->state.var.scissor_box[2];
-        rect.height = ctx->state.var.scissor_box[3];
-
-        [_currentRenderEncoder setScissorRect:rect];
-    }
-
-    [_currentRenderEncoder setViewport:(MTLViewport){ctx->state.viewport[0], ctx->state.viewport[1],
-                                        ctx->state.viewport[2], ctx->state.viewport[3],
-                                        ctx->state.var.depth_range[0], ctx->state.var.depth_range[1]}];
-
-    if (ctx->state.caps.cull_face)
-    {
-        MTLCullMode cull_mode;
-
-        switch(ctx->state.var.cull_face_mode)
-        {
-            case GL_BACK: cull_mode = MTLCullModeBack; break;
-            case GL_FRONT: cull_mode = MTLCullModeFront; break;
-            default:
-                cull_mode = MTLCullModeNone;
-        }
-
-        [_currentRenderEncoder setCullMode:cull_mode];
-
-        MTLWinding winding;
-
-        winding = ctx->state.var.front_face - GL_CW;
-
-        [_currentRenderEncoder setFrontFacingWinding:winding];
-    }
-
-    if (ctx->state.caps.depth_clamp)
-    {
-        [_currentRenderEncoder setDepthClipMode: MTLDepthClipModeClamp];
-    }
-
-    if (ctx->state.var.polygon_mode == GL_LINES)
-    {
-        [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeLines];
-    }
+    // all fixed-function encoder state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateApplyEncoderState: _currentRenderEncoder];
 }
 
 - (bool) newRenderEncoder
@@ -3591,6 +3494,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             pipelineStateDescriptor.stencilAttachmentPixelFormat = ctx->stencil_format.mtl_pixel_format;
     }
 
+    // blend / masks / raster / shader-variant state (rstate category)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
+
     return pipelineStateDescriptor;
 }
 
@@ -3748,23 +3654,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 -(void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)pipelineStateDescriptor
 {
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        if (pipelineStateDescriptor.colorAttachments[i].pixelFormat != MTLPixelFormatInvalid)
-        {
-            pipelineStateDescriptor.colorAttachments[i].blendingEnabled = true;
-
-            pipelineStateDescriptor.colorAttachments[i].sourceRGBBlendFactor = _src_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationRGBBlendFactor = _dst_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].sourceAlphaBlendFactor = _src_blend_alpha_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationAlphaBlendFactor = _dst_blend_alpha_factor[i];
-
-            pipelineStateDescriptor.colorAttachments[i].rgbBlendOperation = _rgb_blend_operation[i];
-            pipelineStateDescriptor.colorAttachments[i].alphaBlendOperation = _alpha_blend_operation[i];
-
-            pipelineStateDescriptor.colorAttachments[i].writeMask = _color_mask[i];
-        }
-    }
+    // per-attachment blend state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
 }
 
 -(bool)bindFramebufferAttachmentTextures
