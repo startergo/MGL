@@ -356,7 +356,9 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&ul type:MTLDataTypeBool atIndex:MGL_RS_FC_ORIGIN_UPPER_LEFT];
         [cv setConstantValue:&pps type:MTLDataTypeBool atIndex:MGL_RS_FC_PROGRAM_POINT_SIZE];
         [cv setConstantValue:&psz type:MTLDataTypeFloat atIndex:MGL_RS_FC_POINT_SIZE];
-        key = [NSString stringWithFormat:@"%p:v:%d%d%d:%g", lib, z01, ul, pps, psz];
+        bool rd = ctx->state.caps.rasterizer_discard;
+        [cv setConstantValue:&rd type:MTLDataTypeBool atIndex:MGL_RS_FC_RASTERIZER_DISCARD];
+        key = [NSString stringWithFormat:@"%p:v:%d%d%d%d:%g", lib, z01, ul, pps, rd, psz];
     } else {
         NSUInteger samples = [self rstateSampleCount];
         bool lower = rs->point_sprite_coord_origin == GL_LOWER_LEFT;
@@ -440,16 +442,17 @@ static bool rs_mode_is_polygon(GLenum m)
     bool ms = ctx->state.caps.multisample;
     desc.alphaToCoverageEnabled = ms && ctx->state.caps.sample_alpha_to_coverage;
     desc.alphaToOneEnabled = ms && ctx->state.caps.sample_alpha_to_one;
-    desc.rasterizationEnabled = !ctx->state.caps.rasterizer_discard;
+    /* RASTERIZER_DISCARD: Metal's rasterizationEnabled=NO requires a void vertex function, so the
+     * vertex fixup instead collapses every vertex to one point far outside the clip volume
+     * (function constant): the vertex stage still runs (side effects), no fragment is produced */
+    desc.rasterizationEnabled = YES;
 
     /* shader fixup specialization (function constants) */
     if (program) {
         id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[_VERTEX_SHADER] stage:_VERTEX_SHADER];
         if (vf) desc.vertexFunction = vf;
-        if (desc.rasterizationEnabled) {
-            id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];
-            if (ff) desc.fragmentFunction = ff;
-        }
+        id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];
+        if (ff) desc.fragmentFunction = ff;
     }
 }
 
@@ -464,7 +467,10 @@ static bool rs_mode_is_polygon(GLenum m)
         id<MTLLibrary> lib = [self compileShader:program->spirv[stage].msl_str];
         if (!lib) continue;
         const char *entry = program->spirv[stage].entry_point ? program->spirv[stage].entry_point : shader->entry_point;
-        id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
+        /* specialized with no values: the fixups take their GL-default branches and the
+         * function stays usable by any pipeline builder (xfb, fallbacks) */
+        id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]
+                                       constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
         if (!fn) continue;
         if (shader->mtl_data.library) CFBridgingRelease(shader->mtl_data.library);
         if (shader->mtl_data.function) CFBridgingRelease(shader->mtl_data.function);

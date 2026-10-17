@@ -24,7 +24,8 @@
 #define MGL_RS_FC_POINT_SIZE          32003
 #define MGL_RS_FC_POINT_ORIGIN_LOWER  32004
 #define MGL_RS_FC_SAMPLE_MASK         32005
-#define MGL_RS_FC_PER_SAMPLE    32006
+#define MGL_RS_FC_PER_SAMPLE           32006
+#define MGL_RS_FC_RASTERIZER_DISCARD   32007
 
 /* GL-side state, reachable as ctx->state.ext_rstate; allocated in mgl_ext_init_rstate(). */
 struct MGLExtState_rstate {

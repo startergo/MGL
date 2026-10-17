@@ -546,14 +546,17 @@ char *mgl_rstate_patch_vertex_msl(const char *msl, const char *entry)
         "constant bool mgl_rs_pps = is_function_constant_defined(mgl_rs_fc_pps_) && mgl_rs_fc_pps_;\n"
         "constant float mgl_rs_fc_psz_ [[function_constant(%d)]];\n"
         "constant float mgl_rs_psz = is_function_constant_defined(mgl_rs_fc_psz_) ? mgl_rs_fc_psz_ : 1.0;\n"
+        "constant bool mgl_rs_fc_rd_ [[function_constant(%d)]];\n"
+        "constant bool mgl_rs_rd = is_function_constant_defined(mgl_rs_fc_rd_) && mgl_rs_fc_rd_;\n"
         "static inline __attribute__((always_inline)) void mgl_rs_vertex_fixup(thread float4 &p, thread float &ps)\n"
         "{\n"
+        "    if (mgl_rs_rd) { p = float4(1.0e6, 1.0e6, 0.5, 1.0); ps = 1.0; return; }\n"
         "    if (!mgl_rs_ul) p.y = -p.y;\n"
         "    if (!mgl_rs_z01) p.z = (p.z + p.w) * 0.5;\n"
         "    if (!mgl_rs_pps%s) ps = mgl_rs_psz;\n"
         "}\n\n",
         MGL_RS_FC_DEPTH_ZERO_TO_ONE, MGL_RS_FC_ORIGIN_UPPER_LEFT,
-        MGL_RS_FC_PROGRAM_POINT_SIZE, MGL_RS_FC_POINT_SIZE,
+        MGL_RS_FC_PROGRAM_POINT_SIZE, MGL_RS_FC_POINT_SIZE, MGL_RS_FC_RASTERIZER_DISCARD,
         has_psz ? "" : " || true");
     rs_str_insert(&b, e.sig_line, prelude);
 

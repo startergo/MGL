@@ -2077,7 +2077,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     shader->mtl_data.function = NULL;
                     return false;  // Signal shader compilation failure
                 }
-                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]];
+                // specialized with no constant values: functions carrying (rstate) function constants
+                // fall back to their GL-default values and stay usable for pipeline creation
+                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]
+                                         constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
                 if (!function) {
                     NSLog(@"MGL ERROR: Failed to find function '%s' in compiled shader", shader->entry_point);
                     shader->mtl_data.library = NULL;

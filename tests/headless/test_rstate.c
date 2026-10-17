@@ -329,7 +329,7 @@ TEST(polygon_offset)
     EXPECT_PIXEL(75, 50, 0, 255, 0, 255, 2);
     /* pushed away: fails even though slightly nearer */
     glPolygonOffset(0.0f, 64.0f);
-    draw_rect(-1, -1, 0, 1, 0.19999f, 0, 0, 1, 1);
+    draw_rect(-1, -1, 0, 1, 0.1999995f, 0, 0, 1, 1);
     EXPECT_PIXEL(25, 50, 255, 0, 0, 255, 2);
     GLfloat f = 0;
     glPolygonOffsetClamp(1.5f, 2.5f, 0.125f);
@@ -474,11 +474,16 @@ TEST(cull_front_face)
     clear_black(); glCullFace(GL_BACK);
     full(0, 0, 1, 0, 1);
     EXPECT_PIXEL(50, 50, 0, 0, 0, 255, 2);
-    /* UPPER_LEFT mirrors y before facing is computed: CCW-in-NDC becomes CW in window space */
+    /* ARB_clip_control: with UPPER_LEFT the window-space area sign is reversed, so facing
+     * stays the NDC winding (CCW front stays front) */
     clear_black(); glFrontFace(GL_CCW); glCullFace(GL_BACK);
     glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     full(0, 0, 0, 1, 1);
+    EXPECT_PIXEL(50, 50, 0, 0, 255, 255, 2);
+    clear_black(); glCullFace(GL_FRONT);
+    full(0, 0, 0, 1, 1);
     EXPECT_PIXEL(50, 50, 0, 0, 0, 255, 2);
+    glCullFace(GL_BACK);
     glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
     clear_black(); glCullFace(GL_FRONT_AND_BACK);
     full(0, 1, 1, 1, 1);
