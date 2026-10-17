@@ -1062,6 +1062,50 @@ TEST(xfb_streams)
     glDeleteProgram(p);
 }
 
+
+TEST(tessellation_with_geometry_rejected)
+{
+    const char *tcs =
+        "#version 450 core\n"
+        "layout(vertices = 3) out;\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+        "    gl_TessLevelInner[0] = 3.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "void main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+        " + gl_TessCoord.z * gl_in[2].gl_Position; }\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void main(){ for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); } EndPrimitive(); }\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, plain_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, tes));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, plain_fs));
+    glLinkProgram(p);
+    GLint ok = 1;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_FALSE);
+    if (!ok)
+    {
+        char log[2048] = "";
+        GLsizei len = 0;
+        glGetProgramInfoLog(p, sizeof log, &len, log);
+        printf("tess+gs log: %s\n", log);
+        EXPECT_TRUE(strstr(log, "geometry") != NULL);
+    }
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -1084,5 +1128,6 @@ int main(void)
     RUN(primitive_queries);
     RUN(xfb_of_geometry_output);
     RUN(xfb_streams);
+    RUN(tessellation_with_geometry_rejected);
     return mgl_test_summary();
 }

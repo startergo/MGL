@@ -3122,10 +3122,5 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
         if (note) note(ctx, 0, prims, prims);
     }
 
-    if (ctx->state.ext_xfb)
-    {
-        struct MGLExtState_xfb *x = ctx->state.ext_xfb;
-    }
-
     free(order);
 }
