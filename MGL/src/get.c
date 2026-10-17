@@ -37,6 +37,7 @@
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_debug.h"
+#include "mgl_ext_program.h"
 
 #define MAX_GET_VALUES 32
 
@@ -1016,7 +1017,7 @@ const GLubyte *mglGetStringi(GLMContext ctx, GLenum name, GLuint index)
             return (const GLubyte *)mgl_glsl_versions[index];
 
         case GL_SPIR_V_EXTENSIONS:
-            break;  /* GL_NUM_SPIR_V_EXTENSIONS is 0 */
+            return mgl_program_spirv_extension(ctx, index);    /* program domain */
 
         default:
             ERROR_RETURN(GL_INVALID_ENUM);
