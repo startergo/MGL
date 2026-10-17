@@ -49,6 +49,7 @@ enum {
     MGL_GEOM_SSBO_OUTV     = 23,    /* u32: GS output vertex records */
     MGL_GEOM_SSBO_IDX      = 24,    /* u32: raster index list (stream 0) */
     MGL_GEOM_SSBO_CTL      = 25,    /* u32: counters + indirect draw arguments */
+    MGL_GEOM_SSBO_CNT      = 27,    /* u32: per-thread emitted vertex count (capture order) */
     MGL_GEOM_SSBO_DRAW     = 26     /* pass-through vertex function: GS output records */
 };
 
@@ -61,6 +62,7 @@ enum {
     MGL_GEOM_MSL_OUTV      = 27,
     MGL_GEOM_MSL_IDX       = 28,
     MGL_GEOM_MSL_CTL       = 29,
+    MGL_GEOM_MSL_CNT       = 22,
     MGL_GEOM_MSL_DRAW      = 23
 };
 
@@ -116,7 +118,8 @@ typedef struct MGLGeomProgram {
     void   *draw_function, *draw_library;           /* pass-through raster vertex function */
 } MGLGeomProgram;
 
-/* per-draw input of the routing helper: the sanitized index list used by the capture pass */
+/* per-draw input of the routing helper: either the assembled lists (CPU assembly, the
+ * fallback) or the sources the prep kernel assembles them from on the GPU */
 typedef struct MGLGeomDraw {
     MGLGeomProgram *gp;
     Program        *program;
@@ -131,13 +134,22 @@ typedef struct MGLGeomDraw {
     GLint    basevertex;
     GLuint   baseinstance;
 
-    /* assembled by the C side */
+    /* assembled by the C side (CPU assembly: the fallback path) */
     const uint32_t *indices;    /* capture index list (indexed draws; restarts removed) */
     GLsizei index_count;
     const uint32_t *prims;      /* gp->in_verts * prims_count slots */
     uint64_t prims_count;       /* input primitives per instance */
     uint32_t vstart;            /* first captured VS record */
     uint32_t vcount;            /* captured VS records per instance */
+
+    /* GPU assembly: the draw command comes from this buffer (the user's indirect buffer,
+     * or a staging buffer the CPU fills for direct draws) */
+    void    *cmd_buffer;        /* MTLBuffer holding the draw command, or NULL for CPU assembly */
+    size_t   cmd_offset;
+    int      cmd_layout;        /* 0 direct staging, 1 arrays-indirect, 2 elements-indirect */
+    uint32_t restart;           /* restart index (or 0xffffffffu) */
+    bool     provoking_first;
+    uint32_t count_bound;       /* upper bound of the vertex count, for sizing only */
 } MGLGeomDraw;
 
 struct MGLExtState_geom {
@@ -147,6 +159,8 @@ struct MGLExtState_geom {
 struct MGLExtMetal_geom {
     /* run one draw through the geometry emulation (capture pass + kernel + raster pass) */
     bool (*draw)(GLMContext ctx, MGLGeomDraw *d);
+    /* the element buffer of the current VAO can be bound as a device buffer (GPU assembly) */
+    bool (*can_assemble_gpu)(GLMContext ctx);
 };
 
 #ifdef __cplusplus
@@ -170,13 +184,20 @@ bool mgl_geom_get_programiv(GLMContext ctx, struct Program_t *program, GLenum pn
 bool mgl_geom_present(GLMContext ctx);
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);
+/* an indirect draw: the prep kernel reads the command from `ibuf`; false when the CPU has
+ * to read it after all (no bound on the counts) */
+bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, struct Buffer_t *ibuf, size_t offset);
 /* the emulation record of the current program (NULL when absent or unusable) */
 MGLGeomProgram *mgl_geom_current(GLMContext ctx);
+
+/* helpers shared with the renderer category (the prep kernel's mode codes) */
+int  mgl_geom_mode_code(GLenum mode);
+uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 
 /* transform feedback of the geometry output (called from the xfb domain) */
 void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program);
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
-                          const uint32_t *ctl);
+                          const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
 
 #ifdef __cplusplus
 }

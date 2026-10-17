@@ -1081,6 +1081,15 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
                   !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
                          : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
+    /* a geometry stage can take the command directly as well: the prep kernel reads it from
+     * the app's buffer, so the CPU never sees the counts */
+    if (geom && !capturing && prim >= 0 && type != GL_UNSIGNED_BYTE && mode != GL_PATCHES)
+    {
+        batch_end(ctx, batch);
+        if (mgl_geom_route_indirect(ctx, mode, type, ibuf, offset))
+            return;
+    }
+
     // read the command when CPU-visible; when nothing needs the counts and Metal can
     // take the command buffer directly, skip the read entirely (gpuaudit)
     bool known = (gpu_ok && !need_counts) ? false

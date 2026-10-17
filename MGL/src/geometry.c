@@ -1544,7 +1544,8 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "layout(std430, binding = %d) readonly buffer MGLGsHdrBlock { uint mgl_hdr[]; };\n", MGL_GEOM_SSBO_HDR);
     sb_put(&b, "layout(std430, binding = %d) buffer MGLGsOutBlock { uint mgl_out[]; };\n", MGL_GEOM_SSBO_OUTV);
     sb_put(&b, "layout(std430, binding = %d) buffer MGLGsIdxBlock { uint mgl_idx[]; };\n", MGL_GEOM_SSBO_IDX);
-    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCtlBlock { uint mgl_ctl[]; };\n\n", MGL_GEOM_SSBO_CTL);
+    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCtlBlock { uint mgl_ctl[]; };\n", MGL_GEOM_SSBO_CTL);
+    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCntBlock { uint mgl_cnt[]; };\n\n", MGL_GEOM_SSBO_CNT);
 
     sb_put(&b, "struct MGLGsInVert\n{\n");
     sb_put(&b, "    vec4 mgl_gs_pos;\n");
@@ -1565,7 +1566,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     if (gp->out_has_clip) sb_put(&b, "float mgl_gs_clip[%u];\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "float mgl_gs_cull[%u];\n", gp->out_clip_size);
     sb_put(&b, "int mgl_gs_prim_in;\nint mgl_gs_invoc;\n");
-    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream;\n");
+    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream, mgl_slot_base;\n");
     /* the vertices of the strip in emit order: threads interleave (one per primitive per
      * invocation), so the reserved slots are not consecutive */
     sb_put(&b, "uint mgl_strip_v[%u];\n\n", gp->max_vertices ? gp->max_vertices : 1);
@@ -1588,7 +1589,8 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     /* load one input primitive */
     sb_put(&b, "void mgl_load_inputs(uint mgl_pi, uint mgl_inst)\n{\n");
     sb_put(&b, "    for (uint mgl_k = 0u; mgl_k < %uu; mgl_k++) {\n", gp->in_verts);
-    sb_put(&b, "        uint mgl_r = (mgl_prim[mgl_pi * %uu + mgl_k] + mgl_inst * mgl_hdr[6]) * %uu;\n", gp->in_verts, gp->in_words);
+    sb_put(&b, "        uint mgl_r = (mgl_prim[mgl_pi * %uu + mgl_k] - mgl_hdr[12] + mgl_inst * mgl_hdr[6]) * %uu;\n",
+           gp->in_verts, gp->in_words);
     if (gp->in_has_pos)
         sb_put(&b, "        mgl_in[mgl_k].mgl_gs_pos = vec4(uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]),"
                    " uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]));\n",
@@ -1638,7 +1640,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "void mgl_gs_emit_stream_vertex(uint s)\n{\n");
     sb_put(&b, "    mgl_stream = s;\n");
     sb_put(&b, "    if (mgl_written >= mgl_hdr[5]) { mgl_ctl[3] = 1u; return; }\n");
-    sb_put(&b, "    uint slot = atomicAdd(mgl_ctl[0], 1u);\n");
+    sb_put(&b, "    uint slot = mgl_slot_base + mgl_seq;\n");
     sb_put(&b, "    if (slot >= mgl_hdr[3]) { mgl_ctl[3] = 1u; return; }\n");
     sb_put(&b, "    mgl_store_output(slot);\n");
     sb_put(&b, "    mgl_strip_v[mgl_strip_n] = slot;\n");
@@ -1694,6 +1696,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    mgl_load_inputs(mgl_pi, mgl_inst);\n");
     sb_put(&b, "    mgl_gs_prim_in = int(mgl_pi);\n    mgl_gs_invoc = int(mgl_inv);\n");
     sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u;\n");
+    sb_put(&b, "    mgl_slot_base = mgl_t * mgl_hdr[5];\n");
     sb_put(&b, "    mgl_gs_pos = vec4(0.0);\n");
     if (gp->out_has_psize) sb_put(&b, "    mgl_gs_psize = 1.0;\n");
     if (gp->out_has_layer) sb_put(&b, "    mgl_gs_layer = 0;\n");
@@ -1706,6 +1709,8 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
                glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, 0));
     sb_put(&b, "    mgl_gs_main();\n");
     sb_put(&b, "    mgl_gs_end_stream_primitive(mgl_stream);\n");
+    sb_put(&b, "    mgl_cnt[mgl_t] = mgl_written;\n");
+    sb_put(&b, "    if (mgl_written != 0u) atomicAdd(mgl_ctl[0], mgl_written);\n");
     sb_put(&b, "}\n\n");
 
 
@@ -2273,8 +2278,9 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     pins_gl[3] = MGL_GEOM_SSBO_OUTV;     pins_msl[3] = MGL_GEOM_MSL_OUTV;
     pins_gl[4] = MGL_GEOM_SSBO_IDX;      pins_msl[4] = MGL_GEOM_MSL_IDX;
     pins_gl[5] = MGL_GEOM_SSBO_CTL;      pins_msl[5] = MGL_GEOM_MSL_CTL;
+    pins_gl[6] = MGL_GEOM_SSBO_CNT;      pins_msl[6] = MGL_GEOM_MSL_CNT;
     msl = geom_spirv_to_msl(ctx, GL_COMPUTE_SHADER, ir, words, gp->kernel_entry, false, &log,
-                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 6);
+                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 7);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
 
@@ -2626,6 +2632,13 @@ static uint64_t geom_assemble(GLMContext ctx, MGLGeomProgram *gp, GLenum mode, c
     return np;
 }
 
+/* the largest number of input primitives `n` vertices can form (the prep kernel's regions
+ * are sized by this: the primitive count of the mode ignoring primitive restart) */
+uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n)
+{
+    return geom_prim_count(GL_TRIANGLES, mode, n);
+}
+
 /* read the index list of an indexed draw as uint32 (handles restart by skipping runs) */
 static uint32_t *geom_index_list(GLMContext ctx, GLenum type, size_t offset, GLsizei count, uint32_t *restart_out)
 {
@@ -2653,19 +2666,43 @@ static uint32_t *geom_index_list(GLMContext ctx, GLenum type, size_t offset, GLs
     return out;
 }
 
+/* the GL draw mode as the prep kernel's code (see kGeomPrepMSL) */
+int mgl_geom_mode_code(GLenum mode)
+{
+    switch (mode)
+    {
+        case GL_POINTS:                   return 0;
+        case GL_LINES:                    return 1;
+        case GL_LINE_STRIP:               return 2;
+        case GL_LINE_LOOP:                return 3;
+        case GL_LINES_ADJACENCY:          return 4;
+        case GL_LINE_STRIP_ADJACENCY:     return 5;
+        case GL_TRIANGLES:                return 6;
+        case GL_TRIANGLE_STRIP:           return 7;
+        case GL_TRIANGLE_FAN:             return 8;
+        case GL_TRIANGLES_ADJACENCY:      return 9;
+        case GL_TRIANGLE_STRIP_ADJACENCY: return 10;
+        default: return -1;
+    }
+}
+
+/* is the primitive restart index enabled and what is it? */
+static uint32_t geom_restart_index(GLMContext ctx)
+{
+    if (!ctx->state.caps.primitive_restart) return 0xffffffffu;
+    if (ctx->state.caps.primitive_restart_fixed_index) return 0xffffffffu;  /* the fixed index */
+    return (uint32_t)ctx->state.var.primitive_restart_index;
+}
+
+static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, GLenum gs_in);
+static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d);
+
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
     MGLGeomProgram *gp;
     MGLGeomDraw d;
     GLenum gs_in;
-    uint32_t *seq = NULL, *indices = NULL;
-    uint64_t nseq = 0, nprims;
-    uint32_t *prims = NULL;
-    uint32_t restart = 0xffffffffu;
-    uint32_t vmin = 0xffffffffu, vmax = 0;
-    GLsizei index_count = 0;
-    GLuint i;
 
     if (!mgl_geom_present(ctx)) return;
 
@@ -2680,106 +2717,12 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
         return;
     }
 
-    if (count <= 0 || instances <= 0) return;
     if (!geom_mode_matches(gp->in_type, mode))
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
     gs_in = gp->in_type;
-
-    /* build the vertex sequence and (for indexed draws) the capture index list: primitive
-     * restart entries are removed from the capture draw */
-    if (indexed)
-    {
-        uint32_t *raw = geom_index_list(ctx, type, offset, count, &restart);
-        if (!raw)
-        {
-            ERROR_RETURN(GL_OUT_OF_MEMORY);
-            return;
-        }
-        seq = xmalloc(sizeof(uint32_t) * (size_t)(count > 0 ? count : 1));
-        indices = xmalloc(sizeof(uint32_t) * (size_t)(count > 0 ? count : 1));
-        for (GLsizei i = 0; i < count; i++)
-        {
-            seq[i] = raw[i];
-            if (raw[i] != restart) indices[index_count++] = raw[i];
-        }
-        free(raw);
-        nseq = (uint64_t)index_count;
-    }
-    else
-    {
-        nseq = (uint64_t)count;
-        index_count = 0;
-        seq = xmalloc(sizeof(uint32_t) * (size_t)nseq);
-        for (i = 0; i < (GLuint)nseq; i++) seq[i] = (uint32_t)(first + (GLint)i);
-    }
-
-    /* the vertex range the capture pass must cover */
-    for (i = 0; i < (GLuint)nseq; i++)
-    {
-        if (seq[i] < vmin) vmin = seq[i];
-        if (seq[i] > vmax) vmax = seq[i];
-    }
-    if (vmin == 0xffffffffu)
-    {
-        free(seq);
-        free(indices);
-        return;     /* nothing to draw */
-    }
-    if (indexed) vmin += (uint32_t)basevertex, vmax += (uint32_t)basevertex;
-
-    /* split on primitive restart and assemble */
-    {
-        uint64_t s = 0;
-
-        nprims = 0;
-        while (s < nseq)
-        {
-            uint64_t e = s;
-            while (e < nseq && seq[e] != restart) e++;
-            nprims += geom_prim_count(gs_in, mode, e - s);
-            s = e + 1;
-        }
-        if (!nprims)
-        {
-            free(seq);
-            free(indices);
-            return;
-        }
-
-        prims = xmalloc(sizeof(uint32_t) * (size_t)(nprims * gp->in_verts));
-        if (!prims)
-        {
-            free(seq);
-            free(indices);
-            ERROR_RETURN(GL_OUT_OF_MEMORY);
-            return;
-        }
-
-        {
-            uint64_t np = 0;
-            s = 0;
-            while (s < nseq)
-            {
-                uint64_t e = s;
-                while (e < nseq && seq[e] != restart) e++;
-                if (e > s)
-                {
-                    uint32_t *sub = xmalloc(sizeof(uint32_t) * (size_t)(e - s));
-                    uint64_t len = e - s;
-                    for (uint64_t j = 0; j < len; j++) sub[j] = seq[s + j] - (indexed ? (uint32_t)basevertex : 0) - vmin;
-                    np += geom_assemble(ctx, gp, mode, sub, len, 0, prims + np * gp->in_verts,
-                                        nprims - np);
-                    free(sub);
-                }
-                s = e + 1;
-            }
-            (void)np;
-        }
-    }
-    free(seq);
 
     memset(&d, 0, sizeof(d));
     d.gp = gp;
@@ -2793,26 +2736,141 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     d.instances = instances;
     d.basevertex = basevertex;
     d.baseinstance = baseinstance;
-    d.prims = prims;
-    d.prims_count = nprims;
-    d.vstart = vmin;
-    d.vcount = vmax - vmin + 1;
+    d.restart = geom_restart_index(ctx);
+    d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
 
     if (!METAL() || !METAL()->draw)
     {
-        free(prims);
-        free(indices);
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
 
-    d.indices = indices;
-    d.index_count = index_count;
+    /* the primitive assembly runs on the GPU whenever the element buffer is device-visible
+     * and nothing forces the CPU path */
+    if (!getenv("MGL_GEOM_CPU_ASSEMBLY") &&
+        METAL()->can_assemble_gpu && METAL()->can_assemble_gpu(ctx) &&
+        geom_route_gpu(ctx, gp, &d))
+        return;
+
+    if (count <= 0 || instances <= 0) return;
+    if (geom_route_cpu(ctx, gp, &d, gs_in)) return;
 
     METAL()->draw(ctx, &d);
+}
+
+/* CPU assembly: the fallback (MGL_GEOM_CPU_ASSEMBLY=1, or an element buffer the GPU cannot
+ * read).  Returns true when it filled d with the lists it built. */
+static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, GLenum gs_in)
+{
+    uint32_t *seq = NULL, *indices = NULL;
+    uint64_t nseq = 0, nprims;
+    uint32_t *prims = NULL;
+    uint32_t restart = d->restart;
+    uint32_t vmin = 0xffffffffu, vmax = 0;
+    GLsizei index_count = 0;
+    GLuint i;
+
+    /* build the vertex sequence and (for indexed draws) the capture index list: primitive
+     * restart entries are removed from the capture draw */
+    if (d->indexed)
+    {
+        uint32_t *raw = geom_index_list(ctx, d->type, d->offset, d->count, &restart);
+        if (!raw) return false;
+        seq = xmalloc(sizeof(uint32_t) * (size_t)(d->count > 0 ? d->count : 1));
+        indices = xmalloc(sizeof(uint32_t) * (size_t)(d->count > 0 ? d->count : 1));
+        for (GLsizei j = 0; j < d->count; j++)
+        {
+            seq[j] = raw[j];
+            if (raw[j] != restart) indices[index_count++] = raw[j];
+        }
+        free(raw);
+        nseq = (uint64_t)index_count;
+    }
+    else
+    {
+        nseq = (uint64_t)d->count;
+        index_count = 0;
+        seq = xmalloc(sizeof(uint32_t) * (size_t)nseq);
+        for (i = 0; i < (GLuint)nseq; i++) seq[i] = (uint32_t)(d->first + (GLint)i);
+    }
+
+    /* the vertex range the capture pass must cover */
+    for (i = 0; i < (GLuint)nseq; i++)
+    {
+        if (seq[i] < vmin) vmin = seq[i];
+        if (seq[i] > vmax) vmax = seq[i];
+    }
+    if (vmin == 0xffffffffu)
+    {
+        free(seq);
+        free(indices);
+        return true;              /* nothing to draw */
+    }
+    if (d->indexed) vmin += (uint32_t)d->basevertex, vmax += (uint32_t)d->basevertex;
+
+    /* split on primitive restart and assemble */
+    {
+        uint64_t s = 0;
+
+        nprims = 0;
+        while (s < nseq)
+        {
+            uint64_t e = s;
+            while (e < nseq && seq[e] != restart) e++;
+            nprims += geom_prim_count(gs_in, d->mode, e - s);
+            s = e + 1;
+        }
+        if (!nprims)
+        {
+            free(seq);
+            free(indices);
+            return true;
+        }
+
+        prims = xmalloc(sizeof(uint32_t) * (size_t)(nprims * gp->in_verts));
+        if (!prims)
+        {
+            free(seq);
+            free(indices);
+            ERROR_RETURN(GL_OUT_OF_MEMORY);
+            return true;
+        }
+
+        {
+            uint64_t np = 0;
+            s = 0;
+            while (s < nseq)
+            {
+                uint64_t e = s;
+                while (e < nseq && seq[e] != restart) e++;
+                if (e > s)
+                {
+                    uint32_t *sub = xmalloc(sizeof(uint32_t) * (size_t)(e - s));
+                    uint64_t len = e - s;
+                    for (uint64_t j = 0; j < len; j++) sub[j] = seq[s + j];
+                    np += geom_assemble(ctx, gp, d->mode, sub, len, 0,
+                                        prims + np * gp->in_verts, nprims - np);
+                    free(sub);
+                }
+                s = e + 1;
+            }
+            (void)np;
+        }
+    }
+    free(seq);
+
+    d->indices = indices;
+    d->index_count = index_count;
+    d->prims = prims;
+    d->prims_count = nprims;
+    d->vstart = vmin;
+    d->vcount = vmax - vmin + 1;
+
+    METAL()->draw(ctx, d);
 
     free(prims);
     free(indices);
+    return true;
 }
 
 /* ------------------------------------------------------------------ init / queries */
@@ -2827,6 +2885,102 @@ void mgl_ext_init_geom(GLMContext ctx)
 bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
     return false;
+}
+
+/* GPU assembly: the prep kernel derives everything from the draw command and the element
+ * buffer, so the CPU never reads the element buffer or assembles the slot list */
+static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d)
+{
+    if (mgl_geom_mode_code(d->mode) < 0) return false;
+    d->count_bound = (uint32_t)(d->count > 0 ? d->count : 1);
+    if (d->count <= 0 || d->instances <= 0) return false;
+    if (d->indexed && d->type == GL_UNSIGNED_INT && ((d->offset & 3u) != 0)) return false;
+    if (d->indexed && d->type == GL_UNSIGNED_SHORT && ((d->offset & 1u) != 0)) return false;
+
+    /* the prep kernel reads the command itself when the draw is indirect */
+    d->cmd_layout = 0;
+    d->cmd_buffer = NULL;
+    d->cmd_offset = 0;
+
+    METAL()->draw(ctx, d);
+    return true;
+}
+
+/* an indirect draw: the prep kernel reads the command from the user's buffer, so the CPU
+ * never sees the counts.  Returns false when the buffer sizes cannot be bounded without
+ * reading the command (then the caller falls back to the CPU route). */
+bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *ibuf, size_t offset)
+{
+    MGLGeomProgram *gp;
+    MGLGeomDraw d;
+    uint32_t bound = 0;
+
+    if (!mgl_geom_present(ctx)) return false;
+    if (mgl_geom_mode_code(mode) < 0) return false;
+
+    gp = mgl_geom_current(ctx);
+    if (!gp) return false;
+    if (!gp->linked && !geom_ensure(ctx, gp,
+                                    ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
+                                                                : ctx->state.program))
+        return false;
+    if (!geom_mode_matches(gp->in_type, mode)) return false;
+
+    /* bound the vertex count without reading the command: an indexed draw cannot use more
+     * indices than the element buffer holds */
+    if (type)
+    {
+        Buffer *eb = ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL;
+        if (!eb || !eb->data.mtl_data) return false;
+        bound = (uint32_t)((eb->size - offset) / (type == GL_UNSIGNED_BYTE ? 1 :
+                                                  type == GL_UNSIGNED_SHORT ? 2 : 4));
+    }
+    else
+    {
+        /* arrays: no more vertices than the smallest attribute buffer can supply */
+        VertexArray *vao = ctx->state.vao;
+        bound = 1u << 20;
+        if (vao)
+        {
+            for (GLuint loc = 0; loc < MAX_ATTRIBS; loc++)
+            {
+                VertexAttrib *a = &vao->attrib[loc];
+                Buffer *ab = a->buffer;
+                uint32_t n;
+
+                if (!(vao->enabled_attribs & (1u << loc))) continue;
+                if (!ab || ab->size <= 0) continue;
+                n = (uint32_t)((size_t)ab->size / (a->stride ? a->stride : 16));
+                if (n && n < bound) bound = n;
+            }
+        }
+        if (bound == (1u << 20)) return false;      /* unbounded: read the command instead */
+    }
+    if (!bound) return false;
+
+    if (!METAL() || !METAL()->draw || !METAL()->can_assemble_gpu || !METAL()->can_assemble_gpu(ctx))
+        return false;
+
+    memset(&d, 0, sizeof(d));
+    d.gp = gp;
+    d.program = ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx) : ctx->state.program;
+    d.mode = mode;
+    d.indexed = type != 0;
+    d.type = type;
+    d.offset = 0;
+    d.count = 0;
+    d.instances = 1;                 /* the kernel reads the real values from the command */
+    d.cmd_buffer = ibuf ? ibuf->data.mtl_data : NULL;
+    d.cmd_offset = offset;
+    d.cmd_layout = type ? 2 : 1;
+    d.restart = geom_restart_index(ctx);
+    d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
+    d.count_bound = bound;
+
+    if (!d.cmd_buffer) return false;
+
+    METAL()->draw(ctx, &d);
+    return true;
 }
 
 /* ------------------------------------------------------------------ transform feedback of the geometry output
@@ -3035,69 +3189,64 @@ static MGLXfbObject *geom_xfb_object(GLMContext ctx)
     return &x->default_obj;
 }
 
-static int geom_record_order(const void *a, const void *b)
-{
-    const uint32_t *ra = *(const uint32_t * const *)a;
-    const uint32_t *rb = *(const uint32_t * const *)b;
-    if (ra[0] != rb[0]) return ra[0] < rb[0] ? -1 : 1;
-    return ra[1] < rb[1] ? -1 : (ra[1] > rb[1] ? 1 : 0);
-}
 
 /* pack the emitted geometry output into the bound transform feedback buffers.  Called after
- * the geometry kernel has been synchronized, from the Metal side of the emulation. */
+ * the geometry kernel has been synchronized, from the Metal side of the emulation.  The
+ * kernel assigns every thread a deterministic slot range (thread * max_vertices), so the
+ * emission order is simply the slot order. */
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
-                          const uint32_t *ctl)
+                          const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words)
 {
     MGLXfbObject *o = geom_xfb_object(ctx);
     MGLXfbProgram *xp = geom_xfb_prog(ctx, gp->program, false);
     uint32_t count = ctl ? ctl[0] : 0;
     uint32_t prims = ctl ? ctl[13] : 0;
-    const uint32_t **order;
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
 
     if (!o || !o->active || !xp || !xp->count || !count) return;
-    if (!records || words < (size_t)count * gp->out_words) return;
+    if (!records || !cnt) return;
 
-    /* the emission order is (input primitive, invocation, vertex) */
-    order = xmalloc(sizeof(*order) * count);
-    if (!order) return;
-    for (uint32_t i = 0; i < count; i++)
-        order[i] = records + (size_t)i * gp->out_words;
-    qsort(order, count, sizeof(*order), geom_record_order);
-
-    for (uint32_t i = 0; i < count; i++)
+    for (uint32_t t = 0; t < cnt_words; t++)
     {
-        const uint32_t *rec = order[i];
-        GLuint stream = (rec[1] >> 24) & 0xff;
+        uint32_t n = cnt[t];
+        uint32_t base_slot = t * gp->max_vertices;
 
-        /* GL captures the rasterization stream; MGL has no glRasterizationStream yet, so it
-         * is stream 0 (the default) */
-        if (stream != 0) continue;
+        if (base_slot + n > (uint32_t)(words / gp->out_words)) break;
 
-        for (GLuint v = 0; v < xp->count; v++)
+        for (uint32_t s = 0; s < n; s++)
         {
-            MGLXfbVarying *var = &xp->vars[v];
-            Buffer *buf;
-            uint32_t *dst;
-            size_t pos;
+            const uint32_t *rec = records + (size_t)(base_slot + s) * gp->out_words;
+            GLuint stream = (rec[1] >> 24) & 0xff;
 
-            if (!var->words) continue;                    /* skip / next-buffer markers */
-            if (!(xp->buffer_mask & (1u << var->buffer))) continue;
-            buf = tfb[var->buffer].buf;
-            if (!buf || !buf->data.buffer_data) continue;
+            /* GL captures the rasterization stream; MGL has no glRasterizationStream yet, so
+             * it is stream 0 (the default) */
+            if (stream != 0) continue;
 
-            pos = (size_t)(o->write_offset[var->buffer] + var->offset);
-            if (pos + var->words * 4 > (size_t)buf->size) continue;   /* full: drop, as GL does */
+            for (GLuint v = 0; v < xp->count; v++)
+            {
+                MGLXfbVarying *var = &xp->vars[v];
+                Buffer *buf;
+                uint32_t *dst;
+                size_t pos;
 
-            dst = (uint32_t *)((uint8_t *)buf->data.buffer_data + pos);
-            for (GLuint w = 0; w < var->words; w++)
-                dst[w] = rec[var->src_word + w];
+                if (!var->words) continue;                    /* skip / next-buffer markers */
+                if (!(xp->buffer_mask & (1u << var->buffer))) continue;
+                buf = tfb[var->buffer].buf;
+                if (!buf || !buf->data.buffer_data) continue;
+
+                pos = (size_t)(o->write_offset[var->buffer] + var->offset);
+                if (pos + var->words * 4 > (size_t)buf->size) continue;   /* full: drop, as GL does */
+
+                dst = (uint32_t *)((uint8_t *)buf->data.buffer_data + pos);
+                for (GLuint w = 0; w < var->words; w++)
+                    dst[w] = rec[var->src_word + w];
+            }
+
+            for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+                if (xp->buffer_mask & (1u << b))
+                    o->write_offset[b] += xp->stride[b];
+            o->vertices[0]++;
         }
-
-        for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
-            if (xp->buffer_mask & (1u << b))
-                o->write_offset[b] += xp->stride[b];
-        o->vertices[0]++;
     }
 
     o->prims_written[0] += prims;
@@ -3121,6 +3270,4 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
         }
         if (note) note(ctx, 0, prims, prims);
     }
-
-    free(order);
 }
