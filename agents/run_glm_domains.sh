@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch one GLM worker per domain in the background (nohup), each in its own worktree.
 #   agents/run_glm_domains.sh introspect texdata tess geom      # start (or --resume if a transcript exists)
-#   agents/run_glm_domains.sh --status                          # what each worker is doing
+#   agents/run_glm_domains.sh [--status]                        # what each worker is doing
 #   agents/run_glm_domains.sh --stop                            # stop all workers
 # Config: agents/.env (git-ignored) or your shell env — see agents/.env.example.
 set -uo pipefail
@@ -27,7 +27,8 @@ case "${1:-}" in
         for pidf in "$WT"/*/.agent/worker.pid; do
             [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null && echo "stopped $(basename "$(dirname "$(dirname "$pidf")")")"
         done; exit 0 ;;
-    "") echo "usage: $0 <domain>... | --status | --stop"; exit 1 ;;
+    "") status; echo; echo "usage: $0 <domain>... (start/resume) | --status | --stop"; exit 0 ;;
+    -h|--help) echo "usage: $0 <domain>... (start/resume) | --status | --stop"; exit 0 ;;
 esac
 
 if [ "${AGENT_PROVIDER:-glm}" = "glm" ] && [ -z "${ANTHROPIC_AUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]; then
