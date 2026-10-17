@@ -41,6 +41,7 @@
 #include "mgl_buffers_err.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_geom.h"
 
 #define MTLX() (ctx->mtl_funcs.ext_buffers)
 
@@ -169,8 +170,9 @@ static Shader *activeStageShader(GLMContext ctx, int stage)
 
 bool validate_program(GLMContext ctx)
 {
-    // Metal has no geometry stage; MGL does not translate geometry shaders
-    if (activeStageShader(ctx, _GEOMETRY_SHADER))
+    // a geometry stage is emulated by the geometry domain (compute + capture passes);
+    // refuse to draw only when that emulation is not available
+    if (activeStageShader(ctx, _GEOMETRY_SHADER) && !mgl_geom_present(ctx))
         return false;
 
     // NULL program is legal (vertex / fragment results undefined, not an error)
@@ -648,6 +650,15 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     if (!mgl_ext_pre_draw(ctx, mode, count, instances))
         return;
 
+    /* a geometry stage runs through its own path: capture pass + kernel + pass-through
+     * raster (it also performs the transform feedback capture of the geometry output) */
+    if (mgl_geom_present(ctx))
+    {
+        batch_end(ctx, batch);
+        mgl_geom_route(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+        return;
+    }
+
     if (mgl_xfb_capturing(ctx))
     {
         batch_end(ctx, batch);
@@ -867,7 +878,9 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
     bool capturing = mgl_xfb_capturing(ctx);
 
     // the GPU can consume the command directly unless the draw needs CPU-side work
-    bool gpu_ok = prim >= 0 && type != GL_UNSIGNED_BYTE && !capturing && mode != GL_PATCHES &&
+    bool geom = mgl_geom_present(ctx);
+
+    bool gpu_ok = prim >= 0 && type != GL_UNSIGNED_BYTE && !capturing && !geom && mode != GL_PATCHES &&
                   !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
                          : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
@@ -903,6 +916,13 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
     GLint first = type ? 0 : (GLint)cmd[2];
     GLint basevertex = type ? (GLint)cmd[3] : 0;
     GLuint baseinstance = type ? cmd[4] : cmd[3];
+
+    if (geom)
+    {
+        batch_end(ctx, batch);
+        mgl_geom_route(ctx, mode, type != 0, type, first_byte, first, count, inst, basevertex, baseinstance);
+        return;
+    }
 
     if (capturing)
     {

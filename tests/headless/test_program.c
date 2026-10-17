@@ -494,19 +494,24 @@ TEST(validate_program_samplers)
 
 TEST(unsupported_stages_fail_link)
 {
+    /* geometry stages are emulated by the geom domain (compute + capture passes), so a
+     * vertex + geometry program links; the compute / raster mix still cannot */
     const char *gs = "#version 450 core\n"
         "layout(triangles) in; layout(triangle_strip, max_vertices=3) out;\n"
         "void main(){ for(int i=0;i<3;i++){ gl_Position = gl_in[i].gl_Position; EmitVertex(); } EndPrimitive(); }\n";
-    GLuint vs = make_shader(GL_VERTEX_SHADER, vs_src);
+    const char *vs2 = "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in vec2 extra;\n"
+        "void main(){ gl_Position = vec4(pos + extra * 0.0, 0.0, 1.0); }\n";
+    GLuint vs = make_shader(GL_VERTEX_SHADER, vs2);
     GLuint g = make_shader(GL_GEOMETRY_SHADER, gs);
     GLint v = 0;
     glGetShaderiv(g, GL_COMPILE_STATUS, &v);   EXPECT_EQ_INT(v, GL_TRUE);
     GLuint p = glCreateProgram();
     glAttachShader(p, vs); glAttachShader(p, g);
     glLinkProgram(p);
-    glGetProgramiv(p, GL_LINK_STATUS, &v);     EXPECT_EQ_INT(v, GL_FALSE);
-    char log[512] = ""; glGetProgramInfoLog(p, sizeof log, NULL, log);
-    EXPECT_TRUE(strstr(log, "geometry shaders are not supported") != NULL);
+    glGetProgramiv(p, GL_LINK_STATUS, &v);     EXPECT_EQ_INT(v, GL_TRUE);
+    EXPECT_TRUE(glGetError() == GL_NO_ERROR);
 
     GLuint cs = make_shader(GL_COMPUTE_SHADER, cs_src);
     GLuint p2 = glCreateProgram();
