@@ -731,14 +731,30 @@ static void record_leaf_kinds(const SMod *m, uint32_t t, uint8_t **out, int *n)
 }
 
 /* grow the id-indexed tables so freshly inserted types are usable by msl_layout()/get_dec() */
+static void grow_arr(void **p, uint32_t old_n, uint32_t new_n, size_t es)
+{
+    *p = realloc(*p, (size_t)new_n * es);
+    memset((char *)*p + old_n * es, 0, (size_t)(new_n - old_n) * es);
+}
+
 static void mgrow(SMod *m, uint32_t id)
 {
     if (id < m->bound) return;
+    uint32_t old_b = m->bound + 1;
     uint32_t nb = m->bound + 1;
     while (nb <= id) nb *= 2;
-    size_t old = m->bound + 1;
-    m->t = realloc(m->t, nb * sizeof(SType));
-    memset(m->t + old, 0, (nb - old) * sizeof(SType));
+    grow_arr((void **)&m->t, old_b, nb, sizeof(SType));
+    grow_arr((void **)&m->name, old_b, nb, sizeof(char *));
+    grow_arr((void **)&m->isconst, old_b, nb, 1);
+    grow_arr((void **)&m->ctype, old_b, nb, 4);
+    grow_arr((void **)&m->cval, old_b, nb, 4);
+    grow_arr((void **)&m->cinst, old_b, nb, sizeof(size_t));
+    grow_arr((void **)&m->isvar, old_b, nb, 1);
+    grow_arr((void **)&m->vtype, old_b, nb, 4);
+    grow_arr((void **)&m->vsc, old_b, nb, 4);
+    grow_arr((void **)&m->vinit, old_b, nb, 4);
+    grow_arr((void **)&m->vinst, old_b, nb, sizeof(size_t));
+    grow_arr((void **)&m->vglobal, old_b, nb, 1);
     m->bound = nb - 1;
 }
 
@@ -1021,6 +1037,8 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
         if (m->bound + 1 > laid_n) {
             laid = realloc(laid, m->bound + 1);
             memset(laid + laid_n, 0, m->bound + 1 - laid_n);
+            old_of = realloc(old_of, (m->bound + 1) * 4);
+            memset(old_of + laid_n, 0, (m->bound + 1 - laid_n) * 4);
             laid_n = m->bound + 1;
         }
         /* member index constants */

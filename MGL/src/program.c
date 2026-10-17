@@ -1050,14 +1050,13 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     ptr->spirv[stage].entry_point = strdup(msl_entry);
 
     /* Metal argument indices are only known after the MSL is emitted: patch the recorded
-     * resources with SPIRV-Cross's automatic bindings (texture slots differ from GL units) */
+     * resources with SPIRV-Cross's automatic bindings (texture slots differ from GL units).
+     * `resources` is the same (context-owned) reflection object created above. */
     for (int res_type = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER; res_type < SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE && res_type < _MAX_SPIRV_RES; res_type++)
     {
         SpirvResourceList *rl = &ptr->spirv_resources_list[stage][res_type];
         const spvc_reflected_resource *list = NULL;
         size_t count = 0;
-        spvc_resources resources = NULL;
-        if (spvc_compiler_create_shader_resources(compiler, &resources) != SPVC_SUCCESS) break;
         spvc_resources_get_resource_list_for_type(resources, res_type, &list, &count);
         for (size_t i = 0; i < count && i < rl->count; i++)
         {
