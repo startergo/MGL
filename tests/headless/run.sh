@@ -27,8 +27,8 @@ for src in "${SRCS[@]}"; do
     fi
     echo "--- $name"
     # MGL logs heavily to stderr; keep only test diagnostics ("  [") visible.
-    timeout_cmd=""; command -v gtimeout >/dev/null && timeout_cmd="gtimeout 120"
-    $timeout_cmd "$exe" 2> >(grep -E '^\s+\[|Assertion|assert|fault|abort' >&2)
+    # hard per-test timeout (MGL_TEST_CASE_TIMEOUT seconds, default 120) so a GPU hang can't wedge the shell
+    perl -e 'alarm shift; exec @ARGV' "${MGL_TEST_CASE_TIMEOUT:-120}" "$exe" 2> >(grep -E '^\s+\[|Assertion|assert|fault|abort' >&2)
     rc=$?
     if [ $rc -ne 0 ]; then echo "FAILED $name (rc=$rc)"; fail=1; fi
 done
