@@ -228,6 +228,15 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 
 @end
 
+/* texparam domain: texture/sampler parameters on Metal (MGLRenderer+TextureParams.m) */
+@interface MGLRenderer (TextureParams)
+- (id<MTLSamplerState>) texparamCreateSampler:(TextureParameter *)p target:(GLenum)target;
+- (id<MTLSamplerState>) texparamSamplerForUnit:(GLuint)unit texture:(Texture *)tex;
+- (id<MTLTexture>) texparamTextureForTex:(Texture *)tex base:(id<MTLTexture>)base;
+- (void) texparamPrepareTextureDescriptor:(MTLTextureDescriptor *)desc forTex:(Texture *)tex;
+- (MTLTextureSwizzleChannels) texparamSwizzleForParams:(TextureParameter *)p;
+@end
+
 MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized);
 
 #endif /* MGLRenderer_Private_h */

@@ -306,7 +306,7 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x910F: RET_TYPE_VAR(type, max_depth_texture_samples); break; // GL_MAX_DEPTH_TEXTURE_SAMPLES
         case 0x9110: RET_TYPE_VAR(type, max_integer_samples); break; // GL_MAX_INTEGER_SAMPLES
         case 0x88FC: RET_TYPE_VAR(type, max_dual_source_draw_buffers); break; // GL_MAX_DUAL_SOURCE_DRAW_BUFFERS
-        case 0x8919: RET_TYPE_VAR(type, sampler_binding); break; // GL_SAMPLER_BINDING
+        case 0x8919: if (!mgl_ext_get_texparam(ctx, pname, type, data)) { RET_TYPE_VAR(type, sampler_binding); } break; // GL_SAMPLER_BINDING (per active unit, texparam)
         case 0x8E89: RET_TYPE_VAR(type, max_tess_control_uniform_blocks); break; // GL_MAX_TESS_CONTROL_UNIFORM_BLOCKS
         case 0x8E8A: RET_TYPE_VAR(type, max_tess_evaluation_uniform_blocks); break; // GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS
         case 0x8DFA: RET_TYPE_VAR(type, shader_compiler); break; // GL_SHADER_COMPILER
