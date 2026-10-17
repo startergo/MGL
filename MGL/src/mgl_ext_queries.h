@@ -93,6 +93,7 @@ void mgl_queries_note_tess(GLMContext ctx, uint64_t tes_invocations, uint64_t te
 void mgl_queries_note_xfb_primitives(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
 /* false while conditional rendering discards rendering (for Clear*, BlitFramebuffer, ...). */
 bool mgl_queries_render_allowed(GLMContext ctx);
+bool mgl_queries_counting_active(GLMContext ctx);   /* gpuaudit: no CPU reads of indirect commands */
 #ifdef __cplusplus
 }
 #endif

@@ -130,6 +130,15 @@ struct MGLExtMetal_xfb {
      * Returns the capture records (record_words words per vertex, instance-major) or NULL. */
     const uint32_t *(*capture)(GLMContext ctx, MGLXfbProgram *xp, GLint vstart, GLsizei vcount,
                                GLsizei instances, GLuint baseinstance);
+    /* gpuaudit: same capture, but encoded and not committed/waited: the returned record
+     * pointer is only valid CPU-side after the retained command buffer (*out_cb) has run;
+     * a GPU consumer (the xfb scatter kernel) chains onto it instead of waiting. */
+    const uint32_t *(*capture_async)(GLMContext ctx, MGLXfbProgram *xp, GLint vstart, GLsizei vcount,
+                                     GLsizei instances, GLuint baseinstance,
+                                     void **out_cb, void **out_scratch);
+    /* gpuaudit: the range was written by a GPU kernel (the xfb scatter): track the GPU
+     * write so a later CPU read synchronises */
+    void (*buffer_gpu_written)(GLMContext ctx, Buffer *buf, size_t offset, size_t size);
     /* the CPU backing store of buf [offset, offset+size) changed: mirror it to the MTLBuffer */
     void (*buffer_written)(GLMContext ctx, Buffer *buf, size_t offset, size_t size);
     /* drop cached Metal objects of a program's capture variant */

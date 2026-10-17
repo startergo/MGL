@@ -36,6 +36,7 @@
 #include "glm_context.h"
 #include "buffers.h"
 #include "mgl_ext_buffers.h"
+#include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
 #include "mgl_ext_vattrib.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_buffers_err.h"
@@ -240,6 +241,9 @@ static void bufferDidModify(GLMContext ctx, Buffer *ptr, size_t offset, size_t s
 {
     ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
 
+    /* gpuaudit: the CPU-visible contents changed; cached index rewrites/scans must go */
+    mgl_gpuaudit_invalidate(ctx, ptr);
+
     if (ptr->data.mtl_data && mtlext(ctx) && mtlext(ctx)->did_modify)
         mtlext(ctx)->did_modify(ctx, ptr, offset, size);
 }
@@ -306,6 +310,8 @@ static void unmapBufferInternal(GLMContext ctx, Buffer *ptr)
 /* allocate (or reuse) the data store; returns 0 on success */
 kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const void *data, bool isUniformConstant)
 {
+    mgl_gpuaudit_invalidate(ctx, ptr);   /* gpuaudit: new contents */
+
     kern_return_t err;
     vm_address_t buffer_data;
     size_t buffer_size;
@@ -1224,6 +1230,20 @@ bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintpt
 
         for (int c = 0; c < dst_n; c++)
             writeDestComponent(&texel_bytes[c * dst_b], kind, dst_b, rgba[c]);
+    }
+
+    /* gpuaudit: the clear itself runs on the GPU (blit fill / staged copies) — the CPU
+     * never walks the range, so it must not be made to wait for (or renamed because of)
+     * queued GPU work either: the fill is encoded on the same queue and ordered after
+     * it.  Only buffers that are already GPU-resident take this path: promoting a
+     * CPU-only buffer would mean a full-copy allocation that costs more than the clear
+     * it saves. */
+    struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
+    if (gpm && gpm->fill_buffer && ptr->data.mtl_data &&
+        gpm->fill_buffer(ctx, ptr, offset, size, texel_bytes, (int)texel))
+    {
+        mgl_gpuaudit_invalidate(ctx, ptr);   /* contents changed */
+        return true;
     }
 
     mgl_buffers_prepare_cpu_write(ctx, ptr, offset == 0 && size == ptr->size);

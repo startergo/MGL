@@ -14,6 +14,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_buffers.h"
+#include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
 #include "mgl_buffers_err.h"
 
 #define EXT() (ctx->state.ext_buffers)
@@ -175,7 +176,13 @@ void mgl_buffers_prepare_cpu_read(GLMContext ctx, Buffer *buf)
         need = MTLX()->current_serial(ctx);   // conservatively: everything queued so far
 
     if (need > completed)
+    {
         MTLX()->make_cpu_visible(ctx, buf, need);
+
+        /* gpuaudit: the CPU view just changed because of a GPU write; cached index
+         * rewrites/scans for this buffer are stale now */
+        mgl_gpuaudit_invalidate(ctx, buf);
+    }
 }
 
 void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffer)
