@@ -2276,7 +2276,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
     _currentRenderEncoder.label = @"GL Render Encoder";
     mglCallExtHooks(self, "RenderEncoderCreated:", _currentRenderEncoder);
-
     // apply all state that isn't included in a renderPassDescriptor into the render encoder
     [self updateCurrentRenderEncoder];
 
@@ -2632,8 +2631,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     program = ctx->state.program;
     vertex_shader = program->shader_slots[_VERTEX_SHADER];
     fragment_shader = program->shader_slots[_FRAGMENT_SHADER];
-    assert(vertex_shader);
-    assert(fragment_shader);
+    if (!vertex_shader || !fragment_shader)
+    {
+        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u lacks stages (vs=%@ fs=%@ tess=%@)",
+              program->name, vertex_shader, fragment_shader, program->shader_slots[_TESS_EVALUATION_SHADER]);
+        return NULL;
+    }
 
     vertexFunction = (__bridge id<MTLFunction>)(vertex_shader->mtl_data.function);
     fragmentFunction = (__bridge id<MTLFunction>)(fragment_shader->mtl_data.function);
@@ -2642,11 +2645,16 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // tess: the evaluation shader is the (rewritten) vertex function of the pipeline —
     // the vertex stage runs as a compute kernel before the render pass
-    if ([self extTessActive])
+    if (vertexFunction.functionType == MTLFunctionTypeKernel)
     {
         Shader *tes = program->shader_slots[_TESS_EVALUATION_SHADER];
         if (tes && tes->mtl_data.function)
             vertexFunction = (__bridge id<MTLFunction>)(tes->mtl_data.function);
+        else
+        {
+            NSLog(@"MGL ERROR: tess program has no evaluation shader function for the pipeline");
+            return NULL;
+        }
     }
 
     // Configure a pipeline descriptor that is used to create a pipeline state.
@@ -3145,7 +3153,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     NSLog(@"MGL INFO: AGX virtualization detected - using safe synchronous compilation");
                 }
 
+                NSLog(@"MGL tess: pipeline: tessActive=%d vfn=%@ ffn=%@ vd=%@",
+                          (int)[self extTessActive],
+                          pipelineStateDescriptor.vertexFunction.name,
+                          pipelineStateDescriptor.fragmentFunction.name,
+                          pipelineStateDescriptor.vertexDescriptor);
+
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
+                NSLog(@"MGL tess: newRenderPipelineState returned %@ err=%@", _pipelineState, error);
+                fflush(stderr);
 
                 if (!_pipelineState) {
                     NSLog(@"MGL ERROR: Pipeline creation failed: %@", error);

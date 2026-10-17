@@ -875,6 +875,19 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         return false;
     }
 
+    /* tess: isoline tessellation is emulated on the quad domain (see mgl_ext_tess.h) */
+    if (stage == _TESS_EVALUATION_SHADER)
+    {
+        size_t tess_words = 0;
+        uint32_t *tess_ir = mgl_tess_prepare_spirv(prepared, prepared_words, &tess_words);
+        if (tess_ir)
+        {
+            free(prepared);
+            prepared = tess_ir;
+            prepared_words = tess_words;
+        }
+    }
+
     if (spvc_context_create(&context) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: SPIRV-Cross context creation failed\n");
@@ -916,6 +929,35 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         if (spvc_compiler_rename_entry_point(compiler, cleansed ? cleansed : entry, msl_entry, model) != SPVC_SUCCESS)
         {
             mgl_append_info_log(log, "ERROR: %s stage: cannot rename entry point \"%s\"\n", stage_label(stage), entry);
+            goto done;
+        }
+    }
+
+    /* tess: the vertex stage of a tessellation pipeline becomes a compute kernel writing
+       its outputs to a buffer; the TCS becomes a multi-patch compute kernel */
+    if (stage == _VERTEX_SHADER && tess_pipeline)
+    {
+        if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_VS_OUT_BUF) != SPVC_SUCCESS ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: tessellation MSL options rejected\n", stage_label(stage));
+            goto done;
+        }
+    }
+    else if (stage == _TESS_CONTROL_SHADER)
+    {
+        if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_MULTI_PATCH_WORKGROUP, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_INPUT_BUFFER_INDEX, MGL_TESS_TCS_IN) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_OUT) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_PATCH_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_PATCH_OUT) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_SHADER_TESS_FACTOR_OUTPUT_BUFFER_INDEX, MGL_TESS_TCS_FACTORS) != SPVC_SUCCESS ||
+            spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_INDIRECT_PARAMS_BUFFER_INDEX, MGL_TESS_TCS_PARAMS) != SPVC_SUCCESS ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: tessellation MSL options rejected\n", stage_label(stage));
             goto done;
         }
     }

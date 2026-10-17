@@ -33,8 +33,8 @@
  * Compute (TCS kernel): uniforms 0..k, then the five SPIRV-Cross generated buffers.
  * Render (TES = vertex function): TES uniforms 0..n, tessellation buffers at 26..29.
  */
-#define MGL_TESS_VS_OUT_BUF     30      /* SPVC MSL_SHADER_OUTPUT_BUFFER_INDEX */
-#define MGL_TESS_VS_PARAMS      31      /* base vertex / base instance / counts */
+#define MGL_TESS_VS_OUT_BUF     30      /* SPVC MSL_SHADER_OUTPUT_BUFFER_INDEX (max index) */
+#define MGL_TESS_VS_PARAMS      29      /* base vertex / base instance / counts */
 #define MGL_TESS_TCS_IN         24      /* SPVC MSL_SHADER_INPUT_BUFFER_INDEX */
 #define MGL_TESS_TCS_OUT        25      /* SPVC MSL_SHADER_OUTPUT_BUFFER_INDEX */
 #define MGL_TESS_TCS_PATCH_OUT  26      /* SPVC MSL_SHADER_PATCH_OUTPUT_BUFFER_INDEX */

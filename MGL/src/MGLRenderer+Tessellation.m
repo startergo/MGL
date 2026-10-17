@@ -49,6 +49,7 @@ static id<MTLBuffer> tTcsParams;    /* spvIndirectParams                   */
 static id<MTLBuffer> tTesParams;    /* cp-per-patch                        */
 static id<MTLBuffer> tConstValues;  /* current generic attribute values    */
 static id<MTLBuffer> tShadow;       /* CPU-converted attribute stream      */
+static id<MTLBuffer> tSmallAttr;    /* small attribute buffers             */
 
 static NSMutableDictionary *tVsPsoCache;    /* VS kernel PSO, per program+VAO */
 static NSMutableDictionary *tTcsPsoCache;   /* TCS kernel PSO, per program    */
@@ -70,9 +71,10 @@ static bool tessBufferEnsure(id<MTLDevice> device, id<MTLBuffer> __strong *buf, 
 
 static id<MTLFunction> tessStageFunction(Program *program, int stage)
 {
-    if (!program || !program->spirv[stage].mtl_function)
+    Shader *sh = program ? program->shader_slots[stage] : NULL;
+    if (!sh || !sh->mtl_data.function)
         return nil;
-    return (__bridge id<MTLFunction>)(program->spirv[stage].mtl_function);
+    return (__bridge id<MTLFunction>)(sh->mtl_data.function);
 }
 
 /* ------------------------------------------------------------------ VS attribute plan
@@ -115,6 +117,9 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
     memset(has, 0, MAX_ATTRIBS * sizeof(bool));
     memset(kind, 0, MAX_ATTRIBS * sizeof(int));
 
+    if (getenv("MGL_TESS_DEBUG"))
+        NSLog(@"MGL tess: VS stage inputs: %d", list->count);
+
     for (int i = 0; i < list->count; i++)
     {
         SpirvResource *r = &list->list[i];
@@ -136,7 +141,11 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
             k += wc;
         }
         if (loc < 0 || loc >= MAX_ATTRIBS)
+        {
+            if (getenv("MGL_TESS_DEBUG"))
+                NSLog(@"MGL tess: VS input %@ has no location (id %u)", [NSString stringWithUTF8String:r->name ? r->name : "?"], r->_id);
             continue;
+        }
 
         has[loc] = true;
 
@@ -240,7 +249,7 @@ static bool tessBuildVSPlan(GLMContext ctx, Program *program, TessVSPlan *plan,
             if (plan->const_buffer < 0)
             {
                 plan->const_buffer = next_index++;
-                if (next_index > MGL_TESS_VS_OUT_BUF)
+                if (next_index >= MGL_TESS_VS_PARAMS)
                 {
                     NSLog(@"MGL ERROR: tess: vertex compute pipeline ran out of buffer indices");
                     return false;
@@ -294,7 +303,7 @@ static bool tessBuildVSPlan(GLMContext ctx, Program *program, TessVSPlan *plan,
         if (s->fetch == TESS_FETCH_SHADOW)
             s->shadow_buffer = next_index++;
 
-        if (next_index > MGL_TESS_VS_OUT_BUF)
+        if (next_index >= MGL_TESS_VS_PARAMS)
         {
             NSLog(@"MGL ERROR: tess: vertex compute pipeline ran out of buffer indices");
             return false;
@@ -377,7 +386,11 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     MTLStageInputOutputDescriptor *sd;
 
     if (!fn || fn.functionType != MTLFunctionTypeKernel)
+    {
+        NSLog(@"MGL ERROR: tess VS stage function is not a kernel (fn=%@ type=%ld)",
+              fn, (long)(fn ? fn.functionType : -1));
         return nil;
+    }
 
     key = tessVSKey(ctx, program, plan);
     if (tVsPsoCache)
@@ -464,6 +477,26 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         }
     }
     desc.stageInputDescriptor = sd;
+
+    if (getenv("MGL_TESS_DEBUG"))
+    {
+        NSMutableString *dbg = [NSMutableString stringWithString: @"MGL tess: VS stage-input descriptor:"];
+        for (int i = 0; i < MAX_ATTRIB_SLOTS; i++)
+        {
+            MTLVertexAttributeDescriptor *a = sd.attributes[i];
+            if (a.format != MTLAttributeFormatInvalid)
+                [dbg appendFormat: @" attr[%d]{fmt=%ld,off=%lu,buf=%lu}", i, (long)a.format,
+                                    (unsigned long)a.offset, (unsigned long)a.bufferIndex];
+        }
+        for (int i = 0; i < 31; i++)
+        {
+            MTLBufferLayoutDescriptor *l = sd.layouts[i];
+            if (l.stride)
+                [dbg appendFormat: @" layout[%d]{stride=%lu,fn=%ld,rate=%lu}", i, (unsigned long)l.stride,
+                                    (long)l.stepFunction, (unsigned long)l.stepRate];
+        }
+        NSLog(@"%@", dbg);
+    }
 
     NSError *err = nil;
     pso = [device newComputePipelineStateWithDescriptor: desc
@@ -699,6 +732,8 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     {
         uint32_t params[4] = { (uint32_t)vfirst, 0, 0, 0 };
 
+        if (getenv("MGL_TESS_DEBUG"))
+            NSLog(@"MGL tess: VS kernel dispatch %u x %d threads", vcount, instances);
         [cenc setComputePipelineState: vs_pso];
         tessBindStageUniforms(ctx, cenc, prog_vs, _VERTEX_SHADER);
         tessBindStageTextures(ctx, cenc, prog_vs, _VERTEX_SHADER);
@@ -799,6 +834,12 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     [cenc endEncoding];
 
     /* ---- 3. read back the factors and build the tessellated geometry ---- */
+    if (getenv("MGL_TESS_DEBUG") && need_readback)
+    {
+        [compute_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            if (b.error) NSLog(@"MGL tess: compute cb error: %@", b.error);
+        }];
+    }
     if (need_readback)
     {
         [compute_cb commit];
@@ -823,6 +864,10 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             mgl_tess_build_patch_blob(ctx, tp, (const unsigned char *)tTcsPatch.contents,
                                       patch_record, factors, (unsigned)total_patches);
             mgl_tess_generate(ctx, tp, factors, (unsigned)total_patches);
+            if (getenv("MGL_TESS_DEBUG"))
+                NSLog(@"MGL tess: patch 0 factors %g %g %g %g / %g %g -> %d verts %d idx",
+                      factors[0], factors[1], factors[2], factors[3], factors[4], factors[5],
+                      S->tess_vertex_count, S->tess_index_count);
             free(factors);
         }
     }
@@ -863,6 +908,9 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         [enc setVertexBuffer: tPatchData offset: 0 atIndex: MGL_TESS_TES_PATCH];
         [enc setVertexBuffer: tTesParams offset: 0 atIndex: MGL_TESS_TES_PARAMS];
 
+        if (getenv("MGL_TESS_DEBUG"))
+            NSLog(@"MGL tess: drawing %d idx as %ld (verts %d, cp=%lu bytes)",
+                  S->tess_index_count, (long)prim, S->tess_vertex_count, (unsigned long)cp_source.length);
         if (tp->point_mode)
             [enc drawPrimitives: MTLPrimitiveTypePoint vertexStart: 0
                      vertexCount: (NSUInteger)S->tess_vertex_count];
@@ -898,6 +946,9 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
 
         if (idx < 0)
             continue;
+        if (getenv("MGL_TESS_DEBUG"))
+            NSLog(@"MGL tess: VS binding %d -> mtl index %d (buf=%p mtl=%p fetch...)", b, idx,
+                  (void *)buf, buf ? buf->data.mtl_data : NULL);
         if (!buf || !buf->data.buffer_data)
         {
             [enc setBuffer: nil offset: 0 atIndex: (NSUInteger)idx];
@@ -906,6 +957,8 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
         {
             MGLRenderer *self2 = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
             [self2 bindMTLBuffer: buf];
+            if (getenv("MGL_TESS_DEBUG"))
+                NSLog(@"MGL tess: VS binding %d idx %d: mtl_data=%p", b, idx, buf->data.mtl_data);
         }
         if (buf->data.mtl_data)
         {
@@ -913,8 +966,14 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
             [enc setBuffer: mtl offset: plan->binding_offset[b] atIndex: (NSUInteger)idx];
         }
         else
-            [enc setBytes: (const void *)((const uint8_t *)buf->data.buffer_data + plan->binding_offset[b])
-                    length: 16 atIndex: (NSUInteger)idx];
+        {
+            /* small buffer without a Metal object: compute stage-in needs a real buffer */
+            if (!tessBufferEnsure(((__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj)->_device, &tSmallAttr, 8192))
+                return false;
+            memcpy(tSmallAttr.contents, (const void *)(uintptr_t)buf->data.buffer_data,
+                   (size_t)buf->size < 8192 ? (size_t)buf->size : 8192);
+            [enc setBuffer: tSmallAttr offset: plan->binding_offset[b] atIndex: (NSUInteger)idx];
+        }
     }
 
     /* current generic values (disabled arrays): one 16-byte slot per location */
@@ -1049,6 +1108,8 @@ static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_
 
 - (void) bindExtTessFuncsToGLMContext: (GLMContext) glm_ctx
 {
+    if (!glm_ctx->mtl_funcs.ext_tess)
+        glm_ctx->mtl_funcs.ext_tess = (struct MGLExtMetal_tess *)calloc(1, sizeof(struct MGLExtMetal_tess));
     if (!glm_ctx->mtl_funcs.ext_tess)
         return;
     glm_ctx->mtl_funcs.ext_tess->draw_patches = tessDrawPatchesHook;

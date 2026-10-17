@@ -457,7 +457,10 @@ static bool rs_mode_is_polygon(GLenum m)
 
     /* shader fixup specialization (function constants) */
     if (program) {
-        id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[_VERTEX_SHADER] stage:_VERTEX_SHADER];
+        /* tess: the render pipeline's vertex stage is the evaluation shader; the vertex
+         * stage runs as a compute kernel before the render pass (MGLRenderer+Tessellation.m) */
+        int vstage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+        id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[vstage] stage:vstage];
         if (vf) desc.vertexFunction = vf;
         id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];
         if (ff) desc.fragmentFunction = ff;
