@@ -18,7 +18,7 @@ orchestrator.py          Lead Engineer — synthesizes reports into prioritized 
 source_patcher.py        exact {"file","old","new"} replacement, writable-path allowlist, git commit per fix
 stub_scanner.py          classifies every mgl* entry point: IMPLEMENTED / EMPTY / NOOP / ASSERT
 config.py                env-driven paths and limits; scrubs absolute paths from logs/reports
-llm_client.py            Anthropic (or compatible gateway) client from env
+llm_client.py            GLM (Z.AI, default) or Anthropic client from env
 ```
 
 ## Setup
@@ -26,15 +26,18 @@ llm_client.py            Anthropic (or compatible gateway) client from env
 ```bash
 cd agents
 pip3 install -r requirements.txt --break-system-packages
-cp .env.example .env          # git-ignored; fill in your key
+cp .env.example .env          # git-ignored; fill in your Z.AI key (GLM is the default)
 set -a; . ./.env; set +a      # or export the variables in your shell profile
 ```
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | — | model access (required unless `--no-llm`) |
-| `ANTHROPIC_BASE_URL` | SDK default | compatible gateway |
-| `AGENT_MODEL` | `claude-opus-5-5` | model id (`glm-5.3` default when a Z.AI URL is set) |
+| `AGENT_PROVIDER` | `glm` | `glm` (Z.AI) or `anthropic` |
+| `ANTHROPIC_AUTH_TOKEN` | — | Z.AI API key (required for GLM unless `--no-llm`) |
+| `ANTHROPIC_API_KEY` | — | Anthropic key when `AGENT_PROVIDER=anthropic` |
+| `ANTHROPIC_BASE_URL` | `https://api.z.ai/api/anthropic` (GLM) | endpoint override |
+| `AGENT_MODEL` | `glm-5.3` (`claude-opus-5-5` for anthropic) | model id |
+| `AGENT_REASONING_EFFORT` | `high` | GLM reasoning effort (`high` / `max`) |
 | `MGL_PROJECT_DIR` | parent of `agents/` | repository root |
 | `MGL_BUILD_DIR` | `$MGL_PROJECT_DIR/build` | build output |
 | `MGL_REPORTS_DIR` | `$MGL_BUILD_DIR/_reports` | JSON reports |

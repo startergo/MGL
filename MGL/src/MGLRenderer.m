@@ -44,6 +44,9 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+TextureExt.h"
+#import "MGLRenderer+RenderState.h"
+#import "MGLRenderer+Framebuffer.h"
 #import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
 
@@ -497,6 +500,10 @@ void logDirtyBits(GLMContext ctx)
         return nil;
     }
 
+    // texext: buffer textures, texture views and multisample textures
+    if ([self texextOwnsTexture: tex])
+        return [self texextCreateMTLTexture: tex];
+
     NSUInteger width, height, depth;
 
     MTLTextureDescriptor *tex_desc;
@@ -689,6 +696,8 @@ void logDirtyBits(GLMContext ctx)
     // swizzle / level range / stencil texturing are applied with texture views at
     // bind time (texparam: -texparamTextureForTex:base:), not baked in here
     [self texparamPrepareTextureDescriptor:tex_desc forTex:tex];
+
+    [self texextAdjustTextureDescriptor: tex_desc forTexture: tex]; // texext: PixelFormatView for view sources
 
     id<MTLTexture> texture;
 
@@ -1810,6 +1819,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (bool)bindMTLTexture:(Texture *)tex
 {
+    [self texextValidateTexture: tex]; // texext: buffer reallocated / view root recreated
+
     if (tex->dirty_bits)
     {
         // release mtl data
@@ -2055,7 +2066,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     shader->mtl_data.function = NULL;
                     return false;  // Signal shader compilation failure
                 }
-                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]];
+                // specialized with no constant values: functions carrying (rstate) function constants
+                // fall back to their GL-default values and stay usable for pipeline creation
+                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]
+                                         constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
                 if (!function) {
                     NSLog(@"MGL ERROR: Failed to find function '%s' in compiled shader", shader->entry_point);
                     shader->mtl_data.library = NULL;
@@ -2165,106 +2179,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (void) updateCurrentRenderEncoder
 {
-    if (ctx->state.caps.depth_test ||
-        ctx->state.caps.stencil_test)
-    {
-        MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-
-        // mtl maps directly to gl
-        if (ctx->state.caps.depth_test)
-        {
-            MTLCompareFunction depthCompareFunction;
-
-            depthCompareFunction = ctx->state.var.depth_func - GL_NEVER;
-            dsDesc.depthCompareFunction = depthCompareFunction;
-
-            dsDesc.depthWriteEnabled = ctx->state.var.depth_writemask;
-        }
-
-        if (ctx->state.caps.stencil_test)
-        {
-            // mtl maps directly to gl
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *frontSDesc = [[MTLStencilDescriptor alloc] init];
-
-                frontSDesc.stencilCompareFunction = ctx->state.var.stencil_func - GL_NEVER;
-                frontSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_fail ];
-                frontSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_fail];
-                frontSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_pass];
-                frontSDesc.writeMask = ctx->state.var.stencil_writemask;
-                frontSDesc.readMask = ctx->state.var.stencil_value_mask;    // ????
-
-                dsDesc.frontFaceStencil = frontSDesc;
-            }
-
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *backSDesc = [[MTLStencilDescriptor alloc] init];
-
-                backSDesc.stencilCompareFunction = ctx->state.var.stencil_back_func - GL_NEVER;
-                backSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_fail ];
-                backSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_fail];
-                backSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_pass];
-                backSDesc.writeMask = ctx->state.var.stencil_back_writemask;
-                backSDesc.readMask = ctx->state.var.stencil_back_value_mask;    // ????
-
-                dsDesc.backFaceStencil = backSDesc;
-            }
-        }
-
-        id <MTLDepthStencilState> dsState = [_device
-                                  newDepthStencilStateWithDescriptor:dsDesc];
-
-        [_currentRenderEncoder setDepthStencilState: dsState];
-    }
-
-    if (ctx->state.caps.scissor_test)
-    {
-        MTLScissorRect rect;
-
-        rect.x = ctx->state.var.scissor_box[0];
-        rect.y = ctx->state.var.scissor_box[1];
-        rect.width = ctx->state.var.scissor_box[2];
-        rect.height = ctx->state.var.scissor_box[3];
-
-        [_currentRenderEncoder setScissorRect:rect];
-    }
-
-    [_currentRenderEncoder setViewport:(MTLViewport){ctx->state.viewport[0], ctx->state.viewport[1],
-                                        ctx->state.viewport[2], ctx->state.viewport[3],
-                                        ctx->state.var.depth_range[0], ctx->state.var.depth_range[1]}];
-
-    if (ctx->state.caps.cull_face)
-    {
-        MTLCullMode cull_mode;
-
-        switch(ctx->state.var.cull_face_mode)
-        {
-            case GL_BACK: cull_mode = MTLCullModeBack; break;
-            case GL_FRONT: cull_mode = MTLCullModeFront; break;
-            default:
-                cull_mode = MTLCullModeNone;
-        }
-
-        [_currentRenderEncoder setCullMode:cull_mode];
-
-        MTLWinding winding;
-
-        winding = ctx->state.var.front_face - GL_CW;
-
-        [_currentRenderEncoder setFrontFacingWinding:winding];
-    }
-
-    if (ctx->state.caps.depth_clamp)
-    {
-        [_currentRenderEncoder setDepthClipMode: MTLDepthClipModeClamp];
-    }
-
-    if (ctx->state.var.polygon_mode == GL_LINES)
-    {
-        [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeLines];
-    }
+    // all fixed-function encoder state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateApplyEncoderState: _currentRenderEncoder];
 }
 
 - (bool) newRenderEncoder
@@ -2289,260 +2205,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // end encoding on current render encoder
     [self endRenderEncoding];
 
-    // grab the next drawable from CAMetalLayer
-    if (_drawable == NULL)
+    // render pass for the bound draw framebuffer (fb domain: MGLRenderer+Framebuffer.m)
+    if (![self fbBuildRenderPassDescriptor])
     {
-        if (!_layer) {
-            NSLog(@"MGL ERROR: Cannot get drawable - no CAMetalLayer available");
-            return false;
-        }
-
-        _drawable = [_layer nextDrawable];
-
-        // late init of gl scissor box on attachment to window system
-        NSRect frame;
-        frame = [_layer frame];
-
-        ctx->state.var.scissor_box[2] = frame.size.width;
-        ctx->state.var.scissor_box[3] = frame.size.height;
+        NSLog(@"MGL ERROR: no render targets for the bound draw framebuffer");
+        return false;
     }
-
-    _renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
-    assert(_renderPassDescriptor);
-
-    if (ctx->state.framebuffer)
-    {
-        Framebuffer *fbo;
-
-        fbo = ctx->state.framebuffer;
-
-        for (int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-        {
-            if (fbo->color_attachments[i].texture)
-            {
-                Texture *tex;
-
-                tex = [self framebufferAttachmentTexture: &fbo->color_attachments[i]];
-                assert(tex);
-
-                assert(tex->mtl_data);
-                _renderPassDescriptor.colorAttachments[i].texture = (__bridge id<MTLTexture> _Nullable)(tex->mtl_data);
-
-                if (fbo->color_attachments[i].buf.rbo->is_draw_buffer)
-                {
-                    GLuint width, height;
-
-                    width = tex->width;
-                    height = tex->height;
-
-                    _renderPassDescriptor.renderTargetWidth = width;
-                    _renderPassDescriptor.renderTargetHeight = height;
-                }
-            }
-
-            // early out
-            if ((fbo->color_attachment_bitfield >> (i+1)) == 0)
-                break;
-        }
-
-        // depth attachment
-        if (fbo->depth.texture)
-        {
-            Texture *tex;
-
-            tex = [self framebufferAttachmentTexture: &fbo->depth];
-            assert(tex);
-
-            _renderPassDescriptor.depthAttachment.texture = (__bridge id<MTLTexture> _Nullable)(tex->mtl_data);
-        }
-
-        // stencil attachment
-        if (fbo->stencil.texture)
-        {
-            Texture *tex;
-
-            tex = [self framebufferAttachmentTexture: &fbo->stencil];
-            assert(tex);
-
-            _renderPassDescriptor.stencilAttachment.texture = (__bridge id<MTLTexture> _Nullable)(tex->mtl_data);
-        }
-    }
-    else
-    {
-        GLuint mgl_drawbuffer;
-        id<MTLTexture> texture, depth_texture, stencil_texture;
-        
-        switch(ctx->state.draw_buffer)
-        {
-            case GL_FRONT: mgl_drawbuffer = _FRONT; break;
-            case GL_BACK: mgl_drawbuffer = _BACK; break;
-            case GL_FRONT_LEFT: mgl_drawbuffer = _FRONT_LEFT; break;
-            case GL_FRONT_RIGHT: mgl_drawbuffer = _FRONT_RIGHT; break;
-            case GL_BACK_LEFT: mgl_drawbuffer = _BACK_LEFT; break;
-            case GL_BACK_RIGHT: mgl_drawbuffer = _BACK_RIGHT; break;
-            case GL_NONE:
-                // Handle GL_NONE gracefully - no draw buffer selected
-                mgl_drawbuffer = _FRONT; // fallback to front
-                DEBUG_PRINT("MGL: draw_buffer is GL_NONE, falling back to FRONT\n");
-                break;
-            default:
-                DEBUG_PRINT("MGL: Unknown draw_buffer value: 0x%x, falling back to FRONT\n", ctx->state.draw_buffer);
-                mgl_drawbuffer = _FRONT; // fallback to front instead of crashing
-                // // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return nil; // Don't crash, handle gracefully
-        }
-
-        if([self checkDrawBufferSize:mgl_drawbuffer])
-        {
-            _drawBuffers[mgl_drawbuffer].drawbuffer = NULL;
-            _drawBuffers[mgl_drawbuffer].depthbuffer = NULL;
-            _drawBuffers[mgl_drawbuffer].stencilbuffer = NULL;
-        }
-
-        // attach color buffer
-        if (mgl_drawbuffer == _FRONT)
-        {
-            // SAFETY: Ensure we have a valid drawable with texture
-            if (!_drawable) {
-                NSLog(@"MGL ERROR: No drawable available for front buffer");
-                return false;
-            }
-
-            texture = _drawable.texture;
-
-            // sleep mode will return a null texture - handle gracefully without crashing
-            if (!texture) {
-                NSLog(@"MGL WARNING: Drawable texture is NULL (sleep mode or window not visible), attempting to get new drawable");
-
-                // Try to get a new drawable
-                _drawable = [_layer nextDrawable];
-                if (_drawable) {
-                    texture = _drawable.texture;
-                    NSLog(@"MGL INFO: Successfully obtained new drawable with texture");
-                } else {
-                    NSLog(@"MGL ERROR: Still no drawable texture available");
-                    return false;
-                }
-            }
-        }
-        else if(_drawBuffers[mgl_drawbuffer].drawbuffer)
-        {
-            texture = _drawBuffers[mgl_drawbuffer].drawbuffer;
-        }
-        else
-        {
-            texture = [self newDrawBuffer: ctx->pixel_format.mtl_pixel_format isDepthStencil:false];
-            _drawBuffers[mgl_drawbuffer].drawbuffer = texture;
-        }
-
-        // attach depth
-        if (ctx->depth_format.mtl_pixel_format &&
-            ctx->state.caps.depth_test)
-        {
-            if(_drawBuffers[mgl_drawbuffer].depthbuffer)
-            {
-                depth_texture = _drawBuffers[mgl_drawbuffer].depthbuffer;
-            }
-            else
-            {
-                depth_texture = [self newDrawBufferWithCustomSize:ctx->depth_format.mtl_pixel_format isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
-                _drawBuffers[mgl_drawbuffer].depthbuffer = depth_texture;
-            }
-        }
-
-        // attach stencil
-        if (ctx->stencil_format.mtl_pixel_format &&
-            ctx->state.caps.stencil_test)
-        {
-            if(_drawBuffers[mgl_drawbuffer].stencilbuffer)
-            {
-                stencil_texture = _drawBuffers[mgl_drawbuffer].stencilbuffer;
-            }
-            else
-            {
-                stencil_texture = [self newDrawBufferWithCustomSize:ctx->depth_format.mtl_pixel_format isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
-                _drawBuffers[mgl_drawbuffer].stencilbuffer = stencil_texture;
-            }
-        }
-
-        _renderPassDescriptor.colorAttachments[0].texture = texture;
-        _renderPassDescriptor.depthAttachment.texture = depth_texture;
-        _renderPassDescriptor.stencilAttachment.texture = stencil_texture;
-
-        _renderPassDescriptor.renderTargetWidth = texture.width;
-        _renderPassDescriptor.renderTargetHeight = texture.height;
-    }
-
-    // in case one of the framebuffers should be cleared
-    if (ctx->state.clear_bitmask)
-    {
-        if (ctx->state.clear_bitmask & GL_COLOR_BUFFER_BIT)
-        {
-            _renderPassDescriptor.colorAttachments[0].clearColor =
-                MTLClearColorMake(STATE(color_clear_value[0]),
-                                  STATE(color_clear_value[1]),
-                                  STATE(color_clear_value[2]),
-                                  STATE(color_clear_value[3]));
-
-            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-        }
-        else
-        {
-            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        }
-
-        if (ctx->state.framebuffer) {
-            Framebuffer * fbo = ctx->state.framebuffer;
-            for(int i=0; i<STATE(max_color_attachments);i++) {
-                FBOAttachment * fboa;
-                fboa = &fbo->color_attachments[i];
-                if (fboa->clear_bitmask & GL_COLOR_BUFFER_BIT) {
-                    _renderPassDescriptor.colorAttachments[i].clearColor =
-                        MTLClearColorMake(fboa->clear_color[0],
-                                        fboa->clear_color[1],
-                                        fboa->clear_color[2],
-                                        fboa->clear_color[3]);
-
-                    _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionClear;
-                } else {
-                    _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionLoad;
-                }
-            }
-        }
-
-        if (ctx->state.clear_bitmask & GL_DEPTH_BUFFER_BIT)
-        {
-            _renderPassDescriptor.depthAttachment.clearDepth = STATE_VAR(depth_clear_value);
-
-            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
-        }
-        else
-        {
-            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
-        }
-
-        if (ctx->state.clear_bitmask & GL_STENCIL_BUFFER_BIT)
-        {
-            _renderPassDescriptor.stencilAttachment.clearStencil = STATE_VAR(stencil_clear_value);
-
-            _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
-        }
-        else
-        {
-            _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
-        }
-
-        ctx->state.clear_bitmask = 0;
-    }
-    else
-    {
-        _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
-        _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
-    }
-
-    _renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     // create a render encoder from the renderpass descriptor
     // CRITICAL SAFETY: Validate inputs before creating render encoder
@@ -2970,86 +2638,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     pipelineStateDescriptor.vertexFunction = vertexFunction;
     pipelineStateDescriptor.fragmentFunction = fragmentFunction;
 
-    if (ctx->state.framebuffer)
-    {
-        Framebuffer *fbo;
+    // attachment formats + raster sample count (fb domain)
+    [self fbApplyPipelineFormats: pipelineStateDescriptor];
 
-        fbo = ctx->state.framebuffer;
-
-        for (int i=0; i<STATE(max_color_attachments); i++)
-        {
-            if (fbo->color_attachments[i].texture)
-            {
-                Texture *tex;
-
-                tex = [self framebufferAttachmentTexture: &fbo->color_attachments[i]];
-                assert(tex);
-
-                RETURN_NULL_ON_FAILURE([self bindMTLTexture: tex]);
-                assert(tex->mtl_data);
-
-                pipelineStateDescriptor.colorAttachments[i].pixelFormat = mtlPixelFormatForGLTex(tex);
-            }
-
-            // early out
-            if ((fbo->color_attachment_bitfield >> (i+1)) == 0)
-                break;
-        }
-
-        // depth attachment
-        if (fbo->depth.texture
-        //    && ctx->state.caps.depth_test // otherwise, the render pipeline's pixelFormat is MTLPixelFormatInvalid
-        )
-        {
-            Texture *tex;
-
-            tex = [self framebufferAttachmentTexture: &fbo->depth];
-            assert(tex);
-
-            RETURN_NULL_ON_FAILURE([self bindMTLTexture: tex]);
-            assert(tex->mtl_data);
-
-            MTLPixelFormat depthFormat = mtlPixelFormatForGLTex(tex);
-            if (depthFormat == MTLPixelFormatInvalid) {
-                NSLog(@"MGL ERROR: Invalid depth texture format, falling back to Depth32Float");
-                depthFormat = MTLPixelFormatDepth32Float;
-            }
-            pipelineStateDescriptor.depthAttachmentPixelFormat = depthFormat;
-        }
-
-        // stencil attachment
-        if (fbo->stencil.texture
-        //    && ctx->state.caps.stencil_test // otherwise, the render pipeline's pixelFormat is MTLPixelFormatInvalid
-        )
-        {
-            Texture *tex;
-
-            tex = [self framebufferAttachmentTexture: &fbo->stencil];
-            assert(tex);
-
-            RETURN_NULL_ON_FAILURE([self bindMTLTexture: tex]);
-            assert(tex->mtl_data);
-
-            MTLPixelFormat stencilFormat = mtlPixelFormatForGLTex(tex);
-            if (stencilFormat == MTLPixelFormatInvalid) {
-                NSLog(@"MGL ERROR: Invalid stencil texture format, falling back to Stencil8");
-                stencilFormat = MTLPixelFormatStencil8;
-            }
-            pipelineStateDescriptor.stencilAttachmentPixelFormat = stencilFormat;
-        }
-    }
-    else
-    {
-        pipelineStateDescriptor.colorAttachments[0].pixelFormat = ctx->pixel_format.mtl_pixel_format;
-
-        if (ctx->depth_format.format &&
-            ctx->state.caps.depth_test)
-            pipelineStateDescriptor.depthAttachmentPixelFormat = ctx->depth_format.mtl_pixel_format;
-
-        if (ctx->stencil_format.format &&
-            ctx->state.caps.stencil_test)
-            pipelineStateDescriptor.stencilAttachmentPixelFormat = ctx->stencil_format.mtl_pixel_format;
-    }
+    // blend / masks / raster / shader-variant state (rstate category)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
+    [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     return pipelineStateDescriptor;
 }
@@ -3151,23 +2745,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 -(void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)pipelineStateDescriptor
 {
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        if (pipelineStateDescriptor.colorAttachments[i].pixelFormat != MTLPixelFormatInvalid)
-        {
-            pipelineStateDescriptor.colorAttachments[i].blendingEnabled = true;
-
-            pipelineStateDescriptor.colorAttachments[i].sourceRGBBlendFactor = _src_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationRGBBlendFactor = _dst_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].sourceAlphaBlendFactor = _src_blend_alpha_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationAlphaBlendFactor = _dst_blend_alpha_factor[i];
-
-            pipelineStateDescriptor.colorAttachments[i].rgbBlendOperation = _rgb_blend_operation[i];
-            pipelineStateDescriptor.colorAttachments[i].alphaBlendOperation = _alpha_blend_operation[i];
-
-            pipelineStateDescriptor.colorAttachments[i].writeMask = _color_mask[i];
-        }
-    }
+    // per-attachment blend state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
 }
 
 -(bool)bindFramebufferAttachmentTextures
@@ -3408,13 +2987,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 // MEMORY SAFETY: Add comprehensive validation to prevent use-after-free crashes
                 if (ctx->state.framebuffer)
                 {
-                    // Validate framebuffer pointer is within reasonable bounds
-                    uintptr_t fb_addr = (uintptr_t)ctx->state.framebuffer;
-                    if (fb_addr < 0x1000 || fb_addr > 0x100000000) {
-                        NSLog(@"MGL ERROR: Invalid framebuffer pointer detected: 0x%lx", fb_addr);
-                        return false;
-                    }
-
                     if (ctx->state.framebuffer->dirty_bits & DIRTY_FBO_BINDING)
                     {
                         RETURN_FALSE_ON_FAILURE([self bindFramebufferAttachmentTextures]);
@@ -3485,8 +3057,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER;
+
+            // the previous encoder may have been ended by a flush / readback
+            if (_currentRenderEncoder == NULL)
+            {
+                RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+            }
         }
-        else if (ctx->state.dirty_bits & DIRTY_RENDER_STATE)
+        else if ((ctx->state.dirty_bits & DIRTY_RENDER_STATE) || _currentRenderEncoder == NULL)
         {
             if (_currentRenderEncoder == NULL)
             {
@@ -3641,6 +3219,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
     else // if (ctx->state.dirty_bits)
     {
+        // the previous encoder may have been ended by a flush / readback
+        if (_currentRenderEncoder == NULL)
+        {
+            RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+        }
+
         // buffer data can be changed but the bindings remain in place.. so we need to update the data if this is the case
         // like a uniform or buffer sub data call
         
@@ -3657,6 +3241,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
             RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
         }
+    }
+
+    // the pass may have been ended (clear, readback, blit, target change) without dirty state
+    if (draw_command && _currentRenderEncoder == NULL)
+    {
+        RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
     }
 
     // Create a render command encoder.
@@ -5727,6 +5317,9 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     }
     
     glm_ctx->mtl_funcs.mtlView = (void *)CFBridgingRetain(view);
+
+    // default framebuffer images + initial viewport/scissor (fb domain)
+    [self fbInitDefaultFramebuffer];
 
     // PROACTIVE TEXTURE CREATION: Create essential textures to break sync loop
     NSLog(@"MGL INFO: PROACTIVE - Creating essential textures to prevent magenta screen");

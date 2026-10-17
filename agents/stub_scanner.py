@@ -32,7 +32,7 @@ GLCOREARB = PROJECT_DIR / "MGL" / "include" / "GL" / "glcorearb.h"
 DISPATCH = SRC_DIR / "glm_dispatch.c"
 
 # Source files that are legacy (compatibility-profile) entry points.
-LEGACY_FILES = {"non_core_unimplemented.c"}
+LEGACY_FILES = {"non_core_unimplemented.c", "legacy_compat.c"}
 
 FUNC_RE = re.compile(
     r"^(?P<ret>[A-Za-z_][\w \*]*?)\s*\b(?P<name>mgl[A-Z]\w*)\s*\(\s*GLMContext\s+ctx(?P<args>[^)]*)\)\s*\{",

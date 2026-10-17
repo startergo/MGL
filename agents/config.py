@@ -10,8 +10,9 @@ user-specific is ever stored in this folder.
   MGL_BUILD_TIMEOUT seconds for one build       (default: 1800)
   MGL_TEST_TIMEOUT  seconds for the test suite  (default: 900)
 
-LLM settings live in llm_client.py (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN,
-ANTHROPIC_BASE_URL, AGENT_MODEL, AGENT_REASONING_EFFORT). Put them in your
+LLM settings live in llm_client.py (AGENT_PROVIDER — glm by default,
+ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, AGENT_MODEL,
+AGENT_REASONING_EFFORT). Put them in your
 shell profile or an untracked .env (see .env.example) — never in a tracked file.
 """
 

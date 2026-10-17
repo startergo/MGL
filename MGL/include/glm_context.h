@@ -559,7 +559,7 @@ typedef struct {
     GLuint read_buffer; // GL_READ_BUFFER
     GLuint max_color_attachments; // GL_MAX_COLOR_ATTACHMENTS
     GLuint max_vertex_attribs; // GL_MAX_VERTEX_ATTRIBS
-    GLuint viewport[4]; // GL_VIEWPORT
+    GLint viewport[4]; // GL_VIEWPORT
     GLfloat color_clear_value[4]; // GL_COLOR_CLEAR_VALUE
 
     Buffer *buffers[MAX_BINDABLE_BUFFERS];

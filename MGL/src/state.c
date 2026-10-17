@@ -16,104 +16,213 @@
  * state.c
  * MGL
  *
+ * Fixed-function render state (enable caps, blend, depth/stencil, raster, viewport).
+ * GL state lives in ctx->state.{caps,var,hints} (read by get.c) and ctx->state.ext_rstate
+ * (indexed state); MGLRenderer+RenderState.m applies it to Metal.
  */
 
 #include "mgl.h"
 #include "glm_context.h"
+#define MGL_RSTATE_INTERNAL 1
+#include "mgl_ext_rstate.h"
 
-#define ENABLE_CAP(_cap_)   ctx->state.caps._cap_ = true; break
-#define DISABLE_CAP(_cap_)   ctx->state.caps._cap_ = false; break
+void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h);
+void mgl_rstate_set_all_scissors(GLMContext ctx, GLint x, GLint y, GLint w, GLint h);
+void mgl_rstate_set_all_depth_ranges(GLMContext ctx, GLdouble n, GLdouble f);
+
+#pragma mark - enable / disable
+
+/* which Metal object a capability lives in */
+enum { CAP_NONE, CAP_ENCODER, CAP_PIPELINE };
+
+static int rs_cap_kind(GLenum cap)
+{
+    switch (cap) {
+        case GL_BLEND: case GL_SAMPLE_ALPHA_TO_COVERAGE: case GL_SAMPLE_ALPHA_TO_ONE:
+        case GL_SAMPLE_COVERAGE: case GL_SAMPLE_MASK: case GL_SAMPLE_SHADING:
+        case GL_RASTERIZER_DISCARD: case GL_PROGRAM_POINT_SIZE: case GL_MULTISAMPLE:
+        case GL_FRAMEBUFFER_SRGB:
+        case GL_DEPTH_TEST: case GL_STENCIL_TEST:   /* default-FB attachments / pipeline formats */
+            return CAP_PIPELINE;
+        case GL_CULL_FACE: case GL_SCISSOR_TEST: case GL_DEPTH_CLAMP:
+        case GL_POLYGON_OFFSET_FILL: case GL_POLYGON_OFFSET_LINE: case GL_POLYGON_OFFSET_POINT:
+            return CAP_ENCODER;
+        default:
+            return CAP_NONE;
+    }
+}
+
+/* returns false for an unknown cap */
+static bool rs_set_cap(GLMContext ctx, GLenum cap, bool on)
+{
+    GLMCaps *c = &ctx->state.caps;
+
+    switch (cap) {
+        case GL_BLEND:
+            for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++) RS()->blend[i] = on;
+            c->blend = on;
+            break;
+        case GL_SCISSOR_TEST:
+            for (int i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++) RS()->scissor_test[i] = on;
+            c->scissor_test = on;
+            break;
+        case GL_LINE_SMOOTH: c->line_smooth = on; break;
+        case GL_POLYGON_SMOOTH: c->polygon_smooth = on; break;
+        case GL_CULL_FACE: c->cull_face = on; break;
+        case GL_DEPTH_TEST: c->depth_test = on; break;
+        case GL_STENCIL_TEST: c->stencil_test = on; break;
+        case GL_DITHER: c->dither = on; break;
+        case GL_COLOR_LOGIC_OP: c->color_logic_op = on; break;
+        case GL_POLYGON_OFFSET_POINT: c->polygon_offset_point = on; break;
+        case GL_POLYGON_OFFSET_LINE: c->polygon_offset_line = on; break;
+        case GL_POLYGON_OFFSET_FILL: c->polygon_offset_fill = on; break;
+        case GL_MULTISAMPLE: c->multisample = on; break;
+        case GL_SAMPLE_ALPHA_TO_COVERAGE: c->sample_alpha_to_coverage = on; break;
+        case GL_SAMPLE_ALPHA_TO_ONE: c->sample_alpha_to_one = on; break;
+        case GL_SAMPLE_COVERAGE: c->sample_coverage = on; break;
+        case GL_RASTERIZER_DISCARD: c->rasterizer_discard = on; break;
+        case GL_FRAMEBUFFER_SRGB: c->framebuffer_srgb = on; break;
+        case GL_PRIMITIVE_RESTART: c->primitive_restart = on; break;
+        case GL_PRIMITIVE_RESTART_FIXED_INDEX: c->primitive_restart_fixed_index = on; break;
+        case GL_DEPTH_CLAMP: c->depth_clamp = on; break;
+        case GL_TEXTURE_CUBE_MAP_SEAMLESS: c->texture_cube_map_seamless = on; break;
+        case GL_SAMPLE_MASK: c->sample_mask = on; break;
+        case GL_SAMPLE_SHADING: c->sample_shading = on; break;
+        case GL_DEBUG_OUTPUT_SYNCHRONOUS: c->debug_output_synchronous = on; break;
+        case GL_DEBUG_OUTPUT: c->debug_output = on; break;
+        case GL_PROGRAM_POINT_SIZE: c->program_point_size = on; break;
+        default:
+            if (cap >= GL_CLIP_DISTANCE0 && cap < GL_CLIP_DISTANCE0 + MAX_CLIP_DISTANCES) {
+                c->clip_distances[cap - GL_CLIP_DISTANCE0] = on;
+                break;
+            }
+            return false;
+    }
+
+    switch (rs_cap_kind(cap)) {
+        case CAP_PIPELINE: mgl_rs_dirty_pipeline(ctx); break;
+        case CAP_ENCODER:  mgl_rs_dirty_encoder(ctx); break;
+        default:           ctx->state.dirty_bits |= DIRTY_STATE; break;
+    }
+    return true;
+}
+
+/* legacy fixed-function caps tolerated (silently) for virglrenderer compatibility */
+static bool rs_legacy_cap(GLenum cap)
+{
+    return cap == GL_TEXTURE_1D || cap == GL_TEXTURE_2D || cap == GL_TEXTURE_3D || cap == GL_TEXTURE_CUBE_MAP;
+}
 
 void mglDisable(GLMContext ctx, GLenum cap)
 {
-    switch(cap)
-    {
-        case GL_BLEND: DISABLE_CAP(blend);
-        case GL_LINE_SMOOTH: DISABLE_CAP(line_smooth);
-        case GL_POLYGON_SMOOTH: DISABLE_CAP(polygon_smooth);
-        case GL_CULL_FACE: DISABLE_CAP(cull_face);
-        case GL_DEPTH_TEST: DISABLE_CAP(depth_test);
-        case GL_STENCIL_TEST: DISABLE_CAP(stencil_test);
-        case GL_DITHER: DISABLE_CAP(dither);
-        case GL_SCISSOR_TEST: DISABLE_CAP(scissor_test);
-        case GL_COLOR_LOGIC_OP: DISABLE_CAP(color_logic_op);
-        case GL_POLYGON_OFFSET_POINT: DISABLE_CAP(polygon_offset_point);
-        case GL_POLYGON_OFFSET_LINE: DISABLE_CAP(polygon_offset_line);
-        case GL_POLYGON_OFFSET_FILL: DISABLE_CAP(polygon_offset_fill);
-        case GL_MULTISAMPLE: DISABLE_CAP(multisample);
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: DISABLE_CAP(sample_alpha_to_coverage);
-        case GL_SAMPLE_ALPHA_TO_ONE: DISABLE_CAP(sample_alpha_to_one);
-        case GL_SAMPLE_COVERAGE: DISABLE_CAP(sample_coverage);
-        case GL_RASTERIZER_DISCARD: DISABLE_CAP(rasterizer_discard);
-        case GL_FRAMEBUFFER_SRGB: DISABLE_CAP(framebuffer_srgb);
-        case GL_PRIMITIVE_RESTART: DISABLE_CAP(primitive_restart);
-        case GL_DEPTH_CLAMP: DISABLE_CAP(depth_clamp);
-        case GL_TEXTURE_CUBE_MAP_SEAMLESS: DISABLE_CAP(texture_cube_map_seamless);
-        case GL_SAMPLE_MASK: DISABLE_CAP(sample_mask);
-        case GL_SAMPLE_SHADING: DISABLE_CAP(sample_shading);
-        case GL_PRIMITIVE_RESTART_FIXED_INDEX: DISABLE_CAP(primitive_restart_fixed_index);
-        case GL_DEBUG_OUTPUT_SYNCHRONOUS: DISABLE_CAP(debug_output_synchronous);
-        case GL_DEBUG_OUTPUT: DISABLE_CAP(debug_output);
-        case GL_PROGRAM_POINT_SIZE: DISABLE_CAP(program_point_size);
-        case GL_TEXTURE_2D:
-        case GL_TEXTURE_3D:
-        case GL_TEXTURE_CUBE_MAP:
-            // Legacy texture enable/disable - no-op in core profile
-            break;
-        default:
-            fprintf(stderr, "MGL WARNING: mglDisable unsupported cap 0x%x\n", cap);
-            // Don't error - just ignore unsupported caps
-            break;
-    }
-
-    ctx->state.dirty_bits |= DIRTY_STATE | DIRTY_RENDER_STATE;
+    if (rs_set_cap(ctx, cap, false)) return;
+    if (rs_legacy_cap(cap)) return;
+    ERROR_RETURN(GL_INVALID_ENUM);
 }
 
 void mglEnable(GLMContext ctx, GLenum cap)
 {
+    if (rs_set_cap(ctx, cap, true)) return;
+    if (rs_legacy_cap(cap)) return;
+    ERROR_RETURN(GL_INVALID_ENUM);
+}
+
+#define RET_CAP(_CAP_)  return ctx->state.caps._CAP_
+
+GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
+{
     switch(cap)
     {
-        case GL_BLEND: ENABLE_CAP(blend);
-        case GL_LINE_SMOOTH: ENABLE_CAP(line_smooth);
-        case GL_POLYGON_SMOOTH: ENABLE_CAP(polygon_smooth);
-        case GL_CULL_FACE: ENABLE_CAP(cull_face);
-        case GL_DEPTH_TEST: ENABLE_CAP(depth_test);
-        case GL_STENCIL_TEST: ENABLE_CAP(stencil_test);
-        case GL_DITHER: ENABLE_CAP(dither);
-        case GL_SCISSOR_TEST: ENABLE_CAP(scissor_test);
-        case GL_COLOR_LOGIC_OP: ENABLE_CAP(color_logic_op);
-        case GL_POLYGON_OFFSET_POINT: ENABLE_CAP(polygon_offset_point);
-        case GL_POLYGON_OFFSET_LINE: ENABLE_CAP(polygon_offset_line);
-        case GL_POLYGON_OFFSET_FILL: ENABLE_CAP(polygon_offset_fill);
-        case GL_PROGRAM_POINT_SIZE: ENABLE_CAP(program_point_size);
-        case GL_MULTISAMPLE: ENABLE_CAP(multisample);
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: ENABLE_CAP(sample_alpha_to_coverage);
-        case GL_SAMPLE_ALPHA_TO_ONE: ENABLE_CAP(sample_alpha_to_one);
-        case GL_SAMPLE_COVERAGE: ENABLE_CAP(sample_coverage);
-        case GL_RASTERIZER_DISCARD: ENABLE_CAP(rasterizer_discard);
-        case GL_FRAMEBUFFER_SRGB: ENABLE_CAP(framebuffer_srgb);
-        case GL_PRIMITIVE_RESTART: ENABLE_CAP(primitive_restart);
-        case GL_DEPTH_CLAMP: ENABLE_CAP(depth_clamp);
-        case GL_TEXTURE_CUBE_MAP_SEAMLESS: ENABLE_CAP(texture_cube_map_seamless);
-        case GL_SAMPLE_MASK: ENABLE_CAP(sample_mask);
-        case GL_SAMPLE_SHADING: ENABLE_CAP(sample_shading);
-        case GL_PRIMITIVE_RESTART_FIXED_INDEX: ENABLE_CAP(primitive_restart_fixed_index);
-        case GL_DEBUG_OUTPUT_SYNCHRONOUS: ENABLE_CAP(debug_output_synchronous);
-        case GL_DEBUG_OUTPUT: ENABLE_CAP(debug_output);
-        case GL_TEXTURE_2D:
-        case GL_TEXTURE_3D:
-        case GL_TEXTURE_CUBE_MAP:
-            // Legacy texture enable/disable - no-op in core profile
-            // virglrenderer may call these for compatibility
-            break;
+        case GL_BLEND: return RS()->blend[0];
+        case GL_SCISSOR_TEST: return RS()->scissor_test[0];
+        case GL_COLOR_LOGIC_OP: RET_CAP(color_logic_op);
+        case GL_CULL_FACE: RET_CAP(cull_face);
+        case GL_DEPTH_CLAMP: RET_CAP(depth_clamp);
+        case GL_DEBUG_OUTPUT: RET_CAP(debug_output);
+        case GL_DEBUG_OUTPUT_SYNCHRONOUS: RET_CAP(debug_output_synchronous);
+        case GL_DEPTH_TEST: RET_CAP(depth_test);
+        case GL_DITHER: RET_CAP(dither);
+        case GL_FRAMEBUFFER_SRGB: RET_CAP(framebuffer_srgb);
+        case GL_LINE_SMOOTH: RET_CAP(line_smooth);
+        case GL_MULTISAMPLE: RET_CAP(multisample);
+        case GL_POLYGON_SMOOTH: RET_CAP(polygon_smooth);
+        case GL_POLYGON_OFFSET_FILL: RET_CAP(polygon_offset_fill);
+        case GL_POLYGON_OFFSET_LINE: RET_CAP(polygon_offset_line);
+        case GL_POLYGON_OFFSET_POINT: RET_CAP(polygon_offset_point);
+        case GL_PROGRAM_POINT_SIZE: RET_CAP(program_point_size);
+        case GL_PRIMITIVE_RESTART: RET_CAP(primitive_restart);
+        case GL_PRIMITIVE_RESTART_FIXED_INDEX: RET_CAP(primitive_restart_fixed_index);
+        case GL_RASTERIZER_DISCARD: RET_CAP(rasterizer_discard);
+        case GL_SAMPLE_ALPHA_TO_COVERAGE: RET_CAP(sample_alpha_to_coverage);
+        case GL_SAMPLE_ALPHA_TO_ONE: RET_CAP(sample_alpha_to_one);
+        case GL_SAMPLE_COVERAGE: RET_CAP(sample_coverage);
+        case GL_SAMPLE_MASK: RET_CAP(sample_mask);
+        case GL_SAMPLE_SHADING: RET_CAP(sample_shading);
+        case GL_STENCIL_TEST: RET_CAP(stencil_test);
+        case GL_TEXTURE_CUBE_MAP_SEAMLESS: RET_CAP(texture_cube_map_seamless);
+
         default:
-            fprintf(stderr, "MGL WARNING: mglEnable unsupported cap 0x%x\n", cap);
-            // Don't error - just ignore unsupported caps
-            break;
+            if (cap >= GL_CLIP_DISTANCE0 && cap < GL_CLIP_DISTANCE0 + MAX_CLIP_DISTANCES)
+                return ctx->state.caps.clip_distances[cap - GL_CLIP_DISTANCE0];
+            ERROR_RETURN_VALUE(GL_INVALID_ENUM, GL_FALSE);
     }
 
-    ctx->state.dirty_bits |= DIRTY_STATE | DIRTY_RENDER_STATE;
+    return GL_FALSE;
 }
+
+/* indexed capabilities: BLEND (per draw buffer) and SCISSOR_TEST (per viewport) */
+static bool rs_indexed_cap(GLMContext ctx, GLenum target, GLuint index, int set, GLboolean *out)
+{
+    switch (target) {
+        case GL_BLEND:
+            if (index >= MAX_COLOR_ATTACHMENTS) { ERROR_RETURN(GL_INVALID_VALUE); return false; }
+            if (set >= 0) {
+                RS()->blend[index] = set;
+                ctx->state.caps.blend = RS()->blend[0];
+                mgl_rs_dirty_pipeline(ctx);
+            }
+            if (out) *out = RS()->blend[index];
+            return true;
+
+        case GL_SCISSOR_TEST:
+            if (index >= MGL_RSTATE_MAX_VIEWPORTS || index >= ctx->state.var.max_viewports) {
+                ERROR_RETURN(GL_INVALID_VALUE); return false;
+            }
+            if (set >= 0) {
+                RS()->scissor_test[index] = set;
+                ctx->state.caps.scissor_test = RS()->scissor_test[0];
+                mgl_rs_dirty_encoder(ctx);
+            }
+            if (out) *out = RS()->scissor_test[index];
+            return true;
+
+        default:
+            ERROR_RETURN(GL_INVALID_ENUM);
+            return false;
+    }
+}
+
+void mglEnablei(GLMContext ctx, GLenum target, GLuint index)
+{
+    rs_indexed_cap(ctx, target, index, 1, NULL);
+}
+
+void mglDisablei(GLMContext ctx, GLenum target, GLuint index)
+{
+    rs_indexed_cap(ctx, target, index, 0, NULL);
+}
+
+GLboolean mglIsEnabledi(GLMContext ctx, GLenum target, GLuint index)
+{
+    GLboolean v = GL_FALSE;
+
+    if (!rs_indexed_cap(ctx, target, index, -1, &v))
+        return GL_FALSE;
+
+    return v;
+}
+
+#pragma mark - raster state
 
 void mglCullFace(GLMContext ctx, GLenum mode)
 {
@@ -126,10 +235,10 @@ void mglCullFace(GLMContext ctx, GLenum mode)
             break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            RS_ERROR(GL_INVALID_ENUM);
     }
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
 
 void mglFrontFace(GLMContext ctx, GLenum mode)
@@ -142,51 +251,52 @@ void mglFrontFace(GLMContext ctx, GLenum mode)
             break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            RS_ERROR(GL_INVALID_ENUM);
     }
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
 
-#define HINT(_target_) ctx->state.hints._target_ = mode; break;
 void mglHint(GLMContext ctx, GLenum target, GLenum mode)
 {
+    RS_CHECK(mode == GL_FASTEST || mode == GL_NICEST || mode == GL_DONT_CARE, GL_INVALID_ENUM);
+
+    /* hints are recorded and queryable; Metal has no equivalent controls (derivative /
+     * smoothing / compression quality are fixed by the driver) */
     switch(target)
     {
-        case GL_LINE_SMOOTH_HINT: HINT(line_smooth_hint);
-        case GL_POLYGON_SMOOTH_HINT: HINT(polygon_smooth_hint)
-        case GL_TEXTURE_COMPRESSION_HINT: HINT(texture_compression_hint);
-        case GL_FRAGMENT_SHADER_DERIVATIVE_HINT: HINT(fragment_shader_derivative_hint);
-            break;
+        case GL_LINE_SMOOTH_HINT: ctx->state.hints.line_smooth_hint = mode; break;
+        case GL_POLYGON_SMOOTH_HINT: ctx->state.hints.polygon_smooth_hint = mode; break;
+        case GL_TEXTURE_COMPRESSION_HINT: ctx->state.hints.texture_compression_hint = mode; break;
+        case GL_FRAGMENT_SHADER_DERIVATIVE_HINT: ctx->state.hints.fragment_shader_derivative_hint = mode; break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            RS_ERROR(GL_INVALID_ENUM);
     }
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
 }
 
 void mglLineWidth(GLMContext ctx, GLfloat width)
 {
-    ERROR_CHECK_RETURN(width <= 0, GL_INVALID_VALUE);
+    RS_CHECK(width > 0.0f, GL_INVALID_VALUE);
 
+    /* Metal rasterises lines 1 pixel wide only; the width is tracked and queryable
+     * (ALIASED_LINE_WIDTH_RANGE reports [1,1]). */
     ctx->state.var.line_width = width;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }
 
 void mglPointSize(GLMContext ctx, GLfloat size)
 {
-    ERROR_CHECK_RETURN(size <= 0, GL_INVALID_VALUE);
+    RS_CHECK(size > 0.0f, GL_INVALID_VALUE);
 
     ctx->state.var.point_size = size;
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    /* point size is a vertex function constant (used unless PROGRAM_POINT_SIZE) */
+    mgl_rs_dirty_pipeline(ctx);
 }
 
 void mglPolygonMode(GLMContext ctx, GLenum face, GLenum mode)
 {
-    ERROR_CHECK_RETURN(face == GL_FRONT_AND_BACK, GL_INVALID_VALUE);
+    RS_CHECK(face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
 
     switch(mode)
     {
@@ -194,27 +304,97 @@ void mglPolygonMode(GLMContext ctx, GLenum face, GLenum mode)
         case GL_LINE:
         case GL_FILL:
             ctx->state.var.polygon_mode = mode;
+            RS()->polygon_mode = mode;
             break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            RS_ERROR(GL_INVALID_ENUM);
     }
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
+
+void mglPolygonOffset(GLMContext ctx, GLfloat factor, GLfloat units)
+{
+    RS()->polygon_offset_factor = factor;
+    RS()->polygon_offset_units = units;
+    RS()->polygon_offset_clamp = 0.0f;
+    ctx->state.var.polygon_offset_factor = factor;
+    ctx->state.var.polygon_offset_units = units;
+
+    mgl_rs_dirty_encoder(ctx);
+}
+
+#pragma mark - points
+
+void mglPointParameterf(GLMContext ctx, GLenum pname, GLfloat param)
+{
+    switch (pname) {
+        case GL_POINT_FADE_THRESHOLD_SIZE:
+            RS_CHECK(param >= 0.0f, GL_INVALID_VALUE);
+            /* only affects multisampled point rendering of points smaller than the threshold:
+             * Metal points are not multisample-faded, the value is tracked/queryable */
+            RS()->point_fade_threshold = param;
+            break;
+
+        case GL_POINT_SPRITE_COORD_ORIGIN:
+            RS_CHECK(param == (GLfloat)GL_LOWER_LEFT || param == (GLfloat)GL_UPPER_LEFT, GL_INVALID_VALUE);
+            RS()->point_sprite_coord_origin = (GLenum)param;
+            mgl_rs_dirty_pipeline(ctx);     /* fragment function constant */
+            break;
+
+        default:
+            RS_ERROR(GL_INVALID_ENUM);
+    }
+}
+
+void mglPointParameterfv(GLMContext ctx, GLenum pname, const GLfloat *params)
+{
+    if (!params) return;
+    mglPointParameterf(ctx, pname, params[0]);
+}
+
+void mglPointParameteri(GLMContext ctx, GLenum pname, GLint param)
+{
+    mglPointParameterf(ctx, pname, (GLfloat)param);
+}
+
+void mglPointParameteriv(GLMContext ctx, GLenum pname, const GLint *params)
+{
+    if (!params) return;
+    mglPointParameterf(ctx, pname, (GLfloat)params[0]);
+}
+
+#pragma mark - scissor / viewport / depth range
 
 void mglScissor(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
+    RS_CHECK(width >= 0 && height >= 0, GL_INVALID_VALUE);
 
-    ctx->state.var.scissor_box[0] = x;
-    ctx->state.var.scissor_box[1] = y;
-    ctx->state.var.scissor_box[2] = width;
-    ctx->state.var.scissor_box[3] = height;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rstate_set_all_scissors(ctx, x, y, width, height);
 }
+
+void mglViewport(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height)
+{
+    RS_CHECK(width >= 0 && height >= 0, GL_INVALID_VALUE);
+
+    mgl_rstate_set_all_viewports(ctx, (GLfloat)x, (GLfloat)y, (GLfloat)width, (GLfloat)height);
+}
+
+void mglDepthRange(GLMContext ctx, GLdouble n, GLdouble f)
+{
+    mgl_rstate_set_all_depth_ranges(ctx, n, f);
+}
+
+void mglClearDepthf(GLMContext ctx, GLfloat d)
+{
+    if (d < 0.0f) d = 0.0f;
+    if (d > 1.0f) d = 1.0f;
+    ctx->state.var.depth_clear_value = d;
+    ctx->state.dirty_bits |= DIRTY_STATE;
+}
+
+#pragma mark - logic op
 
 void mglLogicOp(GLMContext ctx, GLenum opcode)
 {
@@ -225,6 +405,7 @@ void mglLogicOp(GLMContext ctx, GLenum opcode)
         case GL_COPY:
         case GL_COPY_INVERTED:
         case GL_NOOP:
+        case GL_INVERT:
         case GL_AND:
         case GL_NAND:
         case GL_OR:
@@ -235,41 +416,28 @@ void mglLogicOp(GLMContext ctx, GLenum opcode)
         case GL_AND_INVERTED:
         case GL_OR_REVERSE:
         case GL_OR_INVERTED:
+            /* Metal has no framebuffer logic op: state is tracked and queryable, rendering
+             * behaves as GL_COPY (see report) */
             ctx->state.var.logic_op = opcode;
+            ctx->state.var.logic_op_mode = opcode;
             break;
 
         default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+            RS_ERROR(GL_INVALID_ENUM);
     }
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }
 
-void mglStencilFunc(GLMContext ctx, GLenum func, GLint ref, GLuint mask)
+#pragma mark - stencil
+
+static bool rs_valid_func(GLenum func)
 {
     switch(func)
     {
-        case GL_LEQUAL:
-        case GL_GEQUAL:
-        case GL_LESS:
-        case GL_GREATER:
-        case GL_EQUAL:
-        case GL_NOTEQUAL:
-        case GL_ALWAYS:
-        case GL_NEVER:
-            ctx->state.var.stencil_func = func;
-            ctx->state.var.stencil_back_func = func;
-            ctx->state.var.stencil_ref = ref;
-            ctx->state.var.stencil_back_ref = ref;
-            ctx->state.var.stencil_writemask = mask;
-            ctx->state.var.stencil_back_writemask = mask;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+        case GL_LEQUAL: case GL_GEQUAL: case GL_LESS: case GL_GREATER:
+        case GL_EQUAL: case GL_NOTEQUAL: case GL_ALWAYS: case GL_NEVER:
+            return true;
     }
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    return false;
 }
 
 static bool validStencilOpSeparate(GLMContext ctx, GLenum op)
@@ -290,325 +458,96 @@ static bool validStencilOpSeparate(GLMContext ctx, GLenum op)
     return false;
 }
 
-void mglStencilOp(GLMContext ctx, GLenum fail, GLenum zfail, GLenum zpass)
+void mglStencilFuncSeparate(GLMContext ctx, GLenum face, GLenum func, GLint ref, GLuint mask)
 {
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, fail), GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, zfail), GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, zpass), GL_INVALID_ENUM);
+    RS_CHECK(face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
+    RS_CHECK(rs_valid_func(func), GL_INVALID_ENUM);
 
-    ctx->state.var.stencil_fail = fail;
-    ctx->state.var.stencil_pass_depth_fail = zfail;
-    ctx->state.var.stencil_pass_depth_pass = zpass;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-}
-
-void mglStencilMask(GLMContext ctx, GLuint mask)
-{
-    ctx->state.var.stencil_value_mask = mask;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-}
-
-void mglColorMask(GLMContext ctx, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
-{
-    if (red == false || green == false  || blue == false  || alpha == false)
-    {
-        for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-        {
-            STATE(caps.use_color_mask[i]) = true;
-
-            ctx->state.var.color_writemask[i][0] = red;
-            ctx->state.var.color_writemask[i][1] = green;
-            ctx->state.var.color_writemask[i][2] = blue;
-            ctx->state.var.color_writemask[i][3] = alpha;
-
-        }
+    if (face != GL_BACK) {
+        ctx->state.var.stencil_func = func;
+        ctx->state.var.stencil_ref = ref;
+        ctx->state.var.stencil_value_mask = mask;
     }
-    else
-    {
-        for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-        {
-            STATE(caps.use_color_mask[i]) = false;
-        }
+    if (face != GL_FRONT) {
+        ctx->state.var.stencil_back_func = func;
+        ctx->state.var.stencil_back_ref = ref;
+        ctx->state.var.stencil_back_value_mask = mask;
     }
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
 
-void mglDepthMask(GLMContext ctx, GLboolean flag)
+void mglStencilFunc(GLMContext ctx, GLenum func, GLint ref, GLuint mask)
 {
-    ctx->state.var.depth_writemask = flag;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mglStencilFuncSeparate(ctx, GL_FRONT_AND_BACK, func, ref, mask);
 }
 
 void mglStencilOpSeparate(GLMContext ctx, GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass)
 {
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, sfail), GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, dpfail), GL_INVALID_ENUM);
-    ERROR_CHECK_RETURN(validStencilOpSeparate(ctx, dppass), GL_INVALID_ENUM);
+    RS_CHECK(face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
+    RS_CHECK(validStencilOpSeparate(ctx, sfail), GL_INVALID_ENUM);
+    RS_CHECK(validStencilOpSeparate(ctx, dpfail), GL_INVALID_ENUM);
+    RS_CHECK(validStencilOpSeparate(ctx, dppass), GL_INVALID_ENUM);
 
-    switch(face)
-    {
-        case GL_FRONT:
-            ctx->state.var.stencil_fail = sfail;
-            ctx->state.var.stencil_pass_depth_fail = dpfail;
-            ctx->state.var.stencil_pass_depth_pass = dppass;
-            break;
-
-        case GL_BACK:
-            ctx->state.var.stencil_back_fail = sfail;
-            ctx->state.var.stencil_back_pass_depth_fail = dpfail;
-            ctx->state.var.stencil_back_pass_depth_pass = dppass;
-            break;
-
-        case GL_FRONT_AND_BACK:
-            ctx->state.var.stencil_fail = sfail;
-            ctx->state.var.stencil_pass_depth_fail = dpfail;
-            ctx->state.var.stencil_pass_depth_pass = dppass;
-            ctx->state.var.stencil_back_fail = sfail;
-            ctx->state.var.stencil_back_pass_depth_fail = dpfail;
-            ctx->state.var.stencil_back_pass_depth_pass = dppass;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+    if (face != GL_BACK) {
+        ctx->state.var.stencil_fail = sfail;
+        ctx->state.var.stencil_pass_depth_fail = dpfail;
+        ctx->state.var.stencil_pass_depth_pass = dppass;
+    }
+    if (face != GL_FRONT) {
+        ctx->state.var.stencil_back_fail = sfail;
+        ctx->state.var.stencil_back_pass_depth_fail = dpfail;
+        ctx->state.var.stencil_back_pass_depth_pass = dppass;
     }
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
 
-void mglStencilFuncSeparate(GLMContext ctx, GLenum face, GLenum func, GLint ref, GLuint mask)
+void mglStencilOp(GLMContext ctx, GLenum fail, GLenum zfail, GLenum zpass)
 {
-    switch(func)
-    {
-        case GL_LEQUAL:
-        case GL_GEQUAL:
-        case GL_LESS:
-        case GL_GREATER:
-        case GL_EQUAL:
-        case GL_NOTEQUAL:
-        case GL_ALWAYS:
-        case GL_NEVER:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    switch(face)
-    {
-        case GL_FRONT:
-            ctx->state.var.stencil_func = func;
-            ctx->state.var.stencil_ref = ref;
-            ctx->state.var.stencil_writemask = mask;
-            break;
-
-        case GL_BACK:
-            ctx->state.var.stencil_back_func = func;
-            ctx->state.var.stencil_back_ref = ref;
-            ctx->state.var.stencil_back_writemask = mask;
-            break;
-
-        case GL_FRONT_AND_BACK:
-            ctx->state.var.stencil_func = func;
-            ctx->state.var.stencil_ref = ref;
-            ctx->state.var.stencil_writemask = mask;
-            ctx->state.var.stencil_back_func = func;
-            ctx->state.var.stencil_back_ref = ref;
-            ctx->state.var.stencil_back_writemask = mask;
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mglStencilOpSeparate(ctx, GL_FRONT_AND_BACK, fail, zfail, zpass);
 }
 
 void mglStencilMaskSeparate(GLMContext ctx, GLenum face, GLuint mask)
 {
-    switch(face)
-    {
-        case GL_FRONT:
-            ctx->state.var.stencil_writemask = mask;
-            break;
+    RS_CHECK(face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
 
-        case GL_BACK:
-            ctx->state.var.stencil_back_writemask = mask;
-            break;
+    if (face != GL_BACK)  ctx->state.var.stencil_writemask = mask;
+    if (face != GL_FRONT) ctx->state.var.stencil_back_writemask = mask;
 
-        case GL_FRONT_AND_BACK:
-            ctx->state.var.stencil_writemask = mask;
-            ctx->state.var.stencil_back_writemask = mask;
-            break;
+    mgl_rs_dirty_encoder(ctx);
+}
 
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
+void mglStencilMask(GLMContext ctx, GLuint mask)
+{
+    mglStencilMaskSeparate(ctx, GL_FRONT_AND_BACK, mask);
+}
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+#pragma mark - color / depth masks, depth func
+
+void mglColorMask(GLMContext ctx, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
+{
+    for (GLuint i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
+        mglColorMaski(ctx, i, red, green, blue, alpha);
+}
+
+void mglDepthMask(GLMContext ctx, GLboolean flag)
+{
+    ctx->state.var.depth_writemask = flag ? GL_TRUE : GL_FALSE;
+
+    mgl_rs_dirty_encoder(ctx);
 }
 
 void mglDepthFunc(GLMContext ctx, GLenum func)
 {
-    switch(func)
-    {
-        case GL_LEQUAL:
-        case GL_GEQUAL:
-        case GL_LESS:
-        case GL_GREATER:
-        case GL_EQUAL:
-        case GL_NOTEQUAL:
-        case GL_ALWAYS:
-        case GL_NEVER:
-            ctx->state.var.depth_func = func;
-            break;
+    RS_CHECK(rs_valid_func(func), GL_INVALID_ENUM);
 
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
+    ctx->state.var.depth_func = func;
 
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    mgl_rs_dirty_encoder(ctx);
 }
 
-static GLdouble _clamp(GLdouble a)
-{
-    if (a < 0.0)
-        a = 0.0;
-    else if (a > 1.0)
-        a = 1.0;
-
-    return a;
-}
-
-void mglDepthRange(GLMContext ctx, GLdouble n, GLdouble f)
-{
-    n = _clamp(n);
-    f = _clamp(f);
-
-    ctx->state.var.depth_range[0] = n;
-    ctx->state.var.depth_range[1] = f;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-}
-
-void mglViewport(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    ERROR_CHECK_RETURN(width > 0, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(height > 0, GL_INVALID_VALUE);
-
-    ctx->state.viewport[0] = x;
-    ctx->state.viewport[1] = y;
-    ctx->state.viewport[2] = width;
-    ctx->state.viewport[3] = height;
-
-    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-}
-
-#define RET_VAR(_VAR_, _DEFAULT_)  return (ctx->state.var._VAR_ == _DEFAULT_)
-#define RET_CAP(_CAP_)  return ctx->state.caps._CAP_
-
-GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
-{
-    switch(cap)
-    {
-        case GL_BLEND: RET_CAP(blend);
-        case GL_COLOR_LOGIC_OP: RET_CAP(color_logic_op);
-        case GL_CULL_FACE: RET_CAP(cull_face);
-        case GL_DEPTH_CLAMP: RET_CAP(depth_clamp);
-        case GL_DEBUG_OUTPUT: RET_CAP(debug_output);
-        case GL_DEBUG_OUTPUT_SYNCHRONOUS: RET_CAP(debug_output_synchronous);
-        case GL_DEPTH_TEST: RET_CAP(depth_test);
-        case GL_DITHER: RET_CAP(dither);
-        case GL_FRAMEBUFFER_SRGB: RET_CAP(framebuffer_srgb);
-        case GL_LINE_SMOOTH: RET_CAP(line_smooth);
-        case GL_MULTISAMPLE: RET_CAP(multisample);
-        case GL_POLYGON_SMOOTH: RET_CAP(polygon_smooth);
-        case GL_POLYGON_OFFSET_FILL: RET_CAP(polygon_offset_fill);
-        case GL_POLYGON_OFFSET_LINE: RET_CAP(polygon_offset_line);
-        case GL_POLYGON_OFFSET_POINT: RET_CAP(polygon_offset_point);
-        case GL_PROGRAM_POINT_SIZE: RET_CAP(program_point_size);
-        case GL_PRIMITIVE_RESTART: RET_CAP(primitive_restart);
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: RET_CAP(sample_alpha_to_coverage);
-        case GL_SAMPLE_ALPHA_TO_ONE: RET_CAP(sample_alpha_to_one);
-        case GL_SAMPLE_COVERAGE: RET_CAP(sample_coverage);
-        case GL_SAMPLE_MASK: RET_CAP(sample_mask);
-        case GL_SCISSOR_TEST: RET_CAP(scissor_test);
-        case GL_STENCIL_TEST: RET_CAP(stencil_test);
-        case GL_TEXTURE_CUBE_MAP_SEAMLESS: RET_CAP(texture_cube_map_seamless);
-
-        default:
-            ERROR_RETURN_VALUE(GL_INVALID_ENUM, GL_FALSE);
-    }
-
-    return false;
-}
-
-void mglEnablei(GLMContext ctx, GLenum target, GLuint index)
-{
-    if (target >= GL_CLIP_DISTANCE0 &&
-        target >= GL_CLIP_DISTANCE7)
-    {
-        if (index >= 0 &&
-            index < ctx->state.var.max_clip_distances)
-        {
-            ctx->state.caps.clip_distances[index] = true;
-
-            ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-
-            return;
-        }
-
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    ERROR_RETURN(GL_INVALID_ENUM);
-}
-
-void mglDisablei(GLMContext ctx, GLenum target, GLuint index)
-{
-    if (target >= GL_CLIP_DISTANCE0 &&
-        target >= GL_CLIP_DISTANCE7)
-    {
-        if (index >= 0 &&
-            index < ctx->state.var.max_clip_distances)
-        {
-            ctx->state.caps.clip_distances[index] = false;
-
-            ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
-
-            return;
-        }
-
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    ERROR_RETURN(GL_INVALID_ENUM);
-}
-
-GLboolean mglIsEnabledi(GLMContext ctx, GLenum target, GLuint index)
-{
-    if (target >= GL_CLIP_DISTANCE0 &&
-        target >= GL_CLIP_DISTANCE7)
-    {
-        if (index >= 0 &&
-            index < ctx->state.var.max_clip_distances)
-        {
-            return ctx->state.caps.clip_distances[index];
-        }
-
-        ERROR_RETURN_VALUE(GL_INVALID_VALUE, false);
-    }
-
-    ERROR_RETURN_VALUE(GL_INVALID_ENUM, false);
-}
-
-void mglClearDepthf(GLMContext ctx, GLfloat d)
-{
-    ctx->state.var.depth_clear_value = d;
-}
+#pragma mark - blending
 
 void mglBlendColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
@@ -617,250 +556,103 @@ void mglBlendColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLf
     ctx->state.var.blend_color[2] = blue;
     ctx->state.var.blend_color[3] = alpha;
 
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    mgl_rs_dirty_encoder(ctx);     /* -setBlendColorRed:green:blue:alpha: */
 }
 
-void mglBlendEquation(GLMContext ctx, GLenum mode)
+static bool rs_valid_equation(GLenum mode)
 {
     switch(mode)
     {
-        case GL_FUNC_ADD:
-        case GL_FUNC_SUBTRACT:
-        case GL_FUNC_REVERSE_SUBTRACT:
-        case GL_MIN:
-        case GL_MAX:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+        case GL_FUNC_ADD: case GL_FUNC_SUBTRACT: case GL_FUNC_REVERSE_SUBTRACT:
+        case GL_MIN: case GL_MAX:
+            return true;
     }
-
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        ctx->state.var.blend_equation_rgb[i] = mode;
-        ctx->state.var.blend_equation_alpha[i] = mode;
-    }
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    return false;
 }
 
-void mglBlendEquationi(GLMContext ctx, GLuint buf, GLenum mode)
+static bool rs_valid_factor(GLenum f)
 {
-    switch(mode)
+    switch(f)
     {
-        case GL_FUNC_ADD:
-        case GL_FUNC_SUBTRACT:
-        case GL_FUNC_REVERSE_SUBTRACT:
-        case GL_MIN:
-        case GL_MAX:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+        case GL_ZERO: case GL_ONE:
+        case GL_SRC_COLOR: case GL_ONE_MINUS_SRC_COLOR:
+        case GL_DST_COLOR: case GL_ONE_MINUS_DST_COLOR:
+        case GL_SRC_ALPHA: case GL_ONE_MINUS_SRC_ALPHA:
+        case GL_DST_ALPHA: case GL_ONE_MINUS_DST_ALPHA:
+        case GL_CONSTANT_COLOR: case GL_ONE_MINUS_CONSTANT_COLOR:
+        case GL_CONSTANT_ALPHA: case GL_ONE_MINUS_CONSTANT_ALPHA:
+        case GL_SRC_ALPHA_SATURATE:
+        case GL_SRC1_COLOR: case GL_ONE_MINUS_SRC1_COLOR:
+        case GL_SRC1_ALPHA: case GL_ONE_MINUS_SRC1_ALPHA:
+            return true;
     }
-
-    ERROR_CHECK_RETURN(buf >=0 && buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
-
-    ctx->state.var.blend_equation_rgb[buf] = mode;
-    ctx->state.var.blend_equation_alpha[buf] = mode;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    return false;
 }
 
-void mglBlendEquationSeparatei(GLMContext ctx, GLuint buf, GLenum modeRGB, GLenum modeAlpha)
+static void rs_blend_equation(GLMContext ctx, GLuint first, GLuint last, GLenum rgb, GLenum alpha)
 {
-    switch(modeRGB)
-    {
-        case GL_FUNC_ADD:
-        case GL_FUNC_SUBTRACT:
-        case GL_FUNC_REVERSE_SUBTRACT:
-        case GL_MIN:
-        case GL_MAX:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+    for (GLuint i = first; i <= last; i++) {
+        ctx->state.var.blend_equation_rgb[i] = rgb;
+        ctx->state.var.blend_equation_alpha[i] = alpha;
     }
-
-    switch(modeAlpha)
-    {
-        case GL_FUNC_ADD:
-        case GL_FUNC_SUBTRACT:
-        case GL_FUNC_REVERSE_SUBTRACT:
-        case GL_MIN:
-        case GL_MAX:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(buf >= 0 && buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
-
-    ctx->state.var.blend_equation_rgb[buf] = modeRGB;
-    ctx->state.var.blend_equation_alpha[buf] = modeAlpha;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    mgl_rs_dirty_pipeline(ctx);
 }
 
-void mglBlendFunc(GLMContext ctx, GLenum sfactor, GLenum dfactor)
+static void rs_blend_func(GLMContext ctx, GLuint first, GLuint last, GLenum srgb, GLenum drgb, GLenum sa, GLenum da)
 {
-    switch(sfactor)
-    {
-        case GL_ZERO:
-        case GL_ONE:
-        case GL_SRC_COLOR:
-        case GL_ONE_MINUS_SRC_COLOR:
-        case GL_DST_COLOR:
-        case GL_ONE_MINUS_DST_COLOR:
-        case GL_SRC_ALPHA:
-        case GL_ONE_MINUS_SRC_ALPHA:
-        case GL_DST_ALPHA:
-        case GL_ONE_MINUS_DST_ALPHA:
-        case GL_CONSTANT_COLOR:
-        case GL_ONE_MINUS_CONSTANT_COLOR:
-        case GL_CONSTANT_ALPHA:
-        case GL_ONE_MINUS_CONSTANT_ALPHA:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
+    for (GLuint i = first; i <= last; i++) {
+        ctx->state.var.blend_src_rgb[i] = srgb;
+        ctx->state.var.blend_dst_rgb[i] = drgb;
+        ctx->state.var.blend_src_alpha[i] = sa;
+        ctx->state.var.blend_dst_alpha[i] = da;
     }
-
-    switch(dfactor)
-    {
-        case GL_ZERO:
-        case GL_ONE:
-        case GL_SRC_COLOR:
-        case GL_ONE_MINUS_SRC_COLOR:
-        case GL_DST_COLOR:
-        case GL_ONE_MINUS_DST_COLOR:
-        case GL_SRC_ALPHA:
-        case GL_ONE_MINUS_SRC_ALPHA:
-        case GL_DST_ALPHA:
-        case GL_ONE_MINUS_DST_ALPHA:
-        case GL_CONSTANT_COLOR:
-        case GL_ONE_MINUS_CONSTANT_COLOR:
-        case GL_CONSTANT_ALPHA:
-        case GL_ONE_MINUS_CONSTANT_ALPHA:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        ctx->state.var.blend_src_rgb[i] = sfactor;
-        ctx->state.var.blend_src_alpha[i] = sfactor;
-        ctx->state.var.blend_dst_rgb[i] = dfactor;
-        ctx->state.var.blend_dst_alpha[i] = dfactor;
-    }
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
-}
-
-void mglBlendFunci(GLMContext ctx, GLuint buf, GLenum sfactor, GLenum dfactor)
-{
-    switch(sfactor)
-    {
-        case GL_ZERO:
-        case GL_ONE:
-        case GL_SRC_COLOR:
-        case GL_ONE_MINUS_SRC_COLOR:
-        case GL_DST_COLOR:
-        case GL_ONE_MINUS_DST_COLOR:
-        case GL_SRC_ALPHA:
-        case GL_ONE_MINUS_SRC_ALPHA:
-        case GL_DST_ALPHA:
-        case GL_ONE_MINUS_DST_ALPHA:
-        case GL_CONSTANT_COLOR:
-        case GL_ONE_MINUS_CONSTANT_COLOR:
-        case GL_CONSTANT_ALPHA:
-        case GL_ONE_MINUS_CONSTANT_ALPHA:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    switch(dfactor)
-    {
-        case GL_ZERO:
-        case GL_ONE:
-        case GL_SRC_COLOR:
-        case GL_ONE_MINUS_SRC_COLOR:
-        case GL_DST_COLOR:
-        case GL_ONE_MINUS_DST_COLOR:
-        case GL_SRC_ALPHA:
-        case GL_ONE_MINUS_SRC_ALPHA:
-        case GL_DST_ALPHA:
-        case GL_ONE_MINUS_DST_ALPHA:
-        case GL_CONSTANT_COLOR:
-        case GL_ONE_MINUS_CONSTANT_COLOR:
-        case GL_CONSTANT_ALPHA:
-        case GL_ONE_MINUS_CONSTANT_ALPHA:
-            break;
-
-        default:
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    ERROR_CHECK_RETURN(buf >=0 && buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
-
-    ctx->state.var.blend_src_rgb[buf] = sfactor;
-    ctx->state.var.blend_src_alpha[buf] = sfactor;
-    ctx->state.var.blend_dst_rgb[buf] = dfactor;
-    ctx->state.var.blend_dst_alpha[buf] = dfactor;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
-}
-
-void mglBlendFuncSeparatei(GLMContext ctx, GLuint buf, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
-{
-    // Unimplemented function
-    assert(0);
+    mgl_rs_dirty_pipeline(ctx);
 }
 
 void mglBlendEquationSeparate(GLMContext ctx, GLenum modeRGB, GLenum modeAlpha)
 {
-    // Unimplemented function
-    assert(0);
+    RS_CHECK(rs_valid_equation(modeRGB) && rs_valid_equation(modeAlpha), GL_INVALID_ENUM);
+    rs_blend_equation(ctx, 0, MAX_COLOR_ATTACHMENTS - 1, modeRGB, modeAlpha);
 }
 
-void mglPolygonOffset(GLMContext ctx, GLfloat factor, GLfloat units)
+void mglBlendEquation(GLMContext ctx, GLenum mode)
 {
-    // Unimplemented function
-    assert(0);
+    mglBlendEquationSeparate(ctx, mode, mode);
+}
+
+void mglBlendEquationSeparatei(GLMContext ctx, GLuint buf, GLenum modeRGB, GLenum modeAlpha)
+{
+    RS_CHECK(buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
+    RS_CHECK(rs_valid_equation(modeRGB) && rs_valid_equation(modeAlpha), GL_INVALID_ENUM);
+    rs_blend_equation(ctx, buf, buf, modeRGB, modeAlpha);
+}
+
+void mglBlendEquationi(GLMContext ctx, GLuint buf, GLenum mode)
+{
+    mglBlendEquationSeparatei(ctx, buf, mode, mode);
 }
 
 void mglBlendFuncSeparate(GLMContext ctx, GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha, GLenum dfactorAlpha)
 {
-    // Unimplemented function
-    assert(0);
+    RS_CHECK(rs_valid_factor(sfactorRGB) && rs_valid_factor(dfactorRGB) &&
+             rs_valid_factor(sfactorAlpha) && rs_valid_factor(dfactorAlpha), GL_INVALID_ENUM);
+    rs_blend_func(ctx, 0, MAX_COLOR_ATTACHMENTS - 1, sfactorRGB, dfactorRGB, sfactorAlpha, dfactorAlpha);
 }
 
-void mglPointParameterf(GLMContext ctx, GLenum pname, GLfloat param)
+void mglBlendFunc(GLMContext ctx, GLenum sfactor, GLenum dfactor)
 {
-    // Unimplemented function
-    assert(0);
+    mglBlendFuncSeparate(ctx, sfactor, dfactor, sfactor, dfactor);
 }
 
-void mglPointParameterfv(GLMContext ctx, GLenum pname, const GLfloat *params)
+void mglBlendFuncSeparatei(GLMContext ctx, GLuint buf, GLenum srcRGB, GLenum dstRGB, GLenum srcAlpha, GLenum dstAlpha)
 {
-    // Unimplemented function
-    assert(0);
+    RS_CHECK(buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
+    RS_CHECK(rs_valid_factor(srcRGB) && rs_valid_factor(dstRGB) &&
+             rs_valid_factor(srcAlpha) && rs_valid_factor(dstAlpha), GL_INVALID_ENUM);
+    rs_blend_func(ctx, buf, buf, srcRGB, dstRGB, srcAlpha, dstAlpha);
 }
 
-void mglPointParameteri(GLMContext ctx, GLenum pname, GLint param)
+void mglBlendFunci(GLMContext ctx, GLuint buf, GLenum sfactor, GLenum dfactor)
 {
-    // Unimplemented function
-    assert(0);
+    mglBlendFuncSeparatei(ctx, buf, sfactor, dfactor, sfactor, dfactor);
 }
-
-void mglPointParameteriv(GLMContext ctx, GLenum pname, const GLint *params)
-{
-    // Unimplemented function
-    assert(0);
-}
-
