@@ -425,6 +425,10 @@ const GLubyte *mglGetString(GLMContext ctx, GLenum name)
 
 void mglGetInteger64v(GLMContext ctx, GLenum pname, GLint64 *data)
 {
+    // domain extensions with exact 64-bit values (e.g. GL_TIMESTAMP, queries)
+    if (mgl_ext_get(ctx, pname, MGL_GET_INT64, data))
+        return;
+
     // Unimplemented function
     assert(0);
 }
