@@ -45,6 +45,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+TextureExt.h"
+#import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
 #import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
@@ -2085,7 +2086,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     shader->mtl_data.function = NULL;
                     return false;  // Signal shader compilation failure
                 }
-                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]];
+                // specialized with no constant values: functions carrying (rstate) function constants
+                // fall back to their GL-default values and stay usable for pipeline creation
+                function = [library newFunctionWithName:[NSString stringWithUTF8String: shader->entry_point]
+                                         constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
                 if (!function) {
                     NSLog(@"MGL ERROR: Failed to find function '%s' in compiled shader", shader->entry_point);
                     shader->mtl_data.library = NULL;
@@ -2195,106 +2199,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (void) updateCurrentRenderEncoder
 {
-    if (ctx->state.caps.depth_test ||
-        ctx->state.caps.stencil_test)
-    {
-        MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
-
-        // mtl maps directly to gl
-        if (ctx->state.caps.depth_test)
-        {
-            MTLCompareFunction depthCompareFunction;
-
-            depthCompareFunction = ctx->state.var.depth_func - GL_NEVER;
-            dsDesc.depthCompareFunction = depthCompareFunction;
-
-            dsDesc.depthWriteEnabled = ctx->state.var.depth_writemask;
-        }
-
-        if (ctx->state.caps.stencil_test)
-        {
-            // mtl maps directly to gl
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *frontSDesc = [[MTLStencilDescriptor alloc] init];
-
-                frontSDesc.stencilCompareFunction = ctx->state.var.stencil_func - GL_NEVER;
-                frontSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_fail ];
-                frontSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_fail];
-                frontSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_pass];
-                frontSDesc.writeMask = ctx->state.var.stencil_writemask;
-                frontSDesc.readMask = ctx->state.var.stencil_value_mask;    // ????
-
-                dsDesc.frontFaceStencil = frontSDesc;
-            }
-
-            if (ctx->state.var.stencil_func != GL_NEVER)
-            {
-                MTLStencilDescriptor *backSDesc = [[MTLStencilDescriptor alloc] init];
-
-                backSDesc.stencilCompareFunction = ctx->state.var.stencil_back_func - GL_NEVER;
-                backSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_fail ];
-                backSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_fail];
-                backSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_pass];
-                backSDesc.writeMask = ctx->state.var.stencil_back_writemask;
-                backSDesc.readMask = ctx->state.var.stencil_back_value_mask;    // ????
-
-                dsDesc.backFaceStencil = backSDesc;
-            }
-        }
-
-        id <MTLDepthStencilState> dsState = [_device
-                                  newDepthStencilStateWithDescriptor:dsDesc];
-
-        [_currentRenderEncoder setDepthStencilState: dsState];
-    }
-
-    if (ctx->state.caps.scissor_test)
-    {
-        MTLScissorRect rect;
-
-        rect.x = ctx->state.var.scissor_box[0];
-        rect.y = ctx->state.var.scissor_box[1];
-        rect.width = ctx->state.var.scissor_box[2];
-        rect.height = ctx->state.var.scissor_box[3];
-
-        [_currentRenderEncoder setScissorRect:rect];
-    }
-
-    [_currentRenderEncoder setViewport:(MTLViewport){ctx->state.viewport[0], ctx->state.viewport[1],
-                                        ctx->state.viewport[2], ctx->state.viewport[3],
-                                        ctx->state.var.depth_range[0], ctx->state.var.depth_range[1]}];
-
-    if (ctx->state.caps.cull_face)
-    {
-        MTLCullMode cull_mode;
-
-        switch(ctx->state.var.cull_face_mode)
-        {
-            case GL_BACK: cull_mode = MTLCullModeBack; break;
-            case GL_FRONT: cull_mode = MTLCullModeFront; break;
-            default:
-                cull_mode = MTLCullModeNone;
-        }
-
-        [_currentRenderEncoder setCullMode:cull_mode];
-
-        MTLWinding winding;
-
-        winding = ctx->state.var.front_face - GL_CW;
-
-        [_currentRenderEncoder setFrontFacingWinding:winding];
-    }
-
-    if (ctx->state.caps.depth_clamp)
-    {
-        [_currentRenderEncoder setDepthClipMode: MTLDepthClipModeClamp];
-    }
-
-    if (ctx->state.var.polygon_mode == GL_LINES)
-    {
-        [_currentRenderEncoder setTriangleFillMode: MTLTriangleFillModeLines];
-    }
+    // all fixed-function encoder state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateApplyEncoderState: _currentRenderEncoder];
 }
 
 - (bool) newRenderEncoder
@@ -2755,6 +2661,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // attachment formats + raster sample count (fb domain)
     [self fbApplyPipelineFormats: pipelineStateDescriptor];
 
+    // blend / masks / raster / shader-variant state (rstate category)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
     [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     return pipelineStateDescriptor;
@@ -2857,23 +2765,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 -(void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)pipelineStateDescriptor
 {
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        if (pipelineStateDescriptor.colorAttachments[i].pixelFormat != MTLPixelFormatInvalid)
-        {
-            pipelineStateDescriptor.colorAttachments[i].blendingEnabled = true;
-
-            pipelineStateDescriptor.colorAttachments[i].sourceRGBBlendFactor = _src_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationRGBBlendFactor = _dst_blend_rgb_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].sourceAlphaBlendFactor = _src_blend_alpha_factor[i];
-            pipelineStateDescriptor.colorAttachments[i].destinationAlphaBlendFactor = _dst_blend_alpha_factor[i];
-
-            pipelineStateDescriptor.colorAttachments[i].rgbBlendOperation = _rgb_blend_operation[i];
-            pipelineStateDescriptor.colorAttachments[i].alphaBlendOperation = _alpha_blend_operation[i];
-
-            pipelineStateDescriptor.colorAttachments[i].writeMask = _color_mask[i];
-        }
-    }
+    // per-attachment blend state is owned by the rstate category (MGLRenderer+RenderState.m)
+    [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
 }
 
 -(bool)bindFramebufferAttachmentTextures
@@ -3184,8 +3077,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER;
+
+            // the previous encoder may have been ended by a flush / readback
+            if (_currentRenderEncoder == NULL)
+            {
+                RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+            }
         }
-        else if (ctx->state.dirty_bits & DIRTY_RENDER_STATE)
+        else if ((ctx->state.dirty_bits & DIRTY_RENDER_STATE) || _currentRenderEncoder == NULL)
         {
             if (_currentRenderEncoder == NULL)
             {
@@ -3340,6 +3239,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
     else // if (ctx->state.dirty_bits)
     {
+        // the previous encoder may have been ended by a flush / readback
+        if (_currentRenderEncoder == NULL)
+        {
+            RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+        }
+
         // buffer data can be changed but the bindings remain in place.. so we need to update the data if this is the case
         // like a uniform or buffer sub data call
         
