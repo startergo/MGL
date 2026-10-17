@@ -18,3 +18,5 @@ wt/
 build/
 agents/__pycache__/
 agents/output/
+agents/.env
+agents/**/__pycache__/

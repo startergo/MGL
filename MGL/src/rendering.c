@@ -29,6 +29,7 @@
 
 #include "pixel_utils.h"
 #include "glm_context.h"
+#include "mgl_ext_queries.h"
 
 void mglClear(GLMContext ctx, GLbitfield mask)
 {
@@ -37,6 +38,10 @@ void mglClear(GLMContext ctx, GLbitfield mask)
         fprintf(stderr, "MGL Error: mglClear: invalid mask 0x%x\n", mask);
         ERROR_RETURN(GL_INVALID_VALUE);
     }
+
+    // conditional rendering (queries domain) discards clears too
+    if (!mgl_queries_render_allowed(ctx))
+        return;
 
     ctx->state.clear_bitmask = mask;
 }

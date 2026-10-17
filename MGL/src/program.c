@@ -29,6 +29,7 @@
 
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "buffers.h"
 
@@ -855,7 +856,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
     switch (pname) {
         case GL_LINK_STATUS:
             /* If we got here after mglLinkProgram, linking succeeded */
-            *params = GL_TRUE;
+            *params = mgl_xfb_link_failed(ctx, pptr, NULL) ? GL_FALSE : GL_TRUE; // xfb: varying resolution can fail the link
             break;
         case GL_DELETE_STATUS:
             *params = GL_FALSE;  /* Programs are not deleted by default */
@@ -893,6 +894,7 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             }
             break;
         default:
+            if (mgl_xfb_get_programiv(ctx, pptr, pname, params)) break; // xfb: TRANSFORM_FEEDBACK_* pnames
             fprintf(stderr, "mglGetProgramiv: unhandled pname 0x%x\n", pname);
             *params = 0;
             break;
