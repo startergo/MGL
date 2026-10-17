@@ -21,8 +21,29 @@
 #include <mach/mach_vm.h>
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#include <string.h>
 
 #include "glm_context.h"
+#include "mgl_ext.h"
+
+/* sum of an array of counts (for the pre-draw hook) */
+static GLsizei mgl_sum_counts(const GLsizei *count, GLsizei drawcount)
+{
+    GLsizei total = 0;
+    if (!count) return 0;
+    for (GLsizei i = 0; i < drawcount; i++) if (count[i] > 0) total += count[i];
+    return total;
+}
+
+/* read uint32 words of an indirect command from the bound DRAW_INDIRECT_BUFFER (CPU copy) */
+static bool mgl_read_indirect_words(GLMContext ctx, const void *indirect, GLuint *out, int nwords)
+{
+    Buffer *buf = ctx->state.buffers[_DRAW_INDIRECT_BUFFER];
+    size_t off = (size_t)indirect;
+    if (!buf || !buf->data.buffer_data || off + nwords * 4 > (size_t)buf->size) return false;
+    memcpy(out, (const char *)buf->data.buffer_data + off, nwords * 4);
+    return true;
+}
 
 bool check_draw_modes(GLenum mode)
 {
@@ -206,6 +227,8 @@ void mglDrawArrays(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
         return;
     }
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, 1)) return;
+
     ctx->mtl_funcs.mtlDrawArrays(ctx, mode, first, count);
 }
 
@@ -231,6 +254,8 @@ void mglDrawElements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type, co
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, 1)) return;
+
     ctx->mtl_funcs.mtlDrawElements(ctx, mode, count, type, indices);
 }
 
@@ -252,6 +277,8 @@ void mglDrawRangeElements(GLMContext ctx, GLenum mode, GLuint start, GLuint end,
     }
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
+
+    if (!mgl_ext_pre_draw(ctx, mode, count, 1)) return;
 
     ctx->mtl_funcs.mtlDrawRangeElements(ctx, mode, start, end, count, type, indices);
 }
@@ -286,6 +313,8 @@ void mglDrawArraysInstanced(GLMContext ctx, GLenum mode, GLint first, GLsizei co
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
+
     ctx->mtl_funcs.mtlDrawArraysInstanced(ctx, mode, first, count, instancecount);
 }
 
@@ -311,6 +340,8 @@ void mglDrawElementsInstanced(GLMContext ctx, GLenum mode, GLsizei count, GLenum
 
     if (!validate_program(ctx)) { ERROR_RETURN(GL_INVALID_OPERATION); return; }
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
+
     ctx->mtl_funcs.mtlDrawElementsInstanced(ctx, mode, count, type, indices, instancecount);
 }
 
@@ -329,6 +360,8 @@ void mglDrawElementsBaseVertex(GLMContext ctx, GLenum mode, GLsizei count, GLenu
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (!mgl_ext_pre_draw(ctx, mode, count, 1)) return;
 
     ctx->mtl_funcs.mtlDrawElementsBaseVertex(ctx, mode, count, type, indices, basevertex);
 }
@@ -350,6 +383,8 @@ void mglDrawRangeElementsBaseVertex(GLMContext ctx, GLenum mode, GLuint start, G
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, 1)) return;
+
     ctx->mtl_funcs.mtlDrawRangeElementsBaseVertex(ctx, mode, start, end, count, type, indices, basevertex);
 }
 
@@ -368,6 +403,8 @@ void mglDrawElementsInstancedBaseVertex(GLMContext ctx, GLenum mode, GLsizei cou
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
+
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseVertex(ctx, mode, count, type, indices, instancecount, basevertex);
 }
 
@@ -383,6 +420,9 @@ void mglDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirect)
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    { GLuint cmd[4] = {0, 1, 0, 0}; mgl_read_indirect_words(ctx, indirect, cmd, 4);
+      if (!mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1])) return; }
 
     ctx->mtl_funcs.mtlDrawArraysIndirect(ctx, mode, indirect);
 }
@@ -401,6 +441,9 @@ void mglDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, const voi
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
+
+    { GLuint cmd[4] = {0, 1, 0, 0}; mgl_read_indirect_words(ctx, indirect, cmd, 4);
+      if (!mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1])) return; }
 
     ctx->mtl_funcs.mtlDrawArraysIndirect(ctx, mode, indirect);
 }
@@ -424,6 +467,8 @@ void mglDrawArraysInstancedBaseInstance(GLMContext ctx, GLenum mode, GLint first
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
+
     ctx->mtl_funcs.mtlDrawArraysInstancedBaseInstance(ctx, mode, first, count, instancecount, baseinstance);
 }
 
@@ -445,6 +490,8 @@ void mglDrawElementsInstancedBaseInstance(GLMContext ctx, GLenum mode, GLsizei c
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
 
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseInstance(ctx, mode, count, type, indices, instancecount, baseinstance);
 }
@@ -468,6 +515,8 @@ void mglDrawElementsInstancedBaseVertexBaseInstance(GLMContext ctx, GLenum mode,
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, count, instancecount)) return;
+
     ctx->mtl_funcs.mtlDrawElementsInstancedBaseVertexBaseInstance(ctx, mode, count, type, indices, instancecount, basevertex, baseinstance);
 }
 
@@ -481,6 +530,8 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
     }
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
+
+    if (!mgl_ext_pre_draw(ctx, mode, mgl_sum_counts(count, drawcount), 1)) return;
 
     ctx->mtl_funcs.mtlMultiDrawArrays(ctx, mode, first, count, drawcount);
 }
@@ -502,6 +553,8 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, mgl_sum_counts(count, drawcount), 1)) return;
+
     ctx->mtl_funcs.mtlMultiDrawElements(ctx, mode, count, type, indices, drawcount);
 }
 
@@ -522,6 +575,8 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
 
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
+    if (!mgl_ext_pre_draw(ctx, mode, mgl_sum_counts(count, drawcount), 1)) return;
+
     ctx->mtl_funcs.mtlMultiDrawElementsBaseVertex(ctx, mode, count, type, indices, drawcount, basevertex);
 }
 
@@ -541,6 +596,11 @@ void mglMultiDrawArraysIndirect(GLMContext ctx, GLenum mode, const void *indirec
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
+
+    { GLsizei vtx = 0, inst = 0; size_t st = stride ? stride : (16);
+      for (GLsizei d = 0; d < drawcount; d++) { GLuint cmd[2] = {0, 0};
+        if (mgl_read_indirect_words(ctx, (const char *)indirect + d * st, cmd, 2)) { vtx += cmd[0] * cmd[1]; inst = 1; } }
+      if (!mgl_ext_pre_draw(ctx, mode, vtx, inst)) return; }
 
     ctx->mtl_funcs.mtlMultiDrawArraysIndirect(ctx, mode, indirect, drawcount, stride);
 }
@@ -563,6 +623,11 @@ void mglMultiDrawElementsIndirect(GLMContext ctx, GLenum mode, GLenum type, cons
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(STATE(buffers[_DRAW_INDIRECT_BUFFER]), GL_INVALID_OPERATION);
+
+    { GLsizei vtx = 0, inst = 0; size_t st = stride ? stride : (20);
+      for (GLsizei d = 0; d < drawcount; d++) { GLuint cmd[2] = {0, 0};
+        if (mgl_read_indirect_words(ctx, (const char *)indirect + d * st, cmd, 2)) { vtx += cmd[0] * cmd[1]; inst = 1; } }
+      if (!mgl_ext_pre_draw(ctx, mode, vtx, inst)) return; }
 
     ctx->mtl_funcs.mtlMultiDrawElementsIndirect(ctx, mode, type, indirect, drawcount, stride);
 }
