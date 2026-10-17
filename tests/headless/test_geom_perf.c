@@ -138,6 +138,25 @@ int main(void)
         EXPECT_TRUE(covered > 0);
     }
 
+    /* primitive restart: the exact thread count from the prep kernel matters here, because
+     * the worst case (count / 3) is twice the real primitive count */
+    {
+        const GLuint restart = 0xffffffffu;
+        glEnable(GL_PRIMITIVE_RESTART);
+        glPrimitiveRestartIndex(restart);
+        for (int i = 5; i < IDX_COUNT; i += 6) idx[i] = restart;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
+        printf("primitive restart (every 6th index):\n");
+        setenv("MGL_GEOM_WORST_CASE_DISPATCH", "1", 1);
+        run_frames(p, IDX_COUNT, q);
+        unsetenv("MGL_GEOM_WORST_CASE_DISPATCH");
+        run_frames(p, IDX_COUNT, q);
+        for (int i = 0; i < IDX_COUNT; i++) idx[i] = (GLuint)((i * 7919) % VERTS);
+        glDisable(GL_PRIMITIVE_RESTART);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
+    }
+
     /* indirect draws: the prep kernel reads the command from the app's buffer */
     {
         GLuint ib = 0;

@@ -50,10 +50,10 @@ buffers in emission order, with the object / context / query counters advanced.
    kernel, which reads the command itself; the CPU bounds the buffer sizes from the element
    buffer (indexed) or the VAO attribute buffers (arrays). `exec_indirect` no longer forces a
    CPU command read for geometry draws.
-   *Caveat*: the geometry kernel is dispatched by the mode's worst case rather than
-   `dispatchThreadgroupsWithIndirectBuffer:`, because that entry point is a **no-op** on this
-   Metal implementation — verified with a standalone Metal program (`args = {2,0,0}`, 0
-   threads executed). The kernel returns early past the real primitive count.
+   The geometry kernel is dispatched with `dispatchThreadgroupsWithIndirectBuffer:` from the
+   threadgroup count the prep kernel wrote (`{groups, 1, 1}` — Y and Z must be 1, a count of 0
+   dispatches nothing). An earlier measurement that called this entry point a no-op was wrong:
+   the probe passed `{2,0,0}`.
 3. **Transform feedback of GS output** — the records now have a deterministic order (no
    atomics, no CPU sort), and the pack walks them directly. The pack itself is still CPU-side
    with a sync, because the xfb object's counters and the TF queries are CPU state in the xfb /
@@ -63,13 +63,19 @@ buffers in emission order, with the object / context / query counters advanced.
 
 300k scattered indices, 40 frames, geometry pass-through shader:
 
-| path | before | after |
-|------|--------|-------|
-| CPU assembly | 804-843 us/frame | — |
-| GPU assembly (prep kernel) | — | 505-549 us/frame |
+| path | us/frame |
+|------|----------|
+| CPU assembly (fallback) | 630-840 |
+| GPU assembly, worst-case dispatch | 490-550 |
+| GPU assembly, indirect dispatch (exact count) | 485-540 |
+| indirect draw, prep kernel reads the command | 533 |
+| primitive restart every 6th index, worst-case dispatch | 49 800 |
+| primitive restart every 6th index, indirect dispatch | 46 000 |
 
-**1.2x-1.7x faster**; indirect draws with a geometry shader: 553 us/frame (no CPU command
-read).
+**1.2x-1.7x faster** for the normal (restart-free) case; the indirect dispatch wins ~8% when
+primitive restart reduces the primitive count below the mode's worst case. Restart-heavy
+draws are dominated by the prep kernel's single-workgroup scan (one tile per restart run); a
+multi-workgroup prefix sum is the fix if that matters.
 
 ## Shared-file edits
 
@@ -97,4 +103,13 @@ read).
   beyond that the kernel drops vertices and sets an overflow flag.
 * A VS that redeclares `gl_PerVertex` with fewer members than the GS reads trips glslang's
   cross-stage check (pre-existing MGL/glslang behaviour).
-* xfb of GS output still syncs the CPU for the pack (see above).
+* xfb of GS output still syncs the CPU for the pack (see above). The design for the GPU pack:
+  a prefix-sum kernel over the per-thread emitted counts gives every output vertex its
+  compacted transform-feedback index, a scatter kernel writes the varyings from the record,
+  and the write offsets live in a small per-object GPU block so no per-draw sync is needed.
+  It needs hooks in the xfb domain (glEndTransformFeedback) and the queries domain (results
+  resolved inside an active block), because the object counters and the query counters are
+  CPU state there.
+* `test_texparam` aborts intermittently at teardown (~20-40% of direct runs) — verified to
+  happen with the unmodified base build as well (4/10 vs 2/10); its checks always report 0
+  failures.
