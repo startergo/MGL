@@ -41,6 +41,10 @@
 #define MGL_TESS_TCS_FACTORS    27      /* SPVC MSL_SHADER_TESS_FACTOR_OUTPUT_BUFFER_INDEX */
 #define MGL_TESS_TCS_PARAMS     28      /* SPVC MSL_INDIRECT_PARAMS_BUFFER_INDEX */
 #define MGL_TESS_TES_PARAMS     26      /* render stage: cp-per-patch, patch count */
+/* hardware path vertex descriptor buffers (above any TES uniform buffers) */
+#define MGL_TESS_VD_CP           8      /* control point records (PerPatchControlPoint) */
+#define MGL_TESS_VD_PATCH        9      /* per-patch data (PerPatch) */
+#define MGL_TESS_VD_FACTORS     10      /* half tessellation factors (PerPatch, stride 12) */
 #define MGL_TESS_TES_COORDS     27      /* render stage: (u,v,w,patch id) per vertex */
 #define MGL_TESS_TES_CP         28      /* render stage: control point records */
 #define MGL_TESS_TES_PATCH      29      /* render stage: per-patch data blob */
@@ -68,6 +72,8 @@ typedef struct MGLTessPatchMember_t {
     char    name[128];
     size_t  offset;         /* byte offset inside the MSL struct */
     size_t  size;           /* byte size inside the MSL struct */
+    int     attr;           /* MSL [[attribute(N)]] of stage-in interface members, -1 if none */
+    int     is_tess_level;  /* TES patch-in: 1 = gl_TessLevel/Outer, 2 = gl_TessLevelInner */
 } MGLTessPatchMember;
 
 /* per-program tessellation information, filled at link time */
@@ -87,6 +93,8 @@ typedef struct MGLTessProgram_t {
 
     /* control point record: TCS output struct == TES input struct (location-matched) */
     size_t  cp_record_size;     /* bytes per control point (TES 'main0_in') */
+    MGLTessPatchMember tes_cp[MGL_TESS_MAX_PATCH_MEMBERS];
+    int     num_tes_cp;
 
     /* per-patch data: written by the TCS kernel (or defaults) and read by the TES */
     MGLTessPatchMember tcs_patch_out[MGL_TESS_MAX_PATCH_MEMBERS];
@@ -95,7 +103,16 @@ typedef struct MGLTessProgram_t {
     MGLTessPatchMember tes_patch_in[MGL_TESS_MAX_PATCH_MEMBERS];
     int     num_tes_patch_in;
     size_t  tes_patch_in_size;
-    int     tes_tess_level_members;   /* how many of tes_patch_in are the tess-level builtins */
+
+    /* hardware path: [[patch(domain, N)]] control point count baked into the TES MSL */
+    int     hw_cp_count;
+
+    /* plain-vertex variant of the TES (isolines / point_mode emulation), compiled on
+     * first use; the string is owned by this struct */
+    char   *plain_msl;
+    bool    plain_msl_dumped;
+    void   *plain_function;        /* id<MTLFunction>, bridged */
+    void   *plain_library;
 } MGLTessProgram;
 
 #define MGL_TESS_PROGRAM_HASH 257
@@ -110,6 +127,14 @@ struct MGLExtState_tess {
     size_t  index_cap;      /* in indices */
     unsigned char *patch_data;  /* per-patch blob (TES patch-in layout) */
     size_t  patch_cap;      /* in bytes */
+
+    /* GPU tessellated output of the last emulated-path draw (isolines / point_mode):
+     * coordinate records, index list and indirect draw arguments inside one shared
+     * buffer. Exposed for the geometry / transform-feedback stages to consume. */
+    void   *gpu_scratch;         /* id<MTLBuffer> */
+    size_t  gpu_coords_offset;   /* float4 (u, v, w, patch id) per tessellated vertex */
+    size_t  gpu_indices_offset;  /* uint32 indices */
+    size_t  gpu_args_offset;     /* MTLDrawPrimitivesIndirectArguments / indexed */
 
     /* per-draw results handed to the Metal side */
     GLsizei tess_vertex_count;
@@ -154,6 +179,7 @@ void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                const unsigned char *tcs_patch_out, size_t tcs_patch_stride,
                                const float *factors, unsigned patches);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
+char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees */
 bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
                              char *cp_name, size_t cp_len, size_t *record_size);
 

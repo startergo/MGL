@@ -123,26 +123,26 @@ TEST(TessTriangleDomain)
     glPatchParameteri(GL_PATCH_VERTICES, 3);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (!getenv("MGL_NO_DRAW")) glDrawArrays(GL_PATCHES, 0, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
     glFinish();
 
     /* the patch covers the lower-left triangle: expect barycentric-interpolated color.
        pixel (32,16) in a 128x128 window: NDC (-0.5, 0.75)... use a pixel inside the
        lower-left half: window row 96 of 128 (bottom area), col 32 */
     float c[4];
-    read_px(16, 16, c);      /* near corner 0 (top-left): mostly red */
+    read_px(16, 112, c);     /* near corner 0 (top-left): mostly red */
     EXPECT_NEAR(c[0], 0.72f, 0.18f);
     EXPECT_TRUE(c[1] < 0.45f);
     EXPECT_TRUE(c[2] < 0.45f);
-    read_px(16, 112, c);     /* near corner 1 (bottom-left): mostly green */
+    read_px(16, 16, c);      /* near corner 1 (bottom-left): mostly green */
     EXPECT_NEAR(c[1], 0.72f, 0.18f);
     EXPECT_TRUE(c[0] < 0.45f);
-    read_px(112, 112, c);    /* near corner 2 (bottom-right): mostly blue */
+    read_px(112, 16, c);     /* near corner 2 (bottom-right): mostly blue */
     EXPECT_NEAR(c[2], 0.72f, 0.18f);
-    read_px(64, 96, c);      /* interior: all three mixed */
-    EXPECT_TRUE(c[0] > 0.05f);
-    EXPECT_TRUE(c[1] > 0.05f);
-    read_px(112, 16, c);     /* outside the triangle: clear color */
+    read_px(24, 100, c);     /* interior: red dominant, others mixed in */
+    EXPECT_TRUE(c[0] > 0.3f);
+    EXPECT_TRUE(c[1] > 0.02f);
+    read_px(112, 112, c);    /* outside the triangle (top-right): clear color */
     EXPECT_TRUE(c[0] < 0.1f);
     EXPECT_TRUE(c[1] < 0.1f);
     glDeleteProgram(prog);
@@ -205,17 +205,191 @@ TEST(TessDefaultLevels)
     glDrawArrays(GL_PATCHES, 0, 3);
     glFinish();
     float c[4];
-    read_px(16, 16, c);
+    read_px(16, 112, c);
     EXPECT_NEAR(c[0], 0.72f, 0.18f);
-    read_px(112, 112, c);
+    read_px(112, 16, c);
     EXPECT_NEAR(c[2], 0.72f, 0.18f);
     glDeleteProgram(prog);
     return;
 }
 
+
+/* ---------------- quad domain (hardware path), full-viewport bilinear patch -------- */
+static const char *kTcsQuad =
+    "#version 450 core\n"
+    "layout(vertices=4) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=2; gl_TessLevelOuter[1]=2; gl_TessLevelOuter[2]=2; gl_TessLevelOuter[3]=2;\n"
+    "    gl_TessLevelInner[0]=2; gl_TessLevelInner[1]=2; }\n}\n";
+static const char *kTesQuad =
+    "#version 450 core\n"
+    "layout(quads, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+    "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+    "  f_col = mix(mix(tc_col[0], tc_col[1], gl_TessCoord.x), mix(tc_col[3], tc_col[2], gl_TessCoord.x), gl_TessCoord.y);\n"
+    "}\n";
+
+TEST(TessQuadDomain)
+{
+    GLuint prog = make_program(kTcsQuad, kTesQuad);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    GLint mode = 0;
+    glGetProgramiv(prog, GL_TESS_GEN_MODE, &mode);
+    EXPECT_EQ_INT(mode, GL_QUADS);
+    glUseProgram(prog);
+
+    /* full-viewport quad with corner colors; the interior is a bilinear blend */
+    const float pos[4][4] = { { -1, 1, 0, 1 }, { 1, 1, 0, 1 }, { 1, -1, 0, 1 }, { -1, -1, 0, 1 } };
+    const float col[4][4] = { { 0.25f, 0.5f, 0.75f, 1 }, { 0.25f, 0.5f, 0.75f, 1 },
+                              { 0.25f, 0.5f, 0.75f, 1 }, { 0.25f, 0.5f, 0.75f, 1 } };
+    setup_patch_vao(pos, col, 4);
+    glPatchParameteri(GL_PATCH_VERTICES, 4);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+
+    /* a constant-colour patch must fill the viewport exactly (any interior pixel) */
+    float c[4];
+    read_px(64, 64, c);
+    EXPECT_NEAR(c[0], 0.25f, 0.02f);
+    EXPECT_NEAR(c[1], 0.50f, 0.02f);
+    EXPECT_NEAR(c[2], 0.75f, 0.02f);
+    read_px(4, 124, c);
+    EXPECT_NEAR(c[0], 0.25f, 0.02f);
+    EXPECT_NEAR(c[2], 0.75f, 0.02f);
+    read_px(124, 4, c);
+    EXPECT_NEAR(c[1], 0.50f, 0.02f);
+    /* outside the patch is impossible (full viewport) — but the alpha is 1 */
+    read_px(120, 120, c);
+    EXPECT_NEAR(c[3], 1.0f, 0.01f);
+    glDeleteProgram(prog);
+}
+
+TEST(TessIndexedAndInstanced)
+{
+    /* two patches of 3 vertices, drawn from an index buffer with 2 instances; every
+       instance draws the same half-viewport triangle at different x offsets via a
+       per-instance attribute */
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    glUseProgram(prog);
+
+    const float pos[6][4] = {
+        { -1,  1, 0, 1 }, { -1, -1, 0, 1 }, { 0, -1, 0, 1 },      /* patch 0: left half */
+        {  0,  1, 0, 1 }, {  0, -1, 0, 1 }, { 1, -1, 0, 1 },      /* patch 1: right half */
+    };
+    const float col[6][4] = {
+        { 1,0,0,1 }, { 1,0,0,1 }, { 1,0,0,1 },
+        { 0,0,1,1 }, { 0,0,1,1 }, { 0,0,1,1 },
+    };
+    GLuint vao, b[3];
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(3, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+    /* index list: patch 1 first, then patch 0 (exercise the gather path) */
+    const unsigned short idx[6] = { 3, 4, 5, 0, 1, 2 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElementsInstancedBaseVertex(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL, 1, 0);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+
+    float c[4];
+    read_px(16, 64, c);      /* inside the left triangle (red) */
+    EXPECT_NEAR(c[0], 1.0f, 0.2f);
+    read_px(100, 100, c);    /* inside the right triangle (blue) */
+    EXPECT_NEAR(c[2], 1.0f, 0.2f);
+    glDeleteProgram(prog);
+}
+
+TEST(TessOrientationCulling)
+{
+    /* front-face culling with vertex_order: a ccw patch in patch space must render
+       with CULL_FACE BACK when glFrontFace matches the rstate convention */
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_FRONT);
+    glFrontFace(GL_CCW);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glFinish();
+    float c[4];
+    read_px(16, 112, c);     /* would be red without culling */
+    EXPECT_TRUE(c[0] < 0.1f);
+    glCullFace(GL_BACK);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glFinish();
+    read_px(16, 112, c);
+    EXPECT_NEAR(c[0], 0.72f, 0.2f);
+    glDisable(GL_CULL_FACE);
+    glDeleteProgram(prog);
+}
+
+TEST(TessProgramQueries)
+{
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLint v = 0;
+    glGetProgramiv(prog, GL_TESS_CONTROL_OUTPUT_VERTICES, &v);
+    EXPECT_EQ_INT(v, 3);
+    glGetProgramiv(prog, GL_TESS_GEN_MODE, &v);
+    EXPECT_EQ_INT(v, GL_TRIANGLES);
+    glGetProgramiv(prog, GL_TESS_GEN_SPACING, &v);
+    EXPECT_EQ_INT(v, GL_EQUAL);
+    glGetProgramiv(prog, GL_TESS_GEN_VERTEX_ORDER, &v);
+    EXPECT_EQ_INT(v, GL_CCW);
+    glGetProgramiv(prog, GL_TESS_GEN_POINT_MODE, &v);
+    EXPECT_EQ_INT(v, GL_FALSE);
+
+    GLint maxp = 0, maxl = 0;
+    glGetIntegerv(GL_MAX_PATCH_VERTICES, &maxp);
+    EXPECT_TRUE(maxp == 32);
+    glGetIntegerv(GL_MAX_TESS_GEN_LEVEL, &maxl);
+    EXPECT_TRUE(maxl == 64);
+
+    /* queries on a program without tessellation are INVALID_OPERATION */
+    GLuint p2 = make_program(NULL, NULL);
+    glGetProgramiv(p2, GL_TESS_GEN_MODE, &v);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glDeleteProgram(p2);
+    glDeleteProgram(prog);
+}
+
 int main(void)
 {
     RUN(TessTriangleDomain);
+    RUN(TessQuadDomain);
+    RUN(TessIndexedAndInstanced);
+    RUN(TessOrientationCulling);
+    RUN(TessProgramQueries);
     RUN(TessErrors);
     RUN(TessDefaultLevels);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);

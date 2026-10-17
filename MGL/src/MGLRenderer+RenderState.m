@@ -14,6 +14,8 @@
 
 #import <objc/runtime.h>
 #import "MGLRenderer+RenderState.h"
+#import "MGLRenderer_Private.h"
+#import "mgl_ext_tess.h"
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
 
@@ -458,10 +460,18 @@ static bool rs_mode_is_polygon(GLenum m)
     /* shader fixup specialization (function constants) */
     if (program) {
         /* tess: the render pipeline's vertex stage is the evaluation shader; the vertex
-         * stage runs as a compute kernel before the render pass (MGLRenderer+Tessellation.m) */
+         * stage runs as a compute kernel before the render pass (MGLRenderer+Tessellation.m).
+         * Isolines / point_mode run the emulated plain-vertex variant of the TES. */
         int vstage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
-        id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[vstage] stage:vstage];
-        if (vf) desc.vertexFunction = vf;
+        MGLTessProgram *tp = mgl_tess_active_program(ctx);
+        if (tp && tp->plain_function &&
+            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode))
+            desc.vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;
+        else
+        {
+            id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[vstage] stage:vstage];
+            if (vf) desc.vertexFunction = vf;
+        }
         id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];
         if (ff) desc.fragmentFunction = ff;
     }

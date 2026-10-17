@@ -334,12 +334,18 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         member[len] = 0;
         off = (semi - out->body) + 1;
 
-        /* strip [[...]] attribute (keep its number for later use) */
+        /* strip [[...]] attributes, recording an [[attribute(N)]] number */
+        int attr_num = -1;
         attr = strstr(member, "[[");
         if (attr)
         {
             const char *aend = strstr(attr, "]]");
             if (!aend) continue;
+            {
+                const char *adec = strstr(attr, "attribute(");
+                if (adec && adec < aend)
+                    attr_num = (int)strtol(adec + 10, NULL, 10);
+            }
             memmove((void *)attr, (void *)(aend + 2), strlen(aend + 2) + 1);
         }
 
@@ -376,6 +382,8 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         if (!strncmp(type, "patch_control_point<", 20))
         {
             out->cp_ref_member = out->count;
+            out->members[out->count].attr = -1;
+            out->members[out->count].is_tess_level = 0;
             snprintf(out->members[out->count].type, sizeof(out->members[out->count].type), "%s", type);
             snprintf(out->members[out->count].name, sizeof(out->members[out->count].name), "%s", namebuf);
             out->members[out->count].offset = 0;
@@ -391,6 +399,10 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         cursor = round_up(cursor, align);
         out->members[out->count].offset = cursor;
         out->members[out->count].size = size;
+        out->members[out->count].attr = attr_num;
+        out->members[out->count].is_tess_level =
+            !strcmp(namebuf, "gl_TessLevel") || !strcmp(namebuf, "gl_TessLevelOuter") ? 1 :
+            !strcmp(namebuf, "gl_TessLevelInner") ? 2 : 0;
         snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", type);
         snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s", namebuf);
         cursor += size;
@@ -426,89 +438,116 @@ static void str_append(char **buf, size_t *len, size_t *cap, const char *fmt, ..
     *len += (size_t)need;
 }
 
-/* replace an exact occurrence of old with new inside a buffer (new may be shorter/longer) */
-static bool str_replace_exact(char *buf, size_t cap, const char *old, const char *new)
+/* replace an exact occurrence of old with new inside a growable buffer */
+static void buf_replace(char **buf, size_t *len, size_t *cap, const char *old, const char *new)
 {
-    char *at = strstr(buf, old);
-    size_t oldlen = strlen(old), newlen = strlen(new), taillen;
+    char *at = strstr(*buf, old);
+    size_t oldlen = strlen(old), newlen = strlen(new);
 
-    if (!at || strlen(buf) + newlen + 1 > cap + oldlen)   /* cap check is advisory; buffer is heap grown below */
-        return false;
-    taillen = strlen(at + oldlen);
-    memmove(at + newlen, at + oldlen, taillen + 1);
+    if (!at)
+        return;
+    if (newlen > oldlen)
+    {
+        size_t prefix = (size_t)(at - *buf);
+        *cap = *len + newlen - oldlen + 1;
+        *buf = (char *)realloc(*buf, *cap);
+        at = *buf + prefix;
+    }
+    memmove(at + newlen, at + oldlen, *len - (size_t)(at - *buf) - oldlen + 1);
     memcpy(at, new, newlen);
-    return true;
+    *len += newlen - oldlen;
 }
 
-/* VS kernel: route base vertex/instance through our params buffer.
- * GL: gl_VertexID includes base vertex; gl_InstanceID excludes base instance. */
+/* VS kernel (SPIRV-Cross VERTEX_FOR_TESSELLATION):
+ *  - route the base vertex/instance through our params buffer (GL: gl_VertexID includes
+ *    base vertex, gl_InstanceID excludes base instance)
+ *  - drop the [[grid_size]] / [[grid_origin]] parameters and provide them as locals from
+ *    the params buffer: fetching stage-in attributes silently returns zeros when a kernel
+ *    also takes [[grid_size]] (AGX driver bug, verified with a bisected probe)
+ */
 static char *rewrite_vs_kernel(const char *msl)
 {
-    static const char *vtxid = "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + spvDispatchBase.x);";
-    static const char *vtxid2 = "uint gl_VertexID = gl_GlobalInvocationID.x + spvDispatchBase.x;";
-    static const char *instid = "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y + spvDispatchBase.y);";
-    static const char *instid2 = "uint gl_InstanceID = gl_GlobalInvocationID.y + spvDispatchBase.y;";
-    const char *kern = strstr(msl, "kernel void ");
-    char *out;
+    char *out = NULL;
     size_t len = 0, cap = 0;
 
-    if (!kern)
-        return NULL;
-
-    out = NULL;
     str_append(&out, &len, &cap, "%s", msl);
 
-    if (strstr(out, vtxid))
-        str_replace_exact(out, cap, vtxid, "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + mgl_vs_params[0]);");
-    else if (strstr(out, vtxid2))
-        str_replace_exact(out, cap, vtxid2, "uint gl_VertexID = gl_GlobalInvocationID.x + mgl_vs_params[0];");
-    if (strstr(out, instid))
-        str_replace_exact(out, cap, instid, "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y);");
-    else if (strstr(out, instid2))
-        str_replace_exact(out, cap, instid2, "uint gl_InstanceID = gl_GlobalInvocationID.y;");
+    /* parameters -> locals (indices must not collide with the vertex descriptor) */
+    buf_replace(&out, &len, &cap, ", uint3 spvStageInputSize [[grid_size]]", "");
+    buf_replace(&out, &len, &cap, ", uint3 spvDispatchBase [[grid_origin]]", "");
 
-    if (!strstr(out, "mgl_vs_params"))
+    /* insert the locals and the params parameter right after the opening brace */
     {
-        /* shader did not use the ids: still add the parameter for uniformity */
-        free(out);
-        return strdup(msl);
+        char *open = strstr(out, "kernel void ");
+        open = open ? strchr(open, '{') : NULL;
+        if (!open)
+        {
+            free(out);
+            return NULL;
+        }
+
+        char prologue[512];
+        int n = snprintf(prologue, sizeof prologue,
+                         "\n    uint3 spvStageInputSize = uint3(mgl_vs_params[1], mgl_vs_params[2], 1u);\n"
+                         "    uint3 spvDispatchBase = uint3(mgl_vs_params[0], mgl_vs_params[3], 0u);\n",
+                         0);
+        (void)n;
+        size_t plen = strlen(prologue), taillen = len - (size_t)(open + 1 - out);
+        out = (char *)realloc(out, len + plen + 1);
+        memmove(open + 1 + plen, open + 1, taillen + 1);
+        memcpy(open + 1, prologue, plen);
+        len += plen;
     }
+
+    /* GL id semantics (replaces the uses of the removed locals) */
+    buf_replace(&out, &len, &cap,
+                "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + spvDispatchBase.x);",
+                "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + mgl_vs_params[0]);");
+    buf_replace(&out, &len, &cap,
+                "uint gl_VertexID = gl_GlobalInvocationID.x + spvDispatchBase.x;",
+                "uint gl_VertexID = gl_GlobalInvocationID.x + mgl_vs_params[0];");
+    buf_replace(&out, &len, &cap,
+                "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y + spvDispatchBase.y);",
+                "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y);");
+    buf_replace(&out, &len, &cap,
+                "uint gl_InstanceID = gl_GlobalInvocationID.y + spvDispatchBase.y;",
+                "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y);");
 
     /* append the params parameter to the kernel signature */
     {
-        char *sig_end = strchr(out, ')');
-        /* find the signature end: first ')' after "kernel void <name>(" that is not inside "[[ ]]" */
         char *p = strstr(out, "kernel void ");
         char *paren = p ? strchr(p, '(') : NULL;
         int depth = 0;
         char *close = NULL;
-        if (!paren) { free(out); return strdup(msl); }
 
-        for (char *q = paren; q && *q; q++)
+        if (!paren)
         {
-            if (*q == '[' && q[1] == '[') { const char *e = strstr(q, "]]"); if (e) q = (char *)e; continue; }
+            free(out);
+            return NULL;
+        }
+        for (char *q = paren; *q; q++)
+        {
+            if (q[0] == '[' && q[1] == '[') { const char *e = strstr(q, "]]"); if (e) { q = (char *)e; continue; } }
             if (*q == '(') depth++;
             else if (*q == ')') { depth--; if (depth == 0) { close = q; break; } }
         }
         if (!close)
         {
             free(out);
-            return strdup(msl);
+            return NULL;
         }
-        (void)sig_end;
 
-        /* insert ", constant uint* mgl_vs_params [[buffer(N)]]" before close */
-        {
-            char add[128];
-            size_t addlen, taillen;
-            snprintf(add, sizeof add, ", constant uint* mgl_vs_params [[buffer(%d)]]", MGL_TESS_VS_PARAMS);
-            addlen = strlen(add);
-            taillen = strlen(close);
-            out = (char *)realloc(out, len + addlen + 1);
-            memmove(close + addlen, close, taillen + 1);
-            memcpy(close, add, addlen);
-        }
+        char add[128];
+        size_t addlen, taillen;
+        snprintf(add, sizeof add, ", constant uint* mgl_vs_params [[buffer(%d)]]", MGL_TESS_VS_PARAMS);
+        addlen = strlen(add);
+        taillen = strlen(close);
+        out = (char *)realloc(out, len + addlen + 1);
+        close = out + (close - out);
+        memmove(close + addlen, close, taillen + 1);
+        memcpy(close, add, addlen);
     }
+
     return out;
 }
 
@@ -732,20 +771,84 @@ static char *rewrite_tes(const char *msl)
     return out;
 }
 
+/* hardware TES: SPIRV-Cross's post-tessellation vertex function, with the control point
+ * count of [[patch(domain, 0)]] fixed up from the TCS (Metal ignores a mismatch with
+ * drawPatches, but gl_PatchVerticesIn reads it) */
+static char *rewrite_tes_hardware(const char *msl, int cp_count)
+{
+    const char *sig = strstr(msl, "[[ patch(");
+    char *out = NULL;
+    size_t len = 0, cap = 0;
+
+    if (!sig)
+        sig = strstr(msl, "[[patch(");
+    if (!sig)
+        return NULL;
+
+    /* "[[ patch(triangle, 0)]] vertex" -> "[[ patch(triangle, N)]] vertex" */
+    {
+        const char *comma = strchr(sig, ',');
+        const char *digits, *rest;
+        if (!comma)
+            return NULL;
+        digits = comma + 1;
+        while (*digits == ' ')
+            digits++;
+        rest = digits;
+        while (*rest >= '0' && *rest <= '9')
+            rest++;
+
+        str_append(&out, &len, &cap, "%.*s%d%s", (int)(digits - msl), msl,
+                   cp_count > 0 ? cp_count : 3, rest);
+    }
+    return out;
+}
+
 /* entry from program.c: rewrite the MSL of a tessellation-pipeline stage */
 char *mgl_tess_rewrite_stage_msl(GLMContext ctx, int stage, bool tess_pipeline, const char *msl)
 {
     if (!msl)
         return NULL;
 
-
     if (stage == _TESS_EVALUATION_SHADER)
-        return rewrite_tes(msl);
+    {
+        /* keep the native post-tessellation vertex function (hardware path), only
+         * fixing the baked control point count; the plain-vertex variant used for
+         * isolines / point_mode is generated from it on demand (mgl_tess_plain_msl) */
+        int cp_count = 3;
+        if (ctx->state.program && ctx->state.program->spirv[_TESS_CONTROL_SHADER].ir)
+        {
+            int modes[16], count = 0, out_vertices = 0;
+            if (spv_tess_modes(ctx->state.program->spirv[_TESS_CONTROL_SHADER].ir,
+                               ctx->state.program->spirv[_TESS_CONTROL_SHADER].size,
+                               1 /* TessellationControl */, modes, &count, &out_vertices) &&
+                out_vertices > 0)
+                cp_count = out_vertices;
+        }
+        return rewrite_tes_hardware(msl, cp_count);
+    }
 
     if (stage == _VERTEX_SHADER && tess_pipeline)
         return rewrite_vs_kernel(msl);
 
     return NULL;
+}
+
+/* plain-vertex variant of the TES (isolines / point_mode): generated from the stored
+ * hardware MSL and cached. The caller gets a copy and frees it. */
+char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp)
+{
+    if (!tp || !tp->program)
+        return NULL;
+    if (!tp->plain_msl)
+    {
+        const char *msl = tp->program->spirv[_TESS_EVALUATION_SHADER].msl_str;
+        char *plain = rewrite_tes(msl);
+        if (!plain)
+            return NULL;
+        tp->plain_msl = plain;
+    }
+    return strdup(tp->plain_msl);
 }
 
 /* ------------------------------------------------------------------ CPU tessellator
@@ -1202,10 +1305,7 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
         MGLTessProgram **head = &S->programs[(((uintptr_t)program) >> 4) % MGL_TESS_PROGRAM_HASH];
         tp->next = *head;
         *head = tp;
-        if (getenv("MGL_TESS_DEBUG"))
-            fprintf(stderr, "MGL tess: program %u linked domain=%d spacing=%d ccw=%d point=%d tcs=%d outverts=%d\n",
-                    program->name, tp->domain, tp->spacing, tp->vertex_order_ccw, tp->point_mode,
-                    tp->has_tcs, tp->tcs_out_vertices);
+
     }
 
     /* patch data layouts, parsed from the generated MSL */
@@ -1222,44 +1322,40 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
         }
     }
 
+    /* TES interface layouts (from the stored hardware-form MSL): control point members
+     * and patch-in members with their [[attribute(N)]] indices build the render
+     * pipeline's vertex descriptor at draw time */
     {
         struct MslStruct pi;
         const char *msl = program->spirv[_TESS_EVALUATION_SHADER].msl_str;
         char name[160];
-        bool pin_ok = msl_patch_in_name(msl, name, sizeof name);
-        (void)pin_ok;
-        if (getenv("MGL_TESS_DEBUG"))
-            fprintf(stderr, "MGL tess: post-link: TES msl=%p patchin_name=%s ok=%d\n",
-                    (const void *)msl, pin_ok ? name : "(none)", pin_ok);
-        if (pin_ok && msl_parse_struct(msl, name, &pi))
+
+        if (msl_patch_in_name(msl, name, sizeof name) && msl_parse_struct(msl, name, &pi))
         {
-            tp->num_tes_patch_in = pi.count;
-            tp->tes_patch_in_size = pi.size;
             int m = 0;
             for (int i = 0; i < pi.count && m < MGL_TESS_MAX_PATCH_MEMBERS; i++)
             {
                 if (i == pi.cp_ref_member)
-                {
-                    tp->num_tes_patch_in--;
                     continue;
-                }
                 tp->tes_patch_in[m++] = pi.members[i];
             }
-            /* control point record size from the cp struct */
+            tp->num_tes_patch_in = m;
+            tp->tes_patch_in_size = pi.size;
+
             struct MslStruct cp;
             char cpname[128];
-            if (msl_cp_struct_name(msl, name, cpname, sizeof cpname))
+            if (msl_cp_struct_name(msl, name, cpname, sizeof cpname) &&
+                msl_parse_struct(msl, cpname, &cp))
             {
-                if (getenv("MGL_TESS_DEBUG"))
-                    fprintf(stderr, "MGL tess: post-link TES cp struct=%s\n", cpname);
-                if (msl_parse_struct(msl, cpname, &cp))
-                {
-                    tp->cp_record_size = cp.size;
-                    if (getenv("MGL_TESS_DEBUG"))
-                        fprintf(stderr, "MGL tess: cp record size=%zu (%d members)\n", cp.size, cp.count);
-                }
+                tp->cp_record_size = cp.size;
+                tp->num_tes_cp = cp.count < MGL_TESS_MAX_PATCH_MEMBERS ? cp.count : MGL_TESS_MAX_PATCH_MEMBERS;
+                for (int i = 0; i < tp->num_tes_cp; i++)
+                    tp->tes_cp[i] = cp.members[i];
             }
         }
+
+        /* the baked control point count of [[patch(domain, N)]] */
+        tp->hw_cp_count = tp->has_tcs ? tp->tcs_out_vertices : 3;
     }
 }
 
@@ -1293,19 +1389,22 @@ void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, 
 
 /* ------------------------------------------------------------------ MSL name helpers */
 
-/* name of the TES patch input struct: the type of the local "patchIn" the rewritten
- * entry point declares in its prologue ("<patchIn> patchIn;") */
+/* name of the TES patch input struct: the type of the "patchIn" parameter (hardware
+ * form: "<patchIn> patchIn [[stage_in]]") or of the prologue local (plain form) */
 static bool msl_patch_in_name(const char *msl, char *out, size_t out_len)
 {
-    const char *decl = strstr(msl, " patchIn;");
+    const char *decl = strstr(msl, " patchIn [[stage_in]]");
 
     if (!decl)
+        decl = strstr(msl, " patchIn;");
+    if (!decl)
         return false;
+
     const char *e = decl;
     while (e > msl && *(e - 1) == ' ')
         e--;
     const char *b = e;
-    while (b > msl && *(b - 1) != ' ' && *(b - 1) != '\n')
+    while (b > msl && *(b - 1) != ' ' && *(b - 1) != '\n' && *(b - 1) != '(' && *(b - 1) != ',')
         b--;
     if (b == e)
         return false;
@@ -1313,7 +1412,8 @@ static bool msl_patch_in_name(const char *msl, char *out, size_t out_len)
     return true;
 }
 
-/* control point struct name of a rewritten TES ("mgl_cp_ref<T> gl_in;") */
+/* control point struct name of the TES ("patch_control_point<T> gl_in;" in the
+ * hardware form, "mgl_cp_ref<T> gl_in;" in the plain form) */
 static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *out, size_t out_len)
 {
     char head[160];
@@ -1324,10 +1424,19 @@ static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *
     if (!p) { snprintf(head, sizeof head, "struct %s {", patchin_name); p = strstr(msl, head); }
     if (!p)
         return false;
-    const char *ref = strstr(p, "mgl_cp_ref<");
+    const char *ref = strstr(p, "patch_control_point<");
     if (!ref)
+        ref = strstr(p, "mgl_cp_ref<");
+    if (!ref || ref > strchr(p, '}'))
         return false;
-    const char *t0 = ref + strlen("mgl_cp_ref<");
+    const char *t0 = ref + (strstr(ref, "<") == ref + strlen("patch_control_point<") - 1
+                            ? strlen("patch_control_point<") : strlen("mgl_cp_ref<"));
+    /* t0 currently points at the start of the template argument either way */
+    {
+        const char *lt = strchr(p, '<');
+        if (!lt) return false;
+        t0 = lt + 1;
+    }
     const char *t1 = strchr(t0, '>');
     if (!t1 || (size_t)(t1 - t0) >= out_len)
         return false;
@@ -1343,17 +1452,17 @@ static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out)
 
     while ((at = strstr(at, "_patchOut")) != NULL)
     {
-        /* must be a struct declaration: "struct <name>_patchOut" */
-        const char *s = at;
-        while (s > msl && *(s - 1) != ' ' && *(s - 1) != '\n')
-            s--;
-        if (!s || strncmp(s - 7 < msl ? "" : s - 7, "struct ", 7))
+        const char *b = at;
+        char name[160];
+
+        while (b > msl && *(b - 1) != ' ' && *(b - 1) != '\n')
+            b--;
+        if (b == at || b == msl || strncmp(b - 7, "struct ", 7))
         {
             at += 9;
             continue;
         }
-        char name[160];
-        snprintf(name, sizeof name, "%.*s", (int)(at + 9 - s), s);
+        snprintf(name, sizeof name, "%.*s", (int)(at + 9 - b), b);
         if (msl_parse_struct(msl, name, out))
             return true;
         at += 9;
@@ -1371,11 +1480,6 @@ bool mgl_tess_draw_patches(GLMContext ctx, bool indexed, GLenum type, size_t off
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     MGLTessProgram *tp;
-
-    if (getenv("MGL_TESS_DEBUG"))
-        fprintf(stderr, "MGL tess: draw_patches entered: state=%p program=%p pipeline=%p hooks=%p\n",
-                (void *)S, (void *)ctx->state.program, (void *)ctx->state.program_pipeline,
-                (void *)(ctx->mtl_funcs.ext_tess ? ctx->mtl_funcs.ext_tess->draw_patches : NULL));
 
     if (!S)
         return false;

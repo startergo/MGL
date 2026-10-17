@@ -45,6 +45,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #import "MGLRenderer_Private.h"
 #import "mgl_ext_program.h"
+#import "mgl_ext_tess.h"
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
@@ -2648,7 +2649,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if (vertexFunction.functionType == MTLFunctionTypeKernel)
     {
         Shader *tes = program->shader_slots[_TESS_EVALUATION_SHADER];
-        if (tes && tes->mtl_data.function)
+        MGLTessProgram *tp = mgl_tess_active_program(ctx);
+
+        if (tp && tp->plain_function &&
+            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode))
+            vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;  /* emulated TES */
+        else if (tes && tes->mtl_data.function)
             vertexFunction = (__bridge id<MTLFunction>)(tes->mtl_data.function);
         else
         {
@@ -3134,9 +3140,31 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
             }
 
-            // tess: the rewritten TES has no [[stage_in]]; the pipeline must not get a
-            // vertex descriptor (vertex data comes from buffers indexed by vertex_id)
-            pipelineStateDescriptor.vertexDescriptor = [self extTessActive] ? nil : vertexDescriptor;
+            // tess: the post-tessellation TES takes its inputs through a vertex descriptor
+            // with PerPatchControlPoint / PerPatch stepping (MGLRenderer+Tessellation.m).
+            // The emulated (plain-vertex) TES variant used for isolines / point_mode has
+            // no stage_in and must not get tessellation pipeline state.
+            if ([self extTessActive])
+            {
+                MGLTessProgram *tp = mgl_tess_active_program(ctx);
+                bool emulated = tp && tp->plain_function &&
+                                (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode);
+                if (!emulated)
+                {
+                    MTLVertexDescriptor *tvd = [self extTessVertexDescriptor];
+                    if (tvd)
+                    {
+                        pipelineStateDescriptor.vertexDescriptor = tvd;
+                        [self extTessConfigurePipeline: pipelineStateDescriptor];
+                    }
+                    else
+                        pipelineStateDescriptor.vertexDescriptor = nil;
+                }
+                else
+                    pipelineStateDescriptor.vertexDescriptor = nil;
+            }
+            else
+                pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
 
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
             NSError *error;

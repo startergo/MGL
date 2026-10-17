@@ -173,6 +173,8 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
  * a tessellation evaluation shader — the render pipeline's vertex function is then the
  * (rewritten) TES and the vertex stage runs as a compute kernel before the render pass */
 - (bool) extTessActive;
+- (MTLVertexDescriptor *) extTessVertexDescriptor;
+- (void) extTessConfigurePipeline: (MTLRenderPipelineDescriptor *) desc;
 - (bool) bindBuffersToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 - (bool) bindTexturesToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 -(bool)processCompute:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
