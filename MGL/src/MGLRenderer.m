@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+Framebuffer.h"
 #import "mgl_ext_vattrib.h"   // vattrib: vertex descriptor / vertex buffer mapping (MGLRenderer+VertexAttrib.m)
 
@@ -518,6 +519,10 @@ void logDirtyBits(GLMContext ctx)
         return nil;
     }
 
+    // texext: buffer textures, texture views and multisample textures
+    if ([self texextOwnsTexture: tex])
+        return [self texextCreateMTLTexture: tex];
+
     NSUInteger width, height, depth;
 
     MTLTextureDescriptor *tex_desc;
@@ -710,6 +715,8 @@ void logDirtyBits(GLMContext ctx)
     // swizzle / level range / stencil texturing are applied with texture views at
     // bind time (texparam: -texparamTextureForTex:base:), not baked in here
     [self texparamPrepareTextureDescriptor:tex_desc forTex:tex];
+
+    [self texextAdjustTextureDescriptor: tex_desc forTexture: tex]; // texext: PixelFormatView for view sources
 
     id<MTLTexture> texture;
 
@@ -1831,6 +1838,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (bool)bindMTLTexture:(Texture *)tex
 {
+    [self texextValidateTexture: tex]; // texext: buffer reallocated / view root recreated
+
     if (tex->dirty_bits)
     {
         // release mtl data
@@ -2745,6 +2754,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // attachment formats + raster sample count (fb domain)
     [self fbApplyPipelineFormats: pipelineStateDescriptor];
+
+    [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     return pipelineStateDescriptor;
 }
