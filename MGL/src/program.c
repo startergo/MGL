@@ -1188,6 +1188,23 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         }
 
         ok = compile_stage(ctx, dst, stage, glslang_program_SPIRV_get_ptr(glsl_program), size, "main", acc, log);
+
+        /* executable stages keep the GLSL source / type of the shader they came from
+         * (the xfb domain re-translates the vertex stage from source for capture) */
+        if (ok && dst->base.shader_slots[stage])
+        {
+            Shader *exec = dst->base.shader_slots[stage];
+            for (int i = 0; i < obj->num_attached; i++)
+            {
+                Shader *a = obj->attached[i];
+                if ((int)a->glm_type == stage && a->src)
+                {
+                    exec->src = strdup(a->src);
+                    exec->src_len = a->src_len;
+                    break;
+                }
+            }
+        }
     }
 
     /* the glslang program refers to the shaders' intermediates; never keep it past the link */

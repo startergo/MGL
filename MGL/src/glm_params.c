@@ -98,7 +98,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS,&glm_ctx->state.var.stencil_pass_depth_pass);
     glGetIntegerv(GL_STENCIL_REF,&glm_ctx->state.var.stencil_ref);
     glGetIntegerv(GL_STENCIL_WRITEMASK,&glm_ctx->state.var.stencil_writemask);
-    glGetIntegerv(GL_VIEWPORT,glm_ctx->state.viewport);
+    glGetIntegerv(GL_VIEWPORT,(GLuint *)glm_ctx->state.viewport);
 
     glGetIntegerv(GL_BLEND_DST,&glm_ctx->state.var.blend_dst_rgb[0]);
     glGetIntegerv(GL_BLEND_SRC,&glm_ctx->state.var.blend_src_rgb[0]);
@@ -107,7 +107,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_DRAW_BUFFER,&glm_ctx->state.draw_buffer);
     glGetIntegerv(GL_READ_BUFFER,&glm_ctx->state.read_buffer);
 
-    glGetIntegerv(GL_SCISSOR_BOX,glm_ctx->state.var.scissor_box);
+    glGetIntegerv(GL_SCISSOR_BOX,(GLuint *)glm_ctx->state.var.scissor_box);
 
     glGetFloatv(GL_COLOR_CLEAR_VALUE,glm_ctx->state.color_clear_value);
 
@@ -116,8 +116,8 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_MAX_TEXTURE_SIZE,&glm_ctx->state.var.max_texture_size);
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS,&glm_ctx->state.var.max_viewport_dims);
     glGetIntegerv(GL_SUBPIXEL_BITS,&glm_ctx->state.var.subpixel_bits);
-    glGetIntegerv(GL_POLYGON_OFFSET_UNITS,&glm_ctx->state.var.polygon_offset_units);
-    glGetIntegerv(GL_POLYGON_OFFSET_FACTOR,&glm_ctx->state.var.polygon_offset_factor);
+    glGetFloatv(GL_POLYGON_OFFSET_UNITS,&glm_ctx->state.var.polygon_offset_units);
+    glGetFloatv(GL_POLYGON_OFFSET_FACTOR,&glm_ctx->state.var.polygon_offset_factor);
     glGetIntegerv(GL_TEXTURE_BINDING_1D,&glm_ctx->state.var.texture_binding_1d);
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&glm_ctx->state.var.texture_binding_2d);
     glGetIntegerv(GL_TEXTURE_BINDING_3D,&glm_ctx->state.var.texture_binding_3d);
@@ -129,7 +129,7 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_SMOOTH_LINE_WIDTH_RANGE,&glm_ctx->state.var.smooth_line_width_range);
     glGetIntegerv(GL_SMOOTH_LINE_WIDTH_GRANULARITY,&glm_ctx->state.var.smooth_line_width_granularity);
     glGetIntegerv(GL_ALIASED_LINE_WIDTH_RANGE,&glm_ctx->state.var.aliased_line_width_range);
-    glGetIntegerv(GL_SAMPLE_COVERAGE_VALUE,&glm_ctx->state.var.sample_coverage_value);
+    glGetFloatv(GL_SAMPLE_COVERAGE_VALUE,&glm_ctx->state.var.sample_coverage_value);
     glGetIntegerv(GL_SAMPLE_COVERAGE_INVERT,&glm_ctx->state.var.sample_coverage_invert);
     glGetIntegerv(GL_TEXTURE_BINDING_CUBE_MAP,&glm_ctx->state.var.texture_binding_cube_map);
     glGetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE,&glm_ctx->state.var.max_cube_map_texture_size);

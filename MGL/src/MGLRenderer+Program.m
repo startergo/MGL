@@ -63,7 +63,10 @@ static void mtlProgramReleaseObj(GLMContext glm_ctx, void *obj)
             return false;
         }
 
-        fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
+        /* specialized with no values, like -bindMTLProgram: functions carrying function
+         * constants (rstate fixups) take their GL-default branches */
+        fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]
+                       constantValues:[[MTLFunctionConstantValues alloc] init] error:&error];
         if (!fn)
         {
             if (error_log)
