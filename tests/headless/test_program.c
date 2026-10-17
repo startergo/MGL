@@ -529,7 +529,23 @@ TEST(release_compiler_and_precision)
     glReleaseShaderCompiler();
     GLuint s = make_shader(GL_FRAGMENT_SHADER, fs_src);
     glGetShaderiv(s, GL_COMPILE_STATUS, &v);   EXPECT_EQ_INT(v, GL_TRUE);
+    /* release with a live compiled shader is deferred until it is deleted */
+    glReleaseShaderCompiler();
+    GLuint legacy_src_shader = make_shader(GL_VERTEX_SHADER,
+        "#version 140\nin vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n");
+    glGetShaderiv(legacy_src_shader, GL_COMPILE_STATUS, &v); EXPECT_EQ_INT(v, GL_TRUE);
+    glReleaseShaderCompiler();
     glDeleteShader(s);
+    glDeleteShader(legacy_src_shader);           /* last live shader: compiler state torn down here */
+    /* everything still compiles and links afterwards, including legacy-version upgrades */
+    GLuint again = make_shader(GL_VERTEX_SHADER,
+        "#version 140\nin vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n");
+    glGetShaderiv(again, GL_COMPILE_STATUS, &v); EXPECT_EQ_INT(v, GL_TRUE);
+    GLuint fs2 = make_shader(GL_FRAGMENT_SHADER, fs_src);
+    GLuint p2 = glCreateProgram();
+    glAttachShader(p2, again); glAttachShader(p2, fs2); glLinkProgram(p2);
+    glGetProgramiv(p2, GL_LINK_STATUS, &v);    EXPECT_EQ_INT(v, GL_TRUE);
+    glDeleteProgram(p2); glDeleteShader(again); glDeleteShader(fs2);
 
     GLint range[2] = {0}, prec = -1;
     glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &prec);
@@ -551,6 +567,102 @@ TEST(release_compiler_and_precision)
     EXPECT_NO_GL_ERROR();
 }
 
+TEST(instance_and_vertex_id_bases)
+{
+    /* GL: gl_InstanceID excludes baseinstance, gl_VertexID includes basevertex */
+    const char *vs = "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec2 ids;\n"
+        "void main(){ ids = vec2(gl_InstanceID == 0 ? 1.0 : 0.0, gl_VertexID >= 3 ? 1.0 : 0.0);\n"
+        "  gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char *fs = "#version 450 core\n"
+        "layout(location=0) in vec2 ids;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(ids, 0.0, 1.0); }\n";
+    GLuint p = mgl_make_program(vs, fs);
+    if (!p) return;
+    /* verts 0..2 are off screen, 3..5 cover the viewport */
+    static const float v[] = { 5,5, 6,5, 5,6,   -1,-1, 3,-1, -1,3 };
+    static const GLuint idx[] = { 0, 1, 2 };
+    GLuint vao, vbo, ebo;
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glGenBuffers(1, &ebo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glUseProgram(p);
+
+    glClearColor(0, 0, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstancedBaseInstance(GL_TRIANGLES, 3, 3, 1, 5);
+    EXPECT_PIXEL(10, 10, 255, 255, 0, 255, 2);      /* instance id 0 despite baseinstance 5 */
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElementsBaseVertex(GL_TRIANGLES, 3, GL_UNSIGNED_INT, 0, 3);
+    EXPECT_PIXEL(10, 10, 255, 255, 0, 255, 2);      /* vertex ids 3..5 */
+    EXPECT_NO_GL_ERROR();
+
+    glUseProgram(0);
+    glDeleteProgram(p); glDeleteBuffers(1, &vbo); glDeleteBuffers(1, &ebo); glDeleteVertexArrays(1, &vao);
+}
+
+TEST(pipeline_and_binary_draw_pixels)
+{
+    const char *vs = "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "out gl_PerVertex { vec4 gl_Position; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char *fs = "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    static const float tri[] = { -1,-1, 3,-1, -1,3 };
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof tri, tri, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+
+    /* separable stages through a pipeline */
+    GLuint vsp = glCreateShaderProgramv(GL_VERTEX_SHADER, 1, &vs);
+    GLuint fsp = glCreateShaderProgramv(GL_FRAGMENT_SHADER, 1, &fs);
+    GLuint pipe; glGenProgramPipelines(1, &pipe);
+    glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, vsp);
+    glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, fsp);
+    glUseProgram(0);
+    glBindProgramPipeline(pipe);
+    glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_PIXEL(10, 10, 255, 0, 255, 255, 2);
+    glBindProgramPipeline(0);
+
+    /* a program restored from its binary draws the same image */
+    GLuint p = mgl_make_program(vs, fs);
+    if (!p) return;
+    GLint len = 0; glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &len);
+    void *bin = malloc(len); GLenum fmt = 0; GLsizei got = 0;
+    glGetProgramBinary(p, len, &got, &fmt, bin);
+    GLuint q = glCreateProgram();
+    glProgramBinary(q, fmt, bin, got);
+    free(bin);
+    GLint ok = 0; glGetProgramiv(q, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_TRUE);
+    glUseProgram(p);
+    glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLES, 0, 3);
+    GLubyte a[4]; mgl_read_rgba(10, 10, a);
+    glUseProgram(q);
+    glClear(GL_COLOR_BUFFER_BIT); glDrawArrays(GL_TRIANGLES, 0, 3);
+    GLubyte b[4]; mgl_read_rgba(10, 10, b);
+    EXPECT_TRUE(!memcmp(a, b, 4));
+    EXPECT_PIXEL(10, 10, 255, 0, 255, 255, 2);
+    EXPECT_NO_GL_ERROR();
+
+    glUseProgram(0);
+    glDeleteProgramPipelines(1, &pipe);
+    glDeleteProgram(vsp); glDeleteProgram(fsp); glDeleteProgram(p); glDeleteProgram(q);
+    glDeleteBuffers(1, &vbo); glDeleteVertexArrays(1, &vao);
+}
+
 int main(void)
 {
     RUN(compute_link_and_dispatch);
@@ -565,5 +677,7 @@ int main(void)
     RUN(validate_program_samplers);
     RUN(unsupported_stages_fail_link);
     RUN(release_compiler_and_precision);
+    RUN(instance_and_vertex_id_bases);
+    RUN(pipeline_and_binary_draw_pixels);
     return mgl_test_summary();
 }
