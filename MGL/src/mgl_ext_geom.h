@@ -173,6 +173,11 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
 /* the emulation record of the current program (NULL when absent or unusable) */
 MGLGeomProgram *mgl_geom_current(GLMContext ctx);
 
+/* transform feedback of the geometry output (called from the xfb domain) */
+void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program);
+void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
+                          const uint32_t *ctl);
+
 #ifdef __cplusplus
 }
 #endif

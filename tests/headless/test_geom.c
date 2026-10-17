@@ -879,6 +879,189 @@ TEST(primitive_queries)
     glDeleteProgram(p);
 }
 
+
+/* ------------------------------------------------------------------ transform feedback of the geometry output */
+
+TEST(xfb_of_geometry_output)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "layout(location=0) in vec2 v_pos[];\n"
+        "layout(location=0) out vec2 g_pos;\n"
+        "layout(location=1) out vec4 g_col;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = gl_in[i].gl_Position;\n"
+        "    g_pos = v_pos[i] * 2.0;\n"
+        "    g_col = vec4(0.25, 0.5, 0.75, 1.0);\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec2 v_pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_pos = pos; }\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+
+    static const char *vars[3] = { "g_pos", "g_col", NULL };
+    glTransformFeedbackVaryings(p, 2, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint q = 0, tbuf = 0;
+    glGenQueries(1, &q);
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+
+    glUseProgram(p);
+    setup(8, quad);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glDrawArrays(GL_TRIANGLES, 0, 6);          /* two input triangles */
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    GLint written = -1;
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
+    printf("xfb written = %d\n", written);
+    EXPECT_EQ_INT(written, 2);
+
+    struct { float x, y; float r, g, b, a; } out[8];
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    for (int i = 0; i < 6; i++)
+        printf("  v%d = %f %f | %f %f %f\n", i, out[i].x, out[i].y, out[i].r, out[i].g, out[i].b);
+
+    /* the first input triangle is (-1,-1),(1,-1),(-1,1): the geometry doubles it */
+    EXPECT_NEAR(out[0].x, -2.0, 1e-5);
+    EXPECT_NEAR(out[0].y, -2.0, 1e-5);
+    EXPECT_NEAR(out[1].x,  2.0, 1e-5);
+    EXPECT_NEAR(out[2].x, -2.0, 1e-5);
+    EXPECT_NEAR(out[3].r, 0.25, 1e-5);
+    EXPECT_NEAR(out[3].g, 0.5, 1e-5);
+    EXPECT_NEAR(out[3].b, 0.75, 1e-5);
+
+    glDeleteQueries(1, &q);
+    glDeleteBuffers(1, &tbuf);
+    glDeleteProgram(p);
+}
+
+TEST(xfb_streams)
+{
+    /* stream 0 is captured; the vertices emitted to stream 1 are not */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 6) out;\n"
+        "layout(location=0) in vec2 v_pos[];\n"
+        "layout(location=0) out vec2 g_pos;\n"
+        "layout(stream=1, location=1) out vec2 g_other;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = gl_in[i].gl_Position;\n"
+        "    g_pos = v_pos[i];\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "  g_other = vec2(9.0);\n"
+        "  EmitStreamVertex(1);\n"
+        "  EndStreamPrimitive(1);\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec2 v_pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_pos = pos; }\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    GLuint gsh = compile(GL_GEOMETRY_SHADER, gs);
+    GLint cok = 0;
+    glGetShaderiv(gsh, GL_COMPILE_STATUS, &cok);
+    if (!cok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetShaderInfoLog(gsh, sizeof l, &n, l);
+        printf("gs compile log: %s\n", l);
+        return;
+    }
+    glAttachShader(p, gsh);
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+
+    static const char *vars[2] = { "g_pos", NULL };
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("stream link log: %s\n", l);
+        return;
+    }
+
+    GLuint tbuf = 0;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    {
+        static const float zeros[16] = { 0 };
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, sizeof zeros, zeros, GL_STREAM_READ);
+    }
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+
+    glUseProgram(p);
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float out[16];
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    for (int i = 0; i < 6; i++) printf("  s%d = %f %f\n", i, out[i * 2], out[i * 2 + 1]);
+
+    /* stream 0 got three vertices; the stream 1 vertex must not appear in the capture */
+    EXPECT_NEAR(out[0], -1.0, 1e-5);
+    EXPECT_NEAR(out[1], -1.0, 1e-5);
+    EXPECT_NEAR(out[4], 0.0, 1e-5);
+    EXPECT_NEAR(out[5], 1.0, 1e-5);
+    EXPECT_NEAR(out[6], 0.0, 1e-5);
+    EXPECT_NEAR(out[7], 0.0, 1e-5);
+
+    glDeleteBuffers(1, &tbuf);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -899,5 +1082,7 @@ int main(void)
     RUN(viewport_index);
     RUN(separable_pipeline_with_gs);
     RUN(primitive_queries);
+    RUN(xfb_of_geometry_output);
+    RUN(xfb_streams);
     return mgl_test_summary();
 }

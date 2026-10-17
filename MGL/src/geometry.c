@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include <glslang_c_interface.h>
 #include <glslang_c_shader_types.h>
@@ -1609,7 +1610,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
 
     /* store one output vertex */
     sb_put(&b, "void mgl_store_output(uint slot)\n{\n    uint o = slot * %uu;\n", gp->out_words);
-    sb_put(&b, "    mgl_out[o + 0u] = mgl_tag;\n    mgl_out[o + 1u] = mgl_seq;\n");
+    sb_put(&b, "    mgl_out[o + 0u] = mgl_tag;\n    mgl_out[o + 1u] = (mgl_stream << 24u) | mgl_seq;\n");
     if (gp->out_has_pos)
     {
         sb_put(&b, "    mgl_out[o + %uu] = floatBitsToUint(mgl_gs_pos.x);\n", gp->out_pos_off + 0);
@@ -1635,13 +1636,13 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "}\n\n");
 
     sb_put(&b, "void mgl_gs_emit_stream_vertex(uint s)\n{\n");
+    sb_put(&b, "    mgl_stream = s;\n");
     sb_put(&b, "    if (mgl_written >= mgl_hdr[5]) { mgl_ctl[3] = 1u; return; }\n");
     sb_put(&b, "    uint slot = atomicAdd(mgl_ctl[0], 1u);\n");
     sb_put(&b, "    if (slot >= mgl_hdr[3]) { mgl_ctl[3] = 1u; return; }\n");
     sb_put(&b, "    mgl_store_output(slot);\n");
     sb_put(&b, "    mgl_strip_v[mgl_strip_n] = slot;\n");
     sb_put(&b, "    mgl_strip_n++; mgl_written++; mgl_seq++;\n");
-    sb_put(&b, "    mgl_stream = s;\n");
     sb_put(&b, "}\n\n");
     sb_put(&b, "void mgl_gs_end_stream_primitive(uint s)\n{\n");
     sb_put(&b, "    if (mgl_strip_n == 0u) return;\n");
@@ -2826,4 +2827,305 @@ void mgl_ext_init_geom(GLMContext ctx)
 bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
     return false;
+}
+
+/* ------------------------------------------------------------------ transform feedback of the geometry output
+ * With a geometry stage active, GL captures the vertices the geometry shader emits to the
+ * rasterization stream.  The emulation has them in the output vertex buffer already, so the
+ * capture is a CPU pack of those records into the transform feedback buffers. */
+
+static MGLXfbProgram *geom_xfb_prog(GLMContext ctx, Program *p, bool create)
+{
+    struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+
+    if (!x || !p) return NULL;
+    for (GLuint i = 0; i < x->prog_count; i++)
+    {
+        MGLXfbProgram *xp = x->progs[i];
+        if (xp->name == p->name)
+        {
+            if (xp->program != p) xp->program = p;
+            return xp;
+        }
+    }
+    if (!create) return NULL;
+    if (x->prog_count == x->prog_cap)
+    {
+        GLuint cap = x->prog_cap ? x->prog_cap * 2 : 16;
+        MGLXfbProgram **n = realloc(x->progs, cap * sizeof(*n));
+        if (!n) return NULL;
+        x->progs = n;
+        x->prog_cap = cap;
+    }
+    MGLXfbProgram *xp = calloc(1, sizeof(MGLXfbProgram));
+    if (!xp) return NULL;
+    xp->name = p->name;
+    xp->program = p;
+    xp->pending_mode = GL_INTERLEAVED_ATTRIBS;
+    xp->mode = GL_INTERLEAVED_ATTRIBS;
+    x->progs[x->prog_count++] = xp;
+    return xp;
+}
+
+static void geom_xfb_reset(GLMContext ctx, MGLXfbProgram *xp)
+{
+    if (xp->vars)
+    {
+        for (GLuint i = 0; i < xp->count; i++)
+        {
+            free(xp->vars[i].name);
+            free(xp->vars[i].expr);
+        }
+        free(xp->vars);
+    }
+    xp->vars = NULL;
+    xp->count = 0;
+    xp->buffer_mask = 0;
+    memset(xp->stride, 0, sizeof(xp->stride));
+    xp->record_words = 0;
+    free(xp->link_log);
+    xp->link_log = NULL;
+    xp->link_failed = false;
+    xp->linked = true;
+}
+
+static GLenum geom_var_type(const MGLGeomVar *v)
+{
+    if (v->cols > 1)
+    {
+        if (v->base == GL_FLOAT) return v->cols == v->rows ? GL_FLOAT_MAT4 : GL_FLOAT_MAT4;   /* refined below */
+        return GL_INT;
+    }
+    switch (v->base)
+    {
+        case GL_FLOAT:         return v->rows == 1 ? GL_FLOAT : GL_FLOAT_VEC2 + (v->rows - 2);
+        case GL_INT:           return v->rows == 1 ? GL_INT : GL_INT_VEC2 + (v->rows - 2);
+        case GL_UNSIGNED_INT:  return v->rows == 1 ? GL_UNSIGNED_INT : GL_UNSIGNED_INT_VEC2 + (v->rows - 2);
+        case GL_DOUBLE:        return v->rows == 1 ? GL_DOUBLE : GL_DOUBLE_VEC2 + (v->rows - 2);
+        default:               return GL_FLOAT;
+    }
+}
+
+/* resolve the transform feedback varyings of a program with a geometry stage against the
+ * geometry stage's outputs (called from the xfb domain's post-link hook) */
+void mgl_geom_xfb_link(GLMContext ctx, Program *program)
+{
+    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
+
+    if (!gp || !xp) return;
+
+    geom_xfb_reset(ctx, xp);
+    xp->mode = xp->pending_mode;
+
+    if (!xp->pending_count)
+        return;                     /* nothing captured for this program */
+
+    xp->vars = calloc((size_t)xp->pending_count, sizeof(MGLXfbVarying));
+    if (!xp->vars) return;
+    xp->count = xp->pending_count;
+
+    {
+        GLuint buffer = 0, offset = 0;
+        MGLXfbVarying *v;
+
+        for (GLsizei i = 0; i < xp->pending_count; i++)
+        {
+            const char *name = xp->pending[i];
+            v = &xp->vars[i];
+            v->name = xstrdup(name);
+            xp->max_name_length = (GLuint)(strlen(name) + 1 > (size_t)xp->max_name_length ?
+                                            strlen(name) + 1 : (size_t)xp->max_name_length);
+
+            if (!strcmp(name, "gl_NextBuffer"))
+            {
+                v->type = GL_NONE;
+                v->size = 0;
+                xp->stride[buffer] = offset;
+                buffer++;
+                offset = 0;
+                if (buffer >= MGL_XFB_MAX_BUFFERS) { xp->link_failed = true; return; }
+                continue;
+            }
+            if (!strncmp(name, "gl_SkipComponents", 17))
+            {
+                GLuint n = (GLuint)atoi(name + 17);
+                v->type = GL_NONE;
+                v->size = (GLint)n;
+                v->words = n;
+                offset += n * 4;
+                continue;
+            }
+
+            /* builtins */
+            if (!strcmp(name, "gl_Position"))
+            {
+                v->type = GL_FLOAT_VEC4;
+                v->comp_kind = GL_FLOAT;
+                v->rows = 4;
+                v->columns = 1;
+                v->comp_per_elem = 1;
+                v->words = 4;
+                v->src_word = gp->out_pos_off;
+                v->buffer = buffer;
+                v->offset = offset;
+                offset += 16;
+                xp->buffer_mask |= (1u << buffer);
+                continue;
+            }
+            if (!strcmp(name, "gl_PointSize"))
+            {
+                v->type = GL_FLOAT;
+                v->comp_kind = GL_FLOAT;
+                v->rows = 1;
+                v->columns = 1;
+                v->comp_per_elem = 1;
+                v->words = 1;
+                v->src_word = gp->out_psize_off;
+                v->buffer = buffer;
+                v->offset = offset;
+                offset += 4;
+                xp->buffer_mask |= (1u << buffer);
+                continue;
+            }
+
+            /* user output of the geometry stage */
+            int j = -1;
+            for (int k = 0; k < gp->n_out; k++)
+                if (!strcmp(gp->out_v[k].name, name)) { j = k; break; }
+            if (j < 0)
+            {
+                char *log = NULL;
+                mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
+                                          "geometry stage\n", name);
+                free(xp->link_log);
+                xp->link_log = log;
+                xp->link_failed = true;
+                return;
+            }
+
+            const MGLGeomVar *g = &gp->out_v[j];
+            v->type = geom_var_type(g);
+            v->comp_kind = g->base == GL_INT ? GL_INT : g->base == GL_UNSIGNED_INT ? GL_UNSIGNED_INT : GL_FLOAT;
+            v->rows = g->rows;
+            v->columns = g->cols;
+            v->comp_per_elem = g->cols * g->rows * base_words(g->base);
+            v->size = (GLint)g->elems;
+            v->words = g->words;
+            v->src_word = g->offset;
+            v->buffer = buffer;
+            v->offset = offset;
+            offset += v->words * 4;
+            xp->buffer_mask |= (1u << buffer);
+        }
+
+        xp->stride[buffer] = offset;
+    }
+}
+
+/* the active transform feedback object (the xfb domain's current-object rule) */
+static MGLXfbObject *geom_xfb_object(GLMContext ctx)
+{
+    struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+    GLuint name;
+
+    if (!x) return NULL;
+    name = ctx->state.transform_feedback ? ctx->state.transform_feedback->name : 0;
+    if (name && name < x->obj_cap && x->objs[name]) return x->objs[name];
+    return &x->default_obj;
+}
+
+static int geom_record_order(const void *a, const void *b)
+{
+    const uint32_t *ra = *(const uint32_t * const *)a;
+    const uint32_t *rb = *(const uint32_t * const *)b;
+    if (ra[0] != rb[0]) return ra[0] < rb[0] ? -1 : 1;
+    return ra[1] < rb[1] ? -1 : (ra[1] > rb[1] ? 1 : 0);
+}
+
+/* pack the emitted geometry output into the bound transform feedback buffers.  Called after
+ * the geometry kernel has been synchronized, from the Metal side of the emulation. */
+void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
+                          const uint32_t *ctl)
+{
+    MGLXfbObject *o = geom_xfb_object(ctx);
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, gp->program, false);
+    uint32_t count = ctl ? ctl[0] : 0;
+    uint32_t prims = ctl ? ctl[13] : 0;
+    const uint32_t **order;
+    BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
+
+    if (!o || !o->active || !xp || !xp->count || !count) return;
+    if (!records || words < (size_t)count * gp->out_words) return;
+
+    /* the emission order is (input primitive, invocation, vertex) */
+    order = xmalloc(sizeof(*order) * count);
+    if (!order) return;
+    for (uint32_t i = 0; i < count; i++)
+        order[i] = records + (size_t)i * gp->out_words;
+    qsort(order, count, sizeof(*order), geom_record_order);
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const uint32_t *rec = order[i];
+        GLuint stream = (rec[1] >> 24) & 0xff;
+
+        /* GL captures the rasterization stream; MGL has no glRasterizationStream yet, so it
+         * is stream 0 (the default) */
+        if (stream != 0) continue;
+
+        for (GLuint v = 0; v < xp->count; v++)
+        {
+            MGLXfbVarying *var = &xp->vars[v];
+            Buffer *buf;
+            uint32_t *dst;
+            size_t pos;
+
+            if (!var->words) continue;                    /* skip / next-buffer markers */
+            if (!(xp->buffer_mask & (1u << var->buffer))) continue;
+            buf = tfb[var->buffer].buf;
+            if (!buf || !buf->data.buffer_data) continue;
+
+            pos = (size_t)(o->write_offset[var->buffer] + var->offset);
+            if (pos + var->words * 4 > (size_t)buf->size) continue;   /* full: drop, as GL does */
+
+            dst = (uint32_t *)((uint8_t *)buf->data.buffer_data + pos);
+            for (GLuint w = 0; w < var->words; w++)
+                dst[w] = rec[var->src_word + w];
+        }
+
+        for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+            if (xp->buffer_mask & (1u << b))
+                o->write_offset[b] += xp->stride[b];
+        o->vertices[0]++;
+    }
+
+    o->prims_written[0] += prims;
+    o->prims_needed[0] += prims;
+    if (ctx->state.ext_xfb)
+    {
+        struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+        x->total_written[0] += prims;
+        x->total_needed[0] += prims;
+    }
+
+    /* the transform feedback primitive queries are counted by the queries domain */
+    {
+        typedef void (*geom_note_queries_fn)(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
+        static geom_note_queries_fn note;
+        static int looked;
+        if (!looked)
+        {
+            note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
+            looked = 1;
+        }
+        if (note) note(ctx, 0, prims, prims);
+    }
+
+    if (ctx->state.ext_xfb)
+    {
+        struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+    }
+
+    free(order);
 }

@@ -368,6 +368,9 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         return false;
     }
 
+    /* the capture pass has its own encoder: the previous render encoder must be closed */
+    [self endRenderEncoding];
+
     {
         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
         MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
@@ -530,6 +533,15 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         [enc popDebugGroup];
         [enc endEncoding];
         ctx->state.program = saved_program;
+    }
+
+    /* ---- transform feedback of the geometry output: the records are ready, sync and pack ---- */
+    if (mgl_xfb_capturing(ctx))
+    {
+        BUF()->flush(ctx);
+        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents,
+                             gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents);
     }
 
     /* ---- 3. raster pass ---- */

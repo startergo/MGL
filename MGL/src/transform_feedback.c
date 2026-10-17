@@ -24,6 +24,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_geom.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
 #include "hash_table.h"
 
@@ -1346,8 +1347,15 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);
         return;
     }
-    if (p->shader_slots[_GEOMETRY_SHADER] || p->shader_slots[_TESS_EVALUATION_SHADER]) {
-        xfb_fail(xp, "transform feedback from geometry / tessellation stages is not supported", NULL, NULL);
+    if (p->shader_slots[_GEOMETRY_SHADER]) {
+        /* the geometry domain captures the geometry stage's output itself (see
+         * mgl_geom_xfb_link / mgl_geom_xfb_capture); the varyings resolve against the
+         * geometry outputs */
+        mgl_geom_xfb_link(ctx, p);
+        return;
+    }
+    if (p->shader_slots[_TESS_EVALUATION_SHADER]) {
+        xfb_fail(xp, "transform feedback from tessellation stages is not supported", NULL, NULL);
         return;
     }
     xfb_link(ctx, xp, vs->src, true);
