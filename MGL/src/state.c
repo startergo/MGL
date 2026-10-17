@@ -303,7 +303,6 @@ void mglStencilOp(GLMContext ctx, GLenum fail, GLenum zfail, GLenum zpass)
     ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
 }
 
-
 void mglStencilMask(GLMContext ctx, GLuint mask)
 {
     ctx->state.var.stencil_value_mask = mask;
@@ -824,13 +823,6 @@ void mglBlendFuncSeparatei(GLMContext ctx, GLuint buf, GLenum srcRGB, GLenum dst
 }
 
 void mglBlendEquationSeparate(GLMContext ctx, GLenum modeRGB, GLenum modeAlpha)
-{
-    // Unimplemented function
-    assert(0);
-}
-
-
-void mglGetPointerv(GLMContext ctx, GLenum pname, void **params)
 {
     // Unimplemented function
     assert(0);

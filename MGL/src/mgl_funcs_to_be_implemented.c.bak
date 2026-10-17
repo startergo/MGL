@@ -15,37 +15,28 @@ TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *findTransformFeedback(GLMContext ctx, GLuint name);
 TransformFeedback *getTransformFeedback(GLMContext ctx, GLuint name);
 
-// Forward declaration for texture lookup from textures.c
-extern Texture *findTexture(GLMContext ctx, GLuint texture);
-extern Texture *currentTexture(GLMContext ctx, GLuint index);
-
 void mglActiveShaderProgram(GLMContext ctx, GLuint pipeline, GLuint program)
 {
-	// Set active program in pipeline - no-op for now
-	(void)pipeline;
-	(void)program;
+        // Set active program for pipeline - minimal implementation
+	(void)pipeline; (void)program;
 }
 
 void mglBeginConditionalRender(GLMContext ctx, GLuint id, GLenum mode)
 {
-	// Conditional render - no-op, always render
-	(void)id;
-	(void)mode;
+        	// Begin conditional rendering
+	(void)id; (void)mode;
 }
 
 void mglBeginQuery(GLMContext ctx, GLenum target, GLuint id)
 {
-	// Query - no-op, basic stub
+        	if (id == 0) { STATE(error) = GL_INVALID_OPERATION; return; }
 	(void)target;
-	(void)id;
 }
 
 void mglBeginQueryIndexed(GLMContext ctx, GLenum target, GLuint index, GLuint id)
 {
-	// Indexed query - no-op, basic stub
+        	if (id == 0) { STATE(error) = GL_INVALID_OPERATION; return; }
 	(void)target;
-	(void)index;
-	(void)id;
 }
 
 void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
@@ -126,18 +117,12 @@ void mglClampColor(GLMContext ctx, GLenum target, GLenum clamp)
 
 void mglClearBufferiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLint *value)
 {
-	// Clear buffer - use standard clear functions
-	(void)buffer;
-	(void)drawbuffer;
-	(void)value;
+        	(void)buffer; (void)drawbuffer; (void)value;
 }
 
 void mglClearBufferuiv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLuint *value)
 {
-	// Clear buffer - use standard clear functions
-	(void)buffer;
-	(void)drawbuffer;
-	(void)value;
+        	(void)buffer; (void)drawbuffer; (void)value;
 }
 
 void mglClipControl(GLMContext ctx, GLenum origin, GLenum depth)
@@ -149,111 +134,59 @@ void mglClipControl(GLMContext ctx, GLenum origin, GLenum depth)
 
 void mglColorMaski(GLMContext ctx, GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 {
-	// Indexed color mask - use global mask for simplicity
-	(void)index;
-	mglColorMask(ctx, r, g, b, a);
+        	(void)index; (void)r; (void)g; (void)b; (void)a;
 }
 
 void mglColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+        // Deprecated packed color - no-op
+	(void)type; (void)color;
 }
 
 void mglColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+        // Deprecated packed color - no-op
+	(void)type; (void)color;
 }
 
 void mglColorP4ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+        // Deprecated packed color - no-op
+	(void)type; (void)color;
 }
 
 void mglColorP4uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+        // Deprecated packed color - no-op
+	(void)type; (void)color;
 }
 
 void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)
 {
-	fprintf(stderr, "MGL: glCopyImageSubData src=%u dst=%u %dx%dx%d\n",
-	        srcName, dstName, srcWidth, srcHeight, srcDepth);
-	
-	// Find source and destination textures
-	Texture *srcTex = findTexture(ctx, srcName);
-	Texture *dstTex = findTexture(ctx, dstName);
-	
-	if (!srcTex || !dstTex) {
-		fprintf(stderr, "MGL ERROR: CopyImageSubData - texture not found src=%p dst=%p\n",
-		        srcTex, dstTex);
-		return;
-	}
-	
-	if (!srcTex->mtl_data || !dstTex->mtl_data) {
-		fprintf(stderr, "MGL ERROR: CopyImageSubData - no Metal data src=%p dst=%p\n",
-		        srcTex->mtl_data, dstTex->mtl_data);
-		return;
-	}
-	
-	// Use Metal blit to copy texture regions
-	ctx->mtl_funcs.mtlCopyImageSubData(ctx, srcTex, srcLevel, srcX, srcY, srcZ,
-	                                    dstTex, dstLevel, dstX, dstY, dstZ,
-	                                    srcWidth, srcHeight, srcDepth);
+        	(void)srcName; (void)srcTarget; (void)srcLevel; (void)srcX; (void)srcY; (void)srcZ;
+	(void)dstName; (void)dstTarget; (void)dstLevel; (void)dstX; (void)dstY; (void)dstZ;
+	(void)srcWidth; (void)srcHeight; (void)srcDepth;
 }
 
 void mglCreateProgramPipelines(GLMContext ctx, GLsizei n, GLuint *pipelines)
 {
-	for (GLsizei i = 0; i < n; i++)
-	{
-		mglGenProgramPipelines(ctx, 1, &pipelines[i]);
-	}
+        	for (GLsizei i = 0; i < n; i++) pipelines[i] = i + 1;
 }
 
 void mglCreateQueries(GLMContext ctx, GLenum target, GLsizei n, GLuint *ids)
 {
-	for (GLsizei i = 0; i < n; i++)
-	{
-		mglGenQueries(ctx, 1, &ids[i]);
-	}
+        	for (GLsizei i = 0; i < n; i++) ids[i] = i + 1;
 	(void)target;
 }
 
 GLuint  mglCreateShaderProgramv(GLMContext ctx, GLenum type, GLsizei count, const GLchar *const*strings)
 {
-	GLuint shader = mglCreateShader(ctx, type);
-	if (!shader)
-		return 0;
-	
-	mglShaderSource(ctx, shader, count, strings, NULL);
-	mglCompileShader(ctx, shader);
-	
-	GLuint program = mglCreateProgram(ctx);
-	if (!program) {
-		mglDeleteShader(ctx, shader);
-		return 0;
-	}
-	
-	mglAttachShader(ctx, program, shader);
-	mglLinkProgram(ctx, program);
-	mglDeleteShader(ctx, shader);
-	
-	return program;
+        	return 0;
 }
 
 void mglCreateTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 {
-	for (GLsizei i = 0; i < n; i++)
-	{
-		mglGenTransformFeedbacks(ctx, 1, &ids[i]);
-	}
+        	for (GLsizei i = 0; i < n; i++) ids[i] = i + 1;
 }
 
 void mglDebugMessageCallback(GLMContext ctx, GLDEBUGPROC callback, const void *userParam)
@@ -287,9 +220,7 @@ void mglDebugMessageInsert(GLMContext ctx, GLenum source, GLenum type, GLuint id
 
 void mglDeleteQueries(GLMContext ctx, GLsizei n, const GLuint *ids)
 {
-	// Query deletion - no-op, basic stub
-	(void)n;
-	(void)ids;
+        	(void)n; (void)ids;
 }
 
 void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids)
@@ -324,17 +255,12 @@ void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids)
 
 void mglDepthRangeArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLdouble *v)
 {
-	// Depth range array - use first value for global depth range
-	if (count > 0)
-		mglDepthRange(ctx, v[0], v[1]);
-	(void)first;
+        	(void)first; (void)count; (void)v;
 }
 
 void mglDepthRangeIndexed(GLMContext ctx, GLuint index, GLdouble n, GLdouble f)
 {
-	// Indexed depth range - use global depth range
-	(void)index;
-	mglDepthRange(ctx, n, f);
+        	(void)index; (void)n; (void)f;
 }
 
 void mglDepthRangef(GLMContext ctx, GLfloat n, GLfloat f)
@@ -344,53 +270,37 @@ void mglDepthRangef(GLMContext ctx, GLfloat n, GLfloat f)
 
 void mglDrawTransformFeedback(GLMContext ctx, GLenum mode, GLuint id)
 {
-	// Draw from transform feedback - no-op for now
-	(void)mode;
-	(void)id;
+        	(void)mode; (void)id;
 }
 
 void mglDrawTransformFeedbackInstanced(GLMContext ctx, GLenum mode, GLuint id, GLsizei instancecount)
 {
-	// Draw from transform feedback instanced - no-op for now
-	(void)mode;
-	(void)id;
-	(void)instancecount;
+        	(void)mode; (void)id;
 }
 
 void mglDrawTransformFeedbackStream(GLMContext ctx, GLenum mode, GLuint id, GLuint stream)
 {
-	// Draw from transform feedback stream - no-op for now
-	(void)mode;
-	(void)id;
-	(void)stream;
+        	(void)mode; (void)id;
 }
 
 void mglDrawTransformFeedbackStreamInstanced(GLMContext ctx, GLenum mode, GLuint id, GLuint stream, GLsizei instancecount)
 {
-	// Draw from transform feedback stream instanced - no-op for now
-	(void)mode;
-	(void)id;
-	(void)stream;
-	(void)instancecount;
+        	(void)mode; (void)id;
 }
 
 void mglEndConditionalRender(GLMContext ctx)
 {
-	// End conditional render - no-op
-	(void)ctx;
+        	// End conditional rendering
 }
 
 void mglEndQuery(GLMContext ctx, GLenum target)
 {
-	// End query - no-op
-	(void)target;
+        	(void)target;
 }
 
 void mglEndQueryIndexed(GLMContext ctx, GLenum target, GLuint index)
 {
-	// End indexed query - no-op
-	(void)target;
-	(void)index;
+        	(void)target;
 }
 
 void mglEndTransformFeedback(GLMContext ctx)
@@ -407,9 +317,7 @@ void mglEndTransformFeedback(GLMContext ctx)
 
 void mglGenQueries(GLMContext ctx, GLsizei n, GLuint *ids)
 {
-	// Generate query IDs - simple sequential IDs
-	for (GLsizei i = 0; i < n; i++)
-		ids[i] = i + 1;
+        	for (GLsizei i = 0; i < n; i++) ids[i] = i + 1;
 }
 
 void mglGenTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
@@ -423,46 +331,34 @@ void mglGenTransformFeedbacks(GLMContext ctx, GLsizei n, GLuint *ids)
 
 void mglGetActiveAtomicCounterBufferiv(GLMContext ctx, GLuint program, GLuint bufferIndex, GLenum pname, GLint *params)
 {
-	// Atomic counter buffers - return 0
-	(void)program; (void)bufferIndex; (void)pname;
-	if (params) *params = 0;
+        	(void)program; (void)bufferIndex; (void)pname; (void)params;
 }
 
 void mglGetActiveSubroutineName(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
-	// Subroutines - return empty string
-	(void)program; (void)shadertype; (void)index; (void)bufSize;
-	if (length) *length = 0;
-	if (name && bufSize > 0) name[0] = '\0';
+        	if (length) *length = 0; if (name && bufSize > 0) name[0] = 0;
 }
 
 void mglGetActiveSubroutineUniformName(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
-	// Subroutine uniforms - return empty string
-	(void)program; (void)shadertype; (void)index; (void)bufSize;
-	if (length) *length = 0;
-	if (name && bufSize > 0) name[0] = '\0';
+        	if (length) *length = 0; if (name && bufSize > 0) name[0] = 0;
 }
 
 void mglGetActiveSubroutineUniformiv(GLMContext ctx, GLuint program, GLenum shadertype, GLuint index, GLenum pname, GLint *values)
 {
-	// Subroutine uniform parameters - return 0
-	(void)program; (void)shadertype; (void)index; (void)pname;
-	if (values) *values = 0;
+        	(void)program; (void)shadertype; (void)index; (void)pname; (void)values;
 }
 
 void mglGetBooleani_v(GLMContext ctx, GLenum target, GLuint index, GLboolean *data)
 {
-	// Indexed boolean - return false
+        	if (data) *data = GL_FALSE;
 	(void)target; (void)index;
-	if (data) *data = GL_FALSE;
 }
 
 void mglGetBufferParameteri64v(GLMContext ctx, GLenum target, GLenum pname, GLint64 *params)
 {
-	// Buffer parameter - return 0
+        	if (params) *params = 0;
 	(void)target; (void)pname;
-	if (params) *params = 0;
 }
 
 GLuint  mglGetDebugMessageLog(GLMContext ctx, GLuint count, GLsizei bufSize, GLenum *sources, GLenum *types, GLuint *ids, GLenum *severities, GLsizei *lengths, GLchar *messageLog)
@@ -481,16 +377,14 @@ GLuint  mglGetDebugMessageLog(GLMContext ctx, GLuint count, GLsizei bufSize, GLe
 
 void mglGetDoublei_v(GLMContext ctx, GLenum target, GLuint index, GLdouble *data)
 {
-	// Indexed double - return 0.0
+        	if (data) *data = 0.0;
 	(void)target; (void)index;
-	if (data) *data = 0.0;
 }
 
 void mglGetFloati_v(GLMContext ctx, GLenum target, GLuint index, GLfloat *data)
 {
-	// Indexed float - return 0.0
+        	if (data) *data = 0.0f;
 	(void)target; (void)index;
-	if (data) *data = 0.0f;
 }
 
 GLint  mglGetFragDataIndex(GLMContext ctx, GLuint program, const GLchar *name)
@@ -508,7 +402,6 @@ GLint  mglGetFragDataLocation(GLMContext ctx, GLuint program, const GLchar *name
 	(void)name;
 	return 0;
 }
-
 
 GLenum  mglGetGraphicsResetStatus(GLMContext ctx)
 {
@@ -549,131 +442,113 @@ void mglGetObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei bufSize, GLsi
 
 void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary)
 {
-	// Program binary not supported
-	(void)program; (void)bufSize; (void)binary;
-	if (length) *length = 0;
-	if (binaryFormat) *binaryFormat = 0;
+        	if (length) *length = 0;
+	(void)program; (void)bufSize; (void)binaryFormat; (void)binary;
 }
 
 void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInterface, GLenum pname, GLint *params)
 {
-	// Program interface query - return 0
+        	if (params) *params = 0;
 	(void)program; (void)programInterface; (void)pname;
-	if (params) *params = 0;
 }
 
 void mglGetProgramPipelineInfoLog(GLMContext ctx, GLuint pipeline, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
-	// Pipeline info log - return empty
-	(void)pipeline;
-	if (length) *length = 0;
-	if (infoLog && bufSize > 0) infoLog[0] = '\0';
+        	if (length) *length = 0; if (infoLog && bufSize > 0) infoLog[0] = 0;
 }
 
 void mglGetProgramPipelineiv(GLMContext ctx, GLuint pipeline, GLenum pname, GLint *params)
 {
-	// Get program pipeline parameters - return 0
+        	if (params) *params = 0;
 	(void)pipeline; (void)pname;
-	if (params) *params = 0;
 }
 
 GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource index - return 0 (not found)
-	(void)program; (void)programInterface; (void)name;
-	return 0;
+        	return GL_INVALID_INDEX;
 }
 
 GLint  mglGetProgramResourceLocation(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource location - return -1 (not found)
-	(void)program; (void)programInterface; (void)name;
-	return -1;
+        	return -1;
 }
 
 GLint  mglGetProgramResourceLocationIndex(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
-	// Program resource location index - return -1 (not found)
-	(void)program; (void)programInterface; (void)name;
-	return -1;
+        	return -1;
 }
 
 void mglGetProgramResourceName(GLMContext ctx, GLuint program, GLenum programInterface, GLuint index, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (length) *length = 0; if (name && bufSize > 0) name[0] = 0;
 }
 
 void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInterface, GLuint index, GLsizei propCount, const GLenum *props, GLsizei count, GLsizei *length, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (length) *length = 0;
+	(void)program; (void)programInterface; (void)index; (void)propCount; (void)props; (void)count; (void)params;
 }
 
 void mglGetProgramStageiv(GLMContext ctx, GLuint program, GLenum shadertype, GLenum pname, GLint *values)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (values) *values = 0;
+	(void)program; (void)shadertype; (void)pname;
 }
 
 void mglGetQueryBufferObjecti64v(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)id; (void)buffer; (void)pname; (void)offset;
 }
 
 void mglGetQueryBufferObjectiv(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)id; (void)buffer; (void)pname; (void)offset;
 }
 
 void mglGetQueryBufferObjectui64v(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)id; (void)buffer; (void)pname; (void)offset;
 }
 
 void mglGetQueryBufferObjectuiv(GLMContext ctx, GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)id; (void)buffer; (void)pname; (void)offset;
 }
 
 void mglGetQueryIndexediv(GLMContext ctx, GLenum target, GLuint index, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)target; (void)index; (void)pname;
 }
 
 void mglGetQueryObjecti64v(GLMContext ctx, GLuint id, GLenum pname, GLint64 *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)id; (void)pname;
 }
 
 void mglGetQueryObjectiv(GLMContext ctx, GLuint id, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)id; (void)pname;
 }
 
 void mglGetQueryObjectui64v(GLMContext ctx, GLuint id, GLenum pname, GLuint64 *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)id; (void)pname;
 }
 
 void mglGetQueryObjectuiv(GLMContext ctx, GLuint id, GLenum pname, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)id; (void)pname;
 }
 
 void mglGetQueryiv(GLMContext ctx, GLenum target, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)target; (void)pname;
 }
 
 void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision)
@@ -690,150 +565,138 @@ void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum preci
 	}
 }
 
-GLuint mglGetSubroutineIndex(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
+GLuint  mglGetSubroutineIndex(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
 {
-	// TODO: Implement
-	(void)ctx;
-	return 0;
+        	return GL_INVALID_INDEX;
 }
 
-GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
+GLint  mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
 {
-	// TODO: Implement
-	(void)ctx;
-	return 0;
+        	return -1;
 }
 void mglGetTransformFeedbackVarying(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLsizei *size, GLenum *type, GLchar *name)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (length) *length = 0; if (size) *size = 0; if (type) *type = GL_FLOAT;
+	if (name && bufSize > 0) name[0] = 0;
+	(void)program; (void)index;
 }
 
 void mglGetTransformFeedbacki64_v(GLMContext ctx, GLuint xfb, GLenum pname, GLuint index, GLint64 *param)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (param) *param = 0;
+	(void)xfb; (void)pname; (void)index;
 }
 
 void mglGetTransformFeedbacki_v(GLMContext ctx, GLuint xfb, GLenum pname, GLuint index, GLint *param)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (param) *param = 0;
+	(void)xfb; (void)pname; (void)index;
 }
 
 void mglGetTransformFeedbackiv(GLMContext ctx, GLuint xfb, GLenum pname, GLint *param)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (param) *param = 0;
+	(void)xfb; (void)pname;
 }
 
 void mglGetUniformSubroutineuiv(GLMContext ctx, GLenum shadertype, GLint location, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)shadertype; (void)location;
 }
 
 void mglGetUniformdv(GLMContext ctx, GLuint program, GLint location, GLdouble *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0.0;
+	(void)program; (void)location;
 }
 
 void mglGetUniformuiv(GLMContext ctx, GLuint program, GLint location, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)program; (void)location;
 }
 
 void mglGetVertexAttribIiv(GLMContext ctx, GLuint index, GLenum pname, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)index; (void)pname;
 }
 
 void mglGetVertexAttribIuiv(GLMContext ctx, GLuint index, GLenum pname, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)index; (void)pname;
 }
 
 void mglGetVertexAttribLdv(GLMContext ctx, GLuint index, GLenum pname, GLdouble *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0.0;
+	(void)index; (void)pname;
 }
 
 void mglGetnMapdv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)target; (void)query; (void)bufSize; (void)v;
 }
 
 void mglGetnMapfv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)target; (void)query; (void)bufSize; (void)v;
 }
 
 void mglGetnMapiv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)target; (void)query; (void)bufSize; (void)v;
 }
 
 void mglGetnPixelMapfv(GLMContext ctx, GLenum map, GLsizei bufSize, GLfloat *values)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)map; (void)bufSize; (void)values;
 }
 
 void mglGetnPixelMapuiv(GLMContext ctx, GLenum map, GLsizei bufSize, GLuint *values)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)map; (void)bufSize; (void)values;
 }
 
 void mglGetnPixelMapusv(GLMContext ctx, GLenum map, GLsizei bufSize, GLushort *values)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)map; (void)bufSize; (void)values;
 }
 
 void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)target; (void)level; (void)format; (void)type; (void)bufSize; (void)pixels;
 }
 
 void mglGetnUniformdv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLdouble *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0.0;
+	(void)program; (void)location; (void)bufSize;
 }
 
 void mglGetnUniformfv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLfloat *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0.0f;
+	(void)program; (void)location; (void)bufSize;
 }
 
 void mglGetnUniformiv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)program; (void)location; (void)bufSize;
 }
 
 void mglGetnUniformuiv(GLMContext ctx, GLuint program, GLint location, GLsizei bufSize, GLuint *params)
 {
-	// TODO: Implement
-	(void)ctx;
+        	if (params) *params = 0;
+	(void)program; (void)location; (void)bufSize;
 }
 
 GLboolean mglIsQuery(GLMContext ctx, GLuint id)
 {
-	// TODO: Implement
-	(void)ctx;
-	return GL_FALSE;
+        	return GL_FALSE;
 }
 
 GLboolean mglIsTransformFeedback(GLMContext ctx, GLuint id)
@@ -850,26 +713,22 @@ void mglMinSampleShading(GLMContext ctx, GLfloat value)
 
 void mglMultiDrawArraysIndirectCount(GLMContext ctx, GLenum mode, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)mode; (void)indirect; (void)drawcount; (void)maxdrawcount; (void)stride;
 }
 
 void mglMultiDrawElementsIndirectCount(GLMContext ctx, GLenum mode, GLenum type, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)mode; (void)type; (void)indirect; (void)drawcount; (void)maxdrawcount; (void)stride;
 }
 
 void mglNormalP3ui(GLMContext ctx, GLenum type, GLuint coords)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)coords;
 }
 
 void mglNormalP3uiv(GLMContext ctx, GLenum type, const GLuint *coords)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)coords;
 }
 
 void mglObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei length, const GLchar *label)
@@ -891,14 +750,12 @@ void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GL
 
 void mglPatchParameterfv(GLMContext ctx, GLenum pname, const GLfloat *values)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)pname; (void)values;
 }
 
 void mglPatchParameteri(GLMContext ctx, GLenum pname, GLint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)pname; (void)value;
 }
 
 void mglPauseTransformFeedback(GLMContext ctx)
@@ -914,8 +771,7 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglPolygonOffsetClamp(GLMContext ctx, GLfloat factor, GLfloat units, GLfloat clamp)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)factor; (void)units; (void)clamp;
 }
 
 void mglPopDebugGroup(GLMContext ctx)
@@ -931,314 +787,263 @@ void mglPrimitiveRestartIndex(GLMContext ctx, GLuint index)
 
 void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const void *binary, GLsizei length)
 {
-	// TODO: Implement
-	(void)ctx;
+        	STATE(error) = GL_INVALID_OPERATION;
+	(void)program; (void)binaryFormat; (void)binary; (void)length;
 }
 
 void mglProgramParameteri(GLMContext ctx, GLuint program, GLenum pname, GLint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)pname; (void)value;
 }
 
 void mglProgramUniform1d(GLMContext ctx, GLuint program, GLint location, GLdouble v0)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1f(GLMContext ctx, GLuint program, GLint location, GLfloat v0)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1i(GLMContext ctx, GLuint program, GLint location, GLint v0)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1ui(GLMContext ctx, GLuint program, GLint location, GLuint v0)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform1uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0;
 }
 
 void mglProgramUniform2d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform2uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1;
 }
 
 void mglProgramUniform3d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform3uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2;
 }
 
 void mglProgramUniform4d(GLMContext ctx, GLuint program, GLint location, GLdouble v0, GLdouble v1, GLdouble v2, GLdouble v3)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4f(GLMContext ctx, GLuint program, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4i(GLMContext ctx, GLuint program, GLint location, GLint v0, GLint v1, GLint v2, GLint v3)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4iv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4ui(GLMContext ctx, GLuint program, GLint location, GLuint v0, GLuint v1, GLuint v2, GLuint v3)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniform4uiv(GLMContext ctx, GLuint program, GLint location, GLsizei count, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)v0; (void)v1; (void)v2; (void)v3;
 }
 
 void mglProgramUniformMatrix2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix2x3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix2x3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix2x4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix2x4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3x2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3x2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3x4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix3x4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4x2dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4x2fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4x3dv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLdouble *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProgramUniformMatrix4x3fv(GLMContext ctx, GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)location; (void)count; (void)transpose; (void)value;
 }
 
 void mglProvokingVertex(GLMContext ctx, GLenum mode)
@@ -1262,14 +1067,12 @@ void mglPushDebugGroup(GLMContext ctx, GLenum source, GLuint id, GLsizei length,
 
 void mglQueryCounter(GLMContext ctx, GLuint id, GLenum target)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)id; (void)target;
 }
 
 void mglReadnPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, void *data)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)x; (void)y; (void)width; (void)height; (void)format; (void)type; (void)bufSize; (void)data;
 }
 
 void mglReleaseShaderCompiler(GLMContext ctx)
@@ -1290,123 +1093,98 @@ void mglResumeTransformFeedback(GLMContext ctx)
 
 void mglSampleMaski(GLMContext ctx, GLuint maskNumber, GLbitfield mask)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)maskNumber; (void)mask;
 }
 
 void mglScissorArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)first; (void)count; (void)v;
 }
 
 void mglScissorIndexed(GLMContext ctx, GLuint index, GLint left, GLint bottom, GLsizei width, GLsizei height)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)left; (void)bottom; (void)width; (void)height;
 }
 
 void mglScissorIndexedv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)left; (void)bottom; (void)width; (void)height;
 }
 
 void mglSecondaryColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)color;
 }
 
 void mglSecondaryColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)color;
 }
 
 void mglShaderBinary(GLMContext ctx, GLsizei count, const GLuint *shaders, GLenum binaryFormat, const void *binary, GLsizei length)
 {
-	// TODO: Implement
-	(void)ctx;
+        	STATE(error) = GL_INVALID_OPERATION;
+	(void)count; (void)shaders; (void)binaryFormat; (void)binary; (void)length;
 }
 
 void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storageBlockIndex, GLuint storageBlockBinding)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)storageBlockIndex; (void)storageBlockBinding;
 }
 
 void mglSpecializeShader(GLMContext ctx, GLuint shader, const GLchar *pEntryPoint, GLuint numSpecializationConstants, const GLuint *pConstantIndex, const GLuint *pConstantValue)
 {
-	// TODO: Implement
-	(void)ctx;
+        	STATE(error) = GL_INVALID_OPERATION;
+	(void)shader; (void)pEntryPoint; (void)numSpecializationConstants; (void)pConstantIndex; (void)pConstantValue;
 }
 
 void mglTexBuffer(GLMContext ctx, GLenum target, GLenum internalformat, GLuint buffer)
 {
-	// TODO: Implement
-	(void)ctx;
+        	STATE(error) = GL_INVALID_OPERATION;
+	(void)target; (void)internalformat; (void)buffer;
 }
 
 void mglTexBufferRange(GLMContext ctx, GLenum target, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
-	// TODO: Implement
-	(void)ctx;
+        	STATE(error) = GL_INVALID_OPERATION;
+	(void)target; (void)internalformat; (void)buffer;
 }
 
 void mglTexStorage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations)
 {
-    // For multisample textures, we need to create storage but Apple Silicon 
-    // handles MSAA differently than traditional GL. For now, we create a 
-    // regular texture and let the rendering pipeline handle any MSAA.
-    
+    // For multisample textures, create a regular 2D texture
+    // Metal will handle actual MSAA during rendering
+    // Use mglTexImage2D with NULL data to allocate storage
     fprintf(stderr, "MGL: mglTexStorage2DMultisample called - target=0x%x, samples=%d, format=0x%x, %dx%d\n", 
             target, samples, internalformat, width, height);
     
-    // Validate target
-    if (target != GL_TEXTURE_2D_MULTISAMPLE && target != GL_PROXY_TEXTURE_2D_MULTISAMPLE) {
-        fprintf(stderr, "MGL WARNING: mglTexStorage2DMultisample invalid target 0x%x\n", target);
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_ENUM);
-        return;
-    }
-    
-    // For now, silently succeed without error - multisample textures are 
-    // used for capability probing. The actual MSAA will be handled by the
-    // render pipeline when available.
-    (void)samples; (void)internalformat; (void)width; (void)height; (void)fixedsamplelocations;
-    
-    // Don't set an error - let virglrenderer think MSAA is "supported"
-    // This allows the system to fall back gracefully
+    // Allocate texture storage using TexImage2D
+    mglTexImage2D(ctx, target, 0, internalformat, width, height, 0, internalformat, GL_UNSIGNED_BYTE, NULL);
 }
 
 void mglTexStorage3DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)target; (void)samples; (void)internalformat; (void)width; (void)height; (void)depth; (void)fixedsamplelocations;
 }
 
 void mglTransformFeedbackBufferBase(GLMContext ctx, GLuint xfb, GLuint index, GLuint buffer)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)xfb; (void)index; (void)buffer;
 }
 
 void mglTransformFeedbackBufferRange(GLMContext ctx, GLuint xfb, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)xfb; (void)index; (void)buffer; (void)offset; (void)size;
 }
 
 void mglTransformFeedbackVaryings(GLMContext ctx, GLuint program, GLsizei count, const GLchar *const*varyings, GLenum bufferMode)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program; (void)count; (void)varyings; (void)bufferMode;
 }
 
 void mglUniformSubroutinesuiv(GLMContext ctx, GLenum shadertype, GLsizei count, const GLuint *indices)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)shadertype; (void)count; (void)indices;
 }
 
 void mglValidateProgram(GLMContext ctx, GLuint program)
@@ -1417,492 +1195,411 @@ void mglValidateProgram(GLMContext ctx, GLuint program)
 
 void mglValidateProgramPipeline(GLMContext ctx, GLuint pipeline)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)program;
 }
 
 void mglVertexAttrib1d(GLMContext ctx, GLuint index, GLdouble x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib1dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib1f(GLMContext ctx, GLuint index, GLfloat x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib1fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib1s(GLMContext ctx, GLuint index, GLshort x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib1sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttrib2d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib2dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib2f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib2fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib2s(GLMContext ctx, GLuint index, GLshort x, GLshort y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib2sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttrib3d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib3dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib3f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib3fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib3s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib3sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttrib4Nbv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4Niv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4Nsv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4Nub(GLMContext ctx, GLuint index, GLubyte x, GLubyte y, GLubyte z, GLubyte w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4Nubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4Nuiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4Nusv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4bv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z, GLshort w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttrib4ubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttrib4usv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttribI1i(GLMContext ctx, GLuint index, GLint x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribI1iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribI1ui(GLMContext ctx, GLuint index, GLuint x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribI1uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribI2i(GLMContext ctx, GLuint index, GLint x, GLint y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribI2iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribI2ui(GLMContext ctx, GLuint index, GLuint x, GLuint y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribI2uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribI3i(GLMContext ctx, GLuint index, GLint x, GLint y, GLint z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribI3iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribI3ui(GLMContext ctx, GLuint index, GLuint x, GLuint y, GLuint z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribI3uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribI4bv(GLMContext ctx, GLuint index, const GLbyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttribI4i(GLMContext ctx, GLuint index, GLint x, GLint y, GLint z, GLint w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribI4iv(GLMContext ctx, GLuint index, const GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribI4sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttribI4ubv(GLMContext ctx, GLuint index, const GLubyte *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttribI4ui(GLMContext ctx, GLuint index, GLuint x, GLuint y, GLuint z, GLuint w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribI4uiv(GLMContext ctx, GLuint index, const GLuint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribI4usv(GLMContext ctx, GLuint index, const GLushort *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)v;
 }
 
 void mglVertexAttribL1d(GLMContext ctx, GLuint index, GLdouble x)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribL1dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x;
 }
 
 void mglVertexAttribL2d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribL2dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y;
 }
 
 void mglVertexAttribL3d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribL3dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z;
 }
 
 void mglVertexAttribL4d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribL4dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)z; (void)w;
 }
 
 void mglVertexAttribP1ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP1uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP2ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP2uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP3ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP3uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP4ui(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexAttribP4uiv(GLMContext ctx, GLuint index, GLenum type, GLboolean normalized, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)type; (void)normalized; (void)value;
 }
 
 void mglVertexP2ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglVertexP2uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglVertexP3ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglVertexP3uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglVertexP4ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglVertexP4uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)type; (void)value;
 }
 
 void mglViewportArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)first; (void)count; (void)v;
 }
 
 void mglViewportIndexedf(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat w, GLfloat h)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)w; (void)h;
 }
 
 void mglViewportIndexedfv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+        	(void)index; (void)x; (void)y; (void)w; (void)h;
 }
+

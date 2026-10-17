@@ -347,7 +347,6 @@ void error_callback(void *userdata, const char *error)
     DEBUG_PRINT("parseSPIRVShader error:%s\n", error);
 }
 
-
 static_assert(_VERTEX_SHADER == GLSLANG_STAGE_VERTEX, "_VERTEX_SHADER == GLSLANG_STAGE_VERTEX failed");
 static_assert(_TESS_CONTROL_SHADER == GLSLANG_STAGE_TESSCONTROL, "_TESS_CONTROL_SHADER == GLSLANG_STAGE_TESSCONTROL failed");
 static_assert(_TESS_EVALUATION_SHADER == GLSLANG_STAGE_TESSEVALUATION, "_TESS_EVALUATION_SHADER == GLSLANG_STAGE_TESSEVALUATION failed");
@@ -795,38 +794,6 @@ void mglUseProgram(GLMContext ctx, GLuint program)
     }
 }
 
-void mglBindAttribLocation(GLMContext ctx, GLuint program, GLuint index, const GLchar *name)
-{
-    // Unimplemented function
-    // CRITICAL FIX: Handle error gracefully instead of crashing
-        fprintf(stderr, "MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-}
-
-void mglGetActiveAttrib(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
-{
-    // Unimplemented function
-    // CRITICAL FIX: Handle error gracefully instead of crashing
-        fprintf(stderr, "MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-}
-
-void mglGetActiveUniform(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
-{
-    // Unimplemented function
-    // CRITICAL FIX: Handle error gracefully instead of crashing
-        fprintf(stderr, "MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-}
-
-void mglGetAttachedShaders(GLMContext ctx, GLuint program, GLsizei maxCount, GLsizei *count, GLuint *shaders)
-{
-    // Unimplemented function
-    // CRITICAL FIX: Handle error gracefully instead of crashing
-        fprintf(stderr, "MGL ERROR: Critical error in program.c at line %d\n", __LINE__);
-        STATE(error) = GL_INVALID_OPERATION;
-}
-
 GLint  mglGetAttribLocation(GLMContext ctx, GLuint program, const GLchar *name)
 {
 	if (isProgram(ctx, program) == GL_FALSE)
@@ -937,8 +904,6 @@ void mglGetProgramInfoLog(GLMContext ctx, GLuint program, GLsizei bufSize, GLsiz
         }
     }
 }
-
-
 
 #pragma mark program pipelines
 void mglGenProgramPipelines(GLMContext ctx, GLsizei n, GLuint *pipelines)

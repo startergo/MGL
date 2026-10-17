@@ -1757,3 +1757,9 @@ void mglGetNamedBufferSubData(GLMContext ctx, GLuint buffer, GLintptr offset, GL
     assert(0);
 }
 
+void mglGetBufferParameteri64v(GLMContext ctx, GLenum target, GLenum pname, GLint64 *params)
+{
+	// Buffer parameter - return 0
+	(void)target; (void)pname;
+	if (params) *params = 0;
+}

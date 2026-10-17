@@ -43,106 +43,29 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 // for resource types SPVC_RESOURCE_TYPE_UNIFORM_BUFFER..
 #import "spirv_cross_c.h"
 
-typedef struct SyncList_t {
-    GLuint count;
-    GLuint  size;
-    Sync **list;
-} SyncList;
+#import "MGLRenderer_Private.h"
 
-MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
 
-typedef struct MGLDrawable_t {
-    GLuint width;
-    GLuint height;
-    id<MTLTexture> drawbuffer;
-    id<MTLTexture> depthbuffer;
-    id<MTLTexture> stencilbuffer;
-} MGLDrawable;
-
-enum {
-    _FRONT,
-    _BACK,
-    _FRONT_LEFT,
-    _FRONT_RIGHT,
-    _BACK_LEFT,
-    _BACK_RIGHT,
-    _MAX_DRAW_BUFFERS
-};
-
-// CRITICAL SECURITY: Safe Metal object validation helper
-static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const char *objectName) {
-    if (!ptr) {
-        NSLog(@"MGL SECURITY ERROR: NULL pointer for %s", objectName);
-        return nil;
+#pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
+// Calls every category method named ext<Domain><suffix> (single object argument).
+static void mglCallExtHooks(id self, const char *suffix, id arg)
+{
+    unsigned int n = 0;
+    Method *methods = class_copyMethodList([self class], &n);
+    size_t sl = strlen(suffix);
+    for (unsigned int i = 0; i < n; i++) {
+        const char *sel = sel_getName(method_getName(methods[i]));
+        size_t l = strlen(sel);
+        if (strncmp(sel, "ext", 3) == 0 && l > sl && strcmp(sel + l - sl, suffix) == 0) {
+            void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))method_getImplementation(methods[i]);
+            imp(self, method_getName(methods[i]), arg);
+        }
     }
-
-    id<NSObject> obj = (__bridge id<NSObject>)(ptr);
-    if (!obj) {
-        NSLog(@"MGL SECURITY ERROR: Metal bridge cast returned nil for %s", objectName);
-        return nil;
-    }
-
-    if (expectedClass && [obj isKindOfClass:expectedClass] == NO) {
-        NSLog(@"MGL SECURITY ERROR: Metal object is not valid %s (got %@)", objectName, NSStringFromClass([obj class]));
-        return nil;
-    }
-
-    return obj;
+    free(methods);
 }
 
 // Main class performing the rendering
 @implementation MGLRenderer
-{
-    NSView *_view;
-
-    CAMetalLayer *_layer;
-    id<CAMetalDrawable> _drawable;
-
-    GLMContext  ctx;    // context macros need this exact name
-
-    id<MTLDevice> _device;
-
-    // CRITICAL FIX: Thread synchronization to prevent race conditions
-    NSLock *_metalStateLock;
-
-    // AGX GPU Error Tracking - Prevent command queue from entering error state
-    NSUInteger _consecutiveGPUErrors;
-    NSTimeInterval _lastGPUErrorTime;
-    BOOL _gpuErrorRecoveryMode;
-
-    // PROACTIVE TEXTURE STORAGE - Essential textures created during initialization
-    NSMutableArray *_proactiveTextures;
-
-    MGLDrawable _drawBuffers[_MAX_DRAW_BUFFERS];
-
-    MTLBlendFactor _src_blend_rgb_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _dst_blend_rgb_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _src_blend_alpha_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _dst_blend_alpha_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendOperation _rgb_blend_operation[MAX_COLOR_ATTACHMENTS];
-    MTLBlendOperation _alpha_blend_operation[MAX_COLOR_ATTACHMENTS];
-    MTLColorWriteMask _color_mask[MAX_COLOR_ATTACHMENTS];
-
-    // The command queue used to pass commands to the device.
-    id<MTLCommandQueue> _commandQueue;
-
-    // The render pipeline generated from the vertex and fragment shaders in the .metal shader file.
-    id<MTLRenderPipelineState> _pipelineState;
-
-    // render pass descriptor containts the binding information for VAO's and such
-    MTLRenderPassDescriptor *_renderPassDescriptor;
-
-    // each pass a new command buffer is created
-    id<MTLCommandBuffer> _currentCommandBuffer;
-    SyncList  *_currentCommandBufferSyncList;
-
-    id<MTLRenderCommandEncoder> _currentRenderEncoder;
-
-    GLuint _blitOperationComplete;
-
-    id<MTLEvent> _currentEvent;
-    GLsizei _currentSyncName;
-}
 
 MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
 {
@@ -3197,6 +3120,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     NSLog(@"MGL DEBUG: About to create render encoder with descriptor and command buffer");
     @try {
+        mglCallExtHooks(self, "RenderPassDescriptor:", _renderPassDescriptor); // extHookRenderPassDescriptor
         _currentRenderEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor: _renderPassDescriptor];
         if (!_currentRenderEncoder) {
             NSLog(@"MGL ERROR: Failed to create render encoder - invalid render pass descriptor or command buffer");
@@ -3214,6 +3138,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         return false;
     }
     _currentRenderEncoder.label = @"GL Render Encoder";
+    mglCallExtHooks(self, "RenderEncoderCreated:", _currentRenderEncoder);
 
     // apply all state that isn't included in a renderPassDescriptor into the render encoder
     [self updateCurrentRenderEncoder];
@@ -4333,6 +4258,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // Create a render command encoder.
     [_currentRenderEncoder setRenderPipelineState: _pipelineState];
+
+    if (draw_command)
+        mglCallExtHooks(self, "PreDraw:", _currentRenderEncoder);
 
     return true;
 }
@@ -6236,6 +6164,21 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
 
     glm_ctx->mtl_funcs.mtlDispatchCompute = mtlDispatchCompute;
     glm_ctx->mtl_funcs.mtlDispatchComputeIndirect = mtlDispatchComputeIndirect;
+
+    // Category hooks: call every -bindExt*FuncsToGLMContext: (see MGLRenderer_Private.h)
+    {
+        unsigned int n = 0;
+        Method *methods = class_copyMethodList([self class], &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *sel = sel_getName(method_getName(methods[i]));
+            if (strncmp(sel, "bindExt", 7) == 0 && strstr(sel, "FuncsToGLMContext:")) {
+                void (*imp)(id, SEL, GLMContext) = (void (*)(id, SEL, GLMContext))method_getImplementation(methods[i]);
+                imp(self, method_getName(methods[i]), glm_ctx);
+            }
+        }
+        free(methods);
+    }
+
 }
 
 - (id) initMGLRendererFromContext: (void *)glm_ctx andBindToWindow: (NSWindow *)window;
@@ -6807,6 +6750,7 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     // Commit with exception handling
     @try {
         NSLog(@"MGL AGX: Committing command buffer (status: %ld)", (long)status);
+        mglCallExtHooks(self, "WillCommit:", commandBuffer);
         [commandBuffer commit];
         NSLog(@"MGL AGX: Command buffer committed successfully");
     } @catch (NSException *exception) {

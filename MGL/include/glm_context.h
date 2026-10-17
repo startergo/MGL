@@ -31,6 +31,7 @@
 #include "glm_dispatch.h"
 
 #include "hash_table.h"
+#include "mgl_ext.h"
 
 // defines above set sizes in glm_params
 #include "glm_params.h"
@@ -614,6 +615,20 @@ typedef struct {
     // hints
     GLMHints    hints;
     
+    // per-domain extension state (mgl_ext.h) — do not reorder
+    struct MGLExtState_fb *ext_fb;
+    struct MGLExtState_queries *ext_queries;
+    struct MGLExtState_debug *ext_debug;
+    struct MGLExtState_introspect *ext_introspect;
+    struct MGLExtState_program *ext_program;
+    struct MGLExtState_xfb *ext_xfb;
+    struct MGLExtState_vattrib *ext_vattrib;
+    struct MGLExtState_rstate *ext_rstate;
+    struct MGLExtState_texparam *ext_texparam;
+    struct MGLExtState_texdata *ext_texdata;
+    struct MGLExtState_texext *ext_texext;
+    struct MGLExtState_buffers *ext_buffers;
+
     // put at end, big chunk of yuck
     GLMParams   var;
 } GLMState;
@@ -688,6 +703,20 @@ struct GLMMetalFuncs {
 
     void (*mtlDispatchCompute)(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z);
     void (*mtlDispatchComputeIndirect)(GLMContext ctx, GLintptr indirect);
+
+    // per-domain Metal hook tables (mgl_ext.h) — do not reorder
+    struct MGLExtMetal_fb *ext_fb;
+    struct MGLExtMetal_queries *ext_queries;
+    struct MGLExtMetal_debug *ext_debug;
+    struct MGLExtMetal_introspect *ext_introspect;
+    struct MGLExtMetal_program *ext_program;
+    struct MGLExtMetal_xfb *ext_xfb;
+    struct MGLExtMetal_vattrib *ext_vattrib;
+    struct MGLExtMetal_rstate *ext_rstate;
+    struct MGLExtMetal_texparam *ext_texparam;
+    struct MGLExtMetal_texdata *ext_texdata;
+    struct MGLExtMetal_texext *ext_texext;
+    struct MGLExtMetal_buffers *ext_buffers;
 } ;
 
 typedef struct GLMContextRec_t {

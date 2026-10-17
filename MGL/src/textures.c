@@ -29,6 +29,7 @@
 #include "pixel_utils.h"
 #include "utils.h"
 #include "glm_context.h"
+#include "mgl_ext_texdata.h"
 
 extern void *getBufferData(GLMContext ctx, Buffer *ptr);
 
@@ -238,7 +239,6 @@ bool checkInternalFormatForMetal(GLMContext ctx, GLuint internalformat)
     return true;
 }
 
-
 #pragma mark basic tex calls bind / delete / gen...
 void mglGenTextures(GLMContext ctx, GLsizei n, GLuint *textures)
 {
@@ -435,18 +435,6 @@ GLboolean mglIsTexture(GLMContext ctx, GLuint texture)
     return isTexture(ctx, texture);
 }
 
-void mglInvalidateTexImage(GLMContext ctx, GLuint texture, GLint level)
-{
-    // Stub - invalidation is just a hint, safe to ignore
-    fprintf(stderr, "MGL: glInvalidateTexImage called (stub) - texture=%u level=%d\n", texture, level);
-}
-
-void mglInvalidateTexSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth)
-{
-    // Stub - invalidation is just a hint, safe to ignore
-    fprintf(stderr, "MGL: glInvalidateTexSubImage called (stub)\n");
-}
-
 void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
     fprintf(stderr, "MGL: glBindImageTextures called first=%u count=%d\n", first, count);
@@ -460,12 +448,6 @@ void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLu
             }
         }
     }
-}
-
-void mglClientActiveTexture(GLMContext ctx, GLenum texture)
-{
-    // Legacy function for fixed-function pipeline, safe to ignore in modern GL
-    fprintf(stderr, "MGL: glClientActiveTexture called (stub) - legacy function\n");
 }
 
 void mglActiveTexture(GLMContext ctx, GLenum texture)
@@ -724,7 +706,6 @@ bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint inter
 
     return true;
 }
-
 
 bool verifyInternalFormatAndFormatType(GLMContext ctx, GLint internalformat, GLenum format, GLenum type)
 {
@@ -1040,7 +1021,6 @@ bool verifyInternalFormatAndFormatType(GLMContext ctx, GLint internalformat, GLe
 
     return true;
 }
-
 
 void unpackTexture(GLMContext ctx, Texture *tex, GLuint face, GLuint level, void *src_data, void *dst_data, size_t src_pitch, size_t pixel_size, size_t xoffset, size_t yoffset, size_t zoffset, size_t width, size_t height, size_t depth)
 {
@@ -1443,18 +1423,6 @@ void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
     createTextureLevel(ctx, tex, face, level, is_array, internalformat, width, height, 1, format, type, (void *)pixels, proxy);
 }
 
-void mglTexImage2DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations)
-{
-    // Multisample textures are used by virglrenderer for capability probing.
-    // Apple Silicon handles MSAA differently - we silently succeed to allow
-    // the rendering pipeline to proceed without MSAA.
-    fprintf(stderr, "MGL: mglTexImage2DMultisample (stub) - target=0x%x samples=%d internalformat=0x%x %dx%d\n",
-            target, samples, internalformat, width, height);
-    (void)ctx; (void)target; (void)samples; (void)internalformat;
-    (void)width; (void)height; (void)fixedsamplelocations;
-    // Don't set error - allow probing to "succeed" so virglrenderer continues
-}
-
 void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels)
 {
     Texture *tex;
@@ -1500,16 +1468,6 @@ void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
     tex->access = GL_READ_ONLY;
 
     createTextureLevel(ctx, tex, 0, level, is_array, internalformat, width, height, depth, format, type, (void *)pixels, proxy);
-}
-
-void mglTexImage3DMultisample(GLMContext ctx, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations)
-{
-    // Multisample array textures - silently succeed like 2D multisample
-    fprintf(stderr, "MGL: mglTexImage3DMultisample (stub) - target=0x%x samples=%d internalformat=0x%x %dx%dx%d\n",
-            target, samples, internalformat, width, height, depth);
-    (void)ctx; (void)target; (void)samples; (void)internalformat;
-    (void)width; (void)height; (void)depth; (void)fixedsamplelocations;
-    // Don't set error
 }
 
 #pragma mark texSubImage
@@ -1981,7 +1939,6 @@ void mglTexStorage2D(GLMContext ctx, GLenum target, GLsizei levels, GLenum inter
     texStorage(ctx, tex, num_faces, levels, is_array, internalformat, width, height, 1, proxy);
 }
 
-
 void mglTextureStorage2D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
 {
     Texture *tex;
@@ -1996,13 +1953,6 @@ void mglTextureStorage2D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum 
     tex = getTex(ctx, texture, 0);
 
     texStorage(ctx, tex, 1, levels, false, internalformat, width, height, 1, false);
-}
-
-void mglTextureStorage2DMultisample(GLMContext ctx, GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations)
-{
-    fprintf(stderr, "MGL WARNING: glTextureStorage2DMultisample called (stub) - MSAA not fully supported\n");
-    // Fall back to non-MSAA storage
-    mglTextureStorage2D(ctx, texture, 1, internalformat, width, height);
 }
 
 void mglTexStorage3D(GLMContext ctx, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
@@ -2070,14 +2020,6 @@ void mglTextureStorage3D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum 
 
     createTextureLevel(ctx, tex, 0, 0, false, internalformat, width, height, depth, 0, 0, NULL, false);
 }
-
-void mglTextureStorage3DMultisample(GLMContext ctx, GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations)
-{
-    fprintf(stderr, "MGL WARNING: glTextureStorage3DMultisample called (stub) - MSAA not fully supported\n");
-    // Fall back to non-MSAA storage
-    mglTextureStorage3D(ctx, texture, 1, internalformat, width, height, depth);
-}
-
 
 #pragma mark clear tex image
 void mglClearTexImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, const void *data)
@@ -2394,21 +2336,6 @@ void mglGetCompressedTextureSubImage(GLMContext ctx, GLuint texture, GLint level
     fprintf(stderr, "MGL WARNING: glGetCompressedTextureSubImage called (stub) - compressed textures not supported\n");
 }
 
-void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origtexture, GLenum internalformat, GLuint minlevel, GLuint numlevels, GLuint minlayer, GLuint numlayers)
-{
-    fprintf(stderr, "MGL WARNING: glTextureView called (stub) - texture views not supported\n");
-}
-
-void mglTextureBuffer(GLMContext ctx, GLuint texture, GLenum internalformat, GLuint buffer)
-{
-    fprintf(stderr, "MGL WARNING: glTextureBuffer called (stub)\n");
-}
-
-void mglTextureBufferRange(GLMContext ctx, GLuint texture, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size)
-{
-    fprintf(stderr, "MGL WARNING: glTextureBufferRange called (stub)\n");
-}
-
 void mglCompressedTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data)
 {
     fprintf(stderr, "MGL WARNING: glCompressedTextureSubImage1D called (stub)\n");
@@ -2470,45 +2397,48 @@ void mglGetTextureLevelParameterfv(GLMContext ctx, GLuint texture, GLint level, 
     *params = (GLfloat)iparams;
 }
 
-void mglGetTextureParameterfv(GLMContext ctx, GLuint texture, GLenum pname, GLfloat *params)
+void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)
 {
-    fprintf(stderr, "MGL: glGetTextureParameterfv called (stub) pname=0x%x\n", pname);
-    *params = 0.0f;
+	fprintf(stderr, "MGL: glCopyImageSubData src=%u dst=%u %dx%dx%d\n",
+	        srcName, dstName, srcWidth, srcHeight, srcDepth);
+	
+	// Find source and destination textures
+	Texture *srcTex = findTexture(ctx, srcName);
+	Texture *dstTex = findTexture(ctx, dstName);
+	
+	if (!srcTex || !dstTex) {
+		fprintf(stderr, "MGL ERROR: CopyImageSubData - texture not found src=%p dst=%p\n",
+		        srcTex, dstTex);
+		return;
+	}
+	
+	if (!srcTex->mtl_data || !dstTex->mtl_data) {
+		fprintf(stderr, "MGL ERROR: CopyImageSubData - no Metal data src=%p dst=%p\n",
+		        srcTex->mtl_data, dstTex->mtl_data);
+		return;
+	}
+	
+	// Use Metal blit to copy texture regions
+	ctx->mtl_funcs.mtlCopyImageSubData(ctx, srcTex, srcLevel, srcX, srcY, srcZ,
+	                                    dstTex, dstLevel, dstX, dstY, dstZ,
+	                                    srcWidth, srcHeight, srcDepth);
 }
 
-void mglGetTextureParameterIiv(GLMContext ctx, GLuint texture, GLenum pname, GLint *params)
+void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
 {
-    fprintf(stderr, "MGL: glGetTextureParameterIiv called (stub) pname=0x%x\n", pname);
-    *params = 0;
+	// TODO: Implement
+	(void)ctx;
 }
 
-void mglGetTextureParameterIuiv(GLMContext ctx, GLuint texture, GLenum pname, GLuint *params)
+#pragma mark - domain 'texdata' hooks
+
+void mgl_ext_init_texdata(GLMContext ctx)
 {
-    fprintf(stderr, "MGL: glGetTextureParameterIuiv called (stub) pname=0x%x\n", pname);
-    *params = 0;
+    (void)ctx;
 }
 
-void mglGetTextureParameteriv(GLMContext ctx, GLuint texture, GLenum pname, GLint *params)
+bool mgl_ext_get_texdata(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
-    fprintf(stderr, "MGL: glGetTextureParameteriv called (stub) pname=0x%x\n", pname);
-    *params = 0;
+    (void)ctx; (void)pname; (void)type; (void)data;
+    return false;
 }
-
-void mglGetTexParameterIiv(GLMContext ctx, GLenum target, GLenum pname, GLint *params)
-{
-    fprintf(stderr, "MGL: glGetTexParameterIiv called (stub) pname=0x%x\n", pname);
-    *params = 0;
-}
-
-void mglGetTexParameterIuiv(GLMContext ctx, GLenum target, GLenum pname, GLuint *params)
-{
-    fprintf(stderr, "MGL: glGetTexParameterIuiv called (stub) pname=0x%x\n", pname);
-    *params = 0;
-}
-
-void mglSampleCoverage(GLMContext ctx, GLfloat value, GLboolean invert)
-{
-    // Stub - sample coverage is a hint for multisampling
-    fprintf(stderr, "MGL: glSampleCoverage called (stub) value=%f invert=%d\n", value, invert);
-}
-

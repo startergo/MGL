@@ -78,7 +78,6 @@ GLsync mglFenceSync(GLMContext ctx, GLenum condition, GLbitfield flags)
     return ptr;
 }
 
-
 GLboolean mglIsSync(GLMContext ctx, GLsync sync)
 {
     if (sync == NULL)
@@ -226,13 +225,6 @@ void mglGetSynciv(GLMContext ctx, GLsync sync, GLenum pname, GLsizei count, GLsi
 
         values++;
     }
-}
-
-void mglTextureBarrier(GLMContext ctx)
-{
-    // CRITICAL FIX: Handle unimplemented function gracefully instead of crashing
-    fprintf(stderr, "MGL WARNING: mglTextureBarrier is not yet implemented in MGL\n");
-    // No-op implementation - this is optional functionality
 }
 
 void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)

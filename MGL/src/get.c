@@ -19,6 +19,7 @@
  */
 
 #include "glm_context.h"
+#include "mgl_ext.h"
 
 // these cast a void ptr to a type and value
 #define RET_BOOL(__value__) *((GLboolean *)data) = (GLboolean)__value__; break;
@@ -366,6 +367,12 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x82D8: RET_TYPE_VAR(type, vertex_binding_stride); break; // GL_VERTEX_BINDING_STRIDE
         case 0x82D9: RET_TYPE_VAR(type, max_vertex_attrib_relative_offset); break; // GL_MAX_VERTEX_ATTRIB_RELATIVE_OFFSET
         case 0x82DA: RET_TYPE_VAR(type, max_vertex_attrib_bindings); break; // GL_MAX_VERTEX_ATTRIB_BINDINGS
+
+        default:
+            // domain extensions (mgl_ext.h); unknown pnames are an error
+            if (!mgl_ext_get(ctx, pname, type, data))
+                ERROR_RETURN(GL_INVALID_ENUM);
+            break;
     }
 }
 
@@ -468,12 +475,23 @@ void mglGetIntegeri_v(GLMContext ctx, GLenum target, GLuint index, GLint *data)
     }
 }
 
-void mglGetInternalformati64v(GLMContext ctx, GLenum target, GLenum internalformat, GLenum pname, GLsizei count, GLint64 *params)
+void mglGetBooleani_v(GLMContext ctx, GLenum target, GLuint index, GLboolean *data)
 {
-        assert(0);
+	// Indexed boolean - return false
+	(void)target; (void)index;
+	if (data) *data = GL_FALSE;
 }
 
-void mglGetInternalformativ(GLMContext ctx, GLenum target, GLenum internalformat, GLenum pname, GLsizei count, GLint *params)
+void mglGetDoublei_v(GLMContext ctx, GLenum target, GLuint index, GLdouble *data)
 {
-        assert(0);
+	// Indexed double - return 0.0
+	(void)target; (void)index;
+	if (data) *data = 0.0;
+}
+
+void mglGetFloati_v(GLMContext ctx, GLenum target, GLuint index, GLfloat *data)
+{
+	// Indexed float - return 0.0
+	(void)target; (void)index;
+	if (data) *data = 0.0f;
 }

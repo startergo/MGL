@@ -12,3 +12,9 @@ external/glslang/
 /SPIRV-Cross
 /MGL.gputrace
 /Info.plist
+
+# agent worktrees / build
+wt/
+build/
+agents/__pycache__/
+agents/output/

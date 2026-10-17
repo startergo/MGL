@@ -31,6 +31,7 @@
 #include "vertex_arrays.h"
 #include "MGLRenderer.h"
 #include "error.h"
+#include "mgl_ext.h"
 
 extern void getMacOSDefaults(GLMContext glm_ctx);
 extern void init_dispatch(GLMContext ctx);
@@ -271,6 +272,8 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     initHashTable(&STATE(sampler_table), 32);
     
     init_dispatch(ctx);
+
+    mgl_ext_init_all(ctx);
 
     ctx->assert_on_error = GL_TRUE;
     ctx->error_func = error_func;
