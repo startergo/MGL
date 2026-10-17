@@ -406,6 +406,48 @@ void mglCreateBuffers(GLMContext ctx, GLsizei n, GLuint *buffers)
     }
 }
 
+#include "mgl_ext_vattrib.h"
+
+/* Detach a buffer object from every binding point that can reference it: the
+ * generic bindings, all indexed (base/range) bindings, and the vertex bindings and
+ * element buffer of every VAO (other VAOs would otherwise keep a dangling pointer
+ * once the object is freed). */
+static void mgl_buffers_detach_everywhere(GLMContext ctx, Buffer *ptr)
+{
+    for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+        if (STATE(buffers[i]) == ptr)
+            STATE(buffers[i]) = NULL;
+
+    for (int t = 0; t < _MAX_BUFFER_TYPES; t++)
+        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+        {
+            BufferBaseTarget *b = &ctx->state.buffer_base[t].buffers[i];
+            if (b->buf == ptr || (b->buffer == ptr->name && b->buffer != 0))
+                bzero(b, sizeof(*b));
+        }
+
+    HashTable *vt = &STATE(vao_table);
+    for (unsigned k = 0; k < vt->size; k++)
+    {
+        VertexArray *vao = (VertexArray *)vt->keys[k].data;
+        if (!vao) continue;
+        MGLVertexArrayFull *full = mgl_va_full(vao);
+        for (int a = 0; a < MAX_ATTRIBS; a++)
+            if (vao->attrib[a].buffer == ptr)
+                vao->attrib[a].buffer = NULL;
+        for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+            if (full->binding[b].buffer == ptr)
+            {
+                full->binding[b].buffer = NULL;
+                full->binding[b].buffer_name = 0;
+            }
+        if (vao->element_array.buffer == ptr)
+            vao->element_array.buffer = NULL;
+        vao->dirty_bits |= DIRTY_VAO_BUFFER_BASE | DIRTY_VAO_ATTRIB;
+    }
+    STATE(dirty_bits) |= DIRTY_VAO | DIRTY_BUFFER_BASE_STATE;
+}
+
 void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
 {
     GLuint buffer;
@@ -453,49 +495,8 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
 
             deleteHashElement(&STATE(buffer_table), buffer);
 
-            // remove any dangling references
-            GLuint target;
-
-            target = ptr->target;
-            if (STATE(buffers[target]))
-            {
-                if (STATE(buffers[target])->name == buffer)
-                {
-                    STATE(buffers[target]) = NULL;
-                }
-            }
-
-            if (VAO())
-            {
-                if (VAO_ATTRIB_STATE(target).buffer)
-                {
-                    if (VAO_ATTRIB_STATE(target).buffer->name == buffer)
-                    {
-                        VAO_ATTRIB_STATE(target).buffer = NULL;
-                    }
-                }
-            }
-
-            switch(target)
-            {
-                case GL_UNIFORM:
-                case GL_TRANSFORM_FEEDBACK_BUFFER:
-                case GL_SHADER_STORAGE_BUFFER:
-                case GL_ATOMIC_COUNTER_BUFFER:
-                {
-                    GLuint index;
-
-                    index = bufferIndexFromTarget(ctx, target);
-
-                    for(int i=0; i<MAX_BINDABLE_BUFFERS; i++)
-                    {
-                        if (ctx->state.buffer_base[index].buffers[i].buffer == buffer)
-                        {
-                            bzero(&ctx->state.buffer_base[index], sizeof(BufferBaseTarget));
-                        }
-                    }
-                }
-            }
+            // remove every dangling reference before freeing the object
+            mgl_buffers_detach_everywhere(ctx, ptr);
 
             free(ptr);
         } // if (isBuffer(ctx, buffer))
