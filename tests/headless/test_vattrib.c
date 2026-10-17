@@ -648,11 +648,16 @@ TEST(instanced_divisors)
             CAP_VEC4(inst * 64 + vtx, pv[vtx], p1[inst], p2[inst / 2], inst, 0);
         }
 
-    /* base instance offsets instanced fetches but not gl_InstanceID: element = floor(id/div) + base */
+    /* base instance: instanced element = floor(instance / divisor) + baseinstance.  The capture
+     * slot is derived from the fetched value so this does not depend on gl_InstanceID. */
+    GLuint prog2 = cap_program("layout(location=0) in float v;\nlayout(location=1) in float i1;\nlayout(location=2) in float i2;",
+                               "vec4", "vec4(v, i1, i2, 0.0); o.v[int(i1) / 100 + 8] = vec4(v, i1, i2, 1.0)");
+    if (!prog2) return;
+    glUseProgram(prog2);
     cap_reset();
     glDrawArraysInstancedBaseInstance(GL_POINTS, 0, 1, 2, 1);
-    CAP_VEC4(0, 10, 200, 2000, 0, 0);
-    CAP_VEC4(64, 10, 300, 2000, 1, 0);
+    CAP_VEC4(8 + 2, 10, 200, 2000, 1, 0);   /* instance 0 -> p1[1], p2[0 / 2 + 1] */
+    CAP_VEC4(8 + 3, 10, 300, 2000, 1, 0);   /* instance 1 -> p1[2], p2[1 / 2 + 1] */
     EXPECT_NO_GL_ERROR();
 }
 
