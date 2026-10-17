@@ -290,6 +290,7 @@ TEST(blend_per_attachment)
     EXPECT_PIXEL(16, 16, 64, 128, 0, 255, 3);          /* replaced, blue masked off */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glReadBuffer(GL_FRONT);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(2, tex);
     EXPECT_NO_GL_ERROR();

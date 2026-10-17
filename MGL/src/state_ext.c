@@ -1097,6 +1097,17 @@ bool mgl_ext_get_rstate(GLMContext ctx, GLenum pname, GLuint type, void *data)
             return true;
 
         case GL_POLYGON_OFFSET_CLAMP:      mgl_get_store(type, data, 0, RS()->polygon_offset_clamp); return true;
+        case GL_POLYGON_OFFSET_FACTOR:     mgl_get_store(type, data, 0, RS()->polygon_offset_factor); return true;
+        case GL_POLYGON_OFFSET_UNITS:      mgl_get_store(type, data, 0, RS()->polygon_offset_units); return true;
+        case GL_POLYGON_MODE:              mgl_get_store(type, data, 0, RS()->polygon_mode);
+                                           mgl_get_store(type, data, 1, RS()->polygon_mode); return true;
+        case GL_VIEWPORT:                  for (int k = 0; k < 4; k++) mgl_get_store(type, data, k, RS()->viewport[0][k]); return true;
+        case GL_SCISSOR_BOX:               for (int k = 0; k < 4; k++) mgl_get_store(type, data, k, RS()->scissor[0][k]); return true;
+        case GL_PROVOKING_VERTEX:          mgl_get_store(type, data, 0, RS()->provoking_vertex); return true;
+        case GL_PRIMITIVE_RESTART_INDEX:   mgl_get_store(type, data, 0, RS()->primitive_restart_index); return true;
+        case GL_SAMPLE_COVERAGE_VALUE:     mgl_get_store(type, data, 0, RS()->sample_coverage_value); return true;
+        case GL_SAMPLE_COVERAGE_INVERT:    mgl_get_store(type, data, 0, RS()->sample_coverage_invert); return true;
+        case GL_MAX_VIEWPORTS:             mgl_get_store(type, data, 0, rs_max_viewports(ctx)); return true;
         case GL_CLIP_ORIGIN:               mgl_get_store(type, data, 0, RS()->clip_origin); return true;
         case GL_CLIP_DEPTH_MODE:           mgl_get_store(type, data, 0, RS()->clip_depth_mode); return true;
         case GL_PATCH_VERTICES:            mgl_get_store(type, data, 0, RS()->patch_vertices); return true;
