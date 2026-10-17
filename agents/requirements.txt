@@ -1,0 +1,4 @@
+anthropic>=0.40.0
+
+# Native tools used (Xcode command line tools): make, clang (cc), nm, git.
+# External deps (SPIRV-Cross, glslang, SPIRV-Tools) are built by external/build_external.sh.

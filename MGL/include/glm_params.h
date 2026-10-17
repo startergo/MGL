@@ -114,7 +114,7 @@ typedef struct GLMParams_t {
     GLuint logic_op_mode;
     GLuint draw_buffer;
     GLuint read_buffer;
-    GLuint scissor_box[4];
+    GLint scissor_box[4];
     GLuint color_clear_value;
     GLboolean color_writemask[MAX_COLOR_ATTACHMENTS][4];
     GLuint max_texture_size;
@@ -193,8 +193,8 @@ typedef struct GLMParams_t {
     GLuint map1_grid_segments;
     GLuint map2_grid_domain;
     GLuint map2_grid_segments;
-    GLuint polygon_offset_units;
-    GLuint polygon_offset_factor;
+    GLfloat polygon_offset_units;
+    GLfloat polygon_offset_factor;
     GLuint texture_binding_1d;
     GLuint texture_binding_2d;
     GLuint client_attrib_stack_depth;
@@ -227,7 +227,7 @@ typedef struct GLMParams_t {
     GLuint aliased_line_width_range;
     GLuint aliased_point_size_range;
     GLuint active_texture;
-    GLuint sample_coverage_value;
+    GLfloat sample_coverage_value;
     GLuint sample_coverage_invert;
     GLuint texture_binding_cube_map;
     GLuint max_cube_map_texture_size;
