@@ -15,130 +15,126 @@
 
 void mglColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglColorP4ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglColorP4uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// Packed color - deprecated, no-op
-	(void)type;
-	(void)color;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnMapdv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLdouble *v)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnMapfv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLfloat *v)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnMapiv(GLMContext ctx, GLenum target, GLenum query, GLsizei bufSize, GLint *v)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnPixelMapfv(GLMContext ctx, GLenum map, GLsizei bufSize, GLfloat *values)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnPixelMapuiv(GLMContext ctx, GLenum map, GLsizei bufSize, GLuint *values)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglGetnPixelMapusv(GLMContext ctx, GLenum map, GLsizei bufSize, GLushort *values)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglNormalP3ui(GLMContext ctx, GLenum type, GLuint coords)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglNormalP3uiv(GLMContext ctx, GLenum type, const GLuint *coords)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglSecondaryColorP3ui(GLMContext ctx, GLenum type, GLuint color)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglSecondaryColorP3uiv(GLMContext ctx, GLenum type, const GLuint *color)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP2ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP2uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP3ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP3uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP4ui(GLMContext ctx, GLenum type, GLuint value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglVertexP4uiv(GLMContext ctx, GLenum type, const GLuint *value)
 {
-	// TODO: Implement
-	(void)ctx;
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
 void mglClientActiveTexture(GLMContext ctx, GLenum texture)
 {
-    // Legacy function for fixed-function pipeline, safe to ignore in modern GL
-    fprintf(stderr, "MGL: glClientActiveTexture called (stub) - legacy function\n");
+    /* compatibility-profile only; MGL is a core-profile context */
+    ERROR_RETURN(GL_INVALID_OPERATION);
 }

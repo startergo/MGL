@@ -1,0 +1,186 @@
+/*
+ * MGLRenderer+TransformFeedback.m — Metal side of the 'xfb' domain.
+ *
+ * Runs the capture variant of a program's vertex shader (see mgl_ext_xfb.h) in its own
+ * command buffer: an attachment-less render pass with rasterization disabled, the vertex
+ * buffers / uniform buffers bound exactly as the renderer binds them for the real draw, and
+ * the capture SSBO at buffer(MGL_XFB_MSL_BUFFER_INDEX).  The command buffer is waited on and
+ * the records are handed back to transform_feedback.c, which assembles and packs primitives.
+ */
+
+#import "MGLRenderer_Private.h"
+#include "mgl_ext_xfb.h"
+
+@interface MGLRenderer (TransformFeedback)
+- (void) bindExtXfbFuncsToGLMContext: (GLMContext) glm_ctx;
+- (const uint32_t *) xfbCapture: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
+                      instances: (GLsizei) instances baseInstance: (GLuint) baseinstance;
+@end
+
+/* scratch buffer reused across captures (per renderer) */
+static id<MTLBuffer> xfbScratch;
+
+static const uint32_t *xfbCaptureC(GLMContext glm_ctx, MGLXfbProgram *xp, GLint vstart, GLsizei vcount,
+                                   GLsizei instances, GLuint baseinstance)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    return [r xfbCapture: xp vstart: vstart vcount: vcount instances: instances baseInstance: baseinstance];
+}
+
+static void xfbBufferWrittenC(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t size)
+{
+    (void)glm_ctx;
+    if (!buf->data.mtl_data || !size) return;
+
+    id<MTLBuffer> mb = (__bridge id<MTLBuffer>)buf->data.mtl_data;
+    if (offset + size > mb.length) {
+        if (offset >= mb.length) return;
+        size = mb.length - offset;
+    }
+    /* small buffers keep a separate CPU copy (buffer_data) next to the MTLBuffer */
+    if ((void *)buf->data.buffer_data != mb.contents)
+        memcpy((uint8_t *)mb.contents + offset, (const uint8_t *)buf->data.buffer_data + offset, size);
+    if (mb.storageMode == MTLStorageModeManaged)
+        [mb didModifyRange: NSMakeRange(offset, size)];
+}
+
+static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
+{
+    (void)glm_ctx;
+    if (xp->mtl_pipeline) CFBridgingRelease(xp->mtl_pipeline);
+    if (xp->mtl_function) CFBridgingRelease(xp->mtl_function);
+    if (xp->mtl_library) CFBridgingRelease(xp->mtl_library);
+    xp->mtl_pipeline = NULL;
+    xp->mtl_function = NULL;
+    xp->mtl_library = NULL;
+    xp->mtl_pipeline_key = NULL;
+}
+
+@implementation MGLRenderer (TransformFeedback)
+
+- (void) bindExtXfbFuncsToGLMContext: (GLMContext) glm_ctx
+{
+    struct MGLExtMetal_xfb *m = glm_ctx->mtl_funcs.ext_xfb;
+    if (!m) {
+        m = calloc(1, sizeof(struct MGLExtMetal_xfb));
+        if (!m) return;
+        glm_ctx->mtl_funcs.ext_xfb = m;
+    }
+    m->capture = xfbCaptureC;
+    m->buffer_written = xfbBufferWrittenC;
+    m->release_program = xfbReleaseProgramC;
+    mgl_xfb_install_draw_hooks(glm_ctx);
+}
+
+- (id<MTLRenderPipelineState>) xfbPipelineFor: (MGLXfbProgram *) xp vertexDescriptor: (MTLVertexDescriptor *) vd
+{
+    NSError *error = nil;
+
+    if (!xp->mtl_function) {
+        id<MTLLibrary> lib = [_device newLibraryWithSource: [NSString stringWithUTF8String: xp->msl]
+                                                   options: nil error: &error];
+        if (!lib) {
+            NSLog(@"MGL xfb: capture variant failed to compile: %@", error);
+            return nil;
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]];
+        if (!fn) {
+            NSLog(@"MGL xfb: capture entry point %s not found", xp->entry);
+            return nil;
+        }
+        xp->mtl_library = (void *)CFBridgingRetain(lib);
+        xp->mtl_function = (void *)CFBridgingRetain(fn);
+    }
+
+    /* the pipeline depends on the vertex layout; rebuild when it changes */
+    NSString *key = [vd description];
+    if (xp->mtl_pipeline && xp->mtl_pipeline_key) {
+        NSString *old = (__bridge NSString *)xp->mtl_pipeline_key;
+        if ([old isEqualToString: key])
+            return (__bridge id<MTLRenderPipelineState>)xp->mtl_pipeline;
+    }
+
+    MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.label = @"MGL transform feedback capture";
+    pd.vertexFunction = (__bridge id<MTLFunction>)xp->mtl_function;
+    pd.fragmentFunction = nil;
+    pd.vertexDescriptor = vd;
+    pd.rasterizationEnabled = NO;
+    pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+
+    id<MTLRenderPipelineState> ps = [_device newRenderPipelineStateWithDescriptor: pd error: &error];
+    if (!ps) {
+        NSLog(@"MGL xfb: capture pipeline creation failed: %@", error);
+        return nil;
+    }
+    if (xp->mtl_pipeline) CFBridgingRelease(xp->mtl_pipeline);
+    if (xp->mtl_pipeline_key) CFBridgingRelease(xp->mtl_pipeline_key);
+    xp->mtl_pipeline = (void *)CFBridgingRetain(ps);
+    xp->mtl_pipeline_key = (void *)CFBridgingRetain(key);
+    return ps;
+}
+
+- (const uint32_t *) xfbCapture: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
+                      instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
+{
+    if (!_device || !_commandQueue || !xp->msl || !ctx->state.program || !VAO()) return NULL;
+
+    /* map uniform / storage / vertex buffers exactly like the real draw does */
+    if (![self mapBuffersToMTL]) return NULL;
+    if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]) return NULL;
+
+    MTLVertexDescriptor *vd = [self generateVertexDescriptor];
+    if (!vd) return NULL;
+    /* the next real draw must rebuild its own state from the same mapping */
+    ctx->state.dirty_bits |= DIRTY_VAO;
+
+    id<MTLRenderPipelineState> ps = [self xfbPipelineFor: xp vertexDescriptor: vd];
+    if (!ps) return NULL;
+
+    size_t records = (size_t)vcount * (size_t)instances;
+    size_t bytes = (MGL_XFB_HEADER_WORDS + records * xp->record_words) * sizeof(uint32_t);
+    if (!xfbScratch || xfbScratch.length < bytes) {
+        size_t sz = 4096;
+        while (sz < bytes) sz *= 2;
+        xfbScratch = [_device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+        if (!xfbScratch) return NULL;
+    }
+    uint32_t *hdr = (uint32_t *)xfbScratch.contents;
+    hdr[0] = xp->vid_absolute ? (uint32_t)vstart : 0;
+    hdr[1] = (uint32_t)vcount;
+    hdr[2] = xp->iid_absolute ? baseinstance : 0;
+    hdr[3] = xp->record_words;
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.renderTargetWidth = 1;
+    rp.renderTargetHeight = 1;
+    rp.defaultRasterSampleCount = 1;
+
+    id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
+    cb.label = @"MGL transform feedback capture";
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor: rp];
+    if (!enc) return NULL;
+    [enc setRenderPipelineState: ps];
+
+    /* reuse the renderer's binding code on our encoder */
+    id<MTLRenderCommandEncoder> saved = _currentRenderEncoder;
+    _currentRenderEncoder = enc;
+    bool ok = [self bindVertexBuffersToCurrentRenderEncoder];
+    _currentRenderEncoder = saved;
+    if (!ok) { [enc endEncoding]; return NULL; }
+
+    [enc setVertexBuffer: xfbScratch offset: 0 atIndex: MGL_XFB_MSL_BUFFER_INDEX];
+    [enc drawPrimitives: MTLPrimitiveTypePoint vertexStart: (NSUInteger)vstart vertexCount: (NSUInteger)vcount
+          instanceCount: (NSUInteger)instances baseInstance: baseinstance];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        NSLog(@"MGL xfb: capture command buffer failed: %@", cb.error);
+        return NULL;
+    }
+    return hdr + MGL_XFB_HEADER_WORDS;
+}
+
+@end

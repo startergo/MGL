@@ -29,6 +29,7 @@
 
 #include "pixel_utils.h"
 #include "glm_context.h"
+#include "mgl_ext_queries.h"
 
 #include "mgl_ext_fb.h"
 
@@ -53,6 +54,10 @@ void mglClear(GLMContext ctx, GLbitfield mask)
 
     /* Clear is discarded together with primitives (GL 4.6 14.1) */
     if (ctx->state.caps.rasterizer_discard)
+        return;
+
+    /* conditional rendering (queries domain) discards clears too */
+    if (!mgl_queries_render_allowed(ctx))
         return;
 
     MGLFBClearRequest req;
