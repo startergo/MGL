@@ -334,6 +334,7 @@ bool mgl_ext_get_gpuaudit(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case MGL_GPUAUDIT_INDEX_MISSES:  v = s->index_misses; break;
         case MGL_GPUAUDIT_PBO_READBACKS: v = s->pbo_readbacks; break;
         case MGL_GPUAUDIT_GPU_CLEARS:    v = s->gpu_clears; break;
+        case MGL_GPUAUDIT_INDIRECT_NOREAD: v = s->indirect_noread; break;
         default: return false;
     }
 

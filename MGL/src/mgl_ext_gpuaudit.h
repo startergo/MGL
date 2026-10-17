@@ -87,6 +87,7 @@ struct MGLExtState_gpuaudit {
     uint32_t scan_hits, scan_misses;
     uint32_t index_hits, index_misses;
     uint32_t pbo_readbacks, gpu_clears;
+    uint32_t indirect_noread;         /* multi-draw indirect commands never read on the CPU */
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_gpuaudit; filled by MGLRenderer+Gpuaudit.m. */
@@ -126,6 +127,7 @@ struct MGLExtMetal_gpuaudit {
 #define MGL_GPUAUDIT_INDEX_MISSES  0x8F05
 #define MGL_GPUAUDIT_PBO_READBACKS 0x8F06
 #define MGL_GPUAUDIT_GPU_CLEARS    0x8F07
+#define MGL_GPUAUDIT_INDIRECT_NOREAD 0x8F08
 
 #ifdef __cplusplus
 extern "C" {

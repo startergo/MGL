@@ -41,6 +41,7 @@
 #include "mgl_buffers_err.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: cached index rewrites / restart scans */
+#include "mgl_ext_queries.h"   /* gpuaudit: multi-draw indirect without CPU command reads */
 #include "mgl_ext_tess.h"
 #include "mgl_ext_xfb.h"
 
@@ -1051,7 +1052,11 @@ static bool read_indirect(GLMContext ctx, Buffer *buf, size_t offset, uint32_t *
     return true;
 }
 
-static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, Buffer *ibuf, size_t offset)
+/* `need_counts`: only an active CPU-counted pipeline-statistics query wants the
+ * vertex/instance counts of the command (gpuaudit).  When it does not and Metal can
+ * run the draw straight from the app's buffer, the command is never read on the CPU. */
+static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum type, Buffer *ibuf,
+                          size_t offset, bool need_counts)
 {
     uint32_t cmd[5] = { 0, 0, 0, 0, 0 };
     int words = type ? 5 : 4;
@@ -1063,8 +1068,10 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
                   !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
                          : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
-    // read the command when CPU-visible (always when the CPU path needs it)
-    bool known = read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok);
+    // read the command when CPU-visible; when nothing needs the counts and Metal can
+    // take the command buffer directly, skip the read entirely (gpuaudit)
+    bool known = (gpu_ok && !need_counts) ? false
+                                             : read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok || need_counts);
 
     if (!known && !gpu_ok)
         return;
@@ -1082,6 +1089,9 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
         // counts are produced on the GPU and not visible yet
         return;
     }
+
+    if (gpu_ok && !known && ctx->state.ext_gpuaudit)
+        ctx->state.ext_gpuaudit->indirect_noread++;
 
     if (gpu_ok)
     {
@@ -1155,9 +1165,14 @@ void mgl_buffers_multi_draw_indirect(GLMContext ctx, GLenum mode, GLenum type, c
             drawcount = (GLsizei)n;   // clamped to maxdrawcount
     }
 
+    /* gpuaudit: the vertex/instance counts of each command are only needed by a
+     * CPU-counted pipeline-statistics query (transform feedback capture forces the CPU
+     * path anyway); otherwise the commands are handed to Metal unread. */
+    bool need_counts = mgl_queries_counting_active(ctx) || mgl_xfb_capturing(ctx);
+
     DrawBatch batch = { 0 };
     for (GLsizei i = 0; i < drawcount; i++)
-        exec_indirect(ctx, &batch, mode, type, ibuf, offset + step * (size_t)i);
+        exec_indirect(ctx, &batch, mode, type, ibuf, offset + step * (size_t)i, need_counts);
     batch_end(ctx, &batch);
 }
 
@@ -1179,7 +1194,7 @@ static void single_indirect(GLMContext ctx, GLenum mode, GLenum type, const void
     ERROR_CHECK_RETURN((uint64_t)offset + cmd_size <= (uint64_t)ibuf->size, GL_INVALID_OPERATION);
 
     DrawBatch batch = { 0 };
-    exec_indirect(ctx, &batch, mode, type, ibuf, offset);
+    exec_indirect(ctx, &batch, mode, type, ibuf, offset, true);
     batch_end(ctx, &batch);
 }
 

@@ -17,6 +17,7 @@
 #define MGL_GPUAUDIT_INDEX_MISSES  0x8F05
 #define MGL_GPUAUDIT_PBO_READBACKS 0x8F06
 #define MGL_GPUAUDIT_GPU_CLEARS    0x8F07
+#define MGL_GPUAUDIT_INDIRECT_NOREAD 0x8F08
 
 static GLint g_stat(GLenum pname)
 {
@@ -495,6 +496,73 @@ TEST(read_pixels_into_pbo_gpu)
     glDeleteTextures(1, &tex);
 }
 
+/* -------------------------------- F11: multi-draw indirect without CPU reads */
+
+typedef struct { GLuint count, instanceCount, first, baseVertex, baseInstance; } DrawCmd;
+
+TEST(multi_draw_indirect_no_cpu_read)
+{
+    glUseProgram(g_pos_col_prog);
+    glBindVertexArray(g_vao6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ebo6);
+
+    /* 200 commands: half draw the big red triangle, half the small green one */
+    enum { N = 200 };
+    DrawCmd cmds[N];
+    GLuint idx[6] = { 0, 1, 2, 3, 4, 5 };
+    for (int i = 0; i < N; i++)
+    {
+        GLuint first = (i & 1) ? 3 : 0;
+        cmds[i] = (DrawCmd){ 3, 1, first, 0, 0 };
+        if (i == 0)
+            cmds[i].count = 3, cmds[i].first = 0;
+    }
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+
+    GLuint ibuf;
+    glGenBuffers(1, &ibuf);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, ibuf);
+    glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(cmds), cmds, GL_STATIC_DRAW);
+
+    /* reference: the same 200 triangles drawn one by one */
+    GLuint r_ref = 0, g_ref = 0;
+    glClear(GL_COLOR_BUFFER_BIT);
+    for (int i = 0; i < N; i++)
+        glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT,
+                       (const void *)(uintptr_t)(((i & 1) ? 3u : 0u) * sizeof(GLuint)));
+    glFinish();
+    coverage(&r_ref, &g_ref);
+
+    GLint before = g_stat(MGL_GPUAUDIT_INDIRECT_NOREAD);
+    for (int rep = 0; rep < 3; rep++)
+    {
+        GLuint r, g;
+        glClear(GL_COLOR_BUFFER_BIT);
+        glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, N, 20);
+        glFinish();
+        coverage(&r, &g);
+        EXPECT_EQ_INT(r, r_ref);
+        EXPECT_EQ_INT(g, g_ref);
+    }
+    /* every command was handed to Metal unread */
+    EXPECT_EQ_INT(g_stat(MGL_GPUAUDIT_INDIRECT_NOREAD) - before, 3 * N);
+
+    /* with a counting query active the counts are read again and the CPU counters work */
+    GLuint q;
+    glGenQueries(1, &q);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, q);
+    glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, N, 20);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glFinish();
+    GLuint prims = 0;
+    glGetQueryObjectuiv(q, GL_QUERY_RESULT, &prims);
+    EXPECT_EQ_INT(prims, N);
+    glDeleteQueries(1, &q);
+
+    glDeleteBuffers(1, &ibuf);
+    EXPECT_NO_GL_ERROR();
+}
+
 /* ------------------------------------------------------------ F2: pipeline cache */
 
 TEST(pipeline_state_cache)
@@ -620,6 +688,7 @@ int main(void)
     RUN(index_cache_invalidated_on_reupload);
     RUN(index_cache_provoking_state);
     RUN(gpu_buffer_clear);
+    RUN(multi_draw_indirect_no_cpu_read);
     RUN(read_pixels_into_pbo_gpu);
     RUN(cpu_buffer_clear_still_correct);
     RUN(pipeline_state_cache);

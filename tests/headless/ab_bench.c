@@ -210,6 +210,25 @@ int main(int argc, char **argv)
             snprintf(label, sizeof(label), "readPixels PBO 512x512 x%d", iters);
             break;
         }
+        case 9: {  /* 1000-command multi-draw indirect, submit only */
+            enum { N = 1000 };
+            typedef struct { GLuint count, instanceCount, first, baseVertex, baseInstance; } DrawCmd;
+            DrawCmd cmds[N];
+            for (int i = 0; i < N; i++) cmds[i] = (DrawCmd){ 3, 1, 0, 0, 0 };
+            GLuint ibuf;
+            glGenBuffers(1, &ibuf);
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, ibuf);
+            glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(cmds), cmds, GL_STATIC_DRAW);
+            for (int i = 0; i < 5; i++) glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, N, 20);
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++)
+                glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, 0, N, 20);
+            t = now_s() - t0;
+            glFinish();
+            snprintf(label, sizeof(label), "1000-cmd multiDrawIndirect x%d", iters);
+            break;
+        }
         default: return 1;
     }
 
