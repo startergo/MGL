@@ -35,6 +35,7 @@
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
 #include "shaders.h"
 #include "buffers.h"
@@ -851,6 +852,14 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         return false;
     }
 
+    /* introspect: default uniform block, attribute / fragment-output locations, buffer order */
+    uint32_t *patched = mgl_introspect_patch_stage(ctx, ptr, stage, words, nwords, &prepared_words);
+    if (patched)
+    {
+        words = patched;
+        nwords = prepared_words;
+    }
+
     ptr->spirv[stage].stage = stage;
     ptr->spirv[stage].size = nwords;
     ptr->spirv[stage].ir = (unsigned int *)malloc(nwords * sizeof(uint32_t));
@@ -961,6 +970,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             r->name = strdup(rname);
             r->set = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
             r->binding = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
+            r->msl_binding = r->binding; /* refined with the real Metal index after MSL emission */
             r->location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
 
             switch (res_type)
@@ -1039,6 +1049,24 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         fprintf(stderr, "MGL: program %u %s stage MSL:\n%s\n", ptr->name, stage_label(stage), result);
     ptr->spirv[stage].entry_point = strdup(msl_entry);
 
+    /* Metal argument indices are only known after the MSL is emitted: patch the recorded
+     * resources with SPIRV-Cross's automatic bindings (texture slots differ from GL units).
+     * `resources` is the same (context-owned) reflection object created above. */
+    for (int res_type = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER; res_type < SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE && res_type < _MAX_SPIRV_RES; res_type++)
+    {
+        SpirvResourceList *rl = &ptr->spirv_resources_list[stage][res_type];
+        const spvc_reflected_resource *list = NULL;
+        size_t count = 0;
+        spvc_resources_get_resource_list_for_type(resources, res_type, &list, &count);
+        for (size_t i = 0; i < count && i < rl->count; i++)
+        {
+            if (list[i].id != rl->list[i]._id) continue;
+            unsigned msl_b = spvc_compiler_msl_get_automatic_resource_binding(compiler, list[i].id);
+            if (msl_b > 0 && msl_b < 31)
+                rl->list[i].msl_binding = msl_b;
+        }
+    }
+
     /* executable stage object read by the renderer */
     {
         Shader *exec = mgl_shader_new_internal(ctx, stage);
@@ -1072,6 +1100,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 done:
     spvc_context_destroy(context);
     free(prepared);
+    free(patched);
     return ok;
 }
 

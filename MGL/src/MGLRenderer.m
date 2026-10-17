@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "mgl_ext_introspect.h"
 #import "mgl_ext_program.h"
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
@@ -226,6 +227,22 @@ void logDirtyBits(GLMContext ctx)
                 spirv_binding = [self getProgramBinding:stage type:spvc_type index: i];
 
                 buf = buffers[spirv_binding].buf;
+
+                // introspect: default-block uniforms live in a per-program, per-stage buffer
+                if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
+                {
+                    Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stage, i);
+                    if (dub)
+                    {
+                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
+                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
+                        buffer_map->buffers[buffer_map->count].buf = dub;
+                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->count++;
+                        buffers_to_be_mapped--;
+                        continue;
+                    }
+                }
 
                 if (buf)
                 {
@@ -1683,7 +1700,11 @@ void logDirtyBits(GLMContext ctx)
 
         for (GLuint i = 0; i < count; i++)
         {
+            SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].list[i];
             GLuint spirv_binding = [self getProgramBinding:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index: i];
+            /* the shader always reads its own Metal texture slot: the GL sampler uniform only
+             * picks WHICH texture feeds it, never the argument index */
+            GLuint mtl_index = sres->msl_binding;
 
             if (spirv_binding >= TEXTURE_UNITS)
                 continue;
@@ -1706,13 +1727,13 @@ void logDirtyBits(GLMContext ctx)
 
             if (stage == _VERTEX_SHADER)
             {
-                [_currentRenderEncoder setVertexTexture:texture atIndex:spirv_binding];
-                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:spirv_binding];
+                [_currentRenderEncoder setVertexTexture:texture atIndex:mtl_index];
+                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:mtl_index];
             }
             else
             {
-                [_currentRenderEncoder setFragmentTexture:texture atIndex:spirv_binding];
-                [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:spirv_binding];
+                [_currentRenderEncoder setFragmentTexture:texture atIndex:mtl_index];
+                [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:mtl_index];
             }
         }
     }

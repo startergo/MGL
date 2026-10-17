@@ -27,6 +27,7 @@
 
 #include "shaders.h"
 #include "glm_context.h"
+#include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
 
 const glslang_resource_t* glslang_default_resource(void);
@@ -610,7 +611,7 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     lazy_init_compiler(ctx);
 
     memset(&glsl_input, 0, sizeof(glsl_input));
-    initGLSLInput(ctx, ptr->type, ptr->src, &glsl_input);
+    initGLSLInput(ctx, ptr->type, mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
 
     glsl_shader = glslang_shader_create(&glsl_input);
     if (glsl_shader == NULL)
@@ -630,7 +631,13 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     /* For GLSL < 330, auto-assign locations since old shaders don't have layout() qualifiers */
     if (shader_version < 330)
         options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
-
+    /* introspect: GL assigns uniform/interface locations at link time (introspect_spirv.c);
+     * without this, 3.30+ shaders with loose uniforms lacking layout(location) fail to compile */
+    options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
+    /* GL-legal shaders may declare UBO/SSBO/atomic/sampler uniforms without layout(binding);
+     * glslang refuses to compile those for SPIR-V unless it can auto-map bindings.  The invented
+     * numbers are detected and replaced with the GL default (binding 0) at link (introspect_spirv.c). */
+    options |= GLSLANG_SHADER_AUTO_MAP_BINDINGS;
     glslang_shader_set_options(glsl_shader, options);
 
     if (!glslang_shader_preprocess(glsl_shader, &glsl_input) ||
