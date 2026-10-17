@@ -306,6 +306,81 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_
     return best;
 }
 
+/* ------------------------------------------------ converted attribute streams */
+
+static bool ga_shadow_match(const MGLShadowCacheEnt *e, Buffer *buf, uint64_t content, GLintptr start,
+                            GLint stride, GLenum type, GLint size, int kind)
+{
+    return e->mtl_buffer && e->buf == buf && e->content == content && e->start == start &&
+           e->stride == stride && e->type == type && e->size == size && e->kind == kind;
+}
+
+void *mgl_gpuaudit_shadow_lookup(GLMContext ctx, Buffer *buf, GLintptr start, GLint stride,
+                                 GLenum type, GLint size, int kind)
+{
+    struct MGLExtState_gpuaudit *s = GA(ctx);
+    if (!s || !mgl_gpuaudit_cacheable(ctx, buf))
+        return NULL;
+
+    uint64_t content = mgl_gpuaudit_content(ctx, buf);
+
+    for (int i = 0; i < MGL_GA_SHADOW_CACHE; i++)
+    {
+        MGLShadowCacheEnt *e = &s->shadow[i];
+        if (!ga_shadow_match(e, buf, content, start, stride, type, size, kind))
+            continue;
+
+        e->lru = ++s->lru;
+        s->shadow_hits++;
+        return e->mtl_buffer;
+    }
+
+    return NULL;
+}
+
+void *mgl_gpuaudit_shadow_store(GLMContext ctx, Buffer *buf, GLintptr start, GLint stride,
+                                GLenum type, GLint size, int kind, const void *data, size_t bytes)
+{
+    struct MGLExtState_gpuaudit *s = GA(ctx);
+    struct MGLExtMetal_gpuaudit *m = ctx ? ctx->mtl_funcs.ext_gpuaudit : NULL;
+
+    if (!s || !m || !m->index_buffer_new || !data || bytes == 0)
+        return NULL;
+
+    if (!mgl_gpuaudit_cacheable(ctx, buf))
+        return NULL;
+
+    uint64_t content = mgl_gpuaudit_content(ctx, buf);
+    void *mtl = m->index_buffer_new(ctx, data, bytes);
+    if (!mtl)
+        return NULL;
+
+    MGLShadowCacheEnt *best = &s->shadow[0];
+    for (int i = 0; i < MGL_GA_SHADOW_CACHE; i++)
+    {
+        MGLShadowCacheEnt *e = &s->shadow[i];
+        if (!e->mtl_buffer) { best = e; break; }
+        if (e->lru < best->lru) best = e;
+    }
+
+    if (best->mtl_buffer && m->index_buffer_free)
+        m->index_buffer_free(ctx, best->mtl_buffer);
+
+    memset(best, 0, sizeof(*best));
+    best->buf = buf;
+    best->content = content;
+    best->start = start;
+    best->stride = stride;
+    best->type = type;
+    best->size = size;
+    best->kind = kind;
+    best->mtl_buffer = mtl;
+    best->lru = ++s->lru;
+    s->shadow_misses++;
+
+    return mtl;
+}
+
 /* ------------------------------------------------------------- ext plumbing */
 
 void mgl_ext_init_gpuaudit(GLMContext ctx)
@@ -335,6 +410,9 @@ bool mgl_ext_get_gpuaudit(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case MGL_GPUAUDIT_PBO_READBACKS: v = s->pbo_readbacks; break;
         case MGL_GPUAUDIT_GPU_CLEARS:    v = s->gpu_clears; break;
         case MGL_GPUAUDIT_INDIRECT_NOREAD: v = s->indirect_noread; break;
+        case MGL_GPUAUDIT_SHADOW_HITS:   v = s->shadow_hits; break;
+        case MGL_GPUAUDIT_SHADOW_MISSES: v = s->shadow_misses; break;
+        case MGL_GPUAUDIT_XFB_SCATTERS:  v = s->xfb_scatters; break;
         default: return false;
     }
 

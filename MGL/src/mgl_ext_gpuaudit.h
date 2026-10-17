@@ -73,10 +73,26 @@ typedef struct MGLSerialEnt {
     uint64_t  serial;
 } MGLSerialEnt;
 
+/* one cached CPU-converted vertex-attribute stream (vattrib shadow attributes whose GL
+ * format Metal cannot fetch), resident in an MTLBuffer */
+typedef struct MGLShadowCacheEnt {
+    Buffer   *buf;              /* source vertex buffer */
+    uint64_t  content;          /* its content generation */
+    GLintptr  start;            /* binding offset + relative offset */
+    GLint     stride;
+    GLenum    type; GLint size; /* attribute format */
+    int       kind;             /* MGL_VA_KIND_* */
+    void     *mtl_buffer;       /* converted float4/int4 stream */
+    uint64_t  lru;
+} MGLShadowCacheEnt;
+
+#define MGL_GA_SHADOW_CACHE 4
+
 /* GL-side state, reachable as ctx->state.ext_gpuaudit; allocated in mgl_ext_init_gpuaudit(). */
 struct MGLExtState_gpuaudit {
     MGLScanCacheEnt  scan[MGL_GA_SCAN_CACHE];
     MGLIndexCacheEnt index[MGL_GA_INDEX_CACHE];
+    MGLShadowCacheEnt shadow[MGL_GA_SHADOW_CACHE];
     MGLSerialEnt    *serial;            /* open-addressed Buffer* -> generation table */
     uint32_t         serial_cap;        /* power of two, or 0 */
     uint64_t         serial_next;       /* fresh generation values */
@@ -88,6 +104,8 @@ struct MGLExtState_gpuaudit {
     uint32_t index_hits, index_misses;
     uint32_t pbo_readbacks, gpu_clears;
     uint32_t indirect_noread;         /* multi-draw indirect commands never read on the CPU */
+    uint32_t shadow_hits, shadow_misses;
+    uint32_t xfb_scatters;          /* capture draws whose scatter ran on the GPU */
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_gpuaudit; filled by MGLRenderer+Gpuaudit.m. */
@@ -112,6 +130,16 @@ struct MGLExtMetal_gpuaudit {
     void (*draw_indexed_mtl)(GLMContext ctx, int prim, GLenum type, void *mtl_buffer, size_t offset,
                              GLsizei count, GLsizei instances, GLint base_vertex, GLuint base_instance);
 
+    /* XFB (transform feedback) scatter on the GPU: consumes an un-committed capture
+     * command buffer, dispatches one compute kernel per captured varying to copy the
+     * records into the GL transform-feedback buffers, commits the capture and marks the
+     * ranges GPU-written.  Returns false when the kernel or the layout is unsupported;
+     * the caller then uses the synchronous CPU path. */
+    bool (*xfb_scatter)(GLMContext ctx, void *capture_cb, void *record_scratch, void *xp,
+                        Buffer **bufs, const GLintptr *boff, const GLsizeiptr *write_offset,
+                        const uint32_t *prims, uint64_t np, unsigned k, uint64_t vcount,
+                        uint64_t written);
+
     /* upload an index list into an MTLBuffer owned by the caller-free cache */
     void *(*index_buffer_new)(GLMContext ctx, const void *data, size_t bytes);  /* retained MTLBuffer or NULL */
     void  (*index_buffer_free)(GLMContext ctx, void *mtl_buffer);
@@ -128,6 +156,9 @@ struct MGLExtMetal_gpuaudit {
 #define MGL_GPUAUDIT_PBO_READBACKS 0x8F06
 #define MGL_GPUAUDIT_GPU_CLEARS    0x8F07
 #define MGL_GPUAUDIT_INDIRECT_NOREAD 0x8F08
+#define MGL_GPUAUDIT_SHADOW_HITS    0x8F09
+#define MGL_GPUAUDIT_SHADOW_MISSES  0x8F0A
+#define MGL_GPUAUDIT_XFB_SCATTERS   0x8F0B
 
 #ifdef __cplusplus
 extern "C" {
@@ -163,6 +194,16 @@ MGLIndexCacheEnt *mgl_gpuaudit_index_store(GLMContext ctx, Buffer *ebuf, uint32_
 
 /* hook the caches need: is this buffer's CPU view safe to cache (not mapped)? */
 bool mgl_gpuaudit_cacheable(GLMContext ctx, Buffer *ebuf);
+
+/* --- converted vertex-attribute streams (vattrib shadow attributes) ------------- */
+/* returns the cached MTLBuffer with the converted stream, or NULL (then the caller
+ * converts and hands the result to mgl_gpuaudit_shadow_store, which takes ownership
+ * of `data` on success and returns the cached MTLBuffer, or NULL and leaves the
+ * caller to upload its own copy) */
+void *mgl_gpuaudit_shadow_lookup(GLMContext ctx, Buffer *buf, GLintptr start, GLint stride,
+                                 GLenum type, GLint size, int kind);
+void *mgl_gpuaudit_shadow_store(GLMContext ctx, Buffer *buf, GLintptr start, GLint stride,
+                                GLenum type, GLint size, int kind, const void *data, size_t bytes);
 
 void mgl_ext_init_gpuaudit(GLMContext ctx);
 bool mgl_ext_get_gpuaudit(GLMContext ctx, GLenum pname, GLuint type, void *data);

@@ -24,6 +24,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
 #include "hash_table.h"
 
 TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
@@ -1551,28 +1552,57 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
     }
 
     uint64_t written = 0;
+    bool scattered_on_gpu = false;
+
     if (fit && xp->record_words && xp->msl && M && M->capture) {
-        const uint32_t *rec = M->capture(ctx, xp, vstart, vcount, d->instances, d->baseinstance);
-        if (rec) {
-            written = fit;
-            for (uint64_t p = 0; p < written; p++) {
-                uint64_t inst = p / np, pp = p % np;
-                for (unsigned v = 0; v < k; v++) {
-                    uint64_t slot = (uint64_t)prims[pp * k + v] + inst * (uint64_t)vcount;
-                    const uint32_t *r = rec + slot * xp->record_words;
-                    uint64_t vi = p * k + v;
-                    for (GLuint i = 0; i < xp->count; i++) {
-                        MGLXfbVarying *var = &xp->vars[i];
-                        if (!var->words) continue;
-                        Buffer *buf = bufs[var->buffer];
-                        uint8_t *dst = (uint8_t *)buf->data.buffer_data + boff[var->buffer] +
-                                       o->write_offset[var->buffer] + vi * xp->stride[var->buffer] + var->offset;
-                        memcpy(dst, r + var->src_word, var->words * 4);
+        /* gpuaudit: the capture pass is encoded but not waited on, and a compute kernel
+         * copies the records straight into the transform feedback buffers on the same
+         * queue - no CPU round trip and no per-vertex memcpy.  Everything the kernel
+         * needs (primitive table, strides, varying layout) is known on the CPU.  When
+         * the kernel or the layout is unsupported this falls back to the original
+         * synchronous capture + CPU scatter below. */
+        struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
+
+        if (gpm && gpm->xfb_scatter && M->capture_async) {
+            void *cb = NULL, *scratch = NULL;
+            const uint32_t *rec = M->capture_async(ctx, xp, vstart, vcount, d->instances, d->baseinstance, &cb, &scratch);
+
+            if (rec && gpm->xfb_scatter(ctx, cb, scratch, xp, bufs, boff, o->write_offset,
+                                        prims, np, k, (uint64_t)vcount, fit))
+            {
+                written = fit;
+                scattered_on_gpu = true;
+                if (ctx->state.ext_gpuaudit) ctx->state.ext_gpuaudit->xfb_scatters++;
+            }
+            else if (!rec)
+            {
+                fprintf(stderr, "MGL xfb: capture pass failed, nothing written\n");
+            }
+        }
+
+        if (!scattered_on_gpu && !written) {
+            const uint32_t *rec = M->capture(ctx, xp, vstart, vcount, d->instances, d->baseinstance);
+            if (rec) {
+                written = fit;
+                for (uint64_t p = 0; p < written; p++) {
+                    uint64_t inst = p / np, pp = p % np;
+                    for (unsigned v = 0; v < k; v++) {
+                        uint64_t slot = (uint64_t)prims[pp * k + v] + inst * (uint64_t)vcount;
+                        const uint32_t *r = rec + slot * xp->record_words;
+                        uint64_t vi = p * k + v;
+                        for (GLuint i = 0; i < xp->count; i++) {
+                            MGLXfbVarying *var = &xp->vars[i];
+                            if (!var->words) continue;
+                            Buffer *buf = bufs[var->buffer];
+                            uint8_t *dst = (uint8_t *)buf->data.buffer_data + boff[var->buffer] +
+                                           o->write_offset[var->buffer] + vi * xp->stride[var->buffer] + var->offset;
+                            memcpy(dst, r + var->src_word, var->words * 4);
+                        }
                     }
                 }
+            } else {
+                fprintf(stderr, "MGL xfb: capture pass failed, nothing written\n");
             }
-        } else {
-            fprintf(stderr, "MGL xfb: capture pass failed, nothing written\n");
         }
     } else if (fit && xp->record_words == 0) {
         written = fit;   /* only gl_SkipComponents: nothing to store, space is consumed */
@@ -1582,8 +1612,14 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
         if (!bufs[b] || !xp->stride[b] || !written) continue;
         size_t bytes = (size_t)(written * k * xp->stride[b]);
         size_t start = (size_t)(boff[b] + o->write_offset[b]);
-        bufs[b]->data.dirty_bits |= DIRTY_BUFFER_DATA;
-        if (M && M->buffer_written) M->buffer_written(ctx, bufs[b], start, bytes);
+        if (scattered_on_gpu) {
+            /* the range was written by the scatter kernel, not by the CPU: track it as a
+             * GPU write so a later CPU read syncs instead of marking dirty CPU data */
+            if (M && M->buffer_gpu_written) M->buffer_gpu_written(ctx, bufs[b], start, bytes);
+        } else {
+            bufs[b]->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            if (M && M->buffer_written) M->buffer_written(ctx, bufs[b], start, bytes);
+        }
         o->write_offset[b] += (GLsizeiptr)bytes;
     }
 

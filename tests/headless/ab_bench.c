@@ -229,6 +229,25 @@ int main(int argc, char **argv)
             snprintf(label, sizeof(label), "1000-cmd multiDrawIndirect x%d", iters);
             break;
         }
+        case 10: {  /* many small texture uploads (pooled staging) */
+            GLuint tex;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 512, 512, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            GLubyte *tile = (GLubyte *)malloc(512 * 512 * 4);
+            for (int i = 0; i < 512 * 512 * 4; i++) tile[i] = (GLubyte)(i * 7);
+            for (int i = 0; i < 20; i++)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, GL_RGBA, GL_UNSIGNED_BYTE, tile);
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, GL_RGBA, GL_UNSIGNED_BYTE, tile);
+            t = now_s() - t0;
+            glFinish();
+            snprintf(label, sizeof(label), "big texSubImage 512x512 x%d", iters);
+            glDeleteTextures(1, &tex);
+            break;
+        }
         default: return 1;
     }
 

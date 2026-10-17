@@ -29,6 +29,7 @@
 #include "mgl_ext_gpuaudit.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_fb.h"
+#include "mgl_ext_xfb.h"     /* gpuaudit: GPU xfb scatter (MGLXfbProgram layout) */
 
 static inline MGLRenderer *GAR(GLMContext c) { return (__bridge MGLRenderer *)c->mtl_funcs.mtlObj; }
 
@@ -51,6 +52,8 @@ static_assert(sizeof(MGLGAFBTarget) == 40, "MGLRenderer+Framebuffer.m FBTarget l
 @interface MGLGPACache : NSObject
 @property (nonatomic, strong) NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *psos;
 @property (nonatomic, strong) NSMutableArray<NSData *> *psoOrder;
+@property (nonatomic, strong) id<MTLComputePipelineState> xfbScatter;
+@property (nonatomic, strong) id<MTLBuffer> xfbPrims;
 @end
 
 @implementation MGLGPACache
@@ -179,6 +182,192 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
 
     c.psos[key] = ps;
     [c.psoOrder addObject:key];
+}
+
+#pragma mark - transform-feedback scatter on the GPU (F9)
+
+static NSString * const kXFBScatterMSL = @"\n\
+#include <metal_stdlib>\n\
+using namespace metal;\n\
+struct MGLXFBSParams {\n\
+    uint32_t written;         /* output primitives including instances */\n\
+    uint32_t np;              /* primitives assembled per instance */\n\
+    uint32_t k;               /* vertices per primitive */\n\
+    uint32_t vcount;          /* vertex count of the draw */\n\
+    uint32_t record_words;    /* words in one capture record */\n\
+    uint32_t record_off;      /* word offset of the first record (the capture header) */\n\
+    uint32_t src_word;        /* word offset of this varying in the record */\n\
+    uint32_t words;           /* words of this varying */\n\
+    uint32_t out_stride_words;/* stride between output primitive-vertices */\n\
+    uint32_t out_off_words;   /* byte offset of this varying inside the output stride */\n\
+};\n\
+kernel void mgl_xfb_scatter(const device uint32_t* record [[buffer(0)]],\n\
+                            device uint32_t* dst [[buffer(1)]],\n\
+                            constant MGLXFBSParams& p [[buffer(2)]],\n\
+                            const device uint32_t* prims [[buffer(3)]],\n\
+                            uint32_t vi [[thread_position_in_grid]])\n\
+{\n\
+    if (vi >= p.written * p.k) return;\n\
+\n\
+    uint32_t prim = vi / p.k;\n\
+    uint32_t v = vi - prim * p.k;\n\
+    uint32_t pp = prim % p.np;\n\
+    uint32_t inst = prim / p.np;\n\
+    uint32_t slot = prims[pp * p.k + v] + inst * p.vcount;\n\
+\n\
+    const device uint32_t* r = record + p.record_off + (uint64_t)slot * p.record_words + p.src_word;\n\
+    device uint32_t* d = dst + (uint64_t)vi * p.out_stride_words + p.out_off_words;\n\
+    for (uint32_t w = 0; w < p.words; w++) d[w] = r[w];\n\
+}\n";
+
+- (id<MTLComputePipelineState>) gpuauditXFBCatterPipeline
+{
+    MGLGPACache *c = [self gpuauditCache];
+    if (c.xfbScatter)
+        return c.xfbScatter;
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [_device newLibraryWithSource: kXFBScatterMSL options: nil error: &err];
+    if (!lib)
+    {
+        NSLog(@"MGL gpuaudit: xfb scatter library failed: %@", err);
+        return nil;
+    }
+
+    id<MTLFunction> fn = [lib newFunctionWithName: @"mgl_xfb_scatter"];
+    if (!fn)
+        return nil;
+
+    id<MTLComputePipelineState> ps = [_device newComputePipelineStateWithFunction: fn error: &err];
+    if (!ps)
+    {
+        NSLog(@"MGL gpuaudit: xfb scatter pipeline failed: %@", err);
+        return nil;
+    }
+
+    c.xfbScatter = ps;
+    return ps;
+}
+
+- (bool) gpuauditXFBScatter:(void *)capture_cb record:(void *)record_scratch xp:(void *)xp_v
+                       bufs:(Buffer **)bufs boff:(const GLintptr *)boff writeOff:(const GLsizeiptr *)write_offset
+                      prims:(const uint32_t *)prims np:(uint64_t)np k:(unsigned)k
+                    vcount:(uint64_t)vcount written:(uint64_t)written
+{
+    MGLXfbProgram *xp = (MGLXfbProgram *)xp_v;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)capture_cb;
+    id<MTLBuffer> scratch = (__bridge id<MTLBuffer>)record_scratch;
+
+    if (!cb || !scratch || !xp || !prims || !written || !k)
+        return false;
+
+    id<MTLComputePipelineState> ps = [self gpuauditXFBCatterPipeline];
+    if (!ps)
+        return false;
+
+    /* the prims table travels with the kernel; setBytes is limited to 4 KiB */
+    size_t prims_bytes = (size_t)np * k * sizeof(uint32_t);
+    id<MTLBuffer> prims_buf = nil;
+    NSUInteger prims_off = 0;
+
+    if (prims_bytes <= 4096)
+    {
+        /* setBytes below */
+    }
+    else
+    {
+        MGLGPACache *c = [self gpuauditCache];
+        if (!c.xfbPrims || c.xfbPrims.length < prims_bytes)
+        {
+            size_t cap = MAX(prims_bytes, (size_t)c.xfbPrims.length * 2);
+            id<MTLBuffer> fresh = [_device newBufferWithLength:cap options:MTLResourceStorageModeShared];
+            if (!fresh)
+                return false;
+            c.xfbPrims = fresh;
+        }
+
+        memcpy(c.xfbPrims.contents, prims, prims_bytes);
+        prims_buf = c.xfbPrims;
+    }
+
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    enc.label = @"MGL xfb scatter";
+    [enc setComputePipelineState: ps];
+    [enc setBuffer: scratch offset: 0 atIndex: 0];
+
+    NSUInteger tg = 64;
+    uint64_t threads = written * (uint64_t)k;
+
+    for (unsigned b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+    {
+        if (!(xp->buffer_mask & (1u << b)) || !xp->stride[b])
+            continue;
+
+        id<MTLBuffer> dst = (__bridge id<MTLBuffer>)bufs[b]->data.mtl_data;
+        if (!dst)
+        {
+            [enc endEncoding];
+            return false;        /* the CPU path syncs and memcpys instead */
+        }
+
+        uint32_t stride_words = (uint32_t)(xp->stride[b] / 4);
+
+        for (unsigned i = 0; i < (unsigned)xp->count; i++)
+        {
+            const MGLXfbVarying *var = &xp->vars[i];
+            if (!var->words || var->buffer != b)
+                continue;
+
+            struct { uint32_t written, np, k, vcount, record_words, record_off, src_word, words, out_stride_words, out_off_words; } p;
+            p.written = (uint32_t)written;
+            p.np = (uint32_t)np;
+            p.k = k;
+            p.vcount = (uint32_t)vcount;
+            p.record_words = (uint32_t)xp->record_words;
+            p.record_off = (uint32_t)MGL_XFB_HEADER_WORDS;
+            p.src_word = (uint32_t)var->src_word;
+            p.words = (uint32_t)var->words;
+            p.out_stride_words = stride_words;
+            p.out_off_words = (uint32_t)(var->offset / 4);
+
+            NSUInteger dst_off = (NSUInteger)(boff[b] + write_offset[b]);
+
+            [enc setBuffer: dst offset: dst_off atIndex: 1];
+            [enc setBytes: &p length: sizeof(p) atIndex: 2];
+            if (prims_buf)
+                [enc setBuffer: prims_buf offset: 0 atIndex: 3];
+            else
+                [enc setBytes: prims length: prims_bytes atIndex: 3];
+
+
+            [enc dispatchThreads: MTLSizeMake((NSUInteger)threads, 1, 1)
+            threadsPerThreadgroup: MTLSizeMake(tg, 1, 1)];
+        }
+    }
+
+    [enc endEncoding];
+
+    /* the XBO ranges are now GPU-written *by the capture command buffer*: make the
+     * serial tracking follow it, so a later CPU read of an XBO waits for exactly this
+     * buffer (see mgl_buffers_prepare_cpu_read / make_cpu_visible) */
+    /* the capture command buffer becomes the renderer's current one, exactly like a
+     * normally committed draw buffer: the serial tracking stays consistent (a later CPU
+     * read then waits on precisely this command buffer), and the next encoder allocates
+     * a fresh buffer because this one is committed */
+    _currentCommandBuffer = cb;
+
+    for (unsigned b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+    {
+        if (!(xp->buffer_mask & (1u << b)) || !xp->stride[b] || !bufs[b])
+            continue;
+
+        if (written * k * xp->stride[b])
+            mgl_buffers_mark_gpu_use(ctx, bufs[b], true);
+    }
+
+    [cb commit];
+
+    return true;
 }
 
 #pragma mark - GPU buffer clears (glClearBuffer{Sub}Data)
@@ -450,6 +639,22 @@ static bool ga_read_pixels(GLMContext ctx, Framebuffer *fbo, int aspect, GLenum 
     }
 }
 
+static bool ga_xfb_scatter(GLMContext ctx, void *capture_cb, void *record_scratch, void *xp,
+                           Buffer **bufs, const GLintptr *boff, const GLsizeiptr *write_offset,
+                           const uint32_t *prims, uint64_t np, unsigned k, uint64_t vcount,
+                           uint64_t written)
+{
+    @autoreleasepool
+    {
+        bool ok = [GAR(ctx) gpuauditXFBScatter:capture_cb record:record_scratch xp:xp
+                                          bufs:bufs boff:boff writeOff:write_offset
+                                         prims:prims np:np k:k vcount:vcount written:written];
+        if (capture_cb) CFBridgingRelease(capture_cb);
+        if (record_scratch) CFBridgingRelease(record_scratch);
+        return ok;
+    }
+}
+
 static void *ga_index_new(GLMContext ctx, const void *data, size_t bytes)
 {
     @autoreleasepool { return [GAR(ctx) gpuauditIndexBufferNew:data bytes:bytes]; }
@@ -485,6 +690,7 @@ static void ga_draw_indexed(GLMContext ctx, int prim, GLenum type, void *mtl_buf
     m->fill_buffer = ga_fill;
     m->read_pixels_to_buffer = ga_read_pixels;
     m->index_buffer_new = ga_index_new;
+    m->xfb_scatter = ga_xfb_scatter;
     m->index_buffer_free = ga_index_free;
     m->draw_indexed_mtl = ga_draw_indexed;
 }

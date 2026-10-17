@@ -18,6 +18,8 @@
 #define MGL_GPUAUDIT_PBO_READBACKS 0x8F06
 #define MGL_GPUAUDIT_GPU_CLEARS    0x8F07
 #define MGL_GPUAUDIT_INDIRECT_NOREAD 0x8F08
+#define MGL_GPUAUDIT_SHADOW_HITS    0x8F09
+#define MGL_GPUAUDIT_XFB_SCATTERS   0x8F0B
 
 static GLint g_stat(GLenum pname)
 {
@@ -563,6 +565,155 @@ TEST(multi_draw_indirect_no_cpu_read)
     EXPECT_NO_GL_ERROR();
 }
 
+/* ---------------------------- F8: converted vertex-attribute streams (shadow cache) */
+
+static GLuint g_dprog, g_dvao, g_dvbo;
+static double g_dverts[12] = { -1, -1, 0, 1,   3, -1, 0, 1,   -1, 3, 0, 1 };
+
+static void shadow_setup(void)
+{
+    /* a program that takes a double attribute (Metal cannot fetch GL_DOUBLE, so the
+     * stream is converted to float4 on the CPU - cached after the first draw) */
+    const char *vs = "#version 430 core\n"
+        "layout(location = 0) in dvec4 pos;\n"
+        "void main() { gl_Position = vec4(pos.xy / 2.0, 0.0, 1.0); }\n";
+    const char *fs = "#version 430 core\n"
+        "layout(location = 0) out vec4 color;\n"
+        "void main() { color = vec4(0, 1, 0, 1); }\n";
+    g_dprog = mgl_make_program(vs, fs);
+
+    glGenBuffers(1, &g_dvbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_dvbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(g_dverts), g_dverts, GL_STATIC_DRAW);
+    glGenVertexArrays(1, &g_dvao);
+    glBindVertexArray(g_dvao);
+    glEnableVertexAttribArray(0);
+    glVertexAttribLPointer(0, 4, GL_DOUBLE, 32, 0);
+}
+
+TEST(shadow_attribute_cache)
+{
+    shadow_setup();
+    glUseProgram(g_dprog);
+
+    GLuint r = 0, g = 0;
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glFinish();
+        coverage(&r, &g);
+        EXPECT_TRUE(g > 100);              /* the double attribute made it into the shader */
+        EXPECT_EQ_INT(r, 0);
+    }
+    EXPECT_TRUE(g_stat(MGL_GPUAUDIT_SHADOW_HITS) >= 2);   /* draws 2 and 3 were served cached */
+
+    /* re-uploading the vertex data must invalidate the converted stream */
+    double verts2[12] = { -1, -1, 0, 1,   1, -1, 0, 1,   -1, 1, 0, 1 };
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts2), verts2);
+    GLuint g2 = 0;
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glFinish();
+    coverage(&r, &g2);
+    EXPECT_TRUE(g2 > 100);
+    EXPECT_TRUE(g2 < g);                    /* the smaller triangle covers fewer pixels */
+
+    EXPECT_NO_GL_ERROR();
+}
+
+/* ----------------------------------- F9: transform feedback scatter on the GPU */
+
+TEST(xfb_scatter_gpu)
+{
+    /* program capturing gl_Position + a colour, INTERLEAVED */
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec3 vcolor;\n"
+        "layout(location=1) out float vid;\n"
+        "void main(){\n"
+        "  gl_Position = vec4(pos, 0.25, 1.0);\n"
+        "  vcolor = vec3(pos.x * 2.0, pos.y + 10.0, float(gl_VertexID));\n"
+        "  vid = float(gl_VertexID) + 100.0;\n"
+        "}\n";
+    const char *fs = "#version 450 core\nlayout(location=0) out vec4 color;\nvoid main(){ color = vec4(1.0); }\n";
+
+    GLuint p = glCreateProgram();
+    GLuint s = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(s, 1, &vs, NULL); glCompileShader(s); glAttachShader(p, s);
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f); glAttachShader(p, f);
+    const char *vars[3] = { "gl_Position", "vcolor", "vid" };
+    glTransformFeedbackVaryings(p, 3, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, 1);
+    glUseProgram(p);
+
+    const GLuint NV = 9000;
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    static float verts[9000 * 2];
+    for (GLuint i = 0; i < NV; i++) { verts[i * 2] = -1.0f + (float)(i % 17) * 0.01f; verts[i * 2 + 1] = -1.0f + (float)(i % 13) * 0.01f; }
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(NV * 2 * 4), verts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+
+    GLuint b;
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, b);
+    static GLfloat junk[9000 * 8];
+    for (GLuint i = 0; i < NV * 8; i++) junk[i] = -1.0f;
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, (GLsizeiptr)(NV * 8 * 4), junk, GL_DYNAMIC_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, b);
+
+    GLint before = g_stat(MGL_GPUAUDIT_XFB_SCATTERS);
+
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLES, 0, NV);
+    glEndTransformFeedback();
+    glFinish();
+
+    EXPECT_EQ_INT(g_stat(MGL_GPUAUDIT_XFB_SCATTERS), before + 1);   /* kernel path taken */
+
+    /* byte-exact against the CPU path's values */
+    static GLfloat out[9000 * 8];
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, b);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, (GLsizeiptr)(NV * 8 * 4), out);
+
+    int bad = 0;
+    for (GLuint v = 0; v < NV && bad < 4; v++)
+    {
+        GLfloat e[8] = { verts[v * 2], verts[v * 2 + 1], 0.25f, 1.0f,
+                         verts[v * 2] * 2.0f, verts[v * 2 + 1] + 10.0f, (GLfloat)v, (GLfloat)v + 100.0f };
+        for (int c = 0; c < 8; c++)
+            if (out[v * 8 + c] != e[c]) { bad++; break; }
+    }
+    EXPECT_EQ_INT(bad, 0);
+
+    /* a second capture starts over at the buffer start (glBeginTransformFeedback) and
+     * must also be served by the scatter kernel */
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLES, 0, NV);
+    glEndTransformFeedback();
+    glFinish();
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, b);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, (GLsizeiptr)(8 * 4), out);
+    EXPECT_NEAR(out[0], verts[0], 1e-6);
+    EXPECT_NEAR(out[2], 0.25f, 1e-6);
+    EXPECT_NEAR(out[6], 0.0f, 1e-6);       /* gl_VertexID restarts per draw */
+    EXPECT_NEAR(out[7], 100.0f, 1e-6);
+    EXPECT_EQ_INT(g_stat(MGL_GPUAUDIT_XFB_SCATTERS), before + 2);
+
+    EXPECT_NO_GL_ERROR();
+    glDeleteProgram(p);
+}
+
 /* ------------------------------------------------------------ F2: pipeline cache */
 
 TEST(pipeline_state_cache)
@@ -688,6 +839,8 @@ int main(void)
     RUN(index_cache_invalidated_on_reupload);
     RUN(index_cache_provoking_state);
     RUN(gpu_buffer_clear);
+    RUN(xfb_scatter_gpu);
+    RUN(shadow_attribute_cache);
     RUN(multi_draw_indirect_no_cpu_read);
     RUN(read_pixels_into_pbo_gpu);
     RUN(cpu_buffer_clear_still_correct);

@@ -10,6 +10,7 @@
 
 #import "MGLRenderer_Private.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_buffers.h"   /* gpuaudit: GPU-write serial tracking for the xfb scatter */
 
 @interface MGLRenderer (TransformFeedback)
 - (void) bindExtXfbFuncsToGLMContext: (GLMContext) glm_ctx;
@@ -25,6 +26,29 @@ static const uint32_t *xfbCaptureC(GLMContext glm_ctx, MGLXfbProgram *xp, GLint 
 {
     MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
     return [r xfbCapture: xp vstart: vstart vcount: vcount instances: instances baseInstance: baseinstance];
+}
+
+/* gpuaudit (see the implementation below): un-waited capture for the GPU scatter */
+@interface MGLRenderer (GpuauditXfbCapture)
+- (const uint32_t *) xfbCaptureAsync: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
+                          instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
+                        outCommand: (void **) out_cb outScratch: (void **) out_scratch;
+@end
+
+static void xfbBufferGPUWrittenC(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t size)
+{
+    (void)offset; (void)size;
+    /* the scatter kernel wrote through the buffer's MTLBuffer: stamp the GPU-write
+     * serial so a later CPU read waits for it (see mgl_buffers_prepare_cpu_read) */
+    mgl_buffers_mark_gpu_use(glm_ctx, buf, true);
+}
+
+static const uint32_t *xfbCaptureAsyncC(GLMContext glm_ctx, MGLXfbProgram *xp, GLint vstart, GLsizei vcount,
+                                        GLsizei instances, GLuint baseinstance, void **out_cb, void **out_scratch)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    return [r xfbCaptureAsync: xp vstart: vstart vcount: vcount
+                    instances: instances baseInstance: baseinstance outCommand: out_cb outScratch: out_scratch];
 }
 
 static void xfbBufferWrittenC(GLMContext glm_ctx, Buffer *buf, size_t offset, size_t size)
@@ -68,6 +92,8 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     }
     m->capture = xfbCaptureC;
     m->buffer_written = xfbBufferWrittenC;
+    m->capture_async = xfbCaptureAsyncC;            /* gpuaudit: un-waited capture for the GPU scatter */
+    m->buffer_gpu_written = xfbBufferGPUWrittenC;   /* gpuaudit: kernel-written range tracking */
     m->release_program = xfbReleaseProgramC;
     mgl_xfb_install_draw_hooks(glm_ctx);
 }
@@ -120,8 +146,12 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     return ps;
 }
 
-- (const uint32_t *) xfbCapture: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
-                      instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
+/* gpuaudit: async capture - encodes the capture pass but does not commit/wait, so the
+ * record can be consumed on the GPU (see MGLRenderer+Gpuaudit.m).  The returned
+ * command buffer is retained; the caller commits it (or chains after it). */
+- (const uint32_t *) xfbCaptureAsync: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
+                          instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
+                        outCommand: (void **) out_cb outScratch: (void **) out_scratch
 {
     if (!_device || !_commandQueue || !xp->msl || !ctx->state.program || !VAO()) return NULL;
 
@@ -173,14 +203,40 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     [enc drawPrimitives: MTLPrimitiveTypePoint vertexStart: (NSUInteger)vstart vertexCount: (NSUInteger)vcount
           instanceCount: (NSUInteger)instances baseInstance: baseinstance];
     [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
 
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-        NSLog(@"MGL xfb: capture command buffer failed: %@", cb.error);
+    if (out_cb) *out_cb = (void *)CFBridgingRetain(cb);
+    if (out_scratch) *out_scratch = (void *)CFBridgingRetain(xfbScratch);
+
+    return hdr + MGL_XFB_HEADER_WORDS;
+}
+
+/* the synchronous capture of the original design: encode, commit, wait, return the
+ * CPU-readable record (transform_feedback.c keeps using this for its CPU paths) */
+- (const uint32_t *) xfbCapture: (MGLXfbProgram *) xp vstart: (GLint) vstart vcount: (GLsizei) vcount
+                      instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
+{
+    id<MTLCommandBuffer> pending = nil;
+    void *cb_ref = NULL, *scratch_ref = NULL;
+
+    const uint32_t *rec = [self xfbCaptureAsync: xp vstart: vstart vcount: vcount
+                                     instances: instances baseInstance: baseinstance
+                                   outCommand: &cb_ref outScratch: &scratch_ref];
+    if (!rec)
+        return NULL;
+
+    pending = (__bridge_transfer id<MTLCommandBuffer>)cb_ref;
+    if (scratch_ref) CFBridgingRelease(scratch_ref);
+
+    [pending commit];
+    [pending waitUntilCompleted];
+
+    if (pending.status != MTLCommandBufferStatusCompleted)
+    {
+        NSLog(@"MGL xfb: capture command buffer failed: %@", pending.error);
         return NULL;
     }
-    return hdr + MGL_XFB_HEADER_WORDS;
+
+    return rec;
 }
 
 @end

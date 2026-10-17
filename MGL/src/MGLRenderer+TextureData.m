@@ -203,8 +203,13 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
         size_t img = pitch * rows;
         size_t total = img * slices * depth;
 
+        /* gpuaudit note: a pooled staging ring was measured here and rejected - the
+         * staging allocation is cheap (Metal pools small shared allocations) and the
+         * per-upload cost is the copy itself, which is bandwidth bound */
         id<MTLBuffer> staging = [_device newBufferWithLength:MAX(total, 16) options:MTLResourceStorageModeShared];
         uint8_t *dst = (uint8_t *)staging.contents;
+        NSUInteger stage_off = 0;
+
         for (NSUInteger z = 0; z < slices * depth; z++)
             for (NSUInteger y = 0; y < rows; y++)
                 memcpy(dst + z * img + y * pitch, data + z * simg + y * srow, rowbytes);
@@ -217,7 +222,7 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
         for (NSUInteger s = 0; s < slices; s++)
         {
             [blit copyFromBuffer:staging
-                    sourceOffset:s * img
+                    sourceOffset:stage_off + s * img
                sourceBytesPerRow:pitch
              sourceBytesPerImage:img
                       sourceSize:MTLSizeMake(r->w, r->h, depth)
