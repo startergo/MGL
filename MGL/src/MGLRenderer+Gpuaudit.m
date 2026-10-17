@@ -197,10 +197,6 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
     if ((size_t)offset + (size_t)size > mb.length)
         return false;
 
-    /* the GPU overwrites the range: order it after any queued GPU work that reads it
-     * (Metal does that on the queue), and make sure the CPU-visible view follows */
-    mgl_buffers_mark_gpu_use(ctx, buf, true);
-
     [self endRenderEncoding];
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
         [self newCommandBuffer];
@@ -210,56 +206,68 @@ static NSData *gaPSOKey(MTLRenderPipelineDescriptor *d)
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     blit.label = @"MGL buffer clear";
 
-    if (texelSize <= 4)
-    {
-        /* 1/2/4-byte texels: fillBuffer repeats a 4-byte pattern over the range */
-        uint32_t v = 0;
-        for (int i = 0; i < 4; i++)
-            ((uint8_t *)&v)[i] = texel[i % texelSize];
+    bool byteFill = false;
+    if (@available(macOS 10.15, *))
+        byteFill = true;        /* fillBuffer repeats a single byte over a range */
 
-        if (@available(macOS 10.15, *))
-            [blit fillBuffer:mb range:NSMakeRange((NSUInteger)offset, (NSUInteger)size) value:v];
-        else
-        {
-            /* no pattern fill: stage one 64 KiB block and copy it out (below) */
-            size_t stage = 65536 & ~3u;
-            id<MTLBuffer> tmp = [_device newBufferWithLength:stage options:MTLResourceStorageModeShared];
-            uint8_t *p = (uint8_t *)tmp.contents;
-            for (size_t i = 0; i < stage; i += 4)
-                memcpy(p + i, &v, 4);
-            for (size_t off = 0; off < (size_t)size; off += stage)
-            {
-                size_t n = MIN(stage, (size_t)size - off);
-                n &= ~3u;   /* fillBuffer-free path keeps whole 4-byte units */
-                if (n == 0) break;
-                [blit copyFromBuffer:tmp sourceOffset:0 toBuffer:mb destinationOffset:(NSUInteger)(offset + off) size:n];
-            }
-        }
+    if (texelSize == 1 && byteFill)
+    {
+        /* 1-byte texel: fillBuffer repeats a single byte over the whole range */
+        [blit fillBuffer:mb range:NSMakeRange((NSUInteger)offset, (NSUInteger)size) value:texel[0]];
     }
     else
     {
-        /* 8/12/16-byte texels: build a 64 KiB pattern block and copy it across the range */
-        size_t stage = 65536 / (size_t)texelSize * (size_t)texelSize;
-        id<MTLBuffer> tmp = [_device newBufferWithLength:stage options:MTLResourceStorageModeShared];
-        if (!tmp)
+        /* 2..16-byte texels: Metal's fillBuffer repeats only a single byte, so seed a
+         * 64 KiB pattern block and then double it up inside the destination buffer
+         * (16 MiB = 8 doubling copies; a straight staged copy needs 256). */
+        const size_t seed = 65536 / (size_t)texelSize * (size_t)texelSize;
+        size_t span = (size_t)size - ((size_t)size % (size_t)texelSize);
+        if (span < seed)
         {
-            [blit endEncoding];
-            return false;
+            /* small clear: one staging block is enough (and cheaper than a seed+copy) */
+            id<MTLBuffer> tmp = [_device newBufferWithLength:MAX(seed, span) options:MTLResourceStorageModeShared];
+            if (!tmp)
+            {
+                [blit endEncoding];
+                return false;
+            }
+            uint8_t *p = (uint8_t *)tmp.contents;
+            for (size_t i = 0; i + (size_t)texelSize <= span; i += (size_t)texelSize)
+                memcpy(p + i, texel, (size_t)texelSize);
+            [blit copyFromBuffer:tmp sourceOffset:0 toBuffer:mb destinationOffset:(NSUInteger)offset size:span];
         }
-        uint8_t *p = (uint8_t *)tmp.contents;
-        for (size_t i = 0; i + (size_t)texelSize <= stage; i += (size_t)texelSize)
-            memcpy(p + i, texel, (size_t)texelSize);
-
-        for (size_t off = 0; off < (size_t)size; off += stage)
+        else
         {
-            size_t n = MIN(stage, (size_t)size - off);
-            n -= n % (size_t)texelSize;
-            if (n == 0) break;
-            [blit copyFromBuffer:tmp sourceOffset:0 toBuffer:mb destinationOffset:(NSUInteger)(offset + off) size:n];
+            id<MTLBuffer> tmp = [_device newBufferWithLength:seed options:MTLResourceStorageModeShared];
+            if (!tmp)
+            {
+                [blit endEncoding];
+                return false;
+            }
+            uint8_t *p = (uint8_t *)tmp.contents;
+            for (size_t i = 0; i + (size_t)texelSize <= seed; i += (size_t)texelSize)
+                memcpy(p + i, texel, (size_t)texelSize);
+
+            /* seed the first block, then double: [done, done+n) <- [done-n, done) */
+            [blit copyFromBuffer:tmp sourceOffset:0 toBuffer:mb destinationOffset:(NSUInteger)offset size:seed];
+
+            size_t done = seed;
+            while (done < span)
+            {
+                size_t n = MIN(done, span - done);
+                n -= n % (size_t)texelSize;
+                [blit copyFromBuffer:mb sourceOffset:(NSUInteger)(offset + done - n)
+                            toBuffer:mb destinationOffset:(NSUInteger)(offset + done) size:n];
+                done += n;
+            }
         }
     }
 
     [blit endEncoding];
+
+    /* the fill is encoded on the current command buffer: stamp its serial *after*
+     * encoding so a later CPU read waits for exactly this buffer */
+    mgl_buffers_mark_gpu_use(ctx, buf, true);
 
     if (ctx->state.ext_gpuaudit)
         ctx->state.ext_gpuaudit->gpu_clears++;
