@@ -335,8 +335,16 @@ static bool rs_mode_is_polygon(GLenum m)
 {
     struct MGLExtState_rstate *rs = ctx->state.ext_rstate;
     Program *program = ctx->state.program;
+    const char *stage_msl;
 
     if (!shader || !shader->mtl_data.library || !shader->mtl_data.function) return nil;
+    stage_msl = program ? program->spirv[stage].msl_str : NULL;
+
+    /* which function constants the stage takes is decided by the fixup its MSL carries:
+     * the vertex fixup (clip-space flip) marks any *last pre-rasterization* stage —
+     * the vertex shader, or the tessellation evaluation / geometry shader replacing it */
+    bool is_vertex_like = (stage == _VERTEX_SHADER) ||
+                          (stage != _FRAGMENT_SHADER && stage_msl && strstr(stage_msl, "mgl_rs_vertex_fixup"));
     const char *msl = program ? program->spirv[stage].msl_str : NULL;
     if (!mgl_rstate_msl_is_patched(msl)) return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
@@ -345,7 +353,7 @@ static bool rs_mode_is_polygon(GLenum m)
     MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
     NSString *key;
 
-    if (stage == _VERTEX_SHADER) {
+    if (is_vertex_like) {
         bool z01 = rs->clip_depth_mode == GL_ZERO_TO_ONE;
         bool ul  = rs->clip_origin == GL_UPPER_LEFT;
         bool pps = ctx->state.caps.program_point_size;

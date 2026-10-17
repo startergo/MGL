@@ -267,7 +267,11 @@ void logDirtyBits(GLMContext ctx)
 
 - (bool) mapBuffersToMTL
 {
-    if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage:_VERTEX_SHADER] == false)
+    // tess: with a tessellation program the render pipeline's vertex stage is the
+    // evaluation shader, so the vertex-stage buffer map comes from its resources
+    int vertex_stage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+
+    if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage:vertex_stage] == false)
         return false;
 
     if ([self mapGLBuffersToMTLBufferMap: &ctx->state.fragment_buffer_map_list stage:_FRAGMENT_SHADER] == false)
@@ -1674,7 +1678,8 @@ void logDirtyBits(GLMContext ctx)
 - (bool) bindTexturesToCurrentRenderEncoder
 {
     // sampled textures of the vertex and fragment stages (texdata); unbound units are skipped
-    static const int stages[2] = { _VERTEX_SHADER, _FRAGMENT_SHADER };
+    // tess: the vertex-stage textures are the evaluation shader's (tess domain)
+    int stages[2] = { [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER, _FRAGMENT_SHADER };
 
     for (int st = 0; st < 2; st++)
     {
@@ -2635,6 +2640,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     assert(vertexFunction);
     assert(fragmentFunction);
 
+    // tess: the evaluation shader is the (rewritten) vertex function of the pipeline —
+    // the vertex stage runs as a compute kernel before the render pass
+    if ([self extTessActive])
+    {
+        Shader *tes = program->shader_slots[_TESS_EVALUATION_SHADER];
+        if (tes && tes->mtl_data.function)
+            vertexFunction = (__bridge id<MTLFunction>)(tes->mtl_data.function);
+    }
+
     // Configure a pipeline descriptor that is used to create a pipeline state.
     pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
     assert(pipelineStateDescriptor);
@@ -3112,7 +3126,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
             }
 
-            pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
+            // tess: the rewritten TES has no [[stage_in]]; the pipeline must not get a
+            // vertex descriptor (vertex data comes from buffers indexed by vertex_id)
+            pipelineStateDescriptor.vertexDescriptor = [self extTessActive] ? nil : vertexDescriptor;
 
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
             NSError *error;

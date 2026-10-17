@@ -154,5 +154,7 @@ void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                const unsigned char *tcs_patch_out, size_t tcs_patch_stride,
                                const float *factors, unsigned patches);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
+bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
+                             char *cp_name, size_t cp_len, size_t *record_size);
 
 #endif /* MGL_EXT_TESS_H */

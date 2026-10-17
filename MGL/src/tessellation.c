@@ -1384,6 +1384,28 @@ MGLTessProgram *mgl_tess_active_program(GLMContext ctx)
     return mgl_tess_program(ctx, tes);
 }
 
+/* record size of the TES control-point struct (rewritten TES MSL), so the Metal side
+ * can size its scratch buffers without re-parsing the shader source */
+bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
+                             char *cp_name, size_t cp_len, size_t *record_size)
+{
+    struct MslStruct cp;
+    char pin[160], cpn[128];
+
+    if (!msl || !msl_patch_in_name(msl, pin, sizeof pin))
+        return false;
+    if (!msl_cp_struct_name(msl, pin, cpn, sizeof cpn))
+        return false;
+    if (!msl_parse_struct(msl, cpn, &cp))
+        return false;
+    if (patchin_name && patchin_len)
+        snprintf(patchin_name, patchin_len, "%s", pin);
+    if (cp_name && cp_len)
+        snprintf(cp_name, cp_len, "%s", cpn);
+    *record_size = cp.size;
+    return cp.size > 0;
+}
+
 /* exported for MGLRenderer+Tessellation.m */
 bool mgl_tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches)
 {
