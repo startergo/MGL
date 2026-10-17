@@ -49,3 +49,28 @@ without TCS valid, TCS without TES link error); separable pipeline; xfb of tesse
 orientation + culling with tessellation.
 
 Errors: `ERROR_RETURN(GL_X); return;` (the macro does not return by itself).
+
+## CORRECTION (supervisor, verified on the M4 Pro): hardware tessellation WORKS on Apple silicon
+`drawPatches` is NOT dropped. A minimal probe (`.agent/probe_drawpatches.m`: post-tessellation vertex
+function `[[patch(triangle,3)]]`, `MTLVertexStepFunctionPerPatchControlPoint`, factor buffer set with
+`setTessellationFactorBuffer`, `drawPatches:`) renders a red pixel at the centre. Build/run it:
+`clang -fobjc-arc -framework Metal -framework Foundation .agent/probe_drawpatches.m -o /tmp/p && /tmp/p`.
+An earlier "dropped" observation came from a setup bug (missing factor buffer, wrong pipeline
+tessellation fields, wrong step function, or the vertex function lacking `[[patch]]`).
+
+Required design — everything on the GPU, no `waitUntilCompleted` / CPU readback per draw:
+- VS kernel → TCS kernel (SPIRV-Cross TESC→MSL kernel) writes control points, patch data and
+  `MTLTriangle/QuadTessellationFactorsHalf` directly into the factor buffer (GPU → GPU).
+- No TCS: a tiny kernel (or a constant buffer) fills the factor buffer from GL_PATCH_DEFAULT_*_LEVEL.
+- TES → SPIRV-Cross TESE→MSL **post-tessellation vertex function** (native `[[patch(...)]]` output,
+  not a "plain vertex function" rewrite); render with `drawPatches` / `drawIndexedPatches`
+  (patch index buffer for indexed draws), instancing via instanceCount/baseInstance.
+- Pipeline: `tessellationPartitionMode` from TES spacing (Integer/FractionalEven/FractionalOdd — Metal
+  pow2 is unused), `tessellationOutputWindingOrder` from vertex_order mirrored by the y-flip,
+  `maxTessellationFactor` 64, factor step function PerPatch (PerPatchAndPerInstance when instanced).
+- Order: compute encoder then render encoder in the same command buffer (Metal tracks the hazard for
+  untracked resources only if you use fences/barriers — use the buffers domain's serial tracking).
+- Keep the existing CPU tessellator ONLY for what Metal cannot do natively: `isolines` and `point_mode`
+  (or replace it with a compute-shader tessellator writing an index/coord buffer + indirect args, which
+  is preferred: still no CPU readback). Document which path each mode takes.
+- Re-verify every test in test_tess.c pixel-exactly on the hardware path; report the before/after.
