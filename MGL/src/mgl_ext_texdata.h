@@ -52,7 +52,6 @@ struct MGLExtState_texdata {
     int        unpack_cb[4];            /* UNPACK_COMPRESSED_BLOCK_WIDTH/HEIGHT/DEPTH/SIZE */
     int        pack_cb[4];              /* PACK_COMPRESSED_BLOCK_WIDTH/HEIGHT/DEPTH/SIZE */
     Texture   *defaults[_MAX_TEXTURE_TYPES];   /* default texture objects (name 0) */
-    Texture   *proxies[8];              /* proxy texture state, see mgl_texdata_proxy_texture() */
 };
 
 /* A region in Metal geometry: z = slice (array layer / cube-array layer-face) or 3D depth. */
@@ -98,8 +97,8 @@ void  mgl_texdata_free_shadow(GLMContext ctx, Texture *tex, GLuint face, GLuint 
 GLuint mgl_texdata_num_faces(Texture *tex);
 /* glPixelStore hook for the compressed block pnames; returns true if handled */
 bool  mgl_texdata_pixel_store(GLMContext ctx, GLenum pname, GLint param);
-/* proxy texture object for a PROXY_* target (for glGetTexLevelParameter), or NULL */
-Texture *mgl_texdata_proxy_texture(GLMContext ctx, GLenum target);
+/* write tight storage-layout data (Metal geometry) into a level: GPU if realized, else CPU shadow */
+bool  mgl_texdata_write_region(GLMContext ctx, Texture *tex, const TDRegion *r, const TDStorage *src, bool depth, bool stencil);
 #ifdef __cplusplus
 }
 #endif
