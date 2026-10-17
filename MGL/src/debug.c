@@ -564,7 +564,7 @@ static MGLDebugLabel *get_label(struct MGLExtState_debug *st, GLenum identifier,
     return *pp;
 }
 
-static void set_label(GLMContext ctx, GLenum identifier, uintptr_t name, void *object, GLsizei length, const GLchar *label)
+static void set_label(GLMContext ctx, const char *fn, GLenum identifier, uintptr_t name, void *object, GLsizei length, const GLchar *label)
 {
     struct MGLExtState_debug *st = DBG(ctx);
     MGLDebugLabel **pp, *e;
@@ -576,7 +576,7 @@ static void set_label(GLMContext ctx, GLenum identifier, uintptr_t name, void *o
 
         if (length >= MGL_MAX_LABEL_LENGTH)
         {
-            ERROR_RETURN(GL_INVALID_VALUE);
+            ctx->error_func(ctx, fn, GL_INVALID_VALUE);
             return;
         }
     }
@@ -607,7 +607,7 @@ static void set_label(GLMContext ctx, GLenum identifier, uintptr_t name, void *o
         e = calloc(1, sizeof(MGLDebugLabel));
         if (!e)
         {
-            ERROR_RETURN(GL_OUT_OF_MEMORY);
+            ctx->error_func(ctx, fn, GL_OUT_OF_MEMORY);
             return;
         }
         e->identifier = identifier;
@@ -619,7 +619,7 @@ static void set_label(GLMContext ctx, GLenum identifier, uintptr_t name, void *o
     char *copy = malloc(length + 1);
     if (!copy)
     {
-        ERROR_RETURN(GL_OUT_OF_MEMORY);
+        ctx->error_func(ctx, fn, GL_OUT_OF_MEMORY);
         return;
     }
     memcpy(copy, label, length);
@@ -677,7 +677,7 @@ void mglObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei leng
         return;
     }
 
-    set_label(ctx, identifier, name, object, length, label);
+    set_label(ctx, "mglObjectLabel", identifier, name, object, length, label);
 }
 
 void mglGetObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei bufSize, GLsizei *length, GLchar *label)
@@ -713,7 +713,7 @@ void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GL
         return;
     }
 
-    set_label(ctx, GL_SYNC_FENCE, (uintptr_t)ptr, (void *)ptr, length, label);
+    set_label(ctx, "mglObjectPtrLabel", GL_SYNC_FENCE, (uintptr_t)ptr, (void *)ptr, length, label);
 }
 
 void mglGetObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei bufSize, GLsizei *length, GLchar *label)
