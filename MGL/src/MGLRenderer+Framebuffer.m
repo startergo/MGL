@@ -457,6 +457,12 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     for (GLint s = 2; s <= 8; s *= 2)
         if ([_device supportsTextureSampleCount:s]) best = s;
     m->max_samples = best;
+
+    /* sample limits reported by glGet follow what Metal can actually allocate */
+    STATE_VAR(max_framebuffer_samples) = best;
+    STATE_VAR(max_color_texture_samples) = best;
+    STATE_VAR(max_depth_texture_samples) = best;
+    STATE_VAR(max_integer_samples) = best;
 }
 
 - (GLuint) fbRoundSamples:(GLuint)samples
@@ -876,6 +882,9 @@ typedef struct FBClearValues {
 
 static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
 {
+    /* state.c keeps the mask in color_writemask only while use_color_mask is set */
+    if (!ctx->state.caps.use_color_mask[i])
+        return MTLColorWriteMaskAll;
     GLboolean *m = ctx->state.var.color_writemask[i];
     return (m[0] ? MTLColorWriteMaskRed : 0) | (m[1] ? MTLColorWriteMaskGreen : 0) |
            (m[2] ? MTLColorWriteMaskBlue : 0) | (m[3] ? MTLColorWriteMaskAlpha : 0);

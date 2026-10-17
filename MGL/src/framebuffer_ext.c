@@ -14,6 +14,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_fb.h"
+#include "mgl_ext_queries.h"
 
 #define FB_ERROR(_e_)   do { ERROR_RETURN(_e_); return; } while (0)
 
@@ -184,6 +185,10 @@ void mgl_fb_clear_buffer(GLMContext ctx, Framebuffer *fbo, GLenum buffer, GLint 
         return;
 
     if (ctx->state.caps.rasterizer_discard)
+        return;
+
+    /* conditional rendering (queries domain) */
+    if (!mgl_queries_render_allowed(ctx))
         return;
 
     MGLFBClearRequest req;
@@ -789,6 +794,10 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
     if (mgl_fb_status(ctx, readfbo) != GL_FRAMEBUFFER_COMPLETE ||
         mgl_fb_status(ctx, drawfbo) != GL_FRAMEBUFFER_COMPLETE)
         FB_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+
+    /* conditional rendering (queries domain) */
+    if (!mgl_queries_render_allowed(ctx))
+        return;
 
     GLint rs = mgl_fb_samples(ctx, readfbo), ds = mgl_fb_samples(ctx, drawfbo);
     long sw = labs((long)srcX1 - srcX0), sh = labs((long)srcY1 - srcY0);
