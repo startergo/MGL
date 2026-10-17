@@ -44,6 +44,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+TextureExt.h"
 
 
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
@@ -798,6 +799,10 @@ void logDirtyBits(GLMContext ctx)
         return nil;
     }
 
+    // texext: buffer textures, texture views and multisample textures
+    if ([self texextOwnsTexture: tex])
+        return [self texextCreateMTLTexture: tex];
+
     NSUInteger width, height, depth;
 
     MTLTextureDescriptor *tex_desc;
@@ -991,6 +996,8 @@ void logDirtyBits(GLMContext ctx)
     {
         [self swizzleTexDesc:tex_desc forTex:tex];
     }
+
+    [self texextAdjustTextureDescriptor: tex_desc forTexture: tex]; // texext: PixelFormatView for view sources
 
     id<MTLTexture> texture;
 
@@ -2350,6 +2357,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (bool)bindMTLTexture:(Texture *)tex
 {
+    [self texextValidateTexture: tex]; // texext: buffer reallocated / view root recreated
+
     if (tex->dirty_bits)
     {
         // release mtl data
@@ -3113,6 +3122,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // Validate command buffer status - cannot create encoders on committed/buffer
     MTLCommandBufferStatus bufferStatus = _currentCommandBuffer.status;
     if (bufferStatus >= MTLCommandBufferStatusCommitted) {
+        // texext: a flush (e.g. from mtlDeleteMTLObj) commits without opening a new command buffer
+        [self newCommandBuffer];
+        bufferStatus = _currentCommandBuffer ? _currentCommandBuffer.status : MTLCommandBufferStatusError;
+    }
+    if (bufferStatus >= MTLCommandBufferStatusCommitted) {
         NSLog(@"MGL ERROR: Cannot create render encoder on committed command buffer (status: %ld)", (long)bufferStatus);
         [self recordGPUError];
         return false;
@@ -3590,6 +3604,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             ctx->state.caps.stencil_test)
             pipelineStateDescriptor.stencilAttachmentPixelFormat = ctx->stencil_format.mtl_pixel_format;
     }
+
+    [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     return pipelineStateDescriptor;
 }
