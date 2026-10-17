@@ -36,3 +36,17 @@ Baseline vs final suite table, findings fixed (with timings), findings deferred 
 handed to tess/geom.
 
 Errors: `ERROR_RETURN(GL_X); return;` (the macro does not return by itself).
+
+## Reference implementations (read-only copies in `.agent/ref/`, Mesa commit 335d569, MIT licensed)
+Mesa already solves this on Apple GPUs; study before designing, borrow ideas freely, port code only
+with its MIT/Microsoft copyright header kept and a line in your report naming the source file.
+- `.agent/ref/poly/` — the shared GPU emulation library used by BOTH Asahi (AGX GL 4.6, conformant) and
+  KosmicKrisp: `tessellator.h`, `geometry.h`, `prim.h`, `cl/*.cl` (compute kernels: the D3D11 reference
+  tessellator ported to GPU, GS/primitive-restart/index unrolling), `nir/` (the lowering passes).
+- `.agent/ref/kosmickrisp/` — **Mesa's Vulkan-on-Metal driver** (macOS, MSL output: `compiler/nir_to_msl.c`,
+  `vulkan/kk_cmd_draw.c`, `libkk/kk_tessellator.h`). It is the closest existing design to MGL: how it
+  runs tessellation and geometry emulation through Metal compute + MSL is the model to follow.
+- `.agent/ref/asahi/` (`libagx/*.cl`: tessellation, geometry, draws, query, copy) and
+  `.agent/ref/gallium-asahi/` (the GL driver: agx_state.c draw path, xfb, queries).
+MGL uses glslang → SPIR-V → SPIRV-Cross → MSL, not NIR: translate the algorithms (OpenCL C → MSL kernels
+is mostly mechanical), not the NIR plumbing.
