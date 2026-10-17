@@ -813,6 +813,25 @@ TEST(double_uniforms)
     glGetUniformdv(p, ldm, r); EXPECT_NEAR(r[1], 3, 0); EXPECT_NEAR(r[2], 2, 0);
     float f[2]; glGetUniformfv(p, ld2, f); EXPECT_NEAR(f[1], -2.0, 0);
     glProgramUniform1f(p, ld, 1.0f); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+
+    /* the GPU stores fp32 (Metal has no fp64): a dispatch must see the converted values */
+    GLuint cbo;
+    glGenBuffers(1, &cbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 16, NULL, GL_DYNAMIC_COPY);
+    glUseProgram(p);
+    glProgramUniform1d(p, ld, 0.25);
+    glProgramUniform2d(p, ld2, 2.0, 4.0);
+    const double m2[4] = { 1, 2, 3, 4 };
+    glProgramUniformMatrix2dv(p, ldm, 1, GL_TRUE, m2);
+    EXPECT_NO_GL_ERROR();
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    float out = 0;
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4, &out);
+    /* d + d2.y + dm[1][0]: transpose=TRUE lays dm out as rows (1,2)/(3,4), so dm[1][0] = 2 */
+    EXPECT_NEAR(out, 0.25f + 4.0f + 2.0f, 0.0005);
+    EXPECT_NO_GL_ERROR();
 }
 
 int main(void)
