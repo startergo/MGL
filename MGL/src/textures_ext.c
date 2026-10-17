@@ -12,33 +12,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dlfcn.h>
 
 #include "mgl.h"
 #include "glm_context.h"
 #include "utils.h"
 #include "hash_table.h"
 #include "mgl_ext_texext.h"
+#include "mgl_ext_texparam.h"   /* mgl_texparam_record_*: texparam level / view queries */
 
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 extern Texture *currentTexture(GLMContext ctx, GLuint index);
 extern Texture *newTexture(GLMContext ctx, GLenum target, GLuint texture);
 extern Texture *getTex(GLMContext ctx, GLuint name, GLenum target);
 extern bool checkInternalFormatForMetal(GLMContext ctx, GLuint internalformat);
-
-/* texparam domain records (mgl_ext_texparam.h) so its level / view queries report texext state.
-   Resolved at run time so this file also links on branches without the texparam domain. */
-typedef void (*texparam_record_view_fn)(GLMContext, Texture *, GLuint, GLuint, GLuint, GLuint);
-typedef void (*texparam_record_buffer_fn)(GLMContext, Texture *, GLuint, GLintptr, GLsizeiptr);
-typedef void (*texparam_record_ms_fn)(GLMContext, Texture *, GLsizei, GLboolean);
-
-static void *texext_texparam_sym(const char *name)
-{
-    return dlsym(RTLD_DEFAULT, name);
-}
-#define mgl_texparam_record_view ((texparam_record_view_fn)texext_texparam_sym("mgl_texparam_record_view"))
-#define mgl_texparam_record_buffer ((texparam_record_buffer_fn)texext_texparam_sym("mgl_texparam_record_buffer"))
-#define mgl_texparam_record_multisample ((texparam_record_ms_fn)texext_texparam_sym("mgl_texparam_record_multisample"))
 
 #define TEXEXT_ERROR(_e_) do { ctx->error_func(ctx, __FUNCTION__, (_e_)); return; } while (0)
 
@@ -340,9 +326,8 @@ static void texBufferCommon(GLMContext ctx, const char *func, Texture *tex, GLen
         return;
     tex->complete = buf != NULL;
 
-    if (mgl_texparam_record_buffer)
-        mgl_texparam_record_buffer(ctx, tex, buffer, info->buffer_offset,
-                                   buf ? (ranged ? size : buf->size) : 0);
+    mgl_texparam_record_buffer(ctx, tex, buffer, info->buffer_offset,
+                               buf ? (ranged ? size : buf->size) : 0);
 
     texext_mark_dirty(ctx, tex);
 }
@@ -497,8 +482,7 @@ static void texMultisampleCommon(GLMContext ctx, const char *func, Texture *tex,
     if (storage)
         tex->immutable_storage = BUFFER_IMMUTABLE_STORAGE_FLAG;
 
-    if (mgl_texparam_record_multisample)
-        mgl_texparam_record_multisample(ctx, tex, actual, info->fixed_sample_locations);
+    mgl_texparam_record_multisample(ctx, tex, actual, info->fixed_sample_locations);
 
     texext_mark_dirty(ctx, tex);
 }
@@ -839,10 +823,9 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
     tex->complete = true;
     tex->immutable_storage = BUFFER_IMMUTABLE_STORAGE_FLAG;
 
-    if (mgl_texparam_record_view)
-        mgl_texparam_record_view(ctx, tex, info->view_min_level, info->view_num_levels,
-                                 info->view_min_layer, info->view_num_layers);
-    if (info->samples && mgl_texparam_record_multisample)
+    mgl_texparam_record_view(ctx, tex, info->view_min_level, info->view_num_levels,
+                             info->view_min_layer, info->view_num_layers);
+    if (info->samples)
         mgl_texparam_record_multisample(ctx, tex, info->samples, info->fixed_sample_locations);
 
     texext_mark_dirty(ctx, tex);
