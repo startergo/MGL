@@ -24,6 +24,7 @@ PATTERNS = [
     ("e-mail address", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("Anthropic key", re.compile(r"sk-ant-[A-Za-z0-9_-]{10,}")),
     ("generic API key", re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9]{20,}\b")),
+    ("Z.AI API key", re.compile(r"\b[0-9a-f]{32}\.[A-Za-z0-9]{16}\b")),
     ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
     ("AWS key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("bearer/secret assignment", re.compile(r"(?i)\b(?:api[_-]?key|auth[_-]?token|secret|password)\s*[:=]\s*['\"][^'\"$<{]{8,}['\"]")),
@@ -34,9 +35,25 @@ PATTERNS = [
 ALLOW = re.compile(r"noreply@anthropic\.com|user@example\.com|<your[^>]*>")
 
 
+def tracked_files(path: Path):
+    """Files git tracks (or has staged) under path; ignored files like agents/.env are skipped."""
+    import subprocess
+    r = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", str(path)],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        return [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
+    return [ROOT / line for line in r.stdout.splitlines() if (ROOT / line).is_file()]
+
+
+def mask(line: str) -> str:
+    for _, rx in PATTERNS:
+        line = rx.sub(lambda m: m.group(0)[:4] + "…[masked]", line)
+    return line
+
+
 def scan(path: Path):
     hits = []
-    files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
+    files = tracked_files(path)
     for f in files:
         if any(part in SKIP_DIRS for part in f.parts) or f.suffix in SKIP_SUFFIXES or f.name == Path(__file__).name:
             continue
@@ -48,7 +65,7 @@ def scan(path: Path):
             clean = ALLOW.sub("", line)
             for label, rx in PATTERNS:
                 if rx.search(clean):
-                    hits.append((f.relative_to(ROOT) if f.is_relative_to(ROOT) else f.name, n, label, line.strip()[:100]))
+                    hits.append((f.relative_to(ROOT) if f.is_relative_to(ROOT) else f.name, n, label, mask(line.strip())[:100]))
     return hits
 
 
