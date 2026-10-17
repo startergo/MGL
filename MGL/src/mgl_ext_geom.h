@@ -49,6 +49,7 @@ enum {
     MGL_GEOM_SSBO_OUTV     = 23,    /* u32: GS output vertex records */
     MGL_GEOM_SSBO_IDX      = 24,    /* u32: raster index list (stream 0) */
     MGL_GEOM_SSBO_CTL      = 25,    /* u32: counters + indirect draw arguments */
+    MGL_GEOM_SSBO_CNT      = 27,    /* u32: per-thread emitted vertex count (capture order) */
     MGL_GEOM_SSBO_DRAW     = 26     /* pass-through vertex function: GS output records */
 };
 
@@ -61,6 +62,7 @@ enum {
     MGL_GEOM_MSL_OUTV      = 27,
     MGL_GEOM_MSL_IDX       = 28,
     MGL_GEOM_MSL_CTL       = 29,
+    MGL_GEOM_MSL_CNT       = 22,
     MGL_GEOM_MSL_DRAW      = 23
 };
 
@@ -182,6 +184,9 @@ bool mgl_geom_get_programiv(GLMContext ctx, struct Program_t *program, GLenum pn
 bool mgl_geom_present(GLMContext ctx);
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);
+/* an indirect draw: the prep kernel reads the command from `ibuf`; false when the CPU has
+ * to read it after all (no bound on the counts) */
+bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, struct Buffer_t *ibuf, size_t offset);
 /* the emulation record of the current program (NULL when absent or unusable) */
 MGLGeomProgram *mgl_geom_current(GLMContext ctx);
 
@@ -192,7 +197,7 @@ uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 /* transform feedback of the geometry output (called from the xfb domain) */
 void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program);
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
-                          const uint32_t *ctl);
+                          const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
 
 #ifdef __cplusplus
 }

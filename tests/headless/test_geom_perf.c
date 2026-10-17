@@ -138,6 +138,30 @@ int main(void)
         EXPECT_TRUE(covered > 0);
     }
 
+    /* indirect draws: the prep kernel reads the command from the app's buffer */
+    {
+        GLuint ib = 0;
+        const GLuint args[5] = { IDX_COUNT, 1, 0, 0, 0 };   /* count, inst, first, basevertex, baseinst */
+        double t0, t1;
+        GLint prims = 0;
+
+        glGenBuffers(1, &ib);
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, ib);
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof args, args, GL_STATIC_DRAW);
+
+        glBeginQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED, q);
+        t0 = now();
+        for (int f = 0; f < FRAMES; f++)
+            glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        t1 = now();
+        glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &prims);
+        printf("indirect: %.1f us/frame, %d primitives emitted\n", (t1 - t0) * 1e6 / FRAMES, prims);
+        EXPECT_TRUE(prims > 0);
+        glDeleteBuffers(1, &ib);
+    }
+
     free(idx);
     free(verts);
     return mgl_test_summary();

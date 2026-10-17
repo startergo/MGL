@@ -44,6 +44,7 @@ static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
+static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
@@ -302,7 +303,7 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 
 static void geomReleaseStatics(void)
 {
-    gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil;
+    gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
@@ -543,7 +544,8 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES, NULL);
-    if (!gOutv || !gIdx || !gCtl || !gPrep) { geomReleaseStatics(); return false; }
+    gCnt = geomBuffer(_device, gCnt, 4096 + threads * sizeof(uint32_t), NULL);
+    if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
     /* wait for an earlier command buffer that still reads the primitive buffer: before a new
      * one is started (waiting afterwards would commit the one being encoded) */
@@ -834,6 +836,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         [enc setBuffer: gOutv offset: 0 atIndex: MGL_GEOM_MSL_OUTV];
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
+        [enc setBuffer: gCnt offset: 0 atIndex: MGL_GEOM_MSL_CNT];
 
         if ([self geomBindStageBuffers: enc])
         {
@@ -870,7 +873,8 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         BUF()->flush(ctx);
         BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
         mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents,
-                             gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents);
+                             gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
+                             (const uint32_t *)gCnt.contents, gCnt.length / sizeof(uint32_t));
     }
 
     /* ---- 3. raster pass ---- */
