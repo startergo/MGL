@@ -22,6 +22,7 @@
 
 #include "pixel_utils.h"
 #include "glm_context.h"
+#include "texdata_formats.h"
 
 // Legacy format defines not in core profile headers
 #ifndef GL_ALPHA
@@ -1833,7 +1834,22 @@ GLenum internalFormatForGLFormatType(GLenum format, GLenum type)
     }
 }
 
+static MTLPixelFormat legacyMtlFormatForGLInternalFormat(GLenum internal_format);
+
+/* GL internal format -> Metal storage format. Core formats come from the
+ * texdata format table (texdata_formats.c); anything else falls back to the
+ * legacy mapping below. */
 MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
+{
+    const TDFormat *f = tdFormatInfo(tdResolveInternalFormat(internal_format, 0, 0));
+
+    if (f)
+        return (MTLPixelFormat)tdStorageFormat(f)->mtl;
+
+    return legacyMtlFormatForGLInternalFormat(internal_format);
+}
+
+static MTLPixelFormat legacyMtlFormatForGLInternalFormat(GLenum internal_format)
 {
     switch(internal_format)
     {
