@@ -30,15 +30,75 @@
 #include "pixel_utils.h"
 #include "glm_context.h"
 
+#include "mgl_ext_fb.h"
+
+#define FB_ERROR(_e_)   do { ERROR_RETURN(_e_); return; } while (0)
+
+extern GLenum mgl_fb_status(GLMContext ctx, Framebuffer *fbo);
+extern int mgl_fb_slot_kind(GLMContext ctx, Framebuffer *fbo, GLuint slot);
+extern bool mgl_fb_has_depth(GLMContext ctx, Framebuffer *fbo);
+extern bool mgl_fb_has_stencil(GLMContext ctx, Framebuffer *fbo);
+extern void mgl_fb_clear_buffer(GLMContext ctx, Framebuffer *fbo, GLenum buffer, GLint drawbuffer, int kind, const void *value, GLfloat depth, GLint stencil, bool fi);
+extern void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, void *pixels);
+
 void mglClear(GLMContext ctx, GLbitfield mask)
 {
     if (mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
+        FB_ERROR(GL_INVALID_VALUE);
+
+    Framebuffer *fbo = ctx->state.framebuffer;
+
+    if (mgl_fb_status(ctx, fbo) != GL_FRAMEBUFFER_COMPLETE)
+        FB_ERROR(GL_INVALID_FRAMEBUFFER_OPERATION);
+
+    /* Clear is discarded together with primitives (GL 4.6 14.1) */
+    if (ctx->state.caps.rasterizer_discard)
+        return;
+
+    MGLFBClearRequest req;
+    memset(&req, 0, sizeof(req));
+    req.fbo = fbo;
+
+    if (mask & GL_COLOR_BUFFER_BIT)
     {
-        fprintf(stderr, "MGL Error: mglClear: invalid mask 0x%x\n", mask);
-        ERROR_RETURN(GL_INVALID_VALUE);
+        MGLFBDrawState *ds = mgl_fb_draw_state(ctx, fbo);
+
+        for (GLsizei i = 0; i < ds->num_draw_buffers && i < MAX_COLOR_ATTACHMENTS; i++)
+        {
+            int kind = mgl_fb_slot_kind(ctx, fbo, i);
+            if (kind < 0)
+                continue;
+
+            req.color_slots |= 1u << i;
+            req.color_kind[i] = kind;
+            for (int c = 0; c < 4; c++)
+            {
+                GLfloat v = STATE(color_clear_value[c]);
+                if (kind == MGL_FB_KIND_FLOAT) req.color[i].f[c] = v;
+                else if (kind == MGL_FB_KIND_INT) req.color[i].i[c] = (GLint)v;
+                else req.color[i].u[c] = v < 0 ? 0 : (GLuint)v;
+            }
+        }
     }
 
-    ctx->state.clear_bitmask = mask;
+    if ((mask & GL_DEPTH_BUFFER_BIT) && mgl_fb_has_depth(ctx, fbo))
+    {
+        GLdouble d = STATE_VAR(depth_clear_value);
+        req.depth = GL_TRUE;
+        req.depth_value = (GLfloat)(d < 0.0 ? 0.0 : (d > 1.0 ? 1.0 : d));
+    }
+
+    if ((mask & GL_STENCIL_BUFFER_BIT) && mgl_fb_has_stencil(ctx, fbo))
+    {
+        req.stencil = GL_TRUE;
+        req.stencil_value = (GLint)STATE_VAR(stencil_clear_value);
+    }
+
+    if (!req.color_slots && !req.depth && !req.stencil)
+        return;
+
+    if (ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->clear)
+        ctx->mtl_funcs.ext_fb->clear(ctx, &req);
 }
 
 void mglClearColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
@@ -67,55 +127,12 @@ void mglClearDepth(GLMContext ctx, GLdouble depth)
 
 void mglClearBufferfv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLfloat *value)
 {
-    Framebuffer * fbo = ctx->state.framebuffer;
-    FBOAttachment * fboa;
-
-    switch (buffer) {
-        case GL_COLOR:
-            fboa = &fbo->color_attachments[drawbuffer];
-            fboa->clear_bitmask |= GL_COLOR_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
-            fboa->clear_color[1] = value[1];
-            fboa->clear_color[2] = value[2];
-            fboa->clear_color[3] = value[3];
-            break;
-        case GL_DEPTH:
-            fboa = &fbo->depth;
-            fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
-            break;
-        case GL_STENCIL:
-            fboa = &fbo->stencil;
-            fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
-            break;
-        default:
-            fprintf(stderr, "MGL Error: mglClearBufferfv: invalid buffer 0x%x\n", buffer);
-            ERROR_RETURN(GL_INVALID_ENUM);
-            break;
-    }
+    mgl_fb_clear_buffer(ctx, ctx->state.framebuffer, buffer, drawbuffer, MGL_FB_KIND_FLOAT, value, 0, 0, false);
 }
 
 void mglClearBufferfi(GLMContext ctx, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil)
 {
-    Framebuffer * fbo = ctx->state.framebuffer;
-    FBOAttachment * fboa;
-
-    switch (buffer) {
-        case GL_DEPTH_STENCIL:
-            fboa = &fbo->depth;
-            fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
-            fboa->clear_color[0] = depth;
-
-            fboa = &fbo->stencil;
-            fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
-            fboa->clear_color[0] = stencil;
-            break;
-        default:
-            fprintf(stderr, "MGL Error: mglClearBufferfi: invalid buffer 0x%x\n", buffer);
-            ERROR_RETURN(GL_INVALID_ENUM);
-            break;
-    }
+    mgl_fb_clear_buffer(ctx, ctx->state.framebuffer, buffer, drawbuffer, MGL_FB_KIND_FLOAT, NULL, depth, stencil, true);
 }
 
 void mglFinish(GLMContext ctx)
@@ -129,105 +146,183 @@ void mglFlush(GLMContext ctx)
     ctx->mtl_funcs.mtlFlush(ctx, false);
 }
 
+#pragma mark draw / read buffer selection
+
+/* keep the legacy single-value state (GL_DRAW_BUFFER / GL_READ_BUFFER queries) and
+ * binding queries in sync with the bound framebuffers */
+void mgl_fb_sync_bindings(GLMContext ctx)
+{
+    MGLFBDrawState *dds = mgl_fb_draw_state(ctx, ctx->state.framebuffer);
+    MGLFBDrawState *rds = mgl_fb_draw_state(ctx, ctx->state.readbuffer);
+
+    STATE(draw_buffer) = dds->draw_buffers[0];
+    STATE(read_buffer) = rds->read_buffer;
+    STATE_VAR(draw_buffer) = dds->draw_buffers[0];
+    STATE_VAR(read_buffer) = rds->read_buffer;
+    STATE_VAR(draw_framebuffer_binding) = ctx->state.framebuffer ? ctx->state.framebuffer->name : 0;
+    STATE_VAR(read_framebuffer_binding) = ctx->state.readbuffer ? ctx->state.readbuffer->name : 0;
+}
+
+static bool isColorAttachmentEnum(GLenum buf)
+{
+    return buf >= GL_COLOR_ATTACHMENT0 && buf <= GL_COLOR_ATTACHMENT31;
+}
+
+static void drawTargetsChanged(GLMContext ctx, Framebuffer *fbo)
+{
+    if (fbo == ctx->state.framebuffer)
+    {
+        STATE(dirty_bits) |= DIRTY_FBO | DIRTY_STATE;
+        if (ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->targets_changed)
+            ctx->mtl_funcs.ext_fb->targets_changed(ctx);
+    }
+    mgl_fb_sync_bindings(ctx);
+}
+
+/* single = glDrawBuffer semantics (accepts FRONT, BACK, LEFT, FRONT_AND_BACK) */
+void mgl_fb_set_draw_buffers(GLMContext ctx, Framebuffer *fbo, GLsizei n, const GLenum *bufs, bool single)
+{
+    GLenum out[MAX_COLOR_ATTACHMENTS];
+    GLuint maxdb = STATE_VAR(max_draw_buffers) ? STATE_VAR(max_draw_buffers) : MAX_COLOR_ATTACHMENTS;
+    if (maxdb > MAX_COLOR_ATTACHMENTS) maxdb = MAX_COLOR_ATTACHMENTS;
+
+    if (n < 0 || (GLuint)n > maxdb)
+        FB_ERROR(GL_INVALID_VALUE);
+    if (n && !bufs)
+        return;
+
+    for (GLsizei i = 0; i < n; i++)
+    {
+        GLenum b = bufs[i];
+
+        if (b == GL_NONE)
+        {
+            out[i] = b;
+            continue;
+        }
+
+        if (fbo)
+        {
+            if (isColorAttachmentEnum(b))
+            {
+                if (b - GL_COLOR_ATTACHMENT0 >= STATE(max_color_attachments))
+                    FB_ERROR(GL_INVALID_OPERATION);
+            }
+            else
+            {
+                switch(b)
+                {
+                    case GL_FRONT_LEFT: case GL_FRONT_RIGHT: case GL_BACK_LEFT: case GL_BACK_RIGHT:
+                        FB_ERROR(GL_INVALID_OPERATION);
+                    case GL_FRONT: case GL_BACK: case GL_LEFT: case GL_RIGHT: case GL_FRONT_AND_BACK:
+                        FB_ERROR(single ? GL_INVALID_OPERATION : GL_INVALID_ENUM);
+                    default:
+                        FB_ERROR(GL_INVALID_ENUM);
+                }
+            }
+        }
+        else
+        {
+            /* default framebuffer: one color image serving front-left and back-left */
+            switch(b)
+            {
+                case GL_FRONT_LEFT:
+                case GL_BACK_LEFT:
+                    break;
+                case GL_FRONT: case GL_BACK: case GL_LEFT: case GL_FRONT_AND_BACK:
+                    if (!single) FB_ERROR(GL_INVALID_ENUM);
+                    break;
+                case GL_FRONT_RIGHT: case GL_BACK_RIGHT:
+                    FB_ERROR(GL_INVALID_OPERATION);
+                case GL_RIGHT:
+                    if (!single) FB_ERROR(GL_INVALID_ENUM);
+                    FB_ERROR(GL_INVALID_OPERATION);
+                default:
+                    if (isColorAttachmentEnum(b)) FB_ERROR(GL_INVALID_OPERATION);
+                    FB_ERROR(GL_INVALID_ENUM);
+            }
+            if (!single && n != 1)
+                FB_ERROR(GL_INVALID_OPERATION);
+        }
+
+        for (GLsizei j = 0; j < i; j++)
+            if (out[j] == b)
+                FB_ERROR(GL_INVALID_OPERATION);
+
+        out[i] = b;
+    }
+
+    MGLFBDrawState *ds = mgl_fb_draw_state(ctx, fbo);
+    for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
+        ds->draw_buffers[i] = (i < n) ? out[i] : GL_NONE;
+    ds->num_draw_buffers = n;
+
+    drawTargetsChanged(ctx, fbo);
+}
+
+void mgl_fb_set_read_buffer(GLMContext ctx, Framebuffer *fbo, GLenum src)
+{
+    if (fbo)
+    {
+        if (src != GL_NONE)
+        {
+            if (isColorAttachmentEnum(src))
+            {
+                if (src - GL_COLOR_ATTACHMENT0 >= STATE(max_color_attachments))
+                    FB_ERROR(GL_INVALID_OPERATION);
+            }
+            else switch(src)
+            {
+                case GL_FRONT: case GL_BACK: case GL_LEFT: case GL_RIGHT:
+                case GL_FRONT_LEFT: case GL_FRONT_RIGHT: case GL_BACK_LEFT: case GL_BACK_RIGHT:
+                    FB_ERROR(GL_INVALID_OPERATION);
+                default:
+                    FB_ERROR(GL_INVALID_ENUM);
+            }
+        }
+    }
+    else
+    {
+        switch(src)
+        {
+            case GL_NONE: case GL_FRONT: case GL_BACK: case GL_LEFT:
+            case GL_FRONT_LEFT: case GL_BACK_LEFT:
+                break;
+            case GL_RIGHT: case GL_FRONT_RIGHT: case GL_BACK_RIGHT:
+                FB_ERROR(GL_INVALID_OPERATION);
+            default:
+                if (isColorAttachmentEnum(src)) FB_ERROR(GL_INVALID_OPERATION);
+                FB_ERROR(GL_INVALID_ENUM);
+        }
+    }
+
+    mgl_fb_draw_state(ctx, fbo)->read_buffer = src;
+    mgl_fb_sync_bindings(ctx);
+}
+
 void mglDrawBuffers(GLMContext ctx, GLsizei n, const GLenum *bufs)
 {
-    for (GLsizei i=0; i<n; ++i) {
-        mglDrawBuffer(ctx, bufs[i]);
-    }
+    mgl_fb_set_draw_buffers(ctx, ctx->state.framebuffer, n, bufs, false);
 }
 
 void mglDrawBuffer(GLMContext ctx, GLenum buf)
 {
-    if ((buf >= GL_COLOR_ATTACHMENT0) &&
-        (buf <= (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))))
-    {
-        // ok
-    }
-    else
-    switch(buf)
-    {
-        case GL_FRONT:
-            break;
-
-        case GL_NONE:
-        case GL_FRONT_LEFT:
-        case GL_FRONT_RIGHT:
-        case GL_BACK_LEFT:
-        case GL_BACK_RIGHT:
-        case GL_LEFT:
-        case GL_RIGHT:
-        case GL_FRONT_AND_BACK:
-            // TODO: Implement these buffer modes properly
-            fprintf(stderr, "MGL: mglDrawBuffer called with unimplemented mode 0x%x\n", buf);
-            break;
-
-        default:
-            fprintf(stderr, "MGL Error: mglDrawBuffer: invalid enum 0x%x\n", buf);
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    if ((buf >= GL_COLOR_ATTACHMENT0) &&
-        (buf <= (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))))
-    {
-        // probably should validate current fbo..
-        Framebuffer * fbo = ctx->state.framebuffer;
-        if (!fbo || !fbo->color_attachments[buf-GL_COLOR_ATTACHMENT0].buf.rbo)
-        {
-            fprintf(stderr, "MGL Error: mglDrawBuffer: missing color attachment %u\n", (unsigned)(buf - GL_COLOR_ATTACHMENT0));
-            ERROR_RETURN(GL_INVALID_OPERATION);
-            return;
-        }
-        fbo->color_attachments[buf-GL_COLOR_ATTACHMENT0].buf.rbo->is_draw_buffer = GL_TRUE;
-    }
-
-    STATE(draw_buffer) = buf;
-    STATE(dirty_bits) |= DIRTY_STATE;
+    mgl_fb_set_draw_buffers(ctx, ctx->state.framebuffer, 1, &buf, true);
 }
 
 void mglReadBuffer(GLMContext ctx, GLenum buf)
 {
-    if ((buf >= GL_COLOR_ATTACHMENT0) &&
-        (buf <= (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))))
-    {
-        // ok
-    }
-    else
-    switch(buf)
-    {
-        case GL_FRONT:
-        case GL_BACK:
-        case GL_NONE:
-        case GL_FRONT_LEFT:
-        case GL_FRONT_RIGHT:
-        case GL_BACK_LEFT:
-        case GL_BACK_RIGHT:
-        case GL_LEFT:
-        case GL_RIGHT:
-        case GL_FRONT_AND_BACK:
-            // These read buffer modes are accepted but may not be fully implemented
-            break;
-
-        default:
-            fprintf(stderr, "MGL Error: mglReadBuffer: invalid enum 0x%x\n", buf);
-            ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    if ((buf >= GL_COLOR_ATTACHMENT0) &&
-        (buf <= (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))))
-    {
-        // probably should validate current fbo..
-    }
-
-    STATE(read_buffer) = buf;
-    STATE(dirty_bits) |= DIRTY_STATE;
+    mgl_fb_set_read_buffer(ctx, ctx->state.readbuffer, buf);
 }
 
 void mglPixelStorei(GLMContext ctx, GLenum pname, GLint param)
 {
     // ERROR_CHECK_RETURN(param >= 0, GL_INVALID_VALUE);
-    if (param < 0) {
+    if (param < 0 && pname != GL_PACK_SWAP_BYTES && pname != GL_PACK_LSB_FIRST &&
+        pname != GL_UNPACK_SWAP_BYTES && pname != GL_UNPACK_LSB_FIRST) {
         fprintf(stderr, "MGL Error: mglPixelStorei: param < 0 (%d) for pname 0x%x\n", param, pname);
         ERROR_RETURN(GL_INVALID_VALUE);
+        return;
     }
 
     switch(pname)
@@ -320,6 +415,10 @@ void mglPixelStorei(GLMContext ctx, GLenum pname, GLint param)
                     break;
             }
             break;
+
+        default:
+            ERROR_RETURN(GL_INVALID_ENUM);
+            break;
     }
 }
 
@@ -330,182 +429,5 @@ void mglPixelStoref(GLMContext ctx, GLenum pname, GLfloat param)
 
 void mglReadPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels)
 {
-    GLuint pixel_size;
-
-    pixel_size = sizeForFormatType(format, type);
-    // ERROR_CHECK_RETURN(pixel_size != 0, GL_INVALID_ENUM);
-    if (pixel_size == 0) {
-        fprintf(stderr, "MGL Error: mglReadPixels: invalid format/type combination (format=0x%x type=0x%x)\n", format, type);
-        ERROR_RETURN(GL_INVALID_ENUM);
-    }
-
-    // ERROR_CHECK_RETURN(width > 0, GL_INVALID_ENUM);
-    if (width < 0) {
-        fprintf(stderr, "MGL Error: mglReadPixels: width < 0 (%d)\n", width);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    // ERROR_CHECK_RETURN(height > 0, GL_INVALID_ENUM);
-    if (height < 0) {
-        fprintf(stderr, "MGL Error: mglReadPixels: height < 0 (%d)\n", height);
-        ERROR_RETURN(GL_INVALID_VALUE);
-    }
-
-    if (width == 0 || height == 0)
-    {
-        return;
-    }
-
-    size_t row_length;
-    size_t pitch_size;
-    GLuint pitch;
-    size_t buffer_size;
-
-    row_length = (STATE(pack.row_length) ? (size_t)STATE(pack.row_length) : (size_t)width);
-    pitch_size = row_length * (size_t)pixel_size;
-    if (pitch_size > UINT_MAX)
-    {
-        fprintf(stderr, "MGL Error: mglReadPixels: pitch overflow (row_length=%zu pixel_size=%u)\n", row_length, pixel_size);
-        ERROR_RETURN(GL_OUT_OF_MEMORY);
-    }
-    pitch = (GLuint)pitch_size;
-
-    if (pitch_size > 0 && (size_t)height > (SIZE_MAX / pitch_size))
-    {
-        fprintf(stderr, "MGL Error: mglReadPixels: buffer_size overflow (pitch=%zu height=%d)\n", pitch_size, height);
-        ERROR_RETURN(GL_OUT_OF_MEMORY);
-    }
-    buffer_size = pitch_size * (size_t)height;
-    if (buffer_size > UINT_MAX)
-    {
-        fprintf(stderr, "MGL Error: mglReadPixels: buffer_size exceeds API limit (%zu)\n", buffer_size);
-        ERROR_RETURN(GL_OUT_OF_MEMORY);
-    }
-
-    switch(format)
-    {
-        case GL_STENCIL_INDEX:
-            ERROR_CHECK_RETURN(ctx->stencil_format.mtl_pixel_format > 0, GL_INVALID_OPERATION);
-            break;
-
-        case GL_DEPTH_COMPONENT:
-            ERROR_CHECK_RETURN(ctx->depth_format.mtl_pixel_format > 0, GL_INVALID_OPERATION);
-            break;
-
-        case GL_DEPTH_STENCIL:
-            ERROR_CHECK_RETURN((ctx->depth_format.mtl_pixel_format > 0) ||
-                               (ctx->stencil_format.mtl_pixel_format > 0), GL_INVALID_OPERATION);
-            switch(type)
-            {
-                case GL_UNSIGNED_INT_24_8:
-                case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
-                    break;
-
-                default:
-                    ERROR_RETURN(GL_INVALID_ENUM);
-                    break;
-            }
-            break;
-
-        default:
-            break;
-    }
-
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE_3_3_2:
-        case GL_UNSIGNED_BYTE_2_3_3_REV:
-        case GL_UNSIGNED_SHORT_5_6_5:
-        case GL_UNSIGNED_SHORT_5_6_5_REV:
-            // ERROR_CHECK_RETURN(format == GL_RGB || format == GL_BGR, GL_INVALID_OPERATION);
-            if (!(format == GL_RGB || format == GL_BGR)) {
-                fprintf(stderr, "MGL Error: mglReadPixels: invalid format for type (format=0x%x type=0x%x)\n", format, type);
-                ERROR_RETURN(GL_INVALID_OPERATION);
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
-        case GL_UNSIGNED_SHORT_5_5_5_1:
-        case GL_UNSIGNED_SHORT_1_5_5_5_REV:
-        case GL_UNSIGNED_INT_8_8_8_8:
-        case GL_UNSIGNED_INT_8_8_8_8_REV:
-        case GL_UNSIGNED_INT_10_10_10_2:
-        case GL_UNSIGNED_INT_2_10_10_10_REV:
-            // ERROR_CHECK_RETURN(format == GL_RGBA || format == GL_BGRA, GL_INVALID_OPERATION);
-            if (!(format == GL_RGBA || format == GL_BGRA)) {
-                fprintf(stderr, "MGL Error: mglReadPixels: invalid format for type (format=0x%x type=0x%x)\n", format, type);
-                ERROR_RETURN(GL_INVALID_OPERATION);
-            }
-            break;
-    }
-
-    if (STATE(buffers[_PIXEL_PACK_BUFFER]))
-    {
-        Buffer *ptr;
-        uintptr_t offset;
-        uint8_t *base;
-
-        ptr = STATE(buffers[_PIXEL_PACK_BUFFER]);
-
-        // ERROR_CHECK_RETURN(ptr->mapped == false, GL_INVALID_OPERATION);
-        if (ptr->mapped) {
-            fprintf(stderr, "MGL Error: mglReadPixels: pixel pack buffer is mapped\n");
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        if (ptr->size < 0)
-        {
-            fprintf(stderr, "MGL Error: mglReadPixels: pixel pack buffer has negative size (%ld)\n", (long)ptr->size);
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        offset = (uintptr_t)pixels;
-        if (pixel_size && (offset % (uintptr_t)pixel_size) != 0)
-        {
-            fprintf(stderr, "MGL Error: mglReadPixels: pixel pack buffer offset not aligned (offset=%lu pixel_size=%u)\n", (unsigned long)offset, pixel_size);
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        if ((size_t)ptr->size < offset || (size_t)ptr->size - offset < buffer_size)
-        {
-            fprintf(stderr, "MGL Error: mglReadPixels: pixel pack buffer too small (size=%ld offset=%lu req=%zu)\n",
-                    (long)ptr->size, (unsigned long)offset, buffer_size);
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        base = (uint8_t *)(uintptr_t)ptr->data.buffer_data;
-        if (!base)
-        {
-            fprintf(stderr, "MGL Error: mglReadPixels: pixel pack buffer has no CPU storage\n");
-            ERROR_RETURN(GL_INVALID_OPERATION);
-        }
-
-        pixels = (void *)(base + offset);
-    }
-
-    if (!STATE(buffers[_PIXEL_PACK_BUFFER]) && pixels == NULL)
-    {
-        fprintf(stderr, "MGL Error: mglReadPixels: pixels is NULL with no pixel pack buffer bound\n");
-        ERROR_RETURN(GL_INVALID_OPERATION);
-    }
-
-    kern_return_t err;
-    vm_address_t buffer_data;
-
-    err = vm_allocate((vm_map_t) mach_task_self(),
-                      (vm_address_t*) &buffer_data,
-                      (vm_size_t)buffer_size,
-                      VM_FLAGS_ANYWHERE);
-    if (err)
-    {
-        ERROR_RETURN(GL_OUT_OF_MEMORY);
-    }
-
-    ctx->mtl_funcs.mtlReadDrawable(ctx, (void *)buffer_data, pitch, (GLuint)buffer_size, x, y, width, height);
-
-    memcpy(pixels, (void *)buffer_data, buffer_size);
-    
-    vm_deallocate(mach_host_self(), buffer_data, buffer_size);
+    mgl_fb_read_pixels(ctx, x, y, width, height, format, type, -1, pixels);
 }
-
