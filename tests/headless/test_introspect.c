@@ -82,7 +82,114 @@ TEST(draw_uniforms_vs_fs)
     draw_clear();
     EXPECT_PIXEL(10, 10, 0, 0, 0, 255, 3);
     EXPECT_NO_GL_ERROR();
-    glUseProgram(0);
+}
+
+/* explicit default-block uniform locations in the VERTEX stage (the former draw bug) */
+TEST(draw_explicit_uniform_locations_vs)
+{
+    const char *vs = "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=7) uniform float k;\n"
+        "uniform vec2 offs;\n"
+        "void main(){ gl_Position = vec4(pos * k + offs, 0.0, 1.0); }\n";
+    const char *fs = "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "layout(location=3) uniform vec4 tint;\n"
+        "void main(){ color = tint; }\n";
+    GLuint p = mgl_make_program(vs, fs);
+    if (!p) return;
+    setup_tri();
+    glUseProgram(p);
+    GLint lk = glGetUniformLocation(p, "k");
+    GLint lo = glGetUniformLocation(p, "offs");
+    GLint lt = glGetUniformLocation(p, "tint");
+    EXPECT_EQ_INT(lk, 7);
+    EXPECT_EQ_INT(lt, 3);
+    EXPECT_TRUE(lo >= 0 && lo != 3 && lo != 7); /* auto location stays clear of the explicit ones */
+    glUniform1f(lk, 1.0f); glUniform2f(lo, 0.0f, 0.0f); glUniform4f(lt, 0, 0, 1, 1);
+    EXPECT_NO_GL_ERROR();
+    draw_clear();
+    EXPECT_PIXEL(10, 10, 0, 0, 255, 255, 3);
+    /* a location nobody uses is silently ignored by ProgramUniform* */
+    glProgramUniform1f(p, -1, 1.0f);
+    glProgramUniform4f(p, 1000, 1, 1, 1, 1);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    draw_clear();
+    EXPECT_PIXEL(10, 10, 0, 0, 255, 255, 3);
+}
+
+/* bool/bvec default-block uniforms read by the GPU (stored as ints in the Metal block) */
+TEST(draw_bool_uniforms)
+{
+    const char *vs = "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char *fs = "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "uniform bool on;\n"
+        "uniform bvec2 sel;\n"
+        "uniform float shade;\n"
+        "void main(){ color = vec4(on ? 1.0 : 0.0, sel.x ? 0.5 : 0.0, sel.y ? 0.25 : 0.0, shade); }\n";
+    GLuint p = mgl_make_program(vs, fs);
+    if (!p) return;
+    setup_tri();
+    glUseProgram(p);
+    GLint lon = glGetUniformLocation(p, "on");
+    GLint lsel = glGetUniformLocation(p, "sel");
+    GLint lshade = glGetUniformLocation(p, "shade");
+    EXPECT_TRUE(lon >= 0); EXPECT_TRUE(lsel >= 0); EXPECT_TRUE(lshade >= 0);
+    GLint ty = 0, sz = 0;
+    find_uniform(p, "on", &sz, &ty); EXPECT_EQ_INT(ty, GL_BOOL);
+    find_uniform(p, "sel", &sz, &ty); EXPECT_EQ_INT(ty, GL_BOOL_VEC2);
+    GLint b = 1, selv[2] = { 1, 0 }; float shade = 1.0f;
+    EXPECT_NO_GL_ERROR();
+    glUniform1iv(lon, 1, &b);
+    glUniform2iv(lsel, 1, selv);
+    glUniform1f(lshade, 1.0f);
+    EXPECT_NO_GL_ERROR();
+    GLint back = 0;
+    glGetUniformiv(p, lon, &back);
+    EXPECT_EQ_INT(back, 1); /* GL bool reads back as 0/1 */
+    draw_clear();
+    EXPECT_PIXEL(10, 10, 255, 128, 0, 255, 3);
+    b = 0; selv[0] = 0; selv[1] = 1;
+    glUniform1iv(lon, 1, &b);
+    glUniform2iv(lsel, 1, selv);
+    draw_clear();
+    EXPECT_PIXEL(10, 10, 0, 0, 64, 255, 3);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* glGetnUniform*: bufSize too small for the returned data */
+TEST(n_uniform_bufsize)
+{
+    const char *fs = "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "uniform vec4 v;\n"
+        "uniform double d;\n"
+        "void main(){ color = v + float(d); }\n";
+    GLuint p = mgl_make_program(VS_PASS, fs);
+    if (!p) return;
+    glUseProgram(p);
+    GLint lv = glGetUniformLocation(p, "v"), ld = glGetUniformLocation(p, "d");
+    EXPECT_TRUE(lv >= 0); EXPECT_TRUE(ld >= 0);
+    glUniform4f(lv, 1, 2, 3, 4);
+    glProgramUniform1d(p, ld, 0.5);
+    EXPECT_NO_GL_ERROR();
+    GLfloat fv[4] = { 0 };
+    glGetnUniformfv(p, lv, 0, fv);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glGetnUniformfv(p, lv, (GLsizei)(3 * sizeof(GLfloat)), fv);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glGetnUniformfv(p, lv, (GLsizei)(4 * sizeof(GLfloat)), fv);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_EQ_INT(fv[0], 1); EXPECT_EQ_INT(fv[3], 4);
+    GLdouble dv = 0;
+    glGetnUniformdv(p, ld, 4, &dv);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glGetnUniformdv(p, ld, 8, &dv);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_TRUE(dv == 0.5);
 }
 
 static const char *FS_TYPES = "#version 450 core\n"
@@ -711,6 +818,9 @@ TEST(double_uniforms)
 int main(void)
 {
     RUN(draw_uniforms_vs_fs);
+    RUN(draw_explicit_uniform_locations_vs);
+    RUN(draw_bool_uniforms);
+    RUN(n_uniform_bufsize);
     RUN(default_block_reflection);
     RUN(uniform_round_trip);
     RUN(uniform_errors);
