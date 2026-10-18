@@ -213,3 +213,16 @@ primitive slots, VS capture records, inputs by value), which leaves MGL's own se
 tracking as the only un-instrumented shared state between draws.  Next step: log
 `t->write_serial` / `completed_serial` for the transform feedback buffer at the final read
 (`mgl_buffers_prepare_cpu_read`) with and without the per-draw wait.
+
+### Round f5aa6f0+: readback confirmed as the race, wiper not yet identified
+
+Correlated trace: the pack marks the transform feedback buffers with serials 2854/2855/2856
+(`scatter dst[0] ... serial NNNN`), and the very next CPU read sees `write_serial=0 completed=0
+(no wait)`.  So the tracking entry is created by the pack and wiped (or its table slot reused
+and zeroed) before the read.  `mgl_buffers_track` zeroes entries when a slot is created or
+reused (draw_ext.c:111/119/133) and `mgl_buffers_prepare_cpu_write` zeroes them again after an
+orphan/rename (draw_ext.c:214) - one of those runs between the pack and the read, most likely
+from the xfb domain's own `glEndTransformFeedback` bookkeeping.  Next step: stamp the buffers
+again at the *end* of `mglEndTransformFeedback` (after that bookkeeping, i.e. a hook there or
+re-stamp in the geometry domain's fold, which runs first and is therefore too early today) with
+the pack's serial `gXfbSerial`, so `prepare_cpu_read` waits for exactly that command buffer.
