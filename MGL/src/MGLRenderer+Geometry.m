@@ -41,6 +41,7 @@
  * the command buffer they were written for, so a single set can serve every draw) */
 static id<MTLBuffer> gPrim;         /* header + capture index list + input primitive slots */
 static id<MTLBuffer> gVsout;        /* capture header + captured VS records */
+static size_t gPrimOff, gVsoutOff;  /* this draw's ranges in them */
 static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
 static void *gEnqueuedCb;            /* the command buffer this category enqueued */
@@ -52,6 +53,7 @@ static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
+static uint64_t gXfbSerial;         /* the command buffer that last wrote the counter block */
 static GLuint gXfbOwner;            /* the object the counter block belongs to */
 static bool gXfbBegin;              /* the counter block still needs its init kernel */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
@@ -429,11 +431,6 @@ static bool geomCtlPipelines(id<MTLDevice> device)
 }
 
 
-/* ring of writes into gPrim so consecutive draws do not race with an earlier command
- * buffer still reading it */
-#define MGL_GEOM_PRIM_RING 8
-static uint64_t gPrimSerial[MGL_GEOM_PRIM_RING];
-static int gPrimNext;
 
 static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t bytes, size_t *cap)
 {
@@ -447,7 +444,7 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
-    gOutvOff = gCntOff = gPrepOff = 0;
+    gOutvOff = gCntOff = gPrepOff = gPrimOff = gVsoutOff = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
@@ -482,6 +479,14 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
 {
     (void)ctx;
     return !gXfbPending || gXfbOwner == name;
+}
+
+/* give a transform feedback buffer its Metal backing so the scatter can write it */
+bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+    if (!buf->data.mtl_data) [r bindMTLBuffer: buf];
+    return buf->data.mtl_data != NULL;
 }
 
 /* encode the three pack kernels for one draw (see mgl_ext_geom_xfb.h) */
@@ -612,6 +617,12 @@ bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MG
     MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
     return [r geomXfbEncode: gp object: o program: xp tfb: tfb threads: threads
                 maxVertices: max_vertices outWords: out_words vertexCap: vertex_cap];
+}
+
+/* the serial of the command buffer that last wrote the counter block */
+uint64_t geom_xfb_gpu_serial(void)
+{
+    return gXfbSerial;
 }
 
 /* read the pending counters (the caller has synchronised) */
@@ -824,7 +835,6 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     uint32_t bound = d->count_bound ? d->count_bound : (d->count > 0 ? (uint32_t)d->count : 1);
     size_t outv_cap, idx_cap, prim_bytes, vsout_bytes, cap_idx, cap_prim;
     uint32_t *hdr;
-    uint64_t serial;
 
     if (!_device || !_commandQueue || !program || !gp || !gp->linked) return false;
     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
@@ -909,15 +919,27 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
-    /* wait for an earlier command buffer that still reads the primitive buffer: before a new
-     * one is started (waiting afterwards would commit the one being encoded) */
-    serial = BUF()->current_serial(ctx);
-    if (gPrim && gPrimSerial[gPrimNext])
-        BUF()->wait_serial(ctx, gPrimSerial[gPrimNext]);
 
-    gPrim = geomBuffer(_device, gPrim, prim_bytes, &gPrimBytes);
-    gVsout = geomBuffer(_device, gVsout, vsout_bytes, &gVsoutBytes);
-    if (!gPrim || !gVsout) { geomReleaseStatics(); return false; }
+    /* the primitive slots / capture index list and the captured VS records are shared by the
+     * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
+     * own range so a later draw's kernels cannot overwrite them first */
+    if (!gPrim || gPrimOff + prim_bytes > gPrim.length)
+    {
+        gPrim = geomBuffer(_device, gPrim, prim_bytes * 4, &gPrimBytes);
+        gPrimOff = 0;
+    }
+    if (!gPrim) { geomReleaseStatics(); return false; }
+    gPrimOff = (gPrimOff + 255) & ~(size_t)255;
+    if (gPrimOff + prim_bytes > gPrim.length) gPrimOff = 0;
+
+    if (!gVsout || gVsoutOff + vsout_bytes > gVsout.length)
+    {
+        gVsout = geomBuffer(_device, gVsout, vsout_bytes * 4, &gVsoutBytes);
+        gVsoutOff = 0;
+    }
+    if (!gVsout) { geomReleaseStatics(); return false; }
+    gVsoutOff = (gVsoutOff + 255) & ~(size_t)255;
+    if (gVsoutOff + vsout_bytes > gVsout.length) gVsoutOff = 0;
 
     if (![self geomPipelines: gp program: program]) return false;
 
@@ -926,7 +948,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         size_t index_words = (size_t)(!gpu_assembly && d->indexed ? d->index_count : 0);
         size_t prim_words = (size_t)(!gpu_assembly ? d->prims_count * gp->in_verts : 0);
 
-        hdr = (uint32_t *)gPrim.contents;
+        hdr = (uint32_t *)gPrim.contents + gPrimOff / 4;
         memset(hdr, 0, MGL_GEOM_HDR_WORDS * sizeof(uint32_t));
         hdr[1] = (uint32_t)(d->instances > 0 ? d->instances : 1);
         hdr[2] = (uint32_t)gp->invocations;
@@ -981,14 +1003,12 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                 memcpy(hdr + MGL_GEOM_HDR_WORDS, d->indices, index_words * sizeof(uint32_t));
             memcpy(hdr + MGL_GEOM_HDR_WORDS + index_words, d->prims, prim_words * sizeof(uint32_t));
         }
-        gPrimSerial[gPrimNext] = serial;
-        gPrimNext = (gPrimNext + 1) % MGL_GEOM_PRIM_RING;
     }
 
     /* capture variant header lives in its own buffer; with GPU assembly the prep kernel
      * fills in the vertex range */
     {
-        uint32_t *ch = (uint32_t *)gVsout.contents;
+        uint32_t *ch = (uint32_t *)gVsout.contents + gVsoutOff / 4;
         ch[0] = !gpu_assembly && gp->vid_absolute ? (uint32_t)d->vstart : 0;
         ch[1] = (uint32_t)(!gpu_assembly ? d->vcount : 0);
         ch[2] = gp->iid_absolute ? (uint32_t)d->baseinstance : 0;
@@ -1055,10 +1075,10 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         [enc setBuffer: have_eb ? (__bridge id<MTLBuffer>)eb->data.mtl_data : gPrep
                             offset: have_eb ? d->offset : 0
                            atIndex: 2];
-        [enc setBuffer: gPrim offset: (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t) atIndex: 3];
-        [enc setBuffer: gPrim offset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t) atIndex: 4];
-        [enc setBuffer: gPrim offset: 0 atIndex: 5];
-        [enc setBuffer: gVsout offset: 0 atIndex: 6];
+        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t) atIndex: 3];
+        [enc setBuffer: gPrim offset: gPrimOff + MGL_GEOM_HDR_WORDS * sizeof(uint32_t) atIndex: 4];
+        [enc setBuffer: gPrim offset: gPrimOff atIndex: 5];
+        [enc setBuffer: gVsout offset: gVsoutOff atIndex: 6];
         [enc setBuffer: gPrep offset: gPrepOff + 32 * sizeof(uint32_t) atIndex: 7];
 
         [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
@@ -1153,7 +1173,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
             }
         }
         ctx->state.program = saved_program;
-        [enc setVertexBuffer: gVsout offset: 0 atIndex: MGL_GEOM_MSL_VSOUT];
+        [enc setVertexBuffer: gVsout offset: gVsoutOff atIndex: MGL_GEOM_MSL_VSOUT];
 
         if (gpu_assembly)
         {
@@ -1161,7 +1181,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
             [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
                              indexType: MTLIndexTypeUInt32
                            indexBuffer: gPrim
-                     indexBufferOffset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
+                     indexBufferOffset: gPrimOff + MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
                         indirectBuffer: gPrep
                   indirectBufferOffset: gPrepOff + (32 + 7) * sizeof(uint32_t)];
         }
@@ -1171,7 +1191,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                              indexCount: (NSUInteger)d->index_count
                                indexType: MTLIndexTypeUInt32
                              indexBuffer: gPrim
-                       indexBufferOffset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
+                       indexBufferOffset: gPrimOff + MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
                           instanceCount: d->instances > 0 ? (NSUInteger)d->instances : 1
                              baseVertex: d->basevertex
                            baseInstance: d->baseinstance];
@@ -1205,10 +1225,10 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         [enc setComputePipelineState: gGsPso];
 
         size_t index_words = (size_t)(d->indexed ? d->count : 0);
-        [enc setBuffer: gPrim offset: (MGL_GEOM_HDR_WORDS + index_words) * sizeof(uint32_t)
+        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + index_words) * sizeof(uint32_t)
                atIndex: MGL_GEOM_MSL_PRIM];
-        [enc setBuffer: gVsout offset: 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
-        [enc setBuffer: gPrim offset: 0 atIndex: MGL_GEOM_MSL_HDR];
+        [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
+        [enc setBuffer: gPrim offset: gPrimOff atIndex: MGL_GEOM_MSL_HDR];
         [enc setBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_OUTV];
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];

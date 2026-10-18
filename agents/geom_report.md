@@ -98,14 +98,21 @@ buffers in emission order, with the object / context / query counters advanced.
    `glEndQuery` of the four primitive targets and `glGetQueryObject*`, each waiting for the
    command buffer that last wrote it.
 
-   With that in place the *paused* block matches, but the reference block (three draws, no
-   pause) still captures stale records on a fresh build: the values are vertices from an
-   earlier test's draw, i.e. the geometry kernel reads capture records the previous command
-   buffer's capture pass wrote into the shared `gVsout`/`gPrim` buffers. `gOutv`, `gCnt` and
-   now `gPrep` (the prep kernel's draw arguments and dispatch count) are sub-allocated per
-   draw; the remaining shared buffers are `gVsout` (the VS capture records) and `gPrim` —
-   sub-allocating those the same way, or making the capture pass write into this draw's
-   range, is the next step. Single-draw blocks and every other xfb test pass on the GPU path.
+   `gVsout` (the VS capture records) and `gPrim` (the header, capture index list and input
+   primitive slots) are sub-allocated per draw too now, exactly like `gOutv`/`gCnt`/`gPrep`,
+   and the 8-slot serial ring that used to guard `gPrim` (with its per-draw `wait_serial`
+   stall) is gone. A transform feedback buffer without Metal backing gets one from the
+   renderer (`geom_xfb_gpu_ensure`), so a block cannot start on the CPU pack (which advances
+   the object's offsets on the CPU) and continue on the GPU one.
+
+   The multi-draw reference block still captures stale records on a fresh build, so the
+   shared scratch is not the whole story; the write offsets themselves are right (the last
+   draw lands at its cumulative offset), which points at the *scatter* of the earlier draws
+   being skipped or writing nothing. The counter-block serial is tracked at pack-encode time
+   (`geom_xfb_gpu_serial`) but waiting on it made a previously-passing test fail, so the fold
+   still waits on the current serial — that the serial does not identify the buffer that
+   wrote the block is the open question. Single-draw blocks and every other xfb test pass on
+   the GPU path; the CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame

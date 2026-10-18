@@ -3201,6 +3201,8 @@ extern void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, 
 extern void geom_xfb_gpu_reset(GLMContext ctx);
 extern bool geom_xfb_gpu_pending(void);
 extern bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name);
+extern bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf);
+extern uint64_t geom_xfb_gpu_serial(void);
 
 /* try to encode the GPU pack for one draw.  Returns false when the CPU pack must be used. */
 bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
@@ -3218,12 +3220,16 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     if (!getenv("MGL_GEOM_GPU_XFB") || getenv("MGL_GEOM_CPU_XFB")) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 
-    /* the varying table and the buffer strides/sizes must fit the fixed blocks */
+    /* the varying table and the buffer strides/sizes must fit the fixed blocks; a transform
+     * feedback buffer without Metal backing yet gets one from the renderer, so a block never
+     * mixes the CPU pack (which advances the object's offsets on the CPU) with the GPU pack
+     * (whose counter block holds its own) */
     for (b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
         if (xp->buffer_mask & (1u << b))
         {
             Buffer *buf = tfb[b].buf;
-            if (!buf || !buf->data.mtl_data) return false;      /* the CPU path memcpy()s */
+            if (!buf) return false;
+            if (!buf->data.mtl_data && !geom_xfb_gpu_ensure(ctx, buf)) return false;
         }
     if (xp->count > MGL_GEOM_XFB_MAX_VARS) return false;
 
