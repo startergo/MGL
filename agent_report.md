@@ -1,63 +1,58 @@
-# tess domain — round 3 report (branch gl46/tess)
+# tess domain — round 3/4 report (branch gl46/tess)
 
-Merged gl46-port `ea5a3b8` (incl. geom, gpuaudit). Committed: `b430013` (step 1).
-Suite after every step: **19 test files, 0 failures** (`test_tess` 294 checks, `test_tessemu` 4).
+Merged gl46-port `ea5a3b8`. Commits: `b430013` (step 1, PSO caches), `c6738b7` (round-3
+report). Suite at HEAD: **20 test files, 0 failures** (`test_tess` 294 checks).
 
-## Step 1 — PSO cache key: DONE (commit b430013)
+## Step 1 — PSO cache key: DONE (b430013, previous report)
 
-- **Failing test first**: `TessPSOCacheStress` — 50 link/draw/delete cycles of tess programs
-  with distinct TES colours, cache on. Failed intermittently (stale PSO colours), exactly the
-  address-reuse race.
-- **Root cause**: caches keyed on raw object addresses. Two separate instances:
-  (a) `gaPSOKey` (gpuaudit): missing `tessellationFactorScaleEnabled` /
-  `tessellationControlPointIndexType`; `vf`/`ff` are `MTLFunction` pointers, so a freed
-  function reallocated at the same address matched a stale entry.
-  (b) **the tess kernel PSO caches were the actual black-quad culprit**: `tTcsPsoCache` keyed on
-  the *program* pointer — a new program at a recycled address got the previous program's
-  3-control-point TCS kernel for its 4-control-point draw (verified with a standalone
-  triangle-then-quad binary: 1–3/20 black before, 0/200 after).
-- **Fix**: cache entries retain the functions they were built from; lookups verify the retained
-  objects (address reuse can never match); key gained the two missing fields; the tess
-  gpuaudit-cache bypass was removed; VS/TCS/TES params moved to `setBytes` (inline) since the
-  shared CPU-rewritten param buffers also raced in-flight draws.
-- Suite: 19 files, 0 failures, 8 consecutive `test_tess` runs green.
+## Step 2 — factor-record stride (8 tri / 12 quad): root cause CONFIRMED, MGL integration NOT solved
 
-## Step 2 — one drawPatches for all patches: STOPPED at the turn budget with a precise finding
+The supervisor's diagnosis is correct and I verified it end to end with probes:
 
-Method per instructions: `MGL_TESS_TRACE=1` dumps the exact encoder calls, the vertex
-descriptor, the tessellation pipeline fields, the entry MSL (TES+FS), and — from a
-`addCompletedHandler` so the TCS kernel has actually run — the control point, patch and factor
-buffer bytes (`.agent/scratch/trace/`). `.agent/scratch/replay.m` re-issues exactly those
-calls; `.agent/scratch/mp5.m` is the same with a synthetic-data/factor-stride/mutation
-harness.
+- `sizeof(MTLTriangleTessellationFactorsHalf)==8`, `sizeof(MTLQuad…)==12` on this Mac.
+- MGL wrote 12-byte factor records for triangles; in a multi-patch drawPatches Metal reads
+  patch i's factors at `8*i`, crossing into the next record / the zero padding → zero factor →
+  dropped patch. That reproduced my earlier content-dependent `{0,3}`/`{0,2}`/`{0}` patterns.
+- Probe `.agent/scratch/mp5.m` (MGL's exact traced TES/FS MSL + vertex descriptor + traced cp
+  bytes): with factor records rewritten at an 8-byte stride **a single 4-patch drawPatches
+  renders every patch with correct colours** (`p0=red p1=green p2=blue p3=white`, full
+  coverage top+bottom rows). With 12-byte records only patches {0,3} render.
 
-**The exact smallest difference found** (all measurements reproducible on demand):
+I implemented the fix in MGL (triangle-domain TCS kernel recompiled post-link with the
+triangle factor struct + scalar `inside` fixup; factor buffer sized/filled/read at the domain
+stride; TES factor-attribute layout stride 8; single multi-patch drawPatches; compute phase
+in its own command buffer). Result in MGL, reproducibly:
 
-1. The traced 4-patch draw replays with **patches {0,3} rendered and {1,2} dropped** — patch 0
-   red, patch 3 white, quarters 1 and 2 black — with MGL's exact MSL, descriptor, bindings and
-   buffer bytes. So the failure is fully captured by the trace; no MGL-side hidden state.
-2. Mutating only the control-point **data** (swap patch 0's and patch 1's records inside the
-   buffer) moves the rendering to `{1,3}`: slot selection depends on the buffer *content*, not
-   on slot index, buffer length (400 vs 768 bytes — tested with padding), MSL (MGL's exact
-   TES/FS vs a minimal shader — both reproduce), factor values (2 vs 4 — both reproduce),
-   instanceStride (0/12/16 — same), or buffer index (0 vs 8).
-3. Rewriting only the **factor records** at controlled strides (`FSTRIDE`): 12 B → `{0,3}`,
-   16 B → `{0,2}` (quarter 2 shows *slot 2's* colour), 24 B → `{0,3}`, 32 B → `{0}`.
-   The tessellator's effective factor-record stride and its coupling to control-point slot
-   selection do not follow the documented `sizeof(MTLTriangleTessellationFactorsHalf)` = 12 B
-   semantics on this AGX driver.
-4. A minimal probe with different buffer *contents* renders all four quarters "lit", but its
-   centroid colours are wrong/black in the same pattern — i.e. **no configuration of a single
-   multi-patch `drawPatches` was found that renders every patch with per-slot-correct data**;
-   the per-patch rebind workaround renders all four correctly every time.
+- Single-patch draws (Triangle/Quad/DefaultLevels/Orientation) pass — the factor records are
+  now read correctly.
+- Multi-patch draws MISRENDER in a way none of my probes reproduce: patches tessellate across
+  control-point slots (colours bleed past the patch's convex hull), the domain's lower half is
+  dropped, and the last patch is overwritten. The cp and factor buffers were dumped after
+  command-buffer completion and are byte-correct, and the isolated replay of the SAME
+  descriptor + MSL + buffer bytes renders correctly.
+- Bisected against the isolated probes: BGRA8 vs RGBA8 colour attachment (the "colour shift"
+  was my probe reading BGRA bytes as RGBA — not a driver issue), Depth32Float vs
+  Depth32Float_Stencil8 (no difference), CPU-written vs compute-written buffers in the same
+  command buffer (`.agent/scratch/mp9.m`: compute-filled buffers drop the LAST-written patch
+  — a real hazard, worked around by running the tessellation kernels in a dedicated command
+  buffer, which Metal orders before the render pass on the same queue; the misrender above
+  remained), factor values ([2,2,2,2] vs [2,2,2,0,2,0] overlap — both correct in isolation).
+- Per the round rules (green suite required, no workarounds), I reverted the integration to
+  the last committed state (12-byte records + per-patch loop, which rebinds the factor offset
+  per patch). Everything below is preserved in `.agent/scratch/mp5.m`, `mp9.m`, `mp10.m` and
+  this report.
 
-Conclusion: multi-patch `drawPatches` on this AGX (M4 Pro, macOS 26) driver does not honour the
-documented factor-buffer/control-point layout; the per-patch loop stays (documented in
-`MGLRenderer+Tessellation.m`). `gl_PrimitiveID` in a hardware-path TES therefore reads 0 for
-patches > 0, and the 4-patch colour test stays behind `MGL_TESS_UNSTABLE=1`.
+**Exact smallest unsolved difference**: identical vertex descriptor, MSL (specialized with
+the same constants), buffer bytes, draw arguments and framebuffer formats render all patches
+correctly in isolation, while MGL's render pass — whose compute phase ran in a prior command
+buffer — fetches control points across patch records. The one thing the replay cannot copy is
+the live encoder's full state (blend, the TES's uniform bindings at indices 0..k, textures),
+so the suspicion is a state interaction on the tessellator's control-point fetch path that
+only occurs in the full pipeline.
 
-## Steps 3–5: not started (step 2 budget exhausted)
+## Steps 3–5: not started (step 2 budget exhausted first)
 
-Remaining known gaps from previous rounds (unchanged): TCS patch-record blob still built with a
-commit+wait on the emulated path (step 3), indexed patches still read the element buffer on the
-CPU (step 4), isolines/point_mode still render the fallback image (step 5, draw-only tests).
+Remaining gaps unchanged: TCS patch-blob commit+wait (step 3), CPU index reads (step 4),
+isolines/point_mode fallback image (step 5), `gl_PrimitiveID`=0 for patches>0 on the hardware
+path (consequence of the per-patch loop), 4-patch colour test gated behind
+`MGL_TESS_UNSTABLE=1`.
