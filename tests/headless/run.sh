@@ -9,6 +9,11 @@ OUT="$ROOT/build/tests"
 mkdir -p "$OUT"
 LIB="$ROOT/build/libmgl.dylib"
 [ -f "$LIB" ] || { echo "missing $LIB — run 'make lib' first"; exit 2; }
+# refuse to test a stale library: every source must be older than the dylib
+stale="$(find "$ROOT/MGL/src" "$ROOT/MGL/include" -newer "$LIB" -type f \( -name '*.c' -o -name '*.m' -o -name '*.cpp' -o -name '*.h' \) 2>/dev/null | head -3)"
+if [ -n "$stale" ] && [ -z "${MGL_ALLOW_STALE_LIB:-}" ]; then
+    echo "STALE $LIB — sources changed since it was built (run 'make lib'):"; echo "$stale"; exit 2
+fi
 
 if [ $# -gt 0 ]; then
     SRCS=(); for t in "$@"; do SRCS+=("$ROOT/tests/headless/${t%.c}.c"); done
