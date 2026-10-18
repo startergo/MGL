@@ -3281,8 +3281,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
             // gpuaudit: pipeline states are cached by descriptor content (MGLRenderer+Gpuaudit.m);
             // a hit skips the descriptor walk and newRenderPipelineStateWithDescriptor entirely
-            id<MTLRenderPipelineState> gpuauditCached = [self extTessActive] ? nil :
-                [self gpuauditPipelineForDescriptor: pipelineStateDescriptor];
+            id<MTLRenderPipelineState> gpuauditCached = [self gpuauditPipelineForDescriptor: pipelineStateDescriptor];
             if (gpuauditCached)
             {
                 _pipelineState = gpuauditCached;
