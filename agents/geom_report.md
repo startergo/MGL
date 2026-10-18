@@ -74,14 +74,29 @@ buffers in emission order, with the object / context / query counters advanced.
      before the kernel runs, so reusing it for the seed read garbage.
    `memoryBarrierWithScope:MTLBarrierScopeBuffers` is issued between the pack's kernels.
 
-   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it): with it on, single-draw
-   blocks are byte-exact (`xfb_of_geometry_output`, `xfb_streams` pass), but in a
-   multi-draw block the *first* draws' scatter writes are lost — the reference block of
-   `xfb_gpu_pack_multiple_draws_and_pause` ends up with only the last draw's vertices. The
-   write offsets are now correct (the object folds 9 vertices / 72 bytes for three 3-vertex
-   draws), so the remaining suspect is the scatter reading a per-draw input (stride/size)
-   that makes it `continue` — i.e. the ring slot still being clobbered, or the record buffer
-   (`gOutv`) already reused. The CPU pack stays the default path.
+   All per-draw inputs (the input block, the varying table, the begin kernel's seed) are now
+   passed with `setBytes:` — Metal copies them into the command buffer at encode time, so no
+   later CPU write can change what a pending draw reads; the input ring and its seed buffer
+   are gone.
+
+   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it): single-draw blocks are
+   byte-exact (`xfb_of_geometry_output`, `xfb_streams` pass with the GPU pack on), but in a
+   multi-draw block only the last draw's vertices survive. The cause is now identified
+   precisely: **consecutive draws are encoded into different command buffers** (verified by
+   logging the command buffer per pack), and Metal does not guarantee that an earlier command
+   buffer has *completed* before a later one executes — so draw N+1's geometry kernel
+   overwrites the shared record buffer (`gOutv`) before draw N's scatter has read it. The fix
+   is a fresh range per draw for the GPU-written scratch (`gOutv`, `gIdx`, `gCtl`, `gPrep`,
+   `gCnt`, `gXbase`) — a linear allocator per command buffer retired in
+   `addCompletedHandler`, or a serial-tracked ring. A first cut of the ring made the raster
+   pass's indirect draw hang inside the AGX driver (the scratch was per-slot but something
+   still crossed draws); it was reverted rather than left half-working, and the CPU pack
+   stays the default.
+
+   Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
+   feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
+   (~2x)** — the CPU path synchronises after every draw, the GPU path resolves the counters
+   once at the end of the block.
 
 ## Timings (`tests/headless/test_geom_perf.c`)
 

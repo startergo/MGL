@@ -48,9 +48,6 @@ static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and o
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
-static id<MTLBuffer> gXfbIn;        /* ring of per-draw inputs and varying tables */
-static id<MTLBuffer> gXfbSeed;      /* the begin kernel's inputs (CPU-written, never reused) */
-static int gXfbInNext;              /* the ring slot of the draw being encoded */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
 static GLuint gXfbOwner;            /* the object the counter block belongs to */
 static bool gXfbBegin;              /* the counter block still needs its init kernel */
@@ -447,7 +444,7 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
-    gXbase = nil; gXfb = nil; gXfbIn = nil; gXfbSeed = nil; gXfbPending = false; gXfbInNext = 0;
+    gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
@@ -490,7 +487,8 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
               vertexCap: (uint32_t) vertex_cap
 {
     MGLGeomDraw dummy; (void)dummy;
-    uint32_t *in, *vars;
+    uint32_t in[MGL_GEOM_XFB_IN_WORDS];
+    uint32_t vars[MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS];
     id<MTLComputeCommandEncoder> enc;
     NSUInteger wg = MGL_GEOM_XFB_WG;
 
@@ -498,10 +496,8 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     (void)gp;
 
     gXfb = geomBuffer(_device, gXfb, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t), NULL);
-    gXfbIn = geomBuffer(_device, gXfbIn, MGL_GEOM_XFB_RING * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t), NULL);
-    gXfbSeed = geomBuffer(_device, gXfbSeed, MGL_GEOM_XFB_IN_WORDS * sizeof(uint32_t), NULL);
     gXbase = geomBuffer(_device, gXbase, 4096 + (size_t)threads * sizeof(uint32_t), NULL);
-    if (!gXfb || !gXfbIn || !gXfbSeed || !gXbase) { geomReleaseStatics(); return false; }
+    if (!gXfb || !gXbase) { geomReleaseStatics(); return false; }
 
     /* the counter block is GPU-owned for the whole block: the CPU initialises it through a
      * kernel on the command stream (at the first pack, and again after a resume) and only
@@ -516,8 +512,7 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
 
     /* the per-draw inputs and the varying table go into the next ring slot: the GPU may
      * still be reading the previous one */
-    gXfbInNext = (gXfbInNext + 1) % MGL_GEOM_XFB_RING;
-    in = (uint32_t *)gXfbIn.contents + (size_t)gXfbInNext * MGL_GEOM_XFB_SLOT_WORDS;
+    memset(in, 0, sizeof in);
     in[0] = threads;
     in[1] = max_vertices ? max_vertices : 1;
     in[2] = out_words;
@@ -528,8 +523,7 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
         in[8 + b] = (uint32_t)(tfb[b].buf ? tfb[b].buf->data.buffer_size : 0);
     }
 
-    /* the varying records */
-    vars = in + MGL_GEOM_XFB_IN_WORDS;
+    memset(vars, 0, sizeof vars);
     for (GLuint v = 0; v < xp->count; v++)
     {
         vars[v * 4 + 0] = (uint32_t)xp->vars[v].src_word;
@@ -542,17 +536,19 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     if (!enc) return false;
     [enc pushDebugGroup: @"MGL geometry xfb pack"];
 
-    size_t ring_off = (size_t)gXfbInNext * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t);
+    /* every per-draw input is passed by value: Metal copies it into the command buffer at
+     * encode time, so no later CPU write can change what a pending draw reads */
 
     if (gXfbBegin)
     {
         /* the seed must live in its own buffer: the ring slot is restored (and reused by the
          * next draw) before this kernel executes */
-        uint32_t *seed = (uint32_t *)gXfbSeed.contents;
+        uint32_t seed[MGL_GEOM_XFB_IN_WORDS];
+        memset(seed, 0, sizeof seed);
         seed[0] = o->name;
         for (GLuint b = 0; b < 4; b++) seed[1 + b] = (uint32_t)o->write_offset[b];
         [enc setComputePipelineState: gXfbBeginPso];
-        [enc setBuffer: gXfbSeed offset: 0 atIndex: 0];
+        [enc setBytes: seed length: sizeof seed atIndex: 0];
         [enc setBuffer: gXfb offset: 0 atIndex: 1];
         [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
         if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
@@ -561,7 +557,7 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     }
 
     [enc setComputePipelineState: gXfbPrePso];
-    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
+    [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBuffer: gCnt offset: 0 atIndex: 1];
     [enc setBuffer: gXbase offset: 0 atIndex: 2];
     [enc setBuffer: gXfb offset: 0 atIndex: 3];
@@ -570,8 +566,8 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
         [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
 
     [enc setComputePipelineState: gXfbScatterPso];
-    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
-    [enc setBuffer: gXfbIn offset: ring_off + MGL_GEOM_XFB_IN_WORDS * sizeof(uint32_t) atIndex: 1];
+    [enc setBytes: in length: sizeof in atIndex: 0];
+    [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
     [enc setBuffer: gOutv offset: 0 atIndex: 2];
     [enc setBuffer: gCnt offset: 0 atIndex: 3];
     [enc setBuffer: gXbase offset: 0 atIndex: 4];
@@ -591,7 +587,7 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     }
 
     [enc setComputePipelineState: gXfbFinPso];
-    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
+    [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBuffer: gCtl offset: 0 atIndex: 1];
     [enc setBuffer: gXfb offset: 0 atIndex: 2];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
