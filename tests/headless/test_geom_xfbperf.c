@@ -101,7 +101,7 @@ int main(void)
 
     glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
     printf("%s pack: %d frames, %d primitives written, %.3f s (%.1f us/frame)\n",
-           getenv("MGL_GEOM_GPU_XFB") ? "GPU" : "CPU", FRAMES, written, t1 - t0,
+           getenv("MGL_GEOM_CPU_XFB") ? "CPU" : "GPU", FRAMES, written, t1 - t0,
            (t1 - t0) * 1e6 / FRAMES);
     EXPECT_TRUE(written > 0);
 

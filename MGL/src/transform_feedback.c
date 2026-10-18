@@ -432,7 +432,8 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
 
 void mglPauseTransformFeedback(GLMContext ctx)
 {
-    mgl_geom_xfb_flush(ctx);
+    /* the geometry domain's GPU counter block is left alone: pausing only sets a CPU flag,
+     * the block already holds the right write offsets on the GPU */
     MGLXfbObject *o = xfb_current(ctx);
     if (!o->active || o->paused) XFB_ERR(GL_INVALID_OPERATION);
     o->paused = true;
@@ -441,7 +442,7 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglResumeTransformFeedback(GLMContext ctx)
 {
-    mgl_geom_xfb_flush(ctx);
+    /* no fold and no re-seed: the block keeps accumulating on the GPU across the pause */
     MGLXfbObject *o = xfb_current(ctx);
     if (!o->active || !o->paused) XFB_ERR(GL_INVALID_OPERATION);
     /* the program used at Begin must be the active one */
