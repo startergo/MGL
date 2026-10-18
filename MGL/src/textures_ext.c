@@ -18,7 +18,8 @@
 #include "utils.h"
 #include "hash_table.h"
 #include "mgl_ext_texext.h"
-#include "mgl_ext_texparam.h"   /* mgl_texparam_record_*: texparam level / view queries */
+#include "mgl_ext_texparam.h"
+#include "mgl_ext_texdata.h"     /* TD_MAX_LEVELS: textures.c walks every level slot */   /* mgl_texparam_record_*: texparam level / view queries */
 
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 extern Texture *currentTexture(GLMContext ctx, GLuint index);
@@ -109,7 +110,11 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
         if (tex->faces[face].levels)
             free(tex->faces[face].levels);
 
-        tex->faces[face].levels = (TextureLevel *)calloc(levels ? levels : 1, sizeof(TextureLevel));
+        /* always TD_MAX_LEVELS slots: textures.c (texLevel, freeTextureStorage, shadow
+         * frees) indexes the array up to TD_MAX_LEVELS, so a shorter array is read past
+         * its end and garbage "data" pointers get freed (test_texparam abort) */
+        tex->faces[face].levels = (TextureLevel *)calloc(levels > TD_MAX_LEVELS ? levels : TD_MAX_LEVELS,
+                                                         sizeof(TextureLevel));
         if (!tex->faces[face].levels)
         {
             ctx->error_func(ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
