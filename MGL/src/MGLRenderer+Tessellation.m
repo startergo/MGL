@@ -990,19 +990,18 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
     [cenc endEncoding];
 
-    /* the emulated path (isolines / point_mode) and the MGL_TESS_CPU reference path
-     * need the factors on the CPU: commit and wait there. The hardware path signals
-     * an event and makes the render command buffer wait for it — no CPU stall, and
-     * the memory ordering the tessellator's fetch needs (shared storage is untracked,
-     * so the event alone is not enough; the ring is hazard-tracked). */
-    if (need_readback && !use_hardware)
+    /* GPU-side ordering for EVERY non-reference path (no CPU wait): the compute buffer
+     * signals an event the render buffer waits for; the factors and patch data stay on
+     * the GPU. Only MGL_TESS_CPU commits and waits on the CPU. */
+    bool cpu_reference = use_cpu_reference;
+    if (cpu_reference)
     {
         [compute_cb commit];
         [compute_cb waitUntilCompleted];
         if (compute_cb.error)
             NSLog(@"MGL tess: compute cb error %@", compute_cb.error);
 
-        /* a fresh render command buffer: the emulated path's wait may race the
+        /* a fresh render command buffer: the reference path's wait may race the
          * renderer's flush, and Metal forbids encoding on a committed buffer */
         _currentCommandBuffer = [_commandQueue commandBuffer];
         ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
