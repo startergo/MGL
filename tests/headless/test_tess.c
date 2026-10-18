@@ -281,7 +281,6 @@ TEST(TessFourPatches)
         int x = (int)((wx[p] + 1.0f) * 0.5f * w);
         int y = (int)((wy[p] + 1.0f) * 0.5f * h);
         read_px(x, y, c);
- +printf("p%d=(%g,%g,%g) ", p, c[0], c[1], c[2]);
         if (p < 3)
         {
             EXPECT_NEAR(c[p], 1.0f, 0.25f);
@@ -303,6 +302,62 @@ TEST(TessFourPatches)
     glDeleteProgram(prog);
 }
 
+
+/* ------------- indexed patches with primitive restart ----------------------------- */
+TEST(TessIndexedRestart)
+{
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+
+    const float pos[6][4] = {
+        { -1,  1, 0, 1 }, { -1, -1, 0, 1 }, { 0, -1, 0, 1 },
+        { 0,  1, 0, 1 }, { 0, -1, 0, 1 }, { 1, -1, 0, 1 },
+    };
+    const float col[6][4] = {
+        { 1,0,0,1 }, { 1,0,0,1 }, { 1,0,0,1 },
+        { 0,0,1,1 }, { 0,0,1,1 }, { 0,0,1,1 },
+    };
+    GLuint vao, b[3];
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(3, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+    /* index list with a restart between the two patches */
+    const unsigned short idx[7] = { 3, 4, 5, 0xFFFF, 0, 1, 2 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xFFFF);
+
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawElements(GL_PATCHES, 7, GL_UNSIGNED_SHORT, NULL);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    float w = (float)vp[2], h = (float)vp[3];
+    float c[4];
+    read_px((int)(0.20f * w), (int)(0.40f * h), c);
+    read_px((int)(0.70f * w), (int)(0.40f * h), c);
+    printf("R=(%g,%g,%g)\n", c[0], c[1], c[2]);
+    glDisable(GL_PRIMITIVE_RESTART);
+    glDeleteProgram(prog);
+}
 
 /* ------------- consecutive-draw regression ------------------------------------------
  * The per-draw scratch ring and GPU-event ordering broke from the third tess draw on
@@ -338,7 +393,6 @@ TEST(TessConsecutiveDraws)
             read_px(2, (int)h - 4, tlc);
             read_px(2, 2, blc);
             read_px((int)w - 4, 2, brc);
-            printf("TL=(%g,%g,%g) BL=(%g,%g,%g) BR=(%g,%g,%g)\n",
                    tlc[0], tlc[1], tlc[2], blc[0], blc[1], blc[2], brc[0], brc[1], brc[2]);
         }
         {
@@ -590,6 +644,7 @@ int main(void)
 {
     RUN(TessFourPatches);
     RUN(TessIndexedAndInstanced);
+    RUN(TessIndexedRestart);
     RUN(TessConsecutiveDraws);
     RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
