@@ -3248,6 +3248,11 @@ void mgl_geom_xfb_flush(GLMContext ctx)
     /* make the pack's results visible: wait for the command buffer it was encoded into */
     geom_xfb_gpu_wait(ctx);
 
+    if (getenv("MGL_GEOM_XFB_TRACE"))
+    {
+        Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
+        fprintf(stderr, "geom:   fold reads TF backing %p\n", b0 ? b0->data.mtl_data : NULL);
+    }
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
