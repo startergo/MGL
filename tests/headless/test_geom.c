@@ -952,9 +952,11 @@ TEST(xfb_of_geometry_output)
     EXPECT_EQ_INT(written, 2);
 
     struct { float x, y; float r, g, b, a; } out[8];
+    /* read back with no glFinish: the read path must wait for the pack itself */
     memset(out, 0, sizeof out);
     glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
     glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    printf("  immediate read (no glFinish): %5.2f %5.2f %5.2f %5.2f\n", out[0], out[1], out[6], out[7]);
     for (int i = 0; i < 6; i++)
         printf("  v%d = %f %f | %f %f %f\n", i, out[i].x, out[i].y, out[i].r, out[i].g, out[i].b);
 

@@ -619,7 +619,6 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         id<MTLBuffer> mtl = (tfb[b].buf && tfb[b].buf->data.mtl_data)
                             ? (__bridge id<MTLBuffer>)tfb[b].buf->data.mtl_data : gXfb;
         [enc setBuffer: mtl offset: 0 atIndex: 6 + b];
-        if (tfb[b].buf) mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
     }
     {
         NSUInteger slots = (NSUInteger)threads * (max_vertices ? max_vertices : 1);
@@ -633,6 +632,13 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setBuffer: gCtl offset: 0 atIndex: 1];
     [enc setBuffer: gXfb offset: 0 atIndex: 2];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+    /* the transform feedback buffers were written by this encoder: record it *after* the
+     * scatter is encoded, and make sure the serial belongs to this command buffer (the
+     * tracking only notices a new buffer when the serial is queried) */
+    BUF()->current_serial(ctx);
+    for (GLuint b = 0; b < 4; b++)
+        if (tfb[b].buf) mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
 
     /* publish the advanced offsets to the next draw's pack */
     [enc updateFence: gXfbFence];

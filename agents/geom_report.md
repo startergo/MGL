@@ -113,14 +113,18 @@ buffers in emission order, with the object / context / query counters advanced.
    same buffer, and the encoders inside one buffer are already ordered).  The fold waits for
    the specific command buffer the pack was encoded into.
 
-   `MGL_GEOM_XFB_TRACE=1` dumps the transform feedback buffer, the counter block and the
-   draw's counts/prefix after each draw (committing and waiting).  **With the trace on, both
-   blocks of the multi-draw test are byte-exact**; without it the reference block still
-   captures stale data — i.e. the remaining difference is exactly the per-draw commit+wait,
-   not the fence.  Since every per-draw scratch buffer is now sub-allocated and the counter
-   block is fenced, the suspect is MGL's own serial/buffer tracking not observing the
-   geometry emulation's writes (the trace advances it).  Single-draw blocks and every other
-   xfb test pass on the GPU path; the CPU pack stays the default.
+   The transform feedback buffers are marked GPU-written only *after* the scatter is encoded,
+   and the serial is queried first so it belongs to the command buffer that carries it; the
+   multi-draw test reads the buffer back with no glFinish (`immediate read` line).
+
+   Remaining symptom, narrowed twice more: with the per-draw commit+wait of the trace **both
+   blocks are byte-exact**; without it, draw 1's scatter increments `dvert` (so it runs and
+   reads its records) but its bytes never appear in the buffer the CPU reads, while draws 2-3
+   land at their correct cumulative offsets — the test's `immediate read` prints zeros for the
+   first draw.  That points at the TF buffer's Metal backing being replaced (renamed) between
+   the scatter's binding and the CPU read without the earlier contents being carried over, or
+   the scatter of the first draw writing into a backing that is replaced afterwards.  The CPU
+   pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
