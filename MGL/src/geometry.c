@@ -3202,7 +3202,7 @@ extern void geom_xfb_gpu_reset(GLMContext ctx);
 extern bool geom_xfb_gpu_pending(void);
 extern bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name);
 extern bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf);
-extern uint64_t geom_xfb_gpu_serial(void);
+extern void geom_xfb_gpu_wait(GLMContext ctx);
 
 /* try to encode the GPU pack for one draw.  Returns false when the CPU pack must be used. */
 bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
@@ -3245,15 +3245,8 @@ void mgl_geom_xfb_flush(GLMContext ctx)
 
     if (!mgl_geom_xfb_pending(ctx)) return;
 
-    /* make the pack's results visible */
-    if (ctx->mtl_funcs.ext_buffers && ctx->mtl_funcs.ext_buffers->flush &&
-        ctx->mtl_funcs.ext_buffers->wait_serial)
-    {
-        ctx->mtl_funcs.ext_buffers->flush(ctx);
-        ctx->mtl_funcs.ext_buffers->wait_serial(ctx, ctx->mtl_funcs.ext_buffers->current_serial(ctx));
-    }
-    else
-        glFinish();
+    /* make the pack's results visible: wait for the command buffer it was encoded into */
+    geom_xfb_gpu_wait(ctx);
 
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
     {
