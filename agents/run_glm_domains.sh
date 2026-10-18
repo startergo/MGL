@@ -34,8 +34,10 @@ esac
 # pick a Python that has the anthropic SDK (Homebrew upgrades can move python3 to a fresh version)
 PY="${AGENT_PYTHON:-}"
 if [ -z "$PY" ]; then
-    for c in python3 python3.14 python3.13 python3.12 python3.15; do
-        command -v "$c" >/dev/null 2>&1 && "$c" -c 'import anthropic' 2>/dev/null && { PY="$c"; break; }
+    for name in python3 python3.14 python3.13 python3.12 python3.15; do
+        for c in $(which -a "$name" 2>/dev/null); do
+            "$c" -c 'import anthropic' 2>/dev/null && { PY="$c"; break 2; }
+        done
     done
 fi
 [ -n "$PY" ] || { echo "No Python with the anthropic SDK: pip install anthropic (or set AGENT_PYTHON)"; exit 1; }
