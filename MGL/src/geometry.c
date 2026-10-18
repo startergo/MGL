@@ -3193,6 +3193,29 @@ static MGLXfbObject *geom_xfb_object(GLMContext ctx)
 
 /* ---------------- GPU pack of the geometry output ---------------- */
 
+/* the test harness reaches the tracking state through here */
+extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
+
+/* the last context that ran a geometry draw (the trace is a debugging aid) */
+static GLMContext gTraceCtx;
+void *mgl_geom_ctx(void) { return gTraceCtx; }
+
+/* trace helper: the buffer-tracking state of a transform feedback buffer at a CPU read */
+void mgl_geom_xfb_log_read_name(void *ctxp, unsigned name, const char *what)
+{
+    GLMContext ctx = (GLMContext)ctxp;
+    Buffer *buf = ctx ? (ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf) : NULL;
+    struct MGLExtMetal_buffers *b = ctx ? ctx->mtl_funcs.ext_buffers : NULL;
+    MGLBufferTrack *t = ctx ? mgl_buffers_track(ctx, buf, false) : NULL;
+    uint64_t completed = (b && b->completed_serial) ? b->completed_serial(ctx) : 0;
+
+    fprintf(stderr, "geom: read %-9s buf=%u write_serial=%llu completed=%llu (%s)\n",
+            what, name,
+            (unsigned long long)(t ? t->write_serial : 0),
+            (unsigned long long)completed,
+            (!t || t->write_serial <= completed) ? "no wait" : "MUST wait");
+}
+
 /* the Metal side of the pack (MGLRenderer+Geometry.m) */
 extern bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
                                 BufferBaseTarget *tfb, uint32_t threads, uint32_t max_vertices,

@@ -1,4 +1,8 @@
 #include "mgl_test.h"
+/* from MGL/src/geometry.c: trace the buffer tracking of a TF buffer at a CPU read,
+ * looked up by buffer name */
+void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
+void *mgl_geom_ctx(void);
 #include <stdbool.h>
 
 /* ------------------------------------------------------------------ helpers */
@@ -1273,6 +1277,7 @@ TEST(xfb_gpu_pack_multiple_draws_and_pause)
     glEndTransformFeedback();
     memset(expect, 0, sizeof expect);
     glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, ref);
+    if (getenv("MGL_GEOM_XFB_TRACE")) mgl_geom_xfb_log_read_name(mgl_geom_ctx(), ref, "reference");
     glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof expect, expect);
     {
         GLint wa = -1, ga = -1;
