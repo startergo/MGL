@@ -47,7 +47,6 @@ static void *gEnqueuedCb;            /* the command buffer this category enqueue
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
-static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
@@ -446,7 +445,6 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
-    gOutvOff = gCntOff = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
@@ -571,8 +569,8 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     [enc setComputePipelineState: gXfbScatterPso];
     [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
-    [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
-    [enc setBuffer: gCnt offset: gCntOff atIndex: 3];
+    [enc setBuffer: gOutv offset: 0 atIndex: 2];
+    [enc setBuffer: gCnt offset: 0 atIndex: 3];
     [enc setBuffer: gXbase offset: 0 atIndex: 4];
     [enc setBuffer: gXfb offset: 0 atIndex: 5];
     for (GLuint b = 0; b < 4; b++)
@@ -867,33 +865,11 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                         : (size_t)d->vcount * (size_t)(d->instances > 0 ? d->instances : 1))
                        * gp->in_words) * sizeof(uint32_t);
 
-    /* every draw gets its own range of the record buffer: a later draw's geometry kernel
-     * must never overwrite the records an earlier draw's pack still has to read */
-    {
-        size_t need = (size_t)outv_cap * gp->out_words * sizeof(uint32_t);
-        if (!gOutv || gOutvOff + need > gOutv.length)
-        {
-            gOutv = geomBuffer(_device, gOutv, need * 2, &gOutvBytes);
-            gOutvOff = 0;
-        }
-        if (!gOutv) { geomReleaseStatics(); return false; }
-        gOutvOff = (gOutvOff + 255) & ~(size_t)255;
-        if (gOutvOff + need > gOutv.length) { gOutv = geomBuffer(_device, gOutv, need * 2, &gOutvBytes); gOutvOff = 0; }
-    }
+    gOutv = geomBuffer(_device, gOutv, outv_cap * gp->out_words * sizeof(uint32_t), &gOutvBytes);
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES, NULL);
-    {
-        size_t need = 4096 + (size_t)threads * sizeof(uint32_t);
-        if (!gCnt || gCntOff + need > gCnt.length)
-        {
-            gCnt = geomBuffer(_device, gCnt, need * 4, NULL);
-            gCntOff = 0;
-        }
-        if (!gCnt) { geomReleaseStatics(); return false; }
-        gCntOff = (gCntOff + 255) & ~(size_t)255;
-        if (gCntOff + need > gCnt.length) gCntOff = 0;
-    }
+    gCnt = geomBuffer(_device, gCnt, 4096 + threads * sizeof(uint32_t), NULL);
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
     /* wait for an earlier command buffer that still reads the primitive buffer: before a new
@@ -1196,10 +1172,10 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                atIndex: MGL_GEOM_MSL_PRIM];
         [enc setBuffer: gVsout offset: 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
         [enc setBuffer: gPrim offset: 0 atIndex: MGL_GEOM_MSL_HDR];
-        [enc setBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_OUTV];
+        [enc setBuffer: gOutv offset: 0 atIndex: MGL_GEOM_MSL_OUTV];
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
-        [enc setBuffer: gCnt offset: gCntOff atIndex: MGL_GEOM_MSL_CNT];
+        [enc setBuffer: gCnt offset: 0 atIndex: MGL_GEOM_MSL_CNT];
 
         if ([self geomBindStageBuffers: enc])
         {
@@ -1249,10 +1225,9 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         {
             BUF()->flush(ctx);
             BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
-            mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents + gOutvOff / 4,
-                                 (gOutv.length - gOutvOff) / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
-                                 (const uint32_t *)gCnt.contents + gCntOff / 4,
-                                 (gCnt.length - gCntOff) / sizeof(uint32_t));
+            mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents,
+                                 gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
+                                 (const uint32_t *)gCnt.contents, gCnt.length / sizeof(uint32_t));
         }
     }
 
@@ -1338,7 +1313,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                                                              : MTLPrimitiveTypeTriangle;
         if (!_currentRenderEncoder) return false;
 
-        [_currentRenderEncoder setVertexBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_DRAW];
+        [_currentRenderEncoder setVertexBuffer: gOutv offset: 0 atIndex: MGL_GEOM_MSL_DRAW];
 
         [_currentRenderEncoder drawIndexedPrimitives: prim
                                                indexType: MTLIndexTypeUInt32

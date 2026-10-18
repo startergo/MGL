@@ -115,8 +115,6 @@ typedef struct MGLTessProgram_t {
     char   *plain_msl;
     bool    plain_msl_dumped;
     void   *plain_function;        /* id<MTLFunction>, bridged */
-    void   *tcs_function;          /* triangle-domain TCS kernel (8-byte factor records) */
-    void   *tcs_library;
     void   *plain_library;
 } MGLTessProgram;
 
@@ -184,7 +182,6 @@ void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                const unsigned char *tcs_patch_out, size_t tcs_patch_stride,
                                const float *factors, unsigned patches);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
-size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);   /* 8 tri / 12 quad */
 char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees */
 bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
                              char *cp_name, size_t cp_len, size_t *record_size);
