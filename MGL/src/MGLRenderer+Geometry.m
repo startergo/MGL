@@ -30,6 +30,7 @@
 - (bool) geomDraw: (MGLGeomDraw *) d;
 - (bool) geomRasterPass: (MGLGeomDraw *) d;
 - (bool) geomCanAssembleGPU;
+- (void) geomXfbWait;
 @end
 
 /* private renderer methods used here (declared for the compiler; implemented by the
@@ -53,7 +54,9 @@ static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
-static uint64_t gXfbSerial;         /* the command buffer that last wrote the counter block */
+static id<MTLCommandBuffer> gXfbCb; /* that command buffer, for a deterministic wait */
+static id<MTLFence> gXfbFence;     /* orders the packs of one block across command buffers */
+static id<MTLCommandBuffer> gXfbFenceCb;   /* the command buffer that last updated it */
 static GLuint gXfbOwner;            /* the object the counter block belongs to */
 static bool gXfbBegin;              /* the counter block still needs its init kernel */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
@@ -470,6 +473,27 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 
 /* ---------------- the transform feedback pack, Metal side ---------------- */
 
+/* wait for the pack's own command buffer (see geom_xfb_gpu_wait) */
+- (void) geomXfbWait
+{
+    id<MTLCommandBuffer> cb = gXfbCb;
+
+    if (!cb) return;
+    if (cb == _currentCommandBuffer)
+    {
+        BUF()->flush(ctx);                      /* commits it */
+        [cb waitUntilCompleted];
+        return;
+    }
+    if (cb.status < MTLCommandBufferStatusCommitted)
+    {
+        [self endRenderEncoding];
+        [self commitCommandBufferWithAGXRecovery: cb];
+    }
+    if (cb.status != MTLCommandBufferStatusError)
+        [cb waitUntilCompleted];
+}
+
 bool geom_xfb_gpu_pending(void)
 {
     return gXfbPending;
@@ -541,9 +565,18 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
     }
 
+    if (!gXfbFence) gXfbFence = [_device newFence];
+
     enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc) return false;
     [enc pushDebugGroup: @"MGL geometry xfb pack"];
+
+    /* the counter block is shared storage, which Metal does not hazard-track across command
+     * buffers: wait for the previous draw's pack before reading the write offsets.  Metal
+     * forbids waiting on a fence that was updated in the same command buffer, and inside one
+     * buffer the encoders are already ordered, so the wait is only needed across them. */
+    if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+        [enc waitForFence: gXfbFence];
 
     /* every per-draw input is passed by value: Metal copies it into the command buffer at
      * encode time, so no later CPU write can change what a pending draw reads */
@@ -601,10 +634,40 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setBuffer: gXfb offset: 0 atIndex: 2];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
+    /* publish the advanced offsets to the next draw's pack */
+    [enc updateFence: gXfbFence];
+    gXfbFenceCb = _currentCommandBuffer;
+
     [enc popDebugGroup];
     [enc endEncoding];
 
     gXfbPending = true;
+    gXfbCb = _currentCommandBuffer;
+
+    if (getenv("MGL_GEOM_XFB_TRACE"))
+    {
+        /* commit + wait, then dump the transform feedback buffer, the counter block and this
+         * draw's counts / prefix output: bisects "never written" vs "written then clobbered" */
+        Buffer *tfb0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
+        float *tf = (tfb0 && tfb0->data.buffer_data) ? (float *)tfb0->data.buffer_data : NULL;
+        uint32_t *cnt = (uint32_t *)((uint8_t *)gCnt.contents + gCntOff);
+        uint32_t *xb = (uint32_t *)gXbase.contents;
+        uint32_t *blk = (uint32_t *)gXfb.contents;
+        int i;
+
+        BUF()->flush(ctx);
+        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+
+        fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u\n",
+                threads, blk[1], blk[2], blk[3]);
+        fprintf(stderr, "  cnt =");
+        for (uint32_t t = 0; t < threads && t < 8; t++) fprintf(stderr, " %u", cnt[t]);
+        fprintf(stderr, "  xbase =");
+        for (uint32_t t = 0; t < threads && t < 8; t++) fprintf(stderr, " %u", xb[t]);
+        fprintf(stderr, "\n  tf[0..11] =");
+        for (i = 0; i < 12; i++) fprintf(stderr, " %5.2f", tf ? tf[i] : -9.0f);
+        fprintf(stderr, "\n");
+    }
     if (getenv("MGL_GEOM_DEBUG"))
         fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     return true;
@@ -620,9 +683,13 @@ bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MG
 }
 
 /* the serial of the command buffer that last wrote the counter block */
-uint64_t geom_xfb_gpu_serial(void)
+/* wait for the command buffer the last pack was encoded into, so the counter block is
+ * complete before the CPU reads it.  Metal does not hazard-track shared-storage buffers
+ * across command buffers, so "the current serial" may belong to a later, empty buffer. */
+void geom_xfb_gpu_wait(GLMContext ctx)
 {
-    return gXfbSerial;
+    MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+    [r geomXfbWait];
 }
 
 /* read the pending counters (the caller has synchronised) */
