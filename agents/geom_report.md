@@ -84,17 +84,19 @@ buffers in emission order, with the object / context / query counters advanced.
    assertion), so the queue order equals the creation order even when a later command buffer
    is committed earlier — the commit-order hazard the lead identified.
 
-   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it): single-draw blocks are
-   byte-exact (`xfb_of_geometry_output`, `xfb_streams` pass with the GPU pack on), but in a
-   multi-draw block the captures come out shifted: the reference block of
-   `xfb_gpu_pack_multiple_draws_and_pause` shows the last draw's vertices at their correct
-   offset (48) with the first two draws' data missing, and the paused block shows an extra
-   copy of the last draw's data at offset 0. The write offsets the object folds are correct,
-   the per-draw inputs are by value and the command buffers are enqueued in order, so what
-   remains is inside the pack itself across command buffers (most likely the counter block
-   being re-initialised by the begin kernel of a later draw while an earlier draw's scatter
-   still reads it — a per-draw counter block, or a fresh record range per draw, would close
-   it). The CPU pack stays the default.
+   Each draw now also gets **its own range of the record buffer** (`gOutv` is sub-allocated
+   per draw, 256-byte aligned, growing on demand; the geometry kernel, the pack's scatter and
+   the raster pass all bind it at that offset), so a later draw's kernel can no longer
+   overwrite the records an earlier draw's pack still has to read.
+
+   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it). Status, narrowed with a
+   `glFinish()`-between-draws experiment: with the syncs, a block of three draws **without**
+   pauses is byte-exact on the GPU path — so ordering, offsets, per-draw inputs and per-draw
+   records are all correct. What still fails is the block with a **pause/resume** in the
+   middle: the draw after the resume is written at offset 0 *as well as* at the folded offset,
+   overwriting the first draw's vertices. The remaining suspect is the counter block across
+   the pause: the flush folds and the begin kernel re-seeds it, and one of the two appears to
+   race the draw after the resume. The CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
