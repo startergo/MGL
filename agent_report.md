@@ -1,57 +1,65 @@
-# tess domain — round 5 report (scratch ring; branch gl46/tess)
+# tess domain — round 6 report (bind-trace bisection; branch gl46/tess)
 
-Merged gl46-port (geom, gpuaudit). Commits this round: none merged to the branch tip beyond
-the previous state — the scratch-ring work is fully characterised below but reverted per the
-round rules (green suite required; the single-draw multi-patch fix is not complete).
-Suite at HEAD: **20 test files, 0 failures** (`test_tess` 294 checks).
+Merged gl46-port (`61eb64c` → current, 21 test files). Nothing merged to the branch tip —
+the round's work is fully characterised below and reverted per the rules (green suite).
+Suite at HEAD: **21 test files, 0 failures** (`test_tess` 294 checks, `test_tessemu` 4).
 
-## What was built (then reverted): per-draw scratch ring + ordering
+## Step 1 — full encoder bind trace: DONE, hypothesis eliminated
 
-- **Per-draw scratch ring** (`MGL_TESS_RING` blocks, retired in `addCompletedHandler`): every
-  tess scratch range (VS-out, gathered indices, TCS control points, TCS patch outputs,
-  factors, patch blob, emulated coords/indices/args) sub-allocated from one exclusive block
-  per draw; small params via `setBytes`/`setVertexBytes` (inline, cannot be overwritten);
-  never resized in place; the block is released only when the last command buffer encoding
-  the draw completes. Replaces the file-static singletons the supervisor identified.
-- **GPU-side compute→render ordering**: the tessellation kernels run in their own command
-  buffer, `encodeSignalEvent` at its end, `encodeWaitForEvent` at the head of the render
-  command buffer (no CPU wait), the in-flight buffer committed in between. Without this the
-  results were non-deterministic; with it they are stable run-to-run.
-- **Hazard-tracked ring storage** (`MTLResourceHazardTrackingModeTracked`): shared storage is
-  untracked by default, and for untracked resources an event does not order *memory*. This
-  made the draw deterministic.
-- The 8-byte triangle factor records were re-applied (TCS kernel recompiled post-link with
-  `MTLTriangleTessellationFactorsHalf`, all sizes/fills/readbacks/TES-attribute layout at the
-  domain stride) and the per-patch loop removed (one `drawPatches` for all patches).
+Added `MGL_TESS_TRACE`-gated `fprintf` bind tracing (`__FILE__:__LINE__`, index, encoder) to
+every `setVertexBuffer`/`setVertexBytes` call site that can touch the render encoder
+(`MGLRenderer.m` uniform map binder, `MGLRenderer+VertexAttrib.m` all 8 sites, `MGLRenderer+Draw.m`,
+`MGLRenderer+Tessellation.m` 9 sites). For the four-patch draw, in encode order:
 
-Result: single-patch draws all pass; multi-patch draws are deterministic but consistently
-misrender — so the ring is correct infrastructure, but one more live-only defect remains.
+```
+VertexAttrib.m:383 setVertexBuffer idx=0   (GL position array — vattrib map slot 0)
+VertexAttrib.m:383 setVertexBuffer idx=0   (GL colour array    — vattrib map slot 1, index reused)
+Tessellation.m     setVertexBuffer idx=8  (control points)
+Tessellation.m     setVertexBuffer idx=9  (patch data)
+Tessellation.m     setVertexBuffer idx=10 (factors) + setTessellationFactorBuffer
+drawPatches
+```
 
-## The exact unsolved difference (measured, reproducible)
+**Nothing binds 8/9/10 after the tess binds** — the uniform-map binder never fires (no TES
+UBOs in the test) and the vattrib binder uses the low indices. The supervisor's hypothesis
+(another binder overwriting the cp slot) is therefore eliminated for this state.
 
-With the trace (`MGL_TESS_TRACE`) capturing the live pipeline descriptor (tess fields +
-vertex descriptor), the TES/FS MSL, the draw arguments, every bind offset, and the control
-point / factor buffer *bytes* after the compute buffer completes (all verified correct:
-records {pos, tc_col} per patch, factors `0x4000` at the 8-byte stride), `.agent/scratch/
-replay.m` re-issues those exact calls and **renders all four patches correctly** — including
-with the live framebuffer formats (BGRA8 + Depth32Float_Stencil8), depth test, viewport, both
-clip-constant specialisations, and the ring-style single-buffer binds. The live MGL encoder
-with the same inputs (verified by debug prints of the descriptor and binds at draw time, and
-by re-issuing the draw with a freshly built pipeline on the same encoder) renders patches
-with control points fetched from the wrong records: the rendered geometry matches control
-points `{rec[3i], rec[3i+3], rec[3i+6]}` — i.e. control point *j* of patch *i* is fetched
-from record `3(i+j)` (a 96-byte stride per control point) instead of `3i+j` (32 bytes), which
-makes patch 1 degenerate (all three cps at y=+0.5) and stretches the others. The fetch
-stride the hardware uses does not follow the vertex descriptor's 32-byte layout stride in the
-live encoder, while the same descriptor in a standalone encoder does. This is the smallest
-reproducible difference; everything upstream of it (buffers, descriptor, MSL, draw args,
-ordering) is now byte-verified identical.
+## Steps taken beyond the trace (all measured, then reverted)
 
-## Step 1 (PSO cache) — carried from the previous round, still green
+- Re-applied the full round-5 stack (per-draw scratch ring + `setBytes` params + dedicated
+  compute command buffer + `encodeSignalEvent`/`encodeWaitForEvent` + hazard-tracked ring)
+  and the 8-byte triangle factor records with ONE `drawPatches` for all patches.
+  Single-patch draws pass; the four-patch draw is now **deterministic** but still misrenders.
+- Reproduced the misrender **standalone** with the exact traced bytes: `.agent/scratch/replay.m`
+  loads the traced pipeline descriptor (tess fields + vertex descriptor), the TES/FS MSL, the
+  cp/factor buffer bytes dumped after the compute buffer completes, the traced bind offsets,
+  the same specialisation constants (both clip variants), the same framebuffer formats
+  (BGRA8 + Depth32Float_Stencil8 + depth test + viewport) — and with **8-byte factor records
+  it renders all four patches correctly**; with the committed 12-byte records only patches
+  {0,3} render. (Probe switches: F8 = repack records to 8 bytes — the fix; FSEP/FOFF/F8 +
+  same-buffer offsets, TRK = hazard-tracked buffers, EXTRA0 = extra low-index binds, NOF10,
+  CP0, BGRA/D32S8/CULL/SCISSOR — none affect the correct result.)
+- Live-side eliminations this round: fresh PSO on the same encoder (same corruption), draw on
+  a brand-new render encoder with only the three tess binds (same corruption — so prior
+  encoder binds are not it), cp buffer additionally bound at index 0 (same), bind trace
+  (above). The live pipeline descriptor debug print matches the traced descriptor field for
+  field (partition=1 maxFactor=64 stepFn=PerPatch winding=CCW, layout[8] stride=32 step
+  PerPatchControlPoint, attr0@0/attr1@16 both buffer 8).
 
-## Remaining gaps
-- Multi-patch hardware draws keep the per-patch loop (12-byte records, per-patch rebind) —
-  the committed state; `gl_PrimitiveID` reads 0 for patches > 0; the 4-patch colour test
-  stays behind `MGL_TESS_UNSTABLE=1`.
-- Steps 3–5 of the round-3 brief (TCS blob without CPU wait, GPU index gather, isolines /
-  point_mode pixels) not started.
+**Net finding (supersedes round 5's):** with the factor records at the correct 8-byte
+triangle stride, a single multi-patch `drawPatches` renders correctly from CPU-written
+buffers in a standalone encoder, and still fetches control points as if cp *j* of patch *i*
+lived at record `cpCount*(i+j)` when issued from the MGL renderer — with byte-identical
+inputs, an identical pipeline descriptor, and no other binder touching the tess slots. The
+remaining live-only variable is the exact `MTLFunction`/`MTLLibrary` object pair (live:
+compiled by `MGLRenderer+Program.m`'s `compile_msl` at link; replay: recompiled from the
+dumped MSL text at draw time) — i.e. a compiler/driver interaction on the AGX tessellator's
+control-point addressing that depends on which library built the function. That is the next
+thing to bisect (rebuild the live PSO from a replay-compiled function, or vice versa).
+
+## Green state kept
+
+`test_tess` 294 checks / `test_tessemu` 4 / full suite 21 files, 0 failures at HEAD
+(`cda3b3c` + merge). All multi-patch hardware draws still use the committed per-patch loop
+with 12-byte records; the ring/event/tracking work and the probes are preserved under
+`.agent/scratch/` and this report for the next round.
