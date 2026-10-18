@@ -3213,8 +3213,6 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     GLuint b;
 
     if (!o || !o->active || !xp || !xp->count) return false;
-    /* while paused nothing is captured: the block keeps its offsets for the resume */
-    if (o->paused) return false;
     /* GPU pack is opt-in (MGL_GEOM_GPU_XFB=1) until the multi-draw + pause/resume case passes;
      * the CPU pack is the default */
     if (!getenv("MGL_GEOM_GPU_XFB") || getenv("MGL_GEOM_CPU_XFB")) return false;
@@ -3287,6 +3285,14 @@ void mgl_geom_xfb_flush(GLMContext ctx)
     }
 
     geom_xfb_gpu_reset(ctx);
+}
+
+/* the GPU pack's own view of "paused": true when the bound transform feedback object is
+ * active but paused (nothing is captured, the GPU counter block is left untouched) */
+bool mgl_geom_xfb_paused(GLMContext ctx)
+{
+    MGLXfbObject *o = geom_xfb_object(ctx);
+    return o && o->active && o->paused;
 }
 
 bool mgl_geom_xfb_pending(GLMContext ctx)

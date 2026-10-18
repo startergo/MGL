@@ -46,6 +46,7 @@ static id<MTLBuffer> gIdx;          /* raster index list */
 static void *gEnqueuedCb;            /* the command buffer this category enqueued */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
+static size_t gPrepOff;             /* this draw's range in it */
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
 static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
@@ -446,7 +447,7 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
-    gOutvOff = gCntOff = 0;
+    gOutvOff = gCntOff = gPrepOff = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
@@ -882,7 +883,19 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
-    gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES, NULL);
+    /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
+     * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
+     * must not overwrite them first */
+    {
+        if (!gPrep || gPrepOff + MGL_GEOM_PREP_BYTES > gPrep.length)
+        {
+            gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES * 16, NULL);
+            gPrepOff = 0;
+        }
+        if (!gPrep) { geomReleaseStatics(); return false; }
+        gPrepOff = (gPrepOff + 255) & ~(size_t)255;
+        if (gPrepOff + MGL_GEOM_PREP_BYTES > gPrep.length) gPrepOff = 0;
+    }
     {
         size_t need = 4096 + (size_t)threads * sizeof(uint32_t);
         if (!gCnt || gCntOff + need > gCnt.length)
@@ -931,7 +944,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         {
             /* the capture index list and the primitive slots come from the prep kernel:
              * only the inputs are uploaded, never the element buffer contents */
-            uint32_t *in = (uint32_t *)gPrep.contents;
+            uint32_t *in = (uint32_t *)gPrep.contents + gPrepOff / 4;
             memset(in, 0, MGL_GEOM_PREP_BYTES);
             in[0] = (uint32_t)mgl_geom_mode_code(d->mode);
             in[1] = (uint32_t)d->count;
@@ -1027,7 +1040,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 
         [enc pushDebugGroup: @"MGL geometry prep"];
         [enc setComputePipelineState: gPrepPso];
-        [enc setBuffer: gPrep offset: 0 atIndex: 0];                                   /* inputs */
+        [enc setBuffer: gPrep offset: gPrepOff atIndex: 0];                           /* inputs */
         {
             /* the draw command: the user's indirect buffer, or the staging words in gPrep */
             id<MTLBuffer> cmd = gPrep;
@@ -1046,7 +1059,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         [enc setBuffer: gPrim offset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t) atIndex: 4];
         [enc setBuffer: gPrim offset: 0 atIndex: 5];
         [enc setBuffer: gVsout offset: 0 atIndex: 6];
-        [enc setBuffer: gPrep offset: 32 * sizeof(uint32_t) atIndex: 7];
+        [enc setBuffer: gPrep offset: gPrepOff + 32 * sizeof(uint32_t) atIndex: 7];
 
         [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(MGL_GEOM_WG, 1, 1)];
@@ -1150,7 +1163,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                            indexBuffer: gPrim
                      indexBufferOffset: MGL_GEOM_HDR_WORDS * sizeof(uint32_t)
                         indirectBuffer: gPrep
-                  indirectBufferOffset: (32 + 7) * sizeof(uint32_t)];
+                  indirectBufferOffset: gPrepOff + (32 + 7) * sizeof(uint32_t)];
         }
         else if (d->indexed)
         {
@@ -1220,7 +1233,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
             {
                 /* the prep kernel computed the exact threadgroup count */
                 [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
-                                               indirectBufferOffset: (32 + 4) * sizeof(uint32_t)
+                                               indirectBufferOffset: gPrepOff + (32 + 4) * sizeof(uint32_t)
                                               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
             }
             else
@@ -1239,10 +1252,13 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     }
 
     /* ---- transform feedback of the geometry output ---- */
-    if (mgl_xfb_capturing(ctx))
+    if (mgl_xfb_capturing(ctx) && !mgl_geom_xfb_paused(ctx))
     {
-        /* the GPU pack keeps the write offsets and counters in a block the kernels maintain,
-         * so the CPU only folds them in when the application can observe them */
+        /* while paused nothing is captured at all: neither pack may run, because the CPU pack
+         * would advance the object's write offsets on the CPU while the GPU counter block
+         * holds its own.  The GPU pack keeps the write offsets and counters in a block the
+         * kernels maintain, so the CPU only folds them in when the application can observe
+         * them */
         if (!mgl_geom_xfb_pack(ctx, gp, program, (uint32_t)threads,
                                gp->max_vertices ? gp->max_vertices : 1, gp->out_words,
                                (uint32_t)outv_cap))
