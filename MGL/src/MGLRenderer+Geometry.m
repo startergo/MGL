@@ -43,6 +43,7 @@ static id<MTLBuffer> gPrim;         /* header + capture index list + input primi
 static id<MTLBuffer> gVsout;        /* capture header + captured VS records */
 static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
+static void *gEnqueuedCb;            /* the command buffer this category enqueued */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
@@ -596,6 +597,8 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     [enc endEncoding];
 
     gXfbPending = true;
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     return true;
 }
 
@@ -970,6 +973,19 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         return false;
     }
 
+    /* reserve this command buffer's place in the queue now: the emulation's scratch is
+     * shared between draws, so a later draw's kernels must not be allowed to run before an
+     * earlier draw's pack just because the earlier command buffer is committed later.
+     * Metal asserts on enqueueing twice, so only the first enqueue is ours. */
+    if (_currentCommandBuffer.status < MTLCommandBufferStatusEnqueued &&
+        (void *)(__bridge void *)_currentCommandBuffer != gEnqueuedCb)
+    {
+        gEnqueuedCb = (void *)(__bridge void *)_currentCommandBuffer;
+        [_currentCommandBuffer enqueue];
+    }
+
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
     if (gpu_assembly)
     {
@@ -1215,6 +1231,8 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         }
     }
 
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     /* ---- 3. raster pass ---- */
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
         return true;
