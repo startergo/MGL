@@ -281,7 +281,6 @@ TEST(TessFourPatches)
         int x = (int)((wx[p] + 1.0f) * 0.5f * w);
         int y = (int)((wy[p] + 1.0f) * 0.5f * h);
         read_px(x, y, c);
- +printf("p%d=(%g,%g,%g) ", p, c[0], c[1], c[2]);
         if (p < 3)
         {
             EXPECT_NEAR(c[p], 1.0f, 0.25f);
@@ -394,7 +393,6 @@ TEST(TessConsecutiveDraws)
             read_px(2, (int)h - 4, tlc);
             read_px(2, 2, blc);
             read_px((int)w - 4, 2, brc);
-            printf("TL=(%g,%g,%g) BL=(%g,%g,%g) BR=(%g,%g,%g)\n",
                    tlc[0], tlc[1], tlc[2], blc[0], blc[1], blc[2], brc[0], brc[1], brc[2]);
         }
         {
