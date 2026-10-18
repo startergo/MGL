@@ -3194,13 +3194,13 @@ static MGLXfbObject *geom_xfb_object(GLMContext ctx)
 /* ---------------- GPU pack of the geometry output ---------------- */
 
 /* the Metal side of the pack (MGLRenderer+Geometry.m) */
-static bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
+extern bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
                                 BufferBaseTarget *tfb, uint32_t threads, uint32_t max_vertices,
                                 uint32_t out_words, uint32_t vertex_cap);
-static void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim);
-static void geom_xfb_gpu_reset(GLMContext ctx);
-static bool geom_xfb_gpu_pending(void);
-static bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name);
+extern void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim);
+extern void geom_xfb_gpu_reset(GLMContext ctx);
+extern bool geom_xfb_gpu_pending(void);
+extern bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name);
 
 /* try to encode the GPU pack for one draw.  Returns false when the CPU pack must be used. */
 bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
@@ -3210,12 +3210,11 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     MGLXfbObject *o = geom_xfb_object(ctx);
     MGLXfbProgram *xp = geom_xfb_prog(ctx, gp->program, false);
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
-    GLuint b, nvars = 0;
+    GLuint b;
 
     if (!o || !o->active || !xp || !xp->count) return false;
-    /* the GPU pack is not enabled by default: the write-offset advance that the finish
-     * kernel performs is not always observed by the following draw's scatter (see
-     * agents/geom_report.md).  MGL_GEOM_GPU_XFB=1 turns it on for experiments. */
+    /* the CPU pack is the default (MGL_GEOM_GPU_XFB=1 for the GPU pack): in a multi-draw
+     * block the first draws' scatters still read stale records (see agents/geom_report.md) */
     if (!getenv("MGL_GEOM_GPU_XFB")) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 
@@ -3228,14 +3227,7 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
         }
     if (xp->count > MGL_GEOM_XFB_MAX_VARS) return false;
 
-    {
-        bool okg = geom_xfb_gpu_encode(ctx, gp, o, xp, tfb, threads, max_vertices, out_words, vertex_cap);
-        if (getenv("MGL_GEOM_DEBUG"))
-            fprintf(stderr, "geom: pack gpu=%d mtl=%p bd=%p\n", okg,
-                    (void *)(tfb[0].buf ? tfb[0].buf->data.mtl_data : NULL),
-                    (void *)(tfb[0].buf ? (void *)(vm_address_t)tfb[0].buf->data.buffer_data : NULL));
-        return okg;
-    }
+    return geom_xfb_gpu_encode(ctx, gp, o, xp, tfb, threads, max_vertices, out_words, vertex_cap);
 }
 
 /* fold the pending GPU counters into the transform feedback object.  Called at the points
@@ -3258,8 +3250,6 @@ void mgl_geom_xfb_flush(GLMContext ctx)
         glFinish();
 
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
-    if (getenv("MGL_GEOM_DEBUG"))
-        fprintf(stderr, "geom: flush pre obj=%p off0=%u\n", (void *)o, o ? o->write_offset[0] : 0);
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
         float *f = b0 ? (float *)(void *)(vm_address_t)b0->data.buffer_data : NULL;
