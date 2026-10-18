@@ -117,11 +117,8 @@ int main(void)
     unsetenv("MGL_GEOM_CPU_ASSEMBLY");
     gpu = run_frames(p, IDX_COUNT, q);
 
-    /* run_frames already labels its own line, so this summary just states both numbers
-     * truthfully: cpu is the CPU-assembly run, gpu the GPU-assembly run */
-    printf("%s assembly is %.2fx %s (%.1f us/frame CPU vs %.1f us/frame GPU)\n",
-           cpu < gpu ? "CPU" : "GPU", cpu < gpu ? gpu / cpu : cpu / gpu,
-           cpu < gpu ? "faster" : "slower", cpu, gpu);
+    printf("GPU assembly is %.2fx %s the CPU path (%.1f vs %.1f us/frame)\n",
+           cpu > gpu ? cpu / gpu : gpu / cpu, cpu > gpu ? "faster than" : "slower than", cpu, gpu);
 
     /* both paths must rasterize the same amount: count covered pixels */
     {
