@@ -29,6 +29,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_queries.h"
+#include "mgl_ext_geom_xfb.h"
 
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
 
@@ -265,6 +266,12 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
     if (bp < 0) QERR(GL_INVALID_ENUM);
     if (!index_valid(target, index)) QERR(GL_INVALID_VALUE);
     bp = binding_for(target, index);
+
+    /* the geometry domain's transform feedback pack keeps its counters on the GPU: fold them
+     * in before the query stops, so the draws it covered are counted */
+    if (target == GL_PRIMITIVES_GENERATED || target == GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN ||
+        target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED || target == GL_GEOMETRY_SHADER_INVOCATIONS)
+        mgl_geom_xfb_flush(ctx);
 
     q = S->active[bp];
     if (!q || q->target != target) QERR(GL_INVALID_OPERATION);
@@ -707,6 +714,9 @@ static bool query_pname_valid(GLenum pname)
 static void get_query_object(GLMContext ctx, const char *func, GLuint id, GLenum pname, int kind,
                              void *params, Buffer *buf, GLintptr offset)
 {
+    /* the geometry domain's transform feedback pack keeps its counters on the GPU until the
+     * application can observe them */
+    mgl_geom_xfb_flush(ctx);
     MGLQuery *q = lookup_query(ctx, id);
     uint64_t v = 0;
     bool write = true;

@@ -54,10 +54,23 @@ buffers in emission order, with the object / context / query counters advanced.
    threadgroup count the prep kernel wrote (`{groups, 1, 1}` — Y and Z must be 1, a count of 0
    dispatches nothing). An earlier measurement that called this entry point a no-op was wrong:
    the probe passed `{2,0,0}`.
-3. **Transform feedback of GS output** — the records now have a deterministic order (no
-   atomics, no CPU sort), and the pack walks them directly. The pack itself is still CPU-side
-   with a sync, because the xfb object's counters and the TF queries are CPU state in the xfb /
-   queries domains; moving them to a GPU accumulator per object is the remaining work.
+3. **Transform feedback of GS output** — the records have a deterministic order (no atomics,
+   no CPU sort) and the pack walks them directly. The *data* copy now has a GPU
+   implementation (three kernels after the geometry kernel: a prefix sum over the per-thread
+   emitted counts gives every output vertex its compacted transform-feedback index, a scatter
+   writes the varyings, a finish kernel advances the write offsets and folds the stream-0
+   primitive count), with the write offsets and "since the last resolve" counters in a
+   per-object GPU block that the CPU folds in lazily — hooked into `glEndTransformFeedback`,
+   `glPauseTransformFeedback`, `glResumeTransformFeedback`, `glEndQuery(…)` (the four
+   primitive targets) and `glGetQueryObject*`. The per-draw inputs and the varying table live
+   in a 4-slot ring so the CPU never overwrites a block the GPU is still reading.
+   **It is not enabled by default** (`MGL_GEOM_GPU_XFB=1`): in a multi-draw block the write
+   offset the finish kernel advances is not reliably observed by the following draw's
+   scatter — draws after the first land at offset 0 (reproduced deterministically in
+   `xfb_gpu_pack_multiple_draws_and_pause`). The CPU pack stays the default path; the
+   kernels, the ring and the resolve plumbing are in place for whoever chases that race
+   (suspects: cross-kernel visibility of the atomically-updated counter block within one
+   encoder, or the CPU re-seed racing a still-running finish kernel).
 
 ## Timings (`tests/headless/test_geom_perf.c`)
 
@@ -103,13 +116,10 @@ multi-workgroup prefix sum is the fix if that matters.
   beyond that the kernel drops vertices and sets an overflow flag.
 * A VS that redeclares `gl_PerVertex` with fewer members than the GS reads trips glslang's
   cross-stage check (pre-existing MGL/glslang behaviour).
-* xfb of GS output still syncs the CPU for the pack (see above). The design for the GPU pack:
-  a prefix-sum kernel over the per-thread emitted counts gives every output vertex its
-  compacted transform-feedback index, a scatter kernel writes the varyings from the record,
-  and the write offsets live in a small per-object GPU block so no per-draw sync is needed.
-  It needs hooks in the xfb domain (glEndTransformFeedback) and the queries domain (results
-  resolved inside an active block), because the object counters and the query counters are
-  CPU state there.
+* xfb of GS output uses the CPU pack by default (a sync per draw); the GPU pack is implemented
+  but gated off — see above.
+* `MGLXfbObject.write_offset` is `GLsizeiptr` (64-bit) while the GPU block holds 32-bit words;
+  the resolve widens each entry individually.
 * `test_texparam` aborts intermittently at teardown (~20-40% of direct runs) — verified to
   happen with the unmodified base build as well (4/10 vs 2/10); its checks always report 0
   failures.
