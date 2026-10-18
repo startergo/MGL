@@ -638,7 +638,15 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
      * tracking only notices a new buffer when the serial is queried) */
     BUF()->current_serial(ctx);
     for (GLuint b = 0; b < 4; b++)
-        if (tfb[b].buf) mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+        if (tfb[b].buf)
+        {
+            mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+            if (getenv("MGL_GEOM_XFB_TRACE"))
+                fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
+                        tfb[b].buf->data.mtl_data,
+                        (unsigned long long)BUF()->current_serial(ctx),
+                        (void *)(__bridge void *)_currentCommandBuffer);
+        }
 
     /* publish the advanced offsets to the next draw's pack */
     [enc updateFence: gXfbFence];
