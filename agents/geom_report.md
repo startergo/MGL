@@ -105,14 +105,22 @@ buffers in emission order, with the object / context / query counters advanced.
    renderer (`geom_xfb_gpu_ensure`), so a block cannot start on the CPU pack (which advances
    the object's offsets on the CPU) and continue on the GPU one.
 
-   The multi-draw reference block still captures stale records on a fresh build, so the
-   shared scratch is not the whole story; the write offsets themselves are right (the last
-   draw lands at its cumulative offset), which points at the *scatter* of the earlier draws
-   being skipped or writing nothing. The counter-block serial is tracked at pack-encode time
-   (`geom_xfb_gpu_serial`) but waiting on it made a previously-passing test fail, so the fold
-   still waits on the current serial — that the serial does not identify the buffer that
-   wrote the block is the open question. Single-draw blocks and every other xfb test pass on
-   the GPU path; the CPU pack stays the default.
+   The counter block is now fenced (`waitForFence:` before the prefix sum, `updateFence:`
+   after the finish), because it is `MTLResourceStorageModeShared`, which Metal does not
+   hazard-track across command buffers — draw N+1's scatter could read the write offsets
+   before draw N's finish advanced them.  The fence wait is skipped when the pack shares its
+   command buffer with the previous pack (Metal forbids waiting on a fence updated in the
+   same buffer, and the encoders inside one buffer are already ordered).  The fold waits for
+   the specific command buffer the pack was encoded into.
+
+   `MGL_GEOM_XFB_TRACE=1` dumps the transform feedback buffer, the counter block and the
+   draw's counts/prefix after each draw (committing and waiting).  **With the trace on, both
+   blocks of the multi-draw test are byte-exact**; without it the reference block still
+   captures stale data — i.e. the remaining difference is exactly the per-draw commit+wait,
+   not the fence.  Since every per-draw scratch buffer is now sub-allocated and the counter
+   block is fenced, the suspect is MGL's own serial/buffer tracking not observing the
+   geometry emulation's writes (the trace advances it).  Single-draw blocks and every other
+   xfb test pass on the GPU path; the CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
