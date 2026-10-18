@@ -25,6 +25,7 @@
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom.h"
+#include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
 #include "hash_table.h"
 
@@ -431,6 +432,7 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
 
 void mglPauseTransformFeedback(GLMContext ctx)
 {
+    mgl_geom_xfb_flush(ctx);
     MGLXfbObject *o = xfb_current(ctx);
     if (!o->active || o->paused) XFB_ERR(GL_INVALID_OPERATION);
     o->paused = true;
@@ -439,6 +441,7 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglResumeTransformFeedback(GLMContext ctx)
 {
+    mgl_geom_xfb_flush(ctx);
     MGLXfbObject *o = xfb_current(ctx);
     if (!o->active || !o->paused) XFB_ERR(GL_INVALID_OPERATION);
     /* the program used at Begin must be the active one */
@@ -447,8 +450,9 @@ void mglResumeTransformFeedback(GLMContext ctx)
     if (STATE(transform_feedback)) STATE(transform_feedback)->paused = GL_FALSE;
 }
 
-void mglEndTransformFeedback(GLMContext ctx)
+void mglEndTransformFeedback(GLMContext ctx)   /* the geom domain resolves its GPU pack here */
 {
+    mgl_geom_xfb_flush(ctx);
     MGLXfbObject *o = xfb_current(ctx);
     if (!o->active) XFB_ERR(GL_INVALID_OPERATION);
 

@@ -46,6 +46,7 @@
 #include "mgl_ext_geom.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_program.h"
 #include "shaders.h"
 #include "programs.h"
@@ -3189,6 +3190,118 @@ static MGLXfbObject *geom_xfb_object(GLMContext ctx)
     return &x->default_obj;
 }
 
+
+/* ---------------- GPU pack of the geometry output ---------------- */
+
+/* the Metal side of the pack (MGLRenderer+Geometry.m) */
+static bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
+                                BufferBaseTarget *tfb, uint32_t threads, uint32_t max_vertices,
+                                uint32_t out_words, uint32_t vertex_cap);
+static void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim);
+static void geom_xfb_gpu_reset(GLMContext ctx);
+static bool geom_xfb_gpu_pending(void);
+static bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name);
+
+/* try to encode the GPU pack for one draw.  Returns false when the CPU pack must be used. */
+bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
+                       uint32_t threads, uint32_t max_vertices, uint32_t out_words,
+                       uint32_t vertex_cap)
+{
+    MGLXfbObject *o = geom_xfb_object(ctx);
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, gp->program, false);
+    BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
+    GLuint b, nvars = 0;
+
+    if (!o || !o->active || !xp || !xp->count) return false;
+    /* the GPU pack is not enabled by default: the write-offset advance that the finish
+     * kernel performs is not always observed by the following draw's scatter (see
+     * agents/geom_report.md).  MGL_GEOM_GPU_XFB=1 turns it on for experiments. */
+    if (!getenv("MGL_GEOM_GPU_XFB")) return false;
+    if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
+
+    /* the varying table and the buffer strides/sizes must fit the fixed blocks */
+    for (b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+        if (xp->buffer_mask & (1u << b))
+        {
+            Buffer *buf = tfb[b].buf;
+            if (!buf || !buf->data.mtl_data) return false;      /* the CPU path memcpy()s */
+        }
+    if (xp->count > MGL_GEOM_XFB_MAX_VARS) return false;
+
+    {
+        bool okg = geom_xfb_gpu_encode(ctx, gp, o, xp, tfb, threads, max_vertices, out_words, vertex_cap);
+        if (getenv("MGL_GEOM_DEBUG"))
+            fprintf(stderr, "geom: pack gpu=%d mtl=%p bd=%p\n", okg,
+                    (void *)(tfb[0].buf ? tfb[0].buf->data.mtl_data : NULL),
+                    (void *)(tfb[0].buf ? (void *)(vm_address_t)tfb[0].buf->data.buffer_data : NULL));
+        return okg;
+    }
+}
+
+/* fold the pending GPU counters into the transform feedback object.  Called at the points
+ * where the application can observe them, so the command buffer has usually completed. */
+void mgl_geom_xfb_flush(GLMContext ctx)
+{
+    MGLXfbObject *o = geom_xfb_object(ctx);
+    uint32_t dvert, dprim;
+
+    if (!mgl_geom_xfb_pending(ctx)) return;
+
+    /* make the pack's results visible */
+    if (ctx->mtl_funcs.ext_buffers && ctx->mtl_funcs.ext_buffers->flush &&
+        ctx->mtl_funcs.ext_buffers->wait_serial)
+    {
+        ctx->mtl_funcs.ext_buffers->flush(ctx);
+        ctx->mtl_funcs.ext_buffers->wait_serial(ctx, ctx->mtl_funcs.ext_buffers->current_serial(ctx));
+    }
+    else
+        glFinish();
+
+    geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "geom: flush pre obj=%p off0=%u\n", (void *)o, o ? o->write_offset[0] : 0);
+    {
+        Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
+        float *f = b0 ? (float *)(void *)(vm_address_t)b0->data.buffer_data : NULL;
+        fprintf(stderr, "geom: flush name=%u dvert=%u dprim=%u tf=%p words=[%f %f %f %f]\n",
+                o ? o->name : 0, dvert, dprim, (void *)f,
+                f ? f[0] : 0.0f, f ? f[1] : 0.0f, f ? f[2] : 0.0f, f ? f[3] : 0.0f);
+    }
+
+    if (o)
+    {
+        o->vertices[0] += dvert;
+        o->prims_written[0] += dprim;
+        o->prims_needed[0] += dprim;
+    }
+    if (ctx->state.ext_xfb)
+    {
+        struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+        x->total_written[0] += dprim;
+        x->total_needed[0] += dprim;
+    }
+
+    /* the transform feedback primitive queries are counted by the queries domain */
+    {
+        typedef void (*geom_note_queries_fn)(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
+        static geom_note_queries_fn note;
+        static int looked;
+        if (!looked)
+        {
+            note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
+            looked = 1;
+        }
+        if (note) note(ctx, 0, dprim, dprim);
+    }
+
+    geom_xfb_gpu_reset(ctx);
+}
+
+bool mgl_geom_xfb_pending(GLMContext ctx)
+{
+    (void)ctx;
+    return geom_xfb_gpu_pending();
+}
 
 /* pack the emitted geometry output into the bound transform feedback buffers.  Called after
  * the geometry kernel has been synchronized, from the Metal side of the emulation.  The

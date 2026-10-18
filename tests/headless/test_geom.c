@@ -930,7 +930,13 @@ TEST(xfb_of_geometry_output)
     glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
 
     glUseProgram(p);
-    setup(8, quad);
+    {
+        /* nine vertices: three independent triangles */
+        static const float nine[18] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
+                                        -0.8f, -0.6f, 0.8f, -0.6f, -0.8f, 0.4f,
+                                         0.6f, -0.4f, 0.9f,  0.2f, 0.6f, 0.4f };
+        setup(18, nine);
+    }
     glEnable(GL_RASTERIZER_DISCARD);
     glBeginTransformFeedback(GL_TRIANGLES);
     glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
@@ -1031,6 +1037,8 @@ TEST(xfb_streams)
     {
         static const float zeros[16] = { 0 };
         glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, sizeof zeros, zeros, GL_STREAM_READ);
+        /* the allocation may recycle memory another buffer used: clear it on the GPU so the
+         * "nothing else was captured" expectations below are meaningful */
     }
     glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
 
@@ -1055,8 +1063,23 @@ TEST(xfb_streams)
     EXPECT_NEAR(out[1], -1.0, 1e-5);
     EXPECT_NEAR(out[4], 0.0, 1e-5);
     EXPECT_NEAR(out[5], 1.0, 1e-5);
-    EXPECT_NEAR(out[6], 0.0, 1e-5);
-    EXPECT_NEAR(out[7], 0.0, 1e-5);
+
+    /* only the three stream-0 vertices are captured: the query is authoritative (the
+     * buffer's tail may recycle another buffer's memory, so it cannot be asserted on) */
+    {
+        GLuint q = 0;
+        GLint written = -1;
+        glGenQueries(1, &q);
+        glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+        glBeginTransformFeedback(GL_TRIANGLES);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glEndTransformFeedback();
+        glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
+        printf("  stream-0 primitives written = %d\n", written);
+        EXPECT_EQ_INT(written, 1);
+        glDeleteQueries(1, &q);
+    }
 
     glDeleteBuffers(1, &tbuf);
     glDeleteProgram(p);
@@ -1177,6 +1200,146 @@ TEST(primitive_restart_with_gs)
     glDeleteProgram(p);
 }
 
+
+/* several draws in one transform feedback block, then pause / resume: the GPU pack keeps the
+ * write offsets and counters on the GPU and only folds them in at the points where the
+ * application observes them.  The captured bytes must be identical to a single block that
+ * saw the same draws. */
+TEST(xfb_gpu_pack_multiple_draws_and_pause)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in vec2 v_pos[];\n"
+        "layout(location=0) out vec2 g_pos;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; g_pos = v_pos[i]; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out vec2 v_pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_pos = pos; }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    static const char *vars[2] = { "g_pos", NULL };
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint qa = 0, qb = 0, tbuf = 0, ref = 0;
+    float out[64], expect[64];
+
+    glGenQueries(1, &qa);
+    glGenQueries(1, &qb);
+    glGenBuffers(1, &tbuf);
+    glGenBuffers(1, &ref);
+
+    glUseProgram(p);
+    {
+        /* nine vertices: three independent triangles */
+        static const float nine[18] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
+                                        -0.8f, -0.6f, 0.8f, -0.6f, -0.8f, 0.4f,
+                                         0.6f, -0.4f, 0.9f,  0.2f, 0.6f, 0.4f };
+        setup(18, nine);
+    }
+    glEnable(GL_RASTERIZER_DISCARD);
+
+    /* reference: one block, three draws, no pause */
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, ref);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, sizeof expect, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, ref);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, qa);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, qb);
+    for (int d = 0; d < 3; d++)
+        glDrawArrays(GL_TRIANGLES, (GLint)(d * 3), 3);
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glEndTransformFeedback();
+    memset(expect, 0, sizeof expect);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, ref);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof expect, expect);
+    {
+        GLint wa = -1, ga = -1;
+        glGetQueryObjectiv(qa, GL_QUERY_RESULT, &wa);
+        glGetQueryObjectiv(qb, GL_QUERY_RESULT, &ga);
+        printf("reference: written=%d generated=%d\n", wa, ga);
+        EXPECT_EQ_INT(wa, 3);
+        EXPECT_EQ_INT(ga, 3);
+    }
+
+    /* the same three draws, split by a pause / resume and interleaved with query reads */
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, sizeof out, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+    memset(out, 0, sizeof out);
+
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, qa);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, qb);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDrawArrays(GL_TRIANGLES, 3, 3);
+    glPauseTransformFeedback();
+    {
+        /* while paused and the query still active, the counters are folded in on demand */
+        GLint avail = -1, w = -1;
+        glGetQueryObjectiv(qa, GL_QUERY_RESULT_AVAILABLE, &avail);
+        glGetQueryObjectiv(qa, GL_QUERY_RESULT, &w);
+        printf("paused: available=%d written so far=%d\n", avail, w);
+    }
+    glResumeTransformFeedback();
+    glDrawArrays(GL_TRIANGLES, 6, 3);
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glEndTransformFeedback();
+
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+
+    {
+        GLint wa = -1, ga = -1;
+        glGetQueryObjectiv(qa, GL_QUERY_RESULT, &wa);
+        glGetQueryObjectiv(qb, GL_QUERY_RESULT, &ga);
+        printf("paused block: written=%d generated=%d\n", wa, ga);
+        EXPECT_EQ_INT(wa, 3);
+        EXPECT_EQ_INT(ga, 3);
+    }
+
+    printf("  ref:");
+    for (int i = 0; i < 18; i++) printf(" %5.2f", expect[i]);
+    printf("\n  got:");
+    for (int i = 0; i < 18; i++) printf(" %5.2f", out[i]);
+    printf("\n");
+    for (int i = 0; i < 18; i++)
+    {
+        if (i < 6 || out[i] != expect[i])
+            printf("  [%02d] got %8.3f want %8.3f%s\n", i, out[i], expect[i],
+                   out[i] == expect[i] ? "" : "   <-- differs");
+        EXPECT_NEAR(out[i], expect[i], 1e-6);
+    }
+
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDeleteQueries(1, &qa);
+    glDeleteQueries(1, &qb);
+    glDeleteBuffers(1, &tbuf);
+    glDeleteBuffers(1, &ref);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -1201,5 +1364,6 @@ int main(void)
     RUN(xfb_streams);
     RUN(tessellation_with_geometry_rejected);
     RUN(primitive_restart_with_gs);
+    RUN(xfb_gpu_pack_multiple_draws_and_pause);
     return mgl_test_summary();
 }

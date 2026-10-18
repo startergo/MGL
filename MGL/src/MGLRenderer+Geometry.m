@@ -21,6 +21,7 @@
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_geom_xfb.h"
 #include "MGLRenderer_Private.h"
 
 /* the raster pass is a separate method so the pass-through vertex function can be swapped
@@ -45,11 +46,17 @@ static id<MTLBuffer> gIdx;          /* raster index list */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
+static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
+static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
+static id<MTLBuffer> gXfbIn;        /* ring of per-draw inputs and varying tables */
+static int gXfbInNext;              /* the ring slot of the draw being encoded */
+static bool gXfbPending;            /* a pack has not been folded into the object yet */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
 static id<MTLComputePipelineState> gPrepPso;
+static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso;
 static id<MTLComputePipelineState> gFinPso;
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
@@ -226,6 +233,97 @@ static const char *kGeomPrepMSL =
     "    ctl[1] = vmax - vmin + 1u;                     /* capture header: vcount */\n"
     "}\n";
 
+#include "mgl_ext_geom_xfb.h"
+
+/* the transform feedback pack kernels: a prefix sum over the per-thread emitted counts
+ * gives every output vertex its (compacted) transform feedback index, a scatter writes the
+ * varyings, and a finish kernel advances the write offsets and folds the primitive count */
+static const char *kGeomXfbMSL =
+    "#include <metal_stdlib>\n"
+    "#include <simd/simd.h>\n"
+    "using namespace metal;\n"
+    "\n"
+    "#define WG " MGL_GEOM_STR(MGL_GEOM_XFB_WG) "\n"
+    "\n"
+    "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; };\n"
+    "\n"
+    "kernel void mgl_geom_xfb_prefix(constant uint* in [[buffer(0)]],\n"
+    "                                const device uint* cnt [[buffer(1)]],\n"
+    "                                device uint* xbase [[buffer(2)]],\n"
+    "                                device uint* xfb [[buffer(3)]],\n"
+    "                                uint tid [[thread_index_in_threadgroup]])\n"
+    "{\n"
+    "    threadgroup uint tgr[WG];\n"
+    "    threadgroup uint carry[1];\n"
+    "    uint threads = in[0];\n"
+    "    uint v;\n"
+    "\n"
+    "    if (tid == 0u) carry[0] = 0u;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "\n"
+    "    for (uint base = 0u; base < threads; base += WG) {\n"
+    "        uint i = base + tid;\n"
+    "        v = (i < threads) ? cnt[i] : 0u;\n"
+    "        tgr[tid] = v;\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        for (uint s = 1u; s < WG; s *= 2u) {          /* inclusive scan */\n"
+    "            uint add = 0u;\n"
+    "            if (tid >= s) add = tgr[tid - s];\n"
+    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "            tgr[tid] += add;\n"
+    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        }\n"
+    "        if (i < threads) xbase[i] = tgr[tid] - v + carry[0];\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        if (tid == WG - 1u) carry[0] += tgr[WG - 1u];\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_xfb_scatter(constant uint* in [[buffer(0)]],\n"
+    "                                 constant mgl_geom_xfb_var* vars [[buffer(1)]],\n"
+    "                                 const device uint* recs [[buffer(2)]],\n"
+    "                                 const device uint* cnt [[buffer(3)]],\n"
+    "                                 const device uint* xbase [[buffer(4)]],\n"
+    "                                 device uint* xfb [[buffer(5)]],\n"
+    "                                 device uint* dst0 [[buffer(6)]],\n"
+    "                                 device uint* dst1 [[buffer(7)]],\n"
+    "                                 device uint* dst2 [[buffer(8)]],\n"
+    "                                 device uint* dst3 [[buffer(9)]],\n"
+    "                                 uint slot [[thread_position_in_grid]])\n"
+    "{\n"
+    "    uint maxv = in[1], out_words = in[2], nvars = in[3];\n"
+    "    uint t = slot / maxv, s = slot - t * maxv;\n"
+    "    device uint* dst[4];\n"
+    "    dst[0] = dst0; dst[1] = dst1; dst[2] = dst2; dst[3] = dst3;\n"
+    "\n"
+    "    if (t >= in[0] || s >= cnt[t]) return;\n"
+    "\n"
+    "    const device uint* rec = recs + (size_t)slot * out_words;\n"
+    "    if (((rec[1] >> 24) & 0xffu) != 0u) return;       /* the rasterization stream */\n"
+    "\n"
+    "    uint out_index = xbase[t] + s;\n"
+    "    for (uint v = 0u; v < nvars; v++) {\n"
+    "        constant mgl_geom_xfb_var& vr = vars[v];\n"
+    "        device uint* d = dst[vr.buffer];\n"
+    "        uint stride = in[4 + vr.buffer];\n"
+    "        if (!stride || !vr.words) continue;           /* skip / next-buffer markers */\n"
+    "        uint pos = xfb[3 + vr.buffer] + out_index * stride + vr.dst_off;\n"
+    "        if (pos + vr.words * 4u > in[8 + vr.buffer]) continue;   /* full: drop, as GL does */\n"
+    "        for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rec[vr.src_word + w];\n"
+    "    }\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], 1u, memory_order_relaxed);\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_xfb_finish(constant uint* in [[buffer(0)]],\n"
+    "                                const device uint* ctl [[buffer(1)]],\n"
+    "                                device uint* xfb [[buffer(2)]])\n"
+    "{\n"
+    "    for (uint b = 0u; b < 4u; b++)\n"
+    "        if (in[4 + b]) xfb[3 + b] += xfb[1] * in[4 + b];\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], ctl[13], memory_order_relaxed);\n"
+    "}\n";
+
 /* the counters + indirect arguments live in one buffer; two tiny program-independent
  * kernels manage them (zeroing before the geometry kernel, filling the draw arguments
  * from the atomic counters afterwards) */
@@ -286,6 +384,27 @@ static bool geomCtlPipelines(id<MTLDevice> device)
         NSLog(@"MGL geom: prep pipeline failed: %@", error);
         return false;
     }
+
+    /* the transform feedback pack kernels */
+    id<MTLLibrary> xlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomXfbMSL]
+                                               options: nil error: &error];
+    if (!xlib)
+    {
+        NSLog(@"MGL geom: xfb pack library failed: %@", error);
+        return false;
+    }
+    id<MTLFunction> pref = [xlib newFunctionWithName: @"mgl_geom_xfb_prefix"];
+    id<MTLFunction> scf = [xlib newFunctionWithName: @"mgl_geom_xfb_scatter"];
+    id<MTLFunction> finf = [xlib newFunctionWithName: @"mgl_geom_xfb_finish"];
+    if (!pref || !scf || !finf) return false;
+    gXfbPrePso = [device newComputePipelineStateWithFunction: pref error: &error];
+    gXfbScatterPso = [device newComputePipelineStateWithFunction: scf error: &error];
+    gXfbFinPso = [device newComputePipelineStateWithFunction: finf error: &error];
+    if (!gXfbPrePso || !gXfbScatterPso || !gXfbFinPso)
+    {
+        NSLog(@"MGL geom: xfb pack pipeline failed: %@", error);
+        return false;
+    }
     return true;
 }
 
@@ -308,7 +427,9 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
+    gXbase = nil; gXfb = nil; gXfbIn = nil; gXfbPending = false; gXfbInNext = 0;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
+    gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
     gPrimBytes = gVsoutBytes = gOutvBytes = gIdxBytes = 0;
@@ -327,6 +448,167 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 }
 
 @implementation MGLRenderer (Geometry)
+
+/* ---------------- the transform feedback pack, Metal side ---------------- */
+
+bool geom_xfb_gpu_pending(void)
+{
+    return gXfbPending;
+}
+
+bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
+{
+    uint32_t *b = (uint32_t *)(gXfb ? gXfb.contents : NULL);
+    (void)ctx;
+    return b && b[0] == name;
+}
+
+/* encode the three pack kernels for one draw (see mgl_ext_geom_xfb.h) */
+- (bool) geomXfbEncode: (MGLGeomProgram *) gp object: (MGLXfbObject *) o program: (MGLXfbProgram *) xp
+                   tfb: (BufferBaseTarget *) tfb threads: (uint32_t) threads
+             maxVertices: (uint32_t) max_vertices outWords: (uint32_t) out_words
+              vertexCap: (uint32_t) vertex_cap
+{
+    MGLGeomDraw dummy; (void)dummy;
+    uint32_t *in, *vars;
+    id<MTLComputeCommandEncoder> enc;
+    NSUInteger wg = MGL_GEOM_XFB_WG;
+
+    if (!gXfbScatterPso) return false;
+    (void)gp;
+
+    gXfb = geomBuffer(_device, gXfb, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t), NULL);
+    gXfbIn = geomBuffer(_device, gXfbIn, MGL_GEOM_XFB_RING * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t), NULL);
+    gXbase = geomBuffer(_device, gXbase, 4096 + (size_t)threads * sizeof(uint32_t), NULL);
+    if (!gXfb || !gXfbIn || !gXbase) { geomReleaseStatics(); return false; }
+
+    if (!gXfbPending)
+    {
+        /* first pack of this block: the counters block is CPU-owned, seed it */
+        uint32_t *blk = (uint32_t *)gXfb.contents;
+        memset(blk, 0, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t));
+        blk[0] = o->name;
+        for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+            blk[3 + b] = (uint32_t)o->write_offset[b];
+    }
+    else if (((uint32_t *)gXfb.contents)[0] != o->name)
+        return false;                        /* another object: the caller flushes first */
+
+    /* the per-draw inputs and the varying table go into the next ring slot: the GPU may
+     * still be reading the previous one */
+    gXfbInNext = (gXfbInNext + 1) % MGL_GEOM_XFB_RING;
+    in = (uint32_t *)gXfbIn.contents + (size_t)gXfbInNext * MGL_GEOM_XFB_SLOT_WORDS;
+    in[0] = threads;
+    in[1] = max_vertices ? max_vertices : 1;
+    in[2] = out_words;
+    in[3] = (uint32_t)xp->count;
+    for (GLuint b = 0; b < 4; b++)
+    {
+        in[4 + b] = (uint32_t)xp->stride[b];
+        in[8 + b] = (uint32_t)(tfb[b].buf ? tfb[b].buf->data.buffer_size : 0);
+    }
+
+    /* the varying records */
+    vars = in + MGL_GEOM_XFB_IN_WORDS;
+    for (GLuint v = 0; v < xp->count; v++)
+    {
+        vars[v * 4 + 0] = (uint32_t)xp->vars[v].src_word;
+        vars[v * 4 + 1] = (uint32_t)xp->vars[v].offset;
+        vars[v * 4 + 2] = (uint32_t)xp->vars[v].words;
+        vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
+    }
+
+    enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc) return false;
+    [enc pushDebugGroup: @"MGL geometry xfb pack"];
+
+    size_t ring_off = (size_t)gXfbInNext * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t);
+    [enc setComputePipelineState: gXfbPrePso];
+    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
+    [enc setBuffer: gCnt offset: 0 atIndex: 1];
+    [enc setBuffer: gXbase offset: 0 atIndex: 2];
+    [enc setBuffer: gXfb offset: 0 atIndex: 3];
+    [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+
+    [enc setComputePipelineState: gXfbScatterPso];
+    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
+    [enc setBuffer: gXfbIn offset: ring_off + MGL_GEOM_XFB_IN_WORDS * sizeof(uint32_t) atIndex: 1];
+    [enc setBuffer: gOutv offset: 0 atIndex: 2];
+    [enc setBuffer: gCnt offset: 0 atIndex: 3];
+    [enc setBuffer: gXbase offset: 0 atIndex: 4];
+    [enc setBuffer: gXfb offset: 0 atIndex: 5];
+    for (GLuint b = 0; b < 4; b++)
+    {
+        id<MTLBuffer> mtl = (tfb[b].buf && tfb[b].buf->data.mtl_data)
+                            ? (__bridge id<MTLBuffer>)tfb[b].buf->data.mtl_data : gXfb;
+        [enc setBuffer: mtl offset: 0 atIndex: 6 + b];
+        if (tfb[b].buf) mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+    }
+    {
+        NSUInteger slots = (NSUInteger)threads * (max_vertices ? max_vertices : 1);
+        if (slots > vertex_cap) slots = vertex_cap;
+        [enc dispatchThreadgroups: MTLSizeMake((slots + wg - 1) / wg, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+    }
+
+    [enc setComputePipelineState: gXfbFinPso];
+    [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
+    [enc setBuffer: gCtl offset: 0 atIndex: 1];
+    [enc setBuffer: gXfb offset: 0 atIndex: 2];
+    [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+    [enc popDebugGroup];
+    [enc endEncoding];
+
+    gXfbPending = true;
+    return true;
+}
+
+bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
+                         BufferBaseTarget *tfb, uint32_t threads, uint32_t max_vertices,
+                         uint32_t out_words, uint32_t vertex_cap)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+    return [r geomXfbEncode: gp object: o program: xp tfb: tfb threads: threads
+                maxVertices: max_vertices outWords: out_words vertexCap: vertex_cap];
+}
+
+/* read the pending counters (the caller has synchronised) */
+void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim)
+{
+    if (getenv("MGL_GEOM_DEBUG") && gXfb)
+    {
+        uint32_t *d = (uint32_t *)gXfb.contents;
+        uint32_t *c = (uint32_t *)(gCnt ? gCnt.contents : NULL);
+        NSLog(@"MGL geom: block name=%u dvert=%u dprim=%u off=%u cnt0=%u cnt1=%u xb0=%u xb1=%u",
+              d[0], d[1], d[2], d[3], c ? c[0] : 0, c ? c[1] : 0,
+              (uint32_t *)(gXbase ? gXbase.contents : NULL) ? ((uint32_t *)gXbase.contents)[0] : 0,
+              (uint32_t *)(gXbase ? gXbase.contents : NULL) ? ((uint32_t *)gXbase.contents)[1] : 0);
+    }
+    uint32_t *b = (uint32_t *)(gXfb ? gXfb.contents : NULL);
+
+    (void)ctx;
+    if (!b) { *dvert = *dprim = 0; return; }
+    if (o)
+    {
+        for (GLuint i = 0; i < MGL_XFB_MAX_BUFFERS; i++)
+            o->write_offset[i] = (GLsizeiptr)b[3 + i];
+    }
+    *dvert = b[1];
+    *dprim = b[2];
+}
+
+void geom_xfb_gpu_reset(GLMContext ctx)
+{
+    uint32_t *b = (uint32_t *)(gXfb ? gXfb.contents : NULL);
+
+    (void)ctx;
+    gXfbPending = false;
+    if (!b) return;
+    b[1] = 0;
+    b[2] = 0;
+}
+
 
 - (void) bindExtGeomFuncsToGLMContext: (GLMContext) glm_ctx
 {
@@ -880,14 +1162,21 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         ctx->state.program = saved_program;
     }
 
-    /* ---- transform feedback of the geometry output: the records are ready, sync and pack ---- */
+    /* ---- transform feedback of the geometry output ---- */
     if (mgl_xfb_capturing(ctx))
     {
-        BUF()->flush(ctx);
-        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
-        mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents,
-                             gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
-                             (const uint32_t *)gCnt.contents, gCnt.length / sizeof(uint32_t));
+        /* the GPU pack keeps the write offsets and counters in a block the kernels maintain,
+         * so the CPU only folds them in when the application can observe them */
+        if (!mgl_geom_xfb_pack(ctx, gp, program, (uint32_t)threads,
+                               gp->max_vertices ? gp->max_vertices : 1, gp->out_words,
+                               (uint32_t)outv_cap))
+        {
+            BUF()->flush(ctx);
+            BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+            mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents,
+                                 gOutv.length / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
+                                 (const uint32_t *)gCnt.contents, gCnt.length / sizeof(uint32_t));
+        }
     }
 
     /* ---- 3. raster pass ---- */
