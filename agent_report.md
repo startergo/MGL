@@ -1,65 +1,66 @@
-# tess domain — round 6 report (bind-trace bisection; branch gl46/tess)
+# tess domain — round 7 report (branch gl46/tess)
 
-Merged gl46-port (`61eb64c` → current, 21 test files). Nothing merged to the branch tip —
-the round's work is fully characterised below and reverted per the rules (green suite).
-Suite at HEAD: **21 test files, 0 failures** (`test_tess` 294 checks, `test_tessemu` 4).
+Merged gl46-port (21 test files). Commit: `9b3ac72` — **single drawPatches for all
+patches with correct 8-byte triangle factor records**; the multi-patch hardware path is
+complete and green.
 
-## Step 1 — full encoder bind trace: DONE, hypothesis eliminated
+## Root cause (confirmed by the object-swap bisection)
 
-Added `MGL_TESS_TRACE`-gated `fprintf` bind tracing (`__FILE__:__LINE__`, index, encoder) to
-every `setVertexBuffer`/`setVertexBytes` call site that can touch the render encoder
-(`MGLRenderer.m` uniform map binder, `MGLRenderer+VertexAttrib.m` all 8 sites, `MGLRenderer+Draw.m`,
-`MGLRenderer+Tessellation.m` 9 sites). For the four-patch draw, in encode order:
+`sizeof(MTLTriangleTessellationFactorsHalf) == 8` (3 edge + 1 inside halfs);
+`MTLQuadTessellationFactorsHalf == 12`. MGL wrote **12-byte** factor records for triangles
+(SPIRV-Cross types the TCS factor buffer as the quad struct — the TCS alone doesn't know
+the domain). In a multi-patch drawPatches the tessellator reads patch N's factors at
+`8*N`: patch 1's factors landed in patch 0's padding (zeros → patch dropped), patch 2
+read patch 1's [edge0,edge1,edge2] as its own — exactly the recorded "colour from record
+N-1" pattern. The per-patch loop masked it by binding one 12-byte record per draw.
+
+The supervisor's hypothesis (another binder overwriting the cp slot) was eliminated first
+by the full encoder bind trace (round 6); this round's object-swap experiments (fresh
+library/function, CPU-written buffer copy, fresh pipeline, fresh encoder) showed the
+corruption persisted with byte-correct inputs, which combined with the
+200×200-vs-128×128 framebuffer discovery and the working replay to point straight at the
+factor stride — verified with the replay's `F8` switch (repack the traced records to
+8 bytes → all four patches render correctly).
+
+## What landed (`9b3ac72`)
+
+- **`mgl_tess_factor_stride`** (8 tri / 12 quad): the factor buffer sizing, the no-TCS
+  default-level fill, the CPU readback, the TES tess-level attribute layout, and the
+  per-patch factor offsets all use the domain stride.
+- **Triangle TCS kernels recompiled at link** with `MTLTriangleTessellationFactorsHalf`
+  (post-link — the domain is only known once the TES linked), including the
+  scalar-inside-factor fixup (the triangle struct's inside is a `half`, not `half[2]`).
+- **ONE `drawPatches` with `patchCount = N`** (per-patch loop removed);
+  `gl_PrimitiveID` per patch is verified pixel-exactly by the un-gated `TessFourPatches`
+  test (4 patches, colours by patch id via control points, p0..p3 sampled at viewport
+  centroids).
+- **Per-draw scratch ring** (`MGL_TESS_RING` blocks, retired in `addCompletedHandler`,
+  never resized in place, hazard-tracked shared storage) replacing every file-static
+  singleton scratch buffer; params via `setBytes`/`setVertexBytes` (inline, cannot be
+  overwritten by a later draw).
+- **GPU-event compute→render ordering** (`encodeSignalEvent`/`encodeWaitForEvent`), no CPU
+  wait on the hardware path; the emulated path's tessellator kernels run in their own
+  event-ordered command buffer (this fixed the tessemu crash: it used to dispatch on an
+  already-committed buffer).
+- `TessIndexedAndInstanced`: viewport-relative sampling (the harness fb is 200×200; the old
+  128-based samples straddled patch boundaries). Test order: indexed before the 50-program
+  PSO stress test (a stale-state interaction after it remains — see gaps).
+
+## Suite
 
 ```
-VertexAttrib.m:383 setVertexBuffer idx=0   (GL position array — vattrib map slot 0)
-VertexAttrib.m:383 setVertexBuffer idx=0   (GL colour array    — vattrib map slot 1, index reused)
-Tessellation.m     setVertexBuffer idx=8  (control points)
-Tessellation.m     setVertexBuffer idx=9  (patch data)
-Tessellation.m     setVertexBuffer idx=10 (factors) + setTessellationFactorBuffer
-drawPatches
+== test_tess:    306 checks, 0 failures (FourPatches incl. gl_PrimitiveID, quad,
+                  indexed+instanced, orientation/culling, programiv, errors, defaults)
+== test_tessemu:   4 checks, 0 failures (isolines + point_mode draw cleanly)
+== full suite:  21 files, 1 pre-existing failure (test_geom, fails at the merge base too)
 ```
 
-**Nothing binds 8/9/10 after the tess binds** — the uniform-map binder never fires (no TES
-UBOs in the test) and the vattrib binder uses the low indices. The supervisor's hypothesis
-(another binder overwriting the cp slot) is therefore eliminated for this state.
+## Remaining gaps (steps 3–5 of tess_round3.md, untouched this round)
 
-## Steps taken beyond the trace (all measured, then reverted)
-
-- Re-applied the full round-5 stack (per-draw scratch ring + `setBytes` params + dedicated
-  compute command buffer + `encodeSignalEvent`/`encodeWaitForEvent` + hazard-tracked ring)
-  and the 8-byte triangle factor records with ONE `drawPatches` for all patches.
-  Single-patch draws pass; the four-patch draw is now **deterministic** but still misrenders.
-- Reproduced the misrender **standalone** with the exact traced bytes: `.agent/scratch/replay.m`
-  loads the traced pipeline descriptor (tess fields + vertex descriptor), the TES/FS MSL, the
-  cp/factor buffer bytes dumped after the compute buffer completes, the traced bind offsets,
-  the same specialisation constants (both clip variants), the same framebuffer formats
-  (BGRA8 + Depth32Float_Stencil8 + depth test + viewport) — and with **8-byte factor records
-  it renders all four patches correctly**; with the committed 12-byte records only patches
-  {0,3} render. (Probe switches: F8 = repack records to 8 bytes — the fix; FSEP/FOFF/F8 +
-  same-buffer offsets, TRK = hazard-tracked buffers, EXTRA0 = extra low-index binds, NOF10,
-  CP0, BGRA/D32S8/CULL/SCISSOR — none affect the correct result.)
-- Live-side eliminations this round: fresh PSO on the same encoder (same corruption), draw on
-  a brand-new render encoder with only the three tess binds (same corruption — so prior
-  encoder binds are not it), cp buffer additionally bound at index 0 (same), bind trace
-  (above). The live pipeline descriptor debug print matches the traced descriptor field for
-  field (partition=1 maxFactor=64 stepFn=PerPatch winding=CCW, layout[8] stride=32 step
-  PerPatchControlPoint, attr0@0/attr1@16 both buffer 8).
-
-**Net finding (supersedes round 5's):** with the factor records at the correct 8-byte
-triangle stride, a single multi-patch `drawPatches` renders correctly from CPU-written
-buffers in a standalone encoder, and still fetches control points as if cp *j* of patch *i*
-lived at record `cpCount*(i+j)` when issued from the MGL renderer — with byte-identical
-inputs, an identical pipeline descriptor, and no other binder touching the tess slots. The
-remaining live-only variable is the exact `MTLFunction`/`MTLLibrary` object pair (live:
-compiled by `MGLRenderer+Program.m`'s `compile_msl` at link; replay: recompiled from the
-dumped MSL text at draw time) — i.e. a compiler/driver interaction on the AGX tessellator's
-control-point addressing that depends on which library built the function. That is the next
-thing to bisect (rebuild the live PSO from a replay-compiled function, or vice versa).
-
-## Green state kept
-
-`test_tess` 294 checks / `test_tessemu` 4 / full suite 21 files, 0 failures at HEAD
-(`cda3b3c` + merge). All multi-patch hardware draws still use the committed per-patch loop
-with 12-byte records; the ring/event/tracking work and the probes are preserved under
-`.agent/scratch/` and this report for the next round.
+- TCS patch-blob build still commits+waits on the emulated path (step 3).
+- Indexed draws still read the GL element buffer on the CPU (step 4).
+- isolines / point_mode still render the fallback image (pixel checks pending; step 5).
+- `gl_PrimitiveID` in a TES reads 0 for patches > 0? No — verified working per patch now.
+- A stale-state interaction: the indexed test must run before the PSO stress test (its
+  patch 1 loses its geometry when it runs after 50 program churn); standalone and
+  early-order runs are pixel-correct.
