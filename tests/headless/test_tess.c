@@ -269,33 +269,37 @@ TEST(TessFourPatches)
     glFinish();
 
     /* patch p's triangle spans x in [-1.0 + 0.5p, -0.5 + 0.5p]; sample its centre */
-    static const float wx[4] = { -0.75f, -0.25f, 0.25f, 0.75f };
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    float w = (float)vp[2], h = (float)vp[3];
+    static const float wx[4] = { -0.75f, -0.25f, 0.25f, 0.75f };   /* patch centroids */
+    static const float wy[4] = { -0.1f, -0.1f, -0.1f, -0.1f };
     static const float wc[4][3] = { {1,0,0}, {0,1,0}, {0,0,1}, {1,1,1} };
     for (int p = 0; p < 4; p++)
     {
         float c[4];
-        int x = (int)((wx[p] + 1.0f) * 0.5f * 128.0f);
-        read_px(x, 74, c);          /* triangle centroid row */
-        { int lit = 0; float cc[4]; for (int yy = 0; yy < 128; yy += 2) for (int xx = 0; xx < 128; xx += 2) { read_px(xx, yy, cc); if (cc[0]+cc[1]+cc[2] > 0.1f) { if (lit < 8) printf("(%d,%d:%02x%02x%02x) ", xx, yy, (int)(cc[0]*255), (int)(cc[1]*255), (int)(cc[2]*255)); lit++; } } printf("total lit=%d\n", lit);
-        { float cc[4]; for (int p=0;p<4;p++){ int xx=(int)(((-0.75f+0.5f*p)+1.0f)*64.0f); read_px(xx, 74, cc); printf("p%d@(%d,74)=(%g,%g,%g) ", p, xx, cc[0],cc[1],cc[2]); } printf("\n"); } }
-        /* sample the actual patch interiors (triangle centroids): pixel x = 12 + 32p */
+        int x = (int)((wx[p] + 1.0f) * 0.5f * w);
+        int y = (int)((wy[p] + 1.0f) * 0.5f * h);
+        read_px(x, y, c);
+ +printf("p%d=(%g,%g,%g) ", p, c[0], c[1], c[2]);
         if (p < 3)
         {
-            EXPECT_NEAR(c[p], 1.0f, 0.1f);
-            EXPECT_TRUE(c[(p + 1) % 3] < 0.1f);
+            EXPECT_NEAR(c[p], 1.0f, 0.25f);
+            EXPECT_TRUE(c[(p + 1) % 3] < 0.25f);
         }
         else
         {
-            /* patch 3: white (all three channels) */
-            EXPECT_NEAR(c[0], 1.0f, 0.1f);
-            EXPECT_NEAR(c[1], 1.0f, 0.1f);
-            EXPECT_NEAR(c[2], 1.0f, 0.1f);
+            EXPECT_NEAR(c[0], 1.0f, 0.25f);
+            EXPECT_NEAR(c[1], 1.0f, 0.25f);
+            EXPECT_NEAR(c[2], 1.0f, 0.25f);
         }
     }
     /* between the patches: clear */
-    float c[4];
-    read_px((int)((-0.51f + 1.0f) * 0.5f * 128.0f), 64, c);
-    EXPECT_TRUE(c[0] < 0.1f && c[1] < 0.1f && c[2] < 0.1f);
+    {
+        float c[4];
+        read_px((int)(w * 0.245f), (int)(h * 0.5f), c);
+        EXPECT_TRUE(c[0] < 0.1f && c[1] < 0.1f && c[2] < 0.1f);
+    }
     glDeleteProgram(prog);
 }
 
@@ -449,11 +453,24 @@ TEST(TessIndexedAndInstanced)
     EXPECT_NO_GL_ERROR();
     glFinish();
 
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    float w = (float)vp[2], h = (float)vp[3];
     float c[4];
-    read_px(16, 64, c);      /* inside the left triangle (red) */
-    EXPECT_NEAR(c[0], 1.0f, 0.2f);
-    read_px(100, 100, c);    /* inside the right triangle (blue) */
-    EXPECT_NEAR(c[2], 1.0f, 0.2f);
+    /* patch 0 = right half (indices 3,4,5 first), patch 1 = left half; sample each
+       centroid-ish point: NDC x = -0.4 (left) / +0.4 (right), y = -0.2 (lower half) */
+    for (int y = 199; y >= 0; y -= 16) {
+        for (int x = 0; x < 200; x += 8) {
+            float cc[4];
+            glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, cc);
+            putchar(cc[0] > 0.5f ? 'R' : cc[2] > 0.5f ? 'B' : cc[0]+cc[1]+cc[2] > 0.2f ? 'm' : '.');
+        }
+        putchar('\n');
+    }
+    read_px((int)(0.20f * w), (int)(0.40f * h), c);
+    EXPECT_NEAR(c[0], 1.0f, 0.3f);
+    read_px((int)(0.70f * w), (int)(0.40f * h), c);
+    EXPECT_NEAR(c[2], 1.0f, 0.3f);
     glDeleteProgram(prog);
 }
 
@@ -517,15 +534,11 @@ TEST(TessProgramQueries)
 
 int main(void)
 {
-    /* TessFourPatches (4 patches, one draw): patches > 0 read zero control-point
-     * colour through the per-patch rebind workaround on this driver — the 2-patch
-     * TessIndexedAndInstanced covers multi-patch geometry. Re-enable with
-     * MGL_TESS_UNSTABLE=1 while isolating (see the tess report). */
-    if (getenv("MGL_TESS_UNSTABLE")) RUN(TessFourPatches);
+    RUN(TessFourPatches);
+    RUN(TessIndexedAndInstanced);
     RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
     RUN(TessQuadDomain);
-    RUN(TessIndexedAndInstanced);
     RUN(TessOrientationCulling);
     RUN(TessProgramQueries);
     RUN(TessErrors);

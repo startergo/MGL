@@ -25,6 +25,7 @@
 #include "mgl_ext_tess.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_queries.h"
+#include "mgl_ext_program.h"
 #include "glcorearb.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -1218,6 +1219,7 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
 
 /* ------------------------------------------------------------------ per-program state */
 
+static void tess_fix_tcs_factor_struct(GLMContext ctx, MGLTessProgram *tp);
 MGLTessProgram *mgl_tess_program(GLMContext ctx, Program *program)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
@@ -1357,6 +1359,10 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
         /* the baked control point count of [[patch(domain, N)]] */
         tp->hw_cp_count = tp->has_tcs ? tp->tcs_out_vertices : 3;
+
+        /* triangle-domain programs need the TCS factor writes at the 8-byte record
+         * stride the tessellator uses (see mgl_tess_factor_stride) */
+        tess_fix_tcs_factor_struct(ctx, tp);
 
         /* control point RECORD layout: the TCS's input struct (= the VS kernel output)
          * has every member; the TES may only read a subset, so the render descriptor
@@ -1642,4 +1648,68 @@ GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp)
     if (ctx->state.ext_rstate)
         return ((struct MGLExtState_rstate *)ctx->state.ext_rstate)->patch_vertices;
     return 3;
+}
+
+/* the tessellator's factor record stride: 8 bytes for triangles (3 edge + 1 inside
+ * halfs), 12 for quads/isolines (4 edge + 2 inside) */
+size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp)
+{
+    if (tp && tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+        return 8;
+    return 12;
+}
+
+/* post-link: fix the TCS factor-struct type for triangle programs and recompile the
+ * kernel. SPIRV-Cross types the factor buffer as MTLQuadTessellationFactorsHalf (12-
+ * byte records) because the TCS alone doesn't know the domain, and the domain is only
+ * known once the TES linked. The corrected function lives on the MGLTessProgram and
+ * is preferred by the draw path. */
+static void tess_fix_tcs_factor_struct(GLMContext ctx, MGLTessProgram *tp)
+{
+    Spirv *sp = &tp->program->spirv[_TESS_CONTROL_SHADER];
+    char *msl, *at;
+
+    if (!tp->has_tcs || tp->domain != MGL_TESS_DOMAIN_TRIANGLES || !sp->msl_str)
+        return;
+    if (tp->tcs_function)
+        return;                     /* already corrected */
+
+    at = strstr(sp->msl_str, "device MTLQuadTessellationFactorsHalf*");
+    if (!at)
+        return;
+
+    msl = strdup(sp->msl_str);
+    {
+        char *p = msl + (at - sp->msl_str);
+        size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
+        size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
+        memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
+        memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
+
+        /* the triangle struct's inside factor is a scalar (half, not half[2]) */
+        for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )
+        {
+            size_t tail = strlen(w + strlen(".insideTessellationFactor[0]")) + 1;
+            memmove(w + strlen(".insideTessellationFactor"), w + strlen(".insideTessellationFactor[0]"), tail);
+            w += strlen(".insideTessellationFactor");
+        }
+    }
+
+    if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+    {
+        void *lib = NULL, *fn = NULL;
+        char *err = NULL;
+        if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, sp->entry_point, &lib, &fn, &err))
+        {
+            tp->tcs_function = fn;      /* retained by the compile hook */
+            tp->tcs_library = lib;
+        }
+        else
+        {
+            fprintf(stderr, "MGL ERROR: tess: triangle TCS factor-struct recompile failed: %s\n",
+                    err ? err : "?");
+            free(err);
+        }
+    }
+    free(msl);
 }
