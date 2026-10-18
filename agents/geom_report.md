@@ -89,14 +89,18 @@ buffers in emission order, with the object / context / query counters advanced.
    the raster pass all bind it at that offset), so a later draw's kernel can no longer
    overwrite the records an earlier draw's pack still has to read.
 
-   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it). Status, narrowed with a
-   `glFinish()`-between-draws experiment: with the syncs, a block of three draws **without**
-   pauses is byte-exact on the GPU path — so ordering, offsets, per-draw inputs and per-draw
-   records are all correct. What still fails is the block with a **pause/resume** in the
-   middle: the draw after the resume is written at offset 0 *as well as* at the folded offset,
-   overwriting the first draw's vertices. The remaining suspect is the counter block across
-   the pause: the flush folds and the begin kernel re-seeds it, and one of the two appears to
-   race the draw after the resume. The CPU pack stays the default.
+   **This is the default** (`MGL_GEOM_CPU_XFB=1` selects the CPU pack as a fallback). The
+   last bug was the pause: `glPauseTransformFeedback`/`glResumeTransformFeedback` folded and
+   re-seeded the GPU counter block, so the draw after a resume re-wrote at offset 0. They now
+   only set the CPU flag (draws while paused skip the pack, exactly like the vertex-stage
+   capture path), the begin kernel runs only at `glBeginTransformFeedback`, and the CPU folds
+   the block only where GL makes the values observable (`glEndTransformFeedback`, the query
+   result reads, the query end). The three-draw block and the paused block are byte-identical
+   to the CPU pack, with no synchronisation between draws.
+
+   Fold points (each waits for the command buffer that last wrote the block):
+   `glEndTransformFeedback`, `glEndQuery` of the four primitive targets,
+   `glGetQueryObject*`.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
@@ -147,8 +151,16 @@ multi-workgroup prefix sum is the fix if that matters.
   beyond that the kernel drops vertices and sets an overflow flag.
 * A VS that redeclares `gl_PerVertex` with fewer members than the GS reads trips glslang's
   cross-stage check (pre-existing MGL/glslang behaviour).
-* xfb of GS output uses the CPU pack by default (a sync per draw); the GPU pack is implemented
-  but gated off — see above.
+* xfb of GS output uses the GPU pack by default; the CPU pack (sync + memcpy per draw) stays
+  as a fallback for debugging (`MGL_GEOM_CPU_XFB=1`). In `test_geom_xfbperf` (200 draws of
+  30k indices in one block) the two are within noise of each other on this virtualised GPU
+  (GPU 593-613 vs CPU 582-649 us/frame) because the block is one long stream; the GPU pack's
+  win is that it never stalls the CPU mid-block.
+* Observation for follow-up (identical on both pack paths, so not a GPU-pack issue): in the
+  multi-draw test the second and third captured triangles come out as (0,1) repeated — the
+  geometry kernel appears to read the varying at the wrong record word offset for those
+  draws, or the capture pass writes them shifted. `xfb_of_geometry_output` (single draw,
+  value assertions) is exact.
 * `MGLXfbObject.write_offset` is `GLsizeiptr` (64-bit) while the GPU block holds 32-bit words;
   the resolve widens each entry individually.
 * `test_texparam` aborts intermittently at teardown (~20-40% of direct runs) — verified to
