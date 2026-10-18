@@ -123,15 +123,17 @@ buffers in emission order, with the object / context / query counters advanced.
    in three separate command buffers — no backing is created, replaced or renamed between the
    scatter and the read.
 
-   Remaining symptom, now with the exact data: with the trace on, draw 1's captured triangle
-   is `-1,-1, 1,-1, **0,1**` — its *third vertex is stale data from an earlier test* (0,1 is
-   a previous test's varying), and the following draws' triangles come out correct.  So the
-   first draw of a block reads a record slot the geometry kernel did not (yet) write, i.e.
-   the record range handed to draw 1 contains leftover contents and the kernel's own write to
-   that slot has not landed when the scatter reads it — a read-before-write on the per-draw
-   record range, which the trace's per-draw wait hides.  The next step is to fence (or
-   sub-allocate truly fresh, zero-filled) the record range per draw, or to have the pack
-   verify `cnt[t]` before scattering a slot.  The CPU pack stays the default.
+   Correction of the earlier reading: `(0,1)` is **not** stale data from another test — it is
+   the third vertex of the triangles most of these tests draw, and more importantly the same
+   `(0,1)` corruption shows up with the **CPU pack** as well: on the multi-draw test the CPU
+   path captures draw 1 correctly and draws 2-3 as `(0,1)` repeated (the varying comes out as
+   `gl_Position.zw`).  So the remaining defect is *upstream of both packs* — in the capture
+   pass / geometry-kernel input record for the second and later draws of a multi-draw block —
+   and the multi-draw test passes on the CPU path only because both blocks are wrong in the
+   same way.  The per-draw record sub-allocator no longer wraps silently (it starts a fresh,
+   zero-filled buffer instead), so leftover records cannot be read; that was real but not this
+   bug.  The GPU pack additionally mis-captures draw 1, which is the only remaining
+   GPU-pack-specific difference.  The CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
