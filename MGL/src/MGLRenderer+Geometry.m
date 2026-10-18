@@ -49,14 +49,17 @@ static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static id<MTLBuffer> gXfbIn;        /* ring of per-draw inputs and varying tables */
+static id<MTLBuffer> gXfbSeed;      /* the begin kernel's inputs (CPU-written, never reused) */
 static int gXfbInNext;              /* the ring slot of the draw being encoded */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
+static GLuint gXfbOwner;            /* the object the counter block belongs to */
+static bool gXfbBegin;              /* the counter block still needs its init kernel */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
 static id<MTLComputePipelineState> gPrepPso;
-static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso;
+static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
 static id<MTLComputePipelineState> gFinPso;
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
@@ -258,7 +261,7 @@ static const char *kGeomXfbMSL =
     "    uint threads = in[0];\n"
     "    uint v;\n"
     "\n"
-    "    if (tid == 0u) carry[0] = 0u;\n"
+    "    if (tid == 0u) { carry[0] = 0u; xfb[8] = 0u; }   /* per-draw vertex counter */\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "\n"
     "    for (uint base = 0u; base < threads; base += WG) {\n"
@@ -313,6 +316,7 @@ static const char *kGeomXfbMSL =
     "        for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rec[vr.src_word + w];\n"
     "    }\n"
     "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], 1u, memory_order_relaxed);\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], 1u, memory_order_relaxed);\n"
     "}\n"
     "\n"
     "kernel void mgl_geom_xfb_finish(constant uint* in [[buffer(0)]],\n"
@@ -320,8 +324,22 @@ static const char *kGeomXfbMSL =
     "                                device uint* xfb [[buffer(2)]])\n"
     "{\n"
     "    for (uint b = 0u; b < 4u; b++)\n"
-    "        if (in[4 + b]) xfb[3 + b] += xfb[1] * in[4 + b];\n"
+    "        if (in[4 + b]) xfb[3 + b] += xfb[8] * in[4 + b];\n"
     "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], ctl[13], memory_order_relaxed);\n"
+    "}\n"
+    "\n"
+    "/* initialise the counter block on the command stream: the CPU must never write it while\n"
+    " * a pack may be in flight.  in[0] = object name, in[1..4] = the starting write offsets */\n"
+    "kernel void mgl_geom_xfb_begin(constant uint* in [[buffer(0)]], device uint* xfb [[buffer(1)]])\n"
+    "{\n"
+    "    xfb[0] = in[0];\n"
+    "    xfb[1] = 0u;\n"
+    "    xfb[2] = 0u;\n"
+    "    xfb[3] = in[1];\n"
+    "    xfb[4] = in[2];\n"
+    "    xfb[5] = in[3];\n"
+    "    xfb[6] = in[4];\n"
+    "    xfb[7] = 0u;\n"
     "}\n";
 
 /* the counters + indirect arguments live in one buffer; two tiny program-independent
@@ -396,11 +414,13 @@ static bool geomCtlPipelines(id<MTLDevice> device)
     id<MTLFunction> pref = [xlib newFunctionWithName: @"mgl_geom_xfb_prefix"];
     id<MTLFunction> scf = [xlib newFunctionWithName: @"mgl_geom_xfb_scatter"];
     id<MTLFunction> finf = [xlib newFunctionWithName: @"mgl_geom_xfb_finish"];
-    if (!pref || !scf || !finf) return false;
+    id<MTLFunction> begf = [xlib newFunctionWithName: @"mgl_geom_xfb_begin"];
+    if (!pref || !scf || !finf || !begf) return false;
     gXfbPrePso = [device newComputePipelineStateWithFunction: pref error: &error];
     gXfbScatterPso = [device newComputePipelineStateWithFunction: scf error: &error];
     gXfbFinPso = [device newComputePipelineStateWithFunction: finf error: &error];
-    if (!gXfbPrePso || !gXfbScatterPso || !gXfbFinPso)
+    gXfbBeginPso = [device newComputePipelineStateWithFunction: begf error: &error];
+    if (!gXfbPrePso || !gXfbScatterPso || !gXfbFinPso || !gXfbBeginPso)
     {
         NSLog(@"MGL geom: xfb pack pipeline failed: %@", error);
         return false;
@@ -427,9 +447,10 @@ static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t 
 static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
-    gXbase = nil; gXfb = nil; gXfbIn = nil; gXfbPending = false; gXfbInNext = 0;
+    gXbase = nil; gXfb = nil; gXfbIn = nil; gXfbSeed = nil; gXfbPending = false; gXfbInNext = 0;
+    gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
-    gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil;
+    gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
     gPrimBytes = gVsoutBytes = gOutvBytes = gIdxBytes = 0;
@@ -458,9 +479,8 @@ bool geom_xfb_gpu_pending(void)
 
 bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
 {
-    uint32_t *b = (uint32_t *)(gXfb ? gXfb.contents : NULL);
     (void)ctx;
-    return b && b[0] == name;
+    return !gXfbPending || gXfbOwner == name;
 }
 
 /* encode the three pack kernels for one draw (see mgl_ext_geom_xfb.h) */
@@ -479,20 +499,20 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
 
     gXfb = geomBuffer(_device, gXfb, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t), NULL);
     gXfbIn = geomBuffer(_device, gXfbIn, MGL_GEOM_XFB_RING * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t), NULL);
+    gXfbSeed = geomBuffer(_device, gXfbSeed, MGL_GEOM_XFB_IN_WORDS * sizeof(uint32_t), NULL);
     gXbase = geomBuffer(_device, gXbase, 4096 + (size_t)threads * sizeof(uint32_t), NULL);
-    if (!gXfb || !gXfbIn || !gXbase) { geomReleaseStatics(); return false; }
+    if (!gXfb || !gXfbIn || !gXfbSeed || !gXbase) { geomReleaseStatics(); return false; }
 
-    if (!gXfbPending)
+    /* the counter block is GPU-owned for the whole block: the CPU initialises it through a
+     * kernel on the command stream (at the first pack, and again after a resume) and only
+     * reads it back at a resolve.  Writing it here would race the previous draw's finish
+     * kernel and is what made draws after the first land at offset 0. */
+    if (!gXfbPending || gXfbOwner != o->name)
     {
-        /* first pack of this block: the counters block is CPU-owned, seed it */
-        uint32_t *blk = (uint32_t *)gXfb.contents;
-        memset(blk, 0, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t));
-        blk[0] = o->name;
-        for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
-            blk[3 + b] = (uint32_t)o->write_offset[b];
+        if (gXfbPending) return false;       /* another object: the caller flushes first */
+        gXfbOwner = o->name;
+        gXfbBegin = true;
     }
-    else if (((uint32_t *)gXfb.contents)[0] != o->name)
-        return false;                        /* another object: the caller flushes first */
 
     /* the per-draw inputs and the varying table go into the next ring slot: the GPU may
      * still be reading the previous one */
@@ -523,12 +543,31 @@ bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
     [enc pushDebugGroup: @"MGL geometry xfb pack"];
 
     size_t ring_off = (size_t)gXfbInNext * MGL_GEOM_XFB_SLOT_WORDS * sizeof(uint32_t);
+
+    if (gXfbBegin)
+    {
+        /* the seed must live in its own buffer: the ring slot is restored (and reused by the
+         * next draw) before this kernel executes */
+        uint32_t *seed = (uint32_t *)gXfbSeed.contents;
+        seed[0] = o->name;
+        for (GLuint b = 0; b < 4; b++) seed[1 + b] = (uint32_t)o->write_offset[b];
+        [enc setComputePipelineState: gXfbBeginPso];
+        [enc setBuffer: gXfbSeed offset: 0 atIndex: 0];
+        [enc setBuffer: gXfb offset: 0 atIndex: 1];
+        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
+            [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+        gXfbBegin = false;
+    }
+
     [enc setComputePipelineState: gXfbPrePso];
     [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
     [enc setBuffer: gCnt offset: 0 atIndex: 1];
     [enc setBuffer: gXbase offset: 0 atIndex: 2];
     [enc setBuffer: gXfb offset: 0 atIndex: 3];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+    if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
+        [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
 
     [enc setComputePipelineState: gXfbScatterPso];
     [enc setBuffer: gXfbIn offset: ring_off atIndex: 0];
@@ -604,6 +643,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
     (void)ctx;
     gXfbPending = false;
+    gXfbOwner = 0;
     if (!b) return;
     b[1] = 0;
     b[2] = 0;

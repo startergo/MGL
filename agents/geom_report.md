@@ -64,13 +64,24 @@ buffers in emission order, with the object / context / query counters advanced.
    `glPauseTransformFeedback`, `glResumeTransformFeedback`, `glEndQuery(…)` (the four
    primitive targets) and `glGetQueryObject*`. The per-draw inputs and the varying table live
    in a 4-slot ring so the CPU never overwrites a block the GPU is still reading.
-   **It is not enabled by default** (`MGL_GEOM_GPU_XFB=1`): in a multi-draw block the write
-   offset the finish kernel advances is not reliably observed by the following draw's
-   scatter — draws after the first land at offset 0 (reproduced deterministically in
-   `xfb_gpu_pack_multiple_draws_and_pause`). The CPU pack stays the default path; the
-   kernels, the ring and the resolve plumbing are in place for whoever chases that race
-   (suspects: cross-kernel visibility of the atomically-updated counter block within one
-   encoder, or the CPU re-seed racing a still-running finish kernel).
+   Two real bugs were found and fixed this round (both suggested by the lead's checklist):
+   * the finish kernel advanced the write offsets by the **cumulative** vertex counter, which
+     is never reset inside a block, so draw N advanced by every vertex so far — there is now
+     a separate per-draw counter (`xfb[8]`) that the prefix kernel zeroes;
+   * the counter block is now initialised by a **begin kernel on the command stream** (the CPU
+     wrote it at encode time, racing the previous draw's finish kernel), and the per-draw
+     inputs live in a 4-slot ring with a dedicated seed buffer — the ring slot is restored
+     before the kernel runs, so reusing it for the seed read garbage.
+   `memoryBarrierWithScope:MTLBarrierScopeBuffers` is issued between the pack's kernels.
+
+   **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it): with it on, single-draw
+   blocks are byte-exact (`xfb_of_geometry_output`, `xfb_streams` pass), but in a
+   multi-draw block the *first* draws' scatter writes are lost — the reference block of
+   `xfb_gpu_pack_multiple_draws_and_pause` ends up with only the last draw's vertices. The
+   write offsets are now correct (the object folds 9 vertices / 72 bytes for three 3-vertex
+   draws), so the remaining suspect is the scatter reading a per-draw input (stride/size)
+   that makes it `continue` — i.e. the ring slot still being clobbered, or the record buffer
+   (`gOutv`) already reused. The CPU pack stays the default path.
 
 ## Timings (`tests/headless/test_geom_perf.c`)
 
