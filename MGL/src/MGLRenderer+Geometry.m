@@ -906,6 +906,26 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     return eb->data.mtl_data != NULL;
 }
 
+/* per-draw sub-allocation: bump the offset inside the buffer, and when it would wrap start a
+ * NEW (larger, zero-filled) buffer instead — a silent wrap to offset 0 could hand a draw a
+ * range whose previous user is still pending on the GPU, and leftover records in it */
+static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_t need, size_t *off)
+{
+    if (buf && *off + need <= buf.length)
+    {
+        *off = (*off + 255) & ~(size_t)255;
+        if (*off + need <= buf.length) return buf;    /* keep the buffer, advance the range */
+    }
+
+    /* start a fresh buffer so the range is zero-filled and has no previous user */
+    size_t sz = 4096;
+    size_t want = (buf ? buf.length * 2 : 0);
+    if (want < need * 2) want = need * 2;
+    while (sz < want) sz *= 2;
+    *off = 0;
+    return [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+}
+
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
     MGLGeomProgram *gp = d->gp;
@@ -961,66 +981,27 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
-    {
-        size_t need = (size_t)outv_cap * gp->out_words * sizeof(uint32_t);
-        if (!gOutv || gOutvOff + need > gOutv.length)
-        {
-            gOutv = geomBuffer(_device, gOutv, need * 2, &gOutvBytes);
-            gOutvOff = 0;
-        }
-        if (!gOutv) { geomReleaseStatics(); return false; }
-        gOutvOff = (gOutvOff + 255) & ~(size_t)255;
-        if (gOutvOff + need > gOutv.length) { gOutv = geomBuffer(_device, gOutv, need * 2, &gOutvBytes); gOutvOff = 0; }
-    }
+    gOutv = geomSubAlloc(_device, gOutv, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
+    if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
      * must not overwrite them first */
-    {
-        if (!gPrep || gPrepOff + MGL_GEOM_PREP_BYTES > gPrep.length)
-        {
-            gPrep = geomBuffer(_device, gPrep, MGL_GEOM_PREP_BYTES * 16, NULL);
-            gPrepOff = 0;
-        }
-        if (!gPrep) { geomReleaseStatics(); return false; }
-        gPrepOff = (gPrepOff + 255) & ~(size_t)255;
-        if (gPrepOff + MGL_GEOM_PREP_BYTES > gPrep.length) gPrepOff = 0;
-    }
-    {
-        size_t need = 4096 + (size_t)threads * sizeof(uint32_t);
-        if (!gCnt || gCntOff + need > gCnt.length)
-        {
-            gCnt = geomBuffer(_device, gCnt, need * 4, NULL);
-            gCntOff = 0;
-        }
-        if (!gCnt) { geomReleaseStatics(); return false; }
-        gCntOff = (gCntOff + 255) & ~(size_t)255;
-        if (gCntOff + need > gCnt.length) gCntOff = 0;
-    }
+    gPrep = geomSubAlloc(_device, gPrep, MGL_GEOM_PREP_BYTES, &gPrepOff);
+    if (!gPrep) { geomReleaseStatics(); return false; }
+    gCnt = geomSubAlloc(_device, gCnt, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
+    if (!gCnt) { geomReleaseStatics(); return false; }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
 
     /* the primitive slots / capture index list and the captured VS records are shared by the
      * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
      * own range so a later draw's kernels cannot overwrite them first */
-    if (!gPrim || gPrimOff + prim_bytes > gPrim.length)
-    {
-        gPrim = geomBuffer(_device, gPrim, prim_bytes * 4, &gPrimBytes);
-        gPrimOff = 0;
-    }
+    gPrim = geomSubAlloc(_device, gPrim, prim_bytes, &gPrimOff);
     if (!gPrim) { geomReleaseStatics(); return false; }
-    gPrimOff = (gPrimOff + 255) & ~(size_t)255;
-    if (gPrimOff + prim_bytes > gPrim.length) gPrimOff = 0;
-
-    if (!gVsout || gVsoutOff + vsout_bytes > gVsout.length)
-    {
-        gVsout = geomBuffer(_device, gVsout, vsout_bytes * 4, &gVsoutBytes);
-        gVsoutOff = 0;
-    }
+    gVsout = geomSubAlloc(_device, gVsout, vsout_bytes, &gVsoutOff);
     if (!gVsout) { geomReleaseStatics(); return false; }
-    gVsoutOff = (gVsoutOff + 255) & ~(size_t)255;
-    if (gVsoutOff + vsout_bytes > gVsout.length) gVsoutOff = 0;
 
     if (![self geomPipelines: gp program: program]) return false;
 
@@ -1292,6 +1273,23 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
         if (saved_vs) saved_vs->mtl_data.function = saved_vs_fn;
         _currentRenderEncoder = saved;
         ctx->state.dirty_bits |= DIRTY_VAO | DIRTY_PROGRAM | DIRTY_STATE;
+    }
+
+    if (getenv("MGL_GEOM_XFB_TRACE") && gp->in_words)
+    {
+        uint32_t *vs = (uint32_t *)((uint8_t *)gVsout.contents + gVsoutOff);
+        int nw = gp->in_words > 6 ? 6 : gp->in_words;
+        for (int v = 0; v < 3; v++)
+        {
+            fprintf(stderr, "geom:   vsout[%d] @%zu =", v, gVsoutOff / 4 + v * gp->in_words);
+            for (int k = 0; k < nw; k++)
+            {
+                uint32_t w = vs[(size_t)v * gp->in_words + 8 + k];
+                if (k < 4) fprintf(stderr, " %8.3f", *(float *)&w);
+                else fprintf(stderr, " %08x", w);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     /* ---- 2. geometry kernel ---- */
