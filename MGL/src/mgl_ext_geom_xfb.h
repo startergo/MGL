@@ -44,6 +44,8 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, struct Program_t *pro
 void mgl_geom_xfb_flush(GLMContext ctx);
 /* a pack is pending: state the application may read is not up to date yet */
 bool mgl_geom_xfb_pending(GLMContext ctx);
+/* the bound transform feedback object is active but paused: nothing may be captured */
+bool mgl_geom_xfb_paused(GLMContext ctx);
 
 #ifdef __cplusplus
 }

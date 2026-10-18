@@ -89,18 +89,30 @@ buffers in emission order, with the object / context / query counters advanced.
    the raster pass all bind it at that offset), so a later draw's kernel can no longer
    overwrite the records an earlier draw's pack still has to read.
 
-   **This is the default** (`MGL_GEOM_CPU_XFB=1` selects the CPU pack as a fallback). The
-   last bug was the pause: `glPauseTransformFeedback`/`glResumeTransformFeedback` folded and
-   re-seeded the GPU counter block, so the draw after a resume re-wrote at offset 0. They now
-   only set the CPU flag (draws while paused skip the pack, exactly like the vertex-stage
-   capture path), the begin kernel runs only at `glBeginTransformFeedback`, and the CPU folds
-   the block only where GL makes the values observable (`glEndTransformFeedback`, the query
-   result reads, the query end). The three-draw block and the paused block are byte-identical
-   to the CPU pack, with no synchronisation between draws.
+   **Opt-in** (`MGL_GEOM_GPU_XFB=1`; the CPU pack is the default). The pause handling is now
+   as the spec wants it: `glPauseTransformFeedback`/`glResumeTransformFeedback` only set the
+   CPU flag, draws while paused skip the pack entirely (`mgl_geom_xfb_paused`, so neither pack
+   runs and the CPU pack can no longer advance the object's write offsets behind the GPU
+   block's back), the begin kernel runs only at `glBeginTransformFeedback`, and the CPU folds
+   the block only where GL makes the values observable — `glEndTransformFeedback`,
+   `glEndQuery` of the four primitive targets and `glGetQueryObject*`, each waiting for the
+   command buffer that last wrote it.
 
-   Fold points (each waits for the command buffer that last wrote the block):
-   `glEndTransformFeedback`, `glEndQuery` of the four primitive targets,
-   `glGetQueryObject*`.
+   `gVsout` (the VS capture records) and `gPrim` (the header, capture index list and input
+   primitive slots) are sub-allocated per draw too now, exactly like `gOutv`/`gCnt`/`gPrep`,
+   and the 8-slot serial ring that used to guard `gPrim` (with its per-draw `wait_serial`
+   stall) is gone. A transform feedback buffer without Metal backing gets one from the
+   renderer (`geom_xfb_gpu_ensure`), so a block cannot start on the CPU pack (which advances
+   the object's offsets on the CPU) and continue on the GPU one.
+
+   The multi-draw reference block still captures stale records on a fresh build, so the
+   shared scratch is not the whole story; the write offsets themselves are right (the last
+   draw lands at its cumulative offset), which points at the *scatter* of the earlier draws
+   being skipped or writing nothing. The counter-block serial is tracked at pack-encode time
+   (`geom_xfb_gpu_serial`) but waiting on it made a previously-passing test fail, so the fold
+   still waits on the current serial — that the serial does not identify the buffer that
+   wrote the block is the open question. Single-draw blocks and every other xfb test pass on
+   the GPU path; the CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame

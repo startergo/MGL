@@ -31,6 +31,17 @@ case "${1:-}" in
     -h|--help) echo "usage: $0 <domain>... (start/resume) | --status | --stop"; exit 0 ;;
 esac
 
+# pick a Python that has the anthropic SDK (Homebrew upgrades can move python3 to a fresh version)
+PY="${AGENT_PYTHON:-}"
+if [ -z "$PY" ]; then
+    for name in python3 python3.14 python3.13 python3.12 python3.15; do
+        for c in $(which -a "$name" 2>/dev/null); do
+            "$c" -c 'import anthropic' 2>/dev/null && { PY="$c"; break 2; }
+        done
+    done
+fi
+[ -n "$PY" ] || { echo "No Python with the anthropic SDK: pip install anthropic (or set AGENT_PYTHON)"; exit 1; }
+
 if [ "${AGENT_PROVIDER:-glm}" = "glm" ] && [ -z "${ANTHROPIC_AUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]; then
     echo "No Z.AI key: put ANTHROPIC_AUTH_TOKEN=<key> in agents/.env (git-ignored) or export it."; exit 1
 fi
@@ -43,7 +54,7 @@ for d in "$@"; do
         echo "$d already running"; continue
     fi
     resume=""; [ -f "$WT/$d/.agent/transcript.json" ] && resume="--resume"
-    nohup python3 agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
+    nohup "$PY" agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
     echo $! > "$WT/$d/.agent/worker.pid"
     echo "started $d (pid $!) $resume"
 done
