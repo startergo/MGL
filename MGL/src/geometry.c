@@ -3213,9 +3213,9 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     GLuint b;
 
     if (!o || !o->active || !xp || !xp->count) return false;
-    /* the CPU pack is the default (MGL_GEOM_GPU_XFB=1 for the GPU pack): in a multi-draw
-     * transform feedback block an extra write of the last draw's data lands at offset 0
-     * (see agents/geom_report.md) */
+    /* the CPU pack is the default (MGL_GEOM_GPU_XFB=1 for the GPU pack): a block without
+     * pauses is byte-exact on the GPU path, but across a pause/resume the draw after the
+     * resume is also written at offset 0 (see agents/geom_report.md) */
     if (!getenv("MGL_GEOM_GPU_XFB")) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 
