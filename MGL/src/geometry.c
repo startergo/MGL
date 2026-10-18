@@ -3213,10 +3213,9 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     GLuint b;
 
     if (!o || !o->active || !xp || !xp->count) return false;
-    /* the CPU pack is the default (MGL_GEOM_GPU_XFB=1 for the GPU pack): with several draws
-     * per transform feedback block the records are reused by the next draw's geometry kernel
-     * before the previous draw's scatter has read them (consecutive draws are encoded into
-     * different command buffers, which Metal may execute concurrently) */
+    /* the CPU pack is the default (MGL_GEOM_GPU_XFB=1 for the GPU pack): in a multi-draw
+     * transform feedback block an extra write of the last draw's data lands at offset 0
+     * (see agents/geom_report.md) */
     if (!getenv("MGL_GEOM_GPU_XFB")) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 

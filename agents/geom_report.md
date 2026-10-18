@@ -79,19 +79,22 @@ buffers in emission order, with the object / context / query counters advanced.
    later CPU write can change what a pending draw reads; the input ring and its seed buffer
    are gone.
 
+   The geometry category also **enqueues its command buffer when it starts encoding a draw**
+   (`[cb enqueue]`, guarded against Metal's "enqueue an already enqueued command buffer"
+   assertion), so the queue order equals the creation order even when a later command buffer
+   is committed earlier — the commit-order hazard the lead identified.
+
    **Still not the default** (`MGL_GEOM_GPU_XFB=1` enables it): single-draw blocks are
    byte-exact (`xfb_of_geometry_output`, `xfb_streams` pass with the GPU pack on), but in a
-   multi-draw block only the last draw's vertices survive. The cause is now identified
-   precisely: **consecutive draws are encoded into different command buffers** (verified by
-   logging the command buffer per pack), and Metal does not guarantee that an earlier command
-   buffer has *completed* before a later one executes — so draw N+1's geometry kernel
-   overwrites the shared record buffer (`gOutv`) before draw N's scatter has read it. The fix
-   is a fresh range per draw for the GPU-written scratch (`gOutv`, `gIdx`, `gCtl`, `gPrep`,
-   `gCnt`, `gXbase`) — a linear allocator per command buffer retired in
-   `addCompletedHandler`, or a serial-tracked ring. A first cut of the ring made the raster
-   pass's indirect draw hang inside the AGX driver (the scratch was per-slot but something
-   still crossed draws); it was reverted rather than left half-working, and the CPU pack
-   stays the default.
+   multi-draw block the captures come out shifted: the reference block of
+   `xfb_gpu_pack_multiple_draws_and_pause` shows the last draw's vertices at their correct
+   offset (48) with the first two draws' data missing, and the paused block shows an extra
+   copy of the last draw's data at offset 0. The write offsets the object folds are correct,
+   the per-draw inputs are by value and the command buffers are enqueued in order, so what
+   remains is inside the pack itself across command buffers (most likely the counter block
+   being re-initialised by the begin kernel of a later draw while an earlier draw's scatter
+   still reads it — a per-draw counter block, or a fresh record range per draw, would close
+   it). The CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
