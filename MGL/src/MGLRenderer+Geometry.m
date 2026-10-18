@@ -478,6 +478,10 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 {
     id<MTLCommandBuffer> cb = gXfbCb;
 
+    if (getenv("MGL_GEOM_XFB_TRACE") && cb)
+        fprintf(stderr, "geom: wait cb=%p cur=%p status=%ld dvert=%u woff=%u\n",
+                (void *)(__bridge void *)cb, (void *)(__bridge void *)_currentCommandBuffer,
+                (long)cb.status, ((uint32_t *)gXfb.contents)[1], ((uint32_t *)gXfb.contents)[3]);
     if (!cb) return;
     if (cb == _currentCommandBuffer)
     {
@@ -658,6 +662,13 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     gXfbPending = true;
     gXfbCb = _currentCommandBuffer;
 
+    /* diagnostic: commit (but do not wait) after each draw's pack */
+    if (getenv("MGL_GEOM_COMMIT"))
+    {
+        BUF()->flush(ctx);
+        if (getenv("MGL_GEOM_WAIT")) BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+    }
+
     if (getenv("MGL_GEOM_XFB_TRACE"))
     {
         /* commit + wait, then dump the transform feedback buffer, the counter block and this
@@ -672,8 +683,9 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         BUF()->flush(ctx);
         BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
 
-        fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u\n",
-                threads, blk[1], blk[2], blk[3]);
+        uint32_t *hp = (uint32_t *)((uint8_t *)gPrim.contents + gPrimOff);
+        fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u hdr: prims=%u inst=%u vcount=%u vmin=%u\n",
+                threads, blk[1], blk[2], blk[3], hp[0], hp[1], hp[6], hp[12]);
         fprintf(stderr, "  cnt =");
         for (uint32_t t = 0; t < threads && t < 8; t++) fprintf(stderr, " %u", cnt[t]);
         fprintf(stderr, "  xbase =");
