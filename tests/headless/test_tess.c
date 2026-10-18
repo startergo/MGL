@@ -303,6 +303,60 @@ TEST(TessFourPatches)
     glDeleteProgram(prog);
 }
 
+
+/* ------------- consecutive-draw regression ------------------------------------------
+ * The per-draw scratch ring and GPU-event ordering broke from the third tess draw on
+ * in an earlier iteration (stale-build masking). This test hammers the hardware path
+ * with consecutive draws of the SAME program (no program churn), checking pixels
+ * every iteration. */
+TEST(TessConsecutiveDraws)
+{
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    for (int i = 0; i < 30; i++)
+    {
+        glClearColor(0, 0, 0, 1);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        EXPECT_NO_GL_ERROR();
+        glFinish();
+
+        GLint vp[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        float w = (float)vp[2], h = (float)vp[3];
+        float c[4];
+        if (i == 0)
+        {
+            float tlc[4], blc[4], brc[4];
+            read_px(2, (int)h - 4, tlc);
+            read_px(2, 2, blc);
+            read_px((int)w - 4, 2, brc);
+            printf("TL=(%g,%g,%g) BL=(%g,%g,%g) BR=(%g,%g,%g)\n",
+                   tlc[0], tlc[1], tlc[2], blc[0], blc[1], blc[2], brc[0], brc[1], brc[2]);
+        }
+        {
+            /* all three corners must be their own colour: the triangle is
+               (-1,1)=red, (-1,-1)=green, (1,-1)=blue; after the y-flip the red corner
+               is at the TOP-left, green/brown at the BOTTOM */
+            float r[4], g[4], b[4];
+            read_px(2, (int)h - 4, r);
+            read_px(2, 2, g);
+            read_px((int)w - 4, 2, b);
+            EXPECT_NEAR(r[0], 1.0f, 0.10f);
+            EXPECT_NEAR(g[1], 1.0f, 0.10f);
+            EXPECT_NEAR(b[2], 1.0f, 0.10f);
+        }
+    }
+    glDeleteProgram(prog);
+}
+
 /* ------------- PSO cache stress: recompiled programs must never reuse a stale PSO -------
  * 50 programs, each with a different TES body (colour), linked, drawn, checked, deleted.
  * A PSO cache keyed on recycled MTLFunction addresses returns the first program's
@@ -536,6 +590,7 @@ int main(void)
 {
     RUN(TessFourPatches);
     RUN(TessIndexedAndInstanced);
+    RUN(TessConsecutiveDraws);
     RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
     RUN(TessQuadDomain);
