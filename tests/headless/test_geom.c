@@ -1106,6 +1106,77 @@ TEST(tessellation_with_geometry_rejected)
     glDeleteProgram(p);
 }
 
+
+/* primitive restart with a geometry shader: the restarted runs are separate primitives and
+ * the capture pass never sees the restart index */
+TEST(primitive_restart_with_gs)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) out float prim;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; prim = float(gl_PrimitiveIDIn); EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in float prim;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(prim / 2.0, 0.0, 0.0, 1.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glUseProgram(p);
+    clear_black();
+    /* two triangles separated by a restart index */
+    static const float v[12] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
+                                 -1.0f, -0.2f, 1.0f, -0.2f, -1.0f, 0.8f };
+    static const GLuint idx[7] = { 0, 1, 2, 0xffffffffu, 3, 4, 5 };
+    GLuint vao2 = 0, vbo2 = 0, ebo = 0;
+    glGenVertexArrays(1, &vao2);
+    glGenBuffers(1, &vbo2);
+    glGenBuffers(1, &ebo);
+    glBindVertexArray(vao2);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+    glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xffffffffu);
+    glDrawElements(GL_TRIANGLES, 7, GL_UNSIGNED_INT, NULL);
+    EXPECT_NO_GL_ERROR();
+    glDisable(GL_PRIMITIVE_RESTART);
+
+    /* primitive 0 shades red = 0, primitive 1 = 0.5 */
+    int scan = 0;
+    for (int yy = 5; yy < 195 && scan < 3; yy += 5)
+        for (int xx = 5; xx < 195 && scan < 3; xx += 5)
+        {
+            GLubyte c[4] = {0,0,0,0};
+            px(xx, yy, c);
+            if (c[0] || c[1] || c[2]) { printf("  (%d,%d) = %d,%d,%d\n", xx, yy, c[0], c[1], c[2]); scan++; }
+        }
+    EXPECT_TRUE(scan >= 2);
+
+    glBindVertexArray(vao);
+    glDeleteBuffers(1, &vbo2);
+    glDeleteBuffers(1, &ebo);
+    glDeleteVertexArrays(1, &vao2);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -1129,5 +1200,6 @@ int main(void)
     RUN(xfb_of_geometry_output);
     RUN(xfb_streams);
     RUN(tessellation_with_geometry_rejected);
+    RUN(primitive_restart_with_gs);
     return mgl_test_summary();
 }

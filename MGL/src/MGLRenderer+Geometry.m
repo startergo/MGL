@@ -89,7 +89,9 @@ static const char *kGeomPrepMSL =
     "                          device uint* hdr [[buffer(5)]],\n"
     "                          device uint* ctl [[buffer(6)]],\n"
     "                          device uint* prep [[buffer(7)]],\n"
-    "                          uint tid [[thread_index_in_threadgroup]])\n"
+    "                          uint tid [[thread_index_in_threadgroup]],\n"
+    "                          uint slid [[thread_index_in_simdgroup]],\n"
+    "                          uint sgid [[simdgroup_index_in_threadgroup]])\n"
     "{\n"
     "    /* in: mode, count, first, indexed, basevertex, instances, invocations, restart,\n"
     "     *     k (input vertices), provoking_first, index size, cmd layout,\n"
@@ -98,6 +100,7 @@ static const char *kGeomPrepMSL =
     "    uint basevertex = c.v[4], instances = c.v[5], restart = c.v[7];\n"
     "    uint k = c.v[8], provoking_first = c.v[9], idx_size = c.v[10], layout = c.v[11];\n"
     "    uint cap_idx = c.v[12], cap_prim = c.v[13];\n"
+    "    bool restart_en = c.v[14] != 0u;\n"
     "    threadgroup uint tgr[WG];\n"
     "\n"
     "    /* the draw command: a staging buffer for direct draws, the user's indirect buffer\n"
@@ -115,23 +118,22 @@ static const char *kGeomPrepMSL =
     "    /* the vertex index at position i (arrays derive it, indexed draws load it) */\n"
     "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : (uint)(first + (int)(_i)))\n"
     "\n"
-    "    uint needle = 0;\n"
+    "    uint needle = 0, m;\n"
     "    while (needle < count) {\n"
     "        /* find the next restart (or the end) in tiles of WG */\n"
     "        uint next_restart = needle;\n"
     "        for (;;) {\n"
     "            uint i = next_restart + tid;\n"
-    "            bool r = i >= count || (indexed && MGL_IDX(i) == restart);\n"
-    "            tgr[tid] = r ? tid : 0xffffffffu;\n"
-    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-    "            if (tid == 0u) {\n"
-    "                uint m = 0xffffffffu;\n"
-    "                for (uint j = 0; j < WG; j++) if (tgr[j] < m) m = tgr[j];\n"
-    "                tgr[0] = m;\n"
+    "            bool r = i >= count || (indexed && restart_en && MGL_IDX(i) == restart);\n"
+    "            {   /* first restart in this tile: one ballot per simd group */\n"
+    "                uint bb = (uint)(uint64_t)simd_ballot(r);\n"
+    "                uint local = bb ? (ctz(bb) + sgid * 32u) : 0xffffffffu;\n"
+    "                if (slid == 0u) tgr[sgid] = local;\n"
+    "                threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "                m = 0xffffffffu;\n"
+    "                for (uint j = 0; j < WG / 32u; j++) if (tgr[j] < m) m = tgr[j];\n"
+    "                threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "            }\n"
-    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-    "            uint m = tgr[0];\n"
-    "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "            if (m != 0xffffffffu) { next_restart += m; break; }\n"
     "            next_restart += WG;\n"
     "        }\n"
@@ -209,6 +211,8 @@ static const char *kGeomPrepMSL =
     "    prep[2] = vmax;\n"
     "    prep[3] = vmin;\n"
     "    prep[4] = (uint)(((uint64_t)out_prims * instances * c.v[6]) / WG + 1u);   /* threadgroups */\n"
+    "    prep[5] = 1u;\n"
+    "    prep[6] = 1u;\n"
     "    prep[7] = out_idx;                     /* capture indexCount    */\n"
     "    prep[8] = instances;                   /* capture instanceCount */\n"
     "    prep[9] = 0u;                          /* capture startIndex    */\n"
@@ -598,6 +602,7 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
             in[11] = (uint32_t)d->cmd_layout;
             in[12] = (uint32_t)cap_idx;
             in[13] = (uint32_t)cap_prim;
+            in[14] = (ctx->state.caps.primitive_restart || ctx->state.caps.primitive_restart_fixed_index) ? 1u : 0u;
 
             /* the staging command the prep kernel reads when the draw is not indirect */
             if (!d->cmd_buffer)
@@ -853,8 +858,16 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
                   threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
             [enc setComputePipelineState: gGsPso];
-            [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)groups, 1, 1)
-                  threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+            if (gpu_assembly && !getenv("MGL_GEOM_WORST_CASE_DISPATCH"))
+            {
+                /* the prep kernel computed the exact threadgroup count */
+                [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
+                                               indirectBufferOffset: (32 + 4) * sizeof(uint32_t)
+                                              threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+            }
+            else
+                [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)groups, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
 
             [enc setComputePipelineState: gFinPso];
             [enc setBuffer: gCtl offset: 0 atIndex: 0];
