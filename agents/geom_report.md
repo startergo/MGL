@@ -117,14 +117,21 @@ buffers in emission order, with the object / context / query counters advanced.
    and the serial is queried first so it belongs to the command buffer that carries it; the
    multi-draw test reads the buffer back with no glFinish (`immediate read` line).
 
-   Remaining symptom, narrowed twice more: with the per-draw commit+wait of the trace **both
-   blocks are byte-exact**; without it, draw 1's scatter increments `dvert` (so it runs and
-   reads its records) but its bytes never appear in the buffer the CPU reads, while draws 2-3
-   land at their correct cumulative offsets — the test's `immediate read` prints zeros for the
-   first draw.  That points at the TF buffer's Metal backing being replaced (renamed) between
-   the scatter's binding and the CPU read without the earlier contents being carried over, or
-   the scatter of the first draw writing into a backing that is replaced afterwards.  The CPU
-   pack stays the default.
+   Lead followed and *excluded*: the trace now logs the MTLBuffer bound as the scatter's
+   destination (with its serial and command buffer) and the backing the fold reads.  For the
+   multi-draw test all three draws of a block bind the **same** backing the CPU later reads,
+   in three separate command buffers — no backing is created, replaced or renamed between the
+   scatter and the read.
+
+   Remaining symptom, now with the exact data: with the trace on, draw 1's captured triangle
+   is `-1,-1, 1,-1, **0,1**` — its *third vertex is stale data from an earlier test* (0,1 is
+   a previous test's varying), and the following draws' triangles come out correct.  So the
+   first draw of a block reads a record slot the geometry kernel did not (yet) write, i.e.
+   the record range handed to draw 1 contains leftover contents and the kernel's own write to
+   that slot has not landed when the scatter reads it — a read-before-write on the per-draw
+   record range, which the trace's per-draw wait hides.  The next step is to fence (or
+   sub-allocate truly fresh, zero-filled) the record range per draw, or to have the pack
+   verify `cnt[t]` before scattering a slot.  The CPU pack stays the default.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
