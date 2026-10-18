@@ -199,3 +199,17 @@ multi-workgroup prefix sum is the fix if that matters.
 * `test_texparam` aborts intermittently at teardown (~20-40% of direct runs) — verified to
   happen with the unmodified base build as well (4/10 vs 2/10); its checks always report 0
   failures.
+
+### Bisect state (commit 469bd84 round)
+
+With the trace on (a commit+wait after every draw's pack) the multi-draw test is
+**byte-exact and correct on both blocks**: the captured VS records, the prep header
+(prims/instances/vcount/vmin), the counters and the write offsets are all verified right for
+every draw, so the prep kernel and the capture pass are both exonerated.  `MGL_GEOM_COMMIT=1`
+(commit per draw, no wait) still fails; `MGL_GEOM_COMMIT=1 MGL_GEOM_WAIT=1` passes.  The
+remaining defect is therefore a CPU/GPU race that only a wait closes — but every buffer the
+CPU touches between draws is now per-draw sub-allocated (records, counts, prep outputs,
+primitive slots, VS capture records, inputs by value), which leaves MGL's own serial/buffer
+tracking as the only un-instrumented shared state between draws.  Next step: log
+`t->write_serial` / `completed_serial` for the transform feedback buffer at the final read
+(`mgl_buffers_prepare_cpu_read`) with and without the per-draw wait.
