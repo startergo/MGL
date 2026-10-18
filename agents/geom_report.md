@@ -89,18 +89,23 @@ buffers in emission order, with the object / context / query counters advanced.
    the raster pass all bind it at that offset), so a later draw's kernel can no longer
    overwrite the records an earlier draw's pack still has to read.
 
-   **This is the default** (`MGL_GEOM_CPU_XFB=1` selects the CPU pack as a fallback). The
-   last bug was the pause: `glPauseTransformFeedback`/`glResumeTransformFeedback` folded and
-   re-seeded the GPU counter block, so the draw after a resume re-wrote at offset 0. They now
-   only set the CPU flag (draws while paused skip the pack, exactly like the vertex-stage
-   capture path), the begin kernel runs only at `glBeginTransformFeedback`, and the CPU folds
-   the block only where GL makes the values observable (`glEndTransformFeedback`, the query
-   result reads, the query end). The three-draw block and the paused block are byte-identical
-   to the CPU pack, with no synchronisation between draws.
+   **Opt-in** (`MGL_GEOM_GPU_XFB=1`; the CPU pack is the default). The pause handling is now
+   as the spec wants it: `glPauseTransformFeedback`/`glResumeTransformFeedback` only set the
+   CPU flag, draws while paused skip the pack entirely (`mgl_geom_xfb_paused`, so neither pack
+   runs and the CPU pack can no longer advance the object's write offsets behind the GPU
+   block's back), the begin kernel runs only at `glBeginTransformFeedback`, and the CPU folds
+   the block only where GL makes the values observable — `glEndTransformFeedback`,
+   `glEndQuery` of the four primitive targets and `glGetQueryObject*`, each waiting for the
+   command buffer that last wrote it.
 
-   Fold points (each waits for the command buffer that last wrote the block):
-   `glEndTransformFeedback`, `glEndQuery` of the four primitive targets,
-   `glGetQueryObject*`.
+   With that in place the *paused* block matches, but the reference block (three draws, no
+   pause) still captures stale records on a fresh build: the values are vertices from an
+   earlier test's draw, i.e. the geometry kernel reads capture records the previous command
+   buffer's capture pass wrote into the shared `gVsout`/`gPrim` buffers. `gOutv`, `gCnt` and
+   now `gPrep` (the prep kernel's draw arguments and dispatch count) are sub-allocated per
+   draw; the remaining shared buffers are `gVsout` (the VS capture records) and `gPrim` —
+   sub-allocating those the same way, or making the capture pass write into this draw's
+   range, is the next step. Single-draw blocks and every other xfb test pass on the GPU path.
 
    Timing (`tests/headless/test_geom_xfbperf.c`, 200 draws of 30k indices in one transform
    feedback block, 8 MB buffer): **CPU pack 759-1295 us/frame vs GPU pack 548-645 us/frame
