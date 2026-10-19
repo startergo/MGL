@@ -255,3 +255,45 @@ Two corrections and one decisive narrowing:
 ### Isolation round: the separable failure is NOT caused by the allocator
 
 `test_gen2.c` (only `control_no_geometry_shader` + `separable_pipeline_with_gs`) fails at BOTH 94116a0 (no allocator fix) and 25bdf79 (allocator fix). So the pipeline-bound geometry path is broken in isolation regardless of the pool, and my earlier attribution of the regression to the allocator was wrong â what changed with the allocator is only *where the test draws land* in the shared scratch buffer, which changes whether the broken pipeline path is hit at an offset that happens to be 0 (works) or not (fails).  Root cause still open; the next step is supervisor item (b): dump which vertex function the render pipeline for the pipeline composite uses and whether creation succeeds, since that is the one code path only `separable_pipeline_with_gs` exercises.
+
+# Round 18 (this session)
+
+1. `3dc0c94` — the pass-through vertex override survives rstate's specialization.
+   `rstateConfigurePipelineDescriptor` (called directly and again through
+   `bindBlendStateToPipelineStateDescriptor`) replaced the descriptor's vertex function with a
+   specialized copy of the *program's* vertex shader, discarding the override; amplified
+   geometry drew nothing. It is now re-applied after those calls as a specialized copy of the
+   pass-through function (`geomSpecializeVertexOverride`, a stand-in Shader so rstate's own
+   constants and cache are used). The vertexFunction is part of the gpuaudit PSO key, so an
+   overridden and a plain build never alias.
+   Also fixed the real reason the override was needed: `mgl_geom_compile_stage` returned early
+   for a deferred (separable, GS-only) program *before* the builtin scan, so `in_has_pos` was
+   never set and the capture variant stored nothing (gl_Position included) — the geometry
+   kernel read zero inputs. The scan now runs for deferred programs too (clip sizes default to
+   the maximum), and `geom_ensure` derives the input varyings' producing vertex outputs from
+   the pipeline composite (`geom_derive_exprs`). `separable_pipeline_with_gs` now also draws
+   pv alone after the geometry draw and the geometry pipeline again. `MGL_GEOM_TRACE_DRAW`
+   dumps a draw's emulation buffers.
+2. `f2e9f68` — the GPU transform-feedback pack is the default (`MGL_GEOM_CPU_XFB=1` keeps the
+   CPU pack). 10/10 isolated runs of `xfb_gpu_pack_multiple_draws_and_pause` on a clean build
+   with either path.
+3. `b137afc` — arrays of interface blocks with xfb_offset are unrolled in `xfb_layout_shader`
+   (transform_feedback.c, shared: two surgical edits — the array unrolling and AUTO_MAP
+   locations/bindings on the recompile, so shaders relying on link-time locations compile).
+   New `xfb_arrays_of_blocks_xfb_offset` test. `mgl_geom_ctx` /
+   `mgl_geom_xfb_log_read_name` are declared for the harness in tests/headless/mgl_geom_diag.h.
+
+## Still open
+* A geometry stage cannot use interface blocks / struct-typed interface variables: the record
+  layout has no room for the members, so xfb would silently capture zeros. A source-level
+  check in `mgl_geom_compile_stage` that refuses the link was written but reverted: it broke
+  every geometry link in a way I could not explain (the mode loop reported
+  have_in/have_out = 1/1 yet its failure branch fired — stale/inconsistent build state I ran
+  out of time to chase). The compute-source half of the work (emit_block_as_struct: a block
+  becomes `struct T {...}; T inst[n];` with the member qualifiers dropped) was correct and is
+  worth re-landing with the reflection unrolling.
+* GS after tessellation / xfb from the tessellation stages: tess exposes no TES-output
+  buffer for the hardware path (`mgl_tess_draw_patches` rasterizes directly); the emulated
+  path does expose GPU scratch. Needs a TES capture variant feeding the geometry kernel.
+* GS + interface blocks in the *raster* path (the pass-through vertex function would have to
+  emit a matching block declaration for the fragment shader).
