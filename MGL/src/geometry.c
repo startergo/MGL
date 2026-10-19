@@ -182,7 +182,23 @@ typedef struct {
     uint32_t bits;
     bool     is_signed;
     bool     len_is_spec;
+    /* OpTypeStruct: the member type ids, in declaration order (an interface block's members) */
+    uint32_t *members;
+    int      n_members;
 } SpvType;
+
+typedef struct {
+    uint32_t id;            /* the struct type */
+    uint32_t member;        /* the member index */
+    uint32_t deco;
+    uint32_t value;
+} SpvMemberDeco;
+
+typedef struct {
+    uint32_t id;            /* the struct type */
+    uint32_t member;
+    char     name[64];
+} SpvMemberName;
 
 typedef struct {
     uint32_t id;            /* target */
@@ -201,6 +217,8 @@ typedef struct {
     char     name[160];
 } SpvName;
 
+/* per-member metadata of OpTypeStruct (interface blocks) */
+
 typedef struct {
     const uint32_t *w;      /* words */
     size_t          n;
@@ -212,6 +230,10 @@ typedef struct {
     int             n_vars;
     SpvName        *names;
     int             n_names;
+    SpvMemberDeco  *mdecos;        /* OpMemberDecorate of struct types (interface blocks) */
+    int             n_mdecos;
+    SpvMemberName  *mnames;        /* OpMemberName */
+    int             n_mnames;
     struct { uint32_t mode, value; } *modes;
     int             n_modes;
     struct { uint32_t id; uint64_t v; } *consts;
@@ -286,6 +308,25 @@ static SpvVar *spv_find_var(SpvModule *m, uint32_t id)
 {
     for (int i = 0; i < m->n_vars; i++)
         if (m->vars[i].id == id) return &m->vars[i];
+    return NULL;
+}
+
+static bool spv_member_deco(SpvModule *m, uint32_t type_id, uint32_t member, uint32_t deco, uint32_t *value)
+{
+    for (int i = 0; i < m->n_mdecos; i++)
+        if (m->mdecos[i].id == type_id && m->mdecos[i].member == member && m->mdecos[i].deco == deco)
+        {
+            if (value) *value = m->mdecos[i].value;
+            return true;
+        }
+    return false;
+}
+
+static const char *spv_member_name(SpvModule *m, uint32_t type_id, uint32_t member)
+{
+    for (int i = 0; i < m->n_mnames; i++)
+        if (m->mnames[i].id == type_id && m->mnames[i].member == member)
+            return m->mnames[i].name;
     return NULL;
 }
 
@@ -385,6 +426,43 @@ static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **e
                 spv_push_type(m, &t);
                 break;
             }
+            case SpvOpTypeStruct:
+            {
+                /* the member type ids, in declaration order (an interface block) */
+                SpvType t;
+                int nm = (int)wc - 2;
+                memset(&t, 0, sizeof(t));
+                t.id = words[pos + 1];
+                t.kind = SPVT_STRUCT;
+                t.n_members = nm > 0 ? nm : 0;
+                if (t.n_members)
+                {
+                    t.members = xmalloc(sizeof(uint32_t) * (size_t)t.n_members);
+                    for (int k = 0; k < t.n_members; k++)
+                        t.members[k] = words[pos + 2 + k];
+                }
+                spv_push_type(m, &t);
+                break;
+            }
+            case SpvOpMemberName:
+            {
+                char name[64];
+                spv_get_string(words, wc - 3, pos + 3, name, sizeof(name));
+                m->mnames = realloc(m->mnames, sizeof(SpvMemberName) * (size_t)(m->n_mnames + 1));
+                m->mnames[m->n_mnames].id = words[pos + 1];
+                m->mnames[m->n_mnames].member = words[pos + 2];
+                snprintf(m->mnames[m->n_mnames].name, sizeof(m->mnames[m->n_mnames].name), "%s", name);
+                m->n_mnames++;
+                break;
+            }
+            case SpvOpMemberDecorate:
+                m->mdecos = realloc(m->mdecos, sizeof(SpvMemberDeco) * (size_t)(m->n_mdecos + 1));
+                m->mdecos[m->n_mdecos].id = words[pos + 1];
+                m->mdecos[m->n_mdecos].member = words[pos + 2];
+                m->mdecos[m->n_mdecos].deco = words[pos + 3];
+                m->mdecos[m->n_mdecos].value = wc > 4 ? words[pos + 4] : 0;
+                m->n_mdecos++;
+                break;
             case SpvOpConstant:
                 m->consts = realloc(m->consts, sizeof(*m->consts) * (size_t)(m->n_consts + 1));
                 m->consts[m->n_consts].id = words[pos + 2];
@@ -435,6 +513,9 @@ static void spv_free(SpvModule *m)
     free(m->decos);
     free(m->vars);
     free(m->names);
+    for (int i = 0; i < m->n_types; i++) free(m->types[i].members);
+    free(m->mdecos);
+    free(m->mnames);
     free(m->modes);
     free(m->consts);
     free(m);
@@ -508,9 +589,10 @@ static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const
     char prefix[192];
 
     if (index)
-        snprintf(prefix, sizeof(prefix), "%s[%s]", v->name, index);
+        snprintf(prefix, sizeof(prefix), "%s[%s]%s%s", v->name, index,
+                 v->member[0] ? "." : "", v->member);
     else
-        snprintf(prefix, sizeof(prefix), "%s", v->name);
+        snprintf(prefix, sizeof(prefix), "%s%s%s", v->name, v->member[0] ? "." : "", v->member);
 
     for (GLuint e = 0; e < v->elems; e++)
     {
@@ -1146,12 +1228,72 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
         return;
     }
 
+    /* an interface block without an instance name puts its members into the enclosing scope:
+     * emit them as ordinary declarations (with the block's array dimension folded into them
+     * for an input), since a plain struct declaration would not bring the names into scope */
+    {
+        const char *close = strrchr(body, '}');
+        if (close)
+        {
+            const char *after = close + 1;
+            while (*after && isspace((unsigned char)*after)) after++;
+            if (!*after || *after == ';')
+            {
+                const char *open = strchr(body, '{');
+                if (open && open < close)
+                {
+                    SB decl;
+                    memset(&decl, 0, sizeof(decl));
+                    for (const char *p = open + 1; p < close; )
+                    {
+                        if (info->kind == STMT_IFACE_IN && p[0] == '[' && p[1] == ']')
+                        {
+                            sb_put(&decl, "[%u]", in_verts);
+                            p += 2;
+                            continue;
+                        }
+                        sb_put(&decl, "%c", *p);
+                        p++;
+                    }
+                    if (input_iface && info->kind == STMT_IFACE_IN) *input_iface = true;
+                    /* the member text already carries its terminating ';' */
+                    sb_put(out, "%s", decl.s ? decl.s : "");
+                    free(decl.s);
+                    free(raw);
+                    return;
+                }
+            }
+        }
+    }
+
     /* drop the qualifier of a variable declaration; size input arrays */
     if (info->kind == STMT_IFACE_IN)
     {
         if (input_iface) *input_iface = true;
         SB decl;
+        const char *brace = strchr(body, '{');
         memset(&decl, 0, sizeof(decl));
+        if (brace)
+        {
+            /* a named interface block keeps its struct: GLSL needs the "struct" keyword when
+             * it is no longer an interface ("Blk { ... } v[3];" does not parse) */
+            char bname[64] = "";
+            const char *close = strrchr(body, '}');
+            const char *bp = brace, *be;
+            while (bp > body && isspace((unsigned char)bp[-1])) bp--;
+            be = bp;
+            while (be > body && (isalnum((unsigned char)be[-1]) || be[-1] == '_')) be--;
+            if (bp - be > 0 && (size_t)(bp - be) < sizeof(bname))
+            {
+                memcpy(bname, be, bp - be);
+                bname[bp - be] = 0;
+            }
+            if (close && bname[0] && strcmp(bname, "gl_PerVertex"))
+            {
+                sb_put(&decl, "struct %s %.*s; %s ", bname, (int)(close - brace + 1), brace, bname);
+                body = close + 1;
+            }
+        }
         for (const char *p = body; *p; )
         {
             if (p[0] == '[' && p[1] == ']')
@@ -1337,12 +1479,76 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
             t = spv_value_type(m, v->type_id, &dummy);
             elems = 1;
         }
+        /* an interface block is a struct-typed interface variable: its members consume
+         * consecutive locations starting at the block's location (glslang decorates the
+         * variable, not the members).  With an instance name the members are reached through
+         * the instance ("v[i].a"); without one the members are the arrays ("a[i]") and the
+         * block's outer array dimension lives on them. */
         if (t->kind == SPVT_STRUCT)
         {
-            mgl_append_log(log, "ERROR: geometry: struct interface variables are not supported (%s)\n",
-                           spv_name(m, v->id) ? spv_name(m, v->id) : "?");
-            return false;
+            const char *inst = spv_name(m, v->id);
+            bool anon = !inst || !inst[0];
+            GLuint next_loc = location;
+
+            for (int mi = 0; mi < t->n_members && n < MGL_GEOM_MAX_VARYINGS; mi++)
+            {
+                const char *mn = spv_member_name(m, t->id, mi);
+                uint32_t mloc = 0, mid = t->members[mi];
+                SpvType *mt;
+                GLenum mbase;
+                GLuint mrows, mcols, consumed = 1;
+
+                if (!mn) continue;
+
+                /* the vertex dimension of a block input sits on the member itself, so one
+                 * array layer is stripped there (the kernel declares that array itself) */
+                mt = spv_find_type(m, mid);
+                while (mt && mt->kind == SPVT_PTR) { mt = spv_find_type(m, mt->elem); mid = mt->id; }
+                if (inputs && mt && mt->kind == SPVT_ARRAY)
+                {
+                    mid = mt->elem;
+                    mt = spv_find_type(m, mid);
+                }
+                if (!mt || (mt->kind != SPVT_VEC && mt->kind != SPVT_MAT &&
+                            mt->kind != SPVT_FLOAT && mt->kind != SPVT_INT && mt->kind != SPVT_BOOL))
+                {
+                    mgl_append_log(log, "ERROR: geometry: unsupported interface block member type for %s.%s\n",
+                                   anon ? "?" : inst, mn);
+                    return false;
+                }
+
+                mbase = mt->kind == SPVT_FLOAT ? (mt->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
+                        mt->kind == SPVT_INT ? (mt->is_signed ? GL_INT : GL_UNSIGNED_INT) :
+                        mt->kind == SPVT_BOOL ? GL_BOOL : GL_FLOAT;
+                mrows = mt->kind == SPVT_VEC || mt->kind == SPVT_MAT ? mt->n : 1;
+                mcols = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n : 1;
+                /* GLSL 4.60 4.4.1: a double (and its vectors) consumes two locations, a
+                 * matrix one per column, an array one per element */
+                consumed = mcols * (mbase == GL_DOUBLE ? 2u : 1u);
+
+                out = &vars[n++];
+                memset(out, 0, sizeof(*out));
+                snprintf(out->name, sizeof(out->name), "%s", anon ? mn : inst);
+                snprintf(out->member, sizeof(out->member), "%s", anon ? "" : mn);
+                /* a member may carry its own location decoration (glslang does that for the
+                 * builtin block); otherwise it takes the block's next free one */
+                out->location = spv_member_deco(m, t->id, mi, SpvDecorationLocation, &mloc) ?
+                                mloc : next_loc;
+                next_loc = out->location + consumed;
+                out->base = mbase;
+                out->rows = mrows;
+                out->cols = mcols;
+                out->elems = 1;
+                out->words = mcols * mrows * base_words(mbase);
+                out->flat = spv_member_deco(m, t->id, mi, SpvDecorationFlat, NULL) ||
+                            spv_deco(m, v->id, SpvDecorationFlat, NULL);
+                out->noperspective = spv_member_deco(m, t->id, mi, SpvDecorationNoPerspective, NULL) ||
+                                     spv_deco(m, v->id, SpvDecorationNoPerspective, NULL);
+                if (spv_member_deco(m, t->id, mi, SpvDecorationStream, &tmp)) out->stream = tmp;
+            }
+            continue;
         }
+
         if (t->kind != SPVT_VEC && t->kind != SPVT_MAT &&
             t->kind != SPVT_FLOAT && t->kind != SPVT_INT && t->kind != SPVT_BOOL)
         {
@@ -1474,10 +1680,131 @@ static char *rename_main(const char *src, const char *new_name)
 
 /* ---------------- 1. vertex capture variant ---------------- */
 
+/* rewrite the vertex shader's "out" interface blocks into ordinary declarations: an
+ * anonymous block's members become variables, a named block's instance becomes a struct.
+ * The builtin gl_PerVertex block is left alone. */
+static char *geom_plain_outputs(const char *src)
+{
+    SB out;
+    size_t i = 0, len = strlen(src);
+    int depth = 0;
+
+    memset(&out, 0, sizeof(out));
+    while (i < len)
+    {
+        /* comments pass through untouched */
+        if (src[i] == '/' && i + 1 < len && (src[i + 1] == '/' || src[i + 1] == '*'))
+        {
+            if (src[i + 1] == '/')
+            {
+                while (i < len && src[i] != '\n') { sb_put(&out, "%c", src[i]); i++; }
+            }
+            else
+            {
+                sb_put(&out, "/*");
+                i += 2;
+                while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) { sb_put(&out, "%c", src[i]); i++; }
+                if (i + 1 < len) { sb_put(&out, "*/"); i += 2; }
+            }
+            continue;
+        }
+        if (depth == 0)
+        {
+            /* a global-scope declaration: collect the head (up to ';' or '{') and check
+             * whether its last storage qualifier is "out" */
+            size_t save = i, q = i;
+            bool is_out = false, other_storage = false, done_head = false;
+
+            while (q < len && src[q] != ';' && src[q] != '{')
+            {
+                if (src[q] == '(')
+                {
+                    q++;
+                    while (q < len && src[q] != ')') q++;
+                    if (q < len) q++;
+                    continue;
+                }
+                if (isalnum((unsigned char)src[q]) || src[q] == '_')
+                {
+                    char word[64];
+                    int n2 = 0;
+                    while (q < len && (isalnum((unsigned char)src[q]) || src[q] == '_'))
+                    {
+                        if (n2 < 63) word[n2++] = src[q];
+                        q++;
+                    }
+                    word[n2] = 0;
+                    if (!strcmp(word, "out")) { is_out = true; other_storage = false; }
+                    else if (!strcmp(word, "in") || !strcmp(word, "uniform") || !strcmp(word, "buffer") ||
+                             !strcmp(word, "attribute") || !strcmp(word, "varying") ||
+                             !strcmp(word, "struct") || !strcmp(word, "const"))
+                        other_storage = true;
+                    continue;
+                }
+                q++;
+            }
+            if (q < len && src[q] == '{' && is_out && !other_storage) done_head = true;
+            (void)save;
+            if (done_head)
+            {
+                size_t brace = q, close = brace;
+                int d = 0;
+                while (close < len)
+                {
+                    if (src[close] == '{') d++;
+                    else if (src[close] == '}') { d--; if (!d) break; }
+                    close++;
+                }
+                if (close < len)
+                {
+                    /* the block name is the identifier before '{' */
+                    char bname[64] = "";
+                    size_t bp = brace, be;
+                    while (bp > 0 && isspace((unsigned char)src[bp - 1])) bp--;
+                    be = bp;
+                    while (be > 0 && (isalnum((unsigned char)src[be - 1]) || src[be - 1] == '_')) be--;
+                    if (bp - be < sizeof(bname))
+                    {
+                        memcpy(bname, src + be, bp - be);
+                        bname[bp - be] = 0;
+                    }
+                    if (strcmp(bname, "gl_PerVertex"))
+                    {
+                        char inst[64] = "";
+                        size_t p = close + 1;
+                        while (p < len && isspace((unsigned char)src[p])) p++;
+                        while (p < len && (isalnum((unsigned char)src[p]) || src[p] == '_'))
+                        {
+                            size_t n2 = strlen(inst);
+                            if (n2 + 1 < sizeof(inst)) { inst[n2] = src[p]; inst[n2 + 1] = 0; }
+                            p++;
+                        }
+                        if (inst[0])
+                            sb_put(&out, "struct %s {%.*s}; %s %s;", bname, (int)(close - brace - 1),
+                                   src + brace + 1, bname, inst);
+                        else
+                            sb_put(&out, "%.*s;", (int)(close - brace - 1), src + brace + 1);
+                        i = p;
+                        while (i < len && src[i] != ';') i++;
+                        if (i < len) i++;
+                        continue;
+                    }
+                }
+            }
+        }
+        if (src[i] == '{') depth++;
+        else if (src[i] == '}') depth--;
+        sb_put(&out, "%c", src[i]);
+        i++;
+    }
+    return out.s;
+}
+
 static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src, char **log)
 {
     char *renamed = rename_main(vs_src, "mgl_geom_vs_main");
     char *nover = NULL;
+    char *noblk = NULL;
     SB b;
 
     if (!renamed)
@@ -1487,6 +1814,12 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     }
     nover = strip_version(renamed);
     free(renamed);
+    /* the captured outputs must be ordinary variables: an "out" interface block would be
+     * mapped to the vertex function's output struct (and SPIRV-Cross's copy-back of an
+     * anonymous block reads a temporary), while the store below needs the members in scope */
+    noblk = geom_plain_outputs(nover);
+    free(nover);
+    nover = noblk;
 
     memset(&b, 0, sizeof(b));
     sb_put(&b, "#version 460 core\n");
@@ -1946,7 +2279,8 @@ static bool geom_derive_exprs(MGLGeomProgram *gp, Program *vs_program, char **lo
                            gp->in_v[i].name, gp->in_v[i].location);
             goto done;
         }
-        snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s", vs_out[j].name);
+        snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s%s%s", vs_out[j].name,
+                 vs_out[j].member[0] ? "." : "", vs_out[j].member);
     }
     ok = true;
 
@@ -2024,6 +2358,19 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
 
     if (!geom_reflect_stage(m, true, gp->in_v, &gp->n_in, log)) goto done;
     if (!geom_reflect_stage(m, false, gp->out_v, &gp->n_out, log)) goto done;
+
+    /* outputs are declared as plain variables in the generated kernel, so a named interface
+     * block instance ("out B { vec4 c; } b;") is not representable: its members are recorded
+     * with the instance as their base name.  An anonymous block is fine (the members are the
+     * variables). */
+    for (int i = 0; i < gp->n_out; i++)
+        if (gp->out_v[i].member[0])
+        {
+            mgl_append_log(log, "ERROR: geometry: output interface block '%s' needs an instance-free "
+                                "declaration (out B { ... };) - named output blocks are not supported\n",
+                           gp->out_v[i].name);
+            goto done;
+        }
 
     /* the entry names are needed even when the emulation is deferred */
     gp->kernel_entry = xstrdup("mgl_geom_gs");
@@ -2897,7 +3244,8 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
         /* the consumer matches the tess capture's members by name: a linkable program has the
          * same names for the evaluation stage's outputs and the geometry stage's inputs */
         for (int m = 0; m < c->members; m++)
-            if (!strcmp(c->member[m].name, gp->in_v[i].name) &&
+            if (!strcmp(c->member[m].name,
+                        gp->in_v[i].member[0] ? gp->in_v[i].member : gp->in_v[i].name) &&
                 c->member[m].words >= gp->in_v[i].words)
             {
                 j = m;

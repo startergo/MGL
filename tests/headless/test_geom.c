@@ -1121,6 +1121,167 @@ TEST(xfb_streams)
 }
 
 
+TEST(block_vs_fs_control)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out VOut { vec4 a; vec2 b; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); a = vec4(pos, 0.5, 1.0); b = pos * 0.5; }\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in VOut { vec4 a; vec2 b; };\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0, 0.5 + b.x, 0.25, 1.0); }\n";
+    GLuint p = program(vs, NULL, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char l[2048]=""; GLsizei n=0; glGetProgramInfoLog(p, sizeof l, &n, l); printf("blk ctrl log: %s\n", l); }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+    glUseProgram(p);
+    clear_black();
+    { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100);
+    glDeleteProgram(p);
+}
+
+TEST(gs_struct_interface_vars)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out VOut { vec4 a; vec2 b; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); a = vec4(pos, 0.5, 1.0); b = pos * 0.5; }\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in VOut { vec4 a; vec2 b; } v[];\n"
+        "layout(location=0) out GOut { vec4 c; vec2 d; };\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = v[i].a;\n"
+        "    c = vec4(v[i].a.xy * 0.5, 0.0, 1.0);\n"
+        "    d = v[i].b;\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in GOut { vec4 c; vec2 d; };\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0, 0.5 + d.x, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("struct link log: %s\n", l);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+    glUseProgram(p);
+    clear_black();
+    { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100);
+    glDeleteProgram(p);
+}
+
+/* control: a block between the vertex and fragment stages without a geometry shader */
+TEST(gs_struct_member_order)
+{
+    /* member order inside the block is free: the record offsets follow the block's
+     * declaration, not the location order */
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out VOut { vec2 b; vec4 a; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); b = pos * 0.5; a = vec4(pos, 0.5, 1.0); }\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in VOut { vec2 b; vec4 a; } v[];\n"
+        "layout(location=0) out GOut { vec2 d; vec4 e; };\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = v[i].a;\n"
+        "    d = v[i].b;\n"
+        "    e = v[i].a;\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in GOut { vec2 d; vec4 e; };\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(0.0, 0.5 + d.x, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("member order link log: %s\n", l);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+    glUseProgram(p);
+    clear_black();
+    { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100);
+    glDeleteProgram(p);
+}
+
+TEST(gs_named_output_block_rejected)
+{
+    /* a named output interface block is not representable in the generated kernel: the link
+     * must fail with an explanation instead of drawing wrong data */
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=0) out VOut { vec4 a; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); a = vec4(pos, 0.5, 1.0); }\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in VOut { vec4 a[]; };\n"
+        "layout(location=0) out GOut { vec4 c; } g;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = a[i]; g.c = a[i]; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in GOut { vec4 c; } g;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = g.c; }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 1;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_FALSE);
+    glDeleteProgram(p);
+}
+
 /* ---- geometry behind a tessellation stage ----------------------------------------
  * The tess domain's TES-output capture feeds the geometry kernel ("from tess"): there is no
  * vertex capture pass, the import kernel repacks the captured records into this program's
@@ -1836,6 +1997,10 @@ TEST(xfb_arrays_of_blocks_xfb_offset)
 
 int main(void)
 {
+    RUN(block_vs_fs_control);
+    RUN(gs_struct_interface_vars);
+    RUN(gs_struct_member_order);
+    RUN(gs_named_output_block_rejected);
     RUN(control_no_geometry_shader);
     RUN(control_varying_no_gs);
     RUN(passthrough_triangles);

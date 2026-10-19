@@ -88,10 +88,10 @@ static void geomEnvRead(void)
 {
     if (gEnv.read) return;
     gEnv.read = 1;
-    gEnv.draw = (geomEnvRead(), gEnv.draw) != NULL;
-    gEnv.debug = (geomEnvRead(), gEnv.debug) != NULL;
-    gEnv.xfb = (geomEnvRead(), gEnv.xfb) != NULL;
-    gEnv.worst_case = (geomEnvRead(), gEnv.worst_case) != NULL;
+    gEnv.draw = getenv("MGL_GEOM_TRACE_DRAW") != NULL;
+    gEnv.debug = getenv("MGL_GEOM_DEBUG") != NULL;
+    gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
+    gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
 }
 

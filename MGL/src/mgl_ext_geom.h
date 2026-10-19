@@ -71,6 +71,7 @@ enum {
  * VS capture variant, the GS kernel and the pass-through vertex function) */
 typedef struct MGLGeomVar {
     char    name[128];      /* declared name, as written in the source */
+    char    member[64];     /* interface block member ("a" of "v[i].a"); empty for a plain varying */
     GLuint  location;
     GLenum  base;           /* GL_FLOAT / GL_INT / GL_UNSIGNED_INT / GL_DOUBLE / GL_BOOL */
     GLuint  rows;           /* vector components (1..4) */
