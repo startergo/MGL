@@ -931,20 +931,21 @@ static struct TessScanEnt tScanEnt[TESS_SCAN_CACHE];
 static uint64_t tScanClock;
 
 /* ---- test-only GPU-time accounting --------------------------------------------
- * Every command buffer the tess path commits or encodes into gets a completed
- * handler that sums its GPU execution time (GPUEndTime - GPUStartTime) and counts
- * it. Tests use this to compare dispatch sizes with real GPU time and to verify
- * that glFinish waits for all of them (mgl_tess_cbs_completed). */
+ * Opt-in (mgl_tess_diag_enable, tests/headless/mgl_tess_diag.h): every command
+ * buffer the tess path commits or encodes into gets a completed handler that sums
+ * its GPU execution time and counts it. Disabled, there is no per-draw cost. */
+static bool tDiagEnabled = false;
 static double tGpuTimeUs;
 static unsigned tCbsCompleted;
 
+void mgl_tess_diag_enable(int enable) { tDiagEnabled = enable != 0; }
 void mgl_tess_gpu_time_reset(void) { tGpuTimeUs = 0.0; tCbsCompleted = 0; }
 double mgl_tess_gpu_time_us(void) { return tGpuTimeUs; }
 unsigned mgl_tess_cbs_completed(void) { return tCbsCompleted; }
 
 static void tessTimeCommandBuffer(id<MTLCommandBuffer> cb)
 {
-    if (!cb)
+    if (!cb || !tDiagEnabled)
         return;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         if (b.GPUEndTime > b.GPUStartTime)

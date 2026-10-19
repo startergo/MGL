@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "glcorearb.h"
 #include "mgl_test.h"
+#include "mgl_tess_diag.h"
 
 static const char *kVs =
     "#version 450 core\n"
@@ -368,8 +369,6 @@ TEST(TessIndexedRestart)
  * subtracted minv twice and read vs_out[idx - 2*minv]. */
 TEST(TessIndexedNoRescan)
 {
-    extern unsigned mgl_tess_scan_waits(void);
-    extern unsigned mgl_tess_cpu_index_reads(void);
 
     GLuint prog = make_program(kTcsTri, kTesTri);
     GLint link = 0;
@@ -483,8 +482,6 @@ TEST(TessIndexedNoRescan)
  * scan results, keyed on the element buffer and its gpuaudit content serial. */
 TEST(TessRestartCheckCached)
 {
-    extern unsigned mgl_tess_restart_checks(void);
-    extern unsigned mgl_tess_cpu_index_reads(void);
     unsigned c0, r0;
 
     GLuint prog = make_program(kTcsTri, kTesTri);
