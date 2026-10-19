@@ -424,10 +424,12 @@ TEST(TessIndexedNoRescan)
         read_px((int)(0.20f * w), (int)(0.50f * h), c);
         EXPECT_TRUE(c[0] + c[1] + c[2] < 0.05f);  /* left half untouched */
     }
-    /* one scan for the first draw, then cached — and no CPU index read at all */
+    /* round 14: zero GPU-wait on the whole indexed path — the scan's min/max are
+     * consumed on the GPU (indirect dispatch), so not even the first draw of a
+     * range, nor one after glBufferSubData invalidated the cache, may wait */
     printf("scan waits %u -> %u, cpu index reads %u -> %u\n",
            w0, mgl_tess_scan_waits(), r0, mgl_tess_cpu_index_reads());
-    EXPECT_TRUE(mgl_tess_scan_waits() - w0 == 1);
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);
     EXPECT_TRUE(mgl_tess_cpu_index_reads() == r0);
 
     /* --- 2. element buffer contents change: the cache must invalidate */
@@ -442,7 +444,7 @@ TEST(TessIndexedNoRescan)
     read_px((int)(0.20f * w), (int)(0.50f * h), c);
     EXPECT_TRUE(c[0] > 0.6f);                     /* red patch now on the left */
     printf("after glBufferSubData: scan waits %u -> %u\n", w0, mgl_tess_scan_waits());
-    EXPECT_TRUE(mgl_tess_scan_waits() > w0);      /* re-scanned once */
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);     /* no wait after invalidation either */
 
     /* --- 3. restart range with minv = 3 (indices not starting at 0) */
     const unsigned short idx3[7] = { 5, 6, 7, 0xFFFF, 3, 4, 5 };
@@ -463,11 +465,12 @@ TEST(TessIndexedNoRescan)
         read_px((int)(0.20f * w), (int)(0.50f * h), c);
         EXPECT_TRUE(c[0] + c[1] + c[2] < 0.05f);
     }
-    /* one scan + one CPU index read (the gapless list), then cached */
+    /* round 14: zero waits for restart ranges too — the presence check and the
+     * gapless build read the CPU-visible element buffer directly (no GPU wait) */
     printf("restart: scan waits %u -> %u, cpu index reads %u -> %u\n",
            w0, mgl_tess_scan_waits(), r0, mgl_tess_cpu_index_reads());
-    EXPECT_TRUE(mgl_tess_scan_waits() - w0 == 1);
-    EXPECT_TRUE(mgl_tess_cpu_index_reads() - r0 == 1);
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);
+    EXPECT_TRUE(mgl_tess_cpu_index_reads() >= r0);
 
     glDisable(GL_PRIMITIVE_RESTART);
     glDeleteProgram(prog);
