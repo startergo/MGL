@@ -342,3 +342,110 @@ worst case (every thread returns past hdr[0]), which is what made ctl[8] become 
 Also still queued, untouched this round: xfb from tessellation stages, struct interface
 variables in GS inputs/outputs, moving mgl_geom_ctx/mgl_geom_xfb_log_read_name out of public
 headers (the last one is already done: they are declared in tests/headless/mgl_geom_diag.h).
+
+## Round 21 — geometry behind tessellation, xfb from tessellation, struct interface variables
+
+All three items are done; commits `87589fa`, `eafec08`, `1b23e58` on `gl46/geom`
+(suite 26/26 green, `test_geom` 173 checks 0 failures).
+
+### 1. Geometry behind a tessellation stage (the WIP patch finished)
+
+* **tess publication** (`MGLRenderer+Tessellation.m`): the capture's index list is the
+  *tessellator's* uint32 index list (`coords_off + coords_cap * 16`), not `off_indices`
+  (the CPU reference path's list, which stays 0 in the emulated path) — the import kernel
+  read tessellation *coordinates* as vertex indices and the geometry kernel read out of
+  bounds.  The ring block's record / index-list capacities are published too
+  (`records` / `indices` in `MGLTessCapture`) so the consumer sizes its buffers without
+  dividing the ring length.
+* **import kernel**: copies `cnt[1]` (index count, not the vertex count — a tessellated
+  triangle shares its vertices between triangles) into the primitive slots, repacks
+  `cnt[0]` records, and writes the prep block.  The geometry kernel now also dispatches
+  *indirectly* for this route: the dispatch reads **three** words (x, y, z threadgroup
+  counts), so `prep[5]`/`prep[6]` are set as well — that was the actual bug behind "the
+  kernel emits nothing".  The import encoder stays open and the geometry kernel joins it:
+  only dispatches *within one encoder* are guaranteed to be ordered, and the indirect
+  argument fetch is latched early.
+* the geometry draw behind tessellation has a **single instance** (the tess producer
+  tessellates `patches * instances` patches, so every instance is already in the capture);
+  the primitive slots sit directly behind the gPrim header (`cap_idx = 0`).
+* prep block offsets are named (`MGL_GEOM_PREP_CMD_OUT/_GROUPS_OFF`) instead of the
+  hardcoded 16/32/36 mix.
+* `MGLRenderer.m` (shared file): when the geometry stage's pass-through vertex function
+  owns the raster pass, the pipeline is a plain one — no tessellation patch vertex
+  descriptor / tessellation state (they belong to the producer's pass).
+* `tessellation.c` (tess file, one line): the capture record stride is padded to a
+  multiple of 4 words.  The record starts with a `float4` store, and a device `float4`
+  store at a non-16-byte-aligned address is undefined on Metal — every tessellated vertex
+  past the first came back as garbage with a 1-word varying (stride 5).
+
+Tests: `tessellation_triangles_into_gs` (filled triangles), `tessellation_indexed_into_gs`
+(an indexed patch draw), `tessellation_isolines_into_gs` (a line primitive thickened into a
+quad) and `tessellation_point_mode_into_gs` (points turned into triangles), all pixel
+verified.
+
+### 2. Transform feedback from tessellation stages
+
+* **TES without a GS**: the TES is the last pre-rasterization stage, so its output is what
+  GL records.  `transform_feedback.c`'s link hook now resolves the varyings against the TES
+  (`mgl_geom_tess_xfb_link`, via the geometry domain's SPIR-V reflector) instead of failing
+  the link; `draw_buffers.c` routes a `GL_PATCHES` draw with xfb active and a TES but no GS
+  to `mgl_geom_tess_xfb_route`, which runs the tessellated draw with the output capture on
+  (it still rasterizes) and then packs the captured records.
+* the pack is a new kernel `mgl_geom_xfb_tess` (one thread per captured record — the capture
+  already *is* the recorded vertex stream, so there are no prefix sums) plus a finish kernel
+  (write offsets, and the primitive count as `vertices / k`).  The per-record word offsets
+  are refreshed from the published member table on every pack, since the capture's layout is
+  the tess output capture's, not the geometry stage's.  The xfb kernels moved into their own
+  lazy `-geomXfbPipelines` (the tess path has no geometry program to build them with), and
+  the begin kernel now clears the per-draw vertex counter too (the geometry path's prefix
+  kernel used to do that).
+* **TES → GS → xfb** already worked through the geometry stage's pack and is covered by a
+  test.
+
+Tests: `xfb_of_tes_output` (the three tessellated corners land in the buffer, one primitive
+written) and `xfb_of_tes_gs_output` (the geometry stage's shrunken corners are recorded).
+
+### 3. Struct interface variables in GS inputs/outputs
+
+Interface blocks are flattened member by member (glslang decorates the *variable* with the
+location, so the members take the block's running location: a double costs two, a matrix one
+per column).  With an instance name the member is reached through the instance (`v[i].a`),
+without one the member is the variable; `MGLGeomVar.member` carries that path.  The
+transformed geometry shader emits a named input block as `struct B { ... }; B v[K];` (GLSL
+needs the `struct` keyword once it is no longer an interface) and an instance-free block as
+its members' declarations; the vertex capture variant rewrites `out` blocks into ordinary
+declarations (`geom_plain_outputs`) because SPIRV-Cross maps an out block to the vertex
+function's output struct and its copy-back of an *anonymous* block reads a temporary.
+A named *output* block is not representable in the generated kernel, so the link fails with
+an explanation (`gs_named_output_block_rejected`).
+
+Tests: `block_vs_fs_control` (a block between the vertex and fragment stages),
+`gs_struct_interface_vars`, `gs_struct_member_order` (members not in location order),
+`gs_named_output_block_rejected`.
+
+### Shared-file edits this round
+
+* `MGL/src/MGLRenderer.m` — the tess pipeline branch skips the tessellation vertex
+  descriptor / tessellation state when the geometry vertex override is active (one small
+  `bool geomOverride` + two branch arms).
+* `MGL/src/MGLRenderer+Tessellation.m` — the capture publication: the index list points at
+  the tessellator's list, and the record / index capacities are published.
+* `MGL/src/mgl_ext_tess.h` — `MGLTessCapture` gained `records` / `indices` (capacities) and
+  the count offset is documented as a two-word array (vertices, indices).
+* `MGL/src/tessellation.c` — the capture record stride is padded to a multiple of 4 words.
+* `MGL/src/transform_feedback.c` — the TES link refusal calls the geometry domain's resolver.
+* `MGL/src/draw_buffers.c` — one routing branch for xfb + TES + no GS.
+* `MGL/src/mgl_ext_geom.h` — `MGLGeomVar.member`, `MGLGeomTessXfbSource`, two declarations.
+
+### Known gaps / tess-domain findings (not mine, hit while integrating)
+
+* **A TES that declares but does not *use* the varyings its TCS writes reads shifted control
+  points** in the tess domain's emulated path: SPIRV-Cross drops the unused members from the
+  TES control-point struct while the TCS output record keeps them, so `gl_in[k]` reads the
+  wrong words (e.g. a TES that only uses `gl_in[].gl_Position` while the TCS also writes a
+  colour).  Worked around in the tests by making the TES use its varyings; the fix belongs
+  in the tess domain (a canonical control-point record layout for the emulated path).
+* geometry stage: a *named* output interface block (`out B { ... } b;`) fails the link
+  (documented above); `gl_PointSize` / `gl_Layer` from a TES are not captured by the tess
+  output capture, so a transform-feedback varying asking for `gl_PointSize` from a TES-only
+  program records nothing for it.
