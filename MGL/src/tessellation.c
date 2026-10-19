@@ -1189,13 +1189,16 @@ static unsigned tess_cpu_blob_builds;   /* diagnostic: CPU blob builds since loa
 static unsigned tess_cpu_generate_runs; /* diagnostic: CPU tessellator runs since load */
 static unsigned tess_scan_waits;        /* diagnostic: GPU index-scan waits since load */
 static unsigned tess_cpu_index_reads;   /* diagnostic: CPU element-buffer reads since load */
+static unsigned tess_restart_checks;    /* diagnostic: CPU restart-presence scans since load */
 
 unsigned mgl_tess_cpu_blob_builds(void)   { return tess_cpu_blob_builds; }
 unsigned mgl_tess_cpu_generate_runs(void) { return tess_cpu_generate_runs; }
 unsigned mgl_tess_scan_waits(void)        { return tess_scan_waits; }
 unsigned mgl_tess_cpu_index_reads(void)   { return tess_cpu_index_reads; }
+unsigned mgl_tess_restart_checks(void)    { return tess_restart_checks; }
 void mgl_tess_note_scan_wait(void)      { tess_scan_waits++; }
 void mgl_tess_note_cpu_index_read(void) { tess_cpu_index_reads++; }
+void mgl_tess_note_restart_check(void)  { tess_restart_checks++; }
 
 static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                   const unsigned char *tcs_patch_out, size_t tcs_patch_stride,

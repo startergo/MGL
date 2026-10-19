@@ -143,7 +143,6 @@ void mglClearBufferfi(GLMContext ctx, GLenum buffer, GLint drawbuffer, GLfloat d
 
 void mglFinish(GLMContext ctx)
 {
-    fprintf(stderr, "MGL: mglFinish called - flushing and waiting for GPU\n");
     ctx->mtl_funcs.mtlFlush(ctx, true);
 }
 

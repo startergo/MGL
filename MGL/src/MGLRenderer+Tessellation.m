@@ -923,10 +923,36 @@ struct TessScanEnt {
     /* results */
     uint32_t minv, maxv, restart_count, idx_used;
     void *widened;                  /* retained id<MTLBuffer>, gapless uint32 list */
+    bool restart_known;             /* has_restart decided for this content */
+    bool has_restart;
     uint64_t used;                  /* LRU clock */
 };
 static struct TessScanEnt tScanEnt[TESS_SCAN_CACHE];
 static uint64_t tScanClock;
+
+/* ---- test-only GPU-time accounting --------------------------------------------
+ * Opt-in (mgl_tess_diag_enable, tests/headless/mgl_tess_diag.h): every command
+ * buffer the tess path commits or encodes into gets a completed handler that sums
+ * its GPU execution time and counts it. Disabled, there is no per-draw cost. */
+static bool tDiagEnabled = false;
+static double tGpuTimeUs;
+static unsigned tCbsCompleted;
+
+void mgl_tess_diag_enable(int enable) { tDiagEnabled = enable != 0; }
+void mgl_tess_gpu_time_reset(void) { tGpuTimeUs = 0.0; tCbsCompleted = 0; }
+double mgl_tess_gpu_time_us(void) { return tGpuTimeUs; }
+unsigned mgl_tess_cbs_completed(void) { return tCbsCompleted; }
+
+static void tessTimeCommandBuffer(id<MTLCommandBuffer> cb)
+{
+    if (!cb || !tDiagEnabled)
+        return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        if (b.GPUEndTime > b.GPUStartTime)
+            tGpuTimeUs += (b.GPUEndTime - b.GPUStartTime) * 1e6;
+        tCbsCompleted++;
+    }];
+}
 
 static struct TessScanEnt *tessScanLookup(GLMContext ctx, const Buffer *ebuf, size_t offset,
                                           uint32_t count, uint32_t itype, uint32_t restart)
@@ -1104,15 +1130,32 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         /* ---- index analysis -------------------------------------------------------
          * Restart present in the range? (patches re-form around a restart, so the range
          * must be re-written into a gapless list — the only decision that needs the
-         * CPU, read straight from the element buffer's CPU-visible storage). Otherwise
-         * the draw is fully GPU-driven: the scan's min/max never reach the CPU. */
-        have_restart = (restart != 0xffffffffu) &&
-                       tessRangeHasRestart(ctx, type, offset, count, restart);
-
-        if (have_restart)
+         * CPU). The answer is cached per element-buffer content like the round-13 scan
+         * results (the gpuaudit content serial invalidates it), so the CPU scan runs at
+         * most once per content; otherwise the draw is fully GPU-driven and the scan's
+         * min/max never reach the CPU. */
+        if (restart != 0xffffffffu)
         {
             Buffer *ebuf = ctx->state.vao->element_array.buffer;
             struct TessScanEnt *se = tessScanLookup(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+
+            if (se && se->restart_known)
+                have_restart = se->has_restart;
+            else
+            {
+                mgl_tess_note_restart_check();
+                have_restart = tessRangeHasRestart(ctx, type, offset, count, restart);
+                if (!se)
+                    se = tessScanEntry(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+                se->restart_known = true;
+                se->has_restart = have_restart;
+            }
+        }
+
+        if (have_restart)
+        {
+            Buffer *ebuf2 = ctx->state.vao->element_array.buffer;
+            struct TessScanEnt *se = tessScanLookup(ctx, ebuf2, offset, (uint32_t)count, itype, restart);
 
             if (se && se->widened)
             {
@@ -1158,7 +1201,9 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 minv = (GLsizei)lo;
                 maxv = (GLsizei)hi;
 
-                ne = tessScanEntry(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+                ne = se ? se : tessScanEntry(ctx, ebuf2, offset, (uint32_t)count, itype, restart);
+                ne->restart_known = true;
+                ne->has_restart = true;
                 ne->minv = lo;                   /* min/max over the kept indices */
                 ne->maxv = hi;
                 ne->idx_used = kept;
@@ -1306,6 +1351,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 [senc setBuffer: ring offset: off_vsparams atIndex: 5];
                 [senc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
                 [senc endEncoding];
+                tessTimeCommandBuffer(scb);
                 [scb commit];
             }
         }
@@ -1366,7 +1412,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
 
     bool debug_wait = tTrace() && use_hardware;
     if ((need_readback && !use_hardware) || debug_wait)
+    {
         compute_cb = [_commandQueue commandBuffer];
+        tessTimeCommandBuffer(compute_cb);
+    }
     else
     {
         /* kernels and the render pass share one command buffer: Metal executes encoders
@@ -1374,6 +1423,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
             _currentCommandBuffer = [_commandQueue commandBuffer];
         compute_cb = _currentCommandBuffer;
+        tessTimeCommandBuffer(compute_cb);   /* shared with the render pass: fires at frame commit */
     }
 
     cenc = [compute_cb computeCommandEncoder];
@@ -1710,6 +1760,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         /* the VS/TCS command buffer is already committed: the tessellator kernels run
          * in their own, event-ordered command buffer (no CPU stall) */
         emu_cb = [_commandQueue commandBuffer];
+        tessTimeCommandBuffer(emu_cb);
         kenc = [emu_cb computeCommandEncoder];
         cenc = kenc;
         size_t emu_off = off_gpu_emu;                /* range reserved in the ring block */

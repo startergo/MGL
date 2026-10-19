@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "glcorearb.h"
 #include "mgl_test.h"
+#include "mgl_tess_diag.h"
 
 static const char *kVs =
     "#version 450 core\n"
@@ -402,10 +403,6 @@ static const char *kTesIsoPatch2 =
     "  f_col = p_flag;\n"
     "}\n";
 
-/* diagnostics exported by libmgl: CPU-side patch-blob builds and CPU tessellator
- * runs. The GPU emulated path must not grow either counter across a draw. */
-extern unsigned mgl_tess_cpu_blob_builds(void);
-extern unsigned mgl_tess_cpu_generate_runs(void);
 
 TEST(EmuPatchDataGpu)
 {
