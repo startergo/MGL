@@ -1187,9 +1187,15 @@ static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *facto
  * (see MGLTessKernels.h) from the same map (mgl_tess_build_blob_map). */
 static unsigned tess_cpu_blob_builds;   /* diagnostic: CPU blob builds since load */
 static unsigned tess_cpu_generate_runs; /* diagnostic: CPU tessellator runs since load */
+static unsigned tess_scan_waits;        /* diagnostic: GPU index-scan waits since load */
+static unsigned tess_cpu_index_reads;   /* diagnostic: CPU element-buffer reads since load */
 
 unsigned mgl_tess_cpu_blob_builds(void)   { return tess_cpu_blob_builds; }
 unsigned mgl_tess_cpu_generate_runs(void) { return tess_cpu_generate_runs; }
+unsigned mgl_tess_scan_waits(void)        { return tess_scan_waits; }
+unsigned mgl_tess_cpu_index_reads(void)   { return tess_cpu_index_reads; }
+void mgl_tess_note_scan_wait(void)      { tess_scan_waits++; }
+void mgl_tess_note_cpu_index_read(void) { tess_cpu_index_reads++; }
 
 static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                   const unsigned char *tcs_patch_out, size_t tcs_patch_stride,

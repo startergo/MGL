@@ -205,9 +205,14 @@ bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin
                              char *cp_name, size_t cp_len, size_t *record_size);
 
 /* diagnostics for the GPU-path tests: CPU-side patch-blob builds / CPU
- * tessellator runs since library load (the GPU paths must not grow these) */
+ * tessellator runs / GPU index-scan waits / CPU element-buffer reads since
+ * library load (the GPU paths must not grow these on repeat draws) */
 unsigned mgl_tess_cpu_blob_builds(void);
 unsigned mgl_tess_cpu_generate_runs(void);
+unsigned mgl_tess_scan_waits(void);
+unsigned mgl_tess_cpu_index_reads(void);
+void mgl_tess_note_scan_wait(void);
+void mgl_tess_note_cpu_index_read(void);
 
 /* query bookkeeping without CPU tessellation: the tessellated output counts from
  * the levels alone (used by the GPU paths when the levels are CPU-known) */
