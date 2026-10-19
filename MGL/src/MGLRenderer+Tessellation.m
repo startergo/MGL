@@ -1056,6 +1056,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     size_t off_vsparams = 0, off_scanout = 0;   /* GPU-written VS parameter block + scan atomics */
     size_t off_capture = 0;         /* TES-output capture records (tp->capture) */
     size_t cap_pub_records = 0, cap_pub_idx = 0, cap_pub_count = 0;   /* published offsets */
+    uint32_t cap_pub_recs_cap = 0, cap_pub_idx_cap = 0;               /* and their capacities */
     bool cap_msl_had_fixup = false; /* the capture MSL carries the rstate clip-space fixup */
     id<MTLBuffer> tess_gather_ib = nil;
     size_t tess_gather_offset = 0;
@@ -1928,9 +1929,14 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                     [cenc dispatchThreadgroups: MTLSizeMake(((NSUInteger)cc + 63) / 64, 1, 1)
                           threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
                     cap_pub_records = off_capture;
-                    cap_pub_idx = off_indices;
-                    /* totals[0] is the GPU-written VERTEX count (args[0] would be the
-                     * index count: 3x the records for triangle domains) */
+                    /* the consumer's primitive slots come from the tessellator's uint32 index
+                     * list (global coordinate indices, i.e. exactly the capture's record
+                     * indices) — NOT off_indices, which is the CPU path's list and stays 0 */
+                    cap_pub_idx = coords_off + coords_cap * 16;
+                    cap_pub_recs_cap = (uint32_t)coords_cap;
+                    cap_pub_idx_cap = (uint32_t)indices_cap;
+                    /* totals[0] is the GPU-written VERTEX count and totals[1] the index count
+                     * (args[0] would be the index count: 3x the records for triangle domains) */
                     cap_pub_count = emu_off + (size_t)(total_patches * 2) * 4;
                 }
             }
@@ -1970,6 +1976,8 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                     c->index_offset = cap_pub_idx;
                     c->count_offset = cap_pub_count;
                     c->stride = tp->cap_stride;
+                    c->records = cap_pub_recs_cap;
+                    c->indices = cap_pub_idx_cap;
                     c->prim = tp->point_mode ? GL_POINTS :
                               (tp->domain == MGL_TESS_DOMAIN_ISOLINES ? GL_LINES : GL_TRIANGLES);
                     c->members = (uint32_t)tp->cap_members_n;

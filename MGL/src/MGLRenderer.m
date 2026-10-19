@@ -3302,7 +3302,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // with PerPatchControlPoint / PerPatch stepping (MGLRenderer+Tessellation.m).
             // The emulated (plain-vertex) TES variant used for isolines / point_mode has
             // no stage_in and must not get tessellation pipeline state.
-            if ([self extTessActive])
+            // geom: when the geometry stage's pass-through vertex function owns the vertex
+            // stage (a geometry shader behind a tessellation stage rasterizes here), the
+            // pipeline must be a plain one: the tessellation patch vertex descriptor and the
+            // tessellation state belong to the producer's pass, not to this raster pass
+            // (the pass-through function reads a buffer and has no stage-in).
+            bool geomOverride = ctx->state.ext_geom &&
+                                ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override != NULL;
+            if ([self extTessActive] && !geomOverride)
             {
                 MGLTessProgram *tp = mgl_tess_active_program(ctx);
                 bool emulated = tp && tp->plain_function &&
@@ -3321,6 +3328,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 else
                     pipelineStateDescriptor.vertexDescriptor = nil;
             }
+            else if (geomOverride)
+                pipelineStateDescriptor.vertexDescriptor = nil;
             else
                 pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
 

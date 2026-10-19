@@ -47,6 +47,7 @@
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
+#include "mgl_ext_tess.h"     /* the TES-output capture producer (geometry behind tessellation) */
 #include "mgl_ext_program.h"
 #include "shaders.h"
 #include "programs.h"
@@ -2120,10 +2121,21 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     for (i = 0; i < gp->n_out; i++)
         if (gp->out_v[i].stream + 1 > gp->streams) gp->streams = gp->out_v[i].stream + 1;
 
+    /* a tessellation stage in front of the geometry shader: the tess domain's TES-output
+     * capture supplies the records, so there is no vertex stage to derive the inputs'
+     * producing expressions from (the draw-time import repacks the capture instead) */
+    gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
+    if (gp->from_tess && gp->in_has_clip)
+    {
+        mgl_append_log(log, "ERROR: geometry: gl_ClipDistance of a tessellation stage is not captured, "
+                            "so the geometry stage cannot read gl_in[].gl_ClipDistance\n");
+        goto done;
+    }
+
     /* writer side: the vertex outputs feeding each input location.  A separable
      * geometry-only program has no vertex stage to reflect here; geom_ensure() does it from
      * the pipeline's composite once that is available. */
-    if (!gp->deferred)
+    if (!gp->deferred && !gp->from_tess)
     {
         if (!geom_derive_exprs(gp, program, log))
             goto done;
@@ -2234,9 +2246,18 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 
     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
 
-    if (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER])
-        GEOM_FAIL("tessellation before a geometry shader is not supported "
-                  "(the geometry emulation consumes the vertex stage output directly)");
+    /* a tessellation stage in front of the geometry shader: the tess domain's TES-output
+     * capture producer (mgl_ext_tess.h) feeds the geometry kernel instead of a vertex capture
+     * variant — the records are repacked into this program's input record at draw time
+     * (mgl_geom_route / the import kernel in MGLRenderer+Geometry.m) */
+    gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
+    if (gp->from_tess && gp->in_has_clip)
+        GEOM_FAIL("gl_ClipDistance of a tessellation stage is not captured: "
+                  "the geometry stage cannot read gl_in[].gl_ClipDistance");
+    if (!gp->from_tess &&
+        (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER]))
+        GEOM_FAIL("a tessellation control shader without an evaluation shader cannot feed "
+                  "the geometry stage");
 
     {
         const char *src = geom_gs_source(ctx, obj);
@@ -2248,6 +2269,18 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                                         program->spirv[_GEOMETRY_SHADER].size, 460, &log);
             if (!gs_src) GEOM_FAIL("no geometry shader source: %s", log ? log : "?");
         }
+    }
+
+    if (gp->from_tess)
+    {
+        /* no vertex stage is captured: the tess domain publishes the records (with its own
+         * member layout) and the import kernel repacks them into gp's input record */
+        gp->vid_absolute = false;
+        gp->iid_absolute = false;
+        gp->in_clip_size = 0;
+        gp->capture_entry = xstrdup("main0");
+        geom_layout(gp);
+        goto build;          /* skip the capture variant, the draw variant is built below */
     }
 
     {
@@ -2298,6 +2331,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
         GEOM_FAIL("no Metal compile hook available");
 
     /* ---- 2. geometry kernel ---- */
+build:
     glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, &log);
     if (!glsl) GEOM_FAIL("kernel generation failed");
     geom_dump("kernel.glsl", glsl);
@@ -2777,6 +2811,119 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d);
 static GLMContext gTraceCtx;
 void *mgl_geom_ctx(void) { return gTraceCtx; }
 
+/* ---- tessellation in front of the geometry stage ---- */
+
+/* the tess domain tessellates this draw with its TES-output capture enabled (the records and
+ * the output index list are GPU-visible), then the geometry emulation consumes them: the
+ * import kernel (MGLRenderer+Geometry.m) repacks the capture records into this program's
+ * input record and builds the primitive slots, exactly what the prep kernel produces for a
+ * plain draw. */
+static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GLenum type,
+                            size_t offset, GLint first, GLsizei count, GLsizei instances,
+                            GLint basevertex, GLuint baseinstance)
+{
+    Program *program = ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
+                                                   : ctx->state.program;
+    const MGLTessCapture *c;
+    MGLGeomDraw d;
+    GLuint saved_discard;
+    uint32_t want = gp->in_type;      /* the GS input primitive the capture must produce */
+    static const uint32_t kof[3] = { 1u, 2u, 3u };     /* GL_POINTS, GL_LINES, GL_TRIANGLES */
+
+    if (!program || !program->shader_slots[_TESS_EVALUATION_SHADER]) return false;
+
+    /* the tess stage must not rasterize: the geometry stage owns rasterization, and the
+     * fragment shader would otherwise see the tessellation outputs.  rstate discards in the
+     * last pre-rasterization stage's vertex function, so the tess pipeline is rebuilt for it
+     * (the geometry pass restores the value afterwards, before its own raster pass). */
+    mgl_tess_set_capture(ctx, program, true);
+    saved_discard = ctx->state.caps.rasterizer_discard;
+    ctx->state.caps.rasterizer_discard = GL_TRUE;
+    ctx->state.dirty_bits |= DIRTY_PROGRAM;
+    mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
+                          basevertex, baseinstance);
+    ctx->state.caps.rasterizer_discard = saved_discard;
+    ctx->state.dirty_bits |= DIRTY_PROGRAM;
+
+    c = mgl_tess_get_capture(ctx);
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace tess capture c=%p valid=%d prim=%u want=%u members=%d\n",
+                (const void *)c, c ? (int)c->valid : -1, c ? c->prim : 0u, want, c ? c->members : -1);
+    if (!c || !c->valid || !c->buffer_object || !c->buffer)
+    {
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return false;
+    }
+    if (c->prim != want)
+    {
+        /* triangles -> triangles, isolines -> lines, point_mode -> points */
+        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        return false;
+    }
+
+    /* repack: for every geometry input location, the tess capture member at the same location
+     * supplies the words (gl_Position is words 0..3 in both layouts) */
+    memset(&d, 0, sizeof(d));
+    d.tess_ring = c->buffer_object;     /* the MTLBuffer (buffer is its CPU address) */
+    d.tess_recs_off = c->records_offset;
+    d.tess_idx_off = c->index_offset;
+    d.tess_cnt_off = c->count_offset;
+    d.tess_stride = c->stride;
+    d.tess_prim = c->prim;
+    d.tess_pairs[d.tess_npairs++] = 0; d.tess_pairs[d.tess_npairs++] = 0;
+    d.tess_pairs[d.tess_npairs++] = 1; d.tess_pairs[d.tess_npairs++] = 1;
+    d.tess_pairs[d.tess_npairs++] = 2; d.tess_pairs[d.tess_npairs++] = 2;
+    d.tess_pairs[d.tess_npairs++] = 3; d.tess_pairs[d.tess_npairs++] = 3;
+    for (int i = 0; i < gp->n_in; i++)
+    {
+        int j = -1;
+
+        /* the consumer matches the tess capture's members by name: a linkable program has the
+         * same names for the evaluation stage's outputs and the geometry stage's inputs */
+        for (int m = 0; m < c->members; m++)
+            if (!strcmp(c->member[m].name, gp->in_v[i].name) &&
+                c->member[m].words >= gp->in_v[i].words)
+            {
+                j = m;
+                break;
+            }
+        if (j < 0)
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return false;
+        }
+        if (c->member[j].words != gp->in_v[i].words ||
+            d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS)
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return false;
+        }
+        for (uint32_t w = 0; w < gp->in_v[i].words; w++)
+        {
+            d.tess_pairs[d.tess_npairs++] = c->member[j].offset + w;   /* word offset */
+            d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + w;
+        }
+    }
+
+    /* sizing bounds: the capture ring block's record and index-list capacities (the tess
+     * domain sizes them for this draw's patches).  The tess producer tessellates
+     * patches * instances patches, so every instance is already in the capture and the
+     * geometry stage sees a single instance of the assembled primitive stream. */
+    d.gp = gp;
+    d.program = program;
+    d.mode = c->prim;                 /* the assembled primitives are of the capture's type */
+    d.first = first;
+    d.count = c->indices ? (GLsizei)c->indices : count;
+    d.instances = 1;
+    d.basevertex = basevertex;
+    d.baseinstance = baseinstance;
+    d.tess_rec_cap = c->records ? c->records : 1;
+    d.tess_idx_cap = c->indices ? c->indices : 1;
+
+    (void)kof;
+    return METAL()->draw(ctx, &d);
+}
+
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
@@ -2798,6 +2945,24 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
                                     ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
                                                                 : ctx->state.program))
     {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
+
+    /* a tessellation stage in front of the geometry shader: the tess domain tessellates (and
+     * publishes its TES-output capture), then the geometry emulation consumes it.  The GL
+     * draw mode is GL_PATCHES, so the usual input-type check does not apply — the capture's
+     * output primitive type is validated against it instead. */
+    if (gp->from_tess)
+    {
+        if (mode != GL_PATCHES)
+        {
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        if (geom_route_tess(ctx, gp, indexed, type, offset, first, count, instances,
+                            basevertex, baseinstance))
+            return;
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }

@@ -1121,49 +1121,264 @@ TEST(xfb_streams)
 }
 
 
-TEST(tessellation_with_geometry_rejected)
+/* ---- geometry behind a tessellation stage ----------------------------------------
+ * The tess domain's TES-output capture feeds the geometry kernel ("from tess"): there is no
+ * vertex capture pass, the import kernel repacks the captured records into this program's
+ * input records and the tessellator's index list becomes the primitive slots.  A filled
+ * triangle domain (non-indexed and indexed), isolines and point_mode are covered.
+ *
+ * NOTE: every TES here really uses its input varyings.  SPIRV-Cross drops unused ones from
+ * the TES control-point struct, and the emulated TES reads the TCS output with that struct:
+ * a TES that ignores a varying the TCS writes reads shifted control points (tess domain
+ * limitation, see the round-21 report). */
+
+static void setup4(GLuint n, const float *v)
 {
-    const char *tcs =
-        "#version 450 core\n"
-        "layout(vertices = 3) out;\n"
-        "void main(){\n"
-        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
-        "  if (gl_InvocationID == 0) {\n"
-        "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
-        "    gl_TessLevelInner[0] = 3.0;\n"
-        "  }\n"
-        "}\n";
-    const char *tes =
-        "#version 450 core\n"
-        "layout(triangles, equal_spacing, ccw) in;\n"
-        "void main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
-        " + gl_TessCoord.z * gl_in[2].gl_Position; }\n";
-    const char *gs =
-        "#version 450 core\n"
-        "layout(triangles) in;\n"
-        "layout(triangle_strip, max_vertices = 3) out;\n"
-        "void main(){ for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); } EndPrimitive(); }\n";
+    if (!vao)
+    {
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+    }
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, n * sizeof(float), v, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+}
+
+static const char *tess_vs =
+    "#version 450 core\n"
+    "layout(location=0) in vec4 pos;\n"
+    "layout(location=0) out vec4 v_uv;\n"
+    "void main(){ gl_Position = vec4(pos.xy, 0.0, 1.0); v_uv = pos; }\n";
+
+static const char *tri_tcs =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_uv[];\n"
+    "layout(location=0) out vec4 tc_uv[];\n"
+    "void main(){\n"
+    "  tc_uv[gl_InvocationID] = v_uv[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0;\n"
+    "    gl_TessLevelInner[0] = 1.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *tri_tes =
+    "#version 450 core\n"
+    "layout(triangles) in;\n"
+    "layout(location=0) in vec4 tc_uv[];\n"
+    "layout(location=0) out float shade;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+    " + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  shade = 0.75 * tc_uv[0].w;\n"
+    "}\n";
+
+static const char *tess_fs =
+    "#version 450 core\n"
+    "layout(location=0) in float gshade;\n"
+    "layout(location=0) out vec4 color;\n"
+    "void main(){ color = vec4(0.0, gshade, 0.0, 1.0); }\n";
+
+static GLuint tess_gs_prog(const char *tcs, const char *tes, const char *gs)
+{
     GLuint p = glCreateProgram();
-    glAttachShader(p, compile(GL_VERTEX_SHADER, plain_vs));
+    glAttachShader(p, compile(GL_VERTEX_SHADER, tess_vs));
     glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, tcs));
     glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, tes));
     glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
-    glAttachShader(p, compile(GL_FRAGMENT_SHADER, plain_fs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, tess_fs));
     glLinkProgram(p);
-    GLint ok = 1;
+    GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    EXPECT_EQ_INT(ok, GL_FALSE);
     if (!ok)
     {
         char log[2048] = "";
         GLsizei len = 0;
         glGetProgramInfoLog(p, sizeof log, &len, log);
-        printf("tess+gs log: %s\n", log);
-        EXPECT_TRUE(strstr(log, "geometry") != NULL);
+        printf("tess+gs link log: %s\n", log);
     }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    return ok ? p : 0;
+}
+
+static const float tess_tri[12] =
+    { -0.5f, -0.5f, 0.0f, 1.0f, 0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.5f, 0.0f, 1.0f };
+
+TEST(tessellation_triangles_into_gs)
+{
+    /* the geometry stage shrinks every tessellated triangle: the centre pixel is inside the
+     * shrunken triangle, the left edge only inside the unshrunk one */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in float shade[];\n"
+        "layout(location=0) out float gshade;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = vec4(gl_in[i].gl_Position.xy * 0.5, 0.0, 1.0);"
+        " gshade = shade[i]; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    GLuint p = tess_gs_prog(tri_tcs, tri_tes, gs);
+    if (!p) return;
+    glUseProgram(p);
+    clear_black();
+    setup4(12, tess_tri);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100 && c[2] < 32);
+    px(20, 100, c);
+    EXPECT_TRUE(c[0] == 0 && c[1] == 0);
     glDeleteProgram(p);
 }
 
+TEST(tessellation_indexed_into_gs)
+{
+    /* the same tessellated patch through an index buffer (a cyclic permutation keeps the
+     * winding): the primitive slots come from the tessellator's index list either way */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in float shade[];\n"
+        "layout(location=0) out float gshade;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = vec4(gl_in[i].gl_Position.xy * 0.75, 0.0, 1.0);"
+        " gshade = shade[i]; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    GLuint p = tess_gs_prog(tri_tcs, tri_tes, gs);
+    if (!p) return;
+    glUseProgram(p);
+    clear_black();
+    setup4(12, tess_tri);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    GLuint ibo = 0;
+    static const GLuint idx[3] = { 2, 0, 1 };
+    glGenBuffers(1, &ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glDrawElements(GL_PATCHES, 3, GL_UNSIGNED_INT, 0);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100 && c[2] < 32);
+    px(15, 100, c);
+    EXPECT_TRUE(c[0] == 0 && c[1] == 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDeleteBuffers(1, &ibo);
+    glDeleteProgram(p);
+}
+
+TEST(tessellation_isolines_into_gs)
+{
+    /* isolines produce line primitives: the geometry stage thickens the single tessellated
+     * isoline into a quad (triangle_strip) */
+    const char *tcs =
+        "#version 450 core\n"
+        "layout(vertices=2) out;\n"
+        "layout(location=0) in vec4 v_uv[];\n"
+        "layout(location=0) out vec4 tc_uv[];\n"
+        "void main(){\n"
+        "  tc_uv[gl_InvocationID] = v_uv[gl_InvocationID];\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes =
+        "#version 450 core\n"
+        "layout(isolines) in;\n"
+        "layout(location=0) in vec4 tc_uv[];\n"
+        "layout(location=0) out float shade;\n"
+        "void main(){\n"
+        "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+        "  shade = 0.75 * tc_uv[0].w;\n"
+        "}\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(lines) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "layout(location=0) in float shade[];\n"
+        "layout(location=0) out float gshade;\n"
+        "void main(){\n"
+        "  vec2 a = gl_in[0].gl_Position.xy, b = gl_in[1].gl_Position.xy;\n"
+        "  vec2 d = normalize(b - a);\n"
+        "  vec2 n = vec2(-d.y, d.x) * 0.05;\n"
+        "  gshade = shade[0];\n"
+        "  gl_Position = vec4(a - n, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(b - n, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(a + n, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(b + n, 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    static const float line[8] = { -0.5f, 0.0f, 0.0f, 1.0f, 0.5f, 0.0f, 0.0f, 1.0f };
+    GLuint p = tess_gs_prog(tcs, tes, gs);
+    if (!p) return;
+    glUseProgram(p);
+    clear_black();
+    setup4(8, line);
+    glPatchParameteri(GL_PATCH_VERTICES, 2);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 100, c);
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100 && c[2] < 32);
+    px(100, 175, c);
+    EXPECT_TRUE(c[0] == 0 && c[1] == 0);
+    glDeleteProgram(p);
+}
+
+TEST(tessellation_point_mode_into_gs)
+{
+    /* point_mode tessellation emits points: the geometry stage turns each into a small
+     * triangle, so a point at the top control point covers a pixel there */
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, point_mode) in;\n"
+        "layout(location=0) in vec4 tc_uv[];\n"
+        "layout(location=0) out float shade;\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+        " + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  shade = 0.75 * tc_uv[0].w;\n"
+        "}\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in float shade[];\n"
+        "layout(location=0) out float gshade;\n"
+        "void main(){\n"
+        "  vec2 p = gl_in[0].gl_Position.xy;\n"
+        "  gshade = shade[0];\n"
+        "  gl_Position = vec4(p + vec2(-0.1, -0.1), 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(p + vec2( 0.1, -0.1), 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(p + vec2( 0.0,  0.1), 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    GLuint p = tess_gs_prog(tri_tcs, tes, gs);
+    if (!p) return;
+    glUseProgram(p);
+    clear_black();
+    setup4(12, tess_tri);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(100, 150, c);                 /* the top control point (0, 0.5) */
+    EXPECT_TRUE(c[0] < 32 && c[1] > 100 && c[2] < 32);
+    px(100, 25, c);                  /* far below the bottom edge */
+    EXPECT_TRUE(c[0] == 0 && c[1] == 0);
+    glDeleteProgram(p);
+}
 
 /* primitive restart with a geometry shader: the restarted runs are separate primitives and
  * the capture pass never sees the restart index */
@@ -1453,7 +1668,10 @@ int main(void)
     RUN(xfb_of_geometry_output);
     RUN(xfb_streams);
     RUN(xfb_arrays_of_blocks_xfb_offset);
-    RUN(tessellation_with_geometry_rejected);
+    RUN(tessellation_triangles_into_gs);
+    RUN(tessellation_indexed_into_gs);
+    RUN(tessellation_isolines_into_gs);
+    RUN(tessellation_point_mode_into_gs);
     RUN(primitive_restart_with_gs);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
     return mgl_test_summary();

@@ -39,6 +39,7 @@ struct MGLProgramObj_t;
 #define MGL_GEOM_HDR_WORDS          32
 #define MGL_GEOM_ARG_OFFSET         8     /* word offset of the DrawIndexedPrimitives arguments */
 #define MGL_GEOM_BUDGET_BYTES       (256u << 20)     /* per-buffer allocation cap */
+#define MGL_GEOM_TESS_MAX_WORDS     128   /* (src word, dst word) pairs of a tess record import */
 
 /* GLSL (set 0) bindings of the emulation SSBOs; above the per-stage SSBO limit so an
  * application's own layout(std430, binding=N) declarations cannot collide */
@@ -87,6 +88,7 @@ typedef struct MGLGeomProgram {
     GLuint    name;
     bool      linked;       /* the emulation is built and usable */
     bool      deferred;     /* separable program: built from the pipeline at first draw */
+    bool      from_tess;   /* a tessellation stage feeds the geometry kernel (TES-output capture) */
     void    *gs_exec;      /* the geometry stage executable Shader (identity across pipelines) */
     char     *fail;
 
@@ -150,6 +152,20 @@ typedef struct MGLGeomDraw {
     uint32_t restart;           /* restart index (or 0xffffffffu) */
     bool     provoking_first;
     uint32_t count_bound;       /* upper bound of the vertex count, for sizing only */
+
+    /* tess producer: instead of a vertex capture pass, the tess domain's TES-output capture
+     * feeds the geometry kernel.  tess_recs_off / tess_idx_off / tess_cnt_off are byte
+     * offsets into tess_ring (an MTLBuffer the tess domain owns and keeps alive); tess_npairs
+     * (src word, dst word) pairs repack a tess record into this program's input record.
+     * tess_rec_cap / tess_idx_cap are the ring block's record and index-list capacities (the
+     * sizing bounds: the actual counts are GPU-written). */
+    void    *tess_ring;
+    size_t   tess_recs_off, tess_idx_off, tess_cnt_off;
+    uint32_t tess_stride;                       /* words per tess record */
+    uint32_t tess_prim;                         /* its output primitive type */
+    uint32_t tess_rec_cap, tess_idx_cap;        /* record / index-list capacities */
+    uint32_t tess_pairs[MGL_GEOM_TESS_MAX_WORDS];
+    uint32_t tess_npairs;
 } MGLGeomDraw;
 
 struct MGLExtState_geom {

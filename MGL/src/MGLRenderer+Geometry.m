@@ -77,8 +77,7 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
-static id<MTLComputePipelineState> gPrepPso;
-static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
+static id<MTLComputePipelineState> gPrepPso, gTessImportPso;static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
 static id<MTLComputePipelineState> gFinPso;
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
@@ -86,10 +85,16 @@ static void *gPsoKey;               /* the kernel function the PSOs were built f
 #define MGL_GEOM_STR2(x) #x
 #define MGL_GEOM_STR(x) MGL_GEOM_STR2(x)
 
-/* the input block of the prep kernel: everything the assembly needs, 16 words */
-#define MGL_GEOM_PREP_IN_WORDS 16
-#define MGL_GEOM_WG            32
-#define MGL_GEOM_PREP_BYTES    (64 * sizeof(uint32_t))
+/* the prep block of gPrep, in words: the kernel's inputs (a 16-word struct), the staging
+ * words of a direct draw's command, then the kernel's outputs (prep[0..11]: the assembly
+ * counts, the geometry kernel's indirect threadgroup count at [4] and the capture pass's
+ * indirect draw arguments at [7..10]).  Every user of the block goes through these. */
+#define MGL_GEOM_PREP_IN_WORDS  16    /* c.v[0..15] of the prep kernel */
+#define MGL_GEOM_PREP_CMD_OFF   16    /* 4 staging words a direct draw's command */
+#define MGL_GEOM_PREP_OUT_OFF   32    /* prep[0..11], the kernel's outputs */
+#define MGL_GEOM_PREP_GROUPS_OFF (MGL_GEOM_PREP_OUT_OFF + 4)   /* prep[4] */
+#define MGL_GEOM_WG             32
+#define MGL_GEOM_PREP_BYTES     (64 * sizeof(uint32_t))
 
 /* the prep kernel builds, in one workgroup, everything the rest of the emulation needs from
  * the draw command and the element buffer:
@@ -263,6 +268,59 @@ static const char *kGeomPrepMSL =
     "    ctl[1] = vmax - vmin + 1u;                     /* capture header: vcount */\n"
     "}\n";
 
+/* the tess producer's import kernel: repacks the TES-output capture records into this
+ * program's input record (the layouts differ: the tess record follows the tess capture's
+ * member table, this program's record follows geom_layout), copies the tessellator's index
+ * list into the primitive slots and publishes the counts the geometry kernel needs
+ * (gPrim's header words and the prep block, exactly what the prep kernel writes for a
+ * plain draw) */
+static const char *kGeomTessImportMSL =
+    "#include <metal_stdlib>\n"
+    "#include <simd/simd.h>\n"
+    "using namespace metal;\n"
+    "\n"
+    "kernel void mgl_geom_tess_import(const device uint* src [[buffer(0)]],      /* tess records */\n"
+    "                                 const device uint* idx [[buffer(1)]],      /* the tessellator's index list */\n"
+    "                                 const device uint* cnt [[buffer(2)]],      /* cnt[0] records, cnt[1] indices */\n"
+    "                                 device uint* recs [[buffer(3)]],           /* this program's input records */\n"
+    "                                 constant uint* pairs [[buffer(4)]],        /* (src word, dst word) */\n"
+    "                                 device uint* hdr [[buffer(5)]],            /* gPrim header */\n"
+    "                                 device uint* pslot [[buffer(6)]],          /* primitive slots */\n"
+    "                                 device uint* cap_hdr [[buffer(7)]],        /* the capture header */\n"
+    "                                 device uint* prep [[buffer(8)]],           /* prep[0] / prep[4] */\n"
+    "                                 constant uint* cfg [[buffer(9)]],          /* stride,k,npairs,reccap,idxcap,in_words,inst,invoc */\n"
+    "                                 uint t [[thread_position_in_grid]])\n"
+    "{\n"
+    "    uint nrec = cnt[0];\n"
+    "    uint nidx = cnt[1];\n"
+    "    if (nrec > cfg[3]) nrec = cfg[3];                 /* the ring's record capacity */\n"
+    "    if (nidx > cfg[4]) nidx = cfg[4];                 /* and its index capacity */\n"
+    "    if (t == 0u)\n"
+    "    {\n"
+    "        uint prims = nidx / cfg[1];                   /* k index entries per primitive */\n"
+    "        hdr[0] = prims;\n"
+    "        hdr[1] = cfg[6];                              /* instances (folded into the patches) */\n"
+    "        hdr[6] = nrec;\n"
+    "        hdr[8] = 0u;\n"
+    "        hdr[12] = 0u;\n"
+    "        cap_hdr[0] = 0u;\n"
+    "        cap_hdr[1] = nrec;\n"
+    "        cap_hdr[2] = 0u;\n"
+    "        cap_hdr[3] = cfg[5];\n"
+    "        prep[0] = prims;\n"
+    "        prep[4] = (prims * cfg[6] * cfg[7]) / 32u + 1u;   /* the kernel's indirect dispatch: x, y, z */\n"
+    "        prep[5] = 1u;\n"
+    "        prep[6] = 1u;\n"
+    "    }\n"
+    "    if (t < nrec)\n"
+    "    {\n"
+    "        const device uint* s = src + (size_t)t * cfg[0];\n"
+    "        device uint* dst = recs + (size_t)t * cfg[5];\n"
+    "        for (uint p = 0u; p < cfg[2] * 2u; p += 2u) dst[pairs[p + 1u]] = s[pairs[p]];\n"
+    "    }\n"
+    "    if (t < nidx) pslot[t] = idx[t];\n"
+    "}\n";
+
 #include "mgl_ext_geom_xfb.h"
 
 /* the transform feedback pack kernels: a prefix sum over the per-thread emitted counts
@@ -430,6 +488,25 @@ static bool geomCtlPipelines(id<MTLDevice> device)
         return false;
     }
 
+    /* the tess import kernel (a geometry stage behind a tessellation stage) */
+    {
+        id<MTLLibrary> tlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomTessImportMSL]
+                                                   options: nil error: &error];
+        if (!tlib)
+        {
+            NSLog(@"MGL geom: tess import library failed: %@", error);
+            return false;
+        }
+        id<MTLFunction> tfn = [tlib newFunctionWithName: @"mgl_geom_tess_import"];
+        if (!tfn) return false;
+        gTessImportPso = [device newComputePipelineStateWithFunction: tfn error: &error];
+        if (!gTessImportPso)
+        {
+            NSLog(@"MGL geom: tess import pipeline failed: %@", error);
+            return false;
+        }
+    }
+
     /* the transform feedback pack kernels */
     id<MTLLibrary> xlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomXfbMSL]
                                                options: nil error: &error];
@@ -473,7 +550,7 @@ static void geomReleaseStatics(void)
     gPrimPool.next = gVsoutPool.next = gPrepPool.next = gOutvPool.next = gCntPool.next = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
-    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
+    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gTessImportPso = nil;
     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
@@ -1034,14 +1111,32 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
-    MGLGeomProgram *gp = d->gp;
-    Program *program = d->program;
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace geomDraw enter tess=%d gp=%p\n", d->tess_ring != NULL, (void *)d->gp);
+    MGLGeomProgram *gp = d->gp;    Program *program = d->program;
     const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
     uint64_t threads = (uint64_t)(d->prims_count ? d->prims_count : 1)
                        * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations;
     uint32_t bound = d->count_bound ? d->count_bound : (d->count > 0 ? (uint32_t)d->count : 1);
     size_t outv_cap, idx_cap, prim_bytes, vsout_bytes, cap_idx, cap_prim;
     uint32_t *hdr;
+    bool from_tess = (d->tess_ring != NULL);
+    id<MTLComputeCommandEncoder> kenc = nil;     /* the import kernel's encoder (see above) */
+
+    if (from_tess)
+    {
+        /* a tessellation stage feeds the geometry kernel: the capture ring block's record
+         * capacity is the record bound and its index list's capacity the primitive bound
+         * (the tess domain sizes both for this draw's patches; the actual counts are written
+         * by the GPU).  The tess producer tessellates patches * instances patches, so every
+         * instance is already in the capture: this draw has a single instance. */
+        bound = d->tess_rec_cap ? d->tess_rec_cap : 1;
+        d->indexed = false;      /* index_words = 0: the primitive slots sit behind the header */
+        d->type = GL_UNSIGNED_INT;
+        d->count = (GLsizei)(d->tess_idx_cap ? (GLsizei)d->tess_idx_cap : 1);
+        d->count_bound = bound;
+        d->instances = 1;
+    }
 
     if (!_device || !_commandQueue || !program || !gp || !gp->linked) return false;
     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
@@ -1055,9 +1150,14 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     {
         size_t max_out = MGL_GEOM_BUDGET_BYTES / (gp->out_words * sizeof(uint32_t));
         /* with GPU assembly the primitive count is only known on the GPU: dispatch (and
-         * size) by the mode's worst case, the kernel returns early past the real count */
+         * size) by the mode's worst case, the kernel returns early past the real count.
+         * Behind a tessellation stage the bound is the capture's index-list capacity: k
+         * entries make one primitive. */
         uint64_t bound_threads = gpu_assembly
-                                 ? mgl_geom_worst_prims(d->mode, bound)
+                                 ? (from_tess
+                                    ? (uint64_t)(d->tess_idx_cap ? d->tess_idx_cap : 1)
+                                      / (gp->in_verts ? gp->in_verts : 1)
+                                    : mgl_geom_worst_prims(d->mode, bound))
                                    * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations
                                  : threads;
         outv_cap = (size_t)bound_threads * (gp->max_vertices ? gp->max_vertices : 1);
@@ -1067,7 +1167,17 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         threads = bound_threads;
     }
 
-    if (gpu_assembly)
+    if (from_tess)
+    {
+        /* the import kernel fills the primitive slots from the tessellator's index list:
+         * there is no capture index list of our own (cap_idx = 0), and the slots are sized
+         * by that list's capacity */
+        cap_idx = 0;
+        cap_prim = (size_t)(d->tess_idx_cap ? d->tess_idx_cap : 1)
+                   / (gp->in_verts ? gp->in_verts : 1);
+        if (!cap_prim) cap_prim = 1;
+    }
+    else if (gpu_assembly)
     {
         /* the prep kernel writes the lists: size the regions by the mode's worst case */
         cap_idx = (size_t)bound;
@@ -1164,7 +1274,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
             /* the staging command the prep kernel reads when the draw is not indirect */
             if (!d->cmd_buffer)
             {
-                uint32_t *cmd = in + MGL_GEOM_PREP_IN_WORDS;
+                uint32_t *cmd = in + MGL_GEOM_PREP_CMD_OFF;
                 cmd[0] = (uint32_t)d->count;
                 cmd[1] = (uint32_t)d->first;
                 cmd[2] = (uint32_t)d->basevertex;
@@ -1221,7 +1331,49 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     if (getenv("MGL_GEOM_DEBUG"))
         fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
-    if (gpu_assembly)
+    if (from_tess)
+    {
+        /* the tess producer's records are imported instead: repack them into this program's
+         * input record, copy its output index list into the primitive slots and publish the
+         * counts (what the prep kernel writes for a plain draw).  The encoder is left OPEN:
+         * the geometry kernel below dispatches into it too, because only dispatches within
+         * one encoder are guaranteed to be ordered — the kernel's indirect threadgroup count
+         * (prep[4], written here on the GPU) must be visible when that dispatch is issued. */
+        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+        id<MTLBuffer> ring = (__bridge id<MTLBuffer>)d->tess_ring;
+        uint32_t cfg[8];
+        NSUInteger wg = 64, nt = bound > (NSUInteger)d->count ? bound : (NSUInteger)d->count;
+
+        if (!enc) return false;
+        [enc pushDebugGroup: @"MGL geometry tess import"];
+        [enc setComputePipelineState: gTessImportPso];
+        [enc setBuffer: ring offset: d->tess_recs_off atIndex: 0];
+        [enc setBuffer: ring offset: d->tess_idx_off atIndex: 1];
+        [enc setBuffer: ring offset: d->tess_cnt_off atIndex: 2];
+        [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: 3];
+        [enc setBytes: d->tess_pairs length: sizeof(uint32_t) * (NSUInteger)d->tess_npairs atIndex: 4];
+        [enc setBuffer: gPrim offset: gPrimOff atIndex: 5];
+        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t) atIndex: 6];
+        [enc setBuffer: gVsout offset: gVsoutOff atIndex: 7];
+        [enc setBuffer: gPrep offset: gPrepOff + MGL_GEOM_PREP_OUT_OFF * sizeof(uint32_t) atIndex: 8];
+        cfg[0] = d->tess_stride;                 /* words per tess record */
+        cfg[1] = gp->in_verts;                   /* k: input vertices per primitive */
+        cfg[2] = d->tess_npairs / 2;             /* (src, dst) word pairs */
+        cfg[3] = bound;                          /* record capacity */
+        cfg[4] = d->tess_idx_cap;                /* index list capacity */
+        cfg[5] = gp->in_words;                   /* words per input record */
+        cfg[6] = (uint32_t)(d->instances > 0 ? d->instances : 1);
+        cfg[7] = gp->invocations;
+        [enc setBytes: cfg length: sizeof cfg atIndex: 9];
+        [enc dispatchThreadgroups: MTLSizeMake((nt + wg - 1) / wg, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+        [enc popDebugGroup];
+        kenc = enc;                       /* still open: the geometry kernel joins it */
+        if (getenv("MGL_GEOM_TRACE_DRAW"))
+            fprintf(stderr, "geom: trace tess import encoded (reccap=%u idxcap=%u stride=%u)\n",
+                    bound, d->tess_idx_cap, d->tess_stride);
+    }
+    else if (gpu_assembly)
     {
         id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
         Buffer *eb = d->indexed ? (ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL) : NULL;
@@ -1241,7 +1393,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         {
             /* the draw command: the user's indirect buffer, or the staging words in gPrep */
             id<MTLBuffer> cmd = gPrep;
-            size_t cmd_off = MGL_GEOM_PREP_IN_WORDS * sizeof(uint32_t);
+            size_t cmd_off = MGL_GEOM_PREP_CMD_OFF * sizeof(uint32_t);
             if (d->cmd_buffer)
             {
                 cmd = (__bridge id<MTLBuffer>)d->cmd_buffer;
@@ -1256,7 +1408,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         [enc setBuffer: gPrim offset: gPrimOff + MGL_GEOM_HDR_WORDS * sizeof(uint32_t) atIndex: 4];
         [enc setBuffer: gPrim offset: gPrimOff atIndex: 5];
         [enc setBuffer: gVsout offset: gVsoutOff atIndex: 6];
-        [enc setBuffer: gPrep offset: gPrepOff + 32 * sizeof(uint32_t) atIndex: 7];
+        [enc setBuffer: gPrep offset: gPrepOff + MGL_GEOM_PREP_OUT_OFF * sizeof(uint32_t) atIndex: 7];
 
         [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(MGL_GEOM_WG, 1, 1)];
@@ -1265,6 +1417,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     }
 
     /* ---- 1. vertex capture pass ---- */
+    if (!from_tess)      /* the tess producer already wrote the records */
     {
         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
         MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
@@ -1409,7 +1562,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     /* ---- 2. geometry kernel ---- */
     {
-        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+        /* the tess import kernel's encoder is still open: joining it keeps the import's
+         * writes ordered before this kernel (and before its indirect dispatch) */
+        id<MTLComputeCommandEncoder> enc = kenc ? kenc : [_currentCommandBuffer computeCommandEncoder];
         if (!enc) return false;
 
         Program *saved_program = ctx->state.program;
@@ -1450,7 +1605,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
             {
                 /* the prep kernel computed the exact threadgroup count */
                 [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
-                                               indirectBufferOffset: gPrepOff + (32 + 4) * sizeof(uint32_t)
+                                               indirectBufferOffset: gPrepOff + MGL_GEOM_PREP_GROUPS_OFF * sizeof(uint32_t)
                                               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
             }
             else
@@ -1513,6 +1668,23 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         fprintf(stderr, "\ngeom: trace prep @%zu:", gPrepOff / 4);
         for (int i = 0; i < 44; i++)
             fprintf(stderr, " %u", ((uint32_t *)gPrep.contents)[gPrepOff / 4 + i]);
+        fprintf(stderr, "\ngeom: trace prim slots @%zu:", gPrimOff / 4 + MGL_GEOM_HDR_WORDS + (size_t)(d->indexed ? d->count : 0));
+        {
+            size_t pw = (size_t)(d->indexed ? d->count : 0);
+            uint32_t *pp = (uint32_t *)gPrim.contents + gPrimOff / 4 + MGL_GEOM_HDR_WORDS + pw;
+            for (int i = 0; i < 8; i++) fprintf(stderr, " %u", pp[i]);
+        }
+        if (from_tess)
+        {
+            id<MTLBuffer> rb = (__bridge id<MTLBuffer>)d->tess_ring;
+            const uint32_t *cnt = (const uint32_t *)((const uint8_t *)rb.contents + d->tess_cnt_off);
+            const uint32_t *tidx = (const uint32_t *)((const uint8_t *)rb.contents + d->tess_idx_off);
+            const float *rec = (const float *)((const uint8_t *)rb.contents + d->tess_recs_off);
+            fprintf(stderr, "\ngeom: trace tess counts=%u,%u stride=%u idx:", cnt[0], cnt[1], d->tess_stride);
+            for (int i = 0; i < 8; i++) fprintf(stderr, " %u", tidx[i]);
+            fprintf(stderr, "\ngeom: trace tess rec[0]:");
+            for (int i = 0; i < 4; i++) fprintf(stderr, " %f", rec[i]);
+        }
         fprintf(stderr, "\ngeom: trace vsout @%zu:", gVsoutOff / 4);
         {
             uint32_t *p = (uint32_t *)gVsout.contents;
@@ -1522,6 +1694,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
             for (size_t i = (first == 0xffffffff ? 0 : first); i < n && i < (first == 0xffffffff ? 8 : first + 16); i++)
                 fprintf(stderr, " %8.3f", *(float *)&p[i]);
         }
+        fprintf(stderr, "\ngeom: trace cnt @%zu:", gCntOff / 4);
+        for (int i = 0; i < 8; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gCnt.contents)[gCntOff / 4 + i]);
         fprintf(stderr, "\ngeom: trace outv @%zu:", gOutvOff / 4);
         for (int i = 0; i < 12; i++)
         {
@@ -1533,6 +1708,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     /* ---- 3. raster pass ---- */
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
         return true;
+
 
     /* the geometry stage picks the output topology; Metal requires inputPrimitiveTopology
      * when the vertex function writes render_target_array_index / viewport_array_index */
@@ -1581,6 +1757,13 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
         [_currentRenderEncoder setVertexBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_DRAW];
 
+        if (getenv("MGL_GEOM_TRACE_DRAW"))
+        {
+            uint32_t *cp = (uint32_t *)gCtl.contents;
+            fprintf(stderr, "geom: trace raster prim=%d args=%u %u %u %u %u idx=%u %u %u\n",
+                    (int)prim, cp[8], cp[9], cp[10], cp[11], cp[12],
+                    ((uint32_t *)gIdx.contents)[0], ((uint32_t *)gIdx.contents)[1], ((uint32_t *)gIdx.contents)[2]);
+        }
         [_currentRenderEncoder drawIndexedPrimitives: prim
                                                indexType: MTLIndexTypeUInt32
                                              indexBuffer: gIdx

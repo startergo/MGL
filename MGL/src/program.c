@@ -1223,14 +1223,9 @@ static bool check_stage_mask(GLuint mask, char **log, bool separable)
 
     if (mask & SHADER_MASK_BIT(_GEOMETRY_SHADER))
     {
-        /* emulated by the geometry domain: the stage becomes a compute kernel; the
-         * combination with tessellation is rejected by mgl_geom_post_link */
-        if (mask & (SHADER_MASK_BIT(_TESS_CONTROL_SHADER) | SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
-        {
-            mgl_append_info_log(log, "ERROR: a geometry shader after tessellation stages is not supported "
-                                "(the Metal geometry emulation consumes the vertex stage output directly)\n");
-            return false;
-        }
+        /* emulated by the geometry domain: the stage becomes a compute kernel.  A geometry
+         * shader after tessellation stages consumes the tess domain's TES-output capture
+         * (mgl_ext_tess.h) instead of the vertex stage output. */
         if (!(mask & SHADER_MASK_BIT(_VERTEX_SHADER)) && !separable)
         {
             mgl_append_info_log(log, "ERROR: a program containing a geometry shader must contain a vertex shader\n");

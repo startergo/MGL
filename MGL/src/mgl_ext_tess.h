@@ -113,8 +113,11 @@ typedef struct MGLTessCapture {
     void    *buffer_object;  /* retained id<MTLBuffer>, keeps `buffer` mapped */
     size_t   records_offset; /* byte offset of the first record */
     size_t   index_offset;   /* byte offset of the uint32 vertex index list */
-    size_t   count_offset;   /* byte offset of the uint32 vertex count (GPU-written) */
+    size_t   count_offset;   /* byte offset of the uint32 counts: [0] records (GPU-written),
+                              * [1] index entries (GPU-written) */
     uint32_t stride;         /* record stride in 32-bit words */
+    uint32_t records;        /* record capacity of the ring block (sizing bound) */
+    uint32_t indices;        /* index list capacity in uint32 words (sizing bound) */
     uint32_t prim;           /* GL_TRIANGLES / GL_LINES / GL_POINTS of the output */
     uint32_t members;        /* number of used entries in member[], [0] is gl_Position */
     MGLTessCaptureMember member[MGL_TESS_CAPTURE_MAX];

@@ -1729,7 +1729,12 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         if (!have_pos)
             { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 5\n"); goto done; }               /* gl_Position must be present */
     }
-    tp->cap_stride = off;
+    /* Pad the record to a multiple of 4 words (16 bytes): every record starts with the
+     * gl_Position float4 store, and a device float4 store at a non-16-byte-aligned
+     * address is undefined on Metal - the tessellated vertices past the first would
+     * come back as garbage.  The consumers (the geometry domain's import kernel and the
+     * diagnostic capture query) read tp->cap_stride, so they follow the padding. */
+    tp->cap_stride = (off + 3u) & ~3u;
 
     if (tess_trace())
         fprintf(stderr, "MGL tess: capture: %s (stride %u, %d members)\n",
