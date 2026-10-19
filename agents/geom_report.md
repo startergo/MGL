@@ -226,3 +226,28 @@ from the xfb domain's own `glEndTransformFeedback` bookkeeping.  Next step: stam
 again at the *end* of `mglEndTransformFeedback` (after that bookkeeping, i.e. a hook there or
 re-stamp in the geometry domain's fold, which runs first and is therefore too early today) with
 the pack's serial `gXfbSerial`, so `prepare_cpu_read` waits for exactly that command buffer.
+
+### Round bca9e4c: the tracking theory was an artifact; the bug is a stale GS output range
+
+Two corrections and one decisive narrowing:
+
+* `mgl_geom_ctx` was only set at the end of `mgl_geom_route`, which the GPU-assembly path
+  never reaches (it returns early), so the readback trace ran with `ctx == NULL` and printed
+  `write_serial=0` for a **non-existent lookup**.  With that fixed the real state at the
+  reference read is `write_serial=2854 completed=2854 (no wait)` — the tracking is **correct**
+  and the fold has already waited.  The "two entries / wiped entry" theory is dead.
+* `MGL_GEOM_XFB_FLUSH=1` now opts into the per-draw commit+wait separately from
+  `MGL_GEOM_XFB_TRACE=1`, and `geom_xfb_dump` prints the GS output records at the fold:
+  they are **correct for every draw of both blocks** (verified: tri1/tri2/tri3 positions
+  *and* varyings, at the draw's own range).
+
+* The failing values are the tell: with the CPU pack (which "passes" because both blocks are
+  identically wrong) draws 2-3 capture `(0,1) (0,1) (0,1)` and `(-1.6,-1.2), (-1.6,0.8), (0,0)`
+  — i.e. **doubled** vertices.  The doubling factor belongs to `xfb_of_geometry_output`'s
+  geometry shader (`g_pos = v_pos * 2.0`), which runs earlier in the same process.  So the
+  pack is reading GS output records left in `gOutv` by *another program's earlier draw*, while
+  this draw's own records went elsewhere.  That points at the geometry kernel binding a stale
+  `gOutvOff` for the second and later draws of a block (write and read disagree on the range),
+  which the per-draw flush hides by forcing each draw into its own command buffer with fresh
+  bindings.  Next step: log `gOutvOff` in the GS binding and in the scatter binding for draw 2
+  of the multi-draw test; they should be identical — one of them is not.
