@@ -19,7 +19,6 @@ void mgl_ext_init_all(GLMContext ctx)
     mgl_ext_init_geom(ctx);
     mgl_ext_init_tess(ctx);
     mgl_ext_init_gpuaudit(ctx);
-    mgl_ext_init_assertaudit(ctx);
 }
 
 bool mgl_ext_get(GLMContext ctx, GLenum pname, GLuint type, void *data)

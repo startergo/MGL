@@ -492,53 +492,6 @@ TEST(unbound_shader_buffers_legal)
     }
 }
 
-/* ---------- the default vertex array object (name 0) ---------- */
-TEST(default_vao_legal)
-{
-    /* a shader with no vertex inputs draws through the default VAO */
-    const char *vs = "#version 450 core\n"
-                     "void main() { gl_Position = vec4(gl_VertexID == 0 ? -1.0 : 1.0, gl_VertexID == 1 ? 1.0 : -1.0, 0.0, 1.0); }\n";
-    const char *fs = "#version 450 core\nout vec4 col;\nvoid main() { col = vec4(1, 0, 0, 1); }\n";
-    GLuint p = mgl_make_program(vs, fs);
-    EXPECT_TRUE(p != 0);
-    if (p)
-    {
-        glUseProgram(p);
-        glBindVertexArray(0);                 /* the default VAO */
-        GLint binding = -1;
-        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &binding);
-        EXPECT_NO_GL_ERROR();
-        EXPECT_EQ_INT(binding, 0);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        EXPECT_NO_GL_ERROR();                 /* was GL_INVALID_OPERATION */
-        EXPECT_PIXEL(0, 0, 255, 0, 0, 255, 2);
-        glDeleteProgram(p);
-    }
-
-    /* ARB_vertex_attrib_binding entry points still reject "no VAO bound" */
-    GLuint vbo = 0;
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, 64, NULL, GL_STATIC_DRAW);
-    glBindVertexArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
-    EXPECT_NO_GL_ERROR();
-    glEnableVertexAttribArray(0);
-    EXPECT_NO_GL_ERROR();
-    glVertexAttribFormat(0, 4, GL_FLOAT, GL_FALSE, 0);
-    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glBindVertexBuffer(0, vbo, 0, 16);
-    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glVertexAttribBinding(0, 0);
-    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glVertexAttribDivisor(0, 1);
-    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glDisableVertexAttribArray(0);
-    EXPECT_NO_GL_ERROR();
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDeleteBuffers(1, &vbo);
-}
-
 int main(void)
 {
     RUN(ms_texture_storage_legal);
@@ -557,6 +510,5 @@ int main(void)
     RUN(get_integer64i_v_legal);
     RUN(unbound_compute_textures_legal);
     RUN(unbound_shader_buffers_legal);
-    RUN(default_vao_legal);
     return mgl_test_summary();
 }

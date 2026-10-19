@@ -632,7 +632,6 @@ typedef struct {
     struct MGLExtState_geom *ext_geom;
     struct MGLExtState_tess *ext_tess;
     struct MGLExtState_gpuaudit *ext_gpuaudit;
-    struct MGLExtState_assertaudit *ext_assertaudit;
 
     // put at end, big chunk of yuck
     GLMParams   var;
@@ -725,7 +724,6 @@ struct GLMMetalFuncs {
     struct MGLExtMetal_geom *ext_geom;
     struct MGLExtMetal_tess *ext_tess;
     struct MGLExtMetal_gpuaudit *ext_gpuaudit;
-    struct MGLExtMetal_assertaudit *ext_assertaudit;
 } ;
 
 typedef struct GLMContextRec_t {

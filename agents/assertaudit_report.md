@@ -1,7 +1,8 @@
 # assertaudit — removed `assert(0)` audit report
 
 Branch `gl46/assertaudit`. Base: `792cbab` ("adding golden images directory"), audit tree:
-`gl46-port @ 61b7ae5`..`65f5860`.
+`gl46-port` → `61b7ae5` (nullShaderBuffer) → `fd0ddde` (DEAD deletion) →
+`65f5860` (compute fallback) → report + default-VAO revert.
 
 ## 1. Method
 
@@ -22,19 +23,37 @@ Class counts over the 592 sites:
 
 | class | sites | notes |
 |---|---|---|
-| IMPL | 543 | real implementation now (domain agents + this audit) |
-| ILLEGAL | 370 | `non_core_unimplemented.c`: compat-profile entry points; `GL_INVALID_OPERATION` is mandated for them in a core context (GL 4.6 appendix "Deleted Features", and per-function error clauses) |
+| IMPL | 542 | real implementation now (domain agents + this audit) |
+| ILLEGAL | 371 | `non_core_unimplemented.c`: compat-profile entry points; `GL_INVALID_OPERATION` is mandated for them in a core context (GL 4.6 appendix "Deleted Features", and per-function error clauses). Includes the VAO-0 sites (see §2b). |
 | INTERNAL | 44 | internal invariants / defensive returns after rewrites (Metal resource mapping, hash tables, program introspection internals) — callers pre-validate |
 | DEAD | 12 | deleted in fd0ddde |
-| MISSING | 3 | fixed in 61b7ae5 and 65f5860 |
+| MISSING | 2 | fixed in 61b7ae5 (buffer blocks) and 65f5860 (compute images); the third candidate was re-classified ILLEGAL and reverted, see §2b |
 
 ## 2. MISSING items (fixed, one commit each)
 
 | file:line | function | legal input that used to fail | fix |
 |---|---|---|---|
 | `MGL/src/MGLRenderer.m` ~395 (`mapGLBuffersToMTLBufferMap`) | buffer → `[[buffer(n)]]` mapping for vertex/fragment/compute stages | draw / `glDispatchCompute(Indirect)` while a shader-declared UBO, SSBO or atomic-counter block has **no buffer bound**. Raised `GL_INVALID_OPERATION` and dropped the command. GL 4.6 (7.12 "Shader Memory Access", 9.2): unbound block ⇒ undefined accesses, the command still executes. | `nullShaderBuffer`: shared 64 KiB zero-filled `MTLBuffer` (associated-object cache, no header ivar) bound to the slot |
-| `MGL/src/vertex_arrays.c` `mglBindVertexArray` / `MGL/src/vertex_attrib.c` `VAO() == NULL` guards / `draw_buffers.c` `validate_vao` | default VAO handling | the **default vertex array object (name 0)** did not exist: `glDrawArrays`, `glVertexAttribPointer`, `glEnableVertexAttribArray`, `glGetVertexAttrib*` with VAO 0 raised `GL_INVALID_OPERATION`. GL 4.6 §10.4: name 0 is a real (default) VAO; only *client-side* pointers are forbidden in core. | new ext slot `MGL/src/mgl_ext_assertaudit.h` + `MGL/src/assertaudit.c` creates it at context init and binds it; `glBindVertexArray(0)` returns to it. The `ARB_vertex_attrib_binding` entry points (`glVertexAttrib*Format`, `glVertexAttribBinding`, `glBindVertexBuffer(s)`, `glVertexBindingDivisor`, `glVertexAttribDivisor`) still generate `GL_INVALID_OPERATION` for the default VAO — spec text "no vertex array object bound" + Mesa core behaviour |
 | `MGL/src/MGLRenderer.m` 3526 (`bindTexturesToComputeEncoder`) | compute-stage texture/image binding | `glDispatchCompute(Indirect)` while the kernel declares a **sampled texture or storage image whose unit is unbound** → `return false`, the whole dispatch silently did nothing. GL 4.6: fetches are undefined, the dispatch executes. | `computeFallbackTexture` / `computeFallbackSampler`: shared 1×1 black RGBA8 (read+write) texture + nearest/clamp sampler bound to the missing `[[texture(n)]]` / `[[sampler(n)]]` slots |
+
+## 2b. Re-classified as ILLEGAL after review (default VAO)
+
+The audit initially classified "no default vertex array object (name 0)" as a
+MISSING item and briefly created one (commit 61b7ae5); that was **wrong** and has
+been reverted. In a core-profile context there is no usable vertex array object
+zero: GL 4.6 core spec sections 10.3 and 10.4 generate `GL_INVALID_OPERATION` for commands
+that *set, query, or draw from* vertex array state when no vertex array object is
+bound (`glVertexAttribPointer`, `glEnable/DisableVertexAttribArray`,
+`glGetVertexAttrib*`, `glDraw*`, and the `ARB_vertex_attrib_binding` entry points).
+MGL's `ctx->state.vao == NULL` until `glBindVertexArray(n != 0)` is therefore
+spec-correct behaviour, and the original expectations in `test_vattrib.c`
+(`setter_errors`, `pointer_errors`) and `test_buffers.c` (`draw_errors`) were
+right. The revert restored those expectations exactly (`git diff 78f212a` on both
+files is empty).
+
+| site | function(s) | class |
+|---|---|---|
+| `vertex_attrib.c` `if (ctx->state.vao == NULL)` guards, `draw_buffers.c` `validate_vao`, `vertex_arrays.c`/`vertex_buffers.c` `if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION)` | `glVertexAttribPointer`, `glEnable/DisableVertexAttribArray`, `glGetVertexAttrib*`, `glGetVertexAttribPointerv`, `glVertexAttrib*Format`, `glVertexAttribBinding`, `glBindVertexBuffer(s)`, `glVertexBindingDivisor`, `glVertexAttribDivisor`, draws with no VAO bound | ILLEGAL — GL 4.6 core sections 10.3 and 10.4: `GL_INVALID_OPERATION` when no VAO is bound |
 
 ### MISSING items owned by other active workers (not touched)
 
@@ -72,7 +91,7 @@ invariant, DEAD = deleted, MISSING = fixed.
 | `fence.c` (9) | sync objects, `mglGetSynciv` (all four pnames), `mglClientWaitSync`, `mglWaitSync`, `mglDeleteSync(NULL)` | IMPL |
 | `get.c` (6) | `mglGetString(i)`, `mglGetInteger64v/i_v`, `mglGetInternalformativ/i64v` | IMPL |
 | `shaders.c` (4) | `glShaderTypeToGLMType`, `getGLSLStage`, `mglGetShaderiv`, `mglCompileShader` | IMPL (only the 6 core shader types exist; the defensive default is unreachable after `GL_INVALID_ENUM` validation) |
-| `vertex_arrays.c` (3), `vertex_attrib.c` | `mglGetVertexArray*`, VAO creation/binding | IMPL + MISSING #2 (default VAO) |
+| `vertex_arrays.c` (3), `vertex_attrib.c` | `mglGetVertexArray*`, VAO creation/binding | IMPL (queries) / ILLEGAL for the no-VAO guards (§2b) |
 | `rendering.c` (3) | `mglClear` | IMPL |
 | `samplers.c` (2) | `mglSamplerParameterI*`, `mglGetSamplerParameterI*` | IMPL (verified by probe: last-write-wins border colour visible through both int and uint views) |
 | `compute.c` (1), `draw_buffers.c` (1), `error.c` (1), `hash_table.c` (1) | `mglDispatchComputeIndirect`, `getTypeSize` (draw copy), `error_func`, `deleteHashElement` | IMPL / INTERNAL |
@@ -91,13 +110,13 @@ invariant, DEAD = deleted, MISSING = fixed.
 
 ## 5. Verification
 
-* `tests/headless/run.sh` — all 23 suites: **3966 checks, 0 failures**
-  (incl. the new `test_assertaudit`: 144 checks).
+* `tests/headless/run.sh` — all 23 suites: **3952 checks, 0 failures**
+  (incl. `test_assertaudit`: 132 checks).
 * `python3 agents/stub_scanner.py --list EMPTY|NOOP|ASSERT` — clean for every file.
 * `make -j8 lib` — no new warnings in touched files.
-* Spec-behaviour notes updated in `tests/headless/test_buffers.c` (`draw_errors`)
-  and `tests/headless/test_vattrib.c` (`setter_errors`, `pointer_errors`): both
-  encoded the old, spec-violating "VAO 0 always errors" behaviour.
+* `test_vattrib.c` / `test_buffers.c` are byte-identical to their pre-audit state
+  after the §2b revert (`git diff 78f212a -- tests/headless/test_vattrib.c
+  tests/headless/test_buffers.c` is empty).
 
 ## 6. Remaining gaps / emulation limits (user decisions, not silent errors)
 

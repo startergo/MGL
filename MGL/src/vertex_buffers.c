@@ -24,7 +24,6 @@
 
 #include "glm_context.h"
 #include "mgl_ext_vattrib.h"
-#include "mgl_ext_assertaudit.h"
 
 #define VA_ERROR(_e_) do { ctx->error_func(ctx, __FUNCTION__, (_e_)); return; } while (0)
 
@@ -137,15 +136,14 @@ bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint 
 
 void mglBindVertexBuffer(GLMContext ctx, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride)
 {
-    /* ARB_vertex_attrib_binding: INVALID_OPERATION when no VAO (the default object) is bound */
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     bindVertexBufferTo(ctx, VAO(), bindingindex, buffer, offset, stride);
 }
 
 void mglBindVertexBuffers(GLMContext ctx, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
 {
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     bindVertexBuffersTo(ctx, VAO(), first, count, buffers, offsets, strides);
 }

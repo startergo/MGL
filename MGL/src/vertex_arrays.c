@@ -26,7 +26,6 @@
 #include "glm_context.h"
 #include "vertex_arrays.h"
 #include "mgl_ext_vattrib.h"
-#include "mgl_ext_assertaudit.h"
 
 #define VA_ERROR(_e_) do { ctx->error_func(ctx, __FUNCTION__, (_e_)); return; } while (0)
 
@@ -256,9 +255,7 @@ void mglBindVertexArray(GLMContext ctx, GLuint array)
 
     if (array == 0)
     {
-        /* assertaudit: the default (name 0) vertex array object — the context
-         * starts bound to it and glUnbind-style glBindVertexArray(0) returns to it */
-        ptr = mgl_assertaudit_default_vao(ctx);
+        ptr = NULL;
     }
     else
     {
@@ -427,7 +424,7 @@ static void attribPointer(GLMContext ctx, GLuint index, GLint size, GLenum type,
     GLenum err = checkFormat(size, type, normalized, kind);
     if (err) VA_ERROR(err);
 
-    // the default VAO (name 0) exists: only client-side pointers are forbidden
+    // no default vertex array object in the core profile
     if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     Buffer *array_buffer = STATE(buffers[_ARRAY_BUFFER]);
@@ -475,22 +472,21 @@ void mglVertexAttribLPointer(GLMContext ctx, GLuint index, GLint size, GLenum ty
 
 void mglVertexAttribFormat(GLMContext ctx, GLuint attribindex, GLint size, GLenum type, GLboolean normalized, GLuint relativeoffset)
 {
-    /* ARB_vertex_attrib_binding: INVALID_OPERATION when no VAO (the default object) is bound */
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     attribFormat(ctx, VAO(), attribindex, size, type, normalized, FMT_FLOAT, relativeoffset);
 }
 
 void mglVertexAttribIFormat(GLMContext ctx, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset)
 {
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     attribFormat(ctx, VAO(), attribindex, size, type, GL_FALSE, FMT_INTEGER, relativeoffset);
 }
 
 void mglVertexAttribLFormat(GLMContext ctx, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset)
 {
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     attribFormat(ctx, VAO(), attribindex, size, type, GL_FALSE, FMT_LONG, relativeoffset);
 }
@@ -534,7 +530,7 @@ static void attribBinding(GLMContext ctx, VertexArray *vao, GLuint attribindex, 
 
 void mglVertexAttribBinding(GLMContext ctx, GLuint attribindex, GLuint bindingindex)
 {
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     attribBinding(ctx, VAO(), attribindex, bindingindex);
 }
@@ -563,7 +559,7 @@ static void bindingDivisor(GLMContext ctx, VertexArray *vao, GLuint bindingindex
 
 void mglVertexBindingDivisor(GLMContext ctx, GLuint bindingindex, GLuint divisor)
 {
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     bindingDivisor(ctx, VAO(), bindingindex, divisor);
 }
@@ -580,7 +576,7 @@ void mglVertexArrayBindingDivisor(GLMContext ctx, GLuint vaobj, GLuint bindingin
 void mglVertexAttribDivisor(GLMContext ctx, GLuint index, GLuint divisor)
 {
     if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
-    if (VAO() == NULL || mgl_assertaudit_default_vao_bound(ctx)) VA_ERROR(GL_INVALID_OPERATION);
+    if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     attribBinding(ctx, VAO(), index, index);
     bindingDivisor(ctx, VAO(), index, divisor);
