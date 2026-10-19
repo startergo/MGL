@@ -1,4 +1,5 @@
 #include "mgl_test.h"
+#include "mgl_tess_diag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -15,9 +16,6 @@
  *     with a pixel check proving the draws render.
  */
 
-extern void mgl_tess_gpu_time_reset(void);
-extern double mgl_tess_gpu_time_us(void);
-extern unsigned mgl_tess_cbs_completed(void);
 
 #define FRAMES   200
 #define BIG_VERTS (1000 * 1000)
@@ -83,6 +81,7 @@ static const char *kFs =
 
 TEST(IndexedCapacityCost)
 {
+    mgl_tess_diag_enable(1);   /* opt-in: attaches completion handlers per command buffer */
     GLuint p = glCreateProgram();
     struct { GLenum t; const char *s; } srcs[4] = {
         { GL_VERTEX_SHADER, kVs }, { GL_TESS_CONTROL_SHADER, kTcs },
