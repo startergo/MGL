@@ -2858,14 +2858,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     assert(fragmentFunction);
 
     // tess: the evaluation shader is the (rewritten) vertex function of the pipeline —
-    // the vertex stage runs as a compute kernel before the render pass
+    // the vertex stage runs as a compute kernel before the render pass. The plain
+    // (non-post-tessellation) TES variant renders the emulated domains (isolines,
+    // point_mode) and the MGL_TESS_CPU reference path, whose draws are ordinary
+    // primitives a tessellation pipeline would not rasterize.
     if (vertexFunction.functionType == MTLFunctionTypeKernel)
     {
         Shader *tes = program->shader_slots[_TESS_EVALUATION_SHADER];
         MGLTessProgram *tp = mgl_tess_active_program(ctx);
 
         if (tp && tp->plain_function &&
-            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode))
+            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode ||
+             mgl_tess_cpu_reference()))
             vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;  /* emulated TES */
         else if (tes && tes->mtl_data.function)
             vertexFunction = (__bridge id<MTLFunction>)(tes->mtl_data.function);
@@ -3313,7 +3317,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             {
                 MGLTessProgram *tp = mgl_tess_active_program(ctx);
                 bool emulated = tp && tp->plain_function &&
-                                (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode);
+                                (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode ||
+                                 mgl_tess_cpu_reference());
                 if (!emulated)
                 {
                     MTLVertexDescriptor *tvd = [self extTessVertexDescriptor];

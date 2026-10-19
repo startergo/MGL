@@ -151,6 +151,396 @@ TEST(TessTriangleDomain)
     return;
 }
 
+/* ------------------------------------------------------------------ canonical records
+ * The control point / per-patch records must be laid out by GL varying location for
+ * every stage of the pipeline: a TES that declares but never uses a varying, declares
+ * its inputs in a different order than the TCS writes them, per-patch varyings with
+ * different names, or arrayed varyings must never shift the data. Each test renders
+ * the reference triangle and checks the image strictly. */
+
+/* full-image check: every pixel of the lower-left half inside the triangle must be
+ * lit, everything above the anti-diagonal must stay clear; the two-pixel band around
+ * the diagonal itself is ignored (edge sampling). The reference triangle's corners
+ * are (-1,1),(-1,-1),(1,-1): its hypotenuse is the anti-diagonal x + y = w */
+static void check_strict_half(const char *tag, int min_covered)
+{
+    static float img[512 * 512 * 4];
+    GLint vp[4] = { 0, 0, 0, 0 };
+    int w, h, covered = 0, bad = 0;
+
+    glGetIntegerv(GL_VIEWPORT, vp);
+    w = vp[2] > 0 ? vp[2] : 128;
+    h = vp[3] > 0 ? vp[3] : 128;
+    if (w > 512 || h > 512)
+        w = h = 512;
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, img);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            const float *px = &img[(y * w + x) * 4];
+            float lum = px[0] + px[1] + px[2];
+            if (x + y <= w - 3)
+            {
+                if (lum > 0.2f) covered++;
+            }
+            else if (x + y >= w + 1 && lum > 0.2f)
+                bad++;
+        }
+    if (bad || covered < min_covered)
+    {
+        int minx = 999, miny = 999, maxx = -1, maxy = -1, cnt = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                if (img[(y * w + x) * 4] > 0.5f)
+                {
+                    cnt++;
+                    if (x < minx) minx = x;
+                    if (x > maxx) maxx = x;
+                    if (y < miny) miny = y;
+                    if (y > maxy) maxy = y;
+                }
+        fprintf(stderr, "  [%s] covered=%d bad=%d lit=%d bbox=(%d,%d)-(%d,%d) vp=%dx%d\n",
+                tag, covered, bad, cnt, minx, miny, maxx, maxy, w, h);
+    }
+    EXPECT_TRUE(bad == 0);
+    EXPECT_TRUE(covered >= min_covered);
+}
+
+/* point_mode: every rasterized point must lie inside the triangle */
+static void check_points_inside(const char *tag, int min_points)
+{
+    static float img[512 * 512 * 4];
+    GLint vp[4] = { 0, 0, 0, 0 };
+    int w, h, points = 0, bad = 0;
+
+    glGetIntegerv(GL_VIEWPORT, vp);
+    w = vp[2] > 0 ? vp[2] : 128;
+    h = vp[3] > 0 ? vp[3] : 128;
+    if (w > 512 || h > 512)
+        w = h = 512;
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, img);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (img[(y * w + x) * 4] + img[(y * w + x) * 4 + 1] + img[(y * w + x) * 4 + 2] > 0.2f)
+            {
+                points++;
+                if (x + y > w + 1)
+                    bad++;
+            }
+    if (bad || points < min_points)
+        fprintf(stderr, "  [%s] points=%d bad=%d vp=%dx%d\n", tag, points, bad, w, h);
+    EXPECT_TRUE(bad == 0);
+    EXPECT_TRUE(points >= min_points);
+}
+
+/* interior reference triangle (point_mode tests): no control point or tessellated
+ * vertex lands exactly on a clip boundary, so every lattice point rasterizes */
+static const float kIntPos[3][4] = {
+    { -0.6f,  0.6f, 0, 1 },
+    { -0.6f, -0.6f, 0, 1 },
+    {  0.6f, -0.6f, 0, 1 },
+};
+
+static void draw_reference_patch(void)
+{
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glFinish();
+}
+
+/* pixel near reference triangle corner 0 (top-left), 1 (bottom-left), 2 (bottom-right),
+ * moved diagonally inside so it is not on the hypotenuse (x + y = 0) */
+static void corner_px(int corner, int *x, int *y)
+{
+    GLint vp[4] = { 0, 0, 0, 0 };
+    int w, h;
+
+    glGetIntegerv(GL_VIEWPORT, vp);
+    w = vp[2] > 0 ? vp[2] : 128;
+    h = vp[3] > 0 ? vp[3] : 128;
+    *x = (corner == 2) ? w - w / 8 : w / 16;
+    *y = (corner == 0) ? h - h / 8 : h / 16;
+}
+
+/* TCS writes two varyings; the TES declares both but reads only gl_Position */
+static const char *kTcsUnused =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "layout(location=1) out vec4 tc_extra[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  tc_extra[gl_InvocationID] = vec4(0.5, 0.5, 0.5, 1.0);\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *kTesUnused(const char *layout)   /* layout: with/without point_mode */
+{
+    static char buf[1024];
+    snprintf(buf, sizeof buf,
+        "#version 450 core\n"
+        "layout(%s) in;\n"
+        "layout(location=0) in vec4 tc_col[];\n"
+        "layout(location=1) in vec4 tc_extra[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = vec4(1, 1, 1, 1);\n"
+        "}\n", layout);
+    return buf;
+}
+
+/* the same, but the TCS also never writes what the VS sent (v_col unused by the TCS) */
+static const char *kTcsUnusedIn =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=1) in vec4 v_unused[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = vec4(1.0);\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+TEST(TessUnusedTesInput)
+{
+    /* hardware path (drawPatches) */
+    GLuint prog = make_program(kTcsUnused, kTesUnused("triangles, equal_spacing, ccw"));
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    draw_reference_patch();
+    check_strict_half("unused-input hw", 18000);
+    glDeleteProgram(prog);
+
+    /* emulated path (point_mode renders through the plain TES): interior corners, so
+     * every tessellated vertex of the level-3 lattice (10 points) rasterizes */
+    prog = make_program(kTcsUnused, kTesUnused("triangles, equal_spacing, ccw, point_mode"));
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kIntPos, kTriCol, 3);
+    draw_reference_patch();
+    check_points_inside("unused-input emu", 10);
+    glDeleteProgram(prog);
+}
+
+TEST(TessUnusedTcsInput)
+{
+    /* the TCS declares a VS output it never reads: its input record must still match
+     * the vertex kernel's output record */
+    GLuint prog = make_program(kTcsUnusedIn, kTesUnused("triangles, equal_spacing, ccw"));
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    draw_reference_patch();
+    check_strict_half("unused-tcs-input hw", 18000);
+    glDeleteProgram(prog);
+}
+
+/* TCS writes locations 1, 0, 2 in that source order; the TES declares 2, 0, 1 */
+static const char *kTcsOrder =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=1) out vec4 tc_b[];\n"
+    "layout(location=0) out vec4 tc_a[];\n"
+    "layout(location=2) out vec4 tc_c[];\n"
+    "void main() {\n"
+    "  tc_b[gl_InvocationID] = vec4(0.0, 1.0, 0.0, 1.0);\n"
+    "  tc_a[gl_InvocationID] = vec4(1.0, 0.0, 0.0, 1.0);\n"
+    "  tc_c[gl_InvocationID] = vec4(0.0, 0.0, 1.0, 1.0);\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 4.0; gl_TessLevelOuter[1] = 4.0; gl_TessLevelOuter[2] = 4.0;\n"
+    "    gl_TessLevelInner[0] = 4.0;\n"
+    "  }\n"
+    "}\n";
+
+
+
+
+static const char *kTesOrder =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=2) in vec4 t_c[];\n"     /* different names than the TCS, */
+    "layout(location=0) in vec4 t_a[];\n"     /* declared in another order */
+    "layout(location=1) in vec4 t_b[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  f_col = gl_TessCoord.x * t_a[0] + gl_TessCoord.y * t_b[1] + gl_TessCoord.z * t_c[2];\n"
+    "}\n";
+
+TEST(TessReorderedInputs)
+{
+    GLuint prog = make_program(kTcsOrder, kTesOrder);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    draw_reference_patch();
+
+    /* the corners take their colour from the varying at the matching location,
+     * whatever order the two stages declare them in */
+    float c[4];
+    int px, py;
+    corner_px(0, &px, &py);
+    read_px(px, py, c);
+    corner_px(1, &px, &py);
+    read_px(px, py, c);
+    corner_px(2, &px, &py);
+    read_px(px, py, c);
+    fprintf(stderr, " c2=(%.2f,%.2f,%.2f)\n", c[0], c[1], c[2]);
+    corner_px(0, &px, &py);
+    read_px(px, py, c);      /* corner 0: location 0 = red */
+    EXPECT_TRUE(c[0] > 0.6f);
+    EXPECT_TRUE(c[1] < 0.4f);
+    corner_px(1, &px, &py);
+    read_px(px, py, c);      /* corner 1: location 1 = green */
+    EXPECT_TRUE(c[1] > 0.6f);
+    EXPECT_TRUE(c[0] < 0.4f);
+    corner_px(2, &px, &py);
+    read_px(px, py, c);      /* corner 2: location 2 = blue */
+    EXPECT_TRUE(c[2] > 0.6f);
+    EXPECT_TRUE(c[0] < 0.4f);
+    check_strict_half("reordered hw", 18000);
+    glDeleteProgram(prog);
+}
+
+/* per-patch varyings: the names differ between the stages and one is never read */
+static const char *kTcsPatch =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "layout(location=2) patch out vec4 p_col;\n"
+    "layout(location=3) patch out vec4 p_extra;\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    p_col = vec4(0.75, 0.5, 0.25, 1.0);\n"
+    "    p_extra = vec4(1.0, 0.0, 0.0, 1.0);\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *kTesPatch =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=3) patch in vec4 p_unused;\n"
+    "layout(location=2) patch in vec4 t_col;   /* different name, same location */\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  f_col = t_col;\n"
+    "}\n";
+
+TEST(TessPerPatchVaryings)
+{
+    GLuint prog = make_program(kTcsPatch, kTesPatch);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    draw_reference_patch();
+
+    /* every lit pixel carries the per-patch colour (0.75, 0.5, 0.25) */
+    float c[4];
+    {
+        GLint vp[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_VIEWPORT, vp);
+        read_px(vp[2] / 4, vp[3] / 2, c);   /* interior of the triangle */
+    }
+    EXPECT_NEAR(c[0], 0.75f, 0.02f);
+    EXPECT_NEAR(c[1], 0.50f, 0.02f);
+    EXPECT_NEAR(c[2], 0.25f, 0.02f);
+    check_strict_half("per-patch hw", 18000);
+    glDeleteProgram(prog);
+}
+
+/* arrayed varying: the record holds a 2-element array at one location */
+static const char *kTcsArr =
+    "#version 450 core\n"
+    "#extension GL_ARB_arrays_of_arrays : enable\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_arr[][2];\n"
+    "void main() {\n"
+    "  tc_arr[gl_InvocationID][0] = vec4(1.0, 0.0, 0.0, 1.0);\n"
+    "  tc_arr[gl_InvocationID][1] = vec4(0.0, 0.0, 1.0, 1.0);\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *kTesArr =
+    "#version 450 core\n"
+    "#extension GL_ARB_arrays_of_arrays : enable\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_arr[][2];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  f_col = gl_TessCoord.x * tc_arr[0][1] + gl_TessCoord.z * tc_arr[2][0];\n"
+    "}\n";
+
+TEST(TessArrayedVarying)
+{
+    GLuint prog = make_program(kTcsArr, kTesArr);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    draw_reference_patch();
+
+    /* corner 0 reads the array's second element (blue), corner 2 the first (red) */
+    float c[4];
+    int px, py;
+    corner_px(0, &px, &py);
+    read_px(px, py, c);
+    EXPECT_TRUE(c[2] > 0.6f);
+    EXPECT_TRUE(c[0] < 0.4f);
+    corner_px(2, &px, &py);
+    read_px(px, py, c);
+    EXPECT_TRUE(c[0] > 0.6f);
+    EXPECT_TRUE(c[2] < 0.4f);
+    check_strict_half("arrayed hw", 18000);
+    glDeleteProgram(prog);
+}
+
 TEST(TessErrors)
 {
     GLuint p = glCreateProgram();
@@ -859,6 +1249,11 @@ int main(void)
     RUN(TessTriangleDomain);
     RUN(TessQuadDomain);
     RUN(TessOrientationCulling);
+    RUN(TessUnusedTesInput);
+    RUN(TessUnusedTcsInput);
+    RUN(TessReorderedInputs);
+    RUN(TessPerPatchVaryings);
+    RUN(TessArrayedVarying);
     RUN(TessProgramQueries);
     RUN(TessErrors);
     RUN(TessDefaultLevels);
