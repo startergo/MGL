@@ -41,6 +41,10 @@
 #define MGL_TESS_TCS_FACTORS    27      /* SPVC MSL_SHADER_TESS_FACTOR_OUTPUT_BUFFER_INDEX */
 #define MGL_TESS_TCS_PARAMS     28      /* SPVC MSL_INDIRECT_PARAMS_BUFFER_INDEX */
 #define MGL_TESS_TES_PARAMS     26      /* render stage: cp-per-patch, patch count */
+#define MGL_TESS_TES_CAP_COUNT  30      /* capture kernel: GPU-written vertex count */
+#define MGL_TESS_TES_CAP_RECS   24      /* capture kernel: packed output records (24 is a
+                                         * TCS-only reservation, free in the TES kernel;
+                                         * Metal compute allows buffer indices 0..30) */
 /* hardware path vertex descriptor buffers (above any TES uniform buffers) */
 #define MGL_TESS_VD_CP           8      /* control point records (PerPatchControlPoint) */
 #define MGL_TESS_VD_PATCH        9      /* per-patch data (PerPatch) */
@@ -77,6 +81,50 @@ typedef struct MGLTessPatchMember_t {
 } MGLTessPatchMember;
 
 /* per-program tessellation information, filled at link time */
+/* ---- TES-output capture: the producer side of tess -> geometry / transform feedback.
+ *
+ * mgl_tess_set_capture(ctx, program, true) makes every GL_PATCHES draw of that
+ * program write the TES outputs to a GPU buffer, one record per tessellated vertex:
+ *
+ *   word 0..3   gl_Position (float4, unmodified — no rasterizer y/depth fixup)
+ *   then, per user output varying in declaration order, packed with no padding:
+ *               words = elems * cols * rows * base_words   (base_words = 2 for
+ *               double, else 1) — the same rule geometry.c uses for its captured
+ *               VS-output records, so the geometry kernel can consume the records
+ *   stride      tp->cap.stride words per record
+ *
+ * The consumer matches varyings by NAME from capture.members (geometry.c matches
+ * its inputs by name the same way the tess blob map does). The draw is routed
+ * through the emulated tessellation path so the vertex stream is GPU-visible,
+ * and the results are published in the context's MGLTessCapture (below) — valid
+ * until the next GL_PATCHES draw. The vertex count is GPU-written (at
+ * count_offset) for indirect consumers; the tessellated primitive indices are
+ * uint32 at index_offset. */
+#define MGL_TESS_CAPTURE_MAX 16
+typedef struct MGLTessCaptureMember {
+    char     name[64];
+    uint32_t words;       /* packed word count of this member */
+    uint32_t offset;      /* word offset within the record */
+} MGLTessCaptureMember;
+
+typedef struct MGLTessCapture {
+    void    *buffer;         /* CPU address of the ring block's storage (ring.contents):
+                              * stable for the lifetime of buffer_object */
+    void    *buffer_object;  /* retained id<MTLBuffer>, keeps `buffer` mapped */
+    size_t   records_offset; /* byte offset of the first record */
+    size_t   index_offset;   /* byte offset of the uint32 vertex index list */
+    size_t   count_offset;   /* byte offset of the uint32 vertex count (GPU-written) */
+    uint32_t stride;         /* record stride in 32-bit words */
+    uint32_t prim;           /* GL_TRIANGLES / GL_LINES / GL_POINTS of the output */
+    uint32_t members;        /* number of used entries in member[], [0] is gl_Position */
+    MGLTessCaptureMember member[MGL_TESS_CAPTURE_MAX];
+    uint64_t serial;         /* bumped on every producing draw */
+    bool     valid;
+} MGLTessCapture;
+
+void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable);
+const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx);   /* last capture */
+
 typedef struct MGLTessProgram_t {
     struct MGLTessProgram_t *next;
     Program *program;
@@ -121,6 +169,15 @@ typedef struct MGLTessProgram_t {
     uint32_t blob_size[MGL_TESS_BLOB_MAX];
     int      blob_map_n;
 
+    /* TES-output capture (see the MGLTessCapture contract above) */
+    bool     capture;
+    uint32_t cap_stride;                 /* record stride in words */
+    MGLTessCaptureMember cap_members[MGL_TESS_CAPTURE_MAX];
+    int      cap_members_n;
+    void    *capture_function;           /* compiled kernel (owned by the renderer) */
+    void    *capture_library;
+    void    *capture_pso;                /* id<MTLComputePipelineState>, bridged */
+
     /* hardware path: [[patch(domain, N)]] control point count baked into the TES MSL */
     int     hw_cp_count;
 
@@ -138,6 +195,10 @@ typedef struct MGLTessProgram_t {
 
 struct MGLExtState_tess {
     MGLTessProgram *programs[MGL_TESS_PROGRAM_HASH];
+
+    /* published TES-output capture of the last GL_PATCHES draw (valid until the
+     * next one) — see the MGLTessCapture contract above */
+    MGLTessCapture capture;
 
     /* draw-time CPU tessellation scratch (grown on demand) */
     float  *coord_buf;      /* 4 floats per tessellated vertex: u, v, w, patch id */
@@ -201,8 +262,11 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);   /* 8 tri / 12 quad */
 char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees */
+char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp); /* caller frees */
 bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
                              char *cp_name, size_t cp_len, size_t *record_size);
+
+
 
 /* CPU-work diagnostics: incremented by the CPU-side paths above (mgl_tess_note_*);
  * the test-visible getters live in tests/headless/mgl_tess_diag.h */

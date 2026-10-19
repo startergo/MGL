@@ -50,9 +50,21 @@ static const char *kTesIso =
     "  gl_Position.y = mix(-0.75, 0.75, gl_TessCoord.y);\n"
     "  f_col = mix(tc_col[0], tc_col[1], gl_TessCoord.x);\n"
     "}\n";
-/* quads with point mode: emit the corners as points */
-static const char *kTesQuadPt =
+/* quads WITHOUT point mode: capture must report the VERTEX count (4 corners at
+ * level 1), not the index count (2 triangles = 6) */
+static const char *kTesQuadFill =
     "#version 450 core\n"
+    "layout(quads, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+    "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+    "  f_col = tc_col[0];\n"
+    "}\n";
+
+/* quads with point mode: emit the corners as points */
+static const char *kTesQuadPt =    "#version 450 core\n"
     "layout(quads, equal_spacing, ccw, point_mode) in;\n"
     "layout(location=0) in vec4 tc_col[];\n"
     "layout(location=0) out vec4 f_col;\n"
@@ -586,6 +598,115 @@ TEST(EmuDefaultLevelsGpu)
     glDeleteProgram(p);
 }
 
+
+
+/* ------------- TES-output capture (producer for geometry / transform feedback) ----
+ * A triangle patch with levels 1 emits exactly its 3 control-point vertices; the
+ * capture records must match the TES math: barycentric position and the varying. */
+TEST(TessOutputCapture)
+{
+    GLuint p = prog2(kTcsTri, kTesTriPt);   /* barycentric mix + tc_col */
+    GLint link = 0;
+    void *buf = NULL;
+    uint32_t off = 0, cstride = 0, prim = 0, count = 0;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    const float pos[3][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 }, { 0,0.5f,0,1 } };
+    const float col[3][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 } };
+    setup(pos, col, 3, 3);
+
+    mgl_tess_diag_capture(p, 1);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    glFinish();                       /* the ring block is CPU-visible after completion */
+    mgl_tess_diag_capture(p, 0);
+
+    if (!mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count))
+    {
+        printf("capture: not published\n");
+        EXPECT_TRUE(false);
+        return;
+    }
+    printf("capture: prim=0x%x stride=%u words, count=%u\n",
+           (unsigned)prim, cstride, (unsigned)count);
+    EXPECT_TRUE(cstride >= 8);                 /* pos(4) + col(4) */
+    EXPECT_TRUE(count == 3);                   /* levels 1: the 3 corners */
+
+    {
+        const float *r = (const float *)((const uint8_t *)buf + off);
+        int ok = 0;
+        for (uint32_t i = 0; i < count && i < 8; i++)
+        {
+            float x = r[(size_t)i * cstride + 0], y = r[(size_t)i * cstride + 1];
+            for (int k = 0; k < 3; k++)
+                if (x == pos[k][0] && y == pos[k][1])
+                {
+                    /* the TES writes f_col = tc_col[0] for every vertex: the colour of
+                     * control point 0 (tc_col[0] = a_col[0]), not of the matched corner */
+                    EXPECT_TRUE(r[(size_t)i * cstride + 4] == col[0][0] &&
+                                r[(size_t)i * cstride + 5] == col[0][1] &&
+                                r[(size_t)i * cstride + 6] == col[0][2]);
+                    ok++;
+                }
+        }
+        printf("capture: %d/3 corner records match the TES math\n", ok);
+        EXPECT_TRUE(ok == 3);
+    }
+
+    /* ---- second phase: filled QUAD domain (no point mode): the count must be the
+     * vertex count (4 corners at level 1), not the index count (2 triangles = 6) */
+    {
+        const float qpos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 },
+                                   { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
+        const float qcol[4][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 }, { 1,1,0,1 } };
+        GLuint pq = prog2(kTcsQuad, kTesQuadFill);
+        GLint lq = 0;
+        void *bq = NULL;
+        uint32_t oq = 0, sq = 0, pqm = 0, cq = 0;
+
+        glGetProgramiv(pq, GL_LINK_STATUS, &lq);
+        EXPECT_EQ_INT(lq, GL_TRUE);
+        glUseProgram(pq);
+        setup(qpos, qcol, 4, 4);
+        mgl_tess_diag_capture(pq, 1);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawArrays(GL_PATCHES, 0, 4);
+        glFinish();
+        mgl_tess_diag_capture(pq, 0);
+        if (!mgl_tess_diag_capture_info(&bq, &oq, &sq, &pqm, &cq))
+        {
+            printf("capture(quad): not published\n");
+            EXPECT_TRUE(false);
+        }
+        else
+        {
+            printf("capture(quad): prim=0x%x stride=%u count=%u\n", pqm, sq, cq);
+            EXPECT_EQ_INT(cq, 4);
+            EXPECT_EQ_INT(pqm, GL_TRIANGLES);
+            {
+                const float *rq = (const float *)((const uint8_t *)bq + oq);
+                int okq = 0;
+
+                for (uint32_t i = 0; i < cq && i < 8; i++)
+                    for (int k = 0; k < 4; k++)
+                        if (rq[(size_t)i * sq + 0] == qpos[k][0] &&
+                            rq[(size_t)i * sq + 1] == qpos[k][1])
+                            okq++;
+                EXPECT_TRUE(okq == 4);
+                if (okq != 4)
+                    printf("capture(quad): %d/4 corners found\n", okq);
+            }
+        }
+    }
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(IsolinesGpu);
@@ -593,6 +714,7 @@ int main(void)
     RUN(TrianglePointModeGpu);
     RUN(EmuPatchDataGpu);
     RUN(EmuDefaultLevelsGpu);
+    RUN(TessOutputCapture);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }
