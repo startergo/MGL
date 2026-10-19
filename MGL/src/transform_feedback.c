@@ -650,6 +650,11 @@ static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version
     if (vstr) sscanf(vstr, "#version %d", &version);
     int options = GLSLANG_SHADER_VULKAN_RULES_RELAXED;
     if (version < 330) options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
+    /* match the program's own compile (shaders.c): GL assigns interface locations and
+     * bindings at link time, so a shader that relies on that must compile here too — and the
+     * invented locations/bindings are the same glslang would invent for the program, keeping
+     * the reflection and the capture variant consistent with it */
+    options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS | GLSLANG_SHADER_AUTO_MAP_BINDINGS;
 
     glslang_shader_t *sh = glslang_shader_create(&input);
     if (!sh) { *log = strdup("glslang_shader_create failed"); return false; }
@@ -1020,7 +1025,51 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 explicit_stride[var_buffer] = spvc_compiler_get_decoration(c, r->id, SpvDecorationXfbStride);
 
             unsigned members = is_block ? spvc_type_get_num_member_types(base) : 1;
+            /* an array of blocks is unrolled: SPIR-V gives the member offsets inside one
+             * element but no ArrayStride for an interface block array, so the element size
+             * is the extent of the members (std430 rules, which is what glslang used for the
+             * offsets), rounded up to the block alignment.  Element e of `blk` then lands at
+             * member_offset + e * elem_stride. */
+            GLuint elems = 1, elem_stride = 0;
+            if (is_block)
+            {
+                spvc_type vt = spvc_compiler_get_type_handle(c, r->type_id);
+                unsigned dims = spvc_type_get_num_array_dimensions(vt);
+
+                if (dims)
+                {
+                    if (dims != 1)
+                    {
+                        xfb_fail(xp, "arrays of blocks with xfb_offset may have one dimension (%s)",
+                                 var_name ? var_name : "?", NULL);
+                        return false;
+                    }
+                    elems = spvc_type_get_array_dimension(vt, 0);
+                    if (spvc_compiler_has_decoration(c, r->type_id, SpvDecorationArrayStride))
+                        elem_stride = spvc_compiler_get_decoration(c, r->type_id, SpvDecorationArrayStride);
+                    if (!elem_stride)
+                    {
+                        for (unsigned mm = 0; mm < members; mm++)
+                        {
+                            spvc_type_id mt = spvc_type_get_member_type(base, mm);
+                            MGLXfbVarying tmp;
+                            bool tmp_whole = false;
+                            GLuint o;
+
+                            memset(&tmp, 0, sizeof tmp);
+                            if (!spvc_compiler_has_member_decoration(c, r->base_type_id, mm, SpvDecorationOffset))
+                                continue;
+                            o = spvc_compiler_get_member_decoration(c, r->base_type_id, mm, SpvDecorationOffset);
+                            if (xfb_leaf(c, mt, 0, &tmp, &tmp_whole) || !tmp.words) continue;   /* not capturable */
+                            if (o + tmp.words * 4 > elem_stride) elem_stride = o + tmp.words * 4;
+                        }
+                        elem_stride = (elem_stride + 15) & ~15u;
+                    }
+                }
+            }
+
             for (unsigned m = 0; m < members; m++) {
+                for (GLuint e = 0; e < elems; e++) {
                 bool has_off;
                 GLuint off, buf = var_buffer;
                 spvc_type_id tid;
@@ -1029,7 +1078,8 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 if (is_block) {
                     has_off = spvc_compiler_has_member_decoration(c, r->base_type_id, m, SpvDecorationOffset);
                     if (!has_off) continue;
-                    off = spvc_compiler_get_member_decoration(c, r->base_type_id, m, SpvDecorationOffset);
+                    off = spvc_compiler_get_member_decoration(c, r->base_type_id, m, SpvDecorationOffset)
+                          + e * elem_stride;
                     if (spvc_compiler_has_member_decoration(c, r->base_type_id, m, SpvDecorationXfbBuffer))
                         buf = spvc_compiler_get_member_decoration(c, r->base_type_id, m, SpvDecorationXfbBuffer);
                     if (spvc_compiler_has_member_decoration(c, r->base_type_id, m, SpvDecorationXfbStride) && buf < MGL_XFB_MAX_BUFFERS)
@@ -1037,17 +1087,15 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                     const char *mn = spvc_compiler_get_member_name(c, r->base_type_id, m);
                     const char *bn = spvc_compiler_get_name(c, r->base_type_id);
                     if (var_name && var_name[0]) {
-                        snprintf(name, sizeof(name), "%s.%s", bn, mn);
-                        snprintf(expr, sizeof(expr), "%s.%s", var_name, mn);
+                        if (elems > 1) snprintf(name, sizeof(name), "%s[%u].%s", bn, e, mn);
+                        else snprintf(name, sizeof(name), "%s.%s", bn, mn);
+                        if (elems > 1) snprintf(expr, sizeof(expr), "%s[%u].%s", var_name, e, mn);
+                        else snprintf(expr, sizeof(expr), "%s.%s", var_name, mn);
                     } else {
                         snprintf(name, sizeof(name), "%s", mn);
                         snprintf(expr, sizeof(expr), "%s", mn);
                     }
                     tid = spvc_type_get_member_type(base, m);
-                    if (spvc_type_get_num_array_dimensions(spvc_compiler_get_type_handle(c, r->type_id))) {
-                        xfb_fail(xp, "arrays of blocks with xfb_offset are not supported (%s)", name, NULL);
-                        return false;
-                    }
                 } else {
                     has_off = spvc_compiler_has_decoration(c, r->id, SpvDecorationOffset);
                     if (!has_off) continue;
@@ -1074,6 +1122,7 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 src_word += v->words;
                 xp->buffer_mask |= 1u << buf;
                 if (off + v->words * 4 > xp->stride[buf]) xp->stride[buf] = off + v->words * 4;
+                }
             }
         }
     }

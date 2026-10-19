@@ -45,6 +45,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #import "MGLRenderer_Private.h"
 #import "mgl_ext_introspect.h"
+#import "mgl_ext_geom.h"
 #import "mgl_ext_program.h"
 #import "mgl_ext_tess.h"
 #import "MGLRenderer+TextureExt.h"
@@ -2869,6 +2870,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         }
     }
 
+
+
+    // geom: the geometry domain's pass-through vertex function reads the geometry kernel's output from a buffer instead of the app's attributes; it must win over the program's own vertex function.  A bound program pipeline's composite is rebuilt from the stage programs inside begin_draw (mgl_program_scope_enter copies MSL by value), so substituting the composite there is discarded.  The override is a renderer-level override consulted here, and the PSO cache key includes it (MGLRenderer+GpauctAudit.m).
+    if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
+        vertexFunction = (__bridge id<MTLFunction>)((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override;
+
     // Configure a pipeline descriptor that is used to create a pipeline state.
     pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
     assert(pipelineStateDescriptor);
@@ -2881,10 +2888,29 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // blend / masks / raster / shader-variant state (rstate category)
     [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
+
     [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     // blend state, vertex descriptor, depth/stencil formats are bound by their domains
     [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
+
+    // geom: rstateConfigurePipelineDescriptor (called twice above — directly and through
+    // bindBlendStateToPipelineStateDescriptor) replaces the vertex function with a specialized
+    // copy of the PROGRAM's vertex shader, silently discarding the pass-through override
+    // applied above.  Re-apply it as a specialized copy of the pass-through function (the same
+    // vertex function constants: it is the last pre-rasterization stage of the emulated
+    // geometry pipeline).  The descriptor's vertexFunction is part of the PSO cache key
+    // (MGLRenderer+Gpuaudit.m), so an overridden and a plain build never alias.
+    {
+        id<MTLFunction> geomVertexFunction = [self geomSpecializeVertexOverride];
+        if (geomVertexFunction)
+        {
+            pipelineStateDescriptor.vertexFunction = geomVertexFunction;
+            if (getenv("MGL_GEOM_DEBUG"))
+                NSLog(@"MGL geom: PSO vertex function is the pass-through %@", geomVertexFunction.name);
+        }
+    }
+
 
     // the geometry domain needs the topology class set when its pass-through vertex
     // function writes render_target_array_index / viewport_array_index (gl_Layer /

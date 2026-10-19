@@ -24,6 +24,14 @@
 #include "mgl_ext_geom_xfb.h"
 #include "MGLRenderer_Private.h"
 
+/* rstate's vertex/fragment function-constant specialization is declared privately inside
+ * MGLRenderer+RenderState.m; the geometry pass-through function needs the vertex half of it
+ * (it is the last pre-rasterization stage), so the prototype is repeated here rather than
+ * editing the rstate category's header. */
+@interface MGLRenderer (RenderStateSpecialize)
+- (id<MTLFunction>) rstateSpecialize:(Shader *)shader stage:(int)stage;
+@end
+
 /* the raster pass is a separate method so the pass-through vertex function can be swapped
  * in for it and restored afterwards */
 @interface MGLRenderer (Geometry)
@@ -40,17 +48,23 @@
 
 /* per-process scratch (the buffers are shared storage; they are only used by encoders of
  * the command buffer they were written for, so a single set can serve every draw) */
+/* a per-draw scratch pool: the buffer plus the next free offset (geomSubAlloc below) */
+typedef struct {
+    id<MTLBuffer> buf;
+    size_t next;
+} MGLGeomPool;
+
 static id<MTLBuffer> gPrim;         /* header + capture index list + input primitive slots */
 static id<MTLBuffer> gVsout;        /* capture header + captured VS records */
-static size_t gPrimOff, gVsoutOff;  /* this draw's ranges in them */
+static MGLGeomPool gPrimPool, gVsoutPool; static size_t gPrimOff, gVsoutOff;
 static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
 static void *gEnqueuedCb;            /* the command buffer this category enqueued */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
-static size_t gPrepOff;             /* this draw's range in it */
+static MGLGeomPool gPrepPool; static size_t gPrepOff;
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
-static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
+static MGLGeomPool gOutvPool, gCntPool; static size_t gOutvOff, gCntOff;
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
@@ -448,6 +462,7 @@ static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
     gOutvOff = gCntOff = gPrepOff = gPrimOff = gVsoutOff = 0;
+    gPrimPool.next = gVsoutPool.next = gPrepPool.next = gOutvPool.next = gCntPool.next = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
@@ -478,6 +493,10 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 {
     id<MTLCommandBuffer> cb = gXfbCb;
 
+    if (getenv("MGL_GEOM_XFB_TRACE") && cb)
+        fprintf(stderr, "geom: wait cb=%p cur=%p status=%ld dvert=%u woff=%u\n",
+                (void *)(__bridge void *)cb, (void *)(__bridge void *)_currentCommandBuffer,
+                (long)cb.status, ((uint32_t *)gXfb.contents)[1], ((uint32_t *)gXfb.contents)[3]);
     if (!cb) return;
     if (cb == _currentCommandBuffer)
     {
@@ -610,6 +629,9 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setComputePipelineState: gXfbScatterPso];
     [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
+    if (getenv("MGL_GEOM_XFB_TRACE"))
+        fprintf(stderr, "geom: scatter reads out buf=%p off=%zu\n",
+                (void *)(__bridge void *)gOutv, gOutvOff);
     [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
     [enc setBuffer: gCnt offset: gCntOff atIndex: 3];
     [enc setBuffer: gXbase offset: 0 atIndex: 4];
@@ -640,7 +662,16 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     for (GLuint b = 0; b < 4; b++)
         if (tfb[b].buf)
         {
+            if (getenv("MGL_GEOM_XFB_TRACE"))
+                fprintf(stderr, "geom: pack stamp buf=%p name=%u ctx=%p slot=%u\n",
+                        (void *)tfb[b].buf, tfb[b].buf->name, (void *)ctx, b);
             mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+            {
+                MGLBufferTrack *t = mgl_buffers_track(ctx, tfb[b].buf, false);
+                fprintf(stderr, "geom: pack stamped buf=%u -> write_serial=%llu (entry %p)\n",
+                        tfb[b].buf->name,
+                        (unsigned long long)(t ? t->write_serial : 12345), (void *)t);
+            }
             if (getenv("MGL_GEOM_XFB_TRACE"))
                 fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
                         tfb[b].buf->data.mtl_data,
@@ -658,6 +689,13 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     gXfbPending = true;
     gXfbCb = _currentCommandBuffer;
 
+    /* diagnostic: commit (but do not wait) after each draw's pack */
+    if (getenv("MGL_GEOM_COMMIT"))
+    {
+        BUF()->flush(ctx);
+        if (getenv("MGL_GEOM_WAIT")) BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+    }
+
     if (getenv("MGL_GEOM_XFB_TRACE"))
     {
         /* commit + wait, then dump the transform feedback buffer, the counter block and this
@@ -669,11 +707,17 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         uint32_t *blk = (uint32_t *)gXfb.contents;
         int i;
 
-        BUF()->flush(ctx);
-        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        /* the flush+wait is itself the workaround under test: keep it optional so the trace
+         * can observe the unmodified behaviour */
+        if (getenv("MGL_GEOM_XFB_FLUSH"))
+        {
+            BUF()->flush(ctx);
+            BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        }
 
-        fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u\n",
-                threads, blk[1], blk[2], blk[3]);
+        uint32_t *hp = (uint32_t *)((uint8_t *)gPrim.contents + gPrimOff);
+        fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u hdr: prims=%u inst=%u vcount=%u vmin=%u\n",
+                threads, blk[1], blk[2], blk[3], hp[0], hp[1], hp[6], hp[12]);
         fprintf(stderr, "  cnt =");
         for (uint32_t t = 0; t < threads && t < 8; t++) fprintf(stderr, " %u", cnt[t]);
         fprintf(stderr, "  xbase =");
@@ -707,6 +751,18 @@ void geom_xfb_gpu_wait(GLMContext ctx)
 }
 
 /* read the pending counters (the caller has synchronised) */
+void geom_xfb_dump(GLMContext ctx)
+{
+    if (!getenv("MGL_GEOM_XFB_TRACE") || !gOutv) return;
+    fprintf(stderr, "geom: out records @%zu:", gOutvOff / 4);
+    for (int i = 0; i < 6 * 2; i++)
+    {
+        uint32_t w = ((uint32_t *)gOutv.contents)[gOutvOff / 4 + i];
+        fprintf(stderr, " %8.3f", *(float *)&w);
+    }
+    fprintf(stderr, "\n");
+}
+
 void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim)
 {
     if (getenv("MGL_GEOM_DEBUG") && gXfb)
@@ -892,6 +948,36 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 }
 #pragma clang diagnostic pop
 
+/* The pass-through vertex function is the LAST pre-rasterization stage of the emulated
+ * geometry pipeline, so rstate's vertex fixup (clip-space flip, point size, rasterizer
+ * discard) belongs to it — never to the vertex capture variant or the geometry kernel.
+ * generatePipelineDescriptor re-applies the override after rstateConfigurePipelineDescriptor
+ * has specialized the program's own vertex shader, which would otherwise win: rstateSpecialize
+ * is handed a Shader standing in for the pass-through function, so both the function constants
+ * and the specialization cache stay rstate's own (a stack Shader is enough — rstateSpecialize
+ * reads only mtl_data.library / mtl_data.function).  NULL when the override is inactive. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+- (id<MTLFunction>) geomSpecializeVertexOverride
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    MGLGeomProgram *gp;
+
+    if (!g || !g->vertex_override || !g->vertex_override_gp) return nil;
+    gp = (MGLGeomProgram *)g->vertex_override_gp;
+    if (!gp->draw_function || !gp->draw_library) return nil;
+
+    {
+        Shader standin;
+
+        memset(&standin, 0, sizeof standin);
+        standin.mtl_data.function = gp->draw_function;
+        standin.mtl_data.library = gp->draw_library;
+        return [self rstateSpecialize: &standin stage: _VERTEX_SHADER];
+    }
+}
+#pragma clang diagnostic pop
+
 /* can the primitive assembly run on the GPU? It needs the element buffer as a device
  * buffer (a client-side index pointer has to be assembled on the CPU) */
 - (bool) geomCanAssembleGPU
@@ -906,24 +992,33 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     return eb->data.mtl_data != NULL;
 }
 
-/* per-draw sub-allocation: bump the offset inside the buffer, and when it would wrap start a
- * NEW (larger, zero-filled) buffer instead — a silent wrap to offset 0 could hand a draw a
- * range whose previous user is still pending on the GPU, and leftover records in it */
-static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_t need, size_t *off)
+/* reserve `need` bytes: *start receives this draw's range and the pool advances past it, so
+ * the next draw can never land on it.  When the range would not fit, start a NEW (larger,
+ * zero-filled) buffer instead of wrapping to offset 0 — a silent wrap could hand a draw a
+ * range whose previous user is still pending on the GPU. */
+static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start)
 {
-    if (buf && *off + need <= buf.length)
+    size_t s;
+
+    if (need == 0) need = 4;
+
+    s = (pool->next + 255) & ~(size_t)255;
+    if (pool->buf && s + need <= pool->buf.length)
     {
-        *off = (*off + 255) & ~(size_t)255;
-        if (*off + need <= buf.length) return buf;    /* keep the buffer, advance the range */
+        pool->next = s + need;
+        *start = s;
+        return pool->buf;
     }
 
     /* start a fresh buffer so the range is zero-filled and has no previous user */
     size_t sz = 4096;
-    size_t want = (buf ? buf.length * 2 : 0);
+    size_t want = (pool->buf ? pool->buf.length * 2 : 0);
     if (want < need * 2) want = need * 2;
     while (sz < want) sz *= 2;
-    *off = 0;
-    return [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+    pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+    pool->next = need;
+    *start = 0;
+    return pool->buf;
 }
 
 - (bool) geomDraw: (MGLGeomDraw *) d
@@ -940,6 +1035,10 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
     if (!_device || !_commandQueue || !program || !gp || !gp->linked) return false;
     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
         return false;                       /* nothing to do */
+
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace geomDraw gp=%p linked=%d mode=%u first=%u count=%u inst=%u\n",
+                (void *)gp, (int)gp->linked, d->mode, d->first, d->count, d->instances);
 
     /* ---- sizing ---- */
     {
@@ -981,16 +1080,16 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
-    gOutv = geomSubAlloc(_device, gOutv, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
+    gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
     if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
      * must not overwrite them first */
-    gPrep = geomSubAlloc(_device, gPrep, MGL_GEOM_PREP_BYTES, &gPrepOff);
+    gPrep = geomSubAlloc(_device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff);
     if (!gPrep) { geomReleaseStatics(); return false; }
-    gCnt = geomSubAlloc(_device, gCnt, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
+    gCnt = geomSubAlloc(_device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
     if (!gCnt) { geomReleaseStatics(); return false; }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
@@ -998,9 +1097,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
     /* the primitive slots / capture index list and the captured VS records are shared by the
      * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
      * own range so a later draw's kernels cannot overwrite them first */
-    gPrim = geomSubAlloc(_device, gPrim, prim_bytes, &gPrimOff);
+    gPrim = geomSubAlloc(_device, &gPrimPool, prim_bytes, &gPrimOff);
     if (!gPrim) { geomReleaseStatics(); return false; }
-    gVsout = geomSubAlloc(_device, gVsout, vsout_bytes, &gVsoutOff);
+    gVsout = geomSubAlloc(_device, &gVsoutPool, vsout_bytes, &gVsoutOff);
     if (!gVsout) { geomReleaseStatics(); return false; }
 
     if (![self geomPipelines: gp program: program]) return false;
@@ -1308,6 +1407,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
                atIndex: MGL_GEOM_MSL_PRIM];
         [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
         [enc setBuffer: gPrim offset: gPrimOff atIndex: MGL_GEOM_MSL_HDR];
+        if (getenv("MGL_GEOM_XFB_TRACE"))
+            fprintf(stderr, "geom: GS writes out buf=%p off=%zu (cap %zu)\n",
+                    (void *)(__bridge void *)gOutv, gOutvOff, (size_t)gOutv.length);
         [enc setBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_OUTV];
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
@@ -1373,6 +1475,45 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
 
     if (getenv("MGL_GEOM_DEBUG"))
         fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    {
+        /* diagnostic only: wait for this draw's kernels, then dump the assembly header, the
+         * indirect draw arguments, the capture index list, the prep block and the first
+         * non-zero words of the captured VS records and the GS records */
+        BUF()->flush(ctx);
+        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        fprintf(stderr, "geom: trace gpu_assembly=%d prims_count=%llu vstart=%u vcount=%u "
+                        "in_words=%u out_words=%u capture_fn=%p draw_fn=%p\n",
+                (int)gpu_assembly, (unsigned long long)d->prims_count, d->vstart, d->vcount,
+                gp->in_words, gp->out_words, gp->capture_function, gp->draw_function);
+        fprintf(stderr, "geom: trace hdr @%zu:", gPrimOff / 4);
+        for (int i = 0; i < 13; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gPrim.contents)[gPrimOff / 4 + i]);
+        fprintf(stderr, "\ngeom: trace ctl:");
+        for (int i = 0; i < MGL_GEOM_ARG_OFFSET + 5; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gCtl.contents)[i]);
+        fprintf(stderr, "\ngeom: trace idx:");
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %u", ((uint32_t *)gIdx.contents)[i]);
+        fprintf(stderr, "\ngeom: trace prep @%zu:", gPrepOff / 4);
+        for (int i = 0; i < 44; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gPrep.contents)[gPrepOff / 4 + i]);
+        fprintf(stderr, "\ngeom: trace vsout @%zu:", gVsoutOff / 4);
+        {
+            uint32_t *p = (uint32_t *)gVsout.contents;
+            size_t n = gVsout.length / 4, first = 0xffffffff;
+            for (size_t i = 0; i < n; i++) if (p[i]) { first = i; break; }
+            fprintf(stderr, " [first nonzero word = %zu]", first);
+            for (size_t i = (first == 0xffffffff ? 0 : first); i < n && i < (first == 0xffffffff ? 8 : first + 16); i++)
+                fprintf(stderr, " %8.3f", *(float *)&p[i]);
+        }
+        fprintf(stderr, "\ngeom: trace outv @%zu:", gOutvOff / 4);
+        for (int i = 0; i < 12; i++)
+        {
+            uint32_t w = ((uint32_t *)gOutv.contents)[gOutvOff / 4 + i];
+            fprintf(stderr, " %8.3f", *(float *)&w);
+        }
+        fprintf(stderr, "\n");
+    }
     /* ---- 3. raster pass ---- */
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
         return true;
@@ -1387,55 +1528,24 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
 
     if (!gp->draw_function)
     {
-        NSLog(@"MGL geom: the pass-through vertex function is not compiled");
+        NSLog(@"MGL geom: the pass-through vertex function is not compiled (program %u)",
+              program ? program->name : 0);
         return false;
     }
 
-    /* stand the pass-through function in for the vertex stage while the raster pipeline is
-     * built (restored afterwards: the vertex program can still be used on its own) */
+    /* publish the pass-through vertex function through the renderer-level override instead of by swapping the program: with a bound program pipeline the composite is rebuilt from the stage programs inside begin_draw (mgl_program_scope_enter copies MSL by value), so a swap of the composite is discarded there and mutating the shared Shader corrupts the stage program. */
     {
-        Shader *vs = program->shader_slots[_VERTEX_SHADER];
-        char *saved_msl = NULL, *saved_entry = NULL;
-        void *saved_fn = NULL;
-        const char *saved_slot_entry = NULL;
-        bool swapped = false;
+        struct MGLExtState_geom *g = (struct MGLExtState_geom *)ctx->state.ext_geom;
 
-        if (vs)
-        {
-            saved_fn = vs->mtl_data.function;
-            saved_slot_entry = vs->entry_point;
-            vs->mtl_data.function = gp->draw_function;
-            vs->entry_point = gp->draw_entry;
-            swapped = true;
-        }
-        if (program->spirv[_VERTEX_SHADER].msl_str)
-        {
-            saved_msl = program->spirv[_VERTEX_SHADER].msl_str;
-            saved_entry = program->spirv[_VERTEX_SHADER].entry_point;
-            program->spirv[_VERTEX_SHADER].msl_str = gp->draw_msl;
-            program->spirv[_VERTEX_SHADER].entry_point = gp->draw_entry;
-        }
-
+        if (!g) return false;
+        g->vertex_override = gp->draw_function;
+        g->vertex_override_gp = gp;
         ctx->state.dirty_bits |= DIRTY_PROGRAM;
 
         bool ok = [self geomRasterPass: d];
 
-        if (vs)
-        {
-            vs->mtl_data.function = saved_fn;
-            vs->entry_point = saved_slot_entry;
-        }
-        if (saved_msl)
-        {
-            program->spirv[_VERTEX_SHADER].msl_str = saved_msl;
-            program->spirv[_VERTEX_SHADER].entry_point = saved_entry;
-        }
-        else if (swapped)
-        {
-            program->spirv[_VERTEX_SHADER].msl_str = NULL;
-            program->spirv[_VERTEX_SHADER].entry_point = NULL;
-        }
-
+        g->vertex_override = NULL;
+        g->vertex_override_gp = NULL;
         return ok;
     }
 }
