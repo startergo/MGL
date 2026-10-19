@@ -402,3 +402,50 @@ compute path with manual attribute fetch nor a two-level dispatch is
 warranted. The test stays as a regression canary.
 
 Full suite: 21/22 files (test_tesscap added), 0 failures.
+
+---
+
+# tess — round 16 report (GPU-time measurement; glFinish verified)
+
+Commit `22c8c2a`. Merged `gl46-port` (ae5de3e) first.
+
+## The instrumentation
+
+Every command buffer the tess path commits or encodes into (the scan/setup
+buffer, the compute buffer, the tessellator buffer) gets a completed handler
+summing `GPUEndTime - GPUStartTime` and counting itself:
+`mgl_tess_gpu_time_us()` / `mgl_tess_cbs_completed()` (test-only diagnostics).
+
+## (2) glFinish does wait — verified, no bug
+
+`TessGpuTimeAndFinish` (in test_tesscap): draw once, `glFinish`, read the
+completed-counter. Result: **both tess command buffers are already completed at
+glFinish's return** (the counter settles with zero further GL work). Mechanism:
+`mglFinish` → `mtlFlush(true)` → `flushCommandBuffer:` commits the current
+buffer and `waitUntilCompleted`s on it; earlier buffers precede it on the same
+queue (FIFO), and the tess path always leaves a fresh uncommitted buffer behind,
+so the wait target is the newest one. (Side note for the owner of
+`rendering.c`: `mglFinish` still `fprintf`s "MGL: mglFinish called…" on **every**
+call — debug output on the default path outside my domain.)
+
+## (1) GPU time: the capacity dispatch is free — and the small case is the slow one
+
+200 frames each, both draws rasterising identical pixels (the six referenced
+vertices of the 1M-vertex buffer get exactly the small test's geometry), pixel
+check after the measured run:
+
+| run | big (1M-thread dispatch) | small (6-thread) | big again | ratio |
+|---|---|---|---|---|
+| 1 | 20.6 µs/f | 41.0 µs/f | — | 0.50× |
+| 2 | 19.4 µs/f | 31.8 µs/f | — | 0.61× |
+| 3 | 18.0 µs/f | 40.5 µs/f | 18.6 µs/f | 0.44× |
+| 4 | 16.4 µs/f | 27.8 µs/f | 17.7 µs/f | 0.59× |
+
+The 1M-thread capacity-spanning dispatch is consistently **cheaper** than the
+6-thread one (0.4–0.6×), stable across order — not an artifact. The small draw
+is slower because its tiny attribute buffers take the vattrib domain's per-draw
+shadow-copy path (big buffers have real Metal storage). Either way the
+supervisor's >2× threshold is nowhere near met: **no dispatch capping is
+needed**. The test remains as the canary with the pixel assertion.
+
+Full suite: 22/22 files, 0 failures.
