@@ -2,36 +2,28 @@
 #include <stdio.h>
 #include "glcorearb.h"
 
-/* The format mappers are exported (MGL/include/pixel_utils.h); an unexpected
- * format/type must map to 0 / MTLPixelFormatInvalid (callers turn that into a
- * GL error), never reach an assert(0): bitcountForInternalFormat /
- * internalFormatForGLFormatType / mtlPixelFormatForGLFormatType. */
+/* The remaining exported format mapper (MGL/include/pixel_utils.h) must map an
+ * unexpected format/type to MTLPixelFormatInvalid (callers turn that into a GL
+ * error), never reach an assert(0): mtlPixelFormatForGLFormatType.
+ * bitcountForInternalFormat / internalFormatForGLFormatType were dead library
+ * code and are gone (round-19 D1). */
 
-extern GLuint bitcountForInternalFormat(GLenum internalformat, GLenum component);
-extern GLenum internalFormatForGLFormatType(GLenum format, GLenum type);
 extern unsigned int mtlPixelFormatForGLFormatType(GLenum format, GLenum type);
 
 TEST(FormatMappersUnknownValues)
 {
     static const GLenum junk[] = { 0x70000000u, 0xdeadbee0u, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT };
-    int n = (int)(sizeof junk / sizeof junk[0]);
 
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < (int)(sizeof junk / sizeof junk[0]); i++)
     {
-        GLuint b = bitcountForInternalFormat(junk[i], GL_RED);
-        GLenum f = internalFormatForGLFormatType(GL_RGBA, junk[i]);
         unsigned int m = mtlPixelFormatForGLFormatType(GL_RGBA, junk[i]);
-        printf("junk 0x%08x: bitcount=%u internal=0x%x mtl=0x%x\n", (unsigned)junk[i], b,
-               (unsigned)f, m);
-        EXPECT_TRUE(b == 0);                      /* unknown -> 0, not a crash */
-        EXPECT_TRUE(f == 0 || f == (GLenum)GL_INVALID_OPERATION || f == (GLenum)GL_RGBA8);
-        EXPECT_TRUE(m == 0 || m == 0xFFFFFFFFu || m == (unsigned int)80 /* RGBA8Unorm */);
+        printf("junk 0x%08x: mtl=0x%x\n", (unsigned)junk[i], m);
+        EXPECT_TRUE(m == 0 || m == 0xFFFFFFFFu);  /* unknown -> invalid, not a crash */
     }
 
-    /* unknown component leg (packed formats switch on it and fall through to 0) */
-    EXPECT_TRUE(bitcountForInternalFormat(GL_RGB10_A2, 0x60000000u) == 0);
-    EXPECT_TRUE(internalFormatForGLFormatType(0x60000000u, GL_UNSIGNED_BYTE) == 0);
     EXPECT_TRUE(mtlPixelFormatForGLFormatType(0x60000000u, GL_UNSIGNED_BYTE) == 0);
+    EXPECT_TRUE(mtlPixelFormatForGLFormatType(GL_RGBA, 0x60000000u) == 0);
+    EXPECT_TRUE(mtlPixelFormatForGLFormatType(GL_DEPTH_COMPONENT, 0x60000000u) == 0);
 }
 
 static int try_teximage(GLenum ifmt, GLenum fmt, GLenum type)

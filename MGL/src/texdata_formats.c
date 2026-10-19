@@ -472,15 +472,31 @@ GLenum tdValidateFormatType(GLenum format, GLenum type)
             return GL_NO_ERROR;
         case GL_UNSIGNED_INT_10F_11F_11F_REV:
         case GL_UNSIGNED_INT_5_9_9_9_REV:
-            return format == GL_RGB ? GL_NO_ERROR : GL_INVALID_OPERATION;
+            /* table 8.3: the float-packed types carry RGB / BGR */
+            return (format == GL_RGB || format == GL_BGR) ? GL_NO_ERROR : GL_INVALID_OPERATION;
         case GL_UNSIGNED_INT_24_8:
         case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
             return format == GL_DEPTH_STENCIL ? GL_NO_ERROR : GL_INVALID_OPERATION;
+        case GL_UNSIGNED_INT_2_10_10_10_REV:
+            /* table 8.3: RGBA / BGRA / RGB / BGR and the RGBA/BGRA integer twins */
+            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGB ||
+                    format == GL_BGR || format == GL_RGBA_INTEGER ||
+                    format == GL_BGRA_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+        case GL_UNSIGNED_INT_8_8_8_8:
+        case GL_UNSIGNED_INT_8_8_8_8_REV:
+            /* table 8.3: RGBA / BGRA / RGB / BGR and their integer twins */
+            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGB ||
+                    format == GL_BGR || format == GL_RGBA_INTEGER ||
+                    format == GL_BGRA_INTEGER || format == GL_RGB_INTEGER ||
+                    format == GL_BGR_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
         default:
             if (!td_packed(type, &pk)) return GL_INVALID_ENUM;
             if (pk.n == 3)
                 return (format == GL_RGB || format == GL_RGB_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
-            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER || format == GL_BGRA_INTEGER)
+            /* table 8.3: 4_4_4_4(_REV), 5_5_5_1, 1_5_5_5_REV, 10_10_10_2 also carry
+             * the 3-component formats (the 4th component of the data is dropped) */
+            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER ||
+                    format == GL_BGRA_INTEGER || format == GL_RGB || format == GL_BGR)
                 ? GL_NO_ERROR : GL_INVALID_OPERATION;
     }
 }
@@ -1053,6 +1069,23 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
     TDPix *tmp = direct ? NULL : (TDPix *)malloc(sizeof(TDPix) * (size_t)w);
     if (!direct && !tmp) return;
 
+    /* the client's integer-ness / signedness (for the snorm->unorm readback map) */
+    bool cf_integer = false, cf_signed_norm = false, cf_float_client = false;
+    {
+        TDClientFormat cf;
+
+        if (td_client_format(format, &cf))
+        {
+            cf_integer = cf.integer;
+            cf_signed_norm = !cf.integer && (type == GL_BYTE || type == GL_SHORT ||
+                                             type == GL_INT);
+            cf_float_client = (type == GL_FLOAT || type == GL_HALF_FLOAT ||
+                               type == GL_UNSIGNED_INT_10F_11F_11F_REV ||
+                               type == GL_UNSIGNED_INT_5_9_9_9_REV ||
+                               type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV);
+        }
+    }
+
     for (int z = 0; z < d; z++)
     {
         for (int y = 0; y < h; y++)
@@ -1064,6 +1097,16 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             storage_read_row(f, s, ss, w, tmp);
+            /* a signed-normalized storage read back through an unsigned
+             * normalised client maps [-1,1] into [0,1] (GL 4.6 8.5.4: final
+             * conversion to the client's representation); float and signed
+             * clients keep the value as it is, and channels the storage does
+             * not have keep their (0,0,0,1) defaults in client units */
+            if ((f->kind == TDK_SN8 || f->kind == TDK_SN16) && !cf_integer &&
+                !cf_signed_norm && !cf_float_client)
+                for (int x = 0; x < w; x++)
+                    for (int ci = 0; ci < f->ncomp && ci < 4; ci++)
+                        tmp[x].c[ci] = tmp[x].c[ci] * 0.5f + 0.5f;
             client_write_row(o, format, type, swap_bytes, w, tmp);
         }
     }

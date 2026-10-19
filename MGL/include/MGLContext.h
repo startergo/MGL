@@ -33,7 +33,6 @@ GLMContext createGLMContext(GLenum format, GLenum type,
                             GLenum stencil_format, GLenum stencil_type);
 
 GLuint sizeForFormatType(GLenum format, GLenum type);
-GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component);
 
 GLMContext MGLgetCurrentContext(void);
 void MGLsetCurrentContext(GLMContext ctx);

@@ -36,11 +36,6 @@ GLuint sizeForType(GLenum type);
 GLuint sizeForFormatType(GLenum format, GLenum type);
 GLuint sizeForInternalFormat(GLenum internalformat, GLenum format, GLenum type);
 
-GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component);
-GLuint bitcountForInternalFormat(GLenum internalformat, GLenum component);
-
-GLenum internalFormatForGLFormatType(GLenum format, GLenum type);
-
 MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format);
 MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type);
 

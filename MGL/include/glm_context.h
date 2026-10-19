@@ -768,7 +768,6 @@ extern "C" {
 #endif
 
 GLuint sizeForFormatType(GLenum format, GLenum type);
-GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component);
 GLMContext MGLgetCurrentContext(void);
 void MGLget(GLMContext ctx, GLenum param, GLuint *data);
 bool pixelConvertToInternalFormat(GLMContext ctx, GLenum internalformat, GLenum format, GLenum type, const void *src, void *dst, size_t len);

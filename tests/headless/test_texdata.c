@@ -373,7 +373,10 @@ TEST(getn_bufsize)
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, buf);
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_INT_8_8_8_8, buf);
+    /* GL 4.6 (desktop) table 8.3 allows the packed 8_8_8_8 types with the
+     * 3-component formats; a 1-component format with a packed type is the
+     * illegal direction */
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_UNSIGNED_INT_8_8_8_8, buf);
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glDeleteTextures(1, &t);
 }

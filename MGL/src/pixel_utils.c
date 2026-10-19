@@ -996,845 +996,6 @@ GLuint sizeForInternalFormat(GLenum internalformat, GLenum format, GLenum type)
     return 0;
 }
 
-GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component)
-{
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-        case GL_BYTE:
-            return 8;
-
-        case GL_UNSIGNED_SHORT:
-        case GL_SHORT:
-            return 16;
-
-        case GL_UNSIGNED_INT:
-        case GL_INT:
-            return 32;
-
-        case GL_FLOAT:
-            return 32;
-
-        case GL_UNSIGNED_BYTE_3_3_2:
-        case GL_UNSIGNED_BYTE_2_3_3_REV:
-            return 8;
-
-        case GL_UNSIGNED_SHORT_5_6_5:
-        case GL_UNSIGNED_SHORT_5_6_5_REV:
-            switch(component)
-            {
-                case GL_RED: return 5;
-                case GL_GREEN: return 6;
-                case GL_BLUE: return 5;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
-            switch(component)
-            {
-                case GL_RED: return 4;
-                case GL_GREEN: return 4;
-                case GL_BLUE: return 4;
-                case GL_ALPHA: return 4;
-            }
-            break;
-
-
-        case GL_UNSIGNED_SHORT_5_5_5_1:
-        case GL_UNSIGNED_SHORT_1_5_5_5_REV:
-            switch(component)
-            {
-                case GL_RED: return 5;
-                case GL_GREEN: return 5;
-                case GL_BLUE: return 5;
-                case GL_ALPHA: return 1;
-            }
-            break;
-
-            return 16;
-
-        case GL_UNSIGNED_INT_8_8_8_8:
-        case GL_UNSIGNED_INT_8_8_8_8_REV:
-            return 8;
-
-        case GL_UNSIGNED_INT_10_10_10_2:
-        case GL_UNSIGNED_INT_2_10_10_10_REV:
-            switch(component)
-            {
-                case GL_RED: return 10;
-                case GL_GREEN: return 10;
-                case GL_BLUE: return 10;
-                case GL_ALPHA: return 2;
-            }
-            break;
-
-        default:
-            return 0;                 /* unknown internal format: no bit size */
-    }
-
-    return 0;
-}
-
-GLuint bitcountForInternalFormat(GLenum internalformat, GLenum component)
-{
-    // return size in bytes
-    switch(internalformat)
-    {
-        case GL_R3_G3_B2:
-            switch(component)
-            {
-                case GL_RED: return 3;
-                case GL_GREEN: return 3;
-                case GL_BLUE: return 2;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB4:
-            switch(component)
-            {
-                case GL_RED: return 4;
-                case GL_GREEN: return 4;
-                case GL_BLUE: return 42;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB5:
-            switch(component)
-            {
-                case GL_RED: return 5;
-                case GL_GREEN: return 5;
-                case GL_BLUE: return 5;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB8:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 8;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB10:
-            switch(component)
-            {
-                case GL_RED: return 10;
-                case GL_GREEN: return 10;
-                case GL_BLUE: return 10;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB12:
-            switch(component)
-            {
-                case GL_RED: return 12;
-                case GL_GREEN: return 12;
-                case GL_BLUE: return 12;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB16:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 16;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA2:
-            switch(component)
-            {
-                case GL_RED: return 2;
-                case GL_GREEN: return 2;
-                case GL_BLUE: return 2;
-                case GL_ALPHA: return 2;
-            }
-            break;
-
-        case GL_RGBA4:
-            switch(component)
-            {
-                case GL_RED: return 4;
-                case GL_GREEN: return 4;
-                case GL_BLUE: return 4;
-                case GL_ALPHA: return 4;
-            }
-            break;
-
-        case GL_RGB5_A1:
-            switch(component)
-            {
-                case GL_RED: return 5;
-                case GL_GREEN: return 5;
-                case GL_BLUE: return 5;
-                case GL_ALPHA: return 1;
-            }
-            break;
-
-        case GL_RGBA8:
-            return 9;
-
-        case GL_RGB10_A2:
-            switch(component)
-            {
-                case GL_RED: return 10;
-                case GL_GREEN: return 10;
-                case GL_BLUE: return 10;
-                case GL_ALPHA: return 2;
-            }
-            break;
-
-        case GL_RGBA12:
-            return 12;
-
-        case GL_RGBA16:
-            return 16;
-
-        case GL_COMPRESSED_RGB:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_RGBA:
-            return 0;   // return 0 on compressed
-
-        case GL_DEPTH_COMPONENT16:
-            return 16;
-
-        case GL_DEPTH_COMPONENT24:
-            return 24;
-
-        case GL_DEPTH_COMPONENT32:
-            return 32;
-
-        case GL_SRGB:
-            return 8;
-
-        case GL_SRGB8:
-            return 8;
-
-        case GL_SRGB_ALPHA:
-            return 8;
-
-        case GL_SRGB8_ALPHA8:
-            return 8;
-
-        case GL_COMPRESSED_SRGB:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_SRGB_ALPHA:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_RED:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_RG:
-            return 0;   // return 0 on compressed
-
-        case GL_RGBA32F:
-            return 32;
-
-        case GL_RGB32F:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 32;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA16F:
-            return 16;
-
-        case GL_RGB16F:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 16;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R11F_G11F_B10F:
-            switch(component)
-            {
-                case GL_RED: return 11;
-                case GL_GREEN: return 11;
-                case GL_BLUE: return 11;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB9_E5:
-            switch(component)
-            {
-                case GL_RED: return 9;
-                case GL_GREEN: return 9;
-                case GL_BLUE: return 9;
-                case GL_ALPHA: return 5;
-            }
-            break;
-
-        case GL_RGBA32UI:
-            return 32;
-
-        case GL_RGB32UI:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 32;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA16UI:
-            return 16;
-
-        case GL_RGB16UI:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 16;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA8UI:
-            return 8;
-
-        case GL_RGB8UI:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 8;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA32I:
-            return 32;
-
-        case GL_RGB32I:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 32;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA16I:
-            return 16;
-
-        case GL_RGB16I:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 16;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA8I:
-            return 8;
-
-        case GL_RGB8I:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 8;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_DEPTH_COMPONENT32F:
-            return 32;
-
-        case GL_DEPTH32F_STENCIL8:
-            switch(component)
-            {
-                case GL_DEPTH: return 32;
-                case GL_STENCIL: return 8;
-            }
-            break;
-
-        case GL_DEPTH24_STENCIL8:
-            switch(component)
-            {
-                case GL_DEPTH: return 24;
-                case GL_STENCIL: return 8;
-            }
-            break;
-
-        case GL_STENCIL_INDEX1:
-            return 1; // retBits(1);
-
-        case GL_STENCIL_INDEX4:
-            return 1; // retBits(4);
-
-        case GL_STENCIL_INDEX8:
-        case GL_STENCIL_INDEX16:
-        case GL_COMPRESSED_RED_RGTC1:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_SIGNED_RED_RGTC1:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_RG_RGTC2:
-            return 0;   // return 0 on compressed
-
-        case GL_COMPRESSED_SIGNED_RG_RGTC2:
-            return 0;   // return 0 on compressed
-
-        case GL_R8:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R16:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG8:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG16:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R16F:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R32F:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG16F:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG32F:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R8I:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R8UI:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R16I:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R16UI:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R32I:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R32UI:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG8I:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG8UI:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG16I:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG16UI:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG32I:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 32;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG32UI:
-            switch(component)
-            {
-                case GL_RED: return 32;
-                case GL_GREEN: return 32;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_R8_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG8_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB8_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 8;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA8_SNORM:
-            return 8;
-
-        case GL_R16_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 0;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RG16_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 0;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGB16_SNORM:
-            switch(component)
-            {
-                case GL_RED: return 16;
-                case GL_GREEN: return 16;
-                case GL_BLUE: return 16;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_RGBA16_SNORM:
-            return 16;
-
-        case GL_RGB10_A2UI:
-            switch(component)
-            {
-                case GL_RED: return 8;
-                case GL_GREEN: return 8;
-                case GL_BLUE: return 8;
-                case GL_ALPHA: return 2;
-            }
-            break;
-
-        case GL_RGB565:
-            switch(component)
-            {
-                case GL_RED: return 5;
-                case GL_GREEN: return 6;
-                case GL_BLUE: return 5;
-                case GL_ALPHA: return 0;
-            }
-            break;
-
-        case GL_COMPRESSED_RGBA_BPTC_UNORM:
-        case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
-        case GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT:
-        case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT:
-        case GL_COMPRESSED_RGB8_ETC2:
-        case GL_COMPRESSED_SRGB8_ETC2:
-        case GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2:
-        case GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2:
-        case GL_COMPRESSED_RGBA8_ETC2_EAC:
-        case GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC:
-        case GL_COMPRESSED_R11_EAC:
-        case GL_COMPRESSED_SIGNED_R11_EAC:
-        case GL_COMPRESSED_RG11_EAC:
-        case GL_COMPRESSED_SIGNED_RG11_EAC:
-            return 0;   // return 0 on compressed
-
-        default:
-            return 0;
-    }
-
-    return 0;
-}
-
-GLenum internalFormatForGLFormatType(GLenum format, GLenum type)
-{
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-            switch(format)
-            {
-                case GL_RED: return GL_R8;
-                case GL_RG: return GL_RG8;
-                case GL_RGB: return GL_RGB8;
-                case GL_BGR: return GL_RGB8;  /* BGR treated as RGB */
-                case GL_RGBA: return GL_RGBA8;
-                case GL_BGRA: return GL_RGBA8;  /* BGRA treated as RGBA */
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_BYTE:
-            switch(format)
-            {
-                case GL_RED: return GL_R8_SNORM;
-                case GL_RG: return GL_RG8_SNORM;
-                case GL_RGB: return GL_RGB8_SNORM;
-                case GL_RGBA: return GL_RGBA8_SNORM;
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT:
-            switch(format)
-            {
-                case GL_RED: return GL_R16;
-                case GL_RG: return GL_RG16;
-                case GL_RGB: return GL_RGB16;
-                case GL_RGBA: return GL_RGBA16;
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_SHORT:
-            switch(format)
-            {
-                case GL_RED: return GL_R16_SNORM;
-                case GL_RG: return GL_RG16_SNORM;
-                case GL_RGB: return GL_RGB16_SNORM;
-                case GL_RGBA: return GL_RGBA16_SNORM;
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_UNSIGNED_INT:
-            switch(format)
-            {
-                case GL_RED: return GL_R32UI;
-                case GL_RG: return GL_RG32UI;
-                case GL_RGB: return GL_RGB32UI;
-                case GL_RGBA: return GL_RGBA32UI;
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_INT:
-            switch(format)
-            {
-                case GL_RED: return GL_R32I;
-                case GL_RG: return GL_RG32I;
-                case GL_RGB: return GL_RGB32I;
-                case GL_RGBA: return GL_RGBA32I;
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_FLOAT:
-            switch(format)
-            {
-                case GL_RED: return GL_R32F;
-                case GL_RG: return GL_RG32F;
-                case GL_RGB: return GL_RGB32F;
-                case GL_RGBA: return GL_RGBA32F;
-                case GL_DEPTH_COMPONENT: return GL_DEPTH_COMPONENT32F;
-                case GL_DEPTH_STENCIL: return GL_DEPTH32F_STENCIL8;
-
-                default:
-                    return 0;
-            }
-            break;
-
-        case GL_UNSIGNED_BYTE_3_3_2:
-            return 0;
-
-        case GL_UNSIGNED_BYTE_2_3_3_REV:
-            return 0;
-
-        case GL_UNSIGNED_SHORT_5_6_5:
-            return GL_RGB565;
-
-        case GL_UNSIGNED_SHORT_5_6_5_REV:
-            return 0;
-
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-            return GL_RGBA4;
-
-        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
-            return 0;
-
-        case GL_UNSIGNED_INT_8_8_8_8:
-            return GL_RGBA8;
-
-        case GL_UNSIGNED_INT_8_8_8_8_REV:
-            return GL_RGBA8;
-
-        default:
-            break;                    /* unknown type: no internal format */
-    }
-    return 0;                         /* GL_NONE: callers raise GL_INVALID_ENUM/OPERATION */
-}
-
 static MTLPixelFormat legacyMtlFormatForGLInternalFormat(GLenum internal_format);
 
 /* GL internal format -> Metal storage format. Core formats come from the
@@ -2364,135 +1525,272 @@ static MTLPixelFormat legacyMtlFormatForGLInternalFormat(GLenum internal_format)
     return MTLPixelFormatInvalid;
 }
 
+static MTLPixelFormat mglNonPackedFormat(GLenum gl_type, bool is_integer,
+                                         MTLPixelFormat f8unorm, MTLPixelFormat f8snorm,
+                                         MTLPixelFormat f8uint, MTLPixelFormat f8sint,
+                                         MTLPixelFormat f16unorm, MTLPixelFormat f16snorm,
+                                         MTLPixelFormat f16uint, MTLPixelFormat f16sint,
+                                         MTLPixelFormat f32uint, MTLPixelFormat f32sint,
+                                         MTLPixelFormat fhalf, MTLPixelFormat ffloat);
+
+/* (format,type) -> Metal storage for the surfaces this context presents (the
+ * caller, createGLMContext, picks the default framebuffer's colour / depth /
+ * stencil storage from it; the texture paths use the internal-format mappers).
+ *
+ * The mapping follows GL 4.6 tables 8.2 / 8.3 / 8.5: every legal combination
+ * resolves to a format, everything the spec forbids returns MTLPixelFormatInvalid.
+ * Where Metal has the exact bit layout the exact format is used; where it has
+ * not, a wider 4-channel format of the same family is returned and the pixel
+ * path must expand / convert on upload (documented per case below). The packed
+ * layouts were verified against the hardware with .agent/probe_packed.m:
+ * Metal's packed-format names list components from the LOW bit (GL names them
+ * from the high bit), so e.g. MTLPixelFormatA1BGR5Unorm is GL's 5_5_5_1.
+ */
 MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
 {
-    switch(gl_type)
+    /* is the format the integer (unaltered-data) variant of a colour format? */
+    bool is_integer = false;
+    /* 1..4 colour components, 0 = depth / stencil / unknown */
+    int ncomp = 0;
+    bool bgr_order = false;         /* GL_BGRA / GL_BGR / the *_INTEGER twins */
+    bool known_format = true;
+
+    switch (gl_format)
     {
-        case GL_UNSIGNED_BYTE:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR8Uint;
-                case GL_RG: return MTLPixelFormatRG8Uint;
-                case GL_RGBA: return MTLPixelFormatRGBA8Unorm;
-                default:
-                    return 0;
-            }
+        case GL_RED:
+        case GL_GREEN:
+        case GL_BLUE:
+        case GL_RED_INTEGER:
+        case GL_GREEN_INTEGER:
+        case GL_BLUE_INTEGER:
+            ncomp = 1;
+            is_integer = (gl_format == GL_RED_INTEGER || gl_format == GL_GREEN_INTEGER ||
+                          gl_format == GL_BLUE_INTEGER);
             break;
-
-        case GL_BYTE:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR8Sint;
-                case GL_RG: return MTLPixelFormatRG8Sint;
-                case GL_RGBA: return MTLPixelFormatRGBA8Sint;
-                default:
-                    return 0;
-            }
+        case GL_RG:
+        case GL_RG_INTEGER:
+            ncomp = 2;
+            is_integer = (gl_format == GL_RG_INTEGER);
             break;
-
-        case GL_UNSIGNED_SHORT:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR16Uint;
-                case GL_RG: return MTLPixelFormatRG16Uint;
-                case GL_RGBA: return MTLPixelFormatRGBA16Uint;
-                default:
-                    return 0;
-            }
+        case GL_RGB:
+        case GL_BGR:
+        case GL_RGB_INTEGER:
+        case GL_BGR_INTEGER:
+            ncomp = 3;
+            bgr_order = (gl_format == GL_BGR || gl_format == GL_BGR_INTEGER);
+            is_integer = (gl_format == GL_RGB_INTEGER || gl_format == GL_BGR_INTEGER);
             break;
-
-        case GL_SHORT:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR16Sint;
-                case GL_RG: return MTLPixelFormatRG16Sint;
-                case GL_RGBA: return MTLPixelFormatRGBA16Sint;
-                default:
-                    return 0;
-            }
+        case GL_RGBA:
+        case GL_BGRA:
+        case GL_RGBA_INTEGER:
+        case GL_BGRA_INTEGER:
+            ncomp = 4;
+            bgr_order = (gl_format == GL_BGRA || gl_format == GL_BGRA_INTEGER);
+            is_integer = (gl_format == GL_RGBA_INTEGER || gl_format == GL_BGRA_INTEGER);
             break;
-
-        case GL_UNSIGNED_INT:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR32Uint;
-                case GL_RG: return MTLPixelFormatRG32Uint;
-                case GL_RGBA: return MTLPixelFormatRGBA32Uint;
-                case GL_BGRA: return MTLPixelFormatRGBA32Uint;
-                default:
-                    return 0;
-            }
+        default:
+            known_format = false;   /* handled by the depth / stencil cases below */
             break;
+    }
 
-        case GL_INT:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR32Uint;
-                case GL_RG: return MTLPixelFormatRG32Uint;
-                case GL_RGBA: return MTLPixelFormatRGBA32Uint;
-                default:
-                    return 0;
-            }
-            break;
+    /* ---- depth and stencil (GL 4.6 table 8.5) ---- */
+    if (gl_format == GL_DEPTH_COMPONENT)
+    {
+        switch (gl_type)
+        {
+            case GL_UNSIGNED_SHORT: return MTLPixelFormatDepth16Unorm;
+            case GL_SHORT:          return MTLPixelFormatDepth16Unorm;     /* widen + convert */
+            case GL_HALF_FLOAT:     return MTLPixelFormatDepth32Float;     /* widen + convert */
+            case GL_FLOAT:          return MTLPixelFormatDepth32Float;
+            case GL_UNSIGNED_INT:   return MTLPixelFormatDepth24Unorm_Stencil8;  /* D24, widen */
+            case GL_INT:            return MTLPixelFormatDepth24Unorm_Stencil8;  /* widen + convert */
+            default:                return MTLPixelFormatInvalid;
+        }
+    }
+    if (gl_format == GL_DEPTH_STENCIL)
+    {
+        switch (gl_type)
+        {
+            case GL_UNSIGNED_INT_24_8:                 return MTLPixelFormatDepth24Unorm_Stencil8;
+            case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:    return MTLPixelFormatDepth32Float_Stencil8;
+            default:                                   return MTLPixelFormatInvalid;
+        }
+    }
+    if (gl_format == GL_STENCIL_INDEX)
+    {
+        if (gl_type == GL_UNSIGNED_BYTE)
+            return MTLPixelFormatStencil8;
+        return MTLPixelFormatInvalid;
+    }
 
-        case GL_FLOAT:
-            switch(gl_format)
-            {
-                case GL_RED: return MTLPixelFormatR32Float;
-                case GL_RG: return MTLPixelFormatRG32Float;
-                case GL_RGBA: return MTLPixelFormatRGBA32Float;
-                case GL_DEPTH_COMPONENT: return MTLPixelFormatDepth32Float;
-                case GL_DEPTH_STENCIL: return MTLPixelFormatDepth24Unorm_Stencil8;
+    if (!known_format)
+        return MTLPixelFormatInvalid;
 
-                default:
-                    return 0;
-            }
-            break;
-
+    /* ---- packed types (GL 4.6 table 8.3: legal with 3/4-component formats only) ---- */
+    switch (gl_type)
+    {
         case GL_UNSIGNED_BYTE_3_3_2:
-            return 0;
-
         case GL_UNSIGNED_BYTE_2_3_3_REV:
-            return 0;
-
-        case GL_UNSIGNED_SHORT_5_6_5:
-            if (__builtin_available(macOS 11.0, *)) {
-                return MTLPixelFormatB5G6R5Unorm;
-            } else {
-                // Fallback on earlier versions
+            if (ncomp != 3)
                 return MTLPixelFormatInvalid;
-            }
-
-        case GL_UNSIGNED_SHORT_5_6_5_REV:
-            if (__builtin_available(macOS 11.0, *)) {
-                return MTLPixelFormatA1BGR5Unorm;
-            } else {
-                // Fallback on earlier versions
-                return MTLPixelFormatInvalid;
-            }
-
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
-        case GL_UNSIGNED_SHORT_5_5_5_1:
-        case GL_UNSIGNED_SHORT_1_5_5_5_REV:
-            return 0;
-
-        case GL_UNSIGNED_INT_8_8_8_8:
+            /* no 3:3:2 storage in Metal: expand to 8-bit-per-channel on upload */
             return MTLPixelFormatRGBA8Unorm;
 
+        case GL_UNSIGNED_SHORT_5_6_5:
+            if (ncomp != 3)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatB5G6R5Unorm;          /* exact (R in the high 5 bits) */
+
+        case GL_UNSIGNED_SHORT_5_6_5_REV:
+            if (ncomp != 3)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatRGBA8Unorm;           /* no reversed 5:6:5: expand */
+
+        case GL_UNSIGNED_SHORT_4_4_4_4:
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatABGR4Unorm;           /* exact (R in the high nibble) */
+
+        case GL_UNSIGNED_SHORT_4_4_4_4_REV:
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatRGBA8Unorm;           /* no reversed 4:4:4:4: expand */
+
+        case GL_UNSIGNED_SHORT_5_5_5_1:
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatA1BGR5Unorm;          /* exact: the name is LSB-first */
+
+        case GL_UNSIGNED_SHORT_1_5_5_5_REV:
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatBGR5A1Unorm;          /* exact: the name is LSB-first */
+
+        case GL_UNSIGNED_INT_8_8_8_8:
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            /* 8_8_8_8 stores the components in reverse memory order; Metal has that
+             * only for BGRA (as BGRA8*). Everything else expands on upload. */
+            if (is_integer)
+                return MTLPixelFormatRGBA8Uint;        /* expand + swizzle */
+            if (bgr_order && ncomp == 4)
+                return MTLPixelFormatBGRA8Unorm;       /* A,B,G,R memory == B,G,R,A */
+            return MTLPixelFormatRGBA8Unorm;           /* expand + swizzle */
+
         case GL_UNSIGNED_INT_8_8_8_8_REV:
-            return MTLPixelFormatBGRA8Unorm;
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            if (is_integer)
+                return MTLPixelFormatRGBA8Uint;        /* no BGRA8Uint: swizzle on upload */
+            return bgr_order ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA8Unorm;
 
         case GL_UNSIGNED_INT_10_10_10_2:
-            return MTLPixelFormatRGB10A2Unorm;
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            /* alpha in the low 2 bits has no Metal layout (RGB10A2 is the REV one);
+             * keep 10 bits per channel and convert on upload */
+            return is_integer ? MTLPixelFormatRGB10A2Uint : MTLPixelFormatRGB10A2Unorm;
 
         case GL_UNSIGNED_INT_2_10_10_10_REV:
-            return MTLPixelFormatBGR10A2Unorm;
+            if (ncomp != 3 && ncomp != 4)
+                return MTLPixelFormatInvalid;
+            /* RGB10A2Unorm/BGR10A2Unorm have alpha in the high 2 bits: the REV
+             * layout, with BGR10A2 being its BGR-swapped twin (verified on hw).
+             * Only the unorm twin exists; integers swizzle on upload. */
+            if (is_integer)
+                return MTLPixelFormatRGB10A2Uint;
+            return bgr_order ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatRGB10A2Unorm;
+
+        case GL_UNSIGNED_INT_10F_11F_11F_REV:
+            if (ncomp != 3)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatRG11B10Float;         /* exact: R 11f low, B 10f high */
+
+        case GL_UNSIGNED_INT_5_9_9_9_REV:
+            if (ncomp != 3)
+                return MTLPixelFormatInvalid;
+            return MTLPixelFormatRGB9E5Float;          /* exact shared-exponent layout */
+
+        case GL_UNSIGNED_INT_24_8:
+        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+            return MTLPixelFormatInvalid;              /* legal with DEPTH_STENCIL only */
 
         default:
-            break;                    /* unknown type */
+            break;                                    /* non-packed type, see below */
     }
-    return MTLPixelFormatInvalid;     /* callers turn this into a GL error */
+
+    /* ---- non-packed types: legal with every colour format (table 8.3) ----
+     * base formats are Unorm/Snorm/Float, *_INTEGER formats are Uint/Sint.
+     * Metal has no 3-channel storage except RGB9E5/RG11B10: RGB and BGR expand
+     * to the 4-channel format of the family (alpha is written on upload), and
+     * only BGRA8Unorm of the BGRA family exists — everything else uses the
+     * RGBA twin and swizzles on upload. */
+    switch (ncomp)
+    {
+        case 1:
+            return mglNonPackedFormat(gl_type, is_integer,
+                                      MTLPixelFormatR8Unorm, MTLPixelFormatR8Snorm,
+                                      MTLPixelFormatR8Uint, MTLPixelFormatR8Sint,
+                                      MTLPixelFormatR16Unorm, MTLPixelFormatR16Snorm,
+                                      MTLPixelFormatR16Uint, MTLPixelFormatR16Sint,
+                                      MTLPixelFormatR32Uint, MTLPixelFormatR32Sint,
+                                      MTLPixelFormatR16Float, MTLPixelFormatR32Float);
+        case 2:
+            return mglNonPackedFormat(gl_type, is_integer,
+                                      MTLPixelFormatRG8Unorm, MTLPixelFormatRG8Snorm,
+                                      MTLPixelFormatRG8Uint, MTLPixelFormatRG8Sint,
+                                      MTLPixelFormatRG16Unorm, MTLPixelFormatRG16Snorm,
+                                      MTLPixelFormatRG16Uint, MTLPixelFormatRG16Sint,
+                                      MTLPixelFormatRG32Uint, MTLPixelFormatRG32Sint,
+                                      MTLPixelFormatRG16Float, MTLPixelFormatRG32Float);
+        default:
+            break;
+    }
+    if (bgr_order && !is_integer && gl_type == GL_UNSIGNED_BYTE)
+        return MTLPixelFormatBGRA8Unorm;                 /* the one BGRA storage */
+    return mglNonPackedFormat(gl_type, is_integer,
+                              MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Snorm,
+                              MTLPixelFormatRGBA8Uint, MTLPixelFormatRGBA8Sint,
+                              MTLPixelFormatRGBA16Unorm, MTLPixelFormatRGBA16Snorm,
+                              MTLPixelFormatRGBA16Uint, MTLPixelFormatRGBA16Sint,
+                              MTLPixelFormatRGBA32Uint, MTLPixelFormatRGBA32Sint,
+                              MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA32Float);
+}
+
+/* table 8.3's non-packed types, for one component-count family */
+static MTLPixelFormat mglNonPackedFormat(GLenum gl_type, bool is_integer,
+                                         MTLPixelFormat f8unorm, MTLPixelFormat f8snorm,
+                                         MTLPixelFormat f8uint, MTLPixelFormat f8sint,
+                                         MTLPixelFormat f16unorm, MTLPixelFormat f16snorm,
+                                         MTLPixelFormat f16uint, MTLPixelFormat f16sint,
+                                         MTLPixelFormat f32uint, MTLPixelFormat f32sint,
+                                         MTLPixelFormat fhalf, MTLPixelFormat ffloat)
+{
+    if (is_integer)
+    {
+        switch (gl_type)
+        {
+            case GL_UNSIGNED_BYTE:  return f8uint;
+            case GL_BYTE:           return f8sint;
+            case GL_UNSIGNED_SHORT: return f16uint;
+            case GL_SHORT:          return f16sint;
+            case GL_UNSIGNED_INT:   return f32uint;
+            case GL_INT:            return f32sint;
+            default:                return MTLPixelFormatInvalid;
+        }
+    }
+    switch (gl_type)
+    {
+        case GL_UNSIGNED_BYTE:  return f8unorm;
+        case GL_BYTE:           return f8snorm;
+        case GL_UNSIGNED_SHORT: return f16unorm;
+        case GL_SHORT:          return f16snorm;
+        case GL_UNSIGNED_INT:   return f32uint;   /* raw words; conversion on upload */
+        case GL_INT:            return f32sint;   /* raw words; conversion on upload */
+        case GL_HALF_FLOAT:     return fhalf;
+        case GL_FLOAT:          return ffloat;
+        default:                return MTLPixelFormatInvalid;
+    }
 }
 
 MTLPixelFormat mtlPixelFormatForGLTex(Texture * tex)
