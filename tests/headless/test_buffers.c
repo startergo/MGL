@@ -752,8 +752,10 @@ TEST(draw_errors)
     glDrawArrays(GL_TRIANGLES, 0, 0);                             EXPECT_NO_GL_ERROR();
 
     GLuint dummy; glGenVertexArrays(1, &dummy);
+    /* the default VAO (name 0) is a real object: drawing through it is legal
+     * (assertaudit); no attribs are enabled in it, so nothing is rendered */
     glBindVertexArray(0);
-    glDrawArrays(GL_TRIANGLES, 0, 3);                             EXPECT_GL_ERROR(GL_INVALID_OPERATION);  /* no VAO */
+    glDrawArrays(GL_TRIANGLES, 0, 3);                             EXPECT_NO_GL_ERROR();
     glBindVertexArray(g_vao);
     glDeleteVertexArrays(1, &dummy);
 

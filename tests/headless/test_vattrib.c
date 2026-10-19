@@ -224,8 +224,10 @@ TEST(setter_errors)
     glVertexAttribP4ui(max, GL_INT_2_10_10_10_REV, GL_FALSE, 0); EXPECT_GL_ERROR(GL_INVALID_VALUE);
     GLfloat f[4];
     glGetVertexAttribfv(max, GL_CURRENT_VERTEX_ATTRIB, f); EXPECT_GL_ERROR(GL_INVALID_VALUE);
+    /* the default VAO (name 0) exists in core: its state can be queried (assertaudit) */
     glBindVertexArray(0);
-    glGetVertexAttribfv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, f); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glGetVertexAttribfv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, f); EXPECT_NO_GL_ERROR();
+    EXPECT_EQ_INT(f[0], 4.0f);
     glGetVertexAttribfv(0, GL_CURRENT_VERTEX_ATTRIB, f);   EXPECT_NO_GL_ERROR();
 }
 
@@ -241,9 +243,14 @@ TEST(limits)
 TEST(pointer_errors)
 {
     GLuint vbo = make_vbo(NULL, 64);
+    /* buffer-backed attrib setup through the default VAO is legal; the
+     * ARB_vertex_attrib_binding entry points reject it (assertaudit) */
     glBindVertexArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);       EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glEnableVertexAttribArray(0);                                EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);       EXPECT_NO_GL_ERROR();
+    glEnableVertexAttribArray(0);                                EXPECT_NO_GL_ERROR();
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, (void *)16); EXPECT_GL_ERROR(GL_INVALID_OPERATION); /* client pointer */
     glVertexAttribFormat(0, 4, GL_FLOAT, GL_FALSE, 0);           EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glBindVertexBuffer(0, vbo, 0, 16);                           EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glVertexAttribDivisor(0, 1);                                 EXPECT_GL_ERROR(GL_INVALID_OPERATION);

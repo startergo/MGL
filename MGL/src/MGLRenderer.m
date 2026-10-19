@@ -156,6 +156,24 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
         c->imps[i](self, c->sels[i], arg);
 }
 
+@interface MGLNullShaderBufferBox : NSObject
+@property (nonatomic, assign) void *buf;
+@end
+
+@implementation MGLNullShaderBufferBox
+- (void) dealloc
+{
+    Buffer *b = (Buffer *)_buf;
+    if (b)
+    {
+        if (b->data.mtl_data)
+            CFBridgingRelease(b->data.mtl_data);
+        free(b);
+        _buf = NULL;
+    }
+}
+@end
+
 // Main class performing the rendering
 @implementation MGLRenderer
 
@@ -260,6 +278,46 @@ void logDirtyBits(GLMContext ctx)
     ptr->data.dirty_bits &= ~DIRTY_BUFFER_ADDR;
 }
 
+/* assertaudit: GL allows dispatching / drawing while a shader-declared UBO, SSBO or
+ * atomic-counter block has no buffer bound: the command still executes and the block
+ * accesses are undefined (GL 4.6 section 7.12, "Shader Memory Access" / 9.2). Metal
+ * requires an argument buffer at every [[buffer(n)]] slot the function declares, so
+ * bind a shared zero-filled dummy buffer for those slots instead of failing. */
+static char kNullShaderBufferKey;
+
+
+- (Buffer *) nullShaderBuffer
+{
+    MGLNullShaderBufferBox *box = objc_getAssociatedObject(self, &kNullShaderBufferKey);
+    if (box.buf)
+        return (Buffer *)box.buf;
+
+    Buffer *buf = (Buffer *)calloc(1, sizeof(Buffer));
+    if (!buf)
+        return NULL;
+
+    id<MTLBuffer> mtl = [_device newBufferWithLength: 64 * 1024 options: MTLResourceStorageModeShared];
+    if (!mtl)
+    {
+        free(buf);
+        return NULL;
+    }
+
+    memset(mtl.contents, 0, mtl.length);
+
+    buf->name = 0;
+    buf->size = (GLsizeiptr)mtl.length;
+    buf->usage = GL_STATIC_DRAW;
+    buf->data.buffer_data = (vm_address_t)mtl.contents;
+    buf->data.buffer_size = mtl.length;
+    buf->data.mtl_data = (void *)CFBridgingRetain(mtl);
+
+    box = [[MGLNullShaderBufferBox alloc] init];
+    box.buf = buf;
+    objc_setAssociatedObject(self, &kNullShaderBufferKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return buf;
+}
+
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
 {
     int count;
@@ -342,6 +400,21 @@ void logDirtyBits(GLMContext ctx)
                 }
                 else
                 {
+                    /* assertaudit: unbound uniform / storage / atomic-counter block:
+                     * legal in GL (accesses undefined), bind the shared dummy buffer */
+                    Buffer *nullbuf = [self nullShaderBuffer];
+
+                    if (nullbuf)
+                    {
+                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
+                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
+                        buffer_map->buffers[buffer_map->count].buf = nullbuf;
+                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->count++;
+                        buffers_to_be_mapped--;
+                        continue;
+                    }
+
                     ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
 
                     return false;
