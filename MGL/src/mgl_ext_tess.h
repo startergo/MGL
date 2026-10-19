@@ -216,6 +216,12 @@ void mgl_tess_note_scan_wait(void);
 void mgl_tess_note_cpu_index_read(void);
 void mgl_tess_note_restart_check(void);
 
+/* test-only GPU instrumentation: summed GPU time (us) of the tess command buffers
+ * and how many of them completed — read after glFinish */
+void mgl_tess_gpu_time_reset(void);
+double mgl_tess_gpu_time_us(void);
+unsigned mgl_tess_cbs_completed(void);
+
 /* query bookkeeping without CPU tessellation: the tessellated output counts from
  * the levels alone (used by the GPU paths when the levels are CPU-known) */
 void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches);

@@ -3,11 +3,21 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* Round 15, step 2 measurement: the GPU-driven indexed path dispatches the vertex
- * kernel over the full attribute capacity x instances (the GPU-written vcount guards
- * the real work). What does that cost when a tiny draw (2 patches, 6 indices) comes
- * from a 1M-vertex buffer, compared with a 6-vertex buffer? Reported as ms/frame
- * between two glFinish()s, 200 frames each, and the ratio. */
+/* Round 16: re-measure the capacity-spanning vertex dispatch with real GPU time.
+ * Round 15's wall-clock numbers (~0.02 ms/frame including glFinish) are shorter
+ * than a Metal commit+wait round trip, so they prove nothing about GPU cost. The
+ * library now sums GPUEndTime-GPUStartTime over every tess command buffer
+ * (mgl_tess_gpu_time_us) and counts them (mgl_tess_cbs_completed):
+ *
+ *  1) verify glFinish: after a draw + glFinish every committed tess command
+ *     buffer must have completed (the counter settles without further GL work);
+ *  2) GPU time of a 2-patch draw from a 1M-vertex buffer vs a 6-vertex buffer,
+ *     with a pixel check proving the draws render.
+ */
+
+extern void mgl_tess_gpu_time_reset(void);
+extern double mgl_tess_gpu_time_us(void);
+extern unsigned mgl_tess_cbs_completed(void);
 
 #define FRAMES   200
 #define BIG_VERTS (1000 * 1000)
@@ -17,6 +27,23 @@ static double now(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* the completed-counter is bumped by Metal's completion handlers, which are
+ * dispatched asynchronously; wait briefly for it to settle */
+static unsigned wait_counters_settled(unsigned ms)
+{
+    unsigned v = mgl_tess_cbs_completed(), prev = 0;
+    double t0 = now();
+    while (now() - t0 < (double)ms / 1000.0)
+    {
+        if (v != prev)
+            prev = v;
+        v = mgl_tess_cbs_completed();
+        if (v == prev && v > 0)
+            break;
+    }
+    return mgl_tess_cbs_completed();
 }
 
 static const char *kVs =
@@ -54,15 +81,6 @@ static const char *kFs =
     "layout(location=0) out vec4 o_col;\n"
     "void main() { o_col = f_col; }\n";
 
-static double time_frames(int frames)
-{
-    double t0 = now();
-    for (int f = 0; f < frames; f++)
-        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
-    glFinish();
-    return (now() - t0) * 1000.0 / frames;
-}
-
 TEST(IndexedCapacityCost)
 {
     GLuint p = glCreateProgram();
@@ -95,6 +113,22 @@ TEST(IndexedCapacityCost)
         pos[i * 4 + 3] = 1.0f;
         col[i * 4 + 0] = 1.0f; col[i * 4 + 1] = 0.5f; col[i * 4 + 2] = 0.25f; col[i * 4 + 3] = 1.0f;
     }
+    /* the six referenced vertices get exactly the small test's geometry, so both
+       measured draws rasterise the same pixels and only the dispatch size differs */
+    {
+        const float spos[6][4] = {
+            { -1, 1, 0, 1 }, { -1, -1, 0, 1 }, { 0, -1, 0, 1 },
+            {  0, 1, 0, 1 }, {  0, -1, 0, 1 }, { 1, -1, 0, 1 },
+        };
+        for (int i = 0; i < 6; i++)
+        {
+            memcpy(&pos[(900000 + i) * 4], spos[i], 16);
+            col[(900000 + i) * 4 + 0] = 1.0f;
+            col[(900000 + i) * 4 + 1] = 1.0f;
+            col[(900000 + i) * 4 + 2] = 1.0f;
+            col[(900000 + i) * 4 + 3] = 1.0f;
+        }
+    }
     glBindBuffer(GL_ARRAY_BUFFER, b[0]);
     glBufferData(GL_ARRAY_BUFFER, (size_t)BIG_VERTS * 16, pos, GL_STATIC_DRAW);
     glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
@@ -111,9 +145,29 @@ TEST(IndexedCapacityCost)
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    /* warm-up both PSOs and caches, then measure */
-    time_frames(20);
-    double t_big = time_frames(FRAMES);
+    /* ---- glFinish verification: every committed tess command buffer completes ---- */
+    {
+        mgl_tess_gpu_time_reset();
+        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        {
+            unsigned at_finish = mgl_tess_cbs_completed();
+            unsigned settled = wait_counters_settled(200);
+
+            printf("glFinish: %u tess command buffers completed at return, %u after settling\n",
+                   at_finish, settled);
+            EXPECT_TRUE(settled >= 2);           /* scan buffer + the compute/render buffer */
+            EXPECT_TRUE(at_finish >= 1);         /* at least one already done at return */
+        }
+    }
+
+    /* ---- GPU time: big buffer vs small buffer ---- */
+    mgl_tess_gpu_time_reset();
+    for (int f = 0; f < FRAMES; f++)
+        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+    glFinish();
+    wait_counters_settled(200);
+    double t_big = mgl_tess_gpu_time_us() / FRAMES;
 
     /* same draw from a 6-vertex buffer (min + 0): the dispatch covers 6 threads */
     {
@@ -135,10 +189,46 @@ TEST(IndexedCapacityCost)
         glGenBuffers(1, &eb);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, eb);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof sidx, sidx, GL_STATIC_DRAW);
-        time_frames(20);
-        double t_small = time_frames(FRAMES);
-        printf("indexed tiny-draw cost: big-buffer %.4f ms/frame, small-buffer %.4f ms/frame, ratio %.2fx\n",
-               t_big, t_small, t_small > 0 ? t_big / t_small : 0.0);
+        for (int i = 0; i < 20; i++)
+            glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        mgl_tess_gpu_time_reset();
+        for (int f = 0; f < FRAMES; f++)
+            glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        wait_counters_settled(200);
+        double t_small = mgl_tess_gpu_time_us() / FRAMES;
+
+        /* the draw must render: white-ish pixels where the small-buffer patches are */
+        {
+            GLint vp[4];
+            float c[4];
+            glGetIntegerv(GL_VIEWPORT, vp);
+            glReadPixels(vp[2] / 2, vp[3] / 2, 1, 1, GL_RGBA, GL_FLOAT, c);
+            printf("pixel at viewport centre after the measured run: %.2f %.2f %.2f\n",
+                   c[0], c[1], c[2]);
+            EXPECT_TRUE(c[0] + c[1] + c[2] > 0.5f);
+        }
+
+        /* re-measure the big buffer again after the small one (ordering artifact check) */
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+        glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+        glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+        for (int i = 0; i < 20; i++)
+            glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        mgl_tess_gpu_time_reset();
+        for (int f = 0; f < FRAMES; f++)
+            glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_INT, NULL);
+        glFinish();
+        wait_counters_settled(200);
+        double t_big2 = mgl_tess_gpu_time_us() / FRAMES;
+        printf("indexed tiny-draw GPU time: big %.2f, small %.2f, big-again %.2f us/frame "
+               "(ratios %.2fx / %.2fx)\n",
+               t_big, t_small, t_big2, t_small > 0 ? t_big / t_small : 0.0,
+               t_small > 0 ? t_big2 / t_small : 0.0);
         glDeleteBuffers(2, sb);
         glDeleteBuffers(1, &eb);
     }

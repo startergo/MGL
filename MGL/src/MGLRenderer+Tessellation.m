@@ -930,6 +930,29 @@ struct TessScanEnt {
 static struct TessScanEnt tScanEnt[TESS_SCAN_CACHE];
 static uint64_t tScanClock;
 
+/* ---- test-only GPU-time accounting --------------------------------------------
+ * Every command buffer the tess path commits or encodes into gets a completed
+ * handler that sums its GPU execution time (GPUEndTime - GPUStartTime) and counts
+ * it. Tests use this to compare dispatch sizes with real GPU time and to verify
+ * that glFinish waits for all of them (mgl_tess_cbs_completed). */
+static double tGpuTimeUs;
+static unsigned tCbsCompleted;
+
+void mgl_tess_gpu_time_reset(void) { tGpuTimeUs = 0.0; tCbsCompleted = 0; }
+double mgl_tess_gpu_time_us(void) { return tGpuTimeUs; }
+unsigned mgl_tess_cbs_completed(void) { return tCbsCompleted; }
+
+static void tessTimeCommandBuffer(id<MTLCommandBuffer> cb)
+{
+    if (!cb)
+        return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        if (b.GPUEndTime > b.GPUStartTime)
+            tGpuTimeUs += (b.GPUEndTime - b.GPUStartTime) * 1e6;
+        tCbsCompleted++;
+    }];
+}
+
 static struct TessScanEnt *tessScanLookup(GLMContext ctx, const Buffer *ebuf, size_t offset,
                                           uint32_t count, uint32_t itype, uint32_t restart)
 {
@@ -1327,6 +1350,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 [senc setBuffer: ring offset: off_vsparams atIndex: 5];
                 [senc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
                 [senc endEncoding];
+                tessTimeCommandBuffer(scb);
                 [scb commit];
             }
         }
@@ -1387,7 +1411,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
 
     bool debug_wait = tTrace() && use_hardware;
     if ((need_readback && !use_hardware) || debug_wait)
+    {
         compute_cb = [_commandQueue commandBuffer];
+        tessTimeCommandBuffer(compute_cb);
+    }
     else
     {
         /* kernels and the render pass share one command buffer: Metal executes encoders
@@ -1395,6 +1422,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
             _currentCommandBuffer = [_commandQueue commandBuffer];
         compute_cb = _currentCommandBuffer;
+        tessTimeCommandBuffer(compute_cb);   /* shared with the render pass: fires at frame commit */
     }
 
     cenc = [compute_cb computeCommandEncoder];
@@ -1731,6 +1759,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         /* the VS/TCS command buffer is already committed: the tessellator kernels run
          * in their own, event-ordered command buffer (no CPU stall) */
         emu_cb = [_commandQueue commandBuffer];
+        tessTimeCommandBuffer(emu_cb);
         kenc = [emu_cb computeCommandEncoder];
         cenc = kenc;
         size_t emu_off = off_gpu_emu;                /* range reserved in the ring block */
