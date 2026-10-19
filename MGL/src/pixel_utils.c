@@ -1071,7 +1071,7 @@ GLuint bicountForFormatType(GLenum format, GLenum type, GLenum component)
             break;
 
         default:
-            assert(0);
+            return 0;                 /* unknown internal format: no bit size */
     }
 
     return 0;
@@ -1830,8 +1830,9 @@ GLenum internalFormatForGLFormatType(GLenum format, GLenum type)
             return GL_RGBA8;
 
         default:
-            assert(0);
+            break;                    /* unknown type: no internal format */
     }
+    return 0;                         /* GL_NONE: callers raise GL_INVALID_ENUM/OPERATION */
 }
 
 static MTLPixelFormat legacyMtlFormatForGLInternalFormat(GLenum internal_format);
@@ -2487,11 +2488,11 @@ MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
 
         case GL_UNSIGNED_INT_2_10_10_10_REV:
             return MTLPixelFormatBGR10A2Unorm;
-            return 0;
 
         default:
-            assert(0);
+            break;                    /* unknown type */
     }
+    return MTLPixelFormatInvalid;     /* callers turn this into a GL error */
 }
 
 MTLPixelFormat mtlPixelFormatForGLTex(Texture * tex)

@@ -28,8 +28,8 @@ TEST(FormatMappersUnknownValues)
         EXPECT_TRUE(m == 0 || m == 0xFFFFFFFFu || m == (unsigned int)80 /* RGBA8Unorm */);
     }
 
-    /* unknown component / format legs */
-    EXPECT_TRUE(bitcountForInternalFormat(GL_RGBA8, 0x60000000u) == 0);
+    /* unknown component leg (packed formats switch on it and fall through to 0) */
+    EXPECT_TRUE(bitcountForInternalFormat(GL_RGB10_A2, 0x60000000u) == 0);
     EXPECT_TRUE(internalFormatForGLFormatType(0x60000000u, GL_UNSIGNED_BYTE) == 0);
     EXPECT_TRUE(mtlPixelFormatForGLFormatType(0x60000000u, GL_UNSIGNED_BYTE) == 0);
 }

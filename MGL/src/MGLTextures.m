@@ -150,8 +150,9 @@ MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
             return MTLPixelFormatBGR10A2Unorm;
 
         default:
-            assert(0);
+            break;                    /* unknown type */
     }
+    return MTLPixelFormatInvalid;     /* callers turn this into a GL error */
 }
 
 MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
