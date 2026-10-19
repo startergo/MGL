@@ -29,6 +29,7 @@
 #import "MGLTessKernels.h"
 #import "glm_context.h"
 #import "mgl_ext_gpuaudit.h"   /* per-buffer content serial for the scan cache */
+#import "mgl_ext_rstate.h"     /* the clip-space fixup's function-constant indices */
 #import "mgl.h"
 #import "mgl_ext.h"
 #import "mgl_ext_tess.h"
@@ -1044,6 +1045,9 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     bool use_cpu_reference = tCpuReference();
     bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode &&
                         !use_cpu_reference && !tp->capture;   /* capture needs the GPU-visible stream */
+    if (tTrace())
+        NSLog(@"MGL tess: draw: tp=%p capture=%d point_mode=%d domain=%d", (void *)tp,
+              tp->capture ? 1 : 0, tp->point_mode ? 1 : 0, (int)tp->domain);
     bool gpu_emulated = false;
     bool idx_mode_widened = false;
     id<MTLBuffer> widened_mtl = nil;   /* cached gapless index list (restart ranges) */
@@ -1052,6 +1056,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     size_t off_vsparams = 0, off_scanout = 0;   /* GPU-written VS parameter block + scan atomics */
     size_t off_capture = 0;         /* TES-output capture records (tp->capture) */
     size_t cap_pub_records = 0, cap_pub_idx = 0, cap_pub_count = 0;   /* published offsets */
+    bool cap_msl_had_fixup = false; /* the capture MSL carries the rstate clip-space fixup */
     id<MTLBuffer> tess_gather_ib = nil;
     size_t tess_gather_offset = 0;
     uint32_t tess_gather_itype = 0, tess_gather_minv = 0, tess_gather_restart = 0xffffffffu, tess_gather_count = 0, tess_gather_modulo = 0, tess_gather_base = 0;
@@ -1071,6 +1076,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     size_t off_vs_out = 0, off_gather_idx = 0, off_tcs_cp = 0, off_tcs_out = 0;
     size_t off_tcs_patch = 0, off_factors = 0, off_patch_data = 0, off_gpu_emu = 0;
     size_t dbg_coords_off = 0;   /* debug dump only: coordinate stream of the tessellator */
+    size_t dbg_ctl_off = 0;      /* debug dump only: control words (allocs/totals/args) */
     size_t off_coords = 0, off_indices = 0;
     size_t fstride = mgl_tess_factor_stride(ctx, tp);      /* 8 tri / 12 quad */
 
@@ -1769,6 +1775,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         size_t emu_off = off_gpu_emu;                /* range reserved in the ring block */
         size_t coords_off = emu_off + (((size_t)total_patches * 2 + 2 + 5 + 3) & ~(size_t)3) * 4;
         dbg_coords_off = coords_off;
+        dbg_ctl_off = emu_off;
         size_t coords_cap = (size_t)total_patches * (tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
                             tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 2145);
         size_t indices_cap = (size_t)total_patches * (tp->point_mode ? 4225 :
@@ -1792,6 +1799,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         {
             uint8_t *base8 = (uint8_t *)ring.contents;
             uint32_t *base = (uint32_t *)(base8 + emu_off);
+            if (tTrace())
+                NSLog(@"MGL tess: emu dispatch: patches=%u total=%u emu_off=%zu coords_off=%zu "
+                      "ring=%p contents=%p len=%zu cap=%u need=%zu",
+                      (unsigned)patches, (unsigned)total_patches, emu_off, coords_off,
+                      (void *)(__bridge void *)ring, ring.contents, (unsigned long)ring.length,
+                      (unsigned)coords_cap, need);
             kp.patches = (uint32_t)total_patches;
             kp.domain = (uint32_t)tp->domain;
             kp.spacing = (uint32_t)tp->spacing;
@@ -1843,9 +1856,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                         void *lib = NULL, *fn = NULL;
                         char *err = NULL;
 
+                        cap_msl_had_fixup = (strstr(msl, "mgl_rs_vertex_fixup") != NULL);
                         if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, entry, &lib, &fn, &err))
                         {
-                            tp->capture_function = fn;      /* NO y/depth fixup: raw gl_Position */
+                            tp->capture_function = fn;
                             tp->capture_library = lib;
                         }
                         else
@@ -1855,11 +1869,50 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                     }
                     free(msl);
                 }
-                if (tp->capture_function)
+                if (tp->capture_function && !tp->capture_pso)
+                {
+                    NSError *perr = nil;
+                    id<MTLFunction> cfn = (__bridge id<MTLFunction>)tp->capture_function;
+                    id<MTLFunction> cspec = cfn;
+
+                    /* the plain TES carries the rasterizer's clip-space fixup (rstate
+                     * patches the LAST pre-raster stage). The capture must record
+                     * gl_Position exactly as the shader wrote it: compile the kernel
+                     * with the fixup's function constants set to their no-op values */
+                    if (cap_msl_had_fixup)
+                    {
+                        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+                        bool t = true, f = false;
+                        float psz = 1.0f;
+
+                        [cv setConstantValue:&t type:MTLDataTypeBool atIndex:MGL_RS_FC_ORIGIN_UPPER_LEFT];
+                        [cv setConstantValue:&t type:MTLDataTypeBool atIndex:MGL_RS_FC_DEPTH_ZERO_TO_ONE];
+                        [cv setConstantValue:&t type:MTLDataTypeBool atIndex:MGL_RS_FC_PROGRAM_POINT_SIZE];
+                        [cv setConstantValue:&psz type:MTLDataTypeFloat atIndex:MGL_RS_FC_POINT_SIZE];
+                        [cv setConstantValue:&f type:MTLDataTypeBool atIndex:MGL_RS_FC_RASTERIZER_DISCARD];
+                        cspec = [((__bridge id<MTLLibrary>)tp->capture_library)
+                                    newFunctionWithName: cfn.name constantValues: cv error: &perr];
+                    }
+                    if (cspec)
+                    {
+                        id<MTLComputePipelineState> pso =
+                            [_device newComputePipelineStateWithFunction: cspec error: &perr];
+
+                        if (pso)
+                            tp->capture_pso = (__bridge_retained void *)pso;
+                        else
+                            NSLog(@"MGL ERROR: tess: capture kernel pipeline failed: %@",
+                                  perr ? perr.localizedDescription : @"?");
+                    }
+                    else
+                        NSLog(@"MGL ERROR: tess: capture kernel specialization failed: %@",
+                              perr ? perr.localizedDescription : @"?");
+                }
+                if (tp->capture_pso)
                 {
                     uint32_t cc = (uint32_t)coords_cap;
 
-                    [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_function];
+                    [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_pso];
                     tessBindStageUniforms(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
                     tessBindStageTextures(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
                     [cenc setBuffer: ring offset: coords_off atIndex: MGL_TESS_TES_COORDS];
@@ -1869,13 +1922,16 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                         uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
                         [cenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
                     }
-                    [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2 + 2) * 4 atIndex: 30];
-                    [cenc setBuffer: ring offset: off_capture atIndex: 31];
+                    [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4
+                             atIndex: MGL_TESS_TES_CAP_COUNT];
+                    [cenc setBuffer: ring offset: off_capture atIndex: MGL_TESS_TES_CAP_RECS];
                     [cenc dispatchThreadgroups: MTLSizeMake(((NSUInteger)cc + 63) / 64, 1, 1)
                           threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
                     cap_pub_records = off_capture;
                     cap_pub_idx = off_indices;
-                    cap_pub_count = emu_off + (size_t)(total_patches * 2 + 2) * 4;
+                    /* totals[0] is the GPU-written VERTEX count (args[0] would be the
+                     * index count: 3x the records for triangle domains) */
+                    cap_pub_count = emu_off + (size_t)(total_patches * 2) * 4;
                 }
             }
 
@@ -1896,7 +1952,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             /* publish the capture for consumers (geometry / transform feedback):
              * valid until the next GL_PATCHES draw; the ring slot is released by the
              * draw's completion, and consumers copy or consume before then */
-            if (cap_pub_records && tp->capture_function)
+            if (cap_pub_records && tp->capture_pso)
             {
                 struct MGLExtState_tess *S2 = (struct MGLExtState_tess *)ctx->state.ext_tess;
 
@@ -1904,7 +1960,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 {
                     MGLTessCapture *c = &S2->capture;
 
-                    c->buffer = (__bridge void *)ring;
+                    /* the previous capture's ring object goes away with this publish */
+                    if (c->buffer_object && ctx->mtl_funcs.ext_program &&
+                        ctx->mtl_funcs.ext_program->release_obj)
+                        ctx->mtl_funcs.ext_program->release_obj(ctx, c->buffer_object);
+                    c->buffer_object = (void *)CFBridgingRetain(ring);
+                    c->buffer = ring.contents;      /* CPU address, not the object! */
                     c->records_offset = cap_pub_records;
                     c->index_offset = cap_pub_idx;
                     c->count_offset = cap_pub_count;
@@ -1995,6 +2056,14 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                     const float *ptch = (const float *)((uint8_t *)ring.contents + off_tcs_patch);
                     const float *coords = (const float *)((uint8_t *)ring.contents + dbg_coords_off);
                     const uint16_t *hf = (const uint16_t *)((uint8_t *)ring.contents + off_factors);
+                    if (dbg_ctl_off)
+                    {
+                        const uint32_t *ctl = (const uint32_t *)((uint8_t *)ring.contents + dbg_ctl_off);
+                        fprintf(stderr, "MGL tess: trace ctl(allocs0,1 totals0,1 args0..3):");
+                        for (int q = 0; q < 8; q++)
+                            fprintf(stderr, " %u", ctl[q]);
+                        fprintf(stderr, "\n");
+                    }
                     fprintf(stderr, "MGL tess: trace tcs_out(x,y):");
                     for (unsigned i = 0; i < (unsigned)(total_patches * tp->tcs_out_vertices); i++)
                         fprintf(stderr, " [%.3f %.3f]", cps[i * cp_stride / 4 + 4], cps[i * cp_stride / 4 + 5]);
@@ -2029,6 +2098,32 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                           indexBufferOffset: S->gpu_indices_offset
                              indirectBuffer: (__bridge id<MTLBuffer>)S->gpu_scratch
                        indirectBufferOffset: S->gpu_args_offset];
+
+            /* the ring block retires with this command buffer (the capture, if any,
+             * holds its own reference to the buffer object) */
+            {
+                int rslot = ring_slot;
+                id<MTLCommandBuffer> rcb = _currentCommandBuffer;
+
+                if (rcb)
+                    [rcb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                        (void)b;
+                        tessRingRelease(rslot);
+                    }];
+            }
+
+            if (tTrace() && dbg_ctl_off)
+            {
+                const uint8_t *rc = (const uint8_t *)ring.contents;
+                size_t o = dbg_ctl_off;
+
+                [ _currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                    const uint32_t *c = (const uint32_t *)(rc + o);
+                    (void)b;
+                    fprintf(stderr, "MGL tess: trace ctl@renderDone: %u %u %u %u %u %u %u %u\n",
+                            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+                } ];
+            }
 
             ctx->state.dirty_bits = DIRTY_ALL;
             return true;
@@ -2139,6 +2234,17 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             [enc drawIndexedPrimitives: prim indexCount: (NSUInteger)S->tess_index_count
                              indexType: MTLIndexTypeUInt32 indexBuffer: ring indexBufferOffset: off_indices];
 
+        /* the CPU reference path's block retires with the render buffer as well */
+        {
+            int rslot = ring_slot;
+            id<MTLCommandBuffer> rcb = _currentCommandBuffer;
+
+            if (rcb)
+                [rcb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                    (void)b;
+                    tessRingRelease(rslot);
+                }];
+        }
         ctx->state.dirty_bits = DIRTY_ALL;
     }   /* CPU reference path */
 

@@ -442,22 +442,52 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
 
 static void str_append(char **buf, size_t *len, size_t *cap, const char *fmt, ...)
 {
-    va_list ap;
+    va_list ap, ap2;
     int need;
     char tmp[2048];
+    char *heap = NULL;
+    const char *src;
+    char *nb;
 
     va_start(ap, fmt);
+    va_copy(ap2, ap);
     need = vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     if (need < 0)
+    {
+        va_end(ap2);
         return;
+    }
+    if ((size_t)need >= sizeof tmp)
+    {
+        /* long appends (whole shader bodies) do not fit the stack buffer: format
+         * into the heap so they are not truncated */
+        heap = (char *)malloc((size_t)need + 1);
+        if (!heap)
+        {
+            va_end(ap2);
+            return;
+        }
+        vsnprintf(heap, (size_t)need + 1, fmt, ap2);
+    }
+    va_end(ap2);
+    src = heap ? heap : tmp;
     if (*len + (size_t)need + 1 > *cap)
     {
-        *cap = (*len + (size_t)need + 1) * 2;
-        *buf = (char *)realloc(*buf, *cap);
+        size_t nc = (*len + (size_t)need + 1) * 2;
+
+        nb = (char *)realloc(*buf, nc);
+        if (!nb)
+        {
+            free(heap);
+            return;
+        }
+        *buf = nb;
+        *cap = nc;
     }
-    memcpy(*buf + *len, tmp, (size_t)need + 1);
+    memcpy(*buf + *len, src, (size_t)need + 1);
     *len += (size_t)need;
+    free(heap);
 }
 
 /* replace an exact occurrence of old with new inside a growable buffer */
@@ -1286,6 +1316,23 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
         head = &(*head)->next;
     if (*head)
         *head = tp->next;
+    /* release the bridged Metal objects of the compile-once variants */
+    if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
+    {
+        void **owned[6] = { &tp->capture_function, &tp->capture_library, &tp->capture_pso,
+                            &tp->plain_function, &tp->tcs_function, &tp->tcs_library };
+        void *extra[2] = { tp->plain_library, NULL };
+
+        for (int i = 0; i < 6; i++)
+            if (*owned[i])
+            {
+                ctx->mtl_funcs.ext_program->release_obj(ctx, *owned[i]);
+                *owned[i] = NULL;
+            }
+        if (extra[0])
+            ctx->mtl_funcs.ext_program->release_obj(ctx, extra[0]);
+    }
+    free(tp->plain_msl);
     free(tp);
 }
 
@@ -1597,7 +1644,9 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     char *out = NULL, *k = NULL;
     const char *sig, *name, *open, *vid, *body, *p;
     char types[MGL_TESS_CAPTURE_MAX][48];
+    char cap_retname[96];
     struct MslStruct rec;
+    const char *cursor;
     uint32_t off = 4;
     size_t cap, len = 0;
 
@@ -1608,32 +1657,40 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     name = open = vid = body = NULL;
     if (sig)
     {
-        name = sig + 7 + strcspn(sig + 7, " \t");
-        while (name && (*name == ' ' || *name == '\t'))
-            name++;
+        /* the return type is the first token after "vertex " */
+        const char *rt = sig + 7 + strspn(sig + 7, " \t\n");
+        const char *rte = rt + strcspn(rt, " \t\n");
+
+        name = rte + strspn(rte, " \t\n");
         open = name ? strchr(name, '(') : NULL;
         vid = plain ? strstr(plain, "uint mgl_vid [[vertex_id]]") : NULL;
         body = vid ? strchr(vid, '{') : NULL;
+        if (rt >= rte || (size_t)(rte - rt) >= sizeof cap_retname)
+        {
+            rt = NULL;
+            name = NULL;
+        }
+        else
+            snprintf(cap_retname, sizeof cap_retname, "%.*s", (int)(rte - rt), rt);
     }
     if (!sig || !name || !open || !vid || !body || open > vid)
-        goto done;
+        { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 1 sig=%p name=%p open=%p vid=%p body=%p\n", (const void*)sig, (const void*)name, (const void*)open, (const void*)vid, (const void*)body); goto done; }
 
     /* "vertex <Ret> name(...)": the record type is between 'vertex ' and the name */
     {
-        char retname[96];
-        size_t n = (size_t)(name - (sig + 7));
-
-        if (n == 0 || n >= sizeof retname)
-            goto done;
-        snprintf(retname, sizeof retname, "%.*s", (int)n, sig + 7);
-        if (!msl_parse_struct(plain, retname, &rec))
-            goto done;
+        if (!msl_parse_struct(plain, cap_retname, &rec))
+            { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 3 (%s)\n", cap_retname); goto done; }
     }
 
     tp->cap_members_n = 0;
     for (int i = 0; i < rec.count && tp->cap_members_n < MGL_TESS_CAPTURE_MAX; i++)
     {
         const char *m = rec.members[i].name;
+
+        /* the rstate fixup injects a synthetic point-size member into the last
+         * pre-raster stage's output record; it is not a shader output, skip it */
+        if (!strcmp(m, "mgl_rs_PointSize"))
+            continue;
         uint32_t w;
 
         if (!strcmp(m, "gl_Position"))
@@ -1649,7 +1706,7 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             if (tess_trace())
                 fprintf(stderr, "MGL tess: capture: unsupported varying %s of type %s\n",
                         m, rec.members[i].type);
-            goto done;
+            { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 4\n"); goto done; }
         }
         else
         {
@@ -1670,7 +1727,7 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             if (!strcmp(tp->cap_members[i].name, "gl_Position"))
                 have_pos = true;
         if (!have_pos)
-            goto done;               /* gl_Position must be present */
+            { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 5\n"); goto done; }               /* gl_Position must be present */
     }
     tp->cap_stride = off;
 
@@ -1680,20 +1737,24 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     cap = strlen(plain) + 4096;
     k = (char *)malloc(cap);
     if (!k)
-        goto done;
+        { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 6\n"); goto done; }
 
     str_append(&k, &len, &cap, "%.*skernel void ", (int)(sig - plain), plain);
-    str_append(&k, &len, &cap, "%.*s_cap(", (int)(strchr(name, ' ') - name), name);
+    str_append(&k, &len, &cap, "%.*s_cap(", (int)(open - name), name);
     str_append(&k, &len, &cap, "%.*s", (int)(vid - (open + 1)), open + 1);
     str_append(&k, &len, &cap, "uint mgl_vid [[thread_position_in_grid]], "
-                               "device const uint* mgl_cap_count [[buffer(30)]], "
-                               "device uint* mgl_cap [[buffer(31)]])");
-    str_append(&k, &len, &cap, "%.*s", (int)(body - vid + 1), vid);   /* through '{' */
+                               "device const uint* mgl_cap_count [[buffer(%d)]], "
+                               "device uint* mgl_cap [[buffer(%d)]])\n",
+               MGL_TESS_TES_CAP_COUNT, MGL_TESS_TES_CAP_RECS);
+    /* the original signature's tail ("uint mgl_vid [[vertex_id]])") is dropped: the
+     * record store replaces the return value, and thread_position_in_grid is mgl_vid */
+    str_append(&k, &len, &cap, "{");
     str_append(&k, &len, &cap, "\n    if (mgl_vid >= mgl_cap_count[0]) return;\n");
 
-    /* replace every "return <var>;" with the packed record store */
-    p = body + 1;
-    while ((p = strstr(p, "return ")) != NULL)
+    /* replace every "return <var>;" with the packed record store: `cursor` walks the
+     * original body starting just after its '{' (the '{' was emitted above) */
+    cursor = body + 1;
+    while ((p = strstr(cursor, "return ")) != NULL)
     {
         const char *semi = strchr(p, ';');
         char varname[32], store[2048];
@@ -1706,7 +1767,14 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             vn = sizeof varname - 1;
         snprintf(varname, sizeof varname, "%.*s", (int)vn, p + 7);
 
-        str_append(&k, &len, &cap, "%.*s", (int)(p - body), body);
+        str_append(&k, &len, &cap, "%.*s", (int)(p - cursor), cursor);
+        if (vn == 0)
+        {
+            /* a bare "return;" inside the body is legal in the kernel too */
+            str_append(&k, &len, &cap, "return;");
+            cursor = semi + 1;
+            continue;
+        }
         for (int i = 0; i < tp->cap_members_n; i++)
         {
             const MGLTessCaptureMember *cm = &tp->cap_members[i];
@@ -1718,10 +1786,38 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         }
         slen += snprintf(store + slen, sizeof store - (size_t)slen, "}\nreturn;\n");
         str_append(&k, &len, &cap, "%s", store);
-        body = semi + 1;
-        p = body;
+        cursor = semi + 1;
     }
-    str_append(&k, &len, &cap, "%s", body);
+    str_append(&k, &len, &cap, "%s", cursor);
+
+    /* the record struct was written for a vertex function: stage attributes such as
+     * [[position]] / [[user(locn0)]] are not legal on a kernel local, strip them */
+    {
+        char head[160];
+        const char *at;
+        char *decl;
+
+        snprintf(head, sizeof head, "struct %s\n{", cap_retname);
+        at = strstr(k, head);
+        if (!at) { snprintf(head, sizeof head, "struct %s {", cap_retname); at = strstr(k, head); }
+        if (at)
+        {
+            char *ob = strchr(at, '{');
+            char *cb = ob ? strchr(ob, '}') : NULL;
+
+            if (ob && cb)
+                for (char *a = ob; (a = strstr(a, "[[")) != NULL && a < cb; )
+                {
+                    char *e = strstr(a, "]]");
+                    if (!e || e > cb)
+                        break;
+                    memmove(a, e + 2, strlen(e + 2) + 1);
+                    cb -= (size_t)(e + 2 - a);
+                    len -= (size_t)(e + 2 - a);
+                }
+            (void)decl;
+        }
+    }
     out = k;
 
 done:
@@ -2093,6 +2189,9 @@ void mgl_tess_diag_capture(GLuint program, int enable)
     if (S && _ctx)
     {
         MGLTessProgram *tp = mgl_tess_active_program(_ctx);
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: diag_capture(enable=%d): _ctx=%p tp=%p\n",
+                    enable, (void *)_ctx, (void *)tp);
         if (tp)
             tp->capture = enable != 0;
     }
@@ -2114,6 +2213,11 @@ bool mgl_tess_diag_capture_info(void **buffer, uint32_t *records_offset, uint32_
         const uint32_t *w = (const uint32_t *)((const uint8_t *)S->capture.buffer +
                                                S->capture.count_offset);
         *count = *w;
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: diag capture_info: buf=%p count_off=%zu val=%u "
+                            "rec_off=%zu idx_off=%zu\n",
+                    S->capture.buffer, (size_t)S->capture.count_offset, *w,
+                    (size_t)S->capture.records_offset, (size_t)S->capture.index_offset);
     }
     return true;
 }

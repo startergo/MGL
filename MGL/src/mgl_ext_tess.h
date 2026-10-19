@@ -41,6 +41,10 @@
 #define MGL_TESS_TCS_FACTORS    27      /* SPVC MSL_SHADER_TESS_FACTOR_OUTPUT_BUFFER_INDEX */
 #define MGL_TESS_TCS_PARAMS     28      /* SPVC MSL_INDIRECT_PARAMS_BUFFER_INDEX */
 #define MGL_TESS_TES_PARAMS     26      /* render stage: cp-per-patch, patch count */
+#define MGL_TESS_TES_CAP_COUNT  30      /* capture kernel: GPU-written vertex count */
+#define MGL_TESS_TES_CAP_RECS   24      /* capture kernel: packed output records (24 is a
+                                         * TCS-only reservation, free in the TES kernel;
+                                         * Metal compute allows buffer indices 0..30) */
 /* hardware path vertex descriptor buffers (above any TES uniform buffers) */
 #define MGL_TESS_VD_CP           8      /* control point records (PerPatchControlPoint) */
 #define MGL_TESS_VD_PATCH        9      /* per-patch data (PerPatch) */
@@ -104,7 +108,9 @@ typedef struct MGLTessCaptureMember {
 } MGLTessCaptureMember;
 
 typedef struct MGLTessCapture {
-    void    *buffer;         /* id<MTLBuffer>: the ring block of the producing draw */
+    void    *buffer;         /* CPU address of the ring block's storage (ring.contents):
+                              * stable for the lifetime of buffer_object */
+    void    *buffer_object;  /* retained id<MTLBuffer>, keeps `buffer` mapped */
     size_t   records_offset; /* byte offset of the first record */
     size_t   index_offset;   /* byte offset of the uint32 vertex index list */
     size_t   count_offset;   /* byte offset of the uint32 vertex count (GPU-written) */
@@ -170,6 +176,7 @@ typedef struct MGLTessProgram_t {
     int      cap_members_n;
     void    *capture_function;           /* compiled kernel (owned by the renderer) */
     void    *capture_library;
+    void    *capture_pso;                /* id<MTLComputePipelineState>, bridged */
 
     /* hardware path: [[patch(domain, N)]] control point count baked into the TES MSL */
     int     hw_cp_count;

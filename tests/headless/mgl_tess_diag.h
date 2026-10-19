@@ -10,6 +10,9 @@
 #ifndef MGL_TESS_DIAG_H
 #define MGL_TESS_DIAG_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
 /* CPU-side work that the GPU paths must not do (all since library load):
  *   cpu_blob_builds    — per-patch data blobs assembled on the CPU
  *   cpu_generate_runs  — full CPU tessellations
