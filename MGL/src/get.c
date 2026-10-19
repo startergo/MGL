@@ -184,6 +184,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_framebuffer_object",
     "GL_ARB_framebuffer_sRGB",
     "GL_ARB_get_texture_sub_image",
+    "GL_ARB_gl_spirv",                 /* shader binary format: SPIR-V (get.c) */
     "GL_ARB_half_float_pixel",
     "GL_ARB_half_float_vertex",
     "GL_ARB_instanced_arrays",
@@ -194,6 +195,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_map_buffer_range",
     "GL_ARB_multi_bind",
     "GL_ARB_multi_draw_indirect",
+    "GL_ARB_spirv_extensions",         /* glGetStringi(GL_SPIR_V_EXTENSIONS) */
     "GL_ARB_occlusion_query",
     "GL_ARB_occlusion_query2",
     "GL_ARB_pixel_buffer_object",
