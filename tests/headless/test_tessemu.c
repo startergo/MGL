@@ -184,38 +184,56 @@ TEST(IsolinesGpu)
 
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
-    float w = (float)vp[2], h = (float)vp[3];
-    float c[4];
+    int w = vp[2], h = vp[3];
+    unsigned char *px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
 
-    /* each lit row must be one of the 3 isolines; count rows with non-black pixels */
-    int lit_rows = 0;
-    for (int y = 0; y < (int)h; y++)
+    /* expected: n0 = 3 isolines at v = (i + 0.5) / 3 -> NDC y = -0.5, 0, +0.5
+     * -> window y = h/4, h/2, 3h/4 (an exact pixel edge goes to the LOWER row,
+     * the same tie rule the point_mode test verified against Apple GL). */
+    int rows[8], nrow = 0;
+    for (int y = 0; y < h; y++)
     {
-        int lit = 0;
-        for (int x = (int)(w * 0.3f); x < (int)(w * 0.7f); x += 2)
-        {
-            glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, c);
-            if (c[0] + c[1] + c[2] > 0.3f) { lit = 1; break; }
-        }
-        lit_rows += lit;
+        int cnt = 0;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] > 120) cnt++;
+        if (cnt > w / 4)                       /* a line, not a stray pixel */
+        { printf("iso row %d: %d px\n", y, cnt); if (nrow < 8) rows[nrow++] = y; }
     }
-    /* 3 thin lines in a 200-row window: allow a small band per line */
-    EXPECT_TRUE(lit_rows >= 3 && lit_rows <= 24);
-
-    /* the left end of a line is red-dominant, the right end green-dominant */
-    int found = 0;
-    for (int y = 0; y < (int)h && !found; y++)
+    EXPECT_TRUE(nrow == 3);
+    if (nrow == 3)
     {
-        glReadPixels((int)(w * 0.35f), y, 1, 1, GL_RGBA, GL_FLOAT, c);
-        if (c[0] > 0.5f && c[1] < 0.5f)
+        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        for (int k = 0; k < 3; k++)
         {
-            found = 1;
-            float c2[4];
-            glReadPixels((int)(w * 0.65f), y, 1, 1, GL_RGBA, GL_FLOAT, c2);
-            EXPECT_TRUE(c2[1] > 0.5f);   /* green-dominant at the right end */
+            int d = rows[k] - (ey[k] - 1);     /* exact edge -> lower row */
+            EXPECT_TRUE(d >= -1 && d <= 1);
         }
     }
-    EXPECT_TRUE(found);
+
+    /* each line spans the full u range: NDC x +-0.9 -> window 0.05w..0.95w */
+    if (nrow == 3)
+    {
+        int y = rows[0], x0 = -1, x1 = -1;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] > 120)
+            { if (x0 < 0) x0 = x; x1 = x; }
+        printf("iso extent x=[%d..%d]\n", x0, x1);
+        EXPECT_TRUE(x0 <= (int)(w * 0.05f) + 2 && x1 >= (int)(w * 0.95f) - 2);
+
+        /* linear red->green along u: sampled at x = 0.1w, 0.5w, 0.9w */
+        int sx[3] = { w / 10, w / 2, w * 9 / 10 };
+        for (int k = 0; k < 3; k++)
+        {
+            int r = px[(y * w + sx[k]) * 4], g = px[(y * w + sx[k]) * 4 + 1];
+            printf("iso colour at x=%d: r=%d g=%d\n", sx[k], r, g);
+            if (k == 0) EXPECT_TRUE(r > 180 && g < 80);
+            if (k == 1) EXPECT_TRUE(r > 70 && r < 190 && g > 70 && g < 190);
+            if (k == 2) EXPECT_TRUE(g > 180 && r < 80);
+        }
+    }
+    free(px);
     glDeleteProgram(p);
 }
 
