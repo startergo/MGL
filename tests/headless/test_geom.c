@@ -1995,6 +1995,191 @@ TEST(xfb_arrays_of_blocks_xfb_offset)
     glDeleteProgram(p);
 }
 
+/* read a pixel from the framebuffer of the test's bound FBO */
+static void geom_read_u8(int x, int y, GLubyte out[4])
+{
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, out);
+}
+#define EXPECT_U8(x, y, r, g, b, a) do { GLubyte _p[4] = { 1, 2, 3, 4 }; geom_read_u8(x, y, _p); mgl_test_checks++; \
+        if (_p[0] != (GLubyte)(r) || _p[1] != (GLubyte)(g) || _p[2] != (GLubyte)(b) || _p[3] != (GLubyte)(a)) \
+            MGL_FAIL("(%d,%d) is %u,%u,%u,%u, expected %d,%d,%d,%d", x, y, _p[0], _p[1], _p[2], _p[3], r, g, b, a); } while (0)
+
+TEST(pool_rotation_hazard)
+{
+    /* the geometry scratch pools rotate over a few buffers because the CPU writes the
+     * next draw's inputs while the GPU may still be reading the previous draws' records;
+     * a pool that reused its one buffer immediately would corrupt batched draws.  Draw
+     * many small geometry draws back to back — no glFinish between them, so the GPU lags
+     * the CPU — each producing a quad at its own position, and verify every quad. */
+    const char *vs = "#version 450 core\n"
+                     "layout(location=0) in vec2 pos;\n"
+                     "layout(location=0) out vec2 v_pos;\n"
+                     "void main(){ v_pos = pos; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char *gs = "#version 450 core\n"
+                     "layout(points) in;\n"
+                     "layout(location=0) in vec2 v_pos[];\n"
+                     "layout(triangle_strip, max_vertices=4) out;\n"
+                     "layout(location=0) out vec2 g_uv;\n"
+                     "void main(){\n"
+                     "  vec2 p = v_pos[0], e = vec2(0.035, 0.035);\n"
+                     "  g_uv = vec2(0); gl_Position = vec4(p.x - e.x, p.y - e.y, 0.0, 1.0); EmitVertex();\n"
+                     "  g_uv = vec2(1); gl_Position = vec4(p.x + e.x, p.y - e.y, 0.0, 1.0); EmitVertex();\n"
+                     "  g_uv = vec2(1); gl_Position = vec4(p.x - e.x, p.y + e.y, 0.0, 1.0); EmitVertex();\n"
+                     "  g_uv = vec2(0); gl_Position = vec4(p.x + e.x, p.y + e.y, 0.0, 1.0); EmitVertex();\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "layout(location=0) in vec2 g_uv;\n"
+                     "layout(location=0) out vec4 c0;\n"
+                     "void main(){ if (min(g_uv.x, g_uv.y) < 0.25) discard; c0 = vec4(0, 1, 0, 1); }\n";
+    GLuint p = program(vs, gs, fs);
+    if (!p) return;
+
+    GLuint tex, fbo, vao, vbo;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 256, 256);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 2, NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glUseProgram(p);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const int N = 96;
+    float px[N], py[N];
+    for (int i = 0; i < N; i++)
+    {
+        /* a grid of quad centres in NDC; remember the framebuffer pixel to check */
+        px[i] = -0.95f + 1.9f * ((i % 12) / 11.0f);
+        py[i] = -0.95f + 1.9f * ((i / 12) / 7.0f);
+    }
+    glFinish();
+    for (int i = 0; i < N; i++)
+    {
+        float v[2] = { px[i], py[i] };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof v, v);
+        glDrawArrays(GL_POINTS, 0, 1);          /* no flush: the GPU lags behind */
+    }
+    glFinish();
+
+    for (int i = 0; i < N; i++)
+    {
+        int x = (int)((px[i] * 0.5f + 0.5f) * 256), y = (int)((py[i] * 0.5f + 0.5f) * 256);
+        if (x > 0 && x < 255 && y > 0 && y < 255)
+        {
+            EXPECT_U8(x, y, 0, 255, 0, 255);
+            EXPECT_U8(x, y + 6, 0, 0, 0, 255);       /* the gap between quads */
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
+TEST(wild_index_survives_cpu_assembly)
+{
+    /* an out-of-range index (0x10000 with a four-vertex buffer) stretches the capture
+     * ring's vertex window (vcount = vmax - vmin + 1); a corrupted element store reading
+     * near-0xffffffff indices used to size it at 24 * 4e9 bytes, the allocation failed,
+     * the geometry pipelines were torn down and every following draw fell back.  The ring
+     * is budget-capped now; this draw is undefined, but MGL must stay standing and the
+     * next draw must render exactly as before. */
+    const char *vs = "#version 450 core\n"
+                     "layout(location=0) in vec2 pos;\n"
+                     "layout(location=0) out vec2 v_pos;\n"
+                     "void main(){ v_pos = pos; gl_Position = vec4(pos * 0.4, 0.0, 1.0); }\n";
+    const char *gs = "#version 450 core\n"
+                     "layout(points) in;\n"
+                     "layout(location=0) in vec2 v_pos[];\n"
+                     "layout(points, max_vertices = 1) out;\n"
+                     "layout(location=0) out vec2 g_pos;\n"
+                     "void main(){ g_pos = v_pos[0]; gl_Position = gl_in[0].gl_Position; EmitVertex(); EndPrimitive(); }\n";
+    const char *fs = "#version 450 core\n"
+                     "layout(location=0) in vec2 g_pos;\n"
+                     "layout(location=0) out vec4 c0;\n"
+                     "void main(){ c0 = vec4(1, 0, 0, 1); }\n";
+    GLuint p = program(vs, gs, fs);
+    if (!p) return;
+    {
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, GL_TRUE);
+    }
+
+    GLuint tex, fbo, vao, vbo, ebo;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 64, 64);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ebo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 2 * 4, NULL, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glUseProgram(p);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+
+
+    /* the out-of-range index draw (undefined result, MGL must survive it) */
+    {
+        float v[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+        GLuint wild[3] = { 0, 0x10000u, 0 };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof v, v);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof wild, wild, GL_STATIC_DRAW);
+        glDrawElements(GL_POINTS, 3, GL_UNSIGNED_INT, NULL);
+        glFinish();
+    }
+
+    /* the next draw must be unaffected */
+    {
+        float v[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+        GLuint idx[3] = { 0, 1, 2 };
+        GLuint ok[1] = { 3 };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof v, v);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glDrawElements(GL_POINTS, 3, GL_UNSIGNED_INT, NULL);
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof ok, ok);
+        glDrawElements(GL_POINTS, 1, GL_UNSIGNED_INT, NULL);
+        glFinish();
+    }
+    /* the points land at NDC (±0.4, ±0.4): pixels (19,19), (44,19), (19,44), (44,44) */
+    EXPECT_U8(19, 19, 255, 0, 0, 255);
+    EXPECT_U8(44, 44, 255, 0, 0, 255);
+    EXPECT_U8(8, 56, 0, 0, 0, 255);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &ebo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(block_vs_fs_control);
@@ -2029,6 +2214,8 @@ int main(void)
     RUN(xfb_of_tes_output);
     RUN(xfb_of_tes_gs_output);
     RUN(primitive_restart_with_gs);
+    RUN(pool_rotation_hazard);
+    RUN(wild_index_survives_cpu_assembly);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
     return mgl_test_summary();
 }

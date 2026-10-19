@@ -132,8 +132,6 @@ int main(void)
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
     glUseProgram(p);
 
-    glViewport(0, 0, 200, 200);
-
     printf("geometry shader primitive assembly (300k scattered indices, %d frames):\n", FRAMES);
 
     /* the CPU / GPU routes are chosen by MGL_GEOM_CPU_ASSEMBLY, which the driver reads once
