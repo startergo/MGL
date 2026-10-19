@@ -1558,6 +1558,199 @@ void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *facto
     }
 }
 
+/* words a packed MSL type occupies (geometry.c's rule: elems*cols*rows*base) */
+static bool tess_msl_type_words(const char *type, uint32_t *words)
+{
+    uint32_t base = 1, cols = 1, rows = 1;
+    const char *d;
+
+    if (!strncmp(type, "float", 5) || !strncmp(type, "int", 3) || !strncmp(type, "uint", 4) ||
+        !strncmp(type, "bool", 4) || !strncmp(type, "short", 5) || !strncmp(type, "half", 4))
+        base = 1;
+    else if (!strncmp(type, "double", 6))
+        base = 2;
+    else
+        return false;               /* arrays / structs are not captured */
+
+    d = type;
+    while (*d && !(*d >= '0' && *d <= '9'))
+        d++;
+    if (*d)
+    {
+        cols = (uint32_t)strtoul(d, NULL, 10);
+        while (*d && *d != 'x')
+            d++;
+        if (*d == 'x')
+            rows = (uint32_t)strtoul(d + 1, NULL, 10);
+    }
+    *words = base * cols * rows;
+    return true;
+}
+
+/* the capture-kernel MSL: the plain TES vertex function rewritten into a compute
+ * kernel storing the packed output record (see the MGLTessCapture contract).
+ * Fills tp->cap_members[] / tp->cap_stride; NULL when the output interface has
+ * something unsupported. Caller frees. */
+char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
+{
+    char *plain = mgl_tess_plain_msl(ctx, tp);
+    char *out = NULL, *k = NULL;
+    const char *sig, *name, *open, *vid, *body, *p;
+    char types[MGL_TESS_CAPTURE_MAX][48];
+    struct MslStruct rec;
+    uint32_t off = 4;
+    size_t cap, len = 0;
+
+    if (!plain)
+        return NULL;
+
+    sig = strstr(plain, "vertex ");
+    name = open = vid = body = NULL;
+    if (sig)
+    {
+        name = sig + 7 + strcspn(sig + 7, " \t");
+        while (name && (*name == ' ' || *name == '\t'))
+            name++;
+        open = name ? strchr(name, '(') : NULL;
+        vid = plain ? strstr(plain, "uint mgl_vid [[vertex_id]]") : NULL;
+        body = vid ? strchr(vid, '{') : NULL;
+    }
+    if (!sig || !name || !open || !vid || !body || open > vid)
+        goto done;
+
+    /* "vertex <Ret> name(...)": the record type is between 'vertex ' and the name */
+    {
+        char retname[96];
+        size_t n = (size_t)(name - (sig + 7));
+
+        if (n == 0 || n >= sizeof retname)
+            goto done;
+        snprintf(retname, sizeof retname, "%.*s", (int)n, sig + 7);
+        if (!msl_parse_struct(plain, retname, &rec))
+            goto done;
+    }
+
+    tp->cap_members_n = 0;
+    for (int i = 0; i < rec.count && tp->cap_members_n < MGL_TESS_CAPTURE_MAX; i++)
+    {
+        const char *m = rec.members[i].name;
+        uint32_t w;
+
+        if (!strcmp(m, "gl_Position"))
+        {
+            w = 4;
+            snprintf(types[tp->cap_members_n], 48, "float4");
+            tp->cap_members[tp->cap_members_n].offset = 0;
+        }
+        else if (!strncmp(m, "gl_", 3))
+            continue;               /* other builtins are not captured */
+        else if (!tess_msl_type_words(rec.members[i].type, &w))
+        {
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: capture: unsupported varying %s of type %s\n",
+                        m, rec.members[i].type);
+            goto done;
+        }
+        else
+        {
+            snprintf(types[tp->cap_members_n], 48, "%s", rec.members[i].type);
+            tp->cap_members[tp->cap_members_n].offset = off;
+        }
+
+        snprintf(tp->cap_members[tp->cap_members_n].name, 64, "%s", m);
+        tp->cap_members[tp->cap_members_n].words = w;
+        if (strcmp(m, "gl_Position"))
+            off += w;
+        tp->cap_members_n++;
+    }
+    {
+        bool have_pos = false;
+
+        for (int i = 0; i < tp->cap_members_n; i++)
+            if (!strcmp(tp->cap_members[i].name, "gl_Position"))
+                have_pos = true;
+        if (!have_pos)
+            goto done;               /* gl_Position must be present */
+    }
+    tp->cap_stride = off;
+
+    if (tess_trace())
+        fprintf(stderr, "MGL tess: capture: %s (stride %u, %d members)\n",
+                "layout built", tp->cap_stride, tp->cap_members_n);
+    cap = strlen(plain) + 4096;
+    k = (char *)malloc(cap);
+    if (!k)
+        goto done;
+
+    str_append(&k, &len, &cap, "%.*skernel void ", (int)(sig - plain), plain);
+    str_append(&k, &len, &cap, "%.*s_cap(", (int)(strchr(name, ' ') - name), name);
+    str_append(&k, &len, &cap, "%.*s", (int)(vid - (open + 1)), open + 1);
+    str_append(&k, &len, &cap, "uint mgl_vid [[thread_position_in_grid]], "
+                               "device const uint* mgl_cap_count [[buffer(30)]], "
+                               "device uint* mgl_cap [[buffer(31)]])");
+    str_append(&k, &len, &cap, "%.*s", (int)(body - vid + 1), vid);   /* through '{' */
+    str_append(&k, &len, &cap, "\n    if (mgl_vid >= mgl_cap_count[0]) return;\n");
+
+    /* replace every "return <var>;" with the packed record store */
+    p = body + 1;
+    while ((p = strstr(p, "return ")) != NULL)
+    {
+        const char *semi = strchr(p, ';');
+        char varname[32], store[2048];
+        size_t vn = semi ? (size_t)(semi - (p + 7)) : 0;
+        int slen = 0;
+
+        if (!semi)
+            break;
+        if (vn >= sizeof varname)
+            vn = sizeof varname - 1;
+        snprintf(varname, sizeof varname, "%.*s", (int)vn, p + 7);
+
+        str_append(&k, &len, &cap, "%.*s", (int)(p - body), body);
+        for (int i = 0; i < tp->cap_members_n; i++)
+        {
+            const MGLTessCaptureMember *cm = &tp->cap_members[i];
+
+            slen += snprintf(store + slen, sizeof store - (size_t)slen,
+                             "%s*(device %s*)((device uchar*)mgl_cap + (size_t)mgl_vid * %uu + %uu) = %s.%s;\n",
+                             i == 0 ? "{ " : "", types[i],
+                             tp->cap_stride * 4u, cm->offset * 4u, varname, cm->name);
+        }
+        slen += snprintf(store + slen, sizeof store - (size_t)slen, "}\nreturn;\n");
+        str_append(&k, &len, &cap, "%s", store);
+        body = semi + 1;
+        p = body;
+    }
+    str_append(&k, &len, &cap, "%s", body);
+    out = k;
+
+done:
+    if (!out)
+    {
+        tp->cap_members_n = 0;
+        tp->cap_stride = 0;
+    }
+    free(plain);
+    return out;
+}
+
+void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable)
+{
+    MGLTessProgram *tp = mgl_tess_active_program(ctx);
+
+    if (!tp)
+        return;
+    (void)program;
+    tp->capture = enable;
+}
+
+const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    return (S && S->capture.valid) ? &S->capture : NULL;
+}
+
 void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, GLuint tessellated_primitives)
 {
     mgl_queries_note_tess(ctx, tes_invocations, tessellated_primitives);
@@ -1887,4 +2080,40 @@ static void tess_fix_tcs_factor_struct(GLMContext ctx, MGLTessProgram *tp)
         }
     }
     free(msl);
+}
+
+/* ---- tests-only capture access (mgl_tess_diag.h) ---- */
+extern GLMContext _ctx;
+
+void mgl_tess_diag_capture(GLuint program, int enable)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)(_ctx ? _ctx->state.ext_tess : NULL);
+
+    (void)program;
+    if (S && _ctx)
+    {
+        MGLTessProgram *tp = mgl_tess_active_program(_ctx);
+        if (tp)
+            tp->capture = enable != 0;
+    }
+}
+
+bool mgl_tess_diag_capture_info(void **buffer, uint32_t *records_offset, uint32_t *stride_words,
+                                uint32_t *prim, uint32_t *count)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)(_ctx ? _ctx->state.ext_tess : NULL);
+
+    if (!S || !S->capture.valid || !buffer)
+        return false;
+    *buffer = S->capture.buffer;
+    if (records_offset) *records_offset = (uint32_t)S->capture.records_offset;
+    if (stride_words)   *stride_words = S->capture.stride;
+    if (prim)           *prim = S->capture.prim;
+    if (count)
+    {
+        const uint32_t *w = (const uint32_t *)((const uint8_t *)S->capture.buffer +
+                                               S->capture.count_offset);
+        *count = *w;
+    }
+    return true;
 }

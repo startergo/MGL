@@ -22,12 +22,17 @@ unsigned mgl_tess_scan_waits(void);
 unsigned mgl_tess_cpu_index_reads(void);
 unsigned mgl_tess_restart_checks(void);
 
-/* enable (1) / disable (0) the GPU-time instrumentation: sums
- * GPUEndTime - GPUStartTime over every tess command buffer and counts them.
- * Read after glFinish (the completion handlers have run by then). */
+/* ---- tests-only capture access (see the MGLTessCapture contract) ----
+ * mgl_tess_diag_capture enables TES-output capture for a program; after a
+ * glFinish(), mgl_tess_diag_capture_info copies the published capture struct and
+ * the GPU-written vertex count (the caller then reads records straight from the
+ * Metal buffer, which is CPU-visible). */
 void mgl_tess_diag_enable(int enable);
 void mgl_tess_gpu_time_reset(void);
 double mgl_tess_gpu_time_us(void);
 unsigned mgl_tess_cbs_completed(void);
+void mgl_tess_diag_capture(GLuint program, int enable);
+bool mgl_tess_diag_capture_info(void **buffer, uint32_t *records_offset, uint32_t *stride_words,
+                                uint32_t *prim, uint32_t *count);
 
 #endif

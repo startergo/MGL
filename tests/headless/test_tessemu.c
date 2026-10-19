@@ -586,6 +586,66 @@ TEST(EmuDefaultLevelsGpu)
     glDeleteProgram(p);
 }
 
+
+
+/* ------------- TES-output capture (producer for geometry / transform feedback) ----
+ * A triangle patch with levels 1 emits exactly its 3 control-point vertices; the
+ * capture records must match the TES math: barycentric position and the varying. */
+TEST(TessOutputCapture)
+{
+    GLuint p = prog2(kTcsTri, kTesTriPt);   /* barycentric mix + tc_col */
+    GLint link = 0;
+    void *buf = NULL;
+    uint32_t off = 0, cstride = 0, prim = 0, count = 0;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    const float pos[3][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 }, { 0,0.5f,0,1 } };
+    const float col[3][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 } };
+    setup(pos, col, 3, 3);
+
+    mgl_tess_diag_capture(p, 1);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    glFinish();                       /* the ring block is CPU-visible after completion */
+    mgl_tess_diag_capture(p, 0);
+
+    if (!mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count))
+    {
+        printf("capture: not published\n");
+        EXPECT_TRUE(false);
+        return;
+    }
+    printf("capture: prim=0x%x stride=%u words, count=%u\n",
+           (unsigned)prim, cstride, (unsigned)count);
+    EXPECT_TRUE(cstride >= 8);                 /* pos(4) + col(4) */
+    EXPECT_TRUE(count == 3);                   /* levels 1: the 3 corners */
+
+    {
+        const float *r = (const float *)((const uint8_t *)buf + off);
+        int ok = 0;
+        for (uint32_t i = 0; i < count && i < 8; i++)
+        {
+            float x = r[(size_t)i * cstride + 0], y = r[(size_t)i * cstride + 1];
+            for (int k = 0; k < 3; k++)
+                if (x == pos[k][0] && y == pos[k][1])
+                {
+                    EXPECT_TRUE(r[(size_t)i * cstride + 4] == col[k][0] &&
+                                r[(size_t)i * cstride + 5] == col[k][1] &&
+                                r[(size_t)i * cstride + 6] == col[k][2]);
+                    ok++;
+                }
+        }
+        printf("capture: %d/3 corner records match the TES math\n", ok);
+        EXPECT_TRUE(ok == 3);
+    }
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(IsolinesGpu);
@@ -593,6 +653,7 @@ int main(void)
     RUN(TrianglePointModeGpu);
     RUN(EmuPatchDataGpu);
     RUN(EmuDefaultLevelsGpu);
+    RUN(TessOutputCapture);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

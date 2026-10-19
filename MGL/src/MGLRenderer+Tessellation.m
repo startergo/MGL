@@ -1042,13 +1042,16 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     id<MTLComputePipelineState> vs_pso, tcs_pso = nil, gather_pso = nil;
     bool need_readback = tp->has_tcs != 0;
     bool use_cpu_reference = tCpuReference();
-    bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode && !use_cpu_reference;
+    bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode &&
+                        !use_cpu_reference && !tp->capture;   /* capture needs the GPU-visible stream */
     bool gpu_emulated = false;
     bool idx_mode_widened = false;
     id<MTLBuffer> widened_mtl = nil;   /* cached gapless index list (restart ranges) */
     bool gpu_indexed = false;          /* indexed draw driven entirely by GPU scan results */
     bool have_restart = false;
     size_t off_vsparams = 0, off_scanout = 0;   /* GPU-written VS parameter block + scan atomics */
+    size_t off_capture = 0;         /* TES-output capture records (tp->capture) */
+    size_t cap_pub_records = 0, cap_pub_idx = 0, cap_pub_count = 0;   /* published offsets */
     id<MTLBuffer> tess_gather_ib = nil;
     size_t tess_gather_offset = 0;
     uint32_t tess_gather_itype = 0, tess_gather_minv = 0, tess_gather_restart = 0xffffffffu, tess_gather_count = 0, tess_gather_modulo = 0, tess_gather_base = 0;
@@ -1772,6 +1775,18 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                              tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
                              tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288);
         size_t need = (coords_off - emu_off) + coords_cap * 16 + indices_cap * 4;
+        if (tp->capture)
+        {
+            /* the layout (record stride) comes from the capture-kernel rewrite */
+            char *cap_msl = mgl_tess_capture_msl(ctx, tp);
+
+            if (tp->cap_stride)
+            {
+                off_capture = emu_off + need;   /* records appended to the emulated scratch */
+                need += coords_cap * (size_t)tp->cap_stride * 4;
+            }
+            free(cap_msl);      /* the compile step below rebuilds it if needed */
+        }
 
         if (need <= (size_t)(64u << 20) && ring)
         {
@@ -1808,6 +1823,62 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2 + 2) * 4 atIndex: 6];
             [cenc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
+            [cenc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+            /* TES-output capture (tess -> geometry / transform feedback producer):
+             * the plain TES rewritten as a kernel, one record per tessellated vertex,
+             * dispatched after the tessellator in the same encoder. The vertex count
+             * it guards on is the GPU-written draw argument. */
+            if (off_capture)
+            {
+                if (!tp->capture_function)
+                {
+                    char *msl = mgl_tess_capture_msl(ctx, tp);
+                    char entry[160];
+
+                    snprintf(entry, sizeof entry, "%s_cap",
+                             prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point);
+                    if (msl && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+                    {
+                        void *lib = NULL, *fn = NULL;
+                        char *err = NULL;
+
+                        if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, entry, &lib, &fn, &err))
+                        {
+                            tp->capture_function = fn;      /* NO y/depth fixup: raw gl_Position */
+                            tp->capture_library = lib;
+                        }
+                        else
+                            NSLog(@"MGL ERROR: tess: capture kernel failed to compile: %s",
+                                  err ? err : "?");
+                        free(err);
+                    }
+                    free(msl);
+                }
+                if (tp->capture_function)
+                {
+                    uint32_t cc = (uint32_t)coords_cap;
+
+                    [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_function];
+                    tessBindStageUniforms(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
+                    tessBindStageTextures(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
+                    [cenc setBuffer: ring offset: coords_off atIndex: MGL_TESS_TES_COORDS];
+                    [cenc setBuffer: ring offset: cp_source_off atIndex: MGL_TESS_TES_CP];
+                    [cenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
+                    {
+                        uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
+                        [cenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
+                    }
+                    [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2 + 2) * 4 atIndex: 30];
+                    [cenc setBuffer: ring offset: off_capture atIndex: 31];
+                    [cenc dispatchThreadgroups: MTLSizeMake(((NSUInteger)cc + 63) / 64, 1, 1)
+                          threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+                    cap_pub_records = off_capture;
+                    cap_pub_idx = off_indices;
+                    cap_pub_count = emu_off + (size_t)(total_patches * 2 + 2) * 4;
+                }
+            }
+
             /* expose the GPU tessellated output (geometry / xfb consumers) */
             S->gpu_scratch = (__bridge void *)ring;
             S->gpu_coords_offset = coords_off;
@@ -1822,6 +1893,31 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     if (gpu_emulated && kenc)
     {
         [kenc endEncoding];
+            /* publish the capture for consumers (geometry / transform feedback):
+             * valid until the next GL_PATCHES draw; the ring slot is released by the
+             * draw's completion, and consumers copy or consume before then */
+            if (cap_pub_records && tp->capture_function)
+            {
+                struct MGLExtState_tess *S2 = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+                if (S2)
+                {
+                    MGLTessCapture *c = &S2->capture;
+
+                    c->buffer = (__bridge void *)ring;
+                    c->records_offset = cap_pub_records;
+                    c->index_offset = cap_pub_idx;
+                    c->count_offset = cap_pub_count;
+                    c->stride = tp->cap_stride;
+                    c->prim = tp->point_mode ? GL_POINTS :
+                              (tp->domain == MGL_TESS_DOMAIN_ISOLINES ? GL_LINES : GL_TRIANGLES);
+                    c->members = (uint32_t)tp->cap_members_n;
+                    for (int i = 0; i < tp->cap_members_n && i < MGL_TESS_CAPTURE_MAX; i++)
+                        c->member[i] = tp->cap_members[i];
+                    c->serial++;
+                    c->valid = true;
+                }
+            }
         {
             id<MTLEvent> ev2 = [_device newEvent];
             [emu_cb encodeSignalEvent: ev2 value: 1];
@@ -2044,13 +2140,13 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                              indexType: MTLIndexTypeUInt32 indexBuffer: ring indexBufferOffset: off_indices];
 
         ctx->state.dirty_bits = DIRTY_ALL;
-    }
     }   /* CPU reference path */
 
     return true;
 }
 
 
+}
 /* read the draw's index list into a freshly malloc'd widened (+ base vertex) array;
  * the caller copies it into the per-draw scratch block */
 static bool tessReadIndicesInto(GLMContext ctx, GLenum type, size_t offset, GLsizei count,
