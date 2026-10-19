@@ -96,13 +96,6 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 
     MGLDrawable _drawBuffers[_MAX_DRAW_BUFFERS];
 
-    MTLBlendFactor _src_blend_rgb_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _dst_blend_rgb_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _src_blend_alpha_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendFactor _dst_blend_alpha_factor[MAX_COLOR_ATTACHMENTS];
-    MTLBlendOperation _rgb_blend_operation[MAX_COLOR_ATTACHMENTS];
-    MTLBlendOperation _alpha_blend_operation[MAX_COLOR_ATTACHMENTS];
-    MTLColorWriteMask _color_mask[MAX_COLOR_ATTACHMENTS];
 
     // The command queue used to pass commands to the device.
     id<MTLCommandQueue> _commandQueue;
@@ -156,16 +149,12 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 - (id)newDrawBuffer:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil;
 - (id)newDrawBufferWithCustomSize:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil customSize:(CGSize)size;
 - (bool) checkDrawBufferSize:(GLuint) index;
-- (MTLStencilOperation) mtlStencilOpForGLOp:(GLenum) op;
 - (void) updateCurrentRenderEncoder;
 - (bool) newRenderEncoder;
 - (bool) newCommandBuffer;
 - (bool) newCommandBufferAndRenderEncoder;
 -(MTLRenderPipelineDescriptor *)generatePipelineDescriptor;
 - (MTLVertexDescriptor *)generateVertexDescriptor;
-- (MTLBlendFactor) blendFactorFromGL:(GLenum)gl_blend;
-- (MTLBlendOperation) blendOperationFromGL:(GLenum)gl_blend_op;
-- (void) updateBlendStateCache;
 -(void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)pipelineStateDescriptor;
 -(bool)bindFramebufferAttachmentTextures;
 - (void) endRenderEncoding;
@@ -194,7 +183,6 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 -(void) mtlBufferSubData:(GLMContext) glm_ctx buf:(Buffer *)buf offset:(size_t)offset size:(size_t)size ptr:(const void *)ptr;
 -(void *) mtlMapUnmapBuffer:(GLMContext) glm_ctx buf:(Buffer *)buf offset:(size_t) offset size:(size_t) size access:(GLenum) access map:(bool)map;
 -(void) mtlFlushMappedBufferRange:(GLMContext) glm_ctx buf:(Buffer *)buf offset:(size_t) offset length:(size_t) length;
--(void) mtlReadDrawable:(GLMContext) glm_ctx pixelBytes:(void *)pixelBytes bytesPerRow:(NSUInteger)bytesPerRow bytesPerImage:(NSUInteger)bytesPerImage fromRegion:(MTLRegion)region;
 -(void) mtlGetTexImage:(GLMContext) glm_ctx tex: (Texture *)tex pixelBytes:(void *)pixelBytes bytesPerRow:(NSUInteger)bytesPerRow bytesPerImage:(NSUInteger)bytesPerImage fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice;
 -(void)mtlGenerateMipmaps:(GLMContext)glm_ctx forTexture:(Texture *) tex;
 -(void)mtlTexSubImage:(GLMContext)glm_ctx tex:(Texture *)tex buf:(Buffer *)buf src_offset:(size_t)src_offset src_pitch:(size_t)src_pitch src_image_size:(size_t)src_image_size src_size:(size_t)src_size slice:(GLuint)slice level:(GLuint)level width:(size_t)width height:(size_t)height depth:(size_t)depth xoffset:(size_t)xoffset yoffset:(size_t)yoffset zoffset:(size_t)zoffset;
