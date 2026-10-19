@@ -108,6 +108,10 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
             }
 
             first_free->buf = buf;
+            if (getenv("MGL_GEOM_XFB_TRACE"))
+                fprintf(stderr, "geom: track CREATE entry for buf=%u (was serial %llu)\n",
+                        buf ? buf->name : 0,
+                        (unsigned long long)first_free->write_serial);
             first_free->read_serial = first_free->write_serial = 0;
             return first_free;
         }
@@ -116,6 +120,10 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
     if (create && first_free)
     {
         first_free->buf = buf;
+        if (getenv("MGL_GEOM_XFB_TRACE"))
+            fprintf(stderr, "geom: track REUSE entry for buf=%u (was serial %llu)\n",
+                    buf ? buf->name : 0,
+                    (unsigned long long)first_free->write_serial);
         first_free->read_serial = first_free->write_serial = 0;
         return first_free;
     }
@@ -129,6 +137,9 @@ void mgl_buffers_forget(GLMContext ctx, Buffer *buf)
 
     if (t)
     {
+        if (getenv("MGL_GEOM_XFB_TRACE"))
+            fprintf(stderr, "geom: track FORGET entry for buf=%u (was serial %llu)\n",
+                    buf ? buf->name : 0, (unsigned long long)t->write_serial);
         t->buf = TRACK_TOMBSTONE;
         t->read_serial = t->write_serial = 0;
     }
@@ -211,6 +222,9 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 
     if (can_rename && MTLX()->rename_buffer(ctx, buf))
     {
+        if (getenv("MGL_GEOM_XFB_TRACE"))
+            fprintf(stderr, "geom: track ORPHAN buf=%u (serial was %llu, rename)\n",
+                    buf ? buf->name : 0, (unsigned long long)t->write_serial);
         t->read_serial = t->write_serial = 0;
         return;
     }
