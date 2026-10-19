@@ -95,6 +95,162 @@ no emulation is attempted.
 
 ---
 
+# tess — round 13 report (audit: remaining CPU sync points, then removal)
+
+> Round 14 (fully GPU-driven indexed draws — no scan wait at all) is documented
+> at the very bottom; this section is the round-13 record.
+
+## Step 1 — the audit (state as of 9e0a676, before the fixes)
+
+Greps: `waitUntilCompleted|waitUntilScheduled|waitUntilSignaled`,
+`.contents`, and per-draw CPU loops over vertices/patches in
+`tessellation.c` and `MGLRenderer+Tessellation.m`.
+
+### GPU-wait sites (`waitUntilCompleted`)
+
+| site | path | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:931` | index scan (`scb`) for indexed GL_PATCHES draws: the VS grid and the ring layout need `minv/maxv/restart-count` on the CPU | **YES — every indexed patch draw waits once** |
+| `MGLRenderer+Tessellation.m:1255` | `cpu_reference \|\| debug_wait` (MGL_TESS_CPU / MGL_TESS_DEBUG) | no |
+| `MGLRenderer+Tessellation.m:1322-1334` | `tTrace()` dump in the hardware `drawPatches` block | no |
+| `MGLRenderer+Tessellation.m:1497` | `tTrace()` dump in the emulated render block | no |
+
+### `.contents` reads of GPU-written results
+
+| site | what | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:933-935` | `scanout[0..2]` — the scan kernel's min/max/restart count | **YES — indexed patch draws** (paired with :931) |
+| `MGLRenderer+Tessellation.m:1326-1332` | trace dump of cp/factors | no (tTrace) |
+| `MGLRenderer+Tessellation.m:1498-1502` | trace dump of tcs_patch/blob/factors/coords | no (tTrace) |
+| `MGLRenderer+Tessellation.m:1550,1563` | CPU reference path: factor read-back + patch records | no (MGL_TESS_CPU / GPU-tessellator fallback) |
+
+CPU→GPU **writes** through `.contents` (no GPU dependency, not read-backs;
+listed for completeness): :917 scanbuf init, :981 widened index upload,
+:1193-1195 no-TCS half factors, :1386 emulated kernel params,
+:1621-1623 CPU-path uploads, :1745/:1838 attribute shadow uploads.
+
+### Per-draw CPU loops over vertices/patches (outside MGL_TESS_CPU)
+
+| site | what | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:943` `tessReadIndicesInto` | reads the element buffer on the CPU and loops over `count` indices (drops restarts) | **YES when the range contains primitive-restart values** |
+| `MGLRenderer+Tessellation.m:980-981` | widened gapless index list: loop over `tess_idx_used × instances` | same restart case |
+| `MGLRenderer+Tessellation.m:1190-1196` | no-TCS half-factor fill: writes `total_patches × 6` constants | yes, but a pure CPU→GPU constant write (no GPU dependency, 12 B/patch); a kernel dispatch would cost more — kept |
+| `tessellation.c:1475` `mgl_tess_note_counts` | arithmetic-only loop over `total_patches` for query bookkeeping on TCS-less GPU draws | yes; no memory traffic, O(patches) — kept (GL needs the counts; the alternative is GPU query counters) |
+
+Also found while auditing: the scan path allocates a fresh 16-byte
+`MTLBuffer` **per indexed draw** (:914).
+
+## Step 2 — removals
+
+* **commit `68fb738`** — the index-scan stall, the per-draw scan-buffer allocation and
+  the restart-range CPU index loop are gone for repeat draws: the scan results (and,
+  for restart ranges, the gapless widened list as an `MTLBuffer`) are cached in an
+  8-entry LRU in the renderer, keyed on (context, element buffer object, its
+  **gpuaudit content serial** — bumped by every CPU-visible modification —, Metal
+  storage pointer and size, offset, count, index type, restart value/enabled). A hit
+  skips the scan kernel, the wait and the allocation; the gather kernel indexes the
+  cached list with a new `modulo` parameter instead of a per-instance ring copy.
+  Proven by `mgl_tess_scan_waits()` / `mgl_tess_cpu_index_reads()`:
+  `TessIndexedNoRescan` draws each range three times, asserts exactly one scan per
+  range (one CPU index read for the restart case), one more scan after a
+  `glBufferSubData` invalidates the entry, and checks pixels every time.
+
+  Three real bugs surfaced by the new test were fixed in the same commit:
+  indexed patch draws whose indices do not start at 0 rendered the wrong vertices
+  (`tessBuildVSPlan` computed the vertex-rate attribute fetch offsets from `first`
+  before the scan produced the real base vertex — 10 of the test's checks fail
+  against the round-12 library); the widened (primitive-restart) path never actually
+  dropped the restart values (`tessReadIndicesInto` returns them; the old 'gapless'
+  list still contained 0xFFFF entries and used a stale `tess_idx_used`); and the raw
+  gather dispatch left `itype/minv/restart` unbound (undefined values) while the
+  widened dispatch subtracted minv twice. Every kernel parameter is now set
+  explicitly.
+
+Post-fix state of the wait sites (file `MGLRenderer+Tessellation.m`):
+
+| line | path |
+|---|---|
+| 1060 | the one-time scan of a *first* draw of an element range (cache miss); repeat draws skip it entirely |
+| 1469 | `cpu_reference \|\| debug_wait` (MGL_TESS_CPU / MGL_TESS_DEBUG) |
+| 1539 | `tTrace()` dump in the hardware `drawPatches` block |
+| 1711 | `tTrace()` dump in the emulated render block |
+
+All remaining CPU work on the default path is the two documented, justified items:
+the no-TCS half-factor constant fill (12 B/patch, no GPU dependency) and
+`mgl_tess_note_counts` (arithmetic-only query bookkeeping, O(patches), no memory
+traffic) — plus the first-draw-of-a-range scan miss above.
+
+---
+
+# tess — round 14 report (indexed draws fully GPU-driven: the scan wait is gone)
+
+Commits: `0fd3a48` (step 1, test red) and `2d06bb6` (step 2).
+
+## Design
+
+The vertex kernel now indexes its output **absolutely** (vertex id, `vfirst = 0`),
+so the scan's min is not needed at all and the ring's vertex-output region is
+sized by the attribute capacity (`tessVSCapacity`: the smallest vertex-rate
+binding's `(bytes - offset) / stride` — always ≥ maxv+1 for a valid draw)
+instead of the scan range. Only `maxv + 1`, clamped to that capacity, matters:
+
+* the scan kernel (same math, atomics into the ring now) runs in its own command
+  buffer, followed by a new `mgl_tess_scan_setup` kernel that writes the vertex
+  kernel's parameter block `{vfirst=0, vcount, instances, baseinstance}` beside
+  it — both committed before the compute buffer and consumed GPU-side through
+  FIFO ordering; **never read back, never waited on**;
+* the vertex kernel is dispatched at the CPU-known capacity × instances and
+  every thread past the GPU-decided vcount returns before writing; its
+  parameter block is bound from the ring instead of `setBytes`;
+* an indirect dispatch (`dispatchThreadgroupsWithIndirectBuffer`) was
+  implemented first and **rejected**: Metal's stage-in attribute fetch does not
+  follow an indirect grid — every thread beyond the first fetched zeros. The
+  capacity-bound direct dispatch with a GPU-written vcount guard has the same
+  effect with no such limitation;
+* the gather shifts by base only (`minv` unused), reading the absolute records.
+
+The one decision still made on the CPU is whether the range contains a
+primitive-restart value (patches re-form around one, which no kernel-side trick
+can express without variable patch counts): `tessRangeHasRestart` scans the
+element buffer's CPU-visible storage — **no GPU sync** — and restart ranges keep
+the round-13 gapless-list path, which also never waits (the CPU reads the
+indices directly from CPU-visible memory). The scan cache now serves only that
+path, where it still saves the CPU index read on repeat draws — exactly the
+"keep only if it saves work" rule.
+
+## Test
+
+`TessIndexedNoRescan` (strengthened in step 1, red until step 2):
+`mgl_tess_scan_waits()` stays at its initial value through the first draw of a
+fresh element range, three redraws, a `glBufferSubData` that changes the
+contents, and a primitive-restart range — with pixel checks after every draw.
+
+```
+scan waits 0 -> 0, cpu index reads 1 -> 1
+after glBufferSubData: scan waits 0 -> 0
+restart: scan waits 0 -> 0, cpu index reads 1 -> 2
+== wt/tess/tests/headless/test_tess.c:   455 checks, 0 failures
+== wt/tess/tests/headless/test_tessemu.c: 53 checks, 0 failures
+```
+Full suite: 21/21 files, 0 failures. The three remaining `waitUntilCompleted`
+sites are behind MGL_TESS_CPU / MGL_TESS_DEBUG / the cached trace flag only.
+
+## Known limits
+
+* A draw whose absolute max index +1 exceeds the attribute capacity (a
+  massively sparse range drawn from a much larger vertex buffer) is clamped by
+  the GPU: vertices past the capacity stay untransformed and those patches
+  degrade. Sizing by capacity instead of the scan range trades that (pathological)
+  case for never needing min/max on the CPU.
+* The restart presence check is a CPU scan of `count` indices when primitive
+  restart is enabled and the range is not cache-hot; it reads CPU-visible
+  memory only (no GPU interaction) and is counted by
+  `mgl_tess_cpu_index_reads()`.
+
+
+---
+
 # tess — round 12 report (emulated path: GPU patch-blob assembly)
 
 Commits (one per step), after merging `gl46-port` (66de6c9):

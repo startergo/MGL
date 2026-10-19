@@ -359,6 +359,123 @@ TEST(TessIndexedRestart)
     glDeleteProgram(prog);
 }
 
+/* ------------- index-scan cache ------------------------------------------------------
+ * The first indexed draw of an element range runs the GPU index scan (one wait);
+ * every redraw of the same range must hit the cache: no further scan waits and no
+ * CPU element-buffer reads. A glBufferSubData on the element buffer must invalidate
+ * the entry. The restart variant uses indices that do NOT start at 0 (minv = 3):
+ * the gapless widened list must address the right vertices — an earlier variant
+ * subtracted minv twice and read vs_out[idx - 2*minv]. */
+TEST(TessIndexedNoRescan)
+{
+    extern unsigned mgl_tess_scan_waits(void);
+    extern unsigned mgl_tess_cpu_index_reads(void);
+
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+
+    /* red triangle on the left, green on the right, blue on top of the right */
+    const float pos[9][4] = {
+        { -0.9f,  0.6f, 0, 1 }, { -0.9f, -0.6f, 0, 1 }, { -0.1f, -0.6f, 0, 1 },
+        {  0.9f,  0.6f, 0, 1 }, {  0.9f, -0.6f, 0, 1 }, {  0.1f, -0.6f, 0, 1 },
+        {  0.6f,  0.9f, 0, 1 }, {  0.4f,  0.3f, 0, 1 }, { 0.2f, 0.9f, 0, 1 },
+    };
+    const float col[9][4] = {
+        { 1,0,0,1 }, { 1,0,0,1 }, { 1,0,0,1 },
+        { 0,1,0,1 }, { 0,1,0,1 }, { 0,1,0,1 },
+        { 0,0,1,1 }, { 0,0,1,1 }, { 0,0,1,1 },
+    };
+    GLuint vao, b[3];
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(3, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+
+    /* --- 1. plain indexed draw (no restart, minv = 4): green/blue patches on the right */
+    const unsigned short idx[6] = { 4, 5, 6, 6, 7, 8 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    float w = (float)vp[2], h = (float)vp[3];
+    float c[4];
+
+    unsigned w0 = mgl_tess_scan_waits(), r0 = mgl_tess_cpu_index_reads();
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL);
+        EXPECT_NO_GL_ERROR();
+        glFinish();
+        read_px((int)(0.75f * w), (int)(0.45f * h), c);
+        EXPECT_TRUE(c[1] + c[2] > 0.6f);          /* green/blue, never red */
+        read_px((int)(0.20f * w), (int)(0.50f * h), c);
+        EXPECT_TRUE(c[0] + c[1] + c[2] < 0.05f);  /* left half untouched */
+    }
+    /* round 14: zero GPU-wait on the whole indexed path — the scan's min/max are
+     * consumed on the GPU (indirect dispatch), so not even the first draw of a
+     * range, nor one after glBufferSubData invalidated the cache, may wait */
+    printf("scan waits %u -> %u, cpu index reads %u -> %u\n",
+           w0, mgl_tess_scan_waits(), r0, mgl_tess_cpu_index_reads());
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);
+    EXPECT_TRUE(mgl_tess_cpu_index_reads() == r0);
+
+    /* --- 2. element buffer contents change: the cache must invalidate */
+    const unsigned short idx2[6] = { 0, 1, 2, 2, 3, 0 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof idx2, idx2);
+    w0 = mgl_tess_scan_waits();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    read_px((int)(0.20f * w), (int)(0.50f * h), c);
+    EXPECT_TRUE(c[0] > 0.6f);                     /* red patch now on the left */
+    printf("after glBufferSubData: scan waits %u -> %u\n", w0, mgl_tess_scan_waits());
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);     /* no wait after invalidation either */
+
+    /* --- 3. restart range with minv = 3 (indices not starting at 0) */
+    const unsigned short idx3[7] = { 5, 6, 7, 0xFFFF, 3, 4, 5 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx3, idx3, GL_STATIC_DRAW);
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xFFFF);
+
+    w0 = mgl_tess_scan_waits(); r0 = mgl_tess_cpu_index_reads();
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_PATCHES, 7, GL_UNSIGNED_SHORT, NULL);
+        EXPECT_NO_GL_ERROR();
+        glFinish();
+        read_px((int)(0.75f * w), (int)(0.45f * h), c);
+        EXPECT_TRUE(c[1] + c[2] > 0.6f);          /* right-half vertices 3..7 */
+        read_px((int)(0.20f * w), (int)(0.50f * h), c);
+        EXPECT_TRUE(c[0] + c[1] + c[2] < 0.05f);
+    }
+    /* round 14: zero waits for restart ranges too — the presence check and the
+     * gapless build read the CPU-visible element buffer directly (no GPU wait) */
+    printf("restart: scan waits %u -> %u, cpu index reads %u -> %u\n",
+           w0, mgl_tess_scan_waits(), r0, mgl_tess_cpu_index_reads());
+    EXPECT_TRUE(mgl_tess_scan_waits() == w0);
+    EXPECT_TRUE(mgl_tess_cpu_index_reads() >= r0);
+
+    glDisable(GL_PRIMITIVE_RESTART);
+    glDeleteProgram(prog);
+}
+
 /* ------------- consecutive-draw regression ------------------------------------------
  * The per-draw scratch ring and GPU-event ordering broke from the third tess draw on
  * in an earlier iteration (stale-build masking). This test hammers the hardware path
@@ -646,6 +763,7 @@ int main(void)
     RUN(TessFourPatches);
     RUN(TessIndexedAndInstanced);
     RUN(TessIndexedRestart);
+    RUN(TessIndexedNoRescan);
     RUN(TessConsecutiveDraws);
     RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
