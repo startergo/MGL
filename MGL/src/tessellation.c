@@ -26,6 +26,7 @@
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_queries.h"
 #include "mgl_ext_program.h"
+#include "spirv_cross_c.h"
 #include "glcorearb.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -38,6 +39,16 @@ static bool tess_trace(void)
     if (tess_trace_flag < 0)
         tess_trace_flag = (getenv("MGL_TESS_DEBUG") != NULL) ? 1 : 0;
     return tess_trace_flag != 0;
+}
+
+/* MGL_TESS_CPU (force the CPU reference path), evaluated once like tess_trace();
+ * MGLRenderer.m consults it when it picks the pipeline's vertex function */
+static int tess_cpu_flag = -1;
+bool mgl_tess_cpu_reference(void)
+{
+    if (tess_cpu_flag < 0)
+        tess_cpu_flag = (getenv("MGL_TESS_CPU") != NULL) ? 1 : 0;
+    return tess_cpu_flag != 0;
 }
 
 /* failure exit of the TES->plain-MSL rewrite: never silent, but only verbose with
@@ -220,7 +231,10 @@ struct MslStruct;
 static bool tess_cp_record_name(const char *msl, char *out, size_t out_len);
 static bool msl_patch_in_name(const char *msl, char *out, size_t out_len);
 static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *out, size_t out_len);
-static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out);
+static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out, char *name, size_t name_len);
+static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
+                                 char *out_name, size_t out_len);
+static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp);
 
 /* ------------------------------------------------------------------ MSL struct layout
  * Parse an MSL interface struct declaration and compute the byte layout Metal
@@ -245,6 +259,10 @@ static bool msl_scalar_type(const char *t, size_t *align, size_t *size)
         { "float2", 8, 8 }, { "half2",  4, 4 }, { "int2",  8, 8 }, { "uint2", 8, 8 },
         { "float3", 16, 16 }, { "half3",  8, 8 }, { "int3", 16, 16 }, { "uint3", 16, 16 },
         { "float4", 16, 16 }, { "half4",  8, 8 }, { "int4", 16, 16 }, { "uint4", 16, 16 },
+        { "double", 8, 8 }, { "long", 8, 8 }, { "ulong", 8, 8 },
+        { "double2", 16, 16 }, { "long2", 16, 16 }, { "ulong2", 16, 16 },
+        { "double3", 32, 32 }, { "long3", 32, 32 }, { "ulong3", 32, 32 },
+        { "double4", 32, 32 }, { "long4", 32, 32 }, { "ulong4", 32, 32 },
         { NULL, 0, 0 }
     };
     for (int i = 0; tab[i].name; i++)
@@ -422,6 +440,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         out->members[out->count].offset = cursor;
         out->members[out->count].size = size;
         out->members[out->count].attr = attr_num;
+        out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
         out->members[out->count].is_tess_level =
             !strcmp(namebuf, "gl_TessLevel") || !strcmp(namebuf, "gl_TessLevelOuter") ? 1 :
             !strcmp(namebuf, "gl_TessLevelInner") ? 2 : 0;
@@ -434,6 +453,499 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
 
     out->size = cursor;
     return true;        /* the struct was found; count may be 0 (no data members) */
+}
+
+/* ------------------------------------------------------------------ canonical records
+ * The per-vertex control point record and the per-patch record are written by one
+ * stage (the VS kernel / the TCS kernel) and read by another (the TCS kernel / the
+ * TES). SPIRV-Cross emits a struct per stage holding exactly the members THAT stage
+ * statically uses, in declaration order — so a consumer that declares-but-does-not-
+ * use a varying, or declares its inputs in a different order, would read every
+ * following member at a shifted offset. The fix is one canonical record layout per
+ * interface, derived from the UNION of the stages' members keyed by GL varying
+ * location (never by name or by what SPIRV-Cross happens to keep):
+ *
+ *   - user varyings      key = Location decoration (from the program's reflected
+ *                        SPIR-V resources of that stage)
+ *   - builtins           key = fixed slots (gl_Position, gl_PointSize, ...) so every
+ *                        stage agrees regardless of declaration order
+ *   - unreflectable      key = stable hash of the member name (interface blocks whose
+ *                        members SPIRV-Cross flattens but whose locations the resource
+ *                        list does not carry)
+ *
+ * Every stage's MSL struct is then rewritten to the canonical member sequence (the
+ * stage's own member names for members it has, never-referenced pads otherwise), and
+ * the record the stages exchange is byte-identical for producer and consumer.
+ */
+
+/* fixed builtin slots: after user locations, before name hashes, in a stable order */
+static uint32_t tess_builtin_key(const char *name)
+{
+    static const struct { const char *name; uint32_t key; } tab[] = {
+        { "gl_Position",     0x80010000u },
+        { "gl_PointSize",    0x80010001u },
+        { "gl_ClipDistance", 0x80010002u },
+        { "gl_CullDistance", 0x80010003u },
+        { "gl_TessLevel",      0x80020000u },
+        { "gl_TessLevelOuter", 0x80020000u },   /* packed half4 alias of the same slot */
+        { "gl_TessLevelInner", 0x80020001u },
+        { NULL, 0 }
+    };
+    for (int i = 0; tab[i].name; i++)
+        if (!strcmp(name, tab[i].name))
+            return tab[i].key;
+    return 0;
+}
+
+static uint32_t tess_name_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s)
+    {
+        h ^= (uint8_t)*s++;
+        h *= 16777619u;
+    }
+    return 0x40000000u | (h & 0x3fffffffu);
+}
+
+/* attach the canonical key to every member of a parsed stage struct, using the
+ * stage's reflected SPIR-V interface (name -> location). Location 0 is valid, so
+ * "not found" is tracked separately from the key value. Arrayed varyings are
+ * flattened by SPIRV-Cross into "name_0", "name_1" members: they resolve to the
+ * base varying's location with their element index recorded separately */
+static void tess_annotate_keys(struct MslStruct *s, const SpirvResourceList *rl)
+{
+    for (int i = 0; i < s->count; i++)
+    {
+        MGLTessPatchMember *m = &s->members[i];
+        uint32_t key = 0;
+        bool found = false;
+
+        if (rl)
+            for (GLuint j = 0; j < rl->count; j++)
+                if (rl->list && !strcmp(rl->list[j].name, m->name))
+                {
+                    key = (uint32_t)rl->list[j].location;
+                    found = true;
+                    break;
+                }
+        if (!found && rl)
+        {
+            /* flattened array element: strip "_<digits>" and retry */
+            size_t n = strlen(m->name);
+
+            while (n > 1 && m->name[n - 1] >= '0' && m->name[n - 1] <= '9')
+                n--;
+            if (n > 1 && m->name[n - 1] == '_')
+            {
+                char base[128];
+                uint32_t idx = 0;
+
+                snprintf(base, sizeof base, "%.*s", (int)(n - 1), m->name);
+                idx = (uint32_t)atoi(m->name + n);
+                for (GLuint j = 0; j < rl->count; j++)
+                    if (rl->list && !strcmp(rl->list[j].name, base))
+                    {
+                        key = (uint32_t)rl->list[j].location;
+                        m->array_idx = idx;
+                        found = true;
+                        break;
+                    }
+            }
+        }
+        if (!found)
+            key = tess_builtin_key(m->name);
+        if (!found && !key)
+            key = tess_name_hash(m->name);   /* unreflected (block member / gl_ extra) */
+        m->key = key;
+    }
+}
+
+struct CanonRec {
+    MGLTessPatchMember m[MGL_TESS_MAX_PATCH_MEMBERS];
+    int    n;
+    size_t size;        /* record stride, tail-padded to the struct alignment */
+};
+
+/* canonical record = union of the stages' members by key, sorted by key; each key's
+ * slot takes the largest member any stage declares there (the producer's data must
+ * fit even if a consumer declares a narrower type it never reads). A member whose
+ * type is an arrayed varying covers the same slots as another stage's flattened
+ * "name_i" elements of that varying: the two merge into the wider (array) entry */
+static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, int nin)
+{
+    memset(out, 0, sizeof *out);
+    for (int s = 0; s < nin; s++)
+    {
+        if (!in[s])
+            continue;
+        for (int i = 0; i < in[s]->count; i++)
+        {
+            MGLTessPatchMember *m = &in[s]->members[i];
+            bool m_arr = strstr(m->type, "spvUnsafeArray") != NULL;
+            int found = -1;
+
+            if (m->size == 0)
+                continue;               /* patch_control_point reference and friends */
+            for (int j = 0; j < out->n; j++)
+            {
+                bool o_arr = strstr(out->m[j].type, "spvUnsafeArray") != NULL;
+
+                if (out->m[j].key != m->key)
+                    continue;
+                if (o_arr || m_arr ||
+                    (!o_arr && !m_arr && out->m[j].array_idx == m->array_idx))
+                {
+                    found = j;          /* same varying (whole array or an element) */
+                    if (!o_arr && m_arr)
+                    {
+                        /* the array covers the elements already registered */
+                        out->m[j] = *m;
+                        out->m[j].offset = 0;
+                    }
+                    break;
+                }
+            }
+            if (found < 0)
+            {
+                if (out->n >= MGL_TESS_MAX_PATCH_MEMBERS)
+                    return false;
+                out->m[out->n] = *m;
+                out->m[out->n].offset = 0;
+                out->n++;
+            }
+            else if (m->size > out->m[found].size)
+            {
+                /* keep the wider type, remember the member that provides it */
+                snprintf(out->m[found].type, sizeof out->m[found].type, "%s", m->type);
+                snprintf(out->m[found].name, sizeof out->m[found].name, "%s", m->name);
+                out->m[found].size = m->size;
+                out->m[found].array_idx = m->array_idx;
+            }
+        }
+    }
+
+    /* sort by key (insertion sort: n is bounded by MGL_TESS_MAX_PATCH_MEMBERS) */
+    for (int i = 1; i < out->n; i++)
+    {
+        MGLTessPatchMember tmp = out->m[i];
+        int j = i - 1;
+        while (j >= 0 && out->m[j].key > tmp.key)
+        {
+            out->m[j + 1] = out->m[j];
+            j--;
+        }
+        out->m[j + 1] = tmp;
+    }
+
+    /* byte layout: C++ natural alignment, struct tail-padded to its alignment */
+    size_t cursor = 0, maxalign = 1;
+    for (int i = 0; i < out->n; i++)
+    {
+        size_t align = 1, size = 0;
+        if (!msl_element_type(out->m[i].type, &align, &size))
+            return false;               /* unknown member type: keep the stage structs */
+        out->m[i].offset = round_up(cursor, align);
+        cursor = out->m[i].offset + size;
+        out->m[i].size = size;
+        if (align > maxalign)
+            maxalign = align;
+    }
+    out->size = round_up(cursor, maxalign);
+    return true;
+}
+
+/* element count of an MSL arrayed varying type ("spvUnsafeArray<T, N>"), 1 otherwise */
+static uint32_t msl_array_len(const char *type)
+{
+    const char *at = strstr(type, "spvUnsafeArray<");
+
+    if (!at)
+        return 1;
+    at = strrchr(at, ',');
+    while (at && *at && (*at < '0' || *at > '9'))
+        at++;
+    return at ? (uint32_t)strtoul(at, NULL, 10) : 1;
+}
+
+/* does the stage's own struct already match the canonical layout? */
+static bool tess_canon_matches(const struct MslStruct *own, const struct CanonRec *canon)
+{
+    if (!own || own->count != canon->n)
+        return false;
+    for (int i = 0; i < canon->n; i++)
+        if (own->members[i].key != canon->m[i].key ||
+            strcmp(own->members[i].type, canon->m[i].type))
+            return false;
+    return true;
+}
+
+/* element type of "spvUnsafeArray<T, N>" (text between '<' and the last ','), with the
+ * inner template name already renamed when rename_arr; false when type is not an array */
+static bool tess_canon_element_type(const char *type, bool rename_arr, char *out, size_t cap)
+{
+    const char *at = strstr(type, "spvUnsafeArray<");
+    const char *end;
+    size_t n;
+
+    if (!at)
+        return false;
+    at += strlen("spvUnsafeArray<");
+    end = strrchr(type, ',');
+    if (!end || end < at)
+        return false;
+    n = (size_t)(end - at);
+    while (n > 0 && at[n - 1] == ' ')
+        n--;
+    if (n >= cap)
+        return false;
+    memcpy(out, at, n);
+    out[n] = 0;
+    if (rename_arr)
+        for (char *p = out; (p = strstr(p, "spvUnsafeArray")) != NULL; )
+        {
+            memcpy(p, "mgl_spv_arr   ", strlen("spvUnsafeArray"));
+            p += strlen("spvUnsafeArray");
+        }
+    return true;
+}
+
+/* copy of a member type with spvUnsafeArray renamed to our own template (the plain-TES
+ * MSL declares mgl_spv_arr in the prelude, SPIRV-Cross's template only exists in the
+ * kernel forms) */
+static void tess_type_renamed(const char *type, bool rename_arr, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s", type);
+    if (!rename_arr)
+        return;
+    for (char *p = out; (p = strstr(p, "spvUnsafeArray")) != NULL; )
+    {
+        memcpy(p, "mgl_spv_arr   ", strlen("spvUnsafeArray"));
+        p += strlen("spvUnsafeArray");
+    }
+}
+
+/* one canonical member as struct-body lines for a stage. stage/nstage: the members the
+ * stage's own struct declares for this key. A canonical slot that is an ARRAY while the
+ * stage flattened it into per-element members ("name_i", array_idx = element index) is
+ * re-expanded to those members — they tile the slot exactly, and the stage's code refers
+ * to them by their own names and (scalar/vector) types. rename_arr: see above. */
+static void str_append(char **buf, size_t *len, size_t *cap, const char *fmt, ...);
+
+static void tess_canon_member_lines(char **buf, size_t *len, size_t *cap,
+                                    const MGLTessPatchMember *cm,
+                                    const MGLTessPatchMember *stage, int nstage,
+                                    bool rename_arr, bool *first)
+{
+    char type[160];
+    bool canon_arr = strstr(cm->type, "spvUnsafeArray") != NULL;
+    int nflat = 0;
+
+    tess_type_renamed(cm->type, rename_arr, type, sizeof type);
+
+    if (stage)
+        for (int j = 0; j < nstage; j++)
+            if (stage[j].key == cm->key && stage[j].size > 0 &&
+                strstr(stage[j].type, "spvUnsafeArray") == NULL)
+                nflat++;
+    if (canon_arr && nflat > 0)
+    {
+        /* the canonical slot is the whole array, the stage uses flattened elements */
+        char elem[120];
+        uint32_t n = msl_array_len(cm->type);
+
+        if (tess_canon_element_type(cm->type, rename_arr, elem, sizeof elem))
+            for (uint32_t e = 0; e < n; e++)
+            {
+                const char *nm = NULL;
+                char pad[64];
+
+                if (stage)
+                    for (int j = 0; j < nstage; j++)
+                        if (stage[j].key == cm->key && stage[j].size > 0 &&
+                            stage[j].array_idx == e &&
+                            strstr(stage[j].type, "spvUnsafeArray") == NULL)
+                        {
+                            nm = stage[j].name;
+                            break;
+                        }
+                if (!nm)
+                {
+                    snprintf(pad, sizeof pad, "mgl_k%08x_%u", cm->key, e);
+                    nm = pad;
+                }
+                str_append(buf, len, cap, "%s    %s %s;\n", *first ? "\n" : "", elem, nm);
+                *first = false;
+            }
+        return;
+    }
+
+    {
+        const char *nm = NULL;
+        char pad[48];
+
+        if (stage)
+            for (int j = 0; j < nstage; j++)
+                if (stage[j].key == cm->key && stage[j].size > 0)
+                {
+                    nm = stage[j].name;
+                    break;
+                }
+        if (!nm)
+        {
+            snprintf(pad, sizeof pad, "mgl_k%08x", cm->key);
+            nm = pad;
+        }
+        str_append(buf, len, cap, "%s    %s %s;\n", *first ? "\n" : "", type, nm);
+        *first = false;
+    }
+}
+
+/* canonical struct body text for one stage: the stage's member names for members it
+ * declares, syntactically-valid pads for the rest (never referenced by its code) */
+static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own,
+                            const struct CanonRec *canon)
+{
+    char *buf = NULL;
+    size_t len = 0, bc = 0;
+    bool first = true;
+
+    out[0] = 0;
+    for (int i = 0; i < canon->n; i++)
+    {
+        /* not renamed here: msl_rewrite_struct_body renames (and injects the template)
+         * only when the original MSL does not define spvUnsafeArray before the struct */
+        tess_canon_member_lines(&buf, &len, &bc, &canon->m[i],
+                                own ? own->members : NULL, own ? own->count : 0,
+                                false, &first);
+        if (!buf)
+            return;
+    }
+    snprintf(out, cap, "%s", buf);
+    free(buf);
+}
+
+/* replace the body of "struct NAME { ... };" in msl with new_body; returns a malloc'd
+ * copy, or NULL when the struct is absent (nothing to rewrite). The spvUnsafeArray
+ * template is injected when the canonical body needs it and the original declares it
+ * later (SPIRV-Cross emits it after the stage's own structs in kernel form) */
+static const char kSpvUnsafeArray[] =
+    "template <typename T, size_t Num>\n"
+    "struct mgl_spv_arr\n"
+    "{\n"
+    "    T elements[Num ? Num : 1];\n"
+    "    \n"
+    "    thread T& operator [] (size_t pos) thread\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    constexpr const thread T& operator [] (size_t pos) const thread\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    \n"
+    "    device T& operator [] (size_t pos) device\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    constexpr const device T& operator [] (size_t pos) const device\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    \n"
+    "    constexpr const constant T& operator [] (size_t pos) const constant\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    \n"
+    "    threadgroup T& operator [] (size_t pos) threadgroup\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup\n"
+    "    {\n"
+    "        return elements[pos];\n"
+    "    }\n"
+    "};\n";
+
+static char *msl_rewrite_struct_body(const char *msl, const char *name, const char *body)
+{
+    char head[256];
+    const char *p, *open, *close;
+    const char *tmpl = NULL;
+    char *out, *new_body;
+    size_t prefix, tail;
+
+    snprintf(head, sizeof head, "struct %s\n{", name);
+    p = strstr(msl, head);
+    if (!p)
+    {
+        snprintf(head, sizeof head, "struct %s {", name);
+        p = strstr(msl, head);
+    }
+    if (!p)
+        return NULL;
+    open = strchr(p, '{');
+    close = open ? strchr(open, '}') : NULL;
+    if (!open || !close)
+        return NULL;
+
+    /* array members reference spvUnsafeArray: if its template is not already defined
+     * ahead of this struct (SPIRV-Cross emits it after the stage structs in kernel
+     * form), use our own name and declare it in front — the two never collide */
+    new_body = strdup(body);
+    if (new_body && strstr(new_body, "spvUnsafeArray"))
+    {
+        bool before_us = false, before_orig = false;
+
+        for (const char *q = msl; q < p; q++)
+        {
+            if (!before_orig && !strncmp(q, "struct spvUnsafeArray", 21))
+                before_orig = true;
+            if (!before_us && !strncmp(q, "struct mgl_spv_arr", 18))
+                before_us = true;
+        }
+        if (!before_orig)
+        {
+            for (char *at = new_body; (at = strstr(at, "spvUnsafeArray")) != NULL; )
+            {
+                memcpy(at, "mgl_spv_arr   ", strlen("spvUnsafeArray"));
+                at += strlen("spvUnsafeArray");
+            }
+            if (!before_us)
+                tmpl = kSpvUnsafeArray;
+        }
+    }
+    if (!new_body)
+        return NULL;
+
+    prefix = (size_t)(open + 1 - msl);
+    tail = strlen(close);                 /* "};\n..." to the end */
+    out = (char *)malloc(prefix + strlen(new_body) + tail + 1 + (tmpl ? strlen(tmpl) : 0));
+    if (!out)
+    {
+        free(new_body);
+        return NULL;
+    }
+    if (tmpl)
+    {
+        /* the template goes in front of the whole struct declaration */
+        size_t decl = (size_t)(p - msl);
+
+        memcpy(out, msl, decl);
+        memcpy(out + decl, tmpl, strlen(tmpl));
+        memcpy(out + decl + strlen(tmpl), msl + decl, prefix - decl);
+        memcpy(out + prefix + strlen(tmpl), new_body, strlen(new_body));
+        memcpy(out + prefix + strlen(tmpl) + strlen(new_body), close, tail + 1);
+    }
+    else
+    {
+        memcpy(out, msl, prefix);
+        memcpy(out + prefix, new_body, strlen(new_body));
+        memcpy(out + prefix + strlen(new_body), close, tail + 1);
+    }
+    free(new_body);
+    return out;
 }
 
 /* ------------------------------------------------------------------ MSL rewrites
@@ -541,8 +1053,7 @@ static char *rewrite_vs_kernel(const char *msl)
         char prologue[512];
         int n = snprintf(prologue, sizeof prologue,
                          "\n    uint3 spvStageInputSize = uint3(mgl_vs_params[1], mgl_vs_params[2], 1u);\n"
-                         "    uint3 spvDispatchBase = uint3(mgl_vs_params[0], mgl_vs_params[3], 0u);\n",
-                         0);
+                         "    uint3 spvDispatchBase = uint3(mgl_vs_params[0], mgl_vs_params[3], 0u);\n");
         (void)n;
         size_t plen = strlen(prologue), taillen = len - (size_t)(open + 1 - out);
         out = (char *)realloc(out, len + plen + 1);
@@ -627,7 +1138,7 @@ static const char *kTessPrelude =
     "    uint size() const { return mgl_n; }\n"
     "};\n\n";
 
-static char *rewrite_tes(const char *msl)
+static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
 {
     const char *sig = strstr(msl, "[[ patch(");
     if (!sig)
@@ -675,8 +1186,12 @@ static char *rewrite_tes(const char *msl)
         snprintf(entry_ret, sizeof entry_ret, "%.*s", (int)(name_start - vertex_kw - 8), vertex_kw + 7);
     }
 
-    /* patchIn struct type name: first word of the parameter list */
+    /* patchIn struct type name: first word of the parameter list. A TES that reads
+     * neither its control points nor any per-patch varying gets no stage_in struct at
+     * all (the first parameter is then gl_TessCoord or patch_id) — flagged and every
+     * patchIn-related rewrite is skipped */
     char patchin_name[128];
+    bool no_patchin = false;
     {
         const char *p = sig_open + 1;
         while (*p == ' ' || *p == '\n') p++;
@@ -685,31 +1200,50 @@ static char *rewrite_tes(const char *msl)
         if (e == p || (size_t)(e - p) >= sizeof patchin_name)
             { TES_REWRITE_FAIL(62); }
         snprintf(patchin_name, sizeof patchin_name, "%.*s", (int)(e - p), p);
+
+        char head[160];
+        snprintf(head, sizeof head, "struct %s\n{", patchin_name);
+        if (!strstr(msl, head))
+        {
+            snprintf(head, sizeof head, "struct %s {", patchin_name);
+            if (!strstr(msl, head))
+                no_patchin = true;      /* no stage_in struct: no inputs to rebuild */
+        }
     }
 
     /* control point struct type: from patch_control_point<T> in the patchIn struct */
     char cp_type[128];
     {
         char head[160];
-        const char *p;
-        snprintf(head, sizeof head, "struct %s\n{", patchin_name);
-        p = strstr(msl, head);
-        if (!p) { snprintf(head, sizeof head, "struct %s {", patchin_name); p = strstr(msl, head); }
-        if (!p)
-            { TES_REWRITE_FAIL(75); }
-        const char *pcp = strstr(p, "patch_control_point<");
-        if (!pcp || pcp > strchr(p, '}'))
-            { TES_REWRITE_FAIL(78); }
-        const char *t0 = pcp + strlen("patch_control_point<");
-        const char *t1 = strchr(t0, '>');
-        if (!t1 || (size_t)(t1 - t0) >= sizeof cp_type)
-            { TES_REWRITE_FAIL(82); }
-        memcpy(cp_type, t0, (size_t)(t1 - t0));
-        cp_type[t1 - t0] = 0;
+        const char *p = NULL;
+        const char *pcp, *t0, *t1;
+
+        if (!no_patchin)
+        {
+            snprintf(head, sizeof head, "struct %s\n{", patchin_name);
+            p = strstr(msl, head);
+            if (!p) { snprintf(head, sizeof head, "struct %s {", patchin_name); p = strstr(msl, head); }
+        }
+        pcp = p ? strstr(p, "patch_control_point<") : NULL;
+        if (pcp && pcp < strchr(p, '}'))
+        {
+            t0 = pcp + strlen("patch_control_point<");
+            t1 = strchr(t0, '>');
+            if (!t1 || (size_t)(t1 - t0) >= sizeof cp_type)
+                { TES_REWRITE_FAIL(82); }
+            memcpy(cp_type, t0, (size_t)(t1 - t0));
+            cp_type[t1 - t0] = 0;
+        }
+        else
+        {
+            /* no control points referenced: the type is unused, but must name a type */
+            snprintf(cp_type, sizeof cp_type, "mgl_cp_rec");
+        }
     }
 
     struct MslStruct patch_in;
-    if (!msl_parse_struct(msl, patchin_name, &patch_in))
+    memset(&patch_in, 0, sizeof patch_in);
+    if (!no_patchin && !msl_parse_struct(msl, patchin_name, &patch_in))
     {
         if (tess_trace())
             fprintf(stderr, "MGL tess: rewrite_tes: patchIn struct parse failed (%s)\n", patchin_name);
@@ -729,7 +1263,33 @@ static char *rewrite_tes(const char *msl)
     ins += strlen("using namespace metal;");
     str_append(&out, &len, &cap, "%.*s%s", (int)(ins - msl), msl, kTessPrelude);
 
-    /* everything between the prelude and "[[ patch(" */
+    /* everything between the prelude and "[[ patch(", with the canonical control point
+     * record type declared immediately after the prelude, BEFORE the stage's own
+     * structs (the patched patchIn struct references it) */
+    if (tp && tp->num_cp_record > 0)
+    {
+        bool needs_arr = false;
+
+        for (int j = 0; j < tp->num_cp_record && !needs_arr; j++)
+            if (strstr(tp->cp_record[j].type, "spvUnsafeArray"))
+                needs_arr = true;
+        if (needs_arr)
+            str_append(&out, &len, &cap, "%s", kSpvUnsafeArray);
+        str_append(&out, &len, &cap, "\nstruct mgl_cp_rec\n{\n");
+        {
+            bool first = true;
+
+            for (int j = 0; j < tp->num_cp_record; j++)
+            {
+                /* renamed: the template above is ours; array slots the TES flattened
+                 * ("tc_arr_0", "tc_arr_1") are re-expanded so the record's members have
+                 * the names and element types the TES code accesses them by */
+                tess_canon_member_lines(&out, &len, &cap, &tp->cp_record[j],
+                                        tp->tes_cp, tp->num_tes_cp, true, &first);
+            }
+        }
+        str_append(&out, &len, &cap, "};\n");
+    }
     str_append(&out, &len, &cap, "%.*s", (int)(sig - ins), ins);
 
     /* new signature */
@@ -739,27 +1299,70 @@ static char *rewrite_tes(const char *msl)
                "device const uchar* mgl_tess_patch [[buffer(%d)]], "
                "constant uint* mgl_tess_params [[buffer(%d)]], "
                "uint mgl_vid [[vertex_id]])",
-               entry_ret, entry_name, MGL_TESS_TES_COORDS, cp_type, MGL_TESS_TES_CP,
+               entry_ret, entry_name, MGL_TESS_TES_COORDS,
+               (tp && tp->num_cp_record > 0) ? "mgl_cp_rec" : cp_type, MGL_TESS_TES_CP,
                MGL_TESS_TES_PATCH, MGL_TESS_TES_PARAMS);
 
-    /* prologue: rebuild patchIn from the buffers */
-    str_append(&out, &len, &cap, "\n{\n    %s patchIn;\n", patchin_name);
-    for (int i = 0; i < patch_in.count; i++)
+    /* prologue: rebuild patchIn from the buffers. Offsets and the record stride come
+     * from the canonical per-patch record (tp->tes_patch_in), so the blob layout is
+     * identical no matter which members the TES happens to declare */
+    size_t patch_stride = patch_in.size;
     {
-        if (i == patch_in.cp_ref_member)
-            continue;
-        /* per-patch record: the blob holds total_patches records of patch_in.size bytes,
-         * indexed by the patch id the tessellator stored in the coordinate stream */
-        str_append(&out, &len, &cap,
-                   "    patchIn.%s = *(device const %s*)(mgl_tess_patch + "
-                   "(size_t)mgl_tess_coords[mgl_vid].w * %zu + %zu);\n",
-                   patch_in.members[i].name, patch_in.members[i].type, patch_in.size,
-                   patch_in.members[i].offset);
+        const MGLTessProgram *ctp = tp;
+        if (ctp && ctp->num_tes_patch_in)
+            patch_stride = ctp->tes_patch_in_size;
     }
-    if (patch_in.cp_ref_member >= 0)
-        str_append(&out, &len, &cap,
-                   "    patchIn.%s = mgl_cp_ref<%s>{ &mgl_tess_cp[(uint)mgl_tess_coords[mgl_vid].w * mgl_tess_params[0]], mgl_tess_params[0] };\n",
-                   patch_in.members[patch_in.cp_ref_member].name, cp_type);
+    if (!no_patchin)
+    {
+        str_append(&out, &len, &cap, "\n{\n    %s patchIn;\n", patchin_name);
+        for (int i = 0; i < patch_in.count; i++)
+        {
+            size_t moff = patch_in.members[i].offset;
+
+            if (i == patch_in.cp_ref_member)
+                continue;
+            if (tp)
+                for (int j = 0; j < tp->num_tes_patch_in; j++)
+                    if (!strcmp(tp->tes_patch_in[j].name, patch_in.members[i].name) &&
+                        !strcmp(tp->tes_patch_in[j].type, patch_in.members[i].type))
+                    {
+                        moff = tp->tes_patch_in[j].offset;   /* canonical offset */
+                        break;
+                    }
+            /* per-patch record: the blob holds total_patches records of the canonical
+             * patch size, indexed by the patch id the tessellator stored in the
+             * coordinate stream */
+            str_append(&out, &len, &cap,
+                       "    patchIn.%s = *(device const %s*)(mgl_tess_patch + "
+                       "(size_t)mgl_tess_coords[mgl_vid].w * %zu + %zu);\n",
+                       patch_in.members[i].name, patch_in.members[i].type, patch_stride, moff);
+        }
+        if (patch_in.cp_ref_member >= 0)
+            str_append(&out, &len, &cap,
+                       "    patchIn.%s = mgl_cp_ref<%s>{ &mgl_tess_cp[(uint)mgl_tess_coords[mgl_vid].w * mgl_tess_params[0]], mgl_tess_params[0] };\n",
+                       patch_in.members[patch_in.cp_ref_member].name,
+                       (tp && tp->num_cp_record > 0) ? "mgl_cp_rec" : cp_type);
+    }
+    else
+        str_append(&out, &len, &cap, "\n{\n");
+
+    /* debug hook: dump control point N as the vertex position (MGL_TESS_CPDBG=N) */
+    if (tp && tp->num_cp_record > 0)
+    {
+        const char *n = getenv("MGL_TESS_CPDBG");
+        if (n && *n)
+            str_append(&out, &len, &cap,
+                       "\n    { %s dbg = {}; dbg.gl_Position = float4(mgl_tess_cp[%s].gl_Position.xy, 0.0, 1.0); dbg.mgl_rs_PointSize = 1.0; return dbg; }\n",
+                       entry_ret, n);
+        else if (getenv("MGL_TESS_PARAMDBG"))
+            str_append(&out, &len, &cap,
+                       "\n    { %s dbg = {}; dbg.gl_Position = float4(float(mgl_tess_params[0]) * 0.2 - 0.9, float(mgl_tess_params[1]) * 0.2 - 0.9, 0.0, 1.0); dbg.mgl_rs_PointSize = 1.0; return dbg; }\n",
+                       entry_ret);
+        else if (getenv("MGL_TESS_COORDDBG"))
+            str_append(&out, &len, &cap,
+                       "\n    { %s dbg = {}; dbg.gl_Position = float4(mgl_tess_coords[mgl_vid].xy * 1.6 - 0.8, 0.0, 1.0); dbg.mgl_rs_PointSize = 1.0; return dbg; }\n",
+                       entry_ret);
+    }
 
     /* direct builtin parameters of the original entry point */
     {
@@ -777,12 +1380,16 @@ static char *rewrite_tes(const char *msl)
     str_append(&out, &len, &cap, "%s", body_open + 1);
 
     /* strip [[attribute(N)]] from the two struct declarations and replace
-       patch_control_point<T> by mgl_cp_ref<T> so the types work outside stage_in */
-    const char *decl_names[2] = { patchin_name, cp_type };
+       patch_control_point<T> by mgl_cp_ref<mgl_cp_rec> so the types work outside
+       stage_in and the control point stride is the canonical record's */
+    const char *decl_names[2] = { no_patchin ? "" : patchin_name, cp_type };
     for (int d = 0; d < 2; d++)
     {
         char head[160];
         const char *p;
+
+        if (!decl_names[d][0])
+            continue;                       /* no patchIn struct at all */
         snprintf(head, sizeof head, "struct %s\n{", decl_names[d]);
         p = strstr(out, head);
         if (!p) { snprintf(head, sizeof head, "struct %s {", decl_names[d]); p = strstr(out, head); }
@@ -793,35 +1400,115 @@ static char *rewrite_tes(const char *msl)
         if (!open || !close)
             continue;
 
-        size_t bodylen = (size_t)(close - open - 1);
-        char *body = (char *)malloc(bodylen + 1);
-        if (!body)
-            continue;
-        memcpy(body, open + 1, bodylen);
-        body[bodylen] = 0;
+        char canon[4096];
+        char *canon_buf = NULL;
+        const char *newbody = NULL;
 
-        for (char *at = body; (at = strstr(at, "[[")) != NULL; )
+        if (d == 1 && tp && tp->num_cp_record > 0)
         {
-            char *e = strstr(at, "]]");
-            if (!e) break;
-            memmove(at, e + 2, strlen(e + 2) + 1);
-        }
-        for (char *at = body; (at = strstr(at, "patch_control_point<")) != NULL; )
-        {
-            size_t plen = strlen("patch_control_point<");
-            memmove(at + strlen("mgl_cp_ref<"), at + plen, strlen(at + plen) + 1);
-            memcpy(at, "mgl_cp_ref<", strlen("mgl_cp_ref<"));
-            at += strlen("mgl_cp_ref<");
+            /* every TES member must be present in the canonical record (it is, unless
+             * the union bailed out) — otherwise keep the stage's own layout */
+            bool complete = true;
+
+            for (int k = 0; k < tp->num_tes_cp && complete; k++)
+            {
+                bool found = false;
+                for (int j = 0; j < tp->num_cp_record; j++)
+                    if (tp->cp_record[j].key == tp->tes_cp[k].key)
+                    {
+                        found = true;
+                        break;
+                    }
+                if (!found)
+                    complete = false;
+            }
+            if (complete)
+            {
+                bool first = true;
+                size_t blen = 0, bcap = 0;
+
+                canon[0] = 0;
+                for (int j = 0; j < tp->num_cp_record; j++)
+                {
+                    /* renamed: the plain TES declares our own template in the prelude
+                     * (kSpvUnsafeArray), SPIRV-Cross's may not exist in vertex form */
+                    tess_canon_member_lines(&canon_buf, &blen, &bcap, &tp->cp_record[j],
+                                            tp->tes_cp, tp->num_tes_cp, true, &first);
+                    if (!canon_buf)
+                        break;
+                }
+                newbody = canon_buf;
+            }
         }
 
-        size_t prefix = (size_t)(open + 1 - out);
-        size_t newlen = len - bodylen + strlen(body);
-        out = (char *)realloc(out, newlen + 1);
-        if (!out) { free(body); return NULL; }
-        memmove(out + prefix + strlen(body), open + 1 + bodylen, len - (prefix + bodylen) + 1);
-        memcpy(out + prefix, body, strlen(body));
-        len = newlen;
-        free(body);
+        if (!newbody)
+        {
+            size_t bodylen = (size_t)(close - open - 1);
+            char *body = (char *)malloc(bodylen + 1);
+            if (!body)
+                continue;
+            memcpy(body, open + 1, bodylen);
+            body[bodylen] = 0;
+
+            for (char *at = body; (at = strstr(at, "[[")) != NULL; )
+            {
+                char *e = strstr(at, "]]");
+                if (!e) break;
+                memmove(at, e + 2, strlen(e + 2) + 1);
+            }
+            for (char *at = body; (at = strstr(at, "patch_control_point<")) != NULL; )
+            {
+                size_t plen = strlen("patch_control_point<");
+                char *close_ = strchr(at + plen, '>');
+                char repl[192];
+
+                snprintf(repl, sizeof repl, "mgl_cp_ref<%s>",
+                         (tp && tp->num_cp_record > 0) ? "mgl_cp_rec" : cp_type);
+                if (!close_)
+                    break;
+                /* drop the original template argument, keep the member name after '>' */
+                memmove(at + strlen(repl), close_ + 1, strlen(close_ + 1) + 1);
+                memcpy(at, repl, strlen(repl));
+                at += strlen(repl);
+            }
+            newbody = body;
+        }
+
+        {
+            size_t bodylen = (size_t)(close - open - 1);
+            size_t newlen = len - bodylen + strlen(newbody);
+            const char *hold = newbody;
+            char *grown = (char *)realloc(out, newlen + 1);
+
+            if (!grown)
+                return NULL;
+            out = grown;
+            /* recompute open/close after the realloc may have moved the buffer */
+            p = strstr(out, head);
+            if (!p)
+            {
+                snprintf(head, sizeof head, "struct %s {", decl_names[d]);
+                p = strstr(out, head);
+            }
+            if (!p)
+            {
+                if (hold != canon) free((void *)hold);
+                return out;
+            }
+            open = strchr(p, '{');
+            close = strchr(open, '}');
+            if (!open || !close)
+            {
+                if (hold != canon) free((void *)hold);
+                return out;
+            }
+            memmove((void *)(out + (open + 1 - out) + strlen(newbody)),
+                    open + 1 + bodylen, len - (size_t)(open + 1 - out) - bodylen + 1);
+            memcpy((void *)(out + (open + 1 - out)), newbody, strlen(newbody));
+            len = newlen;
+            if (hold != canon)
+                free((void *)hold);
+        }
     }
 
     return out;
@@ -899,7 +1586,9 @@ char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp)
     if (!tp->plain_msl)
     {
         const char *msl = tp->program->spirv[_TESS_EVALUATION_SHADER].msl_str;
-        char *plain = rewrite_tes(msl);
+        char *plain = rewrite_tes(msl, tp);
+        if (getenv("MGL_DUMP_MSL") && plain)
+            fprintf(stderr, "==== plain TES MSL:\n%s\n==== end\n", plain);
         if (!plain)
             return NULL;
         tp->plain_msl = plain;
@@ -1276,11 +1965,11 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
             }
             else if (src)
             {
-                /* copy from the TCS patch output by member name */
+                /* copy from the TCS patch output by varying location (canonical key) */
                 for (int j = 0; j < tp->num_tcs_patch_out; j++)
                 {
-                    if (!strcmp(tp->tcs_patch_out[j].name, m->name) &&
-                        tp->tcs_patch_out[j].size == m->size)
+                    if (tp->tcs_patch_out[j].key == m->key &&
+                        tp->tcs_patch_out[j].key != 0)
                     {
                         memcpy(dst + m->offset, src + tp->tcs_patch_out[j].offset, m->size);
                         break;
@@ -1293,7 +1982,8 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
 
 /* ------------------------------------------------------------------ per-program state */
 
-static void tess_fix_tcs_factor_struct(GLMContext ctx, MGLTessProgram *tp);
+static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out,
+                                   char *struct_name, size_t struct_len);
 MGLTessProgram *mgl_tess_program(GLMContext ctx, Program *program)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
@@ -1319,11 +2009,12 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
     /* release the bridged Metal objects of the compile-once variants */
     if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
     {
-        void **owned[6] = { &tp->capture_function, &tp->capture_library, &tp->capture_pso,
-                            &tp->plain_function, &tp->tcs_function, &tp->tcs_library };
+        void **owned[8] = { &tp->capture_function, &tp->capture_library, &tp->capture_pso,
+                            &tp->plain_function, &tp->tcs_function, &tp->tcs_library,
+                            &tp->vs_function, &tp->vs_library };
         void *extra[2] = { tp->plain_library, NULL };
 
-        for (int i = 0; i < 6; i++)
+        for (int i = 0; i < 8; i++)
             if (*owned[i])
             {
                 ctx->mtl_funcs.ext_program->release_obj(ctx, *owned[i]);
@@ -1402,12 +2093,14 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
     }
 
-    /* patch data layouts, parsed from the generated MSL */
+    /* patch data layouts, parsed from the generated MSL (raw per-stage structs; the
+     * canonical records below give the offsets actually used at draw time) */
     if (has_tcs)
     {
         struct MslStruct po;
+        char po_name[160];
         if (msl_parse_struct(program->spirv[_TESS_CONTROL_SHADER].msl_str, "main0_patchOut", &po) ||
-            msl_parse_struct_entry(program->spirv[_TESS_CONTROL_SHADER].msl_str, &po))
+            msl_parse_struct_entry(program->spirv[_TESS_CONTROL_SHADER].msl_str, &po, po_name, sizeof po_name))
         {
             tp->num_tcs_patch_out = po.count;
             tp->tcs_patch_out_size = po.size;
@@ -1451,51 +2144,10 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
         /* the baked control point count of [[patch(domain, N)]] */
         tp->hw_cp_count = tp->has_tcs ? tp->tcs_out_vertices : 3;
 
-        /* triangle-domain programs need the TCS factor writes at the 8-byte record
-         * stride the tessellator uses (see mgl_tess_factor_stride) */
-        tess_fix_tcs_factor_struct(ctx, tp);
-
-        /* control point RECORD layout: the TCS's input struct (= the VS kernel output)
-         * has every member; the TES may only read a subset, so the render descriptor
-         * must use the full record's offsets, matched by attribute index */
-        {
-            const char *msl2 = program->spirv[tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER].msl_str;
-            struct MslStruct rec;
-            char recname[160];
-
-            bool okname = tess_cp_record_name(msl2, recname, sizeof recname);
-            bool okparse = okname && msl_parse_struct(msl2, recname, &rec);
-            if (tess_trace())
-                fprintf(stderr, "MGL tess: cp record: stage=%d name=%s ok=%d/%d count=%d size=%zu\n",
-                        tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER,
-                        okname ? recname : "(none)", okname, okparse, rec.count, rec.size);
-            if (okparse)
-            {
-                tp->num_cp_record = rec.count;
-                tp->cp_record_full_size = rec.size;
-                for (int i = 0; i < rec.count && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
-                    tp->cp_record[i] = rec.members[i];
-            }
-
-            /* the TES may read a subset of the control point record: remap each member's
-             * offset to the full record's layout, matched by the varying NAME (interface
-             * names are identical across the stages; "gl_Position" for the builtin) */
-            for (int i = 0; i < tp->num_tes_cp; i++)
-            {
-                for (int j = 0; j < tp->num_cp_record; j++)
-                {
-                    if (!strcmp(tp->cp_record[j].name, tp->tes_cp[i].name) &&
-                        tp->cp_record[j].size == tp->tes_cp[i].size)
-                    {
-                        tp->tes_cp[i].offset = tp->cp_record[j].offset;
-                        break;
-                    }
-                }
-                if (tess_trace())
-                    fprintf(stderr, "MGL tess: cp member %s -> record offset %zu\n",
-                            tp->tes_cp[i].name, tp->tes_cp[i].offset);
-            }
-        }
+        /* one canonical record layout per interface (control points / per-patch),
+         * shared by producer and consumer stages; recompiles the VS / TCS kernels
+         * when their SPIRV-Cross struct differs (see "canonical records") */
+        tess_canonicalize_records(ctx, tp);
     }
 
     /* the GPU blob kernel's member map (levels + TCS patch-output copies) */
@@ -1857,6 +2509,408 @@ void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, 
     mgl_queries_note_tess(ctx, tes_invocations, tessellated_primitives);
 }
 
+/* the TCS kernel's two record struct names: the types of the spvIn / spvOut
+ * parameters of its entry point */
+static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
+                                 char *out_name, size_t out_len)
+{
+    bool got_in = false, got_out = false;
+    const char *at = msl;
+
+    while ((at = strstr(at, "device ")) != NULL && !(got_in && got_out))
+    {
+        const char *star = strchr(at, '*');
+        const char *b = at + strlen("device ");
+        const char *nl = strchr(at, '\n');
+
+        /* "device const T* spvIn" / "device T* spvOut" (kernel parameter list) */
+        if (star && nl && star < nl)
+        {
+            const char *param = star + 1;
+            bool is_in, is_out;
+            const char *e = star;
+
+            if (!strncmp(b, "const ", 6))
+                b += 6;                 /* device const T* spvIn */
+            while (param < at + strlen(at) && *param == ' ')
+                param++;
+            is_in = !strncmp(param, "spvIn", 5);
+            is_out = !strncmp(param, "spvOut", 6);
+            while (e > b && *(e - 1) == ' ')
+                e--;
+            if ((is_in || is_out) && e > b)
+            {
+                char name[128];
+                snprintf(name, sizeof name, "%.*s", (int)(e - b), b);
+                if (is_in && !got_in)
+                {
+                    snprintf(in_name, in_len, "%s", name);
+                    got_in = true;
+                }
+                else if (is_out && !got_out)
+                {
+                    snprintf(out_name, out_len, "%s", name);
+                    got_out = true;
+                }
+            }
+        }
+        at += strlen("device ");
+    }
+    return got_in && got_out;
+}
+
+/* ------------------------------------------------------------------ record canonicalization
+ * Parses every stage's interface struct, builds the canonical control-point and
+ * per-patch records (union by varying location — see "canonical records" above),
+ * rewrites the producer MSL structs to them and recompiles those kernels. Consumers
+ * read the records through the canonical layout: the TCS kernel through its rewritten
+ * spvIn/spvOut structs, the plain TES through its rewritten control-point struct and
+ * blob offsets, the hardware TES through the vertex descriptor offsets (tp->tes_cp /
+ * tp->tes_patch_in are already canonical after this call). */
+static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
+{
+    Program *program = tp->program;
+    const char *vs_msl = program->spirv[_VERTEX_SHADER].msl_str;
+    const char *tcs_msl = tp->has_tcs ? program->spirv[_TESS_CONTROL_SHADER].msl_str : NULL;
+    const char *tes_msl = program->spirv[_TESS_EVALUATION_SHADER].msl_str;
+
+    struct MslStruct vs_out, tcs_in, tcs_out, tes_cp, tcs_po, tes_pi;
+    char vs_name[160] = "", tcs_in_name[160] = "", tcs_out_name[160] = "";
+    char po_name[160] = "", pi_name[160] = "", cp_name[160] = "";
+    bool have_vs = false, have_tcs_in = false, have_tcs_out = false;
+    bool have_tcs_po = false, have_pi = false, have_cp = false;
+    struct CanonRec canon, canon_tcs, canon_patch;
+
+    memset(&vs_out, 0, sizeof vs_out);
+    memset(&tcs_in, 0, sizeof tcs_in);
+    memset(&tcs_out, 0, sizeof tcs_out);
+    memset(&tes_cp, 0, sizeof tes_cp);
+    memset(&tcs_po, 0, sizeof tcs_po);
+    memset(&tes_pi, 0, sizeof tes_pi);
+
+    if (vs_msl && tess_cp_record_name(vs_msl, vs_name, sizeof vs_name))
+        have_vs = msl_parse_struct(vs_msl, vs_name, &vs_out);
+    if (tcs_msl)
+    {
+        if (msl_tcs_record_names(tcs_msl, tcs_in_name, sizeof tcs_in_name,
+                                 tcs_out_name, sizeof tcs_out_name))
+        {
+            have_tcs_in = msl_parse_struct(tcs_msl, tcs_in_name, &tcs_in);
+            have_tcs_out = msl_parse_struct(tcs_msl, tcs_out_name, &tcs_out);
+        }
+        have_tcs_po = msl_parse_struct_entry(tcs_msl, &tcs_po, po_name, sizeof po_name);
+    }
+    if (tes_msl)
+    {
+        if (msl_patch_in_name(tes_msl, pi_name, sizeof pi_name))
+            have_pi = msl_parse_struct(tes_msl, pi_name, &tes_pi);
+        if (have_pi && msl_cp_struct_name(tes_msl, pi_name, cp_name, sizeof cp_name))
+            have_cp = msl_parse_struct(tes_msl, cp_name, &tes_cp);
+    }
+
+    /* attach varying locations to every member */
+    tess_annotate_keys(&vs_out, have_vs ?
+        &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(&tcs_in, have_tcs_in ?
+        &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+    tess_annotate_keys(&tcs_out, have_tcs_out ?
+        &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(&tes_cp, have_cp ?
+        &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+    tess_annotate_keys(&tcs_po, have_tcs_po ?
+        &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(&tes_pi, have_pi ?
+        &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+
+    /* propagate the keys to the member copies stored in tp (filled earlier at link
+     * time from the same structs, without annotations) */
+    {
+        struct MslStruct *parsed[3] = { have_tcs_po ? &tcs_po : NULL, have_pi ? &tes_pi : NULL,
+                                        have_cp ? &tes_cp : NULL };
+        for (int s = 0; s < 3; s++)
+        {
+            if (!parsed[s])
+                continue;
+            for (int i = 0; i < parsed[s]->count; i++)
+            {
+                MGLTessPatchMember *src = &parsed[s]->members[i];
+                MGLTessPatchMember *dstarr[3] = { NULL, NULL, NULL };
+                int ndst = 0, ndstmax[3] = { 0, 0, 0 };
+
+                if (parsed[s] == &tcs_po)
+                {
+                    dstarr[0] = tp->tcs_patch_out;
+                    ndstmax[0] = tp->num_tcs_patch_out;
+                    ndst = 1;
+                }
+                else if (parsed[s] == &tes_pi)
+                {
+                    dstarr[0] = tp->tes_patch_in;
+                    ndstmax[0] = tp->num_tes_patch_in;
+                    ndst = 1;
+                }
+                else
+                {
+                    dstarr[0] = tp->tes_cp;
+                    ndstmax[0] = tp->num_tes_cp;
+                    ndst = 1;
+                }
+                for (int d = 0; d < ndst; d++)
+                    for (int j = 0; j < ndstmax[d]; j++)
+                        if (!strcmp(dstarr[d][j].name, src->name) &&
+                            !strcmp(dstarr[d][j].type, src->type))
+                        {
+                            dstarr[d][j].key = src->key;
+                            dstarr[d][j].array_idx = src->array_idx;
+                            break;
+                        }
+            }
+        }
+    }
+
+    /* ---- canonical control point records: one per interface ----
+     * vertex -> TCS: union of the VS output struct and the TCS input struct
+     * TCS -> TES:    union of the TCS output struct and the TES control point struct
+     * (no TCS: the vertex kernel's output feeds the TES directly, one interface)
+     * The pair is keyed by varying location, so a consumer that drops or reorders
+     * members never shifts the record its producer writes. */
+    if (tp->has_tcs)
+    {
+        struct MslStruct *vs_side[2] = { have_vs ? &vs_out : NULL, have_tcs_in ? &tcs_in : NULL };
+        struct MslStruct *tes_side[2] = { have_tcs_out ? &tcs_out : NULL, have_cp ? &tes_cp : NULL };
+
+        if (!tess_canon_union(&canon, vs_side, 2) ||
+            !tess_canon_union(&canon_tcs, tes_side, 2))
+        {
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: canonical record union failed; layouts kept per-stage\n");
+            return;
+        }
+    }
+    else
+    {
+        struct MslStruct *stages[2] = { have_vs ? &vs_out : NULL, have_cp ? &tes_cp : NULL };
+
+        if (!tess_canon_union(&canon, stages, 2))
+        {
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: canonical record union failed; layouts kept per-stage\n");
+            return;
+        }
+        canon_tcs = canon;
+    }
+    /* ---- canonical per-patch record: union of the TCS patch outputs and TES patch
+     * inputs (tessellation levels included: the blob and the vertex descriptor read
+     * them from the factor record, but they occupy the same slot here) */
+    {
+        struct MslStruct *stages[2] = { have_tcs_po ? &tcs_po : NULL, have_pi ? &tes_pi : NULL };
+        if (!tess_canon_union(&canon_patch, stages, 2))
+            return;
+    }
+
+    if (tess_trace())
+    {
+        fprintf(stderr, "MGL tess: canonical vs->tcs record (%d members, %zu bytes):\n",
+                canon.n, canon.size);
+        for (int i = 0; i < canon.n; i++)
+            fprintf(stderr, "MGL tess:   key=%08x %-34s %-22s @%zu (%zu b)\n",
+                    canon.m[i].key, canon.m[i].type, canon.m[i].name,
+                    canon.m[i].offset, canon.m[i].size);
+        if (tp->has_tcs)
+        {
+            fprintf(stderr, "MGL tess: canonical tcs->tes record (%d members, %zu bytes):\n",
+                    canon_tcs.n, canon_tcs.size);
+            for (int i = 0; i < canon_tcs.n; i++)
+                fprintf(stderr, "MGL tess:   key=%08x %-34s %-22s @%zu (%zu b)\n",
+                        canon_tcs.m[i].key, canon_tcs.m[i].type, canon_tcs.m[i].name,
+                        canon_tcs.m[i].offset, canon_tcs.m[i].size);
+        }
+        fprintf(stderr, "MGL tess: canonical patch record (%d members, %zu bytes):\n",
+                canon_patch.n, canon_patch.size);
+        for (int i = 0; i < canon_patch.n; i++)
+            fprintf(stderr, "MGL tess:   key=%08x %-34s %-22s @%zu (%zu b)\n",
+                    canon_patch.m[i].key, canon_patch.m[i].type, canon_patch.m[i].name,
+                    canon_patch.m[i].offset, canon_patch.m[i].size);
+    }
+
+    /* the control point stream the TES reads: the TCS's output record, or the vertex
+     * kernel's output record when no TCS runs */
+    {
+        const struct CanonRec *rec = tp->has_tcs ? &canon_tcs : &canon;
+
+        tp->num_cp_record = rec->n;
+        tp->cp_record_full_size = rec->size;
+        tp->cp_record_size = rec->size;
+        for (int i = 0; i < rec->n && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
+            tp->cp_record[i] = rec->m[i];
+
+        /* TES control point members read at the canonical offsets (attribute indices
+         * unchanged: they belong to the TES's own struct). Flattened elements of an
+         * arrayed varying point into the array member's element slots */
+        for (int i = 0; i < tp->num_tes_cp; i++)
+        {
+            for (int j = 0; j < tp->num_cp_record; j++)
+                if (tp->tes_cp[i].key == rec->m[j].key)
+                {
+                    tp->tes_cp[i].offset = rec->m[j].offset;
+                    if (tp->tes_cp[i].array_idx && strstr(rec->m[j].type, "spvUnsafeArray"))
+                    {
+                        size_t align = 1, size = 0;
+
+                        if (msl_element_type(rec->m[j].type, &align, &size))
+                            tp->tes_cp[i].offset = rec->m[j].offset +
+                                tp->tes_cp[i].array_idx * (size / msl_array_len(rec->m[j].type));
+                    }
+                    break;
+                }
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: tes_cp[%d] %-22s attr=%d key=%08x idx=%u -> offset %zu\n",
+                        i, tp->tes_cp[i].name, tp->tes_cp[i].attr, tp->tes_cp[i].key,
+                        tp->tes_cp[i].array_idx, tp->tes_cp[i].offset);
+        }
+    }
+
+    /* TES patch-in members at canonical offsets (levels too: the blob is laid out
+     * this way; the hardware descriptor overrides the level members to the factor
+     * buffer at draw time) */
+    for (int i = 0; i < tp->num_tes_patch_in; i++)
+        for (int j = 0; j < canon_patch.n; j++)
+            if (tp->tes_patch_in[i].key == canon_patch.m[j].key)
+            {
+                tp->tes_patch_in[i].offset = canon_patch.m[j].offset;
+                break;
+            }
+    tp->tes_patch_in_size = canon_patch.size;
+    if (canon_patch.size)
+        tp->tcs_patch_out_size = canon_patch.size;  /* the TCS patchOut is rewritten below */
+
+    /* the TCS patch output members (the rewritten kernel's canonical patchOut struct)
+     * sit at the canonical offsets as well */
+    for (int i = 0; i < tp->num_tcs_patch_out; i++)
+        for (int j = 0; j < canon_patch.n; j++)
+            if (tp->tcs_patch_out[i].key == canon_patch.m[j].key)
+            {
+                tp->tcs_patch_out[i].offset = canon_patch.m[j].offset;
+                break;
+            }
+
+    /* ---- producer rewrites: whichever kernel writes a record whose SPIRV-Cross
+     * struct differs from the canonical layout is recompiled with the canonical
+     * struct (member names it uses are kept; pads are never referenced) */
+    {
+        char body[4096];
+
+        if (have_vs && !tess_canon_matches(&vs_out, &canon))
+        {
+            char *nw;
+            tess_canon_body(body, sizeof body, &vs_out, &canon);
+            nw = msl_rewrite_struct_body(vs_msl, vs_name, body);
+            if (nw && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+            {
+                void *lib = NULL, *fn = NULL;
+                char *err = NULL;
+                if (ctx->mtl_funcs.ext_program->compile_msl(ctx, nw,
+                        program->spirv[_VERTEX_SHADER].entry_point, &lib, &fn, &err))
+                {
+                    tp->vs_function = fn;
+                    tp->vs_library = lib;
+                    if (tess_trace())
+                        fprintf(stderr, "MGL tess: VS kernel canonicalized (record %zu b)\n",
+                                canon.size);
+                }
+                else
+                {
+                    fprintf(stderr, "MGL ERROR: tess: VS canonical-record recompile failed: %s\n",
+                            err ? err : "?");
+                    free(err);
+                }
+            }
+            free(nw);
+        }
+
+        if (tp->has_tcs && tcs_msl)
+        {
+            char *msl = strdup(tcs_msl);
+            bool changed = false;
+
+            if (have_tcs_in && !tess_canon_matches(&tcs_in, &canon))
+            {
+                char *nw;
+                tess_canon_body(body, sizeof body, &tcs_in, &canon);
+                nw = msl_rewrite_struct_body(msl, tcs_in_name, body);
+                if (nw) { free(msl); msl = nw; changed = true; }
+            }
+            if (have_tcs_out && !tess_canon_matches(&tcs_out, &canon_tcs))
+            {
+                char *nw;
+                tess_canon_body(body, sizeof body, &tcs_out, &canon_tcs);
+                nw = msl_rewrite_struct_body(msl, tcs_out_name, body);
+                if (nw) { free(msl); msl = nw; changed = true; }
+            }
+            if (have_tcs_po && !tess_canon_matches(&tcs_po, &canon_patch))
+            {
+                char *nw;
+                tess_canon_body(body, sizeof body, &tcs_po, &canon_patch);
+                nw = msl_rewrite_struct_body(msl, po_name, body);
+                if (nw) { free(msl); msl = nw; changed = true; }
+            }
+
+            /* triangle domains: write MTLTriangleTessellationFactorsHalf (8-byte factor
+             * records) instead of the quad struct (see mgl_tess_factor_stride) */
+            if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+            {
+                char *step = strstr(msl, "device MTLQuadTessellationFactorsHalf*");
+                if (step)
+                {
+                    size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
+                    size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
+                    char *grown = (char *)realloc(msl, strlen(msl) + newlen - oldlen + 1);
+                    if (grown)
+                    {
+                        char *p;
+                        msl = grown;
+                        p = msl + (step - msl);
+                        memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
+                        memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
+                        for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )
+                        {
+                            size_t tail = strlen(w + strlen(".insideTessellationFactor[0]")) + 1;
+                            memmove(w + strlen(".insideTessellationFactor"),
+                                    w + strlen(".insideTessellationFactor[0]"), tail);
+                            w += strlen(".insideTessellationFactor");
+                        }
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+            {
+                if (getenv("MGL_DUMP_MSL"))
+                    fprintf(stderr, "==== canonical TCS MSL:\n%s\n==== end\n", msl);
+                void *lib = NULL, *fn = NULL;
+                char *err = NULL;
+                if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl,
+                        program->spirv[_TESS_CONTROL_SHADER].entry_point, &lib, &fn, &err))
+                {
+                    tp->tcs_function = fn;
+                    tp->tcs_library = lib;
+                    if (tess_trace())
+                        fprintf(stderr, "MGL tess: TCS kernel canonicalized (cp %zu b, patch %zu b)\n",
+                                canon.size, canon_patch.size);
+                }
+                else
+                {
+                    fprintf(stderr, "MGL ERROR: tess: TCS canonical-record recompile failed: %s\n",
+                            err ? err : "?");
+                    free(err);
+                }
+            }
+            free(msl);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ MSL name helpers */
 
 /* name of the TES patch input struct: the type of the "patchIn" parameter (hardware
@@ -1956,10 +3010,13 @@ static bool tess_cp_record_name(const char *msl, char *out, size_t out_len)
 
 
 /* find the "<name>_patchOut" struct of a TCS (any name) */
-static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out)
+static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out,
+                                   char *struct_name, size_t struct_len)
 {
     const char *at = msl;
 
+    if (struct_name && struct_len)
+        struct_name[0] = 0;
     while ((at = strstr(at, "_patchOut")) != NULL)
     {
         const char *b = at;
@@ -1974,7 +3031,11 @@ static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out)
         }
         snprintf(name, sizeof name, "%.*s", (int)(at + 9 - b), b);
         if (msl_parse_struct(msl, name, out))
+        {
+            if (struct_name && struct_len)
+                snprintf(struct_name, struct_len, "%s", name);
             return true;
+        }
         at += 9;
     }
     return false;
@@ -2077,12 +3138,12 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
             kind = MGL_TESS_BLOB_INNER;
         else
         {
-            /* copy from the TCS patch output record, matched by name and size */
+            /* copy from the TCS patch output record, matched by varying location
+             * (the canonical key — names may differ between the stages) */
             bool found = false;
             for (int j = 0; j < tp->num_tcs_patch_out && !found; j++)
             {
-                if (!strcmp(tp->tcs_patch_out[j].name, m->name) &&
-                    tp->tcs_patch_out[j].size == m->size)
+                if (tp->tcs_patch_out[j].key == m->key)
                 {
                     src = (uint32_t)tp->tcs_patch_out[j].offset;
                     size = (uint32_t)m->size;
@@ -2133,55 +3194,6 @@ size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp)
  * byte records) because the TCS alone doesn't know the domain, and the domain is only
  * known once the TES linked. The corrected function lives on the MGLTessProgram and
  * is preferred by the draw path. */
-static void tess_fix_tcs_factor_struct(GLMContext ctx, MGLTessProgram *tp)
-{
-    Spirv *sp = &tp->program->spirv[_TESS_CONTROL_SHADER];
-    char *msl, *at;
-
-    if (!tp->has_tcs || tp->domain != MGL_TESS_DOMAIN_TRIANGLES || !sp->msl_str)
-        return;
-    if (tp->tcs_function)
-        return;                     /* already corrected */
-
-    at = strstr(sp->msl_str, "device MTLQuadTessellationFactorsHalf*");
-    if (!at)
-        return;
-
-    msl = strdup(sp->msl_str);
-    {
-        char *p = msl + (at - sp->msl_str);
-        size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
-        size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
-        memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
-        memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
-
-        /* the triangle struct's inside factor is a scalar (half, not half[2]) */
-        for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )
-        {
-            size_t tail = strlen(w + strlen(".insideTessellationFactor[0]")) + 1;
-            memmove(w + strlen(".insideTessellationFactor"), w + strlen(".insideTessellationFactor[0]"), tail);
-            w += strlen(".insideTessellationFactor");
-        }
-    }
-
-    if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
-    {
-        void *lib = NULL, *fn = NULL;
-        char *err = NULL;
-        if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, sp->entry_point, &lib, &fn, &err))
-        {
-            tp->tcs_function = fn;      /* retained by the compile hook */
-            tp->tcs_library = lib;
-        }
-        else
-        {
-            fprintf(stderr, "MGL ERROR: tess: triangle TCS factor-struct recompile failed: %s\n",
-                    err ? err : "?");
-            free(err);
-        }
-    }
-    free(msl);
-}
 
 /* ---- tests-only capture access (mgl_tess_diag.h) ---- */
 extern GLMContext _ctx;

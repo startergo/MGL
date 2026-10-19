@@ -464,8 +464,12 @@ static bool rs_mode_is_polygon(GLenum m)
          * Isolines / point_mode run the emulated plain-vertex variant of the TES. */
         int vstage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
         MGLTessProgram *tp = mgl_tess_active_program(ctx);
+        /* tess: the plain (emulated) TES variant also renders the MGL_TESS_CPU reference
+         * path — without this the specialized post-tessellation TES would win here and
+         * the pipeline (built with no tessellation vertex descriptor) fails to create */
         if (tp && tp->plain_function &&
-            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode))
+            (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode ||
+             mgl_tess_cpu_reference()))
             desc.vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;
         else
         {

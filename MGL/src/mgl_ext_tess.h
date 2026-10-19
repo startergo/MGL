@@ -78,6 +78,12 @@ typedef struct MGLTessPatchMember_t {
     size_t  size;           /* byte size inside the MSL struct */
     int     attr;           /* MSL [[attribute(N)]] of stage-in interface members, -1 if none */
     int     is_tess_level;  /* TES patch-in: 1 = gl_TessLevel/Outer, 2 = gl_TessLevelInner */
+    uint32_t array_idx;     /* flattened array element (SPIRV-Cross "name_<i>" members of an
+                             * arrayed varying "name"): 0 for plain members */
+    uint32_t key;           /* canonical interface key: GL varying location, a fixed slot for
+                             * builtins, or a name hash for members no stage reflection
+                             * resolves (blocks) — identical across stages (see
+                             * tess_annotate_keys) */
 } MGLTessPatchMember;
 
 /* per-program tessellation information, filled at link time */
@@ -189,9 +195,15 @@ typedef struct MGLTessProgram_t {
     char   *plain_msl;
     bool    plain_msl_dumped;
     void   *plain_function;        /* id<MTLFunction>, bridged */
-    void   *tcs_function;          /* triangle-domain TCS kernel (8-byte factor records) */
+    void   *tcs_function;          /* canonical-record / triangle-domain TCS kernel */
     void   *tcs_library;
     void   *plain_library;
+
+    /* canonical-record vertex kernel: the VS output struct was rewritten to the
+     * canonical control point record (see "control point record" above); NULL when
+     * the SPIRV-Cross layout already matches and the stage function is used as-is */
+    void   *vs_function;
+    void   *vs_library;
 } MGLTessProgram;
 
 #define MGL_TESS_PROGRAM_HASH 257
@@ -268,6 +280,10 @@ char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees 
 char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp); /* caller frees */
 bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
                              char *cp_name, size_t cp_len, size_t *record_size);
+
+/* MGL_TESS_CPU (reference-path override), evaluated once per process: the renderer's
+ * pipeline selection picks the plain TES instead of the post-tessellation variant */
+bool mgl_tess_cpu_reference(void);
 
 
 

@@ -329,8 +329,6 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
 }
 
 /* forward declarations (helpers used by the draw path) */
-static bool tessReadIndices(GLMContext ctx, GLenum type, size_t offset, GLsizei count, GLint basevertex,
-                            uint32_t *dst, uint32_t *minv, uint32_t *maxv);
 static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> enc, TessVSPlan *plan, GLuint vertex_count);
 static bool tessConvertShadowStream(GLMContext ctx, TessAttribSlot *s, GLuint vertex_count);
 static uint16_t tessFloatToHalf(float f);
@@ -568,11 +566,16 @@ static NSString *tessVSKey(GLMContext ctx, Program *program, TessVSPlan *plan)
 static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> device, Program *program, TessVSPlan *plan)
 {
     id<MTLFunction> fn = tessStageFunction(program, _VERTEX_SHADER);
+    MGLTessProgram *vs_tp = mgl_tess_program(ctx, program);
     NSString *key;
     id<MTLComputePipelineState> pso;
     MTLComputePipelineDescriptor *desc;
     MTLStageInputOutputDescriptor *sd;
 
+    /* canonical-record variant of the kernel (link-time recompile) when the
+     * SPIRV-Cross output struct was rewritten to the canonical control point record */
+    if (vs_tp && vs_tp->vs_function && vs_tp->program == program)
+        fn = (__bridge id<MTLFunction>)vs_tp->vs_function;
     if (!fn || fn.functionType != MTLFunctionTypeKernel)
     {
         NSLog(@"MGL ERROR: tess VS stage function is not a kernel (fn=%@ type=%ld)",
@@ -671,7 +674,7 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         NSMutableString *dbg = [NSMutableString stringWithString: @"MGL tess: VS stage-input descriptor:"];
         for (int i = 0; i < MAX_ATTRIB_SLOTS; i++)
         {
-            MTLVertexAttributeDescriptor *a = sd.attributes[i];
+            MTLAttributeDescriptor *a = sd.attributes[i];
             if (a.format != MTLAttributeFormatInvalid)
                 [dbg appendFormat: @" attr[%d]{fmt=%ld,off=%lu,buf=%lu}", i, (long)a.format,
                                     (unsigned long)a.offset, (unsigned long)a.bufferIndex];
@@ -1074,8 +1077,9 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     id<MTLCommandBuffer> emu_cb = nil;
     id<MTLComputeCommandEncoder> kenc = nil;
     int ring_slot = -1;
-    size_t off_vs_out = 0, off_gather_idx = 0, off_tcs_cp = 0, off_tcs_out = 0;
+    size_t off_vs_out = 0, off_tcs_cp = 0, off_tcs_out = 0;
     size_t off_tcs_patch = 0, off_factors = 0, off_patch_data = 0, off_gpu_emu = 0;
+    size_t off_params = 0;       /* plain-TES parameter words: per-draw, in the ring */
     size_t dbg_coords_off = 0;   /* debug dump only: coordinate stream of the tessellator */
     size_t dbg_ctl_off = 0;      /* debug dump only: control words (allocs/totals/args) */
     size_t off_coords = 0, off_indices = 0;
@@ -1269,6 +1273,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                     off_gpu_emu = need;
                     need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
                 }
+                /* the plain TES's parameter words (16 B) live in this draw's ring block:
+                 * a shared singleton would be overwritten by the next draw while the GPU
+                 * still read it */
+                off_params = need;
+                need += 16;
+
                 ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
                 if (!ring)
                 {
@@ -1328,6 +1338,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 off_gpu_emu = need;
                 need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
             }
+            /* the plain TES's parameter words (16 B) live in this draw's ring block:
+             * a shared singleton would be overwritten by the next draw while the GPU
+             * still read it */
+            off_params = need;
+            need += 16;
+
             ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
             if (!ring)
             {
@@ -1400,6 +1416,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 off_gpu_emu = need;
                 need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
             }
+
+            /* the plain TES's parameter words (16 B) live in this draw's ring block:
+             * a shared singleton would be overwritten by the next draw while the GPU
+             * still read it */
+            off_params = need;
+            need += 16;
 
             ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
             if (!ring)
@@ -1665,9 +1687,18 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             NSLog(@"MGL tess: compute cb error %@", compute_cb.error);
 
         /* a fresh render command buffer: the reference path's wait may race the
-         * renderer's flush, and Metal forbids encoding on a committed buffer */
+         * renderer's flush, and Metal forbids encoding on a committed buffer — the
+         * stale encoder must go and the buffer it belongs to must be committed, or
+         * everything already encoded on it (glClear, earlier draws) is lost */
+        if (_currentCommandBuffer && _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+        {
+            [self endRenderEncoding];
+            [_currentCommandBuffer commit];
+        }
+        else if (_currentCommandBuffer)
+            [self endRenderEncoding];
         _currentCommandBuffer = [_commandQueue commandBuffer];
-        ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+        ctx->state.dirty_bits = DIRTY_ALL;
     }
     else
     {
@@ -1729,12 +1760,15 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                  baseInstance: 0];
             if (tTrace())
             {
-                int slot3 = ring_slot;
                 [compute_cb waitUntilCompleted];
                 float *cp = (float *)((uint8_t *)ring.contents + cp_source_off);
                 for (int k = 0; k < total_patches * cp_count && k < 8; k++)
-                    fprintf(stderr, "MGL tess: idxcp[%d] col=(%g,%g,%g) pos=(%g,%g)\n", k,
-                            cp[k*8], cp[k*8+1], cp[k*8+2], cp[k*8+4], cp[k*8+5]);
+                {
+                    size_t wds = cp_stride / 4;
+                    fprintf(stderr, "MGL tess: idxcp[%d] loc0=(%g,%g,%g) pos=(%g,%g)\n", k,
+                            cp[k*wds], cp[k*wds+1], cp[k*wds+2],
+                            cp[k*wds + wds - 4], cp[k*wds + wds - 3]);
+                }
                 uint16_t *hf3 = (uint16_t *)((uint8_t *)ring.contents + off_factors);
                 fprintf(stderr, "MGL tess: idxfactors:");
                 for (int k = 0; k < total_patches * 4; k++) fprintf(stderr, " %04x", hf3[k]);
@@ -1802,10 +1836,11 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             uint32_t *base = (uint32_t *)(base8 + emu_off);
             if (tTrace())
                 NSLog(@"MGL tess: emu dispatch: patches=%u total=%u emu_off=%zu coords_off=%zu "
-                      "ring=%p contents=%p len=%zu cap=%u need=%zu",
+                      "ring=%p contents=%p len=%zu cap=%u need=%zu [vs_out=%zu tcs_out=%zu tcs_patch=%zu factors=%zu patch_data=%zu cp_off=%zu stride=%zu]",
                       (unsigned)patches, (unsigned)total_patches, emu_off, coords_off,
                       (void *)(__bridge void *)ring, ring.contents, (unsigned long)ring.length,
-                      (unsigned)coords_cap, need);
+                      (unsigned)coords_cap, need, off_vs_out, off_tcs_out, off_tcs_patch,
+                      off_factors, off_patch_data, cp_source_off, cp_stride);
             kp.patches = (uint32_t)total_patches;
             kp.domain = (uint32_t)tp->domain;
             kp.spacing = (uint32_t)tp->spacing;
@@ -2003,38 +2038,40 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         }
     }
 
+    /* plain-vertex variant of the TES: needed by every non-hardware path (isolines,
+     * point_mode, capture and the CPU reference draw — which renders with a plain
+     * indexed draw, not drawPatches) */
+    if ((gpu_emulated || use_cpu_reference) && !tp->plain_function)
+    {
+        char *msl = mgl_tess_plain_msl(ctx, tp);
+        if (!tNoFixup())
+        {
+            char *patched = mgl_rstate_patch_vertex_msl(msl, prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point);
+            if (patched) { free(msl); msl = patched; }
+        }
+        if (msl && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+        {
+            void *lib = NULL, *fn = NULL;
+            char *err = NULL;
+            if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl,
+                    prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point, &lib, &fn, &err))
+            {
+                tp->plain_function = fn;
+                tp->plain_library = lib;
+                ctx->state.dirty_bits |= DIRTY_PROGRAM;
+            }
+            else
+                NSLog(@"MGL ERROR: tess: plain TES variant failed to compile: %s", err ? err : "?");
+            free(err);
+        }
+        free(msl);
+    }
+
     /* GPU emulated path: render with an indirect draw; the patch-data blob was
      * assembled by the blob kernel in the compute stage above (no read-back, no
      * CPU wait) */
     if (gpu_emulated)
     {
-        /* plain-vertex variant of the TES */
-        if (!tp->plain_function)
-        {
-            char *msl = mgl_tess_plain_msl(ctx, tp);
-            if (!tNoFixup())
-            {
-                char *patched = mgl_rstate_patch_vertex_msl(msl, prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point);
-                if (patched) { free(msl); msl = patched; }
-            }
-            if (msl && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
-            {
-                void *lib = NULL, *fn = NULL;
-                char *err = NULL;
-                if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl,
-                        prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point, &lib, &fn, &err))
-                {
-                    tp->plain_function = fn;
-                    tp->plain_library = lib;
-                    ctx->state.dirty_bits |= DIRTY_PROGRAM;
-                }
-                else
-                    NSLog(@"MGL ERROR: tess: plain TES variant failed to compile: %s", err ? err : "?");
-                free(err);
-            }
-            free(msl);
-        }
-
         {
             id<MTLRenderCommandEncoder> enc;
 
@@ -2048,10 +2085,24 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             /* the TES reads the control points where the VS kernel (no TCS) or the TCS
              * kernel wrote them — cp_source_off, like the hardware path's binding */
             [enc setVertexBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
+            if (tTrace())
+            {
+                void *cpPtr = (__bridge void *)cp_source;
+                void *ringPtr = (__bridge void *)ring;
+
+                NSLog(@"MGL tess: emu render bind: coords=%p+%zu cp=%p+%zu ring=%p(%zu)",
+                      S->gpu_scratch, (unsigned long)S->gpu_coords_offset,
+                      cpPtr, (unsigned long)cp_source_off, ringPtr, (unsigned long)ring.length);
+            }
             [enc setVertexBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
             {
+                /* the plain TES takes mgl_tess_params as a buffer POINTER: the words must
+                 * come from a real buffer (setVertexBytes would pass them by value) —
+                 * this draw's exclusive ring slot, never overwritten by a later draw */
                 uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
-                [enc setVertexBytes: tes_params length: sizeof tes_params atIndex: MGL_TESS_TES_PARAMS];
+
+                memcpy((uint8_t *)ring.contents + off_params, tes_params, sizeof tes_params);
+                [enc setVertexBuffer: ring offset: off_params atIndex: MGL_TESS_TES_PARAMS];
 
                 if (tTrace())
                 {
@@ -2151,12 +2202,26 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             for (int p = 0; p < total_patches; p++)
             {
                 const uint16_t *f = hf + p * (fstride / 2);  /* 4 halfs tri / 6 halfs quad */
-                factors[p * 6 + 0] = tessHalfToFloat(f[0]);
-                factors[p * 6 + 1] = tessHalfToFloat(f[1]);
-                factors[p * 6 + 2] = tessHalfToFloat(f[2]);
-                factors[p * 6 + 3] = tessHalfToFloat(f[3]);
-                factors[p * 6 + 4] = tessHalfToFloat(f[4]);
-                factors[p * 6 + 5] = tessHalfToFloat(f[5]);
+                if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+                {
+                    /* MTLTriangleTessellationFactorsHalf: { edge[3], inside } — the
+                     * outer[3] slot a triangle patch never uses stays 0 */
+                    factors[p * 6 + 0] = tessHalfToFloat(f[0]);
+                    factors[p * 6 + 1] = tessHalfToFloat(f[1]);
+                    factors[p * 6 + 2] = tessHalfToFloat(f[2]);
+                    factors[p * 6 + 3] = 0.0f;
+                    factors[p * 6 + 4] = tessHalfToFloat(f[3]);
+                    factors[p * 6 + 5] = 0.0f;
+                }
+                else
+                {
+                    factors[p * 6 + 0] = tessHalfToFloat(f[0]);
+                    factors[p * 6 + 1] = tessHalfToFloat(f[1]);
+                    factors[p * 6 + 2] = tessHalfToFloat(f[2]);
+                    factors[p * 6 + 3] = tessHalfToFloat(f[3]);
+                    factors[p * 6 + 4] = tessHalfToFloat(f[4]);
+                    factors[p * 6 + 5] = tessHalfToFloat(f[5]);
+                }
             }
             mgl_tess_build_patch_blob(ctx, tp, (const unsigned char *)((uint8_t *)ring.contents + off_tcs_patch),
                                       patch_record, factors, (unsigned)total_patches);
@@ -2217,6 +2282,17 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             off_patch_data = off_indices + tessRingAlign(index_bytes);
         }
         memcpy((uint8_t *)ring.contents + off_coords, S->coord_buf, coord_bytes);
+        if (tTrace())
+        {
+            const float *c = (const float *)S->coord_buf;
+            const float *r = (const float *)((uint8_t *)ring.contents + off_coords);
+            fprintf(stderr, "MGL tess: cpu draw: coords@%zu (%u x16B) first:", off_coords,
+                    S->tess_vertex_count);
+            for (unsigned q = 0; q + 3 < S->tess_vertex_count * 4 && q / 4 < 6; q += 4)
+                fprintf(stderr, " [%g %g %g %g]", c[q], c[q + 1], c[q + 2], c[q + 3]);
+            fprintf(stderr, " ring: [%g %g %g %g]", r[0], r[1], r[2], r[3]);
+            fprintf(stderr, "\n");
+        }
         memcpy((uint8_t *)ring.contents + off_indices, S->index_buf, index_bytes);
         memcpy((uint8_t *)ring.contents + off_patch_data, S->patch_data,
                (size_t)S->patch_count * tp->tes_patch_in_size);
@@ -2231,7 +2307,12 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         [enc setVertexBuffer: ring offset: off_coords atIndex: MGL_TESS_TES_COORDS];
         [enc setVertexBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
         [enc setVertexBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
-        [enc setVertexBytes: tes_params length: sizeof tes_params atIndex: MGL_TESS_TES_PARAMS];
+        {
+            /* the plain TES takes mgl_tess_params as a buffer POINTER (see above);
+             * this draw's exclusive ring slot, never overwritten by a later draw */
+            memcpy((uint8_t *)ring.contents + off_params, tes_params, sizeof tes_params);
+            [enc setVertexBuffer: ring offset: off_params atIndex: MGL_TESS_TES_PARAMS];
+        }
 
         if (tTrace())
             NSLog(@"MGL tess: CPU reference path drawing %d idx", S->tess_index_count);
@@ -2308,8 +2389,6 @@ static bool tessReadIndicesInto(GLMContext ctx, GLenum type, size_t offset, GLsi
 /* forward declarations (used by the draw above) */
 static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> enc, TessVSPlan *plan, GLuint vertex_count);
 static bool tessConvertShadowStream(GLMContext ctx, TessAttribSlot *s, GLuint vertex_count);
-static bool tessReadIndices(GLMContext ctx, GLenum type, size_t offset, GLsizei count, GLint basevertex,
-                            uint32_t *dst, uint32_t *minv, uint32_t *maxv);
 
 static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_t offset,
                                 GLint first, GLsizei count, GLsizei instances,
@@ -2387,41 +2466,6 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
             return false;
         [enc setBuffer: tShadowBuf offset: 0 atIndex: (NSUInteger)s->shadow_buffer];
     }
-    return true;
-}
-
-static bool tessReadIndices(GLMContext ctx, GLenum type, size_t offset, GLsizei count, GLint basevertex,
-                            uint32_t *dst, uint32_t *minv, uint32_t *maxv)
-{
-    Buffer *ebuf = ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL;
-    const uint8_t *ptr;
-    size_t esize = (type == GL_UNSIGNED_SHORT) ? 2 : (type == GL_UNSIGNED_INT) ? 4 : 1;
-    uint32_t lo = 0xffffffff, hi = 0;
-
-    if (!ebuf || !ebuf->data.buffer_data)
-        return false;
-    if (offset > (size_t)ebuf->size || (size_t)count * esize > (size_t)ebuf->size - offset)
-        return false;
-
-    mgl_buffers_prepare_cpu_read(ctx, ebuf);
-    ptr = (const uint8_t *)ebuf->data.buffer_data + offset;
-
-    for (GLsizei i = 0; i < count; i++)
-    {
-        uint32_t v;
-        switch (type)
-        {
-            case GL_UNSIGNED_SHORT: v = ((const uint16_t *)ptr)[i]; break;
-            case GL_UNSIGNED_INT:   v = ((const uint32_t *)ptr)[i]; break;
-            default:                v = ptr[i]; break;
-        }
-        dst[i] = (uint32_t)basevertex + v;
-        if (dst[i] < lo) lo = dst[i];
-        if (dst[i] > hi) hi = dst[i];
-    }
-    if (lo == 0xffffffff) { lo = 0; hi = 0; }
-    *minv = lo;
-    *maxv = hi;
     return true;
 }
 
@@ -2648,7 +2692,6 @@ static MTLVertexFormat tessMemberFormat(const char *type)
     {
         MGLTessPatchMember *m = &tp->tes_patch_in[i];
         MTLVertexFormat fmt;
-        NSUInteger offset = (NSUInteger)m->offset;
 
         if (m->attr < 0)
             continue;
@@ -2675,22 +2718,11 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         fmt = tessMemberFormat(m->type);
         if (fmt == MTLVertexFormatInvalid)
             continue;
-        if (tp->has_tcs)
-        {
-            /* the TCS kernel writes its own patchOut struct: use its member offsets */
-            offset = 0;
-            for (int j = 0; j < tp->num_tcs_patch_out; j++)
-            {
-                if (!strcmp(tp->tcs_patch_out[j].name, m->name) &&
-                    tp->tcs_patch_out[j].size == m->size)
-                {
-                    offset = (NSUInteger)tp->tcs_patch_out[j].offset;
-                    break;
-                }
-            }
-        }
+        /* m->offset is the canonical per-patch record offset (link time): identical
+         * for the TCS kernel's rewritten patchOut struct, the blob and this
+         * descriptor, matched by varying location rather than by name */
         vd.attributes[m->attr].format = fmt;
-        vd.attributes[m->attr].offset = offset;
+        vd.attributes[m->attr].offset = (NSUInteger)m->offset;
         vd.attributes[m->attr].bufferIndex = MGL_TESS_VD_PATCH;
         any_patch = true;
     }
