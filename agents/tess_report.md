@@ -97,6 +97,9 @@ no emulation is attempted.
 
 # tess — round 13 report (audit: remaining CPU sync points, then removal)
 
+> Round 14 (fully GPU-driven indexed draws — no scan wait at all) is documented
+> at the very bottom; this section is the round-13 record.
+
 ## Step 1 — the audit (state as of 9e0a676, before the fixes)
 
 Greps: `waitUntilCompleted|waitUntilScheduled|waitUntilSignaled`,
@@ -177,6 +180,74 @@ All remaining CPU work on the default path is the two documented, justified item
 the no-TCS half-factor constant fill (12 B/patch, no GPU dependency) and
 `mgl_tess_note_counts` (arithmetic-only query bookkeeping, O(patches), no memory
 traffic) — plus the first-draw-of-a-range scan miss above.
+
+---
+
+# tess — round 14 report (indexed draws fully GPU-driven: the scan wait is gone)
+
+Commits: `0fd3a48` (step 1, test red) and `2d06bb6` (step 2).
+
+## Design
+
+The vertex kernel now indexes its output **absolutely** (vertex id, `vfirst = 0`),
+so the scan's min is not needed at all and the ring's vertex-output region is
+sized by the attribute capacity (`tessVSCapacity`: the smallest vertex-rate
+binding's `(bytes - offset) / stride` — always ≥ maxv+1 for a valid draw)
+instead of the scan range. Only `maxv + 1`, clamped to that capacity, matters:
+
+* the scan kernel (same math, atomics into the ring now) runs in its own command
+  buffer, followed by a new `mgl_tess_scan_setup` kernel that writes the vertex
+  kernel's parameter block `{vfirst=0, vcount, instances, baseinstance}` beside
+  it — both committed before the compute buffer and consumed GPU-side through
+  FIFO ordering; **never read back, never waited on**;
+* the vertex kernel is dispatched at the CPU-known capacity × instances and
+  every thread past the GPU-decided vcount returns before writing; its
+  parameter block is bound from the ring instead of `setBytes`;
+* an indirect dispatch (`dispatchThreadgroupsWithIndirectBuffer`) was
+  implemented first and **rejected**: Metal's stage-in attribute fetch does not
+  follow an indirect grid — every thread beyond the first fetched zeros. The
+  capacity-bound direct dispatch with a GPU-written vcount guard has the same
+  effect with no such limitation;
+* the gather shifts by base only (`minv` unused), reading the absolute records.
+
+The one decision still made on the CPU is whether the range contains a
+primitive-restart value (patches re-form around one, which no kernel-side trick
+can express without variable patch counts): `tessRangeHasRestart` scans the
+element buffer's CPU-visible storage — **no GPU sync** — and restart ranges keep
+the round-13 gapless-list path, which also never waits (the CPU reads the
+indices directly from CPU-visible memory). The scan cache now serves only that
+path, where it still saves the CPU index read on repeat draws — exactly the
+"keep only if it saves work" rule.
+
+## Test
+
+`TessIndexedNoRescan` (strengthened in step 1, red until step 2):
+`mgl_tess_scan_waits()` stays at its initial value through the first draw of a
+fresh element range, three redraws, a `glBufferSubData` that changes the
+contents, and a primitive-restart range — with pixel checks after every draw.
+
+```
+scan waits 0 -> 0, cpu index reads 1 -> 1
+after glBufferSubData: scan waits 0 -> 0
+restart: scan waits 0 -> 0, cpu index reads 1 -> 2
+== wt/tess/tests/headless/test_tess.c:   455 checks, 0 failures
+== wt/tess/tests/headless/test_tessemu.c: 53 checks, 0 failures
+```
+Full suite: 21/21 files, 0 failures. The three remaining `waitUntilCompleted`
+sites are behind MGL_TESS_CPU / MGL_TESS_DEBUG / the cached trace flag only.
+
+## Known limits
+
+* A draw whose absolute max index +1 exceeds the attribute capacity (a
+  massively sparse range drawn from a much larger vertex buffer) is clamped by
+  the GPU: vertices past the capacity stay untransformed and those patches
+  degrade. Sizing by capacity instead of the scan range trades that (pathological)
+  case for never needing min/max on the CPU.
+* The restart presence check is a CPU scan of `count` indices when primitive
+  restart is enabled and the range is not cache-hot; it reads CPU-visible
+  memory only (no GPU interaction) and is counted by
+  `mgl_tess_cpu_index_reads()`.
+
 
 ---
 
