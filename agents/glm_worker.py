@@ -317,6 +317,7 @@ def main():
         log(logf, f"start domain={args.domain} model={model} provider={llm_client.get_provider()}")
 
     gen = llm_client.generation_kwargs(args.max_tokens)
+    last_sig, repeats = None, 0
     for turn in range(1, args.max_turns + 1):
         compact(messages)
         resp = create_with_retry(client, model=model, system=system, messages=messages, tools=TOOLS, **gen)
@@ -332,6 +333,16 @@ def main():
             transcript.write_text(json.dumps(messages, default=str))
             print(f"[{args.domain}] done in {turn} turns")
             return 0
+        sig = json.dumps([[c["name"], c.get("input")] for c in calls], sort_keys=True, default=str)
+        repeats = repeats + 1 if sig == last_sig else 0
+        last_sig = sig
+        if repeats >= 5:
+            (worktree / "agent_report.md").write_text(
+                "STOPPED BY LOOP GUARD: the same tool call was issued 6 turns in a row.\n\n" + (text or "") + "\n")
+            log(logf, f"turn {turn} loop guard: identical tool call x{repeats + 1}; stopping")
+            transcript.write_text(json.dumps(messages, default=str))
+            print(f"[{args.domain}] stopped by loop guard")
+            return 3
         results = []
         for c in calls:
             name, inp = c["name"], c.get("input") or {}
@@ -342,6 +353,9 @@ def main():
                 out = f"ERROR: {type(e).__name__}: {e}"
             log(logf, f"turn {turn} {name} {brief_inp} -> {out[:200].replace(chr(10), ' | ')}")
             results.append({"type": "tool_result", "tool_use_id": c["id"], "content": out})
+        if repeats >= 2:
+            results.append({"type": "text", "text": f"WARNING: you have issued the identical tool call {repeats + 1} turns in a row. "
+                            "It is not making progress. Do something different (inspect the result, run the test, commit, or report)."})
         note = take_inbox(state_dir)
         if note:
             results.append({"type": "text", "text": "MESSAGE FROM THE SUPERVISOR (takes priority over earlier plans):\n" + note})
