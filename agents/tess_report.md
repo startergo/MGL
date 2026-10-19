@@ -118,7 +118,7 @@ Greps: `waitUntilCompleted|waitUntilScheduled|waitUntilSignaled`,
 |---|---|---|
 | `MGLRenderer+Tessellation.m:933-935` | `scanout[0..2]` — the scan kernel's min/max/restart count | **YES — indexed patch draws** (paired with :931) |
 | `MGLRenderer+Tessellation.m:1326-1332` | trace dump of cp/factors | no (tTrace) |
-| `MGLRenderer+Tessessment+Tessellation.m:1498-1502` | trace dump of tcs_patch/blob/factors/coords | no (tTrace) |
+| `MGLRenderer+Tessellation.m:1498-1502` | trace dump of tcs_patch/blob/factors/coords | no (tTrace) |
 | `MGLRenderer+Tessellation.m:1550,1563` | CPU reference path: factor read-back + patch records | no (MGL_TESS_CPU / GPU-tessellator fallback) |
 
 CPU→GPU **writes** through `.contents` (no GPU dependency, not read-backs;
@@ -140,19 +140,43 @@ Also found while auditing: the scan path allocates a fresh 16-byte
 
 ## Step 2 — removals
 
-* **commit `A`** — the index-scan stall and per-draw scan-buffer allocation
-  are gone for repeat draws: the scan results (and, for restart ranges, the
-  gapless widened list as an `MTLBuffer`) are cached in
-  `MGLExtState_tess`, keyed on (context, element buffer object, its
-  **gpuaudit content serial** `mgl_gpuaudit_invalidate` bumps on every
-  CPU-visible modification, mtl_data pointer, size, offset, count, index
-  type, base vertex, restart value/enabled). A hit skips the scan kernel,
-  the wait, the buffer allocation — and for restart ranges the CPU index
-  loop entirely (the gather kernel binds the cached widened buffer). A miss
-  runs the old path once and populates the cache. Proven by
-  `mgl_tess_scan_waits()` / `mgl_tess_cpu_index_reads()`: the new
-  `IndexedNoRescan` test draws the same range repeatedly and asserts the
-  counters move exactly once.
+* **commit `68fb738`** — the index-scan stall, the per-draw scan-buffer allocation and
+  the restart-range CPU index loop are gone for repeat draws: the scan results (and,
+  for restart ranges, the gapless widened list as an `MTLBuffer`) are cached in an
+  8-entry LRU in the renderer, keyed on (context, element buffer object, its
+  **gpuaudit content serial** — bumped by every CPU-visible modification —, Metal
+  storage pointer and size, offset, count, index type, restart value/enabled). A hit
+  skips the scan kernel, the wait and the allocation; the gather kernel indexes the
+  cached list with a new `modulo` parameter instead of a per-instance ring copy.
+  Proven by `mgl_tess_scan_waits()` / `mgl_tess_cpu_index_reads()`:
+  `TessIndexedNoRescan` draws each range three times, asserts exactly one scan per
+  range (one CPU index read for the restart case), one more scan after a
+  `glBufferSubData` invalidates the entry, and checks pixels every time.
+
+  Three real bugs surfaced by the new test were fixed in the same commit:
+  indexed patch draws whose indices do not start at 0 rendered the wrong vertices
+  (`tessBuildVSPlan` computed the vertex-rate attribute fetch offsets from `first`
+  before the scan produced the real base vertex — 10 of the test's checks fail
+  against the round-12 library); the widened (primitive-restart) path never actually
+  dropped the restart values (`tessReadIndicesInto` returns them; the old 'gapless'
+  list still contained 0xFFFF entries and used a stale `tess_idx_used`); and the raw
+  gather dispatch left `itype/minv/restart` unbound (undefined values) while the
+  widened dispatch subtracted minv twice. Every kernel parameter is now set
+  explicitly.
+
+Post-fix state of the wait sites (file `MGLRenderer+Tessellation.m`):
+
+| line | path |
+|---|---|
+| 1060 | the one-time scan of a *first* draw of an element range (cache miss); repeat draws skip it entirely |
+| 1469 | `cpu_reference \|\| debug_wait` (MGL_TESS_CPU / MGL_TESS_DEBUG) |
+| 1539 | `tTrace()` dump in the hardware `drawPatches` block |
+| 1711 | `tTrace()` dump in the emulated render block |
+
+All remaining CPU work on the default path is the two documented, justified items:
+the no-TCS half-factor constant fill (12 B/patch, no GPU dependency) and
+`mgl_tess_note_counts` (arithmetic-only query bookkeeping, O(patches), no memory
+traffic) — plus the first-draw-of-a-range scan miss above.
 
 ---
 
