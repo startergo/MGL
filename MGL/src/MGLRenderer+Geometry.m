@@ -40,23 +40,17 @@
 
 /* per-process scratch (the buffers are shared storage; they are only used by encoders of
  * the command buffer they were written for, so a single set can serve every draw) */
-/* a per-draw scratch pool: the buffer plus the next free offset (geomSubAlloc below) */
-typedef struct {
-    id<MTLBuffer> buf;
-    size_t next;
-} MGLGeomPool;
-
 static id<MTLBuffer> gPrim;         /* header + capture index list + input primitive slots */
 static id<MTLBuffer> gVsout;        /* capture header + captured VS records */
-static MGLGeomPool gPrimPool, gVsoutPool; static size_t gPrimOff, gVsoutOff;
+static size_t gPrimOff, gVsoutOff;  /* this draw's ranges in them */
 static id<MTLBuffer> gOutv;         /* geometry output vertex records */
 static id<MTLBuffer> gIdx;          /* raster index list */
 static void *gEnqueuedCb;            /* the command buffer this category enqueued */
 static id<MTLBuffer> gCtl;          /* counters + indirect draw arguments */
 static id<MTLBuffer> gPrep;         /* prep kernel inputs, staging command and outputs */
-static MGLGeomPool gPrepPool; static size_t gPrepOff;
+static size_t gPrepOff;             /* this draw's range in it */
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
-static MGLGeomPool gOutvPool, gCntPool; static size_t gOutvOff, gCntOff;
+static size_t gOutvOff, gCntOff;    /* this draw's range inside them */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
 static bool gXfbPending;            /* a pack has not been folded into the object yet */
@@ -454,7 +448,6 @@ static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
     gOutvOff = gCntOff = gPrepOff = gPrimOff = gVsoutOff = 0;
-    gPrimPool.next = gVsoutPool.next = gPrepPool.next = gOutvPool.next = gCntPool.next = 0;
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
@@ -621,9 +614,6 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setComputePipelineState: gXfbScatterPso];
     [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
-    if (getenv("MGL_GEOM_XFB_TRACE"))
-        fprintf(stderr, "geom: scatter reads out buf=%p off=%zu\n",
-                (void *)(__bridge void *)gOutv, gOutvOff);
     [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
     [enc setBuffer: gCnt offset: gCntOff atIndex: 3];
     [enc setBuffer: gXbase offset: 0 atIndex: 4];
@@ -954,33 +944,24 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     return eb->data.mtl_data != NULL;
 }
 
-/* reserve `need` bytes: *start receives this draw's range and the pool advances past it, so
- * the next draw can never land on it.  When the range would not fit, start a NEW (larger,
- * zero-filled) buffer instead of wrapping to offset 0 — a silent wrap could hand a draw a
- * range whose previous user is still pending on the GPU. */
-static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start)
+/* per-draw sub-allocation: bump the offset inside the buffer, and when it would wrap start a
+ * NEW (larger, zero-filled) buffer instead — a silent wrap to offset 0 could hand a draw a
+ * range whose previous user is still pending on the GPU, and leftover records in it */
+static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_t need, size_t *off)
 {
-    size_t s;
-
-    if (need == 0) need = 4;
-
-    s = (pool->next + 255) & ~(size_t)255;
-    if (pool->buf && s + need <= pool->buf.length)
+    if (buf && *off + need <= buf.length)
     {
-        pool->next = s + need;
-        *start = s;
-        return pool->buf;
+        *off = (*off + 255) & ~(size_t)255;
+        if (*off + need <= buf.length) return buf;    /* keep the buffer, advance the range */
     }
 
     /* start a fresh buffer so the range is zero-filled and has no previous user */
     size_t sz = 4096;
-    size_t want = (pool->buf ? pool->buf.length * 2 : 0);
+    size_t want = (buf ? buf.length * 2 : 0);
     if (want < need * 2) want = need * 2;
     while (sz < want) sz *= 2;
-    pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
-    pool->next = need;
-    *start = 0;
-    return pool->buf;
+    *off = 0;
+    return [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
 }
 
 - (bool) geomDraw: (MGLGeomDraw *) d
@@ -1038,16 +1019,16 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
-    gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
+    gOutv = geomSubAlloc(_device, gOutv, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
     if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
      * must not overwrite them first */
-    gPrep = geomSubAlloc(_device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff);
+    gPrep = geomSubAlloc(_device, gPrep, MGL_GEOM_PREP_BYTES, &gPrepOff);
     if (!gPrep) { geomReleaseStatics(); return false; }
-    gCnt = geomSubAlloc(_device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
+    gCnt = geomSubAlloc(_device, gCnt, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
     if (!gCnt) { geomReleaseStatics(); return false; }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
@@ -1055,9 +1036,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     /* the primitive slots / capture index list and the captured VS records are shared by the
      * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
      * own range so a later draw's kernels cannot overwrite them first */
-    gPrim = geomSubAlloc(_device, &gPrimPool, prim_bytes, &gPrimOff);
+    gPrim = geomSubAlloc(_device, gPrim, prim_bytes, &gPrimOff);
     if (!gPrim) { geomReleaseStatics(); return false; }
-    gVsout = geomSubAlloc(_device, &gVsoutPool, vsout_bytes, &gVsoutOff);
+    gVsout = geomSubAlloc(_device, gVsout, vsout_bytes, &gVsoutOff);
     if (!gVsout) { geomReleaseStatics(); return false; }
 
     if (![self geomPipelines: gp program: program]) return false;
@@ -1365,9 +1346,6 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
                atIndex: MGL_GEOM_MSL_PRIM];
         [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
         [enc setBuffer: gPrim offset: gPrimOff atIndex: MGL_GEOM_MSL_HDR];
-        if (getenv("MGL_GEOM_XFB_TRACE"))
-            fprintf(stderr, "geom: GS writes out buf=%p off=%zu (cap %zu)\n",
-                    (void *)(__bridge void *)gOutv, gOutvOff, (size_t)gOutv.length);
         [enc setBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_OUTV];
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
@@ -1447,8 +1425,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     if (!gp->draw_function)
     {
-        NSLog(@"MGL geom: the pass-through vertex function is not compiled (program %u)",
-              program ? program->name : 0);
+        NSLog(@"MGL geom: the pass-through vertex function is not compiled");
         return false;
     }
 
