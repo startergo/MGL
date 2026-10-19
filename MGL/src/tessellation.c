@@ -1176,7 +1176,17 @@ static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *facto
 /* build the per-patch data blob consumed by the rewritten TES (TES patchIn layout):
  * - members written by the TCS are copied from the read-back patch output struct
  * - the tessellation level members are filled from the factors
- * - anything else stays zero (undefined per GL when no TCS writes it) */
+ * - anything else stays zero (undefined per GL when no TCS writes it)
+ *
+ * CPU form: used by the MGL_TESS_CPU reference path and the GPU-tessellator
+ * fallback only — the GPU paths assemble the blob with the mgl_tess_blob kernel
+ * (see MGLTessKernels.h) from the same map (mgl_tess_build_blob_map). */
+static unsigned tess_cpu_blob_builds;   /* diagnostic: CPU blob builds since load */
+static unsigned tess_cpu_generate_runs; /* diagnostic: CPU tessellator runs since load */
+
+unsigned mgl_tess_cpu_blob_builds(void)   { return tess_cpu_blob_builds; }
+unsigned mgl_tess_cpu_generate_runs(void) { return tess_cpu_generate_runs; }
+
 static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                   const unsigned char *tcs_patch_out, size_t tcs_patch_stride,
                                   const float *factors, unsigned patches)
@@ -1184,6 +1194,7 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     size_t need = (size_t)tp->tes_patch_in_size * patches;
 
+    tess_cpu_blob_builds++;
     if (!need)
         return;
     if (S->patch_cap < need)
@@ -1426,6 +1437,9 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
             }
         }
     }
+
+    /* the GPU blob kernel's member map (levels + TCS patch-output copies) */
+    mgl_tess_build_blob_map(ctx, tp);
 }
 
 /* ------------------------------------------------------------------ GL hooks */
@@ -1651,7 +1665,55 @@ bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin
 /* exported for MGLRenderer+Tessellation.m */
 bool mgl_tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches)
 {
+    tess_cpu_generate_runs++;
     return tess_generate(ctx, tp, factors, patches);
+}
+
+/* precompute, once per program, how the GPU blob kernel must assemble each patch's
+ * TES patch-in record: for every TES patch-in member, either the tessellation
+ * levels (from the half factor record) or a byte range of the TCS patch output,
+ * matched by varying name exactly like tess_build_patch_blob does on the CPU. */
+void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
+{
+    int n = 0;
+
+    (void)ctx;
+    tp->blob_map_n = 0;
+    for (int i = 0; i < tp->num_tes_patch_in && n < MGL_TESS_BLOB_MAX; i++)
+    {
+        const MGLTessPatchMember *m = &tp->tes_patch_in[i];
+        uint32_t kind = 0, src = 0, size = 0;
+
+        if (!strcmp(m->name, "gl_TessLevel") || !strcmp(m->name, "gl_TessLevelOuter"))
+            kind = MGL_TESS_BLOB_OUTER;
+        else if (!strcmp(m->name, "gl_TessLevelInner"))
+            kind = MGL_TESS_BLOB_INNER;
+        else
+        {
+            /* copy from the TCS patch output record, matched by name and size */
+            bool found = false;
+            for (int j = 0; j < tp->num_tcs_patch_out && !found; j++)
+            {
+                if (!strcmp(tp->tcs_patch_out[j].name, m->name) &&
+                    tp->tcs_patch_out[j].size == m->size)
+                {
+                    src = (uint32_t)tp->tcs_patch_out[j].offset;
+                    size = (uint32_t)m->size;
+                    kind = MGL_TESS_BLOB_COPY;
+                    found = true;
+                }
+            }
+            if (!found)
+                continue;               /* no producer: stays zero (undefined per GL) */
+        }
+
+        tp->blob_kind[n] = kind;
+        tp->blob_dst[n] = (uint32_t)m->offset;
+        tp->blob_src[n] = src;
+        tp->blob_size[n] = size;
+        n++;
+    }
+    tp->blob_map_n = n;
 }
 
 void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,

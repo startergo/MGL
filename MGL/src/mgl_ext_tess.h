@@ -107,6 +107,20 @@ typedef struct MGLTessProgram_t {
     int     num_tes_patch_in;
     size_t  tes_patch_in_size;
 
+    /* GPU patch-blob map (mgl_tess_blob kernel, built once at link time by
+     * mgl_tess_build_blob_map): for each TES patch-in member, where it comes
+     * from — a byte range of the TCS patch output record, or the tessellation
+     * levels of the half factor record. Mirrors the CPU tess_build_patch_blob. */
+#define MGL_TESS_BLOB_COPY  0u
+#define MGL_TESS_BLOB_OUTER 1u
+#define MGL_TESS_BLOB_INNER 2u
+#define MGL_TESS_BLOB_MAX   MGL_TESS_MAX_PATCH_MEMBERS
+    uint32_t blob_kind[MGL_TESS_BLOB_MAX];
+    uint32_t blob_dst[MGL_TESS_BLOB_MAX];
+    uint32_t blob_src[MGL_TESS_BLOB_MAX];
+    uint32_t blob_size[MGL_TESS_BLOB_MAX];
+    int      blob_map_n;
+
     /* hardware path: [[patch(domain, N)]] control point count baked into the TES MSL */
     int     hw_cp_count;
 
@@ -183,10 +197,16 @@ bool mgl_tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors,
 void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                const unsigned char *tcs_patch_out, size_t tcs_patch_stride,
                                const float *factors, unsigned patches);
+void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);   /* 8 tri / 12 quad */
 char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees */
 bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin_len,
                              char *cp_name, size_t cp_len, size_t *record_size);
+
+/* diagnostics for the GPU-path tests: CPU-side patch-blob builds / CPU
+ * tessellator runs since library load (the GPU paths must not grow these) */
+unsigned mgl_tess_cpu_blob_builds(void);
+unsigned mgl_tess_cpu_generate_runs(void);
 
 #endif /* MGL_EXT_TESS_H */
