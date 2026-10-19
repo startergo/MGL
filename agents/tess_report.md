@@ -1,5 +1,8 @@
 # tess — round 11 report (point_mode + isolines GPU verification)
 
+> Round 12 (GPU patch-blob assembly for the emulated path) is documented at the
+> bottom; this section is the round-11 record.
+
 Worktree `wt/tess`, branch `gl46/tess`. Commits (one per supervisor step):
 
 1. `f6b955c` step 2 — point_mode GPU tests verified pixel-exact against GL_POINTS
@@ -89,3 +92,100 @@ None for point_mode/isolines positions. Known platform-wide characteristic
 (not tess-specific): the point/line pixel-edge tie-break (exact integer window
 coordinates) goes to the lower/left pixel; identical to Apple's native GL, so
 no emulation is attempted.
+
+---
+
+# tess — round 12 report (emulated path: GPU patch-blob assembly)
+
+Commits (one per step), after merging `gl46-port` (66de6c9):
+
+1. `ed1196b` step 1 — tests + CPU-work counters (red)
+2. `6346028` step 2 — the GPU blob kernel, five real bugs fixed
+
+## Step 1 — the test and the counters
+
+`mgl_tess_cpu_blob_builds()` / `mgl_tess_cpu_generate_runs()` are exported from
+libmgl and incremented by the CPU blob build / CPU tessellator. Two tests in
+`test_tessemu.c` force the emulated path (isolines never take the hardware
+tessellator):
+
+* `EmuPatchDataGpu` — a TCS with a per-patch varying (`layout(location=1) patch
+  out vec4 p_flag`) and an isolines TES reading it: the value reaches the TES
+  only through the per-patch data blob. Checks the 3 lines at v=(i+0.5)/3 in
+  the patch colour, full extent, then a **two-patch** variant where each patch
+  carries its own colour and level count (per-patch record indexing).
+* `EmuDefaultLevelsGpu` — TES without TCS + `glPatchParameterfv` defaults
+  {3,8}: 3 lines, per-vertex colour interpolation.
+
+Both check pixels *and* that neither counter moved across the draw. Against the
+pre-round-12 library both failed, and for real reasons:
+
+* has-TCS emulated draws stalled (`[emu_cb waitUntilCompleted]`), built the blob
+  on the CPU and memcpy'd it to **ring offset 0** (off_patch_data was never
+  allocated with a TCS), clobbering the control-point records the TES read: the
+  patch-var program's blob was 64 B/patch and overwrote cp1's gl_Position —
+  lines ended at window x=125 instead of 189. Measured: blob builds 3→4/draw.
+* no-TCS emulated draws never wrote the half tessellation-factor records the
+  GPU tessellator reads (only the hardware path filled them) — it tessellated
+  from zeros: one line at v=0.5 instead of 3. Full CPU blob + tessellator also
+  still ran per draw (builds 4→6, runs 0→1).
+
+## Step 2 — the GPU replacement
+
+New compute kernel `mgl_tess_blob` (`MGLTessKernels.h`), one thread per patch,
+dispatched in the VS/TCS compute encoder right after the TCS kernel: zero the
+patch's TES patch-in record, fill the level members from the half factor record
+(half→float; triangles pack the inside level into `gl_TessLevelOuter.w`), and
+copy the TCS-written members from the TCS patch-output record, using a
+per-program map (`mgl_tess_build_blob_map`) computed once at link time with the
+same name/size matching as the CPU builder. Ordering is FIFO command-buffer
+order plus the existing event wait — **no CPU read-back, no wait** on the
+emulated or the TCS-less hardware path.
+
+Additional fixes the new tests flushed out:
+
+* the plain-TES rewrite read patch data at a fixed record offset — every patch
+  saw patch 0's values (`mgl_tess_patch + member_off`, no patch id). Now
+  indexed by the patch id the tessellator stores in the coordinate stream;
+  verified by the two-patch case (left half red-dominant, right half
+  blue-dominant, per-patch level counts).
+* the emulated and CPU paths bound the control-point buffer at ring offset 0
+  (the VS output) instead of `cp_source_off` — only pass-through TCSs worked.
+* the no-TCS GPU draws ran the full CPU tessellator per draw just to feed
+  `glEndQuery` bookkeeping; replaced by `mgl_tess_note_counts` (same arithmetic
+  as the GPU tessellator's `mgl_patch_counts`), so queries keep working with no
+  CPU tessellation.
+* the CPU reference path (MGL_TESS_CPU) committed `compute_cb` twice and
+  aborted with "commit an already committed command buffer" (it had been
+  unrunnable); also its factor read-back used a 6-half stride for triangles
+  (8-byte records). Both fixed; the CPU path completes again.
+
+Kept on the CPU only behind `MGL_TESS_CPU` (or the GPU-tessellator fallback):
+`mgl_tess_build_patch_blob` + `mgl_tess_generate`. A trace facility
+(MGL_TESS_DEBUG, cached flag) can dump the TCS patch records / blob / factors /
+first coordinates after the compute stages — it does wait once, and only when
+tracing.
+
+## Test results (clean rebuild, `rm -rf build && make -j8 lib`)
+
+```
+== wt/tess/tests/headless/test_tess.c:   429 checks, 0 failures
+== wt/tess/tests/headless/test_tessemu.c: 53 checks, 0 failures
+```
+Full `tests/headless/run.sh`: 21/21 files, 0 failures (no FAILED/BUILD-FAIL).
+`stub_scanner.py --list EMPTY|NOOP|ASSERT` clean for `tessellation.c` and
+`MGLRenderer+Tessellation.m`.
+
+## Known gaps
+
+* The MGL_TESS_CPU reference path renders incorrect pixels (colour/geometry
+  scrambled) although it no longer crashes; its geometry and counters are
+  correct. It is a debug reference only — the GPU paths are the contract. Left
+  as a follow-up.
+* TCS-written tessellation levels are consumed by the GPU tessellator in half
+  precision (Metal's factor-buffer format), so a TES reading gl_TessLevel*
+  sees half-rounded values — same precision as the hardware path (MoltenVK
+  behaves identically).
+* Query counters for TCS-level-dependent GPU draws (PRIMITIVES_GENERATED with
+  a TCS) are not noted — the levels live on the GPU; unchanged from round 11.
+
