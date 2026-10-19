@@ -88,7 +88,7 @@ static void *gPsoKey;               /* the kernel function the PSOs were built f
 
 /* the input block of the prep kernel: everything the assembly needs, 16 words */
 #define MGL_GEOM_PREP_IN_WORDS 16
-#define MGL_GEOM_WG            64
+#define MGL_GEOM_WG            32
 #define MGL_GEOM_PREP_BYTES    (64 * sizeof(uint32_t))
 
 /* the prep kernel builds, in one workgroup, everything the rest of the emulation needs from
@@ -154,7 +154,14 @@ static const char *kGeomPrepMSL =
     "        for (;;) {\n"
     "            uint i = next_restart + tid;\n"
     "            bool r = i >= count || (indexed && restart_en && MGL_IDX(i) == restart);\n"
-    "            {   /* first restart in this tile: one ballot per simd group */\n"
+    "            {   /* first restart in this tile */\n"
+    "#if WG <= 32\n"
+    "                /* one simdgroup covers the whole workgroup: the ballot is the answer, no\n"
+    "                 * threadgroup round trip (primitive restart means this loop runs once per\n"
+    "                 * restart-free run, so a barrier here would dominate the kernel) */\n"
+    "                uint bb = (uint)(uint64_t)simd_ballot(r);\n"
+    "                m = bb ? ctz(bb) : 0xffffffffu;\n"
+    "#else\n"
     "                uint bb = (uint)(uint64_t)simd_ballot(r);\n"
     "                uint local = bb ? (ctz(bb) + sgid * 32u) : 0xffffffffu;\n"
     "                if (slid == 0u) tgr[sgid] = local;\n"
@@ -162,6 +169,7 @@ static const char *kGeomPrepMSL =
     "                m = 0xffffffffu;\n"
     "                for (uint j = 0; j < WG / 32u; j++) if (tgr[j] < m) m = tgr[j];\n"
     "                threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "#endif\n"
     "            }\n"
     "            if (m != 0xffffffffu) { next_restart += m; break; }\n"
     "            next_restart += WG;\n"
@@ -1015,6 +1023,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     size_t want = (pool->buf ? pool->buf.length * 2 : 0);
     if (want < need * 2) want = need * 2;
     while (sz < want) sz *= 2;
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace pool %p grow need=%zu old=%zu -> %zu\n",
+                (void *)pool, need, (size_t)(pool->buf ? pool->buf.length : 0), sz);
     pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
     pool->next = need;
     *start = 0;
@@ -1080,6 +1091,11 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace sizing bound=%u outv_cap=%zu idx_cap=%zu cap_idx=%zu cap_prim=%zu "
+                        "prim_bytes=%zu vsout_bytes=%zu threads=%llu in_words=%u out_words=%u maxverts=%u\n",
+                (unsigned)bound, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
+                (unsigned long long)threads, gp->in_words, gp->out_words, gp->max_vertices);
     gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
     if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);

@@ -2879,9 +2879,12 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
         for (i = 0; i < (GLuint)nseq; i++) seq[i] = (uint32_t)(d->first + (GLint)i);
     }
 
-    /* the vertex range the capture pass must cover */
+    /* the vertex range the capture pass must cover.  The restart sentinel is not a vertex:
+     * counting it would make vmax 0xffffffff and the capture record buffer would be sized by
+     * 4 billion vertices (a >100 GB allocation, which is what stalled primitive restart) */
     for (i = 0; i < (GLuint)nseq; i++)
     {
+        if (d->indexed && seq[i] == restart) continue;
         if (seq[i] < vmin) vmin = seq[i];
         if (seq[i] > vmax) vmax = seq[i];
     }

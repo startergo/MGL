@@ -2697,7 +2697,13 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             return false;
         }
 
-        NSLog(@"MGL INFO: Successfully created new Metal command buffer (AGX validated)");
+        /* per-create logging is opt-in (see MGL_DEBUG_CMDBUF in commit:) */
+        {
+            static BOOL mgl_log_cmdbuf = -1;
+            if (mgl_log_cmdbuf < 0) mgl_log_cmdbuf = getenv("MGL_DEBUG_CMDBUF") ? YES : NO;
+            if (mgl_log_cmdbuf)
+                NSLog(@"MGL INFO: Successfully created new Metal command buffer (AGX validated)");
+        }
     } @catch (NSException *exception) {
         NSLog(@"MGL AGX ERROR: Exception creating command buffer: %@", exception);
         [self recordGPUError];
@@ -5785,10 +5791,15 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
 
     // Commit with exception handling
     @try {
-        NSLog(@"MGL AGX: Committing command buffer (status: %ld)", (long)status);
+        /* per-commit logging is opt-in: it is 1000+ lines per frame for some workloads */
+        static BOOL mgl_log_cmdbuf = -1;
+        if (mgl_log_cmdbuf < 0) mgl_log_cmdbuf = getenv("MGL_DEBUG_CMDBUF") ? YES : NO;
+        if (mgl_log_cmdbuf)
+            NSLog(@"MGL AGX: Committing command buffer (status: %ld)", (long)status);
         mglCallExtHooks(self, "WillCommit:", commandBuffer);
         [commandBuffer commit];
-        NSLog(@"MGL AGX: Command buffer committed successfully");
+        if (mgl_log_cmdbuf)
+            NSLog(@"MGL AGX: Command buffer committed successfully");
     } @catch (NSException *exception) {
         NSLog(@"MGL AGX ERROR: Command buffer commit exception: %@", exception);
         [self recordGPUError];
