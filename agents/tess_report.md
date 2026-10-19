@@ -111,3 +111,50 @@ Full suite: 22/22 files, 0 failures.
 
 # Round history (rounds 11–16; records kept for reference)
 
+
+---
+
+# Round 18 (SPIR-V binary format; assert(0) cleanup; TES-output capture producer)
+
+## A) SPIR-V as a shader binary format — DONE
+`test_spirvbin.c` + `spv_vsfs.h` (word arrays generated with MGL's own glslang via
+`.agent/gen_spv.c`): the enums, `glGetStringi(GL_SPIR_V_EXTENSIONS)`,
+`glShaderBinary(SPIR-V)+glSpecializeShader("main")` linking and drawing (green
+pixel) all pass; `get.c` now advertises `GL_ARB_gl_spirv` + `GL_ARB_spirv_extensions`
+(commits b91aab6/c67b818).
+
+## B) The five assert(0)s — DONE (7b46f20)
+`bitcountForInternalFormat`/`internalFormatForGLFormatType`/
+`mtlPixelFormatForGLFormatType` (pixel_utils.c + the MGLTextures.m copy) now return
+0 / GL_NONE / MTLPixelFormatInvalid on unknown values; `MGLGetContextInfo` writes 0.
+`test_pixelerr`: junk enums through the exported mappers no longer abort (before:
+Abort trap 6 at pixel_utils.c:1833).
+
+## C) TES-output capture producer — interface complete, enable incomplete (e18bb07)
+
+**Contract for the geometry / transform-feedback worker** (all in `mgl_ext_tess.h`):
+`mgl_tess_set_capture(ctx, program, true)` makes every GL_PATCHES draw of that
+program publish a `MGLTessCapture` in `ctx->state.ext_tess->capture`:
+
+* `buffer` + `records_offset` — one packed record per tessellated vertex:
+  words 0..3 = `gl_Position` (raw, no y/depth fixup), then user varyings in
+  declaration order, `words = elems*cols*rows*base_words` (2 for double), no
+  padding — the same rule `geometry.c` uses for its captured VS-output records.
+* `member[]` — name/words/offset table; match varyings by NAME (like the blob map).
+* `index_offset` — the uint32 vertex indices of the tessellated output;
+  `count_offset` — the GPU-written vertex count word (for indirect consumers);
+  `stride` — record stride in words; `prim` — GL_TRIANGLES/LINES/POINTS.
+* Valid until the next GL_PATCHES draw; the producing draw takes the emulated
+  tessellation path (forced) so the stream is GPU-visible; no CPU readback.
+
+The record-writing kernel is the plain TES rewritten (`mgl_tess_capture_msl`),
+dispatched after the tessellator kernels in the same encoder. `program.c`'s
+"geometry after tessellation" rejection is untouched for geom to remove.
+
+**Known gap**: the draw never sees `tp->capture == true`: the tests-only enable
+(`mgl_tess_diag_capture`, using the global `_ctx` + `mgl_tess_active_program`)
+does not stick, so the layout builder is never reached and `TessOutputCapture`
+fails with "not published" (test_tessemu 56 checks, 1 failure). When wiring the
+consumer, geom should call `mgl_tess_set_capture` from its own hook with the live
+context — the producer side (rewrite, ring reservation, dispatch, publication,
+tests-only readback) is complete behind that flag.
