@@ -476,6 +476,100 @@ TEST(TessIndexedNoRescan)
     glDeleteProgram(prog);
 }
 
+/* ------------- restart-presence cache -------------------------------------------------
+ * With primitive restart enabled, whether the range contains the restart value is
+ * decided on the CPU (it re-forms patches, so the draw encoding depends on it) —
+ * but at most ONCE per buffer content: the result is cached like the round-13
+ * scan results, keyed on the element buffer and its gpuaudit content serial. */
+TEST(TessRestartCheckCached)
+{
+    extern unsigned mgl_tess_restart_checks(void);
+
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+
+    const float pos[6][4] = {
+        { -1,  1, 0, 1 }, { -1, -1, 0, 1 }, { 0, -1, 0, 1 },
+        {  0,  1, 0, 1 }, {  0, -1, 0, 1 }, { 1, -1, 0, 1 },
+    };
+    const float col[6][4] = {
+        { 1,0,0,1 }, { 1,0,0,1 }, { 1,0,0,1 },
+        { 0,0,1,1 }, { 0,0,1,1 }, { 0,0,1,1 },
+    };
+    GLuint vao, b[3];
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(3, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xFFFF);
+
+    /* a range WITHOUT the restart value: the presence check runs once, never again */
+    const unsigned short idx[6] = { 0, 1, 2, 3, 4, 5 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+
+    unsigned c0 = mgl_tess_restart_checks();
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL);
+        EXPECT_NO_GL_ERROR();
+    }
+    glFinish();
+    printf("restart checks (no restart values): %u -> %u\n", c0, mgl_tess_restart_checks());
+    EXPECT_TRUE(mgl_tess_restart_checks() - c0 == 1);
+
+    /* new contents: one more check */
+    const unsigned short idx2[6] = { 3, 4, 5, 0, 1, 2 };
+    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof idx2, idx2);
+    c0 = mgl_tess_restart_checks();
+    for (int rep = 0; rep < 2; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL);
+        EXPECT_NO_GL_ERROR();
+    }
+    glFinish();
+    printf("restart checks (after glBufferSubData): %u -> %u\n", c0, mgl_tess_restart_checks());
+    EXPECT_TRUE(mgl_tess_restart_checks() - c0 == 1);
+
+    /* a range WITH a restart value: one presence check, one widened build, then cached */
+    const unsigned short idx3[7] = { 3, 4, 5, 0xFFFF, 0, 1, 2 };
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx3, idx3, GL_STATIC_DRAW);
+    c0 = mgl_tess_restart_checks();
+    unsigned r0;
+    {
+        extern unsigned mgl_tess_cpu_index_reads(void);
+        r0 = mgl_tess_cpu_index_reads();
+    }
+    for (int rep = 0; rep < 3; rep++)
+    {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_PATCHES, 7, GL_UNSIGNED_SHORT, NULL);
+        EXPECT_NO_GL_ERROR();
+    }
+    glFinish();
+    printf("restart checks (restart range): %u -> %u, index reads %u -> %u\n",
+           c0, mgl_tess_restart_checks(), r0, mgl_tess_cpu_index_reads());
+    EXPECT_TRUE(mgl_tess_restart_checks() - c0 == 1);
+    EXPECT_TRUE(mgl_tess_cpu_index_reads() - r0 == 1);
+
+    glDisable(GL_PRIMITIVE_RESTART);
+    glDeleteProgram(prog);
+}
+
 /* ------------- consecutive-draw regression ------------------------------------------
  * The per-draw scratch ring and GPU-event ordering broke from the third tess draw on
  * in an earlier iteration (stale-build masking). This test hammers the hardware path
@@ -764,6 +858,7 @@ int main(void)
     RUN(TessIndexedAndInstanced);
     RUN(TessIndexedRestart);
     RUN(TessIndexedNoRescan);
+    RUN(TessRestartCheckCached);
     RUN(TessConsecutiveDraws);
     RUN(TessPSOCacheStress);
     RUN(TessTriangleDomain);
