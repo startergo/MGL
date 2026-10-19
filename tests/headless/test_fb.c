@@ -489,6 +489,190 @@ TEST(depth_stencil_clear_readback)
     EXPECT_NO_GL_ERROR();
 }
 
+TEST(blit_depth_stencil_to_multisample)
+{
+    GLint maxs = 0;
+    glGetIntegerv(GL_MAX_SAMPLES, &maxs);
+    if (maxs < 4) return;   /* need 4x multisampled depth/stencil targets */
+
+    /* single-sampled source: 8x8 with four depth/stencil quadrants */
+    GLuint srcC, src = make_fbo_rb(GL_RGBA8, 8, 8, &srcC);
+    GLuint srcDS = make_rb(GL_DEPTH24_STENCIL8, 8, 8, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, srcDS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glDisable(GL_SCISSOR_TEST);
+    glClearDepth(0.95f);
+    glClearStencil(200);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    static const float qz[4] = { 0.2f, 0.4f, 0.6f, 0.8f };
+    static const GLubyte qs[4] = { 3, 5, 9, 13 };
+    for (int q = 0; q < 4; q++)
+    {
+        glScissor((q & 1) * 4, (q >> 1) * 4, 4, 4);
+        glClearBufferfi(GL_DEPTH_STENCIL, 0, qz[q], qs[q]);
+    }
+    glDisable(GL_SCISSOR_TEST);
+
+    /* 16x16 4x multisampled destination + single-sample resolve target */
+    GLuint dst;
+    GLuint dstC = make_rb(GL_RGBA8, 16, 16, 4), dstDS = make_rb(GL_DEPTH24_STENCIL8, 16, 16, 4);
+    glGenFramebuffers(1, &dst);
+    glBindFramebuffer(GL_FRAMEBUFFER, dst);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, dstC);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, dstDS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    GLuint resC, res = make_fbo_rb(GL_RGBA8, 16, 16, &resC);
+    GLuint resDS = make_rb(GL_DEPTH24_STENCIL8, 16, 16, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, resDS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    float d = 0;
+    GLubyte st = 0;
+
+    /* resolve helper: copy dst's depth/stencil into the single-sample target and read */
+#define MSBLIT_CHECK(x, y, dz_, st_) do { \
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, dst); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, res); \
+        glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST); \
+        EXPECT_NO_GL_ERROR(); \
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, res); \
+        glReadPixels(x, y, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &d); \
+        EXPECT_NEAR(d, dz_, 1e-6); \
+        glReadPixels(x, y, 1, 1, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, &st); \
+        EXPECT_EQ_INT(st, st_); } while (0)
+
+    /* scaled 2x depth+stencil blit into the multisampled image */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glClearDepth(0.5f);
+    glClearStencil(64);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBlitFramebuffer(0, 0, 8, 8, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+    EXPECT_NO_GL_ERROR();
+    MSBLIT_CHECK(2, 2, 0.2f, 3);
+    MSBLIT_CHECK(10, 2, 0.4f, 5);
+    MSBLIT_CHECK(2, 10, 0.6f, 9);
+    MSBLIT_CHECK(10, 10, 0.8f, 13);
+    MSBLIT_CHECK(7, 7, 0.2f, 3);    /* nearest edge: dest 7 -> source 3.75 -> quadrant 0 */
+    MSBLIT_CHECK(8, 8, 0.8f, 13);   /* dest 8 -> source 4.25 -> quadrant 3 */
+
+    /* the blitted depth is real depth: render against it (draw_rect writes z = 0.5) */
+    glBindFramebuffer(GL_FRAMEBUFFER, dst);
+    glViewport(0, 0, 16, 16);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    const float white[4] = { 1, 1, 1, 1 };
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    draw_rect(-1, -1, 1, 1, white);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, dst);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, res);
+    glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, res);
+    EXPECT_RGBA8(2, 2, 0, 0, 255, 255);       /* stored depth 0.2/0.4 < 0.5: incoming z fails GL_LESS */
+    EXPECT_RGBA8(12, 2, 0, 0, 255, 255);
+    EXPECT_RGBA8(2, 12, 255, 255, 255, 255);  /* stored depth 0.6/0.8 > 0.5: incoming z passes */
+    EXPECT_RGBA8(12, 12, 255, 255, 255, 255);
+    glDisable(GL_DEPTH_TEST);
+
+    /* depth only, scaled down (8x8 -> 4x4, minification) */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glClearDepth(0.5f);
+    glClearStencil(64);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBlitFramebuffer(0, 0, 8, 8, 0, 0, 4, 4, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    EXPECT_NO_GL_ERROR();
+    MSBLIT_CHECK(1, 1, 0.2f, 64);
+    MSBLIT_CHECK(3, 1, 0.4f, 64);
+    MSBLIT_CHECK(2, 2, 0.8f, 64);
+    MSBLIT_CHECK(9, 9, 0.5f, 64);
+
+    /* stencil only, partial destination rectangle */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBlitFramebuffer(0, 0, 8, 8, 4, 4, 12, 12, GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+    EXPECT_NO_GL_ERROR();
+    MSBLIT_CHECK(6, 6, 0.5f, 3);     /* depth outside the minification blit keeps the clear */
+    MSBLIT_CHECK(11, 11, 0.5f, 13);
+    MSBLIT_CHECK(2, 2, 0.8f, 64);    /* outside the partial rectangle */
+    /* scissored: only the lower-left half of the destination is updated */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glClearDepth(0.5f);
+    glClearStencil(64);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 8, 8);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBlitFramebuffer(0, 0, 8, 8, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+    EXPECT_NO_GL_ERROR();
+    glDisable(GL_SCISSOR_TEST);
+    MSBLIT_CHECK(2, 2, 0.2f, 3);
+    MSBLIT_CHECK(10, 2, 0.5f, 64);   /* right half clipped by the scissor */
+    MSBLIT_CHECK(2, 10, 0.5f, 64);
+
+    /* float depth source into a float multisampled target */
+    GLuint fdst, fdstDS = make_rb(GL_DEPTH_COMPONENT32F, 16, 16, 4);
+    glGenFramebuffers(1, &fdst);
+    glBindFramebuffer(GL_FRAMEBUFFER, fdst);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fdstDS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glClearDepth(0.5f);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    GLuint fdst2, f2DS = make_rb(GL_DEPTH_COMPONENT32F, 16, 16, 0);
+    glGenFramebuffers(1, &fdst2);
+    glBindFramebuffer(GL_FRAMEBUFFER, fdst2);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, f2DS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    /* 32F source with two distinct depth bands */
+    GLuint fsrc, fsDS = make_rb(GL_DEPTH_COMPONENT32F, 8, 8, 0);
+    glGenFramebuffers(1, &fsrc);
+    glBindFramebuffer(GL_FRAMEBUFFER, fsrc);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fsDS);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glDisable(GL_SCISSOR_TEST);
+    glClearDepth(0.9f);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 8, 4);
+    glClearDepth(0.25f);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fdst);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fsrc);
+    glBlitFramebuffer(0, 0, 8, 8, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_NEAREST);   /* scaled into 4x MS */
+    EXPECT_NO_GL_ERROR();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fdst);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fdst2);
+    glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fdst2);
+    glReadPixels(2, 2, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &d);
+    EXPECT_NEAR(d, 0.25f, 1e-6);
+    glReadPixels(2, 13, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &d);
+    EXPECT_NEAR(d, 0.9f, 1e-6);
+
+    /* errors: LINEAR with depth/stencil, scaled read from a multisampled framebuffer */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst);
+    glBlitFramebuffer(0, 0, 8, 8, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_LINEAR);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, dst);   /* multisampled read, scaled */
+    glBlitFramebuffer(0, 0, 16, 16, 0, 0, 8, 8, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_NEAREST);  /* resolve stays legal */
+    EXPECT_NO_GL_ERROR();
+
+#undef MSBLIT_CHECK
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, fb_w, fb_h);
+    GLuint fbs[6] = { src, dst, res, fdst, fdst2, fsrc };
+    GLuint rbs[9] = { srcC, srcDS, dstC, dstDS, resC, resDS, fdstDS, f2DS, fsDS };
+    glDeleteFramebuffers(6, fbs);
+    glDeleteRenderbuffers(9, rbs);
+    EXPECT_NO_GL_ERROR();
+}
+
 TEST(completeness_status_codes)
 {
     GLuint fbo;
@@ -867,6 +1051,7 @@ int main(void)
     RUN(blit_copy_flip_scale);
     RUN(multisample_renderbuffer_resolve);
     RUN(depth_stencil_clear_readback);
+    RUN(blit_depth_stencil_to_multisample);
     RUN(completeness_status_codes);
     RUN(dsa_equivalents);
     RUN(pack_state_and_pbo);

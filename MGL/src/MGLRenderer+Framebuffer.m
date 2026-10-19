@@ -1296,7 +1296,7 @@ typedef struct FBBlitParams {
 }
 
 /* single-sample copy of a multisampled depth/stencil image */
-- (id<MTLTexture>) fbResolveDepthStencil:(id<MTLTexture>)ms
+- (id<MTLTexture>) fbResolveDepthStencil:(id<MTLTexture>)ms slice:(NSUInteger)slice
 {
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:ms.pixelFormat width:ms.width height:ms.height mipmapped:NO];
     d.storageMode = MTLStorageModePrivate;
@@ -1306,6 +1306,7 @@ typedef struct FBBlitParams {
     if (fbFormatHasDepth(ms.pixelFormat))
     {
         rp.depthAttachment.texture = ms;
+        rp.depthAttachment.slice = slice;
         rp.depthAttachment.loadAction = MTLLoadActionLoad;
         rp.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
         rp.depthAttachment.resolveTexture = res;
@@ -1314,6 +1315,7 @@ typedef struct FBBlitParams {
     if (fbFormatHasStencil(ms.pixelFormat))
     {
         rp.stencilAttachment.texture = ms;
+        rp.stencilAttachment.slice = slice;
         rp.stencilAttachment.loadAction = MTLLoadActionLoad;
         rp.stencilAttachment.storeAction = MTLStoreActionMultisampleResolve;
         rp.stencilAttachment.resolveTexture = res;
@@ -1325,6 +1327,316 @@ typedef struct FBBlitParams {
     [enc endEncoding];
     return res;
 }
+
+#pragma mark depth/stencil blits into a multisampled image
+
+/* GL 4.6 18.3.1: blitting INTO a multisampled draw framebuffer is legal from a
+ * single-sampled read framebuffer with any (scaled/partial) rectangle, nearest
+ * filtering only (LINEAR + DEPTH/STENCIL is rejected in framebuffer_ext.c). Every
+ * sample of a destination pixel takes the value of the mapped source pixel.
+ *
+ * Implementation: the source aspect is staged into a shader-readable color texture
+ * through a buffer round-trip (packed depth expands to one 32-bit float per pixel,
+ * float depth copies verbatim, unorm16 depth keeps its 2 bytes in R16Unorm, stencil
+ * bytes land in R8Uint), then a full-screen-triangle render pass into the
+ * destination writes [[depth]] and/or [[stencil]]. One invocation per pixel, whose
+ * outputs the rasterizer replicates over every sample — exactly the semantics above.
+ * Where the device cannot export stencil from a fragment shader, stencil is written
+ * with one stencil-REPLACE pass per distinct source value instead. */
+
+enum { DSBLIT_DEPTH = 1, DSBLIT_STENCIL = 2 };
+
+typedef struct DSBlitParams {
+    float dst0[2];
+    float scale[2];
+    float src0[2];
+    float srcSize[2];
+    int32_t ref;
+    int32_t pad;   /* match the float2 alignment of the MSL struct (40 bytes) */
+} DSBlitParams;
+
+/* stage one aspect of a single-sampled source as a shader-readable color texture */
+- (id<MTLTexture>) fbStageAspect:(const FBTarget *)src aspect:(int)aspect
+{
+    MTLPixelFormat pf = src->tex.pixelFormat;
+    if (aspect == MGL_FB_ASPECT_DEPTH && !fbFormatHasDepth(pf)) return nil;
+    if (aspect == MGL_FB_ASPECT_STENCIL && !fbFormatHasStencil(pf)) return nil;
+    NSUInteger W = MAX((NSUInteger)1, src->tex.width >> src->level);
+    NSUInteger H = MAX((NSUInteger)1, src->tex.height >> src->level);
+
+    NSUInteger bpp = fbBytesPerPixel(pf, aspect);
+    if (!bpp) return nil;
+    MTLBlitOption opt = MTLBlitOptionNone;
+    if (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatDepth24Unorm_Stencil8)
+        opt = aspect == MGL_FB_ASPECT_STENCIL ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
+
+    /* the staged color format matches the buffer bytes pixel for pixel */
+    MTLPixelFormat stage = aspect == MGL_FB_ASPECT_DEPTH
+        ? (pf == MTLPixelFormatDepth16Unorm ? MTLPixelFormatR16Unorm : MTLPixelFormatR32Float)
+        : MTLPixelFormatR8Uint;
+
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:stage width:W height:H mipmapped:NO];
+    d.storageMode = MTLStorageModePrivate;
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> out = [_device newTextureWithDescriptor:d];
+    id<MTLBuffer> buf = [_device newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared];
+    if (!out || !buf) return nil;
+
+    id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
+    blit.label = @"MGL ds blit stage";
+    [blit copyFromTexture:src->tex sourceSlice:src->slice sourceLevel:src->level
+             sourceOrigin:MTLOriginMake(0, 0, src->plane) sourceSize:MTLSizeMake(W, H, 1)
+                   toBuffer:buf destinationOffset:0 destinationBytesPerRow:W * bpp destinationBytesPerImage:W * H * bpp options:opt];
+    [blit copyFromBuffer:buf sourceOffset:0 sourceBytesPerRow:W * bpp sourceBytesPerImage:W * H * bpp
+              sourceSize:MTLSizeMake(W, H, 1) toTexture:out destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    return out;
+}
+
+/* mode: DSBLIT_DEPTH and/or DSBLIT_STENCIL (fragment exports), 0 = per-reference stencil pass */
+- (id<MTLRenderPipelineState>) fbDSBlitPipeline:(int)mode dst:(id<MTLTexture>)dst
+{
+    NSMutableDictionary *cache = [self fbCache];
+    NSString *key = [NSString stringWithFormat:@"dsblit:%d:%lu:%lu", mode, (unsigned long)dst.pixelFormat, (unsigned long)dst.sampleCount];
+    id ps = cache[key];
+    if (ps) return [ps isEqual:[NSNull null]] ? nil : ps;
+
+    bool wd = (mode & DSBLIT_DEPTH) != 0, exportS = (mode & DSBLIT_STENCIL) != 0, refmode = mode == 0;
+    bool needS = exportS || refmode;
+
+    NSMutableString *params = [NSMutableString string];
+    NSMutableString *members = [NSMutableString string];
+    NSMutableString *body = [NSMutableString string];
+    if (wd)
+    {
+        [params appendString:@", texture2d<float> sd [[texture(0)]]"];
+        [members appendString:@"    float z [[depth(any)]];\n"];
+        [body appendString:@"    o.z = sd.read(uint2(ic)).r;\n"];
+    }
+    if (needS)
+    {
+        [params appendFormat:@", texture2d<uint> ss [[texture(%d)]]", wd ? 1 : 0];
+        if (exportS)
+        {
+            [members appendString:@"    uint st [[stencil]];\n"];
+            [body appendString:@"    o.st = ss.read(uint2(ic)).r;\n"];
+        }
+    }
+    if (refmode)
+        [body appendString:@"    if (int(ss.read(uint2(ic)).r) != P.ref) discard_fragment();\n"];
+
+    NSString *src = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\nusing namespace metal;\n"
+         "struct DP { float2 dst0; float2 scale; float2 src0; float2 srcSize; int ref; };\n"
+         "vertex float4 fb_dsblit_vs(uint vid [[vertex_id]]) { float2 p = float2((vid << 1) & 2, vid & 2); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
+         "%@fragment %@ fb_dsblit_fs(float4 pos [[position]], constant DP &P [[buffer(0)]]%@) {\n"
+         "    float2 s = P.src0 + (pos.xy - P.dst0) * P.scale;\n"
+         "    int2 ic = int2(floor(s));\n"
+         "    if (ic.x < 0 || ic.y < 0 || ic.x >= int(P.srcSize.x) || ic.y >= int(P.srcSize.y)) discard_fragment();\n"
+         "%@%@    %@}\n",
+        (wd || exportS) ? [NSString stringWithFormat:@"struct DSO {\n%@};\n", members] : @"",
+        (wd || exportS) ? @"DSO" : @"void",
+        params,
+        (wd || exportS) ? @"    DSO o;\n" : @"",
+        body,
+        (wd || exportS) ? @"return o;\n" : @""];
+
+    id<MTLLibrary> lib = [self fbLibrary:src key:[NSString stringWithFormat:@"dsblit%d%d%d", wd ? 1 : 0, exportS ? 1 : 0, refmode ? 1 : 0]];
+    if (!lib) { cache[key] = [NSNull null]; return nil; }
+
+    MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.label = @"MGL ds blit";
+    pd.vertexFunction = [lib newFunctionWithName:@"fb_dsblit_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fb_dsblit_fs"];
+    pd.rasterSampleCount = dst.sampleCount;
+    if (wd && fbFormatHasDepth(dst.pixelFormat)) pd.depthAttachmentPixelFormat = dst.pixelFormat;
+    if (needS && fbFormatHasStencil(dst.pixelFormat)) pd.stencilAttachmentPixelFormat = dst.pixelFormat;
+
+    NSError *err = nil;
+    ps = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps)
+    {
+        if (exportS) cache[@"dsblit:no-stencil-export"] = @YES;   /* fall back to per-reference passes */
+        NSLog(@"MGL fb: depth/stencil blit pipeline (mode %d) failed: %@", mode, err);
+        cache[key] = [NSNull null];
+        return nil;
+    }
+    cache[key] = ps;
+    return ps;
+}
+
+/* 0 = depth only, 1 = depth + stencil, 2 = stencil only (always-pass tests, REPLACE writes) */
+- (id<MTLDepthStencilState>) fbDSBlitState:(int)mode
+{
+    NSMutableDictionary *cache = [self fbCache];
+    NSString *key = [NSString stringWithFormat:@"dsblit-state:%d", mode];
+    id<MTLDepthStencilState> st = cache[key];
+    if (st) return st;
+
+    MTLDepthStencilDescriptor *d = [[MTLDepthStencilDescriptor alloc] init];
+    d.depthCompareFunction = MTLCompareFunctionAlways;
+    d.depthWriteEnabled = mode != 2;   /* stencil-only passes leave depth untouched */
+    if (mode != 0)
+    {
+        MTLStencilDescriptor *s = [[MTLStencilDescriptor alloc] init];
+        s.stencilCompareFunction = MTLCompareFunctionAlways;
+        s.stencilFailureOperation = MTLStencilOperationReplace;
+        s.depthFailureOperation = MTLStencilOperationReplace;
+        s.depthStencilPassOperation = MTLStencilOperationReplace;
+        s.writeMask = 0xffffffff;
+        d.frontFaceStencil = s;
+        d.backFaceStencil = s;
+    }
+    st = [_device newDepthStencilStateWithDescriptor:d];
+    if (st) cache[key] = st;
+    return st;
+}
+
+/* distinct stencil byte values present in a staged R8Uint texture */
+- (bool) fbDSBlitStencilValues:(id<MTLTexture>)staged vals:(uint8_t *)vals count:(int *)count
+{
+    NSUInteger W = staged.width, H = staged.height;
+    id<MTLBuffer> buf = [_device newBufferWithLength:W * H options:MTLResourceStorageModeShared];
+    if (!buf) return false;
+    id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
+    [blit copyFromTexture:staged sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(W, H, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:W
+       destinationBytesPerImage:W * H options:MTLBlitOptionNone];
+    [blit endEncoding];
+    [self fbSubmitAndWait];
+
+    bool seen[256] = { false };
+    int n = 0;
+    const uint8_t *p = (const uint8_t *)buf.contents;
+    for (NSUInteger i = 0; i < W * H; i++)
+        if (!seen[p[i]]) { seen[p[i]] = true; vals[n++] = p[i]; }
+    *count = n;
+    return true;
+}
+
+- (void) fbDSBlitEncode:(const FBTarget *)dst pipeline:(id<MTLRenderPipelineState>)ps state:(id<MTLDepthStencilState>)st
+                   rect:(MTLScissorRect)rect params:(const DSBlitParams *)P ref:(uint32_t)ref
+               depthTex:(id<MTLTexture>)dt stencilTex:(id<MTLTexture>)stex
+{
+    NSUInteger DW = MAX((NSUInteger)1, dst->tex.width >> dst->level), DH = MAX((NSUInteger)1, dst->tex.height >> dst->level);
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    /* attach both aspects of a packed depth/stencil texture so the untouched one is preserved */
+    if (fbFormatHasDepth(dst->tex.pixelFormat)) fbSetAttachment(rp.depthAttachment, dst, MTLLoadActionLoad);
+    if (fbFormatHasStencil(dst->tex.pixelFormat)) fbSetAttachment(rp.stencilAttachment, dst, MTLLoadActionLoad);
+    rp.renderTargetWidth = DW;
+    rp.renderTargetHeight = DH;
+
+    id<MTLRenderCommandEncoder> enc = [_currentCommandBuffer renderCommandEncoderWithDescriptor:rp];
+    enc.label = @"MGL depth/stencil blit";
+    [enc setRenderPipelineState:ps];
+    [enc setDepthStencilState:st];
+    if (ref != UINT32_MAX) [enc setStencilReferenceValue:ref];
+    [enc setViewport:(MTLViewport){ 0, 0, (double)DW, (double)DH, 0.0, 1.0 }];
+    [enc setScissorRect:rect];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setFragmentBytes:P length:sizeof(*P) atIndex:0];
+    if (dt) [enc setFragmentTexture:dt atIndex:0];
+    if (stex) [enc setFragmentTexture:stex atIndex:dt ? 1 : 0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+}
+
+- (void) fbBlitDepthStencilToMS:(const FBTarget *)src to:(const FBTarget *)dst req:(const MGLFBBlitRequest *)req depth:(bool)wantD stencil:(bool)wantS
+{
+    const GLint *s = req->src, *d = req->dst;
+    NSUInteger DW = MAX((NSUInteger)1, dst->tex.width >> dst->level), DH = MAX((NSUInteger)1, dst->tex.height >> dst->level);
+
+    bool dstD = wantD && fbFormatHasDepth(dst->tex.pixelFormat);
+    bool dstS = wantS && fbFormatHasStencil(dst->tex.pixelFormat);
+    if (!dstD && !dstS) return;
+
+    /* a multisampled read framebuffer (scissored same-size MS->MS blit) is resolved first */
+    FBTarget S = *src;
+    if (S.tex.sampleCount > 1)
+    {
+        id<MTLTexture> res = [self fbResolveDepthStencil:S.tex slice:S.slice];
+        if (!res) return;
+        S.tex = res;
+        S.level = S.slice = S.plane = 0;
+    }
+
+    /* destination rectangle clipped to the image and the scissor */
+    NSInteger rx0 = MIN(d[0], d[2]), rx1 = MAX(d[0], d[2]), ry0 = MIN(d[1], d[3]), ry1 = MAX(d[1], d[3]);
+    rx0 = MAX(rx0, 0); ry0 = MAX(ry0, 0); rx1 = MIN(rx1, (NSInteger)DW); ry1 = MIN(ry1, (NSInteger)DH);
+    if (ctx->state.caps.scissor_test)
+    {
+        MTLScissorRect sc = [self fbScissorFor:DW h:DH];
+        rx0 = MAX(rx0, (NSInteger)sc.x); ry0 = MAX(ry0, (NSInteger)sc.y);
+        rx1 = MIN(rx1, (NSInteger)(sc.x + sc.width)); ry1 = MIN(ry1, (NSInteger)(sc.y + sc.height));
+    }
+    if (rx1 <= rx0 || ry1 <= ry0) return;
+
+    id<MTLTexture> dt = dstD ? [self fbStageAspect:&S aspect:MGL_FB_ASPECT_DEPTH] : nil;
+    id<MTLTexture> st = dstS ? [self fbStageAspect:&S aspect:MGL_FB_ASPECT_STENCIL] : nil;
+    if (dstD && !dt) return;
+    if (dstS && !st) return;
+
+    DSBlitParams P;
+    P.dst0[0] = d[0]; P.dst0[1] = d[1];
+    P.scale[0] = (float)((double)(s[2] - s[0]) / (double)(d[2] - d[0]));
+    P.scale[1] = (float)((double)(s[3] - s[1]) / (double)(d[3] - d[1]));
+    P.src0[0] = s[0]; P.src0[1] = s[1];
+    P.srcSize[0] = (float)(dt ? dt.width : st.width);
+    P.srcSize[1] = (float)(dt ? dt.height : st.height);
+    P.ref = 0;
+    P.pad = 0;
+
+    MTLScissorRect rect = { (NSUInteger)rx0, (NSUInteger)ry0, (NSUInteger)(rx1 - rx0), (NSUInteger)(ry1 - ry0) };
+    bool exportStencil = ![self fbCache][@"dsblit:no-stencil-export"];
+
+    /* depth — together with stencil in the same pass when export is available */
+    if (dstD)
+    {
+        bool both = dstS && exportStencil;
+        id<MTLRenderPipelineState> ps = both ? [self fbDSBlitPipeline:DSBLIT_DEPTH | DSBLIT_STENCIL dst:dst->tex] : nil;
+        if (ps)
+        {
+            [self fbDSBlitEncode:dst pipeline:ps state:[self fbDSBlitState:1] rect:rect params:&P ref:UINT32_MAX
+                        depthTex:dt stencilTex:st];
+            dstS = false;
+        }
+        else
+        {
+            ps = [self fbDSBlitPipeline:DSBLIT_DEPTH dst:dst->tex];
+            if (ps)
+                [self fbDSBlitEncode:dst pipeline:ps state:[self fbDSBlitState:0] rect:rect params:&P ref:UINT32_MAX
+                            depthTex:dt stencilTex:nil];
+        }
+    }
+
+    /* stencil, on its own */
+    if (dstS)
+    {
+        id<MTLRenderPipelineState> ps = exportStencil ? [self fbDSBlitPipeline:DSBLIT_STENCIL dst:dst->tex] : nil;
+        if (ps)
+        {
+            [self fbDSBlitEncode:dst pipeline:ps state:[self fbDSBlitState:2] rect:rect params:&P ref:UINT32_MAX
+                        depthTex:nil stencilTex:st];
+        }
+        else
+        {
+            /* no stencil export: one stencil-REPLACE pass per distinct source value */
+            id<MTLRenderPipelineState> rp = [self fbDSBlitPipeline:0 dst:dst->tex];
+            uint8_t vals[256];
+            int n = 0;
+            if (rp && [self fbDSBlitStencilValues:st vals:vals count:&n])
+                for (int i = 0; i < n; i++)
+                {
+                    P.ref = vals[i];   /* the shader keeps only matching pixels; REPLACE writes the same value */
+                    [self fbDSBlitEncode:dst pipeline:rp state:[self fbDSBlitState:2] rect:rect params:&P ref:vals[i]
+                                depthTex:nil stencilTex:st];
+                }
+        }
+    }
+}
+
 
 - (void) fbDepthStencilBlitFrom:(FBTarget)src to:(FBTarget)dst req:(const MGLFBBlitRequest *)req depth:(bool)wantD stencil:(bool)wantS
 {
@@ -1358,13 +1670,13 @@ typedef struct FBBlitParams {
 
     if (dst.tex.sampleCount > 1)
     {
-        NSLog(@"MGL fb: scaled/partial depth-stencil blit into a multisampled image is not supported");
+        [self fbBlitDepthStencilToMS:&src to:&dst req:req depth:wantD stencil:wantS];
         return;
     }
 
     id<MTLTexture> stex = src.tex;
     NSUInteger slevel = src.level, sslice = src.slice, splane = src.plane;
-    if (stex.sampleCount > 1) { stex = [self fbResolveDepthStencil:stex]; slevel = 0; sslice = 0; splane = 0; }
+    if (stex.sampleCount > 1) { stex = [self fbResolveDepthStencil:stex slice:sslice]; slevel = 0; sslice = 0; splane = 0; }
 
     /* CPU nearest resample: fetch source & destination images, combine, upload */
     for (int pass = 0; pass < 2; pass++)

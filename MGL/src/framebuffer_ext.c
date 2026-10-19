@@ -819,7 +819,10 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
 
     if (rs > 0 && ds > 0 && rs != ds)
         FB_ERROR(GL_INVALID_OPERATION);
-    if ((rs > 0 || ds > 0) && (sw != dw || sh != dh))
+    /* GL 4.6 18.3.1: identical rectangles are required when the read framebuffer is
+     * multisampled (or both are); a single-sampled read framebuffer may be blitted
+     * into a multisampled draw framebuffer with a scaled/partial region */
+    if (rs > 0 && (sw != dw || sh != dh))
         FB_ERROR(GL_INVALID_OPERATION);
 
     GLbitfield eff = 0;
