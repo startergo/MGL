@@ -156,6 +156,24 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
         c->imps[i](self, c->sels[i], arg);
 }
 
+@interface MGLNullShaderBufferBox : NSObject
+@property (nonatomic, assign) void *buf;
+@end
+
+@implementation MGLNullShaderBufferBox
+- (void) dealloc
+{
+    Buffer *b = (Buffer *)_buf;
+    if (b)
+    {
+        if (b->data.mtl_data)
+            CFBridgingRelease(b->data.mtl_data);
+        free(b);
+        _buf = NULL;
+    }
+}
+@end
+
 // Main class performing the rendering
 @implementation MGLRenderer
 
@@ -260,6 +278,97 @@ void logDirtyBits(GLMContext ctx)
     ptr->data.dirty_bits &= ~DIRTY_BUFFER_ADDR;
 }
 
+/* assertaudit: GL allows dispatching / drawing while a shader-declared UBO, SSBO or
+ * atomic-counter block has no buffer bound: the command still executes and the block
+ * accesses are undefined (GL 4.6 section 7.12, "Shader Memory Access" / 9.2). Metal
+ * requires an argument buffer at every [[buffer(n)]] slot the function declares, so
+ * bind a shared zero-filled dummy buffer for those slots instead of failing. */
+static char kNullShaderBufferKey;
+
+
+- (Buffer *) nullShaderBuffer
+{
+    MGLNullShaderBufferBox *box = objc_getAssociatedObject(self, &kNullShaderBufferKey);
+    if (box.buf)
+        return (Buffer *)box.buf;
+
+    Buffer *buf = (Buffer *)calloc(1, sizeof(Buffer));
+    if (!buf)
+        return NULL;
+
+    id<MTLBuffer> mtl = [_device newBufferWithLength: 64 * 1024 options: MTLResourceStorageModeShared];
+    if (!mtl)
+    {
+        free(buf);
+        return NULL;
+    }
+
+    memset(mtl.contents, 0, mtl.length);
+
+    buf->name = 0;
+    buf->size = (GLsizeiptr)mtl.length;
+    buf->usage = GL_STATIC_DRAW;
+    buf->data.buffer_data = (vm_address_t)mtl.contents;
+    buf->data.buffer_size = mtl.length;
+    buf->data.mtl_data = (void *)CFBridgingRetain(mtl);
+
+    box = [[MGLNullShaderBufferBox alloc] init];
+    box.buf = buf;
+    objc_setAssociatedObject(self, &kNullShaderBufferKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return buf;
+}
+
+static char kComputeFallbackKey;
+
+/* assertaudit: a compute shader that samples an unbound texture unit (or uses an
+ * unbound image unit) is legal GL: the dispatch still runs and the fetches are
+ * undefined. Metal requires a texture at every [[texture(n)]] slot the kernel
+ * declares, so bind a shared 1x1 black texture + default sampler for those slots
+ * instead of dropping the whole dispatch. */
+- (id<MTLTexture>) computeFallbackTexture
+{
+    NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
+    id<MTLTexture> tex = d[@"tex"];
+    if (tex)
+        return tex;
+
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                            width: 1 height: 1 mipmapped: NO];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModePrivate;
+
+    tex = [_device newTextureWithDescriptor: desc];
+    if (tex)
+    {
+        const uint32_t black[4] = { 0, 0, 0, 0xffffffff };
+        [tex replaceRegion: MTLRegionMake2D(0, 0, 1, 1) mipmapLevel: 0 withBytes: black bytesPerRow: 16];
+
+        MTLSamplerDescriptor *sdesc = [[MTLSamplerDescriptor alloc] init];
+        sdesc.minFilter = MTLSamplerMinMagFilterNearest;
+        sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+        sdesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor: sdesc];
+
+        objc_setAssociatedObject(self, &kComputeFallbackKey,
+                                 @{ @"tex": tex,
+                                    @"sampler": sampler ?: [NSNull null] },
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return tex;
+}
+
+- (id<MTLSamplerState>) computeFallbackSampler
+{
+    if (![self computeFallbackTexture])
+        return NULL;
+    NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
+    id s = d[@"sampler"];
+    return [s isKindOfClass: [NSNull class]] ? NULL : s;
+}
+
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
 {
     int count;
@@ -342,6 +451,21 @@ void logDirtyBits(GLMContext ctx)
                 }
                 else
                 {
+                    /* assertaudit: unbound uniform / storage / atomic-counter block:
+                     * legal in GL (accesses undefined), bind the shared dummy buffer */
+                    Buffer *nullbuf = [self nullShaderBuffer];
+
+                    if (nullbuf)
+                    {
+                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
+                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
+                        buffer_map->buffers[buffer_map->count].buf = nullbuf;
+                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->count++;
+                        buffers_to_be_mapped--;
+                        continue;
+                    }
+
                     ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
 
                     return false;
@@ -2269,29 +2393,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 }
 
 #pragma mark render encoder and command buffer init code
-- (MTLStencilOperation) mtlStencilOpForGLOp:(GLenum) op
-{
-    MTLStencilOperation stencil_op;
-
-    switch(ctx->state.var.stencil_fail)
-    {
-        case GL_KEEP: stencil_op = MTLStencilOperationKeep; break;
-        case GL_ZERO: stencil_op = MTLStencilOperationZero; break;
-        case GL_REPLACE: stencil_op = MTLStencilOperationReplace; break;
-        case GL_INCR: stencil_op = MTLStencilOperationIncrementClamp; break;
-        case GL_INCR_WRAP: stencil_op = MTLStencilOperationDecrementClamp; break;
-        case GL_DECR: stencil_op = MTLStencilOperationInvert; break;
-        case GL_DECR_WRAP: stencil_op = MTLStencilOperationIncrementWrap; break;
-        case GL_INVERT: stencil_op = MTLStencilOperationDecrementWrap; break;
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown stencil operation 0x%x", op);
-            return MTLStencilOperationKeep;
-    }
-
-    return stencil_op;
-}
-
 - (void) updateCurrentRenderEncoder
 {
     // all fixed-function encoder state is owned by the rstate category (MGLRenderer+RenderState.m)
@@ -2801,93 +2902,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 }
 
 #pragma mark utility funcs for processGLState
-- (MTLBlendFactor) blendFactorFromGL:(GLenum)gl_blend
-{
-    MTLBlendFactor factor;
-
-    switch(gl_blend)
-    {
-        case GL_ZERO: factor = MTLBlendFactorZero; break;
-        case GL_ONE: factor = MTLBlendFactorOne; break;
-        case GL_SRC_COLOR: factor = MTLBlendFactorSourceColor; break;
-        case GL_ONE_MINUS_SRC_COLOR: factor = MTLBlendFactorOneMinusSourceColor; break;
-        case GL_DST_COLOR: factor = MTLBlendFactorDestinationColor; break;
-        case GL_ONE_MINUS_DST_COLOR: factor = MTLBlendFactorOneMinusDestinationColor; break;
-        case GL_SRC_ALPHA: factor = MTLBlendFactorSourceAlpha; break;
-        case GL_ONE_MINUS_SRC_ALPHA: factor = MTLBlendFactorOneMinusSourceAlpha; break;
-        case GL_DST_ALPHA: factor = MTLBlendFactorDestinationAlpha; break;
-        case GL_ONE_MINUS_DST_ALPHA: factor = MTLBlendFactorOneMinusDestinationAlpha; break;
-        case GL_CONSTANT_COLOR: factor = MTLBlendFactorSource1Color; break;
-        case GL_ONE_MINUS_CONSTANT_COLOR: factor = MTLBlendFactorOneMinusSource1Color; break;
-        case GL_CONSTANT_ALPHA: factor = MTLBlendFactorSource1Alpha; break;
-        case GL_ONE_MINUS_CONSTANT_ALPHA: factor = MTLBlendFactorOneMinusSource1Alpha; break;
-
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown blend factor 0x%x", gl_blend);
-            return MTLBlendFactorZero;
-    }
-
-    return factor;
-}
-
-- (MTLBlendOperation) blendOperationFromGL:(GLenum)gl_blend_op
-{
-    MTLBlendOperation op;
-
-    switch(gl_blend_op)
-    {
-        case GL_FUNC_ADD: op = MTLBlendOperationAdd; break;
-        case GL_FUNC_SUBTRACT: op = MTLBlendOperationSubtract; break;
-        case GL_FUNC_REVERSE_SUBTRACT: op = MTLBlendOperationReverseSubtract; break;
-        case GL_MIN: op = MTLBlendOperationMin; break;
-        case GL_MAX: op = MTLBlendOperationMax; break;
-
-        default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown blend operation 0x%x", gl_blend_op);
-            return MTLBlendOperationAdd;
-    }
-
-    return op;
-}
-
-- (void) updateBlendStateCache
-{
-    for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
-    {
-        _src_blend_rgb_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_src_rgb[i]];
-        _src_blend_alpha_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_src_alpha[i]];
-
-        _dst_blend_rgb_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_dst_rgb[i]];
-        _dst_blend_alpha_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_dst_alpha[i]];
-
-        _rgb_blend_operation[i] = [self blendOperationFromGL: ctx->state.var.blend_equation_rgb[i]];
-        _alpha_blend_operation[i] = [self blendOperationFromGL: ctx->state.var.blend_equation_alpha[i]];
-
-        if (ctx->state.caps.use_color_mask[i])
-        {
-            _color_mask[i] = MTLColorWriteMaskNone;
-
-            if (ctx->state.var.color_writemask[i][0])
-                _color_mask[i] |= MTLColorWriteMaskRed;
-
-            if (ctx->state.var.color_writemask[i][1])
-                _color_mask[i] |= MTLColorWriteMaskGreen;
-
-            if (ctx->state.var.color_writemask[i][2])
-                _color_mask[i] |= MTLColorWriteMaskBlue;
-
-            if (ctx->state.var.color_writemask[i][3])
-                _color_mask[i] |= MTLColorWriteMaskAlpha;
-        }
-        else
-        {
-            _color_mask[i] = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue | MTLColorWriteMaskAlpha;
-        }
-    }
-}
-
 -(void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)pipelineStateDescriptor
 {
     // per-attachment blend state is owned by the rstate category (MGLRenderer+RenderState.m)
@@ -3245,7 +3259,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 // cache these rather than recalculating them each time
                 if (ctx->state.dirty_bits & DIRTY_ALPHA_STATE)
                 {
-                    [self updateBlendStateCache];
 
                     ctx->state.dirty_bits &= ~DIRTY_ALPHA_STATE;
                 }
@@ -3556,14 +3569,32 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
                     textures_to_be_mapped--;
                 }
+                else if (spirv_binding < TEXTURE_UNITS)
+                {
+                    /* assertaudit: unbound texture / image unit — legal GL (fetches are
+                     * undefined), bind the shared 1x1 fallback so the dispatch still runs */
+                    id<MTLTexture> fallback = [self computeFallbackTexture];
+                    RETURN_FALSE_ON_FAILURE(fallback != NULL);
+
+                    [computeCommandEncoder setTexture: fallback atIndex: spirv_binding];
+
+                    if (gl_texture_type == _TEXTURE)
+                    {
+                        id<MTLSamplerState> sampler = [self computeFallbackSampler];
+                        if (sampler)
+                            [computeCommandEncoder setSamplerState: sampler atIndex: spirv_binding];
+                    }
+
+                    textures_to_be_mapped--;
+                }
 
                 RETURN_FALSE_ON_FAILURE((i<TEXTURE_UNITS));
             }
 
-            // texture not found
+            // resource declarations beyond TEXTURE_UNITS cannot be mapped
             if (textures_to_be_mapped)
             {
-                DEBUG_PRINT("No texture bound for fragment shader location\n");
+                DEBUG_PRINT("No texture bound for compute shader location\n");
 
                 return false;
             }
@@ -4257,174 +4288,6 @@ void mtlFlushBufferRange(GLMContext glm_ctx, Buffer *buf, GLintptr offset, GLsiz
     [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlFlushMappedBufferRange: glm_ctx buf: buf offset: offset length: length];
 }
 
-
-#pragma mark C interface to mtlReadDrawable
--(void) mtlReadDrawable:(GLMContext) glm_ctx pixelBytes:(void *)pixelBytes bytesPerRow:(NSUInteger)bytesPerRow bytesPerImage:(NSUInteger)bytesPerImage fromRegion:(MTLRegion)region
-{
-    id<MTLTexture> texture;
-
-    // if tex is null we are pulling from a readbuffer or a drawable
-    if (glm_ctx->state.readbuffer)
-    {
-        Framebuffer *fbo;
-        GLuint drawbuffer;
-
-        fbo = ctx->state.readbuffer;
-        drawbuffer = ctx->state.read_buffer - GL_COLOR_ATTACHMENT0;
-        assert(drawbuffer >= 0);
-        assert(drawbuffer <= STATE(max_color_attachments));
-
-        // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return;
-        
-        //tex = [self framebufferAttachmentTexture: &fbo->color_attachments[drawbuffer]];
-        //assert(tex);
-
-        //texture = (__bridge id<MTLTexture>)(tex->mtl_data);
-        //assert(texture);
-    }
-    else
-    {
-        GLuint mgl_drawbuffer;
-        id<MTLTexture> texture;
-
-        // reading from the drawbuffer
-        switch(ctx->state.read_buffer)
-        {
-            case GL_FRONT: mgl_drawbuffer = _FRONT; break;
-            case GL_BACK: mgl_drawbuffer = _BACK; break;
-            case GL_FRONT_LEFT: mgl_drawbuffer = _FRONT_LEFT; break;
-            case GL_FRONT_RIGHT: mgl_drawbuffer = _FRONT_RIGHT; break;
-            case GL_BACK_LEFT: mgl_drawbuffer = _BACK_LEFT; break;
-            case GL_BACK_RIGHT: mgl_drawbuffer = _BACK_RIGHT; break;
-            default:
-                // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return;
-        }
-
-        if (mgl_drawbuffer == _FRONT)
-        {
-            [self endRenderEncoding];
-            
-            assert(_currentCommandBuffer);
-            if (_currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
-            {
-                [_currentCommandBuffer presentDrawable: _drawable];
-
-                [_currentCommandBuffer commit];
-            }
-            
-            id<MTLTexture> drawableTexture = _drawable.texture;
-            assert(drawableTexture);
-            
-            // Create a downscale texture
-            MTLTextureDescriptor *downScaleTextureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:drawableTexture.pixelFormat
-                                                                                                                 width:region.size.width
-                                                                                                                height:region.size.height
-                                                                                                             mipmapped:NO];
-            downScaleTextureDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-            id<MTLTexture> downscaledTexture = [_device newTextureWithDescriptor:downScaleTextureDescriptor];
-            
-            // Create a command buffer
-            [self newCommandBuffer];
-            
-            // Use a blit command encoder to copy texture data to the buffer
-            id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
-            
-            // Set up the source and destination sizes
-            MTLOrigin sourceOrigin = MTLOriginMake(0, 0, 0);
-            MTLSize sourceSize = MTLSizeMake(drawableTexture.width, drawableTexture.height, 1);
-            MTLOrigin destinationOrigin = MTLOriginMake(region.origin.x, region.origin.y, 0);
-
-            // Perform the scaling operation
-            [blitEncoder copyFromTexture:drawableTexture
-                             sourceSlice:0
-                             sourceLevel:0
-                            sourceOrigin:sourceOrigin
-                              sourceSize:sourceSize
-                               toTexture:downscaledTexture
-                      destinationSlice:0
-                      destinationLevel:0
-                     destinationOrigin:destinationOrigin];
-            [blitEncoder endEncoding];
-
-            // Create a CPU-accessible buffer
-            NSUInteger bytesPerPixel = 4; // For RGBA8Unorm format
-            NSUInteger bytesPerRow = region.size.width * bytesPerPixel;
-
-            id<MTLBuffer> readBuffer = [_device newBufferWithLength:bytesPerRow * region.size.height
-                                                           options:MTLResourceStorageModeShared];
-
-            // Use another blit command encoder to copy the texture into the buffer
-            id<MTLBlitCommandEncoder> readBlitEncoder = [_currentCommandBuffer blitCommandEncoder];
-            [readBlitEncoder copyFromTexture:downscaledTexture
-                                sourceSlice:0
-                                sourceLevel:0
-                               sourceOrigin:MTLOriginMake(0, 0, 0)
-                                  sourceSize:MTLSizeMake(region.size.width, region.size.height, 1)
-                                   toBuffer:readBuffer
-                          destinationOffset:0
-                     destinationBytesPerRow:bytesPerRow
-                   destinationBytesPerImage:bytesPerRow * region.size.height];
-            [readBlitEncoder endEncoding];
-
-            // Commit and wait for completion
-            [_currentCommandBuffer commit];
-            [_currentCommandBuffer waitUntilCompleted];
-            
-            // copy the data
-            void *data = [readBuffer contents];
-            memcpy(pixelBytes, data, bytesPerRow * region.size.height);
-            
-            // get a new command buffer
-            [self newCommandBuffer];
-        }
-        else if(_drawBuffers[mgl_drawbuffer].drawbuffer)
-        {
-            texture = _drawBuffers[mgl_drawbuffer].drawbuffer;
-        }
-        else
-        {
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
-            return;
-        }
-    }
-}
-
-#pragma mark C interface to mtlGetTexImage
--(void) mtlGetTexImage:(GLMContext) glm_ctx tex: (Texture *)tex pixelBytes:(void *)pixelBytes bytesPerRow:(NSUInteger)bytesPerRow bytesPerImage:(NSUInteger)bytesPerImage fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
-{
-    id<MTLTexture> texture;
-
-    if (tex)
-    {
-        texture = (__bridge id<MTLTexture>)(tex->mtl_data);
-        assert(texture);
-    }
-    else
-    {
- 
-    }
-
-    if ([texture isFramebufferOnly] == NO)
-    {
-        //[texture getBytes:pixelBytes bytesPerRow:bytesPerRow bytesPerImage:bytesPerImage fromRegion:region mipmapLevel:level slice:slice];
-    }
-    else
-    {
-        // issue a gl error as we can't read a framebuffer only texture
-        NSLog(@"Cannot read from framebuffer only texture\n");
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-    }
-}
-
-void mtlReadDrawable(GLMContext glm_ctx, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height)
-{
-    [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlReadDrawable:glm_ctx pixelBytes:pixelBytes bytesPerRow:bytesPerRow bytesPerImage:bytesPerImage fromRegion:MTLRegionMake2D(x,y,width,height)];
-}
 
 void mtlGetTexImage(GLMContext glm_ctx, Texture *tex, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height, GLuint level, GLuint slice)
 {
@@ -5280,7 +5143,6 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     glm_ctx->mtl_funcs.mtlMapUnmapBuffer = mtlMapUnmapBuffer;
     glm_ctx->mtl_funcs.mtlFlushBufferRange = mtlFlushBufferRange;
 
-    glm_ctx->mtl_funcs.mtlReadDrawable = mtlReadDrawable;
     glm_ctx->mtl_funcs.mtlGetTexImage = mtlGetTexImage;
     
     glm_ctx->mtl_funcs.mtlGenerateMipmaps = mtlGenerateMipmaps;
