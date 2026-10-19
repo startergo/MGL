@@ -373,6 +373,57 @@ TEST(get_integer64i_v_legal)
     EXPECT_NO_GL_ERROR();
 }
 
+/* ---------- unbound texture / image units in compute shaders are legal ---------- */
+TEST(unbound_compute_textures_legal)
+{
+    const char *cs = "#version 450 core\n"
+                     "layout(local_size_x=4) in;\n"
+                     "layout(binding=0) uniform sampler2D tex;\n"       /* never bound */
+                     "layout(binding=1, rgba32f) uniform image2D img;\n" /* never bound */
+                     "layout(binding=2) buffer Out { float o[]; };\n"
+                     "void main() { float v = texelFetch(tex, ivec2(0), 0).r;"
+                     "             float w = imageLoad(img, ivec2(0)).r;"
+                     "             o[gl_GlobalInvocationID.x] = 7.0 + v * 0.0 + w * 0.0; }\n";
+    GLuint prog = glCreateProgram();
+    GLuint c = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(c, 1, &cs, NULL);
+    glCompileShader(c);
+    GLint ok = 0;
+    glGetShaderiv(c, GL_COMPILE_STATUS, &ok);
+    EXPECT_EQ_INT(ok, 1);
+    glAttachShader(prog, c);
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, 1);
+    if (ok)
+    {
+        glUseProgram(prog);
+        GLuint ssbo = 0;
+        glGenBuffers(1, &ssbo);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+        const GLfloat zero[4] = { 0, 0, 0, 0 };
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(zero), zero, GL_DYNAMIC_COPY);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo);
+
+        glDispatchCompute(1, 1, 1);
+        EXPECT_NO_GL_ERROR();                 /* was: dispatch silently dropped */
+
+        GLfloat *m = (GLfloat *)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_READ_ONLY);
+        EXPECT_TRUE(m != NULL);
+        if (m)
+        {
+            EXPECT_NEAR(m[0], 7.0f, 1e-6);     /* kernel must have run */
+            EXPECT_NEAR(m[3], 7.0f, 1e-6);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        }
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, 0);
+        glDeleteBuffers(1, &ssbo);
+        glUseProgram(0);
+    }
+    glDeleteProgram(prog);
+    glDeleteShader(c);
+}
+
 /* ---------- unbound shader-declared buffer blocks are legal ---------- */
 TEST(unbound_shader_buffers_legal)
 {
@@ -504,6 +555,7 @@ int main(void)
     RUN(dispatch_compute_indirect_legal);
     RUN(internalformat_query_legal);
     RUN(get_integer64i_v_legal);
+    RUN(unbound_compute_textures_legal);
     RUN(unbound_shader_buffers_legal);
     RUN(default_vao_legal);
     return mgl_test_summary();

@@ -318,6 +318,57 @@ static char kNullShaderBufferKey;
     return buf;
 }
 
+static char kComputeFallbackKey;
+
+/* assertaudit: a compute shader that samples an unbound texture unit (or uses an
+ * unbound image unit) is legal GL: the dispatch still runs and the fetches are
+ * undefined. Metal requires a texture at every [[texture(n)]] slot the kernel
+ * declares, so bind a shared 1x1 black texture + default sampler for those slots
+ * instead of dropping the whole dispatch. */
+- (id<MTLTexture>) computeFallbackTexture
+{
+    NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
+    id<MTLTexture> tex = d[@"tex"];
+    if (tex)
+        return tex;
+
+    MTLTextureDescriptor *desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                            width: 1 height: 1 mipmapped: NO];
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    desc.storageMode = MTLStorageModePrivate;
+
+    tex = [_device newTextureWithDescriptor: desc];
+    if (tex)
+    {
+        const uint32_t black[4] = { 0, 0, 0, 0xffffffff };
+        [tex replaceRegion: MTLRegionMake2D(0, 0, 1, 1) mipmapLevel: 0 withBytes: black bytesPerRow: 16];
+
+        MTLSamplerDescriptor *sdesc = [[MTLSamplerDescriptor alloc] init];
+        sdesc.minFilter = MTLSamplerMinMagFilterNearest;
+        sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+        sdesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+        sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor: sdesc];
+
+        objc_setAssociatedObject(self, &kComputeFallbackKey,
+                                 @{ @"tex": tex,
+                                    @"sampler": sampler ?: [NSNull null] },
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return tex;
+}
+
+- (id<MTLSamplerState>) computeFallbackSampler
+{
+    if (![self computeFallbackTexture])
+        return NULL;
+    NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
+    id s = d[@"sampler"];
+    return [s isKindOfClass: [NSNull class]] ? NULL : s;
+}
+
 - (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage
 {
     int count;
@@ -3518,14 +3569,32 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
                     textures_to_be_mapped--;
                 }
+                else if (spirv_binding < TEXTURE_UNITS)
+                {
+                    /* assertaudit: unbound texture / image unit — legal GL (fetches are
+                     * undefined), bind the shared 1x1 fallback so the dispatch still runs */
+                    id<MTLTexture> fallback = [self computeFallbackTexture];
+                    RETURN_FALSE_ON_FAILURE(fallback != NULL);
+
+                    [computeCommandEncoder setTexture: fallback atIndex: spirv_binding];
+
+                    if (gl_texture_type == _TEXTURE)
+                    {
+                        id<MTLSamplerState> sampler = [self computeFallbackSampler];
+                        if (sampler)
+                            [computeCommandEncoder setSamplerState: sampler atIndex: spirv_binding];
+                    }
+
+                    textures_to_be_mapped--;
+                }
 
                 RETURN_FALSE_ON_FAILURE((i<TEXTURE_UNITS));
             }
 
-            // texture not found
+            // resource declarations beyond TEXTURE_UNITS cannot be mapped
             if (textures_to_be_mapped)
             {
-                DEBUG_PRINT("No texture bound for fragment shader location\n");
+                DEBUG_PRINT("No texture bound for compute shader location\n");
 
                 return false;
             }
