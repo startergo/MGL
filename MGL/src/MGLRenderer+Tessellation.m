@@ -923,6 +923,8 @@ struct TessScanEnt {
     /* results */
     uint32_t minv, maxv, restart_count, idx_used;
     void *widened;                  /* retained id<MTLBuffer>, gapless uint32 list */
+    bool restart_known;             /* has_restart decided for this content */
+    bool has_restart;
     uint64_t used;                  /* LRU clock */
 };
 static struct TessScanEnt tScanEnt[TESS_SCAN_CACHE];
@@ -1104,15 +1106,32 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         /* ---- index analysis -------------------------------------------------------
          * Restart present in the range? (patches re-form around a restart, so the range
          * must be re-written into a gapless list — the only decision that needs the
-         * CPU, read straight from the element buffer's CPU-visible storage). Otherwise
-         * the draw is fully GPU-driven: the scan's min/max never reach the CPU. */
-        have_restart = (restart != 0xffffffffu) &&
-                       tessRangeHasRestart(ctx, type, offset, count, restart);
-
-        if (have_restart)
+         * CPU). The answer is cached per element-buffer content like the round-13 scan
+         * results (the gpuaudit content serial invalidates it), so the CPU scan runs at
+         * most once per content; otherwise the draw is fully GPU-driven and the scan's
+         * min/max never reach the CPU. */
+        if (restart != 0xffffffffu)
         {
             Buffer *ebuf = ctx->state.vao->element_array.buffer;
             struct TessScanEnt *se = tessScanLookup(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+
+            if (se && se->restart_known)
+                have_restart = se->has_restart;
+            else
+            {
+                mgl_tess_note_restart_check();
+                have_restart = tessRangeHasRestart(ctx, type, offset, count, restart);
+                if (!se)
+                    se = tessScanEntry(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+                se->restart_known = true;
+                se->has_restart = have_restart;
+            }
+        }
+
+        if (have_restart)
+        {
+            Buffer *ebuf2 = ctx->state.vao->element_array.buffer;
+            struct TessScanEnt *se = tessScanLookup(ctx, ebuf2, offset, (uint32_t)count, itype, restart);
 
             if (se && se->widened)
             {
@@ -1158,7 +1177,9 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 minv = (GLsizei)lo;
                 maxv = (GLsizei)hi;
 
-                ne = tessScanEntry(ctx, ebuf, offset, (uint32_t)count, itype, restart);
+                ne = se ? se : tessScanEntry(ctx, ebuf2, offset, (uint32_t)count, itype, restart);
+                ne->restart_known = true;
+                ne->has_restart = true;
                 ne->minv = lo;                   /* min/max over the kept indices */
                 ne->maxv = hi;
                 ne->idx_used = kept;

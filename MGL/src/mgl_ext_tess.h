@@ -211,8 +211,10 @@ unsigned mgl_tess_cpu_blob_builds(void);
 unsigned mgl_tess_cpu_generate_runs(void);
 unsigned mgl_tess_scan_waits(void);
 unsigned mgl_tess_cpu_index_reads(void);
+unsigned mgl_tess_restart_checks(void);
 void mgl_tess_note_scan_wait(void);
 void mgl_tess_note_cpu_index_read(void);
+void mgl_tess_note_restart_check(void);
 
 /* query bookkeeping without CPU tessellation: the tessellated output counts from
  * the levels alone (used by the GPU paths when the levels are CPU-known) */

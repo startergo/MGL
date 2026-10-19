@@ -185,7 +185,9 @@ traffic) — plus the first-draw-of-a-range scan miss above.
 
 # tess — round 14 report (indexed draws fully GPU-driven: the scan wait is gone)
 
-Commits: `0fd3a48` (step 1, test red) and `2d06bb6` (step 2).
+> Round 15 (restart-presence caching + the capacity-dispatch measurement) is at the
+> very bottom; this section is the round-14 record. Commits: `0fd3a48` (step 1, test
+> red) and `2d06bb6` (step 2).
 
 ## Design
 
@@ -345,3 +347,58 @@ Full `tests/headless/run.sh`: 21/21 files, 0 failures (no FAILED/BUILD-FAIL).
 * Query counters for TCS-level-dependent GPU draws (PRIMITIVES_GENERATED with
   a TCS) are not noted — the levels live on the GPU; unchanged from round 11.
 
+
+---
+
+# tess — round 15 report (restart-presence caching; capacity dispatch measured)
+
+Commits: `3f93dda` (counter + test, red), `16dce32` (the cache), `0996d27`
+(the measurement). Merged `gl46-port` (d3196c2) first.
+
+## Step 1 — the restart-presence check runs at most once per buffer content
+
+`TessRangeHasRestart` (the only CPU decision left on the indexed path — a
+restart re-forms patches, so the draw encoding depends on it) scanned the
+element buffer on **every** draw with primitive restart enabled. It is now
+cached per element-buffer content: `TessScanEnt` gained
+`restart_known`/`has_restart`, filled by one CPU scan on the first draw of a
+content (the entry is keyed on the buffer, its gpuaudit content serial, the
+range, index type and restart value — exactly the round-13 key), and the
+widened-list build reuses that entry instead of evicting it. Counted by the
+new `mgl_tess_restart_checks()`.
+
+`TessRestartCheckCached` proves it: 3 redraws of a restart-free range →
+exactly one check; `glBufferSubData` → one more; a range that actually
+contains restarts → one check and one gapless-list build (`index reads`
++1), then zero for redraws.
+
+```
+restart checks (no restart values):     2 -> 3
+restart checks (after glBufferSubData): 3 -> 4
+restart checks (restart range):         4 -> 5, index reads 2 -> 3
+== wt/tess/tests/headless/test_tess.c:  468 checks, 0 failures
+```
+
+## Step 2 — the capacity-spanning vertex dispatch is free; no capping needed
+
+The round-14 design dispatches the vertex kernel over the attribute capacity ×
+instances with the GPU-written vcount guarding the work. The new `test_tesscap`
+measures a 2-patch draw (6 indices) from a **1M-vertex** buffer (indices
+900000..900005, so the dispatch covers a million threads of which six work)
+against the same draw from a 6-vertex buffer — 200 frames each,
+`glDrawElements`→`glFinish`:
+
+| run | big buffer | small buffer | ratio |
+|---|---|---|---|
+| 1 | 0.0252 ms/f | 0.0231 ms/f | 1.09× |
+| 2 | 0.0206 ms/f | 0.0864 ms/f | 0.24× |
+| 3 | 0.0195 ms/f | 0.0493 ms/f | 0.40× |
+| 4 | 0.0193 ms/f | 0.0238 ms/f | 0.81× |
+
+The big-buffer draw is ~0.02 ms/frame in every run and never meaningfully
+slower than the small-buffer draw (the small case is sometimes *slower* from
+run-to-run noise) — far below the 2× threshold, so neither an indirect
+compute path with manual attribute fetch nor a two-level dispatch is
+warranted. The test stays as a regression canary.
+
+Full suite: 21/22 files (test_tesscap added), 0 failures.
