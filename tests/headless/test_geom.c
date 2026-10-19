@@ -1,8 +1,7 @@
 #include "mgl_test.h"
 /* from MGL/src/geometry.c: trace the buffer tracking of a TF buffer at a CPU read,
- * looked up by buffer name */
-void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
-void *mgl_geom_ctx(void);
+ * looked up by buffer name (test-facing diagnostics, see mgl_geom_diag.h) */
+#include "mgl_geom_diag.h"
 #include <stdbool.h>
 
 /* ------------------------------------------------------------------ helpers */
@@ -1377,6 +1376,60 @@ TEST(xfb_gpu_pack_multiple_draws_and_pause)
     glDeleteProgram(p);
 }
 
+/* ---- arrays of blocks with xfb_offset, vertex stage only ---- */
+TEST(xfb_arrays_of_blocks_xfb_offset)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(xfb_buffer = 0, xfb_stride = 64) out OutBlk {\n"
+        "    layout(xfb_offset = 0) vec4 a;\n"
+        "    layout(xfb_offset = 16) vec4 b;\n"
+        "} blk[2];\n"
+        "void main(){\n"
+        "  gl_Position = vec4(pos, 0.0, 1.0);\n"
+        "  blk[0].a = vec4(pos, 0.0, 1.0);\n"
+        "  blk[0].b = vec4(1.0, 2.0, 3.0, 4.0);\n"
+        "  blk[1].a = vec4(5.0, 6.0, 7.0, 8.0);\n"
+        "  blk[1].b = vec4(9.0, 10.0, 11.0, 12.0);\n"
+        "}\n";
+    GLuint p = program(vs, NULL, plain_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+    glUseProgram(p);
+    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
+    setup(6, tri);
+    GLuint tb = 0;
+    glGenBuffers(1, &tb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tb);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    {
+        float out[32];
+        memset(out, 0, sizeof out);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tb);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+        /* record 0: blk[0].a, blk[0].b at stride 32, then blk[1].a, blk[1].b */
+        EXPECT_NEAR(out[0], -1.0f, 1e-4);
+        EXPECT_NEAR(out[1], -1.0f, 1e-4);
+        EXPECT_NEAR(out[4], 1.0f, 1e-4);
+        EXPECT_NEAR(out[5], 2.0f, 1e-4);
+        EXPECT_NEAR(out[8], 5.0f, 1e-4);
+        EXPECT_NEAR(out[12], 9.0f, 1e-4);
+        printf("vs blocks: %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f | %.1f %.1f %.1f %.1f\n",
+               out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7],
+               out[8], out[9], out[10], out[11], out[12], out[13], out[14], out[15]);
+    }
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(control_no_geometry_shader);
@@ -1399,6 +1452,7 @@ int main(void)
     RUN(primitive_queries);
     RUN(xfb_of_geometry_output);
     RUN(xfb_streams);
+    RUN(xfb_arrays_of_blocks_xfb_offset);
     RUN(tessellation_with_geometry_rejected);
     RUN(primitive_restart_with_gs);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);

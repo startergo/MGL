@@ -44,11 +44,13 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, struct Program_t *pro
 void mgl_geom_xfb_flush(GLMContext ctx);
 /* a pack is pending: state the application may read is not up to date yet */
 bool mgl_geom_xfb_pending(GLMContext ctx);
-/* trace helper: log the buffer-tracking state (write/completed serial) at a CPU read */
-void *mgl_geom_ctx(void);
-void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
 /* the bound transform feedback object is active but paused: nothing may be captured */
 bool mgl_geom_xfb_paused(GLMContext ctx);
+/* test-facing trace helpers (declared for the harness in tests/headless/mgl_geom_diag.h,
+ * so no library header needs to expose them): log the buffer-tracking state (write /
+ * completed serial) at a CPU read of a transform feedback buffer */
+void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
+void *mgl_geom_ctx(void);
 
 #ifdef __cplusplus
 }
