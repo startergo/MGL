@@ -484,6 +484,8 @@ TEST(TessIndexedNoRescan)
 TEST(TessRestartCheckCached)
 {
     extern unsigned mgl_tess_restart_checks(void);
+    extern unsigned mgl_tess_cpu_index_reads(void);
+    unsigned c0, r0;
 
     GLuint prog = make_program(kTcsTri, kTesTri);
     GLint link = 0;
@@ -519,7 +521,7 @@ TEST(TessRestartCheckCached)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
 
-    unsigned c0 = mgl_tess_restart_checks();
+    c0 = mgl_tess_restart_checks();
     for (int rep = 0; rep < 3; rep++)
     {
         glClearColor(0, 0, 0, 1);
@@ -549,11 +551,7 @@ TEST(TessRestartCheckCached)
     const unsigned short idx3[7] = { 3, 4, 5, 0xFFFF, 0, 1, 2 };
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx3, idx3, GL_STATIC_DRAW);
     c0 = mgl_tess_restart_checks();
-    unsigned r0;
-    {
-        extern unsigned mgl_tess_cpu_index_reads(void);
-        r0 = mgl_tess_cpu_index_reads();
-    }
+    r0 = mgl_tess_cpu_index_reads();
     for (int rep = 0; rep < 3; rep++)
     {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
