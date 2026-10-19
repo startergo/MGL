@@ -251,3 +251,7 @@ Two corrections and one decisive narrowing:
   which the per-draw flush hides by forcing each draw into its own command buffer with fresh
   bindings.  Next step: log `gOutvOff` in the GS binding and in the scatter binding for draw 2
   of the multi-draw test; they should be identical — one of them is not.
+
+### Isolation round: the separable failure is NOT caused by the allocator
+
+`test_gen2.c` (only `control_no_geometry_shader` + `separable_pipeline_with_gs`) fails at BOTH 94116a0 (no allocator fix) and 25bdf79 (allocator fix). So the pipeline-bound geometry path is broken in isolation regardless of the pool, and my earlier attribution of the regression to the allocator was wrong â what changed with the allocator is only *where the test draws land* in the shared scratch buffer, which changes whether the broken pipeline path is hit at an offset that happens to be 0 (works) or not (fails).  Root cause still open; the next step is supervisor item (b): dump which vertex function the render pipeline for the pipeline composite uses and whether creation succeeds, since that is the one code path only `separable_pipeline_with_gs` exercises.
