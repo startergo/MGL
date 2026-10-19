@@ -1,0 +1,589 @@
+diff --git a/MGL/src/MGLRenderer+Geometry.m b/MGL/src/MGLRenderer+Geometry.m
+index 0374bf4..f8f10c5 100644
+--- a/MGL/src/MGLRenderer+Geometry.m
++++ b/MGL/src/MGLRenderer+Geometry.m
+@@ -77,8 +77,7 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
+ 
+ static id<MTLComputePipelineState> gGsPso;
+ static id<MTLComputePipelineState> gInitPso;
+-static id<MTLComputePipelineState> gPrepPso;
+-static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
++static id<MTLComputePipelineState> gPrepPso, gTessImportPso;static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
+ static id<MTLComputePipelineState> gFinPso;
+ static void *gPsoKey;               /* the kernel function the PSOs were built from */
+ 
+@@ -263,6 +262,52 @@ static const char *kGeomPrepMSL =
+     "    ctl[1] = vmax - vmin + 1u;                     /* capture header: vcount */\n"
+     "}\n";
+ 
++/* the tess producer's import kernel: repacks the TES-output capture records into this
++ * program's input record (the layouts differ: the tess record follows the tess capture's
++ * member table, this program's record follows geom_layout), copies the capture's output
++ * index list into the primitive slots and publishes the counts the geometry kernel needs
++ * (gPrim's header words and prep[4], exactly what the prep kernel writes for a plain draw) */
++static const char *kGeomTessImportMSL =
++    "#include <metal_stdlib>\n"
++    "#include <simd/simd.h>\n"
++    "using namespace metal;\n"
++    "\n"
++    "kernel void mgl_geom_tess_import(const device uint* src [[buffer(0)]],      /* tess records */\n"
++    "                                 const device uint* idx [[buffer(1)]],      /* its output index list */\n"
++    "                                 const device uint* cnt [[buffer(2)]],      /* its vertex count (GPU written) */\n"
++    "                                 device uint* recs [[buffer(3)]],           /* this program's input records */\n"
++    "                                 constant uint* pairs [[buffer(4)]],        /* (src word, dst word) */\n"
++    "                                 device uint* hdr [[buffer(5)]],            /* gPrim header */\n"
++    "                                 device uint* prims [[buffer(6)]],          /* primitive slots */\n"
++    "                                 device uint* cap_hdr [[buffer(7)]],        /* the capture header */\n"
++    "                                 device uint* prep [[buffer(8)]],           /* prep[4]: kernel groups */\n"
++    "                                 constant uint* cfg [[buffer(9)]],          /* stride,k,npairs,cap,in_words */\n"
++    "                                 uint t [[thread_position_in_grid]])\n"
++    "{\n"
++    "    uint n = cnt[0];\n"
++    "    if (n > cfg[3]) n = cfg[3];                 /* the ring's record capacity */\n"
++    "    if (t == 0u)\n"
++    "    {\n"
++    "        uint prims = n / cfg[1];\n"
++    "        hdr[0] = prims;\n"
++    "        hdr[6] = n;\n"
++    "        hdr[8] = 0u;\n"
++    "        hdr[12] = 0u;\n"
++    "        cap_hdr[0] = 0u;\n"
++    "        cap_hdr[1] = n;\n"
++    "        cap_hdr[2] = 0u;\n"
++    "        cap_hdr[3] = cfg[4];\n"
++    "        prep[0] = prims ? (prims - 1u) / 32u + 1u : 1u;\n"
++    "    }\n"
++    "    if (t < n)\n"
++    "    {\n"
++    "        const device uint* s = src + (size_t)t * cfg[0];\n"
++    "        device uint* dst = recs + (size_t)t * cfg[4];\n"
++    "        for (uint p = 0u; p < cfg[2] * 2u; p += 2u) dst[pairs[p + 1u]] = s[pairs[p]];\n"
++    "        prims[t] = idx[t];                      /* k consecutive vertices per primitive */\n"
++    "    }\n"
++    "}\n";
++
+ #include "mgl_ext_geom_xfb.h"
+ 
+ /* the transform feedback pack kernels: a prefix sum over the per-thread emitted counts
+@@ -430,6 +475,25 @@ static bool geomCtlPipelines(id<MTLDevice> device)
+         return false;
+     }
+ 
++    /* the tess import kernel (a geometry stage behind a tessellation stage) */
++    {
++        id<MTLLibrary> tlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomTessImportMSL]
++                                                   options: nil error: &error];
++        if (!tlib)
++        {
++            NSLog(@"MGL geom: tess import library failed: %@", error);
++            return false;
++        }
++        id<MTLFunction> tfn = [tlib newFunctionWithName: @"mgl_geom_tess_import"];
++        if (!tfn) return false;
++        gTessImportPso = [device newComputePipelineStateWithFunction: tfn error: &error];
++        if (!gTessImportPso)
++        {
++            NSLog(@"MGL geom: tess import pipeline failed: %@", error);
++            return false;
++        }
++    }
++
+     /* the transform feedback pack kernels */
+     id<MTLLibrary> xlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomXfbMSL]
+                                                options: nil error: &error];
+@@ -473,7 +537,7 @@ static void geomReleaseStatics(void)
+     gPrimPool.next = gVsoutPool.next = gPrepPool.next = gOutvPool.next = gCntPool.next = 0;
+     gXbase = nil; gXfb = nil; gXfbPending = false;
+     gXfbOwner = 0; gXfbBegin = false;
+-    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil;
++    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gTessImportPso = nil;
+     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
+ 
+     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
+@@ -1034,14 +1098,31 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
+ 
+ - (bool) geomDraw: (MGLGeomDraw *) d
+ {
+-    MGLGeomProgram *gp = d->gp;
+-    Program *program = d->program;
++    if (getenv("MGL_GEOM_TRACE_DRAW"))
++        fprintf(stderr, "geom: trace geomDraw enter tess=%d gp=%p\n", d->tess_ring != NULL, (void *)d->gp);
++    MGLGeomProgram *gp = d->gp;    Program *program = d->program;
+     const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
+     uint64_t threads = (uint64_t)(d->prims_count ? d->prims_count : 1)
+                        * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations;
+     uint32_t bound = d->count_bound ? d->count_bound : (d->count > 0 ? (uint32_t)d->count : 1);
+     size_t outv_cap, idx_cap, prim_bytes, vsout_bytes, cap_idx, cap_prim;
+     uint32_t *hdr;
++    bool from_tess = (d->tess_ring != NULL);
++
++    if (from_tess)
++    {
++        /* a tessellation stage feeds the geometry kernel: the capture ring's record capacity
++         * is the sizing bound (the tess domain sizes it for this draw's patches), and the
++         * primitive slots sit behind a capture index list of that many words */
++        id<MTLBuffer> ring = (__bridge id<MTLBuffer>)d->tess_ring;
++
++        bound = (uint32_t)(ring.length / ((size_t)d->tess_stride * sizeof(uint32_t)));
++        if (!bound) bound = 1;
++        d->indexed = true;                    /* index_words = bound: the prim slot offset */
++        d->type = GL_UNSIGNED_INT;
++        d->count = (GLsizei)bound;
++        d->count_bound = bound;
++    }
+ 
+     if (!_device || !_commandQueue || !program || !gp || !gp->linked) return false;
+     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
+@@ -1221,7 +1302,43 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
+     if (getenv("MGL_GEOM_DEBUG"))
+         fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
+-    if (gpu_assembly)
++    if (from_tess)
++    {
++        /* the tess producer's records are imported instead: repack them into this program's
++         * input record, copy its output index list into the primitive slots and publish the
++         * counts (what the prep kernel writes for a plain draw) */
++        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
++        id<MTLBuffer> ring = (__bridge id<MTLBuffer>)d->tess_ring;
++        uint32_t cfg[5];
++        NSUInteger wg = 64, threads = bound;
++
++        if (!enc) return false;
++        [enc pushDebugGroup: @"MGL geometry tess import"];
++        [enc setComputePipelineState: gTessImportPso];
++        [enc setBuffer: ring offset: d->tess_recs_off atIndex: 0];
++        [enc setBuffer: ring offset: d->tess_idx_off atIndex: 1];
++        [enc setBuffer: ring offset: d->tess_cnt_off atIndex: 2];
++        [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: 3];
++        [enc setBytes: d->tess_pairs length: sizeof(uint32_t) * (NSUInteger)d->tess_npairs atIndex: 4];
++        [enc setBuffer: gPrim offset: gPrimOff atIndex: 5];
++        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t) atIndex: 6];
++        [enc setBuffer: gVsout offset: gVsoutOff atIndex: 7];
++        [enc setBuffer: gPrep offset: gPrepOff + (32 + 4) * sizeof(uint32_t) atIndex: 8];   /* prep[4]: the kernel's indirect threadgroup count */
++        cfg[0] = d->tess_stride;
++        cfg[1] = gp->in_verts;
++        cfg[2] = d->tess_npairs / 2;
++        cfg[3] = bound;
++        cfg[4] = gp->in_words;
++        [enc setBytes: cfg length: sizeof cfg atIndex: 9];
++        [enc dispatchThreadgroups: MTLSizeMake((threads + wg - 1) / wg, 1, 1)
++              threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
++        [enc popDebugGroup];
++        [enc endEncoding];
++        if (getenv("MGL_GEOM_TRACE_DRAW"))
++            fprintf(stderr, "geom: trace tess import encoded (bound=%u cap_idx=%zu stride=%u)\n",
++                    bound, cap_idx, d->tess_stride);
++    }
++    else if (gpu_assembly)
+     {
+         id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+         Buffer *eb = d->indexed ? (ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL) : NULL;
+@@ -1265,6 +1382,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
+     }
+ 
+     /* ---- 1. vertex capture pass ---- */
++    if (!from_tess)      /* the tess producer already wrote the records */
+     {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
+@@ -1446,7 +1564,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
+                   threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+ 
+             [enc setComputePipelineState: gGsPso];
+-            if (gpu_assembly && !getenv("MGL_GEOM_WORST_CASE_DISPATCH"))
++            if (gpu_assembly && !from_tess && !getenv("MGL_GEOM_WORST_CASE_DISPATCH"))
+             {
+                 /* the prep kernel computed the exact threadgroup count */
+                 [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
+diff --git a/MGL/src/geometry.c b/MGL/src/geometry.c
+index 7662946..3745a14 100644
+--- a/MGL/src/geometry.c
++++ b/MGL/src/geometry.c
+@@ -47,6 +47,7 @@
+ #include "mgl_ext_buffers.h"
+ #include "mgl_ext_xfb.h"
+ #include "mgl_ext_geom_xfb.h"
++#include "mgl_ext_tess.h"     /* the TES-output capture producer (geometry behind tessellation) */
+ #include "mgl_ext_program.h"
+ #include "shaders.h"
+ #include "programs.h"
+@@ -2120,10 +2121,21 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
+     for (i = 0; i < gp->n_out; i++)
+         if (gp->out_v[i].stream + 1 > gp->streams) gp->streams = gp->out_v[i].stream + 1;
+ 
++    /* a tessellation stage in front of the geometry shader: the tess domain's TES-output
++     * capture supplies the records, so there is no vertex stage to derive the inputs'
++     * producing expressions from (the draw-time import repacks the capture instead) */
++    gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
++    if (gp->from_tess && gp->in_has_clip)
++    {
++        mgl_append_log(log, "ERROR: geometry: gl_ClipDistance of a tessellation stage is not captured, "
++                            "so the geometry stage cannot read gl_in[].gl_ClipDistance\n");
++        goto done;
++    }
++
+     /* writer side: the vertex outputs feeding each input location.  A separable
+      * geometry-only program has no vertex stage to reflect here; geom_ensure() does it from
+      * the pipeline's composite once that is available. */
+-    if (!gp->deferred)
++    if (!gp->deferred && !gp->from_tess)
+     {
+         if (!geom_derive_exprs(gp, program, log))
+             goto done;
+@@ -2234,9 +2246,18 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+ 
+     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
+ 
+-    if (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER])
+-        GEOM_FAIL("tessellation before a geometry shader is not supported "
+-                  "(the geometry emulation consumes the vertex stage output directly)");
++    /* a tessellation stage in front of the geometry shader: the tess domain's TES-output
++     * capture producer (mgl_ext_tess.h) feeds the geometry kernel instead of a vertex capture
++     * variant — the records are repacked into this program's input record at draw time
++     * (mgl_geom_route / the import kernel in MGLRenderer+Geometry.m) */
++    gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
++    if (gp->from_tess && gp->in_has_clip)
++        GEOM_FAIL("gl_ClipDistance of a tessellation stage is not captured: "
++                  "the geometry stage cannot read gl_in[].gl_ClipDistance");
++    if (!gp->from_tess &&
++        (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER]))
++        GEOM_FAIL("a tessellation control shader without an evaluation shader cannot feed "
++                  "the geometry stage");
+ 
+     {
+         const char *src = geom_gs_source(ctx, obj);
+@@ -2250,6 +2271,18 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+         }
+     }
+ 
++    if (gp->from_tess)
++    {
++        /* no vertex stage is captured: the tess domain publishes the records (with its own
++         * member layout) and the import kernel repacks them into gp's input record */
++        gp->vid_absolute = false;
++        gp->iid_absolute = false;
++        gp->in_clip_size = 0;
++        gp->capture_entry = xstrdup("main0");
++        geom_layout(gp);
++        goto build;          /* skip the capture variant, the draw variant is built below */
++    }
++
+     {
+         const char *src = geom_vs_source(ctx, obj);
+         vs_src = xstrdup(src ? src : "");
+@@ -2298,6 +2331,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+         GEOM_FAIL("no Metal compile hook available");
+ 
+     /* ---- 2. geometry kernel ---- */
++build:
+     glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, &log);
+     if (!glsl) GEOM_FAIL("kernel generation failed");
+     geom_dump("kernel.glsl", glsl);
+@@ -2777,6 +2811,116 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d);
+ static GLMContext gTraceCtx;
+ void *mgl_geom_ctx(void) { return gTraceCtx; }
+ 
++/* ---- tessellation in front of the geometry stage ---- */
++
++/* the tess domain tessellates this draw with its TES-output capture enabled (the records and
++ * the output index list are GPU-visible), then the geometry emulation consumes them: the
++ * import kernel (MGLRenderer+Geometry.m) repacks the capture records into this program's
++ * input record and builds the primitive slots, exactly what the prep kernel produces for a
++ * plain draw. */
++static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GLenum type,
++                            size_t offset, GLint first, GLsizei count, GLsizei instances,
++                            GLint basevertex, GLuint baseinstance)
++{
++    Program *program = ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
++                                                   : ctx->state.program;
++    const MGLTessCapture *c;
++    MGLGeomDraw d;
++    GLuint saved_discard;
++    uint32_t want = gp->in_type;      /* the GS input primitive the capture must produce */
++    static const uint32_t kof[3] = { 1u, 2u, 3u };     /* GL_POINTS, GL_LINES, GL_TRIANGLES */
++
++    if (!program || !program->shader_slots[_TESS_EVALUATION_SHADER]) return false;
++
++    /* the tess stage must not rasterize: the geometry stage owns rasterization, and the
++     * fragment shader would otherwise see the tessellation outputs.  rstate discards in the
++     * last pre-rasterization stage's vertex function, so the tess pipeline is rebuilt for it
++     * (the geometry pass restores the value afterwards, before its own raster pass). */
++    mgl_tess_set_capture(ctx, program, true);
++    saved_discard = ctx->state.caps.rasterizer_discard;
++    ctx->state.caps.rasterizer_discard = GL_TRUE;
++    ctx->state.dirty_bits |= DIRTY_PROGRAM;
++    mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
++                          basevertex, baseinstance);
++    ctx->state.caps.rasterizer_discard = saved_discard;
++    ctx->state.dirty_bits |= DIRTY_PROGRAM;
++
++    c = mgl_tess_get_capture(ctx);
++    if (getenv("MGL_GEOM_TRACE_DRAW"))
++        fprintf(stderr, "geom: trace tess capture c=%p valid=%d prim=%u want=%u members=%d\n",
++                (const void *)c, c ? (int)c->valid : -1, c ? c->prim : 0u, want, c ? c->members : -1);
++    if (!c || !c->valid || !c->buffer_object || !c->buffer)
++    {
++        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
++        return false;
++    }
++    if (c->prim != want)
++    {
++        /* triangles -> triangles, isolines -> lines, point_mode -> points */
++        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
++        return false;
++    }
++
++    /* repack: for every geometry input location, the tess capture member at the same location
++     * supplies the words (gl_Position is words 0..3 in both layouts) */
++    memset(&d, 0, sizeof(d));
++    d.tess_ring = c->buffer_object;     /* the MTLBuffer (buffer is its CPU address) */
++    d.tess_recs_off = c->records_offset;
++    d.tess_idx_off = c->index_offset;
++    d.tess_cnt_off = c->count_offset;
++    d.tess_stride = c->stride;
++    d.tess_prim = c->prim;
++    d.tess_pairs[d.tess_npairs++] = 0; d.tess_pairs[d.tess_npairs++] = 0;
++    d.tess_pairs[d.tess_npairs++] = 1; d.tess_pairs[d.tess_npairs++] = 1;
++    d.tess_pairs[d.tess_npairs++] = 2; d.tess_pairs[d.tess_npairs++] = 2;
++    d.tess_pairs[d.tess_npairs++] = 3; d.tess_pairs[d.tess_npairs++] = 3;
++    for (int i = 0; i < gp->n_in; i++)
++    {
++        int j = -1;
++
++        /* the consumer matches the tess capture's members by name: a linkable program has the
++         * same names for the evaluation stage's outputs and the geometry stage's inputs */
++        for (int m = 0; m < c->members; m++)
++            if (!strcmp(c->member[m].name, gp->in_v[i].name) &&
++                c->member[m].words >= gp->in_v[i].words)
++            {
++                j = m;
++                break;
++            }
++        if (j < 0)
++        {
++            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
++            return false;
++        }
++        if (c->member[j].words != gp->in_v[i].words ||
++            d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS)
++        {
++            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
++            return false;
++        }
++        for (uint32_t w = 0; w < gp->in_v[i].words; w++)
++        {
++            d.tess_pairs[d.tess_npairs++] = c->member[j].offset + w;   /* word offset */
++            d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + w;
++        }
++    }
++
++    /* sizing bound: the capture ring's record capacity (the tess domain sizes it for this
++     * draw's patches), so the geometry buffers are allocated once and never reallocated.
++     * The capacity is derived from the ring's length on the Metal side. */
++    d.gp = gp;
++    d.program = program;
++    d.mode = c->prim;                 /* the assembled primitives are of the capture's type */
++    d.first = first;
++    d.count = count;
++    d.instances = instances > 0 ? instances : 1;
++    d.basevertex = basevertex;
++    d.baseinstance = baseinstance;
++
++    (void)kof;
++    return METAL()->draw(ctx, &d);
++}
++
+ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
+                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
+ {
+@@ -2802,6 +2946,24 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
+         return;
+     }
+ 
++    /* a tessellation stage in front of the geometry shader: the tess domain tessellates (and
++     * publishes its TES-output capture), then the geometry emulation consumes it.  The GL
++     * draw mode is GL_PATCHES, so the usual input-type check does not apply — the capture's
++     * output primitive type is validated against it instead. */
++    if (gp->from_tess)
++    {
++        if (mode != GL_PATCHES)
++        {
++            ERROR_RETURN(GL_INVALID_OPERATION);
++            return;
++        }
++        if (geom_route_tess(ctx, gp, indexed, type, offset, first, count, instances,
++                            basevertex, baseinstance))
++            return;
++        ERROR_RETURN(GL_INVALID_OPERATION);
++        return;
++    }
++
+     if (!geom_mode_matches(gp->in_type, mode))
+     {
+         ERROR_RETURN(GL_INVALID_OPERATION);
+diff --git a/MGL/src/mgl_ext_geom.h b/MGL/src/mgl_ext_geom.h
+index 7c9f475..df7a76b 100644
+--- a/MGL/src/mgl_ext_geom.h
++++ b/MGL/src/mgl_ext_geom.h
+@@ -39,6 +39,7 @@ struct MGLProgramObj_t;
+ #define MGL_GEOM_HDR_WORDS          32
+ #define MGL_GEOM_ARG_OFFSET         8     /* word offset of the DrawIndexedPrimitives arguments */
+ #define MGL_GEOM_BUDGET_BYTES       (256u << 20)     /* per-buffer allocation cap */
++#define MGL_GEOM_TESS_MAX_WORDS     128   /* (src word, dst word) pairs of a tess record import */
+ 
+ /* GLSL (set 0) bindings of the emulation SSBOs; above the per-stage SSBO limit so an
+  * application's own layout(std430, binding=N) declarations cannot collide */
+@@ -87,6 +88,7 @@ typedef struct MGLGeomProgram {
+     GLuint    name;
+     bool      linked;       /* the emulation is built and usable */
+     bool      deferred;     /* separable program: built from the pipeline at first draw */
++    bool      from_tess;   /* a tessellation stage feeds the geometry kernel (TES-output capture) */
+     void    *gs_exec;      /* the geometry stage executable Shader (identity across pipelines) */
+     char     *fail;
+ 
+@@ -150,6 +152,17 @@ typedef struct MGLGeomDraw {
+     uint32_t restart;           /* restart index (or 0xffffffffu) */
+     bool     provoking_first;
+     uint32_t count_bound;       /* upper bound of the vertex count, for sizing only */
++
++    /* tess producer: instead of a vertex capture pass, the tess domain's TES-output capture
++     * feeds the geometry kernel.  tess_recs_off / tess_idx_off / tess_cnt_off are byte
++     * offsets into tess_ring (an MTLBuffer the tess domain owns and keeps alive); tess_npairs
++     * (src word, dst word) pairs repack a tess record into this program's input record. */
++    void    *tess_ring;
++    size_t   tess_recs_off, tess_idx_off, tess_cnt_off;
++    uint32_t tess_stride;                       /* words per tess record */
++    uint32_t tess_prim;                         /* its output primitive type */
++    uint32_t tess_pairs[MGL_GEOM_TESS_MAX_WORDS];
++    uint32_t tess_npairs;
+ } MGLGeomDraw;
+ 
+ struct MGLExtState_geom {
+diff --git a/MGL/src/program.c b/MGL/src/program.c
+index 5d145bd..7e7247d 100644
+--- a/MGL/src/program.c
++++ b/MGL/src/program.c
+@@ -1223,14 +1223,9 @@ static bool check_stage_mask(GLuint mask, char **log, bool separable)
+ 
+     if (mask & SHADER_MASK_BIT(_GEOMETRY_SHADER))
+     {
+-        /* emulated by the geometry domain: the stage becomes a compute kernel; the
+-         * combination with tessellation is rejected by mgl_geom_post_link */
+-        if (mask & (SHADER_MASK_BIT(_TESS_CONTROL_SHADER) | SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
+-        {
+-            mgl_append_info_log(log, "ERROR: a geometry shader after tessellation stages is not supported "
+-                                "(the Metal geometry emulation consumes the vertex stage output directly)\n");
+-            return false;
+-        }
++        /* emulated by the geometry domain: the stage becomes a compute kernel.  A geometry
++         * shader after tessellation stages consumes the tess domain's TES-output capture
++         * (mgl_ext_tess.h) instead of the vertex stage output. */
+         if (!(mask & SHADER_MASK_BIT(_VERTEX_SHADER)) && !separable)
+         {
+             mgl_append_info_log(log, "ERROR: a program containing a geometry shader must contain a vertex shader\n");
+diff --git a/tests/headless/test_geom.c b/tests/headless/test_geom.c
+index 092f98d..5679747 100644
+--- a/tests/headless/test_geom.c
++++ b/tests/headless/test_geom.c
+@@ -1121,46 +1121,80 @@ TEST(xfb_streams)
+ }
+ 
+ 
+-TEST(tessellation_with_geometry_rejected)
++TEST(tessellation_triangles_into_gs)
+ {
++    /* the tessellation stage tessellates, the geometry stage consumes the captured TES output:
++     * it shrinks every triangle towards the centre, so a tessellation stage that rasterized
++     * itself would cover more than the geometry output */
+     const char *tcs =
+         "#version 450 core\n"
+         "layout(vertices = 3) out;\n"
+         "void main(){\n"
+         "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+         "  if (gl_InvocationID == 0) {\n"
+-        "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+-        "    gl_TessLevelInner[0] = 3.0;\n"
++        "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0;\n"
++        "    gl_TessLevelInner[0] = 1.0;\n"
+         "  }\n"
+         "}\n";
+     const char *tes =
+         "#version 450 core\n"
+         "layout(triangles, equal_spacing, ccw) in;\n"
+-        "void main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+-        " + gl_TessCoord.z * gl_in[2].gl_Position; }\n";
++        "layout(location=0) out float shade;\n"
++        "void main(){\n"
++        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
++        " + gl_TessCoord.z * gl_in[2].gl_Position;\n"
++        "  shade = 0.5;\n"
++        "}\n";
+     const char *gs =
+         "#version 450 core\n"
+         "layout(triangles) in;\n"
+         "layout(triangle_strip, max_vertices = 3) out;\n"
+-        "void main(){ for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); } EndPrimitive(); }\n";
++        "layout(location=0) in float shade[];\n"
++        "layout(location=0) out float gshade;\n"
++        "void main(){\n"
++        "  for (int i = 0; i < 3; i++) { gl_Position = vec4(gl_in[i].gl_Position.xy * 0.5, 0.0, 1.0);"
++        " gshade = shade[i]; EmitVertex(); }\n"
++        "  EndPrimitive();\n"
++        "}\n";
++    const char *fs =
++        "#version 450 core\n"
++        "layout(location=0) in float gshade;\n"
++        "layout(location=0) out vec4 color;\n"
++        "void main(){ color = vec4(0.0, gshade, 0.0, 1.0); }\n";
+     GLuint p = glCreateProgram();
+     glAttachShader(p, compile(GL_VERTEX_SHADER, plain_vs));
+     glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, tcs));
+     glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, tes));
+     glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+-    glAttachShader(p, compile(GL_FRAGMENT_SHADER, plain_fs));
++    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+     glLinkProgram(p);
+-    GLint ok = 1;
++    GLint ok = 0;
+     glGetProgramiv(p, GL_LINK_STATUS, &ok);
+-    EXPECT_EQ_INT(ok, GL_FALSE);
+     if (!ok)
+     {
+         char log[2048] = "";
+         GLsizei len = 0;
+         glGetProgramInfoLog(p, sizeof log, &len, log);
+-        printf("tess+gs log: %s\n", log);
+-        EXPECT_TRUE(strstr(log, "geometry") != NULL);
++        printf("tess+gs link log: %s\n", log);
+     }
++    EXPECT_EQ_INT(ok, GL_TRUE);
++    if (!ok) return;
++
++    glUseProgram(p);
++    clear_black();
++    static const float tri[6] = { -1.0f, -1.0f, 1.0f, -1.0f, 0.0f, 1.0f };
++    setup(6, tri);
++    glPatchParameteri(GL_PATCH_VERTICES, 3);
++    glDrawArrays(GL_PATCHES, 0, 3);
++    EXPECT_NO_GL_ERROR();
++
++    /* the geometry output is the shrunken triangle: green in the middle, black where the
++     * unshrunk tessellation output would have covered */
++    GLubyte c[4];
++    px(100, 100, c);
++    EXPECT_TRUE(c[1] > 100);
++    px(5, 100, c);
++    EXPECT_TRUE(c[0] == 0 && c[1] == 0);
+     glDeleteProgram(p);
+ }
+ 
+@@ -1453,7 +1487,7 @@ int main(void)
+     RUN(xfb_of_geometry_output);
+     RUN(xfb_streams);
+     RUN(xfb_arrays_of_blocks_xfb_offset);
+-    RUN(tessellation_with_geometry_rejected);
++    RUN(tessellation_triangles_into_gs);
+     RUN(primitive_restart_with_gs);
+     RUN(xfb_gpu_pack_multiple_draws_and_pause);
+     return mgl_test_summary();

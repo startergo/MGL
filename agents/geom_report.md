@@ -297,3 +297,48 @@ Two corrections and one decisive narrowing:
   path does expose GPU scratch. Needs a TES capture variant feeding the geometry kernel.
 * GS + interface blocks in the *raster* path (the pass-through vertex function would have to
   emit a matching block declaration for the fragment shader).
+
+
+# Round 20 — geometry after tessellation: BLOCKED mid-implementation (context exhausted)
+
+The supervisor's queue item 1 (geometry shader after tessellation) was started and got most of
+the way; the work is saved verbatim in `agents/geom_tess_wip.patch` (589 lines, applies cleanly
+on a9ea29c with `git apply`).  It was reverted from the tree so every commit keeps the suite
+green.
+
+What the patch has, and what it proved:
+* link: `program.c` no longer rejects a geometry stage after tessellation stages;
+  `mgl_geom_compile_stage`/`geom_build` set `gp->from_tess`, skip the vertex capture variant
+  and the `geom_derive_exprs` step (there is no vertex stage to reflect) and reject a GS that
+  reads `gl_in[].gl_ClipDistance` (the tess capture does not carry it).
+* route: `geom_route_tess` enables the producer (`mgl_tess_set_capture`), runs
+  `mgl_tess_draw_patches` with `rasterizer_discard` forced on (the geometry stage owns
+  rasterization; rstate discards in the last pre-rasterization stage's vertex function), then
+  hands the capture to the emulation: records are matched to the GS inputs **by name**
+  (`MGLTessCaptureMember` has no location), the output primitive type is validated against
+  `gp->in_type`, and the ring's record capacity (ring.length / stride) is the sizing bound.
+* Metal: a new `mgl_geom_tess_import` compute kernel repacks the tess records into this
+  program's input record ((src word, dst word) pairs, gl_Position is words 0..3 in both),
+  copies the capture's output index list into the primitive slots and writes gPrim's header
+  words — everything the prep kernel produces for a plain draw.  The capture pass is skipped.
+* verified by the trace (`MGL_GEOM_TRACE_DRAW`, which also prints sizing/pool/import lines):
+  the import kernel runs, hdr[0]/hdr[6]/hdr[12] and the repacked records are correct
+  (gl_Position and the 'shade' varying land where geom_layout says), the geometry kernel emits
+  3 vertices and the indirect draw arguments become indexCount=3/instanceCount=1.
+
+Where it stopped (the remaining bug, in one place): the geometry kernel's emitted
+`gl_Position` is (0,0,0,1) although the repacked input record holds (-1,-1,0,1) — i.e. the
+kernel's `mgl_load_inputs` reads the record as zero.  Everything up to that point checks out,
+so the next step is to compare the *geometry kernel's* gVsout binding offset/record indexing
+for a from_tess draw with a plain draw (`mgl_r = (mgl_prim[...] - hdr[12] + inst*hdr[6]) *
+in_words`, binding at gVsoutOff + 8 words) — most likely the primitive slots the import kernel
+fills at `gPrim + (MGL_GEOM_HDR_WORDS + cap_idx)` do not agree with `index_words = d->count`
+the kernel uses, or the tess capture's index list is not 0-based vertex indices.
+Note also: `MGL_GEOM_PREP_IN_WORDS` is 16 but the prep kernel's *outputs* start at word 32
+(binding 7 uses `gPrepOff + 32 * 4`), and the geometry kernel's indirect threadgroup count is
+prep[4] at word 36 — the patch works around that by dispatching the kernel directly with the
+worst case (every thread returns past hdr[0]), which is what made ctl[8] become 3.
+
+Also still queued, untouched this round: xfb from tessellation stages, struct interface
+variables in GS inputs/outputs, moving mgl_geom_ctx/mgl_geom_xfb_log_read_name out of public
+headers (the last one is already done: they are declared in tests/headless/mgl_geom_diag.h).
