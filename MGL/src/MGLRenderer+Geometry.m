@@ -1429,51 +1429,17 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, id<MTLBuffer> buf, size_
         return false;
     }
 
-    /* stand the pass-through function in for the vertex stage while the raster pipeline is
-     * built (restored afterwards: the vertex program can still be used on its own) */
+    /* publish the pass-through vertex function through the renderer-level override instead of by swapping the program: with a bound program pipeline the composite is rebuilt from the stage programs inside begin_draw (mgl_program_scope_enter copies MSL by value), so a swap of the composite is discarded there and mutating the shared Shader corrupts the stage program. */
     {
-        Shader *vs = program->shader_slots[_VERTEX_SHADER];
-        char *saved_msl = NULL, *saved_entry = NULL;
-        void *saved_fn = NULL;
-        const char *saved_slot_entry = NULL;
-        bool swapped = false;
+        struct MGLExtState_geom *g = (struct MGLExtState_geom *)ctx->state.ext_geom;
 
-        if (vs)
-        {
-            saved_fn = vs->mtl_data.function;
-            saved_slot_entry = vs->entry_point;
-            vs->mtl_data.function = gp->draw_function;
-            vs->entry_point = gp->draw_entry;
-            swapped = true;
-        }
-        if (program->spirv[_VERTEX_SHADER].msl_str)
-        {
-            saved_msl = program->spirv[_VERTEX_SHADER].msl_str;
-            saved_entry = program->spirv[_VERTEX_SHADER].entry_point;
-            program->spirv[_VERTEX_SHADER].msl_str = gp->draw_msl;
-            program->spirv[_VERTEX_SHADER].entry_point = gp->draw_entry;
-        }
-
+        if (!g) return false;
+        g->vertex_override = gp->draw_function;
         ctx->state.dirty_bits |= DIRTY_PROGRAM;
 
         bool ok = [self geomRasterPass: d];
 
-        if (vs)
-        {
-            vs->mtl_data.function = saved_fn;
-            vs->entry_point = saved_slot_entry;
-        }
-        if (saved_msl)
-        {
-            program->spirv[_VERTEX_SHADER].msl_str = saved_msl;
-            program->spirv[_VERTEX_SHADER].entry_point = saved_entry;
-        }
-        else if (swapped)
-        {
-            program->spirv[_VERTEX_SHADER].msl_str = NULL;
-            program->spirv[_VERTEX_SHADER].entry_point = NULL;
-        }
-
+        g->vertex_override = NULL;
         return ok;
     }
 }

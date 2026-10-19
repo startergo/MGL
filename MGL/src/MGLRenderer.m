@@ -45,6 +45,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 
 #import "MGLRenderer_Private.h"
 #import "mgl_ext_introspect.h"
+#import "mgl_ext_geom.h"
 #import "mgl_ext_program.h"
 #import "mgl_ext_tess.h"
 #import "MGLRenderer+TextureExt.h"
@@ -2767,6 +2768,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             return NULL;
         }
     }
+
+
+
+    // geom: the geometry domain's pass-through vertex function reads the geometry kernel's output from a buffer instead of the app's attributes; it must win over the program's own vertex function.  A bound program pipeline's composite is rebuilt from the stage programs inside begin_draw (mgl_program_scope_enter copies MSL by value), so substituting the composite there is discarded.  The override is a renderer-level override consulted here, and the PSO cache key includes it (MGLRenderer+GpauctAudit.m).
+    if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
+        vertexFunction = (__bridge id<MTLFunction>)((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override;
 
     // Configure a pipeline descriptor that is used to create a pipeline state.
     pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
