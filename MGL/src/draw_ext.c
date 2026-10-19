@@ -83,6 +83,11 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
     uint32_t i = hash_ptr(buf) & mask;
     MGLBufferTrack *first_free = NULL;
 
+    if (getenv("MGL_GEOM_XFB_TRACE") && create)
+        fprintf(stderr, "geom: track create lookup buf=%p name=%u ctx=%p ext=%p idx=%u cap=%u from=%p\n",
+                (void *)buf, buf ? buf->name : 0, (void *)ctx, (void *)st, i, st->track_cap,
+                __builtin_return_address(0));
+
     for (uint32_t n = 0; n < st->track_cap; n++, i = (i + 1) & mask)
     {
         MGLBufferTrack *t = &st->track[i];

@@ -644,7 +644,16 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     for (GLuint b = 0; b < 4; b++)
         if (tfb[b].buf)
         {
+            if (getenv("MGL_GEOM_XFB_TRACE"))
+                fprintf(stderr, "geom: pack stamp buf=%p name=%u ctx=%p slot=%u\n",
+                        (void *)tfb[b].buf, tfb[b].buf->name, (void *)ctx, b);
             mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+            {
+                MGLBufferTrack *t = mgl_buffers_track(ctx, tfb[b].buf, false);
+                fprintf(stderr, "geom: pack stamped buf=%u -> write_serial=%llu (entry %p)\n",
+                        tfb[b].buf->name,
+                        (unsigned long long)(t ? t->write_serial : 12345), (void *)t);
+            }
             if (getenv("MGL_GEOM_XFB_TRACE"))
                 fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
                         tfb[b].buf->data.mtl_data,
@@ -680,8 +689,13 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         uint32_t *blk = (uint32_t *)gXfb.contents;
         int i;
 
-        BUF()->flush(ctx);
-        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        /* the flush+wait is itself the workaround under test: keep it optional so the trace
+         * can observe the unmodified behaviour */
+        if (getenv("MGL_GEOM_XFB_FLUSH"))
+        {
+            BUF()->flush(ctx);
+            BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        }
 
         uint32_t *hp = (uint32_t *)((uint8_t *)gPrim.contents + gPrimOff);
         fprintf(stderr, "geom: trace draw threads=%u dvert=%u dprim=%u woff=%u hdr: prims=%u inst=%u vcount=%u vmin=%u\n",
@@ -719,6 +733,18 @@ void geom_xfb_gpu_wait(GLMContext ctx)
 }
 
 /* read the pending counters (the caller has synchronised) */
+void geom_xfb_dump(GLMContext ctx)
+{
+    if (!getenv("MGL_GEOM_XFB_TRACE") || !gOutv) return;
+    fprintf(stderr, "geom: out records @%zu:", gOutvOff / 4);
+    for (int i = 0; i < 6 * 2; i++)
+    {
+        uint32_t w = ((uint32_t *)gOutv.contents)[gOutvOff / 4 + i];
+        fprintf(stderr, " %8.3f", *(float *)&w);
+    }
+    fprintf(stderr, "\n");
+}
+
 void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim)
 {
     if (getenv("MGL_GEOM_DEBUG") && gXfb)

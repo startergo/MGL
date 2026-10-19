@@ -2698,6 +2698,10 @@ static uint32_t geom_restart_index(GLMContext ctx)
 static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, GLenum gs_in);
 static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d);
 
+/* the last context that ran a geometry draw (the trace is a debugging aid) */
+static GLMContext gTraceCtx;
+void *mgl_geom_ctx(void) { return gTraceCtx; }
+
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
@@ -2707,6 +2711,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
 
     if (!mgl_geom_present(ctx)) return;
 
+    gTraceCtx = ctx;
     gp = mgl_geom_current(ctx);
     if (!gp) return;
 
@@ -3196,9 +3201,7 @@ static MGLXfbObject *geom_xfb_object(GLMContext ctx)
 /* the test harness reaches the tracking state through here */
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
 
-/* the last context that ran a geometry draw (the trace is a debugging aid) */
-static GLMContext gTraceCtx;
-void *mgl_geom_ctx(void) { return gTraceCtx; }
+void *mgl_geom_ctx(void);
 
 /* trace helper: the buffer-tracking state of a transform feedback buffer at a CPU read */
 void mgl_geom_xfb_log_read_name(void *ctxp, unsigned name, const char *what)
@@ -3209,8 +3212,8 @@ void mgl_geom_xfb_log_read_name(void *ctxp, unsigned name, const char *what)
     MGLBufferTrack *t = ctx ? mgl_buffers_track(ctx, buf, false) : NULL;
     uint64_t completed = (b && b->completed_serial) ? b->completed_serial(ctx) : 0;
 
-    fprintf(stderr, "geom: read %-9s buf=%u write_serial=%llu completed=%llu (%s)\n",
-            what, name,
+    fprintf(stderr, "geom: read %-9s name=%u buf=%p ctx=%p write_serial=%llu completed=%llu (%s)\n",
+            what, name, (void *)buf, (void *)ctx,
             (unsigned long long)(t ? t->write_serial : 0),
             (unsigned long long)completed,
             (!t || t->write_serial <= completed) ? "no wait" : "MUST wait");
@@ -3276,6 +3279,7 @@ void mgl_geom_xfb_flush(GLMContext ctx)
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
         fprintf(stderr, "geom:   fold reads TF backing %p\n", b0 ? b0->data.mtl_data : NULL);
     }
+    { extern void geom_xfb_dump(GLMContext ctx); geom_xfb_dump(ctx); }
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
