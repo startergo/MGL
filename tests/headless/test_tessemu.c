@@ -95,6 +95,7 @@ static GLuint prog2(const char *tcs, const char *tes)
         { GL_VERTEX_SHADER, kVs }, { GL_TESS_CONTROL_SHADER, tcs },
         { GL_TESS_EVALUATION_SHADER, tes }, { GL_FRAGMENT_SHADER, kFs } };
     for (int i = 0; i < 4; i++) {
+        if (!srcs[i].s) continue;      /* separable: skip the missing stage (no TCS) */
         GLuint so = glCreateShader(srcs[i].t);
         glShaderSource(so, 1, &srcs[i].s, NULL); glCompileShader(so); glAttachShader(p, so); glDeleteShader(so);
     }
@@ -343,11 +344,258 @@ TEST(TrianglePointModeGpu)
     glDeleteProgram(p);
 }
 
+/* TCS writing a per-patch varying: the value reaches the TES only through the
+ * per-patch data blob (TCS patch-out record -> blob -> TES patchIn), so this is
+ * the pipeline the GPU blob kernel must reproduce byte-exactly. */
+static const char *kTcsPatchVar =
+    "#version 450 core\n"
+    "layout(vertices=2) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "layout(location=1) patch out vec4 p_flag;\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 8.0;\n"
+    "    p_flag = vec4(0.25, 0.50, 0.75, 1.0);\n"
+    "  }\n"
+    "}\n";
+static const char *kTesIsoPatch =
+    "#version 450 core\n"
+    "layout(isolines, equal_spacing) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=1) patch in vec4 p_flag;\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+    "  gl_Position.y = mix(-0.75, 0.75, gl_TessCoord.y);\n"
+    "  f_col = p_flag;\n"
+    "}\n";
+
+/* two-patch variant: the per-patch value depends on the patch's own control points,
+ * so each patch's blob entry must be assembled from the right TCS patch record */
+static const char *kTcsPatchVar2 =
+    "#version 450 core\n"
+    "layout(vertices=2) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "layout(location=1) patch out vec4 p_flag;\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 8.0;\n"
+    "    if (gl_in[0].gl_Position.x < 0.0) p_flag = vec4(1.00, 0.25, 0.25, 1.0);\n"
+    "    else                             p_flag = vec4(0.25, 0.25, 1.00, 1.0);\n"
+    "  }\n"
+    "}\n";
+static const char *kTesIsoPatch2 =
+    "#version 450 core\n"
+    "layout(isolines, equal_spacing) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=1) patch in vec4 p_flag;\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+    "  gl_Position.y = mix(-0.75, 0.75, gl_TessCoord.y);\n"
+    "  f_col = p_flag;\n"
+    "}\n";
+
+/* diagnostics exported by libmgl: CPU-side patch-blob builds and CPU tessellator
+ * runs. The GPU emulated path must not grow either counter across a draw. */
+extern unsigned mgl_tess_cpu_blob_builds(void);
+extern unsigned mgl_tess_cpu_generate_runs(void);
+
+TEST(EmuPatchDataGpu)
+{
+    /* emulated path is forced by the domain: isolines never take the hardware
+     * tessellator, and MGL_TESS_CPU is not set in this process */
+    GLuint p = prog2(kTcsPatchVar, kTesIsoPatch);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (link != GL_TRUE)
+    {
+        char log[2048] = "";
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        printf("EmuPatchDataGpu link log: [%s]\n", log);
+    }
+    glUseProgram(p);
+
+    const float pos[2][4] = { { -0.9f, 0, 0, 1 }, { 0.9f, 0, 0, 1 } };
+    const float col[2][4] = { { 1,0,0,1 }, { 0,1,0,1 } };
+    setup(pos, col, 2, 2);
+
+    unsigned b0 = mgl_tess_cpu_blob_builds(), g0 = mgl_tess_cpu_generate_runs();
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    printf("patch-blob: cpu blob builds %u -> %u, cpu tessellator runs %u -> %u\n",
+           b0, mgl_tess_cpu_blob_builds(), g0, mgl_tess_cpu_generate_runs());
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    unsigned char *px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+    /* 3 isolines at v=(i+0.5)/3 -> window y = h/4, h/2, 3h/4 (lower row on the tie) */
+    int rows[8], nrow = 0;
+    for (int y = 0; y < h; y++)
+    {
+        int cnt = 0;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] + px[(y * w + x) * 4 + 2] > 120) cnt++;
+        if (cnt > w / 4 && nrow < 8) rows[nrow++] = y;
+    }
+    EXPECT_TRUE(nrow == 3);
+    if (nrow == 3)
+    {
+        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        for (int k = 0; k < 3; k++)
+            EXPECT_TRUE(rows[k] >= ey[k] - 2 && rows[k] <= ey[k]);
+
+        /* the whole line carries the per-patch colour (0.25, 0.50, 0.75): constant
+         * along x, unlike the per-vertex red->green of tc_col */
+        int y = rows[1];
+        int sx[3] = { w / 10, w / 2, w * 9 / 10 };
+        for (int k = 0; k < 3; k++)
+        {
+            int r = px[(y * w + sx[k]) * 4], g = px[(y * w + sx[k]) * 4 + 1], b = px[(y * w + sx[k]) * 4 + 2];
+            printf("patch-blob colour at (%d,%d): %d %d %d\n", sx[k], y, r, g, b);
+            EXPECT_TRUE(r > 48 && r < 80);
+            EXPECT_TRUE(g > 112 && g < 144);
+            EXPECT_TRUE(b > 175 && b < 207);
+        }
+    }
+    /* px stays allocated: the two-patch case below reads back into it */
+
+    /* the GPU emulated path must not have built the blob or tessellated on the CPU */
+    EXPECT_TRUE(mgl_tess_cpu_blob_builds() == b0);
+    EXPECT_TRUE(mgl_tess_cpu_generate_runs() == g0);
+
+    /* --- two patches: each patch's blob entry must carry its own per-patch value.
+     * Patch 0 spans the left half (p_flag red-dominant), patch 1 the right half
+     * (blue-dominant): the TCS picks the colour from the patch's own first control
+     * point, so a blob entry indexed with the wrong patch id would mix them up. */
+    p = prog2(kTcsPatchVar2, kTesIsoPatch2);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    const float pos2[4][4] = { { -0.95f, 0, 0, 1 }, { -0.05f, 0, 0, 1 },
+                               {  0.05f, 0, 0, 1 }, {  0.95f, 0, 0, 1 } };
+    const float col2[4][4] = { { 1,0,0,1 }, { 1,0,0,1 }, { 0,0,1,1 }, { 0,0,1,1 } };
+    setup(pos2, col2, 4, 2);
+
+    b0 = mgl_tess_cpu_blob_builds(); g0 = mgl_tess_cpu_generate_runs();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+    {
+        int y = h / 2;                        /* the middle isoline: window y = h/2 */
+        int ry = -1;
+        for (int dy = -2; dy <= 1 && ry < 0; dy++)
+        {
+            int cnt = 0;
+            for (int x = 0; x < w; x++)
+                if (px[((y + dy) * w + x) * 4] + px[((y + dy) * w + x) * 4 + 1] + px[((y + dy) * w + x) * 4 + 2] > 120) cnt++;
+            if (cnt > w / 4) ry = y + dy;
+        }
+        EXPECT_TRUE(ry > 0);
+        if (ry > 0)
+        {
+            int lr = px[(ry * w + w / 4) * 4], lb = px[(ry * w + w / 4) * 4 + 2];
+            int rr = px[(ry * w + (w * 3) / 4) * 4], rb = px[(ry * w + (w * 3) / 4) * 4 + 2];
+            printf("two-patch blob: left rgb=(%d,%d) right rgb=(%d,%d)\n", lr, lb, rr, rb);
+            EXPECT_TRUE(lr > 150 && lb < 100);      /* patch 0: (1, 0.25, 0.25) */
+            EXPECT_TRUE(rr < 100 && rb > 150);      /* patch 1: (0.25, 0.25, 1) */
+        }
+    }
+
+    EXPECT_TRUE(mgl_tess_cpu_blob_builds() == b0);
+    EXPECT_TRUE(mgl_tess_cpu_generate_runs() == g0);
+    glDeleteProgram(p);
+    free(px);
+}
+
+TEST(EmuDefaultLevelsGpu)
+{
+    /* no TCS: the blob's level members come from the glPatchParameterfv defaults
+     * and everything else stays zero; the emulated path still must not touch the
+     * CPU blob or tessellator */
+    GLuint p = prog2(NULL, kTesIso);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    const float pos[2][4] = { { -0.9f, 0, 0, 1 }, { 0.9f, 0, 0, 1 } };
+    const float col[2][4] = { { 1,0,0,1 }, { 0,1,0,1 } };
+    setup(pos, col, 2, 2);
+    glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, (float[4]){ 3, 8, 1, 1 });
+    glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, (float[2]){ 1, 1 });
+
+    unsigned b0 = mgl_tess_cpu_blob_builds(), g0 = mgl_tess_cpu_generate_runs();
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    printf("default-levels: cpu blob builds %u -> %u, cpu tessellator runs %u -> %u\n",
+           b0, mgl_tess_cpu_blob_builds(), g0, mgl_tess_cpu_generate_runs());
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    unsigned char *px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+    int rows[8], nrow = 0;
+    for (int y = 0; y < h; y++)
+    {
+        int cnt = 0;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] > 120) cnt++;
+        if (cnt > w / 4 && nrow < 8) rows[nrow++] = y;
+    }
+    EXPECT_TRUE(nrow == 3);
+    if (nrow == 3)
+    {
+        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        for (int k = 0; k < 3; k++)
+            EXPECT_TRUE(rows[k] >= ey[k] - 2 && rows[k] <= ey[k]);
+
+        /* per-vertex colour interpolation passes through without a TCS */
+        int y = rows[1];
+        int r = px[(y * w + w / 10) * 4], g = px[(y * w + w * 10 / 10 - 1 - w / 10) * 4 + 1];
+        EXPECT_TRUE(r > 180);
+        EXPECT_TRUE(g > 180);
+    }
+    free(px);
+
+    EXPECT_TRUE(mgl_tess_cpu_blob_builds() == b0);
+    EXPECT_TRUE(mgl_tess_cpu_generate_runs() == g0);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(IsolinesGpu);
     RUN(QuadPointModeGpu);
     RUN(TrianglePointModeGpu);
+    RUN(EmuPatchDataGpu);
+    RUN(EmuDefaultLevelsGpu);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

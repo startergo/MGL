@@ -300,4 +300,75 @@ static NSString *kTessKernelSource =
     @"    indirect[4] = 0u;\n"
     @"    (void)p;\n"
     @"}\n"
+    @"\n"
+    @"/* patch-data blob: assemble each patch's TES patch-in record on the GPU, replacing\n"
+    @" * the emulated path's CPU blob build (and the factor read-back stall it needed).\n"
+    @" * One thread per patch: zero the record, fill the tessellation-level members from\n"
+    @" * the half factor record and copy the TCS-written members from the TCS patch output\n"
+    @" * record, using the per-program map built at link time (mgl_tess_build_blob_map). */\n"
+    @"struct MGLTessBlobMap {\n"
+    @"    uint32_t patches;      /* patches of the draw (instances included) */\n"
+    @"    uint32_t tes_stride;   /* bytes per TES patch-in record */\n"
+    @"    uint32_t tcs_stride;   /* bytes per TCS patch output record (0 without a TCS) */\n"
+    @"    uint32_t fhalfs;       /* halfs per factor record: 4 triangles, 6 otherwise */\n"
+    @"    uint32_t triangles;    /* 1: the 4th half is the single inside level */\n"
+    @"    uint32_t n;            /* map entries in use */\n"
+    @"    uint32_t pad[2];\n"
+    @"    uint32_t kind[32];     /* 0: copy size bytes from the TCS record, 1: outer float4, 2: inner float2 */\n"
+    @"    uint32_t dst[32];\n"
+    @"    uint32_t src[32];\n"
+    @"    uint32_t size[32];\n"
+    @"};\n"
+    @"\n"
+    @"kernel void mgl_tess_blob(constant MGLTessBlobMap &m [[buffer(0)]],\n"
+    @"                          device const uchar *tcs [[buffer(1)]],\n"
+    @"                          device const uchar *factors [[buffer(2)]],\n"
+    @"                          device uchar *out [[buffer(3)]],\n"
+    @"                          uint32_t gid [[thread_position_in_grid]])\n"
+    @"{\n"
+    @"    if (gid >= m.patches || m.tes_stride == 0u)\n"
+    @"        return;\n"
+    @"\n"
+    @"    device uchar *dst = out + (size_t)gid * m.tes_stride;\n"
+    @"    for (uint32_t i = 0; i + 4u <= m.tes_stride; i += 4u)\n"
+    @"        *(device uint32_t *)(dst + i) = 0u;\n"
+    @"    for (uint32_t i = m.tes_stride & ~3u; i < m.tes_stride; i++)\n"
+    @"        dst[i] = 0;\n"
+    @"\n"
+    @"    device const uint16_t *f = (device const uint16_t *)(factors + (size_t)gid * m.fhalfs * 2u);\n"
+    @"    float o0 = mgl_half(f[0]);\n"
+    @"    float o1 = mgl_half(f[1]);\n"
+    @"    float o2 = mgl_half(f[2]);\n"
+    @"    float o3 = mgl_half(f[3]);                       /* triangles: the inside level */\n"
+    @"    float i0 = m.triangles ? o3 : mgl_half(f[4]);\n"
+    @"    float i1 = m.triangles ? 0.0f : mgl_half(f[5]);\n"
+    @"    device const uchar *src = tcs + (size_t)gid * m.tcs_stride;\n"
+    @"\n"
+    @"    for (uint32_t e = 0; e < m.n; e++)\n"
+    @"    {\n"
+    @"        device uchar *d = dst + m.dst[e];\n"
+    @"        if (m.kind[e] == 1u)\n"
+    @"            *(device float4 *)d = float4(o0, o1, o2, o3);\n"
+    @"        else if (m.kind[e] == 2u)\n"
+    @"            *(device float2 *)d = float2(i0, i1);\n"
+    @"        else if (m.size[e])\n"
+    @"            for (uint32_t b = 0; b < m.size[e]; b += 4u)\n"
+    @"                *(device uint32_t *)(d + b) = *(device const uint32_t *)(src + m.src[e] + b);\n"
+    @"    }\n"
+    @"}\n"
     @"\n";
+
+/* host-side mirror of the kernel's MGLTessBlobMap (passed with setBytes) */
+struct MGLTessBlobCfg {
+    uint32_t patches;
+    uint32_t tes_stride;
+    uint32_t tcs_stride;
+    uint32_t fhalfs;
+    uint32_t triangles;
+    uint32_t n;
+    uint32_t pad[2];
+    uint32_t kind[32];
+    uint32_t dst[32];
+    uint32_t src[32];
+    uint32_t size[32];
+};
