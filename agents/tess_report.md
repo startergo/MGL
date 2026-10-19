@@ -95,6 +95,67 @@ no emulation is attempted.
 
 ---
 
+# tess — round 13 report (audit: remaining CPU sync points, then removal)
+
+## Step 1 — the audit (state as of 9e0a676, before the fixes)
+
+Greps: `waitUntilCompleted|waitUntilScheduled|waitUntilSignaled`,
+`.contents`, and per-draw CPU loops over vertices/patches in
+`tessellation.c` and `MGLRenderer+Tessellation.m`.
+
+### GPU-wait sites (`waitUntilCompleted`)
+
+| site | path | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:931` | index scan (`scb`) for indexed GL_PATCHES draws: the VS grid and the ring layout need `minv/maxv/restart-count` on the CPU | **YES — every indexed patch draw waits once** |
+| `MGLRenderer+Tessellation.m:1255` | `cpu_reference \|\| debug_wait` (MGL_TESS_CPU / MGL_TESS_DEBUG) | no |
+| `MGLRenderer+Tessellation.m:1322-1334` | `tTrace()` dump in the hardware `drawPatches` block | no |
+| `MGLRenderer+Tessellation.m:1497` | `tTrace()` dump in the emulated render block | no |
+
+### `.contents` reads of GPU-written results
+
+| site | what | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:933-935` | `scanout[0..2]` — the scan kernel's min/max/restart count | **YES — indexed patch draws** (paired with :931) |
+| `MGLRenderer+Tessellation.m:1326-1332` | trace dump of cp/factors | no (tTrace) |
+| `MGLRenderer+Tessessment+Tessellation.m:1498-1502` | trace dump of tcs_patch/blob/factors/coords | no (tTrace) |
+| `MGLRenderer+Tessellation.m:1550,1563` | CPU reference path: factor read-back + patch records | no (MGL_TESS_CPU / GPU-tessellator fallback) |
+
+CPU→GPU **writes** through `.contents` (no GPU dependency, not read-backs;
+listed for completeness): :917 scanbuf init, :981 widened index upload,
+:1193-1195 no-TCS half factors, :1386 emulated kernel params,
+:1621-1623 CPU-path uploads, :1745/:1838 attribute shadow uploads.
+
+### Per-draw CPU loops over vertices/patches (outside MGL_TESS_CPU)
+
+| site | what | default? |
+|---|---|---|
+| `MGLRenderer+Tessellation.m:943` `tessReadIndicesInto` | reads the element buffer on the CPU and loops over `count` indices (drops restarts) | **YES when the range contains primitive-restart values** |
+| `MGLRenderer+Tessellation.m:980-981` | widened gapless index list: loop over `tess_idx_used × instances` | same restart case |
+| `MGLRenderer+Tessellation.m:1190-1196` | no-TCS half-factor fill: writes `total_patches × 6` constants | yes, but a pure CPU→GPU constant write (no GPU dependency, 12 B/patch); a kernel dispatch would cost more — kept |
+| `tessellation.c:1475` `mgl_tess_note_counts` | arithmetic-only loop over `total_patches` for query bookkeeping on TCS-less GPU draws | yes; no memory traffic, O(patches) — kept (GL needs the counts; the alternative is GPU query counters) |
+
+Also found while auditing: the scan path allocates a fresh 16-byte
+`MTLBuffer` **per indexed draw** (:914).
+
+## Step 2 — removals
+
+* **commit `A`** — the index-scan stall and per-draw scan-buffer allocation
+  are gone for repeat draws: the scan results (and, for restart ranges, the
+  gapless widened list as an `MTLBuffer`) are cached in
+  `MGLExtState_tess`, keyed on (context, element buffer object, its
+  **gpuaudit content serial** `mgl_gpuaudit_invalidate` bumps on every
+  CPU-visible modification, mtl_data pointer, size, offset, count, index
+  type, base vertex, restart value/enabled). A hit skips the scan kernel,
+  the wait, the buffer allocation — and for restart ranges the CPU index
+  loop entirely (the gather kernel binds the cached widened buffer). A miss
+  runs the old path once and populates the cache. Proven by
+  `mgl_tess_scan_waits()` / `mgl_tess_cpu_index_reads()`: the new
+  `IndexedNoRescan` test draws the same range repeatedly and asserts the
+  counters move exactly once.
+
+---
+
 # tess — round 12 report (emulated path: GPU patch-blob assembly)
 
 Commits (one per step), after merging `gl46-port` (66de6c9):
