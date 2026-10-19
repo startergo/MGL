@@ -1409,7 +1409,10 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         return;
     }
     if (p->shader_slots[_TESS_EVALUATION_SHADER]) {
-        xfb_fail(xp, "transform feedback from tessellation stages is not supported", NULL, NULL);
+        /* geom: the TES is the last pre-rasterization stage here, and the tess domain's
+         * output capture is the recorded stream - the geometry domain resolves the varyings
+         * against the TES outputs and packs the capture after the draw */
+        mgl_geom_tess_xfb_link(ctx, p);
         return;
     }
     xfb_link(ctx, xp, vs->src, true);

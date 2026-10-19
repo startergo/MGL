@@ -77,7 +77,27 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
-static id<MTLComputePipelineState> gPrepPso, gTessImportPso;static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
+/* the trace / behaviour switches are read once: this file sits on the draw path and
+ * getenv() per draw (several times per draw) is not free */
+static struct {
+    int  read;
+    bool draw, debug, xfb, worst_case, dump;
+} gEnv = { 0, false, false, false, false, false };
+
+static void geomEnvRead(void)
+{
+    if (gEnv.read) return;
+    gEnv.read = 1;
+    gEnv.draw = (geomEnvRead(), gEnv.draw) != NULL;
+    gEnv.debug = (geomEnvRead(), gEnv.debug) != NULL;
+    gEnv.xfb = (geomEnvRead(), gEnv.xfb) != NULL;
+    gEnv.worst_case = (geomEnvRead(), gEnv.worst_case) != NULL;
+    gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
+}
+
+static id<MTLComputePipelineState> gPrepPso, gTessImportPso;
+static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
+static id<MTLComputePipelineState> gXfbTessPso, gXfbTessFinPso;
 static id<MTLComputePipelineState> gFinPso;
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
@@ -414,7 +434,9 @@ static const char *kGeomXfbMSL =
     "}\n"
     "\n"
     "/* initialise the counter block on the command stream: the CPU must never write it while\n"
-    " * a pack may be in flight.  in[0] = object name, in[1..4] = the starting write offsets */\n"
+    " * a pack may be in flight.  in[0] = object name, in[1..4] = the starting write offsets.\n"
+    " * xfb[8] (the per-draw vertex counter) is cleared here as well: the geometry path's\n"
+    " * prefix kernel does it, the tessellation path has no prefix kernel. */\n"
     "kernel void mgl_geom_xfb_begin(constant uint* in [[buffer(0)]], device uint* xfb [[buffer(1)]])\n"
     "{\n"
     "    xfb[0] = in[0];\n"
@@ -425,7 +447,51 @@ static const char *kGeomXfbMSL =
     "    xfb[5] = in[3];\n"
     "    xfb[6] = in[4];\n"
     "    xfb[7] = 0u;\n"
+    "    xfb[8] = 0u;\n"
+    "}\n"
+    "\n"
+    "/* transform feedback from a tessellation stage WITHOUT a geometry shader: the TES is\n"
+    " * the last pre-rasterization stage, so the captured records are exactly the vertices GL\n"
+    " * records, in capture order and all on stream 0.  One thread per record, no prefix sums.\n"
+    " * in: [0]=record capacity, [1]=words per capture record, [2]=nvars, [3..6]=buffer\n"
+    " * strides, [8..11]=buffer sizes, [12]=captured vertices per primitive */\n"
+    "kernel void mgl_geom_xfb_tess(constant uint* in [[buffer(0)]],\n"
+    "                              constant mgl_geom_xfb_var* vars [[buffer(1)]],\n"
+    "                              const device uint* recs [[buffer(2)]],\n"
+    "                              const device uint* counts [[buffer(3)]],\n"
+    "                              device uint* xfb [[buffer(4)]],\n"
+    "                              device uint* dst0 [[buffer(5)]],\n"
+    "                              device uint* dst1 [[buffer(6)]],\n"
+    "                              device uint* dst2 [[buffer(7)]],\n"
+    "                              device uint* dst3 [[buffer(8)]],\n"
+    "                              uint t [[thread_position_in_grid]])\n"
+    "{\n"
+    "    device uint* dst[4];\n"
+    "    dst[0] = dst0; dst[1] = dst1; dst[2] = dst2; dst[3] = dst3;\n"
+    "    uint nvars = in[2];\n"
+    "    if (t >= in[0] || t >= counts[0]) return;\n"
+    "    const device uint* rec = recs + (size_t)t * in[1];\n"
+    "    for (uint v = 0u; v < nvars; v++) {\n"
+    "        constant mgl_geom_xfb_var& vr = vars[v];\n"
+    "        device uint* d = dst[vr.buffer];\n"
+    "        uint stride = in[3 + vr.buffer];\n"
+    "        if (!stride || !vr.words) continue;\n"
+    "        uint pos = xfb[3 + vr.buffer] + t * stride + vr.dst_off;\n"
+    "        if (pos + vr.words * 4u > in[8 + vr.buffer]) continue;   /* full: drop, as GL does */\n"
+    "        for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rec[vr.src_word + w];\n"
+    "    }\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], 1u, memory_order_relaxed);\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], 1u, memory_order_relaxed);\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_xfb_tess_finish(constant uint* in [[buffer(0)]], device uint* xfb [[buffer(1)]])\n"
+    "{\n"
+    "    for (uint b = 0u; b < 4u; b++)\n"
+    "        if (in[4 + b]) xfb[3 + b] += xfb[8] * in[4 + b];\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], in[12] ? xfb[8] / in[12] : xfb[8],\n"
+    "                              memory_order_relaxed);\n"
     "}\n";
+
 
 /* the counters + indirect arguments live in one buffer; two tiny program-independent
  * kernels manage them (zeroing before the geometry kernel, filling the draw arguments
@@ -507,31 +573,8 @@ static bool geomCtlPipelines(id<MTLDevice> device)
         }
     }
 
-    /* the transform feedback pack kernels */
-    id<MTLLibrary> xlib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomXfbMSL]
-                                               options: nil error: &error];
-    if (!xlib)
-    {
-        NSLog(@"MGL geom: xfb pack library failed: %@", error);
-        return false;
-    }
-    id<MTLFunction> pref = [xlib newFunctionWithName: @"mgl_geom_xfb_prefix"];
-    id<MTLFunction> scf = [xlib newFunctionWithName: @"mgl_geom_xfb_scatter"];
-    id<MTLFunction> finf = [xlib newFunctionWithName: @"mgl_geom_xfb_finish"];
-    id<MTLFunction> begf = [xlib newFunctionWithName: @"mgl_geom_xfb_begin"];
-    if (!pref || !scf || !finf || !begf) return false;
-    gXfbPrePso = [device newComputePipelineStateWithFunction: pref error: &error];
-    gXfbScatterPso = [device newComputePipelineStateWithFunction: scf error: &error];
-    gXfbFinPso = [device newComputePipelineStateWithFunction: finf error: &error];
-    gXfbBeginPso = [device newComputePipelineStateWithFunction: begf error: &error];
-    if (!gXfbPrePso || !gXfbScatterPso || !gXfbFinPso || !gXfbBeginPso)
-    {
-        NSLog(@"MGL geom: xfb pack pipeline failed: %@", error);
-        return false;
-    }
     return true;
 }
-
 
 
 static id<MTLBuffer> geomBuffer(id<MTLDevice> device, id<MTLBuffer> old, size_t bytes, size_t *cap)
@@ -552,6 +595,7 @@ static void geomReleaseStatics(void)
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gTessImportPso = nil;
     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
+    gXfbTessPso = nil; gXfbTessFinPso = nil;
 
     if (gPsoKey) { CFRelease(gPsoKey); gPsoKey = NULL; }
     gPrimBytes = gVsoutBytes = gOutvBytes = gIdxBytes = 0;
@@ -578,7 +622,7 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 {
     id<MTLCommandBuffer> cb = gXfbCb;
 
-    if (getenv("MGL_GEOM_XFB_TRACE") && cb)
+    if ((geomEnvRead(), gEnv.xfb) && cb)
         fprintf(stderr, "geom: wait cb=%p cur=%p status=%ld dvert=%u woff=%u\n",
                 (void *)(__bridge void *)cb, (void *)(__bridge void *)_currentCommandBuffer,
                 (long)cb.status, ((uint32_t *)gXfb.contents)[1], ((uint32_t *)gXfb.contents)[3]);
@@ -617,6 +661,120 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     return buf->data.mtl_data != NULL;
 }
 
+/* encode the tess-source transform feedback pack (no geometry shader: the TES records are
+ * captured as they are, one thread per record - see mgl_ext_geom_xfb.h) */
+- (bool) geomXfbTessEncode: (MGLXfbObject *) o program: (MGLXfbProgram *) xp
+                        tfb: (BufferBaseTarget *) tfb src: (const MGLGeomTessXfbSource *) src
+{
+    uint32_t in[MGL_GEOM_XFB_IN_WORDS];
+    uint32_t vars[MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS];
+    id<MTLComputeCommandEncoder> enc;
+    id<MTLBuffer> ring = (__bridge id<MTLBuffer>)src->ring;
+    NSUInteger wg = MGL_GEOM_XFB_WG;
+
+    if (!ring) return false;
+    if (!gXfbTessPso && ![self geomXfbPipelines]) return false;
+    if (!gXfbTessPso) return false;
+
+    gXfb = geomBuffer(_device, gXfb, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t), NULL);
+    if (!gXfb) { geomReleaseStatics(); return false; }
+
+    if (!gXfbPending || gXfbOwner != o->name)
+    {
+        if (gXfbPending) return false;       /* another object: the caller flushes first */
+        gXfbOwner = o->name;
+        gXfbBegin = true;
+    }
+
+    memset(in, 0, sizeof in);
+    in[0] = src->capacity;                 /* the dispatch bound, clamped again in the kernel */
+    in[1] = src->stride;                   /* words per capture record */
+    in[2] = (uint32_t)xp->count;
+    for (GLuint b = 0; b < 4; b++)
+    {
+        in[3 + b] = (uint32_t)xp->stride[b];
+        in[8 + b] = (uint32_t)(tfb[b].buf ? tfb[b].buf->data.buffer_size : 0);
+    }
+    in[12] = src->per_prim;                /* captured vertices per primitive */
+
+    memset(vars, 0, sizeof vars);
+    for (GLuint v = 0; v < xp->count && v < MGL_GEOM_XFB_MAX_VARS; v++)
+    {
+        vars[v * 4 + 0] = (uint32_t)xp->vars[v].src_word;   /* the capture record's word offset */
+        vars[v * 4 + 1] = (uint32_t)xp->vars[v].offset;
+        vars[v * 4 + 2] = (uint32_t)xp->vars[v].words;
+        vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
+    }
+
+    if (!gXfbFence) gXfbFence = [_device newFence];
+
+    /* the tessellated draw leaves its render encoder open (the next GL command would reuse
+     * it): end it before this command buffer gets a compute encoder */
+    [self endRenderEncoding];
+    enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc) return false;
+    [enc pushDebugGroup: @"MGL geometry xfb tess pack"];
+
+    if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+        [enc waitForFence: gXfbFence];
+
+    if (gXfbBegin)
+    {
+        uint32_t seed[MGL_GEOM_XFB_IN_WORDS];
+        memset(seed, 0, sizeof seed);
+        seed[0] = o->name;
+        for (GLuint b = 0; b < 4; b++) seed[1 + b] = (uint32_t)o->write_offset[b];
+        [enc setComputePipelineState: gXfbBeginPso];
+        [enc setBytes: seed length: sizeof seed atIndex: 0];
+        [enc setBuffer: gXfb offset: 0 atIndex: 1];
+        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
+            [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+        gXfbBegin = false;
+    }
+
+    [enc setComputePipelineState: gXfbTessPso];
+    [enc setBytes: in length: sizeof in atIndex: 0];
+    [enc setBytes: vars length: (NSUInteger)(xp->count < MGL_GEOM_XFB_MAX_VARS ? xp->count : MGL_GEOM_XFB_MAX_VARS)
+                    * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
+    [enc setBuffer: ring offset: src->records atIndex: 2];
+    [enc setBuffer: ring offset: src->counts atIndex: 3];
+    [enc setBuffer: gXfb offset: 0 atIndex: 4];
+    for (GLuint b = 0; b < 4; b++)
+    {
+        id<MTLBuffer> mtl = (tfb[b].buf && tfb[b].buf->data.mtl_data)
+                            ? (__bridge id<MTLBuffer>)tfb[b].buf->data.mtl_data : gXfb;
+        [enc setBuffer: mtl offset: 0 atIndex: 5 + b];
+    }
+    [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)(src->capacity + wg - 1) / wg, 1, 1)
+          threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+
+    [enc setComputePipelineState: gXfbTessFinPso];
+    [enc setBytes: in length: sizeof in atIndex: 0];
+    [enc setBuffer: gXfb offset: 0 atIndex: 1];
+    [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+    BUF()->current_serial(ctx);
+    for (GLuint b = 0; b < 4; b++)
+        if (tfb[b].buf)
+            mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+
+    [enc updateFence: gXfbFence];
+    gXfbFenceCb = _currentCommandBuffer;
+
+    [enc popDebugGroup];
+    [enc endEncoding];
+
+    gXfbPending = true;
+    gXfbCb = _currentCommandBuffer;
+
+    if ((geomEnvRead(), gEnv.xfb))
+        fprintf(stderr, "geom: tess pack encoded (cap=%u stride=%u nvars=%u per_prim=%u)\n",
+                src->capacity, src->stride, xp->count, src->per_prim);
+
+    return true;
+}
+
 /* encode the three pack kernels for one draw (see mgl_ext_geom_xfb.h) */
 - (bool) geomXfbEncode: (MGLGeomProgram *) gp object: (MGLXfbObject *) o program: (MGLXfbProgram *) xp
                    tfb: (BufferBaseTarget *) tfb threads: (uint32_t) threads
@@ -629,7 +787,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     id<MTLComputeCommandEncoder> enc;
     NSUInteger wg = MGL_GEOM_XFB_WG;
 
-    if (!gXfbScatterPso) return false;
+    if (!gXfbScatterPso && ![self geomXfbPipelines]) return false;
     (void)gp;
 
     gXfb = geomBuffer(_device, gXfb, MGL_GEOM_XFB_BLOCK_WORDS * sizeof(uint32_t), NULL);
@@ -714,7 +872,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setComputePipelineState: gXfbScatterPso];
     [enc setBytes: in length: sizeof in atIndex: 0];
     [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
-    if (getenv("MGL_GEOM_XFB_TRACE"))
+    if ((geomEnvRead(), gEnv.xfb))
         fprintf(stderr, "geom: scatter reads out buf=%p off=%zu\n",
                 (void *)(__bridge void *)gOutv, gOutvOff);
     [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
@@ -747,7 +905,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     for (GLuint b = 0; b < 4; b++)
         if (tfb[b].buf)
         {
-            if (getenv("MGL_GEOM_XFB_TRACE"))
+            if ((geomEnvRead(), gEnv.xfb))
                 fprintf(stderr, "geom: pack stamp buf=%p name=%u ctx=%p slot=%u\n",
                         (void *)tfb[b].buf, tfb[b].buf->name, (void *)ctx, b);
             mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
@@ -757,7 +915,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                         tfb[b].buf->name,
                         (unsigned long long)(t ? t->write_serial : 12345), (void *)t);
             }
-            if (getenv("MGL_GEOM_XFB_TRACE"))
+            if ((geomEnvRead(), gEnv.xfb))
                 fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
                         tfb[b].buf->data.mtl_data,
                         (unsigned long long)BUF()->current_serial(ctx),
@@ -781,7 +939,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         if (getenv("MGL_GEOM_WAIT")) BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
     }
 
-    if (getenv("MGL_GEOM_XFB_TRACE"))
+    if ((geomEnvRead(), gEnv.xfb))
     {
         /* commit + wait, then dump the transform feedback buffer, the counter block and this
          * draw's counts / prefix output: bisects "never written" vs "written then clobbered" */
@@ -811,7 +969,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         for (i = 0; i < 12; i++) fprintf(stderr, " %5.2f", tf ? tf[i] : -9.0f);
         fprintf(stderr, "\n");
     }
-    if (getenv("MGL_GEOM_DEBUG"))
+    if ((geomEnvRead(), gEnv.debug))
         fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     return true;
 }
@@ -823,6 +981,15 @@ bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MG
     MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
     return [r geomXfbEncode: gp object: o program: xp tfb: tfb threads: threads
                 maxVertices: max_vertices outWords: out_words vertexCap: vertex_cap];
+}
+
+/* the tess-source variant: one thread per captured record (a tessellation stage without a
+ * geometry shader records the TES output as it is) */
+bool geom_xfb_tess_encode(GLMContext ctx, MGLXfbObject *o, MGLXfbProgram *xp,
+                          BufferBaseTarget *tfb, const MGLGeomTessXfbSource *src)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+    return [r geomXfbTessEncode: o program: xp tfb: tfb src: src];
 }
 
 /* the serial of the command buffer that last wrote the counter block */
@@ -838,7 +1005,7 @@ void geom_xfb_gpu_wait(GLMContext ctx)
 /* read the pending counters (the caller has synchronised) */
 void geom_xfb_dump(GLMContext ctx)
 {
-    if (!getenv("MGL_GEOM_XFB_TRACE") || !gOutv) return;
+    if (!(geomEnvRead(), gEnv.xfb) || !gOutv) return;
     fprintf(stderr, "geom: out records @%zu:", gOutvOff / 4);
     for (int i = 0; i < 6 * 2; i++)
     {
@@ -850,7 +1017,7 @@ void geom_xfb_dump(GLMContext ctx)
 
 void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim)
 {
-    if (getenv("MGL_GEOM_DEBUG") && gXfb)
+    if ((geomEnvRead(), gEnv.debug) && gXfb)
     {
         uint32_t *d = (uint32_t *)gXfb.contents;
         uint32_t *c = (uint32_t *)(gCnt ? gCnt.contents : NULL);
@@ -899,6 +1066,40 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 }
 
 /* ---- compute pipelines of the geometry kernel ---- */
+
+/* the transform feedback pack kernels are program independent: built once, on demand (the
+ * geometry path builds them with the geometry kernel, the tessellation path has no geometry
+ * program, so it asks for them directly) */
+- (bool) geomXfbPipelines
+{
+    NSError *error = nil;
+    id<MTLLibrary> xlib = [_device newLibraryWithSource: [NSString stringWithUTF8String: kGeomXfbMSL]
+                                               options: nil error: &error];
+    if (!xlib)
+    {
+        NSLog(@"MGL geom: xfb pack library failed: %@", error);
+        return false;
+    }
+    id<MTLFunction> pref = [xlib newFunctionWithName: @"mgl_geom_xfb_prefix"];
+    id<MTLFunction> scf = [xlib newFunctionWithName: @"mgl_geom_xfb_scatter"];
+    id<MTLFunction> finf = [xlib newFunctionWithName: @"mgl_geom_xfb_finish"];
+    id<MTLFunction> begf = [xlib newFunctionWithName: @"mgl_geom_xfb_begin"];
+    id<MTLFunction> tessf = [xlib newFunctionWithName: @"mgl_geom_xfb_tess"];
+    id<MTLFunction> tessff = [xlib newFunctionWithName: @"mgl_geom_xfb_tess_finish"];
+    if (!pref || !scf || !finf || !begf || !tessf || !tessff) return false;
+    gXfbPrePso = [_device newComputePipelineStateWithFunction: pref error: &error];
+    gXfbScatterPso = [_device newComputePipelineStateWithFunction: scf error: &error];
+    gXfbFinPso = [_device newComputePipelineStateWithFunction: finf error: &error];
+    gXfbBeginPso = [_device newComputePipelineStateWithFunction: begf error: &error];
+    gXfbTessPso = [_device newComputePipelineStateWithFunction: tessf error: &error];
+    gXfbTessFinPso = [_device newComputePipelineStateWithFunction: tessff error: &error];
+    if (!gXfbPrePso || !gXfbScatterPso || !gXfbFinPso || !gXfbBeginPso || !gXfbTessPso || !gXfbTessFinPso)
+    {
+        NSLog(@"MGL geom: xfb pack pipeline failed: %@", error);
+        return false;
+    }
+    return true;
+}
 
 - (bool) geomPipelines: (MGLGeomProgram *) gp program: (Program *) program
 {
@@ -1100,7 +1301,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     size_t want = (pool->buf ? pool->buf.length * 2 : 0);
     if (want < need * 2) want = need * 2;
     while (sz < want) sz *= 2;
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace pool %p grow need=%zu old=%zu -> %zu\n",
                 (void *)pool, need, (size_t)(pool->buf ? pool->buf.length : 0), sz);
     pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
@@ -1111,7 +1312,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace geomDraw enter tess=%d gp=%p\n", d->tess_ring != NULL, (void *)d->gp);
     MGLGeomProgram *gp = d->gp;    Program *program = d->program;
     const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
@@ -1142,7 +1343,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
         return false;                       /* nothing to do */
 
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace geomDraw gp=%p linked=%d mode=%u first=%u count=%u inst=%u\n",
                 (void *)gp, (int)gp->linked, d->mode, d->first, d->count, d->instances);
 
@@ -1201,7 +1402,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace sizing bound=%u outv_cap=%zu idx_cap=%zu cap_idx=%zu cap_prim=%zu "
                         "prim_bytes=%zu vsout_bytes=%zu threads=%llu in_words=%u out_words=%u maxverts=%u\n",
                 (unsigned)bound, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
@@ -1328,7 +1529,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         [_currentCommandBuffer enqueue];
     }
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    if ((geomEnvRead(), gEnv.debug))
         fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
     if (from_tess)
@@ -1369,7 +1570,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
         [enc popDebugGroup];
         kenc = enc;                       /* still open: the geometry kernel joins it */
-        if (getenv("MGL_GEOM_TRACE_DRAW"))
+        if ((geomEnvRead(), gEnv.draw))
             fprintf(stderr, "geom: trace tess import encoded (reccap=%u idxcap=%u stride=%u)\n",
                     bound, d->tess_idx_cap, d->tess_stride);
     }
@@ -1543,7 +1744,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         ctx->state.dirty_bits |= DIRTY_VAO | DIRTY_PROGRAM | DIRTY_STATE;
     }
 
-    if (getenv("MGL_GEOM_XFB_TRACE") && gp->in_words)
+    if ((geomEnvRead(), gEnv.xfb) && gp->in_words)
     {
         uint32_t *vs = (uint32_t *)((uint8_t *)gVsout.contents + gVsoutOff);
         int nw = gp->in_words > 6 ? 6 : gp->in_words;
@@ -1578,7 +1779,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
                atIndex: MGL_GEOM_MSL_PRIM];
         [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
         [enc setBuffer: gPrim offset: gPrimOff atIndex: MGL_GEOM_MSL_HDR];
-        if (getenv("MGL_GEOM_XFB_TRACE"))
+        if ((geomEnvRead(), gEnv.xfb))
             fprintf(stderr, "geom: GS writes out buf=%p off=%zu (cap %zu)\n",
                     (void *)(__bridge void *)gOutv, gOutvOff, (size_t)gOutv.length);
         [enc setBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_OUTV];
@@ -1601,7 +1802,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
                   threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
             [enc setComputePipelineState: gGsPso];
-            if (gpu_assembly && !getenv("MGL_GEOM_WORST_CASE_DISPATCH"))
+            if (gpu_assembly && !(geomEnvRead(), gEnv.worst_case))
             {
                 /* the prep kernel computed the exact threadgroup count */
                 [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
@@ -1644,9 +1845,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         }
     }
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    if ((geomEnvRead(), gEnv.debug))
         fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if ((geomEnvRead(), gEnv.draw))
     {
         /* diagnostic only: wait for this draw's kernels, then dump the assembly header, the
          * indirect draw arguments, the capture index list, the prep block and the first
@@ -1757,7 +1958,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
         [_currentRenderEncoder setVertexBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_DRAW];
 
-        if (getenv("MGL_GEOM_TRACE_DRAW"))
+        if ((geomEnvRead(), gEnv.draw))
         {
             uint32_t *cp = (uint32_t *)gCtl.contents;
             fprintf(stderr, "geom: trace raster prim=%d args=%u %u %u %u %u idx=%u %u %u\n",

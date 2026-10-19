@@ -1398,6 +1398,22 @@ static char *strip_version(const char *src)
 }
 
 /* dump helper (MGL_GEOM_DUMP=<dir>): writes the generated shaders for inspection */
+/* the trace / behaviour switches are read once (this file is on the draw path) */
+static struct { int read; bool draw, xfb, cpu_xfb, cpu_assembly; } gEnv = { 0, false, false, false, false };
+
+static bool geom_env(int which)
+{
+    if (!gEnv.read)
+    {
+        gEnv.read = 1;
+        gEnv.draw = getenv("MGL_GEOM_TRACE_DRAW") != NULL;
+        gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
+        gEnv.cpu_xfb = getenv("MGL_GEOM_CPU_XFB") != NULL;
+        gEnv.cpu_assembly = getenv("MGL_GEOM_CPU_ASSEMBLY") != NULL;
+    }
+    return which == 0 ? gEnv.draw : which == 1 ? gEnv.xfb : which == 2 ? gEnv.cpu_xfb : gEnv.cpu_assembly;
+}
+
 static void geom_dump(const char *tag, const char *text)
 {
     static int seq;
@@ -2846,7 +2862,7 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     ctx->state.dirty_bits |= DIRTY_PROGRAM;
 
     c = mgl_tess_get_capture(ctx);
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if (geom_env(0))
         fprintf(stderr, "geom: trace tess capture c=%p valid=%d prim=%u want=%u members=%d\n",
                 (const void *)c, c ? (int)c->valid : -1, c ? c->prim : 0u, want, c ? c->members : -1);
     if (!c || !c->valid || !c->buffer_object || !c->buffer)
@@ -2937,7 +2953,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     gp = mgl_geom_current(ctx);
     if (!gp) return;
 
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    if (geom_env(0))
         fprintf(stderr, "geom: trace route mode=%u indexed=%d first=%u count=%u inst=%u gp=%p linked=%d\n",
                 mode, (int)indexed, first, count, instances, (void *)gp, (int)gp->linked);
 
@@ -2997,7 +3013,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
 
     /* the primitive assembly runs on the GPU whenever the element buffer is device-visible
      * and nothing forces the CPU path */
-    if (!getenv("MGL_GEOM_CPU_ASSEMBLY") &&
+    if (!geom_env(3) &&
         METAL()->can_assemble_gpu && METAL()->can_assemble_gpu(ctx) &&
         geom_route_gpu(ctx, gp, &d))
         return;
@@ -3315,16 +3331,20 @@ static GLenum geom_var_type(const MGLGeomVar *v)
 
 /* resolve the transform feedback varyings of a program with a geometry stage against the
  * geometry stage's outputs (called from the xfb domain's post-link hook) */
-void mgl_geom_xfb_link(GLMContext ctx, Program *program)
+/* resolve the transform feedback varyings of one program against the outputs of its LAST
+ * pre-rasterization stage: the geometry stage's out table, or (without a geometry shader)
+ * the tessellation evaluation stage's SPIR-V.  The GL layout rules (gl_NextBuffer /
+ * gl_SkipComponents, interleaved vs separate) are applied to the caller's pending list. */
+static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
+                             const MGLGeomVar *vars, int nvars,
+                             GLuint pos_word, GLuint psize_word,
+                             const char *stage)
 {
-    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
-    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
-
-    if (!gp || !xp) return;
+    GLuint buffer = 0, offset = 0;
+    MGLXfbVarying *v;
 
     geom_xfb_reset(ctx, xp);
     xp->mode = xp->pending_mode;
-
     if (!xp->pending_count)
         return;                     /* nothing captured for this program */
 
@@ -3332,102 +3352,140 @@ void mgl_geom_xfb_link(GLMContext ctx, Program *program)
     if (!xp->vars) return;
     xp->count = xp->pending_count;
 
+    for (GLsizei i = 0; i < xp->pending_count; i++)
     {
-        GLuint buffer = 0, offset = 0;
-        MGLXfbVarying *v;
+        const char *name = xp->pending[i];
+        v = &xp->vars[i];
+        v->name = xstrdup(name);
+        xp->max_name_length = (GLuint)(strlen(name) + 1 > (size_t)xp->max_name_length ?
+                                        strlen(name) + 1 : (size_t)xp->max_name_length);
 
-        for (GLsizei i = 0; i < xp->pending_count; i++)
+        if (!strcmp(name, "gl_NextBuffer"))
         {
-            const char *name = xp->pending[i];
-            v = &xp->vars[i];
-            v->name = xstrdup(name);
-            xp->max_name_length = (GLuint)(strlen(name) + 1 > (size_t)xp->max_name_length ?
-                                            strlen(name) + 1 : (size_t)xp->max_name_length);
-
-            if (!strcmp(name, "gl_NextBuffer"))
-            {
-                v->type = GL_NONE;
-                v->size = 0;
-                xp->stride[buffer] = offset;
-                buffer++;
-                offset = 0;
-                if (buffer >= MGL_XFB_MAX_BUFFERS) { xp->link_failed = true; return; }
-                continue;
-            }
-            if (!strncmp(name, "gl_SkipComponents", 17))
-            {
-                GLuint n = (GLuint)atoi(name + 17);
-                v->type = GL_NONE;
-                v->size = (GLint)n;
-                v->words = n;
-                offset += n * 4;
-                continue;
-            }
-
-            /* builtins */
-            if (!strcmp(name, "gl_Position"))
-            {
-                v->type = GL_FLOAT_VEC4;
-                v->comp_kind = GL_FLOAT;
-                v->rows = 4;
-                v->columns = 1;
-                v->comp_per_elem = 1;
-                v->words = 4;
-                v->src_word = gp->out_pos_off;
-                v->buffer = buffer;
-                v->offset = offset;
-                offset += 16;
-                xp->buffer_mask |= (1u << buffer);
-                continue;
-            }
-            if (!strcmp(name, "gl_PointSize"))
-            {
-                v->type = GL_FLOAT;
-                v->comp_kind = GL_FLOAT;
-                v->rows = 1;
-                v->columns = 1;
-                v->comp_per_elem = 1;
-                v->words = 1;
-                v->src_word = gp->out_psize_off;
-                v->buffer = buffer;
-                v->offset = offset;
-                offset += 4;
-                xp->buffer_mask |= (1u << buffer);
-                continue;
-            }
-
-            /* user output of the geometry stage */
-            int j = -1;
-            for (int k = 0; k < gp->n_out; k++)
-                if (!strcmp(gp->out_v[k].name, name)) { j = k; break; }
-            if (j < 0)
-            {
-                char *log = NULL;
-                mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
-                                          "geometry stage\n", name);
-                free(xp->link_log);
-                xp->link_log = log;
-                xp->link_failed = true;
-                return;
-            }
-
-            const MGLGeomVar *g = &gp->out_v[j];
-            v->type = geom_var_type(g);
-            v->comp_kind = g->base == GL_INT ? GL_INT : g->base == GL_UNSIGNED_INT ? GL_UNSIGNED_INT : GL_FLOAT;
-            v->rows = g->rows;
-            v->columns = g->cols;
-            v->comp_per_elem = g->cols * g->rows * base_words(g->base);
-            v->size = (GLint)g->elems;
-            v->words = g->words;
-            v->src_word = g->offset;
-            v->buffer = buffer;
-            v->offset = offset;
-            offset += v->words * 4;
-            xp->buffer_mask |= (1u << buffer);
+            v->type = GL_NONE;
+            v->size = 0;
+            xp->stride[buffer] = offset;
+            buffer++;
+            offset = 0;
+            if (buffer >= MGL_XFB_MAX_BUFFERS) { xp->link_failed = true; return; }
+            continue;
+        }
+        if (!strncmp(name, "gl_SkipComponents", 17))
+        {
+            GLuint n = (GLuint)atoi(name + 17);
+            v->type = GL_NONE;
+            v->size = (GLint)n;
+            v->words = n;
+            offset += n * 4;
+            continue;
         }
 
-        xp->stride[buffer] = offset;
+        /* builtins */
+        if (!strcmp(name, "gl_Position"))
+        {
+            v->type = GL_FLOAT_VEC4;
+            v->comp_kind = GL_FLOAT;
+            v->rows = 4;
+            v->columns = 1;
+            v->comp_per_elem = 1;
+            v->words = 4;
+            v->src_word = pos_word;
+            v->buffer = buffer;
+            v->offset = offset;
+            offset += 16;
+            xp->buffer_mask |= (1u << buffer);
+            continue;
+        }
+        if (!strcmp(name, "gl_PointSize"))
+        {
+            v->type = GL_FLOAT;
+            v->comp_kind = GL_FLOAT;
+            v->rows = 1;
+            v->columns = 1;
+            v->comp_per_elem = 1;
+            v->words = 1;
+            v->src_word = psize_word;
+            v->buffer = buffer;
+            v->offset = offset;
+            offset += 4;
+            xp->buffer_mask |= (1u << buffer);
+            continue;
+        }
+
+        /* a user output of the stage */
+        int j = -1;
+        for (int k = 0; k < nvars; k++)
+            if (!strcmp(vars[k].name, name)) { j = k; break; }
+        if (j < 0)
+        {
+            char *log = NULL;
+            mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
+                                      "%s\n", name, stage);
+            free(xp->link_log);
+            xp->link_log = log;
+            xp->link_failed = true;
+            return;
+        }
+
+        const MGLGeomVar *g = &vars[j];
+        v->type = geom_var_type(g);
+        v->comp_kind = g->base == GL_INT ? GL_INT : g->base == GL_UNSIGNED_INT ? GL_UNSIGNED_INT : GL_FLOAT;
+        v->rows = g->rows;
+        v->columns = g->cols;
+        v->comp_per_elem = g->cols * g->rows * base_words(g->base);
+        v->size = (GLint)g->elems;
+        v->words = g->words;
+        v->src_word = g->offset;
+        v->buffer = buffer;
+        v->offset = offset;
+        offset += v->words * 4;
+        xp->buffer_mask |= (1u << buffer);
     }
+
+    xp->stride[buffer] = offset;
+}
+
+void mgl_geom_xfb_link(GLMContext ctx, Program *program)
+{
+    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
+
+    if (!gp || !xp) return;
+    geom_xfb_resolve(ctx, xp, gp->out_v, gp->n_out, gp->out_pos_off, gp->out_psize_off,
+                     "geometry stage");
+}
+
+/* transform feedback from a tessellation evaluation stage (no geometry shader): the TES's
+ * SPIR-V outputs are the recorded stream.  The per-record word offsets of the tess output
+ * capture differ from this table, so the pack refreshes src_word from the published member
+ * table on every draw. */
+void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program)
+{
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
+    MGLGeomVar vars[MGL_GEOM_MAX_VARYINGS];
+    SpvModule *m = NULL;
+    char *err = NULL;
+    int n = 0;
+
+    if (!xp || !program || !program->spirv[_TESS_EVALUATION_SHADER].ir) return;
+    m = spv_parse(program->spirv[_TESS_EVALUATION_SHADER].ir,
+                  program->spirv[_TESS_EVALUATION_SHADER].size, (const char **)&err);
+    if (!m)
+    {
+        char *log = NULL;
+        mgl_append_info_log(&log, "ERROR: transform feedback: TES reflection failed (%s)\n",
+                            err ? err : "SPIR-V parse failed");
+        free(xp->link_log);
+        xp->link_log = log;
+        xp->link_failed = true;
+        return;
+    }
+    if (!geom_reflect_stage(m, false, vars, &n, NULL))
+        n = 0;
+    spv_free(m);
+    /* gl_Position is the first word of every capture record; the tess output capture does not
+     * record gl_PointSize (a TES writing it would be dropped) */
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage");
 }
 
 /* the active transform feedback object (the xfb domain's current-object rule) */
@@ -3470,6 +3528,8 @@ void mgl_geom_xfb_log_read_name(void *ctxp, unsigned name, const char *what)
 extern bool geom_xfb_gpu_encode(GLMContext ctx, MGLGeomProgram *gp, MGLXfbObject *o, MGLXfbProgram *xp,
                                 BufferBaseTarget *tfb, uint32_t threads, uint32_t max_vertices,
                                 uint32_t out_words, uint32_t vertex_cap);
+extern bool geom_xfb_tess_encode(GLMContext ctx, MGLXfbObject *o, MGLXfbProgram *xp,
+                                 BufferBaseTarget *tfb, const MGLGeomTessXfbSource *src);
 extern void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim);
 extern void geom_xfb_gpu_reset(GLMContext ctx);
 extern bool geom_xfb_gpu_pending(void);
@@ -3491,7 +3551,7 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     /* the GPU pack is the default (the counters and write offsets stay on the GPU and are
      * only folded in where the application observes them); MGL_GEOM_CPU_XFB=1 asks for the
      * CPU pack, which advances the object's offsets at draw time */
-    if (getenv("MGL_GEOM_CPU_XFB")) return false;
+    if (geom_env(2)) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 
     /* the varying table and the buffer strides/sizes must fit the fixed blocks; a transform
@@ -3522,13 +3582,14 @@ void mgl_geom_xfb_flush(GLMContext ctx)
     /* make the pack's results visible: wait for the command buffer it was encoded into */
     geom_xfb_gpu_wait(ctx);
 
-    if (getenv("MGL_GEOM_XFB_TRACE"))
+    if (geom_env(1))
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
         fprintf(stderr, "geom:   fold reads TF backing %p\n", b0 ? b0->data.mtl_data : NULL);
     }
     { extern void geom_xfb_dump(GLMContext ctx); geom_xfb_dump(ctx); }
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
+    if (geom_env(1))
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
         float *f = b0 ? (float *)(void *)(vm_address_t)b0->data.buffer_data : NULL;
@@ -3660,4 +3721,85 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
         }
         if (note) note(ctx, 0, prims, prims);
     }
+}
+
+/* ------------------------------------------------------------------ xfb from tessellation
+ * Without a geometry shader the tessellation evaluation stage is the LAST
+ * pre-rasterization stage, so transform feedback records its outputs.  The tess domain's
+ * output capture (the same one the geometry stage consumes) is the recorded stream: the
+ * draw runs with the capture enabled and still rasterizes normally, then this pack writes
+ * the captured records into the transform feedback buffers. */
+
+bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t offset,
+                             GLint first, GLsizei count, GLsizei instances,
+                             GLint basevertex, GLuint baseinstance)
+{
+    Program *program = ctx->state.program ? getProgram(ctx, ctx->state.program->name) : NULL;
+    MGLXfbObject *o = geom_xfb_object(ctx);
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, false);
+    BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
+    const MGLTessCapture *c;
+    MGLGeomTessXfbSource src;
+    GLuint b;
+    bool ok;
+
+    if (!program || !o || !o->active || !xp || !xp->count) return false;
+    if (geom_env(2)) return false;
+    if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
+    if (xp->count > MGL_GEOM_XFB_MAX_VARS) return false;
+    for (b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+        if (xp->buffer_mask & (1u << b))
+        {
+            Buffer *buf = tfb[b].buf;
+            if (!buf) return false;
+            if (!buf->data.mtl_data && !geom_xfb_gpu_ensure(ctx, buf)) return false;
+        }
+
+    /* the tess domain records its output for us and rasterizes the patch itself */
+    mgl_tess_set_capture(ctx, program, true);
+    ok = mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
+                               basevertex, baseinstance);
+    if (!ok) return false;
+
+    c = mgl_tess_get_capture(ctx);
+    if (!c || !c->valid || !c->buffer_object || !c->stride) return true;   /* nothing captured */
+
+    /* the capture record's word offsets come from the published member table: they follow the
+     * tess output capture's layout, not the geometry stage's table the link-time resolution
+     * used */
+    for (GLsizei i = 0; i < xp->count; i++)
+    {
+        MGLXfbVarying *v = &xp->vars[i];
+        const char *nm = v->name ? v->name : "";
+        uint32_t w = v->words;
+        bool found = false;
+
+        if (!strcmp(nm, "gl_Position")) { v->src_word = 0; continue; }   /* always first */
+        for (uint32_t k = 0; k < c->members; k++)
+            if (!strcmp(c->member[k].name, nm))
+            {
+                v->src_word = c->member[k].offset;
+                if (!w) w = c->member[k].words;
+                found = true;
+                break;
+            }
+        if (!found && v->type != GL_NONE)
+        {
+            /* a varying the capture does not record (e.g. gl_PointSize): record nothing for it
+             * rather than capturing the wrong words */
+            v->words = 0;
+            v->src_word = 0;
+        }
+    }
+
+    memset(&src, 0, sizeof src);
+    src.ring = c->buffer_object;
+    src.records = c->records_offset;
+    src.counts = c->count_offset;
+    src.stride = c->stride;
+    src.capacity = c->records ? c->records : 1;
+    /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
+    src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
+
+    return geom_xfb_tess_encode(ctx, o, xp, tfb, &src);
 }

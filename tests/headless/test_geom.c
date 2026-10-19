@@ -1336,6 +1336,195 @@ TEST(tessellation_isolines_into_gs)
     glDeleteProgram(p);
 }
 
+/* transform feedback of a tessellation stage WITHOUT a geometry shader: the TES is the last
+ * pre-rasterization stage, so its captured output is what GL records.  A level-1 triangle
+ * patch tessellates to exactly its three corners, so the capture holds three vertices. */
+TEST(xfb_of_tes_output)
+{
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(location=0) in vec4 tc_uv[];\n"
+        "layout(location=0) out vec2 tf_pos;\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+        " + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  tf_pos = gl_Position.xy + 0.5 * tc_uv[0].w;\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 tf_pos;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(tf_pos, 0.0, 1.0); }\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, tess_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, tri_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, tes));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    {
+        static const char *vars[2] = { "tf_pos", NULL };
+        glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    }
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("tes xfb link log: %s\n", l);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint tbuf = 0, q = 0;
+    GLint written = -1;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+
+    glUseProgram(p);
+    setup4(12, tess_tri);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glGenQueries(1, &q);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float out[8];
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    for (int i = 0; i < 3; i++) printf("  tes xfb v%d = %f %f\n", i, out[i * 2], out[i * 2 + 1]);
+
+    /* the three tessellated corners: tc_uv[0].w is 1, so each is shifted by 0.5.  The
+     * tessellator's vertex order is not specified, so the corners are matched as a set */
+    {
+        static const float want[3][2] = { { 1.0f, 0.0f }, { 0.5f, 1.0f }, { 0.0f, 0.0f } };
+        for (int i = 0; i < 3; i++)
+        {
+            bool found = false;
+            for (int j = 0; j < 3; j++)
+                if (fabsf(out[j * 2] - want[i][0]) < 1e-5f && fabsf(out[j * 2 + 1] - want[i][1]) < 1e-5f)
+                    found = true;
+            EXPECT_TRUE(found);
+        }
+    }
+
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
+    printf("  tes xfb primitives written = %d\n", written);
+    EXPECT_EQ_INT(written, 1);            /* three captured vertices = one triangle */
+    glDeleteQueries(1, &q);
+    glDeleteProgram(p);
+}
+
+/* the same tessellated patch behind a geometry shader: transform feedback records the
+ * GEOMETRY stage's output instead - the shrunken triangle, not the TES corners */
+TEST(xfb_of_tes_gs_output)
+{
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(location=0) in vec4 tc_uv[];\n"
+        "layout(location=0) out vec2 tf_pos;\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position"
+        " + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  tf_pos = gl_Position.xy + 0.5 * tc_uv[0].w;\n"
+        "}\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) in vec2 tf_pos[];\n"
+        "layout(location=0) out vec2 g_pos;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    gl_Position = vec4(gl_in[i].gl_Position.xy * 0.5, 0.0, 1.0);\n"
+        "    g_pos = tf_pos[i] * 0.5;\n"
+        "    EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 g_pos;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(g_pos, 0.0, 1.0); }\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, tess_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, tri_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, tes));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    {
+        static const char *vars[2] = { "g_pos", NULL };
+        glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    }
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("tes+gs xfb link log: %s\n", l);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint tbuf = 0, q = 0;
+    GLint written = -1;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+
+    glUseProgram(p);
+    setup4(12, tess_tri);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glGenQueries(1, &q);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float out[8];
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    for (int i = 0; i < 3; i++) printf("  tes+gs xfb v%d = %f %f\n", i, out[i * 2], out[i * 2 + 1]);
+
+    /* the geometry stage halved every TES corner */
+    {
+        static const float want[3][2] = { { 0.5f, 0.0f }, { 0.25f, 0.5f }, { 0.0f, 0.0f } };
+        for (int i = 0; i < 3; i++)
+        {
+            bool found = false;
+            for (int j = 0; j < 3; j++)
+                if (fabsf(out[j * 2] - want[i][0]) < 1e-5f && fabsf(out[j * 2 + 1] - want[i][1]) < 1e-5f)
+                    found = true;
+            EXPECT_TRUE(found);
+        }
+    }
+
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
+    printf("  tes+gs xfb primitives written = %d\n", written);
+    EXPECT_EQ_INT(written, 1);
+    glDeleteQueries(1, &q);
+    glDeleteProgram(p);
+}
+
 TEST(tessellation_point_mode_into_gs)
 {
     /* point_mode tessellation emits points: the geometry stage turns each into a small
@@ -1672,6 +1861,8 @@ int main(void)
     RUN(tessellation_indexed_into_gs);
     RUN(tessellation_isolines_into_gs);
     RUN(tessellation_point_mode_into_gs);
+    RUN(xfb_of_tes_output);
+    RUN(xfb_of_tes_gs_output);
     RUN(primitive_restart_with_gs);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
     return mgl_test_summary();

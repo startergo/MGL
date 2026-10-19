@@ -122,6 +122,19 @@ typedef struct MGLGeomProgram {
 
 /* per-draw input of the routing helper: either the assembled lists (CPU assembly, the
  * fallback) or the sources the prep kernel assembles them from on the GPU */
+/* transform feedback of a tessellation stage without a geometry shader: the same capture
+ * is the recorded vertex stream (see mgl_geom_tess_xfb_route).  The varying table is
+ * MGLXfbProgram's, resolved against the TES's outputs with src_word refreshed from the
+ * published member table on every pack. */
+typedef struct MGLGeomTessXfbSource {
+    void    *ring;          /* the tess ring (id<MTLBuffer>) */
+    size_t   records;       /* byte offset of the first capture record */
+    size_t   counts;        /* byte offset of the GPU-written counts (counts[0] = vertices) */
+    uint32_t stride;        /* words per capture record */
+    uint32_t capacity;      /* record capacity: the dispatch bound */
+    uint32_t per_prim;      /* captured vertices per primitive (primitive counter) */
+} MGLGeomTessXfbSource;
+
 typedef struct MGLGeomDraw {
     MGLGeomProgram *gp;
     Program        *program;
@@ -217,6 +230,16 @@ uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program);
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
                           const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
+
+/* transform feedback of a tessellation stage WITHOUT a geometry shader: the TES is the last
+ * pre-rasterization stage, so GL records its outputs.  mgl_geom_tess_xfb_link resolves the
+ * varyings against the TES's SPIR-V (called from the xfb domain's link hook); the draw-time
+ * route runs the tessellated draw with the output capture on and packs the captured records
+ * into the transform feedback buffers (one thread per record, all on stream 0). */
+void mgl_geom_tess_xfb_link(GLMContext ctx, struct Program_t *program);
+bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t offset,
+                             GLint first, GLsizei count, GLsizei instances,
+                             GLint basevertex, GLuint baseinstance);
 
 #ifdef __cplusplus
 }

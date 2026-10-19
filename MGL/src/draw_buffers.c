@@ -854,6 +854,17 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
 
     if (mgl_xfb_capturing(ctx))
     {
+        /* geom: with a tessellation evaluation stage and no geometry shader the TES is the
+         * last pre-rasterization stage, so transform feedback records its output - the tess
+         * domain's capture is packed by the geometry domain's kernel.  The xfb domain's
+         * vertex-stage capture (route_xfb) would record the wrong stage. */
+        if (activeStageShader(ctx, _TESS_EVALUATION_SHADER) && !activeStageShader(ctx, _GEOMETRY_SHADER))
+        {
+            batch_end(ctx, batch);
+            mgl_geom_tess_xfb_route(ctx, indexed, type, offset, first, count, instances,
+                                    basevertex, baseinstance);
+            return;
+        }
         batch_end(ctx, batch);
         route_xfb(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
         return;
