@@ -2790,6 +2790,10 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     gp = mgl_geom_current(ctx);
     if (!gp) return;
 
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace route mode=%u indexed=%d first=%u count=%u inst=%u gp=%p linked=%d\n",
+                mode, (int)indexed, first, count, instances, (void *)gp, (int)gp->linked);
+
     if (!gp->linked && !geom_ensure(ctx, gp,
                                     ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
                                                                 : ctx->state.program))
@@ -3316,9 +3320,10 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
     GLuint b;
 
     if (!o || !o->active || !xp || !xp->count) return false;
-    /* GPU pack is opt-in (MGL_GEOM_GPU_XFB=1) until the multi-draw + pause/resume case passes;
-     * the CPU pack is the default */
-    if (!getenv("MGL_GEOM_GPU_XFB") || getenv("MGL_GEOM_CPU_XFB")) return false;
+    /* the GPU pack is the default (the counters and write offsets stay on the GPU and are
+     * only folded in where the application observes them); MGL_GEOM_CPU_XFB=1 asks for the
+     * CPU pack, which advances the object's offsets at draw time */
+    if (getenv("MGL_GEOM_CPU_XFB")) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
 
     /* the varying table and the buffer strides/sizes must fit the fixed blocks; a transform

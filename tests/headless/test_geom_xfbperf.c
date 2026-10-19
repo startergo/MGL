@@ -1,5 +1,5 @@
 // Timing of the geometry emulation's transform feedback pack: CPU (sync + memcpy) vs the
-// GPU pack kernels.  Run with MGL_GEOM_GPU_XFB=1 to time the GPU path.
+// GPU pack kernels.  The GPU pack is the default; run with MGL_GEOM_CPU_XFB=1 to time the CPU pack.
 #include "mgl_test.h"
 #include <stdio.h>
 #include <stdlib.h>

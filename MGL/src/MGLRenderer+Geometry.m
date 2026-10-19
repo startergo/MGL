@@ -1036,6 +1036,10 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
         return false;                       /* nothing to do */
 
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: trace geomDraw gp=%p linked=%d mode=%u first=%u count=%u inst=%u\n",
+                (void *)gp, (int)gp->linked, d->mode, d->first, d->count, d->instances);
+
     /* ---- sizing ---- */
     {
         size_t max_out = MGL_GEOM_BUDGET_BYTES / (gp->out_words * sizeof(uint32_t));
