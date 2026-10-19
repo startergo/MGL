@@ -52,6 +52,7 @@
 typedef struct {
     id<MTLBuffer> buf;
     size_t next;
+    void *cb;        /* the last command buffer whose encoders consume this pool's ranges */
 } MGLGeomPool;
 
 static id<MTLBuffer> gPrim;         /* header + capture index list + input primitive slots */
@@ -77,12 +78,23 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
+/* tile-parallel prep (large draws): per-tile restart counts -> prefix sum -> per-tile run
+ * records -> parallel emit; see the comment block in kGeomPrepMSL */
+static id<MTLComputePipelineState> gPrepcPso, gTilesPso, gPrefixPso, gRunsPso, gReducePso, gEmitPso;
+static id<MTLBuffer> gPrepScr;       /* its scratch: per-tile counts and per-run records */
+static size_t gPrepScrWords;
+/* below this index count the serial prep kernel (one dispatch) is cheaper than the chain;
+ * overridable so the test suite can exercise the tile-parallel path on every draw */
+static uint32_t gTiledMin = 4096u;
+/* the scratch is capped so absurdly large indirect draws fall back to the serial kernel
+ * instead of asking for hundreds of megabytes */
+#define MGL_GEOM_TILED_MAX_WORDS (64u * 1024u * 1024u / 4u)
 /* the trace / behaviour switches are read once: this file sits on the draw path and
  * getenv() per draw (several times per draw) is not free */
 static struct {
     int  read;
-    bool draw, debug, xfb, worst_case, dump;
-} gEnv = { 0, false, false, false, false, false };
+    bool draw, debug, xfb, worst_case, dump, serial_prep;
+} gEnv = { 0, false, false, false, false, false, false };
 
 static void geomEnvRead(void)
 {
@@ -93,6 +105,9 @@ static void geomEnvRead(void)
     gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
     gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
+    gEnv.serial_prep = getenv("MGL_GEOM_SERIAL_PREP") != NULL;   /* A/B the serial kernel */
+    const char *tmin = getenv("MGL_GEOM_TILED_MIN");             /* test hook: force the chain */
+    if (tmin) { int v = atoi(tmin); gTiledMin = v > 0 ? (uint32_t)v : 0u; }
 }
 
 static id<MTLComputePipelineState> gPrepPso, gTessImportPso;
@@ -156,6 +171,10 @@ static const char *kGeomPrepMSL =
     "    uint cap_idx = c.v[12], cap_prim = c.v[13];\n"
     "    bool restart_en = c.v[14] != 0u;\n"
     "    threadgroup uint tgr[WG];\n"
+    "\n"
+    "    /* the tile-parallel chain can take over large indirect draws (mgl_geom_prepc sets\n"
+    "     * the flag after parsing the command): the outputs are identical, so just leave */\n"
+    "    if (layout != 0u && prep[18] != 0u) return;\n"
     "\n"
     "    /* the draw command: a staging buffer for direct draws, the user's indirect buffer\n"
     "     * otherwise */\n"
@@ -286,6 +305,293 @@ static const char *kGeomPrepMSL =
     "    hdr[12] = vmin;\n"
     "    ctl[0] = vmin + (indexed ? basevertex : 0u);   /* capture header: vstart */\n"
     "    ctl[1] = vmax - vmin + 1u;                     /* capture header: vcount */\n"
+    "}\n"
+    "\n"
+    "/* ---- tile-parallel variant of the same job, for large draws ----------------------\n"
+    " * The serial kernel walks restart-free runs one at a time; with a restart every few\n"
+    " * indices that is a dependency chain per run and a single workgroup cannot keep the GPU\n"
+    " * busy.  This chain splits the index buffer into WG-sized tiles:\n"
+    " *   mgl_geom_tiles   one workgroup per tile: restart count, index min/max, last restart\n"
+    " *   mgl_geom_prefix  exclusive prefix sum of the per-tile restart counts\n"
+    " *   mgl_geom_runs    one workgroup per tile: (start, subcount) of every run, the prefix\n"
+    " *                    locating a run's start in an earlier tile\n"
+    " *   mgl_geom_reduce  per-run prefix sums (capbase, primbase), totals, the same prep,\n"
+    " *                    hdr and ctl words the serial kernel writes\n"
+    " *   mgl_geom_emit    a binary search per primitive / captured index fills the same slots\n"
+    " * prim slot (primbase[r] + p) * k + v and cap slot capbase[r] + i are exactly the\n"
+    " * addresses the serial kernel computes while walking runs in order, so the results are\n"
+    " * bit-identical.  Requires WG == 32 (one simdgroup per tile).\n"
+    " *\n"
+    " * Context words in the prep block after the serial outputs (prep[n] = block word\n"
+    " * OUT_OFF + n): 12 count, 13 first, 14 basevertex, 15 instances, 16 tiles,\n"
+    " * 17 record capacity, 18 owner (0 = the serial kernel owns the draw, 1 = this chain),\n"
+    " * 19 total restarts, 21..23 the tile grid, 24..26 the emit grid, 27 run count.\n"
+    " * Scratch: nres[0,T) tmin[T,2T) tmax[2T,3T) rbase[3T,4T) lres[4T,5T)\n"
+    " * runs[5T, 5T+4*(Rmax+1)) as (start, subcount, capbase, primbase). */\n"
+    "static inline uint mgl_geom_subprims(uint mode, uint subcount)\n"
+    "{\n"
+    "    switch (mode) {\n"
+    "        case 0u: return subcount;                                   /* points */\n"
+    "        case 1u: return subcount / 2u;                              /* lines */\n"
+    "        case 2u: return subcount >= 2u ? subcount - 1u : 0u;        /* line strip */\n"
+    "        case 3u: return subcount >= 2u ? subcount : 0u;             /* line loop */\n"
+    "        case 4u: return subcount / 4u;                              /* lines adjacency */\n"
+    "        case 5u: return subcount >= 4u ? subcount - 3u : 0u;        /* line strip adj */\n"
+    "        case 6u: return subcount / 3u;                              /* triangles */\n"
+    "        case 7u: case 8u: return subcount >= 3u ? subcount - 2u : 0u;  /* strip / fan */\n"
+    "        case 9u: return subcount / 6u;                              /* triangles adj */\n"
+    "        case 10u: return subcount >= 6u ? (subcount - 4u) / 2u : 0u;   /* tri strip adj */\n"
+    "        default: return 0u;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "static inline uint mgl_geom_vert_id(uint mode, uint p, uint v, uint k, uint subcount, uint provoking_first)\n"
+    "{\n"
+    "    uint id;\n"
+    "    switch (mode) {\n"
+    "        case 0u: id = p; break;                                   /* points */\n"
+    "        case 1u: case 2u: case 4u: case 5u: id = p + v; break;    /* line-ish */\n"
+    "        case 3u: id = (p + v < subcount) ? p + v : 0u; break;     /* line loop */\n"
+    "        case 6u: case 9u: id = p * k + v; break;                  /* tri list / tri adj */\n"
+    "        case 10u: id = p * 2u + v; break;                         /* tri strip adj */\n"
+    "        case 8u:                                                 /* triangle fan */\n"
+    "            if (provoking_first) id = (v == 2u) ? 0u : p + v + 1u;\n"
+    "            else                  id = (v == 0u) ? 0u : p + v;\n"
+    "            break;\n"
+    "        default:                                                 /* triangle strip */\n"
+    "            if ((p & 1u) == 0u) id = p + v;\n"
+    "            else if (provoking_first) id = (v == 0u) ? p + 2u : p + v - 1u;\n"
+    "            else                     id = (v == 0u) ? p + 1u : (v == 1u ? p : p + 2u);\n"
+    "            break;\n"
+    "    }\n"
+    "    return id;\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_prepc(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                           const device uchar* cmd [[buffer(1)]],\n"
+    "                           device uint* prep [[buffer(7)]],\n"
+    "                           uint tid [[thread_index_in_threadgroup]])\n"
+    "{\n"
+    "    /* indirect draws only: normalise the command into the context words the\n"
+    "     * tile-parallel kernels share, pick the owner (this chain or the serial kernel)\n"
+    "     * and publish the tile grid.  c.v[15] is the scratch capacity in words. */\n"
+    "    if (tid != 0u) return;\n"
+    "    uint count = c.v[1], first = c.v[2], basevertex = c.v[4], instances = c.v[5], layout = c.v[11];\n"
+    "    const device uint* u = (const device uint*)cmd;\n"
+    "    if (layout == 1u) { count = u[0]; instances = u[1]; first = u[2]; }\n"
+    "    else if (layout == 2u) { count = u[0]; instances = u[1]; first = u[2]; basevertex = u[3]; }\n"
+    "    uint tiles = (count + WG - 1u) / WG;\n"
+    "    uint64_t rmax = (uint64_t)count + 1u;\n"
+    "    uint64_t words = 5ull * tiles + 4ull * (rmax + 1ull);\n"
+    "    if (count == 0u || instances == 0u || words > (uint64_t)c.v[15]) return;  /* serial keeps it */\n"
+    "    prep[12] = count; prep[13] = first; prep[14] = basevertex; prep[15] = instances;\n"
+    "    prep[16] = tiles; prep[17] = (uint)rmax; prep[18] = 1u;\n"
+    "    prep[21] = tiles; prep[22] = 1u; prep[23] = 1u;\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_tiles(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                           const device uchar* indices [[buffer(2)]],\n"
+    "                           device uint* prep [[buffer(7)]],\n"
+    "                           device uint* sc [[buffer(8)]],\n"
+    "                           uint slid [[thread_index_in_simdgroup]],\n"
+    "                           uint gid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (prep[18] == 0u) return;\n"
+    "    uint T = prep[16];\n"
+    "    uint t = gid;\n"
+    "    if (t >= T) return;\n"
+    "    uint count = prep[12];\n"
+    "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
+    "    bool restart_en = c.v[14] != 0u;\n"
+    "    uint i = t * WG + slid;\n"
+    "    bool valid = i < count;\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : 0u)\n"
+    "    uint vtx = valid ? MGL_IDX(i) : 0u;\n"
+    "    bool res = valid && indexed && restart_en && vtx == restart;\n"
+    "    uint rb = (uint)(uint64_t)simd_ballot(res);\n"
+    "    uint nres = popcount(rb);\n"
+    "    uint tmin = (!res && valid) ? vtx : 0xffffffffu;\n"
+    "    uint tmax = (!res && valid) ? vtx : 0u;\n"
+    "    if (slid == 0u) {\n"
+    "        sc[t] = nres;\n"
+    "        sc[T + t] = simd_min(tmin);\n"
+    "        sc[2u*T + t] = simd_max(tmax);\n"
+    "    }\n"
+    "    uint rank = popcount(rb & ((1u << slid) - 1u));\n"
+    "    if (res && rank == nres - 1u) sc[4u*T + t] = i;   /* the tile's last restart */\n"
+    "#undef MGL_IDX\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_prefix(device uint* prep [[buffer(7)]],\n"
+    "                            device uint* sc [[buffer(8)]],\n"
+    "                            uint tid [[thread_index_in_threadgroup]])\n"
+    "{\n"
+    "    if (prep[18] == 0u) return;\n"
+    "    uint T = prep[16];\n"
+    "    threadgroup uint part[WG];\n"
+    "    uint chunk = (T + WG - 1u) / WG;\n"
+    "    uint b = min(tid * chunk, T), e = min(b + chunk, T);\n"
+    "    uint sum = 0u;\n"
+    "    for (uint t = b; t < e; ++t) { sc[3u*T + t] = sum; sum += sc[t]; }   /* rbase */\n"
+    "    part[tid] = sum;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    uint off = 0u, total = 0u;\n"
+    "    for (uint j = 0u; j < WG; ++j) { total += part[j]; if (j < tid) off += part[j]; }\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    for (uint t = b; t < e; ++t) sc[3u*T + t] += off;\n"
+    "    if (tid == 0u) prep[19] = total;              /* total restarts */\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_runs(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                          const device uchar* indices [[buffer(2)]],\n"
+    "                          device uint* prep [[buffer(7)]],\n"
+    "                          device uint* sc [[buffer(8)]],\n"
+    "                          uint slid [[thread_index_in_simdgroup]],\n"
+    "                          uint gid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (prep[18] == 0u) return;\n"
+    "    uint T = prep[16];\n"
+    "    uint t = gid;\n"
+    "    if (t >= T) return;\n"
+    "    uint count = prep[12], total = prep[19];\n"
+    "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
+    "    bool restart_en = c.v[14] != 0u;\n"
+    "    uint i = t * WG + slid;\n"
+    "    bool valid = i < count;\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : 0u)\n"
+    "    uint vtx = valid ? MGL_IDX(i) : 0u;\n"
+    "    bool res = valid && indexed && restart_en && vtx == restart;\n"
+    "    uint rb = (uint)(uint64_t)simd_ballot(res);\n"
+    "    uint nres = popcount(rb);\n"
+    "    uint rb_t = sc[3u*T + t];                     /* restarts before this tile */\n"
+    "    uint ro = 5u * T;                             /* run records */\n"
+    "    if (res) {\n"
+    "        uint rank = popcount(rb & ((1u << slid) - 1u));\n"
+    "        uint run = rb_t + rank;\n"
+    "        uint start;\n"
+    "        if (rank != 0u) {\n"
+    "            uint prev = 31u - clz(rb & ((1u << slid) - 1u));   /* the previous restart, same tile */\n"
+    "            start = t * WG + prev + 1u;\n"
+    "        } else if (run == 0u) {\n"
+    "            start = 0u;\n"
+    "        } else {\n"
+    "            /* the previous restart is the last one of an earlier tile: the greatest\n"
+    "             * tile u with rbase[u] < rbase[t] (rbase is non-decreasing) */\n"
+    "            uint lo = 0u, hi = t;\n"
+    "            while (lo + 1u < hi) { uint mid = (lo + hi) >> 1; if (sc[3u*T + mid] < rb_t) lo = mid; else hi = mid; }\n"
+    "            start = sc[4u*T + lo] + 1u;\n"
+    "        }\n"
+    "        sc[ro + 4u*run + 0u] = start;\n"
+    "        sc[ro + 4u*run + 1u] = i - start;         /* subcount */\n"
+    "    }\n"
+    "    /* the trailing run after the last restart (the whole buffer when there is none)\n"
+    "     * is recorded by the tile holding that restart */\n"
+    "    bool mine = nres > 0u && rb_t + nres == total;\n"
+    "    if (total == 0u) mine = t == 0u;\n"
+    "    if (mine && slid == 0u) {\n"
+    "        uint start = total > 0u ? sc[4u*T + t] + 1u : 0u;\n"
+    "        sc[ro + 4u*total + 0u] = start;\n"
+    "        sc[ro + 4u*total + 1u] = count - start;\n"
+    "    }\n"
+    "#undef MGL_IDX\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_reduce(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                            device uint* hdr [[buffer(5)]],\n"
+    "                            device uint* ctl [[buffer(6)]],\n"
+    "                            device uint* prep [[buffer(7)]],\n"
+    "                            device uint* sc [[buffer(8)]],\n"
+    "                            uint tid [[thread_index_in_threadgroup]])\n"
+    "{\n"
+    "    if (prep[18] == 0u) return;\n"
+    "    uint T = prep[16], count = prep[12], instances = prep[15], total = prep[19];\n"
+    "    uint R = total + 1u;\n"
+    "    uint ro = 5u * T;\n"
+    "    threadgroup uint pc[WG], pp[WG], rm[WG], rx[WG];\n"
+    "\n"
+    "    /* per-run exclusive prefix sums: capbase over subcount, primbase over subprims */\n"
+    "    uint chunk = (R + WG - 1u) / WG;\n"
+    "    uint b = min(tid * chunk, R), e = min(b + chunk, R);\n"
+    "    uint subc = 0u, subp = 0u;\n"
+    "    for (uint r = b; r < e; ++r) {\n"
+    "        sc[ro + 4u*r + 2u] = subc;\n"
+    "        sc[ro + 4u*r + 3u] = subp;\n"
+    "        uint s = sc[ro + 4u*r + 1u];\n"
+    "        subc += s;\n"
+    "        subp += mgl_geom_subprims(c.v[0], s);\n"
+    "    }\n"
+    "    pc[tid] = subc; pp[tid] = subp;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    uint offc = 0u, offp = 0u, totc = 0u, totp = 0u;\n"
+    "    for (uint j = 0u; j < WG; ++j) { totc += pc[j]; totp += pp[j]; if (j < tid) { offc += pc[j]; offp += pp[j]; } }\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    for (uint r = b; r < e; ++r) { sc[ro + 4u*r + 2u] += offc; sc[ro + 4u*r + 3u] += offp; }\n"
+    "\n"
+    "    /* the tile min/max reduce (over every captured, i.e. non-restart, vertex) */\n"
+    "    uint mn = 0xffffffffu, mx = 0u;\n"
+    "    for (uint t = tid; t < T; t += WG) { mn = min(mn, sc[T + t]); mx = max(mx, sc[2u*T + t]); }\n"
+    "    rm[tid] = mn; rx[tid] = mx;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "\n"
+    "    if (tid == 0u) {\n"
+    "        for (uint j = 1u; j < WG; ++j) { mn = min(mn, rm[j]); mx = max(mx, rx[j]); }\n"
+    "        uint out_prims = totp, out_idx = totc, vmin = mn, vmax = mx;\n"
+    "        if (vmin == 0xffffffffu) { vmin = 0u; vmax = 0u; }\n"
+    "        prep[0] = out_prims; prep[1] = out_idx; prep[2] = vmax; prep[3] = vmin;\n"
+    "        prep[4] = (uint)(((uint64_t)out_prims * instances * c.v[6]) / WG + 1ull);\n"
+    "        prep[5] = 1u; prep[6] = 1u;\n"
+    "        prep[7] = out_idx; prep[8] = instances; prep[9] = 0u;\n"
+    "        prep[10] = c.v[3] != 0u ? prep[14] : 0u;   /* basevertex of the capture draw */\n"
+    "        prep[11] = 0u;\n"
+    "        hdr[0] = out_prims; hdr[1] = instances; hdr[6] = vmax - vmin + 1u; hdr[12] = vmin;\n"
+    "        ctl[0] = vmin + (c.v[3] != 0u ? prep[14] : 0u);\n"
+    "        ctl[1] = vmax - vmin + 1u;                /* capture header: vcount */\n"
+    "        prep[27] = R;\n"
+    "        /* the sentinel record behind the last run stops the emit kernel's searches */\n"
+    "        sc[ro + 4u*R + 0u] = count; sc[ro + 4u*R + 1u] = 0u;\n"
+    "        sc[ro + 4u*R + 2u] = totc;  sc[ro + 4u*R + 3u] = totp;\n"
+    "        uint items = out_prims + out_idx;\n"
+    "        prep[24] = items ? (items + WG - 1u) / WG : 1u;   /* emit grid (never zero) */\n"
+    "        prep[25] = 1u; prep[26] = 1u;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "kernel void mgl_geom_emit(constant mgl_geom_prep_in& c [[buffer(0)]],\n"
+    "                          const device uchar* indices [[buffer(2)]],\n"
+    "                          device uint* prim [[buffer(3)]],\n"
+    "                          device uint* cap [[buffer(4)]],\n"
+    "                          device uint* prep [[buffer(7)]],\n"
+    "                          device uint* sc [[buffer(8)]],\n"
+    "                          uint gid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (prep[18] == 0u) return;\n"
+    "    uint out_prims = prep[0], out_idx = prep[1];\n"
+    "    if (gid >= out_prims + out_idx) return;\n"
+    "    uint mode = c.v[0], first = prep[13], basevertex = prep[14];\n"
+    "    uint indexed = c.v[3], k = c.v[8], provoking_first = c.v[9], idx_size = c.v[10];\n"
+    "    uint cap_idx = c.v[12], cap_prim = c.v[13];\n"
+    "    uint T = prep[16], R = prep[27];\n"
+    "    uint ro = 5u * T;\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : (uint)(first + (int)(_i)))\n"
+    "    if (gid < out_prims) {\n"
+    "        if (gid >= cap_prim) return;              /* the serial kernel's guard */\n"
+    "        uint lo = 0u, hi = R;                     /* last run with primbase <= gid */\n"
+    "        while (lo + 1u < hi) { uint mid = (lo + hi) >> 1; if (sc[ro + 4u*mid + 3u] <= gid) lo = mid; else hi = mid; }\n"
+    "        uint p = gid - sc[ro + 4u*lo + 3u];\n"
+    "        uint start = sc[ro + 4u*lo + 0u], subcount = sc[ro + 4u*lo + 1u];\n"
+    "        for (uint v = 0u; v < k; ++v) {\n"
+    "            uint id = mgl_geom_vert_id(mode, p, v, k, subcount, provoking_first);\n"
+    "            prim[gid * k + v] = MGL_IDX(start + id) + basevertex;\n"
+    "        }\n"
+    "    } else {\n"
+    "        uint j = gid - out_prims;\n"
+    "        if (j >= cap_idx) return;\n"
+    "        uint lo = 0u, hi = R;                     /* last run with capbase <= j */\n"
+    "        while (lo + 1u < hi) { uint mid = (lo + hi) >> 1; if (sc[ro + 4u*mid + 2u] <= j) lo = mid; else hi = mid; }\n"
+    "        uint i = j - sc[ro + 4u*lo + 2u];\n"
+    "        cap[j] = MGL_IDX(sc[ro + 4u*lo + 0u] + i);\n"
+    "    }\n"
+    "#undef MGL_IDX\n"
     "}\n";
 
 /* the tess producer's import kernel: repacks the TES-output capture records into this
@@ -553,6 +859,28 @@ static bool geomCtlPipelines(id<MTLDevice> device)
         NSLog(@"MGL geom: prep pipeline failed: %@", error);
         return false;
     }
+    /* the tile-parallel prep chain lives in the same library */
+    if (MGL_GEOM_WG == 32)
+    {
+        struct { const char *name; __strong id<MTLComputePipelineState> *pso; } k[] = {
+            { "mgl_geom_prepc",  &gPrepcPso },
+            { "mgl_geom_tiles",  &gTilesPso },
+            { "mgl_geom_prefix", &gPrefixPso },
+            { "mgl_geom_runs",   &gRunsPso },
+            { "mgl_geom_reduce", &gReducePso },
+            { "mgl_geom_emit",   &gEmitPso },
+        };
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        {
+            id<MTLFunction> fn = [plib newFunctionWithName: [NSString stringWithUTF8String: k[i].name]];
+            if (fn) *k[i].pso = [device newComputePipelineStateWithFunction: fn error: &error];
+            if (!*k[i].pso)
+            {
+                NSLog(@"MGL geom: tiled prep pipeline '%s' failed: %@", k[i].name, error);
+                return false;
+            }
+        }
+    }
 
     /* the tess import kernel (a geometry stage behind a tessellation stage) */
     {
@@ -767,6 +1095,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
 
     gXfbPending = true;
     gXfbCb = _currentCommandBuffer;
+    geomMarkPools(gXfbCb);          /* the pack (this command buffer) still reads the rings */
 
     if ((geomEnvRead(), gEnv.xfb))
         fprintf(stderr, "geom: tess pack encoded (cap=%u stride=%u nvars=%u per_prim=%u)\n",
@@ -931,6 +1260,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
 
     gXfbPending = true;
     gXfbCb = _currentCommandBuffer;
+    geomMarkPools(gXfbCb);          /* the pack (this command buffer) still reads the rings */
 
     /* diagnostic: commit (but do not wait) after each draw's pack */
     if (getenv("MGL_GEOM_COMMIT"))
@@ -1282,7 +1612,16 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
  * the next draw can never land on it.  When the range would not fit, start a NEW (larger,
  * zero-filled) buffer instead of wrapping to offset 0 — a silent wrap could hand a draw a
  * range whose previous user is still pending on the GPU. */
-static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start)
+/* record the newest command buffer whose encoders consume the pools' ranges: once it has
+ * completed, geomSubAlloc may recycle a full pool (command buffers execute in order) */
+static void geomMarkPools(id<MTLCommandBuffer> cb)
+{
+    void *id = (__bridge void *)cb;
+    gPrimPool.cb = id; gVsoutPool.cb = id; gOutvPool.cb = id; gPrepPool.cb = id; gCntPool.cb = id;
+}
+
+static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start,
+                                  id<MTLCommandBuffer> cur)
 {
     size_t s;
 
@@ -1292,8 +1631,35 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     if (pool->buf && s + need <= pool->buf.length)
     {
         pool->next = s + need;
+        pool->cb = (__bridge void *)cur;
         *start = s;
         return pool->buf;
+    }
+
+    /* the pool is full.  Its ranges are consumed by the encoders of the draw that allocated
+     * them (prep chain, capture pass, geometry kernel, pack, raster pass — geomDraw marks
+     * the pool with the last command buffer that encoded any of those).  When that command
+     * buffer completed — buffers on one queue execute in order — every consumer of every
+     * range in the pool is done and the buffer can simply be reused from the start, which
+     * keeps the pools at what one draw needs instead of growing on every draw. */
+    if (pool->buf && need <= pool->buf.length)
+    {
+        bool dead = true;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)pool->cb;
+        if (cb && cb.status < MTLCommandBufferStatusCompleted) dead = false;
+        /* when the current command buffer still holds (or will hold) consumers, the pool
+         * grows — forcing a flush here measured slower than the growth on this hardware.
+         * Real applications present between frames, which retires the command buffers and
+         * lets the pool recycle; batched draws pay memory instead. */
+        if (dead)
+        {
+            if ((geomEnvRead(), gEnv.draw))
+                fprintf(stderr, "geom: trace pool %p recycle (%zu in use)\n", (void *)pool, need);
+            pool->next = need;
+            pool->cb = (__bridge void *)cur;
+            *start = 0;
+            return pool->buf;
+        }
     }
 
     /* start a fresh buffer so the range is zero-filled and has no previous user */
@@ -1306,6 +1672,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
                 (void *)pool, need, (size_t)(pool->buf ? pool->buf.length : 0), sz);
     pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
     pool->next = need;
+    pool->cb = (__bridge void *)cur;
     *start = 0;
     return pool->buf;
 }
@@ -1407,16 +1774,16 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
                         "prim_bytes=%zu vsout_bytes=%zu threads=%llu in_words=%u out_words=%u maxverts=%u\n",
                 (unsigned)bound, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
                 (unsigned long long)threads, gp->in_words, gp->out_words, gp->max_vertices);
-    gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff);
+    gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
     if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
      * must not overwrite them first */
-    gPrep = geomSubAlloc(_device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff);
+    gPrep = geomSubAlloc(_device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff, _currentCommandBuffer);
     if (!gPrep) { geomReleaseStatics(); return false; }
-    gCnt = geomSubAlloc(_device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff);
+    gCnt = geomSubAlloc(_device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff, _currentCommandBuffer);
     if (!gCnt) { geomReleaseStatics(); return false; }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
@@ -1424,9 +1791,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     /* the primitive slots / capture index list and the captured VS records are shared by the
      * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
      * own range so a later draw's kernels cannot overwrite them first */
-    gPrim = geomSubAlloc(_device, &gPrimPool, prim_bytes, &gPrimOff);
+    gPrim = geomSubAlloc(_device, &gPrimPool, prim_bytes, &gPrimOff, _currentCommandBuffer);
     if (!gPrim) { geomReleaseStatics(); return false; }
-    gVsout = geomSubAlloc(_device, &gVsoutPool, vsout_bytes, &gVsoutOff);
+    gVsout = geomSubAlloc(_device, &gVsoutPool, vsout_bytes, &gVsoutOff, _currentCommandBuffer);
     if (!gVsout) { geomReleaseStatics(); return false; }
 
     if (![self geomPipelines: gp program: program]) return false;
@@ -1611,8 +1978,97 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
         [enc setBuffer: gVsout offset: gVsoutOff atIndex: 6];
         [enc setBuffer: gPrep offset: gPrepOff + MGL_GEOM_PREP_OUT_OFF * sizeof(uint32_t) atIndex: 7];
 
+        /* Large draws go through the tile-parallel chain instead of the serial run walk in
+         * mgl_geom_prep: per-tile restart counts, a prefix sum, per-tile run records and a
+         * parallel emit write the same lists bit for bit (see kGeomPrepMSL).  Direct draws
+         * know the count here, so the CPU picks the path and writes the context words;
+         * indirect draws let mgl_geom_prepc parse the command and decide — it publishes the
+         * context and the grids, and mgl_geom_prep (dispatched right after it) leaves when
+         * the chain takes over. */
+        bool tiled = MGL_GEOM_WG == 32 && !(geomEnvRead(), gEnv.serial_prep);
+        if (tiled)
+        {
+            uint64_t cnt = d->count_bound ? (uint64_t)d->count_bound : (uint64_t)(d->count > 0 ? d->count : 0);
+            uint64_t tiles = (cnt + MGL_GEOM_WG - 1) / MGL_GEOM_WG;
+            uint64_t words = 5ull * tiles + 4ull * ((uint64_t)cnt + 2ull);
+            if (getenv("MGL_GEOM_DEBUG")) NSLog(@"MGL geom tiled: cnt=%llu words=%llu scr=%zu", (unsigned long long)cnt, (unsigned long long)words, gPrepScrWords);
+            uint32_t *in = (uint32_t *)gPrep.contents + gPrepOff / 4;
+
+            if (!gPrepScr || gPrepScrWords < words)
+            {
+                size_t want = words > MGL_GEOM_TILED_MAX_WORDS ? MGL_GEOM_TILED_MAX_WORDS : (size_t)words;
+                id<MTLBuffer> grown = geomBuffer(_device, gPrepScr, want * sizeof(uint32_t), &gPrepScrWords);
+                if (!grown) tiled = false;
+                else gPrepScr = grown;
+            }
+            if (tiled && !d->cmd_buffer)
+            {
+                if ((uint64_t)d->count <= (uint64_t)gTiledMin || words > gPrepScrWords)
+                    tiled = false;                       /* small draw: one dispatch is cheaper */
+                else
+                {
+                    /* publish the context the tiled kernels share (word 18 = the owner) */
+                    in[MGL_GEOM_PREP_OUT_OFF + 12] = (uint32_t)d->count;
+                    in[MGL_GEOM_PREP_OUT_OFF + 13] = (uint32_t)d->first;
+                    in[MGL_GEOM_PREP_OUT_OFF + 14] = (uint32_t)d->basevertex;
+                    in[MGL_GEOM_PREP_OUT_OFF + 15] = (uint32_t)(d->instances > 0 ? d->instances : 1);
+                    in[MGL_GEOM_PREP_OUT_OFF + 16] = (uint32_t)(((uint64_t)d->count + MGL_GEOM_WG - 1) / MGL_GEOM_WG);
+                    in[MGL_GEOM_PREP_OUT_OFF + 17] = (uint32_t)((uint64_t)d->count + 1ull);
+                    in[MGL_GEOM_PREP_OUT_OFF + 18] = 1u;
+                }
+            }
+            else if (tiled)
+            {
+                /* the count is only known on the GPU: mgl_geom_prepc gets the scratch capacity
+                 * and decides (falling back to the serial kernel when it does not fit) */
+                in[15] = (uint32_t)gPrepScrWords;
+                [enc setComputePipelineState: gPrepcPso];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(MGL_GEOM_WG, 1, 1)];
+                [enc setComputePipelineState: gPrepPso];
+            }
+        }
+
         [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(MGL_GEOM_WG, 1, 1)];
+        if (tiled)
+        {
+            uint64_t tiles = ((uint64_t)d->count + MGL_GEOM_WG - 1) / MGL_GEOM_WG;
+            MTLSize wg = MTLSizeMake(MGL_GEOM_WG, 1, 1);
+            [enc setBuffer: gPrepScr offset: 0 atIndex: 8];
+            {
+                [enc setComputePipelineState: gTilesPso];
+                if (d->cmd_buffer)
+                    [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
+                                                  indirectBufferOffset: gPrepOff + (MGL_GEOM_PREP_OUT_OFF + 21) * sizeof(uint32_t)
+                                                 threadsPerThreadgroup: wg];
+                else
+                    [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)tiles, 1, 1) threadsPerThreadgroup: wg];
+            }
+            {
+                [enc setComputePipelineState: gPrefixPso];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: wg];
+            }
+            {
+                [enc setComputePipelineState: gRunsPso];
+                if (d->cmd_buffer)
+                    [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
+                                                  indirectBufferOffset: gPrepOff + (MGL_GEOM_PREP_OUT_OFF + 21) * sizeof(uint32_t)
+                                                 threadsPerThreadgroup: wg];
+                else
+                    [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)tiles, 1, 1) threadsPerThreadgroup: wg];
+            }
+            {
+                [enc setComputePipelineState: gReducePso];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: wg];
+            }
+            {
+                [enc setComputePipelineState: gEmitPso];
+                [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
+                                              indirectBufferOffset: gPrepOff + (MGL_GEOM_PREP_OUT_OFF + 24) * sizeof(uint32_t)
+                                             threadsPerThreadgroup: wg];
+            }
+        }
         [enc popDebugGroup];
         [enc endEncoding];
     }
@@ -1908,7 +2364,10 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     }
     /* ---- 3. raster pass ---- */
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
+    {
+        geomMarkPools(_currentCommandBuffer);   /* the pack above was this draw's last consumer */
         return true;
+    }
 
 
     /* the geometry stage picks the output topology; Metal requires inputPrimitiveTopology
@@ -1947,6 +2406,7 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 {
     MGLGeomProgram *gp = d->gp;
     if (!BUF()->begin_draw(ctx)) return false;
+    geomMarkPools(_currentCommandBuffer);   /* after begin_draw: covers any command buffer it made */
 
     {
         /* the kernel expands every emitted strip into an index *list*, so the raster pass

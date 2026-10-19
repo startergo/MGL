@@ -6,7 +6,11 @@
 /* timing of the geometry emulation's per-draw CPU cost: the primitive assembly runs on the
  * GPU (a prep kernel) unless MGL_GEOM_CPU_ASSEMBLY forces the CPU path.  The test draws a
  * large indexed mesh through a geometry shader many times and reports the wall time of both
- * paths, which is what an application sees between two glFinish()s. */
+ * paths (what an application sees between two glFinish()s) and, via GL_TIME_ELAPSED queries,
+ * the GPU time the draws themselves cost.  The restart-heavy case is where the tile-parallel
+ * prep chain (per-tile restart counts -> prefix sum -> per-tile run records -> parallel
+ * emit) replaces the serial run walk; MGL_GEOM_SERIAL_PREP=1 forces the serial kernel so
+ * before/after runs of this same test can be compared. */
 
 #define IDX_COUNT  (300 * 1000)
 #define VERTS      (100 * 1000)
@@ -48,6 +52,25 @@ static double run_frames(GLuint p, GLsizei count, GLuint query)
     return (t1 - t0) * 1e6 / FRAMES;
 }
 
+/* the same frames with a GL_TIME_ELAPSED query around them: the GPU time of the frame,
+ * which for this workload is dominated by the prep (assembly) chain */
+static double gpu_time_frames(GLsizei count)
+{
+    GLuint tq = 0;
+    GLuint64 ns = 0;
+
+    glGenQueries(1, &tq);
+    glFinish();
+    glBeginQuery(GL_TIME_ELAPSED, tq);
+    for (int f = 0; f < FRAMES; f++)
+        glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, NULL);
+    glEndQuery(GL_TIME_ELAPSED);
+    glFinish();
+    glGetQueryObjectui64v(tq, GL_QUERY_RESULT, &ns);
+    glDeleteQueries(1, &tq);
+    return (double)ns / 1000.0 / FRAMES;   /* us per frame */
+}
+
 int main(void)
 {
     const char *vs =
@@ -73,7 +96,8 @@ int main(void)
     GLuint p, vao, vbo, ebo, q;
     GLuint *idx = malloc(sizeof(GLuint) * IDX_COUNT);
     float *verts = malloc(sizeof(float) * 2 * VERTS);
-    double cpu, gpu;
+    double cpu = 0, gpu = 0;   /* per-frame wall times, for the summary line */
+    (void)cpu; (void)gpu;
 
     for (int i = 0; i < VERTS; i++)
     {
@@ -112,13 +136,11 @@ int main(void)
 
     printf("geometry shader primitive assembly (300k scattered indices, %d frames):\n", FRAMES);
 
-    setenv("MGL_GEOM_CPU_ASSEMBLY", "1", 1);
-    cpu = run_frames(p, IDX_COUNT, q);
-    unsetenv("MGL_GEOM_CPU_ASSEMBLY");
-    gpu = run_frames(p, IDX_COUNT, q);
-
-    printf("GPU assembly is %.2fx %s the CPU path (%.1f vs %.1f us/frame)\n",
-           cpu > gpu ? cpu / gpu : gpu / cpu, cpu > gpu ? "faster than" : "slower than", cpu, gpu);
+    /* the CPU / GPU routes are chosen by MGL_GEOM_CPU_ASSEMBLY, which the driver reads once
+     * per process — so the CPU number comes from a run of this same test with the variable
+     * set, and this process measures the GPU path (set MGL_GEOM_SERIAL_PREP=1 to A/B the
+     * serial prep kernel against the tile-parallel chain) */
+    run_frames(p, IDX_COUNT, q);
 
     /* both paths must rasterize the same amount: count covered pixels */
     {
@@ -178,6 +200,7 @@ int main(void)
         glGetQueryObjectiv(q, GL_QUERY_RESULT, &prims);
         printf("indirect: %.1f us/frame, %d primitives emitted\n", (t1 - t0) * 1e6 / FRAMES, prims);
         EXPECT_TRUE(prims > 0);
+
         glDeleteBuffers(1, &ib);
     }
 
