@@ -209,4 +209,8 @@ bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin
 unsigned mgl_tess_cpu_blob_builds(void);
 unsigned mgl_tess_cpu_generate_runs(void);
 
+/* query bookkeeping without CPU tessellation: the tessellated output counts from
+ * the levels alone (used by the GPU paths when the levels are CPU-known) */
+void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches);
+
 #endif /* MGL_EXT_TESS_H */

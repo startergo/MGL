@@ -373,6 +373,35 @@ static const char *kTesIsoPatch =
     "  f_col = p_flag;\n"
     "}\n";
 
+/* two-patch variant: the per-patch value depends on the patch's own control points,
+ * so each patch's blob entry must be assembled from the right TCS patch record */
+static const char *kTcsPatchVar2 =
+    "#version 450 core\n"
+    "layout(vertices=2) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "layout(location=1) patch out vec4 p_flag;\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 8.0;\n"
+    "    if (gl_in[0].gl_Position.x < 0.0) p_flag = vec4(1.00, 0.25, 0.25, 1.0);\n"
+    "    else                             p_flag = vec4(0.25, 0.25, 1.00, 1.0);\n"
+    "  }\n"
+    "}\n";
+static const char *kTesIsoPatch2 =
+    "#version 450 core\n"
+    "layout(isolines, equal_spacing) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=1) patch in vec4 p_flag;\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+    "  gl_Position.y = mix(-0.75, 0.75, gl_TessCoord.y);\n"
+    "  f_col = p_flag;\n"
+    "}\n";
+
 /* diagnostics exported by libmgl: CPU-side patch-blob builds and CPU tessellator
  * runs. The GPU emulated path must not grow either counter across a draw. */
 extern unsigned mgl_tess_cpu_blob_builds(void);
@@ -444,12 +473,58 @@ TEST(EmuPatchDataGpu)
             EXPECT_TRUE(b > 175 && b < 207);
         }
     }
-    free(px);
+    /* px stays allocated: the two-patch case below reads back into it */
 
     /* the GPU emulated path must not have built the blob or tessellated on the CPU */
     EXPECT_TRUE(mgl_tess_cpu_blob_builds() == b0);
     EXPECT_TRUE(mgl_tess_cpu_generate_runs() == g0);
+
+    /* --- two patches: each patch's blob entry must carry its own per-patch value.
+     * Patch 0 spans the left half (p_flag red-dominant), patch 1 the right half
+     * (blue-dominant): the TCS picks the colour from the patch's own first control
+     * point, so a blob entry indexed with the wrong patch id would mix them up. */
+    p = prog2(kTcsPatchVar2, kTesIsoPatch2);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    const float pos2[4][4] = { { -0.95f, 0, 0, 1 }, { -0.05f, 0, 0, 1 },
+                               {  0.05f, 0, 0, 1 }, {  0.95f, 0, 0, 1 } };
+    const float col2[4][4] = { { 1,0,0,1 }, { 1,0,0,1 }, { 0,0,1,1 }, { 0,0,1,1 } };
+    setup(pos2, col2, 4, 2);
+
+    b0 = mgl_tess_cpu_blob_builds(); g0 = mgl_tess_cpu_generate_runs();
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+    {
+        int y = h / 2;                        /* the middle isoline: window y = h/2 */
+        int ry = -1;
+        for (int dy = -2; dy <= 1 && ry < 0; dy++)
+        {
+            int cnt = 0;
+            for (int x = 0; x < w; x++)
+                if (px[((y + dy) * w + x) * 4] + px[((y + dy) * w + x) * 4 + 1] + px[((y + dy) * w + x) * 4 + 2] > 120) cnt++;
+            if (cnt > w / 4) ry = y + dy;
+        }
+        EXPECT_TRUE(ry > 0);
+        if (ry > 0)
+        {
+            int lr = px[(ry * w + w / 4) * 4], lb = px[(ry * w + w / 4) * 4 + 2];
+            int rr = px[(ry * w + (w * 3) / 4) * 4], rb = px[(ry * w + (w * 3) / 4) * 4 + 2];
+            printf("two-patch blob: left rgb=(%d,%d) right rgb=(%d,%d)\n", lr, lb, rr, rb);
+            EXPECT_TRUE(lr > 150 && lb < 100);      /* patch 0: (1, 0.25, 0.25) */
+            EXPECT_TRUE(rr < 100 && rb > 150);      /* patch 1: (0.25, 0.25, 1) */
+        }
+    }
+
+    EXPECT_TRUE(mgl_tess_cpu_blob_builds() == b0);
+    EXPECT_TRUE(mgl_tess_cpu_generate_runs() == g0);
     glDeleteProgram(p);
+    free(px);
 }
 
 TEST(EmuDefaultLevelsGpu)

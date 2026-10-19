@@ -718,9 +718,13 @@ static char *rewrite_tes(const char *msl)
     {
         if (i == patch_in.cp_ref_member)
             continue;
+        /* per-patch record: the blob holds total_patches records of patch_in.size bytes,
+         * indexed by the patch id the tessellator stored in the coordinate stream */
         str_append(&out, &len, &cap,
-                   "    patchIn.%s = *(device const %s*)(mgl_tess_patch + %zu);\n",
-                   patch_in.members[i].name, patch_in.members[i].type, patch_in.members[i].offset);
+                   "    patchIn.%s = *(device const %s*)(mgl_tess_patch + "
+                   "(size_t)mgl_tess_coords[mgl_vid].w * %zu + %zu);\n",
+                   patch_in.members[i].name, patch_in.members[i].type, patch_in.size,
+                   patch_in.members[i].offset);
     }
     if (patch_in.cp_ref_member >= 0)
         str_append(&out, &len, &cap,
@@ -1465,6 +1469,86 @@ bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data)
 }
 
 /* note exact tessellation statistics to the query domain */
+/* query bookkeeping for GPU-path draws (no CPU tessellation): the tessellated output
+ * counts, computed from the levels with exactly the arithmetic of the GPU tessellator's
+ * mgl_patch_counts (MGLTessKernels.h) and the CPU tessellator. */
+void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches)
+{
+    GLuint ncoords = 0, nindex = 0;
+
+    for (unsigned p = 0; p < patches; p++)
+    {
+        const float *f = factors + p * 6;
+        GLuint pc = 0, pi = 0;
+
+        if (tp->domain == MGL_TESS_DOMAIN_ISOLINES)
+        {
+            int n0 = (int)ceilf(f[0] < 1.0f ? 1.0f : (f[0] > 64.0f ? 64.0f : f[0]));
+            int n1 = tess_round_level(f[1], tp->spacing);
+
+            pc = (GLuint)n0 * (GLuint)(n1 + 1);
+            pi = 2u * (GLuint)n0 * (GLuint)n1;
+        }
+        else if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+        {
+            int n[3], N, j;
+            unsigned prev, cur;
+
+            n[0] = tess_round_level(f[0], tp->spacing);
+            n[1] = tess_round_level(f[1], tp->spacing);
+            n[2] = tess_round_level(f[2], tp->spacing);
+            N = tess_round_level(f[4], tp->spacing);
+            for (int i = 0; i < 3; i++)
+                if (n[i] > N)
+                    N = n[i];
+            if (N < 1)
+                N = 1;
+
+            prev = (unsigned)n[0] + 1u;
+            pc = prev;
+            for (j = 1; j <= N; j++)
+            {
+                cur = (unsigned)(N - j + 1);
+                pc += cur;
+                pi += (prev - 1u) + (cur - 1u);
+                prev = cur;
+            }
+            pi *= 3u;
+        }
+        else
+        {
+            int nu = tess_round_level(f[4], tp->spacing), nv = tess_round_level(f[5], tp->spacing);
+            int o;
+
+            o = tess_round_level(f[2], tp->spacing); if (o > nu) nu = o;
+            o = tess_round_level(f[3], tp->spacing); if (o > nu) nu = o;
+            o = tess_round_level(f[0], tp->spacing); if (o > nv) nv = o;
+            o = tess_round_level(f[1], tp->spacing); if (o > nv) nv = o;
+
+            pc = (GLuint)(nu + 1) * (GLuint)(nv + 1);
+            pi = 6u * (GLuint)nu * (GLuint)nv;
+        }
+
+        if (tp->point_mode)
+            pi = pc;
+        ncoords += pc;
+        nindex += pi;
+    }
+
+    if (ncoords || nindex)
+    {
+        GLuint prims;
+
+        if (tp->point_mode)
+            prims = ncoords;
+        else if (tp->domain == MGL_TESS_DOMAIN_ISOLINES)
+            prims = nindex / 2u;
+        else
+            prims = nindex / 3u;
+        mgl_tess_note_draw(ctx, patches, ncoords, prims);
+    }
+}
+
 void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, GLuint tessellated_primitives)
 {
     mgl_queries_note_tess(ctx, tes_invocations, tessellated_primitives);
