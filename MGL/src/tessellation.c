@@ -30,6 +30,26 @@
 
 /* ------------------------------------------------------------------ helpers */
 
+/* Trace flag, evaluated once: getenv() per draw (or per shader rewrite) is not
+ * free, and this file sits on the draw path. MGL_TESS_DEBUG=1 enables tracing. */
+static int tess_trace_flag = -1;
+static bool tess_trace(void)
+{
+    if (tess_trace_flag < 0)
+        tess_trace_flag = (getenv("MGL_TESS_DEBUG") != NULL) ? 1 : 0;
+    return tess_trace_flag != 0;
+}
+
+/* failure exit of the TES->plain-MSL rewrite: never silent, but only verbose with
+ * MGL_TESS_DEBUG (the step number localises the failing parse in rewrite_tes) */
+#define TES_REWRITE_FAIL(step)                                                    \
+    do {                                                                          \
+        if (tess_trace())                                                         \
+            fprintf(stderr, "MGL tess: plain-TES rewrite failed at step %d\n",    \
+                    (step));                                                      \
+        return NULL;                                                              \
+    } while (0)
+
 static void tess_reset_scratch(struct MGLExtState_tess *t)
 {
     t->tess_vertex_count = 0;
@@ -298,7 +318,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         p = strstr(msl, head);
         if (!p)
         {
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tess_trace())
                 fprintf(stderr, "MGL tess: struct %s not found\n", name);
             return false;
         }
@@ -583,14 +603,14 @@ static char *rewrite_tes(const char *msl)
     if (!sig)
         sig = strstr(msl, "[[patch(");
     if (!sig)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 9); return NULL; }
+        { TES_REWRITE_FAIL(9); }
 
     const char *vertex_kw = strstr(sig, "vertex ");
     if (!vertex_kw || (size_t)(vertex_kw - sig) > 64)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 13); return NULL; }
+        { TES_REWRITE_FAIL(13); }
     const char *sig_open = strchr(vertex_kw, '(');
     if (!sig_open)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 16); return NULL; }
+        { TES_REWRITE_FAIL(16); }
 
     /* matching close paren of the parameter list */
     const char *sig_close = NULL;
@@ -606,12 +626,12 @@ static char *rewrite_tes(const char *msl)
         else if (*q == ')') { if (--depth == 0) { sig_close = q; break; } }
     }
     if (!sig_close)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 32); return NULL; }
+        { TES_REWRITE_FAIL(32); }
 
     /* the opening brace of the function body */
     const char *body_open = strchr(sig_close, '{');
     if (!body_open)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 37); return NULL; }
+        { TES_REWRITE_FAIL(37); }
 
     /* return type and entry name: the entry name is the last identifier before '(' */
     char entry_ret[128], entry_name[128];
@@ -633,7 +653,7 @@ static char *rewrite_tes(const char *msl)
         const char *e = p;
         while (*e && *e != ' ' && *e != '\n') e++;
         if (e == p || (size_t)(e - p) >= sizeof patchin_name)
-            { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 62); return NULL; }
+            { TES_REWRITE_FAIL(62); }
         snprintf(patchin_name, sizeof patchin_name, "%.*s", (int)(e - p), p);
     }
 
@@ -646,14 +666,14 @@ static char *rewrite_tes(const char *msl)
         p = strstr(msl, head);
         if (!p) { snprintf(head, sizeof head, "struct %s {", patchin_name); p = strstr(msl, head); }
         if (!p)
-            { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 75); return NULL; }
+            { TES_REWRITE_FAIL(75); }
         const char *pcp = strstr(p, "patch_control_point<");
         if (!pcp || pcp > strchr(p, '}'))
-            { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 78); return NULL; }
+            { TES_REWRITE_FAIL(78); }
         const char *t0 = pcp + strlen("patch_control_point<");
         const char *t1 = strchr(t0, '>');
         if (!t1 || (size_t)(t1 - t0) >= sizeof cp_type)
-            { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 82); return NULL; }
+            { TES_REWRITE_FAIL(82); }
         memcpy(cp_type, t0, (size_t)(t1 - t0));
         cp_type[t1 - t0] = 0;
     }
@@ -661,11 +681,11 @@ static char *rewrite_tes(const char *msl)
     struct MslStruct patch_in;
     if (!msl_parse_struct(msl, patchin_name, &patch_in))
     {
-        if (getenv("MGL_TESS_DEBUG"))
+        if (tess_trace())
             fprintf(stderr, "MGL tess: rewrite_tes: patchIn struct parse failed (%s)\n", patchin_name);
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 92); return NULL; }
+        { TES_REWRITE_FAIL(92); }
     }
-    if (getenv("MGL_TESS_DEBUG"))
+    if (tess_trace())
         fprintf(stderr, "MGL tess: rewrite_tes: sig ok, cp=%s patchin=%s members=%d cpref=%d\n",
                 cp_type, patchin_name, patch_in.count, patch_in.cp_ref_member);
 
@@ -675,7 +695,7 @@ static char *rewrite_tes(const char *msl)
 
     const char *ins = strstr(msl, "using namespace metal;");
     if (!ins)
-        { fprintf(stderr, "MGL tess: rewrite_tes NULL at rel-line %d\n", 104); return NULL; }
+        { TES_REWRITE_FAIL(104); }
     ins += strlen("using namespace metal;");
     str_append(&out, &len, &cap, "%.*s%s", (int)(ins - msl), msl, kTessPrelude);
 
@@ -1374,7 +1394,7 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
             bool okname = tess_cp_record_name(msl2, recname, sizeof recname);
             bool okparse = okname && msl_parse_struct(msl2, recname, &rec);
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tess_trace())
                 fprintf(stderr, "MGL tess: cp record: stage=%d name=%s ok=%d/%d count=%d size=%zu\n",
                         tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER,
                         okname ? recname : "(none)", okname, okparse, rec.count, rec.size);
@@ -1400,7 +1420,7 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
                         break;
                     }
                 }
-                if (getenv("MGL_TESS_DEBUG"))
+                if (tess_trace())
                     fprintf(stderr, "MGL tess: cp member %s -> record offset %zu\n",
                             tp->tes_cp[i].name, tp->tes_cp[i].offset);
             }
