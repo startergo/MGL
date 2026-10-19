@@ -393,6 +393,7 @@ TEST(TessConsecutiveDraws)
             read_px(2, (int)h - 4, tlc);
             read_px(2, 2, blc);
             read_px((int)w - 4, 2, brc);
+            printf("corners tl=(%.2f %.2f %.2f) bl=(%.2f %.2f %.2f) br=(%.2f %.2f %.2f)\n",
                    tlc[0], tlc[1], tlc[2], blc[0], blc[1], blc[2], brc[0], brc[1], brc[2]);
         }
         {
