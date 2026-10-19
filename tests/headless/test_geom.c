@@ -825,6 +825,36 @@ TEST(separable_pipeline_with_gs)
     EXPECT_NO_GL_ERROR();
     EXPECT_TRUE(count_block(100, 150, is_green) > 10);
 
+    /* the geometry draw must not corrupt the vertex program it shares a Shader with: draw
+     * pv alone (no geometry stage) through a second pipeline — its own vertex function has
+     * to feed the fragment stage again */
+    {
+        GLuint plain = 0;
+        glGenProgramPipelines(1, &plain);
+        glBindProgramPipeline(plain);
+        glUseProgramStages(plain, GL_VERTEX_SHADER_BIT, pv);
+        glUseProgramStages(plain, GL_FRAGMENT_SHADER_BIT, pf);
+        EXPECT_NO_GL_ERROR();
+        clear_black();
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        EXPECT_NO_GL_ERROR();
+        EXPECT_TRUE(count_block(100, 100, is_green) > 10);
+        /* the pixel is outside the triangle: the geometry stage must not be leaking into
+         * the plain vertex program's draws */
+        EXPECT_TRUE(count_block(5, 190, is_black) > 10);
+
+        /* and the geometry pipeline still draws afterwards: its composite program is rebuilt
+         * from the stage programs on every scope entry, so the pass-through override has to
+         * win again rather than the composite's own vertex stage */
+        glBindProgramPipeline(pipe);
+        clear_black();
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        EXPECT_NO_GL_ERROR();
+        EXPECT_TRUE(count_block(100, 150, is_green) > 10);
+
+        glDeleteProgramPipelines(1, &plain);
+    }
+
     glBindProgramPipeline(0);
     glDeleteProgramPipelines(1, &pipe);
     glDeleteProgram(pv); glDeleteProgram(pg); glDeleteProgram(pf);

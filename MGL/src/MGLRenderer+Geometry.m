@@ -24,6 +24,14 @@
 #include "mgl_ext_geom_xfb.h"
 #include "MGLRenderer_Private.h"
 
+/* rstate's vertex/fragment function-constant specialization is declared privately inside
+ * MGLRenderer+RenderState.m; the geometry pass-through function needs the vertex half of it
+ * (it is the last pre-rasterization stage), so the prototype is repeated here rather than
+ * editing the rstate category's header. */
+@interface MGLRenderer (RenderStateSpecialize)
+- (id<MTLFunction>) rstateSpecialize:(Shader *)shader stage:(int)stage;
+@end
+
 /* the raster pass is a separate method so the pass-through vertex function can be swapped
  * in for it and restored afterwards */
 @interface MGLRenderer (Geometry)
@@ -940,6 +948,36 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
 }
 #pragma clang diagnostic pop
 
+/* The pass-through vertex function is the LAST pre-rasterization stage of the emulated
+ * geometry pipeline, so rstate's vertex fixup (clip-space flip, point size, rasterizer
+ * discard) belongs to it — never to the vertex capture variant or the geometry kernel.
+ * generatePipelineDescriptor re-applies the override after rstateConfigurePipelineDescriptor
+ * has specialized the program's own vertex shader, which would otherwise win: rstateSpecialize
+ * is handed a Shader standing in for the pass-through function, so both the function constants
+ * and the specialization cache stay rstate's own (a stack Shader is enough — rstateSpecialize
+ * reads only mtl_data.library / mtl_data.function).  NULL when the override is inactive. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
+- (id<MTLFunction>) geomSpecializeVertexOverride
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    MGLGeomProgram *gp;
+
+    if (!g || !g->vertex_override || !g->vertex_override_gp) return nil;
+    gp = (MGLGeomProgram *)g->vertex_override_gp;
+    if (!gp->draw_function || !gp->draw_library) return nil;
+
+    {
+        Shader standin;
+
+        memset(&standin, 0, sizeof standin);
+        standin.mtl_data.function = gp->draw_function;
+        standin.mtl_data.library = gp->draw_library;
+        return [self rstateSpecialize: &standin stage: _VERTEX_SHADER];
+    }
+}
+#pragma clang diagnostic pop
+
 /* can the primitive assembly run on the GPU? It needs the element buffer as a device
  * buffer (a client-side index pointer has to be assembled on the CPU) */
 - (bool) geomCanAssembleGPU
@@ -1433,6 +1471,45 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
     if (getenv("MGL_GEOM_DEBUG"))
         fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+    {
+        /* diagnostic only: wait for this draw's kernels, then dump the assembly header, the
+         * indirect draw arguments, the capture index list, the prep block and the first
+         * non-zero words of the captured VS records and the GS records */
+        BUF()->flush(ctx);
+        BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        fprintf(stderr, "geom: trace gpu_assembly=%d prims_count=%llu vstart=%u vcount=%u "
+                        "in_words=%u out_words=%u capture_fn=%p draw_fn=%p\n",
+                (int)gpu_assembly, (unsigned long long)d->prims_count, d->vstart, d->vcount,
+                gp->in_words, gp->out_words, gp->capture_function, gp->draw_function);
+        fprintf(stderr, "geom: trace hdr @%zu:", gPrimOff / 4);
+        for (int i = 0; i < 13; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gPrim.contents)[gPrimOff / 4 + i]);
+        fprintf(stderr, "\ngeom: trace ctl:");
+        for (int i = 0; i < MGL_GEOM_ARG_OFFSET + 5; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gCtl.contents)[i]);
+        fprintf(stderr, "\ngeom: trace idx:");
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %u", ((uint32_t *)gIdx.contents)[i]);
+        fprintf(stderr, "\ngeom: trace prep @%zu:", gPrepOff / 4);
+        for (int i = 0; i < 44; i++)
+            fprintf(stderr, " %u", ((uint32_t *)gPrep.contents)[gPrepOff / 4 + i]);
+        fprintf(stderr, "\ngeom: trace vsout @%zu:", gVsoutOff / 4);
+        {
+            uint32_t *p = (uint32_t *)gVsout.contents;
+            size_t n = gVsout.length / 4, first = 0xffffffff;
+            for (size_t i = 0; i < n; i++) if (p[i]) { first = i; break; }
+            fprintf(stderr, " [first nonzero word = %zu]", first);
+            for (size_t i = (first == 0xffffffff ? 0 : first); i < n && i < (first == 0xffffffff ? 8 : first + 16); i++)
+                fprintf(stderr, " %8.3f", *(float *)&p[i]);
+        }
+        fprintf(stderr, "\ngeom: trace outv @%zu:", gOutvOff / 4);
+        for (int i = 0; i < 12; i++)
+        {
+            uint32_t w = ((uint32_t *)gOutv.contents)[gOutvOff / 4 + i];
+            fprintf(stderr, " %8.3f", *(float *)&w);
+        }
+        fprintf(stderr, "\n");
+    }
     /* ---- 3. raster pass ---- */
     if (ctx->state.caps.rasterizer_discard == GL_TRUE)
         return true;
@@ -1458,11 +1535,13 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
 
         if (!g) return false;
         g->vertex_override = gp->draw_function;
+        g->vertex_override_gp = gp;
         ctx->state.dirty_bits |= DIRTY_PROGRAM;
 
         bool ok = [self geomRasterPass: d];
 
         g->vertex_override = NULL;
+        g->vertex_override_gp = NULL;
         return ok;
     }
 }

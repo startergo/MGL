@@ -1873,8 +1873,7 @@ static const char *geom_vs_source(GLMContext ctx, MGLProgramObj *obj)
 }
 
 static GLuint geom_declared_clip_words(const char *src, const char *name)
-{
-    /* the largest explicitly declared array size of gl_ClipDistance / gl_CullDistance */
+{    /* the largest explicitly declared array size of gl_ClipDistance / gl_CullDistance */
     const char *p = src;
     GLuint best = 0;
     while ((p = strstr(p, name)))
@@ -1892,8 +1891,54 @@ static GLuint geom_declared_clip_words(const char *src, const char *name)
 }
 
 /* build the emulation state for one program's geometry stage; a failure here fails the link */
-bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int stage,
-                            const uint32_t *words, size_t nwords, const char *entry, char **log)
+/* match every geometry-stage input varying against the vertex stage outputs of `vs_program`
+ * and record the producing expression (the name the capture variant stores).  Returns false
+ * with a message in `log` when an input is not written or its type differs. */
+static bool geom_derive_exprs(MGLGeomProgram *gp, Program *vs_program, char **log)
+{
+    MGLGeomVar vs_out[MGL_GEOM_MAX_VARYINGS];
+    int n_vs_out = 0;
+    SpvModule *vm = NULL;
+    const char *e2 = NULL;
+    bool ok = false;
+
+    if (!vs_program->spirv[_VERTEX_SHADER].ir)
+    {
+        mgl_append_log(log, "ERROR: geometry: no vertex stage to reflect the inputs from\n");
+        return false;
+    }
+    vm = spv_parse(vs_program->spirv[_VERTEX_SHADER].ir, vs_program->spirv[_VERTEX_SHADER].size, &e2);
+    if (!vm || !geom_reflect_stage(vm, false, vs_out, &n_vs_out, log))
+    {
+        mgl_append_log(log, "ERROR: geometry: could not reflect the vertex stage outputs\n");
+        goto done;
+    }
+    for (int i = 0; i < gp->n_in; i++)
+    {
+        int j = geom_find_location(vs_out, n_vs_out, gp->in_v[i].location);
+        if (j < 0)
+        {
+            mgl_append_log(log, "ERROR: geometry: input '%s' at location %u is not written by the vertex stage\n",
+                           gp->in_v[i].name, gp->in_v[i].location);
+            goto done;
+        }
+        if (vs_out[j].rows != gp->in_v[i].rows || vs_out[j].cols != gp->in_v[i].cols ||
+            vs_out[j].base != gp->in_v[i].base || vs_out[j].elems != gp->in_v[i].elems)
+        {
+            mgl_append_log(log, "ERROR: geometry: type mismatch for '%s' (location %u)\n",
+                           gp->in_v[i].name, gp->in_v[i].location);
+            goto done;
+        }
+        snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s", vs_out[j].name);
+    }
+    ok = true;
+
+done:
+    spv_free(vm);
+    return ok;
+}
+
+bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int stage,                            const uint32_t *words, size_t nwords, const char *entry, char **log)
 {
     MGLProgramObj *obj = (MGLProgramObj *)obj_p;
     MGLGeomProgram *gp = geom_prog_slot(ctx, program, true);
@@ -1901,8 +1946,6 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     const char *err = NULL;
     bool ok = false;
     int i;
-    MGLGeomVar vs_out[MGL_GEOM_MAX_VARYINGS];
-    int n_vs_out = 0;
 
     if (!gp)
     {
@@ -1974,14 +2017,10 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
      * the record layout are kept (so the program queries work), the emulation is built at
      * the first draw, when the pipeline contributes the vertex stage.  The layout uses the
      * default clip distance size here; geom_build() refines it once the vertex stage is
-     * known. */
+     * known.  The builtin scan below still runs for such a program: the input record always
+     * carries gl_Position, and the capture variant only stores what in_has_* says. */
     geom_layout(gp);
     gp->deferred = !program->shader_slots[_VERTEX_SHADER];
-    if (gp->deferred)
-    {
-        ok = true;
-        goto done;
-    }
 
     /* builtins: driven by what the shader source mentions */
     {
@@ -2022,27 +2061,45 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
             }
             if (!vs_src)
             {
-                mgl_append_log(log, "ERROR: geometry: no vertex shader to capture from\n");
-                free(vs_dec);
-                free(decompiled);
-                goto done;
+                /* a separable geometry-only program has no vertex stage of its own: the clip
+                 * sizes default to the maximum now and geom_build() refines them from the
+                 * pipeline's vertex stage at the first draw */
+                if (!gp->deferred)
+                {
+                    mgl_append_log(log, "ERROR: geometry: no vertex shader to capture from\n");
+                    free(vs_dec);
+                    free(decompiled);
+                    goto done;
+                }
+                gp->in_clip_size = gp->in_has_clip ? MGL_GEOM_MAX_CLIP : 0;
+                gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ? MGL_GEOM_MAX_CLIP : 0;
             }
-
-            n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
-            gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
-            n = geom_declared_clip_words(vs_src, "gl_CullDistance");
-            if (gp->in_has_cull)
+            else
             {
-                GLuint nc2 = n ? n : MGL_GEOM_MAX_CLIP;
-                if (nc2 < gp->in_clip_size) gp->in_clip_size = nc2;
+                n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
+                gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+                n = geom_declared_clip_words(vs_src, "gl_CullDistance");
+                if (gp->in_has_cull)
+                {
+                    GLuint nc2 = n ? n : MGL_GEOM_MAX_CLIP;
+                    if (nc2 < gp->in_clip_size) gp->in_clip_size = nc2;
+                }
+                gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
+                                    (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
             }
-            gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
-                                (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
             free(vs_dec);
         /* the clip size of the real vertex stage is only known now */
         geom_layout(gp);
         }
         free(decompiled);
+    }
+
+    if (gp->deferred)
+    {
+        /* the emulation is built at the first draw, when the pipeline contributes the vertex
+         * stage; everything above is reflection only */
+        ok = true;
+        goto done;
     }
 
     /* total output component limit */
@@ -2063,39 +2120,13 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     for (i = 0; i < gp->n_out; i++)
         if (gp->out_v[i].stream + 1 > gp->streams) gp->streams = gp->out_v[i].stream + 1;
 
-    /* writer side: the vertex outputs feeding each input location */
+    /* writer side: the vertex outputs feeding each input location.  A separable
+     * geometry-only program has no vertex stage to reflect here; geom_ensure() does it from
+     * the pipeline's composite once that is available. */
+    if (!gp->deferred)
     {
-        SpvModule *vm = NULL;
-        const char *e2 = NULL;
-        if (program->spirv[_VERTEX_SHADER].ir)
-            vm = spv_parse(program->spirv[_VERTEX_SHADER].ir, program->spirv[_VERTEX_SHADER].size, &e2);
-        if (!vm || !geom_reflect_stage(vm, false, vs_out, &n_vs_out, log))
-        {
-            mgl_append_log(log, "ERROR: geometry: could not reflect the vertex stage outputs\n");
-            spv_free(vm);
+        if (!geom_derive_exprs(gp, program, log))
             goto done;
-        }
-        for (i = 0; i < gp->n_in; i++)
-        {
-            int j = geom_find_location(vs_out, n_vs_out, gp->in_v[i].location);
-            if (j < 0)
-            {
-                mgl_append_log(log, "ERROR: geometry: input '%s' at location %u is not written by the vertex stage\n",
-                               gp->in_v[i].name, gp->in_v[i].location);
-                spv_free(vm);
-                goto done;
-            }
-            if (vs_out[j].rows != gp->in_v[i].rows || vs_out[j].cols != gp->in_v[i].cols ||
-                vs_out[j].base != gp->in_v[i].base || vs_out[j].elems != gp->in_v[i].elems)
-            {
-                mgl_append_log(log, "ERROR: geometry: type mismatch for '%s' (location %u)\n",
-                               gp->in_v[i].name, gp->in_v[i].location);
-                spv_free(vm);
-                goto done;
-            }
-            snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s", vs_out[j].name);
-        }
-        spv_free(vm);
     }
 
     ok = true;
@@ -2427,6 +2458,50 @@ static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             mgl_geom_compile_stage(ctx, gs, MGL_PROGRAM_OBJ(gs), _GEOMETRY_SHADER,
                                    gs->spirv[_GEOMETRY_SHADER].ir, gs->spirv[_GEOMETRY_SHADER].size,
                                    "main", NULL);
+    }
+
+    /* a separable geometry-only program reflected its own stage only: the inputs' producing
+     * vertex outputs and the real clip sizes come from the composite the pipeline builds,
+     * which carries the vertex stage.  geom_build() reads them from gp->in_v[].expr. */
+    if (gp->deferred && program->spirv[_VERTEX_SHADER].ir && gp->n_in)
+    {
+        char *llog = NULL;
+
+        if (!geom_derive_exprs(gp, program, &llog))
+        {
+            geom_fail(ctx, gp, "%s", llog ? llog : "geometry inputs could not be matched");
+            free(llog);
+            return false;
+        }
+        free(llog);
+        {
+            const char *vs_src = geom_vs_source(ctx, MGL_PROGRAM_OBJ(program));
+            char *vs_dec = NULL;
+            GLuint n;
+
+            if (!vs_src)
+            {
+                vs_dec = geom_spirv_to_glsl(program->spirv[_VERTEX_SHADER].ir,
+                                            program->spirv[_VERTEX_SHADER].size, 460, &llog);
+                vs_src = vs_dec;
+            }
+            if (vs_src)
+            {
+                n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
+                gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+                n = geom_declared_clip_words(vs_src, "gl_CullDistance");
+                if (gp->in_has_cull)
+                {
+                    GLuint nc2 = n ? n : MGL_GEOM_MAX_CLIP;
+                    if (nc2 < gp->in_clip_size) gp->in_clip_size = nc2;
+                }
+                gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
+                                    (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
+                geom_layout(gp);
+            }
+            free(vs_dec);
+            free(llog);
+        }
     }
 
     gp->deferred = false;

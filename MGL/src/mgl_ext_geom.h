@@ -156,6 +156,7 @@ struct MGLExtState_geom {
     MGLGeomProgram   progs[MGL_GEOM_MAX_PROGRAMS];
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
+    MGLGeomProgram *vertex_override_gp;   /* its owner, for the rstate specialization */
 };
 
 struct MGLExtMetal_geom {

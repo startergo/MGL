@@ -2787,10 +2787,29 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // blend / masks / raster / shader-variant state (rstate category)
     [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
+
     [self texextAdjustPipelineDescriptor: pipelineStateDescriptor]; // texext: multisample attachments
 
     // blend state, vertex descriptor, depth/stencil formats are bound by their domains
     [self bindBlendStateToPipelineStateDescriptor: pipelineStateDescriptor];
+
+    // geom: rstateConfigurePipelineDescriptor (called twice above — directly and through
+    // bindBlendStateToPipelineStateDescriptor) replaces the vertex function with a specialized
+    // copy of the PROGRAM's vertex shader, silently discarding the pass-through override
+    // applied above.  Re-apply it as a specialized copy of the pass-through function (the same
+    // vertex function constants: it is the last pre-rasterization stage of the emulated
+    // geometry pipeline).  The descriptor's vertexFunction is part of the PSO cache key
+    // (MGLRenderer+Gpuaudit.m), so an overridden and a plain build never alias.
+    {
+        id<MTLFunction> geomVertexFunction = [self geomSpecializeVertexOverride];
+        if (geomVertexFunction)
+        {
+            pipelineStateDescriptor.vertexFunction = geomVertexFunction;
+            if (getenv("MGL_GEOM_DEBUG"))
+                NSLog(@"MGL geom: PSO vertex function is the pass-through %@", geomVertexFunction.name);
+        }
+    }
+
 
     // the geometry domain needs the topology class set when its pass-through vertex
     // function writes render_target_array_index / viewport_array_index (gl_Layer /
