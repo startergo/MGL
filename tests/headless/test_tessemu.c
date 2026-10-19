@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
 #include "glcorearb.h"
 #include "mgl_test.h"
 
@@ -23,6 +25,19 @@ static const char *kTcs =
     "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
     "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 8.0; }\n"
     "}\n";
+static const char *kTcsQuad =
+    "#version 450 core\n"
+    "layout(vertices=4) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=1.0; gl_TessLevelOuter[1]=1.0; gl_TessLevelOuter[2]=1.0; gl_TessLevelOuter[3]=1.0;\n"
+    "    gl_TessLevelInner[0]=1.0; gl_TessLevelInner[1]=1.0; }\n"
+    "}\n";
+
 /* isolines: control points 0->1 along u, lines at v = (i+0.5)/n0 */
 static const char *kTesIso =
     "#version 450 core\n"
@@ -45,12 +60,39 @@ static const char *kTesQuadPt =
     "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
     "  f_col = tc_col[0];\n"
     "}\n";
+static const char *kTcsTri =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=1.0; gl_TessLevelOuter[1]=1.0; gl_TessLevelOuter[2]=1.0;\n"
+    "    gl_TessLevelInner[0]=1.0; }\n"
+    "}\n";
+/* triangles with point mode, barycentric evaluation: the 3 corner vertices of the
+ * level-1 triangle land exactly on the 3 control points */
+static const char *kTesTriPt =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw, point_mode) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  f_col = tc_col[0];\n"
+    "}\n";
 
-static GLuint prog(const char *tes)
+static GLuint prog2(const char *tcs, const char *tes);
+static GLuint prog(const char *tes) { return prog2(kTcs, tes); }
+static GLuint prog2(const char *tcs, const char *tes)
 {
     GLuint p = glCreateProgram();
     struct { GLenum t; const char *s; } srcs[4] = {
-        { GL_VERTEX_SHADER, kVs }, { GL_TESS_CONTROL_SHADER, kTcs },
+        { GL_VERTEX_SHADER, kVs }, { GL_TESS_CONTROL_SHADER, tcs },
         { GL_TESS_EVALUATION_SHADER, tes }, { GL_FRAGMENT_SHADER, kFs } };
     for (int i = 0; i < 4; i++) {
         GLuint so = glCreateShader(srcs[i].t);
@@ -59,6 +101,17 @@ static GLuint prog(const char *tes)
     glLinkProgram(p);
     return p;
 }
+
+static const char *kVsPlain =
+    "#version 450 core\n"
+    "layout(location=0) in vec4 a_pos;\n"
+    "layout(location=0) out vec4 v_col;\n"
+    "void main() { gl_Position = a_pos; v_col = vec4(1); }\n";
+static const char *kFsWhite =
+    "#version 450 core\n"
+    "layout(location=0) in vec4 f_col;\n"
+    "layout(location=0) out vec4 o_col;\n"
+    "void main() { o_col = f_col; }\n";
 
 static void setup(const float pos[][4], const float col[][4], int n, int patch_verts)
 {
@@ -72,6 +125,41 @@ static void setup(const float pos[][4], const float col[][4], int n, int patch_v
     glPatchParameteri(GL_PATCH_VERTICES, patch_verts);
 }
 
+/* pixel-exact reference: draw the first `n` attributes of the bound VAO as plain GL_POINTS
+ * and diff the lit pixels against `tess_px`. Returns true when the sets are identical with
+ * exactly `expect` lit pixels. */
+static bool point_mode_matches_plain_points(const unsigned char *tess_px, int w, int h, int n, int expect)
+{
+    unsigned char *plain_px = calloc((size_t)w * h, 4);
+    GLuint q = glCreateProgram();
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(vs, 1, &kVsPlain, NULL); glCompileShader(vs); glAttachShader(q, vs); glDeleteShader(vs);
+    glShaderSource(fs, 1, &kFsWhite, NULL); glCompileShader(fs); glAttachShader(q, fs); glDeleteShader(fs);
+    glLinkProgram(q);
+    GLint lq = 0; glGetProgramiv(q, GL_LINK_STATUS, &lq);
+    if (lq != GL_TRUE) { printf("plain GL_POINTS program failed to link\n"); glDeleteProgram(q); free(plain_px); return false; }
+    glUseProgram(q);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_POINTS, 0, n);
+    if (glGetError() != GL_NO_ERROR) printf("plain GL_POINTS draw error\n");
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, plain_px);
+    glDeleteProgram(q);
+
+    int only_tess = 0, only_plain = 0, both = 0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            int a = tess_px[(y * w + x) * 4] > 200, b = plain_px[(y * w + x) * 4] > 200;
+            if (a && b) both++;
+            else if (a) only_tess++;
+            else if (b) only_plain++;
+        }
+    printf("point_mode vs GL_POINTS: both=%d tess-only=%d plain-only=%d\n", both, only_tess, only_plain);
+    free(plain_px);
+    return both == expect && only_tess == 0 && only_plain == 0;
+}
+
 TEST(IsolinesGpu)
 {
     GLuint p = prog(kTesIso);
@@ -79,55 +167,179 @@ TEST(IsolinesGpu)
     glGetProgramiv(p, GL_LINK_STATUS, &link);
     EXPECT_EQ_INT(link, GL_TRUE);
     glUseProgram(p);
-    static const float pos[2][4] = { { -0.5f, 0, 0, 1 }, { 0.5f, 0, 0, 1 } };
-    static const float col[2][4] = { { 1,0,0,1 }, { 0,1,0,1 } };
+
+    /* two control points spanning the screen horizontally; 3 isolines (outer0=3),
+       8 segments each (outer1=8). The TES maps v to y in [-0.75, 0.75], so the lines
+       sit at NDC y = -0.5, 0, +0.5 and interpolate red->green along x. */
+    const float pos[2][4] = { { -0.9f, 0, 0, 1 }, { 0.9f, 0, 0, 1 } };
+    const float col[2][4] = { { 1,0,0,1 }, { 0,1,0,1 } };
     setup(pos, col, 2, 2);
+
     glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDrawArrays(GL_PATCHES, 0, 2);
     EXPECT_NO_GL_ERROR();
     glFinish();
-    /* 3 lines at v = 1/6, 3/6, 5/6; scan a column through all of them */
-    int lines = 0;
-    for (int y = 0; y < 128; y++)
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    unsigned char *px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+
+    /* expected: n0 = 3 isolines at v = (i + 0.5) / 3 -> NDC y = -0.5, 0, +0.5
+     * -> window y = h/4, h/2, 3h/4 (an exact pixel edge goes to the LOWER row,
+     * the same tie rule the point_mode test verified against Apple GL). */
+    int rows[8], nrow = 0;
+    for (int y = 0; y < h; y++)
     {
-        unsigned char px[4];
-        glReadPixels(64, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        if (px[0] + px[1] + px[2] > 128)
-        { lines++; printf("lit row %d: %d %d %d\n", y, px[0], px[1], px[2]); }
+        int cnt = 0;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] > 120) cnt++;
+        if (cnt > w / 4)                       /* a line, not a stray pixel */
+        { printf("iso row %d: %d px\n", y, cnt); if (nrow < 8) rows[nrow++] = y; }
     }
-    printf("total lit rows at col 64: %d\n", lines);
-    /* NOTE: pixel verification of the GPU-emulated isolines path is pending a render
-     * wiring fix (see the tess report); the draw itself must succeed cleanly. */
+    EXPECT_TRUE(nrow == 3);
+    if (nrow == 3)
+    {
+        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        for (int k = 0; k < 3; k++)
+        {
+            int d = rows[k] - (ey[k] - 1);     /* exact edge -> lower row */
+            EXPECT_TRUE(d >= -1 && d <= 1);
+        }
+    }
+
+    /* each line spans the full u range: NDC x +-0.9 -> window 0.05w..0.95w */
+    if (nrow == 3)
+    {
+        int y = rows[0], x0 = -1, x1 = -1;
+        for (int x = 0; x < w; x++)
+            if (px[(y * w + x) * 4] + px[(y * w + x) * 4 + 1] > 120)
+            { if (x0 < 0) x0 = x; x1 = x; }
+        printf("iso extent x=[%d..%d]\n", x0, x1);
+        EXPECT_TRUE(x0 <= (int)(w * 0.05f) + 2 && x1 >= (int)(w * 0.95f) - 2);
+
+        /* linear red->green along u: sampled at x = 0.1w, 0.5w, 0.9w */
+        int sx[3] = { w / 10, w / 2, w * 9 / 10 };
+        for (int k = 0; k < 3; k++)
+        {
+            int r = px[(y * w + sx[k]) * 4], g = px[(y * w + sx[k]) * 4 + 1];
+            printf("iso colour at x=%d: r=%d g=%d\n", sx[k], r, g);
+            if (k == 0) EXPECT_TRUE(r > 180 && g < 80);
+            if (k == 1) EXPECT_TRUE(r > 70 && r < 190 && g > 70 && g < 190);
+            if (k == 2) EXPECT_TRUE(g > 180 && r < 80);
+        }
+    }
+    free(px);
     glDeleteProgram(p);
 }
 
 TEST(QuadPointModeGpu)
 {
-    GLuint p = prog(kTesQuadPt);
+    GLuint p = prog2(kTcsQuad, kTesQuadPt);
     GLint link = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &link);
     EXPECT_EQ_INT(link, GL_TRUE);
     glUseProgram(p);
-    static const float pos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 }, { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
-    static const float col[4][4] = { { 1,1,1,1 }, { 1,1,1,1 }, { 1,1,1,1 }, { 1,1,1,1 } };
+
+    /* a 2x2 inner grid (levels 1) emits 4 points at the corners of the viewport quad */
+    const float pos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 }, { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
+    const float col[4][4] = { { 1,1,1,1 }, { 1,1,1,1 }, { 1,1,1,1 }, { 1,1,1,1 } };
     setup(pos, col, 4, 4);
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    unsigned char *tess_px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
     glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glDrawArrays(GL_PATCHES, 0, 4);
     EXPECT_NO_GL_ERROR();
     glFinish();
-    /* 2x2 inner grid (levels 1) -> 4 points at the corners */
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tess_px);
+
+    int points = 0, xs[64], ys[64], npts = 0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (tess_px[(y * w + x) * 4] + tess_px[(y * w + x) * 4 + 1] + tess_px[(y * w + x) * 4 + 2] > 200)
+            { points++; if (npts < 64) { xs[npts] = x; ys[npts] = y; npts++; } }
+    printf("point_mode lit pixels:");
+    for (int k = 0; k < npts; k++) printf(" (%d,%d)", xs[k], ys[k]);
+    printf("\n");
+    /* 4 points of 1 pixel each (gl_PointSize is 1) */
+    EXPECT_TRUE(points >= 4 && points <= 16);
+
+    /* the 4 points sit at the quad corners: NDC (+-0.5, +-0.5) -> window (0.25/0.75 of the
+     * viewport). Point rasterization rounds to the pixel whose centre is closest; a window
+     * coordinate exactly on a pixel edge goes to the LOWER pixel on this hardware (verified
+     * against Apple's native GL), so accept the projected position +-1 px. */
+    int corners = 0;
+    int cx[4] = { (int)(w * 0.25f), (int)(w * 0.75f), (int)(w * 0.75f), (int)(w * 0.25f) };
+    int cy[4] = { (int)(h * 0.25f), (int)(h * 0.25f), (int)(h * 0.75f), (int)(h * 0.75f) };
+    for (int k = 0; k < 4; k++)
+    {
+        int lit = 0;
+        for (int dy = -1; dy <= 1 && !lit; dy++)
+            for (int dx = -1; dx <= 1 && !lit; dx++)
+            {
+                int x = cx[k] + dx, y = cy[k] + dy;
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                if (tess_px[(y * w + x) * 4] + tess_px[(y * w + x) * 4 + 1] + tess_px[(y * w + x) * 4 + 2] > 200)
+                    lit = 1;
+            }
+        corners += lit;
+    }
+    EXPECT_TRUE(corners == 4);
+
+    /* pixel-exact reference: the same 4 NDC positions drawn as plain GL_POINTS must
+     * rasterize to exactly the same pixels as the tessellated point_mode output */
+    EXPECT_TRUE(point_mode_matches_plain_points(tess_px, w, h, 4, 4));
+    free(tess_px);
+    glDeleteProgram(p);
+}
+
+TEST(TrianglePointModeGpu)
+{
+    GLuint p = prog2(kTcsTri, kTesTriPt);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+
+    /* a level-1 triangle patch emits exactly its 3 control points */
+    const float pos[3][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 }, { 0.0f,0.5f,0,1 } };
+    const float col[3][4] = { { 1,1,1,1 }, { 1,1,1,1 }, { 1,1,1,1 } };
+    setup(pos, col, 3, 3);
+
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    unsigned char *tess_px = calloc((size_t)w * h, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    glClearColor(0, 0, 0, 1);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tess_px);
+
     int points = 0;
-    for (int y = 0; y < 128; y++)
-        for (int x = 0; x < 128; x++)
-        {
-            unsigned char px[4];
-            glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            if (px[0] + px[1] + px[2] > 128)
-            { points++; }
-        }
-    /* NOTE: pixel verification pending (see above) */
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (tess_px[(y * w + x) * 4] + tess_px[(y * w + x) * 4 + 1] + tess_px[(y * w + x) * 4 + 2] > 200)
+                points++;
+    EXPECT_TRUE(points >= 3 && points <= 12);
+
+    EXPECT_TRUE(point_mode_matches_plain_points(tess_px, w, h, 3, 3));
+    free(tess_px);
     glDeleteProgram(p);
 }
 
@@ -135,6 +347,7 @@ int main(void)
 {
     RUN(IsolinesGpu);
     RUN(QuadPointModeGpu);
+    RUN(TrianglePointModeGpu);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

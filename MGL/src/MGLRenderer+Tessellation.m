@@ -1,17 +1,25 @@
 /*
  * MGLRenderer+Tessellation.m — Metal side of the 'tess' domain.
  *
- * Executes a GL_PATCHES draw on GPUs without hardware tessellation (all Apple-silicon
- * GPUs: drawPatches is silently dropped). See mgl_ext_tess.h for the design:
+ * Executes a GL_PATCHES draw. Two paths (see mgl_ext_tess.h for the design):
  *
- *   compute:  VS kernel (SPIRV-Cross VERTEX_FOR_TESSELLATION) over (vertices, instances)
- *             -> optional gather kernel (indexed draws) -> TCS kernel (multi-patch)
- *   CPU:      tessellator (GL §11.3.4) from the read-back tessellation factors
- *   render:   the rewritten TES is the render pipeline's vertex function; it reads
- *             (tess coord, patch id) / control points / patch data from buffers and the
- *             tessellated primitives are drawn with drawIndexedPrimitives.
+ *   hardware:  triangles/quads without point_mode use the GPU tessellation pipe:
+ *              compute:  VS kernel (SPIRV-Cross VERTEX_FOR_TESSELLATION) over
+ *                        (vertices, instances) -> optional gather kernel (indexed
+ *                        draws) -> TCS kernel (multi-patch) writing control points,
+ *                        patch data and MTLTriangle/QuadTessellationFactorsHalf
+ *              render:   the post-tessellation TES ([[patch(...)]]) with
+ *                        drawPatches / drawIndexedPatches + setTessellationFactorBuffer
  *
- * The default-levels case (no TCS) needs no GPU readback: the factors are the
+ *   emulated:  isolines and point_mode (Metal's tessellator has no isoline domain
+ *              and cannot emit points): the same VS/TCS compute stages, then the
+ *              D3D11-style tessellator of MGLTessKernels.h runs as compute kernels
+ *              (count -> emit -> indirect draw args) and the TES — rewritten to a
+ *              plain vertex function reading (tess coord, patch id) / control points
+ *              / patch data from buffers — draws the result through an indirect
+ *              draw. No CPU readback on either path.
+ *
+ * The default-levels case (no TCS) needs no TCS kernel: the factors are the
  * glPatchParameterfv defaults and control points pass through from the VS kernel.
  *
  * Licensed under the Apache License, Version 2.0 (see LICENSE).
@@ -32,6 +40,31 @@ size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);
 #import "glcorearb.h"
 
 #define MAX_ATTRIB_SLOTS 16
+
+/* Trace / configuration flags, evaluated once. getenv() per draw would sit directly
+ * on the GL_PATCHES draw path; these are read at most once per process.
+ *   MGL_TESS_DEBUG     — per-draw tracing
+ *   MGL_TESS_CPU       — force the CPU tessellator (reference path)
+ *   MGL_TESS_NO_FIXUP  — do not inject the clip-space fixup into the plain TES */
+static int tTraceFlag = -1, tCpuFlag = -1, tNoFixupFlag = -1;
+static bool tTrace(void)
+{
+    if (tTraceFlag < 0)
+        tTraceFlag = (getenv("MGL_TESS_DEBUG") != NULL) ? 1 : 0;
+    return tTraceFlag != 0;
+}
+static bool tCpuReference(void)
+{
+    if (tCpuFlag < 0)
+        tCpuFlag = (getenv("MGL_TESS_CPU") != NULL) ? 1 : 0;
+    return tCpuFlag != 0;
+}
+static bool tNoFixup(void)
+{
+    if (tNoFixupFlag < 0)
+        tNoFixupFlag = (getenv("MGL_TESS_NO_FIXUP") != NULL) ? 1 : 0;
+    return tNoFixupFlag != 0;
+}
 
 /* A kernel PSO cache entry retains the MTLFunction it was built from: keys use object
  * addresses, and a freed program/function whose address is reallocated (programs are
@@ -217,7 +250,7 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
     memset(has, 0, MAX_ATTRIBS * sizeof(bool));
     memset(kind, 0, MAX_ATTRIBS * sizeof(int));
 
-    if (getenv("MGL_TESS_DEBUG"))
+    if (tTrace())
         NSLog(@"MGL tess: VS stage inputs: %d", list->count);
 
     for (int i = 0; i < list->count; i++)
@@ -242,7 +275,7 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
         }
         if (loc < 0 || loc >= MAX_ATTRIBS)
         {
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tTrace())
                 NSLog(@"MGL tess: VS input %@ has no location (id %u)", [NSString stringWithUTF8String:r->name ? r->name : "?"], r->_id);
             continue;
         }
@@ -560,7 +593,7 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     }
     desc.stageInputDescriptor = sd;
 
-    if (getenv("MGL_TESS_DEBUG"))
+    if (tTrace())
     {
         NSMutableString *dbg = [NSMutableString stringWithString: @"MGL tess: VS stage-input descriptor:"];
         for (int i = 0; i < MAX_ATTRIB_SLOTS; i++)
@@ -795,7 +828,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     id<MTLComputeCommandEncoder> cenc;
     id<MTLComputePipelineState> vs_pso, tcs_pso = nil, gather_pso = nil;
     bool need_readback = tp->has_tcs != 0;
-    bool use_cpu_reference = getenv("MGL_TESS_CPU") != NULL;
+    bool use_cpu_reference = tCpuReference();
     bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode && !use_cpu_reference;
     bool gpu_emulated = false;
     bool idx_mode_widened = false;
@@ -1031,7 +1064,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
     /* ---- 2. compute phase (VS kernel, optional gather, optional TCS kernel) ---- */
     [self endRenderEncoding];
 
-    bool debug_wait = getenv("MGL_TESS_DEBUG") && use_hardware;
+    bool debug_wait = tTrace() && use_hardware;
     if ((need_readback && !use_hardware) || debug_wait)
         compute_cb = [_commandQueue commandBuffer];
     else
@@ -1050,7 +1083,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         uint32_t params[4] = { (uint32_t)vfirst, (uint32_t)vcount, (uint32_t)instances,
                                (uint32_t)baseinstance };
 
-        if (getenv("MGL_TESS_DEBUG"))
+        if (tTrace())
             NSLog(@"MGL tess: VS kernel dispatch %u x %d threads", vcount, instances);
         [cenc setComputePipelineState: vs_pso];
         tessBindStageUniforms(ctx, cenc, prog_vs, _VERTEX_SHADER);
@@ -1253,7 +1286,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             [enc setVertexBuffer: ring offset: off_factors atIndex: MGL_TESS_VD_FACTORS];
             [enc setTessellationFactorBuffer: ring offset: off_factors instanceStride: 0];
 
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tTrace())
             {
                 NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw, fstride=%zu)", cp_count, total_patches, fstride);
             }
@@ -1267,7 +1300,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
        patchIndexBufferOffset: 0
                 instanceCount: 1
                  baseInstance: 0];
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tTrace())
             {
                 int slot3 = ring_slot;
                 [compute_cb waitUntilCompleted];
@@ -1364,7 +1397,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
             gpu_emulated = true;
         }
-        else if (getenv("MGL_TESS_DEBUG"))
+        else if (tTrace())
             NSLog(@"MGL tess: GPU tessellator scratch too large (%zu bytes), using CPU path", need);
     }
     if (gpu_emulated && kenc)
@@ -1416,7 +1449,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         if (!tp->plain_function)
         {
             char *msl = mgl_tess_plain_msl(ctx, tp);
-            if (!getenv("MGL_TESS_NO_FIXUP"))
+            if (!tNoFixup())
             {
                 char *patched = mgl_rstate_patch_vertex_msl(msl, prog_tes->spirv[_TESS_EVALUATION_SHADER].entry_point);
                 if (patched) { free(msl); msl = patched; }
@@ -1490,7 +1523,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
     /* CPU reference path (MGL_TESS_CPU=1): read the factors back and tessellate on the CPU */
     {
-    if (getenv("MGL_TESS_DEBUG") && need_readback)
+    if (tTrace() && need_readback)
     {
         [compute_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
             if (b.error) NSLog(@"MGL tess: compute cb error: %@", b.error);
@@ -1521,7 +1554,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             mgl_tess_build_patch_blob(ctx, tp, (const unsigned char *)((uint8_t *)ring.contents + off_tcs_patch),
                                       patch_record, factors, (unsigned)total_patches);
             mgl_tess_generate(ctx, tp, factors, (unsigned)total_patches);
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tTrace())
                 fprintf(stderr, "MGL tess: cpu path patch 0 factors %g %g %g %g / %g %g -> %d verts %d idx\n",
                         factors[0], factors[1], factors[2], factors[3], factors[4], factors[5],
                         S->tess_vertex_count, S->tess_index_count);
@@ -1572,7 +1605,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
         [enc setVertexBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
         [enc setVertexBytes: tes_params length: sizeof tes_params atIndex: MGL_TESS_TES_PARAMS];
 
-        if (getenv("MGL_TESS_DEBUG"))
+        if (tTrace())
             NSLog(@"MGL tess: CPU reference path drawing %d idx", S->tess_index_count);
         if (tp->point_mode)
             [enc drawPrimitives: MTLPrimitiveTypePoint vertexStart: 0
@@ -1655,7 +1688,7 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
 
         if (idx < 0)
             continue;
-        if (getenv("MGL_TESS_DEBUG"))
+        if (tTrace())
             NSLog(@"MGL tess: VS binding %d -> mtl index %d (buf=%p mtl=%p fetch...)", b, idx,
                   (void *)buf, buf ? buf->data.mtl_data : NULL);
         if (!buf || !buf->data.buffer_data)
@@ -1666,7 +1699,7 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
         {
             MGLRenderer *self2 = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
             [self2 bindMTLBuffer: buf];
-            if (getenv("MGL_TESS_DEBUG"))
+            if (tTrace())
                 NSLog(@"MGL tess: VS binding %d idx %d: mtl_data=%p", b, idx, buf->data.mtl_data);
         }
         if (buf->data.mtl_data)
