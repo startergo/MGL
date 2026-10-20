@@ -162,6 +162,12 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     {
         target = (__bridge id<MTLCommandBuffer>)p->last_cb;
         target_serial = p->last_serial;
+        /* an open command buffer never completes: commit it before waiting (the tracked_cb
+         * path below does this; the last_cb path could reach an uncommitted buffer when a
+         * query split created a fresh one, which hung glQueryCounter / GL_TIME_ELAPSED
+         * resolves around batched draws) */
+        if (target.status < MTLCommandBufferStatusCommitted)
+            [self extBufFlush];
     }
     else
     {
@@ -176,6 +182,17 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
     if (target)
     {
+        /* last resort: a buffer the geometry category enqueued but that was replaced before
+         * it was committed will never run, and waiting on it never returns — kick it */
+        if (target.status == MTLCommandBufferStatusEnqueued &&
+            target != _currentCommandBuffer)
+        {
+            @try { [target commit]; } @catch (NSException *) { return; }
+        }
+        if (target.status < MTLCommandBufferStatusCommitted &&
+            target == _currentCommandBuffer)
+            return;                     /* cannot commit our own encoding buffer: nothing to wait on */
+
         // one in-order queue: completion of this buffer implies earlier ones completed
         [target waitUntilCompleted];
         atomic_max_u64(&p->completed, target_serial);
