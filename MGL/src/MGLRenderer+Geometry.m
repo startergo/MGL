@@ -178,9 +178,12 @@ static const char *kGeomPrepMSL =
     "    bool restart_en = c.v[14] != 0u;\n"
     "    threadgroup uint tgr[WG];\n"
     "\n"
-    "    /* the tile-parallel chain can take over large indirect draws (mgl_geom_prepc sets\n"
-    "     * the flag after parsing the command): the outputs are identical, so just leave */\n"
-    "    if (layout != 0u && prep[18] != 0u) return;\n"
+    "    /* the tile-parallel chain owns this draw (armed by the CPU for direct draws or by\n"
+    "     * mgl_geom_prepc for indirect ones): its outputs are identical, so just leave.\n"
+    "     * A direct draw has layout == 0 and still arms prep[18], so the layout is NOT part\n"
+    "     * of the condition — running both used to cost the serial walk (~1 us per restart)\n"
+    "     * on top of the chain */\n"
+    "    if (prep[18] != 0u) return;\n"
     "\n"
     "    /* the draw command: a staging buffer for direct draws, the user's indirect buffer\n"
     "     * otherwise */\n"
@@ -404,7 +407,7 @@ static const char *kGeomPrepMSL =
     "{\n"
     "    if (prep[18] == 0u) return;\n"
     "    uint T = prep[16];\n"
-    "    uint t = gid;\n"
+    "    uint t = gid / WG;               /* one 32-thread group per tile: gid is the global thread */\n"
     "    if (t >= T) return;\n"
     "    uint count = prep[12];\n"
     "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
@@ -457,7 +460,7 @@ static const char *kGeomPrepMSL =
     "{\n"
     "    if (prep[18] == 0u) return;\n"
     "    uint T = prep[16];\n"
-    "    uint t = gid;\n"
+    "    uint t = gid / WG;               /* one 32-thread group per tile */\n"
     "    if (t >= T) return;\n"
     "    uint count = prep[12], total = prep[19];\n"
     "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
@@ -2378,6 +2381,21 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         fprintf(stderr, "\ngeom: trace prep @%zu:", gPrepOff / 4);
         for (int i = 0; i < 44; i++)
             fprintf(stderr, " %u", ((uint32_t *)gPrep.contents)[gPrepOff / 4 + i]);
+        if (getenv("MGL_GEOM_DUMP_RUNS"))
+        {
+            /* tiled-chain state: T tiles, total restarts, the GS/emit grids, then the
+             * first run records at sc[5T] (start, subcount, prim prefix, cap prefix) */
+            uint32_t *pin = (uint32_t *)gPrep.contents + gPrepOff / 4;
+            uint32_t T = pin[MGL_GEOM_PREP_OUT_OFF + 16];
+            uint32_t tot = pin[MGL_GEOM_PREP_OUT_OFF + 19];
+            uint32_t *sc = (uint32_t *)gPrepScr.contents;
+            fprintf(stderr, "\ngeom: trace runs T=%u total=%u R=%u groups=%u emit=%u rec0..3:",
+                    T, tot, tot + 1u, pin[MGL_GEOM_PREP_OUT_OFF + 4],
+                    pin[MGL_GEOM_PREP_OUT_OFF + 24]);
+            for (int r = 0; gPrepScr && T && r < 4 && r < (int)(tot + 1u); r++)
+                fprintf(stderr, " [%u %u %u %u]", sc[5u * T + 4u * r + 0u], sc[5u * T + 4u * r + 1u],
+                        sc[5u * T + 4u * r + 2u], sc[5u * T + 4u * r + 3u]);
+        }
         fprintf(stderr, "\ngeom: trace prim slots @%zu:", gPrimOff / 4 + MGL_GEOM_HDR_WORDS + (size_t)(d->indexed ? d->count : 0));
         {
             size_t pw = (size_t)(d->indexed ? d->count : 0);
