@@ -52,8 +52,22 @@ TEST(line_stipple)
         if (p[1] > 200 || p[0] > 200) lit++;
         else if (p[0] == 0 && p[1] == 0) dark++;
     }
-    EXPECT_TRUE(lit >= 12 && lit <= 20);
+    /* exactly the first 8 pixels of each 16 (LSB-first pattern) */
+    EXPECT_TRUE(lit == 16);
     EXPECT_TRUE(lit + dark == 32);
+
+    glReadPixels(2, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[1] > 200);
+    glReadPixels(10, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[0] == 0 && p[1] == 0);
+    glReadPixels(17, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[0] == 0 && p[1] == 0);
+    glReadPixels(18, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[1] > 200);
+    glReadPixels(25, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[1] > 200);
+    glReadPixels(26, 31, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, p);
+    EXPECT_TRUE(p[0] == 0 && p[1] == 0);
 }
 
 /* glPointSize(8): the point covers about 8x8 pixels */

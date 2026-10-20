@@ -1591,6 +1591,71 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
     unbind_ffp(ctx, user);
 }
 
+/* glDrawElements + line stipple: the distance from the start of the strip is
+ * a per-vertex attribute, but a vertex shared by two positions of the index
+ * stream has two distances.  The draw is de-indexed: every enabled client
+ * array is gathered in draw order (element k of the new stream is index[k]),
+ * the distances are uploaded for that order, and the draw becomes a plain
+ * array draw.  Returns false when it could not (no readable array memory). */
+static bool draw_elements_stippled_lines(GLMContext ctx, GLenum mode, const uint32_t *idx,
+                                         GLsizei count, const float *pos)
+{
+    struct MGLExtState_compat *s = CS();
+    VertexArray *vao = VAO();
+    float *stream = NULL;
+    bool ok = true;
+
+    if (!vao || !pos)
+        return false;
+
+    /* positions in draw order */
+    stream = (float *)malloc((size_t)count * 4 * sizeof(float));
+    if (!stream)
+        return false;
+
+    for (GLsizei i = 0; i < count; i++)
+    {
+        stream[i * 4 + 0] = pos[idx[i] * 4 + 0];
+        stream[i * 4 + 1] = pos[idx[i] * 4 + 1];
+        stream[i * 4 + 2] = pos[idx[i] * 4 + 2];
+        stream[i * 4 + 3] = pos[idx[i] * 4 + 3];
+    }
+
+    upload_line_stipple(ctx, mode, stream, count);
+
+    /* gather every enabled array in the same order */
+    for (int index = 0; index < MAX_ATTRIBS && ok; index++)
+    {
+        MGLCClientArray *a = &s->arrays[index];
+
+        if (!a->enabled || !a->pointer)
+            continue;
+
+        GLsizei esz = (GLsizei)mgl_va_element_size(a->type, a->size);
+        GLsizei st = a->stride ? a->stride : esz;
+        char *gathered = (char *)malloc((size_t)count * (size_t)esz);
+
+        if (!gathered)
+        {
+            ok = false;
+            break;
+        }
+
+        for (GLsizei i = 0; i < count; i++)
+            memcpy(gathered + (size_t)i * esz,
+                   (const char *)a->pointer + (size_t)idx[i] * st, (size_t)esz);
+
+        upload_stream(ctx, vao, index, a->size, a->type, a->normalized, 0, gathered, count);
+        free(gathered);
+    }
+
+    if (ok)
+        mglDrawArrays(ctx, mode, 0, count);
+
+    free(stream);
+    return ok;
+}
+
 void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type,
                               const void *indices, GLint basevertex)
 {
@@ -1664,6 +1729,23 @@ void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum
             idx32[i] -= mn;
 
     Program *user = bind_ffp(ctx);
+
+    /* line stipple counts pixels from the start of each strip, which a shared
+     * vertex cannot carry as an attribute when a vertex is reused at several
+     * places of the index stream: de-index the draw (gather every enabled
+     * array in draw order) and feed the distances as a plain array */
+    if (s->line_stipple &&
+        (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) && pos)
+    {
+        bool ok = draw_elements_stippled_lines(ctx, mode, idx32, count, pos);
+
+        if (ok)
+        {
+            free(idx32);
+            unbind_ffp(ctx, user);
+            return;
+        }
+    }
 
     GLenum draw_mode = mode;
     uint32_t *draw_idx = idx32;
