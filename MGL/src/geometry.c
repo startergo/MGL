@@ -51,6 +51,7 @@
 #include "mgl_ext_program.h"
 #include "shaders.h"
 #include "programs.h"
+#include "msl_reserved.h"
 #include "hash_table.h"
 #include "mgl_ext_rstate.h"
 
@@ -965,6 +966,10 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
     }
 
     (void)glm_type;
+
+    /* GLSL identifiers that collide with MSL keywords/types must be renamed (CTS shaders
+     * declare e.g. `uniform sampler2D sampler;`); see msl_reserved.h. */
+    mgl_msl_mangle_reserved(comp, ir, words);
 
     if (spvc_compiler_compile(comp, &msl) != SPVC_SUCCESS || !msl)
     {

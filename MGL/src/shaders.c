@@ -26,6 +26,7 @@
 #include <glslang_c_shader_types.h>
 
 #include "shaders.h"
+#include "cts_glsl_compat.h"
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
@@ -611,7 +612,10 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     lazy_init_compiler(ctx);
 
     memset(&glsl_input, 0, sizeof(glsl_input));
-    initGLSLInput(ctx, ptr->type, mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
+    /* GL-legal but SPIR-V-hostile constructs (layout(shared)/layout(packed) blocks, ...) are
+     * rewritten first: cts_glsl_compat.c.  Freed after glslang has copied the source. */
+    char *compat = mgl_cts_glsl_compat(mgl_introspect_shader_source(ctx, ptr));
+    initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
 
     glsl_shader = glslang_shader_create(&glsl_input);
     if (glsl_shader == NULL)
@@ -653,9 +657,11 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         DEBUG_PRINT("MGL shader %u compile failed:\n%s\n", shader, ptr->log);
 
         glslang_shader_delete(glsl_shader);
+        free(compat);
         return;
     }
 
+    free(compat);
     /* warnings survive a successful compile */
     {
         const char *info_log = glslang_shader_get_info_log(glsl_shader);

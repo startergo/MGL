@@ -27,6 +27,7 @@
 #include "mgl_ext_geom.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
+#include "msl_reserved.h"
 #include "hash_table.h"
 
 TransformFeedback *newTransformFeedback(GLMContext ctx, GLuint name);
@@ -1286,6 +1287,10 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir, size_t words, 
 
     const char *cleansed = spvc_compiler_get_cleansed_entry_point_name(comp, "main", SpvExecutionModelVertex);
     spvc_compiler_rename_entry_point(comp, cleansed, entry, SpvExecutionModelVertex);
+
+    /* GLSL identifiers that collide with MSL keywords/types must be renamed; see
+     * msl_reserved.h. */
+    mgl_msl_mangle_reserved(comp, ir, words);
 
     if (spvc_compiler_compile(comp, &result) == SPVC_SUCCESS && result) ret = strdup(result);
 done:

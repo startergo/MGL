@@ -41,6 +41,7 @@
 #include "mgl_ext_tess.h"
 #include "shaders.h"
 #include "buffers.h"
+#include "msl_reserved.h"
 
 void mgl_program_ref(Program *ptr);
 void mgl_program_unref(GLMContext ctx, Program *ptr);
@@ -1086,6 +1087,11 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             }
         }
     }
+
+    /* GLSL identifiers that are MSL keywords/types (e.g. `uniform sampler2D sampler;`)
+     * must be renamed before MSL emission; introspection above already read the GLSL
+     * names, which must stay the ones the GL API reports. */
+    mgl_msl_mangle_reserved(compiler, prepared, prepared_words);
 
     if (stage == _GEOMETRY_SHADER)
     {
