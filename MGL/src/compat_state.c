@@ -663,6 +663,13 @@ void mglGetTexGeniv(GLMContext ctx, GLenum coord, GLenum pname, GLint *params)
 void mglTexEnvf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param)
 {    MGLC_COMPAT_GUARD(ctx);
 
+    GLfloat v[1] = { param };
+    mglTexEnvfv(ctx, target, pname, v);
+}
+
+/* kept for the vector path (handles every pname) */
+static void mglTexEnvf_scalar(GLMContext ctx, GLenum target, GLenum pname, GLfloat param)
+{
     struct MGLExtState_compat *s = CS();
     GLuint unit = STATE(active_texture) % MGLC_MAX_COORDS;
     MGLCTexEnv *e = &s->texenv[unit];
@@ -750,8 +757,22 @@ void mglTexEnvfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *par
     switch (pname)
     {
         case GL_TEXTURE_ENV_MODE:
-            mglTexEnvf(ctx, target, pname, params[0]);
+        {
+            MGLCTexEnv *e = &CS()->texenv[STATE(active_texture) % MGLC_MAX_COORDS];
+
+            switch ((GLenum)params[0])
+            {
+                case GL_MODULATE: case GL_DECAL: case GL_BLEND:
+                case GL_REPLACE: case GL_ADD: case GL_COMBINE:
+                    break;
+                default:
+                    ERROR_RETURN(GL_INVALID_ENUM);
+            }
+
+            e->env_mode = (GLenum)params[0];
+            mgl_compat_dirty(ctx);
             return;
+        }
 
         case GL_TEXTURE_ENV_COLOR:
             memcpy(e->env_color, params, 4 * sizeof(GLfloat));

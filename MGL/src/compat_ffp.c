@@ -257,6 +257,28 @@ static void ffp_build_key(const MGLFFPConfig *c, MGLFFPKey *key)
     int p = 0;
     uint8_t *b = key->bytes;
 
+    /* enum -> small id so distinct values never collide in a byte */
+    struct { GLenum v; int id; } env_ids[] = {
+        { GL_MODULATE, 1 }, { GL_DECAL, 2 }, { GL_BLEND, 3 },
+        { GL_REPLACE, 4 }, { GL_ADD, 5 }, { GL_COMBINE, 6 }, { 0, 0 }
+    };
+    struct { GLenum v; int id; } fog_ids[] = {
+        { GL_EXP, 1 }, { GL_EXP2, 2 }, { GL_LINEAR, 3 }, { 0, 0 }
+    };
+    struct { GLenum v; int id; } target_ids[] = {
+        { GL_TEXTURE_1D, 1 }, { GL_TEXTURE_2D, 2 }, { GL_TEXTURE_3D, 3 },
+        { GL_TEXTURE_CUBE_MAP, 4 }, { 0, 0 }
+    };
+    struct { GLenum v; int id; } combine_ids[] = {
+        { GL_REPLACE, 1 }, { GL_MODULATE, 2 }, { GL_ADD, 3 }, { GL_ADD_SIGNED, 4 },
+        { GL_INTERPOLATE, 5 }, { GL_SUBTRACT, 6 }, { GL_DOT3_RGB, 7 },
+        { GL_DOT3_RGBA, 8 }, { 0, 0 }
+    };
+    struct { GLenum v; int id; } texgen_ids[] = {
+        { GL_OBJECT_LINEAR, 1 }, { GL_EYE_LINEAR, 2 }, { GL_SPHERE_MAP, 3 },
+        { GL_NORMAL_MAP, 4 }, { GL_REFLECTION_MAP, 5 }, { 0, 0 }
+    };
+
     b[p++] = (uint8_t)c->lighting;
     b[p++] = (uint8_t)c->two_sided;
     b[p++] = (uint8_t)c->color_material_mode;
@@ -271,7 +293,9 @@ static void ffp_build_key(const MGLFFPConfig *c, MGLFFPKey *key)
         b[p++] = (uint8_t)((c->light_pos[i] ? 1 : 0) | (c->light_spot[i] ? 2 : 0) | (c->light_att[i] ? 4 : 0));
 
     b[p++] = (uint8_t)c->fog;
-    b[p++] = (uint8_t)c->fog_mode;
+    for (int i = 0; fog_ids[i].id; i++)
+        if (fog_ids[i].v == (GLenum)c->fog_mode)
+            b[p++] = (uint8_t)fog_ids[i].id;
     b[p++] = (uint8_t)c->fog_src;
     b[p++] = (uint8_t)c->alpha_test;
     b[p++] = (uint8_t)c->alpha_func;
@@ -280,20 +304,44 @@ static void ffp_build_key(const MGLFFPConfig *c, MGLFFPKey *key)
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
     {
-        b[p++] = (uint8_t)c->unit.target[u];
-        b[p++] = (uint8_t)c->unit.env_mode[u];
-        b[p++] = (uint8_t)c->unit.combine_rgb[u];
-        b[p++] = (uint8_t)c->unit.combine_a[u];
+        int env_id = 0, fog_unused = 0, tgt_id = 0, crgb = 0, cal = 0;
+
+        for (int i = 0; env_ids[i].id; i++)
+            if (env_ids[i].v == (GLenum)c->unit.env_mode[u])
+                env_id = env_ids[i].id;
+        for (int i = 0; target_ids[i].id; i++)
+            if (target_ids[i].v == (GLenum)c->unit.target[u])
+                tgt_id = target_ids[i].id;
+        for (int i = 0; combine_ids[i].id; i++)
+        {
+            if (combine_ids[i].v == (GLenum)c->unit.combine_rgb[u])
+                crgb = combine_ids[i].id;
+            if (combine_ids[i].v == (GLenum)c->unit.combine_a[u])
+                cal = combine_ids[i].id;
+        }
+
+        (void)fog_unused;
+
+        b[p++] = (uint8_t)tgt_id;
+        b[p++] = (uint8_t)env_id;
+        b[p++] = (uint8_t)crgb;
+        b[p++] = (uint8_t)cal;
         b[p++] = (uint8_t)((c->unit.coord_replace[u] ? 1 : 0) | (c->unit.need_texcoord[u] ? 2 : 0));
 
         for (int k = 0; k < 6; k++)
-            b[p++] = (uint8_t)c->unit.src[k][u];
+            b[p++] = (uint8_t)(c->unit.src[k][u] & 0xFF);
         for (int k = 0; k < 3; k++)
-            b[p++] = (uint8_t)c->unit.op_rgb[k][u];
+            b[p++] = (uint8_t)(c->unit.op_rgb[k][u] & 0xFF);
         for (int k = 0; k < 3; k++)
-            b[p++] = (uint8_t)c->unit.op_a[k][u];
+            b[p++] = (uint8_t)(c->unit.op_a[k][u] & 0xFF);
         for (int cc = 0; cc < 4; cc++)
-            b[p++] = (uint8_t)c->unit.texgen[u][cc];
+        {
+            int id = 0;
+            for (int i = 0; texgen_ids[i].id; i++)
+                if (texgen_ids[i].v == (GLenum)c->unit.texgen[u][cc])
+                    id = texgen_ids[i].id;
+            b[p++] = (uint8_t)id;
+        }
     }
 }
 
@@ -404,42 +452,37 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     }
     else
     {
-        /* material with color-material substitution (mglCM* select the source) */
-        const char *cm = c->color_material_mode ? "mglColor" : NULL;
+        /* material with color-material substitution: all four substituted
+         * parameters are declared so the shader always compiles; the ones
+         * not tracked by glColorMaterial fall back to the material state */
+        sb_add(b, "    vec4 mglMatA0 = mglMatAmbient[0], mglMatA1 = mglMatAmbient[1];\n");
+        sb_add(b, "    vec4 mglMatD0 = mglMatDiffuse[0], mglMatD1 = mglMatDiffuse[1];\n");
+        sb_add(b, "    vec4 mglMatS0 = mglMatSpecular[0], mglMatS1 = mglMatSpecular[1];\n");
+        sb_add(b, "    vec4 mglMatE0 = mglMatEmission[0], mglMatE1 = mglMatEmission[1];\n");
 
-        if (cm)
+        if (c->color_material_mode)
         {
             switch (c->color_material_mode)
             {
                 case GL_EMISSION:
-                    sb_add(b, "    vec4 mglEmi0 = mglColor, mglEmi1 = mglColor;\n");
+                    sb_add(b, "    mglMatE0 = mglColor; mglMatE1 = mglColor;\n");
                     break;
                 case GL_AMBIENT:
-                    sb_add(b, "    vec4 mglAmb0 = mglColor, mglAmb1 = mglColor;\n");
+                    sb_add(b, "    mglMatA0 = mglColor; mglMatA1 = mglColor;\n");
                     break;
                 case GL_DIFFUSE:
-                    sb_add(b, "    vec4 mglDif0 = mglColor, mglDif1 = mglColor;\n");
+                    sb_add(b, "    mglMatD0 = mglColor; mglMatD1 = mglColor;\n");
                     break;
                 case GL_SPECULAR:
-                    sb_add(b, "    vec4 mglSpe0 = mglColor, mglSpe1 = mglColor;\n");
+                    sb_add(b, "    mglMatS0 = mglColor; mglMatS1 = mglColor;\n");
                     break;
-                default:
-                    sb_add(b, "    vec4 mglAmb0 = mglColor, mglAmb1 = mglColor;\n");
-                    sb_add(b, "    vec4 mglDif0 = mglColor, mglDif1 = mglColor;\n");
+                default:    /* AMBIENT_AND_DIFFUSE */
+                    sb_add(b, "    mglMatA0 = mglColor; mglMatA1 = mglColor;\n");
+                    sb_add(b, "    mglMatD0 = mglColor; mglMatD1 = mglColor;\n");
                     break;
             }
-            sb_add(b, "    vec4 mglMatA0 = mglAmb0, mglMatA1 = mglAmb1;\n");
-            sb_add(b, "    vec4 mglMatD0 = mglDif0, mglMatD1 = mglDif1;\n");
-            sb_add(b, "    vec4 mglMatS0 = mglSpe0, mglMatS1 = mglSpe1;\n");
-            sb_add(b, "    vec4 mglMatE0 = mglEmi0, mglMatE1 = mglEmi1;\n");
         }
-        else
-        {
-            sb_add(b, "    vec4 mglMatA0 = mglMatAmbient[0], mglMatA1 = mglMatAmbient[1];\n");
-            sb_add(b, "    vec4 mglMatD0 = mglMatDiffuse[0], mglMatD1 = mglMatDiffuse[1];\n");
-            sb_add(b, "    vec4 mglMatS0 = mglMatSpecular[0], mglMatS1 = mglMatSpecular[1];\n");
-            sb_add(b, "    vec4 mglMatE0 = mglMatEmission[0], mglMatE1 = mglMatEmission[1];\n");
-        }
+        /* no color material: the mglMatAmbient[0] defaults declared above stand */
 
         sb_add(b, "    float mglSh0 = mglMatShininess[0], mglSh1 = mglMatShininess[1];\n");
         sb_add(b, "    vec4 mglColF = mglMatE0 + mglMatA0 * mglLightModelAmbient;\n");
@@ -939,6 +982,14 @@ static GLuint ffp_program(GLMContext ctx, const MGLFFPConfig *c, const MGLFFPKey
     gen_vertex_shader(ctx, c, &vs);
     gen_fragment_shader(ctx, c, &fs);
 
+    if (getenv("MGLC_DUMP"))
+    {
+        FILE *d = fopen("/tmp/mglc_vs.glsl", "w");
+        if (d) { fputs(vs.s, d); fclose(d); }
+        d = fopen("/tmp/mglc_fs.glsl", "w");
+        if (d) { fputs(fs.s, d); fclose(d); }
+    }
+
     GLuint v = compile_stage(ctx, GL_VERTEX_SHADER, vs.s);
     GLuint f = compile_stage(ctx, GL_FRAGMENT_SHADER, fs.s);
 
@@ -1309,6 +1360,7 @@ GLuint mgl_compat_blit_program(GLMContext ctx)
         "void main() {\n"
         "    vec4 t = texture(mglTex, mglUVOut);\n"
         "    if (mglMode == 0) mglFragColor = t;\n"
+        "    else if (mglMode == 2) mglFragColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
         "    else { if (t.r < 0.5) discard; mglFragColor = mglColOut; }\n"
         "}\n";
 

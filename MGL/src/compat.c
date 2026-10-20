@@ -455,6 +455,9 @@ void mgl_compat_init_state(GLMContext ctx)
     }
     for (int i = 0; i < 16; i++)
         s->pixel_transfer[i] = 0.0f;
+    /* GL defaults: color scales (and depth scale) are 1, not 0 */
+    s->pixel_transfer[4] = s->pixel_transfer[5] = s->pixel_transfer[6] =
+    s->pixel_transfer[7] = s->pixel_transfer[12] = 1.0f;
 
     /* evaluators */
     s->map_grid1_n = 1; s->map_grid2_nu = 1; s->map_grid2_nv = 1;

@@ -24,7 +24,7 @@
 #define MGLC_MAX_CLIP_PLANES   8
 #define MGLC_MATRIX_DEPTH      64     /* modelview; spec minimum 32 */
 #define MGLC_MAX_TEXCOORD_ATTR (MAX_ATTRIBS - 8)
-#define MGLC_STIPPLE_UNIT      31     /* texture unit holding the stipple pattern */
+#define MGLC_STIPPLE_UNIT      8      /* texture unit holding stipple/blit textures (FFP uses 0..7) */
 #define MGLC_TEX_PRIO_MAX      65536  /* tracked glPrioritizeTextures values */
 #define MGLC_ATTRIB_STACK      16
 #define MGLC_CLIENT_STACK      16

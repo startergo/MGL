@@ -527,96 +527,107 @@ static void read_pixel_component(GLenum format, GLenum type, const void *pixels,
     }
 }
 
-/* quad in clip space covering the raster rect */
-static void blit_quad(GLMContext ctx, GLint x, GLint y, GLsizei w, GLsizei h, GLfloat zw, GLfloat zh, int mode)
+/* draws a textured quad through the generated fixed-function pipeline (the
+ * same path glBegin uses): the quad is given in clip space with identity
+ * matrices, |tex| is bound to unit 0 with texenv REPLACE, and |color| becomes
+ * the vertex color so MODULATE carries the raster color */
+static void blit_quad(GLMContext ctx, GLint x, GLint y, GLsizei w, GLsizei h,
+                      GLuint tex, const GLfloat *color, int bitmap_mode)
 {
     struct MGLExtState_compat *s = CS();
     GLint *vp = STATE(viewport);
+
+    if (vp[2] <= 0 || vp[3] <= 0)
+        return;
 
     float x0 = (float)(2 * x - vp[0]) / vp[2] - 1.0f;
     float y0 = (float)(2 * y - vp[1]) / vp[3] - 1.0f;
     float x1 = (float)(2 * (x + w) - vp[0]) / vp[2] - 1.0f;
     float y1 = (float)(2 * (y + h) - vp[1]) / vp[3] - 1.0f;
 
-    GLuint prog = mgl_compat_blit_program(ctx);
+    /* save the fixed-function state the blit borrows */
+    GLuint saved_active = STATE(active_texture);
+    Texture *saved_tex0 = STATE(texture_units[0]).textures[_TEXTURE_2D];
+    uint32_t saved_mask0 = s->unit_target_mask[0];
+    GLenum saved_env0 = s->texenv[0].env_mode;
+    GLfloat saved_color[4], saved_tc[4];
+    memcpy(saved_color, s->cur_color, 4 * sizeof(GLfloat));
+    memcpy(saved_tc, s->cur_texcoord[0], 4 * sizeof(GLfloat));
+    MGLCMatrixStack saved_mv = s->modelview;
+    MGLCMatrixStack saved_pr = s->projection;
+    GLenum saved_matrix_mode = s->matrix_mode;
+    GLboolean saved_alpha_test = s->alpha_test;
+    GLenum saved_alpha_func = s->alpha_func;
+    GLfloat saved_alpha_ref = s->alpha_ref;
+    GLboolean saved_recording = s->recording;
 
-    if (!prog)
-        return;
+    /* set up: unit 0 samples the blit texture, REPLACE + optional alpha test */
+    s->recording = GL_FALSE;    /* the internal glBegin must not record */
 
-    Program *user = STATE(program);
-    mglUseProgram(ctx, prog);
+    mglActiveTexture(ctx, GL_TEXTURE0);
+    mglBindTexture(ctx, GL_TEXTURE_2D, tex);
+    s->unit_target_mask[0] |= 0x2;      /* GL_TEXTURE_2D enabled */
+    s->texenv[0].env_mode = GL_MODULATE;
 
-    GLint l;
-
-    l = mglGetUniformLocation(ctx, prog, "mglRect");
-    if (l >= 0) mglUniform4f(ctx, l, x0, y0, x1, y1);
-    l = mglGetUniformLocation(ctx, prog, "mglTex");
-    if (l >= 0) mglUniform1i(ctx, l, MGLC_STIPPLE_UNIT);
-    l = mglGetUniformLocation(ctx, prog, "mglMode");
-    if (l >= 0) mglUniform1i(ctx, l, mode);
-    l = mglGetUniformLocation(ctx, prog, "mglAlphaScale");
-    if (l >= 0) mglUniform1f(ctx, l, 1.0f);
-
-    /* the quad: attributes pos(0), color(3), uv(8) of the internal VAO */
-    VertexArray *vao_save = STATE(vao);
-    GLuint name_save = STATE(var.vertex_array_binding);
-    if (!s->imm_vao)
-        s->imm_vao = newVAO(ctx, 0xfeed0000);
-    STATE(vao) = s->imm_vao;
-    STATE(var.vertex_array_binding) = 0;
-    STATE(dirty_bits) |= DIRTY_VAO;
-
-    float pos[8] = { 0, 0, 1, 0, 1, 1, 0, 1 };
-    float uv[8] = { 0, 0, 1, 0, 1, 1, 0, 1 };
-    float col[16];
-
-    for (int i = 0; i < 4; i++)
+    if (bitmap_mode)
     {
-        col[i * 4 + 0] = s->raster_color[0];
-        col[i * 4 + 1] = s->raster_color[1];
-        col[i * 4 + 2] = s->raster_color[2];
-        col[i * 4 + 3] = s->raster_color[3];
+        s->alpha_test = GL_TRUE;
+        s->alpha_func = GL_GREATER;
+        s->alpha_ref = 0.5f;
     }
 
-    Buffer *saved_ab = STATE(buffers[_ARRAY_BUFFER]);
+    s->matrix_mode = GL_PROJECTION;
+    mglLoadIdentity(ctx);
+    s->matrix_mode = GL_MODELVIEW;
+    mglLoadIdentity(ctx);
 
+    memcpy(s->cur_color, color, 4 * sizeof(GLfloat));
+
+    mglBegin(ctx, GL_QUADS);
+    mglTexCoord2f(ctx, 0.0f, 0.0f);
+    mglVertex2f(ctx, x0, y0);
+    mglTexCoord2f(ctx, 1.0f, 0.0f);
+    mglVertex2f(ctx, x1, y0);
+    mglTexCoord2f(ctx, 1.0f, 1.0f);
+    mglVertex2f(ctx, x1, y1);
+    mglTexCoord2f(ctx, 0.0f, 1.0f);
+    mglVertex2f(ctx, x0, y1);
+    mglEnd(ctx);
+    if (getenv("MGLC_DUMP"))
     {
-        GLuint b0 = 0, b1 = 0, b2 = 0;
-        mglGenBuffers(ctx, 1, &b0);
-        mglGenBuffers(ctx, 1, &b1);
-        mglGenBuffers(ctx, 1, &b2);
-        mglBindBuffer(ctx, GL_ARRAY_BUFFER, b0);
-        mglBufferData(ctx, GL_ARRAY_BUFFER, sizeof pos, pos, GL_STREAM_DRAW);
-        mglVertexAttribPointer(ctx, 0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
-        mglEnableVertexAttribArray(ctx, 0);
-        mglBindBuffer(ctx, GL_ARRAY_BUFFER, b1);
-        mglBufferData(ctx, GL_ARRAY_BUFFER, sizeof col, col, GL_STREAM_DRAW);
-        mglVertexAttribPointer(ctx, 3, 4, GL_FLOAT, GL_FALSE, 0, NULL);
-        mglEnableVertexAttribArray(ctx, 3);
-        mglBindBuffer(ctx, GL_ARRAY_BUFFER, b2);
-        mglBufferData(ctx, GL_ARRAY_BUFFER, sizeof uv, uv, GL_STREAM_DRAW);
-        mglVertexAttribPointer(ctx, 8, 2, GL_FLOAT, GL_FALSE, 0, NULL);
-        mglEnableVertexAttribArray(ctx, 8);
+        GLubyte q[4];
+        mglFinish(ctx);
+        mglReadPixels(ctx, x + w / 2, y + h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q);
     }
 
-    if (saved_ab)
-        mglBindBuffer(ctx, GL_ARRAY_BUFFER, saved_ab->name);
-    else
-        mglBindBuffer(ctx, GL_ARRAY_BUFFER, 0);
+    /* restore */
+    s->matrix_mode = GL_PROJECTION;
+    s->projection = saved_pr;
+    s->matrix_mode = GL_MODELVIEW;
+    s->modelview = saved_mv;
+    s->matrix_mode = saved_matrix_mode;
 
-    mglDrawArrays(ctx, GL_TRIANGLE_FAN, 0, 4);
+    {
+        GLdouble m[16];
+        mgl_compat_get_matrix(ctx, GL_MODELVIEW, m);
+        for (int i = 0; i < 16; i++) s->modelview_f[i] = (GLfloat)m[i];
+        mgl_compat_get_matrix(ctx, GL_PROJECTION, m);
+        for (int i = 0; i < 16; i++) s->projection_f[i] = (GLfloat)m[i];
+    }
 
-    if (user)
-        mglUseProgram(ctx, user->name);
-    else
-        mglUseProgram(ctx, 0);
+    s->alpha_test = saved_alpha_test;
+    s->alpha_func = saved_alpha_func;
+    s->alpha_ref = saved_alpha_ref;
+    memcpy(s->cur_color, saved_color, 4 * sizeof(GLfloat));
+    memcpy(s->cur_texcoord[0], saved_tc, 4 * sizeof(GLfloat));
+    s->texenv[0].env_mode = saved_env0;
+    s->unit_target_mask[0] = saved_mask0;
+    mglBindTexture(ctx, GL_TEXTURE_2D, saved_tex0 ? saved_tex0->name : 0);
+    mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
 
-    STATE(vao) = vao_save;
-    STATE(var.vertex_array_binding) = name_save;
-    STATE(buffers[_ELEMENT_ARRAY_BUFFER]) = vao_save ? vao_save->element_array.buffer : NULL;
-    STATE(dirty_bits) |= DIRTY_VAO;
+    s->recording = saved_recording;
 
-    (void)zw; (void)zh;
+    mgl_compat_dirty(ctx);
 }
 
 void mglDrawPixels(GLMContext ctx, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
@@ -676,7 +687,8 @@ void mglDrawPixels(GLMContext ctx, GLsizei width, GLsizei height, GLenum format,
     GLsizei w = (GLsizei)(width * s->zoom_x);
     GLsizei h = (GLsizei)(height * s->zoom_y);
 
-    blit_quad(ctx, s->raster_window[0], s->raster_window[1], w, h, s->zoom_x, s->zoom_y, 0);
+    blit_quad(ctx, s->raster_window[0], s->raster_window[1], w, h,
+              s->blit_texture, s->raster_color, 0);
 }
 
 void mglBitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig,
@@ -733,7 +745,7 @@ void mglBitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLf
                 mglGenTextures(ctx, 1, &s->blit_texture);
 
             GLuint saved_active = STATE(active_texture);
-            mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
+            mglActiveTexture(ctx, GL_TEXTURE0);
             mglBindTexture(ctx, GL_TEXTURE_2D, s->blit_texture);
             mglTexImage2D(ctx, GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, tex);
             mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -745,7 +757,7 @@ void mglBitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLf
             free(tex);
 
             blit_quad(ctx, s->raster_window[0] - (GLint)xorig, s->raster_window[1] - (GLint)yorig,
-                      width, height, 1.0f, 1.0f, 1);
+                      width, height, s->blit_texture, s->raster_color, 1);
         }
     }
 
@@ -787,7 +799,8 @@ void mglCopyPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei heig
 
     if (tex)
         blit_quad(ctx, s->raster_window[0], s->raster_window[1],
-                  (GLsizei)(width * s->zoom_x), (GLsizei)(height * s->zoom_y), s->zoom_x, s->zoom_y, 0);
+                  (GLsizei)(width * s->zoom_x), (GLsizei)(height * s->zoom_y),
+                  s->blit_texture, s->raster_color, 0);
 }
 
 #pragma mark accumulation buffer
@@ -908,19 +921,7 @@ void mglAccum(GLMContext ctx, GLenum op, GLfloat value)
             mglBindTexture(ctx, GL_TEXTURE_2D, tex);
             mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
 
-            {
-                /* reuse the blit quad with the accum texture */
-                blit_quad(ctx, 0, 0, w, h, 1.0f, 1.0f, 0);
-
-                if (value != 1.0f)
-                {
-                    /* scale during return: multiply through the shader alpha-scale */
-                    GLuint prog = mgl_compat_blit_program(ctx);
-                    GLint l = mglGetUniformLocation(ctx, prog, "mglAlphaScale");
-                    if (l >= 0)
-                        mglUniform1f(ctx, l, value);
-                }
-            }
+            blit_quad(ctx, 0, 0, w, h, tex, (const GLfloat[4]){ value, value, value, value }, 0);
 
             mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
             mglBindTexture(ctx, GL_TEXTURE_2D, saved ? saved->name : 0);
