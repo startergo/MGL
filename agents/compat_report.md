@@ -30,12 +30,17 @@ Update this file at every commit so a fresh session can continue.
   float attachment (see `#pragma mark accumulation buffer`).
 * Compat GLSL (#version 110..150 / compatibility): compat_glsl.c rewrites to core GLSL.
 
-## Known core bugs (worked around, owned by geom worker — do NOT fix here)
+## Former "core bugs" — resolved (they were never core bugs)
 
-1. Default-block `float` uniforms next to `vec4`s get clobbered by UBO-style packing.
-   Workaround in FFP shaders: keep scalar uniforms in separate decl groups; verify any new scalar
-   uniform actually round-trips (use EXPECT on a query or a pixel test).
-2. `glProgramUniform1f` is a no-op — use `glUniform1f` on the bound program.
+The two workarounds from earlier sessions were removed after the geom worker proved core uniform
+packing + glProgramUniform* correct (tests/headless/test_uniforms.c, 297 checks):
+* FFP scalar uniforms are now plain scalars again: mglNormalScale (float), mglAlphaRef (float),
+  mglEnvScaleN (vec2), mglPointSizeParams/mglPointAtten (vec3). No vec4 packing.
+* The "re-sync the first 3 draws because the uniform table is re-derived after the MSL compile"
+  hack in mgl_compat_ffp_sync is gone; one sync per state_serial is enough.
+Regression tests: test_compat_glsl.c glsl_scalar_uniform_sandwich / glsl_program_uniform_compat
+(readback + pixels on a compat context), test_compat_render2.c specular_shininess (the float
+uniform mglMatShininess[0] verified pixel-exact against pow(NdH, exp) for exp 128/16/2).
 
 ## Milestones
 

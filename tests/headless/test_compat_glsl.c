@@ -227,6 +227,76 @@ TEST(glsl_builtin_uniform_locations)
     EXPECT_NO_GL_ERROR();
 }
 
+/* scalar default-block uniforms next to vec4s must round-trip and reach the
+ * GPU (the fixed-function generator declares float/vec2 uniforms of its own);
+ * checked in readback and in rendered pixels, via #version 110 (translated)
+ * and glProgramUniform* on a program that is not current */
+TEST(glsl_scalar_uniform_sandwich)
+{
+    setup_2d(8, 8);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const char *vs = "#version 110\nvoid main(){ gl_Position = vec4(gl_Vertex.xy, 0.0, 1.0); }\n";
+    const char *fs = "#version 110\n"
+        "uniform vec4 a0;\n"
+        "uniform float s1;\n"
+        "uniform vec4 a1;\n"
+        "uniform float s2;\n"
+        "void main(){ gl_FragColor = vec4(a0.x + s1 + a1.y + s2, 0.0, 0.0, 1.0); }\n";
+
+    char log[1024] = { 0 };
+    GLuint p = build(vs, fs, log, sizeof log);
+    EXPECT_TRUE(p != 0);
+    if (!p) { printf("log: %s\n", log); return; }
+
+    glUseProgram(p);
+    glUniform4f(glGetUniformLocation(p, "a0"), 0.25f, 0, 0, 0);
+    glUniform1f(glGetUniformLocation(p, "s1"), 0.25f);
+    glUniform4f(glGetUniformLocation(p, "a1"), 0, 0.25f, 0, 0);
+    glUniform1f(glGetUniformLocation(p, "s2"), 0.25f);
+
+    GLfloat rb = -1.0f;
+    glGetUniformfv(p, glGetUniformLocation(p, "s1"), &rb);
+    EXPECT_NEAR(rb, 0.25f, 1e-6);
+
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
+    EXPECT_PIXEL(4, 4, 255, 0, 0, 255, 2);
+    glUseProgram(0);
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(glsl_program_uniform_compat)
+{
+    setup_2d(8, 8);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const char *vs = "#version 460 core\nlayout(location=0) in vec2 p; void main(){ gl_Position=vec4(p,0,1); }\n";
+    const char *fs = "#version 460 core\nlayout(location=0) out vec4 o; uniform float s1; void main(){ o=vec4(s1,0,0,1); }\n";
+
+    char log[1024] = { 0 };
+    GLuint p = build(vs, fs, log, sizeof log);
+    EXPECT_TRUE(p != 0);
+    if (!p) { printf("log: %s\n", log); return; }
+
+    /* the program is NOT current: only glProgramUniform* may touch it */
+    glProgramUniform1f(p, glGetUniformLocation(p, "s1"), 0.5f);
+    GLfloat rb = -1.0f;
+    glGetUniformfv(p, glGetUniformLocation(p, "s1"), &rb);
+    EXPECT_NEAR(rb, 0.5f, 1e-6);
+
+    glUseProgram(p);
+    glBegin(GL_QUADS);
+    glVertex2f(-1, -1); glVertex2f(1, -1); glVertex2f(1, 1); glVertex2f(-1, 1);
+    glEnd();
+    EXPECT_PIXEL(4, 4, 128, 0, 0, 255, 3);
+    glUseProgram(0);
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     void *ctx = mglCompatCreateContext();
@@ -238,6 +308,8 @@ int main(void)
     RUN(glsl_120_builtins);
     RUN(glsl_150_compat_state_uniforms);
     RUN(glsl_builtin_uniform_locations);
+    RUN(glsl_scalar_uniform_sandwich);
+    RUN(glsl_program_uniform_compat);
 
     return mgl_test_summary();
 }

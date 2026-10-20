@@ -79,8 +79,6 @@ typedef struct {
 typedef struct {
     int used;
     int failed;
-    int draws;
-    int dirty_late;
     GLuint prog;
     uint64_t sync;
     MGLFFPKey key;
@@ -359,7 +357,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->need_normal)
         sb_add(b, "uniform mat3 mglNormalMatrix;\n");
     if (c->rescale && !c->normalize)
-        sb_add(b, "uniform vec4 mglNormalParams;   /* .x = 1/|modelview scale| */\n");
+        sb_add(b, "uniform float mglNormalScale;    /* 1/|modelview scale| */\n");
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.unit_used[u])
@@ -372,8 +370,8 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->point_atten)
     {
-        sb_add(b, "uniform vec4 mglPointAtten;      /* a, b, c, unused */\n");
-        sb_add(b, "uniform vec4 mglPointSizeParams; /* size, min, max, unused */\n");
+        sb_add(b, "uniform vec3 mglPointAtten;      /* a, b, c */\n");
+        sb_add(b, "uniform vec3 mglPointSizeParams; /* size, min, max */\n");
     }
 
     if (c->lighting)
@@ -448,7 +446,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->normalize)
                 sb_add(b, "    mglN = normalize(mglN);\n");
             else
-                sb_add(b, "    mglN *= mglNormalParams.x;\n");
+                sb_add(b, "    mglN *= mglNormalScale;\n");
         }
         else
             sb_add(b, "    mglN = normalize(mglN);\n");  /* lighting needs unit normals */
@@ -649,7 +647,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->point_atten)
     {
         sb_add(b, "    float mglEyeDist = length(mglEye.xyz);\n");
-        sb_add(b, "    gl_PointSize = clamp(mglPointSizeParams.x * inversesqrt(dot(mglPointAtten.xyz, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeParams.y, mglPointSizeParams.z);\n");
+        sb_add(b, "    gl_PointSize = clamp(mglPointSizeParams.x * inversesqrt(dot(mglPointAtten, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeParams.y, mglPointSizeParams.z);\n");
     }
 
     sb_add(b, "    gl_Position = mglProjectionMatrix * mglEye;\n");
@@ -748,7 +746,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->unit.env_mode[u] == GL_COMBINE)
             {
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
-                sb_add(b, "uniform vec4 mglEnvScale%d;     /* rgb scale, alpha scale, 0, 0 */\n", u);
+                sb_add(b, "uniform vec2 mglEnvScale%d;     /* rgb scale, alpha scale */\n", u);
             }
             else if (c->unit.env_mode[u] == GL_BLEND)
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
@@ -761,7 +759,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     }
 
     if (c->alpha_test)
-        sb_add(b, "uniform vec4 mglAlphaParams;    /* .x = reference value */\n");
+        sb_add(b, "uniform float mglAlphaRef;      /* reference value */\n");
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.lod_bias[u])
@@ -921,12 +919,12 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         switch (c->alpha_func)
         {
             case GL_NEVER: expr = "false"; break;
-            case GL_LESS: expr = "c.a < mglAlphaParams.x"; break;
-            case GL_EQUAL: expr = "abs(c.a - mglAlphaParams.x) < 0.0001"; break;
-            case GL_LEQUAL: expr = "c.a <= mglAlphaParams.x"; break;
-            case GL_GREATER: expr = "c.a > mglAlphaParams.x"; break;
-            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaParams.x) >= 0.0001"; break;
-            case GL_GEQUAL: expr = "c.a >= mglAlphaParams.x"; break;
+            case GL_LESS: expr = "c.a < mglAlphaRef"; break;
+            case GL_EQUAL: expr = "abs(c.a - mglAlphaRef) < 0.0001"; break;
+            case GL_LEQUAL: expr = "c.a <= mglAlphaRef"; break;
+            case GL_GREATER: expr = "c.a > mglAlphaRef"; break;
+            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaRef) >= 0.0001"; break;
+            case GL_GEQUAL: expr = "c.a >= mglAlphaRef"; break;
             default: expr = "true"; break;    /* ALWAYS */
         }
         sb_add(b, "    if (!(%s)) discard;\n", expr);
@@ -1137,13 +1135,8 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     for (int i = 0; i < MGLC_FFP_CACHE; i++)
         if (cache && cache[i].used && cache[i].prog == prog)
         {
-            /* the uniform table is re-derived after the MSL compile of the
-             * first draw, so force a re-sync on the first few uses */
-            if (cache[i].sync == s->state_serial && cache[i].draws >= 3)
+            if (cache[i].sync == s->state_serial)
                 return;
-            cache[i].draws++;
-            if (cache[i].sync == s->state_serial && cache[i].draws < 3)
-                cache[i].dirty_late = 1;
             cache[i].sync = s->state_serial;
             break;
         }
@@ -1185,12 +1178,9 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
                 scale = (GLfloat)(1.0 / len);
         }
 
-        loc = uni(ctx, prog, "mglNormalParams");
+        loc = uni(ctx, prog, "mglNormalScale");
         if (loc >= 0)
-        {
-            GLfloat np[4] = { scale, 0.0f, 0.0f, 0.0f };
-            mglUniform4fv(ctx, loc, 1, np);
-        }
+            mglUniform1f(ctx, loc, scale);
     }
 
     /* texture matrices (name is fixed width: mglTextureMatrix%d) */
@@ -1225,16 +1215,10 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     {
         loc = uni(ctx, prog, "mglPointSizeParams");
         if (loc >= 0)
-        {
-            GLfloat sp[4] = { s->point_size, s->point_params[0], s->point_params[1], 0.0f };
-            mglUniform4fv(ctx, loc, 1, sp);
-        }
+            mglUniform3f(ctx, loc, s->point_size, s->point_params[0], s->point_params[1]);
         loc = uni(ctx, prog, "mglPointAtten");
         if (loc >= 0)
-        {
-            GLfloat a[4] = { s->point_params[3], s->point_params[4], s->point_params[5], 0.0f };
-            mglUniform4fv(ctx, loc, 1, a);
-        }
+            mglUniform3f(ctx, loc, s->point_params[3], s->point_params[4], s->point_params[5]);
     }
 
     /* lighting */
@@ -1350,10 +1334,7 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
             snprintf(name, sizeof name, "mglEnvScale%d", u);
             loc = uni(ctx, prog, name);
             if (loc >= 0)
-            {
-                GLfloat es[4] = { s->texenv[u].scale_rgb, s->texenv[u].scale_alpha, 0.0f, 0.0f };
-                mglUniform4fv(ctx, loc, 1, es);
-            }
+                mglUniform2f(ctx, loc, s->texenv[u].scale_rgb, s->texenv[u].scale_alpha);
         }
     }
 
@@ -1372,12 +1353,9 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
 
     if (c.alpha_test)
     {
-        loc = uni(ctx, prog, "mglAlphaParams");
+        loc = uni(ctx, prog, "mglAlphaRef");
         if (loc >= 0)
-        {
-            GLfloat ap[4] = { s->alpha_ref, 0.0f, 0.0f, 0.0f };
-            mglUniform4fv(ctx, loc, 1, ap);
-        }
+            mglUniform1f(ctx, loc, s->alpha_ref);
     }
 
     if (c.polygon_stipple)

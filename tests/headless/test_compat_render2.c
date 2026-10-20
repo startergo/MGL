@@ -469,6 +469,57 @@ TEST(feedback_mode)
     }
 }
 
+/* specular exponent: the scalar uniform mglMatShininess[0] (float array next
+ * to vec4 arrays in the generated shader) must reach the GPU.  The vertex at
+ * (32.5,32.5) with the light at (32.5,36.5,10):
+ *   VP = (0,.3714,.9285), H = normalize(VP+(0,0,1)) -> NdH = .9819
+ * pow(.9819,128)=.0965, pow(.9819,16)=..7458, pow(.9819,2)=.9641 */
+static float specular_at_center(float shininess)
+{
+    setup_2d(64, 64);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glEnable(GL_LIGHTING);
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (GLfloat[4]){ 0, 0, 0, 1 });
+    glEnable(GL_LIGHT0);
+    glLightfv(GL_LIGHT0, GL_POSITION, (GLfloat[4]){ 32.5f, 36.5f, 10, 1 });
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, (GLfloat[4]){ 0, 0, 0, 1 });
+    glLightfv(GL_LIGHT0, GL_SPECULAR, (GLfloat[4]){ 1, 1, 1, 1 });
+
+    glMaterialfv(GL_FRONT, GL_SPECULAR, (GLfloat[4]){ 1, 1, 1, 1 });
+    glMaterialfv(GL_FRONT, GL_AMBIENT, (GLfloat[4]){ 0, 0, 0, 1 });
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, (GLfloat[4]){ 0, 0, 0, 1 });
+    glMaterialf(GL_FRONT, GL_SHININESS, shininess);
+
+    glBegin(GL_QUADS);
+    glNormal3f(0, 0, 1);
+    for (int ty = 0; ty < 16; ty++)
+        for (int tx = 0; tx < 16; tx++)
+        {
+            float x0 = tx * 4.0f + 0.5f, y0 = ty * 4.0f + 0.5f;
+            glVertex3f(x0, y0, 0);
+            glVertex3f(x0 + 4, y0, 0);
+            glVertex3f(x0 + 4, y0 + 4, 0);
+            glVertex3f(x0, y0 + 4, 0);
+        }
+    glEnd();
+
+    GLubyte px[4];
+    mgl_read_rgba(32, 32, px);   /* pixel center = the vertex under the light */
+    glDisable(GL_LIGHTING);
+    glDisable(GL_LIGHT0);
+    return px[0] / 255.0f;
+}
+
+TEST(specular_shininess)
+{
+    EXPECT_NEAR(specular_at_center(128.0f), 0.0965f, 0.02f);
+    EXPECT_NEAR(specular_at_center(16.0f), 0.7458f, 0.03f);
+    EXPECT_NEAR(specular_at_center(2.0f), 0.9641f, 0.02f);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     compat_ctx = mglCompatCreateContext();
@@ -478,6 +529,7 @@ int main(void)
 
     RUN(matrix_transforms);
     RUN(positional_light_and_colormaterial);
+    RUN(specular_shininess);
     RUN(texenv_modes);
     RUN(rasterpos_drawpixels);
     RUN(bitmap);
