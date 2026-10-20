@@ -3,15 +3,6 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* timing of the geometry emulation's per-draw CPU cost: the primitive assembly runs on the
- * GPU (a prep kernel) unless MGL_GEOM_CPU_ASSEMBLY forces the CPU path.  The test draws a
- * large indexed mesh through a geometry shader many times and reports the wall time of both
- * paths (what an application sees between two glFinish()s) and, via GL_TIME_ELAPSED queries,
- * the GPU time the draws themselves cost.  The restart-heavy case is where the tile-parallel
- * prep chain (per-tile restart counts -> prefix sum -> per-tile run records -> parallel
- * emit) replaces the serial run walk; MGL_GEOM_SERIAL_PREP=1 forces the serial kernel so
- * before/after runs of this same test can be compared. */
-
 #define IDX_COUNT  (300 * 1000)
 #define VERTS      (100 * 1000)
 #define FRAMES     40
@@ -22,9 +13,18 @@ static GLuint compile(GLenum type, const char *src)
     GLint ok = 0;
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    (void)&ok;
     return s;
 }
+
+/* timing of the geometry emulation's per-draw CPU cost: the primitive assembly runs on the
+ * GPU (a prep kernel) unless MGL_GEOM_CPU_ASSEMBLY forces the CPU path.  The test draws a
+ * large indexed mesh through a geometry shader many times and reports the wall time of both
+ * paths (what an application sees between two glFinish()s) and, via GL_TIME_ELAPSED queries,
+ * the GPU time the draws themselves cost.  The restart-heavy case is where the tile-parallel
+ * prep chain (per-tile restart counts -> prefix sum -> per-tile run records -> parallel
+ * emit) replaces the serial run walk; MGL_GEOM_SERIAL_PREP=1 forces the serial kernel so
+ * before/after runs of this same test can be compared. */
 
 static double now(void)
 {
@@ -131,8 +131,6 @@ int main(void)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
     glUseProgram(p);
-
-    glViewport(0, 0, 200, 200);
 
     printf("geometry shader primitive assembly (300k scattered indices, %d frames):\n", FRAMES);
 

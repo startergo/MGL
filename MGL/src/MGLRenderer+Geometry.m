@@ -39,6 +39,7 @@
 - (bool) geomRasterPass: (MGLGeomDraw *) d;
 - (bool) geomCanAssembleGPU;
 - (void) geomXfbWait;
+- (void) geomPoolFlushAndWait: (id<MTLCommandBuffer>) cur;
 @end
 
 /* private renderer methods used here (declared for the compiler; implemented by the
@@ -48,11 +49,15 @@
 
 /* per-process scratch (the buffers are shared storage; they are only used by encoders of
  * the command buffer they were written for, so a single set can serve every draw) */
-/* a per-draw scratch pool: the buffer plus the next free offset (geomSubAlloc below) */
+/* a per-draw scratch pool: the CPU writes straight into the range it hands out (the prep
+ * inputs, the record headers), so ranges rotate over MGL_GEOM_POOL_N buffers — the GPU may
+ * still be reading the previous draws' ranges — and a slot is only reused once the command
+ * buffer that consumed it has completed */
+#define MGL_GEOM_POOL_N 4u
 typedef struct {
-    id<MTLBuffer> buf;
-    size_t next;
-    void *cb;        /* the last command buffer whose encoders consume this pool's ranges */
+    id<MTLBuffer> buf[MGL_GEOM_POOL_N];
+    void *cb[MGL_GEOM_POOL_N];        /* the newest command buffer consuming each slot */
+    unsigned cur;
 } MGLGeomPool;
 
 static id<MTLBuffer> gPrim;         /* header + capture index list + input primitive slots */
@@ -93,8 +98,8 @@ static uint32_t gTiledMin = 4096u;
  * getenv() per draw (several times per draw) is not free */
 static struct {
     int  read;
-    bool draw, debug, xfb, worst_case, dump, serial_prep;
-} gEnv = { 0, false, false, false, false, false, false };
+    bool draw, debug, xfb, worst_case, dump, serial_prep, pool_grow;
+} gEnv = { 0, false, false, false, false, false, false, false };
 
 static void geomEnvRead(void)
 {
@@ -106,6 +111,7 @@ static void geomEnvRead(void)
     gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
     gEnv.serial_prep = getenv("MGL_GEOM_SERIAL_PREP") != NULL;   /* A/B the serial kernel */
+    gEnv.pool_grow = getenv("MGL_GEOM_POOL_GROW") != NULL;       /* A/B grow-only scratch pools */
     const char *tmin = getenv("MGL_GEOM_TILED_MIN");             /* test hook: force the chain */
     if (tmin) { int v = atoi(tmin); gTiledMin = v > 0 ? (uint32_t)v : 0u; }
 }
@@ -918,7 +924,11 @@ static void geomReleaseStatics(void)
 {
     gPrim = nil; gVsout = nil; gOutv = nil; gIdx = nil; gCtl = nil; gPrep = nil; gCnt = nil;
     gOutvOff = gCntOff = gPrepOff = gPrimOff = gVsoutOff = 0;
-    gPrimPool.next = gVsoutPool.next = gPrepPool.next = gOutvPool.next = gCntPool.next = 0;
+    memset(&gPrimPool, 0, sizeof gPrimPool);
+    memset(&gVsoutPool, 0, sizeof gVsoutPool);
+    memset(&gPrepPool, 0, sizeof gPrepPool);
+    memset(&gOutvPool, 0, sizeof gOutvPool);
+    memset(&gCntPool, 0, sizeof gCntPool);
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gXfbOwner = 0; gXfbBegin = false;
     gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gTessImportPso = nil;
@@ -1612,69 +1622,95 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
  * the next draw can never land on it.  When the range would not fit, start a NEW (larger,
  * zero-filled) buffer instead of wrapping to offset 0 — a silent wrap could hand a draw a
  * range whose previous user is still pending on the GPU. */
-/* record the newest command buffer whose encoders consume the pools' ranges: once it has
- * completed, geomSubAlloc may recycle a full pool (command buffers execute in order) */
+/* commit and complete the current command buffer (geomSubAlloc at its memory cap).  It is
+ * only called before any encoder of the current draw exists, so nothing is lost. */
+- (void) geomPoolFlushAndWait: (id<MTLCommandBuffer>) cur
+{
+    /* light flush: nothing of the current draw is encoded yet, so ending the previous
+     * draw's encoder and committing is enough (the full buffers-domain flush measured
+     * far slower) */
+    [self endRenderEncoding];
+    if (cur.status < MTLCommandBufferStatusCommitted)
+        [self commitCommandBufferWithAGXRecovery: cur];
+    if (cur.status != MTLCommandBufferStatusError)
+        [cur waitUntilCompleted];
+}
+
+/* record the newest command buffer whose encoders touch the pools' ranges: geomSubAlloc
+ * needs it to know when a full pool's old ranges are dead (consumers can be encoded into a
+ * later command buffer than the one the range was allocated in, e.g. the raster pass) */
 static void geomMarkPools(id<MTLCommandBuffer> cb)
 {
     void *id = (__bridge void *)cb;
-    gPrimPool.cb = id; gVsoutPool.cb = id; gOutvPool.cb = id; gPrepPool.cb = id; gCntPool.cb = id;
+    for (unsigned k = 0; k < MGL_GEOM_POOL_N; k++)
+    {
+        gPrimPool.cb[k] = id; gVsoutPool.cb[k] = id; gOutvPool.cb[k] = id;
+        gPrepPool.cb[k] = id; gCntPool.cb[k] = id;
+    }
 }
 
-static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start,
+static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start,
                                   id<MTLCommandBuffer> cur)
 {
-    size_t s;
+    unsigned slot = (unsigned)-1;
 
     if (need == 0) need = 4;
+    (void) geomEnvRead();
 
-    s = (pool->next + 255) & ~(size_t)255;
-    if (pool->buf && s + need <= pool->buf.length)
+    /* pick the next slot whose consumer command buffer is out of the way: completed, never
+     * used, or the current not-yet-committed one (a command buffer only executes once
+     * committed, and MGL commits them in order, so nothing can touch the old ranges).  A
+     * rotating pool keeps a batched draw sequence off the GPU's toes without waiting. */
+    for (unsigned k = 1; k <= MGL_GEOM_POOL_N; k++)
     {
-        pool->next = s + need;
-        pool->cb = (__bridge void *)cur;
-        *start = s;
-        return pool->buf;
+        unsigned c = (pool->cur + k) % MGL_GEOM_POOL_N;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)pool->cb[c];
+        if (!pool->buf[c]) { slot = c; break; }
+        if (!cb || cb.status >= MTLCommandBufferStatusCompleted) { slot = c; break; }
+        if (cb == cur && cur.status < MTLCommandBufferStatusCommitted) { slot = c; break; }
     }
-
-    /* the pool is full.  Its ranges are consumed by the encoders of the draw that allocated
-     * them (prep chain, capture pass, geometry kernel, pack, raster pass — geomDraw marks
-     * the pool with the last command buffer that encoded any of those).  When that command
-     * buffer completed — buffers on one queue execute in order — every consumer of every
-     * range in the pool is done and the buffer can simply be reused from the start, which
-     * keeps the pools at what one draw needs instead of growing on every draw. */
-    if (pool->buf && need <= pool->buf.length)
+    if (slot == (unsigned)-1)
     {
-        bool dead = true;
-        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)pool->cb;
-        if (cb && cb.status < MTLCommandBufferStatusCompleted) dead = false;
-        /* when the current command buffer still holds (or will hold) consumers, the pool
-         * grows — forcing a flush here measured slower than the growth on this hardware.
-         * Real applications present between frames, which retires the command buffers and
-         * lets the pool recycle; batched draws pay memory instead. */
-        if (dead)
+        /* every slot busy: the GPU is several draws behind.  Command buffers complete in
+         * order, so waiting for the oldest slot's buffer retires the rest; if it is still
+         * uncommitted, commit it first (nothing of this draw is encoded yet). */
+        slot = (pool->cur + 1) % MGL_GEOM_POOL_N;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)pool->cb[slot];
+        if (cb && cb != cur && cb.status < MTLCommandBufferStatusCompleted)
         {
-            if ((geomEnvRead(), gEnv.draw))
-                fprintf(stderr, "geom: trace pool %p recycle (%zu in use)\n", (void *)pool, need);
-            pool->next = need;
-            pool->cb = (__bridge void *)cur;
-            *start = 0;
-            return pool->buf;
+            if (gEnv.draw)
+                fprintf(stderr, "geom: trace pool %p wait (all %u slots busy)\n", (void *)pool, MGL_GEOM_POOL_N);
+            if (cb.status < MTLCommandBufferStatusCommitted)
+                [(id) r geomPoolFlushAndWait: cb];
+            else
+                [cb waitUntilCompleted];
         }
     }
+    pool->cur = slot;
 
-    /* start a fresh buffer so the range is zero-filled and has no previous user */
+    if (pool->buf[slot] && pool->buf[slot].length >= need)
+    {
+        if (gEnv.draw)
+            fprintf(stderr, "geom: trace pool %p slot %u (%zu in use)\n", (void *)pool, slot, need);
+        pool->cb[slot] = (__bridge void *)cur;
+        *start = 0;
+        return pool->buf[slot];
+    }
+
+    /* grow this slot's buffer (zero-filled, no previous user) */
     size_t sz = 4096;
-    size_t want = (pool->buf ? pool->buf.length * 2 : 0);
-    if (want < need * 2) want = need * 2;
+    size_t want = need * 2;
+    if (pool->buf[slot] && pool->buf[slot].length * 2 > want) want = pool->buf[slot].length * 2;
     while (sz < want) sz *= 2;
-    if ((geomEnvRead(), gEnv.draw))
-        fprintf(stderr, "geom: trace pool %p grow need=%zu old=%zu -> %zu\n",
-                (void *)pool, need, (size_t)(pool->buf ? pool->buf.length : 0), sz);
-    pool->buf = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
-    pool->next = need;
-    pool->cb = (__bridge void *)cur;
+    if (gEnv.draw)
+        fprintf(stderr, "geom: trace pool %p slot %u grow need=%zu -> %zu\n",
+                (void *)pool, slot, need, sz);
+    id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+    if (!grown) return nil;                    /* the previous buffers stay usable */
+    pool->buf[slot] = grown;
+    pool->cb[slot] = (__bridge void *)cur;
     *start = 0;
-    return pool->buf;
+    return grown;
 }
 
 - (bool) geomDraw: (MGLGeomDraw *) d
@@ -1760,30 +1796,47 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     }
 
     /* the capture pass writes one record per (vertex, instance); with GPU assembly the
-     * vertex range is only known on the GPU, so size by the index count */
+     * vertex range is only known on the GPU, so size by the index count.  The CPU route's */
     prim_bytes = (MGL_GEOM_HDR_WORDS + cap_idx + cap_prim * gp->in_verts) * sizeof(uint32_t);
-    vsout_bytes = (8 + (gpu_assembly
-                        ? (size_t)bound * (size_t)(d->instances > 0 ? d->instances : 1)
-                        : (size_t)d->vcount * (size_t)(d->instances > 0 ? d->instances : 1))
-                       * gp->in_words) * sizeof(uint32_t);
+    /* CPU route's vcount comes from the index range it read (vmax - vmin + 1): a corrupted element
+     * vcount comes from the index range it read (vmax - vmin + 1): a corrupted element
+     * store (or an index far outside the attribute buffers) would size the capture ring at
+     * gigabytes and the allocation failure then takes the whole program's pipelines down
+     * with it, so the same budget cap the GPU route uses bounds it here too.  The draw's
+     * own output is undefined in that case anyway; the point is to stay standing. */
+    if (!gpu_assembly)
+    {
+        size_t max_vsout = MGL_GEOM_BUDGET_BYTES / (gp->in_words ? (size_t)gp->in_words * sizeof(uint32_t) : 4u);
+        size_t want = (size_t)d->vcount * (size_t)(d->instances > 0 ? d->instances : 1);
+        if (want > max_vsout)
+        {
+            if ((geomEnvRead(), gEnv.draw))
+                fprintf(stderr, "geom: trace vcount %u capped (%zu > %zu)\n", d->vcount, want, max_vsout);
+            want = max_vsout;
+        }
+        vsout_bytes = (8 + want * gp->in_words) * sizeof(uint32_t);
+    }
+    else
+        vsout_bytes = (8 + (size_t)bound * (size_t)(d->instances > 0 ? d->instances : 1)
+                           * gp->in_words) * sizeof(uint32_t);
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
     if ((geomEnvRead(), gEnv.draw))
-        fprintf(stderr, "geom: trace sizing bound=%u outv_cap=%zu idx_cap=%zu cap_idx=%zu cap_prim=%zu "
+        fprintf(stderr, "geom: trace sizing bound=%u inst=%d vcount=%u outv_cap=%zu idx_cap=%zu cap_idx=%zu cap_prim=%zu "
                         "prim_bytes=%zu vsout_bytes=%zu threads=%llu in_words=%u out_words=%u maxverts=%u\n",
-                (unsigned)bound, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
+                (unsigned)bound, d->instances, d->vcount, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
                 (unsigned long long)threads, gp->in_words, gp->out_words, gp->max_vertices);
-    gOutv = geomSubAlloc(_device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
+    gOutv = geomSubAlloc(self, _device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
     if (!gOutv) { geomReleaseStatics(); return false; }
     gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
      * must not overwrite them first */
-    gPrep = geomSubAlloc(_device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff, _currentCommandBuffer);
+    gPrep = geomSubAlloc(self, _device, &gPrepPool, MGL_GEOM_PREP_BYTES, &gPrepOff, _currentCommandBuffer);
     if (!gPrep) { geomReleaseStatics(); return false; }
-    gCnt = geomSubAlloc(_device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff, _currentCommandBuffer);
+    gCnt = geomSubAlloc(self, _device, &gCntPool, 4096 + (size_t)threads * sizeof(uint32_t), &gCntOff, _currentCommandBuffer);
     if (!gCnt) { geomReleaseStatics(); return false; }
     if (!gOutv || !gIdx || !gCtl || !gPrep || !gCnt) { geomReleaseStatics(); return false; }
 
@@ -1791,9 +1844,9 @@ static id<MTLBuffer> geomSubAlloc(id<MTLDevice> device, MGLGeomPool *pool, size_
     /* the primitive slots / capture index list and the captured VS records are shared by the
      * prep kernel, the capture pass, the geometry kernel and the pack: every draw gets its
      * own range so a later draw's kernels cannot overwrite them first */
-    gPrim = geomSubAlloc(_device, &gPrimPool, prim_bytes, &gPrimOff, _currentCommandBuffer);
+    gPrim = geomSubAlloc(self, _device, &gPrimPool, prim_bytes, &gPrimOff, _currentCommandBuffer);
     if (!gPrim) { geomReleaseStatics(); return false; }
-    gVsout = geomSubAlloc(_device, &gVsoutPool, vsout_bytes, &gVsoutOff, _currentCommandBuffer);
+    gVsout = geomSubAlloc(self, _device, &gVsoutPool, vsout_bytes, &gVsoutOff, _currentCommandBuffer);
     if (!gVsout) { geomReleaseStatics(); return false; }
 
     if (![self geomPipelines: gp program: program]) return false;
