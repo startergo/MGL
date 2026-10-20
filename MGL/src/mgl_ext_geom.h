@@ -82,6 +82,8 @@ typedef struct MGLGeomVar {
     bool    flat, noperspective, centroid, sample;
     GLuint  stream;         /* outputs: stream the varying is declared for */
     char    expr[128];      /* writer side: expression of the producing stage output */
+    int     xfb_buffer;     /* shader-declared capture buffer (xfb_buffer=), -1 when not captured */
+    GLuint  xfb_offset;     /* shader-declared capture byte offset (xfb_offset=) */
 } MGLGeomVar;
 
 typedef struct MGLGeomProgram {

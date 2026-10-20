@@ -92,6 +92,26 @@ static bool is_yellow(GLubyte *p) { return p[0] > 200 && p[1] > 200 && p[2] < 32
 static bool is_greenish(GLubyte *p) { return p[0] < 32 && p[1] > 200; }
 static bool is_green_mid(GLubyte *p) { return p[0] < 32 && p[1] > 100 && p[1] < 200; }
 
+/* a private framebuffer so block tests are immune to the viewport / layer state left by
+ * earlier tests */
+static GLuint block_fbo(GLuint *texout, int w, int h)
+{
+    GLuint tex, fbo;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, w, h);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    *texout = tex;
+    return fbo;
+}
+
 /* count pixels in a 7x7 block around (x,y) matching `match` */
 static int count_block(int x, int y, bool (*match)(GLubyte *))
 {
@@ -1251,23 +1271,25 @@ TEST(gs_struct_member_order)
     glDeleteProgram(p);
 }
 
-TEST(gs_named_output_block_rejected)
+TEST(gs_named_output_block_roundtrip)
 {
-    /* a named output interface block is not representable in the generated kernel: the link
-     * must fail with an explanation instead of drawing wrong data */
+    /* named interface blocks on every edge: an anonymous VS block, a named geometry input
+     * block (instance array), a named geometry output block, a named fragment input block.
+     * This used to be rejected at link time ("named output blocks are not supported");
+     * the block is now rewritten to a plain struct + instance in the generated kernel */
     const char *vs =
         "#version 450 core\n"
         "layout(location=0) in vec2 pos;\n"
         "layout(location=0) out VOut { vec4 a; };\n"
-        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); a = vec4(pos, 0.5, 1.0); }\n";
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); a = vec4(pos * 0.5 + 0.5, 0.5, 1.0); }\n";
     const char *gs =
         "#version 450 core\n"
         "layout(triangles) in;\n"
         "layout(triangle_strip, max_vertices = 3) out;\n"
-        "layout(location=0) in VOut { vec4 a[]; };\n"
+        "layout(location=0) in VOut { vec4 a; } v[];\n"
         "layout(location=0) out GOut { vec4 c; } g;\n"
         "void main(){\n"
-        "  for (int i = 0; i < 3; i++) { gl_Position = a[i]; g.c = a[i]; EmitVertex(); }\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; g.c = v[i].a; EmitVertex(); }\n"
         "  EndPrimitive();\n"
         "}\n";
     const char *fs =
@@ -1276,10 +1298,28 @@ TEST(gs_named_output_block_rejected)
         "layout(location=0) out vec4 color;\n"
         "void main(){ color = g.c; }\n";
     GLuint p = program(vs, gs, fs);
-    GLint ok = 1;
+    GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    EXPECT_EQ_INT(ok, GL_FALSE);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) { glDeleteProgram(p); return; }
+
+    {
+        GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+        setup(8, quad);
+        glUseProgram(p);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        {
+            GLubyte c[4];
+            px(48, 48, c);      /* NDC (0.5, 0.5) -> a = (0.75, 0.75, 0.5) -> (191, 191, 128) */
+            EXPECT_TRUE(abs(c[0] - 191) < 10 && abs(c[1] - 191) < 10 && abs(c[2] - 128) < 12);
+        }
+        glDeleteFramebuffers(1, &bfbo);
+        glDeleteTextures(1, &btex);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);  /* do not leave a deleted framebuffer bound */
+        glViewport(0, 0, 200, 200);
+    }
     glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
 }
 
 /* ---- geometry behind a tessellation stage ----------------------------------------
@@ -2375,12 +2415,429 @@ TEST(tiled_restart_gpu_assembly)
     EXPECT_NO_GL_ERROR();
 }
 
+/* ---------- named output interface blocks ---------- */
+
+TEST(gs_output_block_instance_name)
+{
+    /* out Blk { vec4 c; } b; in the geometry stage, in Blk { vec4 c; } b; in the fragment
+     * stage: the block is rewritten to a plain struct + instance in the generated kernel
+     * (the body keeps writing b.c), re-emitted as a location-addressed varying for
+     * rasterization, and matched by location to the fragment stage's input block */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { vec4 c; } b;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.c = vec4(0.0, 1.0, 0.0, 1.0); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "in Blk { vec4 c; } b;\n"
+                     "layout(location=0) out vec4 o;\n"
+                     "void main(){ o = b.c; }\n";
+    GLuint p = program(plain_vs, gs, fs);
+
+    if (!p) return;
+    GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+    setup(8, quad);
+    glUseProgram(p);
+    clear_black();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    EXPECT_EQ_INT(count_block(32, 32, is_green), 49);
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &bfbo);
+    glDeleteTextures(1, &btex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);      /* do not leave a deleted framebuffer bound */
+    glViewport(0, 0, 200, 200);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_two_members_and_plain)
+{
+    /* two block members plus a plain varying beside them: the member locations follow the
+     * declaration order and the plain varying takes the next free one */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { vec4 a; vec2 b; } blk;\n"
+                     "layout(location = 4) out float plain;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; blk.a = vec4(0.0, 1.0, 0.0, 1.0); blk.b = vec2(0.5); plain = 0.25; EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "in Blk { vec4 a; vec2 b; } blk;\n"
+                     "layout(location = 4) in float plain;\n"
+                     "layout(location=0) out vec4 o;\n"
+                     "void main(){ o = blk.a * (blk.b.x + plain); }\n";
+    GLuint p = program(plain_vs, gs, fs);
+
+    if (!p) return;
+    GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+    setup(8, quad);
+    glUseProgram(p);
+    clear_black();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    {
+        GLubyte c[4];
+        px(32, 32, c);          /* 0.75 * green = 191 */
+        EXPECT_TRUE(c[0] < 32 && c[1] > 170 && c[1] < 210 && c[2] < 32);
+    }
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &bfbo);
+    glDeleteTextures(1, &btex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);      /* do not leave a deleted framebuffer bound */
+    glViewport(0, 0, 200, 200);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_array_member)
+{
+    /* vec4 c[2] inside the block: two consecutive locations, both elements carried */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { layout(location = 2) vec4 c[2]; } b;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.c[0] = vec4(0.0, 1.0, 0.0, 1.0); b.c[1] = vec4(0.0, 0.0, 1.0, 1.0); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "in Blk { layout(location = 2) vec4 c[2]; } b;\n"
+                     "layout(location=0) out vec4 o;\n"
+                     "void main(){ o = b.c[0] * 0.5 + b.c[1] * 0.5; }\n";
+    GLuint p = program(plain_vs, gs, fs);
+
+    if (!p) return;
+    GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+    setup(8, quad);
+    glUseProgram(p);
+    clear_black();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    {
+        GLubyte c[4];
+        px(32, 32, c);          /* half green + half blue */
+        EXPECT_TRUE(c[0] < 32 && c[1] > 100 && c[1] < 155 && c[2] > 100 && c[2] < 155);
+    }
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &bfbo);
+    glDeleteTextures(1, &btex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);      /* do not leave a deleted framebuffer bound */
+    glViewport(0, 0, 200, 200);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_flat_and_matrix_members)
+{
+    /* flat interpolation and a mat2 member survive the struct rewrite */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { flat vec4 f; mat2 m; } b;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.f = vec4(1.0, 1.0, 0.0, 1.0); b.m = mat2(1.0, 0.25, 0.25, 1.0); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "in Blk { flat vec4 f; mat2 m; } b;\n"
+                     "layout(location=0) out vec4 o;\n"
+                     "void main(){ vec2 v = b.m * vec2(0.25, 0.25); o = b.f * vec4(v, 0.0, 1.0); }\n";
+    GLuint p = program(plain_vs, gs, fs);
+
+    if (!p) return;
+    GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+    setup(8, quad);
+    glUseProgram(p);
+    clear_black();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    {
+        GLubyte c[4];
+        px(32, 32, c);          /* yellow * (0.3125, 0.3125) -> (80, 80, 0) */
+        EXPECT_TRUE(c[0] > 60 && c[0] < 100 && c[1] > 60 && c[1] < 100 && c[2] < 32);
+    }
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &bfbo);
+    glDeleteTextures(1, &btex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);      /* do not leave a deleted framebuffer bound */
+    glViewport(0, 0, 200, 200);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_anonymous)
+{
+    /* an interface block without an instance name puts its members in the enclosing
+     * scope; the fragment stage may still use an instance name of its own */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { vec4 c; };\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; c = vec4(0.0, 1.0, 0.0, 1.0); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\n"
+                     "in Blk { vec4 c; } i;\n"
+                     "layout(location=0) out vec4 o;\n"
+                     "void main(){ o = i.c; }\n";
+    GLuint p = program(plain_vs, gs, fs);
+
+    if (!p) return;
+    GLuint btex, bfbo = block_fbo(&btex, 64, 64);
+    setup(8, quad);
+    glUseProgram(p);
+    clear_black();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    EXPECT_EQ_INT(count_block(32, 32, is_green), 49);
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &bfbo);
+    glDeleteTextures(1, &btex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);      /* do not leave a deleted framebuffer bound */
+    glViewport(0, 0, 200, 200);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(xfb_of_gs_output_block_members)
+{
+    /* transform feedback of block members named as instance.member, both through the API
+     * (interleaved, sequential offsets) and through shader-declared xfb_buffer/xfb_offset
+     * (GL 4.6 13.3.2: the in-shader qualifiers capture when no API list is given) */
+    const char *vs = plain_vs;
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { vec4 c; vec2 d; } b;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.c = vec4(0.125, 0.25, 0.5, 1.0); b.d = vec2(0.75, 0.875); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = plain_fs;
+    static const char *names[2] = { "b.c", "b.d" };
+    GLuint p, tfb, tbo;
+    GLfloat rec[10];
+
+    p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glTransformFeedbackVaryings(p, 2, names, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    {
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, GL_TRUE);
+        if (!ok) { glDeleteProgram(p); return; }
+    }
+    setup(8, quad);
+    glUseProgram(p);
+    glGenTransformFeedbacks(1, &tfb);
+    glGenBuffers(1, &tbo);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfb);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbo);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    glFinish();
+
+    memset(rec, 0xcc, sizeof rec);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbo);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof rec, rec);
+    {
+        int good = fabsf(rec[0] - 0.125f) < 1e-4f && fabsf(rec[1] - 0.25f) < 1e-4f &&
+                   fabsf(rec[2] - 0.5f) < 1e-4f && fabsf(rec[3] - 1.0f) < 1e-4f &&
+                   fabsf(rec[4] - 0.75f) < 1e-4f && fabsf(rec[5] - 0.875f) < 1e-4f;
+        EXPECT_TRUE(good);
+        printf("  api-named block member xfb: %s\n", good ? "ok" : "BAD");
+    }
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+    glDeleteTransformFeedbacks(1, &tfb);
+    glDeleteBuffers(1, &tbo);
+    glDeleteProgram(p);
+
+    /* shader-declared capture: no glTransformFeedbackVaryings call, the layout qualifiers
+     * pick the buffer (1) and the offsets (16 and 32) */
+    {
+        const char *gs2 = "#version 450 core\n"
+                          "layout(triangles) in;\n"
+                          "layout(triangle_strip, max_vertices = 3) out;\n"
+                          "layout(xfb_buffer = 1) out Blk { layout(xfb_offset = 16) vec4 c; layout(xfb_offset = 32) vec2 d; } b;\n"
+                          "void main(){\n"
+                          "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.c = vec4(0.125, 0.25, 0.5, 1.0); b.d = vec2(0.75, 0.875); EmitVertex(); }\n"
+                          "  EndPrimitive();\n"
+                          "}\n";
+        p = glCreateProgram();
+        glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+        glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs2));
+        glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+        glLinkProgram(p);
+        {
+            GLint ok = 0;
+            glGetProgramiv(p, GL_LINK_STATUS, &ok);
+            EXPECT_EQ_INT(ok, GL_TRUE);
+            if (!ok) { glDeleteProgram(p); return; }
+        }
+        glUseProgram(p);
+        glGenTransformFeedbacks(1, &tfb);
+        glGenBuffers(1, &tbo);
+        glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfb);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 1, tbo);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+        glEnable(GL_RASTERIZER_DISCARD);
+        glBeginTransformFeedback(GL_TRIANGLES);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glEndTransformFeedback();
+        glDisable(GL_RASTERIZER_DISCARD);
+        glFinish();
+
+        memset(rec, 0xcc, sizeof rec);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbo);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof rec, rec);
+        {
+            /* c at byte 16, d at byte 32: words 4..7 and 8..9 */
+            int good = fabsf(rec[4] - 0.125f) < 1e-4f && fabsf(rec[5] - 0.25f) < 1e-4f &&
+                       fabsf(rec[6] - 0.5f) < 1e-4f && fabsf(rec[7] - 1.0f) < 1e-4f &&
+                       fabsf(rec[8] - 0.75f) < 1e-4f && fabsf(rec[9] - 0.875f) < 1e-4f;
+            EXPECT_TRUE(good);
+            printf("  shader-declared xfb_buffer/offset: %s\n", good ? "ok" : "BAD");
+        }
+        glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+        glDeleteTransformFeedbacks(1, &tfb);
+        glDeleteBuffers(1, &tbo);
+        glDeleteProgram(p);
+    }
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_after_tessellation)
+{
+    /* a tessellated pipeline whose geometry stage declares a named output block: the
+     * evaluation stage also feeds the geometry stage through a named block (matched by
+     * block name, with different instance names on both sides) */
+    const char *vs = "#version 450 core\nlayout(location=0) in vec2 pos;\nlayout(location=0) out vec2 v_pos;\nvoid main(){ v_pos = pos; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char *tc = "#version 450 core\nlayout(vertices = 3) out;\nlayout(location=0) in vec2 v_pos[];\nlayout(location=0) out vec2 tc_pos[];\nvoid main(){ gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0; gl_TessLevelOuter[3] = 1.0; gl_TessLevelInner[0] = 1.0; gl_TessLevelInner[1] = 1.0; tc_pos[gl_InvocationID] = v_pos[gl_InvocationID]; gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; }\n";
+    const char *te = "#version 450 core\nlayout(triangles, equal_spacing, ccw) in;\nout VBlk { vec2 p; } vout;\nvoid main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position; vout.p = gl_Position.xy; }\n";
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "in VBlk { vec2 p; } vin[];\n"
+                     "out GBlk { vec4 g; } gout;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; gout.g = vec4(vin[i].p * 0.5 + 0.5, 0.0, 1.0); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\nin GBlk { vec4 g; } gin;\nlayout(location=0) out vec4 o;\nvoid main(){ o = gin.g; }\n";
+    GLuint p, s;
+    GLint ok = 0;
+
+    p = glCreateProgram();
+    s = compile(GL_VERTEX_SHADER, vs); glAttachShader(p, s);
+    s = compile(GL_TESS_CONTROL_SHADER, tc); glAttachShader(p, s);
+    s = compile(GL_TESS_EVALUATION_SHADER, te); glAttachShader(p, s);
+    s = compile(GL_GEOMETRY_SHADER, gs); glAttachShader(p, s);
+    s = compile(GL_FRAGMENT_SHADER, fs); glAttachShader(p, s);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) { glDeleteProgram(p); return; }
+
+    {
+        static const float tri[] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+        setup(6, tri);
+    }
+    {
+        GLuint btex, bfbo = block_fbo(&btex, 32, 32);
+        glPatchParameteri(GL_PATCH_VERTICES, 3);
+        glUseProgram(p);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        {
+            GLubyte c[4];
+            px(16, 16, c);      /* NDC (0.031, 0.031) -> p*0.5+0.5 -> (132, 132, 0) */
+            EXPECT_TRUE(abs(c[0] - 132) < 14 && abs(c[1] - 132) < 14 && c[2] < 32);
+        }
+        glDeleteFramebuffers(1, &bfbo);
+        glDeleteTextures(1, &btex);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);  /* do not leave a deleted framebuffer bound */
+        glViewport(0, 0, 200, 200);
+    }
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(gs_output_block_xfb_errors)
+{
+    /* a member that does not exist must fail the link; a whole-block name selects every
+     * member (the capture then contains both, sequentially) */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "out Blk { vec4 c; vec2 d; } b;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; b.c = vec4(0.125, 0.25, 0.5, 1.0); b.d = vec2(0.75, 0.875); EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = plain_fs;
+    static const char *bad[1] = { "b.nope" };
+    static const char *whole[1] = { "b" };
+    GLuint p;
+    GLint ok = 0;
+
+    p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, plain_vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glTransformFeedbackVaryings(p, 1, bad, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_FALSE);
+    glDeleteProgram(p);
+
+    p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, plain_vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glTransformFeedbackVaryings(p, 1, whole, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (ok)
+    {
+        GLuint tfb, tbo;
+        GLfloat rec[6];
+        setup(8, quad);
+        glUseProgram(p);
+        glGenTransformFeedbacks(1, &tfb);
+        glGenBuffers(1, &tbo);
+        glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfb);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbo);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+        glEnable(GL_RASTERIZER_DISCARD);
+        glBeginTransformFeedback(GL_TRIANGLES);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glEndTransformFeedback();
+        glDisable(GL_RASTERIZER_DISCARD);
+        glFinish();
+        memset(rec, 0xcc, sizeof rec);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbo);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof rec, rec);
+        EXPECT_TRUE(fabsf(rec[0] - 0.125f) < 1e-4f && fabsf(rec[4] - 0.75f) < 1e-4f &&
+                    fabsf(rec[5] - 0.875f) < 1e-4f);
+        printf("  whole-block xfb selection: c then d captured\n");
+        glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+        glDeleteTransformFeedbacks(1, &tfb);
+        glDeleteBuffers(1, &tbo);
+    }
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     RUN(block_vs_fs_control);
     RUN(gs_struct_interface_vars);
     RUN(gs_struct_member_order);
-    RUN(gs_named_output_block_rejected);
+    RUN(gs_named_output_block_roundtrip);
     RUN(control_no_geometry_shader);
     RUN(control_varying_no_gs);
     RUN(passthrough_triangles);
@@ -2414,5 +2871,13 @@ int main(void)
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
     RUN(element_store_tail_integrity);
     RUN(tiled_restart_gpu_assembly);
+    RUN(gs_output_block_instance_name);
+    RUN(gs_output_block_two_members_and_plain);
+    RUN(gs_output_block_array_member);
+    RUN(gs_output_block_flat_and_matrix_members);
+    RUN(gs_output_block_anonymous);
+    RUN(xfb_of_gs_output_block_members);
+    RUN(gs_output_block_after_tessellation);
+    RUN(gs_output_block_xfb_errors);
     return mgl_test_summary();
 }
