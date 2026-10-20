@@ -17,14 +17,16 @@ static GLuint compile(GLenum type, const char *src)
     return s;
 }
 
-/* timing of the geometry emulation's per-draw CPU cost: the primitive assembly runs on the
+/* timing of the geometry emulation's per-draw cost: the primitive assembly runs on the
  * GPU (a prep kernel) unless MGL_GEOM_CPU_ASSEMBLY forces the CPU path.  The test draws a
- * large indexed mesh through a geometry shader many times and reports the wall time of both
- * paths (what an application sees between two glFinish()s) and, via GL_TIME_ELAPSED queries,
- * the GPU time the draws themselves cost.  The restart-heavy case is where the tile-parallel
- * prep chain (per-tile restart counts -> prefix sum -> per-tile run records -> parallel
- * emit) replaces the serial run walk; MGL_GEOM_SERIAL_PREP=1 forces the serial kernel so
- * before/after runs of this same test can be compared. */
+ * large indexed mesh through a geometry shader many times and reports, per case, the wall
+ * time of the draws between two glFinish()s (what an application sees) and the GPU time
+ * measured with a GL_TIME_ELAPSED query around the same batch.  The env knobs the driver
+ * reads are cached at the FIRST draw of the process, so they must be set before the test
+ * starts: MGL_GEOM_SERIAL_PREP=1 replaces the tile-parallel restart prep with the serial
+ * run walk, MGL_GEOM_WORST_CASE_DISPATCH=1 dispatches the geometry kernel with the
+ * worst-case (count / in_verts) thread count instead of the exact count the prep kernel
+ * computed, MGL_GEOM_TILED_MIN=n forces the tile-parallel chain for draws > n indices. */
 
 static double now(void)
 {
@@ -33,11 +35,27 @@ static double now(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static double run_frames(GLuint p, GLsizei count, GLuint query)
+static double gpu_time_frames(GLsizei count)
 {
-    double t0, t1;
+    GLuint tq = 0;
+    GLuint64 ns = 0;
+
+    glGenQueries(1, &tq);
+    glBeginQuery(GL_TIME_ELAPSED, tq);
+    for (int f = 0; f < FRAMES; f++)
+        glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, NULL);
+    glEndQuery(GL_TIME_ELAPSED);
+    glGetQueryObjectui64v(tq, GL_QUERY_RESULT, &ns);   /* no glFinish: the resolve waits */
+    glDeleteQueries(1, &tq);
+    return (double)ns / 1000.0 / FRAMES;   /* us per frame */
+}
+
+static void run_frames(const char *label, GLsizei count, GLuint query)
+{
+    double t0, t1, gpu;
     GLint primitives = 0;
 
+    /* wall time between two finishes */
     glBeginQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED, query);
     t0 = now();
     for (int f = 0; f < FRAMES; f++)
@@ -46,29 +64,18 @@ static double run_frames(GLuint p, GLsizei count, GLuint query)
     t1 = now();
     glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
     glGetQueryObjectiv(query, GL_QUERY_RESULT, &primitives);
-    printf("  %d frames of %d indices: %.3f s (%.1f us/frame), %d primitives emitted\n",
-           FRAMES, count, t1 - t0, (t1 - t0) * 1e6 / FRAMES, primitives);
     EXPECT_TRUE(primitives > 0);
-    return (t1 - t0) * 1e6 / FRAMES;
-}
 
-/* the same frames with a GL_TIME_ELAPSED query around them: the GPU time of the frame,
- * which for this workload is dominated by the prep (assembly) chain */
-static double gpu_time_frames(GLsizei count)
-{
-    GLuint tq = 0;
-    GLuint64 ns = 0;
+    /* GPU time of the same batch (dominated by the prep / assembly chain) */
+    gpu = gpu_time_frames(count);
 
-    glGenQueries(1, &tq);
-    glFinish();
-    glBeginQuery(GL_TIME_ELAPSED, tq);
-    for (int f = 0; f < FRAMES; f++)
-        glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, NULL);
-    glEndQuery(GL_TIME_ELAPSED);
-    glFinish();
-    glGetQueryObjectui64v(tq, GL_QUERY_RESULT, &ns);
-    glDeleteQueries(1, &tq);
-    return (double)ns / 1000.0 / FRAMES;   /* us per frame */
+    /* NB: the emitted count below is the CPU-side approximation the query domain uses
+     * (count / in_verts): with primitive restart the real count is lower (count/6 here,
+     * verified exactly via transform feedback in test_geom's tiled_restart_gpu_assembly);
+     * the exact GPU counters are only plumbed into the xfb queries, not this one */
+
+    printf("  %-28s %9.1f us/frame wall, %9.1f us/frame GPU, %d primitives emitted\n",
+           label, (t1 - t0) * 1e6 / FRAMES, gpu, primitives);
 }
 
 int main(void)
@@ -96,8 +103,6 @@ int main(void)
     GLuint p, vao, vbo, ebo, q;
     GLuint *idx = malloc(sizeof(GLuint) * IDX_COUNT);
     float *verts = malloc(sizeof(float) * 2 * VERTS);
-    double cpu = 0, gpu = 0;   /* per-frame wall times, for the summary line */
-    (void)cpu; (void)gpu;
 
     for (int i = 0; i < VERTS; i++)
     {
@@ -135,11 +140,9 @@ int main(void)
 
     printf("geometry shader primitive assembly (300k scattered indices, %d frames):\n", FRAMES);
 
-    /* the CPU / GPU routes are chosen by MGL_GEOM_CPU_ASSEMBLY, which the driver reads once
-     * per process — so the CPU number comes from a run of this same test with the variable
-     * set, and this process measures the GPU path (set MGL_GEOM_SERIAL_PREP=1 to A/B the
-     * serial prep kernel against the tile-parallel chain) */
-    run_frames(p, IDX_COUNT, q);
+    /* the wall number below is the GPU path (set MGL_GEOM_CPU_ASSEMBLY=1 in the
+     * environment before the process starts to A/B the CPU assembly path) */
+    run_frames("assembly (no restart)", IDX_COUNT, q);
     /* both paths must rasterize the same amount: count covered pixels */
     {
         int covered = 0;
@@ -158,8 +161,12 @@ int main(void)
         EXPECT_TRUE(covered > 0);
     }
 
-    /* primitive restart: the exact thread count from the prep kernel matters here, because
-     * the worst case (count / 3) is twice the real primitive count */
+    /* primitive restart: the real primitive count (count/6 with a restart every 6th index)
+     * is only known after the restart scan, so the prep chain (tiles -> prefix -> runs ->
+     * reduce -> emit) runs instead of the single no-restart prep kernel; the geometry
+     * kernel itself still dispatches with the exact count that chain produced.  The env
+     * knobs (worst-case dispatch, serial prep) are cached at the first draw, so they only
+     * take effect when set before the process starts. */
     {
         const GLuint restart = 0xffffffffu;
         glEnable(GL_PRIMITIVE_RESTART);
@@ -168,10 +175,7 @@ int main(void)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
         printf("primitive restart (every 6th index):\n");
-        setenv("MGL_GEOM_WORST_CASE_DISPATCH", "1", 1);
-        run_frames(p, IDX_COUNT, q);
-        unsetenv("MGL_GEOM_WORST_CASE_DISPATCH");
-        run_frames(p, IDX_COUNT, q);
+        run_frames("restart", IDX_COUNT, q);
         for (int i = 0; i < IDX_COUNT; i++) idx[i] = (GLuint)(((GLuint)i * 7919u) % VERTS);
         glDisable(GL_PRIMITIVE_RESTART);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
@@ -196,8 +200,20 @@ int main(void)
         t1 = now();
         glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
         glGetQueryObjectiv(q, GL_QUERY_RESULT, &prims);
-        printf("indirect: %.1f us/frame, %d primitives emitted\n", (t1 - t0) * 1e6 / FRAMES, prims);
         EXPECT_TRUE(prims > 0);
+        {
+            GLuint tq = 0;
+            GLuint64 ns = 0;
+            glGenQueries(1, &tq);
+            glBeginQuery(GL_TIME_ELAPSED, tq);
+            for (int f = 0; f < FRAMES; f++)
+                glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+            glEndQuery(GL_TIME_ELAPSED);
+            glGetQueryObjectui64v(tq, GL_QUERY_RESULT, &ns);
+            glDeleteQueries(1, &tq);
+            printf("  %-28s %9.1f us/frame wall, %9.1f us/frame GPU, %d primitives emitted\n",
+                   "indirect", (t1 - t0) * 1e6 / FRAMES, (double)ns / 1000.0 / FRAMES, prims);
+        }
 
         glDeleteBuffers(1, &ib);
     }
