@@ -68,7 +68,14 @@ enum {
     MGL_GEOM_MSL_IDX       = 28,
     MGL_GEOM_MSL_CTL       = 29,
     MGL_GEOM_MSL_CNT       = 22,
-    MGL_GEOM_MSL_DRAW      = 23
+    MGL_GEOM_MSL_DRAW      = 23,
+
+    /* Metal argument slots a stage's PROGRAM resources (UBOs incl. instance arrays, the
+     * default-uniform block, SSBOs) may span in the compute kernels: the kernel's own
+     * buffers are pinned at the fixed slots from MGL_GEOM_MSL_CNT (22) up, so a stage
+     * whose resources exceed this fails the link with a clear message instead of
+     * overlapping the emulation's own buffers */
+    MGL_GEOM_KERNEL_USER_SLOTS = 22
 };
 
 /* one interface varying of the geometry stage (canonical word layout shared by the
@@ -98,6 +105,12 @@ typedef struct MGLGeomProgram {
     bool      from_tess;   /* a tessellation stage feeds the geometry kernel (TES-output capture) */
     void    *gs_exec;      /* the geometry stage executable Shader (identity across pipelines) */
     char     *fail;
+
+    /* sampler / image ARRAYS of the geometry stage, from the kernel's SPIR-V: an
+     * array<texture2d, N> Metal argument covers N consecutive argument slots, fed by the
+     * N texture units base..base+N-1 (MGL's sampler-uniform convention, program.c). */
+    struct { char name[64]; int n; } tex_arrays[8];
+    int n_tex_arrays;
 
     GLenum    in_type;      /* GL_POINTS / GL_LINES / GL_LINES_ADJACENCY / GL_TRIANGLES / GL_TRIANGLES_ADJACENCY */
     GLenum    out_type;     /* GL_POINTS / GL_LINE_STRIP / GL_TRIANGLE_STRIP */

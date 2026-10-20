@@ -1021,6 +1021,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             r->set = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationDescriptorSet);
             r->binding = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationBinding);
             r->msl_binding = r->binding; /* refined with the real Metal index after MSL emission */
+            r->array_size = n;           /* sampler/image arrays: consecutive units + argument slots */
             r->location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
 
             switch (res_type)

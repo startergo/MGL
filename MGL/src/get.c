@@ -637,7 +637,16 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
 
         /* uniform blocks */
         case GL_MAX_VERTEX_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_vertex_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
-        case GL_MAX_GEOMETRY_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_geometry_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
+        /* the geometry stage runs as a COMPUTE kernel (compute emulation): its user
+         * UBOs share the kernel's buffer argument table (slots 0..17; 18..27 are the
+         * emulation's own — MGL_GEOM_SSBO_*), so the geometry-stage block limit is
+         * capped at the GL 4.6 minimum the kernel can actually bind, not at what the
+         * render stages report.  Reporting more makes conformant apps build pipelines
+         * the kernel cannot host (KHR-GL46.geometry_shader.limits.max_uniform_blocks
+         * builds MAX_GEOMETRY_UNIFORM_BLOCKS blocks and renders). */
+        case GL_MAX_GEOMETRY_UNIFORM_BLOCKS:
+            PUT1(MIN_D(MIN_D(LIMIT(STATE_VAR(max_geometry_uniform_blocks), 14),
+                             max_uniform_buffer_bindings(ctx)), 14));
         case GL_MAX_TESS_CONTROL_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_tess_control_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
         case GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_tess_evaluation_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
         case GL_MAX_FRAGMENT_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_fragment_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));

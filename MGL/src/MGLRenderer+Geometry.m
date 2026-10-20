@@ -277,10 +277,20 @@ static const char *kGeomPrepMSL =
     "                uint id;\n"
     "                switch (mode) {\n"
     "                    case 0u: id = p; break;                                  /* points */\n"
-    "                    case 1u: case 2u: case 4u: case 5u: id = p + v; break;   /* line-ish */\n"
+    "                    case 1u: case 2u: case 5u: id = p + v; break;            /* line-ish, stride 1 */\n"
     "                    case 3u: id = (p + v < subcount) ? p + v : 0u; break;    /* line loop */\n"
-    "                    case 6u: case 9u: id = p * k + v; break;                 /* tri list / tri adj */\n"
-    "                    case 10u: id = p * 2u + v; break;                        /* tri strip adj */\n"
+    "                    case 4u: case 6u: case 9u: id = p * k + v; break;        /* disjoint groups: lines adj (4) / tri (3) / tri adj (6) */\n"
+    "                    case 10u: {                                             /* tri strip adj: GL 4.6 table 10.4 (even slots triangle\n"
+    "                                                                               verts, odd adjacency; odd triangles flip winding; first/last\n"
+    "                                                                               triangle has no preceding/following adjacency) */\n"
+    "                        uint b = 2u * p, last = subprims - 1u, e = (p & 1u) == 0u;\n"
+    "                        uint v0 = e ? b : b + 2u, v1 = e ? b + 2u : b, v2 = b + 4u;\n"
+    "                        uint a0 = (p == 0u) ? 1u : b - 2u;\n"
+    "                        uint a1 = (p == last) ? (e ? b + 5u : b + 3u) : (e ? b + 6u : b + 3u);\n"
+    "                        uint a2 = (p == last) ? (e ? b + 3u : b + 5u) : (e ? b + 3u : b + 6u);\n"
+    "                        id = (v == 0u) ? v0 : (v == 1u) ? a0 : (v == 2u) ? v1 : (v == 3u) ? a1 : (v == 4u) ? v2 : a2;\n"
+    "                        break;\n"
+    "                    }\n"
     "                    case 8u:                                              /* triangle fan */\n"
     "                        if (provoking_first) id = (v == 2u) ? 0u : p + v + 1u;\n"
     "                        else                  id = (v == 0u) ? 0u : p + v;\n"
@@ -386,10 +396,19 @@ static const char *kGeomPrepMSL =
     "    uint id;\n"
     "    switch (mode) {\n"
     "        case 0u: id = p; break;                                   /* points */\n"
-    "        case 1u: case 2u: case 4u: case 5u: id = p + v; break;    /* line-ish */\n"
+    "        case 1u: case 2u: case 5u: id = p + v; break;             /* line-ish, stride 1 */\n"
     "        case 3u: id = (p + v < subcount) ? p + v : 0u; break;     /* line loop */\n"
-    "        case 6u: case 9u: id = p * k + v; break;                  /* tri list / tri adj */\n"
-    "        case 10u: id = p * 2u + v; break;                         /* tri strip adj */\n"
+    "        case 4u: case 6u: case 9u: id = p * k + v; break;         /* disjoint groups: lines adj (4) / tri (3) / tri adj (6) */\n"
+    "        case 10u: {                                              /* tri strip adj: GL 4.6 table 10.4 (see mgl_geom_prep) */\n"
+    "            uint subprims = (subcount >= 6u) ? (subcount - 4u) / 2u : 0u;\n"
+    "            uint b = 2u * p, last = subprims - 1u, e = (p & 1u) == 0u;\n"
+    "            uint v0 = e ? b : b + 2u, v1 = e ? b + 2u : b, v2 = b + 4u;\n"
+    "            uint a0 = (p == 0u) ? 1u : b - 2u;\n"
+    "            uint a1 = (p == last) ? (e ? b + 5u : b + 3u) : (e ? b + 6u : b + 3u);\n"
+    "            uint a2 = (p == last) ? (e ? b + 3u : b + 5u) : (e ? b + 3u : b + 6u);\n"
+    "            id = (v == 0u) ? v0 : (v == 1u) ? a0 : (v == 2u) ? v1 : (v == 3u) ? a1 : (v == 4u) ? v2 : a2;\n"
+    "            break;\n"
+    "        }\n"
     "        case 8u:                                                 /* triangle fan */\n"
     "            if (provoking_first) id = (v == 2u) ? 0u : p + v + 1u;\n"
     "            else                  id = (v == 0u) ? 0u : p + v;\n"
@@ -1237,7 +1256,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
 
     [enc setComputePipelineState: gXfbPrePso];
     [enc setBytes: in length: sizeof in atIndex: 0];
-    [enc setBuffer: gCnt offset: 0 atIndex: 1];
+    [enc setBuffer: gCnt offset: gCntOff atIndex: 1];   /* this draw's counters, not the pool's start */
     [enc setBuffer: gXbase offset: 0 atIndex: 2];
     [enc setBuffer: gXfb offset: 0 atIndex: 3];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
@@ -1529,14 +1548,96 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
 /* ---- resources of the geometry stage (uniforms, storage, textures) ---- */
 
-- (bool) geomBindStageBuffers: (id<MTLComputeCommandEncoder>) enc
+/* the capture pass runs the vertex stage as a render encoder of its own: realize the
+ * stage's textures before that encoder exists (a deferred upload opens a blit encoder,
+ * which Metal forbids while another encoder is encoding) */
+- (void) geomPrepareStageTextures: (int) stage
+{
+    struct { int spvc_type; bool image; } types[] = {
+        { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+        { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+        { 0, false }
+    };
+
+    if (!STATE(program)) return;
+    for (int t = 0; types[t].spvc_type; t++)
+    {
+        GLuint n = [self getProgramBindingCount: stage type: types[t].spvc_type];
+
+        for (GLuint i = 0; i < n; i++)
+        {
+            SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][types[t].spvc_type].list[i];
+            int b = [self getProgramBinding: stage type: types[t].spvc_type index: i];
+            int cnt = sres->array_size ? (int)sres->array_size : 1;
+
+            for (int e = 0; e < cnt && b >= 0; e++)
+            {
+                int unit = b + e;
+
+                if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
+                Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                              : STATE(active_textures[unit]);
+                if (tex) [self bindMTLTexture: tex];
+            }
+        }
+    }
+}
+
+/* bind one stage's textures to the capture pass's render encoder (vertex slots only: the
+ * pass has no fragment function).  Consecutive units feed array elements (GL sampler
+ * convention: base..base+N-1 at consecutive Metal argument slots). */
+- (void) geomBindRenderStageTextures: (id<MTLRenderCommandEncoder>) enc stage: (int) stage
+{
+    struct { int spvc_type; bool image; } types[] = {
+        { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+        { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+        { 0, false }
+    };
+
+    if (!STATE(program)) return;
+    for (int t = 0; types[t].spvc_type; t++)
+    {
+        GLuint n = [self getProgramBindingCount: stage type: types[t].spvc_type];
+
+        for (GLuint i = 0; i < n; i++)
+        {
+            SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][types[t].spvc_type].list[i];
+            int spirv_binding = [self getProgramBinding: stage type: types[t].spvc_type index: i];
+            NSUInteger mtl_index = (NSUInteger)sres->msl_binding;
+            int cnt = sres->array_size ? (int)sres->array_size : 1;
+
+            if (spirv_binding < 0) continue;
+            for (int e = 0; e < cnt; e++)
+            {
+                int unit = spirv_binding + e;
+
+                if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
+                Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                              : STATE(active_textures[unit]);
+                if (!tex || !tex->mtl_data) continue;
+                id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
+                if (!types[t].image)
+                {
+                    id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
+                    texture = [self texparamTextureForTex: tex base: texture];
+                    if (sampler) [enc setVertexSamplerState: sampler atIndex: mtl_index + e];
+                }
+                [enc setVertexTexture: texture atIndex: mtl_index + e];
+            }
+        }
+    }
+}
+
+- (bool) geomBindStageBuffers: (id<MTLComputeCommandEncoder>) enc geomProgram: (MGLGeomProgram *) gp
 {
     BufferMapList list;
     GLuint count;
 
     memset(&list, 0, sizeof(list));
 
-    /* the same mapping the renderer builds for a normal stage */
+    /* the same mapping the renderer builds for a normal stage; the list already expands
+     * instance arrays (one entry per element at consecutive slots), matching the flat
+     * layout geom_build_pins assigns to the generated kernels */
     if (![self mapGLBuffersToMTLBufferMap: &list stage: _GEOMETRY_SHADER]) return false;
     if (ctx->state.dirty_bits & DIRTY_BUFFER)
     {
@@ -1567,37 +1668,58 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
 
-    /* textures and images of the geometry stage */
+    /* textures and images of the geometry stage: the same mapping the render encoders use
+     * (bindTexturesToCurrentRenderEncoder): sres->msl_binding is the kernel's Metal argument
+     * index, the SPIR-V binding selects the GL texture unit — they are not the enumeration
+     * index.  A sampler ARRAY spans consecutive Metal slots fed by consecutive units
+     * (base..base+N-1, MGL's sampler-uniform convention).  Sampler objects bound to the
+     * unit override the texture's own sampler state. */
     {
-        struct { int spvc_type; int gl_type; } types[] = {
-            { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, 0 },
-            { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, 1 },
-            { 0, 0 }
+        struct { int spvc_type; bool image; } types[] = {
+            { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+            { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+            { 0, false }
         };
 
         for (int t = 0; types[t].spvc_type; t++)
         {
             count = [self getProgramBindingCount: _GEOMETRY_SHADER type: types[t].spvc_type];
-            int left = (int)count;
-            for (int i = 0; left > 0 && i < TEXTURE_UNITS; i++)
+            for (GLuint i = 0; i < count; i++)
             {
-                GLuint binding = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
-                Texture *tex = types[t].gl_type == 0 ? STATE(active_textures[binding])
-                                                     : STATE(image_units[binding].tex);
-                if (!tex) continue;
-                left--;
-                if (![self bindMTLTexture: tex]) continue;
-                id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
-                if (types[t].gl_type == 0)
+                SpirvResource *sres = &STATE(program)->spirv_resources_list[_GEOMETRY_SHADER][types[t].spvc_type].list[i];
+                int spirv_binding = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
+                NSUInteger mtl_index = (NSUInteger)sres->msl_binding;
+                int n = 1;
+
+                for (int a = 0; a < gp->n_tex_arrays; a++)
+                    if (!strcmp(gp->tex_arrays[a].name, sres->name ? sres->name : ""))
+                    { n = gp->tex_arrays[a].n; break; }
+
+                if (spirv_binding < 0) continue;
+
+                for (int e = 0; e < n; e++)
                 {
-                    id<MTLSamplerState> sampler = [self texparamSamplerForUnit: binding texture: tex];
-                    texture = [self texparamTextureForTex: tex base: texture];
-                    [enc setTexture: texture atIndex: (NSUInteger)i];
-                    if (sampler) [enc setSamplerState: sampler atIndex: (NSUInteger)i];
-                }
-                else
-                {
-                    [enc setTexture: texture atIndex: (NSUInteger)i];
+                    int unit = spirv_binding + e;
+                    if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
+
+                    Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                                  : STATE(active_textures[unit]);
+                    if (!tex) continue;
+                    if (![self bindMTLTexture: tex]) continue;
+                    id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
+                    if (!texture) continue;
+                    if (!types[t].image)
+                    {
+                        id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
+                        texture = [self texparamTextureForTex: tex base: texture];
+                        if (sampler) [enc setSamplerState: sampler atIndex: mtl_index + e];
+                    }
+                    [enc setTexture: texture atIndex: mtl_index + e];
+                    if (gEnv.debug && e == 0)
+                        fprintf(stderr, "geom: debug gs %s[%u] '%s' unit %d bound at msl %lu x%d\n",
+                                types[t].image ? "image" : "tex", (unsigned)i,
+                                sres->name ? sres->name : "?", spirv_binding,
+                                (unsigned long)mtl_index, n);
                 }
             }
         }
@@ -2367,6 +2489,11 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         rp.renderTargetHeight = 1;
         rp.defaultRasterSampleCount = 1;
 
+        /* realize the vertex stage's textures now: their deferred uploads would otherwise
+         * try to open a blit encoder once this pass's render encoder exists */
+        ctx->state.program = program;
+        [self geomPrepareStageTextures: _VERTEX_SHADER];
+
         enc = [_currentCommandBuffer renderCommandEncoderWithDescriptor: rp];
         if (!enc)
         {
@@ -2417,6 +2544,10 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                 mgl_buffers_mark_gpu_use(ctx, b, true);
             }
         }
+
+        /* the vertex stage's textures sample in the capture variant just like in the
+         * raster pass (GL allows the VS to sample; the CTS limits tests use 16 units) */
+        [self geomBindRenderStageTextures: enc stage: _VERTEX_SHADER];
         ctx->state.program = saved_program;
         [enc setVertexBuffer: gVsout offset: gVsoutOff atIndex: MGL_GEOM_MSL_VSOUT];
 
@@ -2477,6 +2608,43 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
 
     /* ---- 2. geometry kernel ---- */
     {
+        /* realize the geometry stage's textures before any encoder of this kernel exists:
+         * a deferred upload (texdataEncodeUpload) opens a blit encoder, and Metal forbids
+         * that while a compute encoder is encoding (array elements cover consecutive units) */
+        {
+            struct { int spvc_type; bool image; } types[] = {
+                { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+                { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+                { 0, false }
+            };
+
+            for (int t = 0; types[t].spvc_type; t++)
+            {
+                GLuint n = [self getProgramBindingCount: _GEOMETRY_SHADER type: types[t].spvc_type];
+
+                for (GLuint i = 0; i < n; i++)
+                {
+                    SpirvResource *sres = &STATE(program)->spirv_resources_list[_GEOMETRY_SHADER][types[t].spvc_type].list[i];
+                    int b = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
+                    int cnt = 1;
+
+                    for (int a = 0; a < gp->n_tex_arrays; a++)
+                        if (!strcmp(gp->tex_arrays[a].name, sres->name ? sres->name : ""))
+                        { cnt = gp->tex_arrays[a].n; break; }
+
+                    for (int e = 0; e < cnt && b >= 0; e++)
+                    {
+                        int unit = b + e;
+
+                        if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
+                        Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                                      : STATE(active_textures[unit]);
+                        if (tex) [self bindMTLTexture: tex];
+                    }
+                }
+            }
+        }
+
         /* the tess import kernel's encoder is still open: joining it keeps the import's
          * writes ordered before this kernel (and before its indirect dispatch) */
         id<MTLComputeCommandEncoder> enc = kenc ? kenc : [_currentCommandBuffer computeCommandEncoder];
@@ -2486,8 +2654,19 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         ctx->state.program = program;
 
         [enc pushDebugGroup: @"MGL geometry kernel"];
-        [enc setComputePipelineState: gGsPso];
 
+        /* the counters and indirect arguments start at zero for this draw (a kernel,
+         * not a CPU write: the buffer may still be read by an earlier command buffer).
+         * This kernel uses buffer(0), so it MUST be dispatched before the GS kernel's own
+         * bindings: a compute encoder's bindings persist across setComputePipelineState,
+         * and binding gCtl at slot 0 after the stage buffers would shadow the kernel's
+         * first resource (e.g. element 0 of a uniform-block instance array) */
+        [enc setComputePipelineState: gInitPso];
+        [enc setBuffer: gCtl offset: 0 atIndex: 0];
+        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+        [enc setComputePipelineState: gGsPso];
         size_t index_words = (size_t)(d->indexed ? d->count : 0);
         [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + index_words) * sizeof(uint32_t)
                atIndex: MGL_GEOM_MSL_PRIM];
@@ -2501,21 +2680,13 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
         [enc setBuffer: gCnt offset: gCntOff atIndex: MGL_GEOM_MSL_CNT];
 
-        if ([self geomBindStageBuffers: enc])
+        if ([self geomBindStageBuffers: enc geomProgram: gp])
         {
             NSUInteger wg = 32;
             uint64_t groups = (threads + wg - 1) / wg;
             if (!groups) groups = 1;
             if (groups > 0xffffffffull) groups = 0xffffffffull;
 
-            /* the counters and indirect arguments start at zero for this draw (a kernel,
-             * not a CPU write: the buffer may still be read by an earlier command buffer) */
-            [enc setComputePipelineState: gInitPso];
-            [enc setBuffer: gCtl offset: 0 atIndex: 0];      /* the ctl kernels use buffer(0) */
-            [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
-                  threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
-
-            [enc setComputePipelineState: gGsPso];
             if (gpu_assembly && !(geomEnvRead(), gEnv.worst_case))
             {
                 /* the prep kernel computed the exact threadgroup count */
@@ -2527,6 +2698,9 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                 [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)groups, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
 
+            /* fold the counters into the indirect draw arguments (also uses buffer(0),
+             * so it runs after the GS dispatch, which is the last user of the stage
+             * buffers — no slot is left shadowed for a later kernel) */
             [enc setComputePipelineState: gFinPso];
             [enc setBuffer: gCtl offset: 0 atIndex: 0];
             [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
@@ -2568,6 +2742,8 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
          * non-zero words of the captured VS records and the GS records */
         BUF()->flush(ctx);
         BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
+        if (_currentCommandBuffer && _currentCommandBuffer.error)
+            fprintf(stderr, "geom: trace cb error: %s\n", _currentCommandBuffer.error.localizedDescription.UTF8String);
         fprintf(stderr, "geom: trace gpu_assembly=%d prims_count=%llu vstart=%u vcount=%u "
                         "in_words=%u out_words=%u capture_fn=%p draw_fn=%p\n",
                 (int)gpu_assembly, (unsigned long long)d->prims_count, d->vstart, d->vcount,

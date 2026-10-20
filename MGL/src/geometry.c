@@ -969,6 +969,54 @@ static char *geom_spirv_to_glsl(const uint32_t *ir, size_t words, int version, c
 }
 
 /* translate SPIR-V to MSL with the given buffer pins; returns the MSL source */
+/* record the geometry stage's sampler/image array sizes: the kernel's Metal argument for
+ * array<texture2d, N> spans N slots, so the binder needs the element count per resource */
+static void geom_record_tex_arrays(const uint32_t *ir, size_t words, MGLGeomProgram *gp)
+{
+    spvc_context sctx;
+    spvc_parsed_ir pir;
+    spvc_compiler comp;
+    spvc_resources res;
+    const spvc_reflected_resource *list = NULL;
+    size_t count = 0;
+    int types[2] = { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, SPVC_RESOURCE_TYPE_STORAGE_IMAGE };
+
+    gp->n_tex_arrays = 0;
+    if (spvc_context_create(&sctx) != SPVC_SUCCESS) return;
+    if (spvc_context_parse_spirv(sctx, ir, words, &pir) != SPVC_SUCCESS)
+    { spvc_context_destroy(sctx); return; }
+    if (spvc_context_create_compiler(sctx, SPVC_BACKEND_MSL, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) != SPVC_SUCCESS)
+    { spvc_context_destroy(sctx); return; }
+    if (spvc_compiler_create_shader_resources(comp, &res) != SPVC_SUCCESS)
+    { spvc_context_destroy(sctx); return; }
+
+    for (int t = 0; t < 2; t++)
+    {
+        const char *tn = NULL;
+        size_t n = 0;
+
+        if (types[t] == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE)
+            spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, &list, &n);
+        else
+            spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_STORAGE_IMAGE, &list, &n);
+        (void)tn; (void)count;
+        for (size_t i = 0; i < n && gp->n_tex_arrays < 8; i++)
+        {
+            spvc_type ty = spvc_compiler_get_type_handle(comp, list[i].type_id);
+            unsigned dims = spvc_type_get_num_array_dimensions(ty);
+
+            if (!dims) continue;
+            unsigned asz = (unsigned)spvc_type_get_array_dimension(ty, 0);
+            if (!asz) continue;
+            snprintf(gp->tex_arrays[gp->n_tex_arrays].name, sizeof gp->tex_arrays[0].name,
+                     "%s", list[i].name);
+            gp->tex_arrays[gp->n_tex_arrays].n = (int)asz;
+            gp->n_tex_arrays++;
+        }
+    }
+    spvc_context_destroy(sctx);
+}
+
 static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *ir, size_t words,
                                const char *entry, bool disable_rasterization, char **log,
                                int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count,
@@ -1305,10 +1353,14 @@ static void copy_renamed(SB *out, const char *s, size_t *pos, size_t len, const 
  * group and the interpolation/storage keywords are legal on an interface member but not on
  * the plain struct member the rewritten shader declares (locations are tracked separately
  * by the reflection, so nothing is lost) */
-static char *strip_member_quals(const char *s, size_t n)
+/* strip interface-only member qualifiers; `storage_too` also drops in/out — needed when
+ * the members end up inside a plain struct (GLSL forbids storage qualifiers on struct
+ * members), while re-declared-as-ordinary-declaration paths keep them */
+static char *strip_member_quals2(const char *s, size_t n, bool storage_too)
 {
     static const char *drop[] = { "flat", "smooth", "noperspective", "centroid", "sample",
                                   "invariant", "precise", NULL };
+    static const char *storage[] = { "in", "out", NULL };
     SB out;
     size_t i = 0;
 
@@ -1342,6 +1394,9 @@ static char *strip_member_quals(const char *s, size_t n)
                 w[wl] = 0;
                 for (int k = 0; drop[k]; k++)
                     if (!strcmp(w, drop[k])) kw = 1;
+                if (storage_too)
+                    for (int k = 0; storage[k]; k++)
+                        if (!strcmp(w, storage[k])) kw = 1;
             }
             if (layout || kw)
             {
@@ -1366,6 +1421,11 @@ static char *strip_member_quals(const char *s, size_t n)
         sb_put(&out, "%c", s[i++]);
     }
     return out.s;
+}
+
+static char *strip_member_quals(const char *s, size_t n)
+{
+    return strip_member_quals2(s, n, false);
 }
 
 static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtInfo *info,
@@ -1472,7 +1532,7 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
             }
             if (close && bname[0] && strcmp(bname, "gl_PerVertex"))
             {
-                char *members = strip_member_quals(brace + 1, (size_t)(close - brace - 1));
+                char *members = strip_member_quals2(brace + 1, (size_t)(close - brace - 1), true);
                 sb_put(&decl, "struct %s { %s }; %s ", bname, members ? members : "", bname);
                 free(members);
                 body = close + 1;
@@ -1519,7 +1579,7 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
             }
             if (close && bname[0] && strcmp(bname, "gl_PerVertex"))
             {
-                char *members = strip_member_quals(brace + 1, (size_t)(close - brace - 1));
+                char *members = strip_member_quals2(brace + 1, (size_t)(close - brace - 1), true);
                 sb_put(&decl, "struct %s { %s }; %s ", bname, members ? members : "", bname);
                 free(members);
                 body = close + 1;
@@ -1760,11 +1820,14 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
 
                 if (!mn) continue;
 
-                /* the vertex dimension of a block input sits on the member itself, so one
-                 * array layer is stripped there (the kernel declares that array itself) */
+                /* the vertex dimension of an ANONYMOUS block input sits on the member itself
+                 * (the variable is the bare struct), so one array layer is stripped there.
+                 * With an instance name the variable's outer array was that dimension
+                 * already (stripped above), and the member's array is its own ("vs_gs_out[16]"):
+                 * stripping it here would collapse the member to one element. */
                 mt = spv_find_type(m, mid);
                 while (mt && mt->kind == SPVT_PTR) { mt = spv_find_type(m, mt->elem); mid = mt->id; }
-                if (inputs && mt && mt->kind == SPVT_ARRAY)
+                if (inputs && anon && mt && mt->kind == SPVT_ARRAY)
                 {
                     mid = mt->elem;
                     mt = spv_find_type(m, mid);
@@ -1988,15 +2051,38 @@ static char *geom_plain_outputs(const char *src)
             }
             continue;
         }
+        if (depth == 0 && src[i] == '#')
+        {
+            /* a preprocessor directive is line-scoped: it must not be swallowed into the
+             * next declaration's head (a '#define X 64' feeding a later declaration's
+             * array size would otherwise be dropped when that declaration is rewritten) */
+            while (i < len && src[i] != '\n') { sb_put(&out, "%c", src[i]); i++; }
+            continue;
+        }
         if (depth == 0)
         {
             /* a global-scope declaration: collect the head (up to ';' or '{') and check
              * whether its last storage qualifier is "out" */
             size_t save = i, q = i;
             bool is_out = false, other_storage = false, done_head = false;
+            bool line_start = true;
 
             while (q < len && src[q] != ';' && src[q] != '{')
             {
+                if (src[q] == '\n') line_start = true;
+                else if (src[q] != '#' && !isspace((unsigned char)src[q])) line_start = false;
+                if (src[q] == '#' && line_start)
+                {
+                    /* a preprocessor directive between declarations: it cannot belong to
+                     * the head (a '#define X 16u' feeding a later array size must survive
+                     * the head being rewritten), so end the head here and pass it through */
+                    for (size_t k = save; k < q; k++) sb_put(&out, "%c", src[k]);
+                    while (q < len && src[q] != '\n') { sb_put(&out, "%c", src[q]); q++; }
+                    if (q < len) { sb_put(&out, "\n"); q++; }   /* keep the line break */
+                    save = q;
+                    line_start = true;
+                    continue;
+                }
                 if (src[q] == '(')
                 {
                     q++;
@@ -2062,9 +2148,11 @@ static char *geom_plain_outputs(const char *src)
                         if (inst[0])
                         {
                             /* the block becomes a plain struct + instance; interface-only
-                             * member qualifiers (location/xfb_offset/flat) must go */
-                            char *members = strip_member_quals(src + brace + 1,
-                                                               (size_t)(close - brace - 1));
+                             * member qualifiers (location/xfb_offset/flat) and the storage
+                             * qualifiers (in/out) must go: GLSL forbids them on struct
+                             * members */
+                            char *members = strip_member_quals2(src + brace + 1,
+                                                               (size_t)(close - brace - 1), true);
                             sb_put(&out, "struct %s {%s}; %s %s;", bname,
                                    members ? members : "", bname, inst);
                             free(members);
@@ -2112,6 +2200,7 @@ static char *geom_plain_outputs(const char *src)
 typedef struct {
     char name[64];
     char type[96];      /* GLSL type as written, e.g. "ivec2", "float", "Foo" */
+    char arr[48];       /* array suffix as written, e.g. "[4]" ("" for a scalar) */
 } GeomPlainUni;
 
 typedef struct {
@@ -2139,6 +2228,13 @@ static bool is_plain_uniform_type(const char *t)
     if (!tok[0]) return false;
     for (int i = 0; words[i]; i++)
         if (!strcmp(tok, words[i])) return true;
+    /* opaque types are NOT buffer-storable: they must stay where they were declared
+     * (re-declaring a sampler inside the default-uniform block is illegal) */
+    if (!strncmp(tok, "sampler", 7) || !strncmp(tok, "isampler", 8) ||
+        !strncmp(tok, "usampler", 8) || !strncmp(tok, "image", 5) ||
+        !strncmp(tok, "iimage", 6) || !strncmp(tok, "uimage", 6) ||
+        !strncmp(tok, "atomic_uint", 11) || !strncmp(tok, "texture", 7))
+        return false;
     /* anything else is a user-declared struct type (an identifier): also plain storage */
     for (size_t i = 0; i < n; i++)
         if (!is_ident_char((unsigned char)tok[i])) return false;
@@ -2148,6 +2244,45 @@ static bool is_plain_uniform_type(const char *t)
 /* Remove top-level plain (default-block) uniform declarations from src, recording them
  * (and the raw declarations, for the fallback) .  Declarations of blocks, samplers, images
  * and atomic counters are kept verbatim. */
+/* replace C-style and line comments with spaces (newlines kept), so the plain-uniform
+ * scanner's statement split is not confused: a comment has no ';' and would glue a
+ * #define and the next uniform declaration into one "statement" */
+static char *geom_blank_comments(const char *src)
+{
+    size_t n = strlen(src);
+    char *out = xmalloc(n + 1);
+    size_t i = 0, o = 0;
+
+    while (i < n)
+    {
+        if (src[i] == '/' && i + 1 < n && src[i + 1] == '/')
+        {
+            while (i < n && src[i] != '\n') { out[o++] = ' '; i++; }
+        }
+        else if (src[i] == '/' && i + 1 < n && src[i + 1] == '*')
+        {
+            out[o++] = ' ';
+            out[o++] = ' ';
+            i += 2;
+            while (i < n)
+            {
+                if (src[i] == '*' && i + 1 < n && src[i + 1] == '/')
+                {
+                    out[o++] = ' ';
+                    out[o++] = ' ';
+                    i += 2;
+                    break;
+                }
+                out[o++] = (src[i] == '\n') ? '\n' : ' ';
+                i++;
+            }
+        }
+        else out[o++] = src[i++];
+    }
+    out[o] = 0;
+    return out;
+}
+
 static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *nuni, int max, char **removed)
 {
     SB out;
@@ -2161,14 +2296,6 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
 
     while (pos < len)
     {
-        if (src[pos] == '#')                 /* preprocessor line: verbatim */
-        {
-            size_t end = pos;
-            while (end < len && src[end] != '\n') end++;
-            sb_put(&out, "%.*s", (int)(end - pos), src + pos);
-            pos = end;
-            continue;
-        }
         if (depth > 0)
         {
             while (pos < len && depth > 0)
@@ -2188,6 +2315,30 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
             depth++;
             sb_put(&out, "{");
             pos++;
+            continue;
+        }
+        if (src[pos] == '#')                 /* preprocessor line: verbatim (after the
+                                              * whitespace skip — a '#' found at the raw
+                                              * scan start made the statement scanner eat
+                                              * the NEXT uniform declaration with the #define) */
+        {
+            size_t end = pos;
+            while (end < len && src[end] != '\n') end++;
+            /* honour a trailing backslash (line continuation): the directive continues
+             * on the next line */
+            for (;;)
+            {
+                size_t back = end;
+                while (back > pos && (src[back - 1] == ' ' || src[back - 1] == '\t')) back--;
+                if (back > pos && src[back - 1] == '\\' && end < len)
+                {
+                    end++;
+                    while (end < len && src[end] != '\n') end++;
+                }
+                else break;
+            }
+            sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+            pos = end;
             continue;
         }
 
@@ -2233,19 +2384,34 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                                 const char *nb = e;   /* end of the declarator */
                                 const char *ne;
                                 char name[64];
+                                char arr[48] = "";
                                 size_t nn;
 
                                 while (nb > c && isspace((unsigned char)nb[-1])) nb--;
                                 if (nb > c && nb[-1] == ']')
                                 {
-                                    /* trailing [N]: the name is before the '[' */
-                                    while (nb > c && nb[-1] != '[') nb--;
-                                    if (nb == c) keep = true;
+                                    /* trailing [N]: keep the suffix text, the name ends before '[' */
+                                    const char *ob = nb - 1;   /* at the ']' */
+
+                                    while (ob > c && ob[-1] != '[') ob--;
+                                    if (ob == c) keep = true;   /* ']' with no '[' */
+                                    else
+                                    {
+                                        size_t alen = (size_t)(nb - (ob - 1));
+
+                                        if (alen >= sizeof(arr)) keep = true;
+                                        else
+                                        {
+                                            memcpy(arr, ob - 1, alen);
+                                            arr[alen] = 0;
+                                            nb = ob - 1;         /* the name ends here */
+                                        }
+                                    }
                                 }
                                 ne = nb;
                                 while (ne > c && is_ident_char((unsigned char)ne[-1])) ne--;
                                 nn = (size_t)(nb - ne);
-                                if (!nn || ne == c) keep = true;
+                                if (!nn || ne == c) keep = true;   /* covers "a[2][3]" too */
                                 else
                                 {
                                     memcpy(name, ne, nn);
@@ -2255,7 +2421,33 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                                         size_t t = (size_t)(ne - c);
                                         while (t > 0 && isspace((unsigned char)c[t-1])) t--;
                                         if (t == 0 || t >= sizeof(type)) keep = true;
-                                        else { memcpy(type, c, t); type[t] = 0; }
+                                        else
+                                        {
+                                            memcpy(type, c, t);
+                                            type[t] = 0;
+                                            /* drop precision/storage qualifiers so the
+                                             * type name is what is_plain_uniform_type sees
+                                             * ("lowp isampler2D" -> "isampler2D") */
+                                            for (;;)
+                                            {
+                                                bool again = false;
+                                                static const char *quals[] = { "lowp", "mediump", "highp", "precise", "const", NULL };
+
+                                                for (int q = 0; quals[q]; q++)
+                                                {
+                                                    size_t l = strlen(quals[q]);
+                                                    if (!strncmp(type, quals[q], l) &&
+                                                        (type[l] == ' ' || type[l] == '\t'))
+                                                    {
+                                                        memmove(type, type + l + 1, strlen(type + l + 1) + 1);
+                                                        again = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!again) break;
+                                            }
+                                            if (!type[0]) keep = true;
+                                        }
                                     }
                                     if (!keep)
                                     {
@@ -2264,6 +2456,7 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                                         {
                                             snprintf(uni[*nuni].name, sizeof(uni[*nuni].name), "%s", name);
                                             snprintf(uni[*nuni].type, sizeof(uni[*nuni].type), "%s", type);
+                                            snprintf(uni[*nuni].arr, sizeof(uni[*nuni].arr), "%s", arr);
                                             (*nuni)++;
                                         }
                                     }
@@ -2275,8 +2468,9 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
 
                     if (keep)
                     {
-                        /* opaque or unsupported: keep the declaration verbatim */
-                        *nuni = 0;
+                        /* opaque or unsupported: keep this declaration verbatim (the
+                         * already-removed ones stay removed — they are re-declared from
+                         * the default-uniform block, so they must NOT be reset here) */
                         sb_put(&out, "%.*s", (int)(end - pos), src + pos);
                     }
                     else
@@ -2309,7 +2503,9 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
 }
 
 /* The layout introspect baked into the program's SPIR-V for a stage's default-uniform
- * block: find the injected "mgl_DefaultUniforms" struct and read its member offsets. */
+ * block: find the injected "mgl_DefaultUniforms" STRUCT and read its member offsets.
+ * The name is on both the struct and its instance variable (introspect names them the
+ * same): the struct is the id that carries the OpMemberName entries. */
 static bool geom_dub_layout(SpvModule *m, GeomDubMember *mem, int *nmem, int max)
 {
     uint32_t sid = 0;
@@ -2318,7 +2514,12 @@ static bool geom_dub_layout(SpvModule *m, GeomDubMember *mem, int *nmem, int max
     *nmem = 0;
     if (!m) return false;
     for (int i = 0; i < m->n_names; i++)
-        if (!strcmp(m->names[i].name, "mgl_DefaultUniforms")) { sid = m->names[i].id; break; }
+    {
+        if (strcmp(m->names[i].name, "mgl_DefaultUniforms")) continue;
+        for (int k = 0; k < m->n_mnames; k++)
+            if (m->mnames[k].id == m->names[i].id) { sid = m->names[i].id; break; }
+        if (sid) break;
+    }
     if (!sid) return false;
 
     for (int k = 0; n < max; k++)
@@ -2357,7 +2558,9 @@ static void geom_emit_dub_block(SB *b, const GeomPlainUni *uni, int nuni,
         for (int k = 0; k < nmem; k++)
             if (!strcmp(mem[k].name, uni[i].name)) { off = mem[k].offset; have = true; break; }
         if (!have) continue;      /* introspect did not keep it (unused): skip */
-        sb_put(b, "    layout(offset = %u) %s %s;\n", off, uni[i].type, uni[i].name);
+        /* the array suffix is re-declared: std430 gives a 4-component-vector array a
+         * 16-byte stride, the same layout introspect's msl_layout used for the offsets */
+        sb_put(b, "    layout(offset = %u) %s %s%s;\n", off, uni[i].type, uni[i].name, uni[i].arr);
     }
     sb_put(b, "};\n");
 }
@@ -2371,11 +2574,15 @@ static void geom_emit_dub_block(SB *b, const GeomPlainUni *uni, int nuni,
  * program's patched SPIR-V of the stage (it owns the ordering); mine is the generated
  * module (it owns the binding values that key the pins). */
 
-static void geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
-                            GeomPin *pins, int *npins, int max)
+/* Build the kernel-pinning map.  Returns the number of Metal argument slots the stage's
+ * program resources span (0 on nothing to pin); a block/SSBO declared as an instance ARRAY
+ * spans array_size consecutive slots, so the per-type counters advance by that — the bind
+ * walk (geomBindStageBuffers / the capture pass) lays the buffers out the same way. */
+static int geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
+                           GeomPin *pins, int *npins, int max)
 {
     uint32_t ub[32], uc[32], sb[32];
-    int nub = 0, nuc = 0, nsb = 0;
+    int nub = 0, nuc = 0, nsb = 0, total = 0, ub_span = 0;
     bool has_dub = false;
 
     *npins = 0;
@@ -2387,7 +2594,14 @@ static void geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
         {
             const char *nm = spv_name(prog, v->id);
             if (nm && !strcmp(nm, "mgl_DefaultUniforms")) { has_dub = true; continue; }
-            if (nub < 32) ub[nub++] = v->id;
+            if (nub < 32)
+            {
+                uint32_t asz = 1;
+
+                ub[nub++] = v->id;
+                spv_value_type(prog, v->type_id, &asz);   /* an instance array spans asz slots */
+                ub_span += (int)asz;
+            }
         }
         else if (v->storage == SpvStorageClassUniformConstant) { if (nuc < 32) uc[nuc++] = v->id; }
         else if (v->storage == SpvStorageClassStorageBuffer) { if (nsb < 32) sb[nsb++] = v->id; }
@@ -2401,19 +2615,31 @@ static void geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
         {
             SpvVar *v = &mine->vars[i];
             int flat;
+            uint32_t asz = 1;
 
-            if (v->storage == SpvStorageClassUniform) { if (mub >= nub) continue; flat = mub++; }
+            /* block-instance arrays span asz consecutive slots (GL binding points base..base+asz-1) */
+            spv_value_type(mine, v->type_id, &asz);
+
+            if (v->storage == SpvStorageClassUniform)
+            {
+                if (mub >= nub) continue;
+                flat = mub;
+                mub += asz;
+                total += asz;
+            }
             else if (v->storage == SpvStorageClassUniformConstant)
             {
                 if (muc >= nuc) continue;
-                flat = nub + (has_dub ? 1 : 0) + muc;
+                flat = ub_span + (has_dub ? 1 : 0) + muc;
                 muc++;
+                total++;
             }
             else if (v->storage == SpvStorageClassStorageBuffer)
             {
                 if (msb >= nsb) continue;
-                flat = nub + (has_dub ? 1 : 0) + nuc + msb;
-                msb++;
+                flat = ub_span + (has_dub ? 1 : 0) + nuc + msb;
+                msb += asz;
+                total += asz;
             }
             else continue;
 
@@ -2430,10 +2656,12 @@ static void geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
     if (pin_dub && *npins < max)
     {
         pins[*npins].binding = MGL_GEOM_SSBO_DUB;
-        pins[*npins].msl = nub;
+        pins[*npins].msl = ub_span;   /* right after the UBOs' expanded span */
         pins[*npins].texture = false;
         (*npins)++;
+        total++;
     }
+    return total;
 }
 
 static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
@@ -2555,6 +2783,11 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     geom_dump("gs.transformed.glsl", transformed);
     nover = strip_version(transformed);
     free(transformed);
+    {
+        char *blanked = geom_blank_comments(nover);
+        free(nover);
+        nover = blanked;
+    }
     /* plain (default-block) uniforms are re-declared below as one block that matches the
      * program's default-uniform buffer (see geom_emit_dub_block) */
     stripped_src = geom_strip_plain_uniforms(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src);
@@ -2564,6 +2797,54 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
 
     memset(&b, 0, sizeof(b));
     sb_put(&b, "#version %d core\n", version);
+
+    /* the source's LEADING preprocessor lines must come first: a re-declared uniform's
+     * array size may be a macro (uniform ivec4 a[NUMBER];) that would otherwise not be
+     * defined yet where the default-uniform block is emitted */
+    {
+        size_t nlen = strlen(nover), h = 0, last_pp = 0;
+
+        while (h < nlen)
+        {
+            size_t line = h, s = h;
+
+            while (line < nlen && nover[line] != '\n') line++;
+            while (s < line && (nover[s] == ' ' || nover[s] == '\t')) s++;
+            if (s < line && nover[s] == '#' && s + 1 < line)
+            {
+                /* only self-contained directives may be hoisted: a conditional block
+                 * (#ifdef/#else/#endif) must stay intact around the code it guards */
+                char d[16];
+                size_t t = s + 1, n = 0;
+
+                while (t < line && n < sizeof(d) - 1 &&
+                       (isalnum((unsigned char)nover[t]) || nover[t] == '_'))
+                    d[n++] = nover[t++];
+                d[n] = 0;
+                if (!strcmp(d, "define") || !strcmp(d, "pragma") || !strcmp(d, "extension"))
+                    last_pp = line + 1;
+                else break;
+            }
+            else if (s < line)
+            {
+                /* a one-line global precision statement is also order-independent and
+                 * commonly sits between the #defines and the uniforms */
+                if (!strncmp(nover + s, "precision", 9) && line > s + 2 &&
+                    nover[line - 1] == ';')
+                    last_pp = line + 1;
+                else break;              /* first real statement */
+            }
+            h = line + 1;                          /* blank lines continue the scan */
+        }
+        h = last_pp;
+        if (h)
+        {
+            sb_put(&b, "%.*s", (int)h, nover);
+            char *rest = xstrdup(nover + h);
+            free(nover);
+            nover = rest;
+        }
+    }
 
     /* re-declare the stripped plain uniforms (or put them back if the program's
      * default-uniform block could not be read) — ahead of the source, so the names are
@@ -3382,7 +3663,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     {
         const char *e2 = NULL;
         SpvModule *p_vs = spv_parse(program->spirv[_VERTEX_SHADER].ir,
-                                    program->spirv[_VERTEX_SHADER].size / 4, &e2);
+                                    program->spirv[_VERTEX_SHADER].size, &e2);
 
         glsl = geom_gen_capture_glsl(ctx, gp, vs_src, p_vs, &log);
         if (!glsl) GEOM_FAIL("vertex capture variant generation failed");
@@ -3391,9 +3672,19 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             GEOM_FAIL("vertex capture variant compile failed: %s", log ? log : "?");
         free(glsl);
         {
-            SpvModule *c_vs = spv_parse(ir, words / 4, &e2);
+            SpvModule *c_vs = spv_parse(ir, words, &e2);
+            int span;
+
             npins2 = 0;
-            geom_build_pins(p_vs, c_vs, true, pins2, &npins2, 8);
+            span = geom_build_pins(p_vs, c_vs, true, pins2, &npins2, 8);
+            if (span > MGL_GEOM_KERNEL_USER_SLOTS)
+            {
+                spv_free(c_vs);
+                spv_free(p_vs);
+                GEOM_FAIL("vertex stage resources span %d argument slots; the compute "
+                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS)",
+                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS);
+            }
             spv_free(c_vs);
         }
         spv_free(p_vs);
@@ -3433,7 +3724,7 @@ build:
     {
         const char *e2 = NULL;
         SpvModule *p_gs = spv_parse(program->spirv[_GEOMETRY_SHADER].ir,
-                                    program->spirv[_GEOMETRY_SHADER].size / 4, &e2);
+                                    program->spirv[_GEOMETRY_SHADER].size, &e2);
         SpvModule *k_gs = NULL;
 
         glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, p_gs, &log);
@@ -3441,9 +3732,19 @@ build:
         geom_dump("kernel.glsl", glsl);
         if (!geom_glsl_to_spirv(ctx, GL_COMPUTE_SHADER, glsl, 450, &ir, &words, &log))
             GEOM_FAIL("kernel compile failed: %s", log ? log : "?");
+        geom_record_tex_arrays(ir, words, gp);
         free(glsl);
-        k_gs = spv_parse(ir, words / 4, &e2);
-        geom_build_pins(p_gs, k_gs, true, pins2, &npins2, 8);
+        k_gs = spv_parse(ir, words, &e2);
+        {
+            /* the kernel's own buffers live at fixed Metal slots (MGL_GEOM_MSL_*): the
+             * stage's program resources must fit in the slots below them */
+            int span = geom_build_pins(p_gs, k_gs, true, pins2, &npins2, 8);
+
+            if (span > MGL_GEOM_KERNEL_USER_SLOTS)
+                GEOM_FAIL("geometry stage resources span %d argument slots; the compute "
+                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS)",
+                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS);
+        }
         spv_free(k_gs);
         spv_free(p_gs);
     }
@@ -3835,8 +4136,25 @@ static uint64_t geom_assemble(GLMContext ctx, MGLGeomProgram *gp, GLenum mode, c
                 EMIT6(i, i + 1, i + 2, i + 3, i + 4, i + 5);
                 break;
             case GL_TRIANGLE_STRIP_ADJACENCY:
-                EMIT6(i, i + 1, i + 2, i + 3, i + 4, i + 5);
+            {
+                /* GL 4.6 table 10.4 (as the CTS encodes it): even slots are triangle
+                 * vertices, odd ones adjacency; odd triangles flip winding; the first and
+                 * last triangles have no preceding/following adjacency vertex. The strip
+                 * advances two stream vertices per triangle. */
+                uint64_t T = n >= 4 ? (n - 4) / 2 : 0;
+
+                if (np < T)
+                {
+                    uint64_t b = 2 * np, e = (np & 1) == 0;
+                    uint64_t v0 = e ? b : b + 2, v1 = e ? b + 2 : b, v2 = b + 4;
+                    uint64_t a0 = np == 0 ? 1 : b - 2;
+                    uint64_t a1 = np == T - 1 ? (e ? b + 5 : b + 3) : (e ? b + 6 : b + 3);
+                    uint64_t a2 = np == T - 1 ? (e ? b + 3 : b + 5) : (e ? b + 3 : b + 6);
+
+                    EMIT6(v0, a0, v1, a1, v2, a2);
+                }
                 break;
+            }
             default:
                 break;
         }
@@ -4438,6 +4756,18 @@ static GLenum geom_var_type(const MGLGeomVar *v)
  * pre-rasterization stage: the geometry stage's out table, or (without a geometry shader)
  * the tessellation evaluation stage's SPIR-V.  The GL layout rules (gl_NextBuffer /
  * gl_SkipComponents, interleaved vs separate) are applied to the caller's pending list. */
+/* record an xfb layout error as a link failure with an info-log message */
+static void geom_xfb_fail(GLMContext ctx, MGLXfbProgram *xp, const char *msg)
+{
+    char *log = NULL;
+
+    (void)ctx;
+    mgl_append_info_log(&log, "ERROR: transform feedback: %s\n", msg);
+    free(xp->link_log);
+    xp->link_log = log;
+    xp->link_failed = true;
+}
+
 static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                              const MGLGeomVar *vars, int nvars,
                              GLuint pos_word, GLuint psize_word,
@@ -4449,6 +4779,12 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
     MGLXfbVarying *v;
     char dnames[64][192];
     char xnames[128][192];
+    GLuint xsrc[128];                 /* SEPARATE: the pending name each expansion came from */
+    GLuint sepo[128];                 /* SEPARATE: running byte offset per pending name */
+    bool separate = xp->mode == GL_SEPARATE_ATTRIBS;
+
+    memset(xsrc, 0, sizeof xsrc);
+    memset(sepo, 0, sizeof sepo);
 
     geom_xfb_reset(ctx, xp);
     xp->mode = xp->pending_mode;
@@ -4496,6 +4832,7 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
 
             if (!strcmp(nm, "gl_NextBuffer") || !strncmp(nm, "gl_SkipComponents", 17))
             {
+                xsrc[xn] = q;
                 snprintf(xnames[xn++], sizeof(xnames[0]), "%s", nm);
                 continue;
             }
@@ -4506,11 +4843,17 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             {
                 for (int k = 0; k < nvars && xn < 128; k++)
                     if (vars[k].member[0] && !strcmp(vars[k].name, nm))
+                    {
+                        xsrc[xn] = q;
                         snprintf(xnames[xn++], sizeof(xnames[0]), "%s.%s",
                                  vars[k].name, vars[k].member);
+                    }
             }
             else
+            {
+                xsrc[xn] = q;
                 snprintf(xnames[xn++], sizeof(xnames[0]), "%s", nm);
+            }
         }
         n = xn;
     }
@@ -4537,6 +4880,11 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         {
             v->type = GL_NONE;
             v->size = 0;
+            if (separate)
+            {   /* GL 4.6 13.3.1: gl_NextBuffer is only defined for interleaved capture */
+                geom_xfb_fail(ctx, xp, "gl_NextBuffer used with GL_SEPARATE_ATTRIBS");
+                return;
+            }
             xp->stride[buffer] = offset;
             buffer++;
             offset = 0;
@@ -4549,6 +4897,11 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             v->type = GL_NONE;
             v->size = (GLint)n;
             v->words = n;
+            if (separate)
+            {
+                geom_xfb_fail(ctx, xp, "gl_SkipComponents used with GL_SEPARATE_ATTRIBS");
+                return;
+            }
             offset += n * 4;
             continue;
         }
@@ -4563,10 +4916,9 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             v->comp_per_elem = 1;
             v->words = 4;
             v->src_word = pos_word;
-            v->buffer = buffer;
-            v->offset = offset;
-            offset += 16;
-            xp->buffer_mask |= (1u << buffer);
+            if (separate) { v->buffer = xsrc[i]; v->offset = 0; xp->stride[xsrc[i]] = 16; }
+            else          { v->buffer = buffer;  v->offset = offset; offset += 16; }
+            xp->buffer_mask |= (1u << v->buffer);
             continue;
         }
         if (!strcmp(name, "gl_PointSize"))
@@ -4578,10 +4930,9 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             v->comp_per_elem = 1;
             v->words = 1;
             v->src_word = psize_word;
-            v->buffer = buffer;
-            v->offset = offset;
-            offset += 4;
-            xp->buffer_mask |= (1u << buffer);
+            if (separate) { v->buffer = xsrc[i]; v->offset = 0; xp->stride[xsrc[i]] = 4; }
+            else          { v->buffer = buffer;  v->offset = offset; offset += 4; }
+            xp->buffer_mask |= (1u << v->buffer);
             continue;
         }
 
@@ -4632,20 +4983,32 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         v->size = (GLint)g->elems;
         v->words = g->words;
         v->src_word = g->offset;
-        v->buffer = buffer;
-        v->offset = offset;
-        if (xp->pending_count)
-            offset += v->words * 4;
+        if (separate)
+        {
+            /* each API-selected varying is its own binding point (GL 4.6 13.3.1); a name
+             * that expanded to several block members captures them into that one buffer */
+            v->buffer = xsrc[i];
+            v->offset = sepo[xsrc[i]];
+            sepo[xsrc[i]] += v->words * 4;
+            xp->stride[xsrc[i]] = sepo[xsrc[i]];
+        }
         else
         {
-            /* declared capture: the stride of a buffer is the extent of its captures */
-            GLuint end = offset + v->words * 4;
-            if (end > xp->stride[buffer]) xp->stride[buffer] = end;
+            v->buffer = buffer;
+            v->offset = offset;
+            if (xp->pending_count)
+                offset += v->words * 4;
+            else
+            {
+                /* declared capture: the stride of a buffer is the extent of its captures */
+                GLuint end = offset + v->words * 4;
+                if (end > xp->stride[buffer]) xp->stride[buffer] = end;
+            }
         }
-        xp->buffer_mask |= (1u << buffer);
+        xp->buffer_mask |= (1u << v->buffer);
     }
 
-    if (xp->pending_count)
+    if (xp->pending_count && !separate)
         xp->stride[buffer] = offset;
 }
 

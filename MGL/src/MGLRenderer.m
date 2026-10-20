@@ -440,44 +440,54 @@ static char kComputeFallbackKey;
                     }
                 }
 
-                if (buf)
+                /* an ARRAY of block/SSBO instances (uniform UB {..} ub[8]) occupies
+                 * array_size consecutive Metal argument slots fed by consecutive GL
+                 * binding points (base..base+array_size-1): one list entry per element
+                 * keeps the enumeration aligned with the argument slots */
+                GLuint elems = 1;
+                if (spvc_type != SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
+                    STATE(program) &&
+                    i < (int)STATE(program)->spirv_resources_list[stage][spvc_type].count)
                 {
+                    SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][spvc_type].list[i];
+
+                    elems = sres->array_size ? sres->array_size : 1;
+                }
+
+                for (GLuint e = 0; e < elems && buffer_map->count < MAX_MAPPED_BUFFERS; e++)
+                {
+                    Buffer *eb = (e == 0) ? buf : (spirv_binding + e < MAX_BINDABLE_BUFFERS ?
+                                                   buffers[spirv_binding + e].buf : NULL);
+                    GLintptr eoff = (e == 0) ? buffers[spirv_binding].offset : buffers[spirv_binding + e].offset;
+
+                    if (!eb)
+                    {
+                        /* unbound (or past the bound range): legal in GL, bind the dummy */
+                        Buffer *nullbuf = [self nullShaderBuffer];
+
+                        if (!nullbuf) continue;
+                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
+                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding + e;
+                        buffer_map->buffers[buffer_map->count].buf = nullbuf;
+                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->count++;
+                        continue;
+                    }
+
                     buffer_map->buffers[buffer_map->count].attribute_mask = 0; // non attribute.. no bits set
-                    buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
-                    buffer_map->buffers[buffer_map->count].buf = buf;
-                    buffer_map->buffers[buffer_map->count].offset = buffers[spirv_binding].offset;
+                    buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding + e;
+                    buffer_map->buffers[buffer_map->count].buf = eb;
+                    buffer_map->buffers[buffer_map->count].offset = eoff;
                     buffer_map->count++;
-                    buffers_to_be_mapped--;
 
                     /* shader storage / atomic counter buffers may be written by the shader:
                      * CPU reads (glMapBufferRange, glGetBufferSubData, ...) sync off this */
                     if (spvc_type == SPVC_RESOURCE_TYPE_STORAGE_BUFFER ||
                         spvc_type == SPVC_RESOURCE_TYPE_ATOMIC_COUNTER)
-                        mgl_buffers_mark_gpu_use(ctx, buf, true);
-
-                    //DEBUG_PRINT("Found buffer type: %s buffer_base_index: %d\n", mapped_types[type].name, spirv_binding);
+                        mgl_buffers_mark_gpu_use(ctx, eb, true);
                 }
-                else
-                {
-                    /* assertaudit: unbound uniform / storage / atomic-counter block:
-                     * legal in GL (accesses undefined), bind the shared dummy buffer */
-                    Buffer *nullbuf = [self nullShaderBuffer];
 
-                    if (nullbuf)
-                    {
-                        buffer_map->buffers[buffer_map->count].attribute_mask = 0;
-                        buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
-                        buffer_map->buffers[buffer_map->count].buf = nullbuf;
-                        buffer_map->buffers[buffer_map->count].offset = 0;
-                        buffer_map->count++;
-                        buffers_to_be_mapped--;
-                        continue;
-                    }
-
-                    ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-
-                    return false;
-                }
+                buffers_to_be_mapped--;
 
                 // endless loop
                 RETURN_FALSE_ON_FAILURE(i < MAX_ATTRIBS);
@@ -1931,7 +1941,15 @@ static char kComputeFallbackKey;
             if (spirv_binding >= TEXTURE_UNITS)
                 continue;
 
-            Texture *ptr = STATE(active_textures[spirv_binding]);
+            /* a sampler ARRAY spans array_size consecutive Metal slots fed by the units
+             * base..base+array_size-1 (MGL's sampler-uniform convention, see program.c) */
+            GLuint elems = sres->array_size ? sres->array_size : 1;
+
+            for (GLuint e = 0; e < elems; e++)
+            {
+            if (spirv_binding + e >= TEXTURE_UNITS)
+                continue;
+            Texture *ptr = STATE(active_textures[spirv_binding + e]);
             if (!ptr)
                 continue;
 
@@ -1943,19 +1961,20 @@ static char kComputeFallbackKey;
 
             // sampler objects bound to the unit override the texture's sampler state;
             // swizzle / base+max level / stencil mode select a texture view (texparam)
-            id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
+            id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding + e texture:ptr];
             texture = [self texparamTextureForTex:ptr base:texture];
             assert(sampler);
 
             if (stage == _VERTEX_SHADER)
             {
-                [_currentRenderEncoder setVertexTexture:texture atIndex:mtl_index];
-                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:mtl_index];
+                [_currentRenderEncoder setVertexTexture:texture atIndex:mtl_index + e];
+                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:mtl_index + e];
             }
             else
             {
-                [_currentRenderEncoder setFragmentTexture:texture atIndex:mtl_index];
-                [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:mtl_index];
+                [_currentRenderEncoder setFragmentTexture:texture atIndex:mtl_index + e];
+                [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:mtl_index + e];
+            }
             }
         }
     }
