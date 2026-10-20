@@ -86,6 +86,24 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
 
+## Session 8 (commit "default matrices, diamond-rule line rasterization")
+
+* REAL BUG FIXED: the float matrix caches the generated FFP/compat-GLSL shaders read
+  (s->modelview_f / projection_f / texture_f) were only refreshed by matrix_changed(),
+  so a compat context that never calls a matrix entry point (glLoadIdentity etc.) drew
+  with all-zero matrices — nothing appeared. mgl_compat_init_state now initialises the
+  float caches to identity.
+* Line rasterization "one pixel left/down" was NOT a Metal-vs-GL gap: a probe drawing
+  the same segments on a CORE context (VBO + glDrawArrays) and on the compat context
+  (glBegin) produces byte-identical coverage. A vertical line at integer x=16 lights
+  column 15 (and not 16) because x=16 is the RIGHT corner of column 15's diamonds:
+  GL's diamond-exit rule counts right/top corners and not left/bottom. Same for
+  horizontal lines (row 15 for y=16). Test test_compat_render2.c line_diamond_rule pins
+  this (endpoints, half-pixel cases), and the evaluators test now asserts column 15
+  exactly instead of accepting both.
+* Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
+  rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
+
 ## Session 7 (commit "GL_CLAMP / GENERATE_MIPMAP / texenv LOD bias")
 
 * glTexParameteri(GL_TEXTURE_WRAP_*, GL_CLAMP) is accepted: the hardware gets CLAMP_TO_EDGE
@@ -124,10 +142,9 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
   fails, so a bad state combination can never crash the draw.
 * DrawPixels applies GL_MAP_COLOR via the R/G/B/A pixel maps (v -> map[round(v*(n-1))]); the
   default single-entry maps are identity (1.0).
-* Known gaps documented by tests: a horizontal/vertical line exactly on a pixel boundary rasterizes
-  one pixel left/down on Metal (D3D rule) vs the GL diamond rule - tests read the Metal row and
-  note it; fixed-function texgen/lighting are per-vertex (as GL 1.x says), tests compute the
-  interpolated CPU reference.
+* fixed-function texgen/lighting are per-vertex (as GL 1.x says), tests compute the
+  interpolated CPU reference. (The "one pixel left/down" line note here was wrong — see
+  session 8: that IS the GL diamond rule.)
 
 ## Session 4 (commit "compat GLSL fixes")
 
@@ -161,8 +178,7 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Feedback mode: rewritten (`fb_emit_prims`) with per-type vertex layouts (GL_2D/3D/3D_COLOR/
   3D_COLOR_TEXTURE/4D_COLOR_TEXTURE), per-primitive tokens; TRIANGLE_STRIP/FAN/TRIANGLES now emit
   (the old code relied on `mgl_compat_build_tri_indices` which only converts QUADS/POLYGON).
-* Known gap: a vertical/horizontal line exactly on a pixel boundary rasterizes to the left/bottom
-  pixel on Metal (D3D rule) instead of the GL diamond-rule pixel; the evaluator test accepts both.
+* (removed: the line-on-boundary note above was a misdiagnosis, see session 8)
 
 ## Remaining work
 
@@ -173,3 +189,4 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
   color is stored/queried but not sampled.
 * GENERATE_MIPMAP on glTexImage (compat flag); color-index (glIndex) beyond state tracking.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.
+* Indexed glDrawElements + line stipple (no per-vertex distances yet).

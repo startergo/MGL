@@ -402,6 +402,16 @@ void mgl_compat_init_state(GLMContext ctx)
     }
     memcpy(s->modelview_current.m, s->modelview.stack[0].m, sizeof(MGLCMat));
 
+    /* the float caches the generated shaders read from must start at identity
+     * too (they are only refreshed by matrix_changed() on matrix calls) */
+    for (int i = 0; i < 16; i++)
+    {
+        s->modelview_f[i] = (GLfloat)s->modelview.stack[0].m[i];
+        s->projection_f[i] = (GLfloat)s->projection.stack[0].m[i];
+        for (int u = 0; u < MGLC_MAX_COORDS; u++)
+            s->texture_f[u][i] = (GLfloat)s->texture[u].stack[0].m[i];
+    }
+
     /* current vertex state */
     s->cur_color[0] = s->cur_color[1] = s->cur_color[2] = s->cur_color[3] = 1.0f;
     s->cur_normal[0] = 0.0f; s->cur_normal[1] = 0.0f; s->cur_normal[2] = 1.0f;
