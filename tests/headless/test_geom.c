@@ -2259,6 +2259,122 @@ TEST(element_store_tail_integrity)
     EXPECT_NO_GL_ERROR();
 }
 
+TEST(tiled_restart_gpu_assembly)
+{
+    /* the tile-parallel prep chain (draws above MGL_GEOM_TILED_MIN) used to scan only
+     * 1/32nd of the element store (tile index taken from the global thread id), so with
+     * primitive restart almost every run record was stale: out_prims came out as the
+     * candidate count (count/3) or garbage, and the geometry kernel dispatched up to
+     * 100x the threadgroups it needed (the 50 ms/frame restart regression).  This test
+     * drives a large restart-heavy indexed draw through the GPU assembly path (warm-up
+     * draws first, so the element store is Metal-backed) and checks the exact number of
+     * primitives the geometry stage emitted via transform feedback. */
+    enum { COUNT = 60000, VERTS3 = 1000, RUNS = COUNT / 6 };   /* 10000 triangles */
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "layout(location=0) in vec2 v_pos[];\n"
+                     "layout(location=0) out vec2 g_pos;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; g_pos = v_pos[i]; EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    const char *fs = "#version 450 core\nlayout(location=0) out vec4 c;\nvoid main(){ c = vec4(0.0); }\n";
+    const char *vs = "#version 450 core\nlayout(location=0) in vec2 pos;\nlayout(location=0) out vec2 v_pos;\nvoid main(){ gl_Position = vec4(pos * 0.02, 0.0, 1.0); v_pos = pos; }\n";
+    static const char *vars[2] = { "g_pos", NULL };
+    GLuint p = glCreateProgram();
+    GLuint ebo = 0, tbuf = 0, q = 0;
+    GLuint *idx = malloc(sizeof(GLuint) * COUNT);
+    float *verts = malloc(sizeof(float) * 2 * VERTS3);
+    GLint written = -1;
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    {
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, GL_TRUE);
+        if (!ok) { free(idx); free(verts); return; }
+    }
+
+    for (int i = 0; i < VERTS3; i++)
+    {
+        verts[i * 2 + 0] = (float)(i % 97);
+        verts[i * 2 + 1] = (float)(i % 89);
+    }
+    for (int i = 0; i < COUNT; i++)
+        idx[i] = (GLuint)(((GLuint)i * 7919u) % VERTS3);
+
+    setup(VERTS3, verts);                      /* binds the VAO and vertex buffer */
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * COUNT, idx, GL_STATIC_DRAW);
+    glUseProgram(p);
+
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 6 * sizeof(float) * 3 * RUNS, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+    glGenQueries(1, &q);
+
+    /* warm-up without restart: promotes the element store, so the draws below use the
+     * GPU assembly (the tile-parallel chain) */
+    glEnable(GL_RASTERIZER_DISCARD);
+    for (int i = 0; i < 3; i++)
+        glDrawElements(GL_TRIANGLES, COUNT, GL_UNSIGNED_INT, NULL);
+    glFinish();
+
+    /* restart every 6th index: RUNS runs of five indices -> one triangle each */
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xffffffffu);
+    for (int i = 5; i < COUNT; i += 6) idx[i] = 0xffffffffu;
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * COUNT, idx, GL_STATIC_DRAW);
+
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glDrawElements(GL_TRIANGLES, COUNT, GL_UNSIGNED_INT, NULL);
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDisable(GL_PRIMITIVE_RESTART);
+    EXPECT_NO_GL_ERROR();
+
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &written);
+    printf("  tiled restart xfb written = %d (expect %d)\n", written, RUNS);
+    EXPECT_EQ_INT(written, RUNS);
+
+    /* every record must be a real vertex of the mesh (no stale/garbage records);
+     * the only captured varying is g_pos, so a record is two floats */
+    {
+        float *out = malloc(2 * sizeof(float) * 3 * RUNS);
+        memset(out, 0, 2 * sizeof(float) * 3 * RUNS);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 2 * sizeof(float) * 3 * RUNS, out);
+        int bad = 0;
+        for (int r = 0; r < 3 * RUNS; r++)
+        {
+            float x = out[r * 2 + 0], y = out[r * 2 + 1];
+            if (x < 0.0f || x > 96.0f || y < 0.0f || y > 88.0f ||
+                x != (float)(int)x || y != (float)(int)y)
+                bad++;
+        }
+        printf("  records: %d of %d out of range/non-integral\n", bad, 3 * RUNS);
+        EXPECT_EQ_INT(bad, 0);
+        free(out);
+    }
+
+    glDeleteQueries(1, &q);
+    glDeleteBuffers(1, &tbuf);
+    glDeleteBuffers(1, &ebo);
+    glDeleteProgram(p);
+    free(idx);
+    free(verts);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     RUN(block_vs_fs_control);
@@ -2297,5 +2413,6 @@ int main(void)
     RUN(wild_index_survives_cpu_assembly);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
     RUN(element_store_tail_integrity);
+    RUN(tiled_restart_gpu_assembly);
     return mgl_test_summary();
 }
