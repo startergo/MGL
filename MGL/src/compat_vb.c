@@ -284,29 +284,32 @@ static GLuint convert_prim(GLMContext ctx, GLenum mode, GLuint n, uint32_t **out
     uint32_t *list = NULL;
     GLuint count = 0, cap = 0;
 
+    /* triangles are emitted rotated so the provoking vertex (the LAST vertex
+     * of the quad/polygon) is first: Metal takes flat-shaded values from the
+     * first vertex of a triangle, OpenGL from the last */
     switch (mode)
     {
         case GL_QUADS:
             for (GLuint q = 0; q + 3 < n; q += 4)
             {
+                push_index(ctx, &list, &count, &cap, q + 3);
                 push_index(ctx, &list, &count, &cap, q + 0);
                 push_index(ctx, &list, &count, &cap, q + 1);
                 push_index(ctx, &list, &count, &cap, q + 3);
                 push_index(ctx, &list, &count, &cap, q + 1);
                 push_index(ctx, &list, &count, &cap, q + 2);
-                push_index(ctx, &list, &count, &cap, q + 3);
             }
             break;
 
         case GL_QUAD_STRIP:
             for (GLuint q = 0; q + 3 < n; q += 2)
             {
+                push_index(ctx, &list, &count, &cap, q + 3);
                 push_index(ctx, &list, &count, &cap, q + 0);
                 push_index(ctx, &list, &count, &cap, q + 1);
                 push_index(ctx, &list, &count, &cap, q + 3);
                 push_index(ctx, &list, &count, &cap, q + 1);
                 push_index(ctx, &list, &count, &cap, q + 2);
-                push_index(ctx, &list, &count, &cap, q + 3);
             }
             break;
 
@@ -314,9 +317,9 @@ static GLuint convert_prim(GLMContext ctx, GLenum mode, GLuint n, uint32_t **out
             if (n >= 3)
                 for (GLuint i = 0; i + 2 < n; i++)
                 {
+                    push_index(ctx, &list, &count, &cap, n - 1);
                     push_index(ctx, &list, &count, &cap, i + 0);
                     push_index(ctx, &list, &count, &cap, i + 1);
-                    push_index(ctx, &list, &count, &cap, n - 1);
                 }
             break;
 
@@ -341,8 +344,10 @@ static void draw_index_list(GLMContext ctx, GLenum mode, const uint32_t *idx, GL
 
     if (instances > 1)
         mglDrawElementsInstancedBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL, instances, basevertex);
-    else
+    else if (basevertex)
         mglDrawElementsBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL, basevertex);
+    else
+        mglDrawElements(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL);
 
     /* restore the caller's element binding */
     if (saved)
@@ -352,6 +357,27 @@ static void draw_index_list(GLMContext ctx, GLenum mode, const uint32_t *idx, GL
 }
 
 #pragma mark fixed-function program binding
+
+/* fixed-function default (current) attribute values for every input the
+ * generated program reads but the app did not bind (GL: unbound attributes
+ * use the current value; MGL implements that as constant attribute fetch) */
+static void set_current_attribs(GLMContext ctx)
+{
+    struct MGLExtState_compat *s = CS();
+
+    mglVertexAttrib4f(ctx, MGLC_ATTR_VERTEX, 0.0f, 0.0f, 0.0f, 1.0f);
+    mglVertexAttrib3f(ctx, MGLC_ATTR_NORMAL, s->cur_normal[0], s->cur_normal[1], s->cur_normal[2]);
+    mglVertexAttrib4f(ctx, MGLC_ATTR_COLOR, s->cur_color[0], s->cur_color[1], s->cur_color[2], s->cur_color[3]);
+    mglVertexAttrib4f(ctx, MGLC_ATTR_SECONDARY, s->cur_secondary[0], s->cur_secondary[1],
+                      s->cur_secondary[2], s->cur_secondary[3]);
+    mglVertexAttrib1f(ctx, MGLC_ATTR_FOG, s->cur_fogcoord);
+    mglVertexAttrib1f(ctx, MGLC_ATTR_EDGEFLAG, s->cur_edgeflag ? 1.0f : 0.0f);
+    mglVertexAttrib1f(ctx, MGLC_ATTR_INDEX, s->cur_index);
+
+    for (int u = 0; u < MGLC_MAX_COORDS; u++)
+        mglVertexAttrib4f(ctx, MGLC_ATTR_TEXCOORD(u), s->cur_texcoord[u][0], s->cur_texcoord[u][1],
+                          s->cur_texcoord[u][2], s->cur_texcoord[u][3]);
+}
 
 /* bind the generated fixed-function program (or sync the active user program);
  * returns the program that must be restored afterwards (NULL if none) */
@@ -370,6 +396,8 @@ static Program *bind_ffp(GLMContext ctx)
     if (prog)
     {
         mglUseProgram(ctx, prog);
+        set_current_attribs(ctx);
+        mgl_compat_ffp_sync(ctx, prog);
         return user;    /* NULL */
     }
 
@@ -445,7 +473,7 @@ void mgl_compat_flush_imm(GLMContext ctx)
     struct MGLExtState_compat *s = CS();
     MGLCImm *im = (MGLCImm *)s->imm;
 
-    if (!im || !im->count || !im->active)
+    if (!im || !im->count)
         return;
 
     VaoSave save;
@@ -493,6 +521,28 @@ void mgl_compat_flush_imm(GLMContext ctx)
                 }
                 break;
 
+            case GL_TRIANGLES:
+                if (CS()->shade_model == GL_FLAT)
+                {
+                    /* GL flat shading uses the last vertex; rotate so the
+                     * last vertex leads (Metal takes the first) */
+                    uint32_t *flat = NULL;
+                    GLuint fc = 0, fcap = 0;
+
+                    for (GLuint i = 0; i + 2 < n; i += 3)
+                    {
+                        push_index(ctx, &flat, &fc, &fcap, i + 2);
+                        push_index(ctx, &flat, &fc, &fcap, i + 0);
+                        push_index(ctx, &flat, &fc, &fcap, i + 1);
+                    }
+
+                    if (fc)
+                        draw_index_list(ctx, GL_TRIANGLES, flat, fc, 1, 0);
+
+                    free(flat);
+                    break;
+                }
+                /* FALLTHROUGH */
             default:
                 mglDrawArrays(ctx, mode, 0, (GLsizei)n);
                 break;
@@ -1439,6 +1489,26 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
         GLenum other;
         GLenum pm = polygon_mode_effective(ctx, &other);
 
+        if (s->shade_model == GL_FLAT)
+        {
+            uint32_t *flat = NULL;
+            GLuint fc = 0, fcap = 0;
+
+            for (GLint i = 0; i + 2 < count; i += 3)
+            {
+                push_index(ctx, &flat, &fc, &fcap, (uint32_t)(first + i + 2));
+                push_index(ctx, &flat, &fc, &fcap, (uint32_t)(first + i + 0));
+                push_index(ctx, &flat, &fc, &fcap, (uint32_t)(first + i + 1));
+            }
+
+            if (fc)
+                draw_index_list(ctx, GL_TRIANGLES, flat, fc, 1, 0);
+
+            free(flat);
+            unbind_ffp(ctx, user);
+            return;
+        }
+
         mglDrawArrays(ctx, mode, first, count);
 
         if (pm != GL_FILL)
@@ -1486,9 +1556,11 @@ void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum
     uint32_t *idx32;
 
     /* resolve the index list (client pointer or element buffer) */
-    if (vao && vao->element_array.buffer && indices && !vao->element_array.ptr)
+    if (vao && vao->element_array.buffer)
     {
         Buffer *b = vao->element_array.buffer;
+
+        /* a NULL/offset "pointer" indexes into the bound element buffer */
         if (b->data.buffer_data)
             src = (const char *)(uintptr_t)b->data.buffer_data + (size_t)(uintptr_t)indices;
     }

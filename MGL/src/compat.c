@@ -427,6 +427,8 @@ void mgl_compat_init_state(GLMContext ctx)
 
     /* misc */
     s->shade_model = GL_SMOOTH;
+    s->polygon_mode_front = GL_FILL;
+    s->polygon_mode_back = GL_FILL;
     s->point_size = 1.0f;
     s->point_params[0] = 0.0f;   /* point size min */
     s->point_params[1] = 1.0f;   /* point size max */
@@ -456,6 +458,9 @@ void mgl_compat_init_state(GLMContext ctx)
 
     /* evaluators */
     s->map_grid1_n = 1; s->map_grid2_nu = 1; s->map_grid2_nv = 1;
+
+    /* render mode */
+    s->rmode.mode = GL_RENDER;
 
     s->state_serial = 1;
 }
@@ -701,10 +706,6 @@ void *mglCompatCreateContext(void)
 
     CppCreateMGLRendererHeadless(ctx);
     MGLsetCurrentContext(ctx);
-
-    /* the renderer sets the drawable-dependent state; reset compat defaults */
-    mglDrawBuffer(ctx, GL_FRONT);
-    mglReadBuffer(ctx, GL_FRONT);
 
     return ctx;
 }

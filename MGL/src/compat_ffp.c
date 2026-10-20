@@ -71,7 +71,7 @@ static void sb_add(SB *b, const char *fmt, ...)
 #pragma mark state key
 
 typedef struct {
-    uint8_t bytes[96];
+    uint8_t bytes[256];
 } MGLFFPKey;
 
 #define MGLC_FFP_CACHE 32
@@ -79,6 +79,8 @@ typedef struct {
 typedef struct {
     int used;
     int failed;
+    int draws;
+    int dirty_late;
     GLuint prog;
     uint64_t sync;
     MGLFFPKey key;
@@ -306,7 +308,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->need_normal)
         sb_add(b, "uniform mat3 mglNormalMatrix;\n");
     if (c->rescale && !c->normalize)
-        sb_add(b, "uniform float mglNormalScale;\n");
+        sb_add(b, "uniform vec4 mglNormalParams;   /* .x = 1/|modelview scale| */\n");
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.unit_used[u])
@@ -319,8 +321,8 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->point_atten)
     {
-        sb_add(b, "uniform vec3 mglPointAttenuation;\n");
-        sb_add(b, "uniform float mglPointSize, mglPointSizeMin, mglPointSizeMax;\n");
+        sb_add(b, "uniform vec4 mglPointAtten;      /* a, b, c, unused */\n");
+        sb_add(b, "uniform vec4 mglPointSizeParams; /* size, min, max, unused */\n");
     }
 
     if (c->lighting)
@@ -389,7 +391,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->normalize)
                 sb_add(b, "    mglN = normalize(mglN);\n");
             else
-                sb_add(b, "    mglN *= mglNormalScale;\n");
+                sb_add(b, "    mglN *= mglNormalParams.x;\n");
         }
         else
             sb_add(b, "    mglN = normalize(mglN);\n");  /* lighting needs unit normals */
@@ -593,7 +595,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->point_atten)
     {
         sb_add(b, "    float mglEyeDist = length(mglEye.xyz);\n");
-        sb_add(b, "    gl_PointSize = clamp(mglPointSize * inversesqrt(dot(mglPointAttenuation, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeMin, mglPointSizeMax);\n");
+        sb_add(b, "    gl_PointSize = clamp(mglPointSizeParams.x * inversesqrt(dot(mglPointAtten.xyz, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeParams.y, mglPointSizeParams.z);\n");
     }
 
     sb_add(b, "    gl_Position = mglProjectionMatrix * mglEye;\n");
@@ -692,9 +694,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->unit.env_mode[u] == GL_COMBINE)
             {
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
-                if (c->unit.combine_rgb[u] != GL_DOT3_RGBA)
-                    sb_add(b, "uniform float mglEnvScaleRGB%d;\n", u);
-                sb_add(b, "uniform float mglEnvScaleA%d;\n", u);
+                sb_add(b, "uniform vec4 mglEnvScale%d;     /* rgb scale, alpha scale, 0, 0 */\n", u);
             }
             else if (c->unit.env_mode[u] == GL_BLEND)
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
@@ -703,11 +703,11 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->fog)
     {
         sb_add(b, "uniform vec4 mglFogColor;\n");
-        sb_add(b, "uniform float mglFogDensity, mglFogStart, mglFogScale;\n");
+        sb_add(b, "uniform vec4 mglFogParams;      /* density, start, end, 1/(end-start) */\n");
     }
 
     if (c->alpha_test)
-        sb_add(b, "uniform float mglAlphaRef;\n");
+        sb_add(b, "uniform vec4 mglAlphaParams;    /* .x = reference value */\n");
 
     if (c->polygon_stipple)
         sb_add(b, "uniform sampler2D mglStipple;\n");
@@ -783,9 +783,9 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
                     sb_add(b, "%s - vec3(0.5));\n", e1);
 
                     if (c->unit.combine_rgb[u] == GL_DOT3_RGBA)
-                        sb_add(b, "    c = vec4(mglDot%d) * mglEnvScaleA%d;\n", u, u);
+                        sb_add(b, "    c = vec4(mglDot%d) * mglEnvScale%d.y;\n", u, u);
                     else
-                        sb_add(b, "    c.rgb = mglDot%d * mglEnvScaleRGB%d;\n", u, u);
+                        sb_add(b, "    c.rgb = mglDot%d * mglEnvScale%d.x;\n", u, u);
                 }
                 else
                 {
@@ -795,7 +795,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
                     args[0] = e0; args[1] = e1; args[2] = e2;
                     sb_add(b, "    c.rgb = ");
                     sb_combine(b, c->unit.combine_rgb[u], args, true);
-                    sb_add(b, " * mglEnvScaleRGB%d;\n", u);
+                    sb_add(b, " * mglEnvScale%d.x;\n", u);
                 }
 
                 if (c->unit.combine_rgb[u] != GL_DOT3_RGBA)
@@ -810,7 +810,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
                     args[0] = e0; args[1] = e1; args[2] = e2;
                     sb_add(b, "    c.a = ");
                     sb_combine(b, c->unit.combine_a[u], args, false);
-                    sb_add(b, " * mglEnvScaleA%d;\n", u);
+                    sb_add(b, " * mglEnvScale%d.y;\n", u);
                 }
                 break;
             }
@@ -834,13 +834,13 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         switch (c->fog_mode)
         {
             case GL_LINEAR:
-                sb_add(b, "    mglFogF = clamp((mglFogEnd - mglFogD) * mglFogScale, 0.0, 1.0);\n");
+                sb_add(b, "    mglFogF = clamp((mglFogParams.z - mglFogD) * mglFogParams.w, 0.0, 1.0);\n");
                 break;
             case GL_EXP:
-                sb_add(b, "    mglFogF = clamp(exp(-mglFogDensity * mglFogD), 0.0, 1.0);\n");
+                sb_add(b, "    mglFogF = clamp(exp(-mglFogParams.x * mglFogD), 0.0, 1.0);\n");
                 break;
             default:    /* EXP2 */
-                sb_add(b, "    mglFogF = clamp(exp(-mglFogDensity * mglFogDensity * mglFogD * mglFogD), 0.0, 1.0);\n");
+                sb_add(b, "    mglFogF = clamp(exp(-mglFogParams.x * mglFogParams.x * mglFogD * mglFogD), 0.0, 1.0);\n");
                 break;
         }
         sb_add(b, "    c.rgb = mix(c.rgb, mglFogColor.rgb, mglFogF);\n");
@@ -852,12 +852,12 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         switch (c->alpha_func)
         {
             case GL_NEVER: expr = "false"; break;
-            case GL_LESS: expr = "c.a < mglAlphaRef"; break;
-            case GL_EQUAL: expr = "abs(c.a - mglAlphaRef) < 0.0001"; break;
-            case GL_LEQUAL: expr = "c.a <= mglAlphaRef"; break;
-            case GL_GREATER: expr = "c.a > mglAlphaRef"; break;
-            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaRef) >= 0.0001"; break;
-            case GL_GEQUAL: expr = "c.a >= mglAlphaRef"; break;
+            case GL_LESS: expr = "c.a < mglAlphaParams.x"; break;
+            case GL_EQUAL: expr = "abs(c.a - mglAlphaParams.x) < 0.0001"; break;
+            case GL_LEQUAL: expr = "c.a <= mglAlphaParams.x"; break;
+            case GL_GREATER: expr = "c.a > mglAlphaParams.x"; break;
+            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaParams.x) >= 0.0001"; break;
+            case GL_GEQUAL: expr = "c.a >= mglAlphaParams.x"; break;
             default: expr = "true"; break;    /* ALWAYS */
         }
         sb_add(b, "    if (!(%s)) discard;\n", expr);
@@ -942,6 +942,15 @@ static GLuint ffp_program(GLMContext ctx, const MGLFFPConfig *c, const MGLFFPKey
     GLuint v = compile_stage(ctx, GL_VERTEX_SHADER, vs.s);
     GLuint f = compile_stage(ctx, GL_FRAGMENT_SHADER, fs.s);
 
+    if (getenv("MGLC_DEBUG") && (!v || !f))
+    {
+        fprintf(stderr, "MGLC: stage compile failed (v=%u f=%u)\n", v, f);
+        FILE *fdbg = fopen("/tmp/mglc_vs.glsl", "w");
+        if (fdbg) { fputs(vs.s, fdbg); fclose(fdbg); }
+        fdbg = fopen("/tmp/mglc_fs.glsl", "w");
+        if (fdbg) { fputs(fs.s, fdbg); fclose(fdbg); }
+    }
+
     if (v && f)
     {
         prog = mglCreateProgram(ctx);
@@ -985,10 +994,9 @@ static GLint uni(GLMContext ctx, GLuint prog, const char *name)
     return mglGetUniformLocation(ctx, prog, name);
 }
 
-void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
+void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
 {
     struct MGLExtState_compat *s = CS();
-    GLuint prog = program ? program->name : s->ffp_program;
     MGLFFPCacheEnt *cache = (MGLFFPCacheEnt *)s->ffp_cache;
     MGLFFPConfig c;
     GLint loc;
@@ -1001,17 +1009,22 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
     for (int i = 0; i < MGLC_FFP_CACHE; i++)
         if (cache && cache[i].used && cache[i].prog == prog)
         {
-            if (cache[i].sync == s->state_serial)
+            /* the uniform table is re-derived after the MSL compile of the
+             * first draw, so force a re-sync on the first few uses */
+            if (cache[i].sync == s->state_serial && cache[i].draws >= 3)
                 return;
+            cache[i].draws++;
+            if (cache[i].sync == s->state_serial && cache[i].draws < 3)
+                cache[i].dirty_late = 1;
             cache[i].sync = s->state_serial;
             break;
         }
 
     /* matrices */
     loc = uni(ctx, prog, "mglModelViewMatrix");
-    if (loc >= 0) mglProgramUniformMatrix4fv(ctx, prog, loc, 1, GL_FALSE, s->modelview_f);
+    if (loc >= 0) mglUniformMatrix4fv(ctx, loc, 1, GL_FALSE, s->modelview_f);
     loc = uni(ctx, prog, "mglProjectionMatrix");
-    if (loc >= 0) mglProgramUniformMatrix4fv(ctx, prog, loc, 1, GL_FALSE, s->projection_f);
+    if (loc >= 0) mglUniformMatrix4fv(ctx, loc, 1, GL_FALSE, s->projection_f);
 
     if (c.need_normal)
     {
@@ -1029,7 +1042,7 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
                 nm[i * 3 + j] = (GLfloat)f[i * 4 + j];   /* mat3 column major from the 4x4 */
 
         loc = uni(ctx, prog, "mglNormalMatrix");
-        if (loc >= 0) mglProgramUniformMatrix3fv(ctx, prog, loc, 1, GL_FALSE, nm);
+        if (loc >= 0) mglUniformMatrix3fv(ctx, loc, 1, GL_FALSE, nm);
     }
 
     if (c.rescale && !c.normalize)
@@ -1044,8 +1057,12 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
                 scale = (GLfloat)(1.0 / len);
         }
 
-        loc = uni(ctx, prog, "mglNormalScale");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, scale);
+        loc = uni(ctx, prog, "mglNormalParams");
+        if (loc >= 0)
+        {
+            GLfloat np[4] = { scale, 0.0f, 0.0f, 0.0f };
+            mglUniform4fv(ctx, loc, 1, np);
+        }
     }
 
     /* texture matrices (name is fixed width: mglTextureMatrix%d) */
@@ -1058,7 +1075,7 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
         snprintf(name, sizeof name, "mglTextureMatrix%d", u);
         loc = uni(ctx, prog, name);
         if (loc >= 0)
-            mglProgramUniformMatrix4fv(ctx, prog, loc, 1, GL_FALSE, s->texture_f[u]);
+            mglUniformMatrix4fv(ctx, loc, 1, GL_FALSE, s->texture_f[u]);
     }
 
     /* clip planes */
@@ -1072,23 +1089,23 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
         GLfloat v[4] = { (GLfloat)s->clip_plane[i][0], (GLfloat)s->clip_plane[i][1],
                          (GLfloat)s->clip_plane[i][2], (GLfloat)s->clip_plane[i][3] };
         loc = uni(ctx, prog, name);
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 1, v);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 1, v);
     }
 
     /* point size attenuation */
     if (c.point_atten)
     {
-        loc = uni(ctx, prog, "mglPointSize");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->point_size);
-        loc = uni(ctx, prog, "mglPointSizeMin");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->point_params[0]);
-        loc = uni(ctx, prog, "mglPointSizeMax");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->point_params[1]);
-        loc = uni(ctx, prog, "mglPointAttenuation");
+        loc = uni(ctx, prog, "mglPointSizeParams");
         if (loc >= 0)
         {
-            GLfloat a[3] = { s->point_params[3], s->point_params[4], s->point_params[5] };
-            mglProgramUniform3fv(ctx, prog, loc, 1, a);
+            GLfloat sp[4] = { s->point_size, s->point_params[0], s->point_params[1], 0.0f };
+            mglUniform4fv(ctx, loc, 1, sp);
+        }
+        loc = uni(ctx, prog, "mglPointAtten");
+        if (loc >= 0)
+        {
+            GLfloat a[4] = { s->point_params[3], s->point_params[4], s->point_params[5], 0.0f };
+            mglUniform4fv(ctx, loc, 1, a);
         }
     }
 
@@ -1116,23 +1133,23 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
         }
 
         loc = uni(ctx, prog, "mglLightAmbient");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &amb[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, MGLC_MAX_LIGHTS, &amb[0][0]);
         loc = uni(ctx, prog, "mglLightDiffuse");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &dif[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, MGLC_MAX_LIGHTS, &dif[0][0]);
         loc = uni(ctx, prog, "mglLightSpecular");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &spe[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, MGLC_MAX_LIGHTS, &spe[0][0]);
         loc = uni(ctx, prog, "mglLightPosition");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &pos[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, MGLC_MAX_LIGHTS, &pos[0][0]);
         loc = uni(ctx, prog, "mglLightSpotDir");
-        if (loc >= 0) mglProgramUniform3fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &sd[0][0]);
+        if (loc >= 0) mglUniform3fv(ctx, loc, MGLC_MAX_LIGHTS, &sd[0][0]);
         loc = uni(ctx, prog, "mglLightSpotExp");
-        if (loc >= 0) mglProgramUniform1fv(ctx, prog, loc, MGLC_MAX_LIGHTS, se);
+        if (loc >= 0) mglUniform1fv(ctx, loc, MGLC_MAX_LIGHTS, se);
         loc = uni(ctx, prog, "mglLightSpotCosCut");
-        if (loc >= 0) mglProgramUniform1fv(ctx, prog, loc, MGLC_MAX_LIGHTS, sc);
+        if (loc >= 0) mglUniform1fv(ctx, loc, MGLC_MAX_LIGHTS, sc);
         loc = uni(ctx, prog, "mglLightAtt");
-        if (loc >= 0) mglProgramUniform3fv(ctx, prog, loc, MGLC_MAX_LIGHTS, &att[0][0]);
+        if (loc >= 0) mglUniform3fv(ctx, loc, MGLC_MAX_LIGHTS, &att[0][0]);
         loc = uni(ctx, prog, "mglLightEnabled");
-        if (loc >= 0) mglProgramUniform1iv(ctx, prog, loc, MGLC_MAX_LIGHTS, en);
+        if (loc >= 0) mglUniform1iv(ctx, loc, MGLC_MAX_LIGHTS, en);
 
         GLfloat ma[2][4], md[2][4], ms[2][4], me[2][4], sh[2];
         memcpy(ma[0], s->material_front.ambient, 16);
@@ -1147,17 +1164,17 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
         sh[1] = s->material_back.shininess;
 
         loc = uni(ctx, prog, "mglMatAmbient");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 2, &ma[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 2, &ma[0][0]);
         loc = uni(ctx, prog, "mglMatDiffuse");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 2, &md[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 2, &md[0][0]);
         loc = uni(ctx, prog, "mglMatSpecular");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 2, &ms[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 2, &ms[0][0]);
         loc = uni(ctx, prog, "mglMatEmission");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 2, &me[0][0]);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 2, &me[0][0]);
         loc = uni(ctx, prog, "mglMatShininess");
-        if (loc >= 0) mglProgramUniform1fv(ctx, prog, loc, 2, sh);
+        if (loc >= 0) mglUniform1fv(ctx, loc, 2, sh);
         loc = uni(ctx, prog, "mglLightModelAmbient");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 1, s->light_model_ambient);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 1, s->light_model_ambient);
     }
 
     /* texgen planes */
@@ -1171,14 +1188,14 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
                 snprintf(name, sizeof name, "mglObjectPlane%d_%d", u, cc);
                 loc = uni(ctx, prog, name);
                 if (loc >= 0)
-                    mglProgramUniform4fv(ctx, prog, loc, 1, s->texgen[u].object_plane[cc]);
+                    mglUniform4fv(ctx, loc, 1, s->texgen[u].object_plane[cc]);
             }
             else if (c.unit.texgen[u][cc] == GL_EYE_LINEAR)
             {
                 snprintf(name, sizeof name, "mglEyePlane%d_%d", u, cc);
                 loc = uni(ctx, prog, name);
                 if (loc >= 0)
-                    mglProgramUniform4fv(ctx, prog, loc, 1, s->texgen[u].eye_plane[cc]);
+                    mglUniform4fv(ctx, loc, 1, s->texgen[u].eye_plane[cc]);
             }
         }
 
@@ -1191,51 +1208,54 @@ void mgl_compat_ffp_sync(GLMContext ctx, Program *program)
         char name[32];
         snprintf(name, sizeof name, "mglTex%d", u);
         loc = uni(ctx, prog, name);
-        if (loc >= 0) mglProgramUniform1i(ctx, prog, loc, u);
+        if (loc >= 0) mglUniform1i(ctx, loc, u);
 
         if (c.unit.env_mode[u] == GL_COMBINE || c.unit.env_mode[u] == GL_BLEND)
         {
             snprintf(name, sizeof name, "mglEnvColor%d", u);
             loc = uni(ctx, prog, name);
-            if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 1, s->texenv[u].env_color);
+            if (loc >= 0) mglUniform4fv(ctx, loc, 1, s->texenv[u].env_color);
         }
 
         if (c.unit.env_mode[u] == GL_COMBINE)
         {
-            if (c.unit.combine_rgb[u] != GL_DOT3_RGBA)
-            {
-                snprintf(name, sizeof name, "mglEnvScaleRGB%d", u);
-                loc = uni(ctx, prog, name);
-                if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->texenv[u].scale_rgb);
-            }
-            snprintf(name, sizeof name, "mglEnvScaleA%d", u);
+            snprintf(name, sizeof name, "mglEnvScale%d", u);
             loc = uni(ctx, prog, name);
-            if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->texenv[u].scale_alpha);
+            if (loc >= 0)
+            {
+                GLfloat es[4] = { s->texenv[u].scale_rgb, s->texenv[u].scale_alpha, 0.0f, 0.0f };
+                mglUniform4fv(ctx, loc, 1, es);
+            }
         }
     }
 
     if (c.fog)
     {
         loc = uni(ctx, prog, "mglFogColor");
-        if (loc >= 0) mglProgramUniform4fv(ctx, prog, loc, 1, s->fog_color);
-        loc = uni(ctx, prog, "mglFogDensity");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->fog_density);
-        loc = uni(ctx, prog, "mglFogStart");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->fog_start);
-        loc = uni(ctx, prog, "mglFogScale");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->fog_scale);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 1, s->fog_color);
+
+        loc = uni(ctx, prog, "mglFogParams");
+        if (loc >= 0)
+        {
+            GLfloat fp[4] = { s->fog_density, s->fog_start, s->fog_end, s->fog_scale };
+            mglUniform4fv(ctx, loc, 1, fp);
+        }
     }
 
     if (c.alpha_test)
     {
-        loc = uni(ctx, prog, "mglAlphaRef");
-        if (loc >= 0) mglProgramUniform1f(ctx, prog, loc, s->alpha_ref);
+        loc = uni(ctx, prog, "mglAlphaParams");
+        if (loc >= 0)
+        {
+            GLfloat ap[4] = { s->alpha_ref, 0.0f, 0.0f, 0.0f };
+            mglUniform4fv(ctx, loc, 1, ap);
+        }
     }
 
     if (c.polygon_stipple)
     {
         loc = uni(ctx, prog, "mglStipple");
-        if (loc >= 0) mglProgramUniform1i(ctx, prog, loc, MGLC_STIPPLE_UNIT);
+        if (loc >= 0) mglUniform1i(ctx, loc, MGLC_STIPPLE_UNIT);
     }
 }
 

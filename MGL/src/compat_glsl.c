@@ -43,6 +43,8 @@ typedef struct {
 
     /* which legacy names were used (drives the preamble) */
     unsigned used;
+    int subst;                     /* >0 when legacy syntax was found */
+    int user_loc;                  /* next location for user attributes */
     unsigned fragdata_used;         /* bit n -> gl_FragData[n] */
     int stage;                     /* GL_VERTEX_SHADER / GL_FRAGMENT_SHADER */
     int version;                   /* declared #version number */
@@ -127,78 +129,79 @@ static bool match(const char *id, size_t n, const char *kw)
 /* rewrite one identifier; returns true when it consumed something */
 static bool tr_subst_ident(Tr *t, const char *id, size_t n)
 {
+    /* counted so shaders without legacy syntax pass through untouched */
     /* vertex attributes (compat) */
     if (t->stage == GL_VERTEX_SHADER)
     {
-        if (match(id, n, "gl_Vertex")) { tr_adds(t, "mglVertex"); t->used |= U_VERTEX; return true; }
-        if (match(id, n, "gl_Normal")) { tr_adds(t, "mglNormal"); t->used |= U_NORMAL; return true; }
-        if (match(id, n, "gl_Color")) { tr_adds(t, "mglColor"); t->used |= U_COLOR; return true; }
-        if (match(id, n, "gl_SecondaryColor")) { tr_adds(t, "mglSecondaryColor"); t->used |= U_SECONDARY; return true; }
-        if (match(id, n, "gl_FogCoord")) { tr_adds(t, "mglFogCoord"); t->used |= U_FOGCOORD; return true; }
-        if (match(id, n, "gl_MultiTexCoord0")) { tr_adds(t, "mglTexCoord0"); t->used |= TEXCOORD_BIT(0); return true; }
-        if (match(id, n, "gl_MultiTexCoord1")) { tr_adds(t, "mglTexCoord1"); t->used |= TEXCOORD_BIT(1); return true; }
-        if (match(id, n, "gl_MultiTexCoord2")) { tr_adds(t, "mglTexCoord2"); t->used |= TEXCOORD_BIT(2); return true; }
-        if (match(id, n, "gl_MultiTexCoord3")) { tr_adds(t, "mglTexCoord3"); t->used |= TEXCOORD_BIT(3); return true; }
-        if (match(id, n, "gl_MultiTexCoord4")) { tr_adds(t, "mglTexCoord4"); t->used |= TEXCOORD_BIT(4); return true; }
-        if (match(id, n, "gl_MultiTexCoord5")) { tr_adds(t, "mglTexCoord5"); t->used |= TEXCOORD_BIT(5); return true; }
-        if (match(id, n, "gl_MultiTexCoord6")) { tr_adds(t, "mglTexCoord6"); t->used |= TEXCOORD_BIT(6); return true; }
-        if (match(id, n, "gl_MultiTexCoord7")) { tr_adds(t, "mglTexCoord7"); t->used |= TEXCOORD_BIT(7); return true; }
+        if (match(id, n, "gl_Vertex")) { tr_adds(t, "mglVertex"); t->used |= U_VERTEX; return (t->subst++, true); }
+        if (match(id, n, "gl_Normal")) { tr_adds(t, "mglNormal"); t->used |= U_NORMAL; return (t->subst++, true); }
+        if (match(id, n, "gl_Color")) { tr_adds(t, "mglColor"); t->used |= U_COLOR; return (t->subst++, true); }
+        if (match(id, n, "gl_SecondaryColor")) { tr_adds(t, "mglSecondaryColor"); t->used |= U_SECONDARY; return (t->subst++, true); }
+        if (match(id, n, "gl_FogCoord")) { tr_adds(t, "mglFogCoord"); t->used |= U_FOGCOORD; return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord0")) { tr_adds(t, "mglTexCoord0"); t->used |= TEXCOORD_BIT(0); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord1")) { tr_adds(t, "mglTexCoord1"); t->used |= TEXCOORD_BIT(1); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord2")) { tr_adds(t, "mglTexCoord2"); t->used |= TEXCOORD_BIT(2); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord3")) { tr_adds(t, "mglTexCoord3"); t->used |= TEXCOORD_BIT(3); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord4")) { tr_adds(t, "mglTexCoord4"); t->used |= TEXCOORD_BIT(4); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord5")) { tr_adds(t, "mglTexCoord5"); t->used |= TEXCOORD_BIT(5); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord6")) { tr_adds(t, "mglTexCoord6"); t->used |= TEXCOORD_BIT(6); return (t->subst++, true); }
+        if (match(id, n, "gl_MultiTexCoord7")) { tr_adds(t, "mglTexCoord7"); t->used |= TEXCOORD_BIT(7); return (t->subst++, true); }
 
         /* varyings written by the vertex shader */
-        if (match(id, n, "gl_FrontColor")) { tr_adds(t, "mglFrontColor"); t->used |= U_FRONT_COLOR; return true; }
-        if (match(id, n, "gl_BackColor")) { tr_adds(t, "mglBackColor"); t->used |= U_BACK_COLOR; return true; }
-        if (match(id, n, "gl_FrontSecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return true; }
-        if (match(id, n, "gl_BackSecondaryColor")) { tr_adds(t, "mglBackSecondaryColor"); t->used |= U_BACK_SEC; return true; }
-        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordOut"); t->used |= 0; return true; }
-        if (match(id, n, "gl_ClipVertex")) { tr_adds(t, "mglClipVertex"); t->used |= U_MISC; return true; }
-        if (match(id, n, "ftransform")) { tr_adds(t, "mgl_ftransform"); t->used |= U_MVM | U_MATRICES; return true; }
+        if (match(id, n, "gl_FrontColor")) { tr_adds(t, "mglFrontColor"); t->used |= U_FRONT_COLOR; return (t->subst++, true); }
+        if (match(id, n, "gl_BackColor")) { tr_adds(t, "mglBackColor"); t->used |= U_BACK_COLOR; return (t->subst++, true); }
+        if (match(id, n, "gl_FrontSecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return (t->subst++, true); }
+        if (match(id, n, "gl_BackSecondaryColor")) { tr_adds(t, "mglBackSecondaryColor"); t->used |= U_BACK_SEC; return (t->subst++, true); }
+        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordOut"); t->used |= 0; return (t->subst++, true); }
+        if (match(id, n, "gl_ClipVertex")) { tr_adds(t, "mglClipVertex"); t->used |= U_MISC; return (t->subst++, true); }
+        if (match(id, n, "ftransform")) { tr_adds(t, "mgl_ftransform"); t->used |= U_MVM | U_MATRICES; return (t->subst++, true); }
     }
     else
     {
-        if (match(id, n, "gl_Color")) { tr_adds(t, "mglFrontColor"); t->used |= U_FRONT_COLOR; return true; }
-        if (match(id, n, "gl_SecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return true; }
-        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordIn"); return true; }
-        if (match(id, n, "gl_FragColor")) { tr_adds(t, "mglFragColor"); t->used |= U_FRAG_COLOR; return true; }
+        if (match(id, n, "gl_Color")) { tr_adds(t, "mglFrontColor"); t->used |= U_FRONT_COLOR; return (t->subst++, true); }
+        if (match(id, n, "gl_SecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return (t->subst++, true); }
+        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordIn"); return (t->subst++, true); }
+        if (match(id, n, "gl_FragColor")) { tr_adds(t, "mglFragColor"); t->used |= U_FRAG_COLOR; return (t->subst++, true); }
         if (match(id, n, "gl_FragData")) { t->used |= U_FRAG_DATA; return false; }   /* handled by the caller */
-        if (match(id, n, "gl_FogFragCoord")) { tr_adds(t, "mglFogFragCoord"); t->used |= U_MISC; return true; }
+        if (match(id, n, "gl_FogFragCoord")) { tr_adds(t, "mglFogFragCoord"); t->used |= U_MISC; return (t->subst++, true); }
     }
 
     /* matrices and other built-in uniforms (both stages) */
-    if (match(id, n, "gl_ModelViewMatrix")) { tr_adds(t, "mglModelViewMatrix"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_ProjectionMatrix")) { tr_adds(t, "mglProjectionMatrix"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ModelViewProjectionMatrix")) { tr_adds(t, "mglModelViewProjectionMatrix"); t->used |= U_MVM | U_MATRICES; return true; }
-    if (match(id, n, "gl_ModelViewMatrixInverse")) { tr_adds(t, "mglModelViewMatrixInverse"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_ModelViewMatrixTranspose")) { tr_adds(t, "mglModelViewMatrixTranspose"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_ModelViewMatrixInverseTranspose")) { tr_adds(t, "mglModelViewMatrixInverseTranspose"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_ProjectionMatrixInverse")) { tr_adds(t, "mglProjectionMatrixInverse"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ProjectionMatrixTranspose")) { tr_adds(t, "mglProjectionMatrixTranspose"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ProjectionMatrixInverseTranspose")) { tr_adds(t, "mglProjectionMatrixInverseTranspose"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ModelViewProjectionMatrixInverse")) { tr_adds(t, "mglModelViewProjectionMatrixInverse"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ModelViewProjectionMatrixTranspose")) { tr_adds(t, "mglModelViewProjectionMatrixTranspose"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_ModelViewProjectionMatrixInverseTranspose")) { tr_adds(t, "mglModelViewProjectionMatrixInverseTranspose"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_TextureMatrix")) { tr_adds(t, "mglTextureMatrix"); t->used |= U_MATRICES; return true; }
-    if (match(id, n, "gl_NormalMatrix")) { tr_adds(t, "mglNormalMatrix"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_NormalScale")) { tr_adds(t, "mglNormalScale"); t->used |= U_MVM; return true; }
-    if (match(id, n, "gl_LightModel")) { tr_adds(t, "mglLightModel"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_FrontLightModelProduct")) { tr_adds(t, "mglFrontLightModelProduct"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_BackLightModelProduct")) { tr_adds(t, "mglBackLightModelProduct"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_LightSource")) { tr_adds(t, "mglLightSource"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_FrontLightProduct")) { tr_adds(t, "mglFrontLightProduct"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_BackLightProduct")) { tr_adds(t, "mglBackLightProduct"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_FrontMaterial")) { tr_adds(t, "mglFrontMaterial"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_BackMaterial")) { tr_adds(t, "mglBackMaterial"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_Fog")) { tr_adds(t, "mglFog"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_ClipPlane")) { tr_adds(t, "mglClipPlane"); t->used |= U_LIGHTS; return true; }
-    if (match(id, n, "gl_Point")) { tr_adds(t, "mglPoint"); t->used |= U_LIGHTS; return true; }
+    if (match(id, n, "gl_ModelViewMatrix")) { tr_adds(t, "mglModelViewMatrix"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_ProjectionMatrix")) { tr_adds(t, "mglProjectionMatrix"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewProjectionMatrix")) { tr_adds(t, "mglModelViewProjectionMatrix"); t->used |= U_MVM | U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewMatrixInverse")) { tr_adds(t, "mglModelViewMatrixInverse"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewMatrixTranspose")) { tr_adds(t, "mglModelViewMatrixTranspose"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewMatrixInverseTranspose")) { tr_adds(t, "mglModelViewMatrixInverseTranspose"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_ProjectionMatrixInverse")) { tr_adds(t, "mglProjectionMatrixInverse"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ProjectionMatrixTranspose")) { tr_adds(t, "mglProjectionMatrixTranspose"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ProjectionMatrixInverseTranspose")) { tr_adds(t, "mglProjectionMatrixInverseTranspose"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewProjectionMatrixInverse")) { tr_adds(t, "mglModelViewProjectionMatrixInverse"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewProjectionMatrixTranspose")) { tr_adds(t, "mglModelViewProjectionMatrixTranspose"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_ModelViewProjectionMatrixInverseTranspose")) { tr_adds(t, "mglModelViewProjectionMatrixInverseTranspose"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_TextureMatrix")) { tr_adds(t, "mglTextureMatrix"); t->used |= U_MATRICES; return (t->subst++, true); }
+    if (match(id, n, "gl_NormalMatrix")) { tr_adds(t, "mglNormalMatrix"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_NormalScale")) { tr_adds(t, "mglNormalScale"); t->used |= U_MVM; return (t->subst++, true); }
+    if (match(id, n, "gl_LightModel")) { tr_adds(t, "mglLightModel"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_FrontLightModelProduct")) { tr_adds(t, "mglFrontLightModelProduct"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_BackLightModelProduct")) { tr_adds(t, "mglBackLightModelProduct"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_LightSource")) { tr_adds(t, "mglLightSource"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_FrontLightProduct")) { tr_adds(t, "mglFrontLightProduct"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_BackLightProduct")) { tr_adds(t, "mglBackLightProduct"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_FrontMaterial")) { tr_adds(t, "mglFrontMaterial"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_BackMaterial")) { tr_adds(t, "mglBackMaterial"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_Fog")) { tr_adds(t, "mglFog"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_ClipPlane")) { tr_adds(t, "mglClipPlane"); t->used |= U_LIGHTS; return (t->subst++, true); }
+    if (match(id, n, "gl_Point")) { tr_adds(t, "mglPoint"); t->used |= U_LIGHTS; return (t->subst++, true); }
 
     /* deprecated texture functions */
-    if (match(id, n, "texture2D")) { tr_adds(t, "texture"); return true; }
-    if (match(id, n, "texture3D")) { tr_adds(t, "texture"); return true; }
-    if (match(id, n, "textureCube")) { tr_adds(t, "texture"); return true; }
-    if (match(id, n, "texture2DProj")) { tr_adds(t, "textureProj"); return true; }
-    if (match(id, n, "texture1D")) { tr_adds(t, "texture"); return true; }
-    if (match(id, n, "shadow2D")) { tr_adds(t, "mgl_shadow2D"); return true; }
-    if (match(id, n, "shadow2DProj")) { tr_adds(t, "mgl_shadow2DProj"); return true; }
+    if (match(id, n, "texture2D")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "texture3D")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "textureCube")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "texture2DProj")) { tr_adds(t, "textureProj"); return (t->subst++, true); }
+    if (match(id, n, "texture1D")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "shadow2D")) { tr_adds(t, "mgl_shadow2D"); return (t->subst++, true); }
+    if (match(id, n, "shadow2DProj")) { tr_adds(t, "mgl_shadow2DProj"); return (t->subst++, true); }
 
     return false;
 }
@@ -251,6 +254,7 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
     t.src = joined;
     t.len = total;
     t.stage = (int)type;
+    t.user_loc = MAX_ATTRIBS - 1;
     t.out = NULL;
     t.ocap = 0;
     t.olen = 0;
@@ -347,13 +351,19 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
             {
                 if (match(id, n, "attribute") && !in_preprocessor)
                 {
-                    tr_adds(&t, "in");
+                    /* explicit location: the legacy fixed locations are taken
+                     * by gl_Vertex/gl_Color/... when the shader uses them */
+                    char loc[48];
+                    snprintf(loc, sizeof loc, "layout(location = %d) in", t.user_loc--);
+                    tr_adds(&t, loc);
+                    t.subst++;
                     t.pos += n;
                     continue;
                 }
                 if (match(id, n, "varying") && !in_preprocessor)
                 {
                     tr_adds(&t, t.stage == GL_VERTEX_SHADER ? "out" : "in");
+                    t.subst++;
                     t.pos += n;
                     continue;
                 }
@@ -415,6 +425,14 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
 
         tr_add(&t, &c, 1);
         t.pos++;
+    }
+
+    /* no legacy syntax and a modern #version: leave the source untouched */
+    if (t.subst == 0 && t.version >= 330 && !t.profile_compat)
+    {
+        free(joined);
+        free(t.out);
+        return NULL;
     }
 
     /* build the final source: preamble + rewritten body */
@@ -498,7 +516,9 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
         }
         if (t.used & (U_MVM | U_MATRICES))
         {
-            p += sprintf(p, "uniform mat4 mglModelViewProjectionMatrix;\n");
+            /* ftransform() reads gl_Vertex even when the shader does not */
+            if (!(t.used & U_VERTEX))
+                p += sprintf(p, "layout(location=%d) in vec4 mglVertex;\n", MGLC_ATTR_VERTEX);
             p += sprintf(p, "vec4 mgl_ftransform() { return mglModelViewProjectionMatrix * mglVertex; }\n");
         }
         if (t.used & U_LIGHTS)
@@ -599,9 +619,9 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
 
     /* matrices */
     l = uloc(ctx, prog, "mglModelViewMatrix");
-    if (l >= 0) mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, s->modelview_f);
+    if (l >= 0) mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, s->modelview_f);
     l = uloc(ctx, prog, "mglProjectionMatrix");
-    if (l >= 0) mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, s->projection_f);
+    if (l >= 0) mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, s->projection_f);
 
     {
         GLfloat mvp[16];
@@ -614,7 +634,7 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
             mvp[i] = (GLfloat)mvpr[i];
 
         l = uloc(ctx, prog, "mglModelViewProjectionMatrix");
-        if (l >= 0) mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, mvp);
+        if (l >= 0) mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, mvp);
     }
 
     {
@@ -628,21 +648,21 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)inv[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
             mglc_matrix_transpose(tr, inv);
             l = uloc(ctx, prog, "mglModelViewMatrixInverseTranspose");
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)tr[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
             mglc_matrix_transpose(tr, mv);
             l = uloc(ctx, prog, "mglModelViewMatrixTranspose");
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)tr[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
         }
 
@@ -662,11 +682,11 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
             }
 
             l = uloc(ctx, prog, "mglNormalMatrix");
-            if (l >= 0) mglProgramUniformMatrix3fv(ctx, prog, l, 1, GL_FALSE, nm);
+            if (l >= 0) mglUniformMatrix3fv(ctx, l, 1, GL_FALSE, nm);
 
             double len = sqrt(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
             l = uloc(ctx, prog, "mglNormalScale");
-            if (l >= 0 && len > 0) mglProgramUniform1f(ctx, prog, l, (GLfloat)(1.0 / len));
+            if (l >= 0 && len > 0) mglUniform1f(ctx, l, (GLfloat)(1.0 / len));
         }
     }
 
@@ -681,21 +701,21 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)inv[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
             mglc_matrix_transpose(tr, inv);
             l = uloc(ctx, prog, "mglProjectionMatrixInverseTranspose");
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)tr[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
             mglc_matrix_transpose(tr, pr);
             l = uloc(ctx, prog, "mglProjectionMatrixTranspose");
             if (l >= 0)
             {
                 for (int i = 0; i < 16; i++) f[i] = (GLfloat)tr[i];
-                mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, f);
+                mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, f);
             }
         }
     }
@@ -703,7 +723,7 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
     {
         l = uloc_arr(ctx, prog, "mglTextureMatrix", u);
-        if (l >= 0) mglProgramUniformMatrix4fv(ctx, prog, l, 1, GL_FALSE, s->texture_f[u]);
+        if (l >= 0) mglUniformMatrix4fv(ctx, l, 1, GL_FALSE, s->texture_f[u]);
     }
 
     /* lights / materials / fog */
@@ -723,21 +743,21 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
         {
             l = uloc_mem(ctx, prog, "mglLightSource", i, tab[k].name);
             if (l >= 0)
-                mglProgramUniform4fv(ctx, prog, l, 1, tab[k].v);
+                mglUniform4fv(ctx, l, 1, tab[k].v);
         }
 
         l = uloc_mem(ctx, prog, "mglLightSource", i, "spotExponent");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, lt->spot_exponent);
+        if (l >= 0) mglUniform1f(ctx, l, lt->spot_exponent);
         l = uloc_mem(ctx, prog, "mglLightSource", i, "spotCutoff");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, lt->spot_cutoff);
+        if (l >= 0) mglUniform1f(ctx, l, lt->spot_cutoff);
         l = uloc_mem(ctx, prog, "mglLightSource", i, "spotCosCutoff");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, (lt->spot_cutoff >= 180.0f) ? -2.0f : cosf(lt->spot_cutoff * (float)M_PI / 180.0f));
+        if (l >= 0) mglUniform1f(ctx, l, (lt->spot_cutoff >= 180.0f) ? -2.0f : cosf(lt->spot_cutoff * (float)M_PI / 180.0f));
         l = uloc_mem(ctx, prog, "mglLightSource", i, "constantAttenuation");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, lt->constant_attenuation);
+        if (l >= 0) mglUniform1f(ctx, l, lt->constant_attenuation);
         l = uloc_mem(ctx, prog, "mglLightSource", i, "linearAttenuation");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, lt->linear_attenuation);
+        if (l >= 0) mglUniform1f(ctx, l, lt->linear_attenuation);
         l = uloc_mem(ctx, prog, "mglLightSource", i, "quadraticAttenuation");
-        if (l >= 0) mglProgramUniform1f(ctx, prog, l, lt->quadratic_attenuation);
+        if (l >= 0) mglUniform1f(ctx, l, lt->quadratic_attenuation);
     }
 
     {
@@ -754,31 +774,31 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
 
             snprintf(buf, sizeof buf, "%s.emission", mats[k].base);
             l = uloc(ctx, prog, buf);
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, mats[k].m->emission);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, mats[k].m->emission);
             snprintf(buf, sizeof buf, "%s.ambient", mats[k].base);
             l = uloc(ctx, prog, buf);
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, mats[k].m->ambient);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, mats[k].m->ambient);
             snprintf(buf, sizeof buf, "%s.diffuse", mats[k].base);
             l = uloc(ctx, prog, buf);
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, mats[k].m->diffuse);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, mats[k].m->diffuse);
             snprintf(buf, sizeof buf, "%s.specular", mats[k].base);
             l = uloc(ctx, prog, buf);
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, mats[k].m->specular);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, mats[k].m->specular);
             snprintf(buf, sizeof buf, "%s.shininess", mats[k].base);
             l = uloc(ctx, prog, buf);
-            if (l >= 0) mglProgramUniform1f(ctx, prog, l, mats[k].m->shininess);
+            if (l >= 0) mglUniform1f(ctx, l, mats[k].m->shininess);
         }
     }
 
     l = uloc(ctx, prog, "mglLightModelAmbient");
-    if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, s->light_model_ambient);
+    if (l >= 0) mglUniform4fv(ctx, l, 1, s->light_model_ambient);
     l = uloc(ctx, prog, "mglFrontLightModelProduct");
     if (l >= 0)
     {
         GLfloat v[4];
         for (int i = 0; i < 4; i++)
             v[i] = s->material_front.ambient[i] * s->light_model_ambient[i];
-        mglProgramUniform4fv(ctx, prog, l, 1, v);
+        mglUniform4fv(ctx, l, 1, v);
     }
     l = uloc(ctx, prog, "mglBackLightModelProduct");
     if (l >= 0)
@@ -786,7 +806,7 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
         GLfloat v[4];
         for (int i = 0; i < 4; i++)
             v[i] = s->material_back.ambient[i] * s->light_model_ambient[i];
-        mglProgramUniform4fv(ctx, prog, l, 1, v);
+        mglUniform4fv(ctx, l, 1, v);
     }
 
     /* per-light products (material * light) */
@@ -803,31 +823,31 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
             for (int c = 0; c < 4; c++)
                 v[c] = m->ambient[c] * lt->ambient[c];
             l = uloc_mem(ctx, prog, base, i, "ambient");
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, v);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, v);
 
             for (int c = 0; c < 4; c++)
                 v[c] = m->diffuse[c] * lt->diffuse[c];
             l = uloc_mem(ctx, prog, base, i, "diffuse");
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, v);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, v);
 
             for (int c = 0; c < 4; c++)
                 v[c] = m->specular[c] * lt->specular[c];
             l = uloc_mem(ctx, prog, base, i, "specular");
-            if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, v);
+            if (l >= 0) mglUniform4fv(ctx, l, 1, v);
         }
     }
 
     /* fog */
     l = uloc(ctx, prog, "mglFog.color");
-    if (l >= 0) mglProgramUniform4fv(ctx, prog, l, 1, s->fog_color);
+    if (l >= 0) mglUniform4fv(ctx, l, 1, s->fog_color);
     l = uloc(ctx, prog, "mglFog.density");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->fog_density);
+    if (l >= 0) mglUniform1f(ctx, l, s->fog_density);
     l = uloc(ctx, prog, "mglFog.start");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->fog_start);
+    if (l >= 0) mglUniform1f(ctx, l, s->fog_start);
     l = uloc(ctx, prog, "mglFog.end");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->fog_end);
+    if (l >= 0) mglUniform1f(ctx, l, s->fog_end);
     l = uloc(ctx, prog, "mglFog.scale");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->fog_scale);
+    if (l >= 0) mglUniform1f(ctx, l, s->fog_scale);
 
     /* clip planes + point params */
     for (int i = 0; i < MGLC_MAX_CLIP_PLANES; i++)
@@ -837,20 +857,20 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
         {
             GLfloat v[4] = { (GLfloat)s->clip_plane[i][0], (GLfloat)s->clip_plane[i][1],
                              (GLfloat)s->clip_plane[i][2], (GLfloat)s->clip_plane[i][3] };
-            mglProgramUniform4fv(ctx, prog, l, 1, v);
+            mglUniform4fv(ctx, l, 1, v);
         }
     }
 
     l = uloc(ctx, prog, "mglPoint.size");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->point_size);
+    if (l >= 0) mglUniform1f(ctx, l, s->point_size);
     l = uloc(ctx, prog, "mglPoint.sizeMin");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->point_params[0]);
+    if (l >= 0) mglUniform1f(ctx, l, s->point_params[0]);
     l = uloc(ctx, prog, "mglPoint.sizeMax");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, s->point_params[1]);
+    if (l >= 0) mglUniform1f(ctx, l, s->point_params[1]);
     l = uloc(ctx, prog, "mglPoint.attenuation");
     if (l >= 0)
     {
         GLfloat v[3] = { s->point_params[3], s->point_params[4], s->point_params[5] };
-        mglProgramUniform3fv(ctx, prog, l, 1, v);
+        mglUniform3fv(ctx, l, 1, v);
     }
 }

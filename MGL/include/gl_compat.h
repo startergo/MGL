@@ -8,6 +8,14 @@
 #define GL_COMPAT_H
 #include <stddef.h>
 
+#ifndef GL_APIENTRY
+#ifdef APIENTRY
+#define GL_APIENTRY APIENTRY
+#else
+#define GL_APIENTRY
+#endif
+#endif
+
 #include <GL/glcorearb.h>
 
 
@@ -301,23 +309,47 @@
 #define GL_FOG_COORD 0x8451
 #define GL_FRAGMENT_DEPTH 0x8452
 #define GL_CURRENT_FOG_COORD 0x8453
-#endif /* GL_ACCUM */
-
-#ifndef GL_LINE_WIDTH_RANGE
 #define GL_LINE_WIDTH_RANGE 0x0B22
 #endif
+#endif /* MGL_COMPAT_ENUMS_INCLUDED */
 
 
-
+#ifndef GL_CURRENT_BIT
+#define GL_CURRENT_BIT 0x00000001
+#define GL_POINT_BIT 0x00000002
+#define GL_LINE_BIT 0x00000004
+#define GL_POLYGON_BIT 0x00000008
+#define GL_POLYGON_STIPPLE_BIT 0x00000010
+#define GL_PIXEL_MODE_BIT 0x00000020
+#define GL_LIGHTING_BIT 0x00000040
+#define GL_FOG_BIT 0x00000080
+#define GL_ACCUM_BUFFER_BIT 0x00000200
+#define GL_VIEWPORT_BIT 0x00000800
+#define GL_TRANSFORM_BIT 0x00001000
+#define GL_ENABLE_BIT 0x00002000
+#define GL_EVAL_BIT 0x00010000
+#define GL_LIST_BIT 0x00020000
+#define GL_TEXTURE_BIT 0x00040000
+#define GL_SCISSOR_BIT 0x00080000
+#define GL_MULTISAMPLE_BIT 0x20000000
+#define GL_CLIENT_PIXEL_STORE_BIT 0x00000001
+#define GL_CLIENT_VERTEX_ARRAY_BIT 0x00000002
+#define GL_ALL_ATTRIB_BITS 0xFFFFFFFF
+#define GL_CLIENT_ALL_ATTRIB_BITS 0xFFFFFFFF
 #endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifndef GL_APIENTRY
-#define GL_APIENTRY
-#endif
+/* client vertex arrays (compat) */
+void GL_APIENTRY glEnableClientState(GLenum array);
+void GL_APIENTRY glDisableClientState(GLenum array);
+void GL_APIENTRY glClientActiveTexture(GLenum texture);
+void GL_APIENTRY glPushClientAttrib(GLbitfield mask);
+void GL_APIENTRY glPopClientAttrib(void);
+
+
 
 void GL_APIENTRY glNewList(GLuint list, GLenum mode);
 void GL_APIENTRY glEndList();

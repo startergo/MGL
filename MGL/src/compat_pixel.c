@@ -549,13 +549,13 @@ static void blit_quad(GLMContext ctx, GLint x, GLint y, GLsizei w, GLsizei h, GL
     GLint l;
 
     l = mglGetUniformLocation(ctx, prog, "mglRect");
-    if (l >= 0) mglProgramUniform4f(ctx, prog, l, x0, y0, x1, y1);
+    if (l >= 0) mglUniform4f(ctx, l, x0, y0, x1, y1);
     l = mglGetUniformLocation(ctx, prog, "mglTex");
-    if (l >= 0) mglProgramUniform1i(ctx, prog, l, MGLC_STIPPLE_UNIT);
+    if (l >= 0) mglUniform1i(ctx, l, MGLC_STIPPLE_UNIT);
     l = mglGetUniformLocation(ctx, prog, "mglMode");
-    if (l >= 0) mglProgramUniform1i(ctx, prog, l, mode);
+    if (l >= 0) mglUniform1i(ctx, l, mode);
     l = mglGetUniformLocation(ctx, prog, "mglAlphaScale");
-    if (l >= 0) mglProgramUniform1f(ctx, prog, l, 1.0f);
+    if (l >= 0) mglUniform1f(ctx, l, 1.0f);
 
     /* the quad: attributes pos(0), color(3), uv(8) of the internal VAO */
     VertexArray *vao_save = STATE(vao);
@@ -918,7 +918,7 @@ void mglAccum(GLMContext ctx, GLenum op, GLfloat value)
                     GLuint prog = mgl_compat_blit_program(ctx);
                     GLint l = mglGetUniformLocation(ctx, prog, "mglAlphaScale");
                     if (l >= 0)
-                        mglProgramUniform1f(ctx, prog, l, value);
+                        mglUniform1f(ctx, l, value);
                 }
             }
 

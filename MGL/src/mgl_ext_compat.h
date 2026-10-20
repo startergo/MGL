@@ -440,7 +440,7 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
 
 /* compat_ffp.c (generated fixed-function pipeline) */
 GLuint mgl_compat_ffp_program(GLMContext ctx);        /* bind-on-demand, returns name */
-void mgl_compat_ffp_sync(GLMContext ctx, Program *prog);  /* upload uniforms */
+void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog);  /* upload uniforms */
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *prog); /* user compat shaders */
 GLuint mgl_compat_blit_program(GLMContext ctx);       /* drawpixels/bitmap helper */
 
