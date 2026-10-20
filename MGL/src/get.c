@@ -251,6 +251,10 @@ static const char *mgl_extensions[] = {
 };
 #define NUM_MGL_EXTENSIONS ((GLuint)(sizeof(mgl_extensions) / sizeof(mgl_extensions[0])))
 
+/* compat domain: size / element access of the core extension list */
+GLuint mgl_num_extensions(void) { return NUM_MGL_EXTENSIONS; }
+const char *mgl_extension_name(GLuint i) { return (i < NUM_MGL_EXTENSIONS) ? mgl_extensions[i] : NULL; }
+
 /* GLSL versions accepted by the glslang front end in a core context */
 static const char *mgl_glsl_versions[] = {
     "460 core", "450 core", "440 core", "430 core", "420 core", "410 core",
