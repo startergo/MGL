@@ -632,6 +632,7 @@ typedef struct {
     struct MGLExtState_geom *ext_geom;
     struct MGLExtState_tess *ext_tess;
     struct MGLExtState_gpuaudit *ext_gpuaudit;
+    struct MGLExtState_compat *ext_compat;
 
     // put at end, big chunk of yuck
     GLMParams   var;
@@ -724,6 +725,7 @@ struct GLMMetalFuncs {
     struct MGLExtMetal_geom *ext_geom;
     struct MGLExtMetal_tess *ext_tess;
     struct MGLExtMetal_gpuaudit *ext_gpuaudit;
+    struct MGLExtMetal_compat *ext_compat;
 } ;
 
 typedef struct GLMContextRec_t {
@@ -748,6 +750,12 @@ typedef struct GLMContextRec_t {
 GLMContext createGLMContext(GLenum format, GLenum type,
                             GLenum depth_format, GLenum depth_type,
                             GLenum stencil_format, GLenum stencil_type);
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                            GLenum depth_format, GLenum depth_type,
+                            GLenum stencil_format, GLenum stencil_type,
+                            GLenum profile);
+void mglSetNextContextProfile(GLenum profile);
+GLenum mglNextContextProfile(void);
 
 void mgl_lazy_init(void);
 

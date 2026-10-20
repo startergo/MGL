@@ -31,6 +31,12 @@ extern "C" {
 GLMContext createGLMContext(GLenum format, GLenum type,
                             GLenum depth_format, GLenum depth_type,
                             GLenum stencil_format, GLenum stencil_type);
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                            GLenum depth_format, GLenum depth_type,
+                            GLenum stencil_format, GLenum stencil_type,
+                            GLenum profile);
+void mglSetNextContextProfile(GLenum profile);
+GLenum mglNextContextProfile(void);
 
 GLuint sizeForFormatType(GLenum format, GLenum type);
 

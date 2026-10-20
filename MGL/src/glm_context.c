@@ -74,15 +74,32 @@ GLMContext mglGetContext(void)
     return _ctx;
 }
 
+/* profile of the context being created (compat domain: GL_CONTEXT_COMPATIBILITY_PROFILE_BIT).
+ * Read by mgl_ext_init_compat() during creation, then reset to core. */
+static GLenum mgl_next_context_profile = GL_CONTEXT_CORE_PROFILE_BIT;
+
 GLMContext createGLMContext(GLenum format, GLenum type,
                             GLenum depth_format, GLenum depth_type,
                             GLenum stencil_format, GLenum stencil_type)
+{
+    return createGLMContextProfile(format, type, depth_format, depth_type,
+                                   stencil_format, stencil_type,
+                                   GL_CONTEXT_CORE_PROFILE_BIT);
+}
+
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                            GLenum depth_format, GLenum depth_type,
+                            GLenum stencil_format, GLenum stencil_type,
+                            GLenum profile)
 {
     GLMContext ctx = (GLMContext)malloc(sizeof(GLMContextRec));
     GLMContext save = _ctx;
     int err;
 
     bzero((void *)ctx, sizeof(GLMContextRec));
+
+    mgl_next_context_profile = (profile == GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
+        ? GL_CONTEXT_COMPATIBILITY_PROFILE_BIT : GL_CONTEXT_CORE_PROFILE_BIT;
 
     _ctx = ctx;
 
@@ -293,6 +310,18 @@ GLMContext createGLMContext(GLenum format, GLenum type,
 void MGLsetCurrentContext(GLMContext ctx)
 {
     _ctx = ctx;
+}
+
+/* set the profile of the *next* created context (compat domain) */
+void mglSetNextContextProfile(GLenum profile)
+{
+    mgl_next_context_profile = (profile == GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
+        ? GL_CONTEXT_COMPATIBILITY_PROFILE_BIT : GL_CONTEXT_CORE_PROFILE_BIT;
+}
+
+GLenum mglNextContextProfile(void)
+{
+    return mgl_next_context_profile;
 }
 
 GLMContext MGLgetCurrentContext(void)
