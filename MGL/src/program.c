@@ -1154,8 +1154,52 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         {
             if (list[i].id != rl->list[i]._id) continue;
             unsigned msl_b = spvc_compiler_msl_get_automatic_resource_binding(compiler, list[i].id);
-            if (msl_b > 0 && msl_b < 31)
+            /* 0 is a legitimate Metal buffer index (and the common one): it must not be
+             * treated as "no binding", or the resource is bound at its GL binding point
+             * instead and the shader reads an unbound buffer */
+            if (msl_b < 31)
                 rl->list[i].msl_binding = msl_b;
+        }
+    }
+
+    /*
+     * UBO / SSBO instance arrays (GL: `uniform Block { ... } inst[3];`) are flattened by
+     * SPIRV-Cross into one Metal buffer argument per instance (blk_0 [[buffer(b)]],
+     * blk_1 [[buffer(b+1)]], ...).  GL addresses every instance separately: one block index
+     * per instance, each with its own binding point (the CTS sets binding = block index).
+     * The resource list therefore carries one entry per instance, in MSL buffer order —
+     * which is the order the renderer's buffer map binds at.  `location` (unused for
+     * buffers) carries the instance index so mgli_apply_block_binding() can re-point each
+     * entry from the matching MGLIBlock.
+     */
+    static const int buffer_res_types[2] = { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER };
+    for (size_t t = 0; t < 2; t++)
+    {
+        int res_type = buffer_res_types[t];
+        SpirvResourceList *rl = &ptr->spirv_resources_list[stage][res_type];
+        if (!rl->list) continue;
+        for (GLuint i = 0; i < rl->count; i++)
+        {
+            spvc_type rtype = spvc_compiler_get_type_handle(compiler, rl->list[i].type_id);
+            if (!rtype) continue;
+            unsigned n = array_size(rtype);
+            if (n <= 1) { rl->list[i].location = 0; continue; }
+            SpirvResource *grown = (SpirvResource *)realloc(rl->list, (size_t)(rl->count + n - 1) * sizeof(SpirvResource));
+            if (!grown) continue;
+            rl->list = grown;
+            memmove(&rl->list[i + n], &rl->list[i + 1], (size_t)(rl->count - i - 1) * sizeof(SpirvResource));
+            rl->count += n - 1;
+            SpirvResource base = rl->list[i];
+            for (unsigned j = 0; j < n; j++)
+            {
+                SpirvResource *e = &rl->list[i + j];
+                if (j) *e = base;
+                e->binding += j;
+                e->msl_binding += j;
+                e->location = j;
+                if (j) e->name = strdup(base.name);   /* each entry owns its name */
+            }
+            i += n - 1;   /* the copies are already instance entries */
         }
     }
 

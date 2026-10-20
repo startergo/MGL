@@ -863,20 +863,33 @@ static void tessBindStageUniforms(GLMContext ctx, id<MTLComputeCommandEncoder> e
     for (int t = 0; t < 3; t++)
     {
         SpirvResourceList *list = &program->spirv_resources_list[stage][types[t].spvc];
-        int index = 0;
+        /* buffer_base is indexed by the internal buffer-type index, not by the GLenum */
+        int glt = (types[t].glt == GL_UNIFORM_BUFFER) ? _UNIFORM_BUFFER :
+                  (types[t].glt == GL_SHADER_STORAGE_BUFFER) ? _SHADER_STORAGE_BUFFER :
+                  _ATOMIC_COUNTER_BUFFER;
 
         for (int r = 0; r < list->count && r < 24; r++)
         {
-            Buffer *buf = ctx->state.buffer_base[types[t].glt].buffers[list->list[r].binding].buf;
+            /* bind at the buffer index the stage's MSL actually uses (msl_binding from
+             * SPIRV-Cross, see compile_stage); a running counter made UBOs and SSBOs
+             * overwrite each other's slots */
+            int index = (int)list->list[r].msl_binding;
+            GLuint b = list->list[r].binding;
+            if (b >= MAX_BINDABLE_BUFFERS)
+                continue;   /* binding point out of range for this target */
+            Buffer *buf = ctx->state.buffer_base[glt].buffers[b].buf;
             if (!buf || !buf->data.buffer_data)
-            {
-                index++;
                 continue;
-            }
             [enc setBuffer: (__bridge id<MTLBuffer>)buf->data.mtl_data
-                     offset: (NSUInteger)ctx->state.buffer_base[types[t].glt].buffers[list->list[r].binding].offset
+                     offset: (NSUInteger)ctx->state.buffer_base[glt].buffers[b].offset
                     atIndex: (NSUInteger)index];
-            index++;
+            if (tTrace())
+                NSLog(@"MGL tess: bind stage %d type %d r=%d gl_binding=%u msl=%d buf=%p", stage, t, r,
+                      b, index, (void *)buf->data.mtl_data);
+            /* storage / atomic buffers can be written by the kernel: the CPU has to see it
+             * (glMapBufferRange / glBufferSubData sync off this tracking) */
+            if (t > 0)
+                mgl_buffers_mark_gpu_use(ctx, buf, true);
         }
     }
 }
@@ -1039,6 +1052,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
     /* the control point record stride: the FULL TCS/VS output record (the TES may
      * only read a subset of it; its offsets were remapped at link time) */
     size_t cp_stride = tp->cp_record_full_size ? tp->cp_record_full_size : cp_record;
+    if (cp_stride == 0)
+        cp_stride = 16;    /* legal GL: a TCS may write only tess levels (no per-vertex
+                              outputs) — the record is then unused, but the gather /
+                              tessellator stages still need a stride */
     uint32_t minv = 0, maxv = 0;
     TessVSPlan plan;
     id<MTLCommandBuffer> compute_cb;
@@ -1108,10 +1125,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
 
     /* ---- 1. vertex stage: compute kernel over (vertices, instances) ---- */
     if (!tessBuildVSPlan(ctx, prog_vs, &plan, vfirst, baseinstance))
-        return false;
+         return false;
     vs_pso = tessVsPSO(ctx, _device, prog_vs, &plan);
     if (!vs_pso)
-        return false;
+         return false;
 
     /* ---- indexed draws: everything on the GPU --------------------------------
      * A scan kernel min/max's the vertex indices (sizes the VS grid) into a scratch
@@ -1129,16 +1146,16 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         id<MTLComputePipelineState> scan_pso = tessScanPSOCreate(_device);
         gather_pso = tessGatherPSO(_device);
         if (!scan_pso || !tessScanSetupPSO || !gather_pso)
-            return false;
+             return false;
         if (offset > (size_t)ctx->state.vao->element_array.buffer->size ||
             (size_t)count * esize > (size_t)ctx->state.vao->element_array.buffer->size - offset)
-            return false;
+             return false;
         {
             Buffer *ebuf = ctx->state.vao->element_array.buffer;
             [self bindMTLBuffer: ebuf];
             ebuf_mtl = (__bridge id<MTLBuffer>)(ebuf->data.mtl_data);
             if (!ebuf_mtl)
-                return false;
+                 return false;
         }
 
         /* ---- index analysis -------------------------------------------------------
@@ -1192,7 +1209,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 struct TessScanEnt *ne;
 
                 if (!tessReadIndicesInto(ctx, type, offset, count, basevertex, &idx, &minv, &maxv))
-                    return false;
+                     return false;
                 mgl_tess_note_cpu_index_read();
 
                 for (GLsizei i = 0; i < count; i++)
@@ -1283,7 +1300,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
                 if (!ring)
                 {
                     NSLog(@"MGL ERROR: tess: scratch ring exhausted");
-                    return false;
+                     return false;
                 }
             }
             /* stash the gather parameters where the compute phase dispatch picks them
@@ -1348,7 +1365,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
-                return false;
+                 return false;
             }
 
             /* scan -> setup: min/max/restart on the GPU, then the vertex kernel's
@@ -1427,7 +1444,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
-                return false;
+                 return false;
             }
         }
     }
@@ -1474,7 +1491,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         if (!tessBindVSAttributes(ctx, cenc, &plan, (GLuint)vcount))
         {
             [cenc endEncoding];
-            return false;
+             return false;
         }
         [cenc setBuffer: ring offset: off_vs_out atIndex: MGL_TESS_VS_OUT_BUF];
         if (gpu_indexed)
@@ -1563,7 +1580,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
         if (!tcs_pso)
         {
             [cenc endEncoding];
-            return false;
+             return false;
         }
 
         [cenc setComputePipelineState: tcs_pso];
@@ -1734,10 +1751,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             size_t patch_off = tp->has_tcs ? off_tcs_patch : off_patch_data;
 
             if (![self processGLState: true])
-                return false;
+                 return false;
             enc = _currentRenderEncoder;
             if (!enc)
-                return false;
+                 return false;
 
             [enc setVertexBuffer: ring offset: cp_source_off atIndex: MGL_TESS_VD_CP];
             [enc setVertexBuffer: ring offset: patch_off atIndex: MGL_TESS_VD_PATCH];
@@ -2076,10 +2093,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             id<MTLRenderCommandEncoder> enc;
 
             if (![self processGLState: true])
-                return false;
+                 return false;
             enc = _currentRenderEncoder;
             if (!enc)
-                return false;
+                 return false;
 
             [enc setVertexBuffer: (__bridge id<MTLBuffer>)S->gpu_scratch offset: S->gpu_coords_offset atIndex: MGL_TESS_TES_COORDS];
             /* the TES reads the control points where the VS kernel (no TCS) or the TCS
@@ -2275,7 +2292,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
             if (tRingCap[ring_slot] < base + need)
             {
                 NSLog(@"MGL ERROR: tess: CPU reference scratch overflow");
-                return false;
+                 return false;
             }
             off_coords = base;
             off_indices = base + tessRingAlign(coord_bytes);
@@ -2299,10 +2316,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
 
         /* processGLState builds the render encoder and the (TES-based) pipeline */
         if (![self processGLState: true])
-            return false;
+             return false;
         enc = _currentRenderEncoder;
         if (!enc)
-            return false;
+             return false;
 
         [enc setVertexBuffer: ring offset: off_coords atIndex: MGL_TESS_TES_COORDS];
         [enc setVertexBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
@@ -2355,16 +2372,16 @@ static bool tessReadIndicesInto(GLMContext ctx, GLenum type, size_t offset, GLsi
 
     *dst = NULL;
     if (!ebuf || !ebuf->data.buffer_data)
-        return false;
+         return false;
     if (offset > (size_t)ebuf->size || (size_t)count * esize > (size_t)ebuf->size - offset)
-        return false;
+         return false;
 
     mgl_buffers_prepare_cpu_read(ctx, ebuf);
     ptr = (const uint8_t *)ebuf->data.buffer_data + offset;
 
     out = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
     if (!out)
-        return false;
+         return false;
 
     for (GLsizei i = 0; i < count; i++)
     {
@@ -2430,7 +2447,7 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
         {
             /* small buffer without a Metal object: compute stage-in needs a real buffer */
             if (!tessBufferEnsure(((__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj)->_device, &tSmallAttr, 8192))
-                return false;
+                 return false;
             memcpy(tSmallAttr.contents, (const void *)(uintptr_t)buf->data.buffer_data,
                    (size_t)buf->size < 8192 ? (size_t)buf->size : 8192);
             [enc setBuffer: tSmallAttr offset: plan->binding_offset[b] atIndex: (NSUInteger)idx];
@@ -2463,7 +2480,7 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
         if (s->fetch != TESS_FETCH_SHADOW)
             continue;
         if (!tessConvertShadowStream(ctx, s, vertex_count))
-            return false;
+             return false;
         [enc setBuffer: tShadowBuf offset: 0 atIndex: (NSUInteger)s->shadow_buffer];
     }
     return true;
@@ -2483,7 +2500,7 @@ static bool tessConvertShadowStream(GLMContext ctx, TessAttribSlot *s, GLuint ve
     size_t need = (size_t)vertex_count * 16 + 16;
 
     if (!tessBufferEnsure(self2->_device, &tShadowBuf, need))
-        return false;
+         return false;
 
     if (src)
         mgl_buffers_prepare_cpu_read(ctx, b->buffer);

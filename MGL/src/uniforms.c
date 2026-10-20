@@ -408,7 +408,14 @@ void mgli_apply_block_binding(GLMContext ctx, MGLIProgram *ip, MGLIBlock *b, int
         if (!b->spv_id[s]) continue;
         SpirvResourceList *l = &p->spirv_resources_list[s][res_type];
         for (GLuint k = 0; k < l->count; k++)
-            if (l->list[k]._id == b->spv_id[s] && b->array_element <= 0) l->list[k].binding = (GLuint)b->binding;
+        {
+            /* instance arrays carry one resource entry per instance; match it by the
+             * instance index recorded in `location` (see compile_stage in program.c) */
+            if (l->list[k]._id != b->spv_id[s] ||
+                l->list[k].location != (GLuint)(b->array_element > 0 ? b->array_element : 0))
+                continue;
+            l->list[k].binding = (GLuint)b->binding;
+        }
     }
     ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
 }
