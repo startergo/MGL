@@ -48,6 +48,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "mgl_ext_geom.h"
 #import "mgl_ext_program.h"
 #import "mgl_ext_tess.h"
+#import "mgl_ext_buffers.h"
 #import "MGLRenderer+TextureExt.h"
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer+Framebuffer.h"
@@ -447,7 +448,13 @@ static char kComputeFallbackKey;
                     buffer_map->buffers[buffer_map->count].offset = buffers[spirv_binding].offset;
                     buffer_map->count++;
                     buffers_to_be_mapped--;
-                    
+
+                    /* shader storage / atomic counter buffers may be written by the shader:
+                     * CPU reads (glMapBufferRange, glGetBufferSubData, ...) sync off this */
+                    if (spvc_type == SPVC_RESOURCE_TYPE_STORAGE_BUFFER ||
+                        spvc_type == SPVC_RESOURCE_TYPE_ATOMIC_COUNTER)
+                        mgl_buffers_mark_gpu_use(ctx, buf, true);
+
                     //DEBUG_PRINT("Found buffer type: %s buffer_base_index: %d\n", mapped_types[type].name, spirv_binding);
                 }
                 else
@@ -2847,8 +2854,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     fragment_shader = program->shader_slots[_FRAGMENT_SHADER];
     if (!vertex_shader || !fragment_shader)
     {
-        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u lacks stages (vs=%@ fs=%@ tess=%@)",
-              program->name, vertex_shader, fragment_shader, program->shader_slots[_TESS_EVALUATION_SHADER]);
+        /* the slots are C pointers, not objects: %@ on them would crash objc_msgSend */
+        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u lacks stages (vs=%p fs=%p tess=%p)",
+              program->name, (void *)vertex_shader, (void *)fragment_shader,
+              (void *)program->shader_slots[_TESS_EVALUATION_SHADER]);
         return NULL;
     }
 

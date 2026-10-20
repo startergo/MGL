@@ -495,6 +495,120 @@ TEST(cts_ubo_instance_array_vec4)
     EXPECT_TRUE(uboarr_near(px, 191, 191, 191, 191));   /* 0.25+0.5 */
 }
 
+
+/* ------------------------------------------------------------------ cluster #4: tess control SSBO write + map read
+ * KHR-GL46.constant_expressions.*_tess_control / *_tess_eval (464 cases): the CTS runs the
+ * expression in a tess control shader that writes an SSBO, then maps the buffer READ.  This
+ * exercises MGL's tessellation emulation (VS kernel -> TCS kernel -> hardware TES). */
+
+static int cts_tess_ssbo_case(const char *tcs_body, float *out)
+{
+    static const char *vs = "#version 460 core\nvoid main() { gl_Position = vec4(float(gl_VertexID), 0.0, 0.0, 1.0); }\n";
+    static const char *tcs_tpl =
+        "#version 460 core\n"
+        "layout(vertices = 1) out;\n"
+        "struct Outputs { highp int out0; };\n"
+        "layout(binding = 1, std430) buffer OutBuffer { Outputs outputs[]; };\n"
+        "void main() {\n"
+        "    gl_TessLevelInner[0] = 1.0;\n"
+        "    gl_TessLevelInner[1] = 1.0;\n"
+        "    gl_TessLevelOuter[0] = 1.0;\n"
+        "    gl_TessLevelOuter[1] = 1.0;\n"
+        "    gl_TessLevelOuter[2] = 1.0;\n"
+        "    gl_TessLevelOuter[3] = 1.0;\n"
+        "%s"
+        "}\n";
+    static const char *tes =
+        "#version 460 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+    static const char *fs = "#version 460 core\nlayout(location=0) out vec4 c;\nvoid main() { c = vec4(1.0); }\n";
+
+    char tcs[2048];
+    snprintf(tcs, sizeof tcs, tcs_tpl, tcs_body);
+
+    GLuint prog = glCreateProgram();
+    struct { GLenum t; const char *src; } st[4] = {
+        { GL_VERTEX_SHADER, vs },
+        { GL_TESS_CONTROL_SHADER, tcs },
+        { GL_TESS_EVALUATION_SHADER, tes },
+        { GL_FRAGMENT_SHADER, fs },
+    };
+    for (int i = 0; i < 4; i++)
+    {
+        GLuint s = glCreateShader(st[i].t);
+        const char *src = st[i].src;
+        glShaderSource(s, 1, &src, NULL);
+        glCompileShader(s);
+        GLint cok = 0;
+        glGetShaderiv(s, GL_COMPILE_STATUS, &cok);
+        if (!cok)
+        {
+            char log[1024] = "";
+            glGetShaderInfoLog(s, sizeof log - 1, NULL, log);
+            fprintf(stderr, "  shader 0x%x: %s", st[i].t, log);
+        }
+        glAttachShader(prog, s);
+        glDeleteShader(s);
+    }
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) { glDeleteProgram(prog); return -1; }
+
+    GLuint buf = 0;
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 256, NULL, GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, buf);
+
+    static const float patch_data[12] = {0};
+    GLuint va = 0, vbo = 0;
+    glGenVertexArrays(1, &va);
+    glBindVertexArray(va);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof patch_data, patch_data, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, (void *)0);
+
+    glUseProgram(prog);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
+
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    int *q = (int *)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 256, GL_MAP_READ_BIT);
+    EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
+    EXPECT_TRUE(q != NULL);
+    if (q) { *out = (float)q[0]; glUnmapBuffer(GL_SHADER_STORAGE_BUFFER); }
+
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &va);
+    glDeleteBuffers(1, &buf);
+    glDeleteProgram(prog);
+    return 0;
+}
+
+TEST(cts_tess_control_ssbo_write_and_map_read)
+{
+    float out = 0.0f;
+    int rc = cts_tess_ssbo_case("    outputs[uint(gl_PrimitiveID)].out0 = 42;\n", &out);
+    EXPECT_EQ_INT(rc, 0);
+    EXPECT_EQ_INT((int)out, 42);
+}
+
+TEST(cts_tess_control_ssbo_const_expr_array_length)
+{
+    /* the CTS case array_abs_int_tess_control: a local array with a const-expression size */
+    float out = 0.0f;
+    int rc = cts_tess_ssbo_case(
+        "    float array[int(abs(int(-2)))];\n"
+        "    outputs[uint(gl_PrimitiveID)].out0 = array.length();\n", &out);
+    EXPECT_EQ_INT(rc, 0);
+    EXPECT_EQ_INT((int)out, 2);
+}
 int main(void)
 {
     RUN(cts_msl_reserved_sampler_uniform);
@@ -508,5 +622,7 @@ int main(void)
     RUN(cts_ubo_single_column_major_mat2);
     RUN(cts_ubo_instance_array_float);
     RUN(cts_ubo_instance_array_vec4);
+    RUN(cts_tess_control_ssbo_write_and_map_read);
+    RUN(cts_tess_control_ssbo_const_expr_array_length);
     return mgl_test_summary();
 }

@@ -1040,7 +1040,10 @@ static char *rewrite_vs_kernel(const char *msl)
     buf_replace(&out, &len, &cap, ", uint3 spvStageInputSize [[grid_size]]", "");
     buf_replace(&out, &len, &cap, ", uint3 spvDispatchBase [[grid_origin]]", "");
 
-    /* insert the locals and the params parameter right after the opening brace */
+    /* insert the locals right after the opening brace.  The buffer is grown with realloc,
+     * so the insertion point is kept as an offset — a moved allocation invalidated the
+     * pointer before, the prologue landed in freed memory and the kernel compiled with
+     * undeclared spvStageInputSize / mgl_vs_params (KHR-GL46 tessellation clusters) */
     {
         char *open = strstr(out, "kernel void ");
         open = open ? strchr(open, '{') : NULL;
@@ -1055,10 +1058,14 @@ static char *rewrite_vs_kernel(const char *msl)
                          "\n    uint3 spvStageInputSize = uint3(mgl_vs_params[1], mgl_vs_params[2], 1u);\n"
                          "    uint3 spvDispatchBase = uint3(mgl_vs_params[0], mgl_vs_params[3], 0u);\n");
         (void)n;
-        size_t plen = strlen(prologue), taillen = len - (size_t)(open + 1 - out);
-        out = (char *)realloc(out, len + plen + 1);
-        memmove(open + 1 + plen, open + 1, taillen + 1);
-        memcpy(open + 1, prologue, plen);
+        size_t plen = strlen(prologue), open_off = (size_t)(open + 1 - out);
+        size_t taillen = len - open_off;
+        char *grown = (char *)realloc(out, len + plen + 1);
+        if (!grown) { free(out); return NULL; }
+        out = grown; cap = len + plen + 1;
+        char *ins = out + open_off;
+        memmove(ins + plen, ins, taillen + 1);
+        memcpy(ins, prologue, plen);
         len += plen;
     }
 
@@ -1101,14 +1108,18 @@ static char *rewrite_vs_kernel(const char *msl)
         }
 
         char add[128];
-        size_t addlen, taillen;
+        size_t addlen, taillen, close_off;
         snprintf(add, sizeof add, ", constant uint* mgl_vs_params [[buffer(%d)]]", MGL_TESS_VS_PARAMS);
         addlen = strlen(add);
         taillen = strlen(close);
-        out = (char *)realloc(out, len + addlen + 1);
-        close = out + (close - out);
+        close_off = (size_t)(close - out);          /* offset: realloc may move the buffer */
+        char *grown = (char *)realloc(out, len + addlen + 1);
+        if (!grown) { free(out); return NULL; }
+        out = grown; cap = len + addlen + 1;
+        close = out + close_off;
         memmove(close + addlen, close, taillen + 1);
         memcpy(close, add, addlen);
+        len += addlen;
     }
 
     return out;
@@ -2878,6 +2889,37 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                             memmove(w + strlen(".insideTessellationFactor"),
                                     w + strlen(".insideTessellationFactor[0]"), tail);
                             w += strlen(".insideTessellationFactor");
+                        }
+                        /* gl_TessLevelInner[1] is meaningless for triangles; map it onto the
+                         * scalar inside factor MTLTriangleTessellationFactorsHalf has */
+                        for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[1]")) != NULL; )
+                        {
+                            size_t tail = strlen(w + strlen(".insideTessellationFactor[1]")) + 1;
+                            memmove(w + strlen(".insideTessellationFactor"),
+                                    w + strlen(".insideTessellationFactor[1]"), tail);
+                            w += strlen(".insideTessellationFactor");
+                        }
+                        /* gl_TessLevelOuter[3] is unused for triangles and the factor record
+                         * only has three edges: drop such stores (keeping the right-hand
+                         * side's side effects) */
+                        for (char *w = msl; (w = strstr(w, ".edgeTessellationFactor[3]")) != NULL; )
+                        {
+                            char *ls = w, *semi = strchr(w, ';'), *eq, *rhs;
+                            char repl[512];
+                            while (ls > msl && ls[-1] != '\n' && ls[-1] != ';' &&
+                                   ls[-1] != '{' && ls[-1] != '}')
+                                ls--;
+                            if (!semi) { w += strlen(".edgeTessellationFactor"); continue; }
+                            eq = semi;
+                            while (eq > ls && eq[-1] != '=') eq--;
+                            if (eq == ls) { w = semi; continue; }   /* not a plain assignment */
+                            rhs = eq;
+                            while (*rhs == ' ' || *rhs == '=') rhs++;
+                            snprintf(repl, sizeof repl, "(void)(%.*s);", (int)(semi - rhs), rhs);
+                            size_t span = (size_t)(semi - ls + 1);
+                            memset(ls, ' ', span);
+                            memcpy(ls, repl, strlen(repl) <= span ? strlen(repl) : span);
+                            w = ls + span;
                         }
                         changed = true;
                     }

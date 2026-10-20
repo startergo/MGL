@@ -1154,7 +1154,10 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         {
             if (list[i].id != rl->list[i]._id) continue;
             unsigned msl_b = spvc_compiler_msl_get_automatic_resource_binding(compiler, list[i].id);
-            if (msl_b > 0 && msl_b < 31)
+            /* 0 is a legitimate Metal buffer index (and the common one): it must not be
+             * treated as "no binding", or the resource is bound at its GL binding point
+             * instead and the shader reads an unbound buffer */
+            if (msl_b < 31)
                 rl->list[i].msl_binding = msl_b;
         }
     }
