@@ -27,8 +27,12 @@ typedef struct MGLTexParamRecord {
     GLboolean   fixed_sample_locations;
 } MGLTexParamRecord;
 
-#define MGL_TEXPARAM_NUM_PROXY 11
+/* Hard cap on the per-name texparam record array (names above this, and the
+ * internal sentinel names >= TEX_OBJ_RES_NAME, get no record).  Real GL names
+ * are small sequential integers from MGL's name allocator. */
+#define MGL_TEXPARAM_MAX_RECORDS (1u << 22)
 
+#define MGL_TEXPARAM_NUM_PROXY 11
 /* GL-side state, reachable as ctx->state.ext_texparam; allocated in mgl_ext_init_texparam(). */
 struct MGLExtState_texparam {
     MGLTexParamRecord *records;         /* indexed by texture name */

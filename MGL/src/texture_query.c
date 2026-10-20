@@ -228,6 +228,16 @@ MGLTexParamRecord *mgl_texparam_record(GLMContext ctx, GLuint name, bool create)
     if (!st || name == 0)
         return NULL;
 
+    /* Guard the array growth below:
+     *  - TEX_OBJ_RES_NAME (0xcafebeef) and friends are internal sentinel names
+     *    (default texture / renderbuffer objects), never real GL names;
+     *  - real names are small sequential integers, so cap the record array.
+     * Without this, "while (n <= name) n *= 2" wraps a GLuint for names
+     * >= 2^31 and spins forever (seen as a hang on glTexBuffer() against the
+     * default GL_TEXTURE_BUFFER object, which the CTS state reset does). */
+    if (name >= TEX_OBJ_RES_NAME || name >= MGL_TEXPARAM_MAX_RECORDS)
+        return NULL;
+
     if (name >= st->num_records)
     {
         if (!create)
@@ -236,6 +246,8 @@ MGLTexParamRecord *mgl_texparam_record(GLMContext ctx, GLuint name, bool create)
         GLuint n = st->num_records ? st->num_records : 64;
         while (n <= name)
             n *= 2;
+        if (n > MGL_TEXPARAM_MAX_RECORDS)
+            n = MGL_TEXPARAM_MAX_RECORDS;
 
         MGLTexParamRecord *r = (MGLTexParamRecord *)realloc(st->records, n * sizeof(MGLTexParamRecord));
         if (!r)
