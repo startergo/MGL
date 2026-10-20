@@ -2180,6 +2180,85 @@ TEST(wild_index_survives_cpu_assembly)
     glDeleteProgram(p);
 }
 
+TEST(element_store_tail_integrity)
+{
+    /* regression test for the "0xfffed312 at a fixed tail index" report: a 300032-word
+     * element store whose scattered indices are built with (GLuint)((i * 7919) % VERTS)
+     * must contain exactly those words at every index — in particular from i = 271182,
+     * where i * 7919 overflows a signed int and the naive signed expression produces
+     * (GLuint)(-77038) = 0xfffed312.  The index is well inside the store (271182 <
+     * 300032), so what the assembly reads must be what was uploaded; the driver must not
+     * truncate or mangle the tail. */
+    enum { WORDS = 300032, VERTS2 = 100000 };
+    const char *gs = "#version 450 core\n"
+                     "layout(triangles) in;\n"
+                     "layout(triangle_strip, max_vertices = 3) out;\n"
+                     "layout(location=0) in vec2 v_pos[];\n"
+                     "layout(location=0) out vec2 g_pos;\n"
+                     "void main(){\n"
+                     "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; g_pos = v_pos[i]; EmitVertex(); }\n"
+                     "  EndPrimitive();\n"
+                     "}\n";
+    GLuint p = program(plain_vs, gs, plain_fs);
+    GLuint ebo = 0, q = 0;
+    GLuint *idx = malloc(sizeof(GLuint) * WORDS);
+    GLuint *back = malloc(sizeof(GLuint) * WORDS);
+    GLint emitted = 0;
+
+    if (!p) { free(idx); free(back); return; }
+
+    for (GLuint i = 0; i < WORDS; i++)
+        idx[i] = (GLuint)((i * 7919u) % VERTS2);   /* unsigned: no overflow for any i */
+
+    /* the VAO must be bound before the element buffer (element-array binding is per-VAO),
+     * and every index must be in range so the draw is fully defined */
+    {
+        float *verts = malloc(sizeof(float) * 2 * VERTS2);
+        for (int i = 0; i < VERTS2; i++)
+        {
+            verts[i * 2 + 0] = -1.0f + 2.0f * (float)(i % 977) / 976.0f;
+            verts[i * 2 + 1] = -1.0f + 2.0f * (float)((i * 31) % 977) / 976.0f;
+        }
+        setup(VERTS2, verts);
+        free(verts);
+    }
+
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * WORDS, idx, GL_STATIC_DRAW);
+
+    /* read the store back and compare word by word */
+    glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof(GLuint) * WORDS, back);
+    EXPECT_NO_GL_ERROR();
+    {
+        int bad = 0;
+        for (GLuint i = 0; i < WORDS; i++)
+            if (back[i] != (GLuint)((i * 7919u) % VERTS2)) bad++;
+        EXPECT_EQ_INT(bad, 0);
+        /* the exact words that a signed (int)(i * 7919) % VERTS would corrupt */
+        EXPECT_EQ_INT(back[271181], (GLuint)(271181u * 7919u) % VERTS2);
+        EXPECT_EQ_INT(back[271182], 90258u);
+        EXPECT_EQ_INT(back[271182] == 0xfffed312u, 0);
+        EXPECT_EQ_INT(back[WORDS - 1], (GLuint)(((GLuint)(WORDS - 1)) * 7919u) % VERTS2);
+    }
+
+    /* and the assembly must accept the store: draw through the GS and count primitives */
+    glUseProgram(p);
+    glGenQueries(1, &q);
+    glBeginQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED, q);
+    glDrawElements(GL_TRIANGLES, WORDS, GL_UNSIGNED_INT, NULL);
+    glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &emitted);
+    EXPECT_EQ_INT(emitted, WORDS / 3);
+
+    glDeleteQueries(1, &q);
+    glDeleteBuffers(1, &ebo);
+    glDeleteProgram(p);
+    free(idx);
+    free(back);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     RUN(block_vs_fs_control);
@@ -2217,5 +2296,6 @@ int main(void)
     RUN(pool_rotation_hazard);
     RUN(wild_index_survives_cpu_assembly);
     RUN(xfb_gpu_pack_multiple_draws_and_pause);
+    RUN(element_store_tail_integrity);
     return mgl_test_summary();
 }
