@@ -104,6 +104,34 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
   rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
 
+## Session 8d (commits "indexed line stipple ...", "feedback ... per-vertex data")
+
+* Indexed (glDrawElements/glDrawRangeElements) line stipple works now: the distance
+  from the strip start is a per-vertex attribute, but a vertex reused at two places
+  of the index stream has two distances, so stippled indexed line draws are
+  de-indexed (draw_elements_stippled_lines() in compat_vb.c): every enabled client
+  array is gathered in draw order, upload_line_stipple() feeds the distances for
+  that order, then a plain glDrawArrays draws it.  Falls back to the indexed path
+  when the array memory cannot be read.
+* REAL BUG FIXED while testing that: the generated shader tested the stipple
+  pattern MSB-first ("bit 15 is the first pixel").  GL numbers the pattern
+  LSB-first (proof: Mesa draw_pipe_stipple.c stipple_test() tests
+  (1 << ((counter / factor) & 15)) & pattern, counter starting at 0).  The shader
+  now tests bit (idx % 16) and tests/test_compat_render3.c line_stipple pins the
+  exact pixel set of 0x00FF (first 8 of each 16 lit).  tests/test_compat_render8.c
+  covers indexed strips with vertex reuse, per-segment restarts, and the
+  unstippled indexed paths.
+* Feedback now records per-vertex data: the color array (unit 0 texcoord array)
+  is read per vertex for glDrawArrays/glDrawElements and from the immediate-mode
+  batch (mgl_compat_cpu_draw_rgba / _indexed_rgba, mgl_compat_read_feedback_attribs
+  / mgl_compat_read_array in compat_vb.c); when the arrays are disabled the
+  current color/texcoord is recorded as before.  Gap (documented): lighting and
+  texgen are not applied to feedback colors/coords (GL records the *lit* vertex
+  color); feedback is a picking-style feature and no test relies on lit colors.
+  Also fixed in passing: the glDrawElements feedback path used absolute indices
+  into the [mn,mx]-rebased position array.
+* Tests: test_compat_render8.c (72 checks), feedback tests in render2 (+46).
+
 ## Session 8c (commit "legacy texture formats at real precision")
 
 * LUMINANCE / ALPHA / INTENSITY / LUMINANCE_ALPHA textures are no longer expanded

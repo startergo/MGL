@@ -529,6 +529,13 @@ void mgl_compat_list_record_client_active_texture(GLMContext ctx, GLenum texture
 void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n);
 GLuint mgl_compat_build_tri_indices(GLMContext ctx, GLenum mode, GLuint n, uint32_t **idx);
 void mgl_compat_cpu_draw_indexed(GLMContext ctx, GLenum mode, const float *pos, const uint32_t *idx, GLuint count);
+void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLuint n,
+                              const float *col, const float *tex);
+void mgl_compat_cpu_draw_indexed_rgba(GLMContext ctx, GLenum mode, const float *pos, const uint32_t *idx,
+                                      GLuint count, const float *col, const float *tex);
+float *mgl_compat_read_array(GLMContext ctx, GLuint attrib, GLuint first, GLuint count);
+void mgl_compat_read_feedback_attribs(GLMContext ctx, GLuint first, GLuint count,
+                                      float **col, float **tex);
 
 /* compat_pixel.c */
 void mgl_compat_raster_pos(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfloat w);

@@ -560,6 +560,108 @@ TEST(line_diamond_rule)
     EXPECT_NO_GL_ERROR();
 }
 
+/* feedback must record per-vertex color / texcoords of client arrays, in
+ * draw order (also for indexed draws, which revisit vertices) */
+TEST(feedback_per_vertex_data)
+{
+    setup_2d(64, 64);
+
+    static const float pos[4][4] = {
+        { 4, 4, 0, 1 }, { 30, 4, 0, 1 }, { 30, 20, 0, 1 }, { 4, 20, 0, 1 },
+    };
+    static const GLubyte col[4][4] = {
+        { 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 }, { 128, 128, 0, 255 },
+    };
+    static const float tex[4][4] = {
+        { 0, 0, 0, 1 }, { 1, 0, 0, 1 }, { 1, 1, 0, 1 }, { 0, 1, 0, 1 },
+    };
+    static const GLushort idx[3] = { 3, 2, 1 };     /* reversed draw order */
+
+    GLfloat fb[128];
+    glFeedbackBuffer(128, GL_3D_COLOR_TEXTURE, fb);
+    glRenderMode(GL_FEEDBACK);
+
+    glVertexPointer(4, GL_FLOAT, 0, pos);
+    glColorPointer(4, GL_UNSIGNED_BYTE, 0, col);
+    glTexCoordPointer(4, GL_FLOAT, 0, tex);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, idx);
+
+    GLint count = glRenderMode(GL_RENDER);
+    EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
+
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+
+    /* POLYGON_TOKEN n x11 (3 coords + color + tex) */
+    EXPECT_TRUE(count == 2 + 3 * 11);
+    if (count >= 13)
+    {
+        EXPECT_EQ_INT((int)fb[0], GL_POLYGON_TOKEN);
+        EXPECT_EQ_INT((int)fb[1], 3);
+
+        /* first recorded vertex is index 3: (4,20), color (128,128,0,255),
+         * texcoord (0,1,0,1) */
+        EXPECT_NEAR(fb[2], 4.0, 0.5);
+        EXPECT_NEAR(fb[3], 20.0, 0.5);
+        EXPECT_NEAR(fb[5], 128.0f / 255.0f, 0.01);
+        EXPECT_NEAR(fb[6], 128.0f / 255.0f, 0.01);
+        EXPECT_NEAR(fb[7], 0.0, 0.01);
+        EXPECT_NEAR(fb[8], 1.0, 0.01);
+        EXPECT_NEAR(fb[9], 0.0, 0.01);
+        EXPECT_NEAR(fb[10], 1.0, 0.01);
+
+        /* second vertex is index 2: (30,20), color (0,0,255,255), tex (1,1,0,1) */
+        EXPECT_NEAR(fb[13], 30.0, 0.5);
+        EXPECT_NEAR(fb[14], 20.0, 0.5);
+        EXPECT_NEAR(fb[16], 0.0, 0.01);
+        EXPECT_NEAR(fb[17], 0.0, 0.01);
+        EXPECT_NEAR(fb[18], 1.0, 0.01);
+        EXPECT_NEAR(fb[20], 1.0, 0.01);
+        EXPECT_NEAR(fb[21], 1.0, 0.01);
+    }
+}
+
+/* without a color/texcoord array the current color / texcoord are recorded */
+TEST(feedback_current_values)
+{
+    setup_2d(64, 64);
+
+    static const float pos[3][4] = {
+        { 8, 8, 0, 1 }, { 40, 8, 0, 1 }, { 8, 40, 0, 1 },
+    };
+
+    GLfloat fb[128];
+    glFeedbackBuffer(128, GL_3D_COLOR_TEXTURE, fb);
+    glRenderMode(GL_FEEDBACK);
+
+    glVertexPointer(4, GL_FLOAT, 0, pos);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glColor4f(0.25f, 0.5f, 0.75f, 1.0f);
+    glTexCoord4f(0.1f, 0.2f, 0.3f, 1.0f);
+
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    GLint count = glRenderMode(GL_RENDER);
+    EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
+    glDisableClientState(GL_VERTEX_ARRAY);
+
+    EXPECT_TRUE(count == 2 + 3 * 11);
+    if (count >= 13)
+    {
+        EXPECT_NEAR(fb[5], 0.25, 0.01);
+        EXPECT_NEAR(fb[6], 0.5, 0.01);
+        EXPECT_NEAR(fb[7], 0.75, 0.01);
+        EXPECT_NEAR(fb[8], 1.0, 0.01);
+        EXPECT_NEAR(fb[9], 0.1, 0.01);
+        EXPECT_NEAR(fb[10], 0.2, 0.01);
+    }
+}
+
 int main(void)
 {
     compat_ctx = mglCompatCreateContext();
@@ -579,6 +681,8 @@ int main(void)
     RUN(line_diamond_rule);
     RUN(select_mode);
     RUN(feedback_mode);
+    RUN(feedback_per_vertex_data);
+    RUN(feedback_current_values);
 
     return mgl_test_summary();
 }
