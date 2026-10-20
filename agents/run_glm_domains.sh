@@ -54,7 +54,7 @@ for d in "$@"; do
         echo "$d already running"; continue
     fi
     resume=""; [ -f "$WT/$d/.agent/transcript.json" ] && resume="--resume"
-    nohup "$PY" agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
+    nohup perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' "$PY" agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
     echo $! > "$WT/$d/.agent/worker.pid"
     echo "started $d (pid $!) $resume"
 done
