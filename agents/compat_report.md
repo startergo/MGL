@@ -104,6 +104,27 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
   rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
 
+## Session 8e (commit "glxgears-style end-to-end test")
+
+* tests/headless/test_compat_gears.c: a classic-app frame — three gears built in
+  immediate mode (triangle-fan faces with per-vertex normals + flat-shaded tooth
+  flanks, design after the MIT glxgears gear()), recorded into display lists,
+  drawn through the matrix stacks with a perspective frustum, two directional
+  lights, materials with specular, GL_NORMALIZE and depth testing; the frame is
+  compared against tests/headless/compat_gears_ref.h (10x10-block RGB averages,
+  tolerance 4/255, generated with `test_compat_gears --dump`) plus structural
+  checks (clear colour, coverage, all three material hues).  Deterministic
+  across runs on this GPU.
+* NOTE on the full-suite runs: with another agent building/testing in a parallel
+  worktree on this Mac, whole-suite runs occasionally fail a *random* test
+  (test_geom / test_introspect / even an untouched compat test) — every such
+  test passes standalone and the next suite run is clean.  GPU contention, not a
+  regression: verify suspected failures in isolation before digging.
+* OPERATION NOTE: this repo is a shared checkout with worktrees — NEVER use
+  `git stash` here (the stash list is shared; a `git stash pop` applied another
+  agent's entry into this worktree once and had to be undone with
+  `git checkout HEAD -- <file>`).
+
 ## Session 8d (commits "indexed line stipple ...", "feedback ... per-vertex data")
 
 * Indexed (glDrawElements/glDrawRangeElements) line stipple works now: the distance
