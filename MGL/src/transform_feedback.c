@@ -1377,8 +1377,14 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     Shader *vs = p->shader_slots[_VERTEX_SHADER];
     MGLXfbProgram *xp = xfb_prog(ctx, p, false);
     bool shader_xfb = vs && vs->src && strstr(vs->src, "xfb_");
+    /* the in-shader xfb qualifiers sit on the OUTPUTS of the last pre-rasterization stage:
+     * a geometry or tessellation-evaluation shader declaring them (possibly an interface
+     * block member with xfb_buffer / xfb_offset) is captured through that stage's resolver */
+    Shader *last = p->shader_slots[_GEOMETRY_SHADER] ? p->shader_slots[_GEOMETRY_SHADER] :
+                   p->shader_slots[_TESS_EVALUATION_SHADER];
+    bool stage_xfb = last && last->src && strstr(last->src, "xfb_");
 
-    if (!xp && !shader_xfb) return;
+    if (!xp && !shader_xfb && !stage_xfb) return;
     if (!xp) xp = xfb_prog(ctx, p, true);
     if (!xp) return;
 
@@ -1387,7 +1393,17 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     xp->mode = xp->pending_mode;
 
     /* in-shader xfb qualifiers override glTransformFeedbackVaryings */
-    if (shader_xfb) {
+    if (shader_xfb || stage_xfb) {
+        if (p->shader_slots[_GEOMETRY_SHADER]) {
+            /* geometry stage outputs (incl. named interface blocks): the geometry domain
+             * resolves the declared xfb_buffer / xfb_offset layout against its own table */
+            mgl_geom_xfb_link(ctx, p);
+            return;
+        }
+        if (p->shader_slots[_TESS_EVALUATION_SHADER]) {
+            mgl_geom_tess_xfb_link(ctx, p);
+            return;
+        }
         xfb_link(ctx, xp, vs->src, false);
         if (xp->from_shader || xp->link_failed) return;
         xfb_clear_linked(ctx, xp);

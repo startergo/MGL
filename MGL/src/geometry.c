@@ -583,6 +583,18 @@ static GLuint comp_words(GLenum base) { return base == GL_DOUBLE ? 2 : 1; }
 /* emit "name = <value>;" statements reconstructing v from the word buffer.
  * open/close delimit the word access: <open> + " + N" + <close>.  `index` is the vertex
  * index expression for geometry-stage inputs (which are arrays of the record per vertex). */
+/* the access path of a varying inside the rewritten shader: a named interface block
+ * member is reached through its instance ("b.c"); an anonymous block member (the
+ * reflection records the member name itself) and a plain varying use the bare name */
+static const char *geom_var_expr(char *buf, size_t cap, const MGLGeomVar *v)
+{
+    if (v->member[0] && strcmp(v->name, v->member))
+        snprintf(buf, cap, "%s.%s", v->name, v->member);
+    else
+        snprintf(buf, cap, "%s", v->name);
+    return buf;
+}
+
 static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const char *close,
                              const char *index)
 {
@@ -603,7 +615,7 @@ static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const
         {
             /* matrix: one vecN per column */
             char mname[64];
-            snprintf(mname, sizeof(mname), "%s", glsl_type_name(v->base, v->rows, 0));
+            snprintf(mname, sizeof(mname), "%s", glsl_type_name(v->base, v->rows, v->cols));
             sb_put(b, "    %s%s = %s(", prefix, elem_prefix, mname);
             for (GLuint c = 0; c < v->cols; c++)
             {
@@ -1191,6 +1203,73 @@ static void copy_renamed(SB *out, const char *s, size_t *pos, size_t len, const 
 }
 
 /* emit the rewritten form of an interface declaration [pos, end) */
+/* strip interface-only qualifiers from interface-block member declarations: a layout(...)
+ * group and the interpolation/storage keywords are legal on an interface member but not on
+ * the plain struct member the rewritten shader declares (locations are tracked separately
+ * by the reflection, so nothing is lost) */
+static char *strip_member_quals(const char *s, size_t n)
+{
+    static const char *drop[] = { "flat", "smooth", "noperspective", "centroid", "sample",
+                                  "invariant", "precise", NULL };
+    SB out;
+    size_t i = 0;
+
+    memset(&out, 0, sizeof(out));
+    while (i < n)
+    {
+        if (s[i] == '/' && i + 1 < n && s[i + 1] == '/')
+        {
+            while (i < n && s[i] != '\n') sb_put(&out, "%c", s[i++]);
+            continue;
+        }
+        if (s[i] == '/' && i + 1 < n && s[i + 1] == '*')
+        {
+            sb_put(&out, "/*");
+            i += 2;
+            while (i + 1 < n && !(s[i] == '*' && s[i + 1] == '/')) sb_put(&out, "%c", s[i++]);
+            if (i + 1 < n) { sb_put(&out, "*/"); i += 2; }
+            continue;
+        }
+
+        size_t wl = 0;
+        while (i + wl < n && (isalnum((unsigned char)s[i + wl]) || s[i + wl] == '_')) wl++;
+        if (wl && i + wl < n && (isspace((unsigned char)s[i + wl]) || s[i + wl] == '('))
+        {
+            char w[32];
+            int layout = wl == 6 && !strncmp(s + i, "layout", 6);
+            int kw = 0;
+            if ((size_t)wl < sizeof(w))
+            {
+                memcpy(w, s + i, wl);
+                w[wl] = 0;
+                for (int k = 0; drop[k]; k++)
+                    if (!strcmp(w, drop[k])) kw = 1;
+            }
+            if (layout || kw)
+            {
+                i += wl;
+                if (layout)
+                {
+                    while (i < n && isspace((unsigned char)s[i])) i++;
+                    if (i < n && s[i] == '(')
+                    {
+                        int depth = 0;
+                        while (i < n)
+                        {
+                            if (s[i] == '(') depth++;
+                            else if (s[i] == ')') { depth--; if (!depth) { i++; break; } }
+                            i++;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        sb_put(&out, "%c", s[i++]);
+    }
+    return out.s;
+}
+
 static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtInfo *info,
                            unsigned in_verts, char *gl_in_name, size_t gl_in_cap, bool *input_iface)
 {
@@ -1243,8 +1322,12 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
                 if (open && open < close)
                 {
                     SB decl;
+                    /* members of an anonymous block may carry interface qualifiers
+                     * (layout(location=...), xfb_offset, flat, ...) that are illegal on the
+                     * ordinary declarations emitted here */
+                    char *members = strip_member_quals(open + 1, (size_t)(close - open - 1));
                     memset(&decl, 0, sizeof(decl));
-                    for (const char *p = open + 1; p < close; )
+                    for (const char *p = members ? members : (open + 1); *p; )
                     {
                         if (info->kind == STMT_IFACE_IN && p[0] == '[' && p[1] == ']')
                         {
@@ -1259,6 +1342,7 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
                     /* the member text already carries its terminating ';' */
                     sb_put(out, "%s", decl.s ? decl.s : "");
                     free(decl.s);
+                    free(members);
                     free(raw);
                     return;
                 }
@@ -1290,7 +1374,9 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
             }
             if (close && bname[0] && strcmp(bname, "gl_PerVertex"))
             {
-                sb_put(&decl, "struct %s %.*s; %s ", bname, (int)(close - brace + 1), brace, bname);
+                char *members = strip_member_quals(brace + 1, (size_t)(close - brace - 1));
+                sb_put(&decl, "struct %s { %s }; %s ", bname, members ? members : "", bname);
+                free(members);
                 body = close + 1;
             }
         }
@@ -1310,7 +1396,40 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
     }
     else
     {
-        sb_put(out, "%s", body);
+        SB decl;
+        const char *brace = strchr(body, '{');
+        memset(&decl, 0, sizeof(decl));
+
+        if (brace)
+        {
+            /* a named output interface block ("out B { ... } b;") becomes a plain struct
+             * plus instance: the shader body refers to the members as b.c, which a plain
+             * global of that struct type keeps working; interface-only member qualifiers
+             * (layout(location/xfb_offset/stream), flat, ...) are dropped here — the
+             * reflection keeps the real values.  GLSL matches the block to the next
+             * stage's input block by BLOCK name, so the type name is preserved too. */
+            char bname[64] = "";
+            const char *close = strrchr(body, '}');
+            const char *bp = brace, *be;
+            while (bp > body && isspace((unsigned char)bp[-1])) bp--;
+            be = bp;
+            while (be > body && (isalnum((unsigned char)be[-1]) || be[-1] == '_')) be--;
+            if (bp - be > 0 && (size_t)(bp - be) < sizeof(bname))
+            {
+                memcpy(bname, be, bp - be);
+                bname[bp - be] = 0;
+            }
+            if (close && bname[0] && strcmp(bname, "gl_PerVertex"))
+            {
+                char *members = strip_member_quals(brace + 1, (size_t)(close - brace - 1));
+                sb_put(&decl, "struct %s { %s }; %s ", bname, members ? members : "", bname);
+                free(members);
+                body = close + 1;
+            }
+        }
+        for (const char *p = body; *p; p++) sb_put(&decl, "%c", *p);
+        sb_put(out, "%s", decl.s ? decl.s : body);
+        free(decl.s);
     }
 
     free(raw);
@@ -1509,8 +1628,19 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                     mid = mt->elem;
                     mt = spv_find_type(m, mid);
                 }
-                if (!mt || (mt->kind != SPVT_VEC && mt->kind != SPVT_MAT &&
-                            mt->kind != SPVT_FLOAT && mt->kind != SPVT_INT && mt->kind != SPVT_BOOL))
+                /* an array member ("out B { vec4 c[2]; } b;"): the element type is stored and
+                 * the length becomes elems — one layer only, the rewritten shader declares it
+                 * as a struct member with its own [] dimension, which the generators unroll */
+                GLuint melems = 1;
+                if (mt && mt->kind == SPVT_ARRAY)
+                {
+                    melems = mt->n;
+                    mid = mt->elem;
+                    mt = spv_find_type(m, mid);
+                }
+                if (!mt || melems == 0 || (mt->kind == SPVT_ARRAY) ||
+                    (mt->kind != SPVT_VEC && mt->kind != SPVT_MAT &&
+                     mt->kind != SPVT_FLOAT && mt->kind != SPVT_INT && mt->kind != SPVT_BOOL))
                 {
                     mgl_append_log(log, "ERROR: geometry: unsupported interface block member type for %s.%s\n",
                                    anon ? "?" : inst, mn);
@@ -1524,27 +1654,32 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 mcols = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n : 1;
                 /* GLSL 4.60 4.4.1: a double (and its vectors) consumes two locations, a
                  * matrix one per column, an array one per element */
-                consumed = mcols * (mbase == GL_DOUBLE ? 2u : 1u);
+                consumed = melems * mcols * (mbase == GL_DOUBLE ? 2u : 1u);
 
                 out = &vars[n++];
                 memset(out, 0, sizeof(*out));
                 snprintf(out->name, sizeof(out->name), "%s", anon ? mn : inst);
                 snprintf(out->member, sizeof(out->member), "%s", anon ? "" : mn);
-                /* a member may carry its own location decoration (glslang does that for the
-                 * builtin block); otherwise it takes the block's next free one */
+                out->elems = melems;
+                out->xfb_buffer = -1;
+                out->xfb_offset = 0xffffffffu;
                 out->location = spv_member_deco(m, t->id, mi, SpvDecorationLocation, &mloc) ?
                                 mloc : next_loc;
                 next_loc = out->location + consumed;
                 out->base = mbase;
                 out->rows = mrows;
                 out->cols = mcols;
-                out->elems = 1;
-                out->words = mcols * mrows * base_words(mbase);
+                out->words = melems * mcols * mrows * base_words(mbase);
                 out->flat = spv_member_deco(m, t->id, mi, SpvDecorationFlat, NULL) ||
                             spv_deco(m, v->id, SpvDecorationFlat, NULL);
                 out->noperspective = spv_member_deco(m, t->id, mi, SpvDecorationNoPerspective, NULL) ||
                                      spv_deco(m, v->id, SpvDecorationNoPerspective, NULL);
                 if (spv_member_deco(m, t->id, mi, SpvDecorationStream, &tmp)) out->stream = tmp;
+                /* shader-declared transform feedback capture (xfb_buffer/xfb_offset): the
+                 * member inherits the block's buffer, the offset is its own */
+                if (spv_member_deco(m, t->id, mi, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
+                else if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
+                if (spv_member_deco(m, t->id, mi, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
             }
             continue;
         }
@@ -1561,6 +1696,8 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         memset(out, 0, sizeof(*out));
         snprintf(out->name, sizeof(out->name), "%s", spv_name(m, v->id) ? spv_name(m, v->id) : "");
         out->location = location;
+        out->xfb_buffer = -1;
+        out->xfb_offset = 0xffffffffu;
         out->base = t->kind == SPVT_FLOAT ? (t->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                     t->kind == SPVT_INT ? (t->is_signed ? GL_INT : GL_UNSIGNED_INT) :
                     t->kind == SPVT_BOOL ? GL_BOOL : GL_FLOAT;
@@ -1573,6 +1710,8 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         out->centroid = spv_deco(m, v->id, SpvDecorationCentroid, NULL);
         out->sample = spv_deco(m, v->id, SpvDecorationSample, NULL);
         if (spv_deco(m, v->id, SpvDecorationStream, &tmp)) out->stream = tmp;
+        if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
+        if (spv_deco(m, v->id, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
         (void)location;
     }
 
@@ -1780,10 +1919,24 @@ static char *geom_plain_outputs(const char *src)
                             p++;
                         }
                         if (inst[0])
-                            sb_put(&out, "struct %s {%.*s}; %s %s;", bname, (int)(close - brace - 1),
-                                   src + brace + 1, bname, inst);
+                        {
+                            /* the block becomes a plain struct + instance; interface-only
+                             * member qualifiers (location/xfb_offset/flat) must go */
+                            char *members = strip_member_quals(src + brace + 1,
+                                                               (size_t)(close - brace - 1));
+                            sb_put(&out, "struct %s {%s}; %s %s;", bname,
+                                   members ? members : "", bname, inst);
+                            free(members);
+                        }
                         else
-                            sb_put(&out, "%.*s;", (int)(close - brace - 1), src + brace + 1);
+                        {
+                            /* anonymous block: the members become ordinary outputs of their
+                             * own, so the same qualifier stripping applies */
+                            char *members = strip_member_quals(src + brace + 1,
+                                                               (size_t)(close - brace - 1));
+                            sb_put(&out, "%s;", members ? members : "");
+                            free(members);
+                        }
                         i = p;
                         while (i < len && src[i] != ';') i++;
                         if (i < len) i++;
@@ -1984,7 +2137,8 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     for (int i = 0; i < gp->n_out; i++)
     {
         MGLGeomVar *v = &gp->out_v[i];
-        gen_varying_store(&b, v, "mgl_out", "o", v->name);
+        char src[192];
+        gen_varying_store(&b, v, "mgl_out", "o", geom_var_expr(src, sizeof(src), v));
     }
     sb_put(&b, "}\n\n");
 
@@ -2056,8 +2210,17 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     if (gp->out_has_clip) sb_put(&b, "    for (int i = 0; i < %u; i++) mgl_gs_clip[i] = 0.0;\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "    for (int i = 0; i < %u; i++) mgl_gs_cull[i] = 0.0;\n", gp->out_clip_size);
     for (int i = 0; i < gp->n_out; i++)
-        sb_put(&b, "    %s%s = %s(0);\n", gp->out_v[i].name, gp->out_v[i].elems > 1 ? "[0]" : "",
-               glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, 0));
+    {
+        /* a named output block member is zero-initialized through the instance ("b.c");
+         * a global instance in GLSL is zero-initialized anyway, this is belt and braces */
+        char src[192];
+        if (gp->out_v[i].member[0] && strcmp(gp->out_v[i].name, gp->out_v[i].member))
+            snprintf(src, sizeof(src), "%s.%s", gp->out_v[i].name, gp->out_v[i].member);
+        else
+            snprintf(src, sizeof(src), "%s", gp->out_v[i].name);
+        sb_put(&b, "    %s%s = %s(0);\n", src, gp->out_v[i].elems > 1 ? "[0]" : "",
+               glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, gp->out_v[i].cols));
+    }
     sb_put(&b, "    mgl_gs_main();\n");
     sb_put(&b, "    mgl_gs_end_stream_primitive(mgl_stream);\n");
     sb_put(&b, "    mgl_cnt[mgl_t] = mgl_written;\n");
@@ -2086,11 +2249,20 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
     {
         MGLGeomVar *v = &gp->out_v[i];
         char arr[32] = "";
+        char name[160];
         if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", v->elems);
+        /* a named output block member is emitted as a plain varying of its own: the
+         * raster side links to the fragment stage's input block by location, so the
+         * member's name is irrelevant here (and the instance name would collide) */
+        if (v->member[0] && strcmp(v->name, v->member))
+            snprintf(name, sizeof(name), "mgl_ob%d", i);
+        else
+            snprintf(name, sizeof(name), "%s", v->name);
         sb_put(&b, "layout(location = %u) %s%s%s out %s %s%s;\n", v->location,
                v->flat ? "flat " : "", v->noperspective ? "noperspective " : "",
-               v->centroid ? "centroid " : "", glsl_type_name(v->base, v->rows, v->cols), v->name, arr);
-        if (v->location + 1 > next_loc) next_loc = v->location + 1;
+               v->centroid ? "centroid " : "", glsl_type_name(v->base, v->rows, v->cols), name, arr);
+        if (v->location + v->elems * (v->cols ? v->cols : 1) > next_loc)
+            next_loc = v->location + v->elems * (v->cols ? v->cols : 1);
     }
     if (gp->out_has_layer)
     {
@@ -2114,52 +2286,61 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         sb_put(&b, "    mgl_out_layer = mgl_draw[r + %u];\n", gp->out_layer_off);
     if (gp->out_has_vp)
         sb_put(&b, "    mgl_out_vp = mgl_draw[r + %u];\n", gp->out_vp_off);
-    for (GLuint e = 0; e < 1; e++) (void)e;
     for (int i = 0; i < gp->n_out; i++)
     {
         MGLGeomVar *v = &gp->out_v[i];
-        char arr[32] = "";
-        if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", v->elems);
-        sb_put(&b, "    %s%s = ", v->name, arr);
-        if (v->cols > 1)
+        char name[160];
+        if (v->member[0] && strcmp(v->name, v->member))
+            snprintf(name, sizeof(name), "mgl_ob%d", i);
+        else
+            snprintf(name, sizeof(name), "%s", v->name);
+        for (GLuint e = 0; e < (v->elems > 0 ? v->elems : 1u); e++)
         {
-            char mname[64];
-            snprintf(mname, sizeof(mname), "%s", glsl_type_name(v->base, v->rows, 0));
-            sb_put(&b, "%s(", mname);
-            for (GLuint c = 0; c < v->cols; c++)
+            char arr[32] = "";
+            /* an array element's words are contiguous: cols * rows * base words each */
+            GLuint base = v->offset + e * v->cols * v->rows * comp_words(v->base);
+            if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", e);
+            sb_put(&b, "    %s%s = ", name, arr);
+            if (v->cols > 1)
             {
-                if (c) sb_put(&b, ", ");
+                char mname[64];
+                snprintf(mname, sizeof(mname), "%s", glsl_type_name(v->base, v->rows, v->cols));
+                sb_put(&b, "%s(", mname);
+                for (GLuint c = 0; c < v->cols; c++)
+                {
+                    if (c) sb_put(&b, ", ");
+                    sb_put(&b, "%s(", glsl_type_name(v->base, v->rows, 1));
+                    for (GLuint r2 = 0; r2 < v->rows; r2++)
+                    {
+                        GLuint w = base + (c * v->rows + r2) * comp_words(v->base);
+                        if (r2) sb_put(&b, ", ");
+                        if (v->base == GL_FLOAT) sb_put(&b, "uintBitsToFloat(mgl_draw[r + %u])", w);
+                        else if (v->base == GL_DOUBLE) sb_put(&b, "uint64BitsToDouble(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
+                        else sb_put(&b, "%s(mgl_draw[r + %u])", v->base == GL_INT ? "int" : "uint", w);
+                    }
+                    sb_put(&b, ")");
+                }
+                sb_put(&b, ");\n");
+            }
+            else if (v->rows == 1 && v->base != GL_DOUBLE)
+            {
+                GLuint w = base;
+                sb_put(&b, "%s(mgl_draw[r + %u]);\n", v->base == GL_FLOAT ? "uintBitsToFloat" :
+                           v->base == GL_BOOL ? "uint" : (v->base == GL_INT ? "int" : "uint"), w);
+            }
+            else
+            {
                 sb_put(&b, "%s(", glsl_type_name(v->base, v->rows, 1));
                 for (GLuint r2 = 0; r2 < v->rows; r2++)
                 {
-                    GLuint w = v->offset + (c * v->rows + r2) * comp_words(v->base);
+                    GLuint w = base + r2 * comp_words(v->base);
                     if (r2) sb_put(&b, ", ");
                     if (v->base == GL_FLOAT) sb_put(&b, "uintBitsToFloat(mgl_draw[r + %u])", w);
                     else if (v->base == GL_DOUBLE) sb_put(&b, "uint64BitsToDouble(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
                     else sb_put(&b, "%s(mgl_draw[r + %u])", v->base == GL_INT ? "int" : "uint", w);
                 }
-                sb_put(&b, ")");
+                sb_put(&b, ");\n");
             }
-            sb_put(&b, ");\n");
-        }
-        else if (v->rows == 1 && v->base != GL_DOUBLE)
-        {
-            GLuint w = v->offset;
-            sb_put(&b, "%s(mgl_draw[r + %u]);\n", v->base == GL_FLOAT ? "uintBitsToFloat" :
-                       v->base == GL_BOOL ? "uint" : (v->base == GL_INT ? "int" : "uint"), w);
-        }
-        else
-        {
-            sb_put(&b, "%s(", glsl_type_name(v->base, v->rows, 1));
-            for (GLuint r2 = 0; r2 < v->rows; r2++)
-            {
-                GLuint w = v->offset + r2 * comp_words(v->base);
-                if (r2) sb_put(&b, ", ");
-                if (v->base == GL_FLOAT) sb_put(&b, "uintBitsToFloat(mgl_draw[r + %u])", w);
-                else if (v->base == GL_DOUBLE) sb_put(&b, "uint64BitsToDouble(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
-                else sb_put(&b, "%s(mgl_draw[r + %u])", v->base == GL_INT ? "int" : "uint", w);
-            }
-            sb_put(&b, ");\n");
         }
     }
     sb_put(&b, "}\n");
@@ -2359,18 +2540,10 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     if (!geom_reflect_stage(m, true, gp->in_v, &gp->n_in, log)) goto done;
     if (!geom_reflect_stage(m, false, gp->out_v, &gp->n_out, log)) goto done;
 
-    /* outputs are declared as plain variables in the generated kernel, so a named interface
-     * block instance ("out B { vec4 c; } b;") is not representable: its members are recorded
-     * with the instance as their base name.  An anonymous block is fine (the members are the
-     * variables). */
-    for (int i = 0; i < gp->n_out; i++)
-        if (gp->out_v[i].member[0])
-        {
-            mgl_append_log(log, "ERROR: geometry: output interface block '%s' needs an instance-free "
-                                "declaration (out B { ... };) - named output blocks are not supported\n",
-                           gp->out_v[i].name);
-            goto done;
-        }
+    /* a named output interface block ("out B { vec4 c; } b;") is rewritten to a plain
+     * struct + instance in the generated kernel (the body keeps writing b.c) and its
+     * members are re-emitted as ordinary location-addressed varyings on the raster side,
+     * where the fragment stage's matching input block links by location */
 
     /* the entry names are needed even when the emulation is deferred */
     gp->kernel_entry = xstrdup("mgl_geom_gs");
@@ -3242,15 +3415,24 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
         int j = -1;
 
         /* the consumer matches the tess capture's members by name: a linkable program has the
-         * same names for the evaluation stage's outputs and the geometry stage's inputs */
+         * same names for the evaluation stage's outputs and the geometry stage's inputs.
+         * A block member arrives flattened by SPIRV-Cross as "<instance>_<member>" (the
+         * instance names of the two stages may differ: blocks match by block name) */
         for (int m = 0; m < c->members; m++)
-            if (!strcmp(c->member[m].name,
-                        gp->in_v[i].member[0] ? gp->in_v[i].member : gp->in_v[i].name) &&
-                c->member[m].words >= gp->in_v[i].words)
+        {
+            const char *want = gp->in_v[i].member[0] ? gp->in_v[i].member : gp->in_v[i].name;
+            size_t wl = strlen(want), cl = strlen(c->member[m].name);
+            int hit = !strcmp(c->member[m].name, want);
+            if (!hit && gp->in_v[i].member[0] && cl > wl + 1 &&
+                c->member[m].name[cl - wl - 1] == '_' &&
+                !strcmp(c->member[m].name + cl - wl, want))
+                hit = 1;               /* "<instance>_<member>" */
+            if (hit && c->member[m].words >= gp->in_v[i].words)
             {
                 j = m;
                 break;
             }
+        }
         if (j < 0)
         {
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
@@ -3688,21 +3870,91 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                              GLuint pos_word, GLuint psize_word,
                              const char *stage)
 {
-    GLuint buffer = 0, offset = 0;
+    GLuint dbuffer[64], doffset[64];
+    GLsizei dn = 0;
+    GLuint buffer = 0, offset = 0, n = 0, xn = 0;
     MGLXfbVarying *v;
+    char dnames[64][192];
+    char xnames[128][192];
 
     geom_xfb_reset(ctx, xp);
     xp->mode = xp->pending_mode;
     if (!xp->pending_count)
-        return;                     /* nothing captured for this program */
-
-    xp->vars = calloc((size_t)xp->pending_count, sizeof(MGLXfbVarying));
-    if (!xp->vars) return;
-    xp->count = xp->pending_count;
-
-    for (GLsizei i = 0; i < xp->pending_count; i++)
     {
-        const char *name = xp->pending[i];
+        /* shader-declared capture (xfb_buffer / xfb_offset on outputs, including interface
+         * block members): GL 4.6 13.3.2 — with no API-specified varyings, every output that
+         * declares an xfb_buffer is captured into that buffer at its declared offset */
+        for (int k = 0; k < nvars && dn < 64; k++)
+        {
+            if (vars[k].xfb_buffer < 0) continue;
+            if (vars[k].member[0] && strcmp(vars[k].name, vars[k].member))
+                snprintf(dnames[dn], sizeof(dnames[dn]), "%s.%s", vars[k].name, vars[k].member);
+            else
+                snprintf(dnames[dn], sizeof(dnames[dn]), "%s", vars[k].name);
+            dbuffer[dn] = (GLuint)vars[k].xfb_buffer;
+            doffset[dn] = vars[k].xfb_offset;
+            dn++;
+        }
+        if (!dn) return;             /* nothing captured for this program */
+        /* capture in ascending (buffer, offset) order */
+        for (GLsizei a = 1; a < dn; a++)
+            for (GLsizei b = a; b > 0 && (dbuffer[b - 1] > dbuffer[b] ||
+                 (dbuffer[b - 1] == dbuffer[b] && doffset[b - 1] > doffset[b])); b--)
+            {
+                char tn[192];
+                GLuint tb = dbuffer[b], to = doffset[b];
+                memcpy(tn, dnames[b], sizeof(tn));
+                memcpy(dnames[b], dnames[b - 1], sizeof(dnames[b]));
+                memcpy(dnames[b - 1], tn, sizeof(dnames[b - 1]));
+                dbuffer[b] = dbuffer[b - 1]; doffset[b] = doffset[b - 1];
+                dbuffer[b - 1] = tb; doffset[b - 1] = to;
+            }
+        n = (GLuint)dn;
+    }
+    else
+    {
+        /* API-specified varyings: an interface block instance name ("b") selects every
+         * member of the block (GL 4.6 13.3.1), so expand the names before resolving */
+        n = (GLuint)xp->pending_count;
+        for (GLuint q = 0; q < n && xn < 128; q++)
+        {
+            const char *nm = xp->pending[q];
+            int first = -1, members = 0;
+
+            if (!strcmp(nm, "gl_NextBuffer") || !strncmp(nm, "gl_SkipComponents", 17))
+            {
+                snprintf(xnames[xn++], sizeof(xnames[0]), "%s", nm);
+                continue;
+            }
+            for (int k = 0; k < nvars; k++)
+                if (vars[k].member[0] && !strcmp(vars[k].name, nm))
+                { if (first < 0) first = k; members++; }
+            if (members > 0)
+            {
+                for (int k = 0; k < nvars && xn < 128; k++)
+                    if (vars[k].member[0] && !strcmp(vars[k].name, nm))
+                        snprintf(xnames[xn++], sizeof(xnames[0]), "%s.%s",
+                                 vars[k].name, vars[k].member);
+            }
+            else
+                snprintf(xnames[xn++], sizeof(xnames[0]), "%s", nm);
+        }
+        n = xn;
+    }
+
+    xp->vars = calloc(n, sizeof(MGLXfbVarying));
+    if (!xp->vars) return;
+    xp->count = n;
+
+    for (GLuint i = 0; i < n; i++)
+    {
+        const char *name = xp->pending_count ? xnames[i] : dnames[i];
+
+        if (!xp->pending_count)
+        {
+            buffer = dbuffer[i];
+            offset = doffset[i];
+        }
         v = &xp->vars[i];
         v->name = xstrdup(name);
         xp->max_name_length = (GLuint)(strlen(name) + 1 > (size_t)xp->max_name_length ?
@@ -3760,10 +4012,33 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             continue;
         }
 
-        /* a user output of the stage */
+        /* a user output of the stage: either a plain varying, or an interface block member
+         * written as instance.member ("b.c"); an interface block instance with a single
+         * member also names that member */
         int j = -1;
+        const char *dot = strchr(name, '.');
         for (int k = 0; k < nvars; k++)
-            if (!strcmp(vars[k].name, name)) { j = k; break; }
+        {
+            if (dot)
+            {
+                size_t ilen = (size_t)(dot - name);
+                if (!strncmp(vars[k].name, name, ilen) && vars[k].name[ilen] == 0 &&
+                    !strcmp(vars[k].member, dot + 1))
+                { j = k; break; }
+            }
+            else if (!strcmp(vars[k].name, name))
+            { j = k; break; }
+        }
+        if (j < 0 && dot)
+        {
+            char *log = NULL;
+            mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
+                                      "%s\n", name, stage);
+            free(xp->link_log);
+            xp->link_log = log;
+            xp->link_failed = true;
+            return;
+        }
         if (j < 0)
         {
             char *log = NULL;
@@ -3786,11 +4061,19 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         v->src_word = g->offset;
         v->buffer = buffer;
         v->offset = offset;
-        offset += v->words * 4;
+        if (xp->pending_count)
+            offset += v->words * 4;
+        else
+        {
+            /* declared capture: the stride of a buffer is the extent of its captures */
+            GLuint end = offset + v->words * 4;
+            if (end > xp->stride[buffer]) xp->stride[buffer] = end;
+        }
         xp->buffer_mask |= (1u << buffer);
     }
 
-    xp->stride[buffer] = offset;
+    if (xp->pending_count)
+        xp->stride[buffer] = offset;
 }
 
 void mgl_geom_xfb_link(GLMContext ctx, Program *program)
