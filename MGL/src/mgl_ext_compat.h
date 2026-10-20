@@ -328,9 +328,11 @@ struct MGLExtState_compat {
 
     /* legacy internal formats (LUMINANCE/ALPHA/INTENSITY) expanded to RGBA on
      * upload; remembered so readback re-packs them.  gmm = GL_GENERATE_MIPMAP,
-     * wrap[] stores GL_CLAMP where the hardware got CLAMP_TO_EDGE */
+     * wrap[] stores the requested GL_CLAMP / GL_CLAMP_TO_BORDER (Metal cannot
+     * express all of it: see mgl_compat_clamp_* in compat_state.c), applied[]
+     * is the wrap mode last given to the core sampler state */
     struct { GLuint name; GLenum kind; GLenum type; GLboolean gmm;
-             GLenum wrap[3]; } legacy_tex[MGLC_LEGACY_TEX_MAX];
+             GLenum wrap[3]; GLenum applied[3]; } legacy_tex[MGLC_LEGACY_TEX_MAX];
     int       legacy_tex_count;
 
     /* ---- select / feedback ---- */
@@ -452,6 +454,18 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
 /* compat_ffp.c (generated fixed-function pipeline) */
 GLuint mgl_compat_ffp_program(GLMContext ctx);        /* bind-on-demand, returns name */
 void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog);  /* upload uniforms */
+
+/* GL_CLAMP / GL_CLAMP_TO_BORDER: per-axis decision for a bound texture.
+ * Apple GPUs fetch a border only with the three fixed Metal border colors,
+ * and only as a full border (no GL_CLAMP's 50/50 edge blend for LINEAR).
+ * Modes Metal can do exactly are handed to the sampler (GL_CLAMP_TO_BORDER);
+ * everything else is emulated in the generated fixed-function shader:
+ *   0 = no emulation (hardware), 1 = GL_CLAMP, 2 = GL_CLAMP_TO_BORDER. */
+#define MGLC_CLAMP_NONE  0
+#define MGLC_CLAMP_EMU   1
+#define MGLC_CLAMP_EMU_BORDER 2
+void mgl_compat_clamp_modes(GLMContext ctx, Texture *tex, int emu[3]);
+void mgl_compat_clamp_apply(GLMContext ctx, GLuint name);   /* set the core wrap params */
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *prog); /* user compat shaders */
 GLint mgl_compat_get_uniform_location(GLMContext ctx, GLuint program, const GLchar *name);
 void compat_tex_image1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels);

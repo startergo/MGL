@@ -30,12 +30,17 @@ Update this file at every commit so a fresh session can continue.
   float attachment (see `#pragma mark accumulation buffer`).
 * Compat GLSL (#version 110..150 / compatibility): compat_glsl.c rewrites to core GLSL.
 
-## Known core bugs (worked around, owned by geom worker — do NOT fix here)
+## Former "core bugs" — resolved (they were never core bugs)
 
-1. Default-block `float` uniforms next to `vec4`s get clobbered by UBO-style packing.
-   Workaround in FFP shaders: keep scalar uniforms in separate decl groups; verify any new scalar
-   uniform actually round-trips (use EXPECT on a query or a pixel test).
-2. `glProgramUniform1f` is a no-op — use `glUniform1f` on the bound program.
+The two workarounds from earlier sessions were removed after the geom worker proved core uniform
+packing + glProgramUniform* correct (tests/headless/test_uniforms.c, 297 checks):
+* FFP scalar uniforms are now plain scalars again: mglNormalScale (float), mglAlphaRef (float),
+  mglEnvScaleN (vec2), mglPointSizeParams/mglPointAtten (vec3). No vec4 packing.
+* The "re-sync the first 3 draws because the uniform table is re-derived after the MSL compile"
+  hack in mgl_compat_ffp_sync is gone; one sync per state_serial is enough.
+Regression tests: test_compat_glsl.c glsl_scalar_uniform_sandwich / glsl_program_uniform_compat
+(readback + pixels on a compat context), test_compat_render2.c specular_shininess (the float
+uniform mglMatShininess[0] verified pixel-exact against pow(NdH, exp) for exp 128/16/2).
 
 ## Milestones
 
@@ -81,6 +86,47 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
 
+## Session 8 (commit "default matrices, diamond-rule line rasterization")
+
+* REAL BUG FIXED: the float matrix caches the generated FFP/compat-GLSL shaders read
+  (s->modelview_f / projection_f / texture_f) were only refreshed by matrix_changed(),
+  so a compat context that never calls a matrix entry point (glLoadIdentity etc.) drew
+  with all-zero matrices — nothing appeared. mgl_compat_init_state now initialises the
+  float caches to identity.
+* Line rasterization "one pixel left/down" was NOT a Metal-vs-GL gap: a probe drawing
+  the same segments on a CORE context (VBO + glDrawArrays) and on the compat context
+  (glBegin) produces byte-identical coverage. A vertical line at integer x=16 lights
+  column 15 (and not 16) because x=16 is the RIGHT corner of column 15's diamonds:
+  GL's diamond-exit rule counts right/top corners and not left/bottom. Same for
+  horizontal lines (row 15 for y=16). Test test_compat_render2.c line_diamond_rule pins
+  this (endpoints, half-pixel cases), and the evaluators test now asserts column 15
+  exactly instead of accepting both.
+* Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
+  rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
+
+## Session 8b (commit "GL_CLAMP / CLAMP_TO_BORDER: hardware border colours + shader emulation")
+
+* GL_CLAMP/GL_CLAMP_TO_BORDER are no longer downgraded to CLAMP_TO_EDGE.
+  Per texture axis, compat_state.c decides (mgl_compat_clamp_modes/apply):
+  - border colour is one of Metal's three (transparent/opaque black, opaque white)
+    AND (GL_CLAMP with NEAREST filtering, or GL_CLAMP_TO_BORDER): the sampler gets
+    GL_CLAMP_TO_BORDER -> MTLSamplerAddressModeClampToBorderColor (hardware).
+  - otherwise: sampler stays CLAMP_TO_EDGE and the generated FFP fragment shader
+    emulates it (uniform mglBorderN + mglTexSizeN + a mglSampleN() helper):
+    NEAREST -> border outside [0,1]; LINEAR -> the GL weight function
+    w = clamp(0.5 + min(max(u,0), max(1-u,0)) * N, 0.5, 1) for GL_CLAMP (50/50 at
+    the edges, saturated outside), w = clamp(0.5 + min(u, 1-u) * N, 0, 1) for
+    CLAMP_TO_BORDER (full border half a texel out).  GL_CLAMP_TO_BORDER with an
+    arbitrary border colour is emulated too (the core path keeps the nearest
+    standard colour).
+  * The decision is re-taken whenever WRAP_*/MIN/MAG_FILTER/BORDER_COLOR changes
+    and after every texture upload (size uniform).  Wrap queries return the
+    requested mode.  FFP key gained 2 bytes/unit (clamp axes+nearest). Cube-map
+    textures keep CLAMP_TO_EDGE (border emulation is 2D/1D/3D only).
+* Test: tests/headless/test_compat_render6.c (30 checks) — arbitrary border,
+  hardware colours, runtime switching between the two paths, the 50/50 edge
+  blend and its saturation vs CLAMP_TO_BORDER's full border.
+
 ## Session 7 (commit "GL_CLAMP / GENERATE_MIPMAP / texenv LOD bias")
 
 * glTexParameteri(GL_TEXTURE_WRAP_*, GL_CLAMP) is accepted: the hardware gets CLAMP_TO_EDGE
@@ -119,10 +165,9 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
   fails, so a bad state combination can never crash the draw.
 * DrawPixels applies GL_MAP_COLOR via the R/G/B/A pixel maps (v -> map[round(v*(n-1))]); the
   default single-entry maps are identity (1.0).
-* Known gaps documented by tests: a horizontal/vertical line exactly on a pixel boundary rasterizes
-  one pixel left/down on Metal (D3D rule) vs the GL diamond rule - tests read the Metal row and
-  note it; fixed-function texgen/lighting are per-vertex (as GL 1.x says), tests compute the
-  interpolated CPU reference.
+* fixed-function texgen/lighting are per-vertex (as GL 1.x says), tests compute the
+  interpolated CPU reference. (The "one pixel left/down" line note here was wrong — see
+  session 8: that IS the GL diamond rule.)
 
 ## Session 4 (commit "compat GLSL fixes")
 
@@ -156,8 +201,7 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Feedback mode: rewritten (`fb_emit_prims`) with per-type vertex layouts (GL_2D/3D/3D_COLOR/
   3D_COLOR_TEXTURE/4D_COLOR_TEXTURE), per-primitive tokens; TRIANGLE_STRIP/FAN/TRIANGLES now emit
   (the old code relied on `mgl_compat_build_tri_indices` which only converts QUADS/POLYGON).
-* Known gap: a vertical/horizontal line exactly on a pixel boundary rasterizes to the left/bottom
-  pixel on Metal (D3D rule) instead of the GL diamond-rule pixel; the evaluator test accepts both.
+* (removed: the line-on-boundary note above was a misdiagnosis, see session 8)
 
 ## Remaining work
 
@@ -168,3 +212,4 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
   color is stored/queried but not sampled.
 * GENERATE_MIPMAP on glTexImage (compat flag); color-index (glIndex) beyond state tracking.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.
+* Indexed glDrawElements + line stipple (no per-vertex distances yet).

@@ -79,12 +79,27 @@ typedef struct {
 typedef struct {
     int used;
     int failed;
-    int draws;
-    int dirty_late;
     GLuint prog;
     uint64_t sync;
     MGLFFPKey key;
 } MGLFFPCacheEnt;
+
+/* NEAREST within a mip level? (chooses the border weight function when the
+ * GL_CLAMP emulation is active) */
+static int nearest_ffp_filter(Texture *tex)
+{
+    if (!tex)
+        return 1;
+
+    switch (tex->params.min_filter)
+    {
+        case GL_NEAREST: case GL_NEAREST_MIPMAP_NEAREST: case GL_NEAREST_MIPMAP_LINEAR:
+            break;
+        default:
+            return 0;
+    }
+    return tex->params.mag_filter == GL_NEAREST;
+}
 
 /* effective (fixed-function) texture target of a unit: GL_TEXTURE_1D..CUBE or 0 */
 int mgl_compat_enabled_texture_target(GLMContext ctx, GLuint unit)
@@ -122,6 +137,10 @@ typedef struct {
     int     need_texcoord[MGLC_MAX_COORDS];
     int     lod_bias[MGLC_MAX_COORDS];        /* 1 = bias is non-zero */
     int     texgen[MGLC_MAX_COORDS][4];
+    /* GL_CLAMP / GL_CLAMP_TO_BORDER border emulation (compat_state.c decides):
+     * 2 bits per axis (S,T,R) with the MGLC_CLAMP_* values, 0 = hardware */
+    int     clamp_axes[MGLC_MAX_COORDS];
+    int     clamp_nearest[MGLC_MAX_COORDS];   /* NEAREST weighting when emulating */
     GLboolean unit_used[MGLC_MAX_COORDS];
 } MGLFFPUnit;
 
@@ -198,6 +217,30 @@ static void ffp_build_config(GLMContext ctx, MGLFFPConfig *c)
         c->unit.combine_rgb[u] = (int)e->combine_rgb;
         c->unit.combine_a[u] = (int)e->combine_alpha;
         c->unit.coord_replace[u] = s->coord_replace[u] ? 1 : 0;
+
+        /* GL_CLAMP / GL_CLAMP_TO_BORDER: which axes need shader emulation */
+        if (c->unit.target[u] && c->unit.target[u] != GL_TEXTURE_CUBE_MAP)
+        {
+            static const int texindex[] = { _TEXTURE_1D, _TEXTURE_2D, _TEXTURE_3D, _TEXTURE_CUBE_MAP };
+            static const GLenum targets[] = { GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_TEXTURE_CUBE_MAP };
+            int emu[3] = { 0, 0, 0 };
+
+            for (int i = 0; i < 4; i++)
+                if ((GLenum)c->unit.target[u] == targets[i])
+                {
+                    Texture *tex = STATE(texture_units[u]).textures[texindex[i]];
+                    int axes = 0;
+                    /* only the axes the target actually has */
+                    int naxis = (targets[i] == GL_TEXTURE_1D) ? 1 : (targets[i] == GL_TEXTURE_2D) ? 2 : 3;
+
+                    mgl_compat_clamp_modes(ctx, tex, emu);
+                    for (int a = 0; a < naxis; a++)
+                        axes |= emu[a] << (2 * a);
+                    c->unit.clamp_axes[u] = axes;
+                    c->unit.clamp_nearest[u] = tex ? nearest_ffp_filter(tex) : 1;
+                    break;
+                }
+        }
 
         for (int k = 0; k < 6; k++)
             c->unit.src[k][u] = (int)e->src[k];
@@ -330,6 +373,8 @@ static void ffp_build_key(const MGLFFPConfig *c, MGLFFPKey *key)
         b[p++] = (uint8_t)cal;
         b[p++] = (uint8_t)((c->unit.coord_replace[u] ? 1 : 0) | (c->unit.need_texcoord[u] ? 2 : 0) |
                            (c->unit.lod_bias[u] ? 4 : 0));
+        b[p++] = (uint8_t)c->unit.clamp_axes[u];        /* 2 bits per axis */
+        b[p++] = (uint8_t)c->unit.clamp_nearest[u];
 
         for (int k = 0; k < 6; k++)
             b[p++] = (uint8_t)(c->unit.src[k][u] & 0xFF);
@@ -359,7 +404,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->need_normal)
         sb_add(b, "uniform mat3 mglNormalMatrix;\n");
     if (c->rescale && !c->normalize)
-        sb_add(b, "uniform vec4 mglNormalParams;   /* .x = 1/|modelview scale| */\n");
+        sb_add(b, "uniform float mglNormalScale;    /* 1/|modelview scale| */\n");
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.unit_used[u])
@@ -372,8 +417,8 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->point_atten)
     {
-        sb_add(b, "uniform vec4 mglPointAtten;      /* a, b, c, unused */\n");
-        sb_add(b, "uniform vec4 mglPointSizeParams; /* size, min, max, unused */\n");
+        sb_add(b, "uniform vec3 mglPointAtten;      /* a, b, c */\n");
+        sb_add(b, "uniform vec3 mglPointSizeParams; /* size, min, max */\n");
     }
 
     if (c->lighting)
@@ -448,7 +493,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->normalize)
                 sb_add(b, "    mglN = normalize(mglN);\n");
             else
-                sb_add(b, "    mglN *= mglNormalParams.x;\n");
+                sb_add(b, "    mglN *= mglNormalScale;\n");
         }
         else
             sb_add(b, "    mglN = normalize(mglN);\n");  /* lighting needs unit normals */
@@ -649,7 +694,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->point_atten)
     {
         sb_add(b, "    float mglEyeDist = length(mglEye.xyz);\n");
-        sb_add(b, "    gl_PointSize = clamp(mglPointSizeParams.x * inversesqrt(dot(mglPointAtten.xyz, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeParams.y, mglPointSizeParams.z);\n");
+        sb_add(b, "    gl_PointSize = clamp(mglPointSizeParams.x * inversesqrt(dot(mglPointAtten, vec3(1.0, mglEyeDist, mglEyeDist * mglEyeDist))), mglPointSizeParams.y, mglPointSizeParams.z);\n");
     }
 
     sb_add(b, "    gl_Position = mglProjectionMatrix * mglEye;\n");
@@ -706,9 +751,56 @@ static void sb_src_expr(SB *b, int src, int unit, const MGLFFPConfig *c, const c
     (void)b; (void)c;
 }
 
-static void sb_combine(SB *b, int combine, char *args[3], bool rgb)
+/* ---- GL_CLAMP / GL_CLAMP_TO_BORDER emulation helpers (fragment shader) ---- */
+
+/* per-axis clamp mode packed 2 bits per axis (see MGLC_CLAMP_*) */
+static int axis_mode(int clamp_axes, int axis)
 {
-    switch (combine)
+    return (clamp_axes >> (2 * axis)) & 3;
+}
+
+/* sample coordinate component, clamped when the axis is emulated */
+static const char *axis_coord(int axis, const char *tc, int clamp_axes)
+{
+    static const char comp[3] = { 'x', 'y', 'z' };
+    static char buf[64];
+
+    if (axis_mode(clamp_axes, axis))
+        snprintf(buf, sizeof buf, "clamp(%s.%c, 0.0, 1.0)", tc, comp[axis]);
+    else
+        snprintf(buf, sizeof buf, "%s.%c", tc, comp[axis]);
+    return buf;
+}
+
+/* border weight of one axis (NULL when the axis is not emulated):
+ * NEAREST   -> 0 outside [0,1], 1 inside
+ * LINEAR    -> GL_CLAMP: 50/50 at the edges, ramping to the edge texel half a
+ *              texel in, and saturated at 50/50 further out
+ *           -> CLAMP_TO_BORDER: full border beyond half a texel outside */
+static const char *axis_weight(int axis, const char *tc, int clamp_axes, int nearest, int unit)
+{
+    static const char comp[3] = { 'x', 'y', 'z' };
+    static char buf[192];
+    char c[8], sz[32];
+    int mode = axis_mode(clamp_axes, axis);
+
+    if (!mode)
+        return NULL;
+
+    snprintf(c, sizeof c, "%s.%c", tc, comp[axis]);
+    snprintf(sz, sizeof sz, "mglTexSize%d.%c", unit, comp[axis]);
+
+    if (nearest)
+        snprintf(buf, sizeof buf, "((%s < 0.0 || %s > 1.0) ? 0.0 : 1.0)", c, c);
+    else if (mode == MGLC_CLAMP_EMU)
+        snprintf(buf, sizeof buf, "clamp(0.5 + min(max(%s, 0.0), max(1.0 - %s, 0.0)) * %s, 0.5, 1.0)", c, c, sz);
+    else
+        snprintf(buf, sizeof buf, "clamp(0.5 + min(%s, 1.0 - %s) * %s, 0.0, 1.0)", c, c, sz);
+    return buf;
+}
+
+static void sb_combine(SB *b, int combine, char *args[3], bool rgb)
+{    switch (combine)
     {
         case GL_REPLACE: sb_add(b, "%s", args[0]); break;
         case GL_MODULATE: sb_add(b, "(%s * %s)", args[0], args[1]); break;
@@ -748,10 +840,16 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             if (c->unit.env_mode[u] == GL_COMBINE)
             {
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
-                sb_add(b, "uniform vec4 mglEnvScale%d;     /* rgb scale, alpha scale, 0, 0 */\n", u);
+                sb_add(b, "uniform vec2 mglEnvScale%d;     /* rgb scale, alpha scale */\n", u);
             }
             else if (c->unit.env_mode[u] == GL_BLEND)
                 sb_add(b, "uniform vec4 mglEnvColor%d;\n", u);
+            if (c->unit.clamp_axes[u])
+            {
+                sb_add(b, "uniform vec4 mglBorder%d;       /* GL_CLAMP border color */\n", u);
+                sb_add(b, "uniform vec%d mglTexSize%d;     /* level-0 size */\n",
+                       c->unit.target[u] == GL_TEXTURE_3D ? 3 : 2, u);
+            }
         }
 
     if (c->fog)
@@ -761,7 +859,7 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     }
 
     if (c->alpha_test)
-        sb_add(b, "uniform vec4 mglAlphaParams;    /* .x = reference value */\n");
+        sb_add(b, "uniform float mglAlphaRef;      /* reference value */\n");
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.lod_bias[u])
@@ -779,6 +877,45 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     }
 
     sb_add(b, "layout(location=0) out vec4 mglFragColor;\n");
+
+    /* GL_CLAMP / GL_CLAMP_TO_BORDER border emulation: the sampler stays at
+     * CLAMP_TO_EDGE and the border (with GL_CLAMP's 50/50 edge blend for
+     * LINEAR) is blended here, exactly as GL 1.x defined it. */
+    for (int u = 0; u < MGLC_MAX_COORDS; u++)
+    {
+        if (!c->unit.unit_used[u] || !c->unit.clamp_axes[u])
+            continue;
+
+        int is3d = (c->unit.target[u] == GL_TEXTURE_3D);
+        int ncoord = is3d ? 3 : 2;
+        const char *bias = c->unit.lod_bias[u] ? ", mglLodBias" : "";
+
+        sb_add(b, "vec4 mglSample%d(vec4 tc)\n{\n", u);
+
+        /* clamped sample coordinates (1D textures live in a 2D sampler at t=.5) */
+        if (c->unit.target[u] == GL_TEXTURE_1D)
+            sb_add(b, "    vec2 c = vec2(%s, 0.5);\n", axis_coord(0, "tc", c->unit.clamp_axes[u]));
+        else
+        {
+            sb_add(b, "    vec%d c = vec%d(%s", ncoord, ncoord, axis_coord(0, "tc", c->unit.clamp_axes[u]));
+            for (int a = 1; a < ncoord; a++)
+                sb_add(b, ", %s", axis_coord(a, "tc", c->unit.clamp_axes[u]));
+            sb_add(b, ");\n");
+        }
+        sb_add(b, "    vec4 t = texture(mglTex%d, c%s);\n", u, bias);
+
+        /* border weight per emulated axis */
+        sb_add(b, "    float w = 1.0");
+        for (int a = 0; a < ncoord; a++)
+        {
+            const char *expr = axis_weight(a, "tc", c->unit.clamp_axes[u],
+                                           c->unit.clamp_nearest[u], u);
+            if (expr)
+                sb_add(b, " * %s", expr);
+        }
+        sb_add(b, ";\n");
+        sb_add(b, "    return mix(mglBorder%d, t, w);\n}\n", u);
+    }
 
     sb_add(b, "void main()\n{\n");
 
@@ -798,7 +935,9 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             sb_add(b, "    vec4 mglTexCoordIn%d = vec4(gl_PointCoord, 0.0, 1.0);\n", u);
 
         sb_add(b, "    vec4 mglTex%d = ", u);
-        if (c->unit.target[u] == GL_TEXTURE_1D)
+        if (c->unit.clamp_axes[u])
+            sb_add(b, "mglSample%d(mglTexCoordIn%d);\n", u, u);
+        else if (c->unit.target[u] == GL_TEXTURE_1D)
             sb_add(b, "texture(mglTex%d, vec2(mglTexCoordIn%d.s, 0.5)%s);\n", u, u,
                    c->unit.lod_bias[u] ? ", mglLodBias" : "");
         else if (c->unit.target[u] == GL_TEXTURE_3D || c->unit.target[u] == GL_TEXTURE_CUBE_MAP)
@@ -921,12 +1060,12 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         switch (c->alpha_func)
         {
             case GL_NEVER: expr = "false"; break;
-            case GL_LESS: expr = "c.a < mglAlphaParams.x"; break;
-            case GL_EQUAL: expr = "abs(c.a - mglAlphaParams.x) < 0.0001"; break;
-            case GL_LEQUAL: expr = "c.a <= mglAlphaParams.x"; break;
-            case GL_GREATER: expr = "c.a > mglAlphaParams.x"; break;
-            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaParams.x) >= 0.0001"; break;
-            case GL_GEQUAL: expr = "c.a >= mglAlphaParams.x"; break;
+            case GL_LESS: expr = "c.a < mglAlphaRef"; break;
+            case GL_EQUAL: expr = "abs(c.a - mglAlphaRef) < 0.0001"; break;
+            case GL_LEQUAL: expr = "c.a <= mglAlphaRef"; break;
+            case GL_GREATER: expr = "c.a > mglAlphaRef"; break;
+            case GL_NOTEQUAL: expr = "abs(c.a - mglAlphaRef) >= 0.0001"; break;
+            case GL_GEQUAL: expr = "c.a >= mglAlphaRef"; break;
             default: expr = "true"; break;    /* ALWAYS */
         }
         sb_add(b, "    if (!(%s)) discard;\n", expr);
@@ -1137,13 +1276,8 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     for (int i = 0; i < MGLC_FFP_CACHE; i++)
         if (cache && cache[i].used && cache[i].prog == prog)
         {
-            /* the uniform table is re-derived after the MSL compile of the
-             * first draw, so force a re-sync on the first few uses */
-            if (cache[i].sync == s->state_serial && cache[i].draws >= 3)
+            if (cache[i].sync == s->state_serial)
                 return;
-            cache[i].draws++;
-            if (cache[i].sync == s->state_serial && cache[i].draws < 3)
-                cache[i].dirty_late = 1;
             cache[i].sync = s->state_serial;
             break;
         }
@@ -1153,6 +1287,47 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     if (loc >= 0) mglUniformMatrix4fv(ctx, loc, 1, GL_FALSE, s->modelview_f);
     loc = uni(ctx, prog, "mglProjectionMatrix");
     if (loc >= 0) mglUniformMatrix4fv(ctx, loc, 1, GL_FALSE, s->projection_f);
+
+    /* GL_CLAMP border emulation: border color + level-0 size of each unit */
+    for (int u = 0; u < MGLC_MAX_COORDS; u++)
+    {
+        static const int texindex[] = { _TEXTURE_1D, _TEXTURE_2D, _TEXTURE_3D, _TEXTURE_CUBE_MAP };
+        static const GLenum targets[] = { GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_TEXTURE_CUBE_MAP };
+        char name[32];
+        Texture *tex = NULL;
+
+        if (!c.unit.clamp_axes[u])
+            continue;
+
+        for (int i = 0; i < 4 && !tex; i++)
+            if ((GLenum)c.unit.target[u] == targets[i])
+                tex = STATE(texture_units[u]).textures[texindex[i]];
+        if (!tex)
+            continue;
+
+        snprintf(name, sizeof name, "mglBorder%d", u);
+        loc = uni(ctx, prog, name);
+        if (loc >= 0) mglUniform4fv(ctx, loc, 1, tex->params.border_color);
+
+        snprintf(name, sizeof name, "mglTexSize%d", u);
+        loc = uni(ctx, prog, name);
+        if (loc >= 0)
+        {
+            /* the first level of the base face, as uploaded */
+            GLuint w = tex->width, h = tex->height, d = tex->depth;
+
+            if (tex->faces[0].levels)
+            {
+                w = tex->faces[0].levels[0].width;
+                h = tex->faces[0].levels[0].height;
+                d = tex->faces[0].levels[0].depth;
+            }
+            if (c.unit.target[u] == GL_TEXTURE_3D)
+                mglUniform3f(ctx, loc, (GLfloat)w, (GLfloat)h, (GLfloat)d);
+            else
+                mglUniform2f(ctx, loc, (GLfloat)w, (GLfloat)h);
+        }
+    }
 
     if (c.need_normal)
     {
@@ -1185,12 +1360,9 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
                 scale = (GLfloat)(1.0 / len);
         }
 
-        loc = uni(ctx, prog, "mglNormalParams");
+        loc = uni(ctx, prog, "mglNormalScale");
         if (loc >= 0)
-        {
-            GLfloat np[4] = { scale, 0.0f, 0.0f, 0.0f };
-            mglUniform4fv(ctx, loc, 1, np);
-        }
+            mglUniform1f(ctx, loc, scale);
     }
 
     /* texture matrices (name is fixed width: mglTextureMatrix%d) */
@@ -1225,16 +1397,10 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     {
         loc = uni(ctx, prog, "mglPointSizeParams");
         if (loc >= 0)
-        {
-            GLfloat sp[4] = { s->point_size, s->point_params[0], s->point_params[1], 0.0f };
-            mglUniform4fv(ctx, loc, 1, sp);
-        }
+            mglUniform3f(ctx, loc, s->point_size, s->point_params[0], s->point_params[1]);
         loc = uni(ctx, prog, "mglPointAtten");
         if (loc >= 0)
-        {
-            GLfloat a[4] = { s->point_params[3], s->point_params[4], s->point_params[5], 0.0f };
-            mglUniform4fv(ctx, loc, 1, a);
-        }
+            mglUniform3f(ctx, loc, s->point_params[3], s->point_params[4], s->point_params[5]);
     }
 
     /* lighting */
@@ -1350,10 +1516,7 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
             snprintf(name, sizeof name, "mglEnvScale%d", u);
             loc = uni(ctx, prog, name);
             if (loc >= 0)
-            {
-                GLfloat es[4] = { s->texenv[u].scale_rgb, s->texenv[u].scale_alpha, 0.0f, 0.0f };
-                mglUniform4fv(ctx, loc, 1, es);
-            }
+                mglUniform2f(ctx, loc, s->texenv[u].scale_rgb, s->texenv[u].scale_alpha);
         }
     }
 
@@ -1372,12 +1535,9 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
 
     if (c.alpha_test)
     {
-        loc = uni(ctx, prog, "mglAlphaParams");
+        loc = uni(ctx, prog, "mglAlphaRef");
         if (loc >= 0)
-        {
-            GLfloat ap[4] = { s->alpha_ref, 0.0f, 0.0f, 0.0f };
-            mglUniform4fv(ctx, loc, 1, ap);
-        }
+            mglUniform1f(ctx, loc, s->alpha_ref);
     }
 
     if (c.polygon_stipple)

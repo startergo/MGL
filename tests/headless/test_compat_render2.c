@@ -372,14 +372,17 @@ TEST(evaluators)
     glDisable(GL_MAP1_VERTEX_3);
 
     EXPECT_NO_GL_ERROR();
-    /* vertical line at x=16: GL's diamond rule would light x=16, Metal's line
-     * rasterizer lights x=15 - accept either (documented gap) */
+    /* Vertical line at x=16: x=16 is the RIGHT corner of column 15's diamonds
+     * and the LEFT corner of column 16's.  GL's diamond-exit rule counts the
+     * right corner and not the left one, so exactly column 15 is lit — verified
+     * against a CORE context drawing the same line (identical pixels). */
     {
-        GLubyte a[3], b[3];
-        glReadPixels(15, 32, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, a);
-        glReadPixels(16, 32, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, b);
-        EXPECT_TRUE(a[1] > 200 || b[1] > 200);
+        GLubyte a[4] = { 0, 0, 0, 0 }, b[4] = { 0, 0, 0, 0 };
+        glReadPixels(15, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, a);
+        glReadPixels(16, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+        EXPECT_TRUE(a[1] > 200);
         EXPECT_TRUE(a[0] == 0 && a[2] == 0);
+        EXPECT_TRUE(b[1] == 0);
     }
     EXPECT_PIXEL(32, 32, 0, 0, 0, 255, 8);
 
@@ -469,6 +472,94 @@ TEST(feedback_mode)
     }
 }
 
+/* specular exponent: the scalar uniform mglMatShininess[0] (float array next
+ * to vec4 arrays in the generated shader) must reach the GPU.  The vertex at
+ * (32.5,32.5) with the light at (32.5,36.5,10):
+ *   VP = (0,.3714,.9285), H = normalize(VP+(0,0,1)) -> NdH = .9819
+ * pow(.9819,128)=.0965, pow(.9819,16)=..7458, pow(.9819,2)=.9641 */
+static float specular_at_center(float shininess)
+{
+    setup_2d(64, 64);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glEnable(GL_LIGHTING);
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (GLfloat[4]){ 0, 0, 0, 1 });
+    glEnable(GL_LIGHT0);
+    glLightfv(GL_LIGHT0, GL_POSITION, (GLfloat[4]){ 32.5f, 36.5f, 10, 1 });
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, (GLfloat[4]){ 0, 0, 0, 1 });
+    glLightfv(GL_LIGHT0, GL_SPECULAR, (GLfloat[4]){ 1, 1, 1, 1 });
+
+    glMaterialfv(GL_FRONT, GL_SPECULAR, (GLfloat[4]){ 1, 1, 1, 1 });
+    glMaterialfv(GL_FRONT, GL_AMBIENT, (GLfloat[4]){ 0, 0, 0, 1 });
+    glMaterialfv(GL_FRONT, GL_DIFFUSE, (GLfloat[4]){ 0, 0, 0, 1 });
+    glMaterialf(GL_FRONT, GL_SHININESS, shininess);
+
+    glBegin(GL_QUADS);
+    glNormal3f(0, 0, 1);
+    for (int ty = 0; ty < 16; ty++)
+        for (int tx = 0; tx < 16; tx++)
+        {
+            float x0 = tx * 4.0f + 0.5f, y0 = ty * 4.0f + 0.5f;
+            glVertex3f(x0, y0, 0);
+            glVertex3f(x0 + 4, y0, 0);
+            glVertex3f(x0 + 4, y0 + 4, 0);
+            glVertex3f(x0, y0 + 4, 0);
+        }
+    glEnd();
+
+    GLubyte px[4];
+    mgl_read_rgba(32, 32, px);   /* pixel center = the vertex under the light */
+    glDisable(GL_LIGHTING);
+    glDisable(GL_LIGHT0);
+    return px[0] / 255.0f;
+}
+
+TEST(specular_shininess)
+{
+    EXPECT_NEAR(specular_at_center(128.0f), 0.0965f, 0.02f);
+    EXPECT_NEAR(specular_at_center(16.0f), 0.7458f, 0.03f);
+    EXPECT_NEAR(specular_at_center(2.0f), 0.9641f, 0.02f);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* GL line rasterization (diamond-exit rule): an exact vertical/horizontal
+ * line on a pixel boundary lights the pixel whose RIGHT / TOP corner the line
+ * touches (column 15 for x=16, row 15 for y=16); a line on a pixel center
+ * (16.5) lights that column/row only.  Verified against a CORE context
+ * drawing the same segments through a VBO (identical coverage). */
+TEST(line_diamond_rule)
+{
+    setup_2d(64, 64);
+    glColor4f(0, 1, 0, 1);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(16, 4); glVertex2f(16, 60); glEnd();
+    EXPECT_PIXEL(15, 32, 0, 255, 0, 255, 2);
+    EXPECT_PIXEL(16, 32, 0, 0, 0, 255, 2);
+    EXPECT_PIXEL(15, 4, 0, 255, 0, 255, 2);    /* first/last diamond corners */
+    EXPECT_PIXEL(15, 59, 0, 255, 0, 255, 2);
+    EXPECT_PIXEL(15, 3, 0, 0, 0, 255, 2);      /* just outside the segment */
+    EXPECT_PIXEL(15, 60, 0, 0, 0, 255, 2);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(4, 16); glVertex2f(60, 16); glEnd();
+    EXPECT_PIXEL(32, 15, 0, 255, 0, 255, 2);
+    EXPECT_PIXEL(32, 16, 0, 0, 0, 255, 2);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(16.5f, 4); glVertex2f(16.5f, 60); glEnd();
+    EXPECT_PIXEL(16, 32, 0, 255, 0, 255, 2);
+    EXPECT_PIXEL(15, 32, 0, 0, 0, 255, 2);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(4, 16.5f); glVertex2f(60, 16.5f); glEnd();
+    EXPECT_PIXEL(32, 16, 0, 255, 0, 255, 2);
+    EXPECT_PIXEL(32, 15, 0, 0, 0, 255, 2);
+
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     compat_ctx = mglCompatCreateContext();
@@ -478,12 +569,14 @@ int main(void)
 
     RUN(matrix_transforms);
     RUN(positional_light_and_colormaterial);
+    RUN(specular_shininess);
     RUN(texenv_modes);
     RUN(rasterpos_drawpixels);
     RUN(bitmap);
     RUN(accum);
     RUN(polygon_stipple);
     RUN(evaluators);
+    RUN(line_diamond_rule);
     RUN(select_mode);
     RUN(feedback_mode);
 
