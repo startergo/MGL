@@ -1465,6 +1465,10 @@ static void compat_after_upload(GLMContext ctx, GLenum target, GLint level)
     struct MGLExtState_compat *s = CS();
     GLuint name = bound_tex_name(ctx, target);
 
+    /* the GL_CLAMP emulation uploads the level-0 size as a uniform: sizes can
+     * change here, so the fixed-function sync must run again */
+    mgl_compat_dirty(ctx);
+
     for (int i = 0; i < s->legacy_tex_count; i++)
         if (s->legacy_tex[i].name == name && s->legacy_tex[i].gmm)
         {
@@ -1600,6 +1604,107 @@ void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level
 
 #pragma mark compat texture parameters (GL_CLAMP, GENERATE_MIPMAP)
 
+extern Texture *findTexture(GLMContext ctx, GLuint texture);
+
+/* one of the three border colors Metal samplers can fetch natively? */
+static bool standard_border(const Texture *tex)
+{
+    const float *b = tex->params.border_color;
+    bool black = b[0] == 0.0f && b[1] == 0.0f && b[2] == 0.0f;
+    bool white = b[0] == 1.0f && b[1] == 1.0f && b[2] == 1.0f;
+    if (!black && !white) return false;
+    return b[3] == 0.0f || b[3] == 1.0f;
+}
+
+/* NEAREST filtering in both directions (mip selection may still blend levels,
+ * the within-level border behaviour is what matters here)? */
+static bool nearest_filtering(const Texture *tex)
+{
+    switch (tex->params.min_filter)
+    {
+        case GL_NEAREST: case GL_NEAREST_MIPMAP_NEAREST: case GL_NEAREST_MIPMAP_LINEAR:
+            break;
+        default:
+            return false;
+    }
+    return tex->params.mag_filter == GL_NEAREST;
+}
+
+/* Per-axis emulation decision for a texture that asked for GL_CLAMP or
+ * GL_CLAMP_TO_BORDER (see mgl_ext_compat.h). */
+static void clamp_modes_for(GLMContext ctx, GLuint name, Texture *tex, int emu[3])
+{
+    struct MGLExtState_compat *s = CS();
+    int slot = -1;
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+            slot = i;
+
+    emu[0] = emu[1] = emu[2] = MGLC_CLAMP_NONE;
+    if (slot < 0 || !tex)
+        return;
+
+    bool bstd = standard_border(tex);
+    bool near = nearest_filtering(tex);
+
+    for (int a = 0; a < 3; a++)
+    {
+        GLenum req = s->legacy_tex[slot].wrap[a];
+
+        if (req == GL_CLAMP_TO_BORDER)
+            emu[a] = bstd ? MGLC_CLAMP_NONE : MGLC_CLAMP_EMU_BORDER;
+        else if (req == GL_CLAMP)
+            /* GL_CLAMP saturates at a 50/50 border blend outside [0,1], which
+             * the hardware border mode cannot do; with NEAREST the hardware
+             * matches GL exactly, so only LINEAR is emulated */
+            emu[a] = (bstd && near) ? MGLC_CLAMP_NONE : MGLC_CLAMP_EMU;
+    }
+}
+
+void mgl_compat_clamp_modes(GLMContext ctx, Texture *tex, int emu[3])
+{
+    clamp_modes_for(ctx, tex ? tex->name : 0, tex, emu);
+}
+
+/* push the decision into the core sampler state (the texture must be bound) */
+void mgl_compat_clamp_apply(GLMContext ctx, GLuint name)
+{
+    struct MGLExtState_compat *s = CS();
+    Texture *tex = findTexture(ctx, name);
+    int slot = -1;
+    int emu[3];
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+            slot = i;
+    if (slot < 0 || !tex)
+        return;
+
+    clamp_modes_for(ctx, name, tex, emu);
+
+    static const GLenum axis_pname[3] = { GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R };
+    for (int a = 0; a < 3; a++)
+    {
+        GLenum req = s->legacy_tex[slot].wrap[a];
+        GLenum want;
+
+        if (!req)
+            continue;                       /* axis never asked for a legacy mode */
+        else if (emu[a] == MGLC_CLAMP_NONE)
+            want = GL_CLAMP_TO_BORDER;      /* hardware border fetch */
+        else
+            want = GL_CLAMP_TO_EDGE;        /* emulated in the shader */
+
+        if (want != s->legacy_tex[slot].applied[a])
+        {
+            mglTexParameteri(ctx, tex->target, axis_pname[a], want);
+            s->legacy_tex[slot].applied[a] = want;
+            mgl_compat_dirty(ctx);
+        }
+    }
+}
+
 void compat_tex_parameteri(GLMContext ctx, GLenum target, GLenum pname, GLint param)
 {
     struct MGLExtState_compat *s = CS();
@@ -1619,20 +1724,32 @@ void compat_tex_parameteri(GLMContext ctx, GLenum target, GLenum pname, GLint pa
         int axis = (pname == GL_TEXTURE_WRAP_S) ? 0 : (pname == GL_TEXTURE_WRAP_T) ? 1 : 2;
         int slot;
 
-        if (param == GL_CLAMP)
+        if (param == GL_CLAMP || param == GL_CLAMP_TO_BORDER)
         {
-            /* Apple GPUs have no border fetch: CLAMP behaves as CLAMP_TO_EDGE.
-             * The requested mode is kept for queries. */
+            /* remembered for queries and the border emulation decision; the
+             * wrap handed to the sampler is chosen by mgl_compat_clamp_apply */
             compat_tex_entry(ctx, name, &slot);
             if (slot >= 0)
-                s->legacy_tex[slot].wrap[axis] = GL_CLAMP;
-            mglTexParameteri(ctx, target, pname, GL_CLAMP_TO_EDGE);
+                s->legacy_tex[slot].wrap[axis] = (GLenum)param;
+            if (slot >= 0)
+                mgl_compat_clamp_apply(ctx, name);
             return;
         }
 
         compat_tex_entry(ctx, name, &slot);
         if (slot >= 0)
+        {
             s->legacy_tex[slot].wrap[axis] = 0;
+            s->legacy_tex[slot].applied[axis] = 0;
+        }
+    }
+    else if (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER)
+    {
+        /* the filter is part of the CLAMP decision (and the border weight) */
+        mglTexParameteri(ctx, target, pname, param);
+        mgl_compat_dirty(ctx);
+        mgl_compat_clamp_apply(ctx, name);
+        return;
     }
 
     mglTexParameteri(ctx, target, pname, param);
@@ -1652,8 +1769,11 @@ void compat_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, const G
 {
     if (pname == GL_TEXTURE_BORDER_COLOR)
     {
-        /* tracked by the core (queryable); border fetch itself is not supported */
+        /* the border color is part of the GL_CLAMP decision (only three colors
+         * can be fetched by the hardware) and feeds the mglBorderN uniform */
         mglTexParameterfv(ctx, target, pname, params);
+        mgl_compat_dirty(ctx);
+        mgl_compat_clamp_apply(ctx, bound_tex_name(ctx, target));
         return;
     }
 

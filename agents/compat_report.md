@@ -104,6 +104,29 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
   rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
 
+## Session 8b (commit "GL_CLAMP / CLAMP_TO_BORDER: hardware border colours + shader emulation")
+
+* GL_CLAMP/GL_CLAMP_TO_BORDER are no longer downgraded to CLAMP_TO_EDGE.
+  Per texture axis, compat_state.c decides (mgl_compat_clamp_modes/apply):
+  - border colour is one of Metal's three (transparent/opaque black, opaque white)
+    AND (GL_CLAMP with NEAREST filtering, or GL_CLAMP_TO_BORDER): the sampler gets
+    GL_CLAMP_TO_BORDER -> MTLSamplerAddressModeClampToBorderColor (hardware).
+  - otherwise: sampler stays CLAMP_TO_EDGE and the generated FFP fragment shader
+    emulates it (uniform mglBorderN + mglTexSizeN + a mglSampleN() helper):
+    NEAREST -> border outside [0,1]; LINEAR -> the GL weight function
+    w = clamp(0.5 + min(max(u,0), max(1-u,0)) * N, 0.5, 1) for GL_CLAMP (50/50 at
+    the edges, saturated outside), w = clamp(0.5 + min(u, 1-u) * N, 0, 1) for
+    CLAMP_TO_BORDER (full border half a texel out).  GL_CLAMP_TO_BORDER with an
+    arbitrary border colour is emulated too (the core path keeps the nearest
+    standard colour).
+  * The decision is re-taken whenever WRAP_*/MIN/MAG_FILTER/BORDER_COLOR changes
+    and after every texture upload (size uniform).  Wrap queries return the
+    requested mode.  FFP key gained 2 bytes/unit (clamp axes+nearest). Cube-map
+    textures keep CLAMP_TO_EDGE (border emulation is 2D/1D/3D only).
+* Test: tests/headless/test_compat_render6.c (30 checks) — arbitrary border,
+  hardware colours, runtime switching between the two paths, the 50/50 edge
+  blend and its saturation vs CLAMP_TO_BORDER's full border.
+
 ## Session 7 (commit "GL_CLAMP / GENERATE_MIPMAP / texenv LOD bias")
 
 * glTexParameteri(GL_TEXTURE_WRAP_*, GL_CLAMP) is accepted: the hardware gets CLAMP_TO_EDGE
