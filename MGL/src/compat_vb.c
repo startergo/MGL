@@ -543,7 +543,8 @@ void mgl_compat_flush_imm(GLMContext ctx)
     /* select / feedback mode handles geometry on the CPU */
     if (s->rmode.mode != GL_RENDER)
     {
-        mgl_compat_cpu_draw(ctx, im->mode, im->pos, n);
+        /* feedback records per-vertex color / unit-0 texcoords of the batch */
+        mgl_compat_cpu_draw_rgba(ctx, im->mode, im->pos, n, im->color, im->texcoord[0]);
     }
     else
     {
@@ -1435,16 +1436,17 @@ void mgl_compat_upload_client_arrays(GLMContext ctx, GLuint min_index, GLuint ma
 
 /* reads |count| positions of the current VAO's vertex attribute starting at
  * element |first| (the upload above made element 0 == the lowest index used) */
-const float *mgl_compat_read_positions(GLMContext ctx, GLuint first, GLuint count)
+/* reads `count` elements of an uploaded client array as float[4] per vertex
+ * (malloc'd, caller frees); NULL when the array is not readable */
+float *mgl_compat_read_array(GLMContext ctx, GLuint attrib, GLuint first, GLuint count)
 {
-    struct MGLExtState_compat *s = CS();
     VertexArray *vao = VAO();
 
     if (!vao || count == 0)
         return NULL;
 
     MGLVertexArrayFull *va = mgl_va_full(vao);
-    MGLVertexAttribFormat *f = &va->fmt[MGLC_ATTR_VERTEX];
+    MGLVertexAttribFormat *f = &va->fmt[attrib];
     MGLVertexBinding *b = &va->binding[f->binding];
 
     if (!b || !b->buffer || !b->buffer->data.buffer_data)
@@ -1453,7 +1455,7 @@ const float *mgl_compat_read_positions(GLMContext ctx, GLuint first, GLuint coun
     {
         GLsizei stride = b->stride ? b->stride : (GLsizei)mgl_va_element_size(f->type, (GLint)f->size);
         const char *base = (const char *)(uintptr_t)b->buffer->data.buffer_data + b->offset;
-        float *out = (float *)malloc((size_t)count * 4 * sizeof(float));
+        float *out = (float *)calloc((size_t)count * 4, sizeof(float));
 
         if (!out)
             return NULL;
@@ -1464,11 +1466,33 @@ const float *mgl_compat_read_positions(GLMContext ctx, GLuint first, GLuint coun
             mgl_va_fetch_float(f, el, &out[i * 4]);
         }
 
-        free(s->pos_scratch);
-        s->pos_scratch = out;
-
         return out;
     }
+}
+
+const float *mgl_compat_read_positions(GLMContext ctx, GLuint first, GLuint count)
+{
+    struct MGLExtState_compat *s = CS();
+
+    free(s->pos_scratch);
+    s->pos_scratch = mgl_compat_read_array(ctx, MGLC_ATTR_VERTEX, first, count);
+    return s->pos_scratch;
+}
+
+/* per-vertex data for feedback: the color and unit-0 texture-coordinate
+ * arrays when enabled (NULL = the current values are used) */
+void mgl_compat_read_feedback_attribs(GLMContext ctx, GLuint first, GLuint count,
+                                      float **col, float **tex)
+{
+    struct MGLExtState_compat *s = CS();
+
+    *col = NULL;
+    *tex = NULL;
+
+    if (s->arrays[MGLC_ATTR_COLOR].enabled)
+        *col = mgl_compat_read_array(ctx, MGLC_ATTR_COLOR, first, count);
+    if (s->arrays[MGLC_ATTR_TEXCOORD(0)].enabled)
+        *tex = mgl_compat_read_array(ctx, MGLC_ATTR_TEXCOORD(0), first, count);
 }
 
 /* index range scan */
@@ -1508,7 +1532,14 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
     if (s->rmode.mode != GL_RENDER)
     {
         if (pos)
-            mgl_compat_cpu_draw(ctx, mode, pos, count);
+        {
+            float *col = NULL, *tex = NULL;
+
+            mgl_compat_read_feedback_attribs(ctx, 0, count, &col, &tex);
+            mgl_compat_cpu_draw_rgba(ctx, mode, pos, count, col, tex);
+            free(col);
+            free(tex);
+        }
         return;
     }
 
@@ -1591,6 +1622,71 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
     unbind_ffp(ctx, user);
 }
 
+/* glDrawElements + line stipple: the distance from the start of the strip is
+ * a per-vertex attribute, but a vertex shared by two positions of the index
+ * stream has two distances.  The draw is de-indexed: every enabled client
+ * array is gathered in draw order (element k of the new stream is index[k]),
+ * the distances are uploaded for that order, and the draw becomes a plain
+ * array draw.  Returns false when it could not (no readable array memory). */
+static bool draw_elements_stippled_lines(GLMContext ctx, GLenum mode, const uint32_t *idx,
+                                         GLsizei count, const float *pos)
+{
+    struct MGLExtState_compat *s = CS();
+    VertexArray *vao = VAO();
+    float *stream = NULL;
+    bool ok = true;
+
+    if (!vao || !pos)
+        return false;
+
+    /* positions in draw order */
+    stream = (float *)malloc((size_t)count * 4 * sizeof(float));
+    if (!stream)
+        return false;
+
+    for (GLsizei i = 0; i < count; i++)
+    {
+        stream[i * 4 + 0] = pos[idx[i] * 4 + 0];
+        stream[i * 4 + 1] = pos[idx[i] * 4 + 1];
+        stream[i * 4 + 2] = pos[idx[i] * 4 + 2];
+        stream[i * 4 + 3] = pos[idx[i] * 4 + 3];
+    }
+
+    upload_line_stipple(ctx, mode, stream, count);
+
+    /* gather every enabled array in the same order */
+    for (int index = 0; index < MAX_ATTRIBS && ok; index++)
+    {
+        MGLCClientArray *a = &s->arrays[index];
+
+        if (!a->enabled || !a->pointer)
+            continue;
+
+        GLsizei esz = (GLsizei)mgl_va_element_size(a->type, a->size);
+        GLsizei st = a->stride ? a->stride : esz;
+        char *gathered = (char *)malloc((size_t)count * (size_t)esz);
+
+        if (!gathered)
+        {
+            ok = false;
+            break;
+        }
+
+        for (GLsizei i = 0; i < count; i++)
+            memcpy(gathered + (size_t)i * esz,
+                   (const char *)a->pointer + (size_t)idx[i] * st, (size_t)esz);
+
+        upload_stream(ctx, vao, index, a->size, a->type, a->normalized, 0, gathered, count);
+        free(gathered);
+    }
+
+    if (ok)
+        mglDrawArrays(ctx, mode, 0, count);
+
+    free(stream);
+    return ok;
+}
+
 void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum type,
                               const void *indices, GLint basevertex)
 {
@@ -1653,7 +1749,22 @@ void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum
     if (s->rmode.mode != GL_RENDER)
     {
         if (pos)
-            mgl_compat_cpu_draw_indexed(ctx, mode, pos, idx32, count);
+        {
+            float *col = NULL, *tex = NULL;
+            uint32_t *reb = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
+
+            /* pos/col/tex element 0 is vertex mn: gather in draw order */
+            if (reb)
+            {
+                for (GLsizei i = 0; i < count; i++)
+                    reb[i] = (idx32[i] >= mn) ? idx32[i] - mn : 0;
+                mgl_compat_read_feedback_attribs(ctx, 0, mx - mn + 1, &col, &tex);
+                mgl_compat_cpu_draw_indexed_rgba(ctx, mode, pos, reb, count, col, tex);
+                free(reb);
+                free(col);
+                free(tex);
+            }
+        }
         free(idx32);
         return;
     }
@@ -1664,6 +1775,23 @@ void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum
             idx32[i] -= mn;
 
     Program *user = bind_ffp(ctx);
+
+    /* line stipple counts pixels from the start of each strip, which a shared
+     * vertex cannot carry as an attribute when a vertex is reused at several
+     * places of the index stream: de-index the draw (gather every enabled
+     * array in draw order) and feed the distances as a plain array */
+    if (s->line_stipple &&
+        (mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) && pos)
+    {
+        bool ok = draw_elements_stippled_lines(ctx, mode, idx32, count, pos);
+
+        if (ok)
+        {
+            free(idx32);
+            unbind_ffp(ctx, user);
+            return;
+        }
+    }
 
     GLenum draw_mode = mode;
     uint32_t *draw_idx = idx32;
@@ -1704,13 +1832,27 @@ void mgl_compat_draw_elements(GLMContext ctx, GLenum mode, GLsizei count, GLenum
 
 void mgl_compat_cpu_draw_indexed(GLMContext ctx, GLenum mode, const float *pos, const uint32_t *idx, GLuint count)
 {
+    mgl_compat_cpu_draw_indexed_rgba(ctx, mode, pos, idx, count, NULL, NULL);
+}
+
+/* with per-vertex color / texcoords gathered through the indices */
+void mgl_compat_cpu_draw_indexed_rgba(GLMContext ctx, GLenum mode, const float *pos, const uint32_t *idx,
+                                      GLuint count, const float *col, const float *tex)
+{
     if (!pos || !idx || !count)
         return;
 
     float *stream = (float *)malloc((size_t)count * 4 * sizeof(float));
+    float *col_s = col ? (float *)malloc((size_t)count * 4 * sizeof(float)) : NULL;
+    float *tex_s = tex ? (float *)malloc((size_t)count * 4 * sizeof(float)) : NULL;
 
-    if (!stream)
+    if (!stream || (col && !col_s) || (tex && !tex_s))
+    {
+        free(stream);
+        free(col_s);
+        free(tex_s);
         return;
+    }
 
     for (GLuint i = 0; i < count; i++)
     {
@@ -1718,10 +1860,17 @@ void mgl_compat_cpu_draw_indexed(GLMContext ctx, GLenum mode, const float *pos, 
         stream[i * 4 + 1] = pos[idx[i] * 4 + 1];
         stream[i * 4 + 2] = pos[idx[i] * 4 + 2];
         stream[i * 4 + 3] = pos[idx[i] * 4 + 3];
+
+        if (col_s)
+            memcpy(&col_s[i * 4], &col[idx[i] * 4], 4 * sizeof(float));
+        if (tex_s)
+            memcpy(&tex_s[i * 4], &tex[idx[i] * 4], 4 * sizeof(float));
     }
 
-    mgl_compat_cpu_draw(ctx, mode, stream, count);
+    mgl_compat_cpu_draw_rgba(ctx, mode, stream, count, col_s, tex_s);
     free(stream);
+    free(col_s);
+    free(tex_s);
 }
 
 /* display-list replay helper: the recorded pointer call */

@@ -104,6 +104,73 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
   rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
 
+## Session 8e (commit "glxgears-style end-to-end test")
+
+* tests/headless/test_compat_gears.c: a classic-app frame — three gears built in
+  immediate mode (triangle-fan faces with per-vertex normals + flat-shaded tooth
+  flanks, design after the MIT glxgears gear()), recorded into display lists,
+  drawn through the matrix stacks with a perspective frustum, two directional
+  lights, materials with specular, GL_NORMALIZE and depth testing; the frame is
+  compared against tests/headless/compat_gears_ref.h (10x10-block RGB averages,
+  tolerance 4/255, generated with `test_compat_gears --dump`) plus structural
+  checks (clear colour, coverage, all three material hues).  Deterministic
+  across runs on this GPU.
+* NOTE on the full-suite runs: with another agent building/testing in a parallel
+  worktree on this Mac, whole-suite runs occasionally fail a *random* test
+  (test_geom / test_introspect / even an untouched compat test) — every such
+  test passes standalone and the next suite run is clean.  GPU contention, not a
+  regression: verify suspected failures in isolation before digging.
+* OPERATION NOTE: this repo is a shared checkout with worktrees — NEVER use
+  `git stash` here (the stash list is shared; a `git stash pop` applied another
+  agent's entry into this worktree once and had to be undone with
+  `git checkout HEAD -- <file>`).
+
+## Session 8d (commits "indexed line stipple ...", "feedback ... per-vertex data")
+
+* Indexed (glDrawElements/glDrawRangeElements) line stipple works now: the distance
+  from the strip start is a per-vertex attribute, but a vertex reused at two places
+  of the index stream has two distances, so stippled indexed line draws are
+  de-indexed (draw_elements_stippled_lines() in compat_vb.c): every enabled client
+  array is gathered in draw order, upload_line_stipple() feeds the distances for
+  that order, then a plain glDrawArrays draws it.  Falls back to the indexed path
+  when the array memory cannot be read.
+* REAL BUG FIXED while testing that: the generated shader tested the stipple
+  pattern MSB-first ("bit 15 is the first pixel").  GL numbers the pattern
+  LSB-first (proof: Mesa draw_pipe_stipple.c stipple_test() tests
+  (1 << ((counter / factor) & 15)) & pattern, counter starting at 0).  The shader
+  now tests bit (idx % 16) and tests/test_compat_render3.c line_stipple pins the
+  exact pixel set of 0x00FF (first 8 of each 16 lit).  tests/test_compat_render8.c
+  covers indexed strips with vertex reuse, per-segment restarts, and the
+  unstippled indexed paths.
+* Feedback now records per-vertex data: the color array (unit 0 texcoord array)
+  is read per vertex for glDrawArrays/glDrawElements and from the immediate-mode
+  batch (mgl_compat_cpu_draw_rgba / _indexed_rgba, mgl_compat_read_feedback_attribs
+  / mgl_compat_read_array in compat_vb.c); when the arrays are disabled the
+  current color/texcoord is recorded as before.  Gap (documented): lighting and
+  texgen are not applied to feedback colors/coords (GL records the *lit* vertex
+  color); feedback is a picking-style feature and no test relies on lit colors.
+  Also fixed in passing: the glDrawElements feedback path used absolute indices
+  into the [mn,mx]-rebased position array.
+* Tests: test_compat_render8.c (72 checks), feedback tests in render2 (+46).
+
+## Session 8c (commit "legacy texture formats at real precision")
+
+* LUMINANCE / ALPHA / INTENSITY / LUMINANCE_ALPHA textures are no longer expanded
+  to RGBA32F.  compat_state.c legacy_upload() stores them at the data's own
+  precision — R8/RG8 (UNSIGNED_BYTE), R16/RG16 (UNSIGNED_SHORT), R8_SNORM/RG8_SNORM
+  (BYTE), R16_SNORM (SHORT), R16F (HALF_FLOAT), R32F (FLOAT), 32F+CPU-normalize
+  (INT/UINT) — with client format GL_RED/GL_RG, and sets the sampler swizzle to
+  the legacy replication ((r,r,r,1), (0,0,0,r), (r,r,r,g), (r,r,r,r)).
+* glTexSubImage with legacy client formats now works against the same storage
+  (the core texdata path knows GL_LUMINANCE/ALPHA client layouts).
+* glGetTexImage reads the stored channels and legacy_pack() rebuilds any legacy
+  client layout (LUMINANCE/ALPHA/INTENSITY/LA/RGB/RGBA, byte/short/int/float).
+* GL_TEXTURE_INTERNAL_FORMAT returns the format the app asked for (recorded);
+  after re-specifying the texture with a core format the record and the swizzle
+  are dropped (core query takes over; unsized GL_RGBA is reported as GL_RGBA8,
+  which the GL spec allows).
+* Test: tests/headless/test_compat_render7.c (82 checks).
+
 ## Session 8b (commit "GL_CLAMP / CLAMP_TO_BORDER: hardware border colours + shader emulation")
 
 * GL_CLAMP/GL_CLAMP_TO_BORDER are no longer downgraded to CLAMP_TO_EDGE.

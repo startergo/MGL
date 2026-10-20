@@ -251,6 +251,12 @@ GLint mglRenderMode(GLMContext ctx, GLenum mode)
 
 #pragma mark CPU geometry processing (select / feedback)
 
+/* &arr[i * 4] or NULL (NULL arrays mean "use the current values") */
+static const float *at(const float *arr, GLuint i)
+{
+    return arr ? &arr[i * 4] : NULL;
+}
+
 /* full transform of a vertex: object -> clip -> window (with viewport) */
 static void cpu_transform(GLMContext ctx, const float *obj, float *win, float *eye_z, float *clip_w)
 {
@@ -444,8 +450,10 @@ static void fb_put(GLMContext ctx, GLfloat v)
     s->rmode.feedback_buf[s->rmode.feedback_count++] = v;
 }
 
-/* one feedback vertex: window coords (+w), color, texture as the type asks */
-static void fb_vertex(GLMContext ctx, const float *win)
+/* one feedback vertex: window coords (+w), color, texture as the type asks.
+ * col/tex are this vertex's values (from a color / texcoord array or the
+ * immediate-mode stream) or NULL for the current values */
+static void fb_vertex(GLMContext ctx, const float *win, const float *col, const float *tex)
 {
     struct MGLExtState_compat *s = CS();
     GLenum t = (GLenum)s->rmode.feedback_type;
@@ -455,15 +463,17 @@ static void fb_vertex(GLMContext ctx, const float *win)
 
     if (t == GL_3D_COLOR || t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE)
         for (int i = 0; i < 4; i++)
-            fb_put(ctx, s->cur_color[i]);
+            fb_put(ctx, col ? col[i] : s->cur_color[i]);
 
     if (t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE)
         for (int i = 0; i < 4; i++)
-            fb_put(ctx, s->cur_texcoord[0][i]);
+            fb_put(ctx, tex ? tex[i] : s->cur_texcoord[0][i]);
 }
 
-/* emits the feedback stream for one glBegin/glEnd batch (window-space verts) */
-static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GLuint n)
+/* emits the feedback stream for one vertex batch (window-space verts); the
+ * optional col/tex arrays are float[4] per vertex in the same order */
+static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
+                          const float *col, const float *tex, GLuint n)
 {
     struct MGLExtState_compat *s = CS();
     int vv = fb_vertex_values((GLenum)s->rmode.feedback_type);
@@ -476,7 +486,7 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!clip_visible(ctx, win[i])) continue;
                 if (!fb_room(ctx, 1 + vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POINT_TOKEN);
-                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
             }
             break;
 
@@ -486,8 +496,8 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!clip_visible(ctx, win[i]) || !clip_visible(ctx, win[i + 1])) continue;
                 if (!fb_room(ctx, 1 + 2 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
-                fb_vertex(ctx, win[i]);
-                fb_vertex(ctx, win[i + 1]);
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
+                fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
             }
             break;
 
@@ -504,8 +514,8 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!clip_visible(ctx, win[a]) || !clip_visible(ctx, win[b])) continue;
                 if (!fb_room(ctx, 1 + 2 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
-                fb_vertex(ctx, win[a]);
-                fb_vertex(ctx, win[b]);
+                fb_vertex(ctx, win[a], at(col, a), at(tex, a));
+                fb_vertex(ctx, win[b], at(col, b), at(tex, b));
             }
             break;
         }
@@ -517,9 +527,9 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
-                fb_vertex(ctx, win[i]);
-                fb_vertex(ctx, win[i + 1]);
-                fb_vertex(ctx, win[i + 2]);
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
+                fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
+                fb_vertex(ctx, win[i + 2], at(col, i + 2), at(tex, i + 2));
             }
             break;
 
@@ -530,9 +540,9 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
-                fb_vertex(ctx, win[i]);
-                fb_vertex(ctx, win[i + 1]);
-                fb_vertex(ctx, win[i + 2]);
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
+                fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
+                fb_vertex(ctx, win[i + 2], at(col, i + 2), at(tex, i + 2));
             }
             break;
 
@@ -543,9 +553,9 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
-                fb_vertex(ctx, win[0]);
-                fb_vertex(ctx, win[i]);
-                fb_vertex(ctx, win[i + 1]);
+                fb_vertex(ctx, win[0], at(col, 0), at(tex, 0));
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
+                fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
             }
             break;
 
@@ -558,10 +568,10 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 if (!fb_room(ctx, 2 + 4 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 4.0f);
-                fb_vertex(ctx, win[i]);
-                fb_vertex(ctx, win[i + 1]);
-                fb_vertex(ctx, win[i + 2]);
-                fb_vertex(ctx, win[i + 3]);
+                fb_vertex(ctx, win[i], at(col, i), at(tex, i));
+                fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
+                fb_vertex(ctx, win[i + 2], at(col, i + 2), at(tex, i + 2));
+                fb_vertex(ctx, win[i + 3], at(col, i + 3), at(tex, i + 3));
             }
             break;
 
@@ -585,7 +595,7 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                     fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                     fb_put(ctx, 4.0f);
                     for (int k = 0; k < 4; k++)
-                        fb_vertex(ctx, win[stack[k]]);
+                        fb_vertex(ctx, win[stack[k]], at(col, stack[k]), at(tex, stack[k]));
                 }
                 break;
             }
@@ -608,7 +618,7 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, (GLfloat)vn);
                 for (GLuint i = 0; i < vn; i++)
-                    fb_vertex(ctx, win[g[i]]);
+                    fb_vertex(ctx, win[g[i]], at(col, g[i]), at(tex, g[i]));
             }
             free(heap);
             break;
@@ -625,6 +635,14 @@ void mgl_compat_window_pos(GLMContext ctx, const float *obj, float *win)
 }
 
 void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n)
+{
+    mgl_compat_cpu_draw_rgba(ctx, mode, pos, n, NULL, NULL);
+}
+
+/* same, with per-vertex color / unit-0 texcoords for feedback (NULL = use the
+ * current values); arrays are float[4] per vertex in the same order as pos */
+void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLuint n,
+                              const float *col, const float *tex)
 {
     struct MGLExtState_compat *s = CS();
 
@@ -656,7 +674,7 @@ void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n
 
     if (s->rmode.mode == GL_FEEDBACK)
     {
-        fb_emit_prims(ctx, mode, win, n);
+        fb_emit_prims(ctx, mode, win, col, tex, n);
     }
     else
     {

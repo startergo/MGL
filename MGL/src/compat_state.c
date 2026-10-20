@@ -1231,7 +1231,7 @@ static GLenum legacy_tex_kind(GLenum internalformat)
     return 0;
 }
 
-static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum type)
+static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum type, GLenum iformat)
 {
     struct MGLExtState_compat *s = CS();
 
@@ -1240,6 +1240,7 @@ static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum t
         {
             s->legacy_tex[i].kind = kind;
             s->legacy_tex[i].type = type;
+            s->legacy_tex[i].iformat = iformat;
             return;
         }
 
@@ -1249,6 +1250,7 @@ static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum t
         s->legacy_tex[s->legacy_tex_count].name = name;
         s->legacy_tex[s->legacy_tex_count].kind = kind;
         s->legacy_tex[s->legacy_tex_count].type = type;
+        s->legacy_tex[s->legacy_tex_count].iformat = iformat;
         s->legacy_tex_count++;
     }
 }
@@ -1273,9 +1275,11 @@ static void compat_tex_entry(GLMContext ctx, GLuint name, int *slot)
         s->legacy_tex[s->legacy_tex_count].name = name;
         s->legacy_tex[s->legacy_tex_count].kind = 0;
         s->legacy_tex[s->legacy_tex_count].type = 0;
+        s->legacy_tex[s->legacy_tex_count].iformat = 0;
         *slot = s->legacy_tex_count++;
     }
 }
+
 
 static void legacy_tex_forget(GLMContext ctx, GLuint name)
 {
@@ -1307,7 +1311,58 @@ static int legacy_type_bpc(GLenum type)
     return 0;
 }
 
-/* expands legacy pixel data to RGBA; out must hold w*h*depth*4 floats */
+/* Legacy formats are stored at their real precision (R8/RG8/R16/R32F...) with
+ * the legacy replication done by the sampler swizzle, instead of being blown
+ * up to RGBA32F.  This picks the storage format and client layout for a
+ * (kind, type) pair; returns 0 when the type has no supported storage. */
+static GLenum legacy_storage_format(GLenum kind, GLenum type, GLenum *client_format, int *cpu_float)
+{
+    int two = (kind == GL_LUMINANCE_ALPHA);
+
+    *client_format = two ? GL_RG : GL_RED;
+    *cpu_float = 0;     /* 1 = convert the client data to floats here first */
+
+    switch (type)
+    {
+        case GL_UNSIGNED_BYTE:  return two ? GL_RG8 : GL_R8;
+        case GL_UNSIGNED_SHORT: return two ? GL_RG16 : GL_R16;
+        case GL_BYTE:           *cpu_float = 1; return two ? GL_RG8_SNORM : GL_R8_SNORM;
+        case GL_SHORT:          *cpu_float = 1; return two ? GL_RG16_SNORM : GL_R16_SNORM;
+        case GL_HALF_FLOAT:     *cpu_float = 1; return two ? GL_RG16F : GL_R16F;
+        case GL_FLOAT:          return two ? GL_RG32F : GL_R32F;
+        case GL_UNSIGNED_INT:
+        case GL_INT:            *cpu_float = 1; return two ? GL_RG32F : GL_R32F;
+    }
+    return 0;
+}
+
+/* the sampler swizzle that turns the stored channels into the legacy format:
+ * LUMINANCE (l,l,l,1), ALPHA (0,0,0,a), LUMINANCE_ALPHA (l,l,l,a), INTENSITY (i,i,i,i) */
+static void legacy_set_swizzle(GLMContext ctx, GLenum target, GLenum kind)
+{
+    GLenum r, g, b, a;
+
+    if (kind == GL_LUMINANCE)              { r = GL_RED;  g = GL_RED;  b = GL_RED;  a = GL_ONE;  }
+    else if (kind == GL_ALPHA)              { r = GL_ZERO; g = GL_ZERO; b = GL_ZERO; a = GL_RED; }
+    else if (kind == GL_LUMINANCE_ALPHA)    { r = GL_RED;  g = GL_RED;  b = GL_RED;  a = GL_GREEN; }
+    else                                    { r = GL_RED;  g = GL_RED;  b = GL_RED;  a = GL_RED; }
+
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_R, r);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_G, g);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_B, b);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_A, a);
+}
+
+/* drops the legacy swizzle (the texture was re-specified with a core format) */
+static void legacy_reset_swizzle(GLMContext ctx, GLenum target)
+{
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_R, GL_RED);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+    mglTexParameteri(ctx, target, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+}
+
+/* converts client data to normalized floats (1 or 2 components per texel) */
 typedef unsigned short GLhalf;
 
 /* GLhalf -> float (IEEE 754 half precision) */
@@ -1326,7 +1381,6 @@ static float mgl_compat_half_to_float(GLhalf h)
             return out.f;
         }
         /* subnormal: normalize */
-        exp = 1;
         unsigned e = 0;
         while ((man & 0x400) == 0) { man <<= 1; e++; }
         man &= 0x3FF;
@@ -1345,105 +1399,73 @@ static float mgl_compat_half_to_float(GLhalf h)
     return out.f;
 }
 
-static void legacy_expand(GLenum kind, GLenum type, const void *pixels,
-                          GLsizei w, GLsizei h, GLsizei depth, GLfloat *out)
+static void legacy_to_float(GLenum type, const void *pixels, size_t n, int cc, GLfloat *out)
 {
-    int cc = legacy_client_comps(kind);
-    size_t n = (size_t)w * (size_t)(h ? h : 1) * (size_t)(depth ? depth : 1);
-
-    if (type == GL_UNSIGNED_BYTE)
+    for (size_t i = 0; i < n * (size_t)cc; i++)
     {
-        const GLubyte *p = (const GLubyte *)pixels;
+        float v = 0.0f;
 
-        for (size_t i = 0; i < n; i++)
+        switch (type)
         {
-            float a = p[i * cc], b = (cc == 2) ? p[i * cc + 1] : 0.0f;
-            float v[4];
-
-            if (kind == GL_LUMINANCE) { v[0]=v[1]=v[2]=a/255.0f; v[3]=1.0f; }
-            else if (kind == GL_LUMINANCE_ALPHA) { v[0]=v[1]=v[2]=a/255.0f; v[3]=b/255.0f; }
-            else if (kind == GL_ALPHA) { v[0]=v[1]=v[2]=0.0f; v[3]=a/255.0f; }
-            else { v[0]=v[1]=v[2]=v[3]=a/255.0f; }   /* INTENSITY */
-
-            out[i * 4 + 0] = v[0]; out[i * 4 + 1] = v[1];
-            out[i * 4 + 2] = v[2]; out[i * 4 + 3] = v[3];
+            case GL_BYTE: v = ((const GLbyte *)pixels)[i] / 127.0f; break;
+            case GL_SHORT: v = ((const GLshort *)pixels)[i] / 32767.0f; break;
+            case GL_HALF_FLOAT: v = mgl_compat_half_to_float(((const GLhalf *)pixels)[i]); break;
+            case GL_UNSIGNED_INT: v = (float)((const GLuint *)pixels)[i] / 4294967295.0f; break;
+            case GL_INT: v = (float)((const GLint *)pixels)[i] / 2147483647.0f; break;
+            default: v = ((const GLfloat *)pixels)[i]; break;
         }
-        return;
-    }
-
-    /* generic (slow) path: BYTE/SHORT/INT/FLOAT */
-    for (size_t i = 0; i < n; i++)
-    {
-        const GLubyte *p = (const GLubyte *)pixels + i * cc * (size_t)legacy_type_bpc(type);
-        float c[2] = { 0.0f, 0.0f };
-
-        for (int k = 0; k < cc; k++)
-        {
-            float v = 0.0f;
-
-            switch (type)
-            {
-                case GL_BYTE: v = ((const GLbyte *)p)[k] / 127.0f; break;
-                case GL_UNSIGNED_SHORT: v = ((const GLushort *)p)[k] / 65535.0f; break;
-                case GL_SHORT: v = ((const GLshort *)p)[k] / 32767.0f; break;
-                case GL_HALF_FLOAT: { unsigned short h = ((const unsigned short *)p)[k]; v = mgl_compat_half_to_float((GLhalf)h); break; }
-                case GL_UNSIGNED_INT: v = (float)((const GLuint *)p)[k] / 4294967295.0f; break;
-                case GL_INT: v = (float)((const GLint *)p)[k] / 2147483647.0f; break;
-                case GL_FLOAT: v = ((const GLfloat *)p)[k]; break;
-            }
-            c[k] = v;
-        }
-
-        float v[4];
-        if (kind == GL_LUMINANCE) { v[0]=v[1]=v[2]=c[0]; v[3]=1.0f; }
-        else if (kind == GL_LUMINANCE_ALPHA) { v[0]=v[1]=v[2]=c[0]; v[3]=c[1]; }
-        else if (kind == GL_ALPHA) { v[0]=v[1]=v[2]=0.0f; v[3]=c[0]; }
-        else { v[0]=v[1]=v[2]=v[3]=c[0]; }
-
-        out[i * 4 + 0] = v[0]; out[i * 4 + 1] = v[1];
-        out[i * 4 + 2] = v[2]; out[i * 4 + 3] = v[3];
+        out[i] = v;
     }
 }
 
-/* packs RGBA floats back into a legacy client layout */
+/* packs (l,a) texel values back into a legacy client layout: the components
+ * come from the stored channels (l = red, a = green or 1), the swizzle is not
+ * applied on readback */
 static void legacy_pack(GLenum kind, GLenum format, GLenum type,
                         GLsizei w, GLsizei h, const GLfloat *in, void *out)
 {
-    int cc = legacy_client_comps(kind);
     size_t n = (size_t)w * (size_t)(h ? h : 1);
 
     for (size_t i = 0; i < n; i++)
     {
-        float r = in[i * 4 + 0], a = in[i * 4 + 3];
+        float l = in[i * 4 + 0];
+        float a = (kind == GL_LUMINANCE_ALPHA) ? in[i * 4 + 1] :
+                  (kind == GL_INTENSITY) ? in[i * 4 + 0] : 1.0f;
+        float v[4];
+        int comps = 1;
 
         switch (format)
         {
-            case GL_LUMINANCE:
-                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(r * 255.0f + 0.5f);
-                else ((GLfloat *)out)[i] = r;
-                break;
+            case GL_LUMINANCE: case GL_INTENSITY: case GL_RED:
+                v[0] = l; comps = 1; break;
             case GL_ALPHA:
-                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(a * 255.0f + 0.5f);
-                else ((GLfloat *)out)[i] = a;
-                break;
-            case GL_INTENSITY:
-                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(r * 255.0f + 0.5f);
-                else ((GLfloat *)out)[i] = r;
-                break;
-            default:    /* GL_LUMINANCE_ALPHA */
-                if (type == GL_UNSIGNED_BYTE)
-                {
-                    ((GLubyte *)out)[i * 2] = (GLubyte)(r * 255.0f + 0.5f);
-                    ((GLubyte *)out)[i * 2 + 1] = (GLubyte)(a * 255.0f + 0.5f);
-                }
-                else
-                {
-                    ((GLfloat *)out)[i * 2] = r;
-                    ((GLfloat *)out)[i * 2 + 1] = a;
-                }
-                break;
+                v[0] = (kind == GL_ALPHA) ? in[i * 4 + 0] : a; comps = 1; break;
+            case GL_LUMINANCE_ALPHA:
+                v[0] = l; v[1] = a; comps = 2; break;
+            case GL_RG:
+                v[0] = l; v[1] = a; comps = 2; break;
+            case GL_RGB:
+                v[0] = v[1] = v[2] = l; comps = 3; break;
+            default:    /* GL_RGBA and friends */
+                v[0] = v[1] = v[2] = l; v[3] = a; comps = 4; break;
         }
-        (void)cc;
+
+        for (int k = 0; k < comps; k++)
+        {
+            float x = v[k];
+            size_t o = i * (size_t)comps + k;
+
+            switch (type)
+            {
+                case GL_UNSIGNED_BYTE:  ((GLubyte *)out)[o] = (GLubyte)(x * 255.0f + 0.5f); break;
+                case GL_BYTE:           ((GLbyte *)out)[o] = (GLbyte)(x * 127.0f + (x >= 0 ? 0.5f : -0.5f)); break;
+                case GL_UNSIGNED_SHORT: ((GLushort *)out)[o] = (GLushort)(x * 65535.0f + 0.5f); break;
+                case GL_SHORT:          ((GLshort *)out)[o] = (GLshort)(x * 32767.0f + (x >= 0 ? 0.5f : -0.5f)); break;
+                case GL_UNSIGNED_INT:   ((GLuint *)out)[o] = (GLuint)(x * 4294967295.0f + 0.5f); break;
+                case GL_INT:            ((GLint *)out)[o] = (GLint)(x * 2147483647.0f + (x >= 0 ? 0.5f : -0.5f)); break;
+                default:                ((GLfloat *)out)[o] = x; break;
+            }
+        }
     }
 }
 
@@ -1478,31 +1500,77 @@ static void compat_after_upload(GLMContext ctx, GLenum target, GLint level)
         }
 }
 
+/* uploads a legacy image at its real precision (R8/RG8/R16/RG16/...) and
+ * installs the sampler swizzle; returns false when the format must fall
+ * through to the core path */
+static bool legacy_upload(GLMContext ctx, GLenum target, GLint level, GLenum kind,
+                          GLsizei w, GLsizei h, GLsizei depth, GLint border,
+                          GLenum format, GLenum type, const void *pixels, GLenum req_iformat)
+{
+    GLenum client_format = 0, iformat;
+    const void *data = pixels;
+    GLfloat *conv = NULL;
+    int cpu_float, cc = legacy_client_comps(kind);
+    size_t n = (size_t)w * (size_t)(h ? h : 1) * (size_t)(depth ? depth : 1);
+
+    if (format != kind || !pixels)
+        return false;
+
+    iformat = legacy_storage_format(kind, type, &client_format, &cpu_float);
+    if (!iformat)
+        return false;
+
+    if (cpu_float)
+    {
+        conv = (GLfloat *)malloc(n * (size_t)cc * sizeof(GLfloat));
+        if (!conv)
+            return false;
+        legacy_to_float(type, pixels, n, cc, conv);
+        data = conv;
+        type = GL_FLOAT;
+    }
+
+    if (depth)
+        mglTexImage3D(ctx, target, level, iformat, w, h, depth, border, client_format, type, data);
+    else
+        mglTexImage2D(ctx, target, level, iformat, w, h, border, client_format, type, data);
+
+    free(conv);
+    legacy_set_swizzle(ctx, target, kind);
+    legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, format == GL_INTENSITY ? format : type, req_iformat);
+    compat_after_upload(ctx, target, level);
+    return true;
+}
+
 void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
                         GLsizei width, GLsizei height, GLint border,
                         GLenum format, GLenum type, const void *pixels)
 {
     GLenum kind = legacy_tex_kind((GLenum)internalformat);
 
-    if (kind && legacy_type_bpc(type) && (format == kind) && pixels)
-    {
-        GLfloat *rgba = (GLfloat *)malloc((size_t)width * height * 4 * sizeof(GLfloat));
-
-        if (rgba)
-        {
-            legacy_expand(kind, type, pixels, width, height, 1, rgba);
-            mglTexImage2D(ctx, target, level, GL_RGBA32F, width, height, border, GL_RGBA, GL_FLOAT, rgba);
-            free(rgba);
-            legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
-            compat_after_upload(ctx, target, level);
-            return;
-        }
-    }
+    if (kind && legacy_type_bpc(type) &&
+        legacy_upload(ctx, target, level, kind, width, height, 0, border, format, type, pixels,
+                      (GLenum)internalformat))
+        return;
 
     mglTexImage2D(ctx, target, level, internalformat, width, height, border, format, type, pixels);
 
     if (kind)
-        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type, (GLenum)internalformat);
+    else
+    {
+        /* re-specified with a core format: drop the legacy swizzle/record */
+        GLuint name = bound_tex_name(ctx, target);
+        struct MGLExtState_compat *s = CS();
+
+        for (int i = 0; i < s->legacy_tex_count; i++)
+            if (s->legacy_tex[i].name == name && s->legacy_tex[i].kind)
+            {
+                s->legacy_tex[i].kind = 0;
+                s->legacy_tex[i].iformat = 0;
+                legacy_reset_swizzle(ctx, target);
+            }
+    }
 
     compat_after_upload(ctx, target, level);
 }
@@ -1519,25 +1587,15 @@ void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint intern
 {
     GLenum kind = legacy_tex_kind((GLenum)internalformat);
 
-    if (kind && legacy_type_bpc(type) && (format == kind) && pixels)
-    {
-        GLfloat *rgba = (GLfloat *)malloc((size_t)width * height * depth * 4 * sizeof(GLfloat));
-
-        if (rgba)
-        {
-            legacy_expand(kind, type, pixels, width, height, depth, rgba);
-            mglTexImage3D(ctx, target, level, GL_RGBA32F, width, height, depth, border, GL_RGBA, GL_FLOAT, rgba);
-            free(rgba);
-            legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
-            compat_after_upload(ctx, target, level);
-            return;
-        }
-    }
+    if (kind && legacy_type_bpc(type) &&
+        legacy_upload(ctx, target, level, kind, width, height, depth, border, format, type, pixels,
+                      (GLenum)internalformat))
+        return;
 
     mglTexImage3D(ctx, target, level, internalformat, width, height, depth, border, format, type, pixels);
 
     if (kind)
-        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type, (GLenum)internalformat);
 
     compat_after_upload(ctx, target, level);
 }
@@ -1590,14 +1648,14 @@ void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level
         for (int i = 0; i < s->legacy_tex_count; i++)
             if (s->legacy_tex[i].name == name)
             {
-                switch (s->legacy_tex[i].kind)
+                /* the internal format the app asked for; LUMINANCE(8) etc. are
+                 * what GL reports even though the storage is R8/RG8 */
+                if (s->legacy_tex[i].kind && s->legacy_tex[i].iformat)
                 {
-                    case GL_LUMINANCE: *params = 0x8040; break;        /* LUMINANCE8 */
-                    case GL_LUMINANCE_ALPHA: *params = 0x8045; break;  /* LUMINANCE8_ALPHA8 */
-                    case GL_ALPHA: *params = 0x803C; break;            /* ALPHA8 */
-                    default: *params = 0x8049; break;                  /* INTENSITY8 */
+                    *params = s->legacy_tex[i].iformat;
+                    return;
                 }
-                return;
+                break;      /* re-specified with a core format: ask the core */
             }
     }
 }

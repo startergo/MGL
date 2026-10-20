@@ -1076,10 +1076,11 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->line_stipple)
     {
-        /* pattern bit 15 (MSB) is the first pixel of the line */
+        /* GL numbers the pattern LSB-first: fragment 0 tests bit 0 (this is
+         * what Mesa's line-stipple stage does: bit = (counter / factor) & 15,
+         * pattern >> bit) */
         sb_add(b, "    int mglLIdx = int(floor(mglLineV / float(mglLineStipple.y) + 1e-4));\n");
-        sb_add(b, "    int mglLBit = 15 - (mglLIdx %% 16);\n");
-        sb_add(b, "    if (((mglLineStipple.x >> mglLBit) & 1) == 0) discard;\n");
+        sb_add(b, "    if (((mglLineStipple.x >> (mglLIdx %% 16)) & 1) == 0) discard;\n");
     }
 
     sb_add(b, "    mglFragColor = c;\n");
