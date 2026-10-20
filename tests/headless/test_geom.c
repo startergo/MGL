@@ -236,6 +236,7 @@ TEST(point_to_quad_amplification)
 
     glUseProgram(p);
     static const float one[2] = { 0.0f, 0.0f };
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* 256x256 so the (160,160) read is inside */
     setup(2, one);
     glDrawArrays(GL_POINTS, 0, 1);
     EXPECT_NO_GL_ERROR();
@@ -300,6 +301,7 @@ TEST(primitive_id_and_invocations)
 
 TEST(lines_adjacency_input)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 200, 200); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* adjacency vertices are visible in gl_in[] but only the middle edge is drawn */
     const char *gs =
         "#version 450 core\n"
@@ -425,9 +427,11 @@ TEST(link_error_no_varying)
         "layout(location=0) in vec2 pos;\n"
         "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
     GLuint p = program(vs, gs, fs);
-    GLint ok = 1;
+    GLint ok = 0;
+    /* a geometry input the vertex stage never writes stays undefined in GL — the link
+     * must succeed (KHR-GL46.geometry_shader.output.vertex_emit_at_end) */
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    EXPECT_EQ_INT(ok, GL_FALSE);
+    EXPECT_EQ_INT(ok, GL_TRUE);
     glDeleteProgram(p);
 }
 
@@ -481,6 +485,7 @@ TEST(end_primitive_splitting)
 
 TEST(amplification_max_vertices)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 200, 200); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* one input point becomes three side-by-side triangles */
     const char *gs =
         "#version 450 core\n"
@@ -759,6 +764,7 @@ TEST(layered_rendering)
 
 TEST(viewport_index)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* two viewports side by side; the geometry picks the right one */
     const char *gs =
         "#version 450 core\n"
@@ -797,6 +803,7 @@ TEST(viewport_index)
 
 TEST(separable_pipeline_with_gs)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     const char *gs =
         "#version 450 core\n"
         "layout(triangles) in;\n"
@@ -1143,6 +1150,7 @@ TEST(xfb_streams)
 
 TEST(block_vs_fs_control)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     const char *vs =
         "#version 450 core\n"
         "layout(location=0) in vec2 pos;\n"
@@ -1160,18 +1168,21 @@ TEST(block_vs_fs_control)
     EXPECT_EQ_INT(ok, GL_TRUE);
     if (!ok) return;
     glUseProgram(p);
+    /* the pixel maths below assume a 256x256 viewport centred on (128,128) */
+    glViewport(0, 0, 256, 256);
     clear_black();
     { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
     glDrawArrays(GL_TRIANGLES, 0, 3);
     EXPECT_NO_GL_ERROR();
     GLubyte c[4];
-    px(100, 100, c);
+    px(128, 128, c);
     EXPECT_TRUE(c[0] < 32 && c[1] > 100);
     glDeleteProgram(p);
 }
 
 TEST(gs_struct_interface_vars)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     const char *vs =
         "#version 450 core\n"
         "layout(location=0) in vec2 pos;\n"
@@ -1209,12 +1220,14 @@ TEST(gs_struct_interface_vars)
     EXPECT_EQ_INT(ok, GL_TRUE);
     if (!ok) return;
     glUseProgram(p);
+    /* the pixel maths below assume a 256x256 viewport centred on (128,128) */
+    glViewport(0, 0, 256, 256);
     clear_black();
     { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
     glDrawArrays(GL_TRIANGLES, 0, 3);
     EXPECT_NO_GL_ERROR();
     GLubyte c[4];
-    px(100, 100, c);
+    px(128, 128, c);
     EXPECT_TRUE(c[0] < 32 && c[1] > 100);
     glDeleteProgram(p);
 }
@@ -1222,6 +1235,7 @@ TEST(gs_struct_interface_vars)
 /* control: a block between the vertex and fragment stages without a geometry shader */
 TEST(gs_struct_member_order)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* member order inside the block is free: the record offsets follow the block's
      * declaration, not the location order */
     const char *vs =
@@ -1261,12 +1275,14 @@ TEST(gs_struct_member_order)
     EXPECT_EQ_INT(ok, GL_TRUE);
     if (!ok) return;
     glUseProgram(p);
+    /* the pixel maths below assume a 256x256 viewport centred on (128,128) */
+    glViewport(0, 0, 256, 256);
     clear_black();
     { static const float t[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f }; setup(6, t); }
     glDrawArrays(GL_TRIANGLES, 0, 3);
     EXPECT_NO_GL_ERROR();
     GLubyte c[4];
-    px(100, 100, c);
+    px(128, 128, c);
     EXPECT_TRUE(c[0] < 32 && c[1] > 100);
     glDeleteProgram(p);
 }
@@ -1411,6 +1427,7 @@ static const float tess_tri[12] =
 
 TEST(tessellation_triangles_into_gs)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* the geometry stage shrinks every tessellated triangle: the centre pixel is inside the
      * shrunken triangle, the left edge only inside the unshrunk one */
     const char *gs =
@@ -1442,6 +1459,7 @@ TEST(tessellation_triangles_into_gs)
 
 TEST(tessellation_indexed_into_gs)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* the same tessellated patch through an index buffer (a cyclic permutation keeps the
      * winding): the primitive slots come from the tessellator's index list either way */
     const char *gs =
@@ -1480,6 +1498,7 @@ TEST(tessellation_indexed_into_gs)
 
 TEST(tessellation_isolines_into_gs)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 200, 200); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* isolines produce line primitives: the geometry stage thickens the single tessellated
      * isoline into a quad (triangle_strip) */
     const char *tcs =
@@ -1728,6 +1747,7 @@ TEST(xfb_of_tes_gs_output)
 
 TEST(tessellation_point_mode_into_gs)
 {
+    { GLuint _t; GLuint _f = block_fbo(&_t, 200, 200); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
     /* point_mode tessellation emits points: the geometry stage turns each into a small
      * triangle, so a point at the top control point covers a pixel there */
     const char *tes =
@@ -2832,8 +2852,130 @@ TEST(gs_output_block_xfb_errors)
     EXPECT_NO_GL_ERROR();
 }
 
+TEST(pool_wrap_stress_tiny)
+{
+    /* The scratch pools' slot-reuse rule must be safe however far the GPU lags the CPU.
+     * The pool knobs are read once, at the first geometry draw of the process, and this
+     * test runs first: it forces tiny pools (16 KiB per slot, 2 slots), so the allocator
+     * has to wrap, reclaim and wait every few draws — and every geometry test below keeps
+     * running under the same tiny pools.  The batch below is the purest hazard case:
+     * many geometry draws with NOTHING between them (no state change, no buffer update,
+     * no finish), so the draws pile into one command buffer while the CPU keeps handing
+     * out ranges — a reuse rule that reasons about GPU timing instead of range ownership
+     * corrupts exactly this.  A tess->GS draw is interleaved every few quads: the tess
+     * import consumes the pools from a command buffer the tessellation stage itself
+     * commits, the other consumer path a slot can have. */
+    setenv("MGL_GEOM_POOL_CAP", "16384", 1);
+    setenv("MGL_GEOM_POOL_SLOTS", "2", 1);
+    { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }
+
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(location=0) in vec2 v_pos[];\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "layout(location=0) out vec2 g_uv;\n"
+        "void main(){\n"
+        "  vec2 p = v_pos[0], e = vec2(0.02, 0.02);\n"
+        "  g_uv = vec2(0); gl_Position = vec4(p.x - e.x, p.y - e.y, 0.0, 1.0); EmitVertex();\n"
+        "  g_uv = vec2(1); gl_Position = vec4(p.x + e.x, p.y - e.y, 0.0, 1.0); EmitVertex();\n"
+        "  g_uv = vec2(1); gl_Position = vec4(p.x - e.x, p.y + e.y, 0.0, 1.0); EmitVertex();\n"
+        "  g_uv = vec2(0); gl_Position = vec4(p.x + e.x, p.y + e.y, 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 g_uv;\n"
+        "layout(location=0) out vec4 c0;\n"
+        "void main(){ if (min(g_uv.x, g_uv.y) < 0.25) discard; c0 = vec4(0, 1, 0, 1); }\n";
+    const char *tgs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(location=0) in float shade[];\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "layout(location=0) out float gshade;\n"
+        "void main(){\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = vec4(gl_in[i].gl_Position.xy * 0.06 + vec2(0.86, 0.86),"
+        " 0.0, 1.0); gshade = shade[i]; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    GLuint p = program(plain_vs, gs, fs);
+    GLuint tp = tess_gs_prog(tri_tcs, tri_tes, tgs);
+    if (!p || !tp) return;
+
+    /* the point batch: 96 distinct positions in one static buffer, one draw each */
+    const int N = 96;
+    static float pts[N][2];
+    for (int i = 0; i < N; i++)
+    {
+        pts[i][0] = -0.95f + 1.9f * ((i % 12) / 11.0f);
+        pts[i][1] = -0.95f + 1.9f * ((i / 12) / 7.0f);
+    }
+    GLuint pvao, pvbo, tvao, tvbo;
+    glGenVertexArrays(1, &pvao);
+    glBindVertexArray(pvao);
+    glGenBuffers(1, &pvbo);
+    glBindBuffer(GL_ARRAY_BUFFER, pvbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pts, pts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glGenVertexArrays(1, &tvao);
+    glBindVertexArray(tvao);
+    glGenBuffers(1, &tvbo);
+    glBindBuffer(GL_ARRAY_BUFFER, tvbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof tess_tri, tess_tri, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    glUseProgram(p);                /* the batch below starts with point draws */
+    clear_black();
+    glFinish();
+    for (int i = 0; i < N; i++)
+    {
+        if ((i & 7) == 4)
+        {
+            /* interleaved tess->GS consumer (commits its own command buffer) */
+            glUseProgram(tp);
+            glBindVertexArray(tvao);
+            glDrawArrays(GL_PATCHES, 0, 3);
+            glUseProgram(p);
+        }
+        glBindVertexArray(pvao);
+        glDrawArrays(GL_POINTS, i, 1);          /* nothing between the draws */
+    }
+    glFinish();
+    EXPECT_NO_GL_ERROR();
+
+    int missing = 0;
+    for (int i = 0; i < N; i++)
+    {
+        int x = (int)((pts[i][0] * 0.5f + 0.5f) * 256), y = (int)((pts[i][1] * 0.5f + 0.5f) * 256);
+        if (x <= 0 || x >= 255 || y <= 0 || y >= 255) continue;
+        GLubyte c[4];
+        px(x, y, c);
+        if (!is_green(c)) missing++;
+    }
+    printf("pool-wrap stress (16 KiB x 2 slots): %d/%d quads missing\n", missing, N);
+    EXPECT_TRUE(missing == 0);
+
+    /* the tess blob is green too: the interleaved import path kept working */
+    {
+        GLubyte c[4];
+        px(236, 236, c);
+        EXPECT_TRUE(c[1] > 100);
+    }
+    glDeleteProgram(p);
+    glDeleteProgram(tp);
+    glDeleteVertexArrays(1, &pvao);
+    glDeleteVertexArrays(1, &tvao);
+    glDeleteBuffers(1, &pvbo);
+    glDeleteBuffers(1, &tvbo);
+}
+
 int main(void)
 {
+    RUN(pool_wrap_stress_tiny);     /* first: forces the tiny pools for the whole binary */
     RUN(block_vs_fs_control);
     RUN(gs_struct_interface_vars);
     RUN(gs_struct_member_order);

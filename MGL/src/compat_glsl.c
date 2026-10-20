@@ -152,7 +152,7 @@ static bool tr_subst_ident(Tr *t, const char *id, size_t n)
         if (match(id, n, "gl_BackColor")) { tr_adds(t, "mglBackColor"); t->used |= U_BACK_COLOR; return (t->subst++, true); }
         if (match(id, n, "gl_FrontSecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return (t->subst++, true); }
         if (match(id, n, "gl_BackSecondaryColor")) { tr_adds(t, "mglBackSecondaryColor"); t->used |= U_BACK_SEC; return (t->subst++, true); }
-        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordOut"); t->used |= 0; return (t->subst++, true); }
+        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordV"); t->used |= 0; return (t->subst++, true); }
         if (match(id, n, "gl_ClipVertex")) { tr_adds(t, "mglClipVertex"); t->used |= U_MISC; return (t->subst++, true); }
         if (match(id, n, "gl_FogFragCoord")) { tr_adds(t, "mglFogFragCoord"); t->used |= U_MISC; return (t->subst++, true); }
         if (match(id, n, "ftransform")) { tr_adds(t, "mgl_ftransform"); t->used |= U_MVM | U_MATRICES; return (t->subst++, true); }
@@ -161,7 +161,7 @@ static bool tr_subst_ident(Tr *t, const char *id, size_t n)
     {
         if (match(id, n, "gl_Color")) { tr_adds(t, "mglFrontColor"); t->used |= U_FRONT_COLOR; return (t->subst++, true); }
         if (match(id, n, "gl_SecondaryColor")) { tr_adds(t, "mglFrontSecondaryColor"); t->used |= U_FRONT_SEC; return (t->subst++, true); }
-        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordIn"); return (t->subst++, true); }
+        if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordV"); return (t->subst++, true); }
         if (match(id, n, "gl_FragColor")) { tr_adds(t, "mglFragColor"); t->used |= U_FRAG_COLOR; return (t->subst++, true); }
         if (match(id, n, "gl_FragData")) { t->used |= U_FRAG_DATA; return false; }   /* handled by the caller */
         if (match(id, n, "gl_FogFragCoord")) { tr_adds(t, "mglFogFragCoord"); t->used |= U_MISC; return (t->subst++, true); }
@@ -462,24 +462,27 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
                 if (t.used & TEXCOORD_BIT(u))
                     p += sprintf(p, "layout(location=%d) in vec4 mglTexCoord%d;\n", MGLC_ATTR_TEXCOORD(u), u);
 
-            /* varyings: always declared so VS/FS pairs always link */
-            p += sprintf(p, "out vec4 mglFrontColor;\n");
-            p += sprintf(p, "out vec4 mglBackColor;\n");
-            p += sprintf(p, "out vec4 mglFrontSecondaryColor;\n");
-            p += sprintf(p, "out vec4 mglBackSecondaryColor;\n");
-            p += sprintf(p, "out vec4 mglTexCoordOut[%d];\n", MGLC_MAX_COORDS);
-            p += sprintf(p, "out float mglFogFragCoord;\n");
-            p += sprintf(p, "out vec4 mglClipVertex;\n");
+            /* varyings: always declared so VS/FS pairs always link.  Fixed locations and
+             * names shared with the fragment stage (and with the generated fixed-function
+             * shaders: mglTexCoordV[u] sits at MGLC_VAR_TEXCOORD(u), so a translated
+             * vertex shader also feeds a fixed-function fragment stage) */
+            p += sprintf(p, "layout(location=%d) out vec4 mglFrontColor;\n", MGLC_VAR_COLOR_FRONT);
+            p += sprintf(p, "layout(location=%d) out vec4 mglBackColor;\n", MGLC_VAR_COLOR_BACK);
+            p += sprintf(p, "layout(location=%d) out vec4 mglFrontSecondaryColor;\n", MGLC_VAR_SECONDARY);
+            p += sprintf(p, "layout(location=%d) out vec4 mglBackSecondaryColor;\n", MGLC_VAR_BACKSECONDARY);
+            p += sprintf(p, "layout(location=%d) out vec4 mglTexCoordV[%d];\n", MGLC_VAR_TEXCOORD(0), MGLC_MAX_COORDS);
+            p += sprintf(p, "layout(location=%d) out float mglFogFragCoord;\n", MGLC_VAR_FOGFRAGCOORD);
+            p += sprintf(p, "layout(location=%d) out vec4 mglClipVertex;\n", MGLC_VAR_CLIPVERTEX);
         }
         else
         {
-            p += sprintf(p, "in vec4 mglFrontColor;\n");
-            p += sprintf(p, "in vec4 mglBackColor;\n");
-            p += sprintf(p, "in vec4 mglFrontSecondaryColor;\n");
-            p += sprintf(p, "in vec4 mglBackSecondaryColor;\n");
-            p += sprintf(p, "in vec4 mglTexCoordIn[%d];\n", MGLC_MAX_COORDS);
-            p += sprintf(p, "in float mglFogFragCoord;\n");
-            p += sprintf(p, "in vec4 mglClipVertex;\n");
+            p += sprintf(p, "layout(location=%d) in vec4 mglFrontColor;\n", MGLC_VAR_COLOR_FRONT);
+            p += sprintf(p, "layout(location=%d) in vec4 mglBackColor;\n", MGLC_VAR_COLOR_BACK);
+            p += sprintf(p, "layout(location=%d) in vec4 mglFrontSecondaryColor;\n", MGLC_VAR_SECONDARY);
+            p += sprintf(p, "layout(location=%d) in vec4 mglBackSecondaryColor;\n", MGLC_VAR_BACKSECONDARY);
+            p += sprintf(p, "layout(location=%d) in vec4 mglTexCoordV[%d];\n", MGLC_VAR_TEXCOORD(0), MGLC_MAX_COORDS);
+            p += sprintf(p, "layout(location=%d) in float mglFogFragCoord;\n", MGLC_VAR_FOGFRAGCOORD);
+            p += sprintf(p, "layout(location=%d) in vec4 mglClipVertex;\n", MGLC_VAR_CLIPVERTEX);
 
             if (t.fragdata_used)
             {

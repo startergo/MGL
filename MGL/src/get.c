@@ -598,7 +598,10 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_VERTEX_UNIFORM_VECTORS: PUT1(LIMIT(STATE_VAR(max_vertex_uniform_vectors), 1024));
         case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_fragment_uniform_components), 4096));
         case GL_MAX_FRAGMENT_UNIFORM_VECTORS: PUT1(LIMIT(STATE_VAR(max_fragment_uniform_vectors), 1024));
-        case GL_MAX_GEOMETRY_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_geometry_uniform_components), 1024));
+        /* the geometry constants must match what glslang bakes into shaders as
+         * gl_MaxGeometry* (its default resources: 1024 uniform components, no atomic
+         * counters) — KHR-GL46.geometry_shader.constant_variables compares the two */
+        case GL_MAX_GEOMETRY_UNIFORM_COMPONENTS: PUT1(1024);
         case GL_MAX_TESS_CONTROL_UNIFORM_COMPONENTS: PUT1(1024);
         case GL_MAX_TESS_EVALUATION_UNIFORM_COMPONENTS: PUT1(1024);
         case GL_MAX_COMPUTE_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_compute_uniform_components), 1024));
@@ -610,7 +613,7 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_GEOMETRY_OUTPUT_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_geometry_output_components), 128));
         case GL_MAX_FRAGMENT_INPUT_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_fragment_input_components), 128));
         case GL_MAX_GEOMETRY_OUTPUT_VERTICES: PUT1(256);
-        case GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS: PUT1(1024);
+        case GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS: PUT1(2048);
         case GL_MAX_GEOMETRY_SHADER_INVOCATIONS: PUT1(32);
         case GL_MAX_VERTEX_STREAMS: PUT1(4);
         case GL_MAX_CLIP_DISTANCES: PUT1(MAX_CLIP_DISTANCES);
@@ -666,15 +669,15 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS:
-        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS:
+        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */
         case GL_MAX_COMBINED_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS: PUT1(MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS);
         case GL_MAX_VERTEX_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_vertex_atomic_counters), 1024));
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_tess_control_atomic_counters), 1024));
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_tess_evaluation_atomic_counters), 1024));
-        case GL_MAX_GEOMETRY_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_geometry_atomic_counters), 1024));
+        case GL_MAX_GEOMETRY_ATOMIC_COUNTERS: PUT1(0);
         case GL_MAX_FRAGMENT_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_fragment_atomic_counters), 1024));
         case GL_MAX_COMPUTE_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_compute_atomic_counters), 1024));
         case GL_MAX_COMBINED_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_combined_atomic_counters), 1024));

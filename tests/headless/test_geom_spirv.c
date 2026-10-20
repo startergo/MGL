@@ -128,7 +128,7 @@ int main(void)
 
     {
         GLubyte c[4] = {0, 0, 0, 0};
-        px(100, 150, c);
+        px(50, 50, c);      /* inside the 100x100 default framebuffer */
         printf("binary-gs pixel = %d,%d,%d\n", c[0], c[1], c[2]);
         EXPECT_TRUE(is_green(c));
     }

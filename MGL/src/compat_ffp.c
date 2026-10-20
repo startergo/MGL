@@ -467,18 +467,22 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         sb_add(b, "layout(location=%d) in float mglLineI;   /* distance along the line, pixels */\n", MGLC_ATTR_LINE_I);
 
     /* outputs */
-    sb_add(b, "%sout vec4 mglColorFront;\n", c->flat ? "flat " : "");
+    /* varyings carry fixed locations and the SAME names the fragment stage declares
+     * (GL matches interface variables by name at link time) */
+    sb_add(b, "%slayout(location=%d) out vec4 mglColorFront;\n", c->flat ? "flat " : "", MGLC_VAR_COLOR_FRONT);
     if (c->two_sided)
-        sb_add(b, "%sout vec4 mglColorBack;\n", c->flat ? "flat " : "");
+        sb_add(b, "%slayout(location=%d) out vec4 mglColorBack;\n", c->flat ? "flat " : "", MGLC_VAR_COLOR_BACK);
     if (!c->lighting || c->separate_specular)
-        sb_add(b, "%sout vec4 mglSecondaryOut;\n", c->flat ? "flat " : "");
+        sb_add(b, "%slayout(location=%d) out vec4 mglSecondary;\n", c->flat ? "flat " : "", MGLC_VAR_SECONDARY);
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.unit_used[u])
-            sb_add(b, "out vec4 mglTexCoordOut%d;\n", u);
+            sb_add(b, "layout(location=%d) out vec4 mglTexCoordV%d;\n", MGLC_VAR_TEXCOORD(u), u);
     if (c->fog)
-        sb_add(b, "out vec4 mglEyePos;\n");
+        sb_add(b, "layout(location=%d) out vec4 mglEyePos;\n", MGLC_VAR_EYEPOS);
+    if (c->fog && c->fog_src == GL_FOG_COORD)
+        sb_add(b, "layout(location=%d) out float mglFogCoordV;\n", MGLC_VAR_FOGCOORD);
     if (c->line_stipple)
-        sb_add(b, "out float mglLineV;\n");
+        sb_add(b, "layout(location=%d) out float mglLineV;\n", MGLC_VAR_LINEV);
 
     sb_add(b, "void main()\n{\n");
     sb_add(b, "    vec4 mglEye = mglModelViewMatrix * mglVertex;\n");
@@ -502,7 +506,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (!c->lighting)
     {
         sb_add(b, "    mglColorFront = mglColor;\n");
-        sb_add(b, "    mglSecondaryOut = mglSecondaryColor;\n");
+        sb_add(b, "    mglSecondary = mglSecondaryColor;\n");
     }
     else
     {
@@ -588,7 +592,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
         if (c->separate_specular)
         {
             sb_add(b, "    mglColorFront = mglColF;\n");
-            sb_add(b, "    mglSecondaryOut = mglSpecF;\n");
+            sb_add(b, "    mglSecondary = mglSpecF;\n");
             if (c->two_sided)
                 sb_add(b, "    mglColorBack = mglColB;\n");
         }
@@ -599,6 +603,11 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
                 sb_add(b, "    mglColorBack = mglColB + mglSpecB;\n");
         }
     }
+
+    /* fog coordinate source: the vertex attribute is forwarded (the fragment stage
+     * reads the varying, never the attribute) */
+    if (c->need_fogcoord)
+        sb_add(b, "    mglFogCoordV = mglFogCoord;\n");
 
     /* texture coordinate generation + texture matrix */
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
@@ -613,7 +622,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
         if (!any_gen)
         {
-            sb_add(b, "    mglTexCoordOut%d = mglTextureMatrix%d * mglTexCoord%d;\n", u, u, u);
+            sb_add(b, "    mglTexCoordV%d = mglTextureMatrix%d * mglTexCoord%d;\n", u, u, u);
             continue;
         }
 
@@ -630,7 +639,7 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
         const char *comp[4] = { "s", "t", "r", "q" };
 
-        sb_add(b, "    mglTexCoordOut%d = mglTextureMatrix%d * vec4(", u, u);
+        sb_add(b, "    mglTexCoordV%d = mglTextureMatrix%d * vec4(", u, u);
         for (int cc = 0; cc < 4; cc++)
         {
             const char *sep = cc ? ", " : "";
@@ -816,19 +825,20 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 {
     sb_add(b, "#version 460 core\n\n");
 
-    sb_add(b, "%sin vec4 mglColorFront;\n", c->flat ? "flat " : "");
+    /* varyings carry fixed locations and the SAME names the vertex stage declares */
+    sb_add(b, "%slayout(location=%d) in vec4 mglColorFront;\n", c->flat ? "flat " : "", MGLC_VAR_COLOR_FRONT);
     if (c->two_sided)
-        sb_add(b, "%sin vec4 mglColorBack;\n", c->flat ? "flat " : "");
+        sb_add(b, "%slayout(location=%d) in vec4 mglColorBack;\n", c->flat ? "flat " : "", MGLC_VAR_COLOR_BACK);
     if (!c->lighting || c->separate_specular)
-        sb_add(b, "%sin vec4 mglSecondaryIn;\n", c->flat ? "flat " : "");
+        sb_add(b, "%slayout(location=%d) in vec4 mglSecondary;\n", c->flat ? "flat " : "", MGLC_VAR_SECONDARY);
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.unit_used[u])
-            sb_add(b, "in vec4 mglTexCoordIn%d;\n", u);
+            sb_add(b, "layout(location=%d) in vec4 mglTexCoordV%d;\n", MGLC_VAR_TEXCOORD(u), u);
     if (c->fog)
     {
-        sb_add(b, "in vec4 mglEyePos;\n");
+        sb_add(b, "layout(location=%d) in vec4 mglEyePos;\n", MGLC_VAR_EYEPOS);
         if (c->fog_src == GL_FOG_COORD)
-            sb_add(b, "in float mglFogCoordIn;\n");
+            sb_add(b, "layout(location=%d) in float mglFogCoordV;\n", MGLC_VAR_FOGCOORD);
     }
 
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
@@ -932,19 +942,19 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             continue;
 
         if (c->unit.coord_replace[u])
-            sb_add(b, "    vec4 mglTexCoordIn%d = vec4(gl_PointCoord, 0.0, 1.0);\n", u);
+            sb_add(b, "    vec4 mglTexCoordV%d = vec4(gl_PointCoord, 0.0, 1.0);\n", u);
 
         sb_add(b, "    vec4 mglTex%d = ", u);
         if (c->unit.clamp_axes[u])
-            sb_add(b, "mglSample%d(mglTexCoordIn%d);\n", u, u);
+            sb_add(b, "mglSample%d(mglTexCoordV%d);\n", u, u);
         else if (c->unit.target[u] == GL_TEXTURE_1D)
-            sb_add(b, "texture(mglTex%d, vec2(mglTexCoordIn%d.s, 0.5)%s);\n", u, u,
+            sb_add(b, "texture(mglTex%d, vec2(mglTexCoordV%d.s, 0.5)%s);\n", u, u,
                    c->unit.lod_bias[u] ? ", mglLodBias" : "");
         else if (c->unit.target[u] == GL_TEXTURE_3D || c->unit.target[u] == GL_TEXTURE_CUBE_MAP)
-            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xyz%s);\n", u, u,
+            sb_add(b, "texture(mglTex%d, mglTexCoordV%d.xyz%s);\n", u, u,
                    c->unit.lod_bias[u] ? ", mglLodBias" : "");
         else
-            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xy%s);\n", u, u,
+            sb_add(b, "texture(mglTex%d, mglTexCoordV%d.xy%s);\n", u, u,
                    c->unit.lod_bias[u] ? ", mglLodBias" : "");
     }
 
@@ -1028,14 +1038,14 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     }
 
     if (c->lighting && c->separate_specular)
-        sb_add(b, "    c.rgb += mglSecondaryIn.rgb;\n");
+        sb_add(b, "    c.rgb += mglSecondary.rgb;\n");
 
     if (c->fog)
     {
         sb_add(b, "    float mglFogF;\n");
         sb_add(b, "    float mglFogD = ");
         if (c->fog_src == GL_FOG_COORD)
-            sb_add(b, "mglFogCoordIn;\n");
+            sb_add(b, "mglFogCoordV;\n");
         else
             sb_add(b, "length(mglEyePos.xyz);\n");
 

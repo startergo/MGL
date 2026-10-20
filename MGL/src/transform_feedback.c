@@ -677,6 +677,18 @@ static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version
         glslang_shader_delete(sh);
         return false;
     }
+    /* run the I/O mapper exactly as the program's own link does (program.c): it is what
+     * assigns the locations/bindings AUTO_MAP_* promise.  Without it the capture variant
+     * compiles but SPIRV-Cross emits a stage_in struct whose members have no
+     * [[attribute(n)]] (Metal: "invalid type of input declaration with attribute
+     * 'stage_in'"), and invented bindings would not match the program's reflection */
+    if (!glslang_program_map_io(prog)) {
+        const char *l = glslang_program_get_info_log(prog);
+        *log = strdup(l ? l : "I/O mapping failed");
+        glslang_program_delete(prog);
+        glslang_shader_delete(sh);
+        return false;
+    }
     glslang_program_SPIRV_generate(prog, GLSLANG_STAGE_VERTEX);
     *words = glslang_program_SPIRV_get_size(prog);
     *ir = malloc(*words * sizeof(uint32_t));

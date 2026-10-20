@@ -197,9 +197,12 @@ typedef struct {
 
 typedef struct {
     uint32_t id;            /* the struct type */
-    uint32_t member;
+    uint32_t member;        /* member index */
     char     name[64];
 } SpvMemberName;
+
+/* one resource-binding pin for a generated MSL compile (see geom_build_pins) */
+typedef struct { int binding; int msl; bool texture; } GeomPin;
 
 typedef struct {
     uint32_t id;            /* target */
@@ -302,6 +305,14 @@ static const char *spv_name(SpvModule *m, uint32_t id)
     for (int i = 0; i < m->n_names; i++)
         if (m->names[i].id == id) return m->names[i].name;
     return NULL;
+}
+
+static int spv_binding(SpvModule *m, uint32_t id)
+{
+    for (int i = 0; i < m->n_decos; i++)
+        if (m->decos[i].id == id && m->decos[i].deco == SpvDecorationBinding)
+            return (int)m->decos[i].value;
+    return -1;
 }
 
 static SpvVar *spv_find_var(SpvModule *m, uint32_t id) __attribute__((unused));
@@ -541,6 +552,22 @@ static SpvType *spv_value_type(SpvModule *m, uint32_t type_id, uint32_t *array_e
     return t;
 }
 
+/* the scalar component type of a (possibly vector / matrix) type: a plain SPVT_VEC's kind
+ * says nothing about float vs int — the component type is its element type.  Returning
+ * GL_FLOAT for an ivec4 would make the kernel load it with uintBitsToFloat and the
+ * generated assignment fail to compile ("cannot convert vec4 to ivec4"). */
+static GLenum spv_scalar_base(SpvModule *m, const SpvType *t)
+{
+    const SpvType *s = t;
+    if (!s) return GL_FLOAT;
+    if (s->kind == SPVT_VEC || s->kind == SPVT_MAT) s = spv_find_type(m, s->elem);
+    if (!s) return GL_FLOAT;
+    if (s->kind == SPVT_FLOAT) return s->bits == 64 ? GL_DOUBLE : GL_FLOAT;
+    if (s->kind == SPVT_INT) return s->is_signed ? GL_INT : GL_UNSIGNED_INT;
+    if (s->kind == SPVT_BOOL) return GL_BOOL;
+    return GL_FLOAT;
+}
+
 /* ------------------------------------------------------------------ varying layout */
 
 static const char *glsl_type_name(GLenum base, GLuint rows, GLuint cols)
@@ -688,7 +715,10 @@ static void gen_varying_store(SB *b, const MGLGeomVar *v, const char *dest, cons
                 if (v->rows > 1) snprintf(rp, sizeof(rp), "%s", comp[r]);
 
                 char expr[256];
-                snprintf(expr, sizeof(expr), "%s%s%s%s", src, ep, cp, rp);
+                if (!src)
+                    snprintf(expr, sizeof(expr), "0u");     /* undefined input: zeros */
+                else
+                    snprintf(expr, sizeof(expr), "%s%s%s%s", src, ep, cp, rp);
 
                 GLuint w = v->offset + (e * v->cols * v->rows + c * v->rows + r) * comp_words(v->base);
                 if (v->base == GL_DOUBLE)
@@ -717,7 +747,7 @@ static MGLGeomProgram *geom_prog_slot(GLMContext ctx, Program *p, bool create)
 
     /* run_link builds every executable in a scratch object, so the Program pointer differs
      * between the compile hook and the post-link hook: fall back to the name */
-    for (int i = 0; i < MGL_GEOM_MAX_PROGRAMS; i++)
+    for (int i = 0; i < g->n_progs; i++)
     {
         MGLGeomProgram *gp = &g->progs[i];
         if (gp->name == p->name) return gp;
@@ -725,7 +755,7 @@ static MGLGeomProgram *geom_prog_slot(GLMContext ctx, Program *p, bool create)
     if (!create) return NULL;
 
     /* re-use slots whose program is gone (deleted, or a new object under the name) */
-    for (int i = 0; i < MGL_GEOM_MAX_PROGRAMS; i++)
+    for (int i = 0; i < g->n_progs; i++)
     {
         MGLGeomProgram *gp = &g->progs[i];
         if (gp->name && getProgram(ctx, gp->name)) continue;
@@ -735,7 +765,23 @@ static MGLGeomProgram *geom_prog_slot(GLMContext ctx, Program *p, bool create)
         gp->program = getProgram(ctx, p->name);
         return gp;
     }
-    return NULL;
+
+    /* no free slot: grow the table */
+    if (g->n_progs >= g->progs_cap)
+    {
+        int cap = g->progs_cap ? g->progs_cap * 2 : MGL_GEOM_MAX_PROGRAMS;
+        MGLGeomProgram *grown = realloc(g->progs, (size_t)cap * sizeof(*grown));
+        if (!grown) return NULL;
+        memset(grown + g->n_progs, 0, (size_t)(cap - g->n_progs) * sizeof(*grown));
+        g->progs = grown;
+        g->progs_cap = cap;
+    }
+    {
+        MGLGeomProgram *gp = &g->progs[g->n_progs++];
+        gp->name = p->name;
+        gp->program = getProgram(ctx, p->name);
+        return gp;
+    }
 }
 
 static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
@@ -796,7 +842,13 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
         const char *vstr = strstr(src, "#version");
         if (vstr) sscanf(vstr, "#version %d", &version);
     }
-    if (version < 330) options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
+    /* match the program's own compile (shaders.c mglCompileShader): GL assigns interface
+     * locations and bindings at link time, so a 330+ shader whose outputs/inputs have no
+     * layout(location) (legal GL, e.g. the CTS's "out uint vs_gs_index;") must compile here
+     * too.  The invented locations never reach the record layout — the capture variant
+     * stores outputs explicitly and the kernel reads them back by record offset — and the
+     * invented bindings are re-pinned below (geom_spirv_to_msl), so auto-mapping is inert. */
+    options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS | GLSLANG_SHADER_AUTO_MAP_BINDINGS;
 
     shader = glslang_shader_create(&input);
     if (!shader) { mgl_append_log(log, "ERROR: geometry: glslang shader creation failed\n"); return false; }
@@ -820,6 +872,19 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
     {
         const char *info = glslang_program_get_info_log(prog);
         mgl_append_log(log, "ERROR: geometry: glslang program link failed\n%s", info ? info : "");
+        glslang_program_delete(prog);
+        glslang_shader_delete(shader);
+        return false;
+    }
+
+    /* run the I/O mapper (as program.c's link does): it is what actually assigns the
+     * locations AUTO_MAP_LOCATIONS only promises — without it a shader whose in/out have
+     * no layout(location) compiles but SPIRV-Cross then emits a stage_in struct whose
+     * members carry no [[attribute(n)]], which Metal rejects */
+    if (!glslang_program_map_io(prog))
+    {
+        const char *info = glslang_program_get_info_log(prog);
+        mgl_append_log(log, "ERROR: geometry: glslang I/O mapping failed\n%s", info ? info : "");
         glslang_program_delete(prog);
         glslang_shader_delete(shader);
         return false;
@@ -906,7 +971,8 @@ static char *geom_spirv_to_glsl(const uint32_t *ir, size_t words, int version, c
 /* translate SPIR-V to MSL with the given buffer pins; returns the MSL source */
 static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *ir, size_t words,
                                const char *entry, bool disable_rasterization, char **log,
-                               int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count)
+                               int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count,
+                               const GeomPin *pins2, int npins2)
 {
     spvc_context sctx;
     spvc_parsed_ir pir;
@@ -959,6 +1025,33 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
             if (spvc_compiler_msl_add_resource_binding(comp, &binding) != SPVC_SUCCESS)
             {
                 mgl_append_log(log, "ERROR: geometry: could not pin MSL buffer %d\n", pins_msl[i]);
+                spvc_context_destroy(sctx);
+                return NULL;
+            }
+        }
+
+        /* user resources of the stage (uniform / storage buffers, samplers): pinned to the
+         * flat positions of the renderer's buffer map, so the buffer map built for the
+         * program's own stage binds them verbatim for the emulation shaders too (see
+         * geom_build_pins) */
+        for (int i = 0; i < npins2; i++)
+        {
+            memset(&binding, 0, sizeof(binding));
+            binding.stage = (SpvExecutionModel)pin_stage;
+            binding.desc_set = 0;
+            binding.binding = (unsigned)pins2[i].binding;
+            if (pins2[i].texture)
+            {
+                binding.msl_texture = (unsigned)pins2[i].msl;
+                binding.msl_sampler = (unsigned)pins2[i].msl;
+            }
+            else
+            {
+                binding.msl_buffer = (unsigned)pins2[i].msl;
+            }
+            if (spvc_compiler_msl_add_resource_binding(comp, &binding) != SPVC_SUCCESS)
+            {
+                mgl_append_log(log, "ERROR: geometry: could not pin MSL resource %d\n", pins2[i].binding);
                 spvc_context_destroy(sctx);
                 return NULL;
             }
@@ -1503,15 +1596,58 @@ static char *geom_transform_source(const char *src, unsigned in_verts, char *gl_
             size_t b = skip_blank(src, pos, len);
             while (pos < b)
             {
-                if (src[pos] == '/' && pos + 1 < len && (src[pos + 1] == '/' || src[pos + 1] == '*'))
-                    copy_renamed(&out, src, &pos, len, NULL, NULL, NULL);
+                /* copy a comment in place: copy_renamed() has no stop characters here and
+                 * would run on to the end of the file, copying every declaration after the
+                 * comment verbatim (the CTS limits shaders put a comment between the
+                 * preamble and their declarations) */
+                if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '/')
+                {
+                    while (pos < len && src[pos] != '\n') { sb_put(&out, "%c", src[pos]); pos++; }
+                }
+                else if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '*')
+                {
+                    sb_put(&out, "/*");
+                    pos += 2;
+                    while (pos + 1 < len && !(src[pos] == '*' && src[pos + 1] == '/'))
+                    { sb_put(&out, "%c", src[pos]); pos++; }
+                    if (pos + 1 < len) { sb_put(&out, "*/"); pos += 2; }
+                }
                 else { sb_put(&out, "%c", src[pos]); pos++; }
             }
             if (pos >= len) break;
+            /* a preprocessor directive that follows the skipped blanks is handled by the
+             * '#' branch above (it must not fall through to the statement copier, which
+             * would swallow the following declaration: "#define A (0)\nflat in int x;")
+             */
+            if (src[pos] == '#') continue;
+            /* likewise a comment: skip_blank does not cross it, and the statement copier
+             * would run from the comment to the next ';' — swallowing any "#define" and
+             * the declarations that follow it (the CTS limits shaders) */
+            if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '/')
+            {
+                while (pos < len && src[pos] != '\n') { sb_put(&out, "%c", src[pos]); pos++; }
+                continue;
+            }
+            if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '*')
+            {
+                sb_put(&out, "/*");
+                pos += 2;
+                while (pos + 1 < len && !(src[pos] == '*' && src[pos + 1] == '/'))
+                { sb_put(&out, "%c", src[pos]); pos++; }
+                if (pos + 1 < len) { sb_put(&out, "*/"); pos += 2; }
+                continue;
+            }
         }
 
         StmtInfo info;
         classify_statement(src, pos, len, &info);
+        if (getenv("MGL_GEOM_TRACE"))
+        {
+            char dbg[80];
+            size_t dn = len - pos < 60 ? len - pos : 60;
+            memcpy(dbg, src + pos, dn); dbg[dn] = 0;
+            fprintf(stderr, "MGL geom trace kind=%d qe=%u: [%s]\n", info.kind, info.qual_end, dbg);
+        }
 
         if (info.kind != STMT_OTHER)
         {
@@ -1654,7 +1790,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
 
                 mbase = mt->kind == SPVT_FLOAT ? (mt->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                         mt->kind == SPVT_INT ? (mt->is_signed ? GL_INT : GL_UNSIGNED_INT) :
-                        mt->kind == SPVT_BOOL ? GL_BOOL : GL_FLOAT;
+                        mt->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, mt);
                 mrows = mt->kind == SPVT_VEC || mt->kind == SPVT_MAT ? mt->n : 1;
                 mcols = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n : 1;
                 /* GLSL 4.60 4.4.1: a double (and its vectors) consumes two locations, a
@@ -1705,7 +1841,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         out->xfb_offset = 0xffffffffu;
         out->base = t->kind == SPVT_FLOAT ? (t->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                     t->kind == SPVT_INT ? (t->is_signed ? GL_INT : GL_UNSIGNED_INT) :
-                    t->kind == SPVT_BOOL ? GL_BOOL : GL_FLOAT;
+                    t->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, t);
         out->rows = t->kind == SPVT_VEC || t->kind == SPVT_MAT ? t->n : 1;
         out->cols = t->kind == SPVT_MAT ? spv_find_type(m, t->elem)->n : 1;
         out->elems = elems;
@@ -1958,11 +2094,358 @@ static char *geom_plain_outputs(const char *src)
     return out.s;
 }
 
-static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src, char **log)
+/* ---------------- plain (default-block) uniforms of the emulated stages ----------------
+ *
+ * The vertex capture variant and the geometry kernel are compiled from generated GLSL as
+ * their own SPIR-V modules.  A plain "uniform T x;" there would become one
+ * [[buffer(n)]] argument per variable (SPIRV-Cross has no notion of a default block),
+ * laid out nothing like the program's default-uniform buffer, which introspect injects
+ * as the single block "mgl_DefaultUniforms" for the raster stages.  We strip the plain
+ * declarations from the transformed source and re-declare them as one std430 block whose
+ * member offsets are the ones introspect baked into the program's SPIR-V, so the very
+ * buffer that the renderer already builds for the stage can be bound verbatim for the
+ * capture pass and the kernel (the renderer's buffer map puts the default block right
+ * after the stage's uniform blocks — see mapGLBuffersToMTLBufferMap, which moves the
+ * block to the head of the UNIFORM_CONSTANT list — and geomBuildPins below pins the
+ * generated MSL to exactly those positions). */
+
+typedef struct {
+    char name[64];
+    char type[96];      /* GLSL type as written, e.g. "ivec2", "float", "Foo" */
+} GeomPlainUni;
+
+typedef struct {
+    char     name[64];
+    uint32_t offset;
+} GeomDubMember;
+
+static bool is_plain_uniform_type(const char *t)
+{
+    static const char *words[] = {
+        "float", "int", "uint", "bool", "double",
+        "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4",
+        "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4",
+        "dvec2", "dvec3", "dvec4",
+        "mat2", "mat3", "mat4", "mat2x3", "mat2x4", "mat3x2", "mat3x4", "mat4x2", "mat4x3",
+        "dmat2", "dmat3", "dmat4",
+        "const", "highp", "mediump", "lowp",
+        NULL
+    };
+    char tok[32];
+    size_t n = 0;
+
+    while (t[n] && !isspace((unsigned char)t[n]) && t[n] != '[' && n + 1 < sizeof(tok)) { tok[n] = t[n]; n++; }
+    tok[n] = 0;
+    if (!tok[0]) return false;
+    for (int i = 0; words[i]; i++)
+        if (!strcmp(tok, words[i])) return true;
+    /* anything else is a user-declared struct type (an identifier): also plain storage */
+    for (size_t i = 0; i < n; i++)
+        if (!is_ident_char((unsigned char)tok[i])) return false;
+    return true;
+}
+
+/* Remove top-level plain (default-block) uniform declarations from src, recording them
+ * (and the raw declarations, for the fallback) .  Declarations of blocks, samplers, images
+ * and atomic counters are kept verbatim. */
+static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *nuni, int max, char **removed)
+{
+    SB out;
+    SB rm;
+    size_t pos = 0, len = strlen(src);
+    int depth = 0;
+
+    memset(&out, 0, sizeof(out));
+    memset(&rm, 0, sizeof(rm));
+    *nuni = 0;
+
+    while (pos < len)
+    {
+        if (src[pos] == '#')                 /* preprocessor line: verbatim */
+        {
+            size_t end = pos;
+            while (end < len && src[end] != '\n') end++;
+            sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+            pos = end;
+            continue;
+        }
+        if (depth > 0)
+        {
+            while (pos < len && depth > 0)
+            {
+                if (src[pos] == '{') depth++;
+                else if (src[pos] == '}') depth--;
+                sb_put(&out, "%c", src[pos]);
+                pos++;
+            }
+            continue;
+        }
+
+        while (pos < len && isspace((unsigned char)src[pos])) { sb_put(&out, "%c", src[pos]); pos++; }
+        if (pos >= len) break;
+        if (src[pos] == '{')                    /* a function body starts here */
+        {
+            depth++;
+            sb_put(&out, "{");
+            pos++;
+            continue;
+        }
+
+        /* the end of the statement: ';' at depth 0, or a '{' (a block declaration) */
+        {
+            size_t end = pos;
+            int d = 0;
+            while (end < len)
+            {
+                if (src[end] == '{') break;
+                if (src[end] == ';' && d == 0) { end++; break; }
+                if (src[end] == '(' || src[end] == '[') d++;
+                else if (src[end] == ')' || src[end] == ']') d--;
+                end++;
+            }
+
+            {
+                char id[32];
+                size_t n = read_ident(src + pos, id, sizeof(id));
+
+                if (n && !strcmp(id, "uniform") && end < len && src[end - 1] == ';')
+                {
+                    const char *body = src + pos + n;   /* between "uniform" and ';' */
+                    const char *bend = src + end - 1;
+                    char type[96] = "";
+                    bool keep = false;
+
+                    while (body < bend && isspace((unsigned char)*body)) body++;
+                    while (bend > body && isspace((unsigned char)bend[-1])) bend--;
+
+                    /* "uniform [const] T a[4], b" — split declarators on ',' */
+                    {
+                        const char *p = body;
+                        while (p < bend && !keep)
+                        {
+                            const char *c = p, *e;
+                            while (c < bend && isspace((unsigned char)*c)) c++;
+                            e = c;
+                            while (e < bend && *e != ',') e++;
+                            if (memchr(c, '=', (size_t)(e - c))) keep = true;  /* initializer */
+                            else
+                            {
+                                const char *nb = e;   /* end of the declarator */
+                                const char *ne;
+                                char name[64];
+                                size_t nn;
+
+                                while (nb > c && isspace((unsigned char)nb[-1])) nb--;
+                                if (nb > c && nb[-1] == ']')
+                                {
+                                    /* trailing [N]: the name is before the '[' */
+                                    while (nb > c && nb[-1] != '[') nb--;
+                                    if (nb == c) keep = true;
+                                }
+                                ne = nb;
+                                while (ne > c && is_ident_char((unsigned char)ne[-1])) ne--;
+                                nn = (size_t)(nb - ne);
+                                if (!nn || ne == c) keep = true;
+                                else
+                                {
+                                    memcpy(name, ne, nn);
+                                    name[nn] = 0;
+                                    if (!type[0])
+                                    {
+                                        size_t t = (size_t)(ne - c);
+                                        while (t > 0 && isspace((unsigned char)c[t-1])) t--;
+                                        if (t == 0 || t >= sizeof(type)) keep = true;
+                                        else { memcpy(type, c, t); type[t] = 0; }
+                                    }
+                                    if (!keep)
+                                    {
+                                        if (*nuni >= max || !is_plain_uniform_type(type)) keep = true;
+                                        else
+                                        {
+                                            snprintf(uni[*nuni].name, sizeof(uni[*nuni].name), "%s", name);
+                                            snprintf(uni[*nuni].type, sizeof(uni[*nuni].type), "%s", type);
+                                            (*nuni)++;
+                                        }
+                                    }
+                                }
+                            }
+                            p = e + 1;
+                        }
+                    }
+
+                    if (keep)
+                    {
+                        /* opaque or unsupported: keep the declaration verbatim */
+                        *nuni = 0;
+                        sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+                    }
+                    else
+                    {
+                        if (removed) sb_put(&rm, "%.*s\n", (int)(end - pos), src + pos);
+                    }
+                    pos = end;
+                    continue;
+                }
+            }
+
+            /* anything else: copy, tracking braces */
+            {
+                size_t p = pos;
+                while (p < end)
+                {
+                    if (src[p] == '{') depth++;
+                    sb_put(&out, "%c", src[p]);
+                    p++;
+                }
+                if (end == pos && pos < len) { pos++; }     /* always make progress */
+                else pos = end;
+            }
+        }
+    }
+
+    if (removed) *removed = sb_take(&rm);
+    else free(rm.s);
+    return sb_take(&out);
+}
+
+/* The layout introspect baked into the program's SPIR-V for a stage's default-uniform
+ * block: find the injected "mgl_DefaultUniforms" struct and read its member offsets. */
+static bool geom_dub_layout(SpvModule *m, GeomDubMember *mem, int *nmem, int max)
+{
+    uint32_t sid = 0;
+    int n = 0;
+
+    *nmem = 0;
+    if (!m) return false;
+    for (int i = 0; i < m->n_names; i++)
+        if (!strcmp(m->names[i].name, "mgl_DefaultUniforms")) { sid = m->names[i].id; break; }
+    if (!sid) return false;
+
+    for (int k = 0; n < max; k++)
+    {
+        bool found = false;
+
+        for (int i = 0; i < m->n_mnames && n < max; i++)
+        {
+            if (m->mnames[i].id != sid || m->mnames[i].member != (uint32_t)k) continue;
+            snprintf(mem[n].name, sizeof(mem[n].name), "%s", m->mnames[i].name);
+            mem[n].offset = 0;
+            found = true;
+            break;
+        }
+        if (!found) break;
+        for (int i = 0; i < m->n_mdecos; i++)
+            if (m->mdecos[i].id == sid && m->mdecos[i].member == (uint32_t)k &&
+                m->mdecos[i].deco == SpvDecorationOffset)
+                mem[n].offset = m->mdecos[i].value;
+        n++;
+    }
+    *nmem = n;
+    return n > 0;
+}
+
+/* re-declare the stripped plain uniforms as one block matching that layout */
+static void geom_emit_dub_block(SB *b, const GeomPlainUni *uni, int nuni,
+                                const GeomDubMember *mem, int nmem)
+{
+    sb_put(b, "layout(std430, binding = %d) readonly buffer mgl_DefaultUniforms {\n", MGL_GEOM_SSBO_DUB);
+    for (int i = 0; i < nuni; i++)
+    {
+        uint32_t off = 0;
+        bool have = false;
+
+        for (int k = 0; k < nmem; k++)
+            if (!strcmp(mem[k].name, uni[i].name)) { off = mem[k].offset; have = true; break; }
+        if (!have) continue;      /* introspect did not keep it (unused): skip */
+        sb_put(b, "    layout(offset = %u) %s %s;\n", off, uni[i].type, uni[i].name);
+    }
+    sb_put(b, "};\n");
+}
+
+/* pin the generated module's user resources to the flat buffer positions the renderer's
+ * buffer map gives the same resources of the program's own stage:
+ * mapGLBuffersToMTLBufferMap enumerates [uniform buffers, uniform constants (the default
+ * block first), storage buffers, atomics] and binds each entry at its list position, which
+ * is also the MSL buffer index in the program's stage module (SPIRV-Cross numbers uniform
+ * buffers, then plain-uniform / uniform-constant args, then storage buffers).  prog is the
+ * program's patched SPIR-V of the stage (it owns the ordering); mine is the generated
+ * module (it owns the binding values that key the pins). */
+
+static void geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
+                            GeomPin *pins, int *npins, int max)
+{
+    uint32_t ub[32], uc[32], sb[32];
+    int nub = 0, nuc = 0, nsb = 0;
+    bool has_dub = false;
+
+    *npins = 0;
+
+    for (int i = 0; i < prog->n_vars; i++)
+    {
+        SpvVar *v = &prog->vars[i];
+        if (v->storage == SpvStorageClassUniform)
+        {
+            const char *nm = spv_name(prog, v->id);
+            if (nm && !strcmp(nm, "mgl_DefaultUniforms")) { has_dub = true; continue; }
+            if (nub < 32) ub[nub++] = v->id;
+        }
+        else if (v->storage == SpvStorageClassUniformConstant) { if (nuc < 32) uc[nuc++] = v->id; }
+        else if (v->storage == SpvStorageClassStorageBuffer) { if (nsb < 32) sb[nsb++] = v->id; }
+    }
+
+    /* flat positions: ub j -> j; dub -> nub; uc k -> nub + has_dub + k; sb j -> nub + has_dub + nuc + j */
+    {
+        int mub = 0, muc = 0, msb = 0;
+
+        for (int i = 0; i < mine->n_vars; i++)
+        {
+            SpvVar *v = &mine->vars[i];
+            int flat;
+
+            if (v->storage == SpvStorageClassUniform) { if (mub >= nub) continue; flat = mub++; }
+            else if (v->storage == SpvStorageClassUniformConstant)
+            {
+                if (muc >= nuc) continue;
+                flat = nub + (has_dub ? 1 : 0) + muc;
+                muc++;
+            }
+            else if (v->storage == SpvStorageClassStorageBuffer)
+            {
+                if (msb >= nsb) continue;
+                flat = nub + (has_dub ? 1 : 0) + nuc + msb;
+                msb++;
+            }
+            else continue;
+
+            if (*npins < max)
+            {
+                pins[*npins].binding = spv_binding(mine, v->id);
+                pins[*npins].msl = flat;
+                pins[*npins].texture = (v->storage == SpvStorageClassUniformConstant);
+                (*npins)++;
+            }
+        }
+    }
+
+    if (pin_dub && *npins < max)
+    {
+        pins[*npins].binding = MGL_GEOM_SSBO_DUB;
+        pins[*npins].msl = nub;
+        pins[*npins].texture = false;
+        (*npins)++;
+    }
+}
+
+static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
+                                   const SpvModule *vs_m, char **log)
 {
     char *renamed = rename_main(vs_src, "mgl_geom_vs_main");
     char *nover = NULL;
     char *noblk = NULL;
+    char *removed_src = NULL;
+    GeomPlainUni uni[MGL_GEOM_MAX_VARYINGS];
+    GeomDubMember dub[MGL_GEOM_MAX_VARYINGS];
+    int nuni_ = 0, ndub = 0;
     SB b;
 
     if (!renamed)
@@ -1972,6 +2455,15 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     }
     nover = strip_version(renamed);
     free(renamed);
+    /* plain (default-block) uniforms are re-declared below as one block that matches the
+     * program's default-uniform buffer (see geom_emit_dub_block) */
+    nuni_ = 0;
+    {
+        char *stripped = geom_strip_plain_uniforms(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src);
+        if (!stripped) { free(nover); return NULL; }
+        if (nuni_) { free(nover); nover = stripped; }
+        else free(stripped);
+    }
     /* the captured outputs must be ordinary variables: an "out" interface block would be
      * mapped to the vertex function's output struct (and SPIRV-Cross's copy-back of an
      * anonymous block reads a temporary), while the store below needs the members in scope */
@@ -1981,6 +2473,20 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
 
     memset(&b, 0, sizeof(b));
     sb_put(&b, "#version 460 core\n");
+
+    /* re-declare the stripped plain uniforms (or put them back if the program's
+     * default-uniform block could not be read) — ahead of the source, so the names are
+     * in scope for it */
+    if (nuni_ && geom_dub_layout((SpvModule *)vs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
+        geom_emit_dub_block(&b, uni, nuni_, dub, ndub);
+    else if (removed_src)
+    {
+        sb_put(&b, "%s", removed_src);
+        nuni_ = 0;
+    }
+    free(removed_src);
+    removed_src = NULL;
+
     sb_put(&b, "%s\n", nover);
     free(nover);
 
@@ -2011,19 +2517,24 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
         char open[64], close[8];
         snprintf(open, sizeof(open), "mgl_rec[mgl_o");
         snprintf(close, sizeof(close), "]");
-        gen_varying_store(&b, v, "mgl_rec", "mgl_o", v->expr[0] ? v->expr : v->name);
+        /* an input the vertex stage never writes stays undefined in GL: record zeros */
+        gen_varying_store(&b, v, "mgl_rec", "mgl_o", v->expr[0] ? v->expr : NULL);
     }
 
     sb_put(&b, "}\n");
     return sb_take(&b);
 }
 
-/* ---------------- 2. geometry kernel ---------------- */
-
-static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src, char **log)
+static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src,
+                                  const SpvModule *gs_m, char **log)
 {
     char gl_in_name[64];
     char *main_renamed = rename_main(gs_src, "mgl_gs_main");
+    char *stripped_src = NULL;
+    char *removed_src = NULL;
+    GeomPlainUni uni[MGL_GEOM_MAX_VARYINGS];
+    GeomDubMember dub[MGL_GEOM_MAX_VARYINGS];
+    int nuni_ = 0, ndub = 0;
     char *transformed = geom_transform_source(main_renamed ? main_renamed : gs_src, gp->in_verts,
                                               gl_in_name, sizeof(gl_in_name), NULL, NULL);
     free(main_renamed);
@@ -2044,9 +2555,28 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     geom_dump("gs.transformed.glsl", transformed);
     nover = strip_version(transformed);
     free(transformed);
+    /* plain (default-block) uniforms are re-declared below as one block that matches the
+     * program's default-uniform buffer (see geom_emit_dub_block) */
+    stripped_src = geom_strip_plain_uniforms(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src);
+    if (!stripped_src) { free(nover); return NULL; }
+    if (nuni_) { free(nover); nover = stripped_src; }
+    else free(stripped_src);
 
     memset(&b, 0, sizeof(b));
     sb_put(&b, "#version %d core\n", version);
+
+    /* re-declare the stripped plain uniforms (or put them back if the program's
+     * default-uniform block could not be read) — ahead of the source, so the names are
+     * in scope for it */
+    if (nuni_ && geom_dub_layout((SpvModule *)gs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
+        geom_emit_dub_block(&b, uni, nuni_, dub, ndub);
+    else if (removed_src)
+    {
+        sb_put(&b, "%s", removed_src);
+        nuni_ = 0;
+    }
+    free(removed_src);
+    removed_src = NULL;
     sb_put(&b, "layout(local_size_x = 32) in;\n\n");
     sb_put(&b, "layout(std430, binding = %d) readonly buffer MGLGsPrimBlock { uint mgl_prim[]; };\n", MGL_GEOM_SSBO_PRIM);
     sb_put(&b, "layout(std430, binding = %d) readonly buffer MGLGsVsOutBlock { uint mgl_vsout[]; };\n", MGL_GEOM_SSBO_VSOUT);
@@ -2089,6 +2619,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
 
     sb_put(&b, "%s\n\n", nover);
     free(nover);
+
     /* the rewritten geometry shader declares its inputs and outputs and defines the entry
      * point; the emulation helpers must be visible to it */
     sb_put(&b, "void mgl_gs_emit_stream_vertex(uint s);\n");
@@ -2454,15 +2985,24 @@ static bool geom_derive_exprs(MGLGeomProgram *gp, Program *vs_program, char **lo
         int j = geom_find_location(vs_out, n_vs_out, gp->in_v[i].location);
         if (j < 0)
         {
-            mgl_append_log(log, "ERROR: geometry: input '%s' at location %u is not written by the vertex stage\n",
+            /* GL leaves such an input undefined (its value may be anything): keep the
+             * link valid — the record slot exists, the capture pass just never writes it */
+            mgl_append_log(log, "WARNING: geometry: input '%s' at location %u is not written by the vertex stage\n",
                            gp->in_v[i].name, gp->in_v[i].location);
-            goto done;
+            gp->in_v[i].expr[0] = 0;
+            continue;
         }
         if (vs_out[j].rows != gp->in_v[i].rows || vs_out[j].cols != gp->in_v[i].cols ||
             vs_out[j].base != gp->in_v[i].base || vs_out[j].elems != gp->in_v[i].elems)
         {
             mgl_append_log(log, "ERROR: geometry: type mismatch for '%s' (location %u)\n",
                            gp->in_v[i].name, gp->in_v[i].location);
+            if (getenv("MGL_GEOM_TRACE"))
+                fprintf(stderr, "MGL geom trace: mismatch at loc %u: GS(%s base=%u r=%u c=%u e=%u) "
+                                "VS(%s base=%u r=%u c=%u e=%u)\n",
+                        gp->in_v[i].location, gp->in_v[i].name, gp->in_v[i].base, gp->in_v[i].rows,
+                        gp->in_v[i].cols, gp->in_v[i].elems,
+                        vs_out[j].name, vs_out[j].base, vs_out[j].rows, vs_out[j].cols, vs_out[j].elems);
             goto done;
         }
         snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s%s%s", vs_out[j].name,
@@ -2650,10 +3190,10 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         for (i = 0; i < gp->n_out; i++)
             comps += gp->out_v[i].words * gp->max_vertices;
         comps += (4 + 1 + 1 + 1 + 1 + 2 * gp->out_clip_size) * gp->max_vertices;
-        if (comps > (GLuint)1024)
+        if (comps > (GLuint)2048)
         {
             mgl_append_log(log, "ERROR: geometry: %u total output components exceeds the limit %u\n",
-                           comps, (unsigned)1024);
+                           comps, (unsigned)2048);
             goto done;
         }
     }
@@ -2778,6 +3318,8 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     size_t words = 0;
     char *log = NULL;
     int pins_gl[8], pins_msl[8];
+    GeomPin pins2[8];
+    int npins2 = 0;
 
 #define GEOM_FAIL(...)  do { geom_fail(ctx, gp, __VA_ARGS__); \
                              if (!gp->deferred) obj->link_status = false; goto done; } while (0)
@@ -2837,16 +3379,29 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     }
 
     /* ---- 1. vertex capture variant ---- */
-    glsl = geom_gen_capture_glsl(ctx, gp, vs_src, &log);
-    if (!glsl) GEOM_FAIL("vertex capture variant generation failed");
-    geom_dump("capture.glsl", glsl);
-    if (!geom_glsl_to_spirv(ctx, GL_VERTEX_SHADER, glsl, 430, &ir, &words, &log))
-        GEOM_FAIL("vertex capture variant compile failed: %s", log ? log : "?");
-    free(glsl);
+    {
+        const char *e2 = NULL;
+        SpvModule *p_vs = spv_parse(program->spirv[_VERTEX_SHADER].ir,
+                                    program->spirv[_VERTEX_SHADER].size / 4, &e2);
+
+        glsl = geom_gen_capture_glsl(ctx, gp, vs_src, p_vs, &log);
+        if (!glsl) GEOM_FAIL("vertex capture variant generation failed");
+        geom_dump("capture.glsl", glsl);
+        if (!geom_glsl_to_spirv(ctx, GL_VERTEX_SHADER, glsl, 430, &ir, &words, &log))
+            GEOM_FAIL("vertex capture variant compile failed: %s", log ? log : "?");
+        free(glsl);
+        {
+            SpvModule *c_vs = spv_parse(ir, words / 4, &e2);
+            npins2 = 0;
+            geom_build_pins(p_vs, c_vs, true, pins2, &npins2, 8);
+            spv_free(c_vs);
+        }
+        spv_free(p_vs);
+    }
     pins_gl[0] = MGL_GEOM_SSBO_VSOUT;
     pins_msl[0] = MGL_GEOM_MSL_VSOUT;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->capture_entry, true, &log,
-                            SpvExecutionModelVertex, pins_gl, pins_msl, 1);
+                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, pins2, npins2);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
     /* the renamed vertex main is called from the generated entry point */
@@ -2873,12 +3428,25 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 
     /* ---- 2. geometry kernel ---- */
 build:
-    glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, &log);
-    if (!glsl) GEOM_FAIL("kernel generation failed");
-    geom_dump("kernel.glsl", glsl);
-    if (!geom_glsl_to_spirv(ctx, GL_COMPUTE_SHADER, glsl, 450, &ir, &words, &log))
-        GEOM_FAIL("kernel compile failed: %s", log ? log : "?");
-    free(glsl);
+    /* the program's own geometry-stage module owns the resource order the renderer's
+     * buffer map enumerates; pin this kernel's user resources to those positions */
+    {
+        const char *e2 = NULL;
+        SpvModule *p_gs = spv_parse(program->spirv[_GEOMETRY_SHADER].ir,
+                                    program->spirv[_GEOMETRY_SHADER].size / 4, &e2);
+        SpvModule *k_gs = NULL;
+
+        glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, p_gs, &log);
+        if (!glsl) GEOM_FAIL("kernel generation failed");
+        geom_dump("kernel.glsl", glsl);
+        if (!geom_glsl_to_spirv(ctx, GL_COMPUTE_SHADER, glsl, 450, &ir, &words, &log))
+            GEOM_FAIL("kernel compile failed: %s", log ? log : "?");
+        free(glsl);
+        k_gs = spv_parse(ir, words / 4, &e2);
+        geom_build_pins(p_gs, k_gs, true, pins2, &npins2, 8);
+        spv_free(k_gs);
+        spv_free(p_gs);
+    }
     pins_gl[0] = MGL_GEOM_SSBO_PRIM;     pins_msl[0] = MGL_GEOM_MSL_PRIM;
     pins_gl[1] = MGL_GEOM_SSBO_VSOUT;    pins_msl[1] = MGL_GEOM_MSL_VSOUT;
     pins_gl[2] = MGL_GEOM_SSBO_HDR;      pins_msl[2] = MGL_GEOM_MSL_HDR;
@@ -2887,7 +3455,7 @@ build:
     pins_gl[5] = MGL_GEOM_SSBO_CTL;      pins_msl[5] = MGL_GEOM_MSL_CTL;
     pins_gl[6] = MGL_GEOM_SSBO_CNT;      pins_msl[6] = MGL_GEOM_MSL_CNT;
     msl = geom_spirv_to_msl(ctx, GL_COMPUTE_SHADER, ir, words, gp->kernel_entry, false, &log,
-                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 7);
+                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 7, pins2, npins2);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
 
@@ -2923,7 +3491,7 @@ build:
     free(glsl);
     pins_gl[0] = MGL_GEOM_SSBO_DRAW;     pins_msl[0] = MGL_GEOM_MSL_DRAW;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->draw_entry, false, &log,
-                            SpvExecutionModelVertex, pins_gl, pins_msl, 1);
+                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, NULL, 0);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("pass-through vertex function MSL failed: %s", log ? log : "?");
 

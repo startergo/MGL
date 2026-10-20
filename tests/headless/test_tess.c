@@ -114,6 +114,7 @@ static void read_px(int x, int y, float out[4])
 
 TEST(TessTriangleDomain)
 {
+    glViewport(0, 0, 200, 200);   /* these pixel checks assume a 200x200 window */
     GLuint prog = make_program(kTcsTri, kTesTri);
     GLint link = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &link);
@@ -318,6 +319,7 @@ static const char *kTcsUnusedIn =
 
 TEST(TessUnusedTesInput)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     /* hardware path (drawPatches) */
     GLuint prog = make_program(kTcsUnused, kTesUnused("triangles, equal_spacing, ccw"));
     GLint link = 0;
@@ -343,6 +345,7 @@ TEST(TessUnusedTesInput)
 
 TEST(TessUnusedTcsInput)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     /* the TCS declares a VS output it never reads: its input record must still match
      * the vertex kernel's output record */
     GLuint prog = make_program(kTcsUnusedIn, kTesUnused("triangles, equal_spacing, ccw"));
@@ -394,6 +397,7 @@ static const char *kTesOrder =
 
 TEST(TessReorderedInputs)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     GLuint prog = make_program(kTcsOrder, kTesOrder);
     GLint link = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &link);
@@ -464,6 +468,7 @@ static const char *kTesPatch =
 
 TEST(TessPerPatchVaryings)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     GLuint prog = make_program(kTcsPatch, kTesPatch);
     GLint link = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &link);
@@ -518,6 +523,7 @@ static const char *kTesArr =
 
 TEST(TessArrayedVarying)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     GLuint prog = make_program(kTcsArr, kTesArr);
     GLint link = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &link);
@@ -582,6 +588,7 @@ TEST(TessErrors)
 
 TEST(TessDefaultLevels)
 {
+    glViewport(0, 0, 200, 200);   /* these pixel checks assume a 200x200 window */
     /* TES without TCS: control points pass through, default levels 1..1 */
     GLuint prog = make_program(NULL, kTesTri);
     GLint link = 0;
@@ -1014,6 +1021,7 @@ TEST(TessConsecutiveDraws)
  * pipeline and every later iteration renders the wrong colour. */
 TEST(TessPSOCacheStress)
 {
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
     char tes[512];
     for (int i = 0; i < 50; i++)
     {
@@ -1181,6 +1189,7 @@ TEST(TessIndexedAndInstanced)
 
 TEST(TessOrientationCulling)
 {
+    glViewport(0, 0, 200, 200);   /* these pixel checks assume a 200x200 window */
     /* front-face culling with vertex_order: a ccw patch in patch space must render
        with CULL_FACE BACK when glFrontFace matches the rstate convention */
     GLuint prog = make_program(kTcsTri, kTesTri);

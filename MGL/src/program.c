@@ -1333,13 +1333,41 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         return false;
     }
 
-    /* assigns locations for legacy (< 330) shaders compiled with AUTO_MAP_LOCATIONS */
-    if (!glslang_program_map_io(glsl_program))
+    /* assigns locations for legacy (< 330) shaders compiled with AUTO_MAP_LOCATIONS.
+     * glslang's default resolver assigns them per stage ("does not do proper cross-stage
+     * lining up"), but GL matches interface variables by NAME across linked stages — the
+     * GLSL I/O mapper/resolver does that (a VS "out vec4 a; out vec4 b;" must feed an FS
+     * that declares "in vec4 b; in vec4 a;" the same two slots).  Failing to share the
+     * slots by name also breaks any consumer that reflects producer and consumer
+     * separately (the geometry emulation's VS→GS record layout, transform feedback). */
     {
-        const char *info = glslang_program_get_info_log(glsl_program);
-        mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
-        glslang_program_delete(glsl_program);
-        return false;
+        glslang_mapper_t *mapper = glslang_glsl_mapper_create();
+        glslang_resolver_t *resolver = NULL;
+        int mapped = 0;
+
+        if (mapper)
+        {
+            int first = -1;
+            for (int i = 0; i < obj->num_attached; i++)
+            {
+                int t = (int)obj->attached[i]->glm_type;
+                if (first < 0 || t < first) first = t;
+            }
+            if (first >= 0)
+                resolver = glslang_glsl_resolver_create(glsl_program, (glslang_stage_t)first);
+            if (resolver)
+                mapped = glslang_program_map_io_with_resolver_and_mapper(glsl_program, resolver, mapper);
+        }
+        if (resolver) glslang_glsl_resolver_delete(resolver);
+        if (mapper) glslang_glsl_mapper_delete(mapper);
+
+        if (!mapped)
+        {
+            const char *info = glslang_program_get_info_log(glsl_program);
+            mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
+            glslang_program_delete(glsl_program);
+            return false;
+        }
     }
 
     for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)

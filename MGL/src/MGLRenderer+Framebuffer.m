@@ -23,6 +23,7 @@
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+Framebuffer.h"
 #include "mgl_ext_fb.h"
+#include "mgl_ext_rstate.h"    /* RS(): indexed viewports (default-fb sizing) */
 
 // render-state per-index setters (state_ext.c)
 void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h);
@@ -508,7 +509,16 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
 - (CGSize) fbDrawableSize
 {
     CGSize s = CGSizeZero;
-    if (_layer)
+    /* Headless contexts are bound to a dummy NSView that is not in any window:
+     * its layer bounds are arbitrary (a fresh AppKit layer reports whatever
+     * frame the dummy view was created with), so there is no real drawable.
+     * The "window" for the default framebuffer is then the union of the GL
+     * viewports the app has used, and it never shrinks: the GL viewport is a
+     * transform, not a window size, so a later smaller viewport must not clip
+     * away pixels that are still part of the framebuffer.  Only a view that
+     * lives in a window has a real drawable size. */
+    BOOL windowless = (_view && _view.window == nil);
+    if (_layer && !windowless)
     {
         s = _layer.drawableSize;
         if (s.width < 1 || s.height < 1)
@@ -518,7 +528,24 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
         }
     }
     if (s.width < 1 || s.height < 1)
-        s = CGSizeMake(STATE(viewport[2]) ? STATE(viewport[2]) : 1, STATE(viewport[3]) ? STATE(viewport[3]) : 1);
+    {
+        struct MGLExtMetal_fb *m = FBM(ctx);
+        NSUInteger x1 = 1, y1 = 1;
+        if (ctx->state.ext_rstate)
+            for (int i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++)
+            {
+                NSUInteger rx = (NSUInteger)(ctx->state.ext_rstate->viewport[i][0] + ctx->state.ext_rstate->viewport[i][2]);
+                NSUInteger ry = (NSUInteger)(ctx->state.ext_rstate->viewport[i][1] + ctx->state.ext_rstate->viewport[i][3]);
+                if (rx > x1) x1 = rx;
+                if (ry > y1) y1 = ry;
+            }
+        if (m)
+        {
+            if ((NSUInteger)m->default_width > x1) x1 = m->default_width;
+            if ((NSUInteger)m->default_height > y1) y1 = m->default_height;
+        }
+        s = CGSizeMake((CGFloat)x1, (CGFloat)y1);
+    }
     return s;
 }
 

@@ -192,7 +192,19 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     input->default_profile = GLSLANG_CORE_PROFILE;
     //input->messages = 0xFFFF & ~GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
-    input->resource = glslang_default_resource();
+    {
+        /* the resource limits must match what glGet* reports: the CTS compares the
+         * gl_Max* constants baked into shaders against the queried values
+         * (KHR-GL46.geometry_shader.constant_variables) */
+        static glslang_resource_t res;
+        res = *glslang_default_resource();
+        res.max_geometry_total_output_components = 2048;
+        res.max_geometry_output_components = 128;
+        res.max_geometry_uniform_components = 1024;
+        res.max_geometry_atomic_counters = 0;
+        res.max_geometry_atomic_counter_buffers = 0;
+        input->resource = &res;
+    }
 
     input->force_default_version_and_profile = 1;
 }

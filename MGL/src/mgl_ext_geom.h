@@ -44,6 +44,10 @@ struct MGLProgramObj_t;
 /* GLSL (set 0) bindings of the emulation SSBOs; above the per-stage SSBO limit so an
  * application's own layout(std430, binding=N) declarations cannot collide */
 enum {
+    MGL_GEOM_SSBO_DUB      = 18,    /* u32: the program's default-uniform block (see
+                                     * geometry.c: the capture variant and the kernel
+                                     * re-declare plain uniforms as this block so the
+                                     * buffer built for the raster path binds as-is) */
     MGL_GEOM_SSBO_PRIM     = 20,    /* u32: k slots per input primitive (relative to vstart) */
     MGL_GEOM_SSBO_VSOUT    = 21,    /* u32: captured VS output records */
     MGL_GEOM_SSBO_HDR      = 22,    /* u32: kernel header (MGL_GEOM_HDR_WORDS) */
@@ -185,7 +189,11 @@ typedef struct MGLGeomDraw {
 } MGLGeomDraw;
 
 struct MGLExtState_geom {
-    MGLGeomProgram   progs[MGL_GEOM_MAX_PROGRAMS];
+    /* grown on demand: a long-lived context can link far more geometry programs than a
+     * fixed table holds (the CTS keeps hundreds alive at once) */
+    MGLGeomProgram  *progs;
+    int              n_progs, progs_cap;
+
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
     MGLGeomProgram *vertex_override_gp;   /* its owner, for the rstate specialization */

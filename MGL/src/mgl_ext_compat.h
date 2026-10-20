@@ -49,6 +49,22 @@
 #define MGLC_ATTR_INDEX       7
 #define MGLC_ATTR_TEXCOORD(i) (8 + (i))
 
+/* fixed VARYING locations shared by generated and translated shaders.  Producer and
+ * consumer sides declare the same names with these locations, so the two stages agree
+ * regardless of how unlocated varyings are auto-mapped at link time (GL matches by name;
+ * the old positional aliasing relied on both stages numbering their varyings in the same
+ * declaration order). */
+#define MGLC_VAR_COLOR_FRONT   0
+#define MGLC_VAR_COLOR_BACK    1
+#define MGLC_VAR_SECONDARY     2
+#define MGLC_VAR_TEXCOORD(i)   (3 + (i))
+#define MGLC_VAR_EYEPOS        (3 + MGLC_MAX_COORDS)
+#define MGLC_VAR_FOGCOORD      (4 + MGLC_MAX_COORDS)
+#define MGLC_VAR_LINEV         (5 + MGLC_MAX_COORDS)
+#define MGLC_VAR_BACKSECONDARY (6 + MGLC_MAX_COORDS)
+#define MGLC_VAR_CLIPVERTEX    (7 + MGLC_MAX_COORDS)
+#define MGLC_VAR_FOGFRAGCOORD  (8 + MGLC_MAX_COORDS)
+
 #pragma mark matrices
 
 typedef struct {
