@@ -66,8 +66,7 @@ polygon stipple 32x32 (GPU texture sample), evaluators map1/map2 + EvalMesh1/2,
 select mode (per-primitive hit records, viewport-exact culling), feedback mode
 (GL_2D/3D/3D_COLOR/3D_COLOR_TEXTURE/4D_COLOR_TEXTURE token sizes).
 
-All five suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16
-(full headless suite: 359 checks, 0 failures).
+All six suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16, render4 35.
 
 ## Fixed this session (committed per area)
 
@@ -80,6 +79,19 @@ All five suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16
   state. Fix: `mglActiveTexture(ctx, GL_TEXTURE0 + saved_active)` (state stores a unit *index*).
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
+
+## Session 6 (commit "point sprites/attenuation, legacy texture formats, residency")
+
+* Point attenuation now reaches Metal: mgl_compat_point_parameterfv enables/disables
+  GL_PROGRAM_POINT_SIZE (the Metal pipeline flag that honours a shader point size) depending on
+  whether the attenuation is the identity. Sizes verified pixel-exact: 16*sqrt(1/d) for d=4/9/16.
+* Point sprites verified: gl_PointCoord (0,0) maps to the top-left texel of the point (spec).
+* Legacy internal formats (GL_LUMINANCE/_ALPHA/ALPHA/INTENSITY + the *8/*16 spellings) are expanded
+  to RGBA on upload by compat dispatch wrappers (compat_tex_image1D/2D/3D), stored in
+  s->legacy_tex[], re-packed by compat_get_tex_image, and reported as LUMINANCE8/... by
+  compat_get_tex_level_parameteriv. FLOAT/half/16-bit inputs expand through float; storage is
+  RGBA32F.
+* glAreTexturesResident raises GL_INVALID_VALUE for name 0 (spec) and still reports resident.
 
 ## Session 5 (commit "line stipple, texgen reflection fix, pixel maps")
 
@@ -138,6 +150,7 @@ All five suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16
 * More GLSL-compat coverage: test_compat_glsl.c now covers #version 110/120/150-compat,
   ftransform, gl_FragData, gl_TextureMatrix, gl_LightSource/gl_FrontMaterial/gl_Fog uniforms,
   builtin uniform locations.
-* point sprites + point size attenuation (point size done, sprites untested).
-* CopyPixels test; glPixelMap effect on DrawPixels/readback; color-index behaviour.
+* GL_CLAMP texture borders (borders not supported by core texture code; CLAMP behaves as
+  CLAMP_TO_EDGE) - documented gap, would need a shader-side border fetch.
+* GENERATE_MIPMAP on glTexImage (compat flag); color-index (glIndex) beyond state tracking.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.

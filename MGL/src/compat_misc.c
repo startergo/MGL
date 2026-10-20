@@ -1453,9 +1453,18 @@ GLboolean mglAreTexturesResident(GLMContext ctx, GLsizei n, const GLuint *textur
         return GL_FALSE;
     }
 
-    /* every texture is resident (it lives in the MTLTexture) */
+    /* every texture is resident (it lives in the MTLTexture); the zero name
+     * is not a texture and must raise GL_INVALID_VALUE */
     for (GLsizei i = 0; i < n; i++)
+    {
+        if (textures[i] == 0)
+        {
+            ERROR_RETURN_VALUE(GL_INVALID_VALUE, 0);
+            return GL_FALSE;
+        }
+
         residences[i] = GL_TRUE;
+    }
 
     return GL_TRUE;
 }

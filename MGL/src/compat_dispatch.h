@@ -848,6 +848,13 @@ void mgl_compat_init_dispatch(GLMContext ctx)
     /* ---- compat GLSL ---- */
     ctx->dispatch.shader_source = compat_shader_source2;
     ctx->dispatch.get_uniform_location = mgl_compat_get_uniform_location;
+
+    /* ---- legacy texture formats (LUMINANCE / ALPHA / INTENSITY) ---- */
+    ctx->dispatch.tex_image1D = compat_tex_image1D;
+    ctx->dispatch.tex_image2D = compat_tex_image2D;
+    ctx->dispatch.tex_image3D = compat_tex_image3D;
+    ctx->dispatch.get_tex_image = compat_get_tex_image;
+    ctx->dispatch.get_tex_level_parameteriv = compat_get_tex_level_parameteriv;
 }
 
 #endif /* COMPAT_DISPATCH_H */

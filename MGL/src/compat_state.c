@@ -9,6 +9,13 @@
  */
 
 #include <stdlib.h>
+
+#ifndef GL_INTENSITY
+#define GL_INTENSITY 0x8049
+#endif
+#ifndef GL_LUMINANCE8
+#define GL_LUMINANCE8 0x8040
+#endif
 #include <string.h>
 #include <math.h>
 
@@ -1164,7 +1171,17 @@ void mgl_compat_point_parameterfv(GLMContext ctx, GLenum pname, const GLfloat *p
     {
         for (int i = 0; i < 3; i++)
             s->point_params[3 + i] = params[i];
-        s->point_attenuation = (params[0] != 0.0f || params[1] != 0.0f || params[2] != 0.0f);
+
+        /* (1, 0, 0) is the identity: no shader-driven point size */
+        s->point_attenuation = (params[0] != 1.0f || params[1] != 0.0f || params[2] != 0.0f);
+
+        /* Metal only honours a shader point size when the pipeline is built
+         * for GL_PROGRAM_POINT_SIZE; drive that cap from the attenuation */
+        if (s->point_attenuation)
+            mglEnable(ctx, GL_PROGRAM_POINT_SIZE);
+        else
+            mglDisable(ctx, GL_PROGRAM_POINT_SIZE);
+
         mgl_compat_dirty(ctx);
         return;
     }
@@ -1183,4 +1200,343 @@ void mgl_compat_point_parameteriv(GLMContext ctx, GLenum pname, const GLint *par
         ERROR_RETURN(GL_INVALID_VALUE);
 
     mgl_compat_point_parameterf(ctx, pname, (GLfloat)params[0]);
+}
+
+#pragma mark legacy texture formats (LUMINANCE / ALPHA / INTENSITY)
+
+/* the legacy "kind" of an internal format (0 = none) */
+static GLenum legacy_tex_kind(GLenum internalformat)
+{
+    switch (internalformat)
+    {
+        case 0x1909: return GL_LUMINANCE;          /* GL_LUMINANCE */
+        case 0x8040: case 0x8042: return GL_LUMINANCE;      /* LUMINANCE8/16 */
+        case 0x190A: return GL_LUMINANCE_ALPHA;    /* GL_LUMINANCE_ALPHA */
+        case 0x8045: case 0x8046: return GL_LUMINANCE_ALPHA;
+        case 0x1906: return GL_ALPHA;              /* GL_ALPHA */
+        case 0x803C: case 0x803E: return GL_ALPHA; /* ALPHA8/16 */
+        case 0x8049: case 0x804B: return GL_INTENSITY;       /* INTENSITY8/16 */
+    }
+    return 0;
+}
+
+static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum type)
+{
+    struct MGLExtState_compat *s = CS();
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+        {
+            s->legacy_tex[i].kind = kind;
+            s->legacy_tex[i].type = type;
+            return;
+        }
+
+    if (s->legacy_tex_count < MGLC_LEGACY_TEX_MAX)
+    {
+        s->legacy_tex[s->legacy_tex_count].name = name;
+        s->legacy_tex[s->legacy_tex_count].kind = kind;
+        s->legacy_tex[s->legacy_tex_count].type = type;
+        s->legacy_tex_count++;
+    }
+}
+
+static void legacy_tex_forget(GLMContext ctx, GLuint name)
+{
+    struct MGLExtState_compat *s = CS();
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+        {
+            s->legacy_tex[i] = s->legacy_tex[--s->legacy_tex_count];
+            return;
+        }
+}
+
+/* component count of a legacy kind in the *client* data */
+static int legacy_client_comps(GLenum kind)
+{
+    return (kind == GL_LUMINANCE_ALPHA) ? 2 : 1;
+}
+
+/* bytes per component of a supported client type (0 = unsupported here) */
+static int legacy_type_bpc(GLenum type)
+{
+    switch (type)
+    {
+        case GL_UNSIGNED_BYTE: case GL_BYTE: return 1;
+        case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: return 2;
+        case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT: return 4;
+    }
+    return 0;
+}
+
+/* expands legacy pixel data to RGBA; out must hold w*h*depth*4 floats */
+typedef unsigned short GLhalf;
+
+/* GLhalf -> float (IEEE 754 half precision) */
+static float mgl_compat_half_to_float(GLhalf h)
+{
+    unsigned sign = (unsigned)(h >> 15) & 1;
+    unsigned exp  = (unsigned)(h >> 10) & 0x1F;
+    unsigned man  = (unsigned)h & 0x3FF;
+    union { float f; unsigned u; } out;
+
+    if (exp == 0)
+    {
+        if (man == 0)
+        {
+            out.u = sign << 31;
+            return out.f;
+        }
+        /* subnormal: normalize */
+        exp = 1;
+        unsigned e = 0;
+        while ((man & 0x400) == 0) { man <<= 1; e++; }
+        man &= 0x3FF;
+        exp = (unsigned)(127 - 15 + 1 - e);
+        out.u = (sign << 31) | (exp << 23) | (man << 13);
+        return out.f;
+    }
+
+    if (exp == 0x1F)
+    {
+        out.u = (sign << 31) | 0x7F800000u | (man << 13);
+        return out.f;
+    }
+
+    out.u = (sign << 31) | ((exp + 112) << 23) | (man << 13);
+    return out.f;
+}
+
+static void legacy_expand(GLenum kind, GLenum type, const void *pixels,
+                          GLsizei w, GLsizei h, GLsizei depth, GLfloat *out)
+{
+    int cc = legacy_client_comps(kind);
+    size_t n = (size_t)w * (size_t)(h ? h : 1) * (size_t)(depth ? depth : 1);
+
+    if (type == GL_UNSIGNED_BYTE)
+    {
+        const GLubyte *p = (const GLubyte *)pixels;
+
+        for (size_t i = 0; i < n; i++)
+        {
+            float a = p[i * cc], b = (cc == 2) ? p[i * cc + 1] : 0.0f;
+            float v[4];
+
+            if (kind == GL_LUMINANCE) { v[0]=v[1]=v[2]=a/255.0f; v[3]=1.0f; }
+            else if (kind == GL_LUMINANCE_ALPHA) { v[0]=v[1]=v[2]=a/255.0f; v[3]=b/255.0f; }
+            else if (kind == GL_ALPHA) { v[0]=v[1]=v[2]=0.0f; v[3]=a/255.0f; }
+            else { v[0]=v[1]=v[2]=v[3]=a/255.0f; }   /* INTENSITY */
+
+            out[i * 4 + 0] = v[0]; out[i * 4 + 1] = v[1];
+            out[i * 4 + 2] = v[2]; out[i * 4 + 3] = v[3];
+        }
+        return;
+    }
+
+    /* generic (slow) path: BYTE/SHORT/INT/FLOAT */
+    for (size_t i = 0; i < n; i++)
+    {
+        const GLubyte *p = (const GLubyte *)pixels + i * cc * (size_t)legacy_type_bpc(type);
+        float c[2] = { 0.0f, 0.0f };
+
+        for (int k = 0; k < cc; k++)
+        {
+            float v = 0.0f;
+
+            switch (type)
+            {
+                case GL_BYTE: v = ((const GLbyte *)p)[k] / 127.0f; break;
+                case GL_UNSIGNED_SHORT: v = ((const GLushort *)p)[k] / 65535.0f; break;
+                case GL_SHORT: v = ((const GLshort *)p)[k] / 32767.0f; break;
+                case GL_HALF_FLOAT: { unsigned short h = ((const unsigned short *)p)[k]; v = mgl_compat_half_to_float((GLhalf)h); break; }
+                case GL_UNSIGNED_INT: v = (float)((const GLuint *)p)[k] / 4294967295.0f; break;
+                case GL_INT: v = (float)((const GLint *)p)[k] / 2147483647.0f; break;
+                case GL_FLOAT: v = ((const GLfloat *)p)[k]; break;
+            }
+            c[k] = v;
+        }
+
+        float v[4];
+        if (kind == GL_LUMINANCE) { v[0]=v[1]=v[2]=c[0]; v[3]=1.0f; }
+        else if (kind == GL_LUMINANCE_ALPHA) { v[0]=v[1]=v[2]=c[0]; v[3]=c[1]; }
+        else if (kind == GL_ALPHA) { v[0]=v[1]=v[2]=0.0f; v[3]=c[0]; }
+        else { v[0]=v[1]=v[2]=v[3]=c[0]; }
+
+        out[i * 4 + 0] = v[0]; out[i * 4 + 1] = v[1];
+        out[i * 4 + 2] = v[2]; out[i * 4 + 3] = v[3];
+    }
+}
+
+/* packs RGBA floats back into a legacy client layout */
+static void legacy_pack(GLenum kind, GLenum format, GLenum type,
+                        GLsizei w, GLsizei h, const GLfloat *in, void *out)
+{
+    int cc = legacy_client_comps(kind);
+    size_t n = (size_t)w * (size_t)(h ? h : 1);
+
+    for (size_t i = 0; i < n; i++)
+    {
+        float r = in[i * 4 + 0], a = in[i * 4 + 3];
+
+        switch (format)
+        {
+            case GL_LUMINANCE:
+                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(r * 255.0f + 0.5f);
+                else ((GLfloat *)out)[i] = r;
+                break;
+            case GL_ALPHA:
+                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(a * 255.0f + 0.5f);
+                else ((GLfloat *)out)[i] = a;
+                break;
+            case GL_INTENSITY:
+                if (type == GL_UNSIGNED_BYTE) ((GLubyte *)out)[i] = (GLubyte)(r * 255.0f + 0.5f);
+                else ((GLfloat *)out)[i] = r;
+                break;
+            default:    /* GL_LUMINANCE_ALPHA */
+                if (type == GL_UNSIGNED_BYTE)
+                {
+                    ((GLubyte *)out)[i * 2] = (GLubyte)(r * 255.0f + 0.5f);
+                    ((GLubyte *)out)[i * 2 + 1] = (GLubyte)(a * 255.0f + 0.5f);
+                }
+                else
+                {
+                    ((GLfloat *)out)[i * 2] = r;
+                    ((GLfloat *)out)[i * 2 + 1] = a;
+                }
+                break;
+        }
+        (void)cc;
+    }
+}
+
+/* the texture currently bound to |target| on the active unit */
+static GLuint bound_tex_name(GLMContext ctx, GLenum target)
+{
+    int idx = mgl_compat_target_index(target);
+
+    if (idx < 0)
+        return 0;
+
+    Texture *t = STATE(texture_units[STATE(active_texture)]).textures[idx];
+    return t ? t->name : 0;
+}
+
+void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
+                        GLsizei width, GLsizei height, GLint border,
+                        GLenum format, GLenum type, const void *pixels)
+{
+    GLenum kind = legacy_tex_kind((GLenum)internalformat);
+
+    if (kind && legacy_type_bpc(type) && (format == kind) && pixels)
+    {
+        GLfloat *rgba = (GLfloat *)malloc((size_t)width * height * 4 * sizeof(GLfloat));
+
+        if (rgba)
+        {
+            legacy_expand(kind, type, pixels, width, height, 1, rgba);
+            mglTexImage2D(ctx, target, level, GL_RGBA32F, width, height, border, GL_RGBA, GL_FLOAT, rgba);
+            free(rgba);
+            legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+            return;
+        }
+    }
+
+    mglTexImage2D(ctx, target, level, internalformat, width, height, border, format, type, pixels);
+
+    if (kind)
+        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+}
+
+void compat_tex_image1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
+                        GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
+{
+    compat_tex_image2D(ctx, target, level, internalformat, width, 1, border, format, type, pixels);
+}
+
+void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
+                        GLsizei width, GLsizei height, GLsizei depth, GLint border,
+                        GLenum format, GLenum type, const void *pixels)
+{
+    GLenum kind = legacy_tex_kind((GLenum)internalformat);
+
+    if (kind && legacy_type_bpc(type) && (format == kind) && pixels)
+    {
+        GLfloat *rgba = (GLfloat *)malloc((size_t)width * height * depth * 4 * sizeof(GLfloat));
+
+        if (rgba)
+        {
+            legacy_expand(kind, type, pixels, width, height, depth, rgba);
+            mglTexImage3D(ctx, target, level, GL_RGBA32F, width, height, depth, border, GL_RGBA, GL_FLOAT, rgba);
+            free(rgba);
+            legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+            return;
+        }
+    }
+
+    mglTexImage3D(ctx, target, level, internalformat, width, height, depth, border, format, type, pixels);
+
+    if (kind)
+        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+}
+
+void compat_get_tex_image(GLMContext ctx, GLenum target, GLint level,
+                          GLenum format, GLenum type, void *pixels)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+    GLenum kind = 0;
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+            kind = s->legacy_tex[i].kind;
+
+    if (!kind)
+    {
+        mglGetTexImage(ctx, target, level, format, type, pixels);
+        return;
+    }
+
+    /* read RGBA back, then re-pack to the legacy layout */
+    GLint w = 0, h = 0;
+    mglGetTexLevelParameteriv(ctx, target, level, GL_TEXTURE_WIDTH, &w);
+    mglGetTexLevelParameteriv(ctx, target, level, GL_TEXTURE_HEIGHT, &h);
+
+    if (w <= 0 || h <= 0)
+        return;
+
+    GLfloat *rgba = (GLfloat *)malloc((size_t)w * h * 4 * sizeof(GLfloat));
+
+    if (!rgba)
+        return;
+
+    mglGetTexImage(ctx, target, level, GL_RGBA, GL_FLOAT, rgba);
+    legacy_pack(kind, format, type, w, h, rgba, pixels);
+    free(rgba);
+}
+
+void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level,
+                                      GLenum pname, GLint *params)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+
+    mglGetTexLevelParameteriv(ctx, target, level, pname, params);
+
+    if (pname == GL_TEXTURE_INTERNAL_FORMAT)
+    {
+        for (int i = 0; i < s->legacy_tex_count; i++)
+            if (s->legacy_tex[i].name == name)
+            {
+                switch (s->legacy_tex[i].kind)
+                {
+                    case GL_LUMINANCE: *params = 0x8040; break;        /* LUMINANCE8 */
+                    case GL_LUMINANCE_ALPHA: *params = 0x8045; break;  /* LUMINANCE8_ALPHA8 */
+                    case GL_ALPHA: *params = 0x803C; break;            /* ALPHA8 */
+                    default: *params = 0x8049; break;                  /* INTENSITY8 */
+                }
+                return;
+            }
+    }
 }

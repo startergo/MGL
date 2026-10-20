@@ -25,6 +25,7 @@
 #define MGLC_MATRIX_DEPTH      64     /* modelview; spec minimum 32 */
 #define MGLC_MAX_TEXCOORD_ATTR (MAX_ATTRIBS - 8)
 #define MGLC_STIPPLE_UNIT      8      /* texture unit holding stipple/blit textures (FFP uses 0..7) */
+#define MGLC_LEGACY_TEX_MAX 64
 #define MGLC_TEX_PRIO_MAX      65536  /* tracked glPrioritizeTextures values */
 #define MGLC_ATTRIB_STACK      16
 #define MGLC_CLIENT_STACK      16
@@ -324,6 +325,11 @@ struct MGLExtState_compat {
     /* texture priorities (glPrioritizeTextures) */
     GLclampf  texture_priority[MGLC_TEX_PRIO_MAX];
 
+    /* legacy internal formats (LUMINANCE/ALPHA/INTENSITY) expanded to RGBA on
+     * upload; remembered so readback re-packs them */
+    struct { GLuint name; GLenum kind; GLenum type; } legacy_tex[MGLC_LEGACY_TEX_MAX];
+    int       legacy_tex_count;
+
     /* ---- select / feedback ---- */
     MGLCRenderMode rmode;
 
@@ -445,6 +451,11 @@ GLuint mgl_compat_ffp_program(GLMContext ctx);        /* bind-on-demand, returns
 void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog);  /* upload uniforms */
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *prog); /* user compat shaders */
 GLint mgl_compat_get_uniform_location(GLMContext ctx, GLuint program, const GLchar *name);
+void compat_tex_image1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels);
+void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels);
+void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels);
+void compat_get_tex_image(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, void *pixels);
+void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level, GLenum pname, GLint *params);
 void mgl_compat_window_pos(GLMContext ctx, const float *obj, float *win);  /* obj -> window xyz */
 GLuint mgl_compat_blit_program(GLMContext ctx);       /* drawpixels/bitmap helper */
 
