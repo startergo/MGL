@@ -154,6 +154,7 @@ static bool tr_subst_ident(Tr *t, const char *id, size_t n)
         if (match(id, n, "gl_BackSecondaryColor")) { tr_adds(t, "mglBackSecondaryColor"); t->used |= U_BACK_SEC; return (t->subst++, true); }
         if (match(id, n, "gl_TexCoord")) { tr_adds(t, "mglTexCoordOut"); t->used |= 0; return (t->subst++, true); }
         if (match(id, n, "gl_ClipVertex")) { tr_adds(t, "mglClipVertex"); t->used |= U_MISC; return (t->subst++, true); }
+        if (match(id, n, "gl_FogFragCoord")) { tr_adds(t, "mglFogFragCoord"); t->used |= U_MISC; return (t->subst++, true); }
         if (match(id, n, "ftransform")) { tr_adds(t, "mgl_ftransform"); t->used |= U_MVM | U_MATRICES; return (t->subst++, true); }
     }
     else
@@ -519,6 +520,8 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
             /* ftransform() reads gl_Vertex even when the shader does not */
             if (!(t.used & U_VERTEX))
                 p += sprintf(p, "layout(location=%d) in vec4 mglVertex;\n", MGLC_ATTR_VERTEX);
+            if (!(t.used & U_MATRICES))
+                p += sprintf(p, "uniform mat4 mglModelViewProjectionMatrix;\n");
             p += sprintf(p, "vec4 mgl_ftransform() { return mglModelViewProjectionMatrix * mglVertex; }\n");
         }
         if (t.used & U_LIGHTS)
@@ -533,6 +536,8 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
             p += sprintf(p, "uniform mgl_MaterialParameters mglFrontMaterial;\n");
             p += sprintf(p, "uniform mgl_MaterialParameters mglBackMaterial;\n");
             p += sprintf(p, "uniform vec4 mglLightModelAmbient;\n");
+            p += sprintf(p, "struct mgl_LightModelParameters { vec4 ambient; };\n");
+            p += sprintf(p, "uniform mgl_LightModelParameters mglLightModel;\n");
             p += sprintf(p, "uniform vec4 mglFrontLightModelProduct;\n");
             p += sprintf(p, "uniform vec4 mglBackLightModelProduct;\n");
             p += sprintf(p,
@@ -582,6 +587,35 @@ static GLint uloc_mem(GLMContext ctx, GLuint prog, const char *name, int idx, co
     snprintf(buf, sizeof buf, "%s[%d].%s", name, idx, member);
     GLint l = mglGetUniformLocation(ctx, prog, buf);
     return l;
+}
+
+/* glGetUniformLocation that also accepts the built-in compat names
+ * (gl_ModelViewMatrix & co): the translator renamed them mgl_*  */
+GLint mgl_compat_get_uniform_location(GLMContext ctx, GLuint program, const GLchar *name)
+{
+    if (name && name[0] == 'g' && name[1] == 'l' && name[2] == '_')
+    {
+        char buf[256];
+
+        if (strlen(name) + 1 < sizeof buf)
+        {
+            snprintf(buf, sizeof buf, "mgl%s", name + 3);
+            GLint l = mglGetUniformLocation(ctx, program, buf);
+            if (l >= 0)
+                return l;
+        }
+
+        /* gl_LightModel.ambient was flattened to mglLightModelAmbient */
+        if (!strncmp(name, "gl_LightModel.", 14) && strlen(name) + 3 < sizeof buf)
+        {
+            snprintf(buf, sizeof buf, "mglLightModelA%s", name + 14);
+            return mglGetUniformLocation(ctx, program, buf);
+        }
+
+        return -1;
+    }
+
+    return mglGetUniformLocation(ctx, program, name);
 }
 
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
@@ -742,7 +776,13 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
         for (int k = 0; tab[k].name; k++)
         {
             l = uloc_mem(ctx, prog, "mglLightSource", i, tab[k].name);
-            if (l >= 0)
+            if (l < 0)
+                continue;
+
+            /* the size must match the declared type or the call errors */
+            if (tab[k].n == 3)
+                mglUniform3fv(ctx, l, 1, tab[k].v);
+            else
                 mglUniform4fv(ctx, l, 1, tab[k].v);
         }
 
@@ -791,6 +831,8 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
     }
 
     l = uloc(ctx, prog, "mglLightModelAmbient");
+    if (l >= 0) mglUniform4fv(ctx, l, 1, s->light_model_ambient);
+    l = uloc(ctx, prog, "mglLightModel.ambient");
     if (l >= 0) mglUniform4fv(ctx, l, 1, s->light_model_ambient);
     l = uloc(ctx, prog, "mglFrontLightModelProduct");
     if (l >= 0)

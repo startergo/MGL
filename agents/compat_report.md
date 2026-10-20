@@ -66,7 +66,7 @@ polygon stipple 32x32 (GPU texture sample), evaluators map1/map2 + EvalMesh1/2,
 select mode (per-primitive hit records, viewport-exact culling), feedback mode
 (GL_2D/3D/3D_COLOR/3D_COLOR_TEXTURE/4D_COLOR_TEXTURE token sizes).
 
-All three suites green: pipeline 60, profile 61, render2 65.
+All four suites green: pipeline 60, profile 61, render2 65, glsl 18.
 
 ## Fixed this session (committed per area)
 
@@ -79,6 +79,20 @@ All three suites green: pipeline 60, profile 61, render2 65.
   state. Fix: `mglActiveTexture(ctx, GL_TEXTURE0 + saved_active)` (state stores a unit *index*).
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
+
+## Session 4 (commit "compat GLSL fixes")
+
+* gl_FogFragCoord was only substituted in fragment shaders - now also in vertex shaders (declared
+  as `out float mglFogFragCoord`, already declared in the preamble).
+* ftransform() wrapper referenced mglModelViewProjectionMatrix even when only U_MVM was used -
+  the uniform is now declared in that case too.
+* mgl_compat_sync_builtin_uniforms uploaded `spotDirection` (a vec3) with glUniform4fv ->
+  GL_INVALID_OPERATION at every draw of a shader using gl_LightSource; now matches the type.
+* glGetUniformLocation in compat contexts accepts built-in names (gl_ModelViewMatrix ->
+  mglModelViewMatrix, gl_LightModel.ambient -> mglLightModelAmbient) via a compat dispatch
+  wrapper (`mgl_compat_get_uniform_location`); unused builtins correctly return -1.
+* gl_LightModel is now a proper struct in translated shaders (mgl_LightModelParameters) and is
+  synced (`mglLightModel.ambient`).
 
 ## Session 3 (commit "render2 fixes")
 
@@ -103,8 +117,9 @@ All three suites green: pipeline 60, profile 61, render2 65.
 
 ## Remaining work
 
-* More GLSL-compat coverage (#version 120 + ftransform test exists in pipeline; test edge cases:
-  gl_FragData, gl_MultiTexCoord, gl_ModelViewMatrix uniforms).
+* More GLSL-compat coverage: test_compat_glsl.c now covers #version 110/120/150-compat,
+  ftransform, gl_FragData, gl_TextureMatrix, gl_LightSource/gl_FrontMaterial/gl_Fog uniforms,
+  builtin uniform locations.
 * glTexGen SPHERE_MAP/REFLECTION_MAP/NORMAL_MAP pixel tests; point sprites/point size attenuation.
 * CopyPixels test; glPixelMap effect on DrawPixels/readback; color-index behaviour.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.

@@ -443,6 +443,7 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
 GLuint mgl_compat_ffp_program(GLMContext ctx);        /* bind-on-demand, returns name */
 void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog);  /* upload uniforms */
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *prog); /* user compat shaders */
+GLint mgl_compat_get_uniform_location(GLMContext ctx, GLuint program, const GLchar *name);
 GLuint mgl_compat_blit_program(GLMContext ctx);       /* drawpixels/bitmap helper */
 
 /* compat_vb.c (immediate mode, client arrays, draws) */

@@ -847,6 +847,7 @@ void mgl_compat_init_dispatch(GLMContext ctx)
 
     /* ---- compat GLSL ---- */
     ctx->dispatch.shader_source = compat_shader_source2;
+    ctx->dispatch.get_uniform_location = mgl_compat_get_uniform_location;
 }
 
 #endif /* COMPAT_DISPATCH_H */
