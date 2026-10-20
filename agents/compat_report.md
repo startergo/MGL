@@ -104,6 +104,24 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
 * Probe note: glReadPixels of a 1-pixel-wide GL_RGB row writes PACK_ALIGNMENT-padded
   rows (4 bytes per 3-byte row) — read GL_RGBA in probes.
 
+## Session 8c (commit "legacy texture formats at real precision")
+
+* LUMINANCE / ALPHA / INTENSITY / LUMINANCE_ALPHA textures are no longer expanded
+  to RGBA32F.  compat_state.c legacy_upload() stores them at the data's own
+  precision — R8/RG8 (UNSIGNED_BYTE), R16/RG16 (UNSIGNED_SHORT), R8_SNORM/RG8_SNORM
+  (BYTE), R16_SNORM (SHORT), R16F (HALF_FLOAT), R32F (FLOAT), 32F+CPU-normalize
+  (INT/UINT) — with client format GL_RED/GL_RG, and sets the sampler swizzle to
+  the legacy replication ((r,r,r,1), (0,0,0,r), (r,r,r,g), (r,r,r,r)).
+* glTexSubImage with legacy client formats now works against the same storage
+  (the core texdata path knows GL_LUMINANCE/ALPHA client layouts).
+* glGetTexImage reads the stored channels and legacy_pack() rebuilds any legacy
+  client layout (LUMINANCE/ALPHA/INTENSITY/LA/RGB/RGBA, byte/short/int/float).
+* GL_TEXTURE_INTERNAL_FORMAT returns the format the app asked for (recorded);
+  after re-specifying the texture with a core format the record and the swizzle
+  are dropped (core query takes over; unsized GL_RGBA is reported as GL_RGBA8,
+  which the GL spec allows).
+* Test: tests/headless/test_compat_render7.c (82 checks).
+
 ## Session 8b (commit "GL_CLAMP / CLAMP_TO_BORDER: hardware border colours + shader emulation")
 
 * GL_CLAMP/GL_CLAMP_TO_BORDER are no longer downgraded to CLAMP_TO_EDGE.

@@ -326,12 +326,15 @@ struct MGLExtState_compat {
     /* texture priorities (glPrioritizeTextures) */
     GLclampf  texture_priority[MGLC_TEX_PRIO_MAX];
 
-    /* legacy internal formats (LUMINANCE/ALPHA/INTENSITY) expanded to RGBA on
-     * upload; remembered so readback re-packs them.  gmm = GL_GENERATE_MIPMAP,
-     * wrap[] stores the requested GL_CLAMP / GL_CLAMP_TO_BORDER (Metal cannot
-     * express all of it: see mgl_compat_clamp_* in compat_state.c), applied[]
-     * is the wrap mode last given to the core sampler state */
-    struct { GLuint name; GLenum kind; GLenum type; GLboolean gmm;
+    /* legacy internal formats (LUMINANCE/ALPHA/INTENSITY) are stored at their
+     * real precision (R8/RG8/R16/...) with a sampler swizzle doing the legacy
+     * replication; kind/type remember it for readback re-packing, iformat is
+     * the internal format the app asked for (returned by queries).  gmm =
+     * GL_GENERATE_MIPMAP.  wrap[] stores the requested GL_CLAMP /
+     * GL_CLAMP_TO_BORDER (Metal cannot express all of it: see
+     * mgl_compat_clamp_* in compat_state.c), applied[] is the wrap mode last
+     * given to the core sampler state */
+    struct { GLuint name; GLenum kind; GLenum type; GLenum iformat; GLboolean gmm;
              GLenum wrap[3]; GLenum applied[3]; } legacy_tex[MGLC_LEGACY_TEX_MAX];
     int       legacy_tex_count;
 
