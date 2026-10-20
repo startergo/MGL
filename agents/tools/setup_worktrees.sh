@@ -16,5 +16,7 @@ for d in "${DOMAINS[@]}"; do
     git -C "$ROOT" worktree add -q -b "gl46/$d" "$dir" "$BASE"
     # share the prebuilt external deps instead of rebuilding them per worktree
     rm -rf "$dir/external" && ln -s "$ROOT/external" "$dir/external"
+    # the symlink replaces tracked files: hide them so `git add -A` never commits their deletion
+    git -C "$dir" ls-files -z external | xargs -0 git -C "$dir" update-index --skip-worktree
     echo "created: $d -> gl46/$d"
 done
