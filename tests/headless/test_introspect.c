@@ -422,7 +422,7 @@ TEST(ubo_reflection)
     glGetActiveUniformBlockiv(p, bi, GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, ids);
     char nm[64]; GLsizei len;
     glGetActiveUniformBlockName(p, bi, sizeof nm, &len, nm); EXPECT_STREQ(nm, "Colors");
-    /* member reflection (named instance -> "Colors.member") */
+    /* member reflection (named instance -> "Colors.member"; anonymous block -> plain) */
     const char *names[4] = { "Colors.col", "Colors.xf", "Colors.w", "o3" };
     GLuint mi[4]; glGetUniformIndices(p, 4, names, mi);
     for (int i = 0; i < 4; i++) EXPECT_TRUE(mi[i] != GL_INVALID_INDEX);

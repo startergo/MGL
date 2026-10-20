@@ -39,6 +39,8 @@
 #include "mgl_ext_program.h"
 #include <ctype.h>
 
+#include "cts_glsl_compat.h"   /* bool/bvecN block members: GLSL type recovery (cts domain) */
+
 
 #pragma mark - module model
 
@@ -1429,7 +1431,33 @@ static uint32_t block_type_size(const SMod *m, uint32_t t, uint32_t mstride, int
 typedef struct {
     MGLIProgram *ip; const SMod *m; int stage; int block; bool ssbo;
     int top_level; GLint top_size, top_stride;
+    const MGLBoolPaths *bools;   /* GLSL-declared bool block members of this stage */
 } BlockWalk;
+
+/*
+ * glslang stores bool/bvecN uniform- and buffer-block members as uint/uvecN (GLSL-to-SPIR-V
+ * convention: "a 32-bit int where non-0 means true").  GL introspection must report the GLSL
+ * type, so walk_block() checks the members declared bool in the stage source (cts domain:
+ * cts_glsl_compat.c) and overrides the storage type of exactly those leaves.
+ */
+static void src_bool_leaf_type(const BlockWalk *bw, const char *name, uint32_t t,
+                               GLenum *type, int *kind, int *cols, int *rows)
+{
+    if (!bw->bools || !mgl_cts_bool_paths_has(bw->bools, name))
+        return;
+    const SType *ty = &bw->m->t[t];
+    int n = 1;
+    uint32_t base = t;
+    if (ty->kind == T_VECTOR) { n = (int)ty->count; base = ty->elem; }
+    if (n < 1 || n > 4) return;
+    /* only integer storage can represent a bool member (glslang's uint mapping) */
+    if (bw->m->t[base].kind != T_INT) return;
+    static const GLenum bt[5] = { GL_NONE, GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4 };
+    *type = bt[n];
+    if (kind) *kind = MGLI_K_BOOL;
+    if (cols) *cols = n;
+    if (rows) *rows = 1;
+}
 
 static void add_member(MGLIBlock *blk, int ui)
 {
@@ -1457,6 +1485,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
                     ip->bvars = realloc(ip->bvars, (ip->nbvars + 1) * sizeof(MGLIBufferVar));
                     MGLIBufferVar *b = &ip->bvars[ip->nbvars]; memset(b, 0, sizeof *b);
                     b->name = xstrdup(nm); b->type = gl_type_of(m, et); b->size = (GLint)ty->count; b->block_index = bw->block;
+                    src_bool_leaf_type(bw, nm, et, &b->type, NULL, NULL, NULL);
                     b->offset = (GLint)offset; b->array_stride = (GLint)stride;
                     b->matrix_stride = m->t[et].kind == T_MATRIX ? (GLint)mstride : 0; b->is_row_major = m->t[et].kind == T_MATRIX ? row_major : 0;
                     b->top_size = depth == 0 ? 1 : bw->top_size; b->top_stride = depth == 0 ? 0 : bw->top_stride;
@@ -1474,6 +1503,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
                     u->offset = (GLint)offset; u->array_stride = (GLint)stride;
                     u->matrix_stride = m->t[et].kind == T_MATRIX ? (GLint)mstride : 0; u->is_row_major = m->t[et].kind == T_MATRIX ? row_major : 0;
                     scalar_info(m, et, &u->kind, &u->cols, &u->rows);
+                    src_bool_leaf_type(bw, nm, et, &u->type, &u->kind, &u->cols, &u->rows);
                 }
                 add_member(&bw->ip->ubos[bw->block], ui);
                 u->stages |= 1u << bw->stage;
@@ -1510,6 +1540,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
             ip->bvars = realloc(ip->bvars, (ip->nbvars + 1) * sizeof(MGLIBufferVar));
             MGLIBufferVar *b = &ip->bvars[ip->nbvars]; memset(b, 0, sizeof *b);
             b->name = xstrdup(name); b->type = gl_type_of(m, t); b->size = 1; b->block_index = bw->block;
+            src_bool_leaf_type(bw, name, t, &b->type, NULL, NULL, NULL);
             b->offset = (GLint)offset; b->array_stride = 0;
             b->matrix_stride = ty->kind == T_MATRIX ? (GLint)mstride : 0; b->is_row_major = ty->kind == T_MATRIX ? row_major : 0;
             b->top_size = bw->top_size; b->top_stride = bw->top_stride;
@@ -1527,6 +1558,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
         u->type = gl_type_of(m, t); u->size = 1; u->block_index = bw->block; u->offset = (GLint)offset; u->array_stride = 0;
         u->matrix_stride = ty->kind == T_MATRIX ? (GLint)mstride : 0; u->is_row_major = ty->kind == T_MATRIX ? row_major : 0;
         scalar_info(m, t, &u->kind, &u->cols, &u->rows);
+        src_bool_leaf_type(bw, name, t, &u->type, &u->kind, &u->cols, &u->rows);
     }
     add_member(&bw->ip->ubos[bw->block], ui);
     u->stages |= 1u << bw->stage;
@@ -1660,7 +1692,6 @@ static bool name_is_hidden(const char *n) { return !strncmp(n, "_mgl_sr_", 8); }
 static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *src)
 {
     const SMod *m = s->r;
-    (void)src;
     /* default block members */
     for (uint32_t k = 0; k < s->ndub && s->dub_var; k++) {
         if (!s->dub_active[k]) continue;
@@ -1669,6 +1700,9 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         int cursor = 0, elem = 0, lki = 0;
         walk_default(ip, m, stage, d->name, mt, d->offset, d->explicit_loc, &cursor, 0, -1, &elem, name_is_hidden(d->name), d->leaf, &lki);
     }
+    /* bool/bvecN block members: recover the GLSL-declared types from the stage source */
+    MGLBoolPaths *bools = mgl_cts_bool_block_members(src);
+
     /* opaque uniforms + UBO + SSBO + atomic counters */
     for (uint32_t v = 1; v <= m->bound; v++) {
         if (!m->isvar[v] || !m->vglobal[v] || !s->active[v]) continue;
@@ -1752,14 +1786,20 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
             }
             b->stages |= 1u << stage;
             b->spv_id[stage] = v;
-            BlockWalk bw = { ip, m, stage, bi, ssbo, 0, 1, 0 };
+            BlockWalk bw = { ip, m, stage, bi, ssbo, 0, 1, 0, bools };
             {
                 char prefix[512];
-                if (iname[0]) snprintf(prefix, sizeof prefix, "%s", bname); else prefix[0] = 0;
+                /* GL names block members "<block type name>.<member>" only when the block
+                 * has an instance name; anonymous block members keep their plain names
+                 * (this is what the Khronos CTS reference layout expects) */
+                if (iname[0]) snprintf(prefix, sizeof prefix, "%s", bname);
+                else prefix[0] = 0;
                 walk_block(&bw, prefix, st, 0, 0, 0, 0);
             }
         }
     }
+
+    mgl_cts_bool_paths_free(bools);
 }
 
 /* assign locations to default-block / opaque uniforms (explicit first, then by order).
