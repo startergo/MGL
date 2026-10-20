@@ -147,7 +147,13 @@ wrapped a GLuint for the internal sentinel name `TEX_OBJ_RES_NAME`
 names and caps the array (`MGL_TEXPARAM_MAX_RECORDS`, 1<<22). Full MGL headless
 suite after the fix: 4647 checks, 0 failures.
 
-## 7. Harness limitations / caveats
+## 8. Fix log (cts agent)
+
+| date | cluster | fix | before → after (group) | overall |
+|------|---------|-----|------------------------|---------|
+| 2025-10-21 | #1 (736) pixelstoragemodes "Shader creation failed" | GLSL identifiers that are MSL keywords/types (`sampler`, `texture`, `kernel`, `float4`, ...) are now renamed (`<name>_mgl`, collision-checked against every identifier of the module) before SPIRV-Cross emits MSL: `MGL/src/msl_reserved.{c,h}` + `mgl_msl_mangle_reserved()` hooked after introspection in `program.c:compile_stage`, `geometry.c:geom_spirv_to_msl`, `transform_feedback.c:xfb_spirv_to_msl`. Introspection keeps the GLSL names (rename runs after reflection). | pixelstoragemodes Fail=736 → **0** (Pass=736, NotSupported=160) | 50.5% → **58.6%** |
+
+## 9. Harness limitations / caveats
 
 * `GTF-GL46.*` not run (Khronos-confidential sources unavailable).
 * Single global GL context: CTS cases that need genuinely separate (shared or
