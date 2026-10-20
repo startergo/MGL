@@ -400,6 +400,23 @@ void mglGetPixelMapusv(GLMContext ctx, GLenum map, GLushort *values)
 
 /* uploads pixels into the internal blit texture (RGBA8) applying the color
  * pixel-transfer scales/biases and returns the texture name */
+/* one GL pixel-map lookup: v in [0,1] -> map[round(v * (n-1))] */
+static float pixel_map_lookup(const GLfloat *map, GLuint n, float v)
+{
+    if (!map || n == 0)
+        return v;
+
+    if (n == 1)
+        return map[0];
+
+    GLuint i = (GLuint)(v * (float)(n - 1) + 0.5f);
+
+    if (i >= n)
+        i = n - 1;
+
+    return map[i];
+}
+
 static GLuint blit_upload_pixels(GLMContext ctx, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
 {
     struct MGLExtState_compat *s = CS();
@@ -449,6 +466,15 @@ static GLuint blit_upload_pixels(GLMContext ctx, GLsizei width, GLsizei height, 
                 default:
                     r = g = b = 0; a = 1;
                     break;
+            }
+
+            /* GL_MAP_COLOR: look each component up in the corresponding map */
+            if (s->pixel_transfer[0] != 0.0f)
+            {
+                r = pixel_map_lookup(s->pixel_map[6], s->pixel_map_size[6], r);
+                g = pixel_map_lookup(s->pixel_map[7], s->pixel_map_size[7], g);
+                b = pixel_map_lookup(s->pixel_map[8], s->pixel_map_size[8], b);
+                a = pixel_map_lookup(s->pixel_map[9], s->pixel_map_size[9], a);
             }
 
             rgba[si + 0] = (GLubyte)fminf(255.0f, fmaxf(0.0f, (r * rs + rb) * 255.0f));

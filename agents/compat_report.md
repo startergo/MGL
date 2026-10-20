@@ -66,7 +66,8 @@ polygon stipple 32x32 (GPU texture sample), evaluators map1/map2 + EvalMesh1/2,
 select mode (per-primitive hit records, viewport-exact culling), feedback mode
 (GL_2D/3D/3D_COLOR/3D_COLOR_TEXTURE/4D_COLOR_TEXTURE token sizes).
 
-All four suites green: pipeline 60, profile 61, render2 65, glsl 18.
+All five suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16
+(full headless suite: 359 checks, 0 failures).
 
 ## Fixed this session (committed per area)
 
@@ -79,6 +80,23 @@ All four suites green: pipeline 60, profile 61, render2 65, glsl 18.
   state. Fix: `mglActiveTexture(ctx, GL_TEXTURE0 + saved_active)` (state stores a unit *index*).
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
+
+## Session 5 (commit "line stipple, texgen reflection fix, pixel maps")
+
+* Line stipple is now really implemented: a per-vertex "distance along the line" attribute
+  (MGLC_ATTR_LINE_I = location 1) is computed on the CPU in window space and streamed for
+  immediate mode and glDrawArrays; the FFP vertex shader passes it to the fragment shader, which
+  masks with pattern/factor uniforms. (Indexed lines with stipple still stream no distances - gap.)
+* REFLECTION_MAP texgen referenced the reflection vector without declaring it (SPHERE_MAP only)
+  -> shader compile error -> crash when drawing with no program bound. Both maps declare mglR now,
+  and mgl_compat_ffp_program falls back to a minimal transform+color program when generation
+  fails, so a bad state combination can never crash the draw.
+* DrawPixels applies GL_MAP_COLOR via the R/G/B/A pixel maps (v -> map[round(v*(n-1))]); the
+  default single-entry maps are identity (1.0).
+* Known gaps documented by tests: a horizontal/vertical line exactly on a pixel boundary rasterizes
+  one pixel left/down on Metal (D3D rule) vs the GL diamond rule - tests read the Metal row and
+  note it; fixed-function texgen/lighting are per-vertex (as GL 1.x says), tests compute the
+  interpolated CPU reference.
 
 ## Session 4 (commit "compat GLSL fixes")
 
@@ -120,6 +138,6 @@ All four suites green: pipeline 60, profile 61, render2 65, glsl 18.
 * More GLSL-compat coverage: test_compat_glsl.c now covers #version 110/120/150-compat,
   ftransform, gl_FragData, gl_TextureMatrix, gl_LightSource/gl_FrontMaterial/gl_Fog uniforms,
   builtin uniform locations.
-* glTexGen SPHERE_MAP/REFLECTION_MAP/NORMAL_MAP pixel tests; point sprites/point size attenuation.
+* point sprites + point size attenuation (point size done, sprites untested).
 * CopyPixels test; glPixelMap effect on DrawPixels/readback; color-index behaviour.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.

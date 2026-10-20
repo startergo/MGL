@@ -39,6 +39,7 @@
 
 /* ---- fixed locations shared by generated and translated shaders ---------- */
 #define MGLC_ATTR_VERTEX      0
+#define MGLC_ATTR_LINE_I      1      /* line stipple: distance along the line (pixels) */
 #define MGLC_ATTR_NORMAL      2
 #define MGLC_ATTR_COLOR       3
 #define MGLC_ATTR_SECONDARY   4
@@ -444,6 +445,7 @@ GLuint mgl_compat_ffp_program(GLMContext ctx);        /* bind-on-demand, returns
 void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog);  /* upload uniforms */
 void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *prog); /* user compat shaders */
 GLint mgl_compat_get_uniform_location(GLMContext ctx, GLuint program, const GLchar *name);
+void mgl_compat_window_pos(GLMContext ctx, const float *obj, float *win);  /* obj -> window xyz */
 GLuint mgl_compat_blit_program(GLMContext ctx);       /* drawpixels/bitmap helper */
 
 /* compat_vb.c (immediate mode, client arrays, draws) */

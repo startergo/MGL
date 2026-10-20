@@ -361,6 +361,51 @@ static void draw_index_list(GLMContext ctx, GLenum mode, const uint32_t *idx, GL
 /* fixed-function default (current) attribute values for every input the
  * generated program reads but the app did not bind (GL: unbound attributes
  * use the current value; MGL implements that as constant attribute fetch) */
+/* upload per-vertex line-stipple distances (pixels from the start of the line);
+ * GL_LINES resets per line, strips/loops continue through the batch */
+static void upload_line_stipple(GLMContext ctx, GLenum mode, const float *pos, GLuint n)
+{
+    struct MGLExtState_compat *s = CS();
+
+    if (!s->line_stipple)
+        return;
+
+    switch (mode)
+    {
+        case GL_LINES: case GL_LINE_STRIP: case GL_LINE_LOOP:
+            break;
+        default:
+            return;
+    }
+
+    float *li = (float *)malloc((size_t)n * sizeof(float));
+    if (!li)
+        return;
+
+    float run = 0.0f;
+
+    for (GLuint i = 0; i < n; i++)
+    {
+        if (mode == GL_LINES && (i & 1) == 0)
+            run = 0.0f;     /* each pair is its own primitive */
+
+        if (i > 0)
+        {
+            float a[3], b[3];
+
+            mgl_compat_window_pos(ctx, &pos[(i - 1) * 4], a);
+            mgl_compat_window_pos(ctx, &pos[i * 4], b);
+            float dx = a[0] - b[0], dy = a[1] - b[1];
+            run += sqrtf(dx * dx + dy * dy);
+        }
+
+        li[i] = run;
+    }
+
+    upload_stream(ctx, NULL, MGLC_ATTR_LINE_I, 1, GL_FLOAT, GL_FALSE, 0, li, n);
+    free(li);
+}
+
 static void set_current_attribs(GLMContext ctx)
 {
     struct MGLExtState_compat *s = CS();
@@ -490,6 +535,8 @@ void mgl_compat_flush_imm(GLMContext ctx)
     upload_stream(ctx, s->imm_vao, MGLC_ATTR_INDEX, 1, GL_FLOAT, GL_FALSE, 0, im->index, n);
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         upload_stream(ctx, s->imm_vao, MGLC_ATTR_TEXCOORD(u), 4, GL_FLOAT, GL_FALSE, 0, im->texcoord[u], n);
+
+    upload_line_stipple(ctx, im->mode, im->pos, n);
 
     Program *user = bind_ffp(ctx);
 
@@ -1531,6 +1578,13 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
     }
     else
     {
+        if (s->line_stipple)
+        {
+            const float *pos = mgl_compat_read_positions(ctx, first, count);
+            if (pos)
+                upload_line_stipple(ctx, mode, pos, (GLuint)count);
+        }
+
         mglDrawArrays(ctx, mode, first, count);
     }
 

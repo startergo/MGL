@@ -616,6 +616,14 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GL
     }
 }
 
+/* window-space position of an object-space vertex (for line stipple) */
+void mgl_compat_window_pos(GLMContext ctx, const float *obj, float *win)
+{
+    float eye_z = 0.0f, clip_w = 1.0f;
+
+    cpu_transform(ctx, obj, win, &eye_z, &clip_w);
+}
+
 void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n)
 {
     struct MGLExtState_compat *s = CS();

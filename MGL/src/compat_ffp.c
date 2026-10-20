@@ -415,6 +415,8 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     for (int u = 0; u < MGLC_MAX_COORDS; u++)
         if (c->unit.need_texcoord[u])
             sb_add(b, "layout(location=%d) in vec4 mglTexCoord%d;\n", MGLC_ATTR_TEXCOORD(u), u);
+    if (c->line_stipple)
+        sb_add(b, "layout(location=%d) in float mglLineI;   /* distance along the line, pixels */\n", MGLC_ATTR_LINE_I);
 
     /* outputs */
     sb_add(b, "%sout vec4 mglColorFront;\n", c->flat ? "flat " : "");
@@ -427,9 +429,13 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             sb_add(b, "out vec4 mglTexCoordOut%d;\n", u);
     if (c->fog)
         sb_add(b, "out vec4 mglEyePos;\n");
+    if (c->line_stipple)
+        sb_add(b, "out float mglLineV;\n");
 
     sb_add(b, "void main()\n{\n");
     sb_add(b, "    vec4 mglEye = mglModelViewMatrix * mglVertex;\n");
+    if (c->line_stipple)
+        sb_add(b, "    mglLineV = mglLineI;\n");
 
     if (c->need_normal)
     {
@@ -563,8 +569,10 @@ static void gen_vertex_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
             continue;
         }
 
-        /* sphere map needs a reflection vector */
-        int sphere = (c->unit.texgen[u][0] == GL_SPHERE_MAP || c->unit.texgen[u][1] == GL_SPHERE_MAP);
+        /* sphere/reflection maps need the reflection vector */
+        int sphere = (c->unit.texgen[u][0] == GL_SPHERE_MAP || c->unit.texgen[u][1] == GL_SPHERE_MAP ||
+                      c->unit.texgen[u][0] == GL_REFLECTION_MAP || c->unit.texgen[u][1] == GL_REFLECTION_MAP ||
+                      c->unit.texgen[u][2] == GL_REFLECTION_MAP);
         if (sphere)
         {
             sb_add(b, "    vec3 mglU = normalize(mglEye.xyz);\n");
@@ -754,6 +762,11 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->polygon_stipple)
         sb_add(b, "uniform sampler2D mglStipple;\n");
+    if (c->line_stipple)
+    {
+        sb_add(b, "in float mglLineV;\n");
+        sb_add(b, "uniform ivec2 mglLineStipple;   /* .x = pattern, .y = repeat factor */\n");
+    }
 
     sb_add(b, "layout(location=0) out vec4 mglFragColor;\n");
 
@@ -908,6 +921,14 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
     if (c->polygon_stipple)
         sb_add(b, "    if (texture(mglStipple, gl_FragCoord.xy / 32.0).r < 0.5) discard;\n");
+
+    if (c->line_stipple)
+    {
+        /* pattern bit 15 (MSB) is the first pixel of the line */
+        sb_add(b, "    int mglLIdx = int(floor(mglLineV / float(mglLineStipple.y) + 1e-4));\n");
+        sb_add(b, "    int mglLBit = 15 - (mglLIdx %% 16);\n");
+        sb_add(b, "    if (((mglLineStipple.x >> mglLBit) & 1) == 0) discard;\n");
+    }
 
     sb_add(b, "    mglFragColor = c;\n");
     sb_add(b, "}\n");
@@ -1352,6 +1373,16 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
         loc = uni(ctx, prog, "mglStipple");
         if (loc >= 0) mglUniform1i(ctx, loc, MGLC_STIPPLE_UNIT);
     }
+
+    if (c.line_stipple)
+    {
+        loc = uni(ctx, prog, "mglLineStipple");
+        if (loc >= 0)
+        {
+            GLint ls[2] = { (GLint)(s->line_stipple_pattern & 0xFFFF), (GLint)s->line_stipple_repeat };
+            mglUniform2iv(ctx, loc, 1, ls);
+        }
+    }
 }
 
 GLuint mgl_compat_ffp_program(GLMContext ctx)
@@ -1365,6 +1396,18 @@ GLuint mgl_compat_ffp_program(GLMContext ctx)
     ffp_build_key(&c, &key);
 
     prog = ffp_program(ctx, &c, &key);
+
+    if (!prog)
+    {
+        /* generation failed (bad state combination): fall back to a minimal
+         * transform + color pipeline so the draw never crashes */
+        memset(&c, 0, sizeof c);
+        c.need_color = 1;
+        memset(&c.unit, 0, sizeof c.unit);
+        ffp_build_key(&c, &key);
+        prog = ffp_program(ctx, &c, &key);
+    }
+
     s->ffp_program = prog;
 
     return prog;

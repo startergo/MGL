@@ -510,12 +510,12 @@ void mgl_compat_init_state(GLMContext ctx)
     s->raster_color[0] = s->raster_color[1] = s->raster_color[2] = s->raster_color[3] = 1.0f;
     s->raster_valid = GL_TRUE;
 
-    /* pixel maps: identity sizes 1 */
+    /* pixel maps: identity (a single entry mapping everything to itself) */
     for (int i = 0; i < 10; i++)
     {
         s->pixel_map_size[i] = 1;
         s->pixel_map[i] = (GLfloat *)calloc(2, sizeof(GLfloat));
-        if (s->pixel_map[i]) { s->pixel_map[i][0] = 0.0f; s->pixel_map[i][1] = 1.0f; }
+        if (s->pixel_map[i]) { s->pixel_map[i][0] = 1.0f; s->pixel_map[i][1] = 1.0f; }
     }
     for (int i = 0; i < 16; i++)
         s->pixel_transfer[i] = 0.0f;
