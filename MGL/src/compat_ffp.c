@@ -1037,6 +1037,49 @@ static GLuint ffp_program(GLMContext ctx, const MGLFFPConfig *c, const MGLFFPKey
     return prog;
 }
 
+#pragma mark stipple texture
+
+/* (re)uploads the 32x32 polygon-stipple pattern to the internal texture on
+ * unit MGLC_STIPPLE_UNIT; the fragment shader samples it with gl_FragCoord/32 */
+static void sync_stipple_texture(GLMContext ctx)
+{
+    struct MGLExtState_compat *s = CS();
+
+    /* FNV-1a over the pattern: skip the upload when nothing changed */
+    uint64_t crc = 1469598103934665603ULL;
+    for (int i = 0; i < 32 * 4; i++)
+    {
+        crc ^= s->polygon_stipple_pattern[i];
+        crc *= 1099511628211ULL;
+    }
+
+    if (s->stipple_tex && s->stipple_serial == crc)
+        return;
+
+    GLubyte tex[32 * 32];
+
+    /* GL layout: row 0 = bottom, byte x/8 bit x%8 (LSB = x = 0) */
+    for (int y = 0; y < 32; y++)
+        for (int x = 0; x < 32; x++)
+            tex[y * 32 + x] = ((s->polygon_stipple_pattern[y * 4 + x / 8] >> (x % 8)) & 1) ? 255 : 0;
+
+    if (!s->stipple_tex)
+        mglGenTextures(ctx, 1, &s->stipple_tex);
+
+    GLuint saved_active = STATE(active_texture);
+
+    mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
+    mglBindTexture(ctx, GL_TEXTURE_2D, s->stipple_tex);
+    mglTexImage2D(ctx, GL_TEXTURE_2D, 0, GL_R8, 32, 32, 0, GL_RED, GL_UNSIGNED_BYTE, tex);
+    mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
+
+    s->stipple_serial = crc;
+}
+
 #pragma mark uniform sync
 
 /* location lookup that tolerates missing uniforms (returns -1, no GL error) */
@@ -1305,6 +1348,7 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
 
     if (c.polygon_stipple)
     {
+        sync_stipple_texture(ctx);
         loc = uni(ctx, prog, "mglStipple");
         if (loc >= 0) mglUniform1i(ctx, loc, MGLC_STIPPLE_UNIT);
     }

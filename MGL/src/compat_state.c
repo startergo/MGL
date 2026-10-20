@@ -1052,12 +1052,9 @@ void mglPolygonStipple(GLMContext ctx, const GLubyte *mask)
 
     /* GL rows are LSB-first starting at the bottom row; the pattern is used
      * from the bottom-left of the window (see compat_ffp.c) */
-    for (int row = 0; row < 32; row++)
-    {
-        GLubyte *dst = CS()->polygon_stipple_pattern + (31 - row) * 4;
-        const GLubyte *src = mask + row * 4;
-        dst[0] = src[3]; dst[1] = src[2]; dst[2] = src[1]; dst[3] = src[0];
-    }
+    /* keep the raw GL layout (LSB = x=0, row 0 = bottom): the upload code
+     * in compat_ffp.c reads it in this order */
+    memcpy(CS()->polygon_stipple_pattern, mask, 32 * 4);
 
     mgl_compat_dirty(ctx);
 }
@@ -1068,12 +1065,7 @@ void mglGetPolygonStipple(GLMContext ctx, GLubyte *mask)
     if (!mask)
         return;
 
-    for (int row = 0; row < 32; row++)
-    {
-        const GLubyte *src = CS()->polygon_stipple_pattern + (31 - row) * 4;
-        GLubyte *dst = mask + row * 4;
-        dst[0] = src[3]; dst[1] = src[2]; dst[2] = src[1]; dst[3] = src[0];
-    }
+    memcpy(mask, CS()->polygon_stipple_pattern, 32 * 4);
 }
 
 void mglGetnPolygonStipple(GLMContext ctx, GLsizei bufSize, GLubyte *mask)

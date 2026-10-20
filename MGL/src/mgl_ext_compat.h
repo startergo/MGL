@@ -360,7 +360,8 @@ struct MGLExtState_compat {
     GLuint    stipple_tex;        /* 32x32 R8 pattern, unit MGLC_STIPPLE_UNIT */
     uint64_t  stipple_serial;
     GLuint    blit_program;       /* drawpixels / bitmap / copypixels */
-    GLuint    blit_texture;
+    GLuint    blit_texture;      /* DrawPixels/CopyPixels source */
+    GLuint    bitmap_texture;    /* glBitmap mask (A = pattern) */
     GLuint    accum_tex;          /* accumulation buffer (RGBA32F) */
     GLboolean accum_valid;
     GLsizei   accum_w, accum_h;

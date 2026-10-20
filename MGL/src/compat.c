@@ -86,6 +86,24 @@ bool mgl_compat_valid_cap(GLMContext ctx, GLenum cap)
         case GL_TEXTURE_GEN_T:
         case GL_TEXTURE_GEN_R:
         case GL_TEXTURE_GEN_Q:
+        case GL_MAP1_INDEX:
+        case GL_MAP1_TEXTURE_COORD_1:
+        case GL_MAP1_TEXTURE_COORD_2:
+        case GL_MAP1_TEXTURE_COORD_3:
+        case GL_MAP1_TEXTURE_COORD_4:
+        case GL_MAP1_VERTEX_3:
+        case GL_MAP1_VERTEX_4:
+        case GL_MAP1_COLOR_4:
+        case GL_MAP1_NORMAL:
+        case GL_MAP2_INDEX:
+        case GL_MAP2_TEXTURE_COORD_1:
+        case GL_MAP2_TEXTURE_COORD_2:
+        case GL_MAP2_TEXTURE_COORD_3:
+        case GL_MAP2_TEXTURE_COORD_4:
+        case GL_MAP2_VERTEX_3:
+        case GL_MAP2_VERTEX_4:
+        case GL_MAP2_COLOR_4:
+        case GL_MAP2_NORMAL:
             return true;
     }
 
@@ -93,6 +111,33 @@ bool mgl_compat_valid_cap(GLMContext ctx, GLenum cap)
         return true;
 
     return false;
+}
+
+/* evaluator map slot for GL_MAP1_x / GL_MAP2_x caps (-1 = not a map cap) */
+static int eval_cap_slot(GLenum cap, int *is2d)
+{
+    switch (cap)
+    {
+        case GL_MAP1_INDEX: *is2d = 0; return 0;
+        case GL_MAP1_TEXTURE_COORD_1: *is2d = 0; return 1;
+        case GL_MAP1_TEXTURE_COORD_2: *is2d = 0; return 2;
+        case GL_MAP1_TEXTURE_COORD_3: *is2d = 0; return 3;
+        case GL_MAP1_TEXTURE_COORD_4: *is2d = 0; return 4;
+        case GL_MAP1_VERTEX_3: *is2d = 0; return 5;
+        case GL_MAP1_VERTEX_4: *is2d = 0; return 6;
+        case GL_MAP1_COLOR_4: *is2d = 0; return 7;
+        case GL_MAP1_NORMAL: *is2d = 0; return 8;
+        case GL_MAP2_INDEX: *is2d = 1; return 0;
+        case GL_MAP2_TEXTURE_COORD_1: *is2d = 1; return 1;
+        case GL_MAP2_TEXTURE_COORD_2: *is2d = 1; return 2;
+        case GL_MAP2_TEXTURE_COORD_3: *is2d = 1; return 3;
+        case GL_MAP2_TEXTURE_COORD_4: *is2d = 1; return 4;
+        case GL_MAP2_VERTEX_3: *is2d = 1; return 5;
+        case GL_MAP2_VERTEX_4: *is2d = 1; return 6;
+        case GL_MAP2_COLOR_4: *is2d = 1; return 7;
+        case GL_MAP2_NORMAL: *is2d = 1; return 8;
+    }
+    return -1;
 }
 
 /* per-unit (active texture) texture target enables */
@@ -106,6 +151,18 @@ void mgl_compat_set_cap(GLMContext ctx, GLenum cap, GLboolean on)
         s->lights[light].enabled = on;
         mgl_compat_dirty(ctx);
         return;
+    }
+
+    {
+        int is2d = 0;
+        int slot = eval_cap_slot(cap, &is2d);
+        if (slot >= 0)
+        {
+            if (is2d) s->map2[slot].enabled = on;
+            else s->map1[slot].enabled = on;
+            mgl_compat_dirty(ctx);
+            return;
+        }
     }
 
     switch (cap)
@@ -192,6 +249,13 @@ GLboolean mgl_compat_get_cap(GLMContext ctx, GLenum cap)
 
     if (light >= 0)
         return s->lights[light].enabled;
+
+    {
+        int is2d = 0;
+        int slot = eval_cap_slot(cap, &is2d);
+        if (slot >= 0)
+            return is2d ? s->map2[slot].enabled : s->map1[slot].enabled;
+    }
 
     switch (cap)
     {

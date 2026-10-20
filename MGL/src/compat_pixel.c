@@ -731,33 +731,39 @@ void mglBitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLf
             for (GLsizei row = 0; row < height; row++)
             {
                 const GLubyte *src = bitmap + (size_t)row * (((size_t)width + 7) / 8);
-                /* GL rows are bottom-up */
-                GLsizei dst_row = height - 1 - row;
+                /* GL bitmap row 0 is the bottom row; glTexImage2D row 0 is
+                 * also v=0 (bottom), so no vertical flip is needed */
 
                 for (GLsizei col = 0; col < width; col++)
                 {
-                    GLubyte bit = (src[col / 8] >> (col % 8)) & 1;
-                    tex[(size_t)dst_row * width + col] = bit ? 255 : 0;
+                    GLubyte bit = (src[col / 8] >> (7 - (col % 8))) & 1;   /* MSB first */
+                    tex[(size_t)row * width + col] = bit ? 255 : 0;
                 }
             }
 
-            if (!s->blit_texture)
-                mglGenTextures(ctx, 1, &s->blit_texture);
+            if (!s->bitmap_texture)
+                mglGenTextures(ctx, 1, &s->bitmap_texture);
 
             GLuint saved_active = STATE(active_texture);
             mglActiveTexture(ctx, GL_TEXTURE0);
-            mglBindTexture(ctx, GL_TEXTURE_2D, s->blit_texture);
+            mglBindTexture(ctx, GL_TEXTURE_2D, s->bitmap_texture);
             mglTexImage2D(ctx, GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, tex);
             mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            /* the pattern lives in alpha: modulate keeps the raster color and
+             * the alpha test discards the 0 bits */
+            mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_ONE);
+            mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_ONE);
+            mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_ONE);
+            mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED);
             mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
 
             free(tex);
 
             blit_quad(ctx, s->raster_window[0] - (GLint)xorig, s->raster_window[1] - (GLint)yorig,
-                      width, height, s->blit_texture, s->raster_color, 1);
+                      width, height, s->bitmap_texture, s->raster_color, 1);
         }
     }
 

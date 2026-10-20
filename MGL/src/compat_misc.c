@@ -82,7 +82,7 @@ static void select_close_hit(GLMContext ctx)
         return;
 
     GLuint ncount = s->rmode.select_ptr - s->rmode.select_buf - s->rmode.hit_zmax_slot - 1;
-    s->rmode.select_buf[s->rmode.hit_zmin_slot - 2] = ncount;
+    s->rmode.select_buf[s->rmode.hit_zmin_slot - 1] = ncount;
     s->rmode.select_buf[s->rmode.hit_zmin_slot] = (GLuint)fmin(4294967295.0, (double)s->rmode.zmin * 2147483647.0);
     s->rmode.select_buf[s->rmode.hit_zmax_slot] = (GLuint)fmin(4294967295.0, (double)s->rmode.zmax * 2147483647.0);
     s->rmode.hit_open = GL_FALSE;
@@ -302,9 +302,318 @@ static bool point_in_tri(float px, float py, float ax, float ay, float bx, float
     return !(has_neg && has_pos);
 }
 
-static bool clip_visible(float *win)
+static bool clip_visible(GLMContext ctx, float *win)
 {
-    return win[0] >= 0.0f && win[0] < 65536.0f && win[1] >= 0.0f && win[1] < 65536.0f && win[2] >= 0.0f && win[2] <= 1.0f;
+    const GLint *vp = STATE(viewport);
+    float rx1 = (float)(vp[0] + vp[2]), ry1 = (float)(vp[1] + vp[3]);
+
+    return win[0] >= (float)vp[0] && win[0] <= rx1 &&
+           win[1] >= (float)vp[1] && win[1] <= ry1 &&
+           win[2] >= 0.0f && win[2] <= 1.0f;
+}
+
+/* ---- exact 2D coverage tests against the viewport rectangle ---- */
+
+/* the window rect being tested against; refreshed by mgl_compat_cpu_draw */
+static float vp_rx0, vp_ry0, vp_rx1, vp_ry1;
+
+static void vp_refresh(GLMContext ctx)
+{
+    const GLint *vp = STATE(viewport);
+
+    vp_rx0 = (float)vp[0];
+    vp_ry0 = (float)vp[1];
+    vp_rx1 = (float)(vp[0] + vp[2]);
+    vp_ry1 = (float)(vp[1] + vp[3]);
+}
+
+static bool pt_in_rect(float px, float py)
+{
+    return px >= vp_rx0 && px <= vp_rx1 && py >= vp_ry0 && py <= vp_ry1;
+}
+
+/* true if segments ab and cd share at least one point */
+static bool seg_seg_hit(float ax, float ay, float bx, float by, float cx, float cy, float dx, float dy)
+{
+    float d1 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    float d2 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    float d3 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+    float d4 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)))
+        return true;
+
+    /* collinear / touching cases */
+    (void)d1;
+    return false;
+}
+
+/* triangle vs viewport rect: vertex inside, corner inside, or edge crossing */
+static bool tri_in_viewport(float ax, float ay, float bx, float by, float cx, float cy)
+{
+    float rx0 = vp_rx0, ry0 = vp_ry0, rx1 = vp_rx1, ry1 = vp_ry1;
+
+    if (pt_in_rect(ax, ay) || pt_in_rect(bx, by) || pt_in_rect(cx, cy))
+        return true;
+
+    if (point_in_tri(rx0, ry0, ax, ay, bx, by, cx, cy) ||
+        point_in_tri(rx1, ry0, ax, ay, bx, by, cx, cy) ||
+        point_in_tri(rx1, ry1, ax, ay, bx, by, cx, cy) ||
+        point_in_tri(rx0, ry1, ax, ay, bx, by, cx, cy))
+        return true;
+
+    return seg_seg_hit(ax, ay, bx, by, rx0, ry0, rx1, ry0) ||
+           seg_seg_hit(ax, ay, bx, by, rx1, ry0, rx1, ry1) ||
+           seg_seg_hit(ax, ay, bx, by, rx1, ry1, rx0, ry1) ||
+           seg_seg_hit(ax, ay, bx, by, rx0, ry1, rx0, ry0) ||
+           seg_seg_hit(bx, by, cx, cy, rx0, ry0, rx1, ry0) ||
+           seg_seg_hit(bx, by, cx, cy, rx1, ry0, rx1, ry1) ||
+           seg_seg_hit(bx, by, cx, cy, rx1, ry1, rx0, ry1) ||
+           seg_seg_hit(bx, by, cx, cy, rx0, ry1, rx0, ry0) ||
+           seg_seg_hit(cx, cy, ax, ay, rx0, ry0, rx1, ry0) ||
+           seg_seg_hit(cx, cy, ax, ay, rx1, ry0, rx1, ry1) ||
+           seg_seg_hit(cx, cy, ax, ay, rx1, ry1, rx0, ry1) ||
+           seg_seg_hit(cx, cy, ax, ay, rx0, ry1, rx0, ry0);
+}
+
+/* segment vs viewport rect */
+static bool line_in_viewport(float ax, float ay, float bx, float by)
+{
+    float rx0 = vp_rx0, ry0 = vp_ry0, rx1 = vp_rx1, ry1 = vp_ry1;
+
+    if (pt_in_rect(ax, ay) || pt_in_rect(bx, by))
+        return true;
+
+    return seg_seg_hit(ax, ay, bx, by, rx0, ry0, rx1, ry0) ||
+           seg_seg_hit(ax, ay, bx, by, rx1, ry0, rx1, ry1) ||
+           seg_seg_hit(ax, ay, bx, by, rx1, ry1, rx0, ry1) ||
+           seg_seg_hit(ax, ay, bx, by, rx0, ry1, rx0, ry0);
+}
+
+/* one polygon (as a vertex index list) against the viewport: fan test */
+static bool poly_in_viewport(const float (*win)[3], const uint32_t *vi, GLuint vn)
+{
+    if (vn == 0)
+        return false;
+    if (vn == 1)
+        return pt_in_rect(win[vi[0]][0], win[vi[0]][1]);
+    if (vn == 2)
+        return line_in_viewport(win[vi[0]][0], win[vi[0]][1], win[vi[1]][0], win[vi[1]][1]);
+
+    for (GLuint i = 1; i + 1 < vn; i++)
+        if (tri_in_viewport(win[vi[0]][0], win[vi[0]][1],
+                            win[vi[i]][0], win[vi[i]][1],
+                            win[vi[i + 1]][0], win[vi[i + 1]][1]))
+            return true;
+
+    return false;
+}
+
+/* ---- feedback ---- */
+
+/* values per vertex for each feedback type (RGBA mode) */
+static int fb_coords(GLenum t)
+{
+    if (t == GL_2D) return 2;
+    if (t == GL_4D_COLOR_TEXTURE) return 4;
+    return 3;
+}
+
+static int fb_vertex_values(GLenum t)
+{
+    int v = fb_coords(t);
+    if (t == GL_3D_COLOR || t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE) v += 4;
+    if (t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE) v += 4;
+    return v;
+}
+
+static bool fb_room(GLMContext ctx, int extra)
+{
+    struct MGLExtState_compat *s = CS();
+
+    if (s->rmode.feedback_count + (GLuint)extra > s->rmode.feedback_size)
+        return false;
+    return true;
+}
+
+static void fb_put(GLMContext ctx, GLfloat v)
+{
+    struct MGLExtState_compat *s = CS();
+
+    s->rmode.feedback_buf[s->rmode.feedback_count++] = v;
+}
+
+/* one feedback vertex: window coords (+w), color, texture as the type asks */
+static void fb_vertex(GLMContext ctx, const float *win)
+{
+    struct MGLExtState_compat *s = CS();
+    GLenum t = (GLenum)s->rmode.feedback_type;
+
+    for (int i = 0; i < fb_coords(t); i++)
+        fb_put(ctx, win[i]);
+
+    if (t == GL_3D_COLOR || t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE)
+        for (int i = 0; i < 4; i++)
+            fb_put(ctx, s->cur_color[i]);
+
+    if (t == GL_3D_COLOR_TEXTURE || t == GL_4D_COLOR_TEXTURE)
+        for (int i = 0; i < 4; i++)
+            fb_put(ctx, s->cur_texcoord[0][i]);
+}
+
+/* emits the feedback stream for one glBegin/glEnd batch (window-space verts) */
+static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3], GLuint n)
+{
+    struct MGLExtState_compat *s = CS();
+    int vv = fb_vertex_values((GLenum)s->rmode.feedback_type);
+
+    switch (mode)
+    {
+        case GL_POINTS:
+            for (GLuint i = 0; i < n; i++)
+            {
+                if (!clip_visible(ctx, win[i])) continue;
+                if (!fb_room(ctx, 1 + vv)) continue;
+                fb_put(ctx, (GLfloat)GL_POINT_TOKEN);
+                fb_vertex(ctx, win[i]);
+            }
+            break;
+
+        case GL_LINES:
+            for (GLuint i = 0; i + 1 < n; i += 2)
+            {
+                if (!clip_visible(ctx, win[i]) || !clip_visible(ctx, win[i + 1])) continue;
+                if (!fb_room(ctx, 1 + 2 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
+                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i + 1]);
+            }
+            break;
+
+        case GL_LINE_STRIP:
+        case GL_LINE_LOOP:
+        {
+            GLuint segs = (mode == GL_LINE_STRIP) ? (n ? n - 1 : 0) : n;
+
+            for (GLuint si = 0; si < segs; si++)
+            {
+                GLuint a = si;
+                GLuint b = (si + 1 == n) ? 0 : si + 1;
+
+                if (!clip_visible(ctx, win[a]) || !clip_visible(ctx, win[b])) continue;
+                if (!fb_room(ctx, 1 + 2 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
+                fb_vertex(ctx, win[a]);
+                fb_vertex(ctx, win[b]);
+            }
+            break;
+        }
+
+        case GL_TRIANGLES:
+            for (GLuint i = 0; i + 2 < n; i += 3)
+            {
+                if (!(clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) && clip_visible(ctx, win[i + 2]))) continue;
+                if (!fb_room(ctx, 2 + 3 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                fb_put(ctx, 3.0f);
+                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i + 1]);
+                fb_vertex(ctx, win[i + 2]);
+            }
+            break;
+
+        case GL_TRIANGLE_STRIP:
+            for (GLuint i = 0; i + 2 < n; i++)
+            {
+                if (!(clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) && clip_visible(ctx, win[i + 2]))) continue;
+                if (!fb_room(ctx, 2 + 3 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                fb_put(ctx, 3.0f);
+                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i + 1]);
+                fb_vertex(ctx, win[i + 2]);
+            }
+            break;
+
+        case GL_TRIANGLE_FAN:
+            for (GLuint i = 1; i + 1 < n; i++)
+            {
+                if (!(clip_visible(ctx, win[0]) && clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]))) continue;
+                if (!fb_room(ctx, 2 + 3 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                fb_put(ctx, 3.0f);
+                fb_vertex(ctx, win[0]);
+                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i + 1]);
+            }
+            break;
+
+        case GL_QUADS:
+            for (GLuint i = 0; i + 3 < n; i += 4)
+            {
+                bool vis = clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) &&
+                           clip_visible(ctx, win[i + 2]) && clip_visible(ctx, win[i + 3]);
+                if (!vis) continue;
+                if (!fb_room(ctx, 2 + 4 * vv)) continue;
+                fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                fb_put(ctx, 4.0f);
+                fb_vertex(ctx, win[i]);
+                fb_vertex(ctx, win[i + 1]);
+                fb_vertex(ctx, win[i + 2]);
+                fb_vertex(ctx, win[i + 3]);
+            }
+            break;
+
+        default:    /* GL_QUAD_STRIP, GL_POLYGON */
+        {
+            GLuint step = (mode == GL_QUAD_STRIP) ? 2 : 1;
+            GLuint vn = 0;
+            uint32_t stack[4];
+            const uint32_t *g = stack;
+            uint32_t *heap = NULL;
+
+            if (mode == GL_QUAD_STRIP)
+            {
+                for (GLuint i = 0; i + 3 < n; i += step)
+                {
+                    stack[0] = i; stack[1] = i + 1; stack[2] = i + 3; stack[3] = i + 2;
+                    bool vis = true;
+                    for (int k = 0; k < 4; k++)
+                        if (!clip_visible(ctx, win[stack[k]])) vis = false;
+                    if (!vis || !fb_room(ctx, 2 + 4 * vv)) continue;
+                    fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                    fb_put(ctx, 4.0f);
+                    for (int k = 0; k < 4; k++)
+                        fb_vertex(ctx, win[stack[k]]);
+                }
+                break;
+            }
+
+            /* GL_POLYGON (or unknown): the whole batch is one polygon */
+            heap = (uint32_t *)malloc(n * sizeof(uint32_t));
+            if (!heap)
+                break;
+            g = heap;
+            vn = n;
+            for (GLuint i = 0; i < n; i++)
+                heap[i] = i;
+
+            bool vis = true;
+            for (GLuint i = 0; i < vn; i++)
+                if (!clip_visible(ctx, win[g[i]])) vis = false;
+
+            if (vis && fb_room(ctx, 2 + (int)vn * vv))
+            {
+                fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
+                fb_put(ctx, (GLfloat)vn);
+                for (GLuint i = 0; i < vn; i++)
+                    fb_vertex(ctx, win[g[i]]);
+            }
+            free(heap);
+            break;
+        }
+    }
 }
 
 void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n)
@@ -313,6 +622,8 @@ void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n
 
     if (s->rmode.mode == GL_RENDER || !pos || n == 0)
         return;
+
+    vp_refresh(ctx);
 
     if (n > (1u << 20))
         n = 1u << 20;
@@ -337,155 +648,122 @@ void mgl_compat_cpu_draw(GLMContext ctx, GLenum mode, const float *pos, GLuint n
 
     if (s->rmode.mode == GL_FEEDBACK)
     {
-        switch (mode)
-        {
-            case GL_POINTS:
-                for (GLuint i = 0; i < n; i++)
-                {
-                    if (!clip_visible(win[i])) continue;
-                    if (s->rmode.feedback_count + 5 <= s->rmode.feedback_size)
-                    {
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = (GLfloat)GL_POINT_TOKEN;
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[i][0];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[i][1];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[i][2];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = s->cur_color[0];
-                    }
-                }
-                break;
-
-            case GL_LINES:
-            case GL_LINE_STRIP:
-            case GL_LINE_LOOP:
-            {
-                GLuint segs = 0;
-                if (mode == GL_LINES) segs = n / 2;
-                else if (mode == GL_LINE_STRIP) segs = n ? n - 1 : 0;
-                else segs = n;
-
-                for (GLuint si = 0; si < segs; si++)
-                {
-                    GLuint a = (mode == GL_LINES) ? si * 2 : si;
-                    GLuint b = (mode == GL_LINES) ? si * 2 + 1 : ((si + 1 == n) ? 0 : si + 1);
-
-                    if (!clip_visible(win[a]) || !clip_visible(win[b]))
-                        continue;
-
-                    if (s->rmode.feedback_count + 9 <= s->rmode.feedback_size)
-                    {
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = (GLfloat)GL_LINE_TOKEN;
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[a][0];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[a][1];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[a][2];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = s->cur_color[0];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[b][0];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[b][1];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = win[b][2];
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = s->cur_color[0];
-                    }
-                }
-                break;
-            }
-
-            default:
-            {
-                /* triangles / quads / polygons: POLYGON_TOKEN with a vertex count */
-                uint32_t *idx = NULL;
-                GLuint tn = mgl_compat_build_tri_indices(ctx, mode, n, &idx);
-
-                for (GLuint t = 0; t + 2 < tn; t += 3)
-                {
-                    bool vis = clip_visible(win[idx[t]]) && clip_visible(win[idx[t + 1]]) && clip_visible(win[idx[t + 2]]);
-                    if (!vis) continue;
-
-                    if (s->rmode.feedback_count + 2 + 4 * 3 <= s->rmode.feedback_size)
-                    {
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = (GLfloat)GL_POLYGON_TOKEN;
-                        s->rmode.feedback_buf[s->rmode.feedback_count++] = 3;
-                        for (GLuint k = 0; k < 3; k++)
-                        {
-                            s->rmode.feedback_buf[s->rmode.feedback_count++] = win[idx[t + k]][0];
-                            s->rmode.feedback_buf[s->rmode.feedback_count++] = win[idx[t + k]][1];
-                            s->rmode.feedback_buf[s->rmode.feedback_count++] = win[idx[t + k]][2];
-                            s->rmode.feedback_buf[s->rmode.feedback_count++] = s->cur_color[0];
-                        }
-                    }
-                }
-
-                free(idx);
-                break;
-            }
-        }
+        fb_emit_prims(ctx, mode, win, n);
     }
     else
     {
-        /* select: record hits for primitives that touch the pick volume
-         * (the whole window: the GL default) */
+        /* select: one hit record per GL primitive that touches the pick
+         * volume (the viewport + depth range, i.e. what the rasterizer sees) */
         switch (mode)
         {
             case GL_POINTS:
                 for (GLuint i = 0; i < n; i++)
-                    if (clip_visible(win[i]))
+                    if (clip_visible(ctx, win[i]))
                         select_start_hit(ctx, win[i][2]);
                 break;
 
             case GL_LINES:
                 for (GLuint i = 0; i + 1 < n; i += 2)
-                    if (clip_visible(win[i]) || clip_visible(win[i + 1]))
-                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
-                break;
-
-            case GL_LINE_STRIP: case GL_LINE_LOOP:
-                for (GLuint i = 0; i + 1 < n; i++)
-                    if (clip_visible(win[i]) || clip_visible(win[i + 1]))
-                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
-                break;
-
-            default:
-            {
-                GLuint tn = 0;
-                uint32_t *idx = NULL;
-                extern GLuint mgl_compat_build_tri_indices(GLMContext ctx, GLenum mode, GLuint n, uint32_t **idx);
-
-                tn = mgl_compat_build_tri_indices(ctx, mode, n, &idx);
-
-                for (GLuint t = 0; t + 2 < tn; t += 3)
                 {
-                    float ax = win[idx[t]][0], ay = win[idx[t]][1];
-                    float bx = win[idx[t + 1]][0], by = win[idx[t + 1]][1];
-                    float cx = win[idx[t + 2]][0], cy = win[idx[t + 2]][1];
-                    bool hit = false;
-
-                    /* coarse: bounding box overlapping the window plus a
-                     * sample point test (triangle rasterizer substitute) */
-                    float minx = fminf(fminf(ax, bx), cx), maxx = fmaxf(fmaxf(ax, bx), cx);
-                    float miny = fminf(fminf(ay, by), cy), maxy = fmaxf(fmaxf(ay, by), cy);
-
-                    if (maxx >= 0.0f && minx <= 4096.0f && maxy >= 0.0f && miny <= 4096.0f)
-                    {
-                        if (point_in_tri(0.5f, 0.5f, ax, ay, bx, by, cx, cy) ||
-                            point_in_tri(minx + 0.5f, miny + 0.5f, ax, ay, bx, by, cx, cy) ||
-                            clip_visible(win[idx[t]]) || clip_visible(win[idx[t + 1]]) || clip_visible(win[idx[t + 2]]))
-                            hit = true;
-                    }
-
-                    if (hit)
-                        select_start_hit(ctx, fminf(fminf(win[idx[t]][2], win[idx[t + 1]][2]), win[idx[t + 2]][2]));
+                    uint32_t g[2] = { i, i + 1 };
+                    if (poly_in_viewport(win, g, 2))
+                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
                 }
+                break;
 
-                free(idx);
+            case GL_LINE_STRIP:
+            case GL_LINE_LOOP:
+                for (GLuint i = 0; i + 1 < n; i++)
+                {
+                    uint32_t g[2] = { i, i + 1 };
+                    if (poly_in_viewport(win, g, 2))
+                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
+                }
+                if (mode == GL_LINE_LOOP && n > 2)
+                {
+                    uint32_t g[2] = { n - 1, 0 };
+                    if (poly_in_viewport(win, g, 2))
+                        select_start_hit(ctx, fminf(win[n - 1][2], win[0][2]));
+                }
+                break;
+
+            case GL_TRIANGLES:
+                for (GLuint i = 0; i + 2 < n; i += 3)
+                {
+                    uint32_t g[3] = { i, i + 1, i + 2 };
+                    if (poly_in_viewport(win, g, 3))
+                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]));
+                }
+                break;
+
+            case GL_TRIANGLE_STRIP:
+                for (GLuint i = 0; i + 2 < n; i++)
+                {
+                    uint32_t g[3] = { i, i + 1, i + 2 };
+                    if (poly_in_viewport(win, g, 3))
+                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]));
+                }
+                break;
+
+            case GL_TRIANGLE_FAN:
+                for (GLuint i = 1; i + 1 < n; i++)
+                {
+                    uint32_t g[3] = { 0, i, i + 1 };
+                    if (poly_in_viewport(win, g, 3))
+                        select_start_hit(ctx, fminf(fminf(win[0][2], win[i][2]), win[i + 1][2]));
+                }
+                break;
+
+            case GL_QUADS:
+                for (GLuint i = 0; i + 3 < n; i += 4)
+                {
+                    uint32_t g[4] = { i, i + 1, i + 2, i + 3 };
+                    if (poly_in_viewport(win, g, 4))
+                    {
+                        float z = fminf(fminf(win[i][2], win[i + 1][2]), fminf(win[i + 2][2], win[i + 3][2]));
+                        select_start_hit(ctx, z);
+                    }
+                }
+                break;
+
+            case GL_QUAD_STRIP:
+                for (GLuint i = 0; i + 3 < n; i += 2)
+                {
+                    uint32_t g[4] = { i, i + 1, i + 3, i + 2 };
+                    if (poly_in_viewport(win, g, 4))
+                    {
+                        float z = fminf(fminf(win[i][2], win[i + 1][2]), fminf(win[i + 2][2], win[i + 3][2]));
+                        select_start_hit(ctx, z);
+                    }
+                }
+                break;
+
+            default:    /* GL_POLYGON and anything else: one primitive */
+            {
+                uint32_t *g = (uint32_t *)malloc(n * sizeof(uint32_t));
+                if (g)
+                {
+                    float zmin = 2.0f;
+                    for (GLuint i = 0; i < n; i++)
+                    {
+                        g[i] = i;
+                        if (win[i][2] < zmin) zmin = win[i][2];
+                    }
+                    if (poly_in_viewport(win, g, n))
+                        select_start_hit(ctx, zmin);
+                    free(g);
+                }
                 break;
             }
         }
 
         if (s->rmode.hit_open)
         {
-            /* append the name stack */
+            /* append the name stack, then patch the record header */
             for (GLuint i = 0; i < s->rmode.name_depth; i++)
                 if (!select_write(ctx, s->rmode.name_stack[i]))
                     break;
-            s->rmode.hit_open = GL_FALSE;
-            s->rmode.hit_count++;
+            select_close_hit(ctx);
         }
     }
 
@@ -565,7 +843,7 @@ void mglMap1d(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2, GLint str
     s->map1[idx].fpoints = (GLfloat *)malloc((size_t)order * comps * sizeof(GLfloat));
     if (s->map1[idx].fpoints)
     {
-        int es = stride ? stride / (int)sizeof(GLdouble) : comps;
+        int es = stride ? (stride / (int)sizeof(GLdouble) > 0 ? stride / (int)sizeof(GLdouble) : 1) : comps;
         for (int i = 0; i < order; i++)
             for (int c = 0; c < comps; c++)
                 s->map1[idx].fpoints[i * comps + c] = (GLfloat)points[i * es + c];
@@ -599,7 +877,7 @@ void mglMap1f(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint strid
     s->map1[idx].fpoints = (GLfloat *)malloc((size_t)order * comps * sizeof(GLfloat));
     if (s->map1[idx].fpoints)
     {
-        int es = stride ? stride / (int)sizeof(GLfloat) : comps;
+        int es = stride ? (stride / (int)sizeof(GLfloat) > 0 ? stride / (int)sizeof(GLfloat) : 1) : comps;
         for (int i = 0; i < order; i++)
             for (int c = 0; c < comps; c++)
                 s->map1[idx].fpoints[i * comps + c] = points[i * es + c];
@@ -639,8 +917,8 @@ void mglMap2d(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2, GLint ust
     s->map2[idx].fpoints = (GLfloat *)malloc((size_t)uorder * vorder * comps * sizeof(GLfloat));
     if (s->map2[idx].fpoints)
     {
-        int ue = ustride ? ustride / (int)sizeof(GLdouble) : comps * vorder;
-        int ve = vstride ? vstride / (int)sizeof(GLdouble) : comps;
+        int ue = ustride ? (ustride / (int)sizeof(GLdouble) > 0 ? ustride / (int)sizeof(GLdouble) : 1) : comps * vorder;
+        int ve = vstride ? (vstride / (int)sizeof(GLdouble) > 0 ? vstride / (int)sizeof(GLdouble) : 1) : comps;
         for (int i = 0; i < uorder; i++)
             for (int j = 0; j < vorder; j++)
                 for (int c = 0; c < comps; c++)
@@ -679,8 +957,8 @@ void mglMap2f(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint ustri
     s->map2[idx].fpoints = (GLfloat *)malloc((size_t)uorder * vorder * comps * sizeof(GLfloat));
     if (s->map2[idx].fpoints)
     {
-        int ue = ustride ? ustride / (int)sizeof(GLfloat) : comps * vorder;
-        int ve = vstride ? vstride / (int)sizeof(GLfloat) : comps;
+        int ue = ustride ? (ustride / (int)sizeof(GLfloat) > 0 ? ustride / (int)sizeof(GLfloat) : 1) : comps * vorder;
+        int ve = vstride ? (vstride / (int)sizeof(GLfloat) > 0 ? vstride / (int)sizeof(GLfloat) : 1) : comps;
         for (int i = 0; i < uorder; i++)
             for (int j = 0; j < vorder; j++)
                 for (int c = 0; c < comps; c++)
@@ -803,9 +1081,10 @@ static void eval1(GLMContext ctx, int idx, float u, float *out)
     if (t < 0.0) t = 0.0;
     if (t > 1.0) t = 1.0;
 
-    /* de Casteljau over the control points */
+    /* de Casteljau over the control points (fpoints are floats) */
     double tmp[MGLC_MAX_EVAL_ORDER * 4];
-    memcpy(tmp, s->map1[idx].fpoints, (size_t)n * comps * sizeof(GLfloat));
+    for (int i = 0; i < n * comps; i++)
+        tmp[i] = s->map1[idx].fpoints[i];
 
     for (int k = n - 1; k > 0; k--)
         for (int i = 0; i < k; i++)
@@ -831,24 +1110,28 @@ static void eval2(GLMContext ctx, int idx, float u, float v, float *out)
     double row[MGLC_MAX_EVAL_ORDER * 4];
     double col[MGLC_MAX_EVAL_ORDER * 4];
 
-    /* evaluate each u-row down to one point, then de Casteljau along v */
-    for (int j = 0; j < vn; j++)
+    /* fpoints layout is [u][v] (see mglMap2d/f): collapse the v direction
+     * first for every u row, then de Casteljau along u */
+    for (int j = 0; j < un; j++)
     {
-        memcpy(row, &s->map2[idx].fpoints[(size_t)j * un * comps], (size_t)un * comps * sizeof(GLfloat));
+        /* the v row of control points for this u */
+        for (int i = 0; i < vn; i++)
+            for (int c = 0; c < comps; c++)
+                row[i * comps + c] = s->map2[idx].fpoints[((size_t)j * vn + i) * comps + c];
 
-        for (int k = un - 1; k > 0; k--)
+        for (int k = vn - 1; k > 0; k--)
             for (int i = 0; i < k; i++)
                 for (int c = 0; c < comps; c++)
-                    row[i * comps + c] = (1.0 - tu) * row[i * comps + c] + tu * row[(i + 1) * comps + c];
+                    row[i * comps + c] = (1.0 - tv) * row[i * comps + c] + tv * row[(i + 1) * comps + c];
 
         for (int c = 0; c < comps; c++)
             col[j * comps + c] = row[c];
     }
 
-    for (int k = vn - 1; k > 0; k--)
+    for (int k = un - 1; k > 0; k--)
         for (int i = 0; i < k; i++)
             for (int c = 0; c < comps; c++)
-                col[i * comps + c] = (1.0 - tv) * col[i * comps + c] + tv * col[(i + 1) * comps + c];
+                col[i * comps + c] = (1.0 - tu) * col[i * comps + c] + tu * col[(i + 1) * comps + c];
 
     for (int c = 0; c < comps; c++)
         out[c] = (float)col[c];
