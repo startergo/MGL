@@ -3851,7 +3851,10 @@ void mtlDispatchComputeIndirect(GLMContext glm_ctx, GLintptr indirect)
     @try {
         // Final validation before commit
         currentStatus = _currentCommandBuffer.status;
-        if (currentStatus != 0) { // 0 = MTLCommandBufferStatusNotCommitted
+        // NotEnqueued(0) and Enqueued(1) can both still be committed: the geometry category
+        // reserves its queue slot with -enqueue while the buffer stays open for later draws,
+        // so "enqueued" is a normal pre-commit state here, not an error
+        if (currentStatus > MTLCommandBufferStatusEnqueued) {
             NSLog(@"MGL WARNING: Command buffer in unexpected state %ld - cleaning up", (long)currentStatus);
             [self cleanupCommandBuffer];
             return;

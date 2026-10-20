@@ -105,7 +105,8 @@ int main(void)
         verts[i * 2 + 1] = (float)((i * 31) % 977);
     }
     for (int i = 0; i < IDX_COUNT; i++)
-        idx[i] = (GLuint)((i * 7919) % VERTS);       /* scattered, restart-free */
+        idx[i] = (GLuint)(((GLuint)i * 7919u) % VERTS);  /* scattered, restart-free; unsigned:
+                                                   i * 7919 overflows int for i >= 271182 */
 
     p = glCreateProgram();
     glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
@@ -139,7 +140,6 @@ int main(void)
      * set, and this process measures the GPU path (set MGL_GEOM_SERIAL_PREP=1 to A/B the
      * serial prep kernel against the tile-parallel chain) */
     run_frames(p, IDX_COUNT, q);
-
     /* both paths must rasterize the same amount: count covered pixels */
     {
         int covered = 0;
@@ -172,7 +172,7 @@ int main(void)
         run_frames(p, IDX_COUNT, q);
         unsetenv("MGL_GEOM_WORST_CASE_DISPATCH");
         run_frames(p, IDX_COUNT, q);
-        for (int i = 0; i < IDX_COUNT; i++) idx[i] = (GLuint)((i * 7919) % VERTS);
+        for (int i = 0; i < IDX_COUNT; i++) idx[i] = (GLuint)(((GLuint)i * 7919u) % VERTS);
         glDisable(GL_PRIMITIVE_RESTART);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(GLuint) * IDX_COUNT, idx, GL_STATIC_DRAW);
     }

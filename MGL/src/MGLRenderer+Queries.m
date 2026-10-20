@@ -126,8 +126,11 @@ static inline int mglq_sample_slot(GLenum target)
         {
             id<MTLCommandBuffer> cb = cbo;
             MTLCommandBufferStatus s = cb.status;
+            /* free when the buffer ran, or when it never will: an abandoned uncommitted
+             * buffer (NotEnqueued, or Enqueued by the geometry category and then replaced)
+             * holds no results */
             free_ = (s >= MTLCommandBufferStatusCompleted) ||
-                    (s == MTLCommandBufferStatusNotEnqueued && cb != _currentCommandBuffer);
+                    (s < MTLCommandBufferStatusCommitted && cb != _currentCommandBuffer);
         }
         if (free_)
         {
@@ -222,7 +225,11 @@ static inline int mglq_sample_slot(GLenum target)
 - (void) mglqSplit
 {
     id<MTLCommandBuffer> cb = _currentCommandBuffer;
-    if (cb && cb.status == MTLCommandBufferStatusNotEnqueued)
+    /* < Committed, not just == NotEnqueued: the geometry category enqueues its command
+     * buffer while it is still open, and abandoning that buffer here (creating a new one
+     * without committing it) would leave GPU work that never runs — any later wait on it
+     * (query resolve, fence, readback) hangs forever */
+    if (cb && cb.status < MTLCommandBufferStatusCommitted)
         [self flushCommandBuffer: false];
     if (!_currentCommandBuffer || _currentCommandBuffer.status != MTLCommandBufferStatusNotEnqueued)
         [self newCommandBuffer];
@@ -240,7 +247,25 @@ static inline int mglq_sample_slot(GLenum target)
     if (s >= MTLCommandBufferStatusCompleted)
         return YES;
 
-    if (s == MTLCommandBufferStatusNotEnqueued)
+    if (s == MTLCommandBufferStatusEnqueued)
+    {
+        /* the geometry category reserves queue slots with -enqueue and the renderer commits
+         * the buffer later; if it was replaced first (a query split, a readback, a texture
+         * upload), nobody will commit it anymore.  Kick it so the GPU work this query
+         * covers actually runs — waiting without committing hangs forever. */
+        if (cb == _currentCommandBuffer)
+        {
+            [self mglqSplit];
+        }
+        else
+        {
+            @try { [cb commit]; }
+            @catch (NSException *) { return YES; }   /* uncommittable: it will never run */
+        }
+        if (cb.status == MTLCommandBufferStatusEnqueued)
+            return YES;                              /* commit refused: never runs */
+    }
+    else if (s == MTLCommandBufferStatusNotEnqueued)
     {
         if (cb != _currentCommandBuffer)
             return YES;                 /* abandoned by the renderer: never executed */
