@@ -855,6 +855,14 @@ void mgl_compat_init_dispatch(GLMContext ctx)
     ctx->dispatch.tex_image3D = compat_tex_image3D;
     ctx->dispatch.get_tex_image = compat_get_tex_image;
     ctx->dispatch.get_tex_level_parameteriv = compat_get_tex_level_parameteriv;
+
+    /* ---- compat texture parameters (GL_CLAMP, GENERATE_MIPMAP) ---- */
+    ctx->dispatch.tex_parameteri = compat_tex_parameteri;
+    ctx->dispatch.tex_parameterf = compat_tex_parameterf;
+    ctx->dispatch.tex_parameteriv = compat_tex_parameteriv;
+    ctx->dispatch.tex_parameterfv = compat_tex_parameterfv;
+    ctx->dispatch.get_tex_parameteriv = compat_get_tex_parameteriv;
+    ctx->dispatch.get_tex_parameterfv = compat_get_tex_parameterfv;
 }
 
 #endif /* COMPAT_DISPATCH_H */

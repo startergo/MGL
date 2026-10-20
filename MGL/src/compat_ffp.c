@@ -120,6 +120,7 @@ typedef struct {
     int     op_a[3][MGLC_MAX_COORDS];
     int     coord_replace[MGLC_MAX_COORDS];
     int     need_texcoord[MGLC_MAX_COORDS];
+    int     lod_bias[MGLC_MAX_COORDS];        /* 1 = bias is non-zero */
     int     texgen[MGLC_MAX_COORDS][4];
     GLboolean unit_used[MGLC_MAX_COORDS];
 } MGLFFPUnit;
@@ -245,6 +246,7 @@ static void ffp_build_config(GLMContext ctx, MGLFFPConfig *c)
             c->need_normal = 1;
 
         c->unit.need_texcoord[u] = need_tc;
+        c->unit.lod_bias[u] = (s->texenv[u].lod_bias != 0.0f) ? 1 : 0;
     }
 
     c->need_fogcoord = (c->fog && c->fog_src == GL_FOG_COORD);
@@ -326,7 +328,8 @@ static void ffp_build_key(const MGLFFPConfig *c, MGLFFPKey *key)
         b[p++] = (uint8_t)env_id;
         b[p++] = (uint8_t)crgb;
         b[p++] = (uint8_t)cal;
-        b[p++] = (uint8_t)((c->unit.coord_replace[u] ? 1 : 0) | (c->unit.need_texcoord[u] ? 2 : 0));
+        b[p++] = (uint8_t)((c->unit.coord_replace[u] ? 1 : 0) | (c->unit.need_texcoord[u] ? 2 : 0) |
+                           (c->unit.lod_bias[u] ? 4 : 0));
 
         for (int k = 0; k < 6; k++)
             b[p++] = (uint8_t)(c->unit.src[k][u] & 0xFF);
@@ -760,6 +763,13 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
     if (c->alpha_test)
         sb_add(b, "uniform vec4 mglAlphaParams;    /* .x = reference value */\n");
 
+    for (int u = 0; u < MGLC_MAX_COORDS; u++)
+        if (c->unit.lod_bias[u])
+        {
+            sb_add(b, "uniform float mglLodBias;   /* texenv GL_TEXTURE_LOD_BIAS, active unit */\n");
+            break;
+        }
+
     if (c->polygon_stipple)
         sb_add(b, "uniform sampler2D mglStipple;\n");
     if (c->line_stipple)
@@ -789,11 +799,14 @@ static void gen_fragment_shader(GLMContext ctx, const MGLFFPConfig *c, SB *b)
 
         sb_add(b, "    vec4 mglTex%d = ", u);
         if (c->unit.target[u] == GL_TEXTURE_1D)
-            sb_add(b, "texture(mglTex%d, vec2(mglTexCoordIn%d.s, 0.5));\n", u, u);
+            sb_add(b, "texture(mglTex%d, vec2(mglTexCoordIn%d.s, 0.5)%s);\n", u, u,
+                   c->unit.lod_bias[u] ? ", mglLodBias" : "");
         else if (c->unit.target[u] == GL_TEXTURE_3D || c->unit.target[u] == GL_TEXTURE_CUBE_MAP)
-            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xyz);\n", u, u);
+            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xyz%s);\n", u, u,
+                   c->unit.lod_bias[u] ? ", mglLodBias" : "");
         else
-            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xy);\n", u, u);
+            sb_add(b, "texture(mglTex%d, mglTexCoordIn%d.xy%s);\n", u, u,
+                   c->unit.lod_bias[u] ? ", mglLodBias" : "");
     }
 
     sb_add(b, "    vec4 c = mglPri;\n");
@@ -1372,6 +1385,19 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
         sync_stipple_texture(ctx);
         loc = uni(ctx, prog, "mglStipple");
         if (loc >= 0) mglUniform1i(ctx, loc, MGLC_STIPPLE_UNIT);
+    }
+
+    {
+        int any_bias = 0;
+        for (int u = 0; u < MGLC_MAX_COORDS; u++)
+            if (s->texenv[u].lod_bias != 0.0f)
+                any_bias = 1;
+
+        if (any_bias)
+        {
+            loc = uni(ctx, prog, "mglLodBias");
+            if (loc >= 0) mglUniform1f(ctx, loc, s->texenv[STATE(active_texture)].lod_bias);
+        }
     }
 
     if (c.line_stipple)

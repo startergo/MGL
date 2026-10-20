@@ -104,6 +104,7 @@ typedef struct {
     GLfloat scale_rgb, scale_alpha;
     GLfloat env_color[4];
     GLfloat coord_replace;        /* point sprite coord replace flag */
+    GLfloat lod_bias;             /* GL_TEXTURE_LOD_BIAS (per-unit texenv) */
 } MGLCTexEnv;
 
 /* src / operand arrays: rgb sources in [0..2], alpha sources in [3..5] */
@@ -326,8 +327,10 @@ struct MGLExtState_compat {
     GLclampf  texture_priority[MGLC_TEX_PRIO_MAX];
 
     /* legacy internal formats (LUMINANCE/ALPHA/INTENSITY) expanded to RGBA on
-     * upload; remembered so readback re-packs them */
-    struct { GLuint name; GLenum kind; GLenum type; } legacy_tex[MGLC_LEGACY_TEX_MAX];
+     * upload; remembered so readback re-packs them.  gmm = GL_GENERATE_MIPMAP,
+     * wrap[] stores GL_CLAMP where the hardware got CLAMP_TO_EDGE */
+    struct { GLuint name; GLenum kind; GLenum type; GLboolean gmm;
+             GLenum wrap[3]; } legacy_tex[MGLC_LEGACY_TEX_MAX];
     int       legacy_tex_count;
 
     /* ---- select / feedback ---- */
@@ -456,6 +459,12 @@ void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint intern
 void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const void *pixels);
 void compat_get_tex_image(GLMContext ctx, GLenum target, GLint level, GLenum format, GLenum type, void *pixels);
 void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level, GLenum pname, GLint *params);
+void compat_tex_parameteri(GLMContext ctx, GLenum target, GLenum pname, GLint param);
+void compat_tex_parameterf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param);
+void compat_tex_parameteriv(GLMContext ctx, GLenum target, GLenum pname, const GLint *params);
+void compat_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *params);
+void compat_get_tex_parameteriv(GLMContext ctx, GLenum target, GLenum pname, GLint *params);
+void compat_get_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, GLfloat *params);
 void mgl_compat_window_pos(GLMContext ctx, const float *obj, float *win);  /* obj -> window xyz */
 GLuint mgl_compat_blit_program(GLMContext ctx);       /* drawpixels/bitmap helper */
 

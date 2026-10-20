@@ -66,7 +66,8 @@ polygon stipple 32x32 (GPU texture sample), evaluators map1/map2 + EvalMesh1/2,
 select mode (per-primitive hit records, viewport-exact culling), feedback mode
 (GL_2D/3D/3D_COLOR/3D_COLOR_TEXTURE/4D_COLOR_TEXTURE token sizes).
 
-All six suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16, render4 35.
+All seven suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16, render4 35,
+render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for compat files.
 
 ## Fixed this session (committed per area)
 
@@ -79,6 +80,19 @@ All six suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16, 
   state. Fix: `mglActiveTexture(ctx, GL_TEXTURE0 + saved_active)` (state stores a unit *index*).
 * compat.c: pixel transfer defaults — color scales default to 1.0, not 0 (DrawPixels was black).
 
+
+## Session 7 (commit "GL_CLAMP / GENERATE_MIPMAP / texenv LOD bias")
+
+* glTexParameteri(GL_TEXTURE_WRAP_*, GL_CLAMP) is accepted: the hardware gets CLAMP_TO_EDGE
+  (Apple GPUs have no border fetch - documented approximation) and the requested GL_CLAMP is
+  reported back by glGetTexParameter* (compat wrappers compat_tex_parameter*, compat_get_tex_parameter*).
+* GL_TEXTURE_BORDER_COLOR round-trips through the core parameter storage (queries return it);
+  sampling ignores it (gap).
+* GL_GENERATE_MIPMAP is tracked per texture in the compat texture table; compat_tex_image1D/2D/3D
+  call glGenerateMipmap after a level-0 upload when it is on (levels verified 32->4->1).
+* glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_LOD_BIAS, x) is stored per unit, enters the FFP key and is
+  passed to texture() as the bias argument (uniform mglLodBias, sync from the active unit).
+* glPushAttrib(GL_TEXTURE_BIT)/PopAttrib no longer errors (it was re-applying the invalid params).
 
 ## Session 6 (commit "point sprites/attenuation, legacy texture formats, residency")
 
@@ -150,7 +164,7 @@ All six suites green: pipeline 60, profile 61, render2 65, glsl 18, render3 16, 
 * More GLSL-compat coverage: test_compat_glsl.c now covers #version 110/120/150-compat,
   ftransform, gl_FragData, gl_TextureMatrix, gl_LightSource/gl_FrontMaterial/gl_Fog uniforms,
   builtin uniform locations.
-* GL_CLAMP texture borders (borders not supported by core texture code; CLAMP behaves as
-  CLAMP_TO_EDGE) - documented gap, would need a shader-side border fetch.
+* GL_CLAMP border sampling: CLAMP maps to CLAMP_TO_EDGE (Apple GPUs lack border fetch); the border
+  color is stored/queried but not sampled.
 * GENERATE_MIPMAP on glTexImage (compat flag); color-index (glIndex) beyond state tracking.
 * Line stipple pixel test (fragment shader pattern) - implemented, untested.

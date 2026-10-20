@@ -693,6 +693,13 @@ static void mglTexEnvf_scalar(GLMContext ctx, GLenum target, GLenum pname, GLflo
     if (target != GL_TEXTURE_ENV)
         ERROR_RETURN(GL_INVALID_ENUM);
 
+    if (pname == GL_TEXTURE_LOD_BIAS)
+    {
+        e->lod_bias = param;
+        mgl_compat_dirty(ctx);
+        return;
+    }
+
     if (pname != GL_TEXTURE_ENV_MODE)
         ERROR_RETURN(GL_INVALID_ENUM);
 
@@ -781,6 +788,10 @@ void mglTexEnvfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *par
             return;
         }
 
+        case GL_TEXTURE_LOD_BIAS:
+            s->texenv[unit].lod_bias = params[0];
+            mgl_compat_dirty(ctx);
+            return;
         case GL_TEXTURE_ENV_COLOR:
             memcpy(e->env_color, params, 4 * sizeof(GLfloat));
             break;
@@ -1234,10 +1245,35 @@ static void legacy_tex_record(GLMContext ctx, GLuint name, GLenum kind, GLenum t
 
     if (s->legacy_tex_count < MGLC_LEGACY_TEX_MAX)
     {
+        memset(&s->legacy_tex[s->legacy_tex_count], 0, sizeof s->legacy_tex[0]);
         s->legacy_tex[s->legacy_tex_count].name = name;
         s->legacy_tex[s->legacy_tex_count].kind = kind;
         s->legacy_tex[s->legacy_tex_count].type = type;
         s->legacy_tex_count++;
+    }
+}
+
+/* per-texture compat record (creating it when unknown) */
+static void compat_tex_entry(GLMContext ctx, GLuint name, int *slot)
+{
+    struct MGLExtState_compat *s = CS();
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+        {
+            *slot = i;
+            return;
+        }
+
+    *slot = -1;
+
+    if (s->legacy_tex_count < MGLC_LEGACY_TEX_MAX)
+    {
+        memset(&s->legacy_tex[s->legacy_tex_count], 0, sizeof s->legacy_tex[0]);
+        s->legacy_tex[s->legacy_tex_count].name = name;
+        s->legacy_tex[s->legacy_tex_count].kind = 0;
+        s->legacy_tex[s->legacy_tex_count].type = 0;
+        *slot = s->legacy_tex_count++;
     }
 }
 
@@ -1423,6 +1459,21 @@ static GLuint bound_tex_name(GLMContext ctx, GLenum target)
     return t ? t->name : 0;
 }
 
+/* runs glGenerateMipmap after a level-0 upload when GL_GENERATE_MIPMAP is on */
+static void compat_after_upload(GLMContext ctx, GLenum target, GLint level)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name && s->legacy_tex[i].gmm)
+        {
+            if (level == 0)
+                mglGenerateMipmap(ctx, target);
+            return;
+        }
+}
+
 void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
                         GLsizei width, GLsizei height, GLint border,
                         GLenum format, GLenum type, const void *pixels)
@@ -1439,6 +1490,7 @@ void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint intern
             mglTexImage2D(ctx, target, level, GL_RGBA32F, width, height, border, GL_RGBA, GL_FLOAT, rgba);
             free(rgba);
             legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+            compat_after_upload(ctx, target, level);
             return;
         }
     }
@@ -1447,6 +1499,8 @@ void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint intern
 
     if (kind)
         legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+
+    compat_after_upload(ctx, target, level);
 }
 
 void compat_tex_image1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
@@ -1471,6 +1525,7 @@ void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint intern
             mglTexImage3D(ctx, target, level, GL_RGBA32F, width, height, depth, border, GL_RGBA, GL_FLOAT, rgba);
             free(rgba);
             legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+            compat_after_upload(ctx, target, level);
             return;
         }
     }
@@ -1479,6 +1534,8 @@ void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint intern
 
     if (kind)
         legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type);
+
+    compat_after_upload(ctx, target, level);
 }
 
 void compat_get_tex_image(GLMContext ctx, GLenum target, GLint level,
@@ -1539,4 +1596,118 @@ void compat_get_tex_level_parameteriv(GLMContext ctx, GLenum target, GLint level
                 return;
             }
     }
+}
+
+#pragma mark compat texture parameters (GL_CLAMP, GENERATE_MIPMAP)
+
+void compat_tex_parameteri(GLMContext ctx, GLenum target, GLenum pname, GLint param)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+
+    if (pname == GL_GENERATE_MIPMAP)
+    {
+        int slot;
+        compat_tex_entry(ctx, name, &slot);
+        if (slot >= 0)
+            s->legacy_tex[slot].gmm = param ? GL_TRUE : GL_FALSE;
+        return;     /* not a hardware parameter */
+    }
+
+    if (pname == GL_TEXTURE_WRAP_S || pname == GL_TEXTURE_WRAP_T || pname == GL_TEXTURE_WRAP_R)
+    {
+        int axis = (pname == GL_TEXTURE_WRAP_S) ? 0 : (pname == GL_TEXTURE_WRAP_T) ? 1 : 2;
+        int slot;
+
+        if (param == GL_CLAMP)
+        {
+            /* Apple GPUs have no border fetch: CLAMP behaves as CLAMP_TO_EDGE.
+             * The requested mode is kept for queries. */
+            compat_tex_entry(ctx, name, &slot);
+            if (slot >= 0)
+                s->legacy_tex[slot].wrap[axis] = GL_CLAMP;
+            mglTexParameteri(ctx, target, pname, GL_CLAMP_TO_EDGE);
+            return;
+        }
+
+        compat_tex_entry(ctx, name, &slot);
+        if (slot >= 0)
+            s->legacy_tex[slot].wrap[axis] = 0;
+    }
+
+    mglTexParameteri(ctx, target, pname, param);
+}
+
+void compat_tex_parameterf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param)
+{
+    compat_tex_parameteri(ctx, target, pname, (GLint)param);
+}
+
+void compat_tex_parameteriv(GLMContext ctx, GLenum target, GLenum pname, const GLint *params)
+{
+    compat_tex_parameteri(ctx, target, pname, params ? params[0] : 0);
+}
+
+void compat_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *params)
+{
+    if (pname == GL_TEXTURE_BORDER_COLOR)
+    {
+        /* tracked by the core (queryable); border fetch itself is not supported */
+        mglTexParameterfv(ctx, target, pname, params);
+        return;
+    }
+
+    compat_tex_parameteri(ctx, target, pname, (GLint)(params ? params[0] : 0));
+}
+
+void compat_get_tex_parameteriv(GLMContext ctx, GLenum target, GLenum pname, GLint *params)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+    int slot = -1;
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+            slot = i;
+
+    if (slot >= 0 && pname == GL_GENERATE_MIPMAP)
+    {
+        *params = s->legacy_tex[slot].gmm;
+        return;
+    }
+
+    if (slot >= 0 && (pname == GL_TEXTURE_WRAP_S || pname == GL_TEXTURE_WRAP_T || pname == GL_TEXTURE_WRAP_R))
+    {
+        int axis = (pname == GL_TEXTURE_WRAP_S) ? 0 : (pname == GL_TEXTURE_WRAP_T) ? 1 : 2;
+        *params = s->legacy_tex[slot].wrap[axis] ? (GLint)s->legacy_tex[slot].wrap[axis] : (GLint)GL_CLAMP_TO_EDGE;
+        return;
+    }
+
+    mglGetTexParameteriv(ctx, target, pname, params);
+}
+
+void compat_get_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, GLfloat *params)
+{
+    struct MGLExtState_compat *s = CS();
+    GLuint name = bound_tex_name(ctx, target);
+    int slot = -1;
+
+    for (int i = 0; i < s->legacy_tex_count; i++)
+        if (s->legacy_tex[i].name == name)
+            slot = i;
+
+    if (slot >= 0 && pname == GL_GENERATE_MIPMAP)
+    {
+        *params = s->legacy_tex[slot].gmm ? 1.0f : 0.0f;
+        return;
+    }
+
+    if (slot >= 0 && (pname == GL_TEXTURE_WRAP_S || pname == GL_TEXTURE_WRAP_T || pname == GL_TEXTURE_WRAP_R))
+    {
+        int axis = (pname == GL_TEXTURE_WRAP_S) ? 0 : (pname == GL_TEXTURE_WRAP_T) ? 1 : 2;
+        *params = s->legacy_tex[slot].wrap[axis] ? (GLfloat)s->legacy_tex[slot].wrap[axis] : (GLfloat)GL_CLAMP_TO_EDGE;
+        return;
+    }
+
+    mglGetTexParameterfv(ctx, target, pname, params);
 }
