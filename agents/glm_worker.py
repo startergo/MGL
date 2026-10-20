@@ -146,7 +146,11 @@ def tool_run_shell(worktree: Path, args: dict) -> str:
             return f"REFUSED: command matches a blocked pattern ({pat}). Work inside the worktree only."
     timeout = max(1, min(int(args.get("timeout") or DEFAULT_CMD_TIMEOUT), MAX_CMD_TIMEOUT))
     try:
-        proc = subprocess.Popen(["/bin/bash", "-c", cmd], cwd=worktree, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(["/bin/bash", "-c",
+                                 # CPU guard (user rule: never use all the CPU): per-process CPU-time cap,
+                                 # 4 parallel make jobs, lowest scheduling priority
+                                 "ulimit -t ${MGL_CPU_LIMIT_S:-1500}; export MAKEFLAGS=-j${MGL_JOBS:-4}; "
+                                 "renice -n 15 $$ >/dev/null 2>&1; " + cmd], cwd=worktree, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, start_new_session=True,
                                 env={**os.environ, "MGL_PROJECT_DIR": str(worktree)})
         try:

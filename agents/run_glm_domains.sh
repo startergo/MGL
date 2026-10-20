@@ -54,7 +54,10 @@ for d in "$@"; do
         echo "$d already running"; continue
     fi
     resume=""; [ -f "$WT/$d/.agent/transcript.json" ] && resume="--resume"
-    nohup perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' "$PY" agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
+    running=$(for x in "$WT"/*/.agent/worker.pid; do kill -0 "$(cat "$x")" 2>/dev/null && echo x; done | wc -l | tr -d ' ')
+    if [ "$running" -ge "${MGL_MAX_WORKERS:-2}" ]; then echo "skip $d: $running workers already running (MGL_MAX_WORKERS=${MGL_MAX_WORKERS:-2})"; continue; fi
+    # background QoS + low priority so the user's apps always win (user rule: never use all the CPU)
+    nohup taskpolicy -b nice -n 15 perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' "$PY" agents/glm_worker.py --domain "$d" $resume > "$WT/$d/.agent/worker.out" 2>&1 &
     echo $! > "$WT/$d/.agent/worker.pid"
     echo "started $d (pid $!) $resume"
 done
