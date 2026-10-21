@@ -188,3 +188,145 @@ gl46-port still needs them merged from either branch.
   and any case can be re-run singly for a full log (recipe in §2).
 * 4 cases were dropped by the runner's bookkeeping and re-run manually (§5).
 * fp64 (gpu_shader_fp64) is SUPPORTED since the soft-float port; the fp64.fp64 group now runs (see the 2026-10-21 row above).
+
+---
+
+## 9. Second full KHR-GL46 pass — MGL @ gl46/geom f22b93a (2026-10-21, "round 32")
+
+Fresh results dir `~/MGL-cts/geom32-full` (nothing reused from the first pass), run in
+foreground chunks of `--max-seconds 470` strictly one at a time, `--batch 16
+--per-case-timeout 20`, resumable via the runner's `results.json`. All 9035 listed cases
+recorded. Binary = `build/libmgl.dylib` at commit `f22b93a` (identical code to `HEAD`
+after the gl46-port merge; only `.md` files differ). Raw tables:
+`~/MGL-cts/geom32-full/{summary.txt,clusters.txt}`.
+
+### Totals (first pass → this pass)
+
+```
+                 first pass        round 32
+  Pass             4558 50.5%  →   7544 83.5%   (+2986)
+  Fail             3228 35.7%  →    969 10.7%   (-2259)
+  NotSupported     1167 12.9%  →    497  5.5%   (-670: fp64 now runs & passes 657/659,
+                                                     shader_image_size, sample_variables…)
+  Crash              60        →     17
+  InternalError      16        →      4
+  Timeout             -        →      3
+  CompatibilityWarning 1       →      1
+```
+
+Biggest group moves: constant_expressions 696→1392 (+696, all pass), pixelstoragemodes
+Fail 736→0 (736 pass + 160 NotSupported), shaders Fail 689→58, geometry_shader
+38 pass→133 pass, gpu_shader_fp64 1→657 pass, tessellation_shader 20→25 pass,
+sample_variables 2→8 pass (still mostly broken), layout_location 4→35 pass,
+shading_language_420pack 13→21 pass, limits 112→117 pass.
+
+### Per-group tally (this pass, complete; groups with no Pass in bold sorted first)
+
+```
+  packed_pixels                           250  Fail=249 Pass=1
+  sample_variables                        190  Fail=144 NotSupported=38 Pass=8
+  direct_state_access                     371  Pass=297 Fail=70 InternalError=2 CompatWarn=1 Crash=1
+  shader_storage_buffer_object            124  Fail=70 Pass=54
+  shaders                                2382  Pass=2316 Fail=58 NotSupported=6 Timeout=2
+  texture_gather                           75  Fail=38 Pass=37
+  tessellation_shader                      58  Fail=31 Pass=25 Crash=1 NotSupported=1
+  limits                                  140  Pass=117 Fail=23
+  shading_language_420pack                 43  Fail=22 Pass=21
+  shader_image_load_store                  51  Fail=19 NotSupported=18 Pass=12 Crash=2
+  shader_image_size                        74  NotSupported=54 Fail=20
+  compute_shader                           42  Pass=24 Fail=14 Crash=4
+  vertex_attrib_binding                    30  Fail=18 Pass=12
+  explicit_uniform_location                48  Pass=31 Fail=17
+  program_interface_query                  43  Pass=28 Fail=15
+  gpu_shader5                              22  Fail=15 Pass=7
+  shader_atomic_counters                   30  Pass=16 Fail=14
+  layout_binding                           21  Fail=12 Pass=6 Crash=2 NotSupported=1
+  shader_multisample_interpolation        109  Pass=97 Fail=12
+  shader_draw_parameters_tests             13  Fail=12 NotSupported=1
+  texture_cube_map_array                   27  Pass=12 Fail=7 NotSupported=5 Crash=3
+  multi_bind                               17  Fail=9 Pass=8
+  texture_buffer                           16  Fail=9 Pass=7
+  sample_shading                           13  Fail=8 Pass=5
+  texture_border_clamp                     32  Pass=26 Fail=6
+  copy_image                               13  Pass=7 Fail=6
+  texture_view                              7  Fail=6 Pass=1
+  gl_spirv                                  9  Fail=5 Pass=4
+  shader_group_vote                         5  Fail=5
+  packed_depth_stencil                     25  Pass=21 Fail=4
+  pipeline_statistics_query_tests_ARB      10  Pass=6 Fail=4
+  shader_atomic_counter_ops_tests           4  Fail=4
+  buffer_storage                            9  Pass=6 Fail=3
+  sepshaderobjs                             8  Pass=5 Fail=3
+  gpu_shader_fp64                         659  Pass=657 Fail=2
+  draw_indirect                            70  Pass=68 Fail=2
+  viewport_array                           17  Pass=15 Fail=2
+  transform_feedback_overflow_query_ARB    13  Pass=11 Fail=2
+  CommonBugs                                8  Pass=6 Fail=1 Timeout=1
+  texture_swizzle                           4  Pass=2 Crash=1 Fail=1
+  vertex_attrib_64bit                       4  Pass=2 Fail=2
+  cull_distance                             3  Fail=2 Pass=1
+  separable_programs_tf                     2  Crash=2
+  geometry_shader                         136  Pass=133 NotSupported=2 Fail=1
+  shaders45                                 7  NotSupported=5 Pass=1 Fail=1
+  indirect_parameters_tests                 3  Pass=2 Fail=1
+  incomplete_texture_access                 1  InternalError=1
+  stencil_texturing                         1  Crash=1
+  texture_size_promotion                    1  InternalError=1
+  constant_expressions                   1392  Pass=1392
+  pixelstoragemodes                       896  Pass=736 NotSupported=160
+  shaders30                               650  Pass=650
+  shader_bitfield_operation               324  Pass=324
+  texture_repeat_mode                     162  Pass=162
+  blend_equation_advanced                  88  NotSupported=88
+  internalformat                           52  NotSupported=27 Pass=25
+  layout_location                          35  Pass=35
+  shader_subroutine                        28  NotSupported=27 Pass=1
+  transform_feedback                       20  Pass=20        ← multi-stream capture landed this pass
+  ext_texture_shadow_lod                   16  NotSupported=16
+  aggressive_optimizations                 12  Pass=12
+  draw_elements_base_vertex_tests          12  Pass=10 NotSupported=2
+  shaders44                                12  Pass=12
+  clip_control / clip_control_ARB         8+8  Pass=8 each
+  info                                      6  Pass=6
+  sparse_texture{,2}_tests                 6+6  NotSupported
+  texture_filter_minmax_tests              5  NotSupported=5
+  shader_ballot_tests                      4  NotSupported=4
+  (+ gl_spirv 9 → Fail=5 Pass=4; sample_variables counted above)
+```
+
+### Top failure clusters (normalized reason → count, representative case)
+
+| count | symptom | where | first-guess cause / domain |
+|-------|---------|-------|-----------------------------|
+| 185 | `Test Run() failed` | ssbo 70, texture_gather 38, vertex_attrib_binding 18, compute 14, explicit_uniform_location 13, image_load_store 10, program_interface_query 8, image_size 8 | generic wrapper: per-case logs needed; ssbo group is the biggest single chunk |
+| 148 | `Invalid format used but glTexImageND/ND succeeded` | packed_pixels (pbo_rectangle/varied_*) | compressed-format upload path accepts formats the CTS expects to be rejected (texdata_formats) |
+| 144 | `Compile failed at glcSampleVariablesTests.cpp:N` | sample_variables (mask/rgba32f…) | glcSampleVariables shader compile: `gl_SampleID`-style builtins / `__SAMPLE_COUNT` define (shaders/program) |
+| 96  | (no detail in log body) | direct_state_access 63, limits 23, tess 5 | mostly renderbuffer storage / limit queries — needs single-case re-runs |
+| 83  | `GL_UNPACK_ROW_LENGTH = N failed` | packed_pixels.varied_rectangle.* | pixel-store row length with compressed formats (pixel_utils) |
+| 30  | `Image comparison failed, got N non-white pixels` | shaders.uniform_block.* (std140/shared instance arrays) | UBO layout mismatch for exotic members (uniforms) |
+| 29  | `glGetError() returned GL_INVALID_OPERATION after test` | draw_indirect, tess, shaders | leftover error from one API call in a long test; per-case logs needed |
+| 20  | `GL_EXT_spec_constant_composites … used for spec constants` | sample_shading.render.rgba32f.* | warning turned failure: spec-constant-composites feature not implemented (shaders) |
+| 20  | `Test case failed.` | shading_language_420pack.binding_image_api_override | layout(binding=) on image uniforms with explicit API override (program) |
+| 17  | `glcts exited rc=-N` (batch kill = hang) | compute_shader.copy-image, stencil_texturing, separable_programs_tf×2, texture_cube_map_array×3… | hangs: compute copy-image (compute), separable_programs_tf.*_active (geom/tess: TF while a separable GS/TCS program is active) |
+| 16  | `expected compilation to fail, but both shaders compiled` | shaders.preprocessor.basic.* | preprocessor conformance cases: MGL accepts invalid GLSL (shaders) |
+| 12  | `vertex stage: SPIR-V → MSL translation failed` | shader_draw_parameters_tests | gl_DrawID/gl_BaseVertex capture in the emulation vertex pass (draw/geom) |
+| 11  | `glMapBufferRange() … GL_INVALID_OPERATION` | tessellation_shader.gl_MaxPatchVertices_* | persistent/coherent map flags of a TCS-output buffer (tess/buffers) |
+| 11  | `Invalid result` (sampler gather offsets) | gpu_shader5.texture_gather_offset_color_array | textureGather offsets on arrays (samplers) |
+
+### geom-domain notes from this pass
+
+* `transform_feedback` **20/20** (incl. `draw_xfb_stream_test`, `draw_xfb_stream_instanced_test`
+  — the multi-stream work of this round) and `geometry_shader` 133/136.
+* Still failing in my area, next round's queue:
+  * `transform_feedback_overflow_query_ARB.multiple-streams-{one,multiple}-buffers-per-stream`
+    (query validation at gl3cTransformFeedbackOverflowQueryTests.cpp:1204) — the per-stream
+    "needed vs written" accounting of this round gets these closer but not green.
+  * `separable_programs_tf.geometry_active` / `tessellation_active` **hang** (batch kill).
+  * `pipeline_statistics_query_tests_ARB.functional_geometry_shader_queries`:
+    `GL_GEOMETRY_SHADER_INVOCATIONS`-style query returns 3 instead of 12 (pipeline
+    statistics vs the per-stage counters).
+  * `limits.max_transform_feedback_interleaved_components` (limit value),
+    `texture_buffer.texture_buffer_operations_transform_feedback`,
+    `geometry_shader.constant_variables` (MAX_GEOMETRY_IMAGE_UNIFORMS=8 by choice,
+    see agents/geom_report.md), `geometry_shader.api.max_atomic_counter{s,_buffers}`
+    NotSupported (program domain).
