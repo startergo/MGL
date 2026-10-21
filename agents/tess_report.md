@@ -1,3 +1,117 @@
+# tess — fp64 round 5 — HANDOFF (fresh session starts here)
+
+Branch `gl46/tess`, HEAD **<see below — this commit>** (on top of the gl46-port
+merge 3dbc3f5).  Task: CTS `KHR-GL46.gpu_shader_fp64` group green + suite green.
+**Suite: rc=0, 0 failures (418 PASS lines, 62 test files).**
+
+**Task item (2) done:** `test_fp64` was split — it had grown past run.sh's 120 s
+per-test alarm (steady state ~125 s of Metal compilation, no disk cache).
+Now `test_fp64.c` (scalar_ops, attributes, flat_varying ~90 s),
+`test_fp64b.c` (conversions, ubo_layout, ssbo_compute, extensions) and
+`test_fp64c.c` (varying_dvec34, out_param_fns, uniform_roundtrip,
+xfb_capture) each finish well under the alarm.
+
+## fp64 group status (this round, warm Metal cache)
+
+| case | status |
+|---|---|
+| errors | PASS |
+| conversions | PASS |
+| operators | **PASS** (was FAIL in round 4 — fixed by this round's iface work) |
+| valid_constructors | PASS |
+| varyings | FAIL — multi-variable batch link (see below) |
+| state_query | FAIL — link |
+| max_uniform_components | FAIL — link, log: `geometry: SPIR-V → MSL failed (double types are not supported in buffers in MSL.)` |
+| named_uniform_blocks | FAIL — link |
+
+NOTE: `operators` takes >10 min on a **cold** Metal cache (the case builds ~200
+big fp64 kernels; a first run timed out at 240 s and 620 s, then PASSED in
+~2 min warm).  Run it twice before judging.
+
+## What this round fixed (all committed, c8a6a12)
+
+1. **fp64.c — interface blocks as stage IO** (the core blocker): access chains
+   through `in/out BLOCK { double m; }` and `BLOCK name[]` now work.
+   `tess_pair_iface_members` counterpart for geometry/xfb is not needed (geom
+   reflects the GL view).
+2. **geometry.c**: in_v/out_v reflected from `program->spirv[stage].ir`
+   (GL view — real doubles); the pass-through VS declares u32-slot repr for
+   double varyings; glslang keeps `in double` attributes (VULKAN_RULES_RELAXED
+   privatizes them — flag dropped when the source declares one).
+3. **MGLRenderer+Tessellation.m `tessVsInputKinds`**: rewritten to walk the
+   GL-view module (resource list type ids are from the *compiled* module =
+   wrong id space for fp64).  Fixed wrong SPIR-V opcodes (OpTypeFloat=22,
+   width at ir[m+2]), OpVariable operand order (type, id, storage), and
+   has[]=true for float slots (MGL_VA_KIND_FLOAT == 0).  Double generic +
+   array attributes now fetch UInt2/UInt4 in the VS kernel (verified pixel
+   green: VS double attr → TCS → TES → FS = 5.0 exactly, scratch /tmp/t5.c).
+4. **tessellation.c `rewrite_tes`**: the struct-body splice recomputed offsets
+   from the tracked `len` which drifted → heap overrun → "MSL source is not
+   valid UTF-8" + truncated source.  Now recomputed from `strlen(out)` and
+   `cap` is kept in sync after the realloc.
+
+## Repro material (untracked, do not commit)
+
+- `tests/headless/zz4_cts_varyings.c` — faithful port of CTS GPUShaderFP64Test7
+  ("varyings") for ONE variable per program: `./build/tests/zz4_cts_varyings
+  <type 0..12> [arrayed]`.  Type 0 (double scalar) **links and draws**;
+  check `xfb words` and `pixels`.  The multi-variable batches the CTS builds
+  still fail.
+- `/tmp/t5.c` — minimal VS(double attr)+TCS+TES+FS chain, PASSING (green).
+- `MGL_TESS_DEBUG=1`, `MGL_DUMP_MSL=1`, `MGL_FP64_DUMP=/tmp/dir` (dump
+  `<n>_input.spv`/`<n>_lowered.spv`; disassemble with
+  `external/SPIRV-Tools/build/tools/spirv-dis`), `MGL_GEOM_DUMP=/tmp/dir`,
+  `MGL_GEOM_TRACE=1`.
+
+## Where to continue (ordered)
+
+1. **varyings multi-variable batches**: extend zz4 to build batches like the
+   CTS (`variables` lists capped by GL_MAX_*_COMPONENTS queries — see
+   `executeFunctionalTest` in gl4cGPUShaderFP64Tests.cpp:9228).  Single
+   variable links; find the first batch size/type that fails.  Suspects:
+   location assignment for several block members (my fp64 repr keeps
+   element-index-preserving layouts — see `geom_double_iface` and the iface_ty
+   K_ARR cases), and the FS reading `gs_variableN[i].x`.
+2. **max_uniform_components / named_uniform_blocks / state_query**: all link
+   failures.  max_uniform_components logs
+   `geometry: SPIR-V → MSL failed (double types are not supported in buffers in
+   MSL.)` — a geometry-stage module with doubles in a BUFFER reaches
+   SPIRV-Cross un-lowered.  Likely the geom/xfb record kernel path
+   (transform_feedback.c `xfb_glsl_type_name` family) or a capture variant
+   compiled by `geom_glsl_to_spirv` whose fp64 lowering is skipped — find which
+   module it is (MGL_FP64_DUMP prints every lowering input; if this module is
+   missing from the dump it never got lowered).
+3. **tess interface-block pairing** (gated: `MGL_TESS_PAIR_BLOCKS=1` in
+   tessellation.c): `tess_pair_iface_members` pairs flattened block members
+   between producer/consumer MSL structs (works — trace prints the pairs), but
+   the canonical-record path it enables (cp_record) still emits invalid MSL
+   (heap garbage in the rewrite_tes epilogue).  With it OFF, tess block
+   programs still link (SPIRV-Cross writes its own struct per side) but the
+   VALUES do not cross TCS→TES (two record slots).  Needed for the CTS
+   varyings case.  Debug by enabling the env, dumping
+   `mgl_tess_plain_msl`/`mgl_tess_capture_msl` outputs and checking
+   `tp->cp_record[]` entries for uninitialized members (`num_cp_record` vs
+   what the propagate step copies at tessellation.c ~2806).
+
+## Known gaps / notes
+
+- Whole-column access into a wide (dvec3/dvec4-column) double matrix stage
+  variable is rejected with a clear error (fp64.c rw_access); the CTS only
+  needs [col].row.
+- `glDisableVertexAttribArray` on a never-enabled attribute logs
+  GL_INVALID_OPERATION (0x502) in MGL — pre-existing, seen in scratch runs
+  (core GL allows it as a no-op).  Not addressed.
+- The old `agents/conformance.md` tally is unchanged this round; update it when
+  the four failing cases land.
+
+## Round history
+
+Round 4 and earlier: see the "Accumulated report" section below.
+
+---
+
+# Accumulated report (preserved from gl46-port squash; round-3 and earlier)
+
 # tess — final domain summary (round 17)
 
 GL 4.6 tessellation shaders (TCS/TES, GL_PATCHES) on Metal, branch `gl46/tess`.

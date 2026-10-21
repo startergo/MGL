@@ -561,6 +561,57 @@ static void tess_annotate_keys(struct MslStruct *s, const SpirvResourceList *rl)
     }
 }
 
+/* Interface blocks reach the MSL stage structs as flattened members whose names
+ * SPIRV-Cross prefixes differently on the two sides of an interface
+ * ("<instance>_<member>" on the consumer, "m_<id>_<member>" for an anonymous
+ * block on the producer), so neither the reflected names nor the name hash
+ * line up: the producer's and the consumer's copy of the same GL member
+ * become two different record slots and the value never crosses the stage.
+ * Pair such leftover members positionally — SPIRV-Cross emits block members in
+ * declaration order and both stages declare the same block — requiring the
+ * same MSL type, the same array element, and a common suffix that starts at a
+ * '_' boundary in both names.  GL requires matching blocks across stages, so
+ * the order (and types) agree. */
+static void tess_pair_iface_members(struct MslStruct *a, struct MslStruct *b)
+{
+    static uint32_t next_pair_key = 0x60000000u;
+    char used[MGL_TESS_MAX_PATCH_MEMBERS];
+
+    if (!a || !b || a == b) return;
+    memset(used, 0, sizeof used);
+    for (int i = 0; i < a->count; i++)
+    {
+        MGLTessPatchMember *ma = &a->members[i];
+        size_t na;
+
+        if ((ma->key & 0xc0000000u) != 0x40000000u) continue;   /* only unreflected members */
+        na = strlen(ma->name);
+        for (int j = 0; j < b->count; j++)
+        {
+            MGLTessPatchMember *mb = &b->members[j];
+            size_t nb, k;
+
+            if (used[j] || (mb->key & 0xc0000000u) != 0x40000000u) continue;
+            if (strcmp(ma->type, mb->type) != 0) continue;
+            if (ma->array_idx != mb->array_idx) continue;
+            nb = strlen(mb->name);
+            k = 0;
+            while (k < na && k < nb && ma->name[na - 1 - k] == mb->name[nb - 1 - k]) k++;
+            if (!k) continue;
+            /* the shared suffix must be a whole component of both names: it
+             * consumes a name entirely, starts at a '_' separator, or the
+             * character before it is the separator */
+            if (!((k == na || ma->name[na - k] == '_' || ma->name[na - k - 1] == '_') &&
+                  (k == nb || mb->name[nb - k] == '_' || mb->name[nb - k - 1] == '_'))) continue;
+            ma->key = mb->key = next_pair_key++;
+            used[j] = 1;
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: paired block member %s <-> %s\n", ma->name, mb->name);
+            break;
+        }
+    }
+}
+
 struct CanonRec {
     MGLTessPatchMember m[MGL_TESS_MAX_PATCH_MEMBERS];
     int    n;
@@ -1486,36 +1537,25 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
         }
 
         {
+            /* splice "struct X { OLD }" -> "struct X { NEW }".  All offsets are
+             * recomputed from strlen(out) (ground truth) because the tracked
+             * `len` drifts when the fallback path above already shrank its
+             * copied body, and the drift overran the buffer on the epilogue
+             * str_append. */
             size_t bodylen = (size_t)(close - open - 1);
-            size_t newlen = len - bodylen + strlen(newbody);
+            size_t slen = strlen(out);
+            size_t off = (size_t)(open - out);
+            size_t newlen = slen - bodylen + strlen(newbody);
             const char *hold = newbody;
             char *grown = (char *)realloc(out, newlen + 1);
 
             if (!grown)
                 return NULL;
             out = grown;
-            /* recompute open/close after the realloc may have moved the buffer */
-            p = strstr(out, head);
-            if (!p)
-            {
-                snprintf(head, sizeof head, "struct %s {", decl_names[d]);
-                p = strstr(out, head);
-            }
-            if (!p)
-            {
-                if (hold != canon) free((void *)hold);
-                return out;
-            }
-            open = strchr(p, '{');
-            close = strchr(open, '}');
-            if (!open || !close)
-            {
-                if (hold != canon) free((void *)hold);
-                return out;
-            }
-            memmove((void *)(out + (open + 1 - out) + strlen(newbody)),
-                    open + 1 + bodylen, len - (size_t)(open + 1 - out) - bodylen + 1);
-            memcpy((void *)(out + (open + 1 - out)), newbody, strlen(newbody));
+            cap = newlen + 1;   /* realloc may have shrunk: keep str_append honest */
+            memmove((void *)(out + off + 1 + strlen(newbody)),
+                    out + off + 1 + bodylen, slen - (off + 1 + bodylen) + 1);
+            memcpy((void *)(out + off + 1), newbody, strlen(newbody));
             len = newlen;
             if (hold != canon)
                 free((void *)hold);
@@ -2638,6 +2678,20 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
     tess_annotate_keys(&tes_pi, have_pi ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+
+    /* pair flattened interface-block members that no reflected name matched.
+     * KNOWN-INCOMPLETE (round 5): with the pairing active the canonical-record
+     * build of the plain TES still emits invalid MSL (heap garbage in the
+     * epilogue — "MSL source is not valid UTF-8"); the values do not cross
+     * stages yet, so it is off by default.  Enable with MGL_TESS_PAIR_BLOCKS=1
+     * to resume debugging: the pairing itself works (see the trace), the
+     * overflow is in the canon path it enables (rewrite_tes epilogue). */
+    if (getenv("MGL_TESS_PAIR_BLOCKS"))
+    {
+        if (have_tcs_in)  tess_pair_iface_members(&vs_out, &tcs_in);
+        else if (have_cp) tess_pair_iface_members(&vs_out, &tes_cp);
+        if (have_cp)      tess_pair_iface_members(&tcs_out, &tes_cp);
+    }
 
     /* propagate the keys to the member copies stored in tp (filled earlier at link
      * time from the same structs, without annotations) */

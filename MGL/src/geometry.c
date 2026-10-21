@@ -608,6 +608,23 @@ static const char *word_store(GLenum base, const char *e)
 /* number of words a component of `base` occupies */
 static GLuint comp_words(GLenum base) { return base == GL_DOUBLE ? 2 : 1; }
 
+/* the fp64 interface representation of a double varying (fp64.c: iface_ty):
+ * uvec2 for a scalar, uvec4 for dvec2, and a flat uvec4 array of
+ * elems * cols * ceil(rows/2) slots otherwise (dvec3/dvec4 members, matrices,
+ * and any array element wider than one location, which SPIRV-Cross unrolls
+ * into one location each).  Returns the slot count and writes the GLSL type
+ * (without array suffix) into buf. */
+static GLuint geom_double_iface(GLuint rows, GLuint cols, GLuint elems, char *buf, size_t bufsz)
+{
+    if (elems <= 1 && cols <= 1)
+    {
+        if (rows <= 1) { snprintf(buf, bufsz, "uvec2"); return 1; }
+        if (rows == 2) { snprintf(buf, bufsz, "uvec4"); return 1; }
+    }
+    snprintf(buf, bufsz, "uvec4");
+    return elems * (cols ? cols : 1) * ((rows + 1) / 2);
+}
+
 /* emit "name = <value>;" statements reconstructing v from the word buffer.
  * open/close delimit the word access: <open> + " + N" + <close>.  `index` is the vertex
  * index expression for geometry-stage inputs (which are arrays of the record per vertex). */
@@ -829,6 +846,24 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
     glslang_program_t *prog;
     const char *msgs;
     int version = 330, options = GLSLANG_SHADER_VULKAN_RULES_RELAXED;
+
+    /* VULKAN_RULES_RELAXED moves 64-bit vertex attributes to Private storage
+     * (Vulkan has no Float64 vertex inputs) — and the capture variant embeds
+     * the user's vertex source, where `in double x` must stay a real attribute
+     * (the vertex descriptor feeds u32 slots for it; the fp64 lowering maps
+     * them).  Drop the flag when the source declares one. */
+    if (glm_type == GL_VERTEX_SHADER)
+    {
+        for (const char *p = src; (p = strstr(p, "in ")); p += 3)
+        {
+            const char *t = p + 3;
+            while (*t == ' ' || *t == '\t') t++;
+            if (!strncmp(t, "double", 6) && !isalpha((unsigned char)t[6]) && !isdigit((unsigned char)t[6]))
+                { options &= ~GLSLANG_SHADER_VULKAN_RULES_RELAXED; break; }
+            if (!strncmp(t, "dvec", 4) || !strncmp(t, "dmat", 4))
+                { options &= ~GLSLANG_SHADER_VULKAN_RULES_RELAXED; break; }
+        }
+    }
 
     memset(&input, 0, sizeof(input));
     initGLSLInput(ctx, glm_type, src, &input);
@@ -3075,6 +3110,20 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
             snprintf(name, sizeof(name), "mgl_ob%d", i);
         else
             snprintf(name, sizeof(name), "%s", v->name);
+        if (v->base == GL_DOUBLE)
+        {
+            /* write the u32-slot representation the fragment stage was lowered
+             * to (real double varyings cannot appear in the generated MSL) */
+            char ty[32];
+            GLuint slots = geom_double_iface(v->rows, v->cols, v->elems > 0 ? v->elems : 1, ty, sizeof(ty));
+            snprintf(arr, sizeof(arr), "[%u]", slots);
+            if (slots == 1) arr[0] = 0;
+            sb_put(&b, "layout(location = %u) %s%s%s out %s %s%s;\n", v->location,
+                   v->flat ? "flat " : "", v->noperspective ? "noperspective " : "",
+                   v->centroid ? "centroid " : "", ty, name, arr);
+            if (v->location + slots > next_loc) next_loc = v->location + slots;
+            continue;
+        }
         sb_put(&b, "layout(location = %u) %s%s%s out %s %s%s;\n", v->location,
                v->flat ? "flat " : "", v->noperspective ? "noperspective " : "",
                v->centroid ? "centroid " : "", glsl_type_name(v->base, v->rows, v->cols), name, arr);
@@ -3111,6 +3160,35 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
             snprintf(name, sizeof(name), "mgl_ob%d", i);
         else
             snprintf(name, sizeof(name), "%s", v->name);
+        if (v->base == GL_DOUBLE)
+        {
+            /* fill the u32-slot representation: slot (e,c,p) of the interface
+             * holds doubles 2p and 2p+1 of column c of element e */
+            char ty[32];
+            GLuint slots = geom_double_iface(v->rows, v->cols, v->elems > 0 ? v->elems : 1, ty, sizeof(ty));
+            GLuint cs = (v->cols ? v->cols : 1) * ((v->rows + 1) / 2);   /* slots per element */
+            for (GLuint e = 0; e < (v->elems > 0 ? v->elems : 1u); e++)
+            for (GLuint c = 0; c < (v->cols ? v->cols : 1u); c++)
+            for (GLuint p = 0; p < ((v->rows + 1) / 2); p++)
+            {
+                GLuint base = v->offset + e * v->cols * v->rows * 2;
+                GLuint w0 = base + (c * v->rows + 2 * p) * 2;
+                GLuint w1 = base + (c * v->rows + 2 * p + 1) * 2;
+                char dst[192], one[64];
+                if (2 * p + 1 < v->rows)
+                    snprintf(one, sizeof(one), "uvec2(mgl_draw[r + %u], mgl_draw[r + %u])", w0, w1);
+                else
+                    snprintf(one, sizeof(one), "uvec2(mgl_draw[r + %u], 0u)", w0);
+                if (slots == 1 && strcmp(ty, "uvec2") == 0)
+                    snprintf(dst, sizeof(dst), "%s = %s;", name, one);
+                else if (slots == 1)
+                    snprintf(dst, sizeof(dst), "%s = uvec4(%s, 0u, 0u);", name, one);
+                else
+                    snprintf(dst, sizeof(dst), "%s[%u] = uvec4(%s, 0u, 0u);", name, e * cs + c * ((v->rows + 1) / 2) + p, one);
+                sb_put(&b, "    %s\n", dst);
+            }
+            continue;
+        }
         for (GLuint e = 0; e < (v->elems > 0 ? v->elems : 1u); e++)
         {
             char arr[32] = "";
@@ -3363,8 +3441,21 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         goto done;
     }
 
-    if (!geom_reflect_stage(m, true, gp->in_v, &gp->n_in, log)) goto done;
-    if (!geom_reflect_stage(m, false, gp->out_v, &gp->n_out, log)) goto done;
+    /* fp64: `words` is already software-double lowered (u32 words).  The
+     * interface tables must reflect the GL view — real double types — which
+     * compile_stage keeps in program->spirv[stage].ir; geom_derive_exprs
+     * reflects the vertex outputs from exactly that view, so reflecting the
+     * lowered module here makes every double varying a type mismatch.  The
+     * kernel generation below still uses the lowered module. */
+    {
+        SpvModule *vm = NULL;
+        const char *e2 = NULL;
+        if (program && program->spirv[stage].ir)
+            vm = spv_parse(program->spirv[stage].ir, program->spirv[stage].size, &e2);
+        if (!geom_reflect_stage(vm ? vm : m, true, gp->in_v, &gp->n_in, log)) { if (vm) spv_free(vm); goto done; }
+        if (!geom_reflect_stage(vm ? vm : m, false, gp->out_v, &gp->n_out, log)) { if (vm) spv_free(vm); goto done; }
+        if (vm) spv_free(vm);
+    }
 
     /* a named output interface block ("out B { vec4 c; } b;") is rewritten to a plain
      * struct + instance in the generated kernel (the body keeps writing b.c) and its
@@ -3849,8 +3940,9 @@ build:
 
         if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, gp->draw_entry, &lib, &fn, &err))
         {
+            char *msg = err ? xstrdup(err) : NULL;
             free(err);
-            GEOM_FAIL("pass-through vertex function Metal compile failed: %s", err ? err : "?");
+            GEOM_FAIL("pass-through vertex function Metal compile failed: %s", msg ? msg : "?");
         }
         if (gp->draw_library) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_library);
         if (gp->draw_function) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);

@@ -303,85 +303,84 @@ typedef struct TessVSPlan {
 /* VS input locations and their base type kinds, from the VS stage reflection list */
 static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTRIBS], int kind[MAX_ATTRIBS])
 {
-    SpirvResourceList *list = &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+    /* Walk the GL-view vertex module directly.  The resource list carries type
+     * ids of the *compiled* module, which for fp64 programs is the software-
+     * double-lowered one (u32 word pairs) while spirv[_VERTEX_SHADER].ir keeps
+     * the GL view (Float64 attributes); mixing the id spaces misresolves the
+     * base type and the fetch format ends up Float4 for a `double` attribute. */
+    uint32_t *ir = program->spirv[_VERTEX_SHADER].ir;
+    size_t n = program->spirv[_VERTEX_SHADER].size;
+    size_t k = 5;
 
     memset(has, 0, MAX_ATTRIBS * sizeof(bool));
     memset(kind, 0, MAX_ATTRIBS * sizeof(int));
+    if (!ir) return;
 
-    if (tTrace())
-        NSLog(@"MGL tess: VS stage inputs: %d", list->count);
-
-    for (int i = 0; i < list->count; i++)
+    while (k + 4 < n)
     {
-        SpirvResource *r = &list->list[i];
+        uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
 
-        /* the location decoration lives on the variable */
-        int loc = -1;
-        uint32_t *ir = program->spirv[_VERTEX_SHADER].ir;
-        size_t n = program->spirv[_VERTEX_SHADER].size;
-        size_t k = 5;
-        while (k + 3 < n)
+        if (wc == 0) break;
+        if (op == 59 /* OpVariable */ && ir[k + 3] == SpvStorageClassInput)
         {
-            uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
-            if (wc == 0) break;
-            if (op == 71 /* OpDecorate */ && ir[k + 1] == r->_id && ir[k + 2] == 30 /* Location */)
+            /* OpVariable layout: (result TYPE, result ID, storage class) */
+            uint32_t var_id = ir[k + 2], type_id = ir[k + 1];
+            const char *name = NULL;
+            int loc = -1;
+            size_t j = 5;
+
+            while (j + 3 < n)
             {
-                loc = (int)ir[k + 3];
-                break;
+                uint32_t wc2 = ir[j] >> 16, op2 = ir[j] & 0xffff;
+                if (wc2 == 0) break;
+                if (op2 == 71 /* OpDecorate */ && ir[j + 1] == var_id && ir[j + 2] == 30 /* Location */)
+                    loc = (int)ir[j + 3];
+                else if (op2 == 5 /* OpName */ && ir[j + 1] == var_id)
+                    name = (const char *)&ir[j + 2];
+                if (loc >= 0 && name) break;
+                j += wc2;
             }
-            k += wc;
-        }
-        if (loc < 0 || loc >= MAX_ATTRIBS)
-        {
-            if (tTrace())
-                NSLog(@"MGL tess: VS input %@ has no location (id %u)", [NSString stringWithUTF8String:r->name ? r->name : "?"], r->_id);
-            continue;
-        }
-
-        has[loc] = true;
-
-        /* resolve the base type: OpTypePointer -> (OpTypeVector)? -> OpTypeFloat / OpTypeInt */
-        uint32_t type_id = r->base_type_id;
-        int vec = 1;
-        for (int pass = 0; pass < 2 && type_id; pass++)
-        {
-            k = 5;
-            while (k + 3 < n)
+            /* skip builtins (gl_*): they carry no location anyway */
+            if (loc >= 0 && loc < MAX_ATTRIBS &&
+                !(name && name[0] == 'g' && name[1] == 'l' && (name[2] == 0 || name[2] == '_')))
             {
-                uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
-                if (wc == 0) break;
-                if (ir[k + 1] == type_id)
+                int pass = 0;
+                bool done = false;
+                while (!done && pass++ < 3 && type_id)
                 {
-                    if (op == 23 /* OpTypeVector */)
+                    size_t m = 5;
+                    while (m + 3 < n)
                     {
-                        type_id = ir[k + 2];
-                        vec = ir[k + 3];
-                        break;
+                        uint32_t wc3 = ir[m] >> 16, op3 = ir[m] & 0xffff;
+                        if (wc3 == 0) break;
+                        if (ir[m + 1] == type_id)
+                        {
+                            if (op3 == 23 /* OpTypeVector */) { type_id = ir[m + 2]; break; }
+                            if (op3 == 32 /* OpTypePointer */) { type_id = ir[m + 3]; break; }
+                            if (op3 == 22 /* OpTypeFloat */)
+                            {
+                                kind[loc] = ir[m + 2] == 64 ? MGL_VA_KIND_DOUBLE : MGL_VA_KIND_FLOAT;   /* (result, width) */
+                                done = true; break;
+                            }
+                            if (op3 == 21 /* OpTypeInt */)
+                            {
+                                kind[loc] = ir[m + 3] ? MGL_VA_KIND_INT : MGL_VA_KIND_UINT;
+                                done = true; break;
+                            }
+                            done = true; break;
+                        }
+                        m += wc3;
                     }
-                    if (op == 32 /* OpTypePointer */)
-                    {
-                        type_id = ir[k + 3];
-                        break;
-                    }
-                    if (op == 4 /* OpTypeFloat */)
-                    {
-                        kind[loc] = ir[k + 3] == 64 ? MGL_VA_KIND_DOUBLE : MGL_VA_KIND_FLOAT;
-                        type_id = 0;
-                        break;
-                    }
-                    if (op == 5 /* OpTypeInt */)
-                    {
-                        kind[loc] = ir[k + 3] ? MGL_VA_KIND_INT : MGL_VA_KIND_UINT;
-                        type_id = 0;
-                        break;
-                    }
-                    break;
                 }
-                k += wc;
+                /* kind 0 = MGL_VA_KIND_FLOAT: has[] marks the slot even when the
+                 * kind stays at the float default */
+                if (name || loc >= 0)
+                    has[loc] = true;
             }
         }
-        (void)vec;
+        k += wc;
     }
+    (void)ctx;
 }
 
 /* forward declarations (helpers used by the draw path) */
