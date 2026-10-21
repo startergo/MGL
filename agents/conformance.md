@@ -223,7 +223,7 @@ shading_language_420pack 13→21 pass, limits 112→117 pass.
 ### Per-group tally (this pass, complete; groups with no Pass in bold sorted first)
 
 ```
-  packed_pixels                           250  Fail=249 Pass=1
+  packed_pixels                           250  Fail=249 Pass=1        → **250/250 Pass (round 33)**
   sample_variables                        190  Fail=144 NotSupported=38 Pass=8
   direct_state_access                     371  Pass=297 Fail=70 InternalError=2 CompatWarn=1 Crash=1
   shader_storage_buffer_object            124  Fail=70 Pass=54
@@ -314,6 +314,11 @@ shading_language_420pack 13→21 pass, limits 112→117 pass.
 | 11  | `Invalid result` (sampler gather offsets) | gpu_shader5.texture_gather_offset_color_array | textureGather offsets on arrays (samplers) |
 
 ### geom-domain notes from this pass
+
+* **Round 33 (MGL @ edbec60)**: `packed_pixels` is now **250/250** — see
+  agents/geom_report.md (round 33) for the four pixel-transfer bugs behind it. All other
+  numbers in the table above are from the round-32 full pass; the neighbouring texture
+  groups were re-checked unchanged after the fix.
 
 * `transform_feedback` **20/20** (incl. `draw_xfb_stream_test`, `draw_xfb_stream_instanced_test`
   — the multi-stream work of this round) and `geometry_shader` 133/136.

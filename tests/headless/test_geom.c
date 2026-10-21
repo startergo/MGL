@@ -4063,6 +4063,37 @@ TEST(r31_gs_image_reads)
     glDeleteVertexArrays(1, &vao);
 }
 
+/* the sample_variables builtins: glslang does not declare gl_NumSamples for desktop GLSL
+ * (an OES_sample_variables builtin there), so MGL injects it as the constant GL says it is
+ * (baked from the current draw framebuffer's sample count).  KHR-GL46.sample_variables
+ * needs all five in one program. */
+TEST(sample_variables_builtins)
+{
+    const char *fs =
+        "#version 440 core\n"
+        "layout(location = 0) out vec4 o_color;\n"
+        "uniform uint mask;\n"
+        "void main()\n"
+        "{\n"
+        "    for (int i = 0; i < (gl_NumSamples + 31) / 32; ++i)\n"
+        "        gl_SampleMask[i] = int(mask);\n"
+        "    o_color = vec4(gl_SamplePosition, float(gl_SampleID) / 32.0, 1.0);\n"
+        "    o_color.a = float(gl_SampleMaskIn[0]) / 255.0;\n"
+        "}\n";
+    const char *vs =
+        "#version 440 core\n"
+        "void main() { gl_Position = vec4(0.0); }\n";
+    GLuint p = glCreateProgram();
+    GLint ls = 0;
+
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
@@ -4093,6 +4124,7 @@ int main(void)
     RUN_IF(primitive_queries);
     RUN_IF(xfb_of_geometry_output);
     RUN_IF(xfb_streams);
+    RUN_IF(sample_variables_builtins);
     RUN_IF(xfb_multi_stream_capture);
     RUN_IF(xfb_multi_stream_instanced);
     RUN_IF(xfb_strip_decomposition);

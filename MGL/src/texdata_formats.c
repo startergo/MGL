@@ -472,36 +472,32 @@ GLenum tdValidateFormatType(GLenum format, GLenum type)
             return GL_NO_ERROR;
         case GL_UNSIGNED_INT_10F_11F_11F_REV:
         case GL_UNSIGNED_INT_5_9_9_9_REV:
-            /* table 8.3: the float-packed types carry RGB / BGR */
-            return (format == GL_RGB || format == GL_BGR) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+            /* table 8.3: the float-packed types carry RGB only */
+            return format == GL_RGB ? GL_NO_ERROR : GL_INVALID_OPERATION;
         case GL_UNSIGNED_INT_24_8:
         case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
             return format == GL_DEPTH_STENCIL ? GL_NO_ERROR : GL_INVALID_OPERATION;
         case GL_UNSIGNED_INT_2_10_10_10_REV:
-            /* table 8.3: RGBA / BGRA / RGB / BGR and the RGBA/BGRA integer twins */
-            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGB ||
-                    format == GL_BGR || format == GL_RGBA_INTEGER ||
+            /* table 8.3: RGBA / BGRA and their integer twins */
+            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER ||
                     format == GL_BGRA_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
         case GL_UNSIGNED_INT_8_8_8_8:
         case GL_UNSIGNED_INT_8_8_8_8_REV:
-            /* table 8.3: RGBA / BGRA / RGB / BGR and their integer twins */
-            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGB ||
-                    format == GL_BGR || format == GL_RGBA_INTEGER ||
-                    format == GL_BGRA_INTEGER || format == GL_RGB_INTEGER ||
-                    format == GL_BGR_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+            /* table 8.3: RGBA / BGRA and their integer twins */
+            return (format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER ||
+                    format == GL_BGRA_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
         default:
             if (!td_packed(type, &pk)) return GL_INVALID_ENUM;
             if (pk.n == 3)
                 return (format == GL_RGB || format == GL_RGB_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
-            /* table 8.3: 4_4_4_4(_REV), 5_5_5_1, 1_5_5_5_REV, 10_10_10_2 also carry
-             * the 3-component formats (the 4th component of the data is dropped) */
+            /* table 8.3: 4_4_4_4(_REV), 5_5_5_1, 1_5_5_5_REV, 10_10_10_2 carry the
+             * 4-component formats only */
             return (format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER ||
-                    format == GL_BGRA_INTEGER || format == GL_RGB || format == GL_BGR)
-                ? GL_NO_ERROR : GL_INVALID_OPERATION;
+                    format == GL_BGRA_INTEGER) ? GL_NO_ERROR : GL_INVALID_OPERATION;
     }
 }
 
-GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, bool for_read)
+GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op)
 {
     TDClientFormat cf;
     if (!td_client_format(format, &cf)) return GL_INVALID_ENUM;
@@ -515,11 +511,20 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, bool f
             if (!tex_depth) return GL_INVALID_OPERATION;
             break;
         case GL_DEPTH_STENCIL:
-            if (f->base != GL_DEPTH_STENCIL && !(for_read && tex_depth)) return GL_INVALID_OPERATION;
-            if (f->base != GL_DEPTH_STENCIL) return GL_INVALID_OPERATION;
+            /* DEPTH_STENCIL data also feeds a DEPTH_COMPONENT texture (the stencil
+             * component is dropped); reading it back needs the two-channel internal
+             * format (GL 4.6 8.4: getTexImage of a depth-only texture answers
+             * DEPTH_COMPONENT / FLOAT) */
+            if (!tex_depth) return GL_INVALID_OPERATION;
+            if (f->base != GL_DEPTH_STENCIL && op != TD_PIX_TEXIMAGE && op != TD_PIX_SUBIMAGE)
+                return GL_INVALID_OPERATION;
             break;
         case GL_STENCIL_INDEX:
+            /* glTexImage cannot upload stencil data at all (GL 4.6 table 8.11: the
+             * stencil internal formats are TexStorage-only), SubImage and the clears
+             * can (table 8.14) */
             if (!tex_stencil) return GL_INVALID_OPERATION;
+            if (op == TD_PIX_TEXIMAGE) return GL_INVALID_OPERATION;
             break;
         default:
             if (tex_ds) return GL_INVALID_OPERATION;
@@ -527,6 +532,8 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, bool f
             if (((f->flags & TDF_INTEGER) != 0) != cf.integer) return GL_INVALID_OPERATION;
             break;
     }
+    if (op == TD_PIX_TEXIMAGE && f->base == GL_STENCIL_INDEX)
+        return GL_INVALID_OPERATION;      /* no stencil internal format for TexImage */
     (void)type;
     return GL_NO_ERROR;
 }
@@ -648,6 +655,9 @@ static inline uint64_t f_to_un(double f, int bits)
 static inline int64_t f_to_sn(double f, int bits)
 {
     if (isnan(f)) f = 0;
+    /* GL 4.6 2.3.5.2: -1.0 maps to the MOST NEGATIVE value, not to -(2^(b-1)-1), so the
+     * snorm round-trip of the minimum is exact (RGB8_SNORM uploads of -128 came back -127) */
+    if (f <= -1.0) return -(int64_t)(1ull << (bits - 1));
     return (int64_t)llround(clampd(f, -1.0, 1.0) * (double)((1ull << (bits - 1)) - 1));
 }
 
@@ -1097,16 +1107,10 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             storage_read_row(f, s, ss, w, tmp);
-            /* a signed-normalized storage read back through an unsigned
-             * normalised client maps [-1,1] into [0,1] (GL 4.6 8.5.4: final
-             * conversion to the client's representation); float and signed
-             * clients keep the value as it is, and channels the storage does
-             * not have keep their (0,0,0,1) defaults in client units */
-            if ((f->kind == TDK_SN8 || f->kind == TDK_SN16) && !cf_integer &&
-                !cf_signed_norm && !cf_float_client)
-                for (int x = 0; x < w; x++)
-                    for (int ci = 0; ci < f->ncomp && ci < 4; ci++)
-                        tmp[x].c[ci] = tmp[x].c[ci] * 0.5f + 0.5f;
+            /* a signed-normalized storage read back through any client keeps its value:
+             * GL 4.6 8.5.4 converts through floats and clamps to what the CLIENT type
+             * represents (an UNSIGNED_BYTE read of -0.5 clamps to 0, it is not biased to
+             * 0.25 - KHR-GL46.packed_pixels compares these) */
             client_write_row(o, format, type, swap_bytes, w, tmp);
         }
     }

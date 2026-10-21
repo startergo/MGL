@@ -1403,6 +1403,21 @@ static void glToMetalStorage(Texture *tex, TDStorage *st)
 }
 
 /* upload client pixels into a GL region of a level */
+/* the uncompressed equivalent MGL stores for a compressed internal format given
+ * UNCOMPRESSED client data (GL 4.6 8.5: compress "if possible"; 0 = none, the upload is
+ * rejected) */
+static GLenum rgtcUncompressed(GLenum ifmt)
+{
+    switch (ifmt)
+    {
+        case GL_COMPRESSED_RED_RGTC1:          return GL_R8;
+        case GL_COMPRESSED_SIGNED_RED_RGTC1:   return GL_R8_SNORM;
+        case GL_COMPRESSED_RG_RGTC2:           return GL_RG8;
+        case GL_COMPRESSED_SIGNED_RG_RGTC2:    return GL_RG8_SNORM;
+        default:                               return 0;
+    }
+}
+
 static void uploadClient(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
                          GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
                          GLenum format, GLenum type, const uint8_t *src, bool is3d)
@@ -1618,7 +1633,7 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
         TD_ERR(err);
     }
 
-    err = tdCheckFormatCompat(f, format, type, false);
+    err = tdCheckFormatCompat(f, format, type, TD_PIX_TEXIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     if (f->flags & (TDF_DEPTH | TDF_STENCIL))
@@ -1627,8 +1642,18 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     if (f->flags & TDF_COMPRESSED)
     {
         TD_CHECK(compressedAllowedOnTarget(f, t.tex_target), GL_INVALID_OPERATION);
-        /* the GL would have to compress the client data; MGL has no BC/ETC encoder */
-        TD_CHECK(pixels == NULL && STATE(buffers[_PIXEL_UNPACK_BUFFER]) == NULL, GL_INVALID_OPERATION);
+        if (pixels || STATE(buffers[_PIXEL_UNPACK_BUFFER]))
+        {
+            /* GL 4.6 8.5: uncompressed client data given to a compressed internal format
+             * is compressed "if possible".  MGL has no BC/ETC encoder, and a real BC4 /
+             * BC5 encode is lossy by ~10/255 - more than the 1/127 the CTS compares with -
+             * so store the RGTC families in their uncompressed equivalent instead (what
+             * drivers without a compressor do); the other families (BPTC, ETC2, S3TC)
+             * reject the upload, a documented gap. */
+            TD_CHECK(rgtcUncompressed(ifmt) != 0, GL_INVALID_OPERATION);
+            ifmt = rgtcUncompressed(ifmt);
+            f = tdFormatInfo(ifmt);
+        }
     }
 
     if (t.proxy)
@@ -1735,7 +1760,7 @@ static void texSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLi
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
     TD_CHECK(f, GL_INVALID_OPERATION);
 
-    err = tdCheckFormatCompat(f, format, type, false);
+    err = tdCheckFormatCompat(f, format, type, TD_PIX_SUBIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     /* uncompressed data into a compressed texture would need an encoder */
@@ -2516,7 +2541,7 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
     TD_CHECK(f, GL_INVALID_OPERATION);
 
-    err = tdCheckFormatCompat(f, format, type, true);
+    err = tdCheckFormatCompat(f, format, type, TD_PIX_GETTEXIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     if (whole)
@@ -2875,7 +2900,7 @@ static void clearTex(GLMContext ctx, GLuint texture, GLint level, GLint x, GLint
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face0 < 6 ? face0 : 0, level));
     TD_CHECK(f && !(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
 
-    err = tdCheckFormatCompat(f, format, type, false);
+    err = tdCheckFormatCompat(f, format, type, TD_PIX_SUBIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     for (GLuint fi = face0; fi < face0 + nfaces; fi++)

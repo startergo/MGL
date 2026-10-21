@@ -11,6 +11,8 @@
  *   tdUnpack() / tdPack()   GL format/type <-> Metal storage layout
  *   tdConvertStorage()      storage layout -> storage layout (copy w/ conversion)
  *   tdDecodeETC()           CPU ETC2/EAC decoder (fallback when the GPU lacks ETC)
+ *   tdEncodeRGTC()          CPU BC4/BC5 (RGTC) encoder (glTexImage with a compressed
+ *                           internal format and uncompressed client data)
  */
 #ifndef TEXDATA_FORMATS_H
 #define TEXDATA_FORMATS_H
@@ -92,7 +94,9 @@ size_t tdStorageImageBytes(const TDFormat *f, int w, int h);
 /* GL_NO_ERROR, GL_INVALID_ENUM or GL_INVALID_OPERATION for a format/type pair */
 GLenum tdValidateFormatType(GLenum format, GLenum type);
 /* GL_NO_ERROR or GL_INVALID_OPERATION: can client format be used with a texture of this format? */
-GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, bool for_read);
+GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op);
+/* pixel-operation selector for tdCheckFormatCompat (see its comment) */
+enum { TD_PIX_TEXIMAGE = 0, TD_PIX_SUBIMAGE = 1, TD_PIX_GETTEXIMAGE = 2 };
 
 /* bytes per pixel group (0 if invalid) */
 size_t tdClientPixelSize(GLenum format, GLenum type);
@@ -141,6 +145,11 @@ void tdConvertStorage(const TDFormat *sf, const TDStorage *src, const TDFormat *
 /* ETC2/EAC CPU decode of a w x h image (block data tightly packed) into the
  * decoded storage of f (RGBA8 / R16 / RG16, snorm for signed EAC). */
 void tdDecodeETC(const TDFormat *f, const void *blocks, int w, int h, void *dst, size_t dst_row);
+
+/* compress w x h x d 8-bit samples (row pitch rw, image pitch iw) into the image's BC4 /
+ * BC5 (RGTC1 / RGTC2, signedness per snorm) blocks; NULL on allocation failure. */
+uint8_t *tdEncodeRGTC(const uint8_t *chan0, const uint8_t *chan1, int w, int h, int d,
+                      size_t rw, size_t iw, bool two_channel, bool snorm);
 
 /* half <-> float */
 float    tdHalfToFloat(uint16_t h);

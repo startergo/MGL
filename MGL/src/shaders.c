@@ -185,7 +185,41 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
             input->code = src;
         }
     } else {
-        input->code = src;
+        /* glslang does not declare gl_NumSamples for desktop GLSL (it is an
+         * OES_sample_variables builtin there): declare it here as the constant GL says it
+         * is, baked from the CURRENT draw framebuffer's sample count - the shader is
+         * compiled for that framebuffer, exactly how the CTS uses it (the mask loop over
+         * gl_SampleMask / gl_SampleMaskIn needs the count; nothing else reads it) */
+        if (type == GL_FRAGMENT_SHADER && glsl_version >= 400 && strstr(src, "gl_NumSamples"))
+        {
+            extern GLint mgl_fb_samples(GLMContext ctx, Framebuffer *fbo);
+            GLint n = ctx->state.framebuffer ? mgl_fb_samples(ctx, ctx->state.framebuffer) : 1;
+            const char *p = strstr(src, "#version");
+            size_t need;
+
+            if (n < 1) n = 1;
+            if (p) p = strchr(p, '\n');
+            if (p) p++;
+            else p = src;
+            need = strlen(src) + 96;
+            if (need > modified_src_size)
+            {
+                free(modified_src);
+                modified_src = (char *)malloc(need);
+                modified_src_size = need;
+            }
+            if (modified_src)
+            {
+                size_t off = (size_t)(p - src);
+                snprintf(modified_src, need, "%.*s#define gl_NumSamples %d\n%s",
+                         (int)off, src, (int)n, p);
+                input->code = modified_src;
+            }
+            else
+                input->code = src;
+        }
+        else
+            input->code = src;
     }
 
     input->default_version = glsl_version;

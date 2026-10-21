@@ -543,7 +543,11 @@ static GLenum checkFormatType(GLenum format, GLenum type)
             return (format == GL_RGB) ? GL_NO_ERROR : GL_INVALID_OPERATION;
         if (p.n != n)
             return GL_INVALID_OPERATION;
-        if (n == 3 && !(format == GL_RGB || format == GL_BGR || format == GL_RGB_INTEGER || format == GL_BGR_INTEGER))
+        /* GL 4.6 table 8.3 (the same pairs tdValidateFormatType enforces for uploads):
+         * the 3-component packed types carry RGB only, the 4-component ones RGBA / BGRA
+         * and their integer twins (a BGR / 5_6_5 read is invalid even though the counts
+         * match, KHR-GL46.packed_pixels checks it) */
+        if (n == 3 && !(format == GL_RGB || format == GL_RGB_INTEGER))
             return GL_INVALID_OPERATION;
         if (n == 4 && !(format == GL_RGBA || format == GL_BGRA || format == GL_RGBA_INTEGER || format == GL_BGRA_INTEGER))
             return GL_INVALID_OPERATION;
@@ -624,6 +628,13 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
             if (!readColorSource(ctx, fbo, &attachment, &fi))
                 FB_ERROR(GL_INVALID_OPERATION);
             int k = kindForFormatInfo(fi);
+
+            /* the client format must be integer exactly when the attachment is (GL 4.6
+             * 8.2); beyond that any component count is accepted (GL_RED / GL_GREEN /
+             * GL_BGR ... reads of an RGBA buffer drop or reorder components), and the
+             * (format,type) pair must pass the table in checkFormatType above.  KHR-GL46
+             * packed_pixels relies on reads like GL_RED / GL_FLOAT of an R32F attachment
+             * working, which the strict RGBA-only reading of the spec would reject */
             if (integer != (k != MGL_FB_KIND_FLOAT))
                 FB_ERROR(GL_INVALID_OPERATION);
             aspect = MGL_FB_ASPECT_COLOR;

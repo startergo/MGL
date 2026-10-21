@@ -1,4 +1,92 @@
-READY 63343cc (geometry_shader 133/136 + transform_feedback 18/20 under the 480 s cap; headless suite green; test_geom 541 checks / 0 failures)
+READY edbec60 (packed_pixels 250/250, was 1/250; headless suite green; test_geom 580 checks / 0 failures)
+
+# geom domain — round 33 handoff (packed_pixels cluster)
+
+Branch `gl46/geom`, code tip `edbec60`. Baselines: `test_geom` 580 checks / 0 failures, whole
+`tests/headless/run.sh` green (57 binaries), CTS `KHR-GL46.packed_pixels` **250/250 Pass**
+(results dirs `~/MGL-cts/geom32-pp10`), and the neighbouring groups re-checked unchanged
+(pixelstoragemodes 736 Pass / 160 NotSupported, texture_repeat_mode 162/162, texture_gather
+37/75, texture_border_clamp 26/32, texture_buffer 7/16, texture_view 1/7, copy_image 7/13,
+texture_swizzle 2/4 — all exactly the round-32 full-pass numbers).
+
+## What this round did
+
+Multi-stream transform feedback (round 32) is merged; the supervisor then assigned the
+top CTS failure clusters in size order. **Cluster 1: KHR-GL46.packed_pixels (249 fails → 0).**
+Four independent bugs, all in the pixel-transfer validation/conversion (`edbec60`):
+
+1. **table 8.3 exact pairs** (`texdata_formats.c: tdValidateFormatType`): MGL accepted
+   RGB/BGR with the 4-component packed types (4_4_4_4, 5_5_5_1, 1_5_5_5_REV, 8_8_8_8(_REV),
+   10_10_10_2), BGR with the float-packed types, and RGB_INTEGER/BGR_INTEGER with 8_8_8_8 —
+   418 (format,type) combos the CTS proves invalid ("Invalid format used but glTexImage
+   succeeded", 148 of the 249 case failures).
+2. **operation-aware internal-format check** (`tdCheckFormatCompat`): glTexImage must
+   reject STENCIL_INDEX client data outright and refuse to create a stencil internal
+   format (GL 4.6 table 8.11 - those are TexStorage-only), SubImage/the clears still allow
+   stencil data, and DEPTH_STENCIL client data must also feed a DEPTH_COMPONENT texture
+   (the 18 "Valid format used but glTexImage failed").
+3. **readPixels pair table** (`framebuffer_ext.c: checkFormatType`): only the component
+   *count* was checked for packed types, so (BGR, 5_6_5) etc. were accepted; now the same
+   exact table 8.3 sets apply, while the colour branch deliberately stays permissive about
+   component counts (RED/GREEN/BGR reads of an RGBA buffer are legal on desktop GL - the
+   CTS reads back every non-packed colour pair and expects success).
+4. **SNORM conversions** (`f_to_sn`, the readback remap): -1.0 now maps to the most
+   negative value (2.3.5.2), so the snorm round-trip of the minimum is exact, and a snorm
+   storage read back through an unsigned-normalised client clamps to [0,1] instead of
+   biasing by 0.5 (8.5.4 converts through floats) - both were wrong by up to 128/255.
+5. **RGTC with uncompressed client data**: glTexImage(internalformat = COMPRESSED_*_RGTC1/2,
+   uncompressed data) now stores the format's uncompressed equivalent (GL 4.6 8.5
+   "compressed if possible"). I first wrote a real BC4/BC5 block encoder
+   (`td_rgtc.c`, self-consistent unit test) but the CTS compares gradients at 8-bit
+   precision with a 1/127 epsilon while BC4 on a ~145-unit-per-block ramp loses ~10/255 -
+   mathematically impossible to pass with real compression, so the encoder was dropped for
+   the storage substitution (what drivers without a compressor do). BPTC/ETC2/S3TC still
+   reject uncompressed uploads (documented gap; needs those encoders).
+
+`tests/headless/test_pixelformats.c` (the texdata agent's sweep) was updated to the same
+rules: the D4 sweep now skips the table-8.3-invalid combos and expects the clamped (not
+biased) snorm readback; 1292 combos, 0 failures.
+
+# geom domain — round 32 handoff (multi-stream transform feedback)
+
+Branch `gl46/geom`, code tip `f22b93a` (merge of gl46-port `64a3837` + the multi-stream xfb patch).
+Baselines: `test_geom` 580 checks / 0 failures, whole `tests/headless/run.sh` green (57 binaries),
+CTS `KHR-GL46.transform_feedback` **20/20 Pass** (`~/MGL-cts/mgl-results`).
+(Merged to gl46-port as 16e8498; round 33 continues above.)
+
+## What this round did (all committed)
+
+1. **Streams 1–3 are captured** (`f22b93a`, re-applies the reverted round-31 design, fixed):
+   the geometry-output pack runs one prefix + scatter pass per captured stream. The tags the
+   geometry kernel stamps in its records now carry *per-stream* captured-primitive ordinals
+   (`mgl_pt[4]` / `mgl_cl[4]` replacing the single `mgl_written` / `mgl_closes` counter), so
+   each stream's captures are numbered independently and land in the buffers its varyings
+   name. Changes vs. the reverted `.ref` (these are what fixed the two regressions):
+   * the scatter's capacity test checks only **this pass's** buffers (`in[22]` mask) — the
+     `.ref` tested all four, so a stream-0 pass could drop primitives because a stream-1
+     buffer was full under stream-0 numbering;
+   * the passes share one compute encoder held in a **strong local** `enc` (the `.ref` parked
+     it in `static void *gXfbEnc` with a plain `__bridge` cast — a use-after-release across
+     loop iterations);
+   * the counter block grew **per-stream block totals** (vertices [21..24], primitives written
+     [13..16], primitives emitted ("needed") [17..20]); the per-draw slots [9..12] are cleared
+     by the finish kernel of the draw that produced them, so multi-draw blocks no longer
+     double-count (the `.ref` folded only the last draw's per-draw value);
+   * the prefix pass atomically adds its scan total (the stream's emitted primitives) into
+     `xfb[17+st]`, which the resolve feeds to the queries domain as "needed" — this makes the
+     multi-stream `transform_feedback_overflow_query_ARB` cases count correctly too.
+2. **Tess-path finish kernel per-draw fix**: `xfb[8]` (its per-draw vertex counter) is cleared
+   after the offsets advance; two tess draws in one transform feedback block used to
+   double-advance the write offsets. It also mirrors its counts into the stream-0 block-total
+   slots the resolve reads.
+3. `MGLXfbVarying` (mgl_ext_xfb.h) gained `stream`; `geom_xfb_resolve` copies it from the
+   geometry stage's `MGLGeomVar.stream` (SPIR-V `Stream` decoration), and `mgl_geom_xfb_flush`
+   folds per-stream vertices / written / needed into the object, the context totals, and the
+   per-stream query buckets (`note(ctx, s, written, needed)` for all four streams).
+4. New tests `xfb_multi_stream_capture` and `xfb_multi_stream_instanced` (the CTS
+   `draw_xfb_stream{,_instanced}_test` shape: per-stream indexed queries, captured contents in
+   emission order, `glDrawTransformFeedbackStream[Instanced]` rasterizing each stream), plus a
+   `TEST_ONLY=<name>` filter in test_geom's `main` for debugging state cascades.
 
 # geom domain — round 31 handoff
 
@@ -70,21 +158,17 @@ special-name API error instead of a link failure (spec-correct).
   reports MAX_GEOMETRY_IMAGE_UNIFORMS = 8 (the kernel really binds image units; 0 was a spec
   violation for a 4.6 context, it only matched the CTS's ES constant table). Swap the two
   cases by reverting the value in get.c if you prefer the ES-table agreement.
-* `KHR-GL46.transform_feedback.draw_xfb_stream_test` / `draw_xfb_stream_instanced_test` fail:
-  xfb capture of *streams other than 0* is still not implemented. The multi-stream pack design
-  is fully worked out and was reverted only because two unrelated headless tests
-  (`xfb_of_geometry_output`, `xfb_of_tes_output`) regressed with it; the complete patch is
-  saved in this worktree at `tests/headless/scratch_dts2.c` (the CTS replica test) — see git history of this round for the reverted patch (per-stream record ordinals
-  `mgl_pt[4]`/`mgl_cl[4]`, per-stream pack passes driven by `in[20]`/`in[21]`, per-stream
-  counter-block slots xfb[9..20], per-stream fold + query note). Re-apply, fix the regression,
-  and both CTS cases pass (verified during the round).
-* Overflow queries (`GL_TRANSFORM_FEEDBACK_OVERFLOW_ARB`) are single-stream: the multi-stream
-  cases of `transform_feedback_overflow_query_ARB` fail with it (2 of 13; the same patch adds
-  the needed-vs-written per-stream counters).
+* Streams whose captures **interleave emission** (EmitStreamVertex(0) / EmitStreamVertex(1)
+  alternating inside one open strip) share one strip buffer in the kernel, so the two strips
+  are conflated — the CTS never interleaves, and GL only rasterizes stream 0, so only the
+  captured contents of such a shader would be wrong.
+* The CPU-pack fallback (`MGL_GEOM_CPU_XFB=1`) still captures stream 0 only; the GPU pack is
+  the default path.
 
 ## Shared-file edits this round (all surgical, all listed above)
 
-`MGLRenderer.m`, `MGLRenderer+RenderState.m`, `framebuffers.c`, `textures.c`,
+Round 32: `mgl_ext_xfb.h` (the `stream` field of `MGLXfbVarying`) — my files otherwise.
+Round 31: `MGLRenderer.m`, `MGLRenderer+RenderState.m`, `framebuffers.c`, `textures.c`,
 `textures_ext.c`, `mgl_ext_texext.h`, `get.c`, `program.c`, `draw_buffers.c`, `mgl_ext_xfb.h`,
 `tests/headless/test_xfb.c`. My own files: `geometry.c`, `MGLRenderer+Geometry.m`,
 `mgl_ext_geom.h`, `mgl_ext_geom_xfb.h`, `test_geom.c`.

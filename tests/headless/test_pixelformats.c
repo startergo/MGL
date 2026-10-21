@@ -119,6 +119,25 @@ static const float ref_float[5] = { -1.5f, -0.25f, 0.5f, 2.0f, 0.0625f };
 /* ---- the (format,type) matrix of table 8.3 ---------------------------- */
 typedef struct { GLenum fmt; GLenum type; const char *tag; int ncomp; int is_int; int bits[4]; } FT;
 
+/* the packed (table 8.3) client types */
+static int ft_packed(GLenum type)
+{
+    switch (type)
+    {
+        case GL_UNSIGNED_BYTE_3_3_2: case GL_UNSIGNED_BYTE_2_3_3_REV:
+        case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_5_6_5_REV:
+        case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_4_4_4_4_REV:
+        case GL_UNSIGNED_SHORT_5_5_5_1: case GL_UNSIGNED_SHORT_1_5_5_5_REV:
+        case GL_UNSIGNED_INT_8_8_8_8: case GL_UNSIGNED_INT_8_8_8_8_REV:
+        case GL_UNSIGNED_INT_10_10_10_2: case GL_UNSIGNED_INT_2_10_10_10_REV:
+        case GL_UNSIGNED_INT_10F_11F_11F_REV: case GL_UNSIGNED_INT_5_9_9_9_REV:
+        case GL_UNSIGNED_INT_24_8: case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* ncomp: components of the FORMAT (not storage). bits[]: bits per component
  * (for the reference quantisation); -1 = float precision. */
 static const FT fts[] = {
@@ -724,6 +743,38 @@ TEST(RequiredInternalFormatsSweep)
                     if (base_int != ft_int) continue;
                 }
                 else continue;
+
+                /* GL 4.6 table 8.3: a packed client type accepts only its formats -
+                 * RGB / RGB_INTEGER for the 3-component ones, RGBA / BGRA and their
+                 * integer twins for the 4-component ones, RGB for the float-packed,
+                 * DEPTH_STENCIL for the depth-stencil ones (matches the CTS rule table
+                 * KHR-GL46.packed_pixels enforces) */
+                if (ft_packed(ft->type))
+                {
+                    int rgb = (ft->fmt == GL_RGB || ft->fmt == GL_RGB_INTEGER);
+                    int rgba4 = (ft->fmt == GL_RGBA || ft->fmt == GL_BGRA ||
+                                 ft->fmt == GL_RGBA_INTEGER || ft->fmt == GL_BGRA_INTEGER);
+                    switch (ft->type)
+                    {
+                        case GL_UNSIGNED_BYTE_3_3_2:
+                        case GL_UNSIGNED_BYTE_2_3_3_REV:
+                        case GL_UNSIGNED_SHORT_5_6_5:
+                        case GL_UNSIGNED_SHORT_5_6_5_REV:
+                            if (!rgb) continue;
+                            break;
+                        case GL_UNSIGNED_INT_10F_11F_11F_REV:
+                        case GL_UNSIGNED_INT_5_9_9_9_REV:
+                            if (ft->fmt != GL_RGB) continue;
+                            break;
+                        case GL_UNSIGNED_INT_24_8:
+                        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+                            if (ft->fmt != GL_DEPTH_STENCIL) continue;
+                            break;
+                        default:
+                            if (!rgba4) continue;
+                            break;
+                    }
+                }
             }
 
             memset(up, 0, sizeof up);
@@ -919,12 +970,13 @@ TEST(RequiredInternalFormatsSweep)
                                 break;
                         }
 
-                        /* present the stored value to the readback: a snorm
-                         * storage maps [-1,1]->[0,1] only for unsigned
-                         * normalised clients (not float, not signed) */
+                        /* present the stored value to the readback: a snorm storage read
+                         * back through an unsigned normalised client CLAMPS to [0,1]
+                         * (GL 4.6 8.5.4 converts through floats; a negative value
+                         * clamps to 0, it is not biased - KHR-GL46.packed_pixels) */
                         if ((c->kind == K_SNORM8 || c->kind == K_SNORM16) &&
                             !float_client && !signed_client)
-                            out = stored * 0.5f + 0.5f;
+                            out = stored < 0.0f ? 0.0f : stored;
                         else
                             out = stored;
 
