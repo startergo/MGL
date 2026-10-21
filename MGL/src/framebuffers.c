@@ -1081,6 +1081,12 @@ static void framebufferTextureCommon(GLMContext ctx, Framebuffer *fbo, GLenum at
     }
 
     if (level < 0) FB_ERROR(GL_INVALID_VALUE);
+    /* GL 4.6 §9.2 (glFramebufferTexture): INVALID_VALUE when <level> is greater than the
+     * texture's maximum mip level (tex->num_levels = highest allocated level + 1, exact for
+     * texStorage textures; KHR-GL46.geometry_shader.layered_fbo.fb_texture_invalid_level_number
+     * attaches level 2 of a 2-level texture).  Skipped when no level is allocated, where the
+     * attachment is only framebuffer-incomplete. */
+    if (tex->num_levels && (GLuint)level >= tex->num_levels) FB_ERROR(GL_INVALID_VALUE);
 
     GLenum t = (kind == 2) ? textarget : tex->target;
     if ((t == GL_TEXTURE_RECTANGLE || t == GL_TEXTURE_2D_MULTISAMPLE || t == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) && level != 0)

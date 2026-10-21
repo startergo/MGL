@@ -3355,6 +3355,366 @@ TEST(pool_wrap_stress_tiny)
     glDeleteBuffers(1, &tvbo);
 }
 
+
+/* ===================== round 31 regression tests (CTS geometry_shader fixes) =========== */
+
+static const char *r31_vs = "#version 450 core\n"
+    "void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+static const char *r31_fs = "#version 450 core\n"
+    "out vec4 c; void main() { c = vec4(0.2); }\n";
+
+/* a separable geometry-only program links and answers the four geometry queries before it is
+ * ever drawn (KHR-GL46.geometry_shader.api.getProgramiv3 builds one with glCreateShaderProgramv) */
+TEST(r31_gs_only_spo_queries)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles, invocations = 7) in;\n"
+        "layout(triangle_strip, max_vertices = 33) out;\n"
+        "void main() {\n"
+        "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    GLuint s = compile(GL_GEOMETRY_SHADER, gs);
+    char log[4096] = "";
+    GLsizei len = 0;
+    char *src[1] = { (char *)gs };
+    GLuint p = glCreateShaderProgramv(GL_GEOMETRY_SHADER, 1, (const char **)src);
+    (void)s;
+    GLint ls = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    if (!ls) { glGetProgramInfoLog(p, sizeof log, &len, log); printf("spo link: %s\n", log); }
+    EXPECT_EQ_INT(ls, 1);
+    if (!ls) { glDeleteProgram(p); return; }
+
+    GLint v = -1;
+    glGetProgramiv(p, GL_GEOMETRY_INPUT_TYPE, &v);
+    EXPECT_EQ_INT(v, GL_TRIANGLES);
+    v = -1; glGetProgramiv(p, GL_GEOMETRY_OUTPUT_TYPE, &v);
+    EXPECT_EQ_INT(v, GL_TRIANGLE_STRIP);
+    v = -1; glGetProgramiv(p, GL_GEOMETRY_VERTICES_OUT, &v);
+    EXPECT_EQ_INT(v, 33);
+    v = -1; glGetProgramiv(p, GL_GEOMETRY_SHADER_INVOCATIONS, &v);
+    EXPECT_EQ_INT(v, 7);
+    glDeleteProgram(p);
+}
+
+/* every SSBO bound with glBindBufferRange must land in its own slice of the buffer
+ * (KHR-GL46.geometry_shader.api.max_shader_storage_blocks binds one buffer 8 times) */
+TEST(r31_ssbo_range_bindings)
+{
+    GLint align = 0, maxb = 0;
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &align);
+    glGetIntegerv(GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS, &maxb);
+    EXPECT_TRUE(align >= 4 && maxb >= 2);
+    int n = maxb < 8 ? maxb : 8;
+
+    char gs[4096];
+    int w = 0;
+    w += snprintf(gs + w, sizeof gs - w, "#version 450 core\n"
+        "layout(points) in;\nlayout(points, max_vertices = 1) out;\nint counter = 0;\n");
+    for (int i = 0; i < n; i++)
+        w += snprintf(gs + w, sizeof gs - w,
+            "layout(binding = %d) buffer ssb%d { int value; } S_SSB%d;\n", i, i, i);
+    w += snprintf(gs + w, sizeof gs - w, "void main() {\n");
+    for (int i = 0; i < n; i++)
+        w += snprintf(gs + w, sizeof gs - w, "  counter += S_SSB%d.value++;\n", i);
+    w += snprintf(gs + w, sizeof gs - w,
+        "  gl_Position = vec4(float(counter), 0.0, 0.0, 1.0);\n EmitVertex();\n EndPrimitive();\n}\n");
+
+    GLuint p = program(r31_vs, gs, r31_fs);
+    GLint ls = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, 1);
+    if (!ls) { glDeleteProgram(p); return; }
+
+    int ints = align / 4;
+    GLint data[8 * 256];
+    for (int i = 0; i < n; i++) data[i * ints] = i + 1;
+    GLuint ssbo = 0;
+    glGenBuffers(1, &ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * align, data, GL_DYNAMIC_COPY);
+    for (int i = 0; i < n; i++)
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, i, ssbo, i * align, 4);
+
+    GLuint tf = 0, vao = 0;
+    glGenBuffers(1, &tf);
+    glGenVertexArrays(1, &vao);
+    float init[4] = {0,0,0,0};
+    glBindBuffer(GL_ARRAY_BUFFER, tf);
+    glBufferData(GL_ARRAY_BUFFER, 16, init, GL_STATIC_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tf);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    const char *vars[] = {"gl_Position"};
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float *m = glMapBufferRange(GL_ARRAY_BUFFER, 0, 16, GL_MAP_READ_BIT);
+    float want = 0;
+    for (int i = 0; i < n; i++) want += (float)(i + 1);
+    EXPECT_TRUE(m && m[0] == want);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    int *s = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, n * align, GL_MAP_READ_BIT);
+    int bad = -1;
+    for (int i = 0; i < n; i++)
+        if (s && s[i * ints] != i + 2) { bad = i; break; }
+    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    EXPECT_EQ_INT(bad, -1);
+    glDeleteProgram(p);
+    glDeleteBuffers(1, &ssbo);
+    glDeleteBuffers(1, &tf);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* blending into a layered 3D attachment: the raster pass must build its pipeline from the
+ * pass-through vertex function (no point_size write) with triangle topology
+ * (KHR-GL46.geometry_shader.layered_framebuffer.blending_support) */
+TEST(r31_layered_blending)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 64) out;\n"
+        "void main() {\n"
+        "  for (int n = 0; n < 4; ++n) {\n"
+        "    gl_Layer = n; gl_Position = vec4( 1,  1, 0, 1); EmitVertex();\n"
+        "    gl_Layer = n; gl_Position = vec4( 1, -1, 0, 1); EmitVertex();\n"
+        "    gl_Layer = n; gl_Position = vec4(-1,  1, 0, 1); EmitVertex();\n"
+        "    gl_Layer = n; gl_Position = vec4(-1, -1, 0, 1); EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "  }\n"
+        "}\n";
+    GLuint p = program(r31_vs, gs, r31_fs);
+    GLint ls = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, 1);
+    if (!ls) { glDeleteProgram(p); return; }
+
+    const int W = 4, H = 4, D = 4;
+    unsigned char buf[4][H * W * 4], ref[4][H * W * 4];
+    for (int s = 0; s < D; s++)
+        for (int n = 0; n < W * H; n++)
+        {
+            unsigned char *px = &buf[s][n * 4];
+            px[0] = 0; px[1] = (unsigned char)(s * 255 / 4);
+            px[2] = (unsigned char)(s * 255 / 8); px[3] = (unsigned char)(s * 255 / 12);
+            for (int c = 0; c < 4; c++) {
+                float d = px[c] / 255.0f, t = d * d + 0.8f * 0.2f;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                ref[s][n * 4 + c] = (unsigned char)(t * 255.0f);
+            }
+        }
+    GLuint tex = 0, fbo = 0, vao = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA8, W, H, D);
+    for (int s = 0; s < D; s++)
+        glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, s, W, H, 1, GL_RGBA, GL_UNSIGNED_BYTE, buf[s]);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glViewport(0, 0, W, H);
+    glBlendFunc(GL_ONE_MINUS_SRC_COLOR, GL_DST_COLOR);
+    glEnable(GL_BLEND);
+    glUseProgram(p);
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+
+    GLuint rf = 0;
+    glGenFramebuffers(1, &rf);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, rf);
+    for (int layer = 0; layer < D; layer++)
+    {
+        unsigned char out[H * W * 4];
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, layer);
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, out);
+        for (int i = 0; i < W * H; i++)
+            for (int c = 0; c < 4; c++)
+                if (abs((int)out[i * 4 + c] - (int)ref[layer][i * 4 + c]) > 1)
+                {
+                    printf("layer %d px %d ch %d: %d vs %d\n", layer, i, c,
+                           out[i * 4 + c], ref[layer][i * 4 + c]);
+                    EXPECT_TRUE(0);
+                    c = 4; i = W * H; layer = D;
+                }
+    }
+    glDisable(GL_BLEND);
+    glDeleteProgram(p);
+    glDeleteTextures(1, &tex);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteFramebuffers(1, &rf);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* a framebuffer with no attachments but FRAMEBUFFER_DEFAULT_LAYERS still rasterizes per layer,
+ * so the fragment shader's imageStore reaches every layer
+ * (KHR-GL46.geometry_shader.layered_rendering_fbo_no_attachment) */
+TEST(r31_layered_fbo_no_attachment)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 16) out;\n"
+        "out vec2 uv;\n"
+        "flat out int layer_id;\n"
+        "void main() {\n"
+        "  for (int n = 0; n < 4; ++n) {\n"
+        "    gl_Position = vec4( 1, -1, 0, 1); gl_Layer = n; layer_id = n; uv = vec2(1, 0); EmitVertex();\n"
+        "    gl_Position = vec4( 1,  1, 0, 1); gl_Layer = n; layer_id = n; uv = vec2(1, 1); EmitVertex();\n"
+        "    gl_Position = vec4(-1, -1, 0, 1); gl_Layer = n; layer_id = n; uv = vec2(0, 0); EmitVertex();\n"
+        "    gl_Position = vec4(-1,  1, 0, 1); gl_Layer = n; layer_id = n; uv = vec2(0, 1); EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "  }\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "precision highp int;\n"
+        "layout(rgba32i) writeonly uniform highp iimage2DArray img;\n"
+        "in vec2 uv;\n"
+        "flat in int layer_id;\n"
+        "void main() { imageStore(img, ivec3(ivec2(uv * 32.0), layer_id), ivec4(0, 255, 0, 0)); }\n";
+    GLuint p = program(r31_vs, gs, fs);
+    GLint ls = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, 1);
+    if (!ls) { glDeleteProgram(p); return; }
+
+    const int W = 32, H = 32, NL = 4;
+    GLint *data = malloc(NL * W * H * 4 * sizeof(int));
+    for (int i = 0; i < NL * W * H; i++) {
+        data[i*4+0] = 255; data[i*4+1] = 0; data[i*4+2] = 0; data[i*4+3] = 0;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA32I, W, H, NL);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, W, H, NL, GL_RGBA_INTEGER, GL_INT, data);
+    free(data);
+
+    GLuint fbo = 0, vao = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, W);
+    glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, H);
+    glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_LAYERS, NL);
+    GLint q = -1;
+    glGetFramebufferParameteriv(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_LAYERS, &q);
+    EXPECT_EQ_INT(q, NL);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    glBindImageTexture(0, tex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA32I);
+    glViewport(0, 0, W, H);
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+
+    GLint *layer = malloc(W * H * 4 * sizeof(int));
+    int bad = 0;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    for (int n = 0; n < NL && !bad; n++)
+    {
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, n);
+        if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { bad = n + 1; break; }
+        glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+        glReadPixels(0, 0, W, H, GL_RGBA_INTEGER, GL_INT, layer);
+        for (int i = 0; i < W * H && !bad; i++)
+            if (layer[i*4+0] != 0 || layer[i*4+1] != 255) { bad = n + 1; break; }
+    }
+    free(layer);
+    EXPECT_EQ_INT(bad, 0);
+    glDeleteProgram(p);
+    glDeleteTextures(1, &tex);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteVertexArrays(1, &vao);
+}
+
+
+/* the geometry kernel reads image units like the compute path does
+ * (KHR-GL46.geometry_shader.api.max_image_uniforms) */
+TEST(r31_gs_image_reads)
+{
+    GLint maximg = 0;
+    glGetIntegerv(GL_MAX_GEOMETRY_IMAGE_UNIFORMS, &maximg);
+    EXPECT_TRUE(maximg >= 1);
+    int n = maximg < 8 ? maximg : 8;
+
+    char gs[4096];
+    int w = 0;
+    w += snprintf(gs + w, sizeof gs - w, "#version 450 core\n"
+        "layout(points) in;\nlayout(points, max_vertices = 1) out;\nint counter = 0;\n");
+    for (int i = 0; i < n; i++)
+        w += snprintf(gs + w, sizeof gs - w,
+            "layout(r32i, binding = %d) readonly uniform highp iimage2D img%d;\n", i, i);
+    w += snprintf(gs + w, sizeof gs - w, "void main() {\n");
+    for (int i = 0; i < n; i++)
+        w += snprintf(gs + w, sizeof gs - w, "  counter += imageLoad(img%d, ivec2(0, 0)).x;\n", i);
+    w += snprintf(gs + w, sizeof gs - w,
+        "  gl_Position = vec4(float(counter), 0.0, 0.0, 1.0);\n EmitVertex();\n EndPrimitive();\n}\n");
+
+    GLuint p = program(r31_vs, gs, r31_fs);
+    GLint ls = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, 1);
+    if (!ls) { glDeleteProgram(p); return; }
+
+    GLuint tex[8], fbo[8];
+    glGenTextures(n, tex);
+    glGenFramebuffers(n, fbo);
+    for (int i = 0; i < n; i++)
+    {
+        GLint one = i + 1;
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32I, 1, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_INT, &one);
+        glBindImageTexture(i, tex[i], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32I);
+    }
+
+    GLuint tf = 0, vao = 0;
+    glGenBuffers(1, &tf);
+    glGenVertexArrays(1, &vao);
+    float init[4] = {0,0,0,0};
+    glBindBuffer(GL_ARRAY_BUFFER, tf);
+    glBufferData(GL_ARRAY_BUFFER, 16, init, GL_STATIC_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tf);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    const char *vars[] = {"gl_Position"};
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float want = 0;
+    for (int i = 0; i < n; i++) want += (float)(i + 1);
+    float *m = glMapBufferRange(GL_ARRAY_BUFFER, 0, 16, GL_MAP_READ_BIT);
+    EXPECT_TRUE(m && m[0] == want);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    glDeleteProgram(p);
+    glDeleteTextures(n, tex);
+    glDeleteFramebuffers(n, fbo);
+    glDeleteBuffers(1, &tf);
+    glDeleteVertexArrays(1, &vao);
+}
+
 int main(void)
 {
     RUN(pool_wrap_stress_tiny);     /* first: forces the tiny pools for the whole binary */
@@ -3407,5 +3767,10 @@ int main(void)
     RUN(xfb_of_gs_output_block_members);
     RUN(gs_output_block_after_tessellation);
     RUN(gs_output_block_xfb_errors);
+    RUN(r31_gs_only_spo_queries);
+    RUN(r31_ssbo_range_bindings);
+    RUN(r31_layered_blending);
+    RUN(r31_layered_fbo_no_attachment);
+    RUN(r31_gs_image_reads);
     return mgl_test_summary();
 }

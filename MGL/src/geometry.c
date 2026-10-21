@@ -4628,7 +4628,12 @@ bool mgl_program_check_geom_link(GLMContext ctx, Program *program)
 bool mgl_geom_get_programiv(GLMContext ctx, Program *program, GLenum pname, GLint *params)
 {
     MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
-    if (!gp || !gp->linked) return false;
+    /* the four geometry queries are answered from the geometry stage's OWN reflection (the
+     * SPIR-V execution modes), which is complete as soon as the stage compiled — including a
+     * separable geometry-only program whose emulation is only built at first draw
+     * (KHR-GL46.geometry_shader.api.getProgramiv3 queries a linked GS-only SPO that never
+     * draws).  gp->kernel_entry is set by mgl_geom_compile_stage, deferred or not. */
+    if (!gp || !(gp->linked || gp->kernel_entry)) return false;
 
     switch (pname)
     {
@@ -5382,10 +5387,29 @@ static void geom_xfb_reset(GLMContext ctx, MGLXfbProgram *xp)
 
 static GLenum geom_var_type(const MGLGeomVar *v)
 {
+    /* matrices: the type constant names columns x rows (GL_FLOAT_MAT2x3 is a mat2x3, i.e.
+     * 2 columns of vec3).  MGLGeomVar.rows holds the SPIR-V OpTypeMatrix's ColumnCount and
+     * .cols the column type's vector size, so rows is the GL column count and cols the row
+     * count; the tables are indexed [v->rows][v->cols]. */
     if (v->cols > 1)
     {
-        if (v->base == GL_FLOAT) return v->cols == v->rows ? GL_FLOAT_MAT4 : GL_FLOAT_MAT4;   /* refined below */
-        return GL_INT;
+        static const GLenum fq[5][5] = {
+            {0, 0, 0, 0, 0},
+            {0, 0, 0, 0, 0},
+            {0, 0, GL_FLOAT_MAT2, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4},
+            {0, 0, GL_FLOAT_MAT3x2, GL_FLOAT_MAT3, GL_FLOAT_MAT3x4},
+            {0, 0, GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, GL_FLOAT_MAT4},
+        };
+        static const GLenum dq[5][5] = {
+            {0, 0, 0, 0, 0},
+            {0, 0, 0, 0, 0},
+            {0, 0, GL_DOUBLE_MAT2, GL_DOUBLE_MAT2x3, GL_DOUBLE_MAT2x4},
+            {0, 0, GL_DOUBLE_MAT3x2, GL_DOUBLE_MAT3, GL_DOUBLE_MAT3x4},
+            {0, 0, GL_DOUBLE_MAT4x2, GL_DOUBLE_MAT4x3, GL_DOUBLE_MAT4},
+        };
+        if (v->rows >= 1 && v->rows <= 4 && v->cols >= 1 && v->cols <= 4)
+            return (v->base == GL_DOUBLE) ? dq[v->rows][v->cols] : fq[v->rows][v->cols];
+        return v->base == GL_INT ? GL_INT : GL_FLOAT;
     }
     switch (v->base)
     {

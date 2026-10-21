@@ -16,6 +16,7 @@
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer_Private.h"
 #import "mgl_ext_tess.h"
+#import "mgl_ext_geom.h"
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
 
@@ -473,6 +474,14 @@ static bool rs_mode_is_polygon(GLenum m)
 
     /* shader fixup specialization (function constants) */
     if (program) {
+        /* geom: while the geometry domain's pass-through vertex function owns the vertex
+         * stage (generatePipelineDescriptor installed it), the program's own vertex shader
+         * must NOT be specialized over it — the pass-through is the last pre-rasterization
+         * stage and is specialized separately (geomSpecializeVertexOverride).  Without this
+         * the raster pass built a pipeline from the program's vertex shader, which writes
+         * point_size while the geometry stage's output topology is triangles. */
+        bool geomOwnsVertex = ctx->state.ext_geom &&
+                              ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override != NULL;
         /* tess: the render pipeline's vertex stage is the evaluation shader; the vertex
          * stage runs as a compute kernel before the render pass (MGLRenderer+Tessellation.m).
          * Isolines / point_mode run the emulated plain-vertex variant of the TES. */
@@ -484,7 +493,7 @@ static bool rs_mode_is_polygon(GLenum m)
          * xfb capture renders through the plain TES as well (mgl_tess_plain_render). */
         if (mgl_tess_plain_render(ctx))
             desc.vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;
-        else
+        else if (!geomOwnsVertex)
         {
             Shader *vsh = program->shader_slots[vstage];
             /* tess hardware: the post-tessellation function must declare the

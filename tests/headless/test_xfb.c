@@ -499,9 +499,20 @@ TEST(error_cases)
     const char *dup[] = { "vid", "vid" };
     GLuint pd = make_xfb_program(vs_src, fs_src, 2, dup, GL_INTERLEAVED_ATTRIBS);
     glGetProgramiv(pd, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_FALSE);
-    const char *sep[] = { "vid", "gl_NextBuffer" };
-    GLuint ps = make_xfb_program(vs_src, fs_src, 2, sep, GL_SEPARATE_ATTRIBS);
-    glGetProgramiv(ps, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_FALSE);
+    /* the special names are only valid in GL_INTERLEAVED_ATTRIBS mode: the call itself is
+     * rejected (GL 4.6 §13.4.1) and the previously set varyings stay in place, so a program
+     * with no other varyings links */
+    {
+        const char *sep[] = { "vid", "gl_NextBuffer" };
+        GLuint p2 = glCreateProgram();
+        glAttachShader(p2, compile(GL_VERTEX_SHADER, vs_src));
+        glAttachShader(p2, compile(GL_FRAGMENT_SHADER, fs_src));
+        glTransformFeedbackVaryings(p2, 2, sep, GL_SEPARATE_ATTRIBS); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+        glLinkProgram(p2);
+        glGetProgramiv(p2, GL_LINK_STATUS, &ok); EXPECT_EQ_INT(ok, GL_TRUE);
+        glDeleteProgram(p2);
+        while (glGetError()) {}
+    }
     glGetTransformFeedbackVarying(id_prog(), 5, 0, NULL, NULL, NULL, NULL); EXPECT_GL_ERROR(GL_INVALID_VALUE);
     EXPECT_NO_GL_ERROR();
 

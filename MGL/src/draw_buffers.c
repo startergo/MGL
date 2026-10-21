@@ -153,7 +153,14 @@ bool validate_vao(GLMContext ctx, bool uses_elements)
     {
         Buffer *e = ctx->state.vao->element_array.buffer;
 
-        if (!e || mappedNonPersistent(e))
+        /* no bound element buffer is legal here: GL's <indices> argument is then a pointer
+         * into application memory (Mesa / macOS GL accept client index arrays even in the
+         * core profile; the CTS transform_feedback suite draws this way).  The pointer is
+         * validated in exec_draw_raw. */
+        if (!e)
+            return true;
+
+        if (mappedNonPersistent(e))
             return false;
     }
 
@@ -721,6 +728,11 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
     }
 
     Buffer *ebuf = VAO_STATE(element_array.buffer);
+    /* no element buffer bound: GL's <indices> argument is a client pointer into memory owned
+     * by the application (Mesa and macOS GL accept this even in the core profile; the CTS
+     * transform_feedback suite draws with client index arrays).  The CPU walk reads the
+     * memory directly and the index cache is bypassed for it. */
+    const uint8_t *client = ebuf ? NULL : (const uint8_t *)(uintptr_t)offset;
 
     uint32_t restart_index = 0;
     bool restart = restart_enabled(ctx, type, &restart_index);
@@ -730,16 +742,16 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
      * reads the index bytes on the CPU, so it cannot be stalled by GPU-written element
      * buffers; only 8-bit indices, emulated modes, adjacency and restart need the CPU
      * view (mgl_rstate_index_rewrite_needed / draw_index_list below). */
-    bool need_cpu = adjacency || prim < 0 || type == GL_UNSIGNED_BYTE || restart;
+    bool need_cpu = adjacency || prim < 0 || type == GL_UNSIGNED_BYTE || restart || client != NULL;
     const uint8_t *cpu = NULL;
 
     if (need_cpu)
     {
-        cpu = element_pointer(ctx, ebuf, offset, count, type);
+        cpu = client ? client : element_pointer(ctx, ebuf, offset, count, type);
 
         if (!cpu)
         {
-            // index range outside the element buffer
+            // index range outside the element buffer (or a NULL client pointer)
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             return;
         }
@@ -750,7 +762,8 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
         return;
     }
 
-    if (need_cpu && !adjacency && index_rewrite_needed(ctx, mode, type, cpu, count, ebuf, offset, st))
+    if (need_cpu && !adjacency && !client &&
+        index_rewrite_needed(ctx, mode, type, cpu, count, ebuf, offset, st))
     {
         /* gpuaudit: repeated draws reuse the rewritten list, cached as an MTLBuffer */
         if (draw_cached_index_list(ctx, batch, ebuf, (uint32_t)offset, mode, type, count, 0, st, 0,
@@ -779,15 +792,17 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
         }
     }
 
-    if (prim >= 0 && type != GL_UNSIGNED_BYTE)
+    if (prim >= 0 && type != GL_UNSIGNED_BYTE && !client)
     {
         if (batch_begin(ctx, batch))
             MTLX()->draw_indexed(ctx, prim, type, ebuf, offset, NULL, count, instances, basevertex, baseinstance);
         return;
     }
 
-    /* 8-bit widening / primitive emulation: served from the cache when possible */
-    if (draw_cached_index_list(ctx, batch, ebuf, (uint32_t)offset, mode, type, count, 0, st, adjacency,
+    /* 8-bit widening / primitive emulation: served from the cache when possible
+     * (client-memory indices are never cached — the application owns the memory) */
+    if (!client &&
+        draw_cached_index_list(ctx, batch, ebuf, (uint32_t)offset, mode, type, count, 0, st, adjacency,
                                instances, basevertex, baseinstance))
         return;
 
@@ -802,7 +817,7 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
     origin.adjacency = adjacency ? 1 : 0;
 
     draw_index_list(ctx, batch, mode, type, cpu, count, instances, basevertex, baseinstance,
-                    restart, restart_index, &origin);
+                    restart, restart_index, client ? NULL : &origin);
 }
 
 /* hand a draw to the transform feedback capture wrappers (xfb domain), which capture and

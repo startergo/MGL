@@ -1,4 +1,80 @@
-READY d638595 (geometry_shader 117/135 under the 480 s cap; rendering 33/33; limits 9/9; headless green)
+READY 799b3d3 (geometry_shader 126/135 under the 480 s cap; rendering 33/33; limits 9/9; linking 13/13; primitive_queries 9/9; headless 57 binaries green; test_geom 10/10 stable)
+
+# geom domain — working handoff (round 30)
+
+Branch gl46/geom at 27a49d5 (gl46-port 609e25a merged at 9ac38b0; last code commit 799b3d3).  All work committed;
+`make -j4 lib` clean; tests/headless/run.sh fully green (57 binaries, suite rc=0);
+`for i in $(seq 10); do timeout 120 ./build/tests/test_geom; done` = 10/10 zero.
+CTS geometry_shader 126/135 under the same --max-seconds 480 cap (was 117/135 at round 29;
+pristine ec487f8 measured 110/135).  test_geom is now 519 checks.
+
+## Session results (commits d638595..799b3d3)
+
+* Transform feedback now captures WHOLE primitives (41dc01a).  GL records every vertex of
+  each primitive a strip output decomposes into (shared strip vertices duplicated), and a
+  primitive that does not fit the buffer is not recorded at all.  The record tag's bits
+  0..7 now carry the strip length (freed by dropping the unread per-thread vertex index)
+  and bits 9..23 the primitives the thread closed before this strip; the prefix kernel
+  scans per-thread closed-PRIMITIVE counts, the scatter walks a close's n-per+1 decomposed
+  primitives writing all per vertices at the compacted index, and capacity is tested at
+  the primitive's last vertex against the per-buffer extent (in[14..17]) - no partial
+  writes, exact counts with a half-full buffer (CTS primitive_queries lines+triangles).
+  CPU capture mirrors it.  test_geom gains xfb_strip_decomposition.
+* 8a81a6b: TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counting refinement + the rstate
+  specialization cache key now includes the function pointer and an MSL checksum.
+* Robust source rewriting (5014e6b): the GS source is expanded with
+  glslang_shader_preprocess before the line-based rewrites (the CTS declares an input
+  block whose closing brace sits inside #ifdef/#else - unresolvable otherwise);
+  geom_plain_outputs no longer emits during its head scan (a non-rewritten head made the
+  outer loop re-emit each directive inside it once per character) and the block rewrite
+  keeps only the directive lines of the dropped qualifier head; comments are statements
+  of their own in geom_strip_plain_uniforms (a '// ...' line before a uniform hid it,
+  which then collided an SSBO with a uniform buffer pin - CTS program_resource).
+* Separable pipelines (5014e6b): xfb_post_link resolves GS-only/TES-only programs before
+  the "needs a vertex shader" failure; the geometry kernel's interface matching falls
+  back from location to name+type (separately linked stages assign automatic locations by
+  their own declaration order); a pipeline without a fragment stage is VALID (optional
+  stage; Metal renders with a nil fragment function) and the Metal-side xfb capture
+  resolves the active program from the pipeline when useProgram(0).  CTS
+  api.program_pipeline_vs_gs_capture passes; test_geom gains pipeline_vs_gs_capture +
+  vs_conditional_declarations.
+* GS atomic counters fail the link (799b3d3): MGL reports
+  MAX_GEOMETRY_ATOMIC_COUNTERS/BUFFERS = 0 and GL 4.6 7.11 makes exceeding a stage limit a
+  link error, so a GS declaring any atomic_uint now fails with a log naming the counts
+  (CTS linking.more_ACs_in_GS + more_ACBs; linking now 13/13).
+
+## Shared-file edits this round (all surgical, all reported here)
+
+* MGL/src/transform_feedback.c: xfb_post_link runs the GS/TES branches before the
+  no-vertex-shader failure (no behavior change when a VS is present).
+* MGL/src/program_ext.c: validate_pipeline no longer fails a pipeline for a missing
+  fragment stage (logged as a warning); program_pre_draw can print the pipeline
+  validation log under MGL_DEBUG.
+* MGL/src/MGLRenderer+TransformFeedback.m: xfbCaptureAsync resolves the active program
+  from the pipeline's vertex stage when state.program is NULL.
+* tests/headless/test_program.c: the VS-only pipeline assertion follows the spec (valid).
+* MGL/src/MGLRenderer+RenderState.m (8a81a6b): specialization cache key hardening.
+
+## Remaining failures under the 480 s cap (9) and where to look
+
+* api.getProgramiv3 (linker-visible GEOMETRY_VERTICES_OUT etc. on a non-linked program),
+  api.max_shader_storage_blocks (SSBO limit value) - program domain.
+* api.max_atomic_counter_buffers / max_atomic_counters / max_image_uniforms: CTS-side
+  NotSupported (needs atomic counter / image uniform support; MGL reports 0s).
+* layered_fbo.fb_texture_invalid_level_number / fb_texture_invalid_target (ResourceError),
+  layered_framebuffer.blending_support, layered_rendering_fbo_no_attachment - fb domain
+  (layered framebuffer validation, blending on layered FBOs, FRAMEBUFFER_DEFAULT_LAYERS).
+Nothing geometry-specific remains in the group.
+
+## Tips
+
+* Run the CTS one group at a time: python3 agents/conformance/run.py --pattern
+  'KHR-GL46.geometry_shader.*' --batch 12 --per-case-timeout 90 --max-seconds 480
+  --results-dir ~/MGL-cts/geomNN-results --refresh-caselist; then --summarize-only.
+* MGL_GEOM_DUMP=/tmp/d (per-stage dumped GLSL/MSL) and MGL_DEBUG=1 (error origin + the
+  pipeline validation log) are the fastest triage for link failures.
+* tests/headless/run.sh must be invoked from the worktree ROOT (the dylib's install name
+  is a relative path; running it from tests/headless aborts in dyld).
 
 # geom domain — working handoff (round 29)
 

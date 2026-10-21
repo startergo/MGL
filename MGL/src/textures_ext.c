@@ -68,6 +68,29 @@ MGLTexExtInfo *mgl_texext_info_create(GLMContext ctx, Texture *tex)
     return info;
 }
 
+/* drop the side-table entry of a texture that is being destroyed (see the header: entries are
+ * keyed by the Texture pointer, so a stale entry would alias a Texture reusing the address and
+ * e.g. make texdata refuse to handle it — glGenerateMipmap then failed with GL_OUT_OF_MEMORY
+ * only when a previous test case in the same context had created and deleted a texture view) */
+void mgl_texext_info_free(GLMContext ctx, const Texture *tex)
+{
+    MGLTexExtInfo **p;
+
+    if (!ctx || !tex || !ctx->state.ext_texext)
+        return;
+
+    for (p = &ctx->state.ext_texext->buckets[texext_hash(tex)]; *p; p = &(*p)->next)
+    {
+        if ((*p)->tex == tex)
+        {
+            MGLTexExtInfo *dead = *p;
+            *p = dead->next;
+            free(dead);
+            return;
+        }
+    }
+}
+
 bool mgl_texext_is_view(GLMContext ctx, const Texture *tex)
 {
     MGLTexExtInfo *info = mgl_texext_info(ctx, tex);

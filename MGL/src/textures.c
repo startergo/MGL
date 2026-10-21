@@ -30,6 +30,7 @@
 #include "utils.h"
 #include "glm_context.h"
 #include "mgl_ext_texdata.h"
+#include "mgl_ext_texext.h"
 #include "mgl_ext_texparam.h"
 #include "mgl_ext_fb.h"
 
@@ -692,6 +693,10 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
         if (!attachedToAnyFramebuffer(ctx, tex))
         {
             freeTextureStorage(ctx, tex);
+            /* drop the texext side-table entry first: it is keyed by the Texture pointer and
+             * would otherwise alias a Texture allocated later at this address (a stale "this is
+             * a texture view / buffer / multisample" marker made texdata refuse the new object) */
+            mgl_texext_info_free(ctx, tex);
             free(tex);
         }
         else

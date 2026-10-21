@@ -1865,7 +1865,14 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     for (int i = 0; i < (int)list.count; i++)
     {
         Buffer *b = list.buffers[i].buf;
+        GLintptr off = list.buffers[i].offset;
         if (!b) return false;
+        /* glBindBufferRange binds a *slice* of the buffer: the entry's offset is where the
+         * resource starts.  Binding offset 0 instead made every range binding of one buffer
+         * alias the buffer's start (KHR-GL46.geometry_shader.api.max_shader_storage_blocks
+         * binds one SSBO eight times at consecutive offsets — all eight writes landed on
+         * element 0).  The render paths already honour the offset (MGLRenderer+Draw.m). */
+        if (off < 0 || (GLsizeiptr)off > b->size) off = 0;
         /* the program's default-uniform block lives in CPU memory until a draw flushes
          * it; materialise it the way the render encoders do (updateDirtyBuffer, or the
          * setBytes fast path for small buffers) */
@@ -1874,13 +1881,14 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         if (!b->data.mtl_data)
         {
             if (!b->data.buffer_data || b->size <= 0) return false;
-            [enc setBytes: (const void *)b->data.buffer_data length: (NSUInteger)b->size
+            [enc setBytes: (const void *)((uint8_t *)b->data.buffer_data + off)
+                 length: (NSUInteger)(b->size - (size_t)off)
                  atIndex: (NSUInteger)i];
             b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
             continue;
         }
         [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
-                offset: 0
+                offset: (NSUInteger)off
                atIndex: (NSUInteger)i];
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
@@ -2740,6 +2748,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
             for (int i = 0; i < (int)ctx->state.vertex_buffer_map_list.count; i++)
             {
                 Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
+                GLintptr off = ctx->state.vertex_buffer_map_list.buffers[i].offset;
                 if (getenv("MGL_GEOM_TRACE"))
                     NSLog(@"MGL geom trace: capture bind i=%d buf=%p mtl=%p size=%d data=%p dirty=%llx w0=%08x w1=%08x",
                           i, b, b ? b->data.mtl_data : NULL, b ? (int)b->size : -1,
@@ -2747,6 +2756,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                           (b && b->data.buffer_data) ? *(unsigned *)b->data.buffer_data : 0,
                           (b && b->data.buffer_data && b->size >= 8) ? ((unsigned *)b->data.buffer_data)[1] : 0);
                 if (!b) continue;
+                if (off < 0 || (GLsizeiptr)off > b->size) off = 0;
                 /* the program's default-uniform block lives in CPU memory until a draw
                  * flushes it; materialise it the way the render encoders do */
                 if (!b->data.mtl_data && b->data.dirty_bits)
@@ -2755,14 +2765,14 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                 if (!b->data.mtl_data)
                 {
                     if (!b->data.buffer_data || b->size <= 0) continue;
-                    [enc setVertexBytes: (const void *)b->data.buffer_data
-                                 length: (NSUInteger)b->size
+                    [enc setVertexBytes: (const void *)((uint8_t *)b->data.buffer_data + off)
+                                 length: (NSUInteger)(b->size - (size_t)off)
                                 atIndex: (NSUInteger)i];
                     b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
                     continue;
                 }
                 [enc setVertexBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
-                              offset: 0
+                              offset: (NSUInteger)off
                              atIndex: (NSUInteger)i];
                 mgl_buffers_mark_gpu_use(ctx, b, true);
             }

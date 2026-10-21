@@ -1684,8 +1684,15 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     if (!pptr)
         return;
 
-    /* relinking the current program while transform feedback captures */
+    /* relinking the current program while transform feedback captures; the rule also covers a
+     * paused session of another transform feedback object that still holds this program
+     * (GL 4.6 §7.3.1) */
     if (ctx->state.program == pptr && mgl_xfb_capturing(ctx))
+    {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
+    if (mgl_xfb_program_in_use(ctx, pptr))
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;

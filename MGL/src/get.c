@@ -561,10 +561,12 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(texture_buffer_offset_alignment), 256));
         case GL_MAX_IMAGE_UNITS: PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_IMAGE_SAMPLES: PUT1(0);
+        /* the geometry kernel is a compute pass and binds image units like the compute path
+         * (MGLRenderer+Geometry.m's resource walk), so it supports the full set of image units */
+        case GL_MAX_GEOMETRY_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_VERTEX_IMAGE_UNIFORMS:
         case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
-        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
-        case GL_MAX_GEOMETRY_IMAGE_UNIFORMS: PUT1(0);
+        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(0);
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
         case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
         case GL_MAX_COMBINED_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);

@@ -205,6 +205,26 @@ void mglTransformFeedbackVaryings(GLMContext ctx, GLuint program, GLsizei count,
     if (xfb_current(ctx)->active) XFB_ERR(GL_INVALID_OPERATION);
     if (count && !varyings) XFB_ERR(GL_INVALID_VALUE);
 
+    /* the special varying names are only meaningful in GL_INTERLEAVED_ATTRIBS mode (they
+     * describe the packing of one buffer); GL 4.6 §13.4.1 makes them INVALID_OPERATION in
+     * GL_SEPARATE_ATTRIBS mode (KHR-GL46.transform_feedback.api_errors_test) */
+    if (bufferMode != GL_INTERLEAVED_ATTRIBS)
+        for (GLsizei i = 0; i < count; i++) {
+            const char *n = varyings[i] ? varyings[i] : "";
+            if (!strcmp(n, "gl_NextBuffer") || !strcmp(n, "gl_SkipComponents1") ||
+                !strcmp(n, "gl_SkipComponents2") || !strcmp(n, "gl_SkipComponents3") ||
+                !strcmp(n, "gl_SkipComponents4"))
+                XFB_ERR(GL_INVALID_OPERATION);
+        }
+    else {
+        /* N "gl_NextBuffer" entries pack into N+1 buffers, which must fit the
+         * MAX_TRANSFORM_FEEDBACK_BUFFERS binding points (GL 4.6 §13.4.1) */
+        GLsizei next = 0;
+        for (GLsizei i = 0; i < count; i++)
+            if (varyings[i] && !strcmp(varyings[i], "gl_NextBuffer")) next++;
+        if (next + 1 > (GLsizei)MGL_XFB_MAX_BUFFERS) XFB_ERR(GL_INVALID_OPERATION);
+    }
+
     MGLXfbProgram *xp = xfb_prog(ctx, p, true);
     if (!xp) XFB_ERR(GL_OUT_OF_MEMORY);
 
@@ -476,6 +496,27 @@ bool mgl_xfb_capturing(GLMContext ctx)
     return o->active && !o->paused;
 }
 
+/* GL 4.6 §7.3.1: LinkProgram must generate INVALID_OPERATION while <program> is the active
+ * program of a transform feedback object that is still active (paused counts as active —
+ * KHR-GL46.transform_feedback.api_errors_test relinks the program of a paused session).
+ * Used by mglLinkProgram (program.c). */
+bool mgl_xfb_program_in_use(GLMContext ctx, Program *program)
+{
+    if (!XFB() || !program) return false;
+
+    if (XFB()->default_obj.program == program && XFB()->default_obj.active)
+        return true;
+
+    for (GLuint i = 0; i < XFB()->obj_cap; i++)
+    {
+        MGLXfbObject *o = XFB()->objs[i];
+        if (o && o->program == program && o->active)
+            return true;
+    }
+
+    return false;
+}
+
 #pragma mark - GL entry points: buffer bindings
 
 bool mgl_xfb_validate_bind_buffer(GLMContext ctx, GLenum target, GLuint index, GLuint buffer,
@@ -595,7 +636,12 @@ static void xfb_draw_from(GLMContext ctx, const char *func, GLenum mode, GLuint 
     if (stream >= MGL_XFB_MAX_STREAMS) { ctx->error_func(ctx, func, GL_INVALID_VALUE); return; }
     if (instancecount < 0) { ctx->error_func(ctx, func, GL_INVALID_VALUE); return; }
     MGLXfbObject *o = xfb_obj(ctx, id);
-    if (!o || (id && !findTransformFeedback(ctx, id))) { ctx->error_func(ctx, func, GL_INVALID_VALUE); return; }
+    /* the same object validity rule as glIsTransformFeedback: a name only generated (never
+     * bound) is not a transform feedback object yet, so drawing from it is INVALID_VALUE, not
+     * the INVALID_OPERATION of a valid object that never captured (KHR-GL46.transform_feedback.
+     * api_errors_test walks invalid names with glIsTransformFeedback) */
+    if (!o || (id && (!findTransformFeedback(ctx, id) || !o->created)))
+    { ctx->error_func(ctx, func, GL_INVALID_VALUE); return; }
     if (!o->ended_once) { ctx->error_func(ctx, func, GL_INVALID_OPERATION); return; }
 
     uint64_t count = o->draw_vertices[stream];
@@ -1282,6 +1328,51 @@ static void xfb_glsl_type_name(MGLXfbVarying *v, char *buf, size_t n)
     else snprintf(buf, n, "%s", mid);
 }
 
+/* whole-word identifier match (so 'attribute' does not match 'attributes') */
+static bool xfb_word_at(const char *p, const char *w)
+{
+    size_t n = strlen(w);
+    if (strncmp(p, w, n)) return false;
+    return !(isalnum((unsigned char)p[n]) || p[n] == '_');
+}
+
+/* does the source (after its #version line) use pre-140 syntax that "#version 460 core"
+ * would reject?  Those keywords only exist in compatibility-profile / pre-140 shaders. */
+static bool xfb_has_legacy_keywords(const char *s)
+{
+    static const char *words[] = {
+        "attribute", "varying", "gl_FragColor", "gl_FragData", "gl_FragDepthEXT",
+        "gl_TexCoord", "gl_Color", "gl_SecondaryColor", "gl_Normal", "gl_Vertex",
+        "gl_ModelViewMatrix", "gl_ProjectionMatrix", "gl_ModelViewProjectionMatrix",
+        "gl_NormalMatrix", "gl_TextureMatrix", "gl_FrontColor", "gl_BackColor",
+        "gl_FrontSecondaryColor", "gl_LightSource", "gl_FrontMaterial", "ftransform",
+        "texture2D", "texture3D", "textureCube", "texture2DProj", "shadow2D", "shadow2DProj",
+        NULL
+    };
+
+    if (!s) return true;
+
+    /* comments can mention the words without using them: skip // and /* bodies */
+    const char *p = s;
+    while (*p) {
+        if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_' || *p == 'g') {
+            for (int i = 0; words[i]; i++)
+                if (xfb_word_at(p, words[i])) return true;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+            continue;
+        }
+        p++;
+    }
+    return false;
+}
+
 static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *whole_arrays)
 {
     char *body = strdup(src);
@@ -1289,16 +1380,19 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
     /* The injected capture block uses a std430 SSBO (GLSL 430+); a shader whose
      * own "#version" directive is older (CTS's fp64 tests use 400) must have it
      * raised, because the directive wins over the compile-time default version.
-     * Only modern-core syntax (>= 140, no legacy attribute/varying keywords) is
-     * safe to re-version; legacy shaders keep their version and fail the
-     * capture compile with a clear log instead. */
+     * Only modern-core syntax is safe to re-version; legacy shaders keep their
+     * version and fail the capture compile with a clear log instead.
+     * "Modern syntax" here means: no pre-140 keywords (attribute/varying/gl_FragColor/
+     * texture2D/...).  That covers "#version 130" sources written with in/out — the
+     * CTS transform_feedback suite uses exactly those (KHR-GL46.transform_feedback.*),
+     * and 130 + std430 otherwise fails the compile. */
     {
         char *nl = strstr(body, "\n");
         size_t first = nl ? (size_t)(nl - body) : strlen(body);
         if (first < 64 && !strncmp(body, "#version", 8)) {
             int ver = 0; char prof[24] = "";
             sscanf(body, "#version %d %23s", &ver, prof);
-            if (ver >= 140 && ver < 430) {
+            if (ver < 430 && !xfb_has_legacy_keywords(body + first + 1)) {
                 const char *profile = (!strcmp(prof, "compatibility")) ? " compatibility" : " core";
                 char *bumped = malloc(strlen(body) + 8);
                 if (bumped) {
@@ -1936,12 +2030,24 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
         Buffer *eb = VAO() ? VAO()->element_array.buffer : NULL;
         size_t isz = d->type == GL_UNSIGNED_BYTE ? 1 : d->type == GL_UNSIGNED_SHORT ? 2 : 4;
         uintptr_t off = (uintptr_t)d->indices;
-        if (!eb || !eb->data.buffer_data || off + n * isz > (size_t)eb->size) {
+        const uint8_t *src = NULL;
+        if (eb && eb->data.buffer_data) {
+            if (off + n * isz > (size_t)eb->size) {
+                free(seq); free(prims);
+                ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+                return false;
+            }
+            src = (const uint8_t *)eb->data.buffer_data + off;
+        } else if (!eb) {
+            /* client-memory index array (the same case exec_draw_raw allows): GL's <indices>
+             * argument is the array itself, not an offset */
+            src = (const uint8_t *)off;
+        }
+        if (!src) {
             free(seq); free(prims);
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             return false;
         }
-        const uint8_t *src = (const uint8_t *)eb->data.buffer_data + off;
         uint32_t maxval = isz == 1 ? 0xffu : isz == 2 ? 0xffffu : 0xffffffffu;
         bool restart = ctx->state.caps.primitive_restart_fixed_index || ctx->state.caps.primitive_restart;
         uint32_t restart_index = ctx->state.caps.primitive_restart_fixed_index ? maxval : STATE_VAR(primitive_restart_index);

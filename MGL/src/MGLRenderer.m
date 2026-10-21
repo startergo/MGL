@@ -1994,6 +1994,57 @@ static char kComputeFallbackKey;
         }
     }
 
+    /* storage images (glBindImageTexture) of the vertex and fragment stages: they are plain
+     * [[texture(n)]] arguments of the MSL (access::read / access::write), so they only need the
+     * image unit's texture bound at the reflected Metal slot — no sampler.  The compute path
+     * (bindTexturesToComputeEncoder) already does this; the render path was missing it, so a
+     * fragment imageStore never landed (KHR-GL46.geometry_shader.layered_rendering_fbo_no_attachment
+     * writes its result texture from a fragment shader). */
+    for (int st = 0; st < 2; st++)
+    {
+        int stage = stages[st];
+        GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+
+        for (GLuint i = 0; i < count; i++)
+        {
+            SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+            GLuint unit = sres->binding;              /* the GL image unit */
+            GLuint mtl_index = sres->msl_binding;
+            Texture *ptr;
+            id<MTLTexture> texture;
+            ImageUnit *iu;
+
+            if (unit >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit]);
+            ptr = iu->tex;
+            if (!ptr) continue;                       /* unbound unit: legal GL, undefined results */
+
+            RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
+            if (!ptr->mtl_data) continue;
+            texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
+
+            /* a non-layered binding of an array / 3D texture selects one slice: hand the shader
+             * a view of that slice when the MSL type is a single 2D image.  A layered binding
+             * (or a plain 2D texture) uses the texture as it is. */
+            if (!iu->layered && (iu->layer > 0 || iu->level > 0) &&
+                (ptr->target == GL_TEXTURE_2D_ARRAY || ptr->target == GL_TEXTURE_1D_ARRAY ||
+                 ptr->target == GL_TEXTURE_3D || ptr->target == GL_TEXTURE_CUBE_MAP ||
+                 ptr->target == GL_TEXTURE_CUBE_MAP_ARRAY))
+            {
+                id<MTLTexture> view = [texture newTextureViewWithPixelFormat: texture.pixelFormat
+                                                                    textureType: MTLTextureType2D
+                                                                         levels: NSMakeRange((NSUInteger)iu->level, 1)
+                                                                       slices: NSMakeRange((NSUInteger)iu->layer, 1)];
+                if (view) texture = view;
+            }
+
+            if (stage == _VERTEX_SHADER)
+                [_currentRenderEncoder setVertexTexture: texture atIndex: mtl_index];
+            else
+                [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index];
+        }
+    }
+
     return true;
 }
 

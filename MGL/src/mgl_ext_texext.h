@@ -90,6 +90,10 @@ extern "C" {
 /* side table */
 MGLTexExtInfo *mgl_texext_info(GLMContext ctx, const Texture *tex);           /* NULL if none */
 MGLTexExtInfo *mgl_texext_info_create(GLMContext ctx, Texture *tex);          /* find or create */
+/* drop the side-table entry of a texture that is being destroyed.  The table is keyed by the
+ * Texture pointer: without this, a later Texture allocated at the same address inherits the
+ * old one's kind (view / buffer / multisample) and is then refused by the texdata path. */
+void mgl_texext_info_free(GLMContext ctx, const Texture *tex);
 
 /* buffer texture formats (GL 4.6 Table 8.16); returns false if not a legal buffer texture format */
 bool mgl_texext_buffer_format_info(GLenum internalformat, GLuint *texel_size, GLuint *components, bool *expand3);

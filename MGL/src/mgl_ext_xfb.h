@@ -176,6 +176,9 @@ uint64_t mgl_xfb_primitives_written(GLMContext ctx, GLuint stream);
 uint64_t mgl_xfb_primitives_needed(GLMContext ctx, GLuint stream);
 /* true while a transform feedback object is active and not paused */
 bool mgl_xfb_capturing(GLMContext ctx);
+/* true while <program> is the active program of an active (paused or not) transform feedback
+ * object — glLinkProgram must fail with INVALID_OPERATION then (GL 4.6 §7.3.1) */
+bool mgl_xfb_program_in_use(GLMContext ctx, Program *program);
 #ifdef __cplusplus
 }
 #endif
