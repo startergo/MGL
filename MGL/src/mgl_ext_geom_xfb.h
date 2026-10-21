@@ -11,6 +11,10 @@
  *      primitives that do not fit entirely,
  *   3. a finish kernel advancing the write offsets by the captured vertices and folding the
  *      stream-0 primitive count in.
+ * GL captures EVERY output stream (only stream 0 rasterizes): when the captured varyings
+ * name more than one stream, 1+2 run once per captured stream, each counting only that
+ * stream's records (the ordinals the geometry kernel stamps in the tags are per stream),
+ * and writing only the buffers whose varyings belong to it.
  * The write offsets and the "since the last resolve" counters live in a small GPU block, so
  * no per-draw synchronisation happens; the CPU folds them in lazily at the points where the
  * application can observe the state (glEndTransformFeedback, pause/resume, binding another
@@ -24,18 +28,25 @@
 #define MGL_GEOM_XFB_MAX_VARS  32
 #define MGL_GEOM_XFB_WG        64
 
-/* the GPU counter block: [0] object name, [1] vertices, [2] primitives, [3..6] write
- * offsets, [8] the per-draw vertex counter.  It is owned by the kernels while a pack is
- * pending, and only read by the CPU at a resolve (after a wait), so the CPU never races the
- * GPU on it.
+/* the GPU counter block: [0] object name, [1] vertices (all streams, block total),
+ * [2] primitives (stream 0, block total), [3..6] write offsets, [8] the tess path's
+ * per-draw vertex counter, [9..12] the per-draw captured vertices PER STREAM (cleared by
+ * the finish kernel of the draw that produced them), [13..16] the block-total primitives
+ * WRITTEN per stream, [17..20] the block-total primitives EMITTED per stream ("needed",
+ * what GL_TRANSFORM_FEEDBACK_OVERFLOW compares against written), [21..24] the block-total
+ * captured vertices per stream.  It is owned by the kernels while a pack is pending, and
+ * only read by the CPU at a resolve (after a wait), so the CPU never races the GPU on it.
  * The per-draw inputs and the varying table live in a separate ring, one slot per draw in
  * flight, for the same reason. */
-#define MGL_GEOM_XFB_BLOCK_WORDS  9
+#define MGL_GEOM_XFB_BLOCK_WORDS  25
 /* [0] threads, [1] maxv, [2] out_words, [3] nvars, [4..7] stride[4], [8..11] size[4],
  * [12] feedback-mode vertices per primitive, [13] geometry output type (0/1/2),
- * [14..17] per-buffer captured extent in bytes (max offset+size of its varyings) */
-#define MGL_GEOM_XFB_IN_WORDS     20
-#define MGL_GEOM_XFB_VAR_WORDS    4
+ * [14..17] per-buffer captured extent in bytes (max offset+size of its varyings),
+ * [20] the stream this prefix/scatter pass packs, [21] the stream of each buffer
+ * (2 bits per buffer: a buffer's write offset advances by ITS stream's vertices),
+ * [22] the bitmask of the buffers this pass writes (the capacity test) */
+#define MGL_GEOM_XFB_IN_WORDS     24
+#define MGL_GEOM_XFB_VAR_WORDS    5
 #define MGL_GEOM_XFB_SLOT_WORDS   (MGL_GEOM_XFB_IN_WORDS + MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS)
 #define MGL_GEOM_XFB_RING         4    /* draws in flight */
 

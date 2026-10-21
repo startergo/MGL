@@ -1148,6 +1148,354 @@ TEST(xfb_streams)
 }
 
 
+/* GL captures EVERY output stream, each into the buffers its varyings name (GL 4.6
+ * 13.3.2): the CTS draw_xfb_stream_test shape - a geometry shader emitting three points to
+ * stream 0 and three to stream 1, captured into two buffers with gl_NextBuffer, the
+ * per-stream PRIMITIVES_GENERATED / TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN queries, and
+ * glDrawTransformFeedbackStream rasterizing each stream's capture. */
+TEST(xfb_multi_stream_capture)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices = 6) out;\n"
+        "layout(stream = 1) out vec4 position;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = vec4(-1.0, -1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    gl_Position = vec4( 1.0, -1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    gl_Position = vec4(-1.0,  1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    position = vec4( 1.0, -1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "    position = vec4(-1.0,  1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "    position = vec4( 1.0,  1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "}\n";
+    const char *vs_blank =
+        "#version 450 core\nvoid main() { gl_Position = vec4(0.0); }\n";
+    const char *fs =
+        "#version 450 core\nlayout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(1.0); }\n";
+    const char *vs_pass =
+        "#version 450 core\nlayout(location=0) in vec4 position;\n"
+        "void main() { gl_Position = position; }\n";
+
+    const char *vars[3] = { "gl_Position", "gl_NextBuffer", "position" };
+    GLuint pgen = glCreateProgram();
+    glAttachShader(pgen, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(pgen, compile(GL_VERTEX_SHADER, vs_blank));
+    glAttachShader(pgen, compile(GL_FRAGMENT_SHADER, fs));
+    glTransformFeedbackVaryings(pgen, 3, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(pgen);
+    GLint ls = 0;
+    glGetProgramiv(pgen, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+    if (!ls)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(pgen, sizeof l, &n, l);
+        printf("  multi-stream link log: %s\n", l);
+        return;
+    }
+
+    GLuint pdraw = glCreateProgram();
+    glAttachShader(pdraw, compile(GL_VERTEX_SHADER, vs_pass));
+    glAttachShader(pdraw, compile(GL_FRAGMENT_SHADER, fs));
+    glLinkProgram(pdraw);
+    ls = 0;
+    glGetProgramiv(pdraw, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+
+    GLuint xfb = 0, bo[2], rbo = 0, fbo = 0, vao = 0;
+    glGenTransformFeedbacks(1, &xfb);
+    glGenBuffers(2, bo);
+    glGenRenderbuffers(1, &rbo);
+    glGenFramebuffers(1, &fbo);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, xfb);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo[i]);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_DYNAMIC_COPY);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, i, bo[i]);
+    }
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_R8, 8, 8);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 8, 8);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    GLuint q[8];
+    glGenQueries(8, q);
+    glUseProgram(pgen);
+    for (int s = 0; s < 4; s++)
+    {
+        glBeginQueryIndexed(GL_PRIMITIVES_GENERATED, s, q[s]);
+        glBeginQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, s, q[4 + s]);
+    }
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    for (int s = 0; s < 4; s++)
+    {
+        glEndQueryIndexed(GL_PRIMITIVES_GENERATED, s);
+        glEndQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, s);
+    }
+    EXPECT_NO_GL_ERROR();
+    for (int s = 0; s < 4; s++)
+    {
+        GLint gen = 0, wr = 0;
+        glGetQueryObjectiv(q[s], GL_QUERY_RESULT, &gen);
+        glGetQueryObjectiv(q[4 + s], GL_QUERY_RESULT, &wr);
+        printf("  stream %d: generated=%d written=%d\n", s, gen, wr);
+        EXPECT_EQ_INT(gen, s < 2 ? 3 : 0);
+        EXPECT_EQ_INT(wr, s < 2 ? 3 : 0);
+    }
+
+    /* each buffer holds its own stream's three points, in emission order */
+    for (int s = 0; s < 2; s++)
+    {
+        float m[12];
+        memset(m, 0, sizeof m);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo[s]);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof m, m);
+        printf("  stream %d:", s);
+        for (int i = 0; i < 3; i++) printf(" (%.1f,%.1f)", m[i * 4], m[i * 4 + 1]);
+        printf("\n");
+        if (s == 0)
+        {
+            EXPECT_NEAR(m[0], -1.0, 1e-5); EXPECT_NEAR(m[1], -1.0, 1e-5);
+            EXPECT_NEAR(m[4],  1.0, 1e-5); EXPECT_NEAR(m[5], -1.0, 1e-5);
+            EXPECT_NEAR(m[8], -1.0, 1e-5); EXPECT_NEAR(m[9],  1.0, 1e-5);
+        }
+        else
+        {
+            EXPECT_NEAR(m[0],  1.0, 1e-5); EXPECT_NEAR(m[1], -1.0, 1e-5);
+            EXPECT_NEAR(m[4], -1.0, 1e-5); EXPECT_NEAR(m[5],  1.0, 1e-5);
+            EXPECT_NEAR(m[8],  1.0, 1e-5); EXPECT_NEAR(m[9],  1.0, 1e-5);
+        }
+    }
+
+    /* each stream's capture rasterizes as the triangles its three points form */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(pdraw);
+    for (int s = 0; s < 2; s++)
+    {
+        glBindBuffer(GL_ARRAY_BUFFER, bo[s]);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+        glEnableVertexAttribArray(0);
+        glDrawTransformFeedbackStream(GL_TRIANGLES, xfb, s);
+        EXPECT_NO_GL_ERROR();
+    }
+    {
+        unsigned char pix[8 * 8 * 4];
+        int dark = 0;
+        glReadPixels(0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+        for (int i = 0; i < 8 * 8; i++) if (pix[i * 4] < 200) dark++;
+        printf("  coverage: %d/64 dark\n", dark);
+        EXPECT_EQ_INT(dark, 0);
+    }
+
+    glDeleteQueries(8, q);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteBuffers(2, bo);
+    glDeleteTransformFeedbacks(1, &xfb);
+    glDeleteProgram(pgen);
+    glDeleteProgram(pdraw);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+/* the CTS draw_xfb_stream_instanced_test shape: stream 0 captures a quad's positions and
+ * stream 1 its colors; glDrawTransformFeedbackStreamInstanced draws the capture four times
+ * with per-instance matrices, the four quarter quads covering the framebuffer. */
+TEST(xfb_multi_stream_instanced)
+{
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices = 8) out;\n"
+        "layout(stream = 1) out vec4 color;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = vec4(-1.0, -1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    gl_Position = vec4( 1.0, -1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    gl_Position = vec4(-1.0,  1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    gl_Position = vec4( 1.0,  1.0, 0.0, 1.0);\n"
+        "    EmitStreamVertex(0);\n"
+        "    color = vec4(1.0, 1.0, 1.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "    color = vec4(1.0, 1.0, 1.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "    color = vec4(1.0, 1.0, 1.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "    color = vec4(1.0, 1.0, 1.0, 1.0);\n"
+        "    EmitStreamVertex(1);\n"
+        "}\n";
+    const char *vs_blank =
+        "#version 450 core\nvoid main() { }\n";
+    const char *fs_blank =
+        "#version 450 core\nlayout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(1.0); }\n";
+    const char *vs_draw =
+        "#version 450 core\n"
+        "uniform MatrixBlock\n"
+        "{\n"
+        "    mat4 transformation_0;\n"
+        "    mat4 transformation_1;\n"
+        "    mat4 transformation_2;\n"
+        "    mat4 transformation_3;\n"
+        "};\n"
+        "layout(location=0) in  vec4 position;\n"
+        "layout(location=1) in  vec4 color;\n"
+        "layout(location=0) out vec4 colour;\n"
+        "void main()\n"
+        "{\n"
+        "    switch(gl_InstanceID % 4)\n"
+        "    {\n"
+        "    case 0: gl_Position = position * transformation_0; break;\n"
+        "    case 1: gl_Position = position * transformation_1; break;\n"
+        "    case 2: gl_Position = position * transformation_2; break;\n"
+        "    case 3: gl_Position = position * transformation_3; break;\n"
+        "    }\n"
+        "    colour = color;\n"
+        "}\n";
+    const char *fs_draw =
+        "#version 450 core\nlayout(location=0) in vec4 colour;\nlayout(location=0) out vec4 pixel;\n"
+        "void main(){ pixel = colour; }\n";
+    static const float uniforms[64] = {
+        0.5f, 0.0f, 0.0f, 0.5f,  0.0f, 0.5f, 0.0f, 0.5f,  0.0f, 0.0f, 0.5f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.0f, -0.5f, 0.0f, 0.5f, 0.0f, 0.5f,  0.0f, 0.0f, 0.5f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.0f, -0.5f, 0.0f, 0.5f, 0.0f, -0.5f, 0.0f, 0.0f, 0.5f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.0f, 0.5f,  0.0f, 0.5f, 0.0f, -0.5f, 0.0f, 0.0f, 0.5f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f};
+
+    const char *vars[3] = { "gl_Position", "gl_NextBuffer", "color" };
+    GLuint pgen = glCreateProgram();
+    glAttachShader(pgen, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(pgen, compile(GL_VERTEX_SHADER, vs_blank));
+    glAttachShader(pgen, compile(GL_FRAGMENT_SHADER, fs_blank));
+    glTransformFeedbackVaryings(pgen, 3, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(pgen);
+    GLint ls = 0;
+    glGetProgramiv(pgen, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+    if (!ls)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(pgen, sizeof l, &n, l);
+        printf("  multi-stream instanced link log: %s\n", l);
+        return;
+    }
+
+    GLuint pdraw = glCreateProgram();
+    glAttachShader(pdraw, compile(GL_VERTEX_SHADER, vs_draw));
+    glAttachShader(pdraw, compile(GL_FRAGMENT_SHADER, fs_draw));
+    glLinkProgram(pdraw);
+    ls = 0;
+    glGetProgramiv(pdraw, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+
+    GLuint xfb = 0, bo[2], ubo = 0, rbo = 0, fbo = 0, vao = 0;
+    glGenTransformFeedbacks(1, &xfb);
+    glGenBuffers(2, bo);
+    glGenBuffers(1, &ubo);
+    glGenRenderbuffers(1, &rbo);
+    glGenFramebuffers(1, &fbo);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, xfb);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo[i]);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4 * 4 * sizeof(float), NULL, GL_DYNAMIC_COPY);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, i, bo[i]);
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof uniforms, uniforms, GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+    {
+        GLuint bi = glGetUniformBlockIndex(pdraw, "MatrixBlock");
+        EXPECT_TRUE(bi != GL_INVALID_INDEX);
+        if (bi != GL_INVALID_INDEX) glUniformBlockBinding(pdraw, bi, 0);
+    }
+
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_R8, 4, 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 4, 4);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    glUseProgram(pgen);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 4);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    /* four positions per stream; stream 1 holds the four white colors */
+    for (int s = 0; s < 2; s++)
+    {
+        float m[16];
+        memset(m, 0, sizeof m);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo[s]);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof m, m);
+        if (s == 0)
+        {
+            EXPECT_NEAR(m[0], -1.0, 1e-5);
+            EXPECT_NEAR(m[12],  1.0, 1e-5);
+            EXPECT_NEAR(m[15],  1.0, 1e-5);
+        }
+        else
+        {
+            EXPECT_NEAR(m[0], 1.0, 1e-5);
+            EXPECT_NEAR(m[15], 1.0, 1e-5);
+        }
+    }
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindBuffer(GL_ARRAY_BUFFER, bo[0]);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, bo[1]);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, NULL);
+    glEnableVertexAttribArray(1);
+    glUseProgram(pdraw);
+    glDrawTransformFeedbackStreamInstanced(GL_TRIANGLE_STRIP, xfb, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    {
+        unsigned char pix[4 * 4 * 4];
+        int dark = 0;
+        glReadPixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+        for (int i = 0; i < 4 * 4; i++) if (pix[i * 4] < 200) dark++;
+        printf("  instanced coverage: %d/16 dark\n", dark);
+        EXPECT_EQ_INT(dark, 0);
+    }
+
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rbo);
+    glDeleteBuffers(1, &ubo);
+    glDeleteBuffers(2, bo);
+    glDeleteTransformFeedbacks(1, &xfb);
+    glDeleteProgram(pgen);
+    glDeleteProgram(pdraw);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 TEST(xfb_strip_decomposition)
 {
     /* GL captures whole primitives: a strip output decomposes into its line / triangle
@@ -3717,60 +4065,65 @@ TEST(r31_gs_image_reads)
 
 int main(void)
 {
-    RUN(pool_wrap_stress_tiny);     /* first: forces the tiny pools for the whole binary */
-    RUN(block_vs_fs_control);
-    RUN(gs_struct_interface_vars);
-    RUN(gs_struct_member_order);
-    RUN(gs_named_output_block_roundtrip);
-    RUN(control_no_geometry_shader);
-    RUN(control_varying_no_gs);
-    RUN(passthrough_triangles);
-    RUN(point_to_quad_amplification);
-    RUN(primitive_id_and_invocations);
-    RUN(lines_adjacency_input);
-    RUN(simple_varying_from_gs);
-    RUN(draw_mode_mismatch);
-    RUN(link_error_no_varying);
-    RUN(end_primitive_splitting);
-    RUN(amplification_max_vertices);
-    RUN(triangles_adjacency_input);
-    RUN(indexed_and_instanced);
-    RUN(indirect_draws);
-    RUN(layered_rendering);
-    RUN(viewport_index);
-    RUN(separable_pipeline_with_gs);
-    RUN(primitive_queries);
-    RUN(xfb_of_geometry_output);
-    RUN(xfb_streams);
-    RUN(xfb_strip_decomposition);
-    RUN(pipeline_vs_gs_capture);
-    RUN(vs_conditional_declarations);
-    RUN(gs_atomic_counter_link_fails);
-    RUN(xfb_arrays_of_blocks_xfb_offset);
-    RUN(tessellation_triangles_into_gs);
-    RUN(tessellation_indexed_into_gs);
-    RUN(tessellation_isolines_into_gs);
-    RUN(tessellation_point_mode_into_gs);
-    RUN(xfb_of_tes_output);
-    RUN(xfb_of_tes_gs_output);
-    RUN(primitive_restart_with_gs);
-    RUN(pool_rotation_hazard);
-    RUN(wild_index_survives_cpu_assembly);
-    RUN(xfb_gpu_pack_multiple_draws_and_pause);
-    RUN(element_store_tail_integrity);
-    RUN(tiled_restart_gpu_assembly);
-    RUN(gs_output_block_instance_name);
-    RUN(gs_output_block_two_members_and_plain);
-    RUN(gs_output_block_array_member);
-    RUN(gs_output_block_flat_and_matrix_members);
-    RUN(gs_output_block_anonymous);
-    RUN(xfb_of_gs_output_block_members);
-    RUN(gs_output_block_after_tessellation);
-    RUN(gs_output_block_xfb_errors);
-    RUN(r31_gs_only_spo_queries);
-    RUN(r31_ssbo_range_bindings);
-    RUN(r31_layered_blending);
-    RUN(r31_layered_fbo_no_attachment);
-    RUN(r31_gs_image_reads);
+    /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
+    const char *only = getenv("TEST_ONLY");
+#define RUN_IF(name) do { if (!only || !strcmp(only, #name)) RUN(name); } while (0)
+    RUN_IF(pool_wrap_stress_tiny);     /* first: forces the tiny pools for the whole binary */
+    RUN_IF(block_vs_fs_control);
+    RUN_IF(gs_struct_interface_vars);
+    RUN_IF(gs_struct_member_order);
+    RUN_IF(gs_named_output_block_roundtrip);
+    RUN_IF(control_no_geometry_shader);
+    RUN_IF(control_varying_no_gs);
+    RUN_IF(passthrough_triangles);
+    RUN_IF(point_to_quad_amplification);
+    RUN_IF(primitive_id_and_invocations);
+    RUN_IF(lines_adjacency_input);
+    RUN_IF(simple_varying_from_gs);
+    RUN_IF(draw_mode_mismatch);
+    RUN_IF(link_error_no_varying);
+    RUN_IF(end_primitive_splitting);
+    RUN_IF(amplification_max_vertices);
+    RUN_IF(triangles_adjacency_input);
+    RUN_IF(indexed_and_instanced);
+    RUN_IF(indirect_draws);
+    RUN_IF(layered_rendering);
+    RUN_IF(viewport_index);
+    RUN_IF(separable_pipeline_with_gs);
+    RUN_IF(primitive_queries);
+    RUN_IF(xfb_of_geometry_output);
+    RUN_IF(xfb_streams);
+    RUN_IF(xfb_multi_stream_capture);
+    RUN_IF(xfb_multi_stream_instanced);
+    RUN_IF(xfb_strip_decomposition);
+    RUN_IF(pipeline_vs_gs_capture);
+    RUN_IF(vs_conditional_declarations);
+    RUN_IF(gs_atomic_counter_link_fails);
+    RUN_IF(xfb_arrays_of_blocks_xfb_offset);
+    RUN_IF(tessellation_triangles_into_gs);
+    RUN_IF(tessellation_indexed_into_gs);
+    RUN_IF(tessellation_isolines_into_gs);
+    RUN_IF(tessellation_point_mode_into_gs);
+    RUN_IF(xfb_of_tes_output);
+    RUN_IF(xfb_of_tes_gs_output);
+    RUN_IF(primitive_restart_with_gs);
+    RUN_IF(pool_rotation_hazard);
+    RUN_IF(wild_index_survives_cpu_assembly);
+    RUN_IF(xfb_gpu_pack_multiple_draws_and_pause);
+    RUN_IF(element_store_tail_integrity);
+    RUN_IF(tiled_restart_gpu_assembly);
+    RUN_IF(gs_output_block_instance_name);
+    RUN_IF(gs_output_block_two_members_and_plain);
+    RUN_IF(gs_output_block_array_member);
+    RUN_IF(gs_output_block_flat_and_matrix_members);
+    RUN_IF(gs_output_block_anonymous);
+    RUN_IF(xfb_of_gs_output_block_members);
+    RUN_IF(gs_output_block_after_tessellation);
+    RUN_IF(gs_output_block_xfb_errors);
+    RUN_IF(r31_gs_only_spo_queries);
+    RUN_IF(r31_ssbo_range_bindings);
+    RUN_IF(r31_layered_blending);
+    RUN_IF(r31_layered_fbo_no_attachment);
+    RUN_IF(r31_gs_image_reads);
     return mgl_test_summary();
 }

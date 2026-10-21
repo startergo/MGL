@@ -720,7 +720,7 @@ static const char *kGeomXfbMSL =
     "\n"
     "#define WG " MGL_GEOM_STR(MGL_GEOM_XFB_WG) "\n"
     "\n"
-    "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; };\n"
+    "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; uint stream; };\n"
     "\n"
     "kernel void mgl_geom_xfb_prefix(constant uint* in [[buffer(0)]],\n"
     "                                const device uint* recs [[buffer(4)]],\n"
@@ -735,7 +735,7 @@ static const char *kGeomXfbMSL =
     "    uint maxv = in[1], out_words = in[2];\n"
     "    uint v;\n"
     "\n"
-    "    if (tid == 0u) { carry[0] = 0u; xfb[8] = 0u; }   /* per-draw vertex counter */\n"
+    "    if (tid == 0u) carry[0] = 0u;\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "\n"
     "    for (uint base = 0u; base < threads; base += WG) {\n"
@@ -746,13 +746,16 @@ static const char *kGeomXfbMSL =
     "             * primitive, not by emitted vertex: the scan input is the thread's count\n"
     "             * of primitives it closed - each flagged record stands for the n-per+1\n"
     "             * primitives its strip (n vertices, tag bits 0..7) decomposes into.\n"
-    "             * Degenerate strips never get the flag, matching the scatter. */\n"
+    "             * Degenerate strips never get the flag, matching the scatter.\n"
+    "             * One pack pass per captured stream (in[20]): only that stream's records\n"
+    "             * are counted, and the ordinals the kernel stamps are per stream too. */\n"
     "            const device uint* r = recs + (size_t)i * maxv * out_words;\n"
     "            uint per = (in[13] == 2u) ? 3u : (in[13] == 1u) ? 2u : 1u;\n"
+    "            uint st = in[20];\n"
     "            for (uint s = 0u, n = cnt[i]; s < n; s++) {\n"
     "                uint w = r[(size_t)s * out_words + 1u];\n"
     "                uint sv = w & 0xffu;\n"
-    "                if (((w >> 8) & 1u) && ((w >> 24) == 0u) && sv >= per) v += sv - per + 1u;\n"
+    "                if (((w >> 8) & 1u) && ((w >> 24) == st) && sv >= per) v += sv - per + 1u;\n"
     "            }\n"
     "        }\n"
     "        tgr[tid] = v;\n"
@@ -769,6 +772,11 @@ static const char *kGeomXfbMSL =
     "        if (tid == WG - 1u) carry[0] += tgr[WG - 1u];\n"
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    }\n"
+    "    /* the scan's total is this draw's EMITTED primitives of this stream (\"needed\":\n"
+    "     * the overflow query compares it against the written count) */\n"
+    "    if (tid == 0u && carry[0])\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[17 + in[20]], carry[0],\n"
+    "                                  memory_order_relaxed);\n"
     "}\n"
     "\n"
     "kernel void mgl_geom_xfb_scatter(constant uint* in [[buffer(0)]],\n"
@@ -791,31 +799,32 @@ static const char *kGeomXfbMSL =
     "    if (t >= in[0] || s >= cnt[t]) return;\n"
     "\n"
     "    const device uint* rec = recs + (size_t)slot * out_words;\n"
-    "    if (((rec[1] >> 24) & 0xffu) != 0u) return;       /* only the rasterization stream */\n"
-    "    if (((rec[1] >> 8) & 1u) == 0u) return;           /* only the vertex closing a primitive */\n"
+    "    if (((rec[1] >> 24) & 0xffu) != in[20]) return;  /* this pass packs one stream */\n"
+    "    if (((rec[1] >> 8) & 1u) == 0u) return;          /* only the vertex closing a primitive */\n"
     "\n"
     "    /* GL records WHOLE primitives: the closed strip decomposes into its line /\n"
     "     * triangle primitives and every vertex of each is captured, so shared strip\n"
     "     * vertices are written once per primitive; a primitive whose last vertex would\n"
     "     * not fit is not recorded at all (no partial writes).  The tag carries the\n"
-    "     * strip's length (bits 0..7) and the primitives the thread closed before it\n"
-    "     * (bits 9..23); with the prefix scan (xbase) that gives each decomposed\n"
-    "     * primitive its global captured index.  The geometry stage flags only strips\n"
-    "     * long enough to close one primitive, so the strip's records are in range. */\n"
+    "     * strip's length (bits 0..7) and the primitives the thread closed before it ON\n"
+    "     * THIS STREAM (bits 9..23); with the prefix scan (xbase) that gives each\n"
+    "     * decomposed primitive its global captured index inside its stream.  The\n"
+    "     * geometry stage flags only strips long enough to close one primitive, so the\n"
+    "     * strip's records are in range. */\n"
     "    uint per = (in[13] == 2u) ? 3u : (in[13] == 1u) ? 2u : 1u;\n"
     "    uint n = rec[1] & 0xffu;\n"
     "    uint before = (rec[1] >> 9) & 0x7fffu;\n"
-    "    uint first = s + 1u - n;                       /* the strip's first record */\n"
     "    for (uint p = 0u; p + per <= n; p++) {\n"
     "        uint prim = xbase[t] + before + p;\n"
     "\n"
     "        /* capacity test on the primitive's LAST vertex: a buffer must have room for\n"
-    "         * its largest varying there (in[14+b]).  The test is monotonic in the write\n"
-    "         * offsets, so once a primitive does not fit, no later one does - GL stops\n"
-    "         * recording. */\n"
+    "         * its largest varying there (in[14+b]).  Only THIS stream's buffers are tested\n"
+    "         * (in[22]): another stream's pass owns their offsets and numbers its captured\n"
+    "         * primitives independently.  The test is monotonic in the write offsets, so\n"
+    "         * once a primitive does not fit, no later one does - GL stops recording. */\n"
     "        bool fits = true;\n"
     "        for (uint b = 0u; b < 4u; b++) {\n"
-    "            if (!in[4 + b]) continue;\n"
+    "            if (!((in[22] >> b) & 1u)) continue;\n"
     "            uint end = xfb[3 + b] + (prim * per + per - 1u) * in[4 + b] + in[14 + b];\n"
     "            if (end > in[8 + b]) fits = false;      /* full: the primitive is dropped, as GL does */\n"
     "        }\n"
@@ -828,13 +837,15 @@ static const char *kGeomXfbMSL =
     "                device uint* d = dst[vr.buffer];\n"
     "                uint stride = in[4 + vr.buffer];\n"
     "                if (!stride || !vr.words) continue; /* skip / next-buffer markers */\n"
+    "                if (vr.stream != in[20]) continue; /* another pass packs this stream */\n"
     "                uint pos = xfb[3 + vr.buffer] + (prim * per + j) * stride + vr.dst_off;\n"
     "                for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rj[vr.src_word + w];\n"
     "            }\n"
     "        }\n"
     "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], per, memory_order_relaxed);\n"
-    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], per, memory_order_relaxed);\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[9 + in[20]], per, memory_order_relaxed);\n"
     "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], 1u, memory_order_relaxed);\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[13 + in[20]], 1u, memory_order_relaxed);\n"
     "    }\n"
     "}\n"
     "\n"
@@ -842,16 +853,28 @@ static const char *kGeomXfbMSL =
     "                                const device uint* ctl [[buffer(1)]],\n"
     "                                device uint* xfb [[buffer(2)]])\n"
     "{\n"
+    "    uint dv[4];\n"
+    "    for (uint s = 0u; s < 4u; s++) dv[s] = xfb[9 + s];   /* this draw's captured vertices */\n"
     "    for (uint b = 0u; b < 4u; b++)\n"
-    "        if (in[4 + b]) xfb[3 + b] += xfb[8] * in[4 + b];\n"
-    "    /* the primitives-written count is accumulated by the scatter kernel (it knows the\n"
-    "     * buffer capacities, so a primitive that does not fit is not counted) */\n"
+    "        if (in[4 + b]) {\n"
+    "            /* each buffer captures one stream's varyings (in[21] packs them 2 bits per\n"
+    "             * buffer); its write offset advances by that stream's captured vertices */\n"
+    "            uint st = (in[21] >> (2u * b)) & 3u;\n"
+    "            xfb[3 + b] += dv[st] * in[4 + b];\n"
+    "        }\n"
+    "    for (uint s = 0u; s < 4u; s++) {\n"
+    "        xfb[21 + s] += dv[s];   /* the block totals the CPU resolve folds in */\n"
+    "        xfb[9 + s] = 0u;        /* per-draw counters for the next draw */\n"
+    "    }\n"
+    "    /* the primitives-written counts are accumulated by the scatter kernels (they know\n"
+    "     * the buffer capacities, so a primitive that does not fit is not counted) */\n"
     "}\n"
     "\n"
     "/* initialise the counter block on the command stream: the CPU must never write it while\n"
     " * a pack may be in flight.  in[0] = object name, in[1..4] = the starting write offsets.\n"
-    " * xfb[8] (the per-draw vertex counter) is cleared here as well: the geometry path's\n"
-    " * prefix kernel does it, the tessellation path has no prefix kernel. */\n"
+    " * xfb[8] (the tess path's per-draw vertex counter) is cleared here as well, and so are\n"
+    " * the per-draw / per-stream slots: the geometry path's finish kernel re-clears its own\n"
+    " * after every draw, the tessellation path has no finish-per-stream. */\n"
     "kernel void mgl_geom_xfb_begin(constant uint* in [[buffer(0)]], device uint* xfb [[buffer(1)]])\n"
     "{\n"
     "    xfb[0] = in[0];\n"
@@ -863,6 +886,10 @@ static const char *kGeomXfbMSL =
     "    xfb[6] = in[4];\n"
     "    xfb[7] = 0u;\n"
     "    xfb[8] = 0u;\n"
+    "    xfb[9] = 0u; xfb[10] = 0u; xfb[11] = 0u; xfb[12] = 0u;   /* per-draw vertices per stream */\n"
+    "    xfb[13] = 0u; xfb[14] = 0u; xfb[15] = 0u; xfb[16] = 0u;  /* primitives written per stream */\n"
+    "    xfb[17] = 0u; xfb[18] = 0u; xfb[19] = 0u; xfb[20] = 0u;  /* primitives emitted per stream */\n"
+    "    xfb[21] = 0u; xfb[22] = 0u; xfb[23] = 0u; xfb[24] = 0u;  /* block vertices per stream */\n"
     "}\n"
     "\n"
     "/* transform feedback from a tessellation stage WITHOUT a geometry shader: the TES is\n"
@@ -901,10 +928,19 @@ static const char *kGeomXfbMSL =
     "\n"
     "kernel void mgl_geom_xfb_tess_finish(constant uint* in [[buffer(0)]], device uint* xfb [[buffer(1)]])\n"
     "{\n"
+    "    uint dv = xfb[8];                       /* this draw's captured vertices (stream 0) */\n"
+    "    uint prims = in[12] ? dv / in[12] : dv; /* whole captured primitives */\n"
     "    for (uint b = 0u; b < 4u; b++)\n"
-    "        if (in[4 + b]) xfb[3 + b] += xfb[8] * in[4 + b];\n"
-    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], in[12] ? xfb[8] / in[12] : xfb[8],\n"
-    "                              memory_order_relaxed);\n"
+    "        if (in[4 + b]) xfb[3 + b] += dv * in[4 + b];\n"
+    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], prims, memory_order_relaxed);\n"
+    "    /* the tessellation path captures ONE stream: mirror this draw's counts into the\n"
+    "     * per-stream block-total slots the CPU resolve reads (every capture is written:\n"
+    "     * the kernel drops only vertices past the buffer's end, and GL counts the whole\n"
+    "     * primitives that still fit) */\n"
+    "    xfb[21] += dv;\n"
+    "    xfb[13] += prims;\n"
+    "    xfb[17] += prims;\n"
+    "    xfb[8] = 0u;                            /* per-draw counter for the next draw */\n"
     "}\n";
 
 
@@ -1365,7 +1401,9 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     return true;
 }
 
-/* encode the three pack kernels for one draw (see mgl_ext_geom_xfb.h) */
+/* encode the pack kernels for one draw (see mgl_ext_geom_xfb.h).  GL captures every
+ * output stream: one prefix + scatter pass per captured stream, sharing one compute
+ * encoder (the passes of one draw are ordered inside it), then a single finish. */
 - (bool) geomXfbEncode: (MGLGeomProgram *) gp object: (MGLXfbObject *) o program: (MGLXfbProgram *) xp
                    tfb: (BufferBaseTarget *) tfb threads: (uint32_t) threads
              maxVertices: (uint32_t) max_vertices outWords: (uint32_t) out_words
@@ -1374,7 +1412,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     MGLGeomDraw dummy; (void)dummy;
     uint32_t in[MGL_GEOM_XFB_IN_WORDS];
     uint32_t vars[MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS];
-    id<MTLComputeCommandEncoder> enc;
+    id<MTLComputeCommandEncoder> enc = nil;
     NSUInteger wg = MGL_GEOM_XFB_WG;
 
     if (!gXfbScatterPso && ![self geomXfbPipelines]) return false;
@@ -1421,10 +1459,11 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     memset(vars, 0, sizeof vars);
     for (GLuint v = 0; v < xp->count; v++)
     {
-        vars[v * 4 + 0] = (uint32_t)xp->vars[v].src_word;
-        vars[v * 4 + 1] = (uint32_t)xp->vars[v].offset;
-        vars[v * 4 + 2] = (uint32_t)xp->vars[v].words;
-        vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
+        vars[v * 5 + 0] = (uint32_t)xp->vars[v].src_word;
+        vars[v * 5 + 1] = (uint32_t)xp->vars[v].offset;
+        vars[v * 5 + 2] = (uint32_t)xp->vars[v].words;
+        vars[v * 5 + 3] = (uint32_t)xp->vars[v].buffer;
+        vars[v * 5 + 4] = (uint32_t)xp->vars[v].stream;
         /* the per-buffer captured extent: the scatter's capacity test checks the last
          * vertex of a primitive against the buffer's largest varying (bytes) */
         if (xp->vars[v].words)
@@ -1432,73 +1471,111 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
             uint32_t e = (uint32_t)(xp->vars[v].offset + xp->vars[v].words * 4);
             GLuint b = xp->vars[v].buffer;
             if (b < 4 && e > in[14 + b]) in[14 + b] = e;
+            /* the buffer's stream: its write offset advances by that stream's vertices */
+            if (b < 4 && xp->vars[v].stream < 4)
+                in[21] = (in[21] & ~(3u << (2 * b))) | ((uint32_t)xp->vars[v].stream << (2 * b));
         }
     }
 
     if (!gXfbFence) gXfbFence = [_device newFence];
 
-    enc = [_currentCommandBuffer computeCommandEncoder];
-    if (!enc) return false;
-    [enc pushDebugGroup: @"MGL geometry xfb pack"];
-
-    /* the counter block is shared storage, which Metal does not hazard-track across command
-     * buffers: wait for the previous draw's pack before reading the write offsets.  Metal
-     * forbids waiting on a fence that was updated in the same command buffer, and inside one
-     * buffer the encoders are already ordered, so the wait is only needed across them. */
-    if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
-        [enc waitForFence: gXfbFence];
-
-    /* every per-draw input is passed by value: Metal copies it into the command buffer at
-     * encode time, so no later CPU write can change what a pending draw reads */
-
-    if (gXfbBegin)
+    /* GL captures every stream, each into the buffers its varyings name: dispatch one
+     * prefix + scatter pass per captured stream (in[20]).  Without a geometry stage, or
+     * with varyings that carry no stream, this is the single stream-0 pass of the old
+     * code.  The passes share one compute encoder: they are ordered inside it, and every
+     * one of them reads the same write offsets (only the finish kernel advances them). */
+    for (GLuint st = 0; st < MGL_XFB_MAX_STREAMS; st++)
     {
-        /* the seed must live in its own buffer: the ring slot is restored (and reused by the
-         * next draw) before this kernel executes */
-        uint32_t seed[MGL_GEOM_XFB_IN_WORDS];
-        memset(seed, 0, sizeof seed);
-        seed[0] = o->name;
-        for (GLuint b = 0; b < 4; b++) seed[1 + b] = (uint32_t)o->write_offset[b];
-        [enc setComputePipelineState: gXfbBeginPso];
-        [enc setBytes: seed length: sizeof seed atIndex: 0];
-        [enc setBuffer: gXfb offset: 0 atIndex: 1];
-        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        bool has = false;
+        uint32_t mask = 0;
+        for (GLuint v = 0; v < xp->count; v++)
+            if (xp->vars[v].words && xp->vars[v].buffer < 4 &&
+                xp->vars[v].stream == st && in[4 + xp->vars[v].buffer])
+            {
+                has = true;
+                mask |= 1u << xp->vars[v].buffer;
+            }
+        if (!has) continue;
+        in[20] = (uint32_t)st;
+        in[22] = mask;
+
+        if (!enc)
+        {
+            enc = [_currentCommandBuffer computeCommandEncoder];
+            if (!enc) return false;
+            [enc pushDebugGroup: @"MGL geometry xfb pack"];
+
+            /* the counter block is shared storage, which Metal does not hazard-track across
+             * command buffers: wait for the previous draw's pack before reading the write
+             * offsets.  Metal forbids waiting on a fence that was updated in the same
+             * command buffer, and inside one buffer the encoders are already ordered, so
+             * the wait is only needed across them. */
+            if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+                [enc waitForFence: gXfbFence];
+
+            /* every per-draw input is passed by value: Metal copies it into the command
+             * buffer at encode time, so no later CPU write can change what a pending
+             * draw reads */
+
+            if (gXfbBegin)
+            {
+                /* the seed must live in its own buffer: the ring slot is restored (and
+                 * reused by the next draw) before this kernel executes */
+                uint32_t seed[MGL_GEOM_XFB_IN_WORDS];
+                memset(seed, 0, sizeof seed);
+                seed[0] = o->name;
+                for (GLuint b = 0; b < 4; b++) seed[1 + b] = (uint32_t)o->write_offset[b];
+                [enc setComputePipelineState: gXfbBeginPso];
+                [enc setBytes: seed length: sizeof seed atIndex: 0];
+                [enc setBuffer: gXfb offset: 0 atIndex: 1];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+                if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
+                    [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+                gXfbBegin = false;
+            }
+        }
+
+        [enc setComputePipelineState: gXfbPrePso];
+        [enc setBytes: in length: sizeof in atIndex: 0];
+        [enc setBuffer: gCnt offset: gCntOff atIndex: 1];   /* this draw's counters, not the pool's start */
+        [enc setBuffer: gXbase offset: 0 atIndex: 2];
+        [enc setBuffer: gXfb offset: 0 atIndex: 3];
+        [enc setBuffer: gOutv offset: gOutvOff atIndex: 4]; /* the records: the scan counts closed primitives */
+        [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
         if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
             [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
-        gXfbBegin = false;
-    }
 
-    [enc setComputePipelineState: gXfbPrePso];
-    [enc setBytes: in length: sizeof in atIndex: 0];
-    [enc setBuffer: gCnt offset: gCntOff atIndex: 1];   /* this draw's counters, not the pool's start */
-    [enc setBuffer: gXbase offset: 0 atIndex: 2];
-    [enc setBuffer: gXfb offset: 0 atIndex: 3];
-    [enc setBuffer: gOutv offset: gOutvOff atIndex: 4]; /* the records: the scan counts closed primitives */
-    [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
-    if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
-        [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+        [enc setComputePipelineState: gXfbScatterPso];
+        [enc setBytes: in length: sizeof in atIndex: 0];
+        [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
+        if ((geomEnvRead(), gEnv.xfb))
+            fprintf(stderr, "geom: scatter reads out buf=%p off=%zu stream=%u mask=%x\n",
+                    (void *)(__bridge void *)gOutv, gOutvOff, st, mask);
+        [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
+        [enc setBuffer: gCnt offset: gCntOff atIndex: 3];
+        [enc setBuffer: gXbase offset: 0 atIndex: 4];
+        [enc setBuffer: gXfb offset: 0 atIndex: 5];
+        for (GLuint b = 0; b < 4; b++)
+        {
+            id<MTLBuffer> mtl = (tfb[b].buf && tfb[b].buf->data.mtl_data)
+                                ? (__bridge id<MTLBuffer>)tfb[b].buf->data.mtl_data : gXfb;
+            [enc setBuffer: mtl offset: 0 atIndex: 6 + b];
+        }
+        {
+            NSUInteger slots = (NSUInteger)threads * (max_vertices ? max_vertices : 1);
+            if (slots > vertex_cap) slots = vertex_cap;
+            [enc dispatchThreadgroups: MTLSizeMake((slots + wg - 1) / wg, 1, 1)
+                  threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+        }
+        if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
+            [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+    }   /* next captured stream */
 
-    [enc setComputePipelineState: gXfbScatterPso];
-    [enc setBytes: in length: sizeof in atIndex: 0];
-    [enc setBytes: vars length: (NSUInteger)xp->count * MGL_GEOM_XFB_VAR_WORDS * sizeof(uint32_t) atIndex: 1];
-    if ((geomEnvRead(), gEnv.xfb))
-        fprintf(stderr, "geom: scatter reads out buf=%p off=%zu\n",
-                (void *)(__bridge void *)gOutv, gOutvOff);
-    [enc setBuffer: gOutv offset: gOutvOff atIndex: 2];
-    [enc setBuffer: gCnt offset: gCntOff atIndex: 3];
-    [enc setBuffer: gXbase offset: 0 atIndex: 4];
-    [enc setBuffer: gXfb offset: 0 atIndex: 5];
-    for (GLuint b = 0; b < 4; b++)
+    if (!enc)
     {
-        id<MTLBuffer> mtl = (tfb[b].buf && tfb[b].buf->data.mtl_data)
-                            ? (__bridge id<MTLBuffer>)tfb[b].buf->data.mtl_data : gXfb;
-        [enc setBuffer: mtl offset: 0 atIndex: 6 + b];
-    }
-    {
-        NSUInteger slots = (NSUInteger)threads * (max_vertices ? max_vertices : 1);
-        if (slots > vertex_cap) slots = vertex_cap;
-        [enc dispatchThreadgroups: MTLSizeMake((slots + wg - 1) / wg, 1, 1)
-              threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
+        /* no stream had a captured varying: nothing to do (the CPU resolve still folds the
+         * emitted counters) */
+        return true;
     }
 
     [enc setComputePipelineState: gXfbFinPso];
@@ -1518,6 +1595,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                 fprintf(stderr, "geom: pack stamp buf=%p name=%u ctx=%p slot=%u\n",
                         (void *)tfb[b].buf, tfb[b].buf->name, (void *)ctx, b);
             mgl_buffers_mark_gpu_use(ctx, tfb[b].buf, true);
+            if ((geomEnvRead(), gEnv.xfb))
             {
                 MGLBufferTrack *t = mgl_buffers_track(ctx, tfb[b].buf, false);
                 fprintf(stderr, "geom: pack stamped buf=%u -> write_serial=%llu (entry %p)\n",
@@ -1647,6 +1725,24 @@ void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_
     }
     *dvert = b[1];
     *dprim = b[2];
+}
+
+/* the per-stream counts of a finished pack (the caller has synchronised): [21..24] the
+ * block-total captured vertices per stream (what the buffers' write offsets advanced by),
+ * [13..16] the block-total primitives WRITTEN per stream and [17..20] the primitives
+ * EMITTED per stream ("needed") - the overflow query compares the two. */
+void geom_xfb_gpu_read_streams(GLMContext ctx, uint32_t dvert[MGL_XFB_MAX_STREAMS],
+                               uint32_t dprim[2 * MGL_XFB_MAX_STREAMS])
+{
+    uint32_t *b = (uint32_t *)(gXfb ? gXfb.contents : NULL);
+
+    (void)ctx;
+    for (GLuint s = 0; s < MGL_XFB_MAX_STREAMS; s++)
+    {
+        dvert[s] = b ? b[21 + s] : 0;
+        dprim[s] = b ? b[13 + s] : 0;
+        dprim[s + MGL_XFB_MAX_STREAMS] = b ? b[17 + s] : 0;
+    }
 }
 
 void geom_xfb_gpu_reset(GLMContext ctx)

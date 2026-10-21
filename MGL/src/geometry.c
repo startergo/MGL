@@ -3090,7 +3090,11 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     if (gp->out_has_clip) sb_put(&b, "float mgl_gs_clip[%u];\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "float mgl_gs_cull[%u];\n", gp->out_clip_size);
     sb_put(&b, "int mgl_gs_prim_in;\nint mgl_gs_invoc;\n");
-    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream, mgl_slot_base, mgl_closes;\n");
+    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream, mgl_slot_base;\n");
+    /* per-stream captured-primitive ordinals: transform feedback captures every stream, and a
+     * record's ordinal (header bits 9..23) must count the primitives of ITS OWN stream that
+     * were closed before it (KHR-GL46.transform_feedback.draw_xfb_stream*) */
+    sb_put(&b, "uint mgl_pt[4];\nuint mgl_cl[4];\n");
     sb_put(&b, "uint mgl_t = 0u;          /* thread (primitive/invocation) index - the scratch segment key */\n");
     sb_put(&b, "uint mgl_lcnt = 0u;\n");
     /* the vertices of the strip in emit order: threads interleave (one per primitive per
@@ -3179,9 +3183,10 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     {
         sb_put(&b, "    /* a point output makes every vertex its own primitive: flag the record as\n");
         sb_put(&b, "     * closing one (bit 8), stamp its length (1, bits 0..7) and the number of\n");
-        sb_put(&b, "     * primitives the thread closed before it (bits 9..23), by which the transform\n");
-        sb_put(&b, "     * feedback pack indexes the captured primitives */\n");
-        sb_put(&b, "    mgl_out[slot * %uu + 1u] |= (1u << 8u) | (mgl_written << 9u) | 1u;\n", gp->out_words);
+        sb_put(&b, "     * primitives the thread closed before it ON THE SAME STREAM (bits 9..23),\n");
+        sb_put(&b, "     * by which the transform feedback pack indexes the captured primitives */\n");
+        sb_put(&b, "    mgl_out[slot * %uu + 1u] |= (1u << 8u) | (mgl_pt[s] << 9u) | 1u;\n", gp->out_words);
+        sb_put(&b, "    mgl_pt[s]++;\n");
     }
     sb_put(&b, "    mgl_strip_n++; mgl_written++; mgl_seq++;\n");
     if (out_type_code == 0)
@@ -3233,18 +3238,19 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     {
         sb_put(&b, "    /* close the strip: flag its last record for the transform feedback pack\n");
         sb_put(&b, "     * (bit 8), stamp the strip's length (bits 0..7) and the number of primitives\n");
-        sb_put(&b, "     * the thread closed before it (bits 9..23) - a strip of n vertices decomposes\n");
-        sb_put(&b, "     * into n-1 line / n-2 triangle captured primitives, so one close can stand for\n");
-        sb_put(&b, "     * several.  A strip shorter than one output primitive is degenerate: nothing\n");
-        sb_put(&b, "     * can be captured from it, so it gets no flag and consumes no ordinal, exactly\n");
-        sb_put(&b, "     * what the pack counts. */\n");
+        sb_put(&b, "     * the thread closed before it ON THIS STREAM (bits 9..23) - a strip of n\n");
+        sb_put(&b, "     * vertices decomposes into n-1 line / n-2 triangle captured primitives, so\n");
+        sb_put(&b, "     * one close can stand for several.  A strip shorter than one output primitive\n");
+        sb_put(&b, "     * is degenerate: nothing can be captured from it, so it gets no flag and\n");
+        sb_put(&b, "     * consumes no ordinal, exactly what the pack counts.  Every stream is\n");
+        sb_put(&b, "     * captured, so the flag is not limited to the rasterization stream. */\n");
         if (out_type_code == 1)
-            sb_put(&b, "    if (mgl_strip_n >= 2u && s == 0u) {\n");
+            sb_put(&b, "    if (mgl_strip_n >= 2u) {\n");
         else
-            sb_put(&b, "    if (mgl_strip_n >= 3u && s == 0u) {\n");
+            sb_put(&b, "    if (mgl_strip_n >= 3u) {\n");
         sb_put(&b, "        mgl_out[mgl_strip_v[mgl_strip_n - 1u] * %uu + 1u] |=\n", gp->out_words);
-        sb_put(&b, "            (1u << 8u) | (mgl_closes << 9u) | mgl_strip_n;\n");
-        sb_put(&b, "        mgl_closes += mgl_strip_n - %uu + 1u;\n", (unsigned)(out_type_code == 1 ? 2 : 3));
+        sb_put(&b, "            (1u << 8u) | (mgl_cl[s] << 9u) | mgl_strip_n;\n");
+        sb_put(&b, "        mgl_cl[s] += mgl_strip_n - %uu + 1u;\n", (unsigned)(out_type_code == 1 ? 2 : 3));
         sb_put(&b, "    }\n");
         sb_put(&b, "    if (mgl_strip_n > 0u) atomicAdd(mgl_ctl[13u + s], 1u);\n");
         /* PRIMITIVES_GENERATED counts what the rasterizer / transform feedback consume:
@@ -3277,8 +3283,12 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    uint mgl_pi = mgl_p - mgl_inst * mgl_hdr[0];\n");
     sb_put(&b, "    mgl_load_inputs(mgl_pi, mgl_inst);\n");
     sb_put(&b, "    mgl_gs_prim_in = int(mgl_pi);\n    mgl_gs_invoc = int(mgl_inv);\n");
-    sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u; mgl_closes = 0u;\n");
+    sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u;\n");
     sb_put(&b, "    mgl_slot_base = mgl_t * mgl_hdr[5];\n");
+    /* thread-local arrays are NOT zero-initialised in MSL: the per-stream ordinals must
+     * start at 0, or the captured primitive indices of every stream but the first are garbage */
+    sb_put(&b, "    mgl_pt[0]=0u; mgl_pt[1]=0u; mgl_pt[2]=0u; mgl_pt[3]=0u;\n");
+    sb_put(&b, "    mgl_cl[0]=0u; mgl_cl[1]=0u; mgl_cl[2]=0u; mgl_cl[3]=0u;\n");
     sb_put(&b, "    mgl_gs_pos = vec4(0.0);\n");
     if (gp->out_has_psize) sb_put(&b, "    mgl_gs_psize = 1.0;\n");
     if (gp->out_has_layer) sb_put(&b, "    mgl_gs_layer = 0;\n");
@@ -5679,6 +5689,7 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             v->words = g->words;
             v->src_word = g->offset;
         }
+        v->stream = g->stream;   /* only stream 0 rasterizes, but GL captures every stream */
         if (separate)
         {
             /* each API-selected varying is its own binding point (GL 4.6 13.3.1); a name
@@ -5837,8 +5848,12 @@ bool mgl_geom_xfb_pack(GLMContext ctx, MGLGeomProgram *gp, Program *program,
  * where the application can observe them, so the command buffer has usually completed. */
 void mgl_geom_xfb_flush(GLMContext ctx)
 {
+    extern void geom_xfb_gpu_read_streams(GLMContext ctx, uint32_t dvert[MGL_XFB_MAX_STREAMS],
+                                          uint32_t dprim[2 * MGL_XFB_MAX_STREAMS]);
     MGLXfbObject *o = geom_xfb_object(ctx);
     uint32_t dvert, dprim;
+    uint32_t sv[MGL_XFB_MAX_STREAMS];
+    uint32_t sp[2 * MGL_XFB_MAX_STREAMS];
 
     if (!mgl_geom_xfb_pending(ctx)) return;
 
@@ -5851,27 +5866,39 @@ void mgl_geom_xfb_flush(GLMContext ctx)
         fprintf(stderr, "geom:   fold reads TF backing %p\n", b0 ? b0->data.mtl_data : NULL);
     }
     { extern void geom_xfb_dump(GLMContext ctx); geom_xfb_dump(ctx); }
+    /* geom_xfb_gpu_read also refreshes o->write_offset[] from the block */
     geom_xfb_gpu_read(ctx, o, &dvert, &dprim);
+    /* the per-stream counters of the geometry pack are authoritative when they were used
+     * (a geometry stage captures every stream); the tessellation / vertex-stage paths only
+     * fill stream 0's slots (their finish kernels mirror the totals in) */
+    geom_xfb_gpu_read_streams(ctx, sv, sp);
     if (geom_env(1))
     {
         Buffer *b0 = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0].buf;
         float *f = b0 ? (float *)(void *)(vm_address_t)b0->data.buffer_data : NULL;
-        fprintf(stderr, "geom: flush name=%u dvert=%u dprim=%u tf=%p words=[%f %f %f %f]\n",
-                o ? o->name : 0, dvert, dprim, (void *)f,
+        fprintf(stderr, "geom: flush name=%u total dvert=%u dprim=%u streams v=[%u %u %u %u] w=[%u %u %u %u] n=[%u %u %u %u] tf=%p words=[%f %f %f %f]\n",
+                o ? o->name : 0, dvert, dprim,
+                sv[0], sv[1], sv[2], sv[3],
+                sp[0], sp[1], sp[2], sp[3],
+                sp[4], sp[5], sp[6], sp[7],
+                (void *)f,
                 f ? f[0] : 0.0f, f ? f[1] : 0.0f, f ? f[2] : 0.0f, f ? f[3] : 0.0f);
     }
 
-    if (o)
+    for (GLuint s = 0; s < MGL_XFB_MAX_STREAMS; s++)
     {
-        o->vertices[0] += dvert;
-        o->prims_written[0] += dprim;
-        o->prims_needed[0] += dprim;
-    }
-    if (ctx->state.ext_xfb)
-    {
-        struct MGLExtState_xfb *x = ctx->state.ext_xfb;
-        x->total_written[0] += dprim;
-        x->total_needed[0] += dprim;
+        if (o)
+        {
+            o->vertices[s] += sv[s];
+            o->prims_written[s] += sp[s];
+            o->prims_needed[s] += sp[s + MGL_XFB_MAX_STREAMS];
+        }
+        if (ctx->state.ext_xfb)
+        {
+            struct MGLExtState_xfb *x = ctx->state.ext_xfb;
+            x->total_written[s] += sp[s];
+            x->total_needed[s] += sp[s + MGL_XFB_MAX_STREAMS];
+        }
     }
 
     /* the transform feedback primitive queries are counted by the queries domain */
@@ -5884,7 +5911,11 @@ void mgl_geom_xfb_flush(GLMContext ctx)
             note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
             looked = 1;
         }
-        if (note) note(ctx, 0, dprim, dprim);
+        /* sp[s] = written, sp[s + MAX] = emitted (needed): needed > written is the overflow
+         * condition of GL_TRANSFORM_FEEDBACK_OVERFLOW_ARB / _STREAM_OVERFLOW_ARB */
+        if (note)
+            for (GLuint s = 0; s < MGL_XFB_MAX_STREAMS; s++)
+                note(ctx, s, sp[s], sp[s + MGL_XFB_MAX_STREAMS]);
     }
 
     geom_xfb_gpu_reset(ctx);

@@ -51,6 +51,9 @@ typedef struct MGLXfbVarying_t {
     GLenum   comp_kind;     /* GL_FLOAT / GL_INT / GL_UNSIGNED_INT */
     GLuint   columns;       /* matrix columns (1 otherwise) */
     GLuint   rows;          /* vector size / matrix rows */
+    GLuint   stream;        /* the stream the varying is declared for (geometry output; 0
+                             * otherwise).  Only stream 0 rasterizes, but GL captures every
+                             * stream, each into the buffers its varyings name */
 } MGLXfbVarying;
 
 /* per program object */
