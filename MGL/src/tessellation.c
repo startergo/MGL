@@ -854,8 +854,66 @@ static void tess_canon_member_lines(char **buf, size_t *len, size_t *cap,
 
 /* canonical struct body text for one stage: the stage's member names for members it
  * declares, syntactically-valid pads for the rest (never referenced by its code) */
-static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own,
-                            const struct CanonRec *canon)
+/* A scalar-double VS output renders as uint2 in the VS's own MSL but occupies
+ * the full uint4 slot in the canonical control-point record (the consumer
+ * side's repr, "one uint4 = one 128-bit GL location").  Widen the whole-
+ * variable stores `out.<name> = <expr>;` so the canonicalized VS kernel still
+ * compiles.  (Reads of such members always go through `.xy` and work either
+ * way.) */
+static void tess_widen_double_stores(char **msl_p, const struct MslStruct *stage,
+                                     const struct CanonRec *canon)
+{
+    char pat[160];
+
+    for (int i = 0; i < canon->n; i++)
+    {
+        const MGLTessPatchMember *cm = &canon->m[i];
+        const MGLTessPatchMember *sm = NULL;
+
+        for (int j = 0; j < stage->count; j++)
+            if (stage->members[j].key == cm->key) { sm = &stage->members[j]; break; }
+        if (!sm || !sm->name[0])
+            continue;
+        if (!strstr(cm->type, "uint4") || !strstr(sm->type, "uint2"))
+            continue;
+        if (strstr(sm->type, "spvUnsafeArray") || strstr(cm->type, "spvUnsafeArray"))
+            continue;   /* per-element stores only happen on the TCS side */
+
+        snprintf(pat, sizeof pat, "out.%s = ", sm->name);
+        {
+            char *hit = strstr(*msl_p, pat);
+
+            while (hit)
+            {
+                size_t e0 = (size_t)(hit - *msl_p) + strlen(pat);
+                const char *sc = strchr(*msl_p + e0, ';');
+                size_t elen, add, olen;
+                char *grown;
+
+                if (!sc)
+                    break;
+                elen = (size_t)(sc - (*msl_p + e0));
+                add = strlen("uint4(") + strlen(", 0u, 0u)");
+                olen = strlen(*msl_p);
+                grown = (char *)realloc(*msl_p, olen + add + 1);
+                if (!grown)
+                    return;
+                *msl_p = grown;
+                /* layout: "uint4(" expr ", 0u, 0u)" <tail from ';'> — the tail
+                 * moves first (it is the only region beyond the expr), then the
+                 * expr itself shifts right past "uint4(" */
+                memmove(*msl_p + e0 + 6 + elen + 9, *msl_p + e0 + elen,
+                        olen - (e0 + elen) + 1);
+                memmove(*msl_p + e0 + 6, *msl_p + e0, elen);
+                memcpy(*msl_p + e0, "uint4(", 6);
+                memcpy(*msl_p + e0 + 6 + elen, ", 0u, 0u)", 9);
+                hit = strstr(*msl_p + e0 + 6 + elen + 9, pat);
+            }
+        }
+    }
+}
+
+static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own,                            const struct CanonRec *canon)
 {
     char *buf = NULL;
     size_t len = 0, bc = 0;
@@ -1352,18 +1410,63 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
         }
         str_append(&out, &len, &cap, "};\n");
     }
+    else
+    {
+        /* no canonical record (TES reads neither control points nor per-patch varyings,
+         * or pairing is off): the entry signature still names the control point buffer,
+         * so the fallback type must be declared here — a TES with no cp inputs gets
+         * cp_type == "mgl_cp_rec" and nothing would declare it ("unknown type name
+         * 'mgl_cp_rec'" from newLibraryWithSource) */
+        str_append(&out, &len, &cap, "\nstruct mgl_cp_rec\n{\n    float4 gl_Position;\n};\n");
+    }
     str_append(&out, &len, &cap, "%.*s", (int)(sig - ins), ins);
 
-    /* new signature */
+    /* new signature.  The original entry point's buffer/texture/sampler
+     * parameters must survive: everything except the patch stage_in struct,
+     * gl_TessCoord / patch_id, which the prologue rebuilds from the coordinate
+     * stream (a TES reading a uniform block would otherwise lose it —
+     * "use of undeclared identifier" in the generated body). */
+    char *kept = NULL;
+    size_t klen = 0, kcap = 0;
+    {
+        const char *ps = sig_open + 1;
+        while (ps < sig_close)
+        {
+            const char *e = ps;
+            int depth = 0;
+
+            while (e < sig_close && (depth || *e != ','))
+            {
+                if (*e == '(' || *e == '<') depth++;
+                else if (*e == ')' || *e == '>') depth--;
+                e++;
+            }
+            {
+                size_t n = (size_t)(e - ps);
+                char ent[512];
+
+                if (n >= sizeof ent) n = sizeof ent - 1;
+                memcpy(ent, ps, n);
+                ent[n] = 0;
+                if (!strstr(ent, "[[stage_in]]") && !strstr(ent, "position_in_patch") &&
+                    !strstr(ent, "[[patch_id]]"))
+                    str_append(&kept, &klen, &kcap, "%s%s", klen ? ", " : "", ent);
+            }
+            ps = e < sig_close ? e + 1 : e;
+            while (ps < sig_close && (*ps == ' ' || *ps == '\n' || *ps == '\t')) ps++;
+        }
+    }
     str_append(&out, &len, &cap,
                "vertex %s %s(device const float4* mgl_tess_coords [[buffer(%d)]], "
                "device const %s* mgl_tess_cp [[buffer(%d)]], "
                "device const uchar* mgl_tess_patch [[buffer(%d)]], "
                "constant uint* mgl_tess_params [[buffer(%d)]], "
-               "uint mgl_vid [[vertex_id]])",
+               "uint mgl_vid [[vertex_id]]%s%s)",
                entry_ret, entry_name, MGL_TESS_TES_COORDS,
                (tp && tp->num_cp_record > 0) ? "mgl_cp_rec" : cp_type, MGL_TESS_TES_CP,
-               MGL_TESS_TES_PATCH, MGL_TESS_TES_PARAMS);
+               MGL_TESS_TES_PATCH, MGL_TESS_TES_PARAMS,
+               kept && klen ? ", " : "", kept ? kept : "");
+    free(kept);
 
     /* prologue: rebuild patchIn from the buffers. Offsets and the record stride come
      * from the canonical per-patch record (tp->tes_patch_in), so the blob layout is
@@ -1440,6 +1543,7 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
 
     /* original body */
     str_append(&out, &len, &cap, "%s", body_open + 1);
+    if (getenv("MGL_TESS_STEPS")) { FILE *fq = fopen("/tmp/tessstep0.txt", "w"); if (fq) { fputs(out, fq); fclose(fq); } }
 
     /* strip [[attribute(N)]] from the two struct declarations and replace
        patch_control_point<T> by mgl_cp_ref<mgl_cp_rec> so the types work outside
@@ -1537,30 +1641,38 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
         }
 
         {
-            /* splice "struct X { OLD }" -> "struct X { NEW }".  All offsets are
+            /* splice "struct X { OLD }" -> "struct X { NEW }".  Offsets are
              * recomputed from strlen(out) (ground truth) because the tracked
              * `len` drifts when the fallback path above already shrank its
-             * copied body, and the drift overran the buffer on the epilogue
-             * str_append. */
+             * copied body.  The buffer is only ever GROWN: a shrinking realloc
+             * would truncate below `slen`, and the memmove source tail
+             * [off+1+bodylen, slen) would read past the allocation. */
             size_t bodylen = (size_t)(close - open - 1);
             size_t slen = strlen(out);
             size_t off = (size_t)(open - out);
             size_t newlen = slen - bodylen + strlen(newbody);
             const char *hold = newbody;
-            /* keep the buffer large enough for the whole move: the tail is read from
-             * out .. out+len while a shrunk allocation (newlen < len) would already be
-             * shorter than that, and the memmove read would run past its end */
-            size_t keep = newlen > len ? newlen : len;
-            char *grown = (char *)realloc(out, keep + 1);
 
-            if (!grown)
-                return NULL;
-            out = grown;
-            cap = newlen + 1;   /* realloc may have shrunk: keep str_append honest */
+            if (cap < slen + 1 || cap < newlen + 1)
+            {
+                size_t want = (slen > newlen ? slen : newlen) + 1;
+                char *grown = (char *)realloc(out, want);
+
+                if (!grown)
+                    return NULL;
+                out = grown;
+                cap = want;
+            }
             memmove((void *)(out + off + 1 + strlen(newbody)),
-                    out + off + 1 + bodylen, slen - (off + 1 + bodylen) + 1);
+                    out + off + 1 + bodylen, slen - (off + 1 + bodylen));
             memcpy((void *)(out + off + 1), newbody, strlen(newbody));
+            out[newlen] = 0;   /* explicit terminator: never read out[slen] */
             len = newlen;
+            if (getenv("MGL_TESS_STEPS")) { char pth[64]; snprintf(pth, sizeof pth, "/tmp/tessstep%d.txt", d + 1); FILE *fq = fopen(pth, "w"); if (fq) { fputs(out, fq); fclose(fq); }
+                const char *z = memchr(out, 0, len + 1);
+                fprintf(stderr, "SPLICE-POST d=%d newlen=%zu len=%zu strlen=%zu cap=%zu nul_at=%ld ctx=[%.40s]\n",
+                        d, newlen, len, strlen(out), cap, z ? (long)(z - out) : -1L, z ? z - 20 : "");
+                if (z) { fprintf(stderr, "  hex@nul-8:"); for (int q = -8; q <= 2; q++) fprintf(stderr, " %02x", (unsigned char)z[q]); fprintf(stderr, "\n"); } }
             if (hold != canon)
                 free((void *)hold);
         }
@@ -2460,6 +2572,33 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     str_append(&k, &len, &cap, "%.*skernel void ", (int)(sig - plain), plain);
     str_append(&k, &len, &cap, "%.*s_cap(", (int)(open - name), name);
     str_append(&k, &len, &cap, "%.*s", (int)(vid - (open + 1)), open + 1);
+    /* the plain signature's tail after the mgl_vid parameter: the original
+     * entry's buffers (uniform blocks etc.) — they must stay in the kernel's
+     * signature, the body reads them */
+    {
+        const char *vp = vid + strlen("uint mgl_vid [[vertex_id]]");
+        const char *close = NULL;
+        int depth = 0;
+
+        for (const char *q = open; *q; q++)
+        {
+            if (q[0] == '[' && q[1] == '[')
+            {
+                const char *e = strstr(q, "]]");
+                if (e) { q = e; continue; }
+            }
+            if (*q == '(') depth++;
+            else if (*q == ')' && --depth == 0) { close = q; break; }
+        }
+        while (*vp == ' ') vp++;
+        if (*vp == ',' && close)
+        {
+            const char *t = vp + 1;
+
+            while (*t == ' ' || *t == '\n') t++;
+            str_append(&k, &len, &cap, "%.*s, ", (int)(close - t), t);
+        }
+    }
     str_append(&k, &len, &cap, "uint mgl_vid [[thread_position_in_grid]], "
                                "device const uint* mgl_cap_count [[buffer(%d)]], "
                                "device uint* mgl_cap [[buffer(%d)]])\n",
@@ -2548,8 +2687,26 @@ done:
     return out;
 }
 
-void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable)
+/* True when the current tessellated draw rasterizes through the plain TES
+ * (MGLRenderer+Tessellation.m's emulated path: GPU tessellator + indirect
+ * draw, or the CPU reference) instead of the hardware post-tessellation
+ * pipeline.  Transform-feedback capture forces this path as well — the
+ * captured records must be GPU-visible — and so do isolines / point_mode.
+ * With a geometry shader the geometry pass-through renders instead, so the
+ * plain TES is never the raster vertex function there. */
+bool mgl_tess_plain_render(GLMContext ctx)
 {
+    MGLTessProgram *tp = mgl_tess_active_program(ctx);
+
+    if (!tp || !tp->plain_function)
+        return false;
+    if (ctx->state.program && ctx->state.program->shader_slots[_GEOMETRY_SHADER])
+        return false;
+    return tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode || tp->capture ||
+           mgl_tess_cpu_reference();
+}
+
+void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable){
     MGLTessProgram *tp = mgl_tess_active_program(ctx);
 
     if (!tp)
@@ -2880,6 +3037,12 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
             char *nw;
             tess_canon_body(body, sizeof body, &vs_out, &canon);
             nw = msl_rewrite_struct_body(vs_msl, vs_name, body);
+            /* scalar-double outputs: uint2 store in the VS body, uint4 slot in
+             * the canonical record — widen the stores before compiling */
+            if (nw)
+                tess_widen_double_stores(&nw, &vs_out, &canon);
+            if (getenv("MGL_DUMP_MSL") && nw)
+                fprintf(stderr, "==== tess VS canonical MSL:\n%s\n==== end\n", nw);
             if (nw && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
             {
                 void *lib = NULL, *fn = NULL;
@@ -2939,17 +3102,16 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 {
                     size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
                     size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
-                    /* remember the offset: realloc may move the block, and `step` would
-                     * then point into freed memory (the offset below was computed with
-                     * the stale pointer, so p could land anywhere — a use-after-free
-                     * read and, on a moved block, a corrupted kernel source) */
-                    size_t step_at = (size_t)(step - msl);
+                    /* remember the offset before the realloc: realloc may move the
+                     * block and `step` would then dangle (use-after-free read, and on a
+                     * moved block a corrupted kernel source) */
+                    size_t at = (size_t)(step - msl);
                     char *grown = (char *)realloc(msl, strlen(msl) + newlen - oldlen + 1);
                     if (grown)
                     {
                         char *p;
                         msl = grown;
-                        p = msl + step_at;
+                        p = msl + at;
                         memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
                         memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
                         for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )

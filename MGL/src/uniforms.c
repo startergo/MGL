@@ -177,7 +177,9 @@ void mgli_get_uniform(GLMContext ctx, const char *func, GLuint program, GLint lo
             case MGLI_SET_F: ((GLfloat *)params)[k] = is_int ? (GLfloat)iv : (GLfloat)d; break;
             case MGLI_SET_D: ((GLdouble *)params)[k] = is_int ? (GLdouble)iv : d; break;
             case MGLI_SET_I: ((GLint *)params)[k] = is_int ? (GLint)iv : (GLint)lround(d); break;
-            case MGLI_SET_UI: ((GLuint *)params)[k] = is_int ? (GLuint)iv : (GLuint)llround(d); break;
+            /* a negative float/double converts to 0, not the wrapped two's-complement of
+             * the rounded signed value (the CTS state_query expectations pin this) */
+            case MGLI_SET_UI: ((GLuint *)params)[k] = is_int ? (GLuint)iv : (d > 0.0 ? (GLuint)llround(d) : 0u); break;
         }
     }
 }

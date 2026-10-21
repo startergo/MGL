@@ -117,7 +117,7 @@ typedef struct {
     struct { uint32_t sid; uint32_t mem[32]; uint32_t n; } ifmem[32];
     size_t nifmem;
 
-    /* stage-IO element wrappers (see iface_pair_struct / iface_mat_struct) */
+    /* stage-IO element wrappers (see iface_slot_struct) */
     struct { uint32_t id, orig; } pstruct[32]; size_t npstruct;
     struct { uint32_t id, orig; } mstruct[32]; size_t nmstruct;
     /* access-chain id -> original element type of an IO array the chain landed on */
@@ -137,6 +137,15 @@ typedef struct {
     uint32_t *attrhity;      /* hi variable id -> its pointer type */
     uint32_t  nattrhi;
     uint32_t *attrcomp;      /* access-chain id -> (attribute var << 4) | comp+1 */
+    uint32_t *attrslotidx;   /* access-chain id -> slot index (arrays/matrices), ~0 = n/a */
+    uint8_t  *elemslice;     /* chain id: 1 = lands on a member-SLICE (multi-slot element) */
+    struct { uint32_t nslots, rows, id; } slotsc[64];
+    size_t nslotsc;
+    uint32_t *elemidx;       /* ... element index of the slice */
+    uint32_t *elemstride;    /* ... slots per element */
+    uint32_t *elemorig;      /* ... the element's original type */
+    uint32_t *attrsgeom;     /* attribute ptr type -> (nelem<<16)|(cols<<8)|rows, 0 = plain */
+    uint32_t *attrorig;      /* attribute ptr type -> original pointee type id */
     uint8_t  *ioiface;       /* pointer type id -> stage IO with the u32-pair repr */
     uint32_t *arrlane;       /* access-chain id -> widened buffer-array element type
                               * (vec<lanes>(u64); loads extract lane 0, stores fill it) */
@@ -661,66 +670,38 @@ static uint32_t iface_mark(F64 *f, uint32_t id, uint32_t orig)
     return id;
 }
 
-static uint32_t iface_of_scalar_or_vec(F64 *f, uint32_t orig)
+static uint32_t iface_slot_struct(F64 *f, uint32_t nslots, uint32_t rows)
 {
-    uint32_t n = f->ty[orig].n;
-    if (n <= 1) return iface_mark(f, uint2_of(f), orig);
-    if (n == 2) return iface_mark(f, uint4_of(f), orig);
-    return iface_mark(f, mkarray(f, uint4_of(f), (n + 1) / 2), orig);
+    /* cache by (nslots, rows) — types must not multiply across statements */
+    for (size_t k = 0; k < f->nslotsc; k++)
+        if (f->slotsc[k].nslots == nslots && f->slotsc[k].rows == rows)
+            return f->slotsc[k].id;
+    if (nslots == 0 || nslots > 32) return uint4_of(f);
+    uint32_t mty = (rows == 1) ? uint2_of(f) : uint4_of(f);
+    uint32_t id = nid(f);
+    uint32_t *o = malloc((nslots + 1) * 4);
+    o[0] = id;
+    for (uint32_t i = 0; i < nslots; i++) o[i + 1] = mty;
+    binst(&f->pre, SpvOpTypeStruct, o, nslots + 1);
+    free(o);
+    f->ty[id].kind = K_STRUCT; f->ty[id].has64 = 0; f->ty[id].is64 = 0; f->ty[id].def = 0;
+    /* register the members so smember()/struct_nmembers() work without a def */
+    if (f->nifmem < 32) {
+        f->ifmem[f->nifmem].sid = id;
+        for (uint32_t i = 0; i < nslots && i < 32; i++) f->ifmem[f->nifmem].mem[i] = mty;
+        f->ifmem[f->nifmem].n = nslots;
+        f->nifmem++;
+    }
+    f->slotsc[f->nslotsc % 64].nslots = nslots;
+    f->slotsc[f->nslotsc % 64].rows = rows;
+    f->slotsc[f->nslotsc % 64].id = id;
+    f->nslotsc++;
+    return id;
 }
 
-/* struct { uint4 s[2]; } — the per-element representation of a dvec3/dvec4
- * inside a stage-IO ARRAY: element indices stay 1:1 (the flat uint4[] form
- * cannot express `x[i]` as one access chain, since one element spans two
- * locations) while the whole element remains a single OpLoad. */
-static uint32_t iface_pair_struct(F64 *f, uint32_t vec)
-{
-    for (size_t k = 0; k < f->npstruct; k++)
-        if (f->pstruct[k].orig == vec) return f->pstruct[k].id;
-    uint32_t arr = mkarray(f, uint4_of(f), 2);
-    uint32_t id = nid(f);
-    f->ty[id].kind = K_STRUCT; f->ty[id].has64 = 1; f->ty[id].is64 = 0; f->ty[id].def = 0;
-    uint32_t o[2] = {id, arr};
-    binst(&f->pre, SpvOpTypeStruct, o, 2);
-    /* register the single member so smember()/snmembers() work without a def */
-    if (f->nifmem < 32 && f->npstruct < 32) {
-        f->ifmem[f->nifmem].sid = id;
-        f->ifmem[f->nifmem].mem[0] = arr;
-        f->ifmem[f->nifmem].n = 1;
-        f->nifmem++;
-        f->pstruct[f->npstruct].id = id;
-        f->pstruct[f->npstruct].orig = vec;
-        f->npstruct++;
-    }
-    return iface_mark(f, id, vec);
-}
 
 /* struct { uint4 f[C*slots]; } — the per-element representation of a dmatNxR
  * inside a stage-IO ARRAY (same reason as iface_pair_struct). */
-static uint32_t iface_mat_struct(F64 *f, uint32_t mat)
-{
-    for (size_t k = 0; k < f->nmstruct; k++)
-        if (f->mstruct[k].orig == mat) return f->mstruct[k].id;
-    uint32_t cols = f->ty[mat].n;
-    uint32_t rows = veclen(f, f->ty[mat].elem);
-    uint32_t slots = (rows + 1) / 2;
-    uint32_t arr = mkarray(f, uint4_of(f), cols * slots);
-    uint32_t id = nid(f);
-    f->ty[id].kind = K_STRUCT; f->ty[id].has64 = 1; f->ty[id].is64 = 0; f->ty[id].def = 0;
-    uint32_t o[2] = {id, arr};
-    binst(&f->pre, SpvOpTypeStruct, o, 2);
-    if (f->nifmem < 32 && f->nmstruct < 32) {
-        f->ifmem[f->nifmem].sid = id;
-        f->ifmem[f->nifmem].mem[0] = arr;
-        f->ifmem[f->nifmem].n = 1;
-        f->nifmem++;
-        f->mstruct[f->nmstruct].id = id;
-        f->mstruct[f->nmstruct].orig = mat;
-        f->nmstruct++;
-    }
-    return iface_mark(f, id, mat);
-}
-
 /* ------------------------------------------------ vertex-attribute slots  --
  * Metal vertex descriptors fetch at most 4 x 32 bits per attribute slot and
  * MSL has no double at all, so a double/dvecN vertex input is fetched as its
@@ -746,6 +727,58 @@ static uint32_t attr_slot0_ty(F64 *f, uint32_t orig)
 static uint32_t attr_slot1_ty(F64 *f, uint32_t n)
 {
     return (n == 3) ? uint2_of(f) : uint4_of(f);
+}
+
+/* is this a double scalar/vector, or a matrix of them? */
+static bool is_f64_scalar_or_vec_or_mat(F64 *f, uint32_t id)
+{
+    if (is_f64_scalar_or_vec(f, id)) return true;
+    return f->ty[id].kind == K_MAT && is_f64_scalar_or_vec(f, f->ty[id].elem);
+}
+
+/* slot geometry of an ARRAY-of-double or MATRIX vertex attribute:
+ *   nelem  elements (each: cols columns of `rows` doubles)
+ * Columns are slot-ALIGNED: a column with an odd row count pads its last slot
+ * (a slot is one Metal location, uint4 = 2 doubles), so every (element, column)
+ * maps to whole slots — the app-facing location layout ("location k+i*cols+c
+ * holds column c of element i") is what the current-value and shadow-stream
+ * deliveries feed. */
+static bool attr_geom(F64 *f, uint32_t ty, uint32_t *nelem, uint32_t *cols, uint32_t *rows)
+{
+    *nelem = 1; *cols = 1; *rows = 1;
+    if (f->ty[ty].kind == K_ARR)
+    {
+        if (!is_f64_scalar_or_vec_or_mat(f, f->ty[ty].elem)) return false;
+        *nelem = arrlen(f, ty);
+        ty = f->ty[ty].elem;
+        if (f->ty[ty].kind == K_ARR) return false;   /* arrays of arrays: not attributes */
+    }
+    if (f->ty[ty].kind == K_MAT)
+    {
+        if (!is_f64_scalar_or_vec(f, f->ty[ty].elem)) return false;
+        *cols = f->ty[ty].n;
+        *rows = veclen(f, f->ty[ty].elem);
+    }
+    else if (f->ty[ty].kind == K_VEC) *rows = f->ty[ty].n;
+    else if (f->ty[ty].kind != K_FLOAT) return false;
+    if (!*nelem || !*cols || !*rows || *rows > 4) return false;
+    return true;
+}
+
+static uint32_t attr_slots_per_col(uint32_t rows) { return (rows + 1) / 2; }
+
+/* the slot representation of an ARRAY-of-double / double-matrix vertex
+ * attribute: array of uint2/uint4, one element per Metal location.  SPIRV-Cross
+ * flattens an array stage input into one [[attribute(k+j)]] per element, which
+ * is exactly the delivery shape. */
+static uint32_t attr_slotarr_ty(F64 *f, uint32_t orig)
+{
+    uint32_t nelem, cols, rows;
+
+    if (!attr_geom(f, orig, &nelem, &cols, &rows)) return 0;
+    uint32_t spc = attr_slots_per_col(rows);
+    uint32_t slot = (rows == 1) ? uint2_of(f) : uint4_of(f);
+    return mkarray(f, slot, nelem * cols * spc);
 }
 
 /* copy OpName/OpMemberName and the interface member decorations of an
@@ -821,6 +854,16 @@ static uint32_t iface_struct(F64 *f, uint32_t orig)
     return iface_mark(f, id, orig);
 }
 
+static uint32_t iface_of_scalar_or_vec(F64 *f, uint32_t orig)
+{
+    uint32_t n = f->ty[orig].n;
+    if (n <= 1) return iface_mark(f, uint2_of(f), orig);
+    if (n == 2) return iface_mark(f, uint4_of(f), orig);
+    /* dvec3/dvec4: a named-member pair struct { uint4 m0; uint4 m1; } (NOT an
+     * array — see iface_slot_struct) */
+    return iface_mark(f, iface_slot_struct(f, (n + 1) / 2, n), orig);
+}
+
 static uint32_t iface_ty(F64 *f, uint32_t orig)
 {
     Ty *t = &f->ty[orig];
@@ -831,28 +874,37 @@ static uint32_t iface_ty(F64 *f, uint32_t orig)
         if (is_f64(f, t->elem)) return iface_of_scalar_or_vec(f, orig);
         return orig;
     case K_MAT: {
-        /* FLAT array of uint4, one per GL location: a dmatCxR column (dvecR)
-         * takes ceil(R/2) locations.  (An array-of-arrays here is rejected by
-         * SPIRV-Cross for stage IO variables.) */
+        /* one named-member slot struct: a dmatCxR column (dvecR) takes
+         * ceil(R/2) uint4 slots, columns slot-aligned (see iface_slot_struct
+         * for why the members are named rather than an array) */
         if (!is_f64_scalar_or_vec(f, t->elem)) return orig;
         uint32_t slots = iface_slots(f, t->elem);
-        return iface_mark(f, mkarray(f, uint4_of(f), t->n * slots), orig);
+        return iface_mark(f, iface_slot_struct(f, t->n * slots, veclen(f, t->elem)), orig);
     }
     case K_ARR: {
         if (!t->n) return orig;
         if (is_f64_scalar_or_vec(f, t->elem)) {
             uint32_t n = (f->ty[t->elem].kind == K_FLOAT) ? 1 : f->ty[t->elem].n;
-            if (n >= 3) {
-                /* dvec3/dvec4 elements: one wrapper struct per element keeps
-                 * `x[i]` (and `x[i].c`) expressible as a single access chain */
-                return iface_mark(f, mkarray(f, iface_pair_struct(f, t->elem), arrlen(f, orig)), orig);
+            if (n <= 2)
+            {
+                /* scalar/dvec2 elements stay a real array (uint2/uint4 elements):
+                 * `x[i]` with a DYNAMIC i must stay expressible (struct member
+                 * indexes are literals), and these members are only ever stored
+                 * element-wise */
+                return iface_mark(f, mkarray(f, (n == 1) ? uint2_of(f) : uint4_of(f),
+                                             arrlen(f, orig)), orig);
             }
+            /* dvec3/dvec4 elements: one slot struct for the whole array (element
+             * indexes fold to a member slice — literal indexes only, which is
+             * all SPIRV-Cross supports for struct-valued stage IO anyway) */
             uint32_t slots = iface_slots(f, t->elem);
-            return iface_mark(f, mkarray(f, uint4_of(f), arrlen(f, orig) * slots), orig);
+            return iface_mark(f, iface_slot_struct(f, arrlen(f, orig) * slots, n), orig);
         }
         if (f->ty[t->elem].kind == K_MAT && is_f64_scalar_or_vec(f, f->ty[t->elem].elem)) {
-            /* arrays of double matrices: one wrapper struct per element */
-            return iface_mark(f, mkarray(f, iface_mat_struct(f, t->elem), arrlen(f, orig)), orig);
+            /* arrays of double matrices: the same one-struct-for-the-array rule */
+            uint32_t mslots = f->ty[t->elem].n * iface_slots(f, f->ty[t->elem].elem);
+            return iface_mark(f, iface_slot_struct(f, arrlen(f, orig) * mslots,
+                                                   veclen(f, f->ty[t->elem].elem)), orig);
         }
         if (f->ty[t->elem].kind == K_STRUCT && is64(f, t->elem)) {
             /* array of an interface block (TCS/GS/TES `in BLOCK name[]`): map
@@ -1557,6 +1609,45 @@ static uint32_t iface_to_reg(F64 *f, uint32_t v, uint32_t ity, uint32_t orig)
             wrapped = true;
             welem = f->ty[ity].elem;
         }
+        if (t->kind == K_ARR && f->ty[ity].kind == K_STRUCT) {
+            /* the whole array is ONE slot struct (see iface_ty): extract each
+             * element's member slice, convert it, rebuild the array value */
+            uint32_t es, elemstruct = 0;
+            if (f->ty[ety].kind == K_MAT) {
+                uint32_t rows = veclen(f, f->ty[ety].elem);
+
+                es = f->ty[ety].n * ((rows + 1) / 2);
+                elemstruct = iface_slot_struct(f, es, rows);
+            } else {
+                uint32_t n = (f->ty[ety].kind == K_FLOAT) ? 1 : f->ty[ety].n;
+
+                es = (n + 1) / 2;
+                elemstruct = (es == 1) ? ((n == 1) ? uint2_of(f) : uint4_of(f))
+                                       : iface_slot_struct(f, es, n);
+            }
+            {
+                uint32_t mty = struct_member(f, ity, 0);
+                uint32_t comps[16];
+
+                for (uint32_t i = 0; i < cnt && i < 16; i++) {
+                    if (es == 1)
+                        comps[i] = iface_pair_to_reg(f, xcomp(f, mty, v, i), elemstruct, ety);
+                    else
+                    {
+                        uint32_t mids[32];
+                        uint32_t sv;
+
+                        for (uint32_t q = 0; q < es && q < 32; q++)
+                            mids[q] = xcomp(f, mty, v, i * es + q);
+                        sv = cstruct_n(f, elemstruct, mids, es);
+                        comps[i] = (f->ty[ety].kind == K_MAT)
+                                     ? iface_to_reg(f, sv, elemstruct, ety)
+                                     : iface_pair_to_reg(f, sv, elemstruct, ety);
+                    }
+                }
+                return cstruct_n(f, orig, comps, cnt > 16 ? 16 : cnt);
+            }
+        }
         if (wrapped) {
             uint32_t comps[16];
             for (uint32_t i = 0; i < cnt && i < 16; i++) {
@@ -2224,16 +2315,53 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
     if (f->attrslot[baseptr]) {
         /* component access into a double attribute (glslang: pos.x as a chain).
          * Attributes are read-only, so the chain's only user is a load; drop
-         * the chain here and let the load fetch the whole attribute + extract. */
+         * the chain here and let the load fetch the slot + extract. */
         if (f->ins[j].op == SpvOpAccessChain && wc == 5 && f->isconst[iw[4]] &&
             f->ty[baseptr].kind == K_PTR && f->ty[f->ty[baseptr].elem].kind == K_VEC &&
             (uint32_t)f->cval[iw[4]] < f->attrn[baseptr]) {
             f->attrcomp[iw[2]] = (base << 4) | ((uint32_t)f->cval[iw[4]] + 1);
             return;
         }
-        fail(f, "fp64: element access into a double vertex attribute "
-                "is not supported (copy it to a local first)");
-        return;
+        /* ARRAY-of-double / double-matrix attribute: fold the (element, column,
+         * row) constant indexes into ONE slot of the flattened slot array and a
+         * pair inside that slot.  The chain's only user is a load (read-only),
+         * so the chain is dropped and the load reads slot `slot` (recorded in
+         * attrslotidx) + pair `row % 2`. */
+        {
+            uint32_t geom = f->attrsgeom[baseptr];
+
+            if (geom) {
+                uint32_t nelem = geom >> 16, cols = (geom >> 8) & 0xff, rows = geom & 0xff;
+                uint32_t orig = f->attrorig[baseptr];
+                uint32_t ei = 0, col = 0, row = 0, cur = orig;
+                bool good = true;
+
+                for (uint32_t k2 = 4; k2 < wc && good; k2++)
+                {
+                    if (!f->isconst[iw[k2]]) { good = false; break; }
+                    uint32_t c = (uint32_t)f->cval[iw[k2]];
+
+                    if (f->ty[cur].kind == K_ARR) { ei = c; cur = f->ty[cur].elem; }
+                    else if (f->ty[cur].kind == K_MAT) { col = c; cur = f->ty[cur].elem; }
+                    else if (f->ty[cur].kind == K_VEC) { row = c; cur = f->ty[cur].elem; }
+                    else good = false;
+                }
+                if (good && f->ins[j].op == SpvOpAccessChain && ei < nelem && col < cols &&
+                    row < rows && (f->ty[cur].kind == K_FLOAT ||
+                                   (f->ty[cur].kind == K_VEC && veclen(f, cur) == 1)))
+                {
+                    uint32_t spc = attr_slots_per_col(rows);
+                    uint32_t slot = ei * cols * spc + col * spc + row / 2;
+
+                    f->attrslotidx[iw[2]] = slot;
+                    f->attrcomp[iw[2]] = (base << 4) | ((row % 2) + 1);
+                    return;
+                }
+            }
+            fail(f, "fp64: element access into a double vertex attribute "
+                    "is not supported (copy it to a local first)");
+            return;
+        }
     }
     if (f->ioiface[baseptr]) {
         /* constant component read of a double stage variable (glslang: v.x as a
@@ -2316,6 +2444,49 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
             curi = ifmode ? smember(f, curi, member) : curo;
             if (curi != curo) patched = true;
             i += 1;
+        } else if (t->kind == K_ARR && ifmode && is_f64_scalar_or_vec(f, t->elem) &&
+                   f->ty[t->elem].n >= 3) {
+            /* stage-IO array of dvec3/dvec4: ONE slot struct for the whole
+             * member (named members); element i is the member slice
+             * [i*slots, i*slots+slots).  Literal index only — record it and let
+             * the load/store splice the slice. */
+            if (nout >= 24 || !f->isconst[iw[4 + i]]) {
+                fail(f, "fp64: dynamic index into a dvec3/dvec4 stage-IO array "
+                        "is not supported");
+                return;
+            }
+            uint32_t es = (f->ty[t->elem].n + 1) / 2;
+
+            f->elemslice[rid] = 1;
+            f->elemidx[rid] = (uint32_t)f->cval[iw[4 + i]];
+            f->elemstride[rid] = es;
+            f->elemorig[rid] = t->elem;
+            curo = t->elem;
+            /* curi stays the WHOLE-member struct: the chain lands there and the
+             * load/store splices the recorded slice */
+            elemreg = curo;
+            patched = true;
+            i += 1;
+        } else if (t->kind == K_ARR && ifmode &&
+                   f->ty[t->elem].kind == K_MAT && is_f64_scalar_or_vec(f, f->ty[t->elem].elem)) {
+            /* arrays of double matrices: same slice rule (columns of each
+             * element are slot-aligned inside the one big struct) */
+            if (nout >= 24 || !f->isconst[iw[4 + i]]) {
+                fail(f, "fp64: dynamic index into a double-matrix stage-IO array "
+                        "is not supported");
+                return;
+            }
+            uint32_t mslots = f->ty[t->elem].n * iface_slots(f, f->ty[t->elem].elem);
+
+            f->elemslice[rid] = 1;
+            f->elemidx[rid] = (uint32_t)f->cval[iw[4 + i]];
+            f->elemstride[rid] = mslots;
+            f->elemorig[rid] = t->elem;
+            curo = t->elem;
+            /* curi stays the WHOLE-member struct (see above) */
+            elemreg = curo;
+            patched = true;
+            i += 1;
         } else if (t->kind == K_ARR && ifmode && is_f64_scalar_or_vec(f, t->elem)) {
             /* stage-IO array of doubles: elements are uint4 (scalar/dvec2) or
              * one wrapper struct each (dvec3/dvec4); the index stays 1:1 */
@@ -2324,7 +2495,10 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
             curo = t->elem;
             curi = (f->ty[curi].kind == K_ARR) ? f->ty[curi].elem : uint4_of(f);
             elemreg = curo;
-            if (f->ty[curo].kind == K_FLOAT) pair = 0;   /* one double per uint4 slot */
+            /* a scalar-double element is the whole uint4 slot: elemreg covers its
+             * loads AND stores.  Setting `pair` here would also set attrcomp, which
+             * rw_load_store checks first and rejects for stores ("component
+             * writes") — that broke `tv[gl_InvocationID] = x;` in a TCS. */
             patched = true;
             i += 1;
         } else if (t->kind == K_ARR && ifmode &&
@@ -2510,7 +2684,51 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
         uint32_t n = f->attrn[ptyv];
         uint32_t extra = (f->ins[j].wc > 4) ? 1 : 0;
         uint32_t lo = nid(f);
+        uint32_t slotarr = f->attrslotidx[ptr];
         uint32_t o[4] = {f->ty[ptyv].elem, lo, var, extra ? iw[4] : 0};
+
+        if (slotarr != 0xffffffffu)
+        {
+            /* array/matrix attribute: the slot variable is a flattened array of
+             * uint2/uint4 (one per Metal location); read slot `slotarr` and take
+             * the recorded pair.  Only element/component reads reach here (the
+             * fold in rw_access rejects anything else). */
+            uint32_t elemty = f->ty[f->ty[ptyv].elem].elem;    /* uint2 or uint4 */
+            uint32_t jconst = nid(f);
+
+            f->vty[jconst] = f->u32ty; f->isconst[jconst] = 1; f->cval[jconst] = slotarr;
+            {
+                uint32_t oc[4] = {f->u32ty, jconst, slotarr};
+                binst(&f->pre, SpvOpConstant, oc, 3);
+            }
+            {
+                uint32_t pty2 = ptr_for(f, storage, elemty);
+                uint32_t ap = nid(f);
+                uint32_t oa[5] = {pty2, ap, var, jconst};
+
+                f->vty[ap] = pty2;
+                binst(&f->body, SpvOpAccessChain, oa, 4);
+                {
+                    uint32_t ol[3] = {elemty, lo, ap};
+
+                    binst(&f->body, SpvOpLoad, ol, 3);
+                }
+            }
+            /* `lo` is now the slot's u32 vector */
+            uint32_t res;
+
+            if (comp == 0xffffffff) {
+                if (elemty == uint2_of(f)) res = bitcast(f, f->f64ty, lo);
+                else if (f->ty[rt].kind == K_VEC && f->ty[rt].n == 2) res = bitcast(f, ulong2_of(f), lo);
+                else { fail(f, "fp64: only scalar / dvec2 array attribute elements are read whole"); return; }
+            } else {
+                uint32_t bl = bitcast(f, ulong2_of(f), lo);
+
+                res = xcomp(f, f->f64ty, bl, comp & 1);
+            }
+            emit_result(f, rt, rid, res);
+            return;
+        }
         binst(&f->body, SpvOpLoad, o, 3 + extra);
         uint32_t res;
         if (comp == 0xffffffff) {
@@ -2597,27 +2815,65 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
         return;
     }
     if (f->elemreg[ptr]) {
-        /* one element of a stage-IO array of doubles (uint4 slot for a
-         * scalar/dvec2, a wrapper struct for dvec3/dvec4/dmatN) */
+        /* one element of a stage-IO array of doubles (a uint2/uint4 slot for a
+         * scalar/dvec2 element; for dvec3/dvec4/matrix elements the chain lands
+         * on the whole member struct and the element is a member SLICE — see
+         * the elemslice recording in rw_access) */
         uint32_t orig = f->elemreg[ptr];
         uint32_t fk = f->ty[orig].kind;
         uint32_t flat = 0;      /* the uint4[] member of a wrapper struct */
-        if (fk == K_VEC && f->ty[orig].n >= 3) flat = smember(f, pointee, 0);
-        if (fk == K_MAT) flat = smember(f, pointee, 0);
+        uint32_t slice = f->elemslice[ptr];
+        uint32_t sl0 = 0, sln = 0;
+
+        if (slice)
+        {
+            uint32_t rows = (fk == K_MAT) ? veclen(f, f->ty[orig].elem) : f->ty[orig].n;
+            uint32_t es = (fk == K_MAT) ? f->ty[orig].n * ((rows + 1) / 2) : (rows + 1) / 2;
+
+            sl0 = f->elemidx[ptr] * es;
+            sln = es;
+            flat = iface_slot_struct(f, es, rows);   /* the element struct type */
+        }
+        else
+        {
+            if (fk == K_VEC && f->ty[orig].n >= 3) flat = smember(f, pointee, 0);
+            if (fk == K_MAT) flat = smember(f, pointee, 0);
+        }
         if (isload) {
             uint32_t tmp = nid(f);
             uint32_t o[3] = {pointee, tmp, ptr};
             binst(&f->body, SpvOpLoad, o, 3);
             uint32_t res;
+            uint32_t v = tmp;
+            if (slice)
+            {
+                /* extract the element's slot members out of the whole member */
+                uint32_t mids[16];
+                uint32_t mty = (f->ty[flat].kind == K_STRUCT) ? struct_member(f, flat, 0) : uint4_of(f);
+
+                for (uint32_t q = 0; q < sln && q < 16; q++)
+                    mids[q] = xcomp(f, mty, tmp, sl0 + q);
+                v = cstruct_n(f, flat, mids, sln);
+            }
             if (fk == K_FLOAT) {
-                res = xcomp(f, f->f64ty, bitcast(f, ulong2_of(f), tmp), 0);
+                /* the element slot is a uint4 (16B, the canonical "two doubles per
+                 * 128-bit location" slot) or a uint2 (8B — SPIRV-Cross's own
+                 * rendering of a scalar-double stage variable).  Bitcast to the
+                 * matching size: a size-mismatched OpBitcast would be emitted by
+                 * SPIRV-Cross as a CONVERTING constructor (ulong2(x)) and silently
+                 * zero-extend. */
+                if (f->ty[pointee].kind == K_VEC && f->ty[pointee].n == 2 &&
+                    f->ty[f->ty[pointee].elem].width == 32)
+                    res = bitcast(f, f->f64ty, tmp);   /* uint2 (8B) -> u64 */
+                else
+                    res = xcomp(f, f->f64ty, bitcast(f, ulong2_of(f), tmp), 0);
             } else if (fk == K_VEC && f->ty[orig].n == 2) {
                 res = bitcast(f, ulong2_of(f), tmp);
             } else if (fk == K_VEC) {
-                uint32_t arr = xcomp(f, flat, tmp, 0);
+                uint32_t arr = slice ? v : xcomp(f, flat, tmp, 0);
                 res = iface_pair_to_reg(f, arr, flat, orig);
             } else {   /* K_MAT */
-                uint32_t arr = xcomp(f, flat, tmp, 0);
+                uint32_t arr = slice ? v : xcomp(f, flat, tmp, 0);
                 res = iface_to_reg(f, arr, flat, orig);
             }
             emit_result(f, iw[1], iw[2], res);
@@ -2625,18 +2881,53 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
             uint32_t val = iw[2];
             uint32_t conv;
             if (fk == K_FLOAT) {
-                uint32_t z = k_u64(f, 0);
-                uint32_t b = bitcast(f, uint2_of(f), val);
-                uint32_t zz = bitcast(f, uint2_of(f), z);
-                conv = cstruct(f, uint4_of(f), (uint32_t[]){b, zz}, 2);
+                if (f->ty[pointee].kind == K_VEC && f->ty[pointee].n == 2 &&
+                    f->ty[f->ty[pointee].elem].width == 32)
+                {
+                    /* uint2 slot (the fp64 iface form): store the double's words */
+                    conv = bitcast(f, uint2_of(f), val);
+                }
+                else
+                {
+                    /* uint4 slot (SPIRV-Cross's own rendering of a scalar-double
+                     * stage variable): uint4(lo, hi) with the high words zero */
+                    uint32_t z = k_u64(f, 0);
+                    uint32_t b = bitcast(f, uint2_of(f), val);
+                    uint32_t zz = bitcast(f, uint2_of(f), z);
+
+                    conv = cstruct(f, uint4_of(f), (uint32_t[]){b, zz}, 2);
+                }
             } else if (fk == K_VEC && f->ty[orig].n == 2) {
                 conv = bitcast(f, uint4_of(f), val);
             } else if (fk == K_VEC) {
                 uint32_t arr = reg_to_iface_pair(f, val, flat, orig);
-                conv = cstruct(f, pointee, &arr, 1);
+                conv = slice ? arr : cstruct(f, pointee, &arr, 1);
             } else {   /* K_MAT */
                 uint32_t arr = reg_to_iface(f, val, flat, orig);
-                conv = cstruct(f, pointee, &arr, 1);
+                conv = slice ? arr : cstruct(f, pointee, &arr, 1);
+            }
+            if (slice)
+            {
+                /* splice the element's slots into the member struct: load the
+                 * whole member, replace [sl0, sl0+sln), store it back */
+                uint32_t nmem = struct_nmembers(f, pointee);
+                uint32_t mids[64];
+                uint32_t mty = struct_member(f, pointee, 0);
+                uint32_t whole = nid(f);
+                uint32_t ol[3] = {pointee, whole, ptr};
+
+                if (nmem > 64) nmem = 64;
+                binst(&f->body, SpvOpLoad, ol, 3);
+                for (uint32_t q = 0; q < nmem; q++)
+                    mids[q] = (q >= sl0 && q < sl0 + sln) ?
+                              xcomp(f, mty, conv, q - sl0) :
+                              xcomp(f, mty, whole, q);
+                {
+                    uint32_t ns = cstruct_n(f, pointee, mids, nmem);
+
+                    binst2(&f->body, SpvOpStore, ptr, ns);
+                }
+                return;
             }
             binst2(&f->body, SpvOpStore, ptr, conv);
         }
@@ -3123,13 +3414,29 @@ static void fp64_attr_slots(F64 *f)
             is64(f, iw[3])) {
             Ty *t = &f->ty[iw[3]];
             if (f->vertex_inputs && iw[2] == SpvStorageClassInput &&
-                (t->kind == K_FLOAT || t->kind == K_VEC)) {
-                uint32_t slot0 = attr_slot0_ty(f, iw[3]);
+                (t->kind == K_FLOAT || t->kind == K_VEC ||
+                 t->kind == K_MAT || t->kind == K_ARR)) {
+                uint32_t slot0 = (t->kind == K_FLOAT || t->kind == K_VEC)
+                                     ? attr_slot0_ty(f, iw[3])
+                                     : attr_slotarr_ty(f, iw[3]);
                 if (slot0) {
-                    /* vertex attribute: raw word slots (see attr_slot0_ty) */
+                    /* vertex attribute: raw word slots (see attr_slot0_ty).  Arrays and
+                     * matrices become one slot per Metal location (attr_slotarr_ty);
+                     * attrn is the double count of ONE slot, so the dvec3/4 hi-variable
+                     * synthesis below only fires for the plain dvec3/dvec4 case. */
                     f->ty[iw[1]].elem = slot0;   /* the def pass emits the same pointee */
                     f->attrslot[iw[1]] = 1;
-                    f->attrn[iw[1]] = (t->kind == K_VEC) ? t->n : 1;
+                    if (t->kind == K_FLOAT || t->kind == K_VEC)
+                        f->attrn[iw[1]] = (t->kind == K_VEC) ? t->n : 1;
+                    else
+                    {
+                        uint32_t ne, cl, rw;
+
+                        attr_geom(f, iw[3], &ne, &cl, &rw);
+                        f->attrn[iw[1]] = (rw == 1) ? 1 : 2;   /* per slot */
+                        f->attrsgeom[iw[1]] = (ne << 16) | (cl << 8) | rw;
+                        f->attrorig[iw[1]] = iw[3];
+                    }
                 }
             } else {
                 /* every other double crosses the stage boundary as its u32-word
@@ -3244,11 +3551,19 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     f.attrhi = calloc(f.libshift, 4);
     f.attrhity = calloc(f.libshift, 4);
     f.attrcomp = calloc(f.libshift, 4);
+    f.attrslotidx = malloc(f.libshift * 4);
+    for (uint32_t q = 0; q < f.libshift; q++) f.attrslotidx[q] = 0xffffffffu;
+    f.attrsgeom = calloc(f.libshift, 4);
+    f.attrorig = calloc(f.libshift, 4);
+    f.elemslice = calloc(f.libshift, 1);
+    f.elemidx = calloc(f.libshift, 4);
+    f.elemstride = calloc(f.libshift, 4);
+    f.elemorig = calloc(f.libshift, 4);
     f.ioiface = calloc(f.libshift, 1);
     f.arrlane = calloc(f.libshift, 4);
     f.elemreg = calloc(f.libshift, 4);
     f.warr = calloc(f.libshift, 1);
-    if (!f.attrslot || !f.attrn || !f.attrhi || !f.attrhity || !f.attrcomp || !f.ioiface || !f.arrlane || !f.elemreg || !f.warr) {
+    if (!f.attrslot || !f.attrn || !f.attrhi || !f.attrhity || !f.attrcomp || !f.attrslotidx || !f.attrsgeom || !f.attrorig || !f.elemslice || !f.elemidx || !f.elemstride || !f.elemorig || !f.ioiface || !f.arrlane || !f.elemreg || !f.warr) {
         fail(&f, "fp64: out of memory");
         goto done;
     }
@@ -3389,6 +3704,15 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
         out.w[3] = nb;
     }
     if (out_nwords) *out_nwords = out.n;
+    if (out.n && getenv("MGL_FP64_DUMP"))
+    {
+        char path[256];
+        static int seq;
+
+        snprintf(path, sizeof path, "%s/lowered_%d.spv", getenv("MGL_FP64_DUMP"), seq++);
+        FILE *fp = fopen(path, "wb");
+        if (fp) { fwrite(out.w, 4, out.n, fp); fclose(fp); }
+    }
     if (getenv("MGL_FP64_DUMP")) {
         dump_module(out.w, out.n, "lowered");
         dump_module(f.w, f.n, "input");
@@ -3406,7 +3730,7 @@ done:
     free(f.ty); free(f.vty); free(f.cval); free(f.isconst);
     free(f.decs); free(f.mdecs);
     free(f.iface); free(f.iforig); free(f.rowmajor); free(f.roworig); free(f.rowmap);
-    free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
+    free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.attrslotidx); free(f.attrsgeom); free(f.attrorig); free(f.elemslice); free(f.elemidx); free(f.elemstride); free(f.elemorig); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
     free(f.vc);
     free(f.pre.w); free(f.preann.w); free(f.lead.w); free(f.defs.w); free(f.body.w);
     free(f.libdefs.w); free(f.libfns.w); free(f.hdradd.w);

@@ -49,6 +49,8 @@
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_tess.h"     /* the TES-output capture producer (geometry behind tessellation) */
 #include "mgl_ext_program.h"
+#include "fp64.h"             /* software doubles: lower the generated variants like program.c does */
+#include "cts_glsl_compat.h"  /* layout(packed)/layout(shared) block rewrites (as shaders.c does) */
 #include "shaders.h"
 #include "programs.h"
 #include "msl_reserved.h"
@@ -676,7 +678,7 @@ static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const
                     GLuint w = v->offset + (e * v->cols * v->rows + c * v->rows + r) * comp_words(v->base);
                     if (r) sb_put(b, ", ");
                     if (v->base == GL_FLOAT) sb_put(b, "uintBitsToFloat(%s + %u%s)", open, w, close);
-                    else if (v->base == GL_DOUBLE) sb_put(b, "uint64BitsToDouble(uvec2(%s + %u%s, %s + %u%s))",
+                    else if (v->base == GL_DOUBLE) sb_put(b, "packDouble2x32(uvec2(%s + %u%s, %s + %u%s))",
                                                           open, w, close, open, w + 1, close);
                     else if (v->base == GL_BOOL) sb_put(b, "(%s + %u%s) != 0u", open, w, close);
                     else sb_put(b, "%s(%s + %u%s)", v->base == GL_INT ? "int" : "uint", open, w, close);
@@ -703,7 +705,7 @@ static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const
                     GLuint w = v->offset + (e * v->rows + r) * comp_words(v->base);
                     if (r) sb_put(b, ", ");
                     if (v->base == GL_FLOAT) sb_put(b, "uintBitsToFloat(%s + %u%s)", open, w, close);
-                    else if (v->base == GL_DOUBLE) sb_put(b, "uint64BitsToDouble(uvec2(%s + %u%s, %s + %u%s))",
+                    else if (v->base == GL_DOUBLE) sb_put(b, "packDouble2x32(uvec2(%s + %u%s, %s + %u%s))",
                                                           open, w, close, open, w + 1, close);
                     else if (v->base == GL_BOOL) sb_put(b, "(%s + %u%s) != 0u", open, w, close);
                     else sb_put(b, "%s(%s + %u%s)", v->base == GL_INT ? "int" : "uint", open, w, close);
@@ -900,7 +902,13 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
     }
 
     memset(&input, 0, sizeof(input));
-    initGLSLInput(ctx, glm_type, src, &input);
+    /* GL-legal but SPIR-V-hostile constructs (layout(shared)/layout(packed)
+     * uniform blocks — the CTS's named_uniform_blocks uses all three layouts)
+     * must be rewritten the same way the program's own compile does
+     * (shaders.c: mgl_cts_glsl_compat).  glslang copies the source; the string
+     * must stay alive until then. */
+    char *compat = mgl_cts_glsl_compat(src);
+    initGLSLInput(ctx, glm_type, compat ? compat : src, &input);
     if (force_version && input.default_version < force_version)
     {
         input.default_version = force_version;
@@ -920,7 +928,7 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
     options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS | GLSLANG_SHADER_AUTO_MAP_BINDINGS;
 
     shader = glslang_shader_create(&input);
-    if (!shader) { mgl_append_log(log, "ERROR: geometry: glslang shader creation failed\n"); return false; }
+    if (!shader) { mgl_append_log(log, "ERROR: geometry: glslang shader creation failed\n"); free(compat); return false; }
     glslang_shader_set_options(shader, options);
 
     if (!glslang_shader_preprocess(shader, &input) ||
@@ -930,8 +938,10 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
         const char *debug = glslang_shader_get_info_debug_log(shader);
         mgl_append_log(log, "ERROR: geometry: GLSL → SPIR-V failed\n%s\n%s", info ? info : "", debug ? debug : "");
         glslang_shader_delete(shader);
+        free(compat);
         return false;
     }
+    free(compat);   /* glslang has copied the source by now */
 
     prog = glslang_program_create();
     if (!prog) { glslang_shader_delete(shader); return false; }
@@ -975,11 +985,37 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
 
     uint32_t *out = xmalloc(n * sizeof(uint32_t));
     glslang_program_SPIRV_get(prog, out);
-    *ir = out;
-    *words = n;
-
     glslang_program_delete(prog);
     glslang_shader_delete(shader);
+
+    /* fp64: the generated variant re-declares the stage's uniform blocks and
+     * keeps the body's doubles, so the software-double lowering program.c runs
+     * on its own stage modules must run here too — otherwise SPIRV-Cross sees
+     * double members in a buffer ("double types are not supported in buffers
+     * in MSL").  vertex_inputs matches program.c's rule (VS stage = true). */
+    {
+        bool lowered64 = false;
+        size_t lwords = 0;
+        char llog[512] = {0};
+        uint32_t *lowered = mgl_fp64_lower_module(out, n, glm_type == GL_VERTEX_SHADER,
+                                                  &lowered64, &lwords, llog, sizeof llog);
+        if (lowered64 && lowered)
+        {
+            free(out);
+            out = lowered;
+            n = lwords;
+        }
+        else if (lowered64)
+        {
+            mgl_append_log(log, "ERROR: geometry: fp64 lowering of the generated variant failed: %s\n",
+                           llog[0] ? llog : "?");
+            free(out);
+            return false;
+        }
+    }
+
+    *ir = out;
+    *words = n;
     return true;
 }
 
@@ -1190,6 +1226,18 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
 
     char *out = xstrdup(msl);
     spvc_context_destroy(sctx);
+
+    /* fp64: the soft-float library functions take scalar parameters by
+     * `thread const T&`; a `constant`-space buffer member cannot bind to that
+     * (program.c / transform_feedback.c run the same fix on their MSL). */
+    {
+        char *fixed = mgl_fp64_fix_msl_scalar_params(out);
+        if (fixed)
+        {
+            free(out);
+            out = fixed;
+        }
+    }
     return out;
 }
 
@@ -3395,7 +3443,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
                         GLuint w = base + (c * v->rows + r2) * comp_words(v->base);
                         if (r2) sb_put(&b, ", ");
                         if (v->base == GL_FLOAT) sb_put(&b, "uintBitsToFloat(mgl_draw[r + %u])", w);
-                        else if (v->base == GL_DOUBLE) sb_put(&b, "uint64BitsToDouble(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
+                        else if (v->base == GL_DOUBLE) sb_put(&b, "packDouble2x32(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
                         else sb_put(&b, "%s(mgl_draw[r + %u])", v->base == GL_INT ? "int" : "uint", w);
                     }
                     sb_put(&b, ")");
@@ -3416,7 +3464,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
                     GLuint w = base + r2 * comp_words(v->base);
                     if (r2) sb_put(&b, ", ");
                     if (v->base == GL_FLOAT) sb_put(&b, "uintBitsToFloat(mgl_draw[r + %u])", w);
-                    else if (v->base == GL_DOUBLE) sb_put(&b, "uint64BitsToDouble(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
+                    else if (v->base == GL_DOUBLE) sb_put(&b, "packDouble2x32(uvec2(mgl_draw[r + %u], mgl_draw[r + %u]))", w, w + 1);
                     else sb_put(&b, "%s(mgl_draw[r + %u])", v->base == GL_INT ? "int" : "uint", w);
                 }
                 sb_put(&b, ");\n");
@@ -3588,6 +3636,15 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
     geom_free_prog(ctx, gp);
     gp->name = program->name;
     gp->program = getProgram(ctx, program->name);
+    /* program.c links into a scratch object (attached=0) and moves the result
+     * into the real program only on success, so the GLSL sources of the stages
+     * are NOT on `obj` — resolve the real program object (same name) for
+     * source lookups.  Without this the VS had to be decompiled from SPIR-V,
+     * which the GLSL backend rejects for std140 double blocks. */
+    {
+        MGLProgramObj *real = gp->program ? MGL_PROGRAM_OBJ(gp->program) : NULL;
+        if (real && real->num_attached) obj = real;
+    }
 
     m = spv_parse(words, nwords, &err);
     if (!m)
@@ -5529,31 +5586,43 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         /* a user output of the stage: either a plain varying, or an interface block member
          * written as instance.member ("b.c"); an interface block instance with a single
          * member also names that member */
-        int j = -1;
+        /* a trailing "[N]" selects ONE array element (GL 4.6 13.3.1: "the name may include
+         * an array index"); without it the whole array is captured.  Strip it before the
+         * name/member match and remember the element for the offset below. */
         const char *dot = strchr(name, '.');
+        char xname[192];
+        GLuint xelem = 0;
+        bool xhave_elem = false;
+        const char *xbrk = strrchr(name, '[');
+        if (xbrk && (!dot || xbrk > dot))
+        {
+            char *xend;
+            long e = strtol(xbrk + 1, &xend, 10);
+
+            if (e >= 0 && xend && *xend == ']' && xend[1] == 0)
+            {
+                snprintf(xname, sizeof xname, "%.*s", (int)(xbrk - name), name);
+                xelem = (GLuint)e;
+                xhave_elem = true;
+            }
+        }
+        const char *match = xhave_elem ? xname : name;
+        if (xhave_elem && dot)
+            dot = strchr(match, '.');      /* member part also lost the "[N]" */
+        int j = -1;
         for (int k = 0; k < nvars; k++)
         {
             if (dot)
             {
-                size_t ilen = (size_t)(dot - name);
-                if (!strncmp(vars[k].name, name, ilen) && vars[k].name[ilen] == 0 &&
+                size_t ilen = (size_t)(dot - match);
+                if (!strncmp(vars[k].name, match, ilen) && vars[k].name[ilen] == 0 &&
                     !strcmp(vars[k].member, dot + 1))
                 { j = k; break; }
             }
-            else if (!strcmp(vars[k].name, name))
+            else if (!strcmp(vars[k].name, match))
             { j = k; break; }
         }
-        if (j < 0 && dot)
-        {
-            char *log = NULL;
-            mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
-                                      "%s\n", name, stage);
-            free(xp->link_log);
-            xp->link_log = log;
-            xp->link_failed = true;
-            return;
-        }
-        if (j < 0)
+        if (j < 0 || (xhave_elem && xelem >= vars[j].elems))
         {
             char *log = NULL;
             mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' is not an output of the "
@@ -5570,9 +5639,22 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         v->rows = g->rows;
         v->columns = g->cols;
         v->comp_per_elem = g->cols * g->rows * base_words(g->base);
-        v->size = (GLint)g->elems;
-        v->words = g->words;
-        v->src_word = g->offset;
+        if (xhave_elem && g->elems > 1)
+        {
+            /* one element of an arrayed output: a single element's words at its own
+             * word offset inside the record */
+            GLuint per = g->words / g->elems;
+
+            v->size = 1;
+            v->words = per;
+            v->src_word = g->offset + xelem * per;
+        }
+        else
+        {
+            v->size = (GLint)g->elems;
+            v->words = g->words;
+            v->src_word = g->offset;
+        }
         if (separate)
         {
             /* each API-selected varying is its own binding point (GL 4.6 13.3.1); a name
@@ -6001,6 +6083,28 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
             v->words = 0;
             v->src_word = 0;
         }
+    }
+
+    /* words may have been filled in from the published capture member table above —
+     * the interleaved record layout (per-buffer strides, var offsets) must be
+     * recomputed from the final word counts, exactly as the link-time resolver
+     * would have done with these numbers.  Without this a double varying whose
+     * words only became known now packs into a zero-stride record and every
+     * write is dropped ("full: drop" in the encode kernel). */
+    {
+        GLuint off[4] = { 0, 0, 0, 0 };
+
+        for (GLuint v = 0; v < xp->count; v++)
+        {
+            MGLXfbVarying *xv = &xp->vars[v];
+
+            if (xv->type == GL_NONE)
+                continue;   /* gl_NextBuffer advances the stream only */
+            xv->offset = off[xv->buffer];
+            off[xv->buffer] += xv->words * 4;
+        }
+        for (GLuint b = 0; b < 4; b++)
+            xp->stride[b] = off[b];
     }
 
     memset(&src, 0, sizeof src);

@@ -194,6 +194,7 @@ typedef struct MGLTessProgram_t {
     void    *capture_function;           /* compiled kernel (owned by the renderer) */
     void    *capture_library;
     void    *capture_pso;                /* id<MTLComputePipelineState>, bridged */
+    bool     capture_fc_fixup;           /* kernel MSL carries the rstate fixup (specialize) */
 
     /* hardware path: [[patch(domain, N)]] control point count baked into the TES MSL */
     int     hw_cp_count;
@@ -260,6 +261,7 @@ bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data);
 void mgl_ext_delete_program_tess(GLMContext ctx, Program *program);
 MGLTessProgram *mgl_tess_program(GLMContext ctx, Program *program);
 MGLTessProgram *mgl_tess_active_program(GLMContext ctx);
+bool mgl_tess_plain_render(GLMContext ctx);
 
 /* called from program.c during link: MSL variants for the tessellation stages.
  * returns a malloc'd replacement for msl (caller frees the original), or NULL to keep it */

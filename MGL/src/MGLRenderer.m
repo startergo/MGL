@@ -3358,10 +3358,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                 ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override != NULL;
             if ([self extTessActive] && !geomOverride)
             {
-                MGLTessProgram *tp = mgl_tess_active_program(ctx);
-                bool emulated = tp && tp->plain_function &&
-                                (tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode ||
-                                 mgl_tess_cpu_reference());
+                /* isolines / point_mode / CPU reference / xfb capture render through
+                 * the plain TES + indirect draw (mgl_tess_plain_render, tessellation.c) */
+                bool emulated = mgl_tess_plain_render(ctx);
                 if (!emulated)
                 {
                     MTLVertexDescriptor *tvd = [self extTessVertexDescriptor];
