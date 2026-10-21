@@ -2,6 +2,86 @@
 
 GL 4.6 tessellation shaders (TCS/TES, GL_PATCHES) on Metal, branch `gl46/tess`.
 Files: `MGL/src/tessellation.c` (GL side: program introspection, MSL rewrites,
+CPU reference), `MGL/src/MGLRenderer+Tessellation.m` (draw execution), `mgl_ext_tess.h`
+(GL/Metal interface), `tests/headless/test_tess.c` (499 checks), `tests/headless/test_tessemu.c`
+(emulation-only checks). Hardware `drawPatches` path on Apple silicon.
+
+## fp64 round 3 — HANDOFF (fresh session starts here)
+
+**Commits this session:*### details
+
+* `16ed51a` (headless drawable 200x200), `fddcd25` (UBO/SSBO/conversions
++ fp32 guards), `3f5ac66` (advertise both fp64 extensions), `1924bfb` (CTS hangs: texparam
+growth cap + >4KB dub Metal buffers), `3e64955` (xfb capture rework, WIP).
+
+**Suite state:** 28 binaries green (test_fp64 now 401 checks incl. fp64_conversions /
+fp64_ubo_layout / fp64_ssbo_compute / fp64_extensions; test_tess 499; test_xfb 249).
+`test_gpuaudit shadow_attribute_cache`: UNSKIPPED since round 2 and passing (104 checks, 0
+failures, no SKIP in the file).
+
+**CTS:** runner `.agent/cts_run.py 'KHR-GL46.gpu_shader_fp64.*' <timeout> [start-at] [limit]`
+(foreground, sequential, results appended to .agent/cts_results.txt; old file has stale
+UNKNOWN verdicts - delete before rerunning). With the current build the group's dmatN
+cases PASS; the ~110 scalar/dvecN builtin cases fail ONLY on the xfb capture path below.
+Still to write: `agents/conformance.md` with the final tally.
+
+**Active bug (one root cause):** fp64 soft-float calls take `thread const ulong&`; when an
+argument is an *lvalue* uniform member (`_4499(mgl_DefaultUniforms_1.uniform_0, ...)`) Metal
+rejects the bind. Normal FS/VS shaders work (SPIRV-Cross materializes temporaries there);
+the xfb capture kernel does not. Repro: `tests/headless/zz1_qs.c` pattern = VS
+`uniform double uniform_0..2; flat out double result_0;` + `glTransformFeedbackVaryings`,
+then draw with RASTERIZER_DISCARD (see git stash? no - the repro is described in the commit
+message; recreate from the CTS case `KHR-GL46.gpu_shader_fp64.builtin.clamp_double`).
+Likely fix: fp64.c lowering should emit an OpCopyObject/load-temporary for lvalue arguments
+of the soft-float calls, or a post-pass on the capture MSL.
+
+**CTS process rules (supervisor):** foreground only, one batch at a time, <20 min per call,
+never nohup/&; add files by path (never `git add -A`); never commit symlinks/external; no
+`git stash`; MAKEFLAGS=-j4, low CPU.
+
+**Known gaps:** dvec3/dvec4 stage varyings compile wrong in the FS (`in.dv[0]` rendered as
+scalar index into uint4; pre-existing round-2 gap, only scalar/dvec2 varyings verified);
+texparam records capped at 1M names (queries above return spec defaults).
+
+
+### details
+
+* `16ed51a` **headless drawable fixed**: `CppCreateMGLRendererHeadless` pins
+  contentsScale 2 so the default framebuffer is always 200x200. Over a bare SSH
+  session `[[NSScreen mainScreen] backingScaleFactor]` returned 1.0, halving the
+  drawable to 100x100 — every pixel read at y >= 100 returned zeros. This was the
+  entire "TES output clipped/shifted" mystery from the round-2 checkpoint (126
+  failing checks) AND the test_geom/test_geom_spirv "missing vertexDescriptor
+  binding" failures. Full suite green again right after (28 binaries, 0 failures).
+  NOTE (shared file MGLRenderer.m — surgical, one flag + one conditional).
+* `fddcd25` **real double uniforms/UBO/SSBO layouts** (verified at runtime, new
+  tests `fp64_conversions`, `fp64_ubo_layout`, `fp64_ssbo_compute`):
+  - OpFConv-from-double declared `mgl_fp64_to_fp32` with an i32 result type
+    although the function returns float → malformed SPIR-V; SPIRV-Cross threw
+    ("nullptr") for `float(d)` of any non-constant double in ANY stage.
+  - std140 scalar-double arrays: fp64 now widens the array element itself to
+    vec<stride/8>(u64) (def pass; layout stays decoration-exact) and routes
+    element chains through a new `arrlane` marker (loads extract lane 0, stores
+    re-fill pad lanes). Fixes the `ulong2`-argument compile error and wrong
+    offsets for `double a[n]`; dvecN arrays / dmatN keep using SPIRV-Cross's
+    own packing. std140 layout matrix verified end-to-end: s/v2/v3/v4/arr,
+    dvec2.y, dvec3.z, dvec4.w, dmat2/3x2/4 columns.
+  - **fp32 arithmetic was being lowered to soft-float64 calls** in any program
+    containing doubles (MSL silently truncated float args to ulong):
+    `vec4(dvec4) * 0.25f` rendered 0. All float ops in the body rewrite now
+    guard on the result/operand type containing Float64.
+  - SSBO std430 loads + widened std140 stores through a compute shader,
+    bit-exact readback (`fp64_ssbo_compute`).
+  - default-block double uniforms verified at runtime (dvec4/dvec2/double/dmat2
+    through `glUniform*dv`) — they were already correct; earlier "failures" were
+    my probes reading UNORM-clamped values > 1.
+* `3f5ac66` **extensions advertised**: `GL_ARB_gpu_shader_fp64`,
+  `GL_ARB_vertex_attrib_64bit` (+ `fp64_extensions` test: glGetStringi listing +
+  glVertexAttribL*/glGetVertexAttribLdv round trip).
+
+
+GL 4.6 tessellation shaders (TCS/TES, GL_PATCHES) on Metal, branch `gl46/tess`.
+Files: `MGL/src/tessellation.c` (GL side: program introspection, MSL rewrites,
 CPU reference), `MGL/src/MGLRenderer+Tessellation.m` (draw execution),
 `MGL/src/MGLTessKernels.h` (GPU kernel source), `MGL/src/mgl_ext_tess.h`
 (state/design), tests `test_tess.c`, `test_tessemu.c`, `test_tesscap.c` +
@@ -244,3 +324,143 @@ indices).
 
 Suite: 25 test binaries, 0 failures (250 PASS); test_tess 468 checks,
 test_tessemu 65 checks, test_pixelformats 2 tests / 1596-combination sweep.
+
+---
+
+# fp64 progress (round 2, checkpoint 2026-10-20 09:3x)
+
+## Done this session (commit 7aa4145, 0ecf799, f1fc18b)
+1. **dvecN vertex attributes bit-exact on the draw path** (item 1 of the gap
+   list, supervisor priority).  fp64.c lowers double/dvecN vertex inputs to
+   raw u32 word slots (double->uint2, dvec2->uint4, dvec3/dvec4 -> uint4 @loc k
+   + uint2/uint4 @loc k+1, the second location is a new Input variable with a
+   Location decoration and entry-point interface entry).  Loads reassemble the
+   u64 register values with pure bitcasts; constant component access (pos.x via
+   access chains) expands to whole-slot load + extract.  The renderer feeds the
+   slots: glVertexAttribLPointer data is fetched DIRECTLY from the app buffer
+   when aligned (zero CPU work, bit-exact — Metal has no 64-bit vertex format,
+   so the words ARE the value), misaligned/converted streams go through the
+   gpuaudit shadow cache as one 16/32-byte-per-element stream shared by both
+   word slots (glVertexAttribPointer GL_DOUBLE converts fp32 exactly per spec,
+   floats widen).  Disabled arrays feed the current generic double value's
+   bits.  The tess VS compute kernel gets the same word-slot treatment.
+   test_gpuaudit shadow_attribute_cache is UNSKIPPED and passes.
+2. **Link restructure**: all stages' SPIR-V is generated before any stage is
+   compiled to MSL.  Interleaving compile_stage work with
+   glslang_program_SPIRV_generate corrupted glslang's TPoolAllocator (garbage
+   pool sizes -> std::bad_alloc on the next generate); hit by any program with
+   a dvecN attribute (hidden behind the round-1 skip).
+3. **Location rules**: dvec3/dvec4 consume two locations; vertex-input location
+   overlap now fails the link (GL 4.6 11.1.1) instead of emitting two Metal
+   attributes at one index.  mgl_introspect_slot_owner() resolves word slots.
+4. **xfb of double varyings** (transform_feedback.c): GL_DOUBLE* + dmat leaf
+   types, words = components*2, capture GLSL writes unpackDouble2x32 per
+   component (bit-exact), capture variant runs the fp64 lowering and gets its
+   input Locations copied from the program's GL view (lone-shader compiles
+   have none — spvc needs them for [[attribute(n)]]).
+5. **flat double varyings + uniform round trip**: whole-variable OpLoad/OpStore
+   of double stage IO never hit the u32-pair iface path before (only access
+   chains did) — the IO pointer pointee is now rewritten up front.  Scalar
+   K_FLOAT types had n=0, which sent every scalar pair conversion down the
+   vector path (uint2(uint4,uint4) garbage).  glGetUniformdv round-trips
+   denormals and 1e308 exactly.
+
+## In progress at checkpoint (NOT green)
+Today's Metal runtime changed under us mid-session (the MAIN CHECKOUT's
+prebuilt test binaries fail identically; nothing was installed — CLT 26.5):
+- compute PSOs with a stage-input descriptor now REQUIRE setStageInRegion
+  (the tess VS kernel dispatch was dropped silently -> black) — FIXED.
+- drawPatches' N must equal the TES function's [[patch(domain, N)]] (Metal
+  dropped the draw) — FIXED with a per-N cached rebuild (textual
+  re-substitution on the stored MSL + compile_msl + rstate standin
+  specialization); gl_PatchVerticesIn reads the same N, so no-TCS programs
+  now report the real GL_PATCH_VERTICES.
+- REMAINING: test_tess TES output is still clipped/shifted (10 tests fail;
+  the tessellated shape renders but not where expected), test_geom /
+  test_geom_spirv fail with 'missing vertexDescriptor Buffer binding at
+  index 8' (debug layer).  Next steps: dump one failing TES draw's exact
+  gl_Position values (xfb capture is a good probe), fix the geom binding,
+  then re-run the whole suite, then items 4/5 (rcp/rsq ulp, extensions +
+  limits + the KHR-GL46.gpu_shader_fp64 CTS group + conformance.md).
+- Queued by supervisor (AFTER fp64 + CTS green): optional MGL_FP64_FAST=1
+  double-single (float32x2) fast path, reference metal-float64 (MIT).
+
+
+
+- Queued by supervisor (AFTER fp64 + CTS green): optional MGL_FP64_FAST=1
+  double-single (float32x2) fast path, reference metal-float64 (MIT).
+
+---
+
+# fp64 progress (software IEEE doubles, round 1 — earlier session)
+
+Design (from the crashed prior session, kept): `MGL/src/fp64.c` lowers
+SPIR-V *after* glslang — every OpTypeFloat 64 becomes u64, every double op is
+rewritten into calls into a merged soft-float64 library
+(`MGL/src/fp64_softfloat.glsl`, generated from Mesa's
+`src/compiler/glsl/float64.glsl` (Berkeley SoftFloat port, MIT) by
+`.agent/fp64/gen_lib.py`, which also applies MGL fixes and appends composed
+entry points: div/rcp/sqrt/mod/rem/ldexp/frexp + a fused FMA).  The library
+SPIR-V is merged per-module by reachability (`merge_lib`), and `program.c`
+translates the result with SPIRV-Cross MSL options + a textual fixup
+(`thread const ulong&` scalars → by-value — see shared-file edits).
+
+## Library work this session (all verified bit-exact on the GPU)
+
+GPU stress harness `.agent/fp64/runops.m` (+ `mklib.sh`, `x2msl`, `xdis`):
+one Metal kernel per library op, 16k structured-random pairs (subnormals,
+min/max double, ±0, exact-tie patterns) bit-compared against libc:
+
+  * add/sub/mul/**fused fma**/floor/ceil/trunc/round/fract/sqrt/glmod(OpFMod
+    semantics)/frem/ldexp: **0 bad / 16382**.
+  * div (rcp + exact-fma Markstein, subnormal operands rescaled by powers of
+    two): **1 bad / 15649** (2^-1074/2^-1075-scale corner, 1 ulp).
+  * rcp: 1 bad / 16382 (Newton-Raphson fixed point at exact powers of two,
+    1 ulp); rsq = rcp∘sqrt inherits it (~12% of *duplicated* structured
+    inputs, unique failures few).  Both are **internal only** — GLSL exposes
+    no fp64 rcp/rsq/inversesqrt.
+  * CPU reference models: `.agent/fp64/cfma.c` (fused FMA, 0 bad / 20M),
+    `cf64.c` (add/mul, used to find the port bugs).
+
+Bugs found & fixed in the Mesa port (all in `gen_lib.py`'s fix list, with
+comments): round-to-even mask at exact ties clears the wrong bit; the
+subnormal-result `increment` recomputed with an unsigned compare (always
+false → truncation); ftrunc/fround lose the sign of -0; subnormal+subnormal
+add carries out of the subnormal field without rounding; fround's tie test
+fires after the half-ulp carry (round(218000.5689) → 218000); rcp seed
+overflowed for |src| > fp32 range (now seeded from the normalized
+significand; subnormal normalization fixed; sign applied to the seed so NR
+converges); fdiv's Markstein residual now uses the fused fma and early-outs
+zero/inf quotients.  Mesa's ffma was mul-then-add (two roundings) — replaced
+by a genuinely fused mulAdd (exact 192-bit product+addend, one RNE round,
+subnormal results rounded once onto the 2^-1074 grid).  Shifts by 0/64 at
+alignment corners are split out (UB in GLSL, silently masked by Metal).
+
+## GLSL op coverage (tests/headless/test_fp64.c — 311 checks, 0 failures)
+
+add/sub/mul/div/fma/neg/abs/sign/min/max/mod/rem/clamp/mix/step/smoothstep/
+floor/ceil/trunc/round/fract/sqrt/ldexp/exp/log/pow/sin/cos/atan comparisons,
+conversions int/uint/float/int64/uint64↔double, unpackDouble2x32 — all
+bit-exact vs per-op CPU references (contraction-proofed with `volatile`;
+FMA-contracted refs would not match per-op GPU rounding).
+
+## Known gaps (next session)
+
+1. **dvecN vertex attributes** (ARB_vertex_attrib_64bit): the lowering maps
+   Input doubles to raw u64-pair attributes, but MGL's renderer feeds
+   GL_DOUBLE streams as converted fp32 (attribute cache) → MSL cast error /
+   link failure.  `test_gpuaudit.c: shadow_attribute_cache` is SKIPped with
+   a note.  Plan: load the fp32 attribute and widen per component with
+   `mgl_fp32_to_fp64` (attempted; crashed in SPIRV-Cross (bad_alloc) after
+   the rewrite — the OpTypePointer for Input must be rewritten *before* the
+   body pass so the load pass sees the iface mark; reverted to keep the
+   suite green, see git history of this session for the attempt).
+2. rcp/rsq 1-ulp Newton fixed points (internal only; fix = last-ulp
+   correction via the exact residual pair).
+3. Not yet done (API side): GL_ARB_gpu_shader_fp64 / GL_ARB_vertex_attrib_64bit
+   advertisement, glGet* limits, double uniforms/attributes plumbing checks.
+4. test_fp64dbg.c / zz_dbg.c debug harnesses deleted (per checkpoint rule);
+   the standalone GPU harness lives in `.agent/fp64/` (untracked).
+
+Suite after this session: all test binaries 0 failures
+(test_fp64 311; test_tess 499; test_tessemu 65; test_gpuaudit 94 + 1 SKIP).

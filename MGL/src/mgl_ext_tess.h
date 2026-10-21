@@ -146,6 +146,14 @@ typedef struct MGLTessProgram_t {
     int     point_mode;
 
     int     tcs_out_vertices;   /* GL_TESS_CONTROL_OUTPUT_VERTICES */
+
+    /* hardware TES post-tessellation function: Metal validates that the
+     * [[patch(domain, N)]] control point count equals drawPatches' N, and
+     * gl_PatchVerticesIn reads the same N — so without a TCS the function is
+     * recompiled when GL_PATCH_VERTICES changes (cached per N here) */
+    void   *tes_hw_function;    /* bridged id<MTLFunction> or NULL */
+    void   *tes_hw_library;
+    int     tes_hw_n;           /* N baked into tes_hw_function */
     int     tessellation_active;/* TES (or TCS) present and usable */
 
     /* control point record: TCS output struct == TES input struct (location-matched) */
@@ -275,6 +283,14 @@ void mgl_tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                const float *factors, unsigned patches);
 void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp);
 GLsizei mgl_tess_patch_vertices_in(GLMContext ctx, MGLTessProgram *tp);
+
+/* re-substitute the [[patch(domain, N)]] control point count in the stored
+ * hardware TES MSL (heap string, free() it) */
+char *mgl_tess_rewrite_tes_hw(const char *msl, int n);
+
+/* hardware TES post-tessellation function matching the current draw's control
+ * point count (cached per N in MGLTessProgram; returns a bridged id<MTLFunction>) */
+void *mgl_tess_hw_tes_function(GLMContext ctx, MGLTessProgram *tp);
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);   /* 8 tri / 12 quad */
 char *mgl_tess_plain_msl(GLMContext ctx, MGLTessProgram *tp);   /* caller frees */
 char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp); /* caller frees */

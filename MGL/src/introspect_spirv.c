@@ -541,6 +541,8 @@ static bool loc_free(const LocMap *lm, uint32_t base, uint32_t n)
     return true;
 }
 static void loc_take(LocMap *lm, uint32_t base, uint32_t n) { for (uint32_t i = 0; i < n && base + i < 1024; i++) lm->used[base + i] = 1; }
+static bool loc_taken(const LocMap *lm, uint32_t base, uint32_t n)
+{ for (uint32_t i = 0; i < n && base + i < 1024; i++) if (lm->used[base + i]) return true; return false; }
 static uint32_t loc_alloc(LocMap *lm, uint32_t n) { for (uint32_t b = 0; b < 1024; b++) if (loc_free(lm, b, n)) { loc_take(lm, b, n); return b; } return 0; }
 
 static bool stage_is_arrayed_io(int stage, bool input)
@@ -575,7 +577,11 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
         LocMap lm; memset(&lm, 0, sizeof lm);
         for (uint32_t v = 1; v <= m->bound; v++) {
             if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != SpvStorageClassInput || is_builtin_var(m, v)) continue;
-            uint32_t l; if (get_dec(m, v, -1, SpvDecorationLocation, &l)) loc_take(&lm, l, io_loc_count(m, _VERTEX_SHADER, v, true));
+            uint32_t l, n = io_loc_count(m, _VERTEX_SHADER, v, true);
+            if (get_dec(m, v, -1, SpvDecorationLocation, &l)) {
+                if (loc_taken(&lm, l, n)) ip->attrib_conflict = 1;
+                loc_take(&lm, l, n);
+            }
         }
         for (int pass = 0; pass < 2; pass++)
             for (uint32_t v = 1; v <= m->bound; v++) {
@@ -584,7 +590,11 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
                 uint32_t n = io_loc_count(m, _VERTEX_SHADER, v, true);
                 int bound = -1;
                 for (int b = 0; b < ip->nattrib_binds; b++) if (!strcmp(ip->attrib_binds[b].name, id_name(m, v))) bound = (int)ip->attrib_binds[b].index;
-                if (pass == 0 && bound >= 0) { loc_take(&lm, (uint32_t)bound, n); stage_set_loc(&sc[_VERTEX_SHADER], v, (uint32_t)bound, -1); }
+                if (pass == 0 && bound >= 0) {
+                    if (loc_taken(&lm, (uint32_t)bound, n)) ip->attrib_conflict = 1;
+                    loc_take(&lm, (uint32_t)bound, n);
+                    stage_set_loc(&sc[_VERTEX_SHADER], v, (uint32_t)bound, -1);
+                }
                 if (pass == 1 && bound < 0) stage_set_loc(&sc[_VERTEX_SHADER], v, loc_alloc(&lm, n), -1);
             }
     }
@@ -771,7 +781,6 @@ static uint32_t map_gpu_type(SMod *m, Inserts *ins, uint32_t *next_id, uint32_t 
     uint32_t r = t;
     SType *ty = &m->t[t];
     if (ty->kind == T_BOOL) r = int_t;
-    else if (ty->kind == T_FLOAT && ty->width == 64 && float_t) r = float_t;
     else if (ty->kind == T_VECTOR || ty->kind == T_MATRIX) {
         uint32_t e = map_gpu_type(m, ins, next_id, ty->elem, int_t, float_t, cache, ncache);
         ty = &m->t[t]; /* recursion may have grown (realloc'd) the type table */
@@ -923,31 +932,10 @@ static void emit_conv(SMod *m, WBuf *body, uint32_t *next_id, Inserts *ins, uint
     }
 }
 
-/* Metal has no fp64: edit every 64-bit float type in place to 32 bits and replace double
- * constants with float constants emitted at the same position (def-before-use is preserved) */
-static void lower_doubles(SMod *m, uint32_t **repls)
-{
-    for (size_t i = 1; i < m->first_func; i++) {
-        if (m->in[i].dead || !m->in[i].w) continue;
-        uint32_t *w = m->in[i].w, op = w[0] & 0xffff, wc = m->in[i].len;
-        if (op == SpvOpTypeFloat && wc == 3 && w[2] == 64) {
-            w[2] = 32;
-            if (w[1] <= m->bound) m->t[w[1]].width = 32;
-        } else if ((op == SpvOpConstant || op == SpvOpSpecConstant) && wc == 5 && w[1] <= m->bound && m->t[w[1]].kind == T_FLOAT) {
-            union { double d; uint64_t u; } v;
-            v.u = (uint64_t)w[3] | ((uint64_t)w[4] << 32);
-            float f = (float)v.d;
-            uint32_t bits;
-            memcpy(&bits, &f, 4);
-            m->in[i].dead = 1;
-            uint32_t *r = malloc(4 * sizeof(uint32_t));
-            r[0] = (4u << 16) | op; r[1] = w[1]; r[2] = w[2]; r[3] = bits;
-            repls[i] = r;
-            if (w[2] <= m->bound) m->cval[w[2]] = bits; /* keep the module model in sync */
-        }
-    }
-}
-
+/* Metal has no fp64 hardware: doubles now survive into the module that is reflected
+ * (the GL view) and are lowered to software fp64 by fp64.c on the MSL side, so the
+ * default-block layout below can use real 8-byte doubles and the CPU shadow stores
+ * them without conversion. */
 static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t *out_n)
 {
     SMod *m = sc->m;
@@ -997,7 +985,6 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
     /* Metal has no fp64: rewrite every double in the module to float (values stay doubles in
      * the CPU-side shadow and are converted on upload; GL introspection still reports the
      * original types via the recorded leaf kinds) */
-    lower_doubles(m, repls);
     if (pack) {
         /* verify every use is a load or an access chain (otherwise keep the original module) */
         uint8_t *ptrs = zalloc(next_id + 1);
@@ -1355,8 +1342,8 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             u->st[stage].offset = offset; u->st[stage].array_stride = stride;
             uint32_t b = strip_arrays(m, et);
             if (m->t[b].kind == T_MATRIX) { uint32_t cs, ca; msl_layout(m, m->t[b].elem, &cs, &ca); u->st[stage].matrix_stride = align_up(cs, ca); }
-            /* GPU storage: 4 bytes per scalar (int for bool, float for double) */
-            u->st[stage].scalar_size = 4;
+            /* GPU storage: 4 bytes per scalar (int for bool), 8 for software-double leaves */
+            u->st[stage].scalar_size = (u->kind == MGLI_K_DOUBLE) ? 8 : 4;
             u->st[stage].spv_id = spv_id; u->st[stage].res_type = res_type; u->st[stage].elem_base = *elem_cursor;
             *elem_cursor += (int)(ty->count ? ty->count : 1);
             return;
@@ -1389,10 +1376,11 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
     }
     u->stages |= 1u << stage;
     u->st[stage].present = 1;
+    if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64wd.txt","a"); if (d_) { fprintf(d_, "walk %s stage=%d off=%u\n", name, stage, offset); fclose(d_); } }
     u->st[stage].offset = offset; u->st[stage].array_stride = 0;
     if (ty->kind == T_MATRIX) { uint32_t cs, ca; msl_layout(m, ty->elem, &cs, &ca); u->st[stage].matrix_stride = align_up(cs, ca); }
-    /* GPU storage: 4 bytes per scalar (int for bool, float for double) */
-    u->st[stage].scalar_size = 4;
+    /* GPU storage: 4 bytes per scalar (int for bool), 8 for software-double leaves */
+    u->st[stage].scalar_size = (u->kind == MGLI_K_DOUBLE) ? 8 : 4;
     u->st[stage].spv_id = spv_id; u->st[stage].res_type = res_type; u->st[stage].elem_base = *elem_cursor;
     *elem_cursor += 1;
 }
@@ -1698,6 +1686,7 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         DubMember *d = &s->dub[k];
         uint32_t mt = m->t[strip_arrays(m, pointee(m, m->vtype[s->dub_var]))].mem[k];
         int cursor = 0, elem = 0, lki = 0;
+        if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64rs.txt","a"); if (d_) { fprintf(d_, "reflect %s d->offset=%u active=%d k=%u ndub=%u dubvar=%u\n", d->name, d->offset, s->dub_active ? s->dub_active[k] : -1, k, s->ndub, s->dub_var); fclose(d_); } }
         walk_default(ip, m, stage, d->name, mt, d->offset, d->explicit_loc, &cursor, 0, -1, &elem, name_is_hidden(d->name), d->leaf, &lki);
     }
     /* bool/bvecN block members: recover the GLSL-declared types from the stage source */
@@ -1858,8 +1847,22 @@ static bool assign_uniform_locations(MGLIProgram *ip)
 #pragma mark - link entry
 
 /* compile the patched module once with SPIRV-Cross MSL; false (and a log line) if it is rejected */
+/* does this module contain a Float64 type? (software fp64: kept in the GL
+ * view, lowered to u64 + soft-float calls by fp64.c before MSL) */
+static bool module_has_fp64(const uint32_t *words, size_t n)
+{
+    if (n < 6) return false;
+    for (size_t i = 5; i + 2 < n; i += (words[i] >> 16) ? (words[i] >> 16) : 1)
+        if ((words[i] & 0xffff) == SpvOpTypeFloat && words[i + 2] == 64)
+            return true;
+    return false;
+}
+
 static bool msl_accepts(const uint32_t *words, size_t n, int stage)
 {
+    /* SPIRV-Cross rejects double types in buffers, which the GL view of a
+     * software-fp64 module legitimately contains (fp64.c lowers it later). */
+    if (module_has_fp64(words, n)) return true;
     spvc_context c = NULL; spvc_parsed_ir ir = NULL; spvc_compiler comp = NULL; spvc_compiler_options opt = NULL;
     const char *res = NULL;
     bool ok = spvc_context_create(&c) == SPVC_SUCCESS &&
@@ -2018,6 +2021,7 @@ uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage
 bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
 {
     StageCtx sc[MGLI_STAGES];
+    ip->attrib_conflict = 0;   /* re-detected below per link */
     memset(sc, 0, sizeof sc);
     ip->stage_mask = 0;
     ip->first_stage = ip->last_stage = -1;
@@ -2048,7 +2052,8 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
             for (uint32_t k = 0; k < ty->nmem; k++) {
                 DubMember *d = &sc[s].dub[k];
                 d->type = ty->mem[k]; d->member = k; d->gtype = ty->mem[k];
-                get_dec(r, st, (int32_t)k, SpvDecorationOffset, &d->offset);
+                { bool ok_ = get_dec(r, st, (int32_t)k, SpvDecorationOffset, &d->offset);
+                  if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64off.txt","a"); if (d_) { fprintf(d_, "mem %d name=%s off=%u found=%d\n", k, member_name(r, st, k), d->offset, ok_); fclose(d_); } } }
                 uint32_t l; d->explicit_loc = get_dec(r, st, (int32_t)k, SpvDecorationLocation, &l) ? (int)l : -1;
                 snprintf(d->name, sizeof d->name, "%s", member_name(r, st, k));
             }
@@ -2097,6 +2102,7 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
 
     /* reflection */
     for (int s = 0; s < MGLI_STAGES; s++) if (sc[s].present && sc[s].r) reflect_stage(ip, &sc[s], s, stage_source(ctx, ptr, s));
+    if (getenv("MGL_FP64_DUMP")) { for (int s2 = 0; s2 < MGLI_STAGES; s2++) { if (!sc[s2].dub_var || !ptr->spirv[s2].ir) continue; char path[256]; snprintf(path, sizeof path, "/tmp/fp64glview%d.spv", s2); FILE *f_ = fopen(path, "wb"); if (f_) { fwrite(ptr->spirv[s2].ir, 4, ptr->spirv[s2].size, f_); fclose(f_); } } }
     if (ip->first_stage >= 0 && sc[ip->first_stage].r)
         reflect_io(ip, sc[ip->first_stage].r, ip->first_stage, sc[ip->first_stage].active, true, &ip->inputs, &ip->ninputs);
     if (ip->last_stage >= 0 && ip->last_stage != _COMPUTE_SHADER && sc[ip->last_stage].r)

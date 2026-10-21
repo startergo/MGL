@@ -185,6 +185,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_framebuffer_sRGB",
     "GL_ARB_get_texture_sub_image",
     "GL_ARB_gl_spirv",                 /* shader binary format: SPIR-V (get.c) */
+    "GL_ARB_gpu_shader_fp64",          /* software fp64 (fp64.c), GLSL doubles + fp64 lib */
     "GL_ARB_half_float_pixel",
     "GL_ARB_half_float_vertex",
     "GL_ARB_instanced_arrays",
@@ -242,6 +243,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_uniform_buffer_object",
     "GL_ARB_vertex_array_bgra",
     "GL_ARB_vertex_array_object",
+    "GL_ARB_vertex_attrib_64bit",      /* dvecN attributes + glVertexAttribL* (vertex_attrib.c) */
     "GL_ARB_vertex_attrib_binding",
     "GL_ARB_vertex_type_10f_11f_11f_rev",
     "GL_ARB_vertex_type_2_10_10_10_rev",

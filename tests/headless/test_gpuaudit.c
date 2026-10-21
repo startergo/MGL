@@ -570,17 +570,25 @@ TEST(multi_draw_indirect_no_cpu_read)
 static GLuint g_dprog, g_dvao, g_dvbo;
 static double g_dverts[12] = { -1, -1, 0, 1,   3, -1, 0, 1,   -1, 3, 0, 1 };
 
-static void shadow_setup(void)
+static const char *shadow_vs_src(void)
 {
-    /* a program that takes a double attribute (Metal cannot fetch GL_DOUBLE, so the
-     * stream is converted to float4 on the CPU - cached after the first draw) */
-    const char *vs = "#version 430 core\n"
+    /* a program that takes a dvec4 attribute: the fp64 lowering fetches it as
+     * raw u32 word slots; misaligned streams are converted on the CPU and
+     * cached after the first draw */
+    return "#version 430 core\n"
         "layout(location = 0) in dvec4 pos;\n"
         "void main() { gl_Position = vec4(pos.xy / 2.0, 0.0, 1.0); }\n";
-    const char *fs = "#version 430 core\n"
+}
+static const char *shadow_fs_src(void)
+{
+    return "#version 430 core\n"
         "layout(location = 0) out vec4 color;\n"
         "void main() { color = vec4(0, 1, 0, 1); }\n";
-    g_dprog = mgl_make_program(vs, fs);
+}
+
+static void shadow_setup(void)
+{
+    g_dprog = mgl_make_program(shadow_vs_src(), shadow_fs_src());
 
     glGenBuffers(1, &g_dvbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_dvbo);
@@ -588,7 +596,13 @@ static void shadow_setup(void)
     glGenVertexArrays(1, &g_dvao);
     glBindVertexArray(g_dvao);
     glEnableVertexAttribArray(0);
-    glVertexAttribLPointer(0, 4, GL_DOUBLE, 32, 0);
+    /* misaligned relative offset on purpose: a bit-exact L-pointer stream cannot
+     * be fetched directly by Metal, so it goes through the converted (cached)
+     * shadow path even for glVertexAttribLPointer */
+    glBufferData(GL_ARRAY_BUFFER, 3 * 36, NULL, GL_STATIC_DRAW);
+    for (int i = 0; i < 3; i++)
+        glBufferSubData(GL_ARRAY_BUFFER, i * 36 + 3, 32, g_dverts + i * 4);
+    glVertexAttribLPointer(0, 4, GL_DOUBLE, 36, (void *)(uintptr_t)3);
 }
 
 TEST(shadow_attribute_cache)
@@ -610,7 +624,8 @@ TEST(shadow_attribute_cache)
 
     /* re-uploading the vertex data must invalidate the converted stream */
     double verts2[12] = { -1, -1, 0, 1,   1, -1, 0, 1,   -1, 1, 0, 1 };
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts2), verts2);
+    for (int i = 0; i < 3; i++)
+        glBufferSubData(GL_ARRAY_BUFFER, i * 36 + 3, 32, verts2 + i * 4);
     GLuint g2 = 0;
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 3);

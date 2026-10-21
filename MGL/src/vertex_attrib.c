@@ -157,6 +157,35 @@ void mgl_va_fetch_float(const MGLVertexAttribFormat *fmt, const void *src, GLflo
     }
 }
 
+/* Fetch one element of a double attribute as the raw u32 words consumed by the
+ * fp64-lowered shader (two words per component).  glVertexAttribLPointer data
+ * keeps its bits verbatim (bit-exact transport); glVertexAttribPointer data is
+ * converted exactly as the GL spec demands: GL_DOUBLE converts the source
+ * double to float32 (and back, losslessly for the shader-visible value), other
+ * types widen their float/int value to double. */
+void mgl_va_fetch_dbl_words(const MGLVertexAttribFormat *fmt, const void *src, GLuint out[8])
+{
+    if (fmt->type == GL_DOUBLE)
+    {
+        for (int i = 0; i < fmt->size && i < 4; i++)
+        {
+            GLdouble v;
+            memcpy(&v, (const GLubyte *)src + i * 8, 8);
+            if (!fmt->is_long) v = (GLdouble)(GLfloat)v;
+            memcpy(&out[i * 2], &v, 8);
+        }
+        return;
+    }
+
+    GLfloat t[4];
+    mgl_va_fetch_float(fmt, src, t);
+    for (int i = 0; i < fmt->size && i < 4; i++)
+    {
+        GLdouble v = (GLdouble)t[i];
+        memcpy(&out[i * 2], &v, 8);
+    }
+}
+
 /* decode one element of integer array data (no conversion), defaults (0,0,0,1) */
 void mgl_va_fetch_int(const MGLVertexAttribFormat *fmt, const void *src, GLint out[4])
 {

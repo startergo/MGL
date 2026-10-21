@@ -1248,6 +1248,32 @@ TEST(TessProgramQueries)
 
 int main(void)
 {
+    if (getenv("GRID")) {
+        GLuint prog = make_program(kTcsTri, kTesTri);
+        glUseProgram(prog);
+        setup_patch_vao(kTriPos, kTriCol, 3);
+        glPatchParameteri(GL_PATCH_VERTICES, 3);
+        glClearColor(0, 0, 1, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        for (int y = 7; y >= 0; y--) {
+            for (int x = 0; x < 8; x++) {
+                float c[4];
+                glReadPixels(x * 16 + 4, y * 16 + 4, 1, 1, GL_RGBA, GL_FLOAT, c);
+                putchar(c[0] > 0.5f ? 'R' : c[1] > 0.5f ? 'G' : c[2] > 0.5f ? 'b' : '.');
+            }
+            putchar('\n');
+        }
+        return 0;
+    }
+    if (getenv("ONE")) {
+        const char *one = getenv("ONE");
+        if (!strcmp(one, "tri")) RUN(TessTriangleDomain);
+        if (!strcmp(one, "psocache")) RUN(TessPSOCacheStress);
+        if (!strcmp(one, "deflvl")) RUN(TessDefaultLevels);
+        printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
+        return mgl_test_failures != 0;
+    }
     RUN(TessFourPatches);
     RUN(TessIndexedAndInstanced);
     RUN(TessIndexedRestart);

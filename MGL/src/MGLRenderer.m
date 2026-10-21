@@ -428,6 +428,10 @@ static char kComputeFallbackKey;
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
                 {
                     Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stage, i);
+                    if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64bind.txt","a"); if (d_) { fprintf(d_, "stage=%d i=%d spirv_binding=%u type=%d dub=%p:", stage, i, spirv_binding, (int)spvc_type, (void*)dub);
+                        unsigned char *dd = (unsigned char *)dub->data.buffer_data;
+                        for (int q = 0; q < 32; q++) fprintf(d_, " %02x", dd ? dd[q] : 0);
+                        fprintf(d_, "\n"); fclose(d_); } }
                     if (dub)
                     {
                         buffer_map->buffers[buffer_map->count].attribute_mask = 0;
@@ -651,6 +655,11 @@ static char kComputeFallbackKey;
 
         assert(ptr);
 
+        /* same 4 KB setVertexBytes cap as the fragment path: large default
+         * uniform blocks need a real MTLBuffer (created lazily here) */
+        if (ptr->size >= 4096 && !ptr->data.mtl_data)
+            [self bindMTLBuffer: ptr];
+
         // for buffers less than 4k we should use this call
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
@@ -691,7 +700,13 @@ static char kComputeFallbackKey;
         offset = map->offset;
 
         assert(ptr);
-        
+
+        /* GL default-uniform blocks legitimately exceed setFragmentBytes' 4 KB
+         * cap (4096 fp32 components, halved for doubles); materialize a real
+         * MTLBuffer on demand instead of trapping (fp64 CTS max_uniform_components) */
+        if (ptr->size >= 4096 && !ptr->data.mtl_data)
+            [self bindMTLBuffer: ptr];
+
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
@@ -5322,6 +5337,10 @@ void* CppCreateMGLRendererFromContextAndBindToWindow (void *glm_ctx, void *windo
     return  (__bridge void *)(renderer);
 }
 
+/* true for contexts created through CppCreateMGLRendererHeadless: their drawable size
+ * must not depend on whether a display happens to be attached (see contentsScale) */
+static bool mgl_headless_context = false;
+
 void* CppCreateMGLRendererHeadless (void *glm_ctx)
 {
     assert (glm_ctx);
@@ -5333,6 +5352,7 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     assert (view);
     [view setWantsLayer:YES];
 
+    mgl_headless_context = true;
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
     return  (__bridge void *)(renderer);
 }
@@ -5414,7 +5434,11 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     _layer.presentsWithTransaction = NO;
 
     // AGX-safe scale factor handling
-    int scaleFactor = [[NSScreen mainScreen] backingScaleFactor];
+    // tess: headless contexts (QEMU offscreen blit / headless tests) pin the scale so the
+    // default drawable is always 200x200: [[NSScreen mainScreen] backingScaleFactor] is
+    // 2.0 with a display attached but 1.0 over a bare SSH session, which silently halved
+    // the default framebuffer and broke every pixel test that reads y >= 100.
+    int scaleFactor = mgl_headless_context ? 2 : [[NSScreen mainScreen] backingScaleFactor];
     [_layer setContentsScale: scaleFactor];
 
     // AGX-safe layer attachment

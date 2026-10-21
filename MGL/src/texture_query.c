@@ -243,19 +243,26 @@ MGLTexParamRecord *mgl_texparam_record(GLMContext ctx, GLuint name, bool create)
         if (!create)
             return NULL;
 
-        GLuint n = st->num_records ? st->num_records : 64;
+        /* uint64: n *= 2 on a GLuint wraps to 0 for names with the top bit set
+         * and looped forever; and CTS-style sessions allocate millions of
+         * object names - the name-indexed array must not follow them into
+         * gigabytes (2.6 GB RSS + minutes per glTexBuffer during
+         * glu::resetStateGLCore). Above the cap the query paths fall back to
+         * their spec defaults. */
+        uint64_t n = st->num_records ? st->num_records : 64;
         while (n <= name)
             n *= 2;
         if (n > MGL_TEXPARAM_MAX_RECORDS)
             n = MGL_TEXPARAM_MAX_RECORDS;
+        GLuint cap = (GLuint)n;
 
-        MGLTexParamRecord *r = (MGLTexParamRecord *)realloc(st->records, n * sizeof(MGLTexParamRecord));
+        MGLTexParamRecord *r = (MGLTexParamRecord *)realloc(st->records, cap * sizeof(MGLTexParamRecord));
         if (!r)
             return NULL;
 
-        bzero(r + st->num_records, (n - st->num_records) * sizeof(MGLTexParamRecord));
+        bzero(r + st->num_records, (cap - st->num_records) * sizeof(MGLTexParamRecord));
         st->records = r;
-        st->num_records = n;
+        st->num_records = cap;
     }
 
     MGLTexParamRecord *rec = &st->records[name];

@@ -140,6 +140,8 @@ typedef struct MGLIProgram {
     MGLIAtomicBuffer *abufs; int nabufs;
     MGLIStageSub sub[MGLI_STAGES];
 
+    int      attrib_conflict;   /* two vertex inputs overlap locations (link error) */
+
     int      nxfb;  /* transform feedback varyings (from mgl_xfb_program_info, refreshed per query) */
 
     /* per-stage default uniform block (one Buffer per stage, see renderer buffer map) */
@@ -197,6 +199,13 @@ const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader);
 
 /* Attribute location lookup (mglGetAttribLocation in program.c forwards here). */
 GLint mgl_introspect_get_attrib_location(GLMContext ctx, GLuint program, const GLchar *name);
+
+/* Resolve which GL attribute owns Metal attribute slot `loc` and its GL type:
+ * a dvec3/dvec4 vertex input is split by the fp64 lowering into word slots at
+ * locations k and k+1, so slot k+1 belongs to the attribute at k (cbase 2).
+ * Returns the GL type of the owning input (0 if the slot is not a program
+ * input); *owner gets the attribute location, *cbase its first component. */
+GLenum mgl_introspect_slot_owner(GLMContext ctx, GLuint program, GLint loc, GLint *owner, GLint *cbase);
 
 /* ---- internal (introspect domain files) ---------------------------------------------------- */
 MGLIProgram *mgli_find(GLMContext ctx, GLuint program);

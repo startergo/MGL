@@ -348,6 +348,42 @@ GLint mgl_introspect_get_attrib_location(GLMContext ctx, GLuint program, const G
     return var_location(ip->inputs, ip->ninputs, name, NULL);
 }
 
+static bool is_double_type(GLenum t)
+{
+    return t == GL_DOUBLE || t == GL_DOUBLE_VEC2 || t == GL_DOUBLE_VEC3 || t == GL_DOUBLE_VEC4;
+}
+
+GLenum mgl_introspect_slot_owner(GLMContext ctx, GLuint program, GLint loc, GLint *owner, GLint *cbase)
+{
+    if (cbase) *cbase = 0;
+    if (owner) *owner = loc;
+    if (loc < 0 || loc >= MAX_ATTRIBS) return 0;
+    MGLIProgram *ip = mgli_find(ctx, program);
+    if (!ip || !ip->linked || !vertex_inputs(ip)) return 0;
+    for (int i = 0; i < ip->ninputs; i++)
+    {
+        MGLIVar *v = &ip->inputs[i];
+        if (v->location != loc || v->location < 0) continue;
+        if (owner) *owner = loc;
+        return v->type;
+    }
+    /* second word slot of a two-location double attribute */
+    if (loc > 0)
+        for (int i = 0; i < ip->ninputs; i++)
+        {
+            MGLIVar *v = &ip->inputs[i];
+            if (v->location != loc - 1 || v->location < 0) continue;
+            if (is_double_type(v->type) && v->size >= 1 &&
+                (v->type == GL_DOUBLE_VEC3 || v->type == GL_DOUBLE_VEC4))
+            {
+                if (owner) *owner = loc - 1;
+                if (cbase) *cbase = 2;
+                return v->type;
+            }
+        }
+    return 0;
+}
+
 void mglGetActiveAttrib(GLMContext ctx, GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name)
 {
     if (bufSize < 0) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }

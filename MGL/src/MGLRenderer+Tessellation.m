@@ -212,6 +212,60 @@ static id<MTLFunction> tessStageFunction(Program *program, int stage)
     return (__bridge id<MTLFunction>)(sh->mtl_data.function);
 }
 
+/* The hardware TES function must declare the same control point count N as
+ * drawPatches gets (Metal validates the pair; gl_PatchVerticesIn also reads N).
+ * With a TCS the count is fixed by GL_TESS_CONTROL_OUTPUT_VERTICES; without one
+ * it is GL_PATCH_VERTICES, which can change between draws — recompile the
+ * post-tessellation function with the new N when that happens (the rewrite is
+ * a textual substitution on the stored MSL, cheap and cached per N). */
+void *mgl_tess_hw_tes_function(GLMContext ctx, MGLTessProgram *tp)
+{
+    int n = tp->has_tcs ? tp->tcs_out_vertices : mgl_tess_patch_vertices_in(ctx, tp);
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    if (tp->tes_hw_function && tp->tes_hw_n == n)
+        return tp->tes_hw_function;
+
+    const char *msl = tp->program && tp->program->spirv[_TESS_EVALUATION_SHADER].msl_str ?
+                      tp->program->spirv[_TESS_EVALUATION_SHADER].msl_str : NULL;
+    if (!msl)
+        return NULL;
+
+    char *rewritten = mgl_tess_rewrite_tes_hw(msl, n);
+    if (!rewritten)
+        return NULL;
+
+    if (getenv("MGL_TESS_DEBUG")) {
+        const char *p = strstr(rewritten, "patch(");
+        NSLog(@"MGL tess: TES rebuild N=%d -> %.*s", n, p ? 40 : 4, p ? p : "none");
+        FILE *df = fopen("/tmp/tes_rebuild.metal", "w");
+        if (df) { fputs(rewritten, df); fclose(df); }
+    }
+
+    MGLRenderer *self = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+    (void)self;
+    /* compile through the program domain's path: it specializes the rstate
+     * clip-space function constants (y flip / z01 / point size) exactly like
+     * the link-time compile did */
+    const char *ep = tp->program->shader_slots[_TESS_EVALUATION_SHADER] ?
+                     tp->program->shader_slots[_TESS_EVALUATION_SHADER]->entry_point : "main0";
+    void *library = NULL, *function = NULL;
+    char *errlog = NULL;
+    if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, rewritten, (ep && *ep) ? ep : "main0",
+                                                 &library, &function, &errlog)) {
+        NSLog(@"MGL tess: TES recompile for patch N=%d failed: %s", n, errlog ? errlog : "?");
+        free(errlog);
+        return NULL;
+    }
+    free(errlog);
+    if (tp->tes_hw_function) CFBridgingRelease(tp->tes_hw_function);
+    if (tp->tes_hw_library) CFBridgingRelease(tp->tes_hw_library);
+    tp->tes_hw_function = function;
+    tp->tes_hw_library = library;
+    tp->tes_hw_n = n;
+    return tp->tes_hw_function;
+}
+
 /* ------------------------------------------------------------------ VS attribute plan
  * The VS of a tessellation pipeline is a compute kernel: its attributes are fed
  * through a compute-pipeline stage input descriptor (MTLStepFunctionThreadPositionInGridX/Y),
@@ -231,6 +285,8 @@ typedef struct TessAttribSlot {
     int     shadow_buffer;      /* Metal buffer index of the converted stream */
     int     shadow_words;       /* words per element of the converted stream */
     int     binding_step;       /* divisor of the slot's GL binding */
+    uint8_t dbl;                /* fp64 word slot: 1 low (comp 0), 2 high (comp 2) */
+    int     dbl_words;          /* u32 words this slot fetches */
 } TessAttribSlot;
 
 typedef struct TessVSPlan {
@@ -401,6 +457,22 @@ static bool tessBuildVSPlan(GLMContext ctx, Program *program, TessVSPlan *plan,
                 }
             }
             s->fetch = TESS_FETCH_CONST;
+            if (s->kind == MGL_VA_KIND_DOUBLE)
+            {
+                /* word slots of the current double value (dvec3/dvec4 span two) */
+                int n = (f->size == GL_BGRA) ? 4 : f->size;
+                s->dbl = 1;
+                s->dbl_words = (n > 2) ? 2 : n;
+                if (n >= 3 && plan->count + 1 < MAX_ATTRIB_SLOTS && loc + 1 < MAX_ATTRIBS)
+                {
+                    TessAttribSlot *h = &plan->slot[plan->count + 1];
+                    *h = *s;
+                    h->loc = loc + 1;
+                    h->dbl = 2;
+                    h->dbl_words = n - 2;
+                    plan->count++;
+                }
+            }
             plan->count++;
             continue;
         }
@@ -408,6 +480,58 @@ static bool tessBuildVSPlan(GLMContext ctx, Program *program, TessVSPlan *plan,
         elem = mgl_va_element_size(f->type, f->size);
         aligned = (b->stride % 4) == 0 && (b->offset % 4) == 0 && (f->relativeoffset % 4) == 0 &&
                   (b->stride == 0 || f->relativeoffset + elem <= (GLuint)b->stride);
+
+        if (s->kind == MGL_VA_KIND_DOUBLE)
+        {
+            /* fp64 attribute: fetched as raw u32 words; dvec3/dvec4 occupy a
+             * second word slot at loc+1 (mirrors vattribGenerateVertexDescriptor) */
+            int n = (f->size == GL_BGRA) ? 4 : f->size;
+            GLsizei delem = n * 8;
+            s->dbl = 1;
+            s->dbl_words = (n > 2) ? 2 : n;
+            s->binding = f->binding;
+            s->offset = (size_t)b->offset + (size_t)f->relativeoffset;
+
+            if (f->is_long && aligned)
+            {
+                s->fetch = TESS_FETCH_DIRECT;
+                s->mtl_format = (s->dbl_words >= 2) ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
+            }
+            else
+            {
+                s->fetch = TESS_FETCH_SHADOW;
+                s->shadow_words = n * 2;        /* u32 words per element */
+            }
+
+            if (plan->binding_buffer_index[s->binding] < 0)
+            {
+                plan->binding_buffer_index[s->binding] = next_index++;
+                plan->binding_stride[s->binding] = b->stride ? (size_t)b->stride : (size_t)delem;
+                plan->binding_step[s->binding] = b->divisor;
+            }
+            if (s->fetch == TESS_FETCH_SHADOW)
+                s->shadow_buffer = next_index++;
+
+            if (n >= 3 && plan->count + 1 < MAX_ATTRIB_SLOTS && loc + 1 < MAX_ATTRIBS)
+            {
+                TessAttribSlot *h = &plan->slot[plan->count + 1];   /* after the low slot */
+                *h = *s;
+                h->loc = loc + 1;
+                h->dbl = 2;
+                h->dbl_words = n - 2;
+                if (h->fetch == TESS_FETCH_DIRECT)
+                    h->offset += 16;
+                plan->count++;                                    /* the hi slot counts too */
+            }
+
+            if (next_index >= MGL_TESS_VS_PARAMS)
+            {
+                NSLog(@"MGL ERROR: tess: vertex compute pipeline ran out of buffer indices");
+                return false;
+            }
+            plan->count++;
+            continue;
+        }
 
         if (aligned && !f->is_long)
         {
@@ -603,7 +727,8 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         if (s->fetch == TESS_FETCH_CONST)
         {
             /* current generic value: 16-byte slot per location, constant step */
-            sd.attributes[s->loc].format = (s->kind == MGL_VA_KIND_INT) ? MTLAttributeFormatInt4 :
+            sd.attributes[s->loc].format = (s->dbl) ? ((s->dbl_words >= 2) ? MTLAttributeFormatUInt4 : MTLAttributeFormatUInt2) :
+                                           (s->kind == MGL_VA_KIND_INT) ? MTLAttributeFormatInt4 :
                                            (s->kind == MGL_VA_KIND_UINT) ? MTLAttributeFormatUInt4 :
                                            MTLAttributeFormatFloat4;
             sd.attributes[s->loc].offset = (NSUInteger)(s->loc * 16);
@@ -612,10 +737,13 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         }
         if (s->fetch == TESS_FETCH_SHADOW)
         {
-            sd.attributes[s->loc].format = (s->kind == MGL_VA_KIND_INT) ? MTLAttributeFormatInt4 :
+            sd.attributes[s->loc].format = (s->dbl) ? ((s->dbl_words >= 2) ? MTLAttributeFormatUInt4 : MTLAttributeFormatUInt2) :
+                                           (s->kind == MGL_VA_KIND_INT) ? MTLAttributeFormatInt4 :
                                            (s->kind == MGL_VA_KIND_UINT) ? MTLAttributeFormatUInt4 :
                                            MTLAttributeFormatFloat4;
-            sd.attributes[s->loc].offset = 0;
+            /* fp64: both word slots of one attribute share the converted stream,
+             * the high half living at byte 16 of each element */
+            sd.attributes[s->loc].offset = (s->dbl == 2) ? 16 : 0;
             sd.attributes[s->loc].bufferIndex = s->shadow_buffer;
             continue;
         }
@@ -655,7 +783,16 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         TessAttribSlot *s = &plan->slot[i];
         if (s->fetch != TESS_FETCH_SHADOW)
             continue;
-        sd.layouts[s->shadow_buffer].stride = 16;
+        if (s->dbl)
+        {
+            /* one double-word element per vertex: 16 bytes for dvec1/dvec2,
+             * 32 for dvec3/dvec4 (high half read at byte offset 16) */
+            sd.layouts[s->shadow_buffer].stride = (s->shadow_words > 4) ? 32 : 16;
+        }
+        else
+        {
+            sd.layouts[s->shadow_buffer].stride = 16;
+        }
         if (s->binding_step > 0)
         {
             sd.layouts[s->shadow_buffer].stepFunction = MTLStepFunctionThreadPositionInGridY;
@@ -1494,6 +1631,10 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
              return false;
         }
         [cenc setBuffer: ring offset: off_vs_out atIndex: MGL_TESS_VS_OUT_BUF];
+        /* the vertex kernel fetches attributes through the compute stage-in
+         * descriptor: Metal requires the fetched index region (X vertices,
+         * Y instances) or the dispatch is dropped */
+        [cenc setStageInRegion: MTLRegionMake2D(0, 0, (NSUInteger)vcount, (NSUInteger)instances)];
         if (gpu_indexed)
         {
             /* GPU-driven indexed draw: the scan-setup kernel wrote the parameter
@@ -1763,7 +1904,7 @@ static struct TessScanEnt *tessScanEntry(GLMContext ctx, const Buffer *ebuf, siz
 
             if (tTrace())
             {
-                NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw, fstride=%zu)", cp_count, total_patches, fstride);
+                NSLog(@"MGL tess: drawPatches cp=%d patches=%d (hw, fstride=%zu, tcs=%d outv=%d hwn=%d pvin=%d)", cp_count, total_patches, fstride, tp->has_tcs, tp->tcs_out_vertices, tp->tes_hw_n, patch_verts_in);
             }
 
             /* ONE drawPatches for every patch of the draw: the factor records are at the
@@ -2466,8 +2607,28 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
             for (int i = 0; i < plan->count; i++)
             {
                 TessAttribSlot *s = &plan->slot[i];
-                if (s->fetch == TESS_FETCH_CONST)
+                if (s->fetch == TESS_FETCH_CONST && !s->dbl)
                     memcpy(data + s->loc * 16, vs->current[s->loc].v.f, 16);
+                else if (s->fetch == TESS_FETCH_CONST)
+                {
+                    /* word slots of the current double value */
+                    int own = (s->dbl == 2) ? s->loc - 1 : s->loc;
+                    MGLCurrentAttrib *cur = &vs->current[own];
+                    int c0 = (s->dbl == 2) ? 2 : 0;
+                    GLuint *w = (GLuint *)(data + s->loc * 16);
+                    for (int c = c0; c < c0 + 2; c++)
+                    {
+                        GLdouble v;
+                        switch (cur->kind)
+                        {
+                            case MGL_VA_KIND_INT:    v = (GLdouble)cur->v.i[c]; break;
+                            case MGL_VA_KIND_UINT:   v = (GLdouble)cur->v.u[c]; break;
+                            case MGL_VA_KIND_DOUBLE: v = cur->d[c]; break;
+                            default:                 v = (GLdouble)cur->v.f[c]; break;
+                        }
+                        memcpy(&w[(c - c0) * 2], &v, 8);
+                    }
+                }
             }
         }
         [enc setBytes: data length: sizeof(data) atIndex: (NSUInteger)plan->const_buffer];
@@ -2479,6 +2640,8 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
         TessAttribSlot *s = &plan->slot[i];
         if (s->fetch != TESS_FETCH_SHADOW)
             continue;
+        if (s->dbl == 2)
+            continue;   /* both word slots share one stream, converted by the low slot */
         if (!tessConvertShadowStream(ctx, s, vertex_count))
              return false;
         [enc setBuffer: tShadowBuf offset: 0 atIndex: (NSUInteger)s->shadow_buffer];
@@ -2491,13 +2654,15 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
 static bool tessConvertShadowStream(GLMContext ctx, TessAttribSlot *s, GLuint vertex_count)
 {
     MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
-    MGLVertexAttribFormat *f = &va->fmt[s->loc];
+    int own = (s->dbl == 2) ? s->loc - 1 : s->loc;
+    MGLVertexAttribFormat *f = &va->fmt[own];
     MGLVertexBinding *b = &va->binding[f->binding];
     MGLRenderer *self2 = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
     const uint8_t *src = b->buffer && b->buffer->data.buffer_data ?
                          (const uint8_t *)b->buffer->data.buffer_data : NULL;
     size_t stride = b->stride ? (size_t)b->stride : (size_t)mgl_va_element_size(f->type, f->size);
-    size_t need = (size_t)vertex_count * 16 + 16;
+    size_t stride_out = s->dbl ? ((size_t)(s->shadow_words) * 4 + 15) & ~(size_t)15 : 16;
+    size_t need = (size_t)vertex_count * stride_out + 16;
 
     if (!tessBufferEnsure(self2->_device, &tShadowBuf, need))
          return false;
@@ -2510,15 +2675,20 @@ static bool tessConvertShadowStream(GLMContext ctx, TessAttribSlot *s, GLuint ve
         for (GLuint i = 0; i < vertex_count; i++)
         {
             const uint8_t *el = src + (size_t)b->offset + (size_t)f->relativeoffset + (size_t)i * stride;
-            float *out = (float *)(dst + (size_t)i * 16);
+            float *out = (float *)(dst + (size_t)i * stride_out);
 
             if (!src)
             {
-                memset(out, 0, 16);
+                memset(out, 0, stride_out);
                 continue;
             }
 
-            if (s->kind == MGL_VA_KIND_INT || s->kind == MGL_VA_KIND_UINT)
+            if (s->dbl)
+            {
+                /* raw u32 words of the double value (see mgl_va_fetch_dbl_words) */
+                mgl_va_fetch_dbl_words(f, el, (GLuint *)out);
+            }
+            else if (s->kind == MGL_VA_KIND_INT || s->kind == MGL_VA_KIND_UINT)
             {
                 GLint iv[4];
                 mgl_va_fetch_int(f, el, iv);

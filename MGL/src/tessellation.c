@@ -1558,6 +1558,12 @@ static char *rewrite_tes_hardware(const char *msl, int cp_count)
     return out;
 }
 
+/* public re-substitution used when GL_PATCH_VERTICES changes after link */
+char *mgl_tess_rewrite_tes_hw(const char *msl, int n)
+{
+    return rewrite_tes_hardware(msl, n);
+}
+
 /* entry from program.c: rewrite the MSL of a tessellation-pipeline stage */
 char *mgl_tess_rewrite_stage_msl(GLMContext ctx, int stage, bool tess_pipeline, const char *msl)
 {

@@ -23,6 +23,7 @@
 // gpuaudit: cached shadow attribute streams (CPU format conversion off the draw path)
 #include "mgl_ext_gpuaudit.h"
 #import "mgl_ext_vattrib.h"
+#import "mgl_ext_introspect.h"
 
 #define F4(_a_, _b_, _c_, _d_) switch (n) { case 1: return _a_; case 2: return _b_; case 3: return _c_; case 4: return _d_; } break
 
@@ -222,6 +223,18 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
         plan->shadow_index[a] = -1;
     }
 
+    /* pass 1: record what the shader consumes at every attribute index (the
+       double-slot resolution in the main loop needs the kind of location-1) */
+    for (MTLVertexAttribute *attr in vfunc.vertexAttributes)
+    {
+        if (!attr.active) continue;
+        NSUInteger pl = attr.attributeIndex;
+        if (pl >= MAX_ATTRIBS) continue;
+        int pcomps = 0;
+        plan->shader_kind[pl] = shaderKindForDataType(attr.attributeType, &pcomps);
+        plan->shader_comps[pl] = pcomps;
+    }
+
     for (MTLVertexAttribute *attr in vfunc.vertexAttributes)
     {
         if (!attr.active)
@@ -234,14 +247,97 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
             return nil;
         }
 
-        int comps;
-        int kind = shaderKindForDataType(attr.attributeType, &comps);
-        plan->shader_kind[loc] = kind;
-        plan->shader_comps[loc] = comps;
+        int comps = plan->shader_comps[loc];
+        int kind = plan->shader_kind[loc];
 
-        MGLVertexAttribFormat *f = &va->fmt[loc];
+        /* fp64 double slots: the lowering fetches double/dvecN inputs as raw
+           u32 words (two per component); dvec3/dvec4 span locations k and k+1,
+           both fed from GL attribute k with 8 bytes per component.  The GL view
+           of the program tells which slot is a double input (a uvec4 input at
+           the same index is NOT). */
+        GLint owner_loc = (GLint)loc, cbase = 0;
+        GLenum ity = mgl_introspect_slot_owner(ctx, program->name, (GLint)loc, &owner_loc, &cbase);
+        bool dbl_slot = (kind == MGL_VA_KIND_UINT) &&
+                        (ity == GL_DOUBLE || ity == GL_DOUBLE_VEC2 || ity == GL_DOUBLE_VEC3 || ity == GL_DOUBLE_VEC4);
+        int owner = dbl_slot ? (int)owner_loc : (int)loc;
+
+        MGLVertexAttribFormat *f = &va->fmt[owner];
         MGLVertexBinding *b = &va->binding[f->binding];
         int bidx = plan->binding_index[f->binding];
+
+        if (dbl_slot)
+        {
+            /* double-word slot: dvec1/dvec2 use location k only, dvec3/dvec4
+               use k and k+1 (this slot carries components [cbase, cbase+n)) */
+            int words = f->size - cbase;
+            if (words <= 0) words = 1;
+            if (words > 2) words = 2;
+            plan->dbl[loc] = cbase ? 2 : 1;
+            plan->dbl_words[loc] = words;
+            MTLVertexFormat wfmt = (words >= 2) ? MTLVertexFormatUInt4 : MTLVertexFormatUInt2;
+            GLsizei elem = f->size * 8;
+
+            if (!(vao->enabled_attribs & (1u << (GLuint)owner)) || b->buffer == NULL || bidx < 0)
+            {
+                // disabled array: feed the current generic double value bits
+                desc.attributes[loc].format = wfmt;
+                desc.attributes[loc].offset = loc * 16;
+                desc.attributes[loc].bufferIndex = MGL_VA_CONST_BUFFER_INDEX;
+                plan->fetch[loc] = MGL_VA_FETCH_CONST;
+                plan->const_mask |= (1u << loc);
+                continue;
+            }
+
+            bool aligned = (b->stride % 4) == 0 && (b->offset % 4) == 0 &&
+                           (f->relativeoffset % 4) == 0 &&
+                           (b->stride == 0 || f->relativeoffset + elem <= (GLuint)b->stride);
+
+            if (f->is_long && aligned)
+            {
+                // glVertexAttribLPointer: the raw words in the buffer ARE the value
+                desc.attributes[loc].format = wfmt;
+                desc.attributes[loc].offset = f->relativeoffset + cbase * 8;
+                desc.attributes[loc].bufferIndex = bidx;
+                plan->fetch[loc] = MGL_VA_FETCH_DIRECT;
+                if (!layout_done[bidx])
+                {
+                    desc.layouts[bidx].stride = b->stride ? b->stride : elem;
+                    desc.layouts[bidx].stepFunction = (b->divisor == 0) ? MTLVertexStepFunctionPerVertex
+                                                                      : MTLVertexStepFunctionPerInstance;
+                    desc.layouts[bidx].stepRate = 1;
+                    layout_done[bidx] = true;
+                }
+            }
+            else
+            {
+                // converted shadow stream of the attribute's double words (16-32
+                // bytes per element), shared by both slots of a dvec3/dvec4
+                if (next_shadow <= max_binding_index)
+                {
+                    NSLog(@"MGL ERROR: vattrib: out of Metal vertex buffer indices for converted attributes");
+                    return nil;
+                }
+                if (plan->dbl[loc] == 1)
+                {
+                    plan->shadow_index[loc] = --next_shadow;
+                    plan->shadow_stride[loc] = (elem + 15) & ~15;
+                }
+                else
+                {
+                    plan->shadow_index[loc] = plan->shadow_index[owner];   // same stream
+                }
+                int sidx = plan->shadow_index[loc];
+                desc.attributes[loc].format = wfmt;
+                desc.attributes[loc].offset = cbase * 8;
+                desc.attributes[loc].bufferIndex = sidx;
+                desc.layouts[sidx].stride = plan->shadow_stride[owner];
+                desc.layouts[sidx].stepFunction = (b->divisor == 0) ? MTLVertexStepFunctionPerVertex
+                                                                   : MTLVertexStepFunctionPerInstance;
+                desc.layouts[sidx].stepRate = 1;
+                plan->fetch[loc] = MGL_VA_FETCH_SHADOW;
+            }
+            continue;
+        }
 
         if (!(vao->enabled_attribs & (1u << loc)) || b->buffer == NULL || bidx < 0)
         {
@@ -410,10 +506,12 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     MGLVertexBinding *b = &va->binding[f->binding];
     struct MGLExtState_vattrib *s = [self vattribState];
     int kind = s->plan.shader_kind[attrib];
+    bool dbl = s->plan.dbl[attrib] != 0;   /* the plan marked this slot as a double word slot */
 
     const GLubyte *base = [self vattribCPUData: b->buffer];
     GLsizeiptr size = b->buffer->size;
-    GLsizei elem = mgl_va_element_size(f->type, f->size);
+    GLsizei elem = dbl ? (GLsizei)f->size * 8 : mgl_va_element_size(f->type, f->size);
+    size_t stride_out = dbl ? (size_t)s->plan.shadow_stride[attrib] : 16;
     GLsizeiptr start = b->offset + f->relativeoffset;
     size_t n = 0;
 
@@ -423,7 +521,8 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     /* gpuaudit: the converted stream only depends on the source bytes and the layout,
      * so it is cached as an MTLBuffer keyed on the buffer's content generation instead
      * of being rebuilt (calloc + per-element conversion + newBufferWithBytes) per draw */
-    void *cached = mgl_gpuaudit_shadow_lookup(ctx, b->buffer, start, b->stride, f->type, f->size, kind);
+    void *cached = mgl_gpuaudit_shadow_lookup(ctx, b->buffer, start, b->stride, f->type, f->size,
+                                              dbl ? MGL_VA_KIND_DOUBLE : kind);
     if (cached)
     {
         [enc setVertexBuffer: (__bridge id<MTLBuffer>)cached offset: 0 atIndex: index];
@@ -431,23 +530,27 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     }
 
     size_t count = n ? n : 1;
-    GLuint *out = (GLuint *)calloc(count, 16);
+    GLuint *out = (GLuint *)calloc(count, stride_out);
     if (!out)
         return;
 
     for (size_t i = 0; i < n; i++)
     {
         const GLubyte *src = base + start + i * (size_t)b->stride;
+        GLuint *o = &out[i * (stride_out / 4)];
 
-        if (kind == MGL_VA_KIND_FLOAT)
-            mgl_va_fetch_float(f, src, (GLfloat *)&out[i * 4]);
+        if (dbl)
+            mgl_va_fetch_dbl_words(f, src, o);
+        else if (kind == MGL_VA_KIND_FLOAT)
+            mgl_va_fetch_float(f, src, (GLfloat *)o);
         else
-            mgl_va_fetch_int(f, src, (GLint *)&out[i * 4]);
+            mgl_va_fetch_int(f, src, (GLint *)o);
     }
 
-    size_t len = count * 16;
+    size_t len = count * stride_out;
 
-    void *stored = mgl_gpuaudit_shadow_store(ctx, b->buffer, start, b->stride, f->type, f->size, kind, out, len);
+    void *stored = mgl_gpuaudit_shadow_store(ctx, b->buffer, start, b->stride, f->type, f->size,
+                                             dbl ? MGL_VA_KIND_DOUBLE : kind, out, len);
     if (stored)
     {
         [enc setVertexBuffer: (__bridge id<MTLBuffer>)stored offset: 0 atIndex: index];
@@ -482,6 +585,29 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
             continue;
 
         MGLCurrentAttrib *cur = &s->current[a];
+
+        /* fp64 word slot: the current double value's raw u32 words (component
+           c occupies words 2c..2c+1; the high slot carries components 2,3) */
+        if (plan->dbl[a])
+        {
+            int own = (plan->dbl[a] == 2) ? a - 1 : a;
+            MGLCurrentAttrib *c2 = &s->current[own];
+            int c0 = (plan->dbl[a] == 2) ? 2 : 0;
+            int nw = (plan->dbl_words[a] >= 2) ? 2 : 1;
+            for (int c = c0; c < c0 + nw; c++)
+            {
+                GLdouble v;
+                switch (c2->kind)
+                {
+                    case MGL_VA_KIND_INT:   v = (GLdouble)c2->v.i[c]; break;
+                    case MGL_VA_KIND_UINT:  v = (GLdouble)c2->v.u[c]; break;
+                    case MGL_VA_KIND_DOUBLE: v = c2->d[c]; break;
+                    default:                v = (GLdouble)c2->v.f[c]; break;
+                }
+                memcpy(&data[a].u[(c - c0) * 2], &v, 8);
+            }
+            continue;
+        }
 
         for (int c = 0; c < 4; c++)
         {
@@ -546,8 +672,14 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
 
     for (int a = 0; a < MAX_ATTRIBS; a++)
     {
-        if (plan->fetch[a] == MGL_VA_FETCH_SHADOW && va->binding[va->fmt[a].binding].buffer)
-            [self vattribBindShadow: a index: plan->shadow_index[a] encoder: enc];
+        if (plan->fetch[a] != MGL_VA_FETCH_SHADOW || !va->binding[va->fmt[a].binding].buffer)
+            continue;
+        /* dvec3/dvec4: both word slots share one converted stream, owned by
+           the attribute's low slot */
+        int owner = (plan->dbl[a] == 2) ? a - 1 : a;
+        if (owner != a)
+            continue;   /* bound when the low slot is reached */
+        [self vattribBindShadow: a index: plan->shadow_index[a] encoder: enc];
     }
 
     if (plan->const_mask)

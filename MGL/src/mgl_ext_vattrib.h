@@ -70,7 +70,10 @@ typedef struct MGLVattribDrawPlan_t {
     int         shader_kind[MAX_ATTRIBS];             /* MGL_VA_KIND_* of the shader input */
     int         shader_comps[MAX_ATTRIBS];
     int         shadow_index[MAX_ATTRIBS];            /* Metal buffer index of a SHADOW stream */
+    int         shadow_stride[MAX_ATTRIBS];           /* element stride of that stream */
     unsigned    const_mask;
+    uint8_t     dbl[MAX_ATTRIBS];                     /* fp64 word slot: 0 none, 1 low (comp 0), 2 high (comp 2) */
+    int         dbl_words[MAX_ATTRIBS];               /* u32 words this slot fetches */
 } MGLVattribDrawPlan;
 
 /* GL-side state, reachable as ctx->state.ext_vattrib; allocated in mgl_ext_init_vattrib(). */
@@ -97,6 +100,7 @@ GLsizei mgl_va_element_size(GLenum type, GLint size);            /* bytes of one
 /* vertex_attrib.c: decode one element of attribute data at src into 4 components */
 void mgl_va_fetch_float(const MGLVertexAttribFormat *fmt, const void *src, GLfloat out[4]);
 void mgl_va_fetch_int(const MGLVertexAttribFormat *fmt, const void *src, GLint out[4]);
+void mgl_va_fetch_dbl_words(const MGLVertexAttribFormat *fmt, const void *src, GLuint out[8]);
 float mgl_va_uf11_to_float(GLuint v);
 bool mgl_va_attrib_param(VertexArray *vao, GLuint index, GLenum pname, GLint64 *out);
 float mgl_va_uf10_to_float(GLuint v);

@@ -666,6 +666,14 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         else
             mgl_set_info_log(&ptr->log, "ERROR: %s compilation failed\n", getShaderTypeStr(ptr->glm_type));
 
+        if (getenv("MGL_SHADER_DUMP")) {   /* diagnosis: keep the rejected source */
+            char path[256];
+            snprintf(path, sizeof path, "%s/failed_%u_%s.glsl", getenv("MGL_SHADER_DUMP"), shader,
+                     getShaderTypeStr(ptr->glm_type));
+            FILE *f = fopen(path, "w");
+            if (f) { fwrite(ptr->src, 1, ptr->src_len ? ptr->src_len : strlen(ptr->src), f); fclose(f); }
+        }
+
         DEBUG_PRINT("MGL shader %u compile failed:\n%s\n", shader, ptr->log);
 
         glslang_shader_delete(glsl_shader);

@@ -473,8 +473,30 @@ static bool rs_mode_is_polygon(GLenum m)
             desc.vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;
         else
         {
-            id<MTLFunction> vf = [self rstateSpecialize:program->shader_slots[vstage] stage:vstage];
-            if (vf) desc.vertexFunction = vf;
+            Shader *vsh = program->shader_slots[vstage];
+            /* tess hardware: the post-tessellation function must declare the
+             * control point count drawPatches gets (Metal validates the pair);
+             * mgl_tess_hw_tes_function rebuilds it, cached per N, when
+             * GL_PATCH_VERTICES changed after the link — specialize the rebuilt
+             * function through a standin Shader (like the geometry override) */
+            void *hw = (vstage == _TESS_EVALUATION_SHADER && tp && !tp->plain_function)
+                       ? mgl_tess_hw_tes_function(ctx, tp) : NULL;
+            if (hw)
+            {
+                Shader standin;
+                memset(&standin, 0, sizeof standin);
+                standin.entry_point = vsh->entry_point;
+                standin.mtl_data.function = hw;
+                standin.mtl_data.library = tp->tes_hw_library;
+                id<MTLFunction> vf = [self rstateSpecialize: &standin stage: vstage];
+                if (vf) desc.vertexFunction = vf;
+                else desc.vertexFunction = (__bridge id<MTLFunction>)hw;
+            }
+            else
+            {
+                id<MTLFunction> vf = [self rstateSpecialize: vsh stage: vstage];
+                if (vf) desc.vertexFunction = vf;
+            }
             /* DEBUG: unspecialized TES */
             if (getenv("MGL_TESS_NOSPEC") && vstage == _TESS_EVALUATION_SHADER)
                 desc.vertexFunction = (__bridge id<MTLFunction>)program->shader_slots[vstage]->mtl_data.function;

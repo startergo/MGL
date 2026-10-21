@@ -233,6 +233,13 @@ int mgl_toolchain_glsl_to_msl(
 
     if (!glslang_shader_parse(shader, &input)) {
         const char *info_log = glslang_shader_get_info_log(shader);
+        if (getenv("MGL_SHADER_DUMP")) {   /* diagnosis: keep the rejected source */
+            char path[256];
+            static unsigned seq = 0;
+            snprintf(path, sizeof path, "%s/toolchain_%u.glsl", getenv("MGL_SHADER_DUMP"), seq++);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(src, f); fclose(f); }
+        }
         const char *debug_log = glslang_shader_get_info_debug_log(shader);
         size_t info_len = info_log ? strlen(info_log) : 0;
         size_t dbg_len = debug_log ? strlen(debug_log) : 0;

@@ -17,6 +17,8 @@
 #include <dlfcn.h>
 
 #include <glslang_c_interface.h>
+#include "fp64.h"
+#include "mgl_ext_introspect.h"
 #include <glslang_c_shader_types.h>
 #include "spirv_cross_c.h"
 #include "spirv.h"
@@ -636,6 +638,10 @@ static bool xfb_debug(void)
 
 /* GLSL vertex source -> SPIR-V with the same glslang setup as mglCompileShader/mglLinkProgram.
  * force_version: 0 = as the source says, else compile as this (core) version. */
+/* program.c: default-uniform-block packing for the capture variant's lone vertex stage */
+extern uint32_t *mgl_program_pack_stage_for_msl(GLMContext ctx, Program *program,
+                                                const uint32_t *in, size_t n, size_t *out_n);
+
 static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version, uint32_t **ir, size_t *words, char **log)
 {
     glslang_input_t input;
@@ -799,10 +805,15 @@ static GLenum xfb_gl_type(spvc_basetype bt, unsigned rows, unsigned cols)
     static const GLenum f[4] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4 };
     static const GLenum i[4] = { GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4 };
     static const GLenum u[4] = { GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4 };
+    static const GLenum d[4] = { GL_DOUBLE, GL_DOUBLE_VEC2, GL_DOUBLE_VEC3, GL_DOUBLE_VEC4 };
     static const GLenum m[3][3] = {
         { GL_FLOAT_MAT2,   GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4 },
         { GL_FLOAT_MAT3x2, GL_FLOAT_MAT3,   GL_FLOAT_MAT3x4 },
         { GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, GL_FLOAT_MAT4 } };
+    static const GLenum dm[3][3] = {
+        { GL_DOUBLE_MAT2,   GL_DOUBLE_MAT2x3, GL_DOUBLE_MAT2x4 },
+        { GL_DOUBLE_MAT3x2, GL_DOUBLE_MAT3,   GL_DOUBLE_MAT3x4 },
+        { GL_DOUBLE_MAT4x2, GL_DOUBLE_MAT4x3, GL_DOUBLE_MAT4 } };
 
     if (rows < 1 || rows > 4 || cols < 1 || cols > 4) return GL_NONE;
     switch (bt) {
@@ -810,6 +821,10 @@ static GLenum xfb_gl_type(spvc_basetype bt, unsigned rows, unsigned cols)
             if (cols == 1) return f[rows - 1];
             if (rows < 2) return GL_NONE;
             return m[cols - 2][rows - 2];
+        case SPVC_BASETYPE_FP64:
+            if (cols == 1) return d[rows - 1];
+            if (rows < 2) return GL_NONE;
+            return dm[cols - 2][rows - 2];
         case SPVC_BASETYPE_INT32:  return cols == 1 ? i[rows - 1] : GL_NONE;
         case SPVC_BASETYPE_UINT32: return cols == 1 ? u[rows - 1] : GL_NONE;
         default: return GL_NONE;
@@ -826,7 +841,6 @@ static const char *xfb_leaf(spvc_compiler c, spvc_type_id tid, unsigned consumed
     if (left > 1) return "arrays of arrays cannot be captured";
     spvc_basetype bt = spvc_type_get_basetype(t);
     if (bt == SPVC_BASETYPE_STRUCT) return "a structure cannot be captured as a whole";
-    if (bt == SPVC_BASETYPE_FP64) return "double precision varyings are not supported (Metal has no doubles)";
 
     unsigned rows = spvc_type_get_vector_size(t), cols = spvc_type_get_columns(t);
     GLenum type = xfb_gl_type(bt, rows, cols);
@@ -835,12 +849,15 @@ static const char *xfb_leaf(spvc_compiler c, spvc_type_id tid, unsigned consumed
     v->type = type;
     v->rows = rows;
     v->columns = cols;
-    v->comp_kind = bt == SPVC_BASETYPE_FP32 ? GL_FLOAT : bt == SPVC_BASETYPE_INT32 ? GL_INT : GL_UNSIGNED_INT;
+    v->comp_kind = bt == SPVC_BASETYPE_FP32 ? GL_FLOAT : bt == SPVC_BASETYPE_INT32 ? GL_INT :
+                   bt == SPVC_BASETYPE_FP64 ? GL_DOUBLE : GL_UNSIGNED_INT;
     v->comp_per_elem = rows * cols;
     *whole_array = left == 1;
     v->size = left == 1 ? (GLint)spvc_type_get_array_dimension(t, 0) : 1;
     if (v->size < 1) return "unsized array";
-    v->words = v->comp_per_elem * (GLuint)v->size;
+    /* a double is captured as its two u32 words: bit-exact GL xfb of double
+     * varyings (the capture GLSL writes unpackDouble2x32 per component) */
+    v->words = v->comp_per_elem * (GLuint)v->size * (bt == SPVC_BASETYPE_FP64 ? 2 : 1);
     return NULL;
 }
 
@@ -977,6 +994,12 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
             v->offset = 0;
             xp->stride[i] = v->words * 4;
         } else {
+            /* GL 4.6 / ARB_gpu_shader_fp64: "each double-precision variable
+             * captured must be aligned to a multiple of eight bytes relative
+             * to the beginning of a vertex" (Mesa: align(xfb_offset, 2) in
+             * float units).  Everything else is packed at 4-byte granularity. */
+            if (v->comp_kind == GL_DOUBLE)
+                offset = (offset + 7u) & ~7u;
             v->buffer = buffer;
             v->offset = offset;
             offset += v->words * 4;
@@ -1131,6 +1154,10 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 v->buffer = buf;
                 v->offset = off;
                 if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
+                /* GL 4.6: an offset applied to a double-precision type must
+                 * be a multiple of 8 (defined behavior only then) */
+                if (v->comp_kind == GL_DOUBLE && (off & 7))
+                { xfb_fail(xp, "xfb_offset of %s is not a multiple of 8 as it is applied to a type that is or contains a double", name, NULL); return false; }
                 v->src_word = src_word;
                 src_word += v->words;
                 xp->buffer_mask |= 1u << buf;
@@ -1226,46 +1253,265 @@ static void xfb_cat(XfbStr *b, const char *fmt, ...)
     }
 }
 
+/* GLSL type name of a captured varying (for the fp64 lowering's local copy) */
+static void xfb_glsl_type_name(MGLXfbVarying *v, char *buf, size_t n)
+{
+    const char *pfx;   /* scalar base + vector prefix */
+    switch (v->comp_kind) {
+    case GL_DOUBLE:       pfx = "d"; break;
+    case GL_FLOAT:        pfx = "";  break;
+    case GL_INT:          pfx = "i"; break;
+    case GL_UNSIGNED_INT: pfx = "u"; break;
+    case GL_BOOL:         pfx = "b"; break;
+    default:              snprintf(buf, n, "vec4"); return;
+    }
+    char mid[48];
+    if (v->columns > 1) {
+        /* matrices: matN / dmatN, matCxR / dmatCxR when non-square */
+        if (v->rows == v->columns) snprintf(mid, sizeof mid, "%smat%u", pfx, v->columns);
+        else snprintf(mid, sizeof mid, "%smat%ux%u", pfx, v->columns, v->rows);
+    } else if (v->rows > 1) {
+        snprintf(mid, sizeof mid, "%svec%u", pfx, v->rows);
+    } else {
+        static const char *scalar[5] = { "double", "float", "int", "uint", "bool" };
+        int k = !strcmp(pfx, "d") ? 0 : !strcmp(pfx, "") ? 1 : !strcmp(pfx, "i") ? 2
+              : !strcmp(pfx, "u") ? 3 : 4;
+        snprintf(mid, sizeof mid, "%s", scalar[k]);
+    }
+    if (v->size > 1) snprintf(buf, n, "%s[%d]", mid, v->size);
+    else snprintf(buf, n, "%s", mid);
+}
+
 static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *whole_arrays)
 {
-    char *renamed = xfb_rename_main(src);
-    if (!renamed) return NULL;
+    char *body = strdup(src);
+    if (!body) return NULL;
+    /* The injected capture block uses a std430 SSBO (GLSL 430+); a shader whose
+     * own "#version" directive is older (CTS's fp64 tests use 400) must have it
+     * raised, because the directive wins over the compile-time default version.
+     * Only modern-core syntax (>= 140, no legacy attribute/varying keywords) is
+     * safe to re-version; legacy shaders keep their version and fail the
+     * capture compile with a clear log instead. */
+    {
+        char *nl = strstr(body, "\n");
+        size_t first = nl ? (size_t)(nl - body) : strlen(body);
+        if (first < 64 && !strncmp(body, "#version", 8)) {
+            int ver = 0; char prof[24] = "";
+            sscanf(body, "#version %d %23s", &ver, prof);
+            if (ver >= 140 && ver < 430) {
+                const char *profile = (!strcmp(prof, "compatibility")) ? " compatibility" : " core";
+                char *bumped = malloc(strlen(body) + 8);
+                if (bumped) {
+                    snprintf(bumped, strlen(body) + 8, "#version 460%s\n%s", profile, body + first + 1);
+                    free(body);
+                    body = bumped;
+                }
+            }
+        }
+    }
 
-    XfbStr b = {0};
-    xfb_cat(&b, "%s\n", renamed);
-    free(renamed);
-    xfb_cat(&b, "layout(std430, binding = %d) buffer MGLXfbCaptureBlock { uint mgl_xfb_hdr[%d]; uint mgl_xfb_data[]; };\n",
-            MGL_XFB_SSBO_BINDING, MGL_XFB_HEADER_WORDS);
-    xfb_cat(&b, "void main()\n{\n    mgl_xfb_original_main();\n");
-    xfb_cat(&b, "    uint mgl_xfb_o = ((uint(gl_VertexID) - mgl_xfb_hdr[0]) + (uint(gl_InstanceID) - mgl_xfb_hdr[2]) * mgl_xfb_hdr[1]) * mgl_xfb_hdr[3];\n");
+    /* The capture statements are appended INSIDE main's body (before its closing
+     * brace) instead of wrapping it with a renamed function: a non-entry function
+     * that reads uniforms gets its globals parameterized by SPIRV-Cross, and the
+     * synthesized call then passes constant-buffer members into `thread&`
+     * parameters - invalid MSL ("cannot bind reference in address space").
+     * Inside the entry point the outputs are ordinary locals-in-scope and the
+     * uniforms render as direct constant-buffer reads, like any shader. */
+    XfbStr s = {0};
+    xfb_cat(&s, "    uint mgl_xfb_o = ((uint(gl_VertexID) - mgl_xfb_hdr[0]) + (uint(gl_InstanceID) - mgl_xfb_hdr[2]) * mgl_xfb_hdr[1]) * mgl_xfb_hdr[3];\n");
 
     for (GLuint i = 0; i < xp->count; i++) {
         MGLXfbVarying *v = &xp->vars[i];
         if (!v->words) continue;
         GLuint w = v->src_word;
+        /* The fp64 lowering only supports whole-variable (or single-index)
+         * access to double stage outputs; reading element-wise requires a
+         * Function-storage copy first ("copy it to a local first"). */
+        char var[32], tyname[64];
+        const char *expr;
+        if (v->comp_kind == GL_DOUBLE) {
+            xfb_glsl_type_name(v, tyname, sizeof tyname);
+            snprintf(var, sizeof var, "mgl_xfb_v%u", i);
+            xfb_cat(&s, "    %s %s = %s;\n", tyname, var, v->expr);
+            expr = var;
+        } else {
+            expr = v->expr;
+        }
         for (GLint e = 0; e < v->size; e++) {
             char elem[320];
-            if (whole_arrays[i]) snprintf(elem, sizeof(elem), "(%s)[%d]", v->expr, e);
-            else snprintf(elem, sizeof(elem), "(%s)", v->expr);
+            if (whole_arrays[i]) snprintf(elem, sizeof(elem), "(%s)[%d]", expr, e);
+            else snprintf(elem, sizeof(elem), "(%s)", expr);
             for (GLuint col = 0; col < v->columns; col++) {
                 for (GLuint row = 0; row < v->rows; row++) {
                     char comp[400];
                     if (v->columns > 1) snprintf(comp, sizeof(comp), "%s[%u][%u]", elem, col, row);
                     else if (v->rows > 1) snprintf(comp, sizeof(comp), "%s[%u]", elem, row);
                     else snprintf(comp, sizeof(comp), "%s", elem);
-                    const char *conv = v->comp_kind == GL_FLOAT ? "floatBitsToUint" : "uint";
-                    xfb_cat(&b, "    mgl_xfb_data[mgl_xfb_o + %uu] = %s(%s);\n", w++, conv, comp);
+                    const char *conv = v->comp_kind == GL_FLOAT ? "floatBitsToUint" : v->comp_kind == GL_DOUBLE ? "unpackDouble2x32" : "uint";
+                    if (v->comp_kind == GL_DOUBLE) {
+                        /* one double component -> two u32 words, bit-exact */
+                        xfb_cat(&s, "    mgl_xfb_data[mgl_xfb_o + %uu] = %s(%s).x;\n", w++, conv, comp);
+                        xfb_cat(&s, "    mgl_xfb_data[mgl_xfb_o + %uu] = %s(%s).y;\n", w++, conv, comp);
+                    } else {
+                        xfb_cat(&s, "    mgl_xfb_data[mgl_xfb_o + %uu] = %s(%s);\n", w++, conv, comp);
+                    }
                 }
             }
         }
     }
-    xfb_cat(&b, "}\n");
-    return b.s;
+
+    /* locate main()'s closing brace and splice the statements in front of it */
+    char *m = strstr(body, "main");
+    char *close = NULL;
+    if (m) {
+        while (*m && *m != '{') m++;
+        int depth = 0;
+        while (*m) {
+            if (*m == '{') depth++;
+            else if (*m == '}') { depth--; if (!depth) { close = m; break; } }
+            m++;
+        }
+    }
+    char *out = NULL;
+    const char *body_base = body;
+    if (close) {
+        XfbStr b = {0};
+        /* the block must be declared before main (the statements read mgl_xfb_hdr);
+         * and after the shader's own #version line, which must stay first */
+        size_t vlen = 0;
+        if (!strncmp(body, "#version", 8)) {
+            const char *vn = strchr(body, '\n');
+            vlen = vn ? (size_t)(vn - body) + 1 : strlen(body);
+        }
+        xfb_cat(&b, "%.*slayout(std430, binding = %d) buffer MGLXfbCaptureBlock { uint mgl_xfb_hdr[%d]; uint mgl_xfb_data[]; };\n",
+                (int)vlen, body, MGL_XFB_SSBO_BINDING, MGL_XFB_HEADER_WORDS);
+        body += vlen;   /* the shader's own #version line was just emitted; close is
+                           absolute, so close - body stays correct without shifting it */
+        (void)body_base;
+        if (getenv("MGL_XFB_DEBUG"))
+            fprintf(stderr, "[xfb] splice: vlen=%zu bodylen=%zu closeoff=%ld stmts=%zu\n",
+                    vlen, strlen(body_base), (long)(close - body_base), s.len);
+        xfb_cat(&b, "%.*s\n%s}\n", (int)(close - body), body, s.s ? s.s : "");
+        out = b.s;
+    } else {
+        /* no main found: fall back to the legacy wrapper shape */
+        XfbStr b = {0};
+        xfb_cat(&b, "%s\n", body);
+        xfb_cat(&b, "layout(std430, binding = %d) buffer MGLXfbCaptureBlock { uint mgl_xfb_hdr[%d]; uint mgl_xfb_data[]; };\n",
+                MGL_XFB_SSBO_BINDING, MGL_XFB_HEADER_WORDS);
+        xfb_cat(&b, "void main()\n{\n    mgl_xfb_original_main();\n%s}\n", s.s ? s.s : "");
+        out = b.s;
+    }
+    free(body_base);
+    free(s.s);
+    return out;
 }
 
 /* capture SPIR-V -> MSL with the options program.c uses, the capture SSBO pinned to
  * buffer(MGL_XFB_MSL_BUFFER_INDEX) so every other resource keeps its automatic index */
-static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir, size_t words, const char *entry)
+/* The capture VS is compiled as a LONE shader: GL only assigns interface
+ * locations at link time (the program's GL view, assign_interface_locations),
+ * and SPIRV-Cross needs them to emit [[attribute(n)]] members.  Copy the
+ * linked program's locations onto the capture module's inputs by name. */
+static uint32_t *xfb_patch_input_locations(GLMContext ctx, const uint32_t *ir, size_t words, size_t *out_words)
+{
+    size_t insert = 0;
+    uint32_t bound = ir[3];
+
+    /* find where the type definitions start: insert decorations there */
+    {
+        size_t k = 5;
+        while (k + 1 < words) {
+            uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
+            if (!wc) break;
+            if (op == 19 /* SpvOpTypeVoid */ || op == 20 || op == 21 || op == 22) {
+                insert = k;
+                break;
+            }
+            k += wc;
+        }
+        if (!insert) return NULL;
+    }
+
+    /* collect OpName / Input variables / existing locations */
+    uint32_t *nameoff = calloc(bound + 1, 4);   /* id -> offset into pool (+1, 0 = none) */
+    char *pool = malloc(words * 4 + 64);
+    size_t pool_len = 0;
+    uint32_t *loc = calloc(bound + 1, 4);
+    uint32_t *invars = malloc((bound + 1) * 4);
+    size_t nin = 0;
+    {
+        size_t k = 5;
+        while (k + 1 < words) {
+            uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
+            if (!wc) break;
+            if (op == 5 /* OpName */ && wc >= 3 && ir[k + 1] <= bound) {
+                size_t nb = (wc - 2) * 4;
+                char *dst = pool + pool_len;
+                memcpy(dst, &ir[k + 2], nb);
+                dst[nb - 1] = 0;
+                nameoff[ir[k + 1]] = (uint32_t)(pool_len + 1);
+                pool_len += nb;
+            } else if (op == 71 /* OpDecorate */ && wc >= 4 && ir[k + 2] == 30 /* Location */ &&
+                       ir[k + 1] <= bound) {
+                loc[ir[k + 1]] = ir[k + 3] + 1;   /* biased */
+            }
+            k += wc;
+        }
+        /* second pass: global Input variables (before the first OpFunction) */
+        k = insert;
+        while (k + 1 < words) {
+            uint32_t wc = ir[k] >> 16, op = ir[k] & 0xffff;
+            if (!wc) break;
+            if (op == 54 /* SpvOpFunction */) break;
+            if (op == 59 /* OpVariable */ && wc >= 4 && ir[k + 3] == 1 /* Input */ &&
+                ir[k + 2] <= bound && nin < bound) {
+                invars[nin++] = ir[k + 2];
+            }
+            k += wc;
+        }
+    }
+
+    MGLIProgram *ip = ctx->state.program ? mgli_find(ctx, ctx->state.program->name) : NULL;
+    uint32_t decs[64];
+    uint32_t ndec = 0;
+
+    for (size_t i = 0; i < nin; i++) {
+        uint32_t v = invars[i];
+        if (loc[v]) continue;   /* explicit location in the source */
+        const char *nm = nameoff[v] ? pool + (size_t)(nameoff[v] - 1) : NULL;
+        GLint l = -1;
+        if (nm && ip) {
+            for (int q = 0; q < ip->ninputs; q++)
+                if (ip->inputs[q].location >= 0 && !strcmp(ip->inputs[q].name, nm)) {
+                    l = ip->inputs[q].location;
+                    break;
+                }
+        }
+        if (l < 0) l = (GLint)i;   /* declaration order: what the GL view assigns */
+        if (ndec + 4 <= 64) {
+            decs[ndec++] = (4u << 16) | 71u;   /* OpDecorate, 4 words */
+            decs[ndec++] = v;
+            decs[ndec++] = 30;   /* Location */
+            decs[ndec++] = (uint32_t)l;
+        }
+    }
+
+    uint32_t *out = NULL;
+    if (ndec) {
+        out = malloc((words + ndec) * 4);
+        if (out) {
+            memcpy(out, ir, insert * 4);
+            memcpy(out + insert, decs, ndec * 4);
+            memcpy(out + insert + ndec, ir + insert, (words - insert) * 4);
+            *out_words = words + ndec;
+        }
+    }
+    free(nameoff); free(pool); free(loc); free(invars);
+    return out;
+}
+
+static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t words_in, const char *entry)
 {
     spvc_context sctx = NULL;
     spvc_parsed_ir pir = NULL;
@@ -1273,11 +1519,54 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir, size_t words, 
     spvc_compiler_options opts = NULL;
     const char *result = NULL;
     char *ret = NULL;
-    (void)ctx;
+    uint32_t *lowered = NULL;
+    uint32_t *patched = NULL;
+    size_t lower_words = 0;
+    const uint32_t *ir = ir_in;
+    size_t words = words_in;
 
-    if (spvc_context_create(&sctx) != SPVC_SUCCESS) return NULL;
+    /* the capture VS is a lone shader: GL locations only exist after link-time
+     * assignment; copy the linked program's locations onto it by name */
+    {
+        size_t pw = 0;
+        patched = xfb_patch_input_locations(ctx, ir, words, &pw);
+        if (patched) {
+            ir = patched;
+            words = pw;
+        }
+    }
+
+    /* the capture VS carries the same doubles as the original vertex stage:
+     * lower them exactly like compile_stage does before translating to MSL
+     * (MSL has no doubles; raw u64 words + soft-float calls) */
+    {
+        bool is64 = false;
+        size_t lw = 0;
+        char log[256] = {0};
+        lowered = mgl_fp64_lower_module(ir, words, true, &is64, &lw, log, sizeof log);
+        if (getenv("MGL_XFB_DEBUG"))
+            fprintf(stderr, "MGL xfb: capture fp64 lower: is64=%d words=%zu log='%s'\n", (int)is64, lw, log);
+        if (is64 && lowered) {
+            lower_words = lw;
+            if (getenv("MGL_XFB_DEBUG")) {
+                FILE *df = fopen("/tmp/xfb_low.spv", "wb");
+                if (df) { fwrite(lowered, 4, lw, df); fclose(df); }
+                df = fopen("/tmp/xfb_pre.spv", "wb");
+                if (df) { fwrite(ir, 4, words, df); fclose(df); }
+            }
+        } else {
+            free(lowered);
+            lowered = NULL;
+        }
+    }
+
+    if (spvc_context_create(&sctx) != SPVC_SUCCESS) { free(lowered); free(patched); return NULL; }
     spvc_context_set_error_callback(sctx, xfb_spvc_error, NULL);
-    if (spvc_context_parse_spirv(sctx, ir, words, &pir) != SPVC_SUCCESS) goto done;
+    {
+        const uint32_t *parse_src = lowered ? lowered : ir;
+        size_t parse_n = lowered ? lower_words : words;
+        if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS) goto done;
+    }
     if (spvc_context_create_compiler(sctx, SPVC_BACKEND_MSL, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) != SPVC_SUCCESS) goto done;
     spvc_compiler_msl_add_discrete_descriptor_set(comp, 3);
     if (spvc_compiler_create_compiler_options(comp, &opts) != SPVC_SUCCESS) goto done;
@@ -1304,9 +1593,29 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir, size_t words, 
      * msl_reserved.h. */
     mgl_msl_mangle_reserved(comp, ir, words);
 
-    if (spvc_compiler_compile(comp, &result) == SPVC_SUCCESS && result) ret = strdup(result);
+    if (spvc_compiler_compile(comp, &result) == SPVC_SUCCESS && result) {
+        /* fp64: the capture kernel carries the soft-float library; a
+         * `thread const T&` parameter cannot bind the `constant`-space
+         * uniform members at the call sites (Metal: "no matching function"),
+         * so take them by value like every other lowered stage. */
+        if (lowered)
+        {
+            char *fixed = mgl_fp64_fix_msl_scalar_params(result);
+            if (fixed) ret = fixed;
+        }
+        if (!ret) ret = strdup(result);
+        if (getenv("MGL_XFB_DEBUG")) {
+            char path[256];
+            static unsigned seq = 0;
+            snprintf(path, sizeof path, "/tmp/xfb_capture_%u.metal", seq++);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(ret, f); fclose(f); }
+        }
+    }
 done:
     spvc_context_destroy(sctx);
+    free(lowered);
+    free(patched);
     return ret;
 }
 
@@ -1364,8 +1673,29 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     free(ir); ir = NULL;
     free(log); log = NULL;
     if (!xfb_glsl_to_spirv(ctx, glsl, 430, &ir, &words, &log)) {
+        if (getenv("MGL_SHADER_DUMP")) {   /* diagnosis: keep the capture source */
+            char path[256];
+            static unsigned seq = 0;
+            snprintf(path, sizeof path, "%s/xfb_capture_%u.glsl", getenv("MGL_SHADER_DUMP"), seq++);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(glsl, f); fclose(f); }
+        }
+        if (getenv("MGL_SHADER_DUMP")) {
+            char path[256]; static unsigned seq = 0;
+            snprintf(path, sizeof path, "%s/xfb_glcapture_%u.glsl", getenv("MGL_SHADER_DUMP"), seq++);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(glsl, f); fclose(f); }
+        }
         xfb_fail(xp, "capture variant compilation failed: %s", log, NULL);
         goto done;
+    }
+
+    /* pack loose uniforms into the default uniform block (and run the draw-params
+     * patching) exactly like the normal vertex stage, see mgl_program_pack_stage_for_msl */
+    {
+        size_t pn = 0;
+        uint32_t *prepped = mgl_program_pack_stage_for_msl(ctx, xp->program, ir, words, &pn);
+        if (prepped) { free(ir); ir = prepped; words = pn; }
     }
 
     char entry[64];
@@ -1661,7 +1991,7 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
          * synchronous capture + CPU scatter below. */
         struct MGLExtMetal_gpuaudit *gpm = ctx->mtl_funcs.ext_gpuaudit;
 
-        if (gpm && gpm->xfb_scatter && M->capture_async) {
+        if (gpm && gpm->xfb_scatter && M->capture_async && !getenv("MGL_XFB_NO_SCATTER")) {
             void *cb = NULL, *scratch = NULL;
             const uint32_t *rec = M->capture_async(ctx, xp, vstart, vcount, d->instances, d->baseinstance, &cb, &scratch);
 

@@ -49,6 +49,7 @@ static int comp_bytes(const MGLIUniform *u) { return u->kind == MGLI_K_DOUBLE ? 
 
 void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
 {
+    if (getenv("MGL_FP64_DUMP")) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[uni] %s present[f]=%d scalar=%d off=%d\n", u->name?u->name:"?", u->st[4].present, u->st[4].scalar_size, u->st[4].offset); fclose(d);} }
     if (!u->shadow) return;
     Program *p = ip->prog;
     for (int s = 0; s < MGLI_STAGES; s++) {
@@ -72,6 +73,7 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                     size_t di = u->st[s].offset + (size_t)e * u->st[s].array_stride + (size_t)c * u->st[s].matrix_stride +
                                 (size_t)r * u->st[s].scalar_size;
                     if (di + u->st[s].scalar_size > ip->dub_size[s]) continue;
+                    if (getenv("MGL_FP64_DUMP")) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[cpy] name=%s off=%d scalar=%d\n", u->name, u->st[s].offset, u->st[s].scalar_size); fclose(d);} }
                     if (u->kind == MGLI_K_DOUBLE && u->st[s].scalar_size == 4) {
                         /* GPU stores fp32 (Metal has no fp64): convert from the double shadow */
                         float f = (float)*(const double *)(src + si);

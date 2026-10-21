@@ -40,6 +40,7 @@
 #include "mgl_ext_geom.h"
 #include "mgl_ext_tess.h"
 #include "shaders.h"
+#include "fp64.h"
 #include "buffers.h"
 #include "msl_reserved.h"
 
@@ -683,8 +684,7 @@ static void wb_push_n(WordBuf *b, const uint32_t *w, size_t n)
  * Returns a malloc'd module, or NULL on malformed input / OOM.
  */
 static uint32_t *spirv_prepare_for_msl(const uint32_t *in, size_t n, int stage, size_t *out_n)
-{
-    static const char draw_params_ext[] = "SPV_KHR_shader_draw_parameters";
+{    static const char draw_params_ext[] = "SPV_KHR_shader_draw_parameters";
     uint32_t bound, inst_var = 0, base_var = 0, inst_ptr_type = 0, inst_type = 0;
     bool has_cap = false, has_ext = false, add_base = false, cap_section_done = false;
     WordBuf b = {0};
@@ -832,6 +832,21 @@ static uint32_t *spirv_prepare_for_msl(const uint32_t *in, size_t n, int stage, 
     return b.w;
 }
 
+/* transform_feedback.c compiles its capture variant as a lone vertex stage;
+ * route it through the same default-uniform-block packing as every other stage
+ * so loose uniforms do not become constant address-space entry-point arguments
+ * (soft-float64 calls take `thread` references and cannot bind those). */
+uint32_t *mgl_program_pack_stage_for_msl(GLMContext ctx, Program *program,
+                                         const uint32_t *in, size_t n, size_t *out_n)
+{
+    size_t pn = 0;
+    uint32_t *patched = mgl_introspect_patch_stage(ctx, program, _VERTEX_SHADER, in, n, &pn);
+    if (!patched) return NULL;
+    uint32_t *prep = spirv_prepare_for_msl(patched, pn, _VERTEX_SHADER, out_n);
+    free(patched);
+    return prep;
+}
+
 /*
  * Translate one stage's SPIR-V module into the executable of dst:
  * SPIRV-Cross reflection + MSL, then a Metal library/function (errors go to *log).
@@ -884,6 +899,45 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         mgl_append_info_log(log, "ERROR: %s stage: malformed SPIR-V instruction stream\n", stage_label(stage));
         return false;
+    }
+
+    if (stage == _VERTEX_SHADER)
+    {
+        /* a vertex input location overlap is a link error (GL 4.6, 11.1.1); the
+           fp64 lowering would otherwise emit two Metal attributes at one index */
+        MGLIProgram *ip = mgli_find(ctx, ptr->name);
+        if (ip && ip->attrib_conflict)
+        {
+            mgl_append_info_log(log, "ERROR: vertex stage: conflicting vertex attribute locations\n");
+            free(prepared);
+            return false;
+        }
+    }
+
+    bool lowered64 = false;
+
+    /* fp64: lower software doubles (u64 bit patterns + soft-float calls).
+     * ptr->spirv[stage].ir above keeps the GL view (real double types) for
+     * introspection; everything MSL-facing uses the lowered module. */
+    {
+        char fp64log[512] = {0};
+        size_t lower_words = 0;
+        uint32_t *lowered = mgl_fp64_lower_module(prepared, prepared_words, stage == _VERTEX_SHADER,
+                                                  &lowered64, &lower_words,
+                                                  fp64log, sizeof fp64log);
+        if (lowered64 && lowered)
+        {
+            free(prepared);
+            prepared = lowered;
+            prepared_words = lower_words;
+        }
+        else if (lowered64)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: %s\n", stage_label(stage),
+                                fp64log[0] ? fp64log : "fp64 lowering failed");
+            free(prepared);
+            return false;
+        }
     }
 
     /* tess: isoline tessellation is emulated on the quad domain (see mgl_ext_tess.h) */
@@ -1137,10 +1191,33 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
-    ptr->spirv[stage].msl_str = strdup(result);
+    /* SPIRV-Cross gives soft-float64 library functions `thread const T&`
+     * scalar parameters; a `constant`-space buffer member cannot bind to
+     * those.  mgl_fp64_fix_msl_scalar_params() takes them by value instead —
+     * functions that assign to their parameters (mgl_fdiv64 rescales its
+     * operands) also get plain `thread T&` refs — by-value is the GLSL
+     * semantics either way. */
+    if (lowered64)
+    {
+        char *fixed = mgl_fp64_fix_msl_scalar_params(result);
+        if (fixed)
+            ptr->spirv[stage].msl_str = fixed;
+        else
+            ptr->spirv[stage].msl_str = strdup(result);
+    }
+    else
+    {
+        ptr->spirv[stage].msl_str = strdup(result);
+    }
+    if (getenv("MGL_FP64_DUMP") && ptr->spirv[stage].msl_str) {
+        char path[256]; snprintf(path, sizeof path, "/tmp/fp64msl%d.metal", stage);
+        FILE *f_ = fopen(path, "w");
+        if (f_) { fputs(ptr->spirv[stage].msl_str, f_); fclose(f_); }
+    }
     if (getenv("MGL_DUMP_MSL"))
         fprintf(stderr, "MGL: program %u %s stage MSL:\n%s\n", ptr->name, stage_label(stage), result);
     ptr->spirv[stage].entry_point = strdup(msl_entry);
+
 
     /* Metal argument indices are only known after the MSL is emitted: patch the recorded
      * resources with SPIRV-Cross's automatic bindings (texture slots differ from GL units).
@@ -1371,60 +1448,88 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
         }
     }
 
-    for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
+    /* Generate every stage's SPIR-V before any stage is compiled to MSL: MGL's
+     * per-stage work (introspection rewrite, fp64 lowering, SPIRV-Cross, Metal
+     * library build) must not interleave with glslang's pool-based generator.
+     * Interleaving them corrupted glslang's TPoolAllocator state on the next
+     * glslang_program_SPIRV_generate (garbage pool sizes -> std::bad_alloc),
+     * so glslang work is finished first and each module is handed over as a
+     * private copy. */
     {
-        const char *msgs;
-        size_t size;
+        const uint32_t *mods[_MAX_SHADER_TYPES] = {0};
+        size_t sizes[_MAX_SHADER_TYPES] = {0};
 
-        if (!(mask & SHADER_MASK_BIT(stage)))
-            continue;
-
-        glslang_program_SPIRV_generate(glsl_program, (glslang_stage_t)stage);
-
-        msgs = glslang_program_SPIRV_get_messages(glsl_program);
-        if (msgs && *msgs)
+        for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
         {
-            mgl_append_info_log(log, "%s", msgs);
-            if (strstr(msgs, "error") || strstr(msgs, "ERROR"))
+            const char *msgs;
+            size_t size;
+
+            if (!(mask & SHADER_MASK_BIT(stage)))
+                continue;
+
+            glslang_program_SPIRV_generate(glsl_program, (glslang_stage_t)stage);
+
+            msgs = glslang_program_SPIRV_get_messages(glsl_program);
+            if (msgs && *msgs)
             {
-                ok = false;
-                break;
-            }
-        }
-
-        size = glslang_program_SPIRV_get_size(glsl_program);
-        if (size == 0)
-        {
-            mgl_append_info_log(log, "ERROR: %s stage: SPIR-V generation produced no code\n", stage_label(stage));
-            ok = false;
-            break;
-        }
-
-        ok = compile_stage(ctx, dst, stage, glslang_program_SPIRV_get_ptr(glsl_program), size, "main", acc, log,
-                           (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
-
-        /* executable stages keep the GLSL source / type of the shader they came from
-         * (the xfb domain re-translates the vertex stage from source for capture) */
-        if (ok && dst->base.shader_slots[stage])
-        {
-            Shader *exec = dst->base.shader_slots[stage];
-            for (int i = 0; i < obj->num_attached; i++)
-            {
-                Shader *a = obj->attached[i];
-                if ((int)a->glm_type == stage && a->src)
+                mgl_append_info_log(log, "%s", msgs);
+                if (strstr(msgs, "error") || strstr(msgs, "ERROR"))
                 {
-                    exec->src = strdup(a->src);
-                    exec->src_len = a->src_len;
+                    ok = false;
                     break;
                 }
             }
+
+            size = glslang_program_SPIRV_get_size(glsl_program);
+            if (size == 0)
+            {
+                mgl_append_info_log(log, "ERROR: %s stage: SPIR-V generation produced no code\n", stage_label(stage));
+                ok = false;
+                break;
+            }
+            mods[stage] = (const uint32_t *)malloc(size * 4);
+            if (!mods[stage])
+            {
+                mgl_append_info_log(log, "ERROR: out of memory\n");
+                ok = false;
+                break;
+            }
+            memcpy((void *)mods[stage], glslang_program_SPIRV_get_ptr(glsl_program), size * 4);
+            sizes[stage] = size;
         }
+
+        for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
+        {
+            if (!(mask & SHADER_MASK_BIT(stage)) || !mods[stage])
+                continue;
+
+            ok = compile_stage(ctx, dst, stage, mods[stage], sizes[stage], "main", acc, log,
+                               (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
+            free((void *)mods[stage]);
+
+            /* executable stages keep the GLSL source / type of the shader they came from
+             * (the xfb domain re-translates the vertex stage from source for capture) */
+            if (ok && dst->base.shader_slots[stage])
+            {
+                Shader *exec = dst->base.shader_slots[stage];
+                for (int i = 0; i < obj->num_attached; i++)
+                {
+                    Shader *a = obj->attached[i];
+                    if ((int)a->glm_type == stage && a->src)
+                    {
+                        exec->src = strdup(a->src);
+                        exec->src_len = a->src_len;
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* the glslang program refers to the shaders' intermediates; never keep it past the link */
+        glslang_program_delete(glsl_program);
+
+        return ok;
     }
-
-    /* the glslang program refers to the shaders' intermediates; never keep it past the link */
-    glslang_program_delete(glsl_program);
-
-    return ok;
 }
 
 static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, ReflectAcc *acc, char **log)
