@@ -55,11 +55,17 @@ enum {
     MGL_GEOM_SSBO_IDX      = 24,    /* u32: raster index list (stream 0) */
     MGL_GEOM_SSBO_CTL      = 25,    /* u32: counters + indirect draw arguments */
     MGL_GEOM_SSBO_CNT      = 27,    /* u32: per-thread emitted vertex count (capture order) */
-    MGL_GEOM_SSBO_DRAW     = 26     /* pass-through vertex function: GS output records */
+    MGL_GEOM_SSBO_DRAW     = 26,    /* pass-through vertex function: GS output records */
+    MGL_GEOM_SSBO_LSCR     = 28     /* u32: per-thread output index scratch + (at word
+                                     * hdr[4]) the per-thread entry counts and scanned
+                                     * bases; a scan + copy pass compacts the segments
+                                     * into the raster list, because writing them there
+                                     * straight from an atomicAdd reservation would leave
+                                     * the rasterization order a thread race */
 };
 
 /* Metal buffer indices of the same buffers (pinned above the range SPIRV-Cross auto-assigns
- * to the program's own UBO/SSBO resources); 30 is used by the xfb capture variant */
+ * to the program's own UBO/SSBO resources); Apple GPUs expose 31 buffer slots (0..30) */
 enum {
     MGL_GEOM_MSL_PRIM      = 24,
     MGL_GEOM_MSL_VSOUT     = 25,
@@ -69,6 +75,7 @@ enum {
     MGL_GEOM_MSL_CTL       = 29,
     MGL_GEOM_MSL_CNT       = 22,
     MGL_GEOM_MSL_DRAW      = 23,
+    MGL_GEOM_MSL_LSCR      = 30,
 
     /* Metal argument slots a stage's PROGRAM resources (UBOs incl. instance arrays, the
      * default-uniform block, SSBOs) may span in the compute kernels: the kernel's own
@@ -103,6 +110,9 @@ typedef struct MGLGeomProgram {
     bool      linked;       /* the emulation is built and usable */
     bool      deferred;     /* separable program: built from the pipeline at first draw */
     bool      from_tess;   /* a tessellation stage feeds the geometry kernel (TES-output capture) */
+    bool      fs_uses_prim; /* the linked fragment stage reads gl_PrimitiveID: the record
+                             * then carries the primitive id and the FS attribute is
+                             * redirected onto the pass-through VS's varying */
     void    *gs_exec;      /* the geometry stage executable Shader (identity across pipelines) */
     char     *fail;
 
@@ -131,6 +141,7 @@ typedef struct MGLGeomProgram {
     GLuint  out_pos_off, out_psize_off, out_layer_off, out_vp_off, out_prim_off, out_clip_off, out_cull_off;
     GLuint  out_clip_size;
     GLuint  layer_loc, vp_loc;      /* varying locations the pass-through VS uses */
+    GLuint  prim_loc;               /* ditto for gl_PrimitiveID forwarded to the FS */
     bool    vid_absolute, iid_absolute;
 
     char   *kernel_msl, *kernel_entry, *final_entry;
@@ -217,6 +228,14 @@ struct MGLExtMetal_geom {
     bool (*draw)(GLMContext ctx, MGLGeomDraw *d);
     /* the element buffer of the current VAO can be bound as a device buffer (GPU assembly) */
     bool (*can_assemble_gpu)(GLMContext ctx);
+    /* exact geometry-stage query counting: the emulation keeps per-stream counters on the
+     * GPU and folds them into persistent accumulator words after every draw.
+     * query_begin marks the words that restart at the next draw (a counting period begins);
+     * query_read flushes the pending GPU work and reports the accumulated value, 0 when no
+     * geometry-stage draw ran since the begin.  Word w<4 is PRIMITIVES_GENERATED stream w,
+     * w+4 is GEOMETRY_SHADER_PRIMITIVES_EMITTED stream w (queries.c owns the mapping). */
+    void (*query_begin)(GLMContext ctx, unsigned words);            /* bitmask of words */
+    void (*query_read)(GLMContext ctx, unsigned word, uint64_t *out);
 };
 
 #ifdef __cplusplus

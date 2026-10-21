@@ -153,7 +153,13 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
                           instances: (GLsizei) instances baseInstance: (GLuint) baseinstance
                         outCommand: (void **) out_cb outScratch: (void **) out_scratch
 {
-    if (!_device || !_commandQueue || !xp->msl || !ctx->state.program || !VAO()) return NULL;
+    /* geom (reported): the active program may come from a bound pipeline (no useProgram):
+     * the vertex stage of the pipeline is the program the capture resolves against, the
+     * same way the C side's xfb_active_program does */
+    Program *xfb_prog = ctx->state.program;
+    if (!xfb_prog && ctx->state.program_pipeline)
+        xfb_prog = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER];
+    if (!_device || !_commandQueue || !xp->msl || !xfb_prog || !VAO()) return NULL;
 
     /* map uniform / storage / vertex buffers exactly like the real draw does */
     if (![self mapBuffersToMTL]) return NULL;

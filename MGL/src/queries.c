@@ -252,6 +252,19 @@ static void begin_query(GLMContext ctx, GLenum target, GLuint index, GLuint id)
     q->cpu_count = 0;
     S->active[bp] = q;
 
+    /* a geometry stage counts these on the GPU (per-stream counters folded into a
+     * persistent accumulator after every draw): the word restarts at the next draw,
+     * which opens this query's counting period.  The clipping counters ride on the
+     * stream-0 generated word: what the geometry stage emits is what reaches clipping */
+    if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
+        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES)
+    {
+        unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
+                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index : 0u;
+        if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_begin)
+            ctx->mtl_funcs.ext_geom->query_begin(ctx, 1u << word);
+    }
+
     if (target_is_gpu(target) && QMTL(ctx) && QMTL(ctx)->begin)
         QMTL(ctx)->begin(ctx, q);
 }
@@ -278,6 +291,21 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
 
     S->active[bp] = NULL;
     q->active = false;
+
+    /* the geometry stage's exact per-stream counters accumulated since the begin fold
+     * into the CPU-tracked part here; queries without a geometry-stage draw read 0 */
+    if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
+        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES)
+    {
+        unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
+                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index : 0u;
+        if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_read)
+        {
+            uint64_t v = 0;
+            ctx->mtl_funcs.ext_geom->query_read(ctx, word, &v);
+            q->cpu_count += v;
+        }
+    }
 
     if (target_is_gpu(target) && QMTL(ctx) && QMTL(ctx)->end)
     {
@@ -534,17 +562,20 @@ static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
            tessellation factors: the tess domain reports the exact numbers after
            tessellating (mgl_queries_note_tess) */
     }
-    else
+    else if (!has_gs)
     {
         count_active(S, MGL_QB_CLIPPING_INPUT_PRIMITIVES, prims);
         count_active(S, MGL_QB_CLIPPING_OUTPUT_PRIMITIVES, prims);
-        /* without a geometry shader every primitive goes to vertex stream 0 */
+        /* without a geometry shader every primitive goes to vertex stream 0; with one
+         * the counts come from the kernel's per-stream counters (see end_query) */
         count_active(S, MGL_QB_PRIMITIVES_GENERATED + 0, prims);
     }
     if (has_gs)
     {
+        /* GEOMETRY_SHADER_PRIMITIVES_EMITTED and PRIMITIVES_GENERATED come from the
+         * geometry kernel's per-stream counters, read through the ext_geom query hooks
+         * (begin/end query); the invocation count is the input primitive count */
         count_active(S, MGL_QB_GEOMETRY_SHADER_INVOCATIONS, prims);
-        count_active(S, MGL_QB_GEOMETRY_SHADER_PRIMITIVES_EMITTED, prims);
     }
 
     return true;

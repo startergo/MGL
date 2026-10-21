@@ -536,10 +536,16 @@ static bool validate_pipeline(GLMContext ctx, MGLPipelineObj *pipe, char **log)
         ok = false;
     }
 
-    if (pipe->base.stage_programs[_VERTEX_SHADER] && !pipe->base.stage_programs[_FRAGMENT_SHADER])
+    if (pipe->base.stage_programs[_VERTEX_SHADER] && !pipe->base.stage_programs[_FRAGMENT_SHADER] &&
+        !ctx->state.caps.rasterizer_discard)
     {
-        mgl_append_info_log(log, "ERROR: no fragment stage; the Metal backend needs a fragment function to rasterize\n");
-        ok = false;
+        /* geom (reported): a pipeline without a fragment program is legal GL - the stage
+         * is optional and results are undefined; with transform feedback active (the CTS
+         * api.program_pipeline_vs_gs_capture pass-2 shape draws with discard re-enabled)
+         * nothing rasterizes anyway.  Metal renders such a pipeline with a nil fragment
+         * function, so it is not an error; kept as an info-log note only. */
+        mgl_append_info_log(log,
+                            "WARNING: no fragment stage; rasterization output is undefined\n");
     }
 
     if (!mgl_program_validate_samplers(ctx, progs, nprogs, log))
@@ -1328,12 +1334,15 @@ static bool program_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
     {
         char *log = NULL;
         bool ok = validate_pipeline(ctx, MGL_PIPELINE_OBJ(STATE(program_pipeline)), &log);
-        free(log);
         if (!ok)
         {
+            if (getenv("MGL_DEBUG") && log)
+                fprintf(stderr, "MGL: pipeline validation: %s\n", log);
+            free(log);
             ERROR_RETURN(GL_INVALID_OPERATION);
             return false;
         }
+        free(log);
     }
 
     return true;

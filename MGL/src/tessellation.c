@@ -1547,7 +1547,11 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
             size_t off = (size_t)(open - out);
             size_t newlen = slen - bodylen + strlen(newbody);
             const char *hold = newbody;
-            char *grown = (char *)realloc(out, newlen + 1);
+            /* keep the buffer large enough for the whole move: the tail is read from
+             * out .. out+len while a shrunk allocation (newlen < len) would already be
+             * shorter than that, and the memmove read would run past its end */
+            size_t keep = newlen > len ? newlen : len;
+            char *grown = (char *)realloc(out, keep + 1);
 
             if (!grown)
                 return NULL;
@@ -2935,12 +2939,17 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 {
                     size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
                     size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
+                    /* remember the offset: realloc may move the block, and `step` would
+                     * then point into freed memory (the offset below was computed with
+                     * the stale pointer, so p could land anywhere — a use-after-free
+                     * read and, on a moved block, a corrupted kernel source) */
+                    size_t step_at = (size_t)(step - msl);
                     char *grown = (char *)realloc(msl, strlen(msl) + newlen - oldlen + 1);
                     if (grown)
                     {
                         char *p;
                         msl = grown;
-                        p = msl + (step - msl);
+                        p = msl + step_at;
                         memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
                         memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
                         for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )

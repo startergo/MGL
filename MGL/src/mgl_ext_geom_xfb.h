@@ -2,9 +2,13 @@
  * Owned by agent 'geom' (part of the geometry emulation).
  *
  * Three small kernels run after the geometry kernel, in the same command buffer:
- *   1. a prefix sum over the per-thread emitted-vertex counts, giving every output vertex
- *      its (compacted) transform feedback index,
- *   2. a scatter writing each record's varyings into the bound transform feedback buffers,
+ *   1. a prefix sum over the per-thread CLOSED-PRIMITIVE counts (read from the record
+ *      tags), giving every captured primitive its transform feedback index - GL records
+ *      whole primitives, not loose vertices,
+ *   2. a scatter writing every vertex of each closed primitive into the bound transform
+ *      feedback buffers (a strip output decomposes into its line / triangle primitives,
+ *      so shared strip vertices are captured once per primitive, as GL does), dropping
+ *      primitives that do not fit entirely,
  *   3. a finish kernel advancing the write offsets by the captured vertices and folding the
  *      stream-0 primitive count in.
  * The write offsets and the "since the last resolve" counters live in a small GPU block, so
@@ -21,12 +25,16 @@
 #define MGL_GEOM_XFB_WG        64
 
 /* the GPU counter block: [0] object name, [1] vertices, [2] primitives, [3..6] write
- * offsets.  It is owned by the kernels while a pack is pending, and only read by the CPU at
- * a resolve (after a wait), so the CPU never races the GPU on it.
+ * offsets, [8] the per-draw vertex counter.  It is owned by the kernels while a pack is
+ * pending, and only read by the CPU at a resolve (after a wait), so the CPU never races the
+ * GPU on it.
  * The per-draw inputs and the varying table live in a separate ring, one slot per draw in
  * flight, for the same reason. */
-#define MGL_GEOM_XFB_BLOCK_WORDS  8
-#define MGL_GEOM_XFB_IN_WORDS     16   /* threads, maxv, out_words, nvars, stride[4], size[4] */
+#define MGL_GEOM_XFB_BLOCK_WORDS  9
+/* [0] threads, [1] maxv, [2] out_words, [3] nvars, [4..7] stride[4], [8..11] size[4],
+ * [12] feedback-mode vertices per primitive, [13] geometry output type (0/1/2),
+ * [14..17] per-buffer captured extent in bytes (max offset+size of its varyings) */
+#define MGL_GEOM_XFB_IN_WORDS     20
 #define MGL_GEOM_XFB_VAR_WORDS    4
 #define MGL_GEOM_XFB_SLOT_WORDS   (MGL_GEOM_XFB_IN_WORDS + MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS)
 #define MGL_GEOM_XFB_RING         4    /* draws in flight */

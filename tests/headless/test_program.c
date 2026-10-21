@@ -235,9 +235,11 @@ TEST(pipeline_objects)
     glGetProgramPipelineiv(pipe, GL_VERTEX_SHADER, &v);   EXPECT_EQ_INT(v, vsp);
     glGetProgramPipelineiv(pipe, GL_FRAGMENT_SHADER, &v); EXPECT_EQ_INT(v, 0);
 
-    /* vertex without fragment: validation fails with a log */
+    /* vertex without fragment: legal (the fragment stage is optional; rasterization
+     * output is undefined), so validation succeeds - geom: the geometry CTS
+     * program_pipeline_vs_gs_capture draws exactly so; MGL notes it in the log */
     glValidateProgramPipeline(pipe);
-    glGetProgramPipelineiv(pipe, GL_VALIDATE_STATUS, &v); EXPECT_EQ_INT(v, GL_FALSE);
+    glGetProgramPipelineiv(pipe, GL_VALIDATE_STATUS, &v); EXPECT_EQ_INT(v, GL_TRUE);
     glGetProgramPipelineiv(pipe, GL_INFO_LOG_LENGTH, &v); EXPECT_TRUE(v > 1);
 
     /* stages the program has no executable for are cleared */

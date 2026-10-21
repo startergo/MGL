@@ -521,11 +521,16 @@ static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **e
 static void spv_free(SpvModule *m)
 {
     if (!m) return;
+    /* every struct type owns its member-id array: free them while m->types is still
+     * valid.  free(m->types) first would leave the members pointers read from freed
+     * memory (the allocator writes its free-list links over the first types), and
+     * freeing one of those garbage pointers corrupts the heap — an intermittent
+     * SIGTRAP in malloc that took a while to trace back to here. */
+    for (int i = 0; i < m->n_types; i++) free(m->types[i].members);
     free(m->types);
     free(m->decos);
     free(m->vars);
     free(m->names);
-    for (int i = 0; i < m->n_types; i++) free(m->types[i].members);
     free(m->mdecos);
     free(m->mnames);
     free(m->modes);
@@ -837,6 +842,35 @@ static void geom_fail(GLMContext ctx, MGLGeomProgram *gp, const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------ glslang / SPIRV-Cross wrappers */
+
+/* expand the preprocessor conditionals of a shader source.  The geometry emulation rewrites
+ * sources line by line, which cannot follow a conditional that opens inside one declaration
+ * and closes inside another (the CTS declares an input block whose closing brace sits within
+ * an #ifdef/#else pair); the expanded source has no conditionals left, so the rewrite works
+ * on straight-line text.  Returns a malloc'd string, or NULL when preprocessing fails - the
+ * callers then fall back to the original source (whose own compile will report the error). */
+static char *geom_preprocess_source(GLMContext ctx, GLuint glm_type, const char *src)
+{
+    glslang_input_t input;
+    glslang_shader_t *shader;
+    const char *code;
+    char *out;
+
+    memset(&input, 0, sizeof(input));
+    initGLSLInput(ctx, glm_type, src, &input);
+    shader = glslang_shader_create(&input);
+    if (!shader) return NULL;
+    glslang_shader_set_options(shader, GLSLANG_SHADER_VULKAN_RULES_RELAXED);
+    if (!glslang_shader_preprocess(shader, &input))
+    {
+        glslang_shader_delete(shader);
+        return NULL;
+    }
+    code = glslang_shader_get_preprocessed_code(shader);
+    out = code ? strdup(code) : NULL;
+    glslang_shader_delete(shader);
+    return out;
+}
 
 static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src, int force_version,
                                uint32_t **ir, size_t *words, char **log)
@@ -1965,6 +1999,25 @@ static int geom_find_location(const MGLGeomVar *vars, int count, GLuint location
     return -1;
 }
 
+/* match an interface variable by NAME and type.  Programs linked separately (a pipeline's
+ * stages) assign automatic varying locations by their own declaration order, so the same
+ * interface can come out with different locations in different programs; conformant
+ * implementations interface-match such stages by name when the locations were automatic.
+ * The capture expression follows the name+type match, falling back from the location
+ * match geom_derive_exprs tries first. */
+static int geom_find_name(const MGLGeomVar *vars, int count, const char *name)
+{
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < count; i++)
+        if (vars[i].name[0] && !strcmp(vars[i].name, name)) return i;
+    return -1;
+}
+
+static bool geom_var_types_match(const MGLGeomVar *a, const MGLGeomVar *b)
+{
+    return a->rows == b->rows && a->cols == b->cols && a->base == b->base && a->elems == b->elems;
+}
+
 /* ------------------------------------------------------------------ code generation */
 
 /* remove the "#version ..." line of a source so a new one can be prepended */
@@ -2101,6 +2154,8 @@ static char *geom_plain_outputs(const char *src)
             size_t save = i, q = i;
             bool is_out = false, other_storage = false, done_head = false;
             bool line_start = true;
+            bool head_has_directive = false;
+            (void)save;
 
             while (q < len && src[q] != ';' && src[q] != '{')
             {
@@ -2110,13 +2165,13 @@ static char *geom_plain_outputs(const char *src)
                 {
                     /* a preprocessor directive between declarations: it cannot belong to
                      * the head (a '#define X 16u' feeding a later array size must survive
-                     * the head being rewritten), so end the head here and pass it through */
-                    for (size_t k = save; k < q; k++) sb_put(&out, "%c", src[k]);
-                    while (q < len && src[q] != '\n') { sb_put(&out, "%c", src[q]); q++; }
-                    if (q < len) { sb_put(&out, "\n"); q++; }   /* keep the line break */
-                    save = q;
-                    line_start = true;
-                    continue;
+                     * the head being rewritten), so the head ends before it.  The scan is
+                     * observational only: nothing is emitted here, because a head that
+                     * turns out not to need rewriting leaves the outer loop re-scanning
+                     * the same text, which would re-emit the directive once per
+                     * character.  Both outcomes emit the region exactly once below. */
+                    head_has_directive = true;
+                    break;
                 }
                 if (src[q] == '(')
                 {
@@ -2172,6 +2227,22 @@ static char *geom_plain_outputs(const char *src)
                     if (strcmp(bname, "gl_PerVertex"))
                     {
                         char inst[64] = "";
+                        /* the rewritten block drops the scanned head (it holds the
+                         * storage qualifiers), but any preprocessor directive inside it
+                         * (a '#define' between the qualifiers and the name) must survive:
+                         * copy the head's directive lines, and only those */
+                        {
+                            size_t k = i;
+                            while (k < brace)
+                            {
+                                size_t ls = k, le = k;
+                                while (ls < brace && (src[ls] == ' ' || src[ls] == '\t')) ls++;
+                                while (le < brace && src[le] != '\n') le++;
+                                if (ls < brace && src[ls] == '#')
+                                    sb_put(&out, "%.*s\n", (int)(le - ls), src + ls);
+                                k = (le < brace) ? le + 1 : brace;
+                            }
+                        }
                         size_t p = close + 1;
                         while (p < len && isspace((unsigned char)src[p])) p++;
                         while (p < len && (isalnum((unsigned char)src[p]) || src[p] == '_'))
@@ -2188,7 +2259,7 @@ static char *geom_plain_outputs(const char *src)
                              * members */
                             char *members = strip_member_quals2(src + brace + 1,
                                                                (size_t)(close - brace - 1), true);
-                            sb_put(&out, "struct %s {%s}; %s %s;", bname,
+                            sb_put(&out, "\nstruct %s {%s}; %s %s;", bname,
                                    members ? members : "", bname, inst);
                             free(members);
                         }
@@ -2198,7 +2269,7 @@ static char *geom_plain_outputs(const char *src)
                              * own, so the same qualifier stripping applies */
                             char *members = strip_member_quals(src + brace + 1,
                                                                (size_t)(close - brace - 1));
-                            sb_put(&out, "%s;", members ? members : "");
+                            sb_put(&out, "\n%s;", members ? members : "");
                             free(members);
                         }
                         i = p;
@@ -2207,6 +2278,26 @@ static char *geom_plain_outputs(const char *src)
                         continue;
                     }
                 }
+            }
+            /* not rewritten: the head passes through verbatim, exactly once.  A scan that
+             * stopped at a preprocessor directive emits only up to the '#', leaving the
+             * directive to the outer loop's own branch (a rewrite would otherwise have
+             * swallowed it, and emitting a character at a time here would rescan the head
+             * for every character of it). */
+            if (!done_head)
+            {
+                if (head_has_directive)
+                {
+                    for (size_t k = i; k < q && k < len; k++) sb_put(&out, "%c", src[k]);
+                    i = q;
+                }
+                else
+                {
+                    for (size_t k = i; k <= q && k < len; k++) sb_put(&out, "%c", src[k]);
+                    if (q < len && src[q] == '{') depth++;
+                    i = (q < len) ? q + 1 : len;
+                }
+                continue;
             }
         }
         if (src[i] == '{') depth++;
@@ -2372,6 +2463,27 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                 }
                 else break;
             }
+            sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+            pos = end;
+            continue;
+        }
+        /* comments are pass-through statements of their own: without this, a '// ...'
+         * line directly before a declaration becomes the head of that declaration's
+         * statement, and the declaration (e.g. a plain uniform to strip) is never
+         * recognized */
+        if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '/')
+        {
+            size_t end = pos;
+            while (end < len && src[end] != '\n') end++;
+            sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+            pos = end;
+            continue;
+        }
+        if (src[pos] == '/' && pos + 1 < len && src[pos + 1] == '*')
+        {
+            size_t end = pos + 2;
+            while (end + 1 < len && !(src[end] == '*' && src[end + 1] == '/')) end++;
+            end = (end + 1 < len) ? end + 2 : len;
             sb_put(&out, "%.*s", (int)(end - pos), src + pos);
             pos = end;
             continue;
@@ -2792,15 +2904,18 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
                                   const SpvModule *gs_m, char **log)
 {
     char gl_in_name[64];
-    char *main_renamed = rename_main(gs_src, "mgl_gs_main");
+    char *gs_expanded = geom_preprocess_source(ctx, GL_GEOMETRY_SHADER, gs_src);
+    const char *gs_base = gs_expanded ? gs_expanded : gs_src;
+    char *main_renamed = rename_main(gs_base, "mgl_gs_main");
     char *stripped_src = NULL;
     char *removed_src = NULL;
     GeomPlainUni uni[MGL_GEOM_MAX_VARYINGS];
     GeomDubMember dub[MGL_GEOM_MAX_VARYINGS];
     int nuni_ = 0, ndub = 0;
-    char *transformed = geom_transform_source(main_renamed ? main_renamed : gs_src, gp->in_verts,
+    char *transformed = geom_transform_source(main_renamed ? main_renamed : gs_base, gp->in_verts,
                                               gl_in_name, sizeof(gl_in_name), NULL, NULL);
     free(main_renamed);
+    free(gs_expanded);
     char *nover = NULL;
     SB b;
     GLuint out_type_code = gp->out_type == GL_POINTS ? 0 : gp->out_type == GL_LINE_STRIP ? 1 : 2;
@@ -2900,7 +3015,13 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "layout(std430, binding = %d) buffer MGLGsOutBlock { uint mgl_out[]; };\n", MGL_GEOM_SSBO_OUTV);
     sb_put(&b, "layout(std430, binding = %d) buffer MGLGsIdxBlock { uint mgl_idx[]; };\n", MGL_GEOM_SSBO_IDX);
     sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCtlBlock { uint mgl_ctl[]; };\n", MGL_GEOM_SSBO_CTL);
-    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCntBlock { uint mgl_cnt[]; };\n\n", MGL_GEOM_SSBO_CNT);
+    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsCntBlock { uint mgl_cnt[]; };\n", MGL_GEOM_SSBO_CNT);
+    /* the emitted strips land in a per-thread scratch segment; a scan + copy pass (see
+     * mgl_geom_lscan / mgl_geom_lcopy) moves them into the raster list in primitive
+     * order, so the rasterization order is the emission order the GL spec requires
+     * instead of the order of a pack of racing atomicAdds.  The binding starts at the
+     * scratch: [scratch hdr[4] words | counts | scanned bases] */
+    sb_put(&b, "layout(std430, binding = %d) buffer MGLGsLscrBlock { uint mgl_lscr[]; };\n\n", MGL_GEOM_SSBO_LSCR);
 
     sb_put(&b, "struct MGLGsInVert\n{\n");
     sb_put(&b, "    vec4 mgl_gs_pos;\n");
@@ -2921,7 +3042,9 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     if (gp->out_has_clip) sb_put(&b, "float mgl_gs_clip[%u];\n", gp->out_clip_size);
     if (gp->out_has_cull) sb_put(&b, "float mgl_gs_cull[%u];\n", gp->out_clip_size);
     sb_put(&b, "int mgl_gs_prim_in;\nint mgl_gs_invoc;\n");
-    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream, mgl_slot_base;\n");
+    sb_put(&b, "uint mgl_written, mgl_strip_n, mgl_seq, mgl_tag, mgl_stream, mgl_slot_base, mgl_closes;\n");
+    sb_put(&b, "uint mgl_t = 0u;          /* thread (primitive/invocation) index - the scratch segment key */\n");
+    sb_put(&b, "uint mgl_lcnt = 0u;\n");
     /* the vertices of the strip in emit order: threads interleave (one per primitive per
      * invocation), so the reserved slots are not consecutive */
     sb_put(&b, "uint mgl_strip_v[%u];\n\n", gp->max_vertices ? gp->max_vertices : 1);
@@ -2968,7 +3091,10 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
 
     /* store one output vertex */
     sb_put(&b, "void mgl_store_output(uint slot)\n{\n    uint o = slot * %uu;\n", gp->out_words);
-    sb_put(&b, "    mgl_out[o + 0u] = mgl_tag;\n    mgl_out[o + 1u] = (mgl_stream << 24u) | mgl_seq;\n");
+    /* the tag word: [0..7] the strip length (stamped at the close), [8] the close flag,
+     * [9..23] the primitives the thread closed before this strip, [24..31] the stream.
+     * The pack (prefix + scatter) is the only reader. */
+    sb_put(&b, "    mgl_out[o + 0u] = mgl_tag;\n    mgl_out[o + 1u] = (mgl_stream << 24u);\n");
     if (gp->out_has_pos)
     {
         sb_put(&b, "    mgl_out[o + %uu] = floatBitsToUint(mgl_gs_pos.x);\n", gp->out_pos_off + 0);
@@ -3001,7 +3127,20 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    if (slot >= mgl_hdr[3]) { mgl_ctl[3] = 1u; return; }\n");
     sb_put(&b, "    mgl_store_output(slot);\n");
     sb_put(&b, "    mgl_strip_v[mgl_strip_n] = slot;\n");
+    if (out_type_code == 0)
+    {
+        sb_put(&b, "    /* a point output makes every vertex its own primitive: flag the record as\n");
+        sb_put(&b, "     * closing one (bit 8), stamp its length (1, bits 0..7) and the number of\n");
+        sb_put(&b, "     * primitives the thread closed before it (bits 9..23), by which the transform\n");
+        sb_put(&b, "     * feedback pack indexes the captured primitives */\n");
+        sb_put(&b, "    mgl_out[slot * %uu + 1u] |= (1u << 8u) | (mgl_written << 9u) | 1u;\n", gp->out_words);
+    }
     sb_put(&b, "    mgl_strip_n++; mgl_written++; mgl_seq++;\n");
+    if (out_type_code == 0)
+    {
+        sb_put(&b, "    atomicAdd(mgl_ctl[13u + s], 1u);\n");
+        sb_put(&b, "    atomicAdd(mgl_ctl[17u + s], 1u);\n");
+    }
     sb_put(&b, "}\n\n");
     sb_put(&b, "void mgl_gs_end_stream_primitive(uint s)\n{\n");
     sb_put(&b, "    if (mgl_strip_n == 0u) return;\n");
@@ -3014,35 +3153,73 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     else
         sb_put(&b, "    if (n >= 3u) cnt = (n - 2u) * 3u;\n");
     sb_put(&b, "    if (s == 0u && cnt > 0u) {\n");
-    sb_put(&b, "        uint base = atomicAdd(mgl_ctl[1], cnt);\n");
-    sb_put(&b, "        if (base + cnt > mgl_hdr[4]) { mgl_ctl[3] = 1u; }\n");
+    /* the strip's list entries go to this thread's scratch segment (mgl_t * lc + the
+     * entries written so far); mgl_geom_lscan / mgl_geom_lcopy compact the segments into
+     * mgl_idx in primitive order afterwards. Writing them straight into mgl_idx through
+     * an atomicAdd reservation leaves the strip order - and so the rasterization order,
+     * which the GL spec fixes as the emission order - to a thread race. */
+    sb_put(&b, "        uint lc = 3u * mgl_hdr[5];\n");
+    sb_put(&b, "        uint base = mgl_t * lc + mgl_lcnt;\n");
+    sb_put(&b, "        if (base + cnt > mgl_t * lc + lc || base + cnt > mgl_hdr[4]) { mgl_ctl[3] = 1u; }\n");
     sb_put(&b, "        else {\n");
     if (out_type_code == 0)
     {
-        sb_put(&b, "            for (uint i = 0u; i < n; i++) mgl_idx[base + i] = mgl_strip_v[i];\n");
+        sb_put(&b, "            for (uint i = 0u; i < n; i++) mgl_lscr[base + i] = mgl_strip_v[i];\n");
     }
     else if (out_type_code == 1)
     {
-        sb_put(&b, "            for (uint i = 0u; i + 1u < n; i++) { mgl_idx[base + i * 2u] = mgl_strip_v[i];"
-                   " mgl_idx[base + i * 2u + 1u] = mgl_strip_v[i + 1u]; }\n");
+        sb_put(&b, "            for (uint i = 0u; i + 1u < n; i++) { mgl_lscr[base + i * 2u] = mgl_strip_v[i];"
+                   " mgl_lscr[base + i * 2u + 1u] = mgl_strip_v[i + 1u]; }\n");
     }
     else
     {
         sb_put(&b, "            for (uint i = 0u; i + 2u < n; i++) {\n");
         sb_put(&b, "                uint a = mgl_strip_v[i], b2 = mgl_strip_v[i + 1u], c = mgl_strip_v[i + 2u];\n");
-        sb_put(&b, "                if ((i & 1u) == 0u) { mgl_idx[base + i * 3u] = a; mgl_idx[base + i * 3u + 1u] = b2; mgl_idx[base + i * 3u + 2u] = c; }\n");
-        sb_put(&b, "                else { mgl_idx[base + i * 3u] = b2; mgl_idx[base + i * 3u + 1u] = a; mgl_idx[base + i * 3u + 2u] = c; }\n");
+        sb_put(&b, "                if ((i & 1u) == 0u) { mgl_lscr[base + i * 3u] = a; mgl_lscr[base + i * 3u + 1u] = b2; mgl_lscr[base + i * 3u + 2u] = c; }\n");
+        sb_put(&b, "                else { mgl_lscr[base + i * 3u] = b2; mgl_lscr[base + i * 3u + 1u] = a; mgl_lscr[base + i * 3u + 2u] = c; }\n");
         sb_put(&b, "            }\n");
     }
+    sb_put(&b, "            mgl_lcnt += cnt;\n");
     sb_put(&b, "        }\n    }\n");
-    sb_put(&b, "    atomicAdd(mgl_ctl[13u + s], 1u);\n");
+    if (out_type_code != 0)
+    {
+        sb_put(&b, "    /* close the strip: flag its last record for the transform feedback pack\n");
+        sb_put(&b, "     * (bit 8), stamp the strip's length (bits 0..7) and the number of primitives\n");
+        sb_put(&b, "     * the thread closed before it (bits 9..23) - a strip of n vertices decomposes\n");
+        sb_put(&b, "     * into n-1 line / n-2 triangle captured primitives, so one close can stand for\n");
+        sb_put(&b, "     * several.  A strip shorter than one output primitive is degenerate: nothing\n");
+        sb_put(&b, "     * can be captured from it, so it gets no flag and consumes no ordinal, exactly\n");
+        sb_put(&b, "     * what the pack counts. */\n");
+        if (out_type_code == 1)
+            sb_put(&b, "    if (mgl_strip_n >= 2u && s == 0u) {\n");
+        else
+            sb_put(&b, "    if (mgl_strip_n >= 3u && s == 0u) {\n");
+        sb_put(&b, "        mgl_out[mgl_strip_v[mgl_strip_n - 1u] * %uu + 1u] |=\n", gp->out_words);
+        sb_put(&b, "            (1u << 8u) | (mgl_closes << 9u) | mgl_strip_n;\n");
+        sb_put(&b, "        mgl_closes += mgl_strip_n - %uu + 1u;\n", (unsigned)(out_type_code == 1 ? 2 : 3));
+        sb_put(&b, "    }\n");
+        sb_put(&b, "    if (mgl_strip_n > 0u) atomicAdd(mgl_ctl[13u + s], 1u);\n");
+        /* PRIMITIVES_GENERATED counts what the rasterizer / transform feedback consume:
+         * a strip output decomposes into n-1 line / n-2 triangle primitives */
+        if (out_type_code == 1)
+            sb_put(&b, "    if (mgl_strip_n >= 2u) atomicAdd(mgl_ctl[17u + s], mgl_strip_n - 1u);\n");
+        else
+            sb_put(&b, "    if (mgl_strip_n >= 3u) atomicAdd(mgl_ctl[17u + s], mgl_strip_n - 2u);\n");
+    }
+    else
+        sb_put(&b, "    /* points: every emitted vertex was counted in the emit */\n");
     sb_put(&b, "    mgl_strip_n = 0u;\n");
     sb_put(&b, "}\n\n");
     sb_put(&b, "void mgl_gs_emit_vertex() { mgl_gs_emit_stream_vertex(0u); }\n");
     sb_put(&b, "void mgl_gs_end_primitive() { mgl_gs_end_stream_primitive(0u); }\n\n");
 
     sb_put(&b, "void main()\n{\n");
-    sb_put(&b, "    uint mgl_t = gl_GlobalInvocationID.x;\n");
+    sb_put(&b, "    mgl_t = gl_GlobalInvocationID.x;\n");
+    /* the per-thread counters are reset up front: a thread that bails out below must
+     * still publish a zero so the scan/copy passes and the xfb prefix never read a stale
+     * count from an earlier draw that used the same scratch slot */
+    sb_put(&b, "    mgl_cnt[mgl_t] = 0u;\n");
+    sb_put(&b, "    mgl_lscr[mgl_hdr[4] + mgl_t] = 0u;\n");
     sb_put(&b, "    uint mgl_invocations = mgl_hdr[2];\n");
     sb_put(&b, "    if (mgl_invocations == 0u) return;\n");
     sb_put(&b, "    uint mgl_p = mgl_t / mgl_invocations;\n");
@@ -3052,7 +3229,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    uint mgl_pi = mgl_p - mgl_inst * mgl_hdr[0];\n");
     sb_put(&b, "    mgl_load_inputs(mgl_pi, mgl_inst);\n");
     sb_put(&b, "    mgl_gs_prim_in = int(mgl_pi);\n    mgl_gs_invoc = int(mgl_inv);\n");
-    sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u;\n");
+    sb_put(&b, "    mgl_tag = mgl_p; mgl_seq = 0u; mgl_written = 0u; mgl_strip_n = 0u; mgl_stream = 0u; mgl_closes = 0u;\n");
     sb_put(&b, "    mgl_slot_base = mgl_t * mgl_hdr[5];\n");
     sb_put(&b, "    mgl_gs_pos = vec4(0.0);\n");
     if (gp->out_has_psize) sb_put(&b, "    mgl_gs_psize = 1.0;\n");
@@ -3076,6 +3253,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    mgl_gs_main();\n");
     sb_put(&b, "    mgl_gs_end_stream_primitive(mgl_stream);\n");
     sb_put(&b, "    mgl_cnt[mgl_t] = mgl_written;\n");
+    sb_put(&b, "    mgl_lscr[mgl_hdr[4] + mgl_t] = mgl_lcnt;\n");
     sb_put(&b, "    if (mgl_written != 0u) atomicAdd(mgl_ctl[0], mgl_written);\n");
     sb_put(&b, "}\n\n");
 
@@ -3140,6 +3318,11 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         gp->vp_loc = next_loc++;
         sb_put(&b, "layout(location = %u) flat out uint mgl_out_vp;\n", gp->vp_loc);
     }
+    if (gp->out_has_prim)
+    {
+        gp->prim_loc = next_loc++;
+        sb_put(&b, "layout(location = %u) flat out uint mgl_out_prim;\n", gp->prim_loc);
+    }
 
     sb_put(&b, "\nvoid main()\n{\n");
     sb_put(&b, "    uint r = uint(gl_VertexID) * %uu;\n", gp->out_words);
@@ -3152,6 +3335,8 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         sb_put(&b, "    mgl_out_layer = mgl_draw[r + %u];\n", gp->out_layer_off);
     if (gp->out_has_vp)
         sb_put(&b, "    mgl_out_vp = mgl_draw[r + %u];\n", gp->out_vp_off);
+    if (gp->out_has_prim)
+        sb_put(&b, "    mgl_out_prim = mgl_draw[r + %u];\n", gp->out_prim_off);
     for (int i = 0; i < gp->n_out; i++)
     {
         MGLGeomVar *v = &gp->out_v[i];
@@ -3342,6 +3527,18 @@ static bool geom_derive_exprs(MGLGeomProgram *gp, Program *vs_program, char **lo
     for (int i = 0; i < gp->n_in; i++)
     {
         int j = geom_find_location(vs_out, n_vs_out, gp->in_v[i].location);
+        if (j >= 0 && !geom_var_types_match(&vs_out[j], &gp->in_v[i]))
+        {
+            /* separately-linked stages (pipeline) assign automatic locations by their own
+             * declaration order: try the canonical name+type pairing before failing */
+            int k = geom_find_name(vs_out, n_vs_out, gp->in_v[i].name);
+            if (k >= 0 && geom_var_types_match(&vs_out[k], &gp->in_v[i])) j = k;
+        }
+        if (j < 0)
+        {
+            int k = geom_find_name(vs_out, n_vs_out, gp->in_v[i].name);
+            if (k >= 0) j = k;      /* same automatic-location caveat, unseen slot */
+        }
         if (j < 0)
         {
             /* GL leaves such an input undefined (its value may be anything): keep the
@@ -3439,6 +3636,39 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         mgl_append_log(log, "ERROR: geometry: invocations %u exceeds the limit %u\n",
                        gp->invocations, (unsigned)32);
         goto done;
+    }
+
+    /* link-time limit check: MGL reports MAX_GEOMETRY_ATOMIC_COUNTERS and
+     * MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS as 0 (see get.c - the geometry emulation has no
+     * atomic counter support yet), so a geometry shader that declares ANY atomic counter
+     * must fail the link, exactly as GL 4.6 7.11 does when the stage exceeds its limits
+     * (the CTS linking.more_ACs_in_GS / more_ACBs_in_GS_than_supported shape) */
+    {
+        uint32_t bindings[64];
+        int nac = 0, nacb = 0;
+
+        for (i = 0; i < m->n_vars; i++)
+        {
+            SpvVar *v = &m->vars[i];
+            uint32_t bind = 0;
+            int k;
+            bool seen = false;
+
+            if (v->storage != SpvStorageClassAtomicCounter) continue;
+            nac++;
+            if (spv_deco(m, v->id, SpvDecorationBinding, &bind))
+                for (k = 0; k < nacb; k++)
+                    if (bindings[k] == bind) { seen = true; break; }
+            if (!seen && nacb < 64) bindings[nacb++] = bind;
+        }
+        if (nac > 0)
+        {
+            mgl_append_log(log, "ERROR: geometry: the geometry stage uses %d atomic counter(s) in "
+                                "%d buffer(s), but MAX_GEOMETRY_ATOMIC_COUNTERS and "
+                                "MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS are 0 (no geometry-stage "
+                                "atomic counter support)\n", nac, nacb);
+            goto done;
+        }
     }
 
     /* fp64: `words` is already software-double lowered (u32 words).  The
@@ -3682,6 +3912,9 @@ static bool msl_value_parameters(char *msl, const char *entry)
 
 /* build (or rebuild) the emulation for one geometry stage; `program` is the program that
  * owns the vertex + geometry stages (a linked program, or a pipeline's composite) */
+/* forward: defined below mgl_geom_post_link's helpers */
+static void geom_patch_fs_primitive_id(GLMContext ctx, MGLGeomProgram *gp, Program *program);
+
 static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 {
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
@@ -3724,6 +3957,26 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                                         program->spirv[_GEOMETRY_SHADER].size, 460, &log);
             if (!gs_src) GEOM_FAIL("no geometry shader source: %s", log ? log : "?");
         }
+    }
+
+    /* Metal maps a fragment shader's gl_PrimitiveID to the rasterizer's primitive index,
+     * which knows nothing of the geometry stage (an emitted strip decomposes into several
+     * raster primitives, and the FS must see the GS's value instead).  When the linked
+     * fragment stage reads it, the output record always carries the primitive id and the
+     * pass-through vertex function forwards it as a varying (geom_patch_fs_primitive_id
+     * redirects the fragment function's attribute onto that varying below).  The kernel
+     * keeps the input primitive id in the word when the geometry shader never writes
+     * gl_PrimitiveID, which is the value Mesa feeds the fragment stage then. */
+    gp->fs_uses_prim = false;
+    if (program->spirv[_FRAGMENT_SHADER].msl_str &&
+        strstr(program->spirv[_FRAGMENT_SHADER].msl_str, "[[primitive_id]]"))
+        gp->fs_uses_prim = true;
+    if (gp->fs_uses_prim)
+    {
+        gp->out_has_prim = true;
+        /* the flag was not known when the stage was reflected: recompute the record
+         * layout so the output carries the primitive id word */
+        geom_layout(gp);
     }
 
     if (gp->from_tess)
@@ -3846,20 +4099,31 @@ build:
     pins_gl[4] = MGL_GEOM_SSBO_IDX;      pins_msl[4] = MGL_GEOM_MSL_IDX;
     pins_gl[5] = MGL_GEOM_SSBO_CTL;      pins_msl[5] = MGL_GEOM_MSL_CTL;
     pins_gl[6] = MGL_GEOM_SSBO_CNT;      pins_msl[6] = MGL_GEOM_MSL_CNT;
+    pins_gl[7] = MGL_GEOM_SSBO_LSCR;     pins_msl[7] = MGL_GEOM_MSL_LSCR;
     msl = geom_spirv_to_msl(ctx, GL_COMPUTE_SHADER, ir, words, gp->kernel_entry, false, &log,
-                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 7, pins2, npins2);
+                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 8, pins2, npins2);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
 
-    /* the kernel must have a stable name: SPIRV-Cross always emits "kernel void main0(" */
+    /* the kernel must have a stable name: SPIRV-Cross always emits "kernel void main0(".
+     * The replacement is longer than the match, so the rename goes through a fresh
+     * buffer: moving the tail in place writes past the end of the MSL string (it is a
+     * strdup of the exact length) and corrupts the heap. */
     {
         const char *want = "kernel void main0(";
+        const char *repl = "kernel void mgl_geom_gs(";
         char *e = strstr(msl, want);
         if (!e) GEOM_FAIL("kernel MSL has no main0 entry point");
         {
+            size_t pre = (size_t)(e - msl);
             size_t rest = strlen(e + strlen(want));
-            memmove(e + strlen("kernel void mgl_geom_gs("), e + strlen(want), rest + 1);
-            memcpy(e, "kernel void mgl_geom_gs(", strlen("kernel void mgl_geom_gs("));
+            char *out = xmalloc(pre + strlen(repl) + rest + 1);
+
+            memcpy(out, msl, pre);
+            memcpy(out + pre, repl, strlen(repl));
+            memcpy(out + pre + strlen(repl), e + strlen(want), rest + 1);
+            free(msl);
+            msl = out;
         }
     }
     msl_value_parameters(msl, "mgl_gs_main(");
@@ -3948,6 +4212,11 @@ build:
         if (gp->draw_function) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);
         gp->draw_library = lib;
         gp->draw_function = fn;
+
+        /* with a geometry stage the fragment shader's gl_PrimitiveID comes from the
+         * record the pass-through function feeds, not from the rasterizer */
+        if (gp->fs_uses_prim && gp->out_has_prim && !getenv("MGL_GEOM_NO_FSPRIM"))
+            geom_patch_fs_primitive_id(ctx, gp, program);
     }
     else
         GEOM_FAIL("no Metal compile hook available");
@@ -3961,6 +4230,226 @@ done:
     free(log);
 }
 
+/* whole-word identifier search: `name` must not be part of a longer identifier */
+static const char *geom_ident_find(const char *hay, const char *name, size_t nlen)
+{
+    const char *p = hay;
+
+    if (!nlen || !name) return NULL;
+    while ((p = strstr(p, name)) != NULL)
+    {
+        if ((p == hay || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')) &&
+            (!p[nlen] || (!isalnum((unsigned char)p[nlen]) && p[nlen] != '_')))
+            return p;
+        p += nlen;
+    }
+    return NULL;
+}
+
+/* small string-splice helpers for the MSL surgery below (one-shot, link time) */
+static char *geom_str_cut(const char *base, size_t from, size_t to)
+{
+    size_t n = strlen(base);
+    char *out;
+
+    if (to > n) to = n;
+    if (from > to) from = to;
+    out = xmalloc(n - (to - from) + 1);
+    memcpy(out, base, from);
+    memcpy(out + from, base + to, n - to + 1);
+    return out;
+}
+
+static char *geom_str_insert(const char *base, size_t at, const char *ins)
+{
+    size_t n = strlen(base), m = strlen(ins);
+    char *out = xmalloc(n + m + 1);
+
+    if (at > n) at = n;
+    memcpy(out, base, at);
+    memcpy(out + at, ins, m);
+    memcpy(out + at + m, base + at, n - at + 1);
+    return out;
+}
+
+/* Redirect the fragment function's gl_PrimitiveID attribute onto the varying the
+ * pass-through vertex function writes: Metal's [[primitive_id]] is the rasterizer's
+ * primitive index, which ignores the geometry stage entirely (an emitted strip becomes
+ * several raster primitives, all of which must see the value the GS wrote).
+ *
+ * The AGX device layer rejects integer fragment inputs as bare entry parameters (it
+ * misreads them as color attachment inputs), so the id moves into the entry's
+ * [[stage_in]] struct — exactly where SPIRV-Cross puts every other varying — and the
+ * body's references are renamed onto the struct member. */
+static void geom_patch_fs_primitive_id(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+{
+    const char *fmsl = program->spirv[_FRAGMENT_SHADER].msl_str;
+    const char *attr = fmsl ? strstr(fmsl, "[[primitive_id]]") : NULL;
+    const char *name_end, *pb, *pe, *pl, *p;
+    char entry[96], entry_open[104], in_struct[112], member[160], name[80];
+    char *cur = NULL, *tmp;
+    size_t nlen, from, to, at;
+    const char *body, *hit;
+    char stage_in_name[32];
+    void *lib = NULL, *fn = NULL;
+    char *err = NULL;
+    const char *fs_entry;
+    Shader *fs = program->shader_slots[_FRAGMENT_SHADER];
+
+    if (!attr || !fs) return;
+
+    /* the parameter holding the attribute is "uint <name> [[primitive_id]]" */
+    pb = attr;
+    while (pb > fmsl && *pb != ',' && *pb != '(') pb--;
+    if (pb == fmsl || (*pb != ',' && *pb != '(')) return;
+    pe = attr + strlen("[[primitive_id]]");
+    while (*pe == ' ') pe++;
+    if (*pe != ',' && *pe != ')') return;               /* trailing attributes: not handled */
+
+    name_end = attr;
+    while (name_end > pb && name_end[-1] == ' ') name_end--;
+    p = name_end;
+    while (p > pb && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) p--;
+    nlen = (size_t)(name_end - p);
+    if (!nlen || nlen >= sizeof name) return;
+    memcpy(name, name_end - nlen, nlen);
+    name[nlen] = 0;
+
+    /* entry name: the identifier ending at the parameter list's '(' */
+    pl = pb;
+    while (pl > fmsl && *pl != '(') pl--;
+    if (pl == fmsl) return;
+    {
+        const char *e2 = pl;
+        while (e2 > fmsl && e2[-1] == ' ') e2--;
+        p = e2;
+        while (p > fmsl && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) p--;
+        if (p == e2 || (size_t)(e2 - p) >= sizeof entry - 8) return;
+        memcpy(entry, p, (size_t)(e2 - p));
+        entry[e2 - p] = 0;
+    }
+    snprintf(entry_open, sizeof entry_open, "%s(", entry);
+    snprintf(in_struct, sizeof in_struct, "struct %s_in", entry);
+    snprintf(member, sizeof member, "    uint %.*s [[user(locn%u)]];\n", (int)nlen, name_end - nlen, gp->prim_loc);
+
+    /* 1. drop the parameter (keeping the list a valid parameter list) */
+    from = (size_t)(pb - fmsl) + 1;
+    if (*pe == ',')
+    {
+        to = (size_t)(pe - fmsl) + 1;
+    }
+    else
+    {
+        to = (size_t)(pe - fmsl);
+        if (*pb == ',') from = (size_t)(pb - fmsl);
+    }
+    cur = geom_str_cut(fmsl, from, to);
+
+    /* the stage_in parameter's name (SPIRV-Cross uses "in"; created below otherwise) */
+    snprintf(stage_in_name, sizeof stage_in_name, "in");
+
+    /* 2. add the id as a member of the entry's input struct (created if the shader has
+     *    no other varyings) */
+    if ((hit = strstr(cur, in_struct)) != NULL)
+    {
+        const char *close = strstr(hit, "};");
+        if (!close) { free(cur); return; }
+        /* existing [[stage_in]] parameter: keep its name */
+        {
+            const char *si = strstr(cur, "[[stage_in]]");
+            if (si)
+            {
+                const char *e2 = si;
+                while (e2 > cur && e2[-1] == ' ') e2--;
+                p = e2;
+                while (p > cur && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) p--;
+                if (e2 - p > 0 && (size_t)(e2 - p) < sizeof stage_in_name)
+                {
+                    memcpy(stage_in_name, p, (size_t)(e2 - p));
+                    stage_in_name[e2 - p] = 0;
+                }
+            }
+        }
+        tmp = geom_str_insert(cur, (size_t)(close - cur), member);
+        free(cur);
+        cur = tmp;
+    }
+    else
+    {
+        const char *esig = strstr(cur, entry_open);
+        const char *line;
+        char decl[256];
+
+        if (!esig) { free(cur); return; }
+        line = esig;
+        while (line > cur && line[-1] != '\n') line--;
+        snprintf(decl, sizeof decl, "%s\n{\n%s};\n\n", in_struct, member);
+        tmp = geom_str_insert(cur, (size_t)(line - cur), decl);
+        free(cur);
+        cur = tmp;
+
+        esig = strstr(cur, entry_open);
+        at = (size_t)(esig - cur) + strlen(entry_open);
+        {
+            char param[160];
+            snprintf(param, sizeof param, " %s_in %s [[stage_in]]%s", entry, stage_in_name,
+                     (cur[at] == ')') ? "" : ",");
+            tmp = geom_str_insert(cur, at, param);
+            free(cur);
+            cur = tmp;
+        }
+    }
+
+    /* 3. rename the body's references onto the struct member */
+    {
+        const char *esig = strstr(cur, entry_open);
+        const char *brace;
+
+        if (!esig) { free(cur); return; }
+        brace = strchr(esig, '{');
+        if (!brace) { free(cur); return; }
+        body = brace + 1;
+
+        {
+            size_t body_at = (size_t)(body - cur);
+            SB b;
+            const char *s = body;
+            const char *nm = name;
+
+            memset(&b, 0, sizeof b);
+            sb_put(&b, "%.*s", (int)body_at, cur);
+            while ((hit = geom_ident_find(s, nm, nlen)) != NULL)
+            {
+                sb_put(&b, "%.*s%s.%.*s", (int)(hit - s), s, stage_in_name, (int)nlen, nm);
+                s = hit + nlen;
+            }
+            sb_put(&b, "%s", s);
+            free(cur);
+            cur = b.s;      /* ownership moves */
+        }
+    }
+
+    /* 4. compile and install (a failure keeps the original function: gl_PrimitiveID
+     *    then reports the raster primitive index, which is wrong for a GS but keeps
+     *    the program drawing) */
+    fs_entry = program->spirv[_FRAGMENT_SHADER].entry_point ?
+               program->spirv[_FRAGMENT_SHADER].entry_point : fs->entry_point;
+    if (!ctx->mtl_funcs.ext_program || !ctx->mtl_funcs.ext_program->compile_msl ||
+        !ctx->mtl_funcs.ext_program->compile_msl(ctx, cur, fs_entry, &lib, &fn, &err))
+    {
+        free(cur);
+        free(err);
+        return;
+    }
+
+    free(program->spirv[_FRAGMENT_SHADER].msl_str);
+    program->spirv[_FRAGMENT_SHADER].msl_str = cur;
+    if (fs->mtl_data.library) ctx->mtl_funcs.ext_program->release_obj(ctx, fs->mtl_data.library);
+    if (fs->mtl_data.function) ctx->mtl_funcs.ext_program->release_obj(ctx, fs->mtl_data.function);
+    fs->mtl_data.library = lib;
+    fs->mtl_data.function = fn;
+    geom_dump("fsprim.msl", cur);
+}
 /* post-link hook: the emulation is built here unless the program has no vertex stage of
  * its own (a separable geometry-only program gets it from the pipeline at draw time) */
 void mgl_geom_post_link(GLMContext ctx, Program *program)
@@ -4203,8 +4692,10 @@ static uint64_t geom_assemble(GLMContext ctx, MGLGeomProgram *gp, GLenum mode, c
                 EMIT2(i, i + 1);
                 break;
             case GL_LINE_LOOP:
+                /* the loop's closing segment (n-1, 0): the loop bound i + k <= n stops at
+                 * i = n - 2, so the wrap-around segment is emitted after the loop (the
+                 * dead `else` arm above never fired for the same reason) */
                 if (i + 1 < n) EMIT2(i, i + 1);
-                else EMIT2(i, 0);
                 break;
             case GL_LINES_ADJACENCY:
             case GL_LINE_STRIP_ADJACENCY:
@@ -4250,6 +4741,13 @@ static uint64_t geom_assemble(GLMContext ctx, MGLGeomProgram *gp, GLenum mode, c
             default:
                 break;
         }
+    }
+    if (mode == GL_LINE_LOOP && n >= 2 && np < cap)
+    {
+        /* close the loop: (n-1, 0) */
+        out[np * k + 0] = idx[n - 1] + base;
+        out[np * k + 1] = idx[0] + base;
+        np++;
     }
 
 #undef EMIT1
@@ -5311,15 +5809,31 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
     MGLXfbProgram *xp = geom_xfb_prog(ctx, gp->program, false);
     uint32_t count = ctl ? ctl[0] : 0;
     uint32_t prims = ctl ? ctl[13] : 0;
+    uint32_t written = 0;    /* primitives whose last vertex actually landed */
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
 
     if (!o || !o->active || !xp || !xp->count || !count) return;
     if (!records || !cnt) return;
 
+    GLuint per = (gp->out_type == GL_LINE_STRIP) ? 2 :
+                 (gp->out_type == GL_TRIANGLE_STRIP) ? 3 : 1;
+    uint32_t close_base = 0;   /* closed stream-0 primitives in the threads before t */
+    uint32_t extent[4] = { 0, 0, 0, 0 };
+
+    /* the per-buffer captured extent: a primitive fits when its last vertex's largest
+     * varying fits (GL records whole primitives, never a partial one) */
+    for (GLuint v = 0; v < xp->count; v++)
+        if (xp->vars[v].words)
+        {
+            uint32_t e = (uint32_t)(xp->vars[v].offset + xp->vars[v].words * 4);
+            if (xp->vars[v].buffer < 4 && e > extent[xp->vars[v].buffer]) extent[xp->vars[v].buffer] = e;
+        }
+
     for (uint32_t t = 0; t < cnt_words; t++)
     {
         uint32_t n = cnt[t];
         uint32_t base_slot = t * gp->max_vertices;
+        uint32_t thread_prims = 0;   /* captured primitives this thread closed */
 
         if (base_slot + n > (uint32_t)(words / gp->out_words)) break;
 
@@ -5332,39 +5846,77 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
              * it is stream 0 (the default) */
             if (stream != 0) continue;
 
-            for (GLuint v = 0; v < xp->count; v++)
+            /* only the vertex closing a strip captures anything: the geometry kernel
+             * flags exactly the non-degenerate closes, and the tag carries the strip's
+             * length (bits 0..7) plus the primitives the thread closed before it
+             * (bits 9..23).  The strip decomposes into n-per+1 line / triangle
+             * primitives, every one captured with all of its vertices. */
+            if (!((rec[1] >> 8) & 1u)) continue;
             {
-                MGLXfbVarying *var = &xp->vars[v];
-                Buffer *buf;
-                uint32_t *dst;
-                size_t pos;
+                uint32_t n = rec[1] & 0xffu;
+                uint32_t before = (rec[1] >> 9) & 0x7fffu;
 
-                if (!var->words) continue;                    /* skip / next-buffer markers */
-                if (!(xp->buffer_mask & (1u << var->buffer))) continue;
-                buf = tfb[var->buffer].buf;
-                if (!buf || !buf->data.buffer_data) continue;
+                if (n >= per) thread_prims += n - per + 1u;
+                if (n < per) continue;          /* defensive: a degenerate close */
 
-                pos = (size_t)(o->write_offset[var->buffer] + var->offset);
-                if (pos + var->words * 4 > (size_t)buf->size) continue;   /* full: drop, as GL does */
+                for (uint32_t p = 0; p + per <= n; p++)
+                {
+                    uint32_t prim = close_base + before + p;
+                    bool fits = true;
 
-                dst = (uint32_t *)((uint8_t *)buf->data.buffer_data + pos);
-                for (GLuint w = 0; w < var->words; w++)
-                    dst[w] = rec[var->src_word + w];
+                    for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+                    {
+                        if (!(xp->buffer_mask & (1u << b))) continue;
+                        Buffer *buf = tfb[b].buf;
+                        size_t endb = (size_t)o->write_offset[b]
+                                      + (size_t)(prim * per + per - 1u) * xp->stride[b] + extent[b];
+                        if (!buf || endb > (size_t)buf->size) { fits = false; break; }
+                    }
+                    if (!fits) break;           /* full: the primitive is dropped, as GL does */
+
+                    for (uint32_t j = 0; j < per; j++)
+                    {
+                        const uint32_t *rj = records + (size_t)(base_slot + s - n + 1u + p + j) * gp->out_words;
+
+                        for (GLuint v = 0; v < xp->count; v++)
+                        {
+                            MGLXfbVarying *var = &xp->vars[v];
+                            Buffer *buf;
+                            uint32_t *dst;
+                            size_t pos;
+
+                            if (!var->words) continue;            /* skip / next-buffer markers */
+                            if (!(xp->buffer_mask & (1u << var->buffer))) continue;
+                            buf = tfb[var->buffer].buf;
+                            if (!buf || !buf->data.buffer_data) continue;
+
+                            pos = (size_t)o->write_offset[var->buffer]
+                                  + (size_t)(prim * per + j) * xp->stride[var->buffer] + var->offset;
+                            dst = (uint32_t *)((uint8_t *)buf->data.buffer_data + pos);
+                            for (GLuint w = 0; w < var->words; w++)
+                                dst[w] = rj[var->src_word + w];
+                        }
+                    }
+
+                    /* the whole primitive landed: advance every buffer by its per vertices */
+                    for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+                        if (xp->buffer_mask & (1u << b))
+                            o->write_offset[b] += (GLsizeiptr)(per * xp->stride[b]);
+                    o->vertices[0] += per;
+                    written++;
+                }
             }
-
-            for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
-                if (xp->buffer_mask & (1u << b))
-                    o->write_offset[b] += xp->stride[b];
-            o->vertices[0]++;
         }
+
+        close_base += thread_prims;
     }
 
-    o->prims_written[0] += prims;
+    o->prims_written[0] += written;
     o->prims_needed[0] += prims;
     if (ctx->state.ext_xfb)
     {
         struct MGLExtState_xfb *x = ctx->state.ext_xfb;
-        x->total_written[0] += prims;
+        x->total_written[0] += written;
         x->total_needed[0] += prims;
     }
 
@@ -5378,7 +5930,7 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
             note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
             looked = 1;
         }
-        if (note) note(ctx, 0, prims, prims);
+        if (note) note(ctx, 0, written, prims);
     }
 }
 

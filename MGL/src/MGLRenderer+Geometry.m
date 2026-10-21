@@ -100,6 +100,7 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
+static id<MTLComputePipelineState> gLscanPso, gLcopyPso, gLzeroPso;   /* raster list order passes */
 /* tile-parallel prep (large draws): per-tile restart counts -> prefix sum -> per-tile run
  * records -> parallel emit; see the comment block in kGeomPrepMSL */
 static id<MTLComputePipelineState> gPrepcPso, gTilesPso, gPrefixPso, gRunsPso, gReducePso, gEmitPso;
@@ -147,6 +148,11 @@ static id<MTLComputePipelineState> gPrepPso, gTessImportPso;
 static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
 static id<MTLComputePipelineState> gXfbTessPso, gXfbTessFinPso;
 static id<MTLComputePipelineState> gFinPso;
+static id<MTLComputePipelineState> gQaccPso;      /* query accumulator (see mgl_geom_qacc) */
+static id<MTLBuffer> gQacc;                       /* 8 persistent query words, shared storage */
+static uint32_t gQaccReset;                       /* words that restart at the next draw */
+static bool gQaccRan;                             /* an update was encoded since the last begin */
+static id<MTLCommandBuffer> gQaccCb;              /* last command buffer holding an update */
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
 
 /* stringise a macro value for the embedded MSL */
@@ -277,9 +283,9 @@ static const char *kGeomPrepMSL =
     "                uint id;\n"
     "                switch (mode) {\n"
     "                    case 0u: id = p; break;                                  /* points */\n"
-    "                    case 1u: case 2u: case 5u: id = p + v; break;            /* line-ish, stride 1 */\n"
+    "                    case 2u: case 5u: id = p + v; break;                     /* line strip(-adj): stride 1 */\n"
     "                    case 3u: id = (p + v < subcount) ? p + v : 0u; break;    /* line loop */\n"
-    "                    case 4u: case 6u: case 9u: id = p * k + v; break;        /* disjoint groups: lines adj (4) / tri (3) / tri adj (6) */\n"
+    "                    case 1u: case 4u: case 6u: case 9u: id = p * k + v; break; /* disjoint groups: lines (2) / lines adj (4) / tri (3) / tri adj (6) */\n"
     "                    case 10u: {                                             /* tri strip adj: GL 4.6 table 10.4 (even slots triangle\n"
     "                                                                               verts, odd adjacency; odd triangles flip winding; first/last\n"
     "                                                                               triangle has no preceding/following adjacency) */\n"
@@ -717,6 +723,7 @@ static const char *kGeomXfbMSL =
     "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; };\n"
     "\n"
     "kernel void mgl_geom_xfb_prefix(constant uint* in [[buffer(0)]],\n"
+    "                                const device uint* recs [[buffer(4)]],\n"
     "                                const device uint* cnt [[buffer(1)]],\n"
     "                                device uint* xbase [[buffer(2)]],\n"
     "                                device uint* xfb [[buffer(3)]],\n"
@@ -725,6 +732,7 @@ static const char *kGeomXfbMSL =
     "    threadgroup uint tgr[WG];\n"
     "    threadgroup uint carry[1];\n"
     "    uint threads = in[0];\n"
+    "    uint maxv = in[1], out_words = in[2];\n"
     "    uint v;\n"
     "\n"
     "    if (tid == 0u) { carry[0] = 0u; xfb[8] = 0u; }   /* per-draw vertex counter */\n"
@@ -732,7 +740,21 @@ static const char *kGeomXfbMSL =
     "\n"
     "    for (uint base = 0u; base < threads; base += WG) {\n"
     "        uint i = base + tid;\n"
-    "        v = (i < threads) ? cnt[i] : 0u;\n"
+    "        v = 0u;\n"
+    "        if (i < threads) {\n"
+    "            /* GL captures whole primitives, so the pack is indexed by captured\n"
+    "             * primitive, not by emitted vertex: the scan input is the thread's count\n"
+    "             * of primitives it closed - each flagged record stands for the n-per+1\n"
+    "             * primitives its strip (n vertices, tag bits 0..7) decomposes into.\n"
+    "             * Degenerate strips never get the flag, matching the scatter. */\n"
+    "            const device uint* r = recs + (size_t)i * maxv * out_words;\n"
+    "            uint per = (in[13] == 2u) ? 3u : (in[13] == 1u) ? 2u : 1u;\n"
+    "            for (uint s = 0u, n = cnt[i]; s < n; s++) {\n"
+    "                uint w = r[(size_t)s * out_words + 1u];\n"
+    "                uint sv = w & 0xffu;\n"
+    "                if (((w >> 8) & 1u) && ((w >> 24) == 0u) && sv >= per) v += sv - per + 1u;\n"
+    "            }\n"
+    "        }\n"
     "        tgr[tid] = v;\n"
     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "        for (uint s = 1u; s < WG; s *= 2u) {          /* inclusive scan */\n"
@@ -769,20 +791,51 @@ static const char *kGeomXfbMSL =
     "    if (t >= in[0] || s >= cnt[t]) return;\n"
     "\n"
     "    const device uint* rec = recs + (size_t)slot * out_words;\n"
-    "    if (((rec[1] >> 24) & 0xffu) != 0u) return;       /* the rasterization stream */\n"
+    "    if (((rec[1] >> 24) & 0xffu) != 0u) return;       /* only the rasterization stream */\n"
+    "    if (((rec[1] >> 8) & 1u) == 0u) return;           /* only the vertex closing a primitive */\n"
     "\n"
-    "    uint out_index = xbase[t] + s;\n"
-    "    for (uint v = 0u; v < nvars; v++) {\n"
-    "        constant mgl_geom_xfb_var& vr = vars[v];\n"
-    "        device uint* d = dst[vr.buffer];\n"
-    "        uint stride = in[4 + vr.buffer];\n"
-    "        if (!stride || !vr.words) continue;           /* skip / next-buffer markers */\n"
-    "        uint pos = xfb[3 + vr.buffer] + out_index * stride + vr.dst_off;\n"
-    "        if (pos + vr.words * 4u > in[8 + vr.buffer]) continue;   /* full: drop, as GL does */\n"
-    "        for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rec[vr.src_word + w];\n"
+    "    /* GL records WHOLE primitives: the closed strip decomposes into its line /\n"
+    "     * triangle primitives and every vertex of each is captured, so shared strip\n"
+    "     * vertices are written once per primitive; a primitive whose last vertex would\n"
+    "     * not fit is not recorded at all (no partial writes).  The tag carries the\n"
+    "     * strip's length (bits 0..7) and the primitives the thread closed before it\n"
+    "     * (bits 9..23); with the prefix scan (xbase) that gives each decomposed\n"
+    "     * primitive its global captured index.  The geometry stage flags only strips\n"
+    "     * long enough to close one primitive, so the strip's records are in range. */\n"
+    "    uint per = (in[13] == 2u) ? 3u : (in[13] == 1u) ? 2u : 1u;\n"
+    "    uint n = rec[1] & 0xffu;\n"
+    "    uint before = (rec[1] >> 9) & 0x7fffu;\n"
+    "    uint first = s + 1u - n;                       /* the strip's first record */\n"
+    "    for (uint p = 0u; p + per <= n; p++) {\n"
+    "        uint prim = xbase[t] + before + p;\n"
+    "\n"
+    "        /* capacity test on the primitive's LAST vertex: a buffer must have room for\n"
+    "         * its largest varying there (in[14+b]).  The test is monotonic in the write\n"
+    "         * offsets, so once a primitive does not fit, no later one does - GL stops\n"
+    "         * recording. */\n"
+    "        bool fits = true;\n"
+    "        for (uint b = 0u; b < 4u; b++) {\n"
+    "            if (!in[4 + b]) continue;\n"
+    "            uint end = xfb[3 + b] + (prim * per + per - 1u) * in[4 + b] + in[14 + b];\n"
+    "            if (end > in[8 + b]) fits = false;      /* full: the primitive is dropped, as GL does */\n"
+    "        }\n"
+    "        if (!fits) return;\n"
+    "\n"
+    "        for (uint j = 0u; j < per; j++) {\n"
+    "            const device uint* rj = recs + (size_t)(slot - n + 1u + p + j) * out_words;\n"
+    "            for (uint v = 0u; v < nvars; v++) {\n"
+    "                constant mgl_geom_xfb_var& vr = vars[v];\n"
+    "                device uint* d = dst[vr.buffer];\n"
+    "                uint stride = in[4 + vr.buffer];\n"
+    "                if (!stride || !vr.words) continue; /* skip / next-buffer markers */\n"
+    "                uint pos = xfb[3 + vr.buffer] + (prim * per + j) * stride + vr.dst_off;\n"
+    "                for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rj[vr.src_word + w];\n"
+    "            }\n"
+    "        }\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], per, memory_order_relaxed);\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], per, memory_order_relaxed);\n"
+    "        atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], 1u, memory_order_relaxed);\n"
     "    }\n"
-    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], 1u, memory_order_relaxed);\n"
-    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], 1u, memory_order_relaxed);\n"
     "}\n"
     "\n"
     "kernel void mgl_geom_xfb_finish(constant uint* in [[buffer(0)]],\n"
@@ -791,7 +844,8 @@ static const char *kGeomXfbMSL =
     "{\n"
     "    for (uint b = 0u; b < 4u; b++)\n"
     "        if (in[4 + b]) xfb[3 + b] += xfb[8] * in[4 + b];\n"
-    "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[2], ctl[13], memory_order_relaxed);\n"
+    "    /* the primitives-written count is accumulated by the scatter kernel (it knows the\n"
+    "     * buffer capacities, so a primitive that does not fit is not counted) */\n"
     "}\n"
     "\n"
     "/* initialise the counter block on the command stream: the CPU must never write it while\n"
@@ -876,11 +930,86 @@ static const char *kGeomCtlMSL =
     "    c.mgl_ctl[10] = 0u;                /* startIndex  */\n"
     "    c.mgl_ctl[11] = 0u;                /* baseVertex  */\n"
     "    c.mgl_ctl[12] = 0u;                /* baseInstance */\n"
+    "}\n"
+    "\n"
+    "/* query accumulator: folds one draw's per-stream geometry-stage counters into the\n"
+    " * persistent query words.  A word whose reset bit is set restarts at this draw's\n"
+    " * value (the CPU raises the bit when a query begins, so the first draw after it\n"
+    " * opens a new counting period); every other word accumulates.  Dispatched with a\n"
+    " * single thread right after the geometry kernel of every geometry-stage draw, in\n"
+    " * the same compute encoder - consecutive dispatches there are ordered.\n"
+    " * Word w < 4: PRIMITIVES_GENERATED stream w (ctl[17 + w], the primitives the\n"
+    " * rasterizer / transform feedback consume, strips decomposed).  Word 4 + w:\n"
+    " * GEOMETRY_SHADER_PRIMITIVES_EMITTED stream w (ctl[13 + w], one per emitted\n"
+    " * primitive as the shader closed it). */\n"
+    "kernel void mgl_geom_qacc(device mgl_geom_ctl& c [[buffer(0)]],\n"
+    "                          device uint* acc [[buffer(1)]],\n"
+    "                          constant uint& reset_mask [[buffer(2)]])\n"
+    "{\n"
+    "    for (uint w = 0u; w < 8u; w++)\n"
+    "    {\n"
+    "        uint v = (w < 4u) ? c.mgl_ctl[17u + w] : c.mgl_ctl[9u + w];\n"
+    "        if ((reset_mask >> w) & 1u) acc[w] = v;\n"
+    "        else                        acc[w] += v;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* order pass 0: the per-thread list counts start at zero - threads beyond this\n"
+    " * draw's dispatch grid (an indirect draw's exact group count is smaller than the\n"
+    " * worst-case bound) never run the geometry kernel to publish a zero themselves */\n"
+    "kernel void mgl_geom_lzero(constant uint* in [[buffer(0)]],\n"
+    "                           device uint* lc  [[buffer(1)]],\n"
+    "                           uint t [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (t >= in[0]) return;\n"
+    "    lc[t] = 0u;\n"
+    "    lc[in[0] + t] = 0u;\n"
+    "}\n"
+    "\n"
+    "/* order pass 1: exclusive prefix sum of the per-thread list entry counts (lc[t])\n"
+    " * into lc[T + t], and the total into ctl[1].  A single 32-wide simdgroup walks the\n"
+    " * whole thread range in chunks of 32, carrying the running total. */\n"
+    "kernel void mgl_geom_lscan(constant uint* in [[buffer(0)]],\n"
+    "                           device uint* c   [[buffer(1)]],\n"
+    "                           device uint* lc  [[buffer(2)]],\n"
+    "                           uint sgid [[thread_index_in_simdgroup]])\n"
+    "{\n"
+    "    uint T = in[0], carry = 0u;\n"
+    "    for (uint base = 0u; base < T; base += 32u)\n"
+    "    {\n"
+    "        uint t = base + sgid;\n"
+    "        uint orig = (t < T) ? lc[t] : 0u;\n"
+    "        uint v = orig;\n"
+    "        for (uint o = 1u; o < 32u; o <<= 1)\n"
+    "        {\n"
+    "            uint u = simd_shuffle_up(v, o);\n"
+    "            if (sgid >= o) v += u;\n"
+    "        }\n"
+    "        if (t < T) lc[T + t] = carry + v - orig;    /* exclusive base */\n"
+    "        carry += simd_broadcast(v, 31u);\n"
+    "    }\n"
+    "    if (sgid == 0u) c[1] = carry;                   /* total list entries */\n"
+    "}\n"
+    "\n"
+    "/* order pass 2: copy each thread's scratch segment into the raster list at its\n"
+    " * scanned offset - the segments then sit in primitive order, which an atomicAdd\n"
+    " * append could not guarantee */\n"
+    "kernel void mgl_geom_lcopy(constant uint* in [[buffer(0)]],\n"
+    "                           device uint* lscr [[buffer(1)]],\n"
+    "                           device uint* lc   [[buffer(2)]],\n"
+    "                           device uint* idx  [[buffer(3)]],\n"
+    "                           uint t [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (t >= in[0]) return;\n"
+    "    uint n = lc[t];\n"
+    "    if (n == 0u) return;\n"
+    "    uint dst = lc[in[0] + t], src = t * in[1];\n"
+    "    for (uint i = 0u; i < n; i++) idx[dst + i] = lscr[src + i];\n"
     "}\n";
 
 static bool geomCtlPipelines(id<MTLDevice> device)
 {
-    if (gInitPso && gFinPso && gPrepPso) return true;
+    if (gInitPso && gFinPso && gPrepPso && gLscanPso && gLcopyPso && gLzeroPso && gQaccPso) return true;
 
     NSError *error = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomCtlMSL]
@@ -892,11 +1021,19 @@ static bool geomCtlPipelines(id<MTLDevice> device)
     }
     id<MTLFunction> initfn = [lib newFunctionWithName: @"mgl_geom_init"];
     id<MTLFunction> finfn = [lib newFunctionWithName: @"mgl_geom_finalize"];
-    if (!initfn || !finfn) return false;
+    id<MTLFunction> lscanfn = [lib newFunctionWithName: @"mgl_geom_lscan"];
+    id<MTLFunction> lcopyfn = [lib newFunctionWithName: @"mgl_geom_lcopy"];
+    id<MTLFunction> lzerofn = [lib newFunctionWithName: @"mgl_geom_lzero"];
+    id<MTLFunction> qaccfn = [lib newFunctionWithName: @"mgl_geom_qacc"];
+    if (!initfn || !finfn || !lscanfn || !lcopyfn || !lzerofn || !qaccfn) return false;
 
     gInitPso = [device newComputePipelineStateWithFunction: initfn error: &error];
     gFinPso = [device newComputePipelineStateWithFunction: finfn error: &error];
-    if (!gInitPso || !gFinPso) return false;
+    gLscanPso = [device newComputePipelineStateWithFunction: lscanfn error: &error];
+    gLcopyPso = [device newComputePipelineStateWithFunction: lcopyfn error: &error];
+    gLzeroPso = [device newComputePipelineStateWithFunction: lzerofn error: &error];
+    gQaccPso = [device newComputePipelineStateWithFunction: qaccfn error: &error];
+    if (!gInitPso || !gFinPso || !gLscanPso || !gLcopyPso || !gLzeroPso || !gQaccPso) return false;
 
     /* the prep kernel lives in its own library (it declares its own input struct) */
     id<MTLLibrary> plib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomPrepMSL]
@@ -985,8 +1122,9 @@ static void geomReleaseStatics(void)
     memset(&gOutvPool, 0, sizeof gOutvPool);
     memset(&gCntPool, 0, sizeof gCntPool);
     gXbase = nil; gXfb = nil; gXfbPending = false;
+    gQacc = nil; gQaccCb = nil; gQaccReset = 0; gQaccRan = false;
     gXfbOwner = 0; gXfbBegin = false;
-    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gTessImportPso = nil;
+    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gLscanPso = gLcopyPso = gLzeroPso = nil; gTessImportPso = nil;
     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
     gXfbTessPso = nil; gXfbTessFinPso = nil;
 
@@ -1040,6 +1178,61 @@ bool geom_xfb_gpu_pending(void)
     return gXfbPending;
 }
 
+/* exact geometry-stage query counting: the accumulator words of gQacc are written by a
+ * dispatch that follows every geometry kernel, so a read must first let the command
+ * buffer holding the last one retire (queries.c calls these through ext_geom) */
+- (void) geomQueryBegin: (unsigned) words
+{
+    gQaccReset |= words;
+    gQaccRan = false;
+}
+
+- (void) geomQueryRead: (unsigned) word out: (uint64_t *) out
+{
+    if (!out) return;
+    if (!gQacc || !gQaccRan || word >= 8) { *out = 0; return; }
+
+    if (gQaccCb == _currentCommandBuffer)
+    {
+        BUF()->flush(ctx);                      /* commits it */
+        [gQaccCb waitUntilCompleted];
+    }
+    else if (gQaccCb.status < MTLCommandBufferStatusCommitted)
+    {
+        [self endRenderEncoding];
+        [self commitCommandBufferWithAGXRecovery: gQaccCb];
+        if (gQaccCb.status != MTLCommandBufferStatusError)
+            [gQaccCb waitUntilCompleted];
+    }
+    else if (gQaccCb.status != MTLCommandBufferStatusError &&
+             gQaccCb.status != MTLCommandBufferStatusCompleted)
+    {
+        [gQaccCb waitUntilCompleted];
+    }
+
+    *out = ((volatile uint32_t *)gQacc.contents)[word];
+    if (getenv("MGL_GEOM_QDEBUG"))
+        fprintf(stderr, "geom: qacc read w%u -> %u  [%u %u %u %u | %u %u %u %u] ran=%d\n",
+                word, (unsigned)*out,
+                ((volatile uint32_t *)gQacc.contents)[0], ((volatile uint32_t *)gQacc.contents)[1],
+                ((volatile uint32_t *)gQacc.contents)[2], ((volatile uint32_t *)gQacc.contents)[3],
+                ((volatile uint32_t *)gQacc.contents)[4], ((volatile uint32_t *)gQacc.contents)[5],
+                ((volatile uint32_t *)gQacc.contents)[6], ((volatile uint32_t *)gQacc.contents)[7],
+                (int)gQaccRan);
+}
+
+static void geomQueryBeginC(GLMContext glm_ctx, unsigned words)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    [r geomQueryBegin: words];
+}
+
+static void geomQueryReadC(GLMContext glm_ctx, unsigned word, uint64_t *out)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    [r geomQueryRead: word out: out];
+}
+
 bool geom_xfb_gpu_valid(GLMContext ctx, GLuint name)
 {
     (void)ctx;
@@ -1086,7 +1279,10 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     for (GLuint b = 0; b < 4; b++)
     {
         in[3 + b] = (uint32_t)xp->stride[b];
-        in[8 + b] = (uint32_t)(tfb[b].buf ? tfb[b].buf->data.buffer_size : 0);
+        /* the bound range, not the Metal backing size: a pooled buffer is rounded up
+         * (4096 for small allocations) and the pack's fill test must use the range the
+         * GL object actually exposes */
+        in[8 + b] = (uint32_t)(tfb[b].buf ? (tfb[b].size ? tfb[b].size : tfb[b].buf->size) : 0);
     }
     in[12] = src->per_prim;                /* captured vertices per primitive */
 
@@ -1206,10 +1402,20 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     in[1] = max_vertices ? max_vertices : 1;
     in[2] = out_words;
     in[3] = (uint32_t)xp->count;
+    /* vertices per primitive of the feedback mode: the pack counts written primitives
+     * in these units (a strip output decomposes into its n-1 / n-2 line / triangle
+     * primitives) */
+    in[12] = (o->primitive_mode == GL_LINES) ? 2u : (o->primitive_mode == GL_TRIANGLES) ? 3u : 1u;
+    /* the geometry stage's output type (0 points, 1 line_strip, 2 triangle_strip):
+     * it decides how the emitted vertices form feedback primitives */
+    in[13] = (gp->out_type == GL_LINE_STRIP) ? 1u : (gp->out_type == GL_TRIANGLE_STRIP) ? 2u : 0u;
     for (GLuint b = 0; b < 4; b++)
     {
         in[4 + b] = (uint32_t)xp->stride[b];
-        in[8 + b] = (uint32_t)(tfb[b].buf ? tfb[b].buf->data.buffer_size : 0);
+        /* the bound range, not the Metal backing size: a pooled buffer is rounded up
+         * (4096 for small allocations) and the pack's fill test must use the range the
+         * GL object actually exposes */
+        in[8 + b] = (uint32_t)(tfb[b].buf ? (tfb[b].size ? tfb[b].size : tfb[b].buf->size) : 0);
     }
 
     memset(vars, 0, sizeof vars);
@@ -1219,6 +1425,14 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         vars[v * 4 + 1] = (uint32_t)xp->vars[v].offset;
         vars[v * 4 + 2] = (uint32_t)xp->vars[v].words;
         vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
+        /* the per-buffer captured extent: the scatter's capacity test checks the last
+         * vertex of a primitive against the buffer's largest varying (bytes) */
+        if (xp->vars[v].words)
+        {
+            uint32_t e = (uint32_t)(xp->vars[v].offset + xp->vars[v].words * 4);
+            GLuint b = xp->vars[v].buffer;
+            if (b < 4 && e > in[14 + b]) in[14 + b] = e;
+        }
     }
 
     if (!gXfbFence) gXfbFence = [_device newFence];
@@ -1259,6 +1473,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setBuffer: gCnt offset: gCntOff atIndex: 1];   /* this draw's counters, not the pool's start */
     [enc setBuffer: gXbase offset: 0 atIndex: 2];
     [enc setBuffer: gXfb offset: 0 atIndex: 3];
+    [enc setBuffer: gOutv offset: gOutvOff atIndex: 4]; /* the records: the scan counts closed primitives */
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
     if ([enc respondsToSelector: @selector(memoryBarrierWithScope:)])
         [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
@@ -1458,6 +1673,8 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     }
     m->draw = geomDrawC;
     m->can_assemble_gpu = geomCanAssembleGPUC;
+    m->query_begin = geomQueryBeginC;
+    m->query_read = geomQueryReadC;
 }
 
 /* ---- compute pipelines of the geometry kernel ---- */
@@ -1784,7 +2001,10 @@ static MTLPrimitiveTopologyClass gGeomTopology = MTLPrimitiveTopologyClassUnspec
     if (!gPrepPso) return false;
     if (!ctx->state.vao) return true;
     eb = ctx->state.vao->element_array.buffer;
-    if (!eb) return false;
+    /* a draw without an element-array binding has no indices to read back: the prep
+     * kernel derives them from `first`, so the GPU route is always available (returning
+     * false here used to push every non-indexed draw onto the CPU assembly path) */
+    if (!eb) return true;
     if (!eb->data.mtl_data) [self bindMTLBuffer: eb];
     return eb->data.mtl_data != NULL;
 }
@@ -2078,8 +2298,10 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     }
     else if (gpu_assembly)
     {
-        /* the prep kernel writes the lists: size the regions by the mode's worst case */
-        cap_idx = (size_t)bound;
+        /* the prep kernel writes the lists: the capture list holds one entry per vertex
+         * of every restart-free run (<= the drawn vertex count), and the primitive slots
+         * sit behind it at HDR + cap_idx - the geometry kernel binds that same offset */
+        cap_idx = (size_t)(d->count_bound ? d->count_bound : (d->count > 0 ? d->count : 1));
         cap_prim = (size_t)mgl_geom_worst_prims(d->mode, bound);
         if (!cap_idx) cap_idx = 1;
         if (!cap_prim) cap_prim = 1;
@@ -2125,7 +2347,8 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     geomPoolResetPins();
     gOutv = geomSubAlloc(self, _device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
     if (!gOutv) { geomReleaseStatics(); return false; }
-    gIdx = geomBuffer(_device, gIdx, idx_cap * sizeof(uint32_t), &gIdxBytes);
+    /* [ raster list | per-thread strip scratch | per-thread counts and scanned bases ] */
+    gIdx = geomBuffer(_device, gIdx, ((size_t)idx_cap * 2 + (size_t)threads * 2) * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
@@ -2655,6 +2878,21 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
 
         [enc pushDebugGroup: @"MGL geometry kernel"];
 
+        /* zero the list-order pass' per-thread counts up front: threads beyond this
+         * draw's dispatch grid (an indirect draw's exact group count is smaller than the
+         * worst-case bound) never run the kernel to publish a zero themselves */
+        {
+            uint32_t zero_in[1] = { (uint32_t)threads };
+            NSUInteger zwg = 32;
+            uint64_t zgroups = (threads * 2 + zwg - 1) / zwg;
+            if (!zgroups) zgroups = 1;
+            [enc setComputePipelineState: gLzeroPso];
+            [enc setBytes: zero_in length: sizeof zero_in atIndex: 0];
+            [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 1];
+            [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)zgroups, 1, 1)
+                  threadsPerThreadgroup: MTLSizeMake(zwg, 1, 1)];
+        }
+
         /* the counters and indirect arguments start at zero for this draw (a kernel,
          * not a CPU write: the buffer may still be read by an earlier command buffer).
          * This kernel uses buffer(0), so it MUST be dispatched before the GS kernel's own
@@ -2667,8 +2905,9 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
               threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
         [enc setComputePipelineState: gGsPso];
-        size_t index_words = (size_t)(d->indexed ? d->count : 0);
-        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + index_words) * sizeof(uint32_t)
+        /* the primitive slots start behind the capture index list (the prep kernel, the
+         * tess import and the CPU route all write them at HDR + cap_idx) */
+        [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t)
                atIndex: MGL_GEOM_MSL_PRIM];
         [enc setBuffer: gVsout offset: gVsoutOff + 8 * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_VSOUT];
         [enc setBuffer: gPrim offset: gPrimOff atIndex: MGL_GEOM_MSL_HDR];
@@ -2679,6 +2918,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         [enc setBuffer: gIdx offset: 0 atIndex: MGL_GEOM_MSL_IDX];
         [enc setBuffer: gCtl offset: 0 atIndex: MGL_GEOM_MSL_CTL];
         [enc setBuffer: gCnt offset: gCntOff atIndex: MGL_GEOM_MSL_CNT];
+        [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_LSCR];
 
         if ([self geomBindStageBuffers: enc geomProgram: gp])
         {
@@ -2698,6 +2938,33 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                 [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)groups, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
 
+            /* order the emitted strips: scan the per-thread list counts into bases, then
+             * copy the per-thread scratch segments into the raster list in primitive
+             * order (the GL-required emission order); finalize folds the total into the
+             * indirect draw arguments */
+            {
+                uint32_t scan_in[2] = { (uint32_t)threads, (uint32_t)gp->max_vertices * 3u };
+                [enc setComputePipelineState: gLscanPso];
+                [enc setBytes: scan_in length: sizeof scan_in atIndex: 0];
+                [enc setBuffer: gCtl offset: 0 atIndex: 1];
+                [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 2];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(32, 1, 1)];
+                [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+
+                [enc setComputePipelineState: gLcopyPso];
+                [enc setBytes: scan_in length: sizeof scan_in atIndex: 0];
+                [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * sizeof(uint32_t) atIndex: 1];
+                [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 2];
+                [enc setBuffer: gIdx offset: 0 atIndex: 3];
+                NSUInteger lwg = 32;
+                uint64_t cgroups = (threads + lwg - 1) / lwg;
+                if (!cgroups) cgroups = 1;
+                [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)cgroups, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(lwg, 1, 1)];
+                [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+            }
+
             /* fold the counters into the indirect draw arguments (also uses buffer(0),
              * so it runs after the GS dispatch, which is the last user of the stage
              * buffers — no slot is left shadowed for a later kernel) */
@@ -2705,6 +2972,28 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
             [enc setBuffer: gCtl offset: 0 atIndex: 0];
             [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
                   threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+            /* fold this draw's per-stream counters into the persistent query words
+             * (queries.c reads them through the ext_geom query hooks); the dispatch is
+             * ordered after the geometry kernel within this encoder */
+            if (!gQacc)
+                gQacc = [_device newBufferWithLength: 8 * sizeof(uint32_t)
+                                             options: MTLResourceStorageModeShared];
+            if (gQacc && gQaccPso)
+            {
+                uint32_t mask = gQaccReset;
+                if (getenv("MGL_GEOM_QDEBUG"))
+                    fprintf(stderr, "geom: qacc dispatch mask=%x\n", mask);
+                gQaccReset = 0;
+                gQaccRan = true;
+                gQaccCb = _currentCommandBuffer;
+                [enc setComputePipelineState: gQaccPso];
+                [enc setBuffer: gCtl offset: 0 atIndex: 0];
+                [enc setBuffer: gQacc offset: 0 atIndex: 1];
+                [enc setBytes: &mask length: sizeof mask atIndex: 2];
+                [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+            }
         }
 
         [enc popDebugGroup];

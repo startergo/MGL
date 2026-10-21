@@ -4468,6 +4468,20 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst
     ctx->dispatch.draw_arrays_instanced(ctx, mode, first, count, instancecount);
 }
 
+/* ARB_draw_instanced alias: the CTS's extension init overwrites the core pointer with
+ * loader->get("glDrawArraysInstancedARB") when the extension is advertised (glwInitExtGL.inl),
+ * so MGL must export the alias or every instanced draw in the suite calls NULL */
+void glDrawArraysInstancedARB(GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
+{
+    glDrawArraysInstanced(mode, first, count, instancecount);
+}
+
+/* ARB_draw_instanced alias (see glDrawArraysInstancedARB) */
+void glDrawElementsInstancedARB(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount)
+{
+    glDrawElementsInstanced(mode, count, type, indices, instancecount);
+}
+
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount)
 {
     GLMContext ctx = GET_CONTEXT();
@@ -4809,6 +4823,12 @@ void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params)
     GLMContext ctx = GET_CONTEXT();
 
     ctx->dispatch.get_query_objectui64v(ctx, id, pname, params);
+}
+
+/* ARB_instanced_arrays alias (see glDrawArraysInstancedARB) */
+void glVertexAttribDivisorARB(GLuint index, GLuint divisor)
+{
+    glVertexAttribDivisor(index, divisor);
 }
 
 void glVertexAttribDivisor(GLuint index, GLuint divisor)
@@ -7322,6 +7342,12 @@ void glTextureBarrier()
     GLMContext ctx = GET_CONTEXT();
 
     ctx->dispatch.texture_barrier(ctx);
+}
+
+/* ARB_gl_spirv alias (see glDrawArraysInstancedARB) */
+void glSpecializeShaderARB(GLuint shader, const GLchar *pEntryPoint, GLuint numSpecializationConstants, const GLuint *pConstantIndex, const GLuint *pConstantValue)
+{
+    glSpecializeShader(shader, pEntryPoint, numSpecializationConstants, pConstantIndex, pConstantValue);
 }
 
 void glSpecializeShader(GLuint shader, const GLchar *pEntryPoint, GLuint numSpecializationConstants, const GLuint *pConstantIndex, const GLuint *pConstantValue)

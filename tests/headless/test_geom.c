@@ -1148,6 +1148,388 @@ TEST(xfb_streams)
 }
 
 
+TEST(xfb_strip_decomposition)
+{
+    /* GL captures whole primitives: a strip output decomposes into its line / triangle
+     * primitives, each captured with ALL of its vertices (shared strip vertices repeated),
+     * and a primitive that does not fit the buffer is not captured at all.  Checks the
+     * captured layout, the written count with a large buffer, and the half-full cut - the
+     * shape of the CTS primitive_queries cases. */
+    struct
+    {
+        const char *layout;
+        GLenum mode;
+        int n;          /* emitted strip vertices */
+        int prim;       /* primitives the strip decomposes into */
+        int per;        /* vertices per captured primitive */
+    } cases[2] = {
+        { "line_strip",     GL_LINES,     6, 5, 2 },
+        { "triangle_strip", GL_TRIANGLES, 5, 3, 3 },
+    };
+
+    for (int c = 0; c < 2; c++)
+    {
+        char gs[1024];
+        snprintf(gs, sizeof gs,
+                 "#version 450 core\n"
+                 "layout(points) in;\n"
+                 "layout(%s, max_vertices = 8) out;\n"
+                 "layout(location=0) out vec2 g_pos;\n"
+                 "void main(){\n"
+                 "  for (int i = 0; i < %d; i++) { g_pos = vec2(float(i), float(i) + 10.0); EmitVertex(); }\n"
+                 "  EndPrimitive();\n"
+                 "}\n", cases[c].layout, cases[c].n);
+        const char *fs =
+            "#version 450 core\n"
+            "layout(location=0) out vec4 color;\n"
+            "void main(){ color = vec4(0.0); }\n";
+        const char *vs =
+            "#version 450 core\n"
+            "layout(location=0) in vec2 pos;\n"
+            "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+        GLuint p = glCreateProgram();
+        glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+        glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+        glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+        static const char *vars[2] = { "g_pos", NULL };
+        glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+        glLinkProgram(p);
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, GL_TRUE);
+        if (!ok) return;
+
+        GLuint big = 0, small = 0;
+        glGenBuffers(1, &big);
+        glGenBuffers(1, &small);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, big);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, cases[c].prim * cases[c].per * 8, NULL, GL_STREAM_READ);
+        /* half the primitives' worth of space: the whole-primitive rule must cut there */
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, small);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, (cases[c].prim / 2) * cases[c].per * 8, NULL, GL_STREAM_READ);
+
+        glUseProgram(p);
+        static const float pt[2] = { 0.0f, 0.0f };
+        setup(2, pt);
+        GLuint qw = 0, qg = 0;
+        glGenQueries(1, &qw);
+        glGenQueries(1, &qg);
+
+        for (int round = 0; round < 2; round++)
+        {
+            GLuint buf = round ? small : big;
+            int want = round ? cases[c].prim / 2 : cases[c].prim;
+
+            glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, buf);
+            glEnable(GL_RASTERIZER_DISCARD);
+            glBeginTransformFeedback(cases[c].mode);
+            glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, qw);
+            glBeginQuery(GL_PRIMITIVES_GENERATED, qg);
+            glDrawArrays(GL_POINTS, 0, 1);
+            glEndQuery(GL_PRIMITIVES_GENERATED);
+            glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+            glEndTransformFeedback();
+            glDisable(GL_RASTERIZER_DISCARD);
+            EXPECT_NO_GL_ERROR();
+
+            GLint written = -1, gen = -1;
+            glGetQueryObjectiv(qw, GL_QUERY_RESULT, &written);
+            glGetQueryObjectiv(qg, GL_QUERY_RESULT, &gen);
+            printf("  %s round %d: written = %d generated = %d (want %d/%d)\n",
+                   cases[c].layout, round, written, gen, want, cases[c].prim);
+            EXPECT_EQ_INT(written, want);
+            EXPECT_EQ_INT(gen, cases[c].prim);      /* generated is not buffer-limited */
+
+            /* the captured stream repeats the shared strip vertices: primitive p holds
+             * vertices p..p+per-1 of the emitted strip */
+            float out[32];
+            memset(out, 0, sizeof out);
+            glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, buf);
+            glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0,
+                               (GLsizeiptr)(want * cases[c].per * 8), out);
+            for (int pr = 0; pr < want; pr++)
+                for (int j = 0; j < cases[c].per; j++)
+                {
+                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 0], (float)(pr + j), 1e-5);
+                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 1], (float)(pr + j) + 10.0, 1e-5);
+                }
+        }
+
+        glDeleteQueries(1, &qw);
+        glDeleteQueries(1, &qg);
+        glDeleteBuffers(1, &big);
+        glDeleteBuffers(1, &small);
+        glDeleteProgram(p);
+    }
+}
+
+TEST(pipeline_vs_gs_capture)
+{
+    /* the CTS api.program_pipeline_vs_gs_capture shape: a pipeline whose GS-only program
+     * captures transform feedback varyings from the geometry output (pass 1), then the
+     * geometry stage is dropped from the pipeline and the VS-only program captures its own
+     * varyings into the same buffer (pass 2).  Separable programs assign automatic varying
+     * locations by their own declaration order, so the stages interface-match by name. */
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 pos;\n"
+        "flat out ivec4 out_vs_1;\n"
+        "flat out int vslot;\n"
+        "void main()\n"
+        "{\n"
+        "    vslot = gl_VertexID;\n"
+        "    out_vs_1 = ivec4(gl_VertexID, gl_VertexID + 1, gl_VertexID + 2, gl_VertexID + 3);\n"
+        "    gl_Position = vec4(1.0, 0.0, 0.0, 1.0);\n"
+        "}\n";
+    /* the inputs are declared in the OPPOSITE order to the VS outputs on purpose */
+    const char *gs =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices=1) out;\n"
+        "flat in int vslot[];\n"
+        "flat in ivec4 out_vs_1[];\n"
+        "out vec4 out_gs_1;\n"
+        "void main()\n"
+        "{\n"
+        "    out_gs_1 = vec4(float(out_vs_1[0].x * 2), float(out_vs_1[0].y * 2 + 1),"
+        " float(out_vs_1[0].z * 2 + 2), float(out_vs_1[0].w * 2 + 3));\n"
+        "    gl_Position = vec4(0, 0, 0, 1);\n"
+        "    EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    GLuint v = compile(GL_VERTEX_SHADER, vs);
+    GLuint g = compile(GL_GEOMETRY_SHADER, gs);
+    GLuint vpo = glCreateProgram();
+    GLuint gpo = glCreateProgram();
+    glProgramParameteri(vpo, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glProgramParameteri(gpo, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glAttachShader(vpo, v);
+    glAttachShader(gpo, g);
+    static const char *gv[1] = { "out_gs_1" };
+    static const char *vv[1] = { "out_vs_1" };
+    glTransformFeedbackVaryings(gpo, 1, gv, GL_INTERLEAVED_ATTRIBS);
+    glTransformFeedbackVaryings(vpo, 1, vv, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(vpo);
+    glLinkProgram(gpo);
+    GLint lv = 0, lg = 0;
+    glGetProgramiv(vpo, GL_LINK_STATUS, &lv);
+    glGetProgramiv(gpo, GL_LINK_STATUS, &lg);
+    EXPECT_EQ_INT(lv, GL_TRUE);
+    EXPECT_EQ_INT(lg, GL_TRUE);
+    if (!lv || !lg) return;
+
+    GLuint ppo = 0;
+    glGenProgramPipelines(1, &ppo);
+    glUseProgramStages(ppo, GL_VERTEX_SHADER_BIT, vpo);
+    glUseProgramStages(ppo, GL_GEOMETRY_SHADER_BIT, gpo);
+    glUseProgram(0);
+    glBindProgramPipeline(ppo);
+    EXPECT_NO_GL_ERROR();
+
+    setup(2, (const float[]){ 0.0f, 0.0f });
+    GLuint tfo = 0;
+    glGenBuffers(1, &tfo);
+    glBindBuffer(GL_ARRAY_BUFFER, tfo);
+    glBufferData(GL_ARRAY_BUFFER, 16, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfo);
+
+    /* pass 1: the geometry stage captures its own output */
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    EXPECT_NO_GL_ERROR();
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+    glEndTransformFeedback();
+    EXPECT_NO_GL_ERROR();
+    glDisable(GL_RASTERIZER_DISCARD);
+
+    float out[4] = { 0, 0, 0, 0 };
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 16, out);
+    printf("  gs pass captured: %f %f %f %f (want 0 3 6 9)\n", out[0], out[1], out[2], out[3]);
+    EXPECT_NEAR(out[0], 0.0, 1e-5);
+    EXPECT_NEAR(out[1], 3.0, 1e-5);
+    EXPECT_NEAR(out[2], 6.0, 1e-5);
+    EXPECT_NEAR(out[3], 9.0, 1e-5);
+
+    /* pass 2: drop the geometry stage - the vertex program captures its own varying */
+    glUseProgramStages(ppo, GL_GEOMETRY_SHADER_BIT, 0);
+    EXPECT_NO_GL_ERROR();
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfo);
+    glBeginTransformFeedback(GL_POINTS);
+    EXPECT_NO_GL_ERROR();
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+    glEndTransformFeedback();
+    EXPECT_NO_GL_ERROR();
+
+    int out2[4] = { -1, -1, -1, -1 };
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 16, out2);
+    printf("  vs pass captured: %d %d %d %d (want 0 1 2 3)\n", out2[0], out2[1], out2[2], out2[3]);
+    EXPECT_EQ_INT(out2[0], 0);
+    EXPECT_EQ_INT(out2[1], 1);
+    EXPECT_EQ_INT(out2[2], 2);
+    EXPECT_EQ_INT(out2[3], 3);
+
+    glBindProgramPipeline(0);
+    glDeleteProgramPipelines(1, &ppo);
+    glDeleteProgram(vpo);
+    glDeleteProgram(gpo);
+    glDeleteShader(v);
+    glDeleteShader(g);
+    glDeleteBuffers(1, &tfo);
+}
+
+TEST(vs_conditional_declarations)
+{
+    /* the CTS nonarray_input shape: the vertex source declares its outputs inside
+     * #ifndef / #else / #endif groups (including an interface block in the inactive
+     * branch), and the geometry source does the same.  The capture-variant and kernel
+     * rewrites must keep the preprocessor structure balanced - comments directly before a
+     * declaration are their own statement, and a head scan never emits anything. */
+    static const char *kVsPreamble = "#version 460 core\n";
+    static const char *kVsBodyNoBlock =
+        "#ifndef USE_BLOCK\n"
+        "    #define V1 v1\n"
+        "    #define V2 v2\n"
+        "\n"
+        "    out vec4 v1;\n"
+        "    out vec4 v2;\n"
+        "#else\n"
+        "    #extension GL_ARB_shader_interface_blocks : require\n"
+        "    out VS_GS\n"
+        "    {\n"
+        "        vec4 v1;\n"
+        "        vec4 v2;\n"
+        "    } interface_block;\n"
+        "#endif\n"
+        "\n"
+        "void main()\n"
+        "{\n"
+        "    V1 = vec4(-1, -1, 0, 1);\n"
+        "    V2 = vec4(-1,  1, 0, 1);\n"
+        "}\n";
+    static const char *kVsBodyBlock =
+        "#ifndef USE_BLOCK\n"
+        "    out vec4 v1;\n"
+        "    out vec4 v2;\n"
+        "#else\n"
+        "    out VS_GS\n"
+        "    {\n"
+        "        vec4 v1;\n"
+        "        vec4 v2;\n"
+        "    } interface_block;\n"
+        "#endif\n"
+        "\n"
+        "void main()\n"
+        "{\n"
+        "    interface_block.v1 = vec4(-1, -1, 0, 1);\n"
+        "    interface_block.v2 = vec4(-1,  1, 0, 1);\n"
+        "}\n";
+    static const char *kDefineUseBlock = "#define USE_BLOCK\n";
+    static const char *kGs =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices=4) out;\n"
+        "in vec4 v1[];\n"
+        "in vec4 v2[];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = v1[0]; EmitVertex();\n"
+        "    gl_Position = v2[0]; EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    static const char *kGsBlock =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices=4) out;\n"
+        "in VS_GS\n"
+        "{\n"
+        "    vec4 v1;\n"
+        "    vec4 v2;\n"
+        "} ib[];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = ib[0].v1; EmitVertex();\n"
+        "    gl_Position = ib[0].v2; EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 c;\n"
+        "void main(){ c = vec4(0, 1, 0, 1); }\n";
+
+    struct { const char *name; const char *const *parts; int n; const char *gs; } cases[2];
+    const char *noBlock[2] = { kVsPreamble, kVsBodyNoBlock };
+    const char *block[3] = { kVsPreamble, kDefineUseBlock, kVsBodyBlock };
+    cases[0].name = "vs-no-block"; cases[0].parts = noBlock; cases[0].n = 2; cases[0].gs = kGs;
+    cases[1].name = "vs-block";    cases[1].parts = block;   cases[1].n = 3; cases[1].gs = kGsBlock;
+
+    for (int i = 0; i < 2; i++)
+    {
+        GLuint v = glCreateShader(GL_VERTEX_SHADER);
+        GLuint g = glCreateShader(GL_GEOMETRY_SHADER);
+        GLuint f = compile(GL_FRAGMENT_SHADER, fs);
+        GLuint p = glCreateProgram();
+        GLint ok = 0;
+        glShaderSource(v, cases[i].n, cases[i].parts, NULL);
+        glCompileShader(v);
+        glShaderSource(g, 1, &cases[i].gs, NULL);
+        glCompileShader(g);
+        glAttachShader(p, v);
+        glAttachShader(p, g);
+        glAttachShader(p, f);
+        glLinkProgram(p);
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok)
+        {
+            char l[1024] = "";
+            glGetProgramInfoLog(p, sizeof l, NULL, l);
+            printf("  %s link log: %s\n", cases[i].name, l);
+        }
+        EXPECT_EQ_INT(ok, GL_TRUE);
+        glDeleteProgram(p);
+        glDeleteShader(v);
+        glDeleteShader(g);
+        glDeleteShader(f);
+    }
+}
+
+TEST(gs_atomic_counter_link_fails)
+{
+    /* MGL reports MAX_GEOMETRY_ATOMIC_COUNTERS / MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS = 0
+     * (no geometry-stage atomic counters), so a geometry shader using one must FAIL to
+     * link - the CTS linking.more_ACs_in_GS_than_supported shape */
+    const char *gs =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices=1) out;\n"
+        "layout(binding = 0) uniform atomic_uint counter0;\n"
+        "void main()\n"
+        "{\n"
+        "    if (atomicCounter(counter0) == 0u) { gl_Position = vec4(0); EmitVertex(); }\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER,
+        "#version 460 core\nlayout(location=0) in vec4 pos;\nvoid main(){ gl_Position = pos; }\n"));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER,
+        "#version 460 core\nlayout(location=0) out vec4 c;\nvoid main(){ c = vec4(1); }\n"));
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_FALSE);
+    if (ok)
+        printf("  link log: (linked, expected failure)\n");
+    else
+    {
+        char l[512] = "";
+        glGetProgramInfoLog(p, sizeof l, NULL, l);
+        printf("  link log: %s", l);
+    }
+    glDeleteProgram(p);
+}
+
 TEST(block_vs_fs_control)
 {
     { GLuint _t; GLuint _f = block_fbo(&_t, 256, 256); (void)_f; }   /* private 256x256 FBO: pixel checks read up to (255,255) */
@@ -3000,6 +3382,10 @@ int main(void)
     RUN(primitive_queries);
     RUN(xfb_of_geometry_output);
     RUN(xfb_streams);
+    RUN(xfb_strip_decomposition);
+    RUN(pipeline_vs_gs_capture);
+    RUN(vs_conditional_declarations);
+    RUN(gs_atomic_counter_link_fails);
     RUN(xfb_arrays_of_blocks_xfb_offset);
     RUN(tessellation_triangles_into_gs);
     RUN(tessellation_indexed_into_gs);

@@ -1760,10 +1760,9 @@ static void xfb_post_link(GLMContext ctx, Program *p)
 
     if (xp->pending_count == 0) return;
 
-    if (!vs || !vs->src) {
-        xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);
-        return;
-    }
+    /* a separable program may have no vertex stage at all: a GS-only (or TES-only)
+     * program resolves its transform feedback varyings against ITS outputs, so the
+     * geometry-domain linkers run before the "needs a vertex shader" failure */
     if (p->shader_slots[_GEOMETRY_SHADER]) {
         /* the geometry domain captures the geometry stage's output itself (see
          * mgl_geom_xfb_link / mgl_geom_xfb_capture); the varyings resolve against the
@@ -1776,6 +1775,11 @@ static void xfb_post_link(GLMContext ctx, Program *p)
          * output capture is the recorded stream - the geometry domain resolves the varyings
          * against the TES outputs and packs the capture after the draw */
         mgl_geom_tess_xfb_link(ctx, p);
+        return;
+    }
+
+    if (!vs || !vs->src) {
+        xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);
         return;
     }
     xfb_link(ctx, xp, vs->src, true);

@@ -368,7 +368,15 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&psz type:MTLDataTypeFloat atIndex:MGL_RS_FC_POINT_SIZE];
         bool rd = ctx->state.caps.rasterizer_discard;
         [cv setConstantValue:&rd type:MTLDataTypeBool atIndex:MGL_RS_FC_RASTERIZER_DISCARD];
-        key = [NSString stringWithFormat:@"%p:v:%d%d%d%d:%g", lib, z01, ul, pps, rd, psz];
+        /* the key must not collide when a program is deleted and a later one's Metal
+         * objects land on the same addresses: the specialized entry would hand the dead
+         * program's function to the new one and it would render with the wrong shader
+         * (seen as flaky CTS failures once per-program recompiles made reuse common).
+         * The function pointer plus a checksum of the MSL make that practically
+         * impossible. */
+        uint64_t h = 1469598103934665603ULL;
+        if (msl) { for (const char *q = msl; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; } }
+        key = [NSString stringWithFormat:@"%p:%p:%llx:v:%d%d%d%d:%g", lib, base, (unsigned long long)h, z01, ul, pps, rd, psz];
     } else {
         NSUInteger samples = [self rstateSampleCount];
         bool lower = rs->point_sprite_coord_origin == GL_LOWER_LEFT;
@@ -388,7 +396,13 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&lower type:MTLDataTypeBool atIndex:MGL_RS_FC_POINT_ORIGIN_LOWER];
         [cv setConstantValue:&mask type:MTLDataTypeUInt atIndex:MGL_RS_FC_SAMPLE_MASK];
         [cv setConstantValue:&per_sample type:MTLDataTypeBool atIndex:MGL_RS_FC_PER_SAMPLE];
-        key = [NSString stringWithFormat:@"%p:f:%d:%x:%d", lib, lower, mask, per_sample];
+        /* same as above: function pointer + MSL checksum, so a reused library address
+         * cannot resurrect a deleted program's fragment function */
+        {
+            uint64_t h = 1469598103934665603ULL;
+            if (msl) { for (const char *q = msl; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; } }
+            key = [NSString stringWithFormat:@"%p:%p:%llx:f:%d:%x:%d", lib, base, (unsigned long long)h, lower, mask, per_sample];
+        }
     }
 
     MGLRSCache *c = [self rstateCache];
