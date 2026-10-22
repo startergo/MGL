@@ -1,7 +1,105 @@
-READY 76c84f1 (direct_state_access 367/371 Pass, was 297; gl46-port merged at 76c84f1; headless suite 58/58, test_geom 593 checks / 0 failures)
+READY 22826fa (texture_gather in progress: root causes identified — AGX vertex-stage shadow sampling returns raw values + SPIRV-Cross drops ConstOffsets; compute-stage gather_compare fix landed; suite 58/58, test_geom 593/0)
 
-# geom domain — round 36 handoff (KHR-GL46.direct_state_access cluster)
+# geom domain — round 37 handoff (KHR-GL46.texture_gather, partial)
 
+Commit `22826fa` on gl46/geom (gl46-port merged at 76c84f1/2e9b5e8 earlier this
+round).  Cluster status when picked up: plain-gather 23/33 Pass (10 Fail),
+offset-gather 10/33 Pass (23 Fail), offsets-gather + gpu_shader5 families not
+re-run yet.  Everything below is REPRODUCED and verified with scratch tests.
+
+## Root causes (all reproduced in raw Metal and/or MGL scratches)
+
+1. **AGX vertex-stage shadow sampling is broken at the driver level.**  In
+   VERTEX functions, `depth2d.gather_compare(...)` AND `depth2d.sample_compare(...)`
+   return the RAW depth values — the sampler's compareFunction is ignored.
+   Fragment functions: correct.  Compute: sample_compare correct.
+   - Raw Metal repro: `tests/headless/scratch_mtlgather.m` (build:
+     `clang -fobjc-arc -fmodules -framework Metal -framework Foundation -o /tmp/mg tests/headless/scratch_mtlgather.m`).
+   - MGL repro: `scratch_vdg.c` (exact CTS plain-gather-depth-2d replica,
+     got = raw patch values = exactly the CTS "got").
+   - The CTS runs each gather case in THREE stages (pass 0 vertex, pass 1
+     fragment, pass 2 compute — GatherBase::Run loop i=0..2); ANY failing pass
+     fails the case, so the VS pass keeps all depth-gather cases red until
+     fully emulated.
+2. **SPIRV-Cross drops the ConstOffsets operand.**  GLSL
+   `textureGatherOffsets(s, uv, offs, comp)` compiles to SPIR-V
+   OpImageGather+ConstOffsets, but the emitted MSL is a plain
+   `t.gather(s, uv, int2(0), component::x)` — the four offsets are silently
+   lost (verified with MGL_DUMP_MSL; scratch_gat.c fs_gather_offsets).
+   All `offsets-gather-*` fail for every type.  Fixing this requires a
+   SPIR-V-level pass (the offset values live in SPIR-V constants; they are
+   unrecoverable from MSL).  My task brief explicitly allows a new
+   `MGL/src/*.cpp` SPIR-V pass + a minimal Makefile rule for it.
+   Rewrite shape: OpImageGather{ConstOffsets} → 4 × OpImageGather{Offset} with
+   the i-th constant offset + OpCompositeExtract(i) + OpCompositeConstruct
+   (GL 4.6 8.11.1: result[i] = gather(uv+offs[i])[i]... verify the exact
+   tap-index mapping against GatherBase::Expected before coding).
+3. **Tap order is NOT a bug**: GL/CTS gather order = (x0,y1)(x1,y1)(x1,y0)(x0,y0)
+   of block floor(uv*size-0.5+off) — identical to Metal hardware gathers.
+   Verified via the CTS's own expected data (GatherBase patch
+   Vec4((12..15)/16,(8..11)/16,(0..3)/16,(4..7)/16) with depth format consuming
+   floats sequentially: texels (22,25)(23,25)(22,26)(23,26) = 12..15/16; CTS
+   expects comparisons (1,1,0,0) = (14,15,13,12)/16 = (t2,t3,t1,t0)) and via
+   the raw-Metal tap decode ((22,26)(23,26)(23,25)(22,25)).
+
+## Landed this round (22826fa)
+
+- `mgl_fix_gather_compare_vs()` in program.c: MSL post-processing for
+  VERTEX+COMPUTE stages that rewrites `OBJ.gather_compare(S, UV, REF[, OFF])`
+  to `mgl_gcmp_vs(OBJ, ...)` — 4 texel-centre sample_compare taps at level(0)
+  (exact for any filter), GL tap order, depth2d + depth2d_array overloads.
+  Fixups land after the `using namespace metal;` anchor (file scope) with the
+  inline copy stripped.  Effect: compute-stage depth gathers now compare.
+  VS gathers still raw (VS sample_compare is the broken primitive).
+  Suite 58/58 green, test_geom 593/0.
+- Note: watch the paren offsets in that pass — the open paren is at
+  `.gather_compare(` + 15 (off-by-one cost an hour; there is a unit-style
+  debug print if needed via getenv).
+
+## Remaining work for this cluster (in value order)
+
+1. **VS shadow-sampling emulation** (~15 depth-gather cases): in VERTEX MSL
+   (a) rewrite `depth2d<float> NAME` → `texture2d<float> NAME` for samplers
+   only used by comparison ops in that stage, (b) rewrite ALL
+   `.sample_compare(...)` (and mgl_gcmp_vs) to raw `t.sample(s, uv, level(0)).x`
+   + manual `ref OP d`, (c) plumbing for OP: GL_TEXTURE_COMPARE_FUNC lives in
+   the sampler state; pass it via a small [[buffer]] constant MGL fills at
+   bind time (compare-op int + maybe flags) — needs a new bind site in
+   MGLRenderer.m's sampler loop, (d) bind a NON-compare MTLSamplerState for
+   the vertex stage of those resources (using a compare sampler with
+   texture2d.sample is UB — this is why the type rewrite is required).
+   Cube/cube-array depth gathers stay a documented gap (face-quad mapping).
+2. **ConstOffsets SPIR-V pass** (~12 offsets-gather-* cases incl. non-depth
+   types that already work otherwise).
+3. **2drect gathers** (plain-gather-*-2drect, ~5 cases): uninvestigated;
+   likely MGL's RECTANGLE emulation (unnormalized coords) vs gather — the
+   sampler-target binding fix from round 36 already covers the unit binding.
+4. **plain-gather-int-2darray** fails while uint passes — unexplained, one case.
+5. gpu_shader5.texture_gather_offset_* (12) — same families; re-run after the
+   above land.
+
+## Reference CTS internals (gl4cTextureGatherTests.cpp)
+
+- GatherBase::Run: 3 passes (vertex/fragment/compute), 1x1 RGBA32F renderbuffer,
+  POINT draw with p=(uv.x, uv.y, ref, 1) as a vec4 attribute, `flat` varying.
+- Expected values: GatherBase::Expected (RGBA R = (0,4,8,12)/16), depth classes
+  override to (1,1,0,0); patch at (22,25) size 2x2; BufferData() =
+  Vec4(23/32, 26/32, 13.5/16, 3) = (u, v, ref, ...).
+- The depth texture: 6 mip levels (only level 0 filled) + default
+  NEAREST_MIPMAP_LINEAR — gather treats it as complete (GL 4.6 8.17).
+
+## Next clusters after this: KHR-GL46.limits (23), then the 4 remaining
+direct_state_access failures (see round-36 handoff below; two are documented
+gaps, attribute_format is flaky-crash, compressed_subimage conflicts with
+packed_pixels without a BC4/BC5 encoder + GL_TEXTURE_COMPRESSED=1 reporting).
+
+Run rules: -j4 max, one CTS batch at a time (--max-seconds <= 480, <= 2 chunks
+per call), FRESH results dir per pattern (run.py reuses caselist.txt!), scratch
+tests untracked, never `git add -A`, no symlinks/scratch commits, merge
+gl46-port before the next READY.
+
+
+(round 36)
 First cluster from the second CTS pass: direct_state_access 297 Pass / 70 Fail /
 2 InternalError / 1 Crash -> **367 Pass / 2 Fail / 1 Crash / 1 CompatWarn** (full
 group re-run with batch=30, fresh results dir `~/MGL-cts/geom38z`). Fix commit

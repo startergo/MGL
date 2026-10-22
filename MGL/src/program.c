@@ -624,6 +624,211 @@ static GLuint sampler_type_key(spvc_compiler c, spvc_type_id type_id)
     return key;
 }
 
+/* ------------------------------------------------------------------ */
+/* AGX workaround: gather_compare in VERTEX/COMPUTE functions returns the
+ * RAW depth values (the comparison is never applied) on Apple GPUs —
+ * fragment functions are unaffected.  KHR-GL46.texture_gather
+ * plain/offset/offsets-gather-depth-* exercise all three stages, so the
+ * vertex and compute stages must not use the hardware gather_compare.
+ *
+ * Rewrite every `OBJ.gather_compare(S, COORD, REF[, OFF])` into a call to a
+ * helper that performs four explicit texel-centre sample_compare taps at
+ * level 0.  At an exact texel centre bilinear filtering puts all weight on
+ * that tap, so the result equals the hardware comparison for ANY filter
+ * setting, and the sampler's wrap modes apply exactly as for gather.
+ * Tap order = the GL/CTS convention measured from hardware gathers:
+ * (x0,y1) (x1,y1) (x1,y0) (x0,y0) of the 2x2 block floor(uv*size-0.5+off).
+ *
+ * depthcube/depthcube_array gathers keep the (broken) hardware path: their
+ * tap quads are face-layout dependent and the CTS cube cases are documented
+ * as a gap. */
+static const char *k_gcmp_helpers =
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor(uv * sz - float2(0.5)) + float2(off));\n"
+"    vec<T,4> r;\n"
+"    r[0] = t.sample_compare(s, (float2(b + int2(0, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[1] = t.sample_compare(s, (float2(b + int2(1, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[2] = t.sample_compare(s, (float2(b + int2(1, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[3] = t.sample_compare(s, (float2(b + int2(0, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    return r;\n"
+"}\n"
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float3 uv, T ref, int2 off)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor(uv.xy * sz - float2(0.5)) + float2(off));\n"
+"    uint layer = uint(uv.z + 0.5);\n"
+"    vec<T,4> r;\n"
+"    r[0] = t.sample_compare(s, float3((float2(b + int2(0, 1)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
+"    r[1] = t.sample_compare(s, float3((float2(b + int2(1, 1)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
+"    r[2] = t.sample_compare(s, float3((float2(b + int2(1, 0)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
+"    r[3] = t.sample_compare(s, float3((float2(b + int2(0, 0)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
+"    return r;\n"
+"}\n";
+
+static bool mgl_is_idchar(int c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '.' || c == '[' || c == ']';
+}
+
+/* length of the balanced-paren argument list starting at open (the '(') */
+static size_t mgl_arglist_len(const char *open)
+{
+    size_t depth = 0, i = 0;
+    do
+    {
+        if (open[i] == '(') depth++;
+        else if (open[i] == ')') depth--;
+        else if (open[i] == '\0') return 0;
+        i++;
+    } while (depth > 0);
+    return i;    /* includes both parens */
+}
+
+/* split the top-level comma-separated args of "(a, b, c)" into out[4] */
+static int mgl_split_args(const char *args, size_t len, char out[5][256])
+{
+    int n = 0;
+    size_t depth = 0, start = 1;    /* skip '(' */
+    for (size_t i = 1; i < len; i++)
+    {
+        char c = args[i];
+        if (c == '(' || c == '[') depth++;
+        else if (c == ')' || c == ']') depth--;
+        if ((c == ',' && depth == 0) || i == len - 1)
+        {
+            size_t end = (c == ',' && depth == 0) ? i : i;
+            while (end > start && (args[end - 1] == ' ' || args[end - 1] == '\n' || args[end - 1] == '\t')) end--;
+            size_t a = start;
+            while (a < end && (args[a] == ' ' || args[a] == '\n' || args[a] == '\t')) a++;
+            if (n < 5 && end > a && end - a < 256)
+            {
+                memcpy(out[n], args + a, end - a);
+                out[n][end - a] = 0;
+                n++;
+            }
+            start = i + 1;
+        }
+    }
+    return n;
+}
+
+static char *mgl_fix_gather_compare_vs(const char *msl)
+{
+    if (!msl || !strstr(msl, ".gather_compare("))
+        return NULL;
+
+    /* count rewrites first for a single allocation */
+    int calls = 0;
+    const char *p = msl;
+    while ((p = strstr(p, ".gather_compare(")) != NULL) { calls++; p += 10; }
+    if (!calls) return NULL;
+
+    size_t need = strlen(msl) + strlen(k_gcmp_helpers) + (size_t)calls * 96 + 16;
+    char *out = (char *)malloc(need);
+    if (!out) return NULL;
+    out[0] = 0;
+
+    const char *src = msl;
+    const char *inserted = NULL;
+    while (1)
+    {
+        const char *hit = strstr(src, ".gather_compare(");
+        if (!hit)
+        {
+            strcat(out, src);
+            break;
+        }
+        /* object expression before the dot */
+        const char *obj = hit;
+        while (obj > src && mgl_is_idchar((unsigned char)obj[-1])) obj--;
+
+        /* full call = ".gather_compare(" + arglist */
+        size_t alen = mgl_arglist_len(hit + 15);   /* hit[15] == '(' */
+        if (alen == 0 || obj == hit)
+        {
+            /* malformed: copy verbatim up to and including the dot-call and continue */
+            strncat(out, src, (size_t)(hit - src) + 16 + 1);
+            src = hit + 17;
+            continue;
+        }
+
+        /* append the untouched prefix */
+        strncat(out, src, (size_t)(obj - src));
+
+        /* inject helpers once, right before the first rewritten call */
+        if (!inserted)
+        {
+            strcat(out, "\n");
+            strcat(out, k_gcmp_helpers);
+            strcat(out, "\n");
+            inserted = out + strlen(out);
+        }
+
+        char args[5][256];
+        int nargs = mgl_split_args(hit + 15, alen, args);
+        /* SPIRV-Cross emits (sampler, coord, ref[, int2 offset]) */
+        if (nargs >= 3)
+        {
+            char objname[128];
+            size_t ol = (size_t)(hit - obj);
+            if (ol >= sizeof objname) ol = sizeof objname - 1;
+            memcpy(objname, obj, ol);
+            objname[ol] = 0;
+
+            char buf[512];
+            if (nargs >= 4)
+                snprintf(buf, sizeof buf, "mgl_gcmp_vs(%s, %s, %s, %s, %s)", objname,
+                         args[0], args[1], args[2], args[3]);
+            else
+                snprintf(buf, sizeof buf, "mgl_gcmp_vs(%s, %s, %s, %s, int2(0))", objname,
+                         args[0], args[1], args[2]);
+            strcat(out, buf);
+        }
+        else
+        {
+            /* unexpected arg count: keep the original call */
+            strncat(out, obj, (size_t)(hit - obj) + 15 + alen);
+        }
+        src = hit + 15 + alen;
+    }
+
+    /* the helpers must appear at file scope: move them before the first
+     * function if the call site was inside one — simplest robust placement is
+     * right after the "using namespace metal;" preamble when present. */
+    if (inserted)
+    {
+        const char *anchor = strstr(out, "using namespace metal;");
+        if (anchor)
+        {
+            size_t tail_at = (size_t)(anchor - out) + strlen("using namespace metal;");
+            char *moved = (char *)malloc(need);
+            if (moved)
+            {
+                memcpy(moved, out, tail_at);
+                strcpy(moved + tail_at, "\n");
+                strcat(moved, k_gcmp_helpers);
+                strcat(moved, out + tail_at);
+                /* strip the inline copy appended earlier (first occurrence after tail) */
+                char *dup = strstr(moved + tail_at + strlen(k_gcmp_helpers), k_gcmp_helpers);
+                if (dup)
+                {
+                    size_t rl = strlen(k_gcmp_helpers);
+                    memmove(dup, dup + rl, strlen(dup + rl) + 1);
+                }
+                free(out);
+                out = moved;
+            }
+        }
+    }
+    return out;
+}
+
+
 /* GL texture target a sampler/image uniform of this SPIR-V type samples: the
  * GLSL sampler dimension picks WHICH of the unit's per-target bindings feeds it
  * (sampler2DMS -> GL_TEXTURE_2D_MULTISAMPLE, sampler2DArray -> GL_TEXTURE_2D_ARRAY,
@@ -1244,6 +1449,19 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             free(tess_owned);
             tess_owned = stripped;
             result = stripped;
+        }
+    }
+
+    /* AGX: gather_compare is broken in vertex/compute functions (raw values,
+     * no comparison) — rewrite those calls to explicit sample_compare taps. */
+    if (stage == _VERTEX_SHADER || stage == _COMPUTE_SHADER)
+    {
+        char *fixed_gc = mgl_fix_gather_compare_vs(result);
+        if (fixed_gc)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = fixed_gc;
+            result = fixed_gc;
         }
     }
 
