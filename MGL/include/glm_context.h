@@ -391,6 +391,7 @@ typedef struct SpirvResource_t {
     GLuint  location;
     GLuint  msl_binding; /* Metal argument index SPIRV-Cross chose (differs from the GL unit for textures) */
     GLuint  array_size;  /* elements for arrayed resources (sampler/image arrays span that many argument slots and units) */
+    GLuint  target;      /* GL texture target this sampler/image type reads (GL_TEXTURE_2D, ..._2D_MULTISAMPLE, ...); 0 = none */
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {

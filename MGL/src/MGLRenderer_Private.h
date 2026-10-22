@@ -33,6 +33,53 @@ typedef struct SyncList_t {
 
 MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
 
+/* MGLRenderer+VertexAttrib.m — binds the vattrib plan's per-attribute vertex
+ * buffers to an encoder.  Declared here because the transform-feedback capture
+ * path has no processGLState pass and must call it directly. */
+@interface MGLRenderer (VertexAttrib)
+- (void) extVattribPreDraw: (id<MTLRenderCommandEncoder>) enc;
+@end
+
+/* Resolve the texture a sampler/image uniform of GL target <gl_target> on texture
+ * unit <unit> must sample.  GL semantics: the sampler's dimension picks the unit's
+ * binding for THAT target (a sampler2DMS reads GL_TEXTURE_2D_MULTISAMPLE even when
+ * GL_TEXTURE_2D of the same unit was bound last — KHR-GL46.direct_state_access
+ * textures_storage_multisample does exactly that through glBindTextureUnit).
+ * Falls back to the unit's "most recently bound" texture (active_textures) when
+ * the per-target binding is empty or the reflected target is unknown, which keeps
+ * array-of-samplers and pre-existing behaviour working. */
+static inline Texture * mgl_texture_for_sampler(GLMContext ctx, GLuint unit, GLuint gl_target)
+{
+    if (unit >= TEXTURE_UNITS)
+        return NULL;
+    if (gl_target)
+    {
+        GLuint idx = _MAX_TEXTURE_TYPES;
+        switch (gl_target)
+        {
+            case GL_TEXTURE_BUFFER: idx = _TEXTURE_BUFFER_TARGET; break;
+            case GL_TEXTURE_1D: idx = _TEXTURE_1D; break;
+            case GL_TEXTURE_2D: idx = _TEXTURE_2D; break;
+            case GL_TEXTURE_3D: idx = _TEXTURE_3D; break;
+            case GL_TEXTURE_RECTANGLE: idx = _TEXTURE_RECTANGLE; break;
+            case GL_TEXTURE_1D_ARRAY: idx = _TEXTURE_1D_ARRAY; break;
+            case GL_TEXTURE_2D_ARRAY: idx = _TEXTURE_2D_ARRAY; break;
+            case GL_TEXTURE_CUBE_MAP: idx = _TEXTURE_CUBE_MAP; break;
+            case GL_TEXTURE_CUBE_MAP_ARRAY: idx = _TEXTURE_CUBE_MAP_ARRAY; break;
+            case GL_TEXTURE_2D_MULTISAMPLE: idx = _TEXTURE_2D_MULTISAMPLE; break;
+            case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: idx = _TEXTURE_2D_MULTISAMPLE_ARRAY; break;
+            default: break;
+        }
+        if (idx < _MAX_TEXTURE_TYPES)
+        {
+            Texture *t = ctx->state.texture_units[unit].textures[idx];
+            if (t)
+                return t;
+        }
+    }
+    return ctx->state.active_textures[unit];
+}
+
 typedef struct MGLDrawable_t {
     GLuint width;
     GLuint height;

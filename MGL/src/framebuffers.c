@@ -1021,7 +1021,10 @@ static void framebufferTextureCommon(GLMContext ctx, Framebuffer *fbo, GLenum at
 
     Texture *tex = findTexture(ctx, texture);
     if (!tex)
-        FB_ERROR(kind == 0 || kind == 4 ? GL_INVALID_VALUE : GL_INVALID_OPERATION);
+        /* CTS/spec: glFramebufferTexture with an unknown name is INVALID_VALUE,
+         * but glFramebufferTextureLayer is INVALID_OPERATION (GL 4.6 9.2.4:
+         * "texture is not zero or the name of an existing ... object") */
+        FB_ERROR(kind == 0 ? GL_INVALID_VALUE : GL_INVALID_OPERATION);
 
     GLuint max2d = STATE_VAR(max_texture_size) ? STATE_VAR(max_texture_size) : 16384;
     GLuint max3d = STATE_VAR(max_3d_texture_size) ? STATE_VAR(max_3d_texture_size) : 2048;

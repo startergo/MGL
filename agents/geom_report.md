@@ -1,4 +1,192 @@
-READY 7a984b5 (packed_pixels 250/250 + sample_variables 130/190; headless suite green; test_geom 581 checks / 0 failures)
+READY 76c84f1 (direct_state_access 367/371 Pass, was 297; gl46-port merged at 76c84f1; headless suite 58/58, test_geom 593 checks / 0 failures)
+
+# geom domain — round 36 handoff (KHR-GL46.direct_state_access cluster)
+
+First cluster from the second CTS pass: direct_state_access 297 Pass / 70 Fail /
+2 InternalError / 1 Crash -> **367 Pass / 2 Fail / 1 Crash / 1 CompatWarn** (full
+group re-run with batch=30, fresh results dir `~/MGL-cts/geom38z`). Fix commit
+`27f9b60`; `gl46-port` (tess fast fp64) merged afterwards at `76c84f1`.
+
+## Root causes fixed (27f9b60)
+
+1. **Sampler->texture binding by GL target** (60+ cases). Draw paths fed every
+   sampler from `active_textures[unit]` = "most recently bound". GL feeds a
+   sampler from the unit's binding for ITS dimension: a `sampler2DMS` keeps
+   reading `GL_TEXTURE_2D_MULTISAMPLE` even after `glBindTextureUnit` rebinds
+   the 2D target. `SpirvResource.target` (new field, glm_context.h) is derived
+   at reflection time from the SPIR-V image type (`sampler_gl_target()` in
+   program.c — accept BOTH `SPVC_BASETYPE_IMAGE` and `_SAMPLED_IMAGE`).
+   `mgl_texture_for_sampler(ctx, unit, target)` (static inline,
+   MGLRenderer_Private.h) prefers the per-target binding, falls back to
+   active_textures (arrays/unknowns keep working). Call sites: render-path
+   sampler binding + compute-path sampler binding (MGLRenderer.m),
+   MGLRenderer+Geometry.m (4).
+   -> textures_storage_multisample_2d_* 30/30, _3d_* 30/30.
+2. **sRGB readback decode** — fbDecodeColor returned raw encoded bytes for
+   RGBA8/BGRA8Unorm_sRGB; glReadPixels must return linear (fbSRGBDecode).
+   -> renderbuffers_storage, renderbuffers_storage_multisample.
+3. **Spec errors**: NamedFramebufferTextureLayer unknown texture -> INVALID_OPERATION;
+   NamedFramebufferReadBuffer(FRONT_AND_BACK) on an FBO -> INVALID_OPERATION;
+   sampler-state texParameter on multisample targets -> INVALID_OPERATION (set
+   AND get); GL_TEXTURE_TARGET query on a TEXTURE_BUFFER -> INVALID_OPERATION
+   (tex_param.c); glGetTextureImage on a cube-incomplete texture ->
+   INVALID_OPERATION (new `cubeComplete()` in textures.c); mglValidateProgram no
+   longer fails VS-only programs (separable; the round-35 trampoline fragment
+   already rasterizes them). test_texparam updated (GL 4.6 8.10).
+   -> framebuffers_*_errors 8/8, textures_parameter_*_errors 2/2,
+      textures_image_query_errors, program_pipelines_functional.
+4. **XFB capture never bound vertex attributes** (the big one). The capture
+   render pass (MGLRenderer+TransformFeedback.m xfbCaptureAsync) has no
+   processGLState, so the "PreDraw:" ext-hook fan-out never ran and only
+   non-attribute map entries were bound -> the VS-as-capture read zeros from
+   unbound MSL slots (exactly one attribute - the last MSL slot - survived).
+   Fix: call `[self extVattribPreDraw: enc]` after bindVertexBuffersToCurrentRenderEncoder
+   (declared in MGLRenderer_Private.h as a category interface).
+   Repro matrix: scratch_af.c (int/float x contiguous/sparse x DSA/legacy).
+   -> vertex_arrays_enable_disable_attributes, vertex_arrays_vertex_buffers.
+5. **resolveBuffer lazy-created buffer objects** for any name below the name
+   high-water mark (`buffer < current_name`), so DSA vertex-buffer binding
+   accepted the CTS's not-a-buffer probe once earlier cases raised the
+   watermark (batch-only failure; standalone always passed). Removed the lazy
+   create — GL 4.6 21.2 requires an *existing* object for DSA names.
+   -> vertex_arrays_vertex_buffers_errors in batch mode.
+   NOTE when re-running single cases: run.py REUSES `caselist.txt` inside a
+   results dir — always use a FRESH dir per pattern or you re-run the first
+   caselist (that produced bogus "passes" this round).
+
+## Remaining direct_state_access failures (documented gaps)
+
+* `textures_compressed_subimage` — needs texImage*(specific compressed
+  internalformat) to either really compress or be INVALID_OPERATION, but
+  `KHR-GL46.packed_pixels` (12 RGTC cases, green since edbec60) requires the
+  upload to SUCCEED and read back losslessly (MGL stores RGTC as R8/RG8,
+  GL_TEXTURE_COMPRESSED=0). Proper fix: report GL_TEXTURE_COMPRESSED=1 +
+  COMPRESSED_IMAGE_SIZE = blocks*8/16 and encode BC4/BC5 in
+  getCompressedTexImage (encoder ~40 lines; min/max endpoints + 3-bit indices);
+  keeping getTexImage returning the stored R8/RG8 keeps packed_pixels green.
+  Verified: blanket INVALID_OPERATION fixes this case but regresses 12
+  packed_pixels -> net -11, so it was reverted.
+* `vertex_arrays_attribute_format` — 17/52 rows; flaky (Fail standalone, Crash
+  rc=-5 in batch). All size-1 function families reproduced byte-exactly
+  (scratch_afx/scratch_afy: FLOAT/HALF/UBYTE/DOUBLE/INT x DSA split + XFB +
+  bufferStorage) PASS, capture record verified [1.0f,5.0f], scatter slots
+  correct (MGL_XFBDBG traces); the deqp process still reads heap-pointer
+  garbage from the mapped immutable XFB buffer. Suspect readback/aliasing of
+  glBufferStorage'd XFB buffers after the capture encoder ran in the same
+  process (glMapBufferRange path). Next: instrument
+  mgl_buffers_prepare_cpu_read for storage-backed XFB buffers in the CTS run.
+* `framebuffers_check_status` — CompatibilityWarning only (CTS informational).
+
+## Next clusters (from agents/conformance.md, second pass)
+
+1. `KHR-GL46.texture_gather` (38) — likely textureGather on 2D/2D-array +
+   offsets; check SPIRV-Cross MSL gather() emission + sampler-target binding
+   (fix #1 above may already cover part of it).
+2. `KHR-GL46.limits` (23) — mostly glGet* caps (MAX_* enums); see
+   mgl_ext_get_geom/get.c plumbing.
+
+Run rules reminder: -j4 max, CTS via agents/conformance/run.py with
+--max-seconds <= 480 (<= 2 chunks per call), fresh results dir per pattern,
+scratch tests untracked, never `git add -A`, no symlinks/scratch commits.
+
+
+Two clusters this round; both committed, `gl46-port` (02c2871, tess fp64) merged on top
+(merge a5a9170, clean). Headless suite fully green after the merge (incl. the tess
+agent's test_tess 499 / test_tessemu 65), `test_geom` 593 checks / 0 failures.
+
+## KHR-GL46.sample_variables 130/190 → 152 Pass / 38 NotSupported / 0 Fail
+
+* The 22 `mask.*.samples_0` cases draw with mask values 0..7 into a single-sample
+  framebuffer and expect full red: GL 4.6 13.3 ignores the sample-mask output when
+  SAMPLE_BUFFERS is 0. The patched-MSL helper `mgl_rs_sample_mask()` now takes the
+  written mask plus a new function constant `MGL_RS_FC_PIPELINE_SAMPLES` (32008) with
+  the render pipeline's sample count and drops the written bits only for single-sample
+  pipelines; `rstateSpecialize` binds it and keys the specialization cache on it.
+  4x-MSAA gating (1..4 samples) verified unchanged (scratch_smsk.c).
+* The 38 NotSupported are the `samples_8` cases: Metal caps MSAA at 4 samples on Apple
+  GPUs (`supportsTextureSampleCount:8` = false on the M4 Pro), so `GL_MAX_SAMPLES = 4`
+  is honest; the CTS itself reports NotSupported from `getInternalformativ(GL_SAMPLES)`.
+
+## KHR-GL46.shader_storage_buffer_object 54/124 → 118 Pass / 6 Fail
+
+Fixes (commit 3a610a5, then 791fc1f; see the commit messages for the mechanism):
+
+1. **Vertex-only programs** (VS + SSBO writes + rasterizer discard): MGL refused to
+   build a render pipeline without a fragment function so nothing ran. Now builds the
+   documented vertex-only pipeline (fragmentFunction nil, rasterizationEnabled NO —
+   `rstateConfigurePipelineDescriptor` keeps it disabled for a nil fragment function);
+   SPIRV-Cross already emits the required `vertex void` function.
+2. **`.length()` on runtime-sized arrays** (25 unsizedArrayLength cases): SPIRV-Cross
+   implements it through `spvBufferSizeConstants [[buffer(25)]]` (bound-range byte
+   size per Metal buffer index); MGL never bound it. `BufferMap` records the range
+   size; `geomBindSSBOSizes{,Compute}` bind the sizes for the render vertex/fragment
+   tables (skipped while the geometry pass-through owns vertex slot 25) and the
+   compute dispatch; compute bindings also honour glBindBufferRange offsets now.
+3. **coherent/volatile/restrict** SSBO qualifiers produced unparseable MSL
+   (`volatile device Block&`, C99 `restrict`): `mgl_geom_strip_msl_volatile()`
+   rewrites them to `device`/`__restrict` in every stage's MSL (neither qualifier is
+   expressible on Metal anyway).
+4. **glslang limits**: `max_atomic_counter_bindings` 1→8 to match
+   GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS; per-stage atomic counters aligned with glGet.
+5. **SSBO block instance arrays** (`buffer Output {...} g_output[4];`): the map
+   enumeration re-expanded each instance entry (skip added, clamped for the unflattened
+   geometry-stage lists — basic-stdLayout-case1/4 vs+cs).
+6. **SSBO atomics from VS+GS** (basic-atomic-case1, exact values verified):
+   initializer-fed plain uniforms in capture/kernel variants (extracted into the DUB,
+   paren-aware declarator scan), `geom_build_pins` classified like SPIRV-Cross
+   reflection (Block vs BufferBlock on the block struct; the DUB takes its renderer
+   flat; pool blocks skipped), `msl_value_parameters` handles template commas, the GS
+   kernel binder materialises CPU-shadowed buffers, and the introspection patcher no
+   longer drops the GS module's default-uniform rewrite (its MSL-acceptance gate cannot
+   parse geometry stages reading gl_PrimitiveIDIn).
+7. **Negative-API**: INVALID_VALUE for BindBufferBase/Range with index ≥
+   MAX_SHADER_STORAGE_BUFFER_BINDINGS (the cached limit was 0 because
+   `getMacOSDefaults` cannot query GL 4.3+ limits from Apple's GL 4.1) and for
+   BindBufferRange's unaligned offset even with name 0 (size>0 only for a real buffer);
+   glShaderStorageBlockBinding range checks live.
+8. **GLSL-only declaration**: `layout(binding = N) buffer;` (Vulkan GLSL) is rejected
+   with a `#error`; packing/matrix-order qualifiers (`layout(shared,row_major)
+   buffer;`) stay legal.
+
+### Remaining 6 fails (gaps)
+* `advanced-write-fragment`: standalone `layout(binding=N,offset=M) uniform atomic_uint
+  c;` maps to a *thread* atomic in MSL, and thread atomics have no fetch_add. Needs the
+  atomic-counter domain to route standalone counters into a `device atomic_uint`
+  buffer (block-form atomic counters are not accepted by glslang either).
+* `advanced-write-tessellation`, `basic-atomic-case2`: SSBO writes/atomics from TCS/TES
+  (tess domain; the TES stage MSL also fails there on a `[[patch(quad, 3)]]` attribute
+  with a bad vertex count — see the ssbo4 logs).
+* `basic-syntax`, `basic-syntaxSSO`: two runtime-sized arrays in one buffer block
+  (legal per the CTS); would need runtime-computed offsets for the earlier members —
+  MSL structs allow one unsized tail member only.
+* `negative-glsl-compileTime`: its last check wants `vec4(array_member)` to be a
+  compile error; glslang accepts it (would need a source-level validator).
+
+## Shared-file edits this round (all small, all listed)
+* `MGL/include/glm_context.h` — BufferMap gained `GLsizeiptr size` (bound range size).
+* `MGL/src/MGLRenderer.m` — vertex-only pipeline in generatePipelineDescriptor; map
+  enumeration records sizes / skips expanded instance entries; compute sizes bind.
+* `MGL/src/MGLRenderer+RenderState.m` — pipeline-sample-count function constant (and
+  round 1: rasterizationEnabled=NO kept for nil fragment functions).
+* `MGL/src/MGLRenderer+Draw.m` — geomBindSSBOSizes calls in extBufBeginDraw /
+  extBufEncodeDispatch.
+* `MGL/src/MGLRenderer_Private.h` — declarations for the two geomBindSSBOSizes methods.
+* `MGL/src/program.c` — call to mgl_geom_strip_msl_volatile() in the stage MSL path.
+* `MGL/src/shaders.c` — glslang resource limits (atomic counters).
+* `MGL/src/buffers.c` — maxBindingsForTarget SSBO fallback; BindBufferRange checks.
+* `MGL/src/program_introspection.c` — SSBO binding limit fallback.
+* `MGL/src/introspect_spirv.c` — skip the MSL-acceptance gate for the geometry stage.
+* `MGL/src/state_ext.c`, `MGL/src/mgl_ext_rstate.h` — sample-mask single-sample rule.
+* `MGL/src/cts_glsl_compat.c` — reject binding-only buffer layout declarations.
+
+Scratch tests used this round (untracked, in tests/headless/): scratch_smsk.c,
+scratch_vsssbo.c, scratch_ssblen.c, scratch_ssbcv.c, scratch_ssbng.c, scratch_ssbia.c,
+scratch_ssbgsa.c, scratch_gspu.c, scratch_ssuni.c, scratch_ssbbb.c, scratch_ssbrb.c,
+scratch_ssac.c, scratch_ssbtw.c, scratch_ssbl.c.
+
+Next clusters on the supervisor's list: direct_state_access (70 fail), then the
+remaining sample_variables NotSupported cases are hardware-honest (Metal MSAA ≤ 4).
+
 
 # geom domain — round 34 handoff (sample_variables cluster)
 

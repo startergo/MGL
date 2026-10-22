@@ -40,15 +40,15 @@ static bool resolveBuffer(GLMContext ctx, GLuint buffer, Buffer **out)
         return true;
     }
 
-    Buffer *buf = findBuffer(ctx, buffer);
+    /* GL 4.6 21.2 (DSA): the name must be an *existing* buffer object.  A name
+     * that was never bound/created (glGenBuffers name, a deleted name, or a
+     * plain integer) is INVALID_OPERATION — exactly what the CTS checks with
+     * its not_a_buffer probe (KHR-GL46.direct_state_access
+     * vertex_arrays_vertex_buffers_errors).  Do NOT lazily create objects
+     * here: that would accept names glIsBuffer reports as "not a buffer". */
+    *out = findBuffer(ctx, buffer);
 
-    // a name returned by GenBuffers that has not been bound yet: create its object now
-    if (buf == NULL && buffer < STATE(buffer_table).current_name)
-        buf = getBuffer(ctx, GL_ARRAY_BUFFER, buffer);
-
-    *out = buf;
-
-    return buf != NULL;
+    return *out != NULL;
 }
 
 static void setBinding(GLMContext ctx, VertexArray *vao, GLuint bindingindex, Buffer *buf, GLintptr offset, GLsizei stride)

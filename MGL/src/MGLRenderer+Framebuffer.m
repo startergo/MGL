@@ -187,6 +187,12 @@ static float fbUFToFloat(uint32_t v, int mbits)
     return ldexpf((float)(m | (1u << mbits)), (int)e - 15 - mbits);
 }
 
+/* IEC 61966-2-1 sRGB transfer-function decode (raw encoded byte -> linear) */
+static float fbSRGBDecode(float c)
+{
+    return (c <= 0.04045f) ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
 /* decode one texel to canonical rgba; returns kind */
 static int fbDecodeColor(MTLPixelFormat f, const uint8_t *p, void *out4)
 {
@@ -215,11 +221,19 @@ static int fbDecodeColor(MTLPixelFormat f, const uint8_t *p, void *out4)
         case MTLPixelFormatRG16Snorm: o[0] = S16(0); o[1] = S16(1); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRG16Float: o[0] = H16(0); o[1] = H16(1); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRG32Float: o[0] = F32(0); o[1] = F32(1); return MGL_FB_KIND_FLOAT;
-        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm:
             for (int i = 0; i < 4; i++) o[i] = U8(i);
             return MGL_FB_KIND_FLOAT;
-        case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+            /* GL: reading an sRGB attachment returns linear values (the blit gives
+             * the raw encoded bytes); alpha is never encoded */
+            for (int i = 0; i < 4; i++) o[i] = (i < 3) ? fbSRGBDecode(U8(i)) : U8(i);
+            return MGL_FB_KIND_FLOAT;
+        case MTLPixelFormatBGRA8Unorm:
             o[0] = U8(2); o[1] = U8(1); o[2] = U8(0); o[3] = U8(3); return MGL_FB_KIND_FLOAT;
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+            o[0] = fbSRGBDecode(U8(2)); o[1] = fbSRGBDecode(U8(1)); o[2] = fbSRGBDecode(U8(0)); o[3] = U8(3);
+            return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA8Snorm: for (int i = 0; i < 4; i++) o[i] = S8(i); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA16Unorm: for (int i = 0; i < 4; i++) o[i] = U16(i); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA16Snorm: for (int i = 0; i < 4; i++) o[i] = S16(i); return MGL_FB_KIND_FLOAT;

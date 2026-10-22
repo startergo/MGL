@@ -624,6 +624,34 @@ static GLuint sampler_type_key(spvc_compiler c, spvc_type_id type_id)
     return key;
 }
 
+/* GL texture target a sampler/image uniform of this SPIR-V type samples: the
+ * GLSL sampler dimension picks WHICH of the unit's per-target bindings feeds it
+ * (sampler2DMS -> GL_TEXTURE_2D_MULTISAMPLE, sampler2DArray -> GL_TEXTURE_2D_ARRAY,
+ * ...).  0 when the type is not an image. */
+static GLuint sampler_gl_target(spvc_compiler c, spvc_type_id type_id)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, type_id);
+    spvc_basetype bt = spvc_type_get_basetype(t);
+    if (bt != SPVC_BASETYPE_IMAGE && bt != SPVC_BASETYPE_SAMPLED_IMAGE)
+        return 0;
+
+    bool arrayed = spvc_type_get_image_arrayed(t);
+    bool ms = spvc_type_get_image_multisampled(t);
+
+    switch (spvc_type_get_image_dimension(t))
+    {
+        case SpvDim1D:  return GL_TEXTURE_1D;
+        case SpvDim2D:  return ms ? (arrayed ? GL_TEXTURE_2D_MULTISAMPLE_ARRAY : GL_TEXTURE_2D_MULTISAMPLE)
+                                   : (arrayed ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D);
+        case SpvDim3D:  return GL_TEXTURE_3D;
+        case SpvDimCube:return arrayed ? GL_TEXTURE_CUBE_MAP_ARRAY : GL_TEXTURE_CUBE_MAP;
+        case SpvDimRect:return GL_TEXTURE_RECTANGLE;
+        case SpvDimBuffer: return GL_TEXTURE_BUFFER;
+        default: break;
+    }
+    return 0;
+}
+
 static bool add_sampler(MGLProgramObj *obj, GLuint unit, GLuint key, int stage, const char *name)
 {
     MGLSamplerUse *list = (MGLSamplerUse *)realloc(obj->samplers, (obj->num_samplers + 1) * sizeof(MGLSamplerUse));
@@ -1085,6 +1113,9 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             r->msl_binding = r->binding; /* refined with the real Metal index after MSL emission */
             r->array_size = n;           /* sampler/image arrays: consecutive units + argument slots */
             r->location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
+            if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE || res_type == SPVC_RESOURCE_TYPE_SEPARATE_IMAGE ||
+                res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE)
+                r->target = sampler_gl_target(compiler, list[i].type_id);
 
             switch (res_type)
             {

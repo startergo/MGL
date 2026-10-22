@@ -154,14 +154,12 @@ void mglValidateProgram(GLMContext ctx, GLuint program)
     {
         ok = mgl_program_validate_samplers(ctx, &ptr, 1, &log);
 
-        if (!(obj->linked_mask & SHADER_MASK_BIT(_COMPUTE_SHADER)) &&
-            (obj->linked_mask & SHADER_MASK_BIT(_VERTEX_SHADER)) &&
-            !(obj->linked_mask & SHADER_MASK_BIT(_FRAGMENT_SHADER)))
-        {
-            mgl_append_info_log(&log, "ERROR: program %u has no fragment shader; the Metal backend needs a "
-                                "fragment function to rasterize\n", program);
-            ok = false;
-        }
+        /* A program with a vertex stage and no fragment stage is link-valid and
+         * validate-valid in GL (separable programs: the fragment stage usually
+         * comes from another program of the pipeline).  MGL rasterizes such a
+         * program with the trampoline fragment function (see bindMTLProgram:),
+         * so it is not a validation error.  (KHR-GL46.direct_state_access
+         * program_pipelines_functional validates a vertex-only program.) */
     }
 
     if (ok)

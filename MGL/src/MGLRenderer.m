@@ -1985,7 +1985,9 @@ static char kComputeFallbackKey;
             {
             if (spirv_binding + e >= TEXTURE_UNITS)
                 continue;
-            Texture *ptr = STATE(active_textures[spirv_binding + e]);
+            /* GL sampler semantics: the sampler's dimension selects the unit's
+             * binding for that target (mgl_texture_for_sampler) */
+            Texture *ptr = mgl_texture_for_sampler(ctx, spirv_binding + e, sres->target);
             if (!ptr)
                 continue;
 
@@ -3736,7 +3738,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
                 switch(gl_texture_type)
                 {
-                    case _TEXTURE: ptr = STATE(active_textures[spirv_binding]); break;
+                    case _TEXTURE:
+                    {
+                        /* GL sampler semantics: dimension selects the unit's
+                         * per-target binding (mgl_texture_for_sampler) */
+                        SpirvResource *sres = NULL;
+                        GLuint cnt = [self getProgramBindingCount:_COMPUTE_SHADER type:spvc_type];
+                        for (GLuint k = 0; k < cnt; k++)
+                            if ([self getProgramBinding:_COMPUTE_SHADER type:spvc_type index:k] == spirv_binding)
+                            { sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][spvc_type].list[k]; break; }
+                        ptr = mgl_texture_for_sampler(ctx, spirv_binding, sres ? sres->target : 0);
+                        break;
+                    }
                     case _IMAGE_TEXTURE: ptr = STATE(image_units[spirv_binding].tex); break;
                     default:
                         ptr = NULL;

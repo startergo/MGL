@@ -1893,7 +1893,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
                 if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
-                                              : STATE(active_textures[unit]);
+                                              : mgl_texture_for_sampler(ctx, unit, sres->target);
                 if (tex) [self bindMTLTexture: tex];
             }
         }
@@ -1930,7 +1930,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
                 if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
-                                              : STATE(active_textures[unit]);
+                                              : mgl_texture_for_sampler(ctx, unit, sres->target);
                 if (!tex || !tex->mtl_data) continue;
                 id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
                 if (!types[t].image)
@@ -2047,7 +2047,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
                     if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
 
                     Texture *tex = types[t].image ? STATE(image_units[unit].tex)
-                                                  : STATE(active_textures[unit]);
+                                                  : mgl_texture_for_sampler(ctx, unit, sres->target);
                     if (!tex) continue;
                     if (![self bindMTLTexture: tex]) continue;
                     id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
@@ -2990,7 +2990,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
 
                         if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
                         Texture *tex = types[t].image ? STATE(image_units[unit].tex)
-                                                      : STATE(active_textures[unit]);
+                                                      : mgl_texture_for_sampler(ctx, unit, sres->target);
                         if (tex) [self bindMTLTexture: tex];
                     }
                 }

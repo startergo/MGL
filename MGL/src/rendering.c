@@ -280,6 +280,7 @@ void mgl_fb_set_read_buffer(GLMContext ctx, Framebuffer *fbo, GLenum src)
             {
                 case GL_FRONT: case GL_BACK: case GL_LEFT: case GL_RIGHT:
                 case GL_FRONT_LEFT: case GL_FRONT_RIGHT: case GL_BACK_LEFT: case GL_BACK_RIGHT:
+                case GL_FRONT_AND_BACK:  /* table 17.4 constants on an FBO: INVALID_OPERATION (CTS) */
                     FB_ERROR(GL_INVALID_OPERATION);
                 default:
                     FB_ERROR(GL_INVALID_ENUM);

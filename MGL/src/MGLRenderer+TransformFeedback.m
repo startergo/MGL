@@ -202,6 +202,16 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     id<MTLRenderCommandEncoder> saved = _currentRenderEncoder;
     _currentRenderEncoder = enc;
     bool ok = [self bindVertexBuffersToCurrentRenderEncoder];
+    if (ok)
+    {
+        /* vattrib: the plan generateVertexDescriptor just built routes each
+         * attribute's buffer to its MSL slot; bindVertexBuffersToCurrentRenderEncoder
+         * skips attribute_mask entries (they belong to the vattrib plan).  On the
+         * normal draw path the processGLState "PreDraw:" hook does this; the
+         * capture has no processGLState, so call it here (KHR-GL46.direct_state_access
+         * vertex_arrays_enable_disable_attributes). */
+        [self extVattribPreDraw: enc];
+    }
     _currentRenderEncoder = saved;
     if (!ok) { [enc endEncoding]; return NULL; }
 

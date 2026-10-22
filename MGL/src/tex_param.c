@@ -178,7 +178,7 @@ GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenu
     *changed = false;
 
     if (!is_sampler && tp_is_multisample_target(target) && mglTexParamIsSamplerState(pname))
-        return GL_INVALID_ENUM;
+        return GL_INVALID_OPERATION;   /* GL 4.6 8.10: sampler states on multisample targets */
 
     switch (pname)
     {
@@ -412,6 +412,16 @@ static GLuint tp_view_num_layers(Texture *tex)
  */
 GLenum mglTexParamGet(GLMContext ctx, Texture *tex, TextureParameter *p, bool is_sampler, GLenum pname, void *out, int vt)
 {
+    if (!is_sampler && tex)
+    {
+        /* GL 4.6 8.11: sampler-state queries on multisample targets, and any
+         * GL_TEXTURE_TARGET query on a buffer texture, are INVALID_OPERATION */
+        if (tp_is_multisample_target(tex->target) && mglTexParamIsSamplerState(pname))
+            return GL_INVALID_OPERATION;
+        if (tex->target == GL_TEXTURE_BUFFER && pname == GL_TEXTURE_TARGET)
+            return GL_INVALID_OPERATION;
+    }
+
     switch (pname)
     {
         case GL_TEXTURE_WRAP_S:      tp_store(out, vt, 0, p->wrap_s); return GL_NO_ERROR;

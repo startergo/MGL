@@ -199,7 +199,9 @@ TEST(param_errors)
 
     /* multisample: no sampler state, base level must be 0 */
     GLuint m; glGenTextures(1, &m); glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, m);
-    glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR); EXPECT_GL_ERROR(GL_INVALID_ENUM);
+    /* GL 4.6 8.10: sampler states on multisample targets are INVALID_OPERATION
+     * (KHR-GL46.direct_state_access textures_parameter_setup_errors) */
+    glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_BASE_LEVEL, 1); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_SWIZZLE_R, GL_GREEN); EXPECT_NO_GL_ERROR();
     EXPECT_EQ_INT(tex_i(GL_TEXTURE_2D_MULTISAMPLE, GL_TEXTURE_SWIZZLE_R), GL_GREEN);
