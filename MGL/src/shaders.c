@@ -237,6 +237,17 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
         res.max_geometry_uniform_components = 1024;
         res.max_geometry_atomic_counters = 0;
         res.max_geometry_atomic_counter_buffers = 0;
+        /* atomic_uint layout(binding=...): glslang's default limit (1) rejects legal
+         * GL 4.6 shaders — MGL reports GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS = 8
+         * (get.c's MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS; keep in sync), and the
+         * baked gl_MaxAtomicCounterBindings must match it
+         * (KHR-GL46.shader_storage_buffer_object advanced-write-fragment) */
+        res.max_atomic_counter_bindings = 8;
+        res.max_vertex_atomic_counters = 1024;
+        res.max_fragment_atomic_counters = 1024;
+        res.max_compute_atomic_counters = 1024;
+        res.max_tess_control_atomic_counters = 1024;
+        res.max_tess_evaluation_atomic_counters = 1024;
         input->resource = &res;
     }
 

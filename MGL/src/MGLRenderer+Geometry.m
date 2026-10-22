@@ -1952,6 +1952,17 @@ void geom_xfb_gpu_reset(GLMContext ctx)
      * instance arrays (one entry per element at consecutive slots), matching the flat
      * layout geom_build_pins assigns to the generated kernels */
     if (![self mapGLBuffersToMTLBufferMap: &list stage: _GEOMETRY_SHADER]) return false;
+    if (getenv("MGL_SSBO_DEBUG"))
+    {
+        NSLog(@"MGL geom: gs kernel resource list: count=%u", list.count);
+        for (int i = 0; i < (int)list.count; i++)
+            NSLog(@"MGL geom:   gs slot[%d]: base=%u buf=%p off=%ld size=%ld data=%p mtl=%p", i,
+                  list.buffers[i].buffer_base_index, (void *)list.buffers[i].buf,
+                  (long)list.buffers[i].offset,
+                  (long)(list.buffers[i].buf ? list.buffers[i].buf->size : -1),
+                  list.buffers[i].buf ? (void *)list.buffers[i].buf->data.buffer_data : NULL,
+                  list.buffers[i].buf ? (void *)list.buffers[i].buf->data.mtl_data : NULL);
+    }
     if (ctx->state.dirty_bits & DIRTY_BUFFER)
     {
         [self updateDirtyBaseBufferList: &list];
@@ -1974,6 +1985,10 @@ void geom_xfb_gpu_reset(GLMContext ctx)
          * setBytes fast path for small buffers) */
         if (!b->data.mtl_data && b->data.dirty_bits)
             if (![self updateDirtyBuffer: b]) return false;
+        if (!b->data.mtl_data) [self bindMTLBuffer: b];
+        /* a storage buffer that is still CPU-shadowed must become a real MTLBuffer:
+         * the setBytes fallback below binds inline bytes, and the kernel's SSBO writes
+         * would vanish (KHR-GL46.shader_storage_buffer_object basic-atomic-case1) */
         if (!b->data.mtl_data)
         {
             if (!b->data.buffer_data || b->size <= 0) return false;
@@ -1986,6 +2001,10 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
                 offset: (NSUInteger)off
                atIndex: (NSUInteger)i];
+        if (getenv("MGL_SSBO_DEBUG"))
+            NSLog(@"MGL geom: gs kernel bind i=%d off=%ld len=%lu base=%u", i, (long)off,
+                  (unsigned long)((__bridge id<MTLBuffer>)b->data.mtl_data).length,
+                  list.buffers[i].buffer_base_index);
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
 
@@ -3282,6 +3301,86 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     gGeomTopology = MTLPrimitiveTopologyClassUnspecified;
 
     return true;
+}
+
+#pragma mark - SSBO runtime-array lengths (shared program-resource utility)
+
+/* SPIRV-Cross implements .length() on an SSBO's runtime-sized array through a
+ * `constant uint* spvBufferSizeConstants [[buffer(25)]]` argument: element [i] is the
+ * byte size of the bound range of the buffer at Metal buffer index i. The list index IS
+ * the Metal buffer index (extBufBindList binds list[i] at index i), so one fill covers
+ * every stage resource; entries that are not SSBOs are simply never read.
+ * GL 4.6 4.4.1.3: the element count is (bound range size - array offset) / stride, and
+ * SPIRV-Cross bakes the offset/stride as constants, so the bound range size is exactly
+ * what must be fed (KHR-GL46.shader_storage_buffer_object advanced-unsizedArrayLength,
+ * incl. the bindRange{Offset,Size} variants). */
+- (void) geomFillSSBOSizes: (uint32_t *) sizes list: (BufferMapList *) list count: (GLuint *) out_count
+{
+    GLuint n = 0;
+    memset(sizes, 0, MAX_MAPPED_BUFFERS * sizeof(uint32_t));
+    for (GLuint i = 0; i < list->count && i < MAX_MAPPED_BUFFERS; i++) {
+        BufferMap *m = &list->buffers[i];
+        if (!m->buf) continue;
+        /* base binding records the whole buffer size, a range binding its size;
+         * a zero (unset) record falls back to buffer end - offset */
+        GLsizeiptr sz = m->size > 0 ? m->size : (m->buf->size - (m->offset > 0 ? m->offset : 0));
+        sizes[i] = sz > 0 ? (uint32_t)sz : 0;
+        n = i + 1;
+    }
+    *out_count = n;
+}
+
+/* render pass: bind the sizes for the vertex / fragment table. Skipped while the
+ * geometry stage's pass-through vertex function owns the vertex table, whose slot
+ * MGL_SSBO_SIZE_BUFFER_INDEX is MGL_GEOM_MSL_VSOUT — the pass-through never reads
+ * sizes (the program's vertex stage runs as a capture kernel before the pass). */
+- (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex
+{
+    Program *p = ctx->state.program;
+
+    if (!p || stage < 0 || !p->spirv[stage].msl_str) return;
+    if (!strstr(p->spirv[stage].msl_str, "spvBufferSizeConstants")) return;
+    if (vertex && ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
+        return;
+    if (!_currentRenderEncoder) return;
+
+    uint32_t sizes[MAX_MAPPED_BUFFERS];
+    GLuint n = 0;
+    [self geomFillSSBOSizes: sizes list: list count: &n];
+    if (!n) return;
+    if (vertex)
+        [_currentRenderEncoder setVertexBytes: sizes length: (NSUInteger)n * sizeof(uint32_t)
+                                     atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
+    else
+        [_currentRenderEncoder setFragmentBytes: sizes length: (NSUInteger)n * sizeof(uint32_t)
+                                       atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
+}
+
+/* compute pass: glDispatchCompute's own encoder binding (not the geometry kernels) */
+- (void) geomBindSSBOSizesCompute: (id <MTLComputeCommandEncoder>) enc
+{
+    Program *p = ctx->state.program;
+
+    if (!enc || !p || !p->spirv[_COMPUTE_SHADER].msl_str) return;
+    if (!strstr(p->spirv[_COMPUTE_SHADER].msl_str, "spvBufferSizeConstants")) return;
+
+    uint32_t sizes[MAX_MAPPED_BUFFERS];
+    GLuint n = 0;
+    [self geomFillSSBOSizes: sizes list: &ctx->state.compute_buffer_map_list count: &n];
+    if (getenv("MGL_SSBO_DEBUG"))
+    {
+        NSLog(@"MGL geom: ssbo sizes (compute): n=%u list->count=%u [0]=%u [1]=%u msl=%p",
+              n, ctx->state.compute_buffer_map_list.count, sizes[0], sizes[1],
+              p->spirv[_COMPUTE_SHADER].msl_str);
+        for (GLuint i = 0; i < ctx->state.compute_buffer_map_list.count; i++)
+        {
+            BufferMap *m = &ctx->state.compute_buffer_map_list.buffers[i];
+            NSLog(@"MGL geom:   cs slot[%u]: base=%u off=%ld size=%ld buf=%p",
+                  i, m->buffer_base_index, (long)m->offset, (long)m->size, (void *)m->buf);
+        }
+    }
+    if (!n) return;
+    [enc setBytes: sizes length: (NSUInteger)n * sizeof(uint32_t) atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
 }
 
 @end

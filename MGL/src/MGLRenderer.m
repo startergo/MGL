@@ -438,6 +438,7 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
                         buffer_map->buffers[buffer_map->count].buf = dub;
                         buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->buffers[buffer_map->count].size = dub->size;
                         buffer_map->count++;
                         buffers_to_be_mapped--;
                         continue;
@@ -463,6 +464,7 @@ static char kComputeFallbackKey;
                     Buffer *eb = (e == 0) ? buf : (spirv_binding + e < MAX_BINDABLE_BUFFERS ?
                                                    buffers[spirv_binding + e].buf : NULL);
                     GLintptr eoff = (e == 0) ? buffers[spirv_binding].offset : buffers[spirv_binding + e].offset;
+                    GLsizeiptr esz = (e == 0) ? buffers[spirv_binding].size : buffers[spirv_binding + e].size;
 
                     if (!eb)
                     {
@@ -474,6 +476,7 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding + e;
                         buffer_map->buffers[buffer_map->count].buf = nullbuf;
                         buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->buffers[buffer_map->count].size = 0;
                         buffer_map->count++;
                         continue;
                     }
@@ -482,6 +485,7 @@ static char kComputeFallbackKey;
                     buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding + e;
                     buffer_map->buffers[buffer_map->count].buf = eb;
                     buffer_map->buffers[buffer_map->count].offset = eoff;
+                    buffer_map->buffers[buffer_map->count].size = esz;
                     buffer_map->count++;
 
                     /* shader storage / atomic counter buffers may be written by the shader:
@@ -489,6 +493,23 @@ static char kComputeFallbackKey;
                     if (spvc_type == SPVC_RESOURCE_TYPE_STORAGE_BUFFER ||
                         spvc_type == SPVC_RESOURCE_TYPE_ATOMIC_COUNTER)
                         mgl_buffers_mark_gpu_use(ctx, eb, true);
+                }
+
+                /* an instance-array entry was just expanded into `elems` slots: skip
+                 * its remaining instance entries here, or each of them re-expands and
+                 * the enumeration runs off the list (basic-stdLayout-case1).  The list
+                 * may be unflattened (one entry with array_size = N, e.g. the geometry
+                 * stage's), so never skip past the entries that exist */
+                if (elems > 1)
+                {
+                    int skip = (int)elems - 1;
+
+                    if (skip > buffers_to_be_mapped - 1) skip = buffers_to_be_mapped - 1;
+                    if (skip > 0)
+                    {
+                        i += skip;
+                        buffers_to_be_mapped -= skip;
+                    }
                 }
 
                 buffers_to_be_mapped--;
@@ -2937,19 +2958,31 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     program = ctx->state.program;
     vertex_shader = program->shader_slots[_VERTEX_SHADER];
     fragment_shader = program->shader_slots[_FRAGMENT_SHADER];
-    if (!vertex_shader || !fragment_shader)
+    if (!vertex_shader)
     {
-        /* the slots are C pointers, not objects: %@ on them would crash objc_msgSend */
-        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u lacks stages (vs=%p fs=%p tess=%p)",
-              program->name, (void *)vertex_shader, (void *)fragment_shader,
+        NSLog(@"MGL ERROR: generatePipelineDescriptor: program %u has no vertex shader (fs=%p tess=%p)",
+              program->name, (void *)fragment_shader,
               (void *)program->shader_slots[_TESS_EVALUATION_SHADER]);
         return NULL;
     }
 
     vertexFunction = (__bridge id<MTLFunction>)(vertex_shader->mtl_data.function);
-    fragmentFunction = (__bridge id<MTLFunction>)(fragment_shader->mtl_data.function);
     assert(vertexFunction);
-    assert(fragmentFunction);
+    /* A program with only a vertex shader is legal for GL rasterizer-discard /
+     * transform-feedback-style draws (GL 4.6 10.4; KHR-GL46's SSBO tests write
+     * storage buffers from the vertex stage that way). Metal runs the vertex
+     * stage of a vertex-only pipeline when fragmentFunction is nil and
+     * rasterizationEnabled is NO (MTLRenderPipeline.h: "you must either set
+     * fragmentFunction to non-nil, or set rasterizationEnabled to NO") — and
+     * only a *void* vertex function may write buffers, which SPIRV-Cross emits
+     * for exactly these programs (no rasterization outputs). */
+    bool vertex_only = false;
+    if (fragment_shader)
+        fragmentFunction = (__bridge id<MTLFunction>)(fragment_shader->mtl_data.function);
+    else {
+        fragmentFunction = nil;
+        vertex_only = true;
+    }
 
     // tess: the evaluation shader is the (rewritten) vertex function of the pipeline —
     // the vertex stage runs as a compute kernel before the render pass. The plain
@@ -2989,6 +3022,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     // attachment formats + raster sample count (fb domain)
     [self fbApplyPipelineFormats: pipelineStateDescriptor];
+
+    if (vertex_only)
+    {
+        /* nothing rasterizes: keep the descriptor free of attachment formats the
+         * absent fragment stage would have to match, and disable rasterization so
+         * Metal accepts the nil fragment function */
+        for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
+            pipelineStateDescriptor.colorAttachments[i].pixelFormat = MTLPixelFormatInvalid;
+        pipelineStateDescriptor.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
+        pipelineStateDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
+        pipelineStateDescriptor.rasterizationEnabled = NO;
+    }
 
     // blend / masks / raster / shader-variant state (rstate category)
     [self rstateConfigurePipelineDescriptor: pipelineStateDescriptor];
@@ -3629,8 +3674,17 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
         assert(buffer);
 
-        [computeCommandEncoder setBuffer:buffer offset:0 atIndex:i ];
+        /* glBindBufferRange offsets: the bound range starts at the recorded offset
+         * (KHR-GL46.shader_storage_buffer_object advanced-unsizedArrayLength-cs
+         * -std430-vec-bindrangeOffset) */
+        GLintptr off = ctx->state.compute_buffer_map_list.buffers[i].offset;
+        if (off < 0 || (size_t)off >= buffer.length) off = 0;
+
+        [computeCommandEncoder setBuffer:buffer offset:(NSUInteger)off atIndex:i ];
     }
+
+    /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25) */
+    [self geomBindSSBOSizesCompute: computeCommandEncoder];
 
     return true;
 }

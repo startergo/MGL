@@ -523,7 +523,10 @@ void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storage
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return;
     if (storageBlockIndex >= (GLuint)ip->nssbos) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
-    GLuint max = ctx->state.var.max_shader_storage_buffer_bindings > 0 ? (GLuint)ctx->state.var.max_shader_storage_buffer_bindings : MAX_BINDABLE_BUFFERS;
+    /* same fallback as maxBindingsForTarget(): Apple's GL 4.1 cannot be asked for
+     * GL 4.3+ limits, so an unset (0) cached value falls back to get.c's reported
+     * MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS */
+    GLuint max = ctx->state.var.max_shader_storage_buffer_bindings > 0 ? (GLuint)ctx->state.var.max_shader_storage_buffer_bindings : 8;
     if (max > MAX_BINDABLE_BUFFERS) max = MAX_BINDABLE_BUFFERS; /* renderer binding table size */
     if (storageBlockBinding >= max) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     ip->ssbos[storageBlockIndex].binding = (GLint)storageBlockBinding;

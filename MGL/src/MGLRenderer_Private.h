@@ -121,6 +121,11 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 /* geometry domain (MGLRenderer+Geometry.m): Metal requires inputPrimitiveTopology when the
  * vertex stage writes render_target_array_index / viewport_array_index */
 - (void) geomConfigureTopology: (MTLRenderPipelineDescriptor *) pd;
+/* geom: SSBO runtime-array .length() — bind SPIRV-Cross's spvBufferSizeConstants
+ * (bound-range byte size of the SSBO at each Metal buffer index) to the render or
+ * compute tables; no-op when the stage MSL does not reference it */
+- (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex;
+- (void) geomBindSSBOSizesCompute: (id <MTLComputeCommandEncoder>) enc;
 /* geom: when the pass-through vertex override is active, a specialized copy of it (the same
  * rstate vertex function constants — it is the last pre-rasterization stage); NULL when the
  * override is inactive, so the caller leaves the descriptor's vertex function alone */

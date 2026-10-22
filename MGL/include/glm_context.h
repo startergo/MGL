@@ -403,6 +403,10 @@ typedef struct BufferMap_t {
     GLuint      attribute_mask;
     Buffer      *buf;
     GLintptr    offset;
+    /* byte size of the bound range (whole buffer for glBindBufferBase, the range
+     * size for glBindBufferRange): SPIRV-Cross's spvBufferSizeConstants — the
+     * runtime-array .length() implementation — reads it per bound SSBO */
+    GLsizeiptr  size;
 } BufferMap;
 
 typedef struct BufferMapList_t {

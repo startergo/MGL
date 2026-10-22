@@ -689,8 +689,16 @@ static GLuint maxBindingsForTarget(GLMContext ctx, GLenum target)
             break;
 
         case GL_SHADER_STORAGE_BUFFER:
-            if (STATE_VAR(max_shader_storage_buffer_bindings) && STATE_VAR(max_shader_storage_buffer_bindings) < max)
-                max = STATE_VAR(max_shader_storage_buffer_bindings);
+        {
+            /* getMacOSDefaults() asks Apple's GL 4.1 for GL 4.3+ limits and gets
+             * nothing back, so the cached value can be unset (0): fall back to the
+             * limit get.c reports (MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS), keeping
+             * the error paths of glBindBuffer{Base,Range} spec-correct
+             * (KHR-GL46.shader_storage_buffer_object negative-api-bind) */
+            GLuint lim = STATE_VAR(max_shader_storage_buffer_bindings);
+            if (!lim || lim > MAX_BINDABLE_BUFFERS) lim = MAX_BINDABLE_BUFFERS < 8 ? MAX_BINDABLE_BUFFERS : 8;
+            if (lim < max) max = lim;
+        }
             break;
 
         case GL_TRANSFORM_FEEDBACK_BUFFER:
@@ -808,12 +816,18 @@ void mglBindBufferRange(GLMContext ctx, GLenum target, GLuint index, GLuint buff
     ERROR_CHECK_RETURN(checkIndexedTarget(ctx, target), GL_INVALID_ENUM);
     ERROR_CHECK_RETURN(index < maxBindingsForTarget(ctx, target), GL_INVALID_VALUE);
 
+    /* GL 4.6 6.1.1: BindBufferRange validates offset / alignment regardless of the
+     * bound name — binding zero with an unaligned offset is still INVALID_VALUE
+     * (KHR-GL46.shader_storage_buffer_object negative-api-bind); the size>0 check
+     * applies to a real buffer only (basic-binding binds name 0 with size 0 and
+     * expects the binding to simply break) */
+    ERROR_CHECK_RETURN(offset >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN((offset % offsetAlignmentForTarget(ctx, target)) == 0, GL_INVALID_VALUE);
+
     if (buffer)
     {
         ERROR_CHECK_RETURN(isBufferName(ctx, buffer), GL_INVALID_OPERATION);
-        ERROR_CHECK_RETURN(offset >= 0, GL_INVALID_VALUE);
         ERROR_CHECK_RETURN(size > 0, GL_INVALID_VALUE);
-        ERROR_CHECK_RETURN((offset % offsetAlignmentForTarget(ctx, target)) == 0, GL_INVALID_VALUE);
 
         if (target == GL_TRANSFORM_FEEDBACK_BUFFER || target == GL_ATOMIC_COUNTER_BUFFER)
         {

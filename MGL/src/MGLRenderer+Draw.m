@@ -372,6 +372,14 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
         return false;
 
+    /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25).
+     * The vertex table's stage is the evaluation shader while tessellation is active
+     * (mapBuffersToMTL mirrors this). */
+    [self geomBindSSBOSizes: &ctx->state.vertex_buffer_map_list
+                     stage: [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER
+                    vertex: true];
+    [self geomBindSSBOSizes: &ctx->state.fragment_buffer_map_list stage: _FRAGMENT_SHADER vertex: false];
+
     return true;
 }
 
@@ -588,6 +596,9 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         if (off < mb.length)
             [enc setBuffer: mb offset: off atIndex: i];
     }
+
+    /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25) */
+    [self geomBindSSBOSizesCompute: enc];
 
     if (![self bindTexturesToComputeEncoder: enc])
     {

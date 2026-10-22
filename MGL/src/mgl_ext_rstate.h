@@ -26,6 +26,10 @@
 #define MGL_RS_FC_SAMPLE_MASK         32005
 #define MGL_RS_FC_PER_SAMPLE           32006
 #define MGL_RS_FC_RASTERIZER_DISCARD   32007
+#define MGL_RS_FC_PIPELINE_SAMPLES     32008   /* the render pipeline's sample count; a
+                                                * single-sample pipeline IGNORES a fragment
+                                                * shader's gl_SampleMask write (GL 4.6 13.3,
+                                                * KHR-GL46.sample_variables mask.*) */
 
 /* GL-side state, reachable as ctx->state.ext_rstate; allocated in mgl_ext_init_rstate(). */
 struct MGLExtState_rstate {

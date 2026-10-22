@@ -1199,6 +1199,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* geom: SPIRV-Cross maps GLSL `coherent`/`volatile` SSBO qualifiers to a `volatile`
+     * address-space qualifier in the MSL parameter declarations (`volatile device
+     * Block& ...`).  MSL cannot parse that qualifier order (basic-syntax's coherent
+     * restrict volatile block), and a volatile block reference makes member matrices
+     * lose their operator[] (advanced-matrix).  Neither qualifier is expressible on
+     * Metal anyway - cross-invocation ordering is provided by MGL's encoder
+     * serialization (glMemoryBarrier) - so the qualifier is dropped (geometry.c). */
+    {
+        char *stripped = mgl_geom_strip_msl_volatile(result);
+        if (stripped)
+        {
+            free(tess_owned);
+            tess_owned = stripped;
+            result = stripped;
+        }
+    }
+
     /* SPIRV-Cross gives soft-float64 library functions `thread const T&`
      * scalar parameters; a `constant`-space buffer member cannot bind to
      * those.  mgl_fp64_fix_msl_scalar_params() takes them by value instead —

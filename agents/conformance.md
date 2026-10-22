@@ -227,6 +227,7 @@ shading_language_420pack 13→21 pass, limits 112→117 pass.
 ```
   packed_pixels                           250  Fail=249 Pass=1        → **250/250 Pass (round 33)**
   sample_variables                        190  Fail=144 NotSupported=38 Pass=8
+                                                          → **130 Pass / 22 Fail / 38 NotSupported (round 34)**
   direct_state_access                     371  Pass=297 Fail=70 InternalError=2 CompatWarn=1 Crash=1
   shader_storage_buffer_object            124  Fail=70 Pass=54
   shaders                                2382  Pass=2316 Fail=58 NotSupported=6 Timeout=2

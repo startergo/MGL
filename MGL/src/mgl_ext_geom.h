@@ -85,6 +85,15 @@ enum {
     MGL_GEOM_KERNEL_USER_SLOTS = 22
 };
 
+/* SPIRV-Cross's buffer-size constants argument (`constant uint* spvBufferSizeConstants
+ * [[buffer(25)]]`), how it implements .length() on SSBO runtime arrays: element [i] is
+ * the byte size of the bound range of the SSBO at Metal buffer index i (SPIRV-Cross
+ * default, spirv_cross_msl.hpp buffer_size_buffer_index). The geometry kernel variants
+ * move it inside the user slot range (MGL_GEOM_KERNEL_SIZE_BUFFER) because the kernel's
+ * own buffers are pinned from MGL_GEOM_MSL_CNT (22) up. */
+#define MGL_SSBO_SIZE_BUFFER_INDEX 25
+#define MGL_GEOM_KERNEL_SIZE_BUFFER 21
+
 /* one interface varying of the geometry stage (canonical word layout shared by the
  * VS capture variant, the GS kernel and the pass-through vertex function) */
 typedef struct MGLGeomVar {
@@ -249,6 +258,9 @@ bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data);
 /* geometry stage compilation hook called by program.c's compile_stage() */
 bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj, int stage,
                             const uint32_t *words, size_t nwords, const char *entry, char **log);
+/* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
+ * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
+char *mgl_geom_strip_msl_volatile(const char *msl);
 /* post-link hook: replaces the vertex stage with the pass-through function */
 void mgl_geom_post_link(GLMContext ctx, struct Program_t *program);
 bool mgl_geom_link_failed(GLMContext ctx, struct Program_t *program, const char **reason);

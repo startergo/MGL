@@ -1834,7 +1834,7 @@ static char *geom_transform_source(const char *src, unsigned in_verts, char *gl_
             char dbg[80];
             size_t dn = len - pos < 60 ? len - pos : 60;
             memcpy(dbg, src + pos, dn); dbg[dn] = 0;
-            fprintf(stderr, "MGL geom trace kind=%d qe=%u: [%s]\n", info.kind, info.qual_end, dbg);
+            fprintf(stderr, "MGL geom trace kind=%d qe=%u: [%s]\n", info.kind, (unsigned)info.qual_end, dbg);
         }
 
         if (info.kind != STMT_OTHER)
@@ -2103,6 +2103,55 @@ static char *strip_version(const char *src)
 
 /* dump helper (MGL_GEOM_DUMP=<dir>): writes the generated shaders for inspection */
 /* the trace / behaviour switches are read once (this file is on the draw path) */
+
+/* GLSL `coherent` / `volatile` qualifiers on SSBO blocks become a `volatile`
+ * address-space qualifier in SPIRV-Cross's MSL parameter declarations, which MSL
+ * rejects (`volatile device Block& x`) and which strips member matrices of their
+ * operator[]; `restrict` comes out as the C99 keyword, which MSL reserves but only
+ * accepts spelled `__restrict`.  Neither qualifier has a Metal equivalent —
+ * cross-invocation ordering is provided by MGL's encoder serialization — so this pass
+ * rewrites both in device/constant address-space declarations (called from program.c's
+ * stage MSL finalization).  Returns a malloc'd replacement, or NULL when nothing
+ * changed. */
+char *mgl_geom_strip_msl_volatile(const char *msl)
+{
+    static const struct { const char *bad, *good; } pats[] = {
+        { "volatile device ",  "device " },
+        { "volatile constant ", "constant " },
+        { "device volatile ",  "device " },
+        { "constant volatile ", "constant " },
+        /* GLSL `restrict` becomes the C99 keyword, which MSL reserves but only
+         * accepts in the compiler's double-underscore spelling */
+        { "& restrict ", "& __restrict " },
+        { "* restrict ", "* __restrict " },
+    };
+
+    if (!msl) return NULL;
+
+    bool changed = false;
+    for (size_t p = 0; p < sizeof pats / sizeof pats[0] && !changed; p++)
+        changed = strstr(msl, pats[p].bad) != NULL;
+    if (!changed) return NULL;
+
+    char *out = strdup(msl);
+    if (!out) return NULL;
+
+    for (size_t p = 0; p < sizeof pats / sizeof pats[0]; p++)
+    {
+        size_t bl = strlen(pats[p].bad), gl = strlen(pats[p].good);
+        char *q = out;
+        while ((q = strstr(q, pats[p].bad)) != NULL)
+        {
+            /* shift the tail first: the replacement may be longer, and writing it
+             * first would clobber the not-yet-moved bytes */
+            memmove(q + gl, q + bl, strlen(q + bl) + 1);
+            memmove(q, pats[p].good, gl);
+            q += gl;
+        }
+    }
+    return out;
+}
+
 static struct { int read; bool draw, xfb, cpu_xfb, cpu_assembly; } gEnv = { 0, false, false, false, false };
 
 static bool geom_env(int which)
@@ -2588,12 +2637,32 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                         const char *p = body;
                         while (p < bend && !keep)
                         {
-                            const char *c = p, *e;
+                            const char *c = p, *e, *full;
+                            int pd = 0;   /* commas inside an initializer's parens do not
+                                          * separate declarators ("= uint[4](1u, 2u, ...)") */
                             while (c < bend && isspace((unsigned char)*c)) c++;
                             e = c;
-                            while (e < bend && *e != ',') e++;
-                            if (memchr(c, '=', (size_t)(e - c))) keep = true;  /* initializer */
-                            else
+                            while (e < bend)
+                            {
+                                if (*e == '(' || *e == '[') pd++;
+                                else if (*e == ')' || *e == ']') pd--;
+                                else if (*e == ',' && pd <= 0) break;
+                                e++;
+                            }
+                            full = e;   /* uncropped end: the advance below needs it */
+                            /* a default-value initializer ("= ...") is dropped instead of
+                             * forcing the whole statement to be kept: the value lives in
+                             * the default-uniform block, seeded at link from the
+                             * initializer (the program's uniform shadow), so re-declaring
+                             * the member in the block preserves the value.  Keeping the
+                             * declaration would leave a default-block uniform in the
+                             * variant that SPIRV-Cross buffers at an auto index,
+                             * colliding with the pinned storage buffers
+                             * (basic-atomic-case1). */
+                            {
+                                const char *eq = memchr(c, '=', (size_t)(e - c));
+                                if (eq) e = eq;   /* declarator ends before "= ..." */
+                            }
                             {
                                 const char *nb = e;   /* end of the declarator */
                                 const char *ne;
@@ -2676,7 +2745,9 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                                     }
                                 }
                             }
-                            p = e + 1;
+                            /* advance from the uncropped declarator end: from a cropped
+                             * initializer the scan would land inside "= ..." */
+                            p = full + 1;
                         }
                     }
 
@@ -2734,6 +2805,9 @@ static bool geom_dub_layout(SpvModule *m, GeomDubMember *mem, int *nmem, int max
             if (m->mnames[k].id == m->names[i].id) { sid = m->names[i].id; break; }
         if (sid) break;
     }
+    if (getenv("MGL_SSBO_DEBUG"))
+        fprintf(stderr, "MGL geom: dub_layout: m=%p n_names=%d n_mnames=%d sid=%u\n",
+                (void *)m, m->n_names, m->n_mnames, sid);
     if (!sid) return false;
 
     for (int k = 0; n < max; k++)
@@ -2792,26 +2866,53 @@ static void geom_emit_dub_block(SB *b, const GeomPlainUni *uni, int nuni,
  * program resources span (0 on nothing to pin); a block/SSBO declared as an instance ARRAY
  * spans array_size consecutive slots, so the per-type counters advance by that — the bind
  * walk (geomBindStageBuffers / the capture pass) lays the buffers out the same way. */
-static int geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
+/* the Block / BufferBlock decoration sits on the block's OpTypeStruct, not on the
+ * variable: resolve through the pointer (and any instance array) */
+static bool spv_var_is_buffer_block(SpvModule *m, SpvVar *v)
+{
+    SpvType *t = spv_value_type(m, v->type_id, NULL);
+
+    return t && t->kind == SPVT_STRUCT && spv_deco(m, t->id, SpvDecorationBufferBlock, NULL);
+}
+
+static int geom_build_pins(SpvModule *prog, SpvModule *mine,
                            GeomPin *pins, int *npins, int max)
 {
     uint32_t ub[32], uc[32], sb[32];
     int nub = 0, nuc = 0, nsb = 0, total = 0, ub_span = 0;
+    int dub_flat = -1;
     bool has_dub = false;
 
     *npins = 0;
 
+    /* Classify exactly like SPIRV-Cross's reflection (and hence like the renderer's
+     * mapGLBuffersToMTLBufferMap enumerates the resource types): a Uniform-storage
+     * variable with the Block decoration is a UBO — including the program's
+     * default-uniform block mgl_DefaultUniforms, at its module position — while one
+     * with the Buffer decoration (or StorageBuffer storage) is an SSBO.  glslang in
+     * this toolchain emits SSBOs with Uniform storage + Buffer decoration, so going
+     * by the storage class alone mixes both classes into one counter and the flats
+     * stop matching the renderer's list whenever a stage has both a DUB and SSBOs
+     * (KHR-GL46.shader_storage_buffer_object basic-atomic-case1). */
     for (int i = 0; i < prog->n_vars; i++)
     {
         SpvVar *v = &prog->vars[i];
+
         if (v->storage == SpvStorageClassUniform)
         {
             const char *nm = spv_name(prog, v->id);
-            if (nm && !strcmp(nm, "mgl_DefaultUniforms")) { has_dub = true; continue; }
+            bool is_dub = nm && !strcmp(nm, "mgl_DefaultUniforms");
+
+            if (!is_dub && spv_var_is_buffer_block(prog, v))
+            {
+                if (nsb < 32) sb[nsb++] = v->id;
+                continue;
+            }
             if (nub < 32)
             {
                 uint32_t asz = 1;
 
+                if (is_dub) { has_dub = true; dub_flat = ub_span; }
                 ub[nub++] = v->id;
                 spv_value_type(prog, v->type_id, &asz);   /* an instance array spans asz slots */
                 ub_span += (int)asz;
@@ -2821,7 +2922,8 @@ static int geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
         else if (v->storage == SpvStorageClassStorageBuffer) { if (nsb < 32) sb[nsb++] = v->id; }
     }
 
-    /* flat positions: ub j -> j; dub -> nub; uc k -> nub + has_dub + k; sb j -> nub + has_dub + nuc + j */
+    /* flat positions: ub j -> j (the DUB included at its position); uc k -> ub_span + k;
+     * sb j -> ub_span + nuc + j — the order mapGLBuffersToMTLBufferMap builds the list */
     {
         int mub = 0, muc = 0, msb = 0;
 
@@ -2830,51 +2932,79 @@ static int geom_build_pins(SpvModule *prog, SpvModule *mine, bool pin_dub,
             SpvVar *v = &mine->vars[i];
             int flat;
             uint32_t asz = 1;
+            const char *nm = spv_name(mine, v->id);
 
             /* block-instance arrays span asz consecutive slots (GL binding points base..base+asz-1) */
             spv_value_type(mine, v->type_id, &asz);
 
+            /* the generated variants pin their own pool blocks (MGLGs* / MGLGeom*) at
+             * bindings above the DUB slot; user bindings stay below it (MGL reports at
+             * most 14 uniform-buffer / 8 storage-buffer binding points), so the binding
+             * cleanly separates them */
+            {
+                uint32_t bnd = (uint32_t)spv_binding(mine, v->id);
+
+                if (bnd == MGL_GEOM_SSBO_DUB)
+                {
+                    if (!has_dub) continue;   /* no default-uniform block to mirror */
+                    flat = dub_flat;
+                    goto pin;
+                }
+                if (bnd > MGL_GEOM_SSBO_DUB) continue;   /* kernel pool resource */
+            }
+
             if (v->storage == SpvStorageClassUniform)
             {
-                if (mub >= nub) continue;
-                flat = mub;
-                mub += asz;
-                total += asz;
+                if (spv_var_is_buffer_block(mine, v))
+                {
+                    if (msb >= nsb) continue;
+                    flat = ub_span + nuc + msb;
+                    msb += asz;
+                    total += asz;
+                }
+                else
+                {
+                    if (mub >= nub) continue;
+                    flat = mub;
+                    mub += asz;
+                    total += asz;
+                }
             }
             else if (v->storage == SpvStorageClassUniformConstant)
             {
                 if (muc >= nuc) continue;
-                flat = ub_span + (has_dub ? 1 : 0) + muc;
+                flat = ub_span + muc;
                 muc++;
                 total++;
             }
             else if (v->storage == SpvStorageClassStorageBuffer)
             {
                 if (msb >= nsb) continue;
-                flat = ub_span + (has_dub ? 1 : 0) + nuc + msb;
+                flat = ub_span + nuc + msb;
                 msb += asz;
                 total += asz;
             }
             else continue;
 
+pin:
             if (*npins < max)
             {
                 pins[*npins].binding = spv_binding(mine, v->id);
                 pins[*npins].msl = flat;
                 pins[*npins].texture = (v->storage == SpvStorageClassUniformConstant);
+                if (getenv("MGL_SSBO_DEBUG"))
+                    fprintf(stderr, "MGL geom:   pin var %u storage %d asz %u -> binding %u msl %d name='%s'%s\n",
+                            v->id, (int)v->storage, asz, pins[*npins].binding, flat,
+                            nm ? nm : "(null)",
+                            (flat == dub_flat && has_dub) ? " (DUB)" : "");
                 (*npins)++;
             }
         }
     }
 
-    if (pin_dub && *npins < max)
-    {
-        pins[*npins].binding = MGL_GEOM_SSBO_DUB;
-        pins[*npins].msl = ub_span;   /* right after the UBOs' expanded span */
-        pins[*npins].texture = false;
-        (*npins)++;
-        total++;
-    }
+    if (getenv("MGL_SSBO_DEBUG"))
+        fprintf(stderr, "MGL geom: pins: nub=%d ub_span=%d has_dub=%d dub_flat=%d nuc=%d nsb=%d total=%d npins=%d\n",
+                nub, ub_span, (int)has_dub, dub_flat, nuc, nsb, total, *npins);
     return total;
 }
 
@@ -3986,7 +4116,16 @@ static bool msl_value_parameters(char *msl, const char *entry)
         if (!strncmp(p, "thread const ", 13))
         {
             char *amp = p + 13;
-            while (amp < close && *amp != '&' && *amp != ',') amp++;
+            int depth = 0;   /* a template argument list has its own commas
+                              * ("spvUnsafeArray<uint, 8>&"): only an '&' at depth 0
+                              * separates the type from the parameter name */
+            while (amp < close)
+            {
+                if (*amp == '<') depth++;
+                else if (*amp == '>') depth--;
+                else if (depth == 0 && (*amp == '&' || *amp == ',')) break;
+                amp++;
+            }
             if (amp < close && *amp == '&')
             {
                 size_t tail = strlen(amp) + 1;
@@ -4116,7 +4255,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             int span;
 
             npins2 = 0;
-            span = geom_build_pins(p_vs, c_vs, true, pins2, &npins2, 8);
+            span = geom_build_pins(p_vs, c_vs, pins2, &npins2, 8);
             if (span > MGL_GEOM_KERNEL_USER_SLOTS)
             {
                 spv_free(c_vs);
@@ -4178,7 +4317,7 @@ build:
         {
             /* the kernel's own buffers live at fixed Metal slots (MGL_GEOM_MSL_*): the
              * stage's program resources must fit in the slots below them */
-            int span = geom_build_pins(p_gs, k_gs, true, pins2, &npins2, 8);
+            int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8);
 
             if (span > MGL_GEOM_KERNEL_USER_SLOTS)
                 GEOM_FAIL("geometry stage resources span %d argument slots; the compute "

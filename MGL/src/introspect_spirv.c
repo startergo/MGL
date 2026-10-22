@@ -2035,7 +2035,14 @@ uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage
         out = transform_stage(ctx, &sc[stage], stage, &n);
         if (out) {
             dump_words(out, n, program, stage, attempt ? "patched_nopack" : "patched");
-            if (!msl_accepts(out, n, stage)) { free(out); out = NULL; }
+            /* the gate exists so a broken patch cannot poison the pipeline MSL — but the
+             * geometry stage never becomes pipeline MSL (the geometry domain rewrites it
+             * into a compute kernel), and SPIRV-Cross's MSL backend rejects geometry
+             * modules that read gl_PrimitiveIDIn ("PrimitiveId is not supported in this
+             * execution model"), which would otherwise drop the whole patched module —
+             * including the default-uniform block rewrite — and leave the stage's plain
+             * uniforms unbound (KHR-GL46.shader_storage_buffer_object basic-atomic-case1) */
+            if (stage != _GEOMETRY_SHADER && !msl_accepts(out, n, stage)) { free(out); out = NULL; }
             else {
                 *out_words = n;
                 /* leaf kinds survive to the post-link reflection (StageCtx is freed below) */

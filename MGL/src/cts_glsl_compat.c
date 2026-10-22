@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdbool.h>
 #include "cts_glsl_compat.h"
 
 static int is_ident_char(int c) { return isalnum(c) || c == '_'; }
@@ -224,11 +225,101 @@ static char *strip_gl_block_packings(const char *src)
     return out.buf;
 }
 
+/* GLSL 4.60 4.4.3: a global layout-qualifier declaration for the *buffer* interface
+ * without a block ("layout(binding = 1) buffer;") is not valid OpenGL GLSL — it only
+ * parses as Vulkan GLSL, which glslang implements.  A rewrite that keeps it would let
+ * an ill-formed program link, so the declaration is rejected with a #error line
+ * (KHR-GL46.shader_storage_buffer_object negative-glsl-compileTime; `uniform;` IS
+ * legal and is left alone). */
+static char *reject_buffer_layout_decl(const char *src)
+{
+    const char *q = src, *emitted = src;
+    bool changed = false;
+    Str out = { NULL, 0, 0 };
+
+    if (!src) return NULL;
+
+    while ((q = strstr(q, "buffer")) != NULL)
+    {
+        const char *b = q;                 /* token start */
+        q += strlen("buffer");
+        if (!(b == src || !is_ident_char((unsigned char)b[-1])) ||
+            is_ident_char((unsigned char)*q))
+            continue;                      /* part of an identifier */
+
+        const char *pb = b;
+        while (pb > src && isspace((unsigned char)pb[-1])) pb--;
+        const char *fa = q;
+        while (*fa && isspace((unsigned char)*fa)) fa++;
+
+        /* "layout(...)buffer;" — layout qualifier list directly before, semicolon
+         * right after (a block would name the interface between them).  A global
+         * buffer-interface layout declaration is legal GLSL for the packing /
+         * matrix-order qualifiers (GLSL 4.60 4.4.3; the CTS's "layout(shared,
+         * row_major) buffer;"), but not for a binding point — reject only those. */
+        if (!(pb > src && pb[-1] == ')' && *fa == ';'))
+            continue;
+
+        {
+            const char *pe = pb - 1;             /* the ')' */
+            int depth = 0;
+            const char *po = pe;                 /* walk back to the matching '(' */
+
+            while (po > src)
+            {
+                if (*po == ')') depth++;
+                else if (*po == '(') { if (depth-- == 0) break; }
+                po--;
+            }
+            if (po <= src || *po != '(') continue;
+
+            /* does the qualifier list mention a binding point? */
+            {
+                const char *scan = po + 1;
+                bool has_binding = false;
+
+                for (; scan + 7 <= pe; scan++)
+                {
+                    if ((scan == po + 1 || !is_ident_char((unsigned char)scan[-1])) &&
+                        strncmp(scan, "binding", 7) == 0 &&
+                        !is_ident_char((unsigned char)scan[7]))
+                    {
+                        has_binding = true;
+                        break;
+                    }
+                }
+                if (!has_binding) continue;
+            }
+        }
+
+        str_append(&out, emitted, (size_t)(b - emitted));
+        str_append(&out, "buffer;", 7);
+        /* the #error must be the first token on its own line */
+        str_append(&out, "\n#error MGL: a buffer interface layout declaration"
+                         " is not valid in OpenGL\n", 63);
+        emitted = fa + 1;                  /* past the ';' */
+        q = emitted;
+        changed = true;
+    }
+
+    if (!changed)
+    {
+        free(out.buf);
+        return NULL;
+    }
+    str_append(&out, emitted, strlen(emitted));
+    str_push(&out, 0);
+    return out.buf;
+}
+
 char *mgl_cts_glsl_compat(const char *src)
 {
     if (!src) return NULL;
     char *a = strip_gl_block_packings(src);
-    return a;   /* further rewrites chain here */
+    char *b = reject_buffer_layout_decl(a);
+    if (!b) return a;
+    free(a);
+    return b;   /* further rewrites chain here */
 }
 
 /* ================================================================== bool block members

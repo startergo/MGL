@@ -1,4 +1,24 @@
-READY edbec60 (packed_pixels 250/250, was 1/250; headless suite green; test_geom 580 checks / 0 failures)
+READY 7a984b5 (packed_pixels 250/250 + sample_variables 130/190; headless suite green; test_geom 581 checks / 0 failures)
+
+# geom domain — round 34 handoff (sample_variables cluster)
+
+Cluster 2 of the supervisor's list. `KHR-GL46.sample_variables` **8 Pass / 144 Fail →
+130 Pass / 22 Fail / 38 NotSupported** (`~/MGL-cts/geom32-sv3`); sample_shading re-checked
+unchanged (5/13), headless suite green, `test_geom` 581 checks / 0 failures.
+
+* glslang declares gl_SampleID / gl_SamplePosition / gl_SampleMask / gl_SampleMaskIn for
+  desktop GLSL but NOT `gl_NumSamples` (an OES_sample_variables builtin there), so every
+  shader of the group failed with "undeclared identifier". MGL now injects
+  `#define gl_NumSamples N` after the `#version` line of a fragment shader that mentions it
+  (`shaders.c: initGLSLInput`), N baked from the current draw framebuffer's sample count
+  via `mgl_fb_samples` — GL defines it as a compile-time constant and the CTS binds its
+  MSAA framebuffer before compiling. Only shaders containing the identifier are touched.
+  (A direct `const int gl_NumSamples` is impossible: glslang reserves the gl_ prefix.)
+* The 22 remaining `mask.*` failures are a different mechanism: the cases WRITE
+  `gl_SampleMask[0]` and expect the write to gate rasterization (a fragment writing mask 0
+  must discard). That needs the MSL `sample_mask` fragment output wired through
+  SPIRV-Cross + the render pipeline — a natural follow-up cluster.
+* 38 NotSupported are the sample counts MGL does not expose (samples_2/4/8 variants).
 
 # geom domain — round 33 handoff (packed_pixels cluster)
 

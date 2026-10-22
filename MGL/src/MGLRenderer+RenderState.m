@@ -397,12 +397,14 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&lower type:MTLDataTypeBool atIndex:MGL_RS_FC_POINT_ORIGIN_LOWER];
         [cv setConstantValue:&mask type:MTLDataTypeUInt atIndex:MGL_RS_FC_SAMPLE_MASK];
         [cv setConstantValue:&per_sample type:MTLDataTypeBool atIndex:MGL_RS_FC_PER_SAMPLE];
+        uint32_t psamples = (uint32_t)MAX(samples, 1);
+        [cv setConstantValue:&psamples type:MTLDataTypeUInt atIndex:MGL_RS_FC_PIPELINE_SAMPLES];
         /* same as above: function pointer + MSL checksum, so a reused library address
          * cannot resurrect a deleted program's fragment function */
         {
             uint64_t h = 1469598103934665603ULL;
             if (msl) { for (const char *q = msl; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; } }
-            key = [NSString stringWithFormat:@"%p:%p:%llx:f:%d:%x:%d", lib, base, (unsigned long long)h, lower, mask, per_sample];
+            key = [NSString stringWithFormat:@"%p:%p:%llx:f:%d:%x:%d:%u", lib, base, (unsigned long long)h, lower, mask, per_sample, psamples];
         }
     }
 
@@ -469,8 +471,10 @@ static bool rs_mode_is_polygon(GLenum m)
     desc.alphaToOneEnabled = ms && ctx->state.caps.sample_alpha_to_one;
     /* RASTERIZER_DISCARD: Metal's rasterizationEnabled=NO requires a void vertex function, so the
      * vertex fixup instead collapses every vertex to one point far outside the clip volume
-     * (function constant): the vertex stage still runs (side effects), no fragment is produced */
-    desc.rasterizationEnabled = YES;
+     * (function constant): the vertex stage still runs (side effects), no fragment is produced.
+     * A vertex-only pipeline (fragment shader absent — GL rasterizer-discard / SSBO-writing
+     * vertex programs) keeps rasterization disabled: its vertex function is void. */
+    desc.rasterizationEnabled = (desc.fragmentFunction != nil);
 
     /* shader fixup specialization (function constants) */
     if (program) {

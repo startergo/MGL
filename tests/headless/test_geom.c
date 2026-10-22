@@ -4094,6 +4094,85 @@ TEST(sample_variables_builtins)
     glDeleteProgram(p);
 }
 
+/* KHR-GL46.sample_variables mask.*.samples_0: with SAMPLE_BUFFERS == 0 the fragment
+ * shader's gl_SampleMask write must NOT gate rasterization (GL 4.6 13.3: the sample
+ * mask output is ignored) — every mask value renders the full quad.  Implemented by
+ * specializing the patched MSL with the pipeline's sample count
+ * (MGL_RS_FC_PIPELINE_SAMPLES): mgl_rs_sample_mask() drops the shader-written mask
+ * only for single-sample pipelines.  (Metal caps MSAA at 4 samples on Apple GPUs, so
+ * the CTS's samples_8 cases are honest NotSupported results.) */
+TEST(sample_mask_single_sample_ignored)
+{
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location = 0) out vec4 o_color;\n"
+        "uniform int u_sampleMask;\n"
+        "void main()\n"
+        "{\n"
+        "    for (int i = 0; i < (gl_NumSamples + 31) / 32; ++i)\n"
+        "        gl_SampleMask[i] = u_sampleMask & gl_SampleMaskIn[i];\n"
+        "    o_color = vec4(1, 0, 0, 1);\n"
+        "}\n";
+    const char *vs =
+        "#version 460 core\n"
+        "in vec2 a_position;\n"
+        "void main() { gl_Position = vec4(a_position, 0.0, 1.0); }\n";
+    GLuint p = glCreateProgram(), tex, fbo;
+    GLint ls = 0;
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ls);
+    EXPECT_EQ_INT(ls, GL_TRUE);
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 16, 16);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 16, 16);
+
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    float pos[] = { -1, -1, -1, 1, 1, -1, 1, 1 };
+    static const GLushort idx[] = { 0, 1, 2, 2, 1, 3 };
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glUseProgram(p);
+    GLint loc = glGetUniformLocation(p, "u_sampleMask");
+    const int masks[] = { 0, 1, 2, 3, 4, 5, 6, 7, 0 };
+    for (unsigned m = 0; m < sizeof masks / sizeof masks[0]; m++) {
+        glClearBufferfv(GL_COLOR, 0, (const float[4]){0, 1, 0, 1});
+        glUniform1i(loc, masks[m]);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, idx);
+        int bad = 0;
+        GLubyte px[4];
+        for (int y = 2; y < 14 && !bad; y++) {
+            mgl_read_rgba(8, y, px);
+            if (px[0] < 250 || px[1] > 5) bad++;
+        }
+        if (bad) printf("   mask=%d: (%d,%d,%d,%d)\n", masks[m], px[0], px[1], px[2], px[3]);
+        EXPECT_EQ_INT(bad, 0);
+    }
+    EXPECT_NO_GL_ERROR();
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, 512, 512);
+}
+
 int main(void)
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
@@ -4125,6 +4204,7 @@ int main(void)
     RUN_IF(xfb_of_geometry_output);
     RUN_IF(xfb_streams);
     RUN_IF(sample_variables_builtins);
+    RUN_IF(sample_mask_single_sample_ignored);
     RUN_IF(xfb_multi_stream_capture);
     RUN_IF(xfb_multi_stream_instanced);
     RUN_IF(xfb_strip_decomposition);

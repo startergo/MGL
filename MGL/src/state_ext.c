@@ -603,9 +603,9 @@ char *mgl_rstate_patch_fragment_msl(const char *msl, const char *entry)
     if (returns_struct) {
         char pre[256];
         if (has_sm)
-            snprintf(pre, sizeof pre, "out.%s &= mgl_rs_sample_mask(mgl_rs_sid_arg);", sm);
+            snprintf(pre, sizeof pre, "out.%s = mgl_rs_sample_mask(out.%s, mgl_rs_sid_arg);", sm, sm);
         else
-            snprintf(pre, sizeof pre, "out.mgl_rs_SampleMask = mgl_rs_sample_mask(mgl_rs_sid_arg);");
+            snprintf(pre, sizeof pre, "out.mgl_rs_SampleMask = mgl_rs_sample_mask(0xffffffffu, mgl_rs_sid_arg);");
         rs_patch_returns(&b, body_open, &body_close, pre);
     }
     if (has_pc) {
@@ -644,8 +644,17 @@ char *mgl_rstate_patch_fragment_msl(const char *msl, const char *entry)
         "constant uint mgl_rs_smask = is_function_constant_defined(mgl_rs_fc_smask_) ? mgl_rs_fc_smask_ : 0xffffffffu;\n"
         "constant bool mgl_rs_fc_pss_ [[function_constant(%d)]];\n"
         "#define mgl_rs_sid_arg (is_function_constant_defined(mgl_rs_fc_pss_) && mgl_rs_fc_pss_ ? (1u << mgl_rs_sid_) : 0xffffffffu)\n"
-        "static inline __attribute__((always_inline)) uint mgl_rs_sample_mask(uint per_sample) { return mgl_rs_smask & per_sample; }\n\n",
-        MGL_RS_FC_POINT_ORIGIN_LOWER, MGL_RS_FC_SAMPLE_MASK, MGL_RS_FC_PER_SAMPLE);
+        "constant uint mgl_rs_fc_psmp_ [[function_constant(%d)]];\n"
+        "constant bool mgl_rs_single = !is_function_constant_defined(mgl_rs_fc_psmp_) || mgl_rs_fc_psmp_ <= 1u;\n"
+        "static inline __attribute__((always_inline)) uint mgl_rs_sample_mask(uint wrote, uint per_sample) {\n"
+        "    /* a SINGLE-SAMPLE pipeline ignores the fragment shader's gl_SampleMask write\n"
+        "     * (GL 4.6 13.3): the coverage of the one sample is not gated by it, only the\n"
+        "     * API sample mask and per-sample-shading bit are (KHR-GL46.sample_variables\n"
+        "     * mask.* draws with every mask value and expects the same full-coverage red) */\n"
+        "    return mgl_rs_single ? (mgl_rs_smask & per_sample) : (wrote & mgl_rs_smask & per_sample);\n"
+        "}\n\n",
+        MGL_RS_FC_POINT_ORIGIN_LOWER, MGL_RS_FC_SAMPLE_MASK, MGL_RS_FC_PER_SAMPLE,
+        MGL_RS_FC_PIPELINE_SAMPLES);
     rs_str_insert(&b, e.sig_line, prelude);
 
     if (returns_struct && !has_sm)
