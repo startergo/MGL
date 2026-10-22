@@ -33,6 +33,7 @@
 #import "mgl.h"
 #import "mgl_ext.h"
 #import "mgl_ext_tess.h"
+#import "mgl_ext_queries.h"  /* tess-count queries force the exact CPU path */
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);
 #import "mgl_ext_rstate.h"
 #import "mgl_ext_vattrib.h"
@@ -1381,6 +1382,12 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     id<MTLComputePipelineState> vs_pso, tcs_pso = nil, gather_pso = nil;
     bool need_readback = tp->has_tcs != 0;
     bool use_cpu_reference = tCpuReference();
+    /* Counting queries on tessellated output need EXACT vertex counts; the
+     * hardware path computes tess factors on the GPU, so its counts are not
+     * knowable on the CPU.  Take the exact-count CPU reference path while
+     * such a query is active (rare: measurement runs only). */
+    if (mgl_queries_tess_counts_active(ctx))
+        use_cpu_reference = true;
     bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode &&
                         !use_cpu_reference && !tp->capture;   /* capture needs the GPU-visible stream */
     if (tTrace())

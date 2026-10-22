@@ -1,66 +1,91 @@
-# tess — round 9: MGL_FP64_FAST (double-single fp64) + tessellation conformance
+# tess — round 9 handoff: tessellation_shader conformance (in progress)
 
-Branch `gl46/tess`, HEAD **807903c** (= gl46-port 0b49dfd + 2d34339 fp64-fast).
-Suite: **438 PASS / 0 FAIL** default; **433 PASS** with `MGL_FP64_FAST=1`.
+Branch `gl46/tess`, HEAD **952a232** (= gl46-port 769277d merged + tess work).
+**Full headless suite: 438 PASS / 0 FAIL.**  `MGL_FP64_FAST=1`: 433 PASS (only
+the three bit-exactness fp64 tests differ — documented, merged by supervisor).
 
-## 1. MGL_FP64_FAST=1 — opt-in double-single (float-float) fp64
+**Mergeable now: `READY 952a232`** — tess query-count fix + command-buffer
+guards + trace dumps; no regressions (suite green), CTS improves 25→29 Pass.
 
-`MGL_FP64_FAST=1` (any value except `0`) selects a second arithmetic backend
-for MGL's software fp64: **double-single** arithmetic — a double is carried
-as a pair of floats (hi, lo) with x = hi + lo, computed with Dekker/Knuth
-error-free transformations plus fused multiply-add (the approach of A. Thall,
-*"Extended-Precision Floating-Point Numbers for GPU Computation"*, also used
-by github.com/philipturner/metal-float64).  Default (unset / `0`) is the
-historic exact SoftFloat path, **byte-for-byte unchanged** (verified: full
-suite green, exact battery in test_fp64fast checks bit-exactness vs the CPU).
+## KHR-GL46.tessellation_shader current state (58 cases)
 
-Files: `MGL/src/fp64_df64.glsl` (+ generated `fp64_df64.h`), selection in
-`fp64.c`, precise-math compile in `MGLRenderer.m`/`MGLRenderer+Program.m`
-via `mslCompileOptionsForSource:` (MGLRenderer+Tessellation.m).
+29 Pass / 25 Fail / 2 "TIMEOUT" (they RUN, just slower than the 180 s harness
+limit — the counting-query fix makes the CTS vertex-counter draws take the
+exact-count CPU route) / 1 NotSupported (`max_in_out_attributes`, needs
+MAX_..._ATTRIBUTES limit work) / 1 crash (`single.primitive_coverage`).
 
-### How it works
-* Same 39 entry points/signatures as `fp64_softfloat.glsl`; every entry
-  point takes/returns **IEEE-754 double bit patterns**, unpacks to (hi, lo)
-  with a few integer ops, computes in floats, packs back.  Memory contents,
-  constants, uniforms, xfb capture, stage IO and vertex attributes therefore
-  stay exact IEEE doubles; only arithmetic results are approximate.
-* Metal compiles MSL with **fast math** by default, which reassociates the
-  two-sum EFTs (e.g. `e - (hi - s)` -> `(e - hi) + s`) and silently drops the
-  low float (verified live).  The fast library's internal helpers are named
-  `df64_*`; `fp64.c` re-adds `OpName` markers for the merged functions
-  (merge drops them), the identifier survives glslang -> SPIR-V ->
-  SPIRV-Cross into the MSL, and the renderer compiles such sources with
-  `mathMode = MTLMathModeSafe` + precise FP functions.
-* Also fixed (generic, mode-independent): a type-dedup collision in
-  `merge_lib` — when the module lacks a type the library needs (e.g. `float`
-  in a double-only compute shader), the new type is emitted with a shifted
-  id but derived keys (vectors/pointers/function types) still hashed the
-  unshifted library id, which could collide with an unrelated module id
-  (observed: the library's `vec2` keyed onto the module's `v2ulong`,
-  producing `sqrt(ulong)` compile errors in compute).
+### Done this round
+* **Counting queries on tessellated output**: `mgl_queries_tess_counts_active()`
+  (queries.c); while PRIMITIVES_GENERATED(stream 0) / TESS_EVALUATION_-
+  INVOCATIONS / clipping counters are active the tess draw takes the exact-count
+  CPU reference path (hardware tess factors are GPU-computed; CPU cannot know
+  the counts).  This fixed the whole CTS `glMapBufferRange() failed:
+  GL_INVALID_OPERATION` cluster: the CTS sizes its TF buffers from a
+  PRIMITIVES_GENERATED query (with RASTERIZER_DISCARD), got 0, mapped length 0
+  (spec: INVALID_OPERATION).  Now `tessellation_shader_tessellation.{TES,TCS_TES}`,
+  `gl_InvocationID...`, `vertex_spacing/ordering` run their real assertions.
+* **Committed command buffer guards**: CPU readbacks commit the command buffer;
+  the geom tess-xfb route must not ask a committed buffer for an encoder
+  (Metal asserts).  A nil encoder is handled as "no work".  (Do NOT call
+  newCommandBuffer there — its event/serial re-arm deadlocks the GPU,
+  verified.)
+* xfb-trace dumps (geometry.c): `MGL_GEOM_XFB_TRACE=1` prints the tess capture
+  member table and the TF varying mapping (run headless tests DIRECTLY —
+  `tests/headless/run.sh` swallows stderr!).
 
-### Accuracy / range limits (MGL_FP64_FAST=1)
-* ~48 significant bits: relative error < 2^-46 for add/sub/mul/fma,
-  slightly worse for div/sqrt/rcp (one Markstein/Newton refinement).
-* Cancellation-heavy results (fract, mod) are accurate to ~2^-44 * |inputs|
-  absolute, not relative to the small result (inherent to float-float).
-* |x| < 2^127 (~1.7e38): doubles beyond the float range clamp to ±inf;
-  values below 2^-126 flush to ±0 (no double subnormals); results below
-  ~2^-126 keep only single-float precision.
-* Exact in fast mode: compares (ordered/unordered), isnan/isinf, abs, neg,
-  sign, min/max, ldexp, frexp (integer/bit operations), float<->double
-  conversions, double<->int64 conversions of integral values < 2^48,
-  floor/ceil/trunc/round/roundeven of values that fit 48 bits.
-* The precise-math compile applies to the whole program's MSL, so the user
-  shader's own float code is also compiled with IEEE semantics (no fast
-  approximations) while the flag is set.
-* CTS `KHR-GL46.gpu_shader_fp64` targets exact IEEE behavior and will NOT
-  pass in fast mode by design; the three bit-exactness headless tests
-  (test_fp64/b/c) fail on last-bit assertions, all other 433 tests pass.
+### Where the next session should pick up (active investigation)
+**Multi-varying TF capture corrupts data** — the root of
+`tcs_to_tes.gl_in/gl_tessLevel/data_pass_through/...` ("Invalid component at
+index 0 (found:0 expected:22)").  Repro: `tests/headless/zz31_glin.c` (untracked
+scratch; run `./build/tests/zz31_glin` directly, env `MGL_GEOM_XFB_TRACE=1`).
+Findings so far:
+* ONE TF varying → whole chain (VS block/plain → TCS gl_in/patches → TES →
+  capture → TF) is CORRECT.
+* TWO SEPARATE_ATTRIBS varyings (vec4 + ivec4) → second buffer all zeros AND
+  the FIRST varying's y component becomes 0.
+* Routing/matching is correct (trace: members result0@4, result1@8,
+  gl_Position@0, stride 12; vars buf/off sane; `mgl_geom_xfb_tess` pack kernel
+  in MGLRenderer+Geometry.m:900 looks word-correct).
+* Next suspects: the post-link stride/offset recompute in
+  `mgl_geom_tess_xfb_route` (geometry.c ~6425, "words may have been filled in
+  from the published capture member table") and the CAPTURE kernel's record
+  packing for ivec4 members (tessellation.c `mgl_tess_capture_layout`), or the
+  vars[] table field order vs the MSL `struct mgl_geom_xfb_var`.
 
-### Tests
-`tests/headless/test_fp64fast.c` — 298 checks, both modes in one binary
-(mode is read per lowering): 24-operator battery vs CPU double (exact mode
-bit-exact; fast mode within 2^-44, input-scaled for fract/mod), NaN/inf
-classification + compares via select chains (bit-exact both modes), and a
-`distinct` check proving the two modes lower differently.
+### Remaining failures, grouped with hints
+* `vertex.vertex_ordering` — real assertion now: "Clockwise ordering was
+  expected but retrieved tessellation coordinates are laid out in
+  counter-clockwise order" → tessellationOutputWindingOrder mirroring
+  (y-flip) in the CPU + GPU tessellator paths (MGLRenderer+Tessellation.m
+  `vertex_order_ccw`, tessellation.c CPU tessellator).
+* `single.primitive_coverage` — CRASHES (assert or hang under 180 s; reproduce
+  with `bash agents/conformance/one.sh` + longer window).
+* `quads.inner_tessellation_level_rounding`, `triangles.degenerate_triangle` —
+  "Zero vertices were generated": degenerate/negative levels must still
+  generate vertices (negative → clamp to 0 per-edge rules; inner 1/2 with
+  equal spacing still generates the interior).
+* `tc_barriers.*` (3) — TCS barrier semantics (reads of other invocations'
+  outputs).
+* `point_mode.*` (2) — point rendering verification.
+* `invariance_rule1..7` — tessellation invariance (needs deterministic
+  per-vertex output; likely follows the plumbing fixes).
+* `compilation_and_linking_errors.tc_invalid_output_patch_vertex_count` —
+  missing link error (TCS output vertices > MAX_PATCH_VERTICES).
+* `single.xfb_captures_data_from_correct_stage` — "Separable program should
+  have succeeded": separable TES program + glCreateShaderProgramv link failure
+  (esextcTessellationShaderXFB.cpp:228).
+* `single.max_patch_vertices` — 32-vertex patches: captured vec4 wrong scale
+  (explicit-length gl_in arrays; patch vertex count wiring).
+* `single.isolines_tessellation` — isolines rendering check.
+* `max_in_out_attributes` NotSupported — MAX_GEOMETRY.../limit queries; decide
+  real limits vs genuine gap.
+
+### Harness notes
+* Case list: `build/tess_list.txt`; per-case: `bash agents/conformance/one.sh
+  '<case>'` (180 s timeout, prints `== name: status` on stdout, glcts output
+  on stderr).
+* `MGL_TESS_DEBUG=1`, `MGL_GEOM_XFB_TRACE=1` for traces; CTS runs print them
+  (one.sh passes stderr through).
+* The CPU reference route is slow (per-draw readback); the two "TIMEOUT" cases
+  need a longer window or the counter program sped up later (the count query
+  is what forces the CPU path).

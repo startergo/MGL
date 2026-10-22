@@ -88,6 +88,11 @@ extern "C" {
 /* compute dispatch counter (COMPUTE_SHADER_INVOCATIONS); called by mglDispatchCompute*. */
 void mgl_queries_note_dispatch(GLMContext ctx, uint64_t invocations);
 void mgl_queries_note_tess(GLMContext ctx, uint64_t tes_invocations, uint64_t tessellated_primitives);
+/* true while any query that needs TESSELLATED output counts is active; the tess
+ * domain uses this to pick its exact-count CPU path for those draws, because the
+ * counts of a hardware-tessellated draw (GPU-computed tess factors) cannot be
+ * known on the CPU without a readback. */
+bool mgl_queries_tess_counts_active(GLMContext ctx);
 /* transform feedback: primitives actually written to stream and primitives that were needed
  * (needed > written ⇒ overflow).  For the 'xfb' domain. */
 void mgl_queries_note_xfb_primitives(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);

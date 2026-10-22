@@ -599,6 +599,17 @@ void mgl_queries_note_dispatch(GLMContext ctx, uint64_t invocations)
         count_active(S, MGL_QB_COMPUTE_SHADER_INVOCATIONS, invocations);
 }
 
+bool mgl_queries_tess_counts_active(GLMContext ctx)
+{
+    struct MGLExtState_queries *S = QS(ctx);
+    if (!S)
+        return false;
+    return S->active[MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS] != NULL ||
+           S->active[MGL_QB_CLIPPING_INPUT_PRIMITIVES] != NULL ||
+           S->active[MGL_QB_CLIPPING_OUTPUT_PRIMITIVES] != NULL ||
+           S->active[MGL_QB_PRIMITIVES_GENERATED + 0] != NULL;
+}
+
 void mgl_queries_note_xfb_primitives(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed)
 {
     struct MGLExtState_queries *S = QS(ctx);

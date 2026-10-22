@@ -6383,10 +6383,16 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     mgl_tess_set_capture(ctx, program, true);
     ok = mgl_tess_draw_patches(ctx, indexed, type, offset, first, count, instances,
                                basevertex, baseinstance);
+    if (geom_env(1))
+        fprintf(stderr, "geom: tessxfb route tess_draw ok=%d\n", (int)ok);
     if (!ok) return false;
 
     c = mgl_tess_get_capture(ctx);
     if (!c || !c->valid || !c->buffer_object || !c->stride) return true;   /* nothing captured */
+    if (geom_env(1))
+        for (uint32_t k = 0; k < c->members; k++)
+            fprintf(stderr, "geom: tess capture member[%u] '%s' off=%u words=%u\n",
+                    k, c->member[k].name, c->member[k].offset, c->member[k].words);
 
     /* the capture record's word offsets come from the published member table: they follow the
      * tess output capture's layout, not the geometry stage's table the link-time resolution
@@ -6397,6 +6403,10 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
         const char *nm = v->name ? v->name : "";
         uint32_t w = v->words;
         bool found = false;
+
+        if (geom_env(1))
+            fprintf(stderr, "geom: tessxfb var[%d] name='%s' words=%u type=%04x buf=%u off=%u\n",
+                    i, nm, v->words, v->type, v->buffer, v->offset);
 
         if (!strcmp(nm, "gl_Position")) { v->src_word = 0; continue; }   /* always first */
         for (uint32_t k = 0; k < c->members; k++)

@@ -1334,9 +1334,13 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     if (!gXfbFence) gXfbFence = [_device newFence];
 
     /* the tessellated draw leaves its render encoder open (the next GL command would reuse
-     * it): end it before this command buffer gets a compute encoder */
+     * it): end it before this command buffer gets a compute encoder.  The buffer may also
+     * have been COMMITTED under us (CPU readback in the tessellation draw, query result):
+     * Metal asserts when an encoder is requested on a committed buffer; the commit paths
+     * leave _currentCommandBuffer == nil, and a nil buffer yields a nil encoder, which the
+     * geometry capture path treats as "no work done this pass". */
     [self endRenderEncoding];
-    enc = [_currentCommandBuffer computeCommandEncoder];
+    enc = _currentCommandBuffer ? [_currentCommandBuffer computeCommandEncoder] : nil;
     if (!enc) return false;
     [enc pushDebugGroup: @"MGL geometry xfb tess pack"];
 
