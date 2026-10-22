@@ -912,6 +912,14 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             free(prepared);
             return false;
         }
+        /* more attribute vectors than MAX_VERTEX_ATTRIBS (dvec3/dvec4 count two,
+           ARB_vertex_attrib_64bit) — the slots exceed the Metal attribute limit */
+        if (ip && ip->attrib_overflow)
+        {
+            mgl_append_info_log(log, "ERROR: vertex stage: too many vertex attribute components\n");
+            free(prepared);
+            return false;
+        }
     }
 
     bool lowered64 = false;
@@ -1213,6 +1221,11 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         char path[256]; snprintf(path, sizeof path, "/tmp/fp64msl%d.metal", stage);
         FILE *f_ = fopen(path, "w");
         if (f_) { fputs(ptr->spirv[stage].msl_str, f_); fclose(f_); }
+    }
+    if (getenv("MGL_FP64_DUMP") && lowered64 && prepared) {   /* lowered SPIR-V, for spirv-dis */
+        char path[256]; snprintf(path, sizeof path, "/tmp/fp64lower%d.spv", stage);
+        FILE *f_ = fopen(path, "wb");
+        if (f_) { fwrite(prepared, 4, prepared_words, f_); fclose(f_); }
     }
     if (getenv("MGL_DUMP_MSL"))
         fprintf(stderr, "MGL: program %u %s stage MSL:\n%s\n", ptr->name, stage_label(stage), result);
@@ -1787,6 +1800,16 @@ GLint  mglGetAttribLocation(GLMContext ctx, GLuint program, const GLchar *name)
     if (!name || !strncmp(name, "gl_", 3))
         return -1;
 
+    /* the link-time introspection table carries the GL locations: dvec3/dvec4
+       inputs (and their array elements / matrix columns) take one GL location
+       each while the SPIR-V Location decoration (the resource list below) is
+       the internal slot the fp64 word-pair interface fetches */
+    {
+        GLint iloc = mgl_introspect_get_attrib_location(ctx, program, name);
+        if (iloc >= 0)
+            return iloc;
+    }
+
     {
         int count = ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].count;
 
@@ -1796,6 +1819,29 @@ GLint  mglGetAttribLocation(GLMContext ctx, GLuint program, const GLchar *name)
 
             if (str && !strcmp(str, name))
                 return (GLint)ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].location;
+        }
+        /* GLSL 4.60 §11.1.1 / glGetActiveAttrib name form: an array (or matrix
+         * column / matrix itself) is queried as "name[0]" — the exact form
+         * reflection reports — while the resource list carries the bare name
+         * (or "name[0]"); accept both directions of that one suffix. */
+        {
+            size_t len = name ? strlen(name) : 0;
+
+            if (len > 3 && !strcmp(name + len - 3, "[0]"))
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    const char *str = ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].name;
+                    size_t slen = str ? strlen(str) : 0;
+
+                    if (!str)
+                        continue;
+                    if (slen == len - 3 && !strncmp(str, name, slen))
+                        return (GLint)ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].location;
+                    if (!strcmp(str, name))
+                        return (GLint)ptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT].list[i].location;
+                }
+            }
         }
     }
 

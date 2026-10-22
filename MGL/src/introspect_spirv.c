@@ -403,6 +403,24 @@ static uint32_t loc_count(const SMod *m, uint32_t t)
     }
 }
 
+/* GL-visible location span of a VERTEX INPUT (ARB_vertex_attrib_64bit: "dvec3/dvec4
+ * vertex inputs consume one location"; matrix columns use the same generic attributes
+ * as the single-precision equivalent, one per column/element).  The SPIR-V Location
+ * decoration (loc_count above) stays the internal slot span: two per dvec3/dvec4
+ * element, which the fp64 word-pair interface and Metal attribute indices need. */
+static uint32_t loc_count_gl(const SMod *m, uint32_t t)
+{
+    if (t > m->bound) return 1;
+    const SType *ty = &m->t[t];
+    switch (ty->kind) {
+        case T_VECTOR: return 1;
+        case T_MATRIX: return ty->count * loc_count_gl(m, ty->elem);
+        case T_ARRAY: return (ty->count ? ty->count : 1) * loc_count_gl(m, ty->elem);
+        case T_STRUCT: { uint32_t n = 0; for (uint32_t i = 0; i < ty->nmem; i++) n += loc_count_gl(m, ty->mem[i]); return n ? n : 1; }
+        default: return 1;
+    }
+}
+
 #pragma mark - GL type mapping
 
 static GLenum gl_type_of(const SMod *m, uint32_t t)
@@ -574,28 +592,44 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
     /* vertex inputs */
     if (sc[_VERTEX_SHADER].present) {
         SMod *m = sc[_VERTEX_SHADER].m;
-        LocMap lm; memset(&lm, 0, sizeof lm);
-        for (uint32_t v = 1; v <= m->bound; v++) {
-            if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != SpvStorageClassInput || is_builtin_var(m, v)) continue;
-            uint32_t l, n = io_loc_count(m, _VERTEX_SHADER, v, true);
-            if (get_dec(m, v, -1, SpvDecorationLocation, &l)) {
-                if (loc_taken(&lm, l, n)) ip->attrib_conflict = 1;
-                loc_take(&lm, l, n);
-            }
-        }
-        for (int pass = 0; pass < 2; pass++)
+        LocMap lm, lmg; memset(&lm, 0, sizeof lm); memset(&lmg, 0, sizeof lmg);
+        /* per link: GL locations (lmg) and internal slots (lm) are (re)assigned;
+           the SPIR-V Location decoration carries the internal slot (two per
+           dvec3/dvec4 element for the fp64 word-pair interface), the GL location
+           (one per element/column, ARB_vertex_attrib_64bit) is remembered in
+           ip->attrib_gl and reported by introspection */
+        free(ip->attrib_gl); ip->attrib_gl = NULL; ip->nattrib_gl = 0;
+        for (int pass = 0; pass < 3; pass++)
             for (uint32_t v = 1; v <= m->bound; v++) {
                 if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != SpvStorageClassInput || is_builtin_var(m, v)) continue;
-                if (get_dec(m, v, -1, SpvDecorationLocation, NULL)) continue;
-                uint32_t n = io_loc_count(m, _VERTEX_SHADER, v, true);
+                uint32_t l, n = io_loc_count(m, _VERTEX_SHADER, v, true);
+                uint32_t ng = loc_count_gl(m, pointee(m, m->vtype[v]));
+                bool eloc = !!get_dec(m, v, -1, SpvDecorationLocation, &l);
                 int bound = -1;
-                for (int b = 0; b < ip->nattrib_binds; b++) if (!strcmp(ip->attrib_binds[b].name, id_name(m, v))) bound = (int)ip->attrib_binds[b].index;
-                if (pass == 0 && bound >= 0) {
-                    if (loc_taken(&lm, (uint32_t)bound, n)) ip->attrib_conflict = 1;
-                    loc_take(&lm, (uint32_t)bound, n);
-                    stage_set_loc(&sc[_VERTEX_SHADER], v, (uint32_t)bound, -1);
-                }
-                if (pass == 1 && bound < 0) stage_set_loc(&sc[_VERTEX_SHADER], v, loc_alloc(&lm, n), -1);
+                if (!eloc)
+                    for (int b = 0; b < ip->nattrib_binds; b++) if (!strcmp(ip->attrib_binds[b].name, id_name(m, v))) bound = (int)ip->attrib_binds[b].index;
+                if (pass == 0 && !eloc) continue;
+                if (pass == 1 && (eloc || bound < 0)) continue;   /* glBindAttribLocation */
+                if (pass == 2 && (eloc || bound >= 0)) continue;  /* automatic */
+                uint32_t gl;
+                bool gl_fixed;   /* explicit / bound: the base was chosen, not allocated */
+                if (eloc) { gl = l; gl_fixed = true; }
+                else if (bound >= 0) { gl = (uint32_t)bound; gl_fixed = true; }
+                else { gl = loc_alloc(&lmg, ng); gl_fixed = false; }
+                if (gl_fixed && loc_taken(&lmg, gl, ng)) { ip->attrib_conflict = 1;
+                    if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: conflict var=%u name=%s gl=%u ng=%u n=%u pass=%d\n", v, id_name(m, v), gl, ng, n, pass); }
+                loc_take(&lmg, gl, ng);
+                /* internal slot: prefer the GL location (keeps float attributes at their
+                   own index), otherwise allocate the two-slot span elsewhere */
+                uint32_t slot;
+                if (loc_free(&lm, gl, n)) { slot = gl; loc_take(&lm, slot, n); }
+                else { slot = loc_alloc(&lm, n); }   /* loc_alloc takes the range */
+                if (slot + n > MAX_ATTRIBS || gl + ng > MAX_ATTRIBS) ip->attrib_overflow = 1;
+                stage_set_loc(&sc[_VERTEX_SHADER], v, slot, -1);
+                ip->attrib_gl = realloc(ip->attrib_gl, (size_t)(ip->nattrib_gl + 1) * sizeof(*ip->attrib_gl));
+                ip->attrib_gl[ip->nattrib_gl].var = v;
+                ip->attrib_gl[ip->nattrib_gl].gl = (GLint)gl;
+                ip->nattrib_gl++;
             }
     }
     /* fragment outputs */
@@ -1562,7 +1596,7 @@ static int add_block(MGLIBlock **arr, int *n, const char *name, int *created)
     return (*n)++;
 }
 
-static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *name, uint32_t t, GLint loc, GLint index, GLint comp, GLint patch)
+static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *name, uint32_t t, GLint loc, GLint index, GLint comp, GLint patch, GLint slot)
 {
     for (int i = 0; i < *n; i++) if (!strcmp((*arr)[i].name, name)) { (*arr)[i].stages |= 1u << stage; return; }
     *arr = realloc(*arr, (*n + 1) * sizeof(MGLIVar));
@@ -1571,6 +1605,7 @@ static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *
     v->type = gl_type_of(m, t);
     v->size = (m->t[t].kind == T_ARRAY) ? (GLint)m->t[t].count : 1;
     v->location = loc; v->index = index; v->component = comp; v->is_per_patch = patch;
+    v->slot = slot;
     v->stages = 1u << stage;
     (*n)++;
 }
@@ -1587,7 +1622,7 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
         bool is_block = m->t[st].kind == T_STRUCT && get_dec(m, st, -1, SpvDecorationBlock, NULL);
         uint32_t bi;
         if (get_dec(m, v, -1, SpvDecorationBuiltIn, &bi)) {
-            add_io(arr, narr, m, stage, id_name(m, v), t, -1, -1, 0, patch);
+            add_io(arr, narr, m, stage, id_name(m, v), t, -1, -1, 0, patch, -1);
             continue;
         }
         if (is_block) {
@@ -1600,8 +1635,8 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
                 char nm[512]; snprintf(nm, sizeof nm, "%s.%s", id_name(m, st), member_name(m, st, i));
                 uint32_t ml; if (get_dec(m, st, (int32_t)i, SpvDecorationLocation, &ml)) loc = ml;
                 uint32_t mt = m->t[st].mem[i];
-                if (m->t[mt].kind == T_ARRAY) { char n2[520]; snprintf(n2, sizeof n2, "%s[0]", nm); add_io(arr, narr, m, stage, n2, mt, (GLint)loc, 0, 0, patch); }
-                else add_io(arr, narr, m, stage, nm, mt, (GLint)loc, 0, 0, patch);
+                if (m->t[mt].kind == T_ARRAY) { char n2[520]; snprintf(n2, sizeof n2, "%s[0]", nm); add_io(arr, narr, m, stage, n2, mt, (GLint)loc, 0, 0, patch, -1); }
+                else add_io(arr, narr, m, stage, nm, mt, (GLint)loc, 0, 0, patch, -1);
                 loc += loc_count(m, mt);
             }
             continue;
@@ -1614,7 +1649,7 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
             uint32_t l = loc;
             for (uint32_t i = 0; i < m->t[t].nmem; i++) {
                 char nm[512]; snprintf(nm, sizeof nm, "%s.%s", id_name(m, v), member_name(m, t, i));
-                add_io(arr, narr, m, stage, nm, m->t[t].mem[i], (GLint)l, 0, 0, patch);
+                add_io(arr, narr, m, stage, nm, m->t[t].mem[i], (GLint)l, 0, 0, patch, -1);
                 l += loc_count(m, m->t[t].mem[i]);
             }
             continue;
@@ -1622,8 +1657,16 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
         char nm[512];
         if (m->t[t].kind == T_ARRAY) snprintf(nm, sizeof nm, "%s[0]", id_name(m, v));
         else snprintf(nm, sizeof nm, "%s", id_name(m, v));
+        /* vertex inputs: `loc` (the Location decoration) is the internal slot
+           base; the GL location comes from the link-time assignment */
+        GLint gl = (GLint)loc, slot = -1;
+        if (stage == _VERTEX_SHADER && input) {
+            slot = (GLint)loc;
+            for (int k = 0; k < ip->nattrib_gl; k++)
+                if (ip->attrib_gl[k].var == v) { gl = ip->attrib_gl[k].gl; break; }
+        }
         add_io(arr, narr, m, stage, nm, t,
-               (GLint)loc, (stage == _FRAGMENT_SHADER && !input) ? (GLint)idx : 0, (GLint)comp, patch);
+               gl, (stage == _FRAGMENT_SHADER && !input) ? (GLint)idx : 0, (GLint)comp, patch, slot);
     }
 }
 

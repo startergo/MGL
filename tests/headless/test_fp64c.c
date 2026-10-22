@@ -609,10 +609,13 @@ TEST(fp64_attributes)
         GLuint vs = glCreateShader(GL_VERTEX_SHADER);
         GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
         GLuint p = glCreateProgram();
+        /* ARB_vertex_attrib_64bit: a dvec4 VERTEX INPUT consumes ONE location, so
+         * a second attribute at location 1 is legal; the true conflict is a
+         * second attribute at location 0 */
         const char *vsrc =
             "#version 430 core\n"
             "layout(location = 0) in dvec4 a;\n"
-            "layout(location = 1) in vec2 b;\n"
+            "layout(location = 0) in vec2 b;\n"
             "void main() { gl_Position = vec4(b, 0.0, 1.0) + vec4(float(a.x)); }\n";
         const char *fsrc =
             "#version 430 core\n"

@@ -36,6 +36,7 @@
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);
 #import "mgl_ext_rstate.h"
 #import "mgl_ext_vattrib.h"
+#import "mgl_ext_introspect.h"   /* mgl_introspect_slot_owner: internal slot -> GL location */
 #import "mgl_ext_rstate.h"
 #import "mgl_ext_buffers.h"
 #import "mgl_ext_program.h"
@@ -287,6 +288,9 @@ typedef struct TessAttribSlot {
     int     binding_step;       /* divisor of the slot's GL binding */
     uint8_t dbl;                /* fp64 word slot: 1 low (comp 0), 2 high (comp 2) */
     int     dbl_words;          /* u32 words this slot fetches */
+    int     glloc;              /* GL attribute location feeding this slot (== loc except
+                                   for dvec3/dvec4-based inputs, which span two internal
+                                   slots per element but one GL location) */
 } TessAttribSlot;
 
 typedef struct TessVSPlan {
@@ -346,20 +350,51 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
             {
                 int pass = 0;
                 bool done = false;
-                while (!done && pass++ < 3 && type_id)
+                int elems = 1, cols = 1, rows = 1, dbl = 0;
+                while (!done && pass++ < 6 && type_id)
                 {
                     size_t m = 5;
                     while (m + 3 < n)
                     {
                         uint32_t wc3 = ir[m] >> 16, op3 = ir[m] & 0xffff;
                         if (wc3 == 0) break;
-                        if (ir[m + 1] == type_id)
+                        /* match only type declarations (19..33): instructions
+                         * without a result id (OpCapability et al) carry their
+                         * operands in the same word slot and false-match small
+                         * type ids */
+                        if (op3 >= 19 && op3 <= 33 && ir[m + 1] == type_id)
                         {
-                            if (op3 == 23 /* OpTypeVector */) { type_id = ir[m + 2]; break; }
+                            if (op3 == 23 /* OpTypeVector */) { rows = ir[m + 3]; type_id = ir[m + 2]; break; }
                             if (op3 == 32 /* OpTypePointer */) { type_id = ir[m + 3]; break; }
+                            if (op3 == 28 /* OpTypeArray */)
+                            {
+                                /* OpConstant: (result TYPE, result ID, value):
+                                 * length id is at ir[m+3], the constant's own
+                                 * result id at ir[m+2]; fall back to 1 */
+                                size_t c = 5;
+                                uint32_t alen = 1;
+
+                                while (c + 3 < n)
+                                {
+                                    uint32_t wc4 = ir[c] >> 16, op4 = ir[c] & 0xffff;
+
+                                    if (wc4 == 0) break;
+                                    if (op4 == 43 /* OpConstant */ && ir[c + 2] == ir[m + 3])
+                                    {
+                                        alen = ir[c + 3];
+                                        break;
+                                    }
+                                    c += wc4;
+                                }
+                                elems *= (int)alen;
+                                type_id = ir[m + 2];
+                                break;
+                            }
+                            if (op3 == 24 /* OpTypeMatrix: its n is the column count */) { cols = ir[m + 3]; type_id = ir[m + 2]; break; }
                             if (op3 == 22 /* OpTypeFloat */)
                             {
-                                kind[loc] = ir[m + 2] == 64 ? MGL_VA_KIND_DOUBLE : MGL_VA_KIND_FLOAT;   /* (result, width) */
+                                dbl = (ir[m + 2] == 64);
+                                kind[loc] = dbl ? MGL_VA_KIND_DOUBLE : MGL_VA_KIND_FLOAT;   /* (result, width) */
                                 done = true; break;
                             }
                             if (op3 == 21 /* OpTypeInt */)
@@ -372,10 +407,27 @@ static void tessVsInputKinds(GLMContext ctx, Program *program, bool has[MAX_ATTR
                         m += wc3;
                     }
                 }
-                /* kind 0 = MGL_VA_KIND_FLOAT: has[] marks the slot even when the
-                 * kind stays at the float default */
+                /* GLSL 4.60 §4.4.1: the attribute occupies elems * cols
+                 * locations, a dvecR one ceil(R/2) — and the fp64-lowered MSL
+                 * declares one Metal attribute at each of them (SPIRV-Cross
+                 * flattens wide doubles, matrices and arrays), so every one
+                 * must be covered by the VS stage-input descriptor. */
                 if (name || loc >= 0)
-                    has[loc] = true;
+                {
+                    int locs = elems * cols * (dbl ? (rows + 1) / 2 : 1);
+
+                    if (locs < 1) locs = 1;
+                    if (loc + locs > MAX_ATTRIBS) locs = MAX_ATTRIBS - loc;
+                    for (int q = 0; q < locs; q++)
+                    {
+                        has[loc + q] = true;
+                        kind[loc + q] = kind[loc];
+                    }
+                if (getenv("MGL_TESS_DEBUG"))
+                    NSLog(@"MGL tess: vs input %s loc=%d elems=%d cols=%d rows=%d dbl=%d -> %d slots",
+                          name ? name : "?", loc, elems, cols, rows, dbl,
+                          elems * cols * (dbl ? (rows + 1) / 2 : 1));
+                }
             }
         }
         k += wc;
@@ -436,14 +488,20 @@ static bool tessBuildVSPlan(GLMContext ctx, Program *program, TessVSPlan *plan,
 
         if (!has[loc])
             continue;
-        f = &va->fmt[loc];
+        /* `loc` is the internal (Metal) slot; resolve the GL attribute location
+           that feeds it (identical except for dvec3/dvec4-based inputs) */
+        GLint glloc = loc, cbase = 0;
+        mgl_introspect_slot_owner(ctx, program->name, loc, &glloc, &cbase);
+        if (glloc < 0) glloc = loc;
+        f = &va->fmt[glloc];
         b = &va->binding[f->binding];
 
         s->loc = loc;
+        s->glloc = glloc;
         s->kind = kind[loc];
         s->binding_step = b->divisor;
 
-        if (!(ctx->state.vao->enabled_attribs & (1u << loc)) || b->buffer == NULL)
+        if (!(ctx->state.vao->enabled_attribs & (1u << glloc)) || b->buffer == NULL)
         {
             /* disabled array: the current generic value is a constant */
             if (plan->const_buffer < 0)
@@ -1329,6 +1387,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
         NSLog(@"MGL tess: draw: tp=%p capture=%d point_mode=%d domain=%d", (void *)tp,
               tp->capture ? 1 : 0, tp->point_mode ? 1 : 0, (int)tp->domain);
     bool gpu_emulated = false;
+    if (tTrace())
+        NSLog(@"MGL tess: draw path: cpu_ref=%d hw=%d kernels=%d capture=%d",
+              (int)use_cpu_reference, (int)use_hardware, (int)tessKernels(ctx), (int)tp->capture);
     bool idx_mode_widened = false;
     id<MTLBuffer> widened_mtl = nil;   /* cached gapless index list (restart ranges) */
     bool gpu_indexed = false;          /* indexed draw driven entirely by GPU scan results */
@@ -1362,11 +1423,18 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     size_t fstride = mgl_tess_factor_stride(ctx, tp);      /* 8 tri / 12 quad */
 
     if (!tp || !va || cp_stride == 0)
+    {
+        if (tTrace())
+            NSLog(@"MGL tess: draw bail: tp=%p va=%p cp_stride=%zu",
+                  (void *)tp, (const void *)va, cp_stride);
         return false;
+    }
 
     if (patch_verts_in < 1)
         patch_verts_in = 1;
     patches = count / patch_verts_in;             /* trailing incomplete patch is dropped */
+    if (tTrace())
+        NSLog(@"MGL tess: draw patches=%d (count=%d pv=%d)", (int)patches, (int)count, (int)patch_verts_in);
     if (patches <= 0)
         return true;
     total_patches = patches * instances;
@@ -1384,10 +1452,18 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
 
     /* ---- 1. vertex stage: compute kernel over (vertices, instances) ---- */
     if (!tessBuildVSPlan(ctx, prog_vs, &plan, vfirst, baseinstance))
-         return false;
+    {
+        if (tTrace())
+            NSLog(@"MGL tess: draw bail: VS plan");
+        return false;
+    }
     vs_pso = tessVsPSO(ctx, _device, prog_vs, &plan);
     if (!vs_pso)
-         return false;
+    {
+        if (tTrace())
+            NSLog(@"MGL tess: draw bail: VS PSO");
+        return false;
+    }
 
     /* ---- indexed draws: everything on the GPU --------------------------------
      * A scan kernel min/max's the vertex indices (sizes the VS grid) into a scratch
@@ -1405,7 +1481,11 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
         id<MTLComputePipelineState> scan_pso = tessScanPSOCreate(_device);
         gather_pso = tessGatherPSO(_device);
         if (!scan_pso || !tessScanSetupPSO || !gather_pso)
-             return false;
+        {
+            if (tTrace())
+                NSLog(@"MGL tess: draw bail: scan/gather PSO");
+            return false;
+        }
         if (offset > (size_t)ctx->state.vao->element_array.buffer->size ||
             (size_t)count * esize > (size_t)ctx->state.vao->element_array.buffer->size - offset)
              return false;
@@ -2045,9 +2125,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                 for (int k = 0; k < total_patches * cp_count && k < 8; k++)
                 {
                     size_t wds = cp_stride / 4;
-                    fprintf(stderr, "MGL tess: idxcp[%d] loc0=(%g,%g,%g) pos=(%g,%g)\n", k,
-                            cp[k*wds], cp[k*wds+1], cp[k*wds+2],
-                            cp[k*wds + wds - 4], cp[k*wds + wds - 3]);
+                    fprintf(stderr, "MGL tess: idxcp[%d] wds=%zu words:", k, wds);
+                    for (size_t q = 0; q < wds && q < 10; q++) fprintf(stderr, " %g", cp[k * wds + q]);
+                    fprintf(stderr, "\n");
                 }
                 uint16_t *hf3 = (uint16_t *)((uint8_t *)ring.contents + off_factors);
                 fprintf(stderr, "MGL tess: idxfactors:");
@@ -2161,8 +2241,7 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             if (off_capture)
             {
                 if (tessEnsureCapturePso(ctx, tp, prog_tes) && tp->capture_pso)
-                {
-                    uint32_t cc = (uint32_t)coords_cap;
+                {                    uint32_t cc = (uint32_t)coords_cap;
 
                     [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_pso];
                     tessBindStageUniforms(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
@@ -2190,6 +2269,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                      * (args[0] would be the index count: 3x the records for triangle domains) */
                     cap_pub_count = emu_off + (size_t)(total_patches * 2) * 4;
                 }
+                else if (tTrace())
+                    NSLog(@"MGL tess: draw bail: capture PSO failed to build (off_capture=%zu)",
+                          off_capture);
             }
 
             /* expose the GPU tessellated output (geometry / xfb consumers) */
@@ -2697,9 +2779,9 @@ static bool tessBindVSAttributes(GLMContext ctx, id<MTLComputeCommandEncoder> en
                     memcpy(data + s->loc * 16, vs->current[s->loc].v.f, 16);
                 else if (s->fetch == TESS_FETCH_CONST)
                 {
-                    /* word slots of the current double value */
-                    int own = (s->dbl == 2) ? s->loc - 1 : s->loc;
-                    MGLCurrentAttrib *cur = &vs->current[own];
+                    /* word slots of the current double value (the GL location holds
+                       all four components: one glVertexAttribL*d call feeds both) */
+                    MGLCurrentAttrib *cur = &vs->current[s->glloc];
                     int c0 = (s->dbl == 2) ? 2 : 0;
                     GLuint *w = (GLuint *)(data + s->loc * 16);
                     for (int c = c0; c < c0 + 2; c++)
@@ -2959,6 +3041,19 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         tp->cp_record_full_size : (tp->cp_record_size ? tp->cp_record_size : 16));
     vd.layouts[MGL_TESS_VD_CP].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
     vd.layouts[MGL_TESS_VD_CP].stepRate = 1;
+    if (getenv("MGL_TESS_DEBUG"))
+    {
+        NSMutableString *ds = [NSMutableString string];
+        for (int i = 0; i < tp->num_tes_cp; i++)
+        {
+            MGLTessPatchMember *m = &tp->tes_cp[i];
+            if (m->attr < 0) continue;
+            [ds appendFormat:@" a%d@%zu", m->attr, m->offset];
+        }
+        [ds appendFormat:@" stride=%zu full=%zu cp_record_size=%zu ncp=%d",
+            (size_t)vd.layouts[MGL_TESS_VD_CP].stride, tp->cp_record_full_size, tp->cp_record_size, tp->num_tes_cp];
+        NSLog(@"MGL tess: tes vd CP:%@", ds);
+    }
 
     bool any_patch = false, any_factors = false;
     for (int i = 0; i < tp->num_tes_patch_in; i++)

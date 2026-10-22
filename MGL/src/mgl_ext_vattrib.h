@@ -74,6 +74,8 @@ typedef struct MGLVattribDrawPlan_t {
     unsigned    const_mask;
     uint8_t     dbl[MAX_ATTRIBS];                     /* fp64 word slot: 0 none, 1 low (comp 0), 2 high (comp 2) */
     int         dbl_words[MAX_ATTRIBS];               /* u32 words this slot fetches */
+    int         owner_gl[MAX_ATTRIBS];                /* GL attribute location feeding this internal slot
+                                                         (== the index except for dvec3/dvec4-based inputs) */
 } MGLVattribDrawPlan;
 
 /* GL-side state, reachable as ctx->state.ext_vattrib; allocated in mgl_ext_init_vattrib(). */

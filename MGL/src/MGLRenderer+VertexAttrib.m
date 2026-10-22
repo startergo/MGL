@@ -221,6 +221,7 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     {
         plan->fetch[a] = MGL_VA_FETCH_NONE;
         plan->shadow_index[a] = -1;
+        plan->owner_gl[a] = -1;
     }
 
     /* pass 1: record what the shader consumes at every attribute index (the
@@ -257,6 +258,7 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
            the same index is NOT). */
         GLint owner_loc = (GLint)loc, cbase = 0;
         GLenum ity = mgl_introspect_slot_owner(ctx, program->name, (GLint)loc, &owner_loc, &cbase);
+        plan->owner_gl[loc] = owner_loc;   /* GL location feeding this internal slot */
         bool dbl_slot = (kind == MGL_VA_KIND_UINT) &&
                         (ity == GL_DOUBLE || ity == GL_DOUBLE_VEC2 || ity == GL_DOUBLE_VEC3 || ity == GL_DOUBLE_VEC4);
         int owner = dbl_slot ? (int)owner_loc : (int)loc;
@@ -590,7 +592,7 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
            c occupies words 2c..2c+1; the high slot carries components 2,3) */
         if (plan->dbl[a])
         {
-            int own = (plan->dbl[a] == 2) ? a - 1 : a;
+            int own = plan->owner_gl[a] >= 0 ? plan->owner_gl[a] : a;   /* owning GL location */
             MGLCurrentAttrib *c2 = &s->current[own];
             int c0 = (plan->dbl[a] == 2) ? 2 : 0;
             int nw = (plan->dbl_words[a] >= 2) ? 2 : 1;
@@ -675,7 +677,7 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
         if (plan->fetch[a] != MGL_VA_FETCH_SHADOW || !va->binding[va->fmt[a].binding].buffer)
             continue;
         /* dvec3/dvec4: both word slots share one converted stream, owned by
-           the attribute's low slot */
+           the attribute's low slot (adjacent internal slots) */
         int owner = (plan->dbl[a] == 2) ? a - 1 : a;
         if (owner != a)
             continue;   /* bound when the low slot is reached */

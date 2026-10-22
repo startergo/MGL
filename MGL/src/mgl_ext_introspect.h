@@ -78,11 +78,17 @@ typedef struct MGLIVar {          /* program inputs / outputs */
     char   *name;
     GLenum  type;
     GLint   size;
-    GLint   location;             /* -1 for built-ins */
+    GLint   location;             /* -1 for built-ins; vertex inputs: the GL location
+                                     (one per dvec3/dvec4 element and per matrix column,
+                                     ARB_vertex_attrib_64bit "one generic attribute") */
     GLint   index;                /* fragment output index (dual source), else 0 / -1 */
     GLint   component;
     GLint   is_per_patch;
     GLbitfield stages;
+    GLint   slot;                 /* vertex inputs: internal Metal/SPIR-V slot base the
+                                     fp64 word-pair interface fetches from (== location
+                                     except for dvec3/dvec4-based inputs, which take two
+                                     slots per element); -1 when not a vertex input */
 } MGLIVar;
 
 typedef struct MGLIAtomicBuffer {
@@ -141,6 +147,10 @@ typedef struct MGLIProgram {
     MGLIStageSub sub[MGLI_STAGES];
 
     int      attrib_conflict;   /* two vertex inputs overlap locations (link error) */
+    int      attrib_overflow;  /* vertex inputs exceed MAX_VERTEX_ATTRIBS vectors (link error) */
+    /* conformant GL location per vertex-input variable (var id -> GL location);
+       the SPIR-V Location decoration is the internal slot (see MGLIVar.slot) */
+    struct { uint32_t var; GLint gl; } *attrib_gl; int nattrib_gl;
 
     int      nxfb;  /* transform feedback varyings (from mgl_xfb_program_info, refreshed per query) */
 

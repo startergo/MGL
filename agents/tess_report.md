@@ -1,76 +1,89 @@
-# tess — fp64 round 6 — HANDOFF (fresh session starts here)
+# tess — fp64 round 8 — HANDOFF
 
-Branch `gl46/tess`, HEAD **<see below — this commit>** (on top of the gl46-port
-merge 2d1d20c + merge commit e79b744).  Task: CTS `KHR-GL46.gpu_shader_fp64`
-group green + suite green.
-**Suite: rc=0, 0 failures (425 PASS lines; tests/headless/run.sh).**
-**fp64.fp64 group: 8/9 Pass in 331 s** (`--deqp-case='KHR-GL46.gpu_shader_fp64.fp64.*'`).
-`test_fp64` 14.5 s / `test_fp64b` 6.1 s / `test_fp64c` 11.8 s cold incl. build.
+Branch `gl46/tess`, HEAD **4b02364** (merge 0f8e970 = gl46-port 01ec14a + d3db0af +
+4b02364).  **DONE this round: `KHR-GL46.gpu_shader_fp64` 9/9 (varyings was the last
+one), full headless suite 433 PASS / 0 FAIL.**  Next: the optional `MGL_FP64_FAST=1`
+double-single mode.
 
-## fp64 group status (round 6)
+## What was fixed (all in d3db0af unless noted)
 
-| case | status |
-|---|---|
-| errors / conversions / operators / valid_constructors / illegal_conversions | PASS |
-| **state_query** | **PASS** (was FAIL) — glGetUniformuiv of a negative double must convert to 0, not the wrapped `(GLuint)llround(d)` (uniforms.c, one-line shared-file edit).  143 sub-cases were hitting this. |
-| **max_uniform_components** | **PASS** (was FAIL) — two bugs: (a) the TES-capture kernel's fallback type `mgl_cp_rec` was never declared when the TES reads no control points ("unknown type name 'mgl_cp_rec'" from newLibraryWithSource) — now a default `struct mgl_cp_rec { float4 gl_Position; };` is emitted; (b) the CPU-reference tessellator (taken when the GPU tessellator's worst-case scratch exceeds the 64 MiB budget — 1024-patch draws need ~221 MiB worst-case) never ran the capture kernel, so xfb behind tessellation silently captured nothing.  `tessEnsureCapturePso`/`tessPublishCapture` (MGLRenderer+Tessellation.m) are shared by both paths now; the CPU path dispatches the capture kernel over its CPU-written coords/indices in the draw's ring block before processGLState.  Repro: `tests/headless/zz20_muc.c` (ZZ_STAGE/ZZ_N/ZZ_TY envs) and `zz21_isoxfb.c`. |
-| named_uniform_blocks | PASS (round 5) |
-| **varyings** | **FAIL** — 14/26 variable batches "A valid program object failed to link".  See the diagnosis below; scalar/dvec2-only batches LINK (my zz22 scratch proves it), every batch containing a dmat*/dvec3/dvec4 variable fails at the TES MSL compile. |
+1. **Conformant double vertex-attribute locations** (ARB_vertex_attrib_64bit):
+   dvec3/dvec4 VERTEX INPUTS — and every array element / matrix column of them —
+   consume **ONE GL location** (`layout(location=4) in dvec4 a[4]` → attributes 4-7);
+   the SPIR-V `Location` decoration is the *internal Metal slot* (two per dvec3/dvec4
+   element) that the fp64 word-pair interface and the vattrib plans use.
+   * `introspect_spirv.c assign_interface_locations`: dual allocation (GL map
+     `ip->attrib_gl` + internal slot map), conflict check in GL space, `attrib_overflow`
+     (vectors > MAX_VERTEX_ATTRIBS, dvec3/dvec4 counting two — spec-allowed) → link
+     error in program.c ("too many vertex attribute components").
+   * `MGLIVar.slot` (mgl_ext_introspect.h) carries the internal slot; reflect_io fills
+     it for vertex inputs; `mgl_introspect_slot_owner` (program_introspection.c) maps
+     any internal slot → owning GL location + component base (unit = 2 slots for
+     dvec3/dvec4-based inputs).
+   * `mglGetAttribLocation` (program.c) consults the introspection table first.
+   * Plans: `MGLVattribDrawPlan.owner_gl[]` (mgl_ext_vattrib.h) +
+     `TessAttribSlot.glloc` (MGLRenderer+Tessellation.m) — the const/current-value
+     path reads `current[owner_gl]` (one `glVertexAttribL*d` call holds all four
+     doubles and feeds both word slots).
+2. **fp64.c chain walk**: (a) the generic AccessChain rewrite now sets
+   `f->vty[rid] = newrt` (stale ptr-to-double type made rw_load_store emit
+   `OpLoad v2uint` from a uint4 slot pointer + an illegal `OpBitcast v2uint→v2ulong`
+   which SPIRV-Cross renders as a zero-extending *conversion* — struct-member double
+   reads returned 0/garbage); (b) the dvec3/dvec4 element-component fold and the
+   matrix column fold add the recorded `elemslice` offset (`elemidx*elemstride`,
+   an `OpIAdd` for dynamic column indices) — array element [1]/matrix column c read
+   their own slots; (c) scalar-double array attribute elements bitcast directly
+   (`as_type<ulong>(uint2)`), not through ulong2.
+3. **geometry.c pass-through reader** (`geom_gen_draw_glsl`): emits whole uint4 slots
+   as `(lo,hi,lo',hi')` word quadruples from the densely-packed record, with the
+   correct per-element stride (the old code emitted `uvec4(uvec2(lo,lo'),0,0)` and a
+   zero stride for vectors) and `uvec2` slots for `double[N]` members.
+4. **4b02364 — canonical-record keying** (pre-existing failures, present at 9eacc94
+   and through the gl46-port merges — the round-7 "422/0" note was wrong):
+   * builtins (`gl_Position` & co) key through the fixed table FIRST; the vertex
+     stage's top-level `gl_Position` variable was otherwise name-hashed while the TES
+     side used the builtin key → the vs→tcs record had TWO gl_Position members and
+     the no-TCS (default-levels) hardware path rasterized nothing
+     (TessDefaultLevels, EmuDefaultLevelsGpu).
+   * flattened consumer members (`tc_arr_0/1` from arrays-of-arrays) re-check the
+     stage varying list for the base name (exact or `name[0]`) and key by that
+     LOCATION (0 is valid — matched flag, not `key != 0`) so they alias the
+     producer's whole-array member (TessArrayedVarying).
+   * test_fp64c's conflict subtest now uses `location = 0` twice (a dvec4 at 0 plus a
+     vec2 at 1 is legal under the one-location rule).
 
-## varyings — exactly where it stops (verified this round)
+## Verification
+* `KHR-GL46.gpu_shader_fp64.fp64.*`: **9/9 Pass** (varyings 31 s; operators ~13 min —
+  needs a >240 s timeout).
+* Full `tests/headless/run.sh`: **433 PASS / 0 FAIL** (incl. the gl46-port merge's
+  new tests).
+* `python3 agents/stub_scanner.py --list "EMPTY|NOOP|ASSERT"` clean for
+  tessellation.c / MGLRenderer+Tessellation.m / fp64.c / geometry.c / test_tess.c.
 
-The chain needed by the CTS (GPUShaderFP64Test7): array/matrix double VERTEX
-ATTRIBUTES (current values, `glVertexAttribL4dv(loc+index)`, one location per
-(element, column)) -> VS/TCS/TES/GS interface blocks with the SAME variables ->
-xfb of every gs_variableN[M] (+ FS expectation).
+## Scratch repros (untracked; do not commit)
+`tests/headless/zz26_varval2.c` (CTS-faithful dvec3[2]+dvec4 chain, xfb + FS pixel,
+modes: default/nogs/notess/pix), `zz27_varyarr.c` (flat varying arrays/matrices,
+26 checks), `zz28_smallvar.c` (the CTS small-types multi-variable batch),
+`zz29_dattr.c` (double[2] attribute current values), `zz30_deflvl.c` (no-TCS default
+levels isolation), zz31/zz32 (bisect leftovers — deletable).
+Debug knobs: `MGL_TESS_DEBUG`, `MGL_GEOM_DUMP=<dir>` (generated GLSL/MSL),
+`MGL_FP64_DUMP` (writes /tmp/fp64msl<stage>.metal + /tmp/fp64lower<stage>.spv,
+disassemble with `external/SPIRV-Tools/build/tools/spirv-dis`), `MGL_LOC_DEBUG`.
 
-Done and working (all in fp64.c unless noted):
-* xfb names `name[N]` (array ELEMENT) resolve in the geometry capture path —
-  geometry.c's lookup now strips the trailing "[N]" and captures ONE element
-  (offset into the record, words of one element).
-* the geometry kernel's generated GLSL used `uint64BitsToDouble(uvec2(lo,hi))`
-  — invalid (takes uint64_t) and glslang "compilation terminated"; now
-  `packDouble2x32(uvec2(lo,hi))` (GLSL 4.00 core).
-* array/matrix double vertex attributes: `ptr Input (array|mat double)` gets a
-  slot repr `array uint2/uint4 K` (attr_slotarr_ty; column-aligned, one Metal
-  location per (element, column) half).  Constant (element, column, row) chains
-  fold to (slot j, pair) — attrslotidx/attrsgeom/attrorig side tables; loads
-  read the slot + extract the pair.  Geometry/attrsgeom verified: batches with
-  doubles/dvec2/dvec3/dvec4/matrix inputs LINK the vertex stage.
-* stage-IO dvec3/dvec4/matrix members: named-member slot structs
-  (iface_slot_struct) instead of arrays-of-uint4 — OpCompositeConstruct(struct)
-  avoids SPIRV-Cross's spvArrayCopyFrom*ThreadGroup helpers whose address
-  spaces break when MGL moves tess/geom output to a device buffer (this is
-  what "no matching function for call to spvArrayCopyFromStackToThreadGroup1"
-  was).  Indexed element stores/loads of dvec3-4/matrix elements splice a
-  member SLICE (elemslice/elemidx/elemstride/elemorig; literal indexes only —
-  SPIRV-Cross can't dynamically index struct-valued stage IO either).
-
-The REMAINING failure: the tessellation canonical-record MSL splice
-(msl_rewrite_struct_body + the member renames in tessellation.c) does not
-flatten NESTED structs inside interface blocks.  The fp64 slot struct for
-`dmat2 tc_variable4` appears as `anon_te_variable4 te_variable4;` in the block;
-the splice rewrites the block body and member accesses by NAME from its own
-flat member list, producing e.g.
-`anon_te_variable4 _139 = anon_te_variable4{ in_data_tc_variable0, ... }`
-(member subobject type mismatch: uint4 vs uint2) or `anon_vs_variable4{ }`
-(empty composite).  Plan for round 7 (fp64.c only): expand multi-slot block
-members into N FLAT uint4 members (`tc_variable4_0`, `tc_variable4_1`) at the
-iface_struct level (like the vertex-attribute slots), so no nested struct ever
-reaches the splice; whole-member matrix loads/stores then emit per-slot member
-chains (record expanded[chain] = {base, nslots} the same way elemslice does).
-
-Scratch repros (untracked, kept): `tests/headless/zz22_varbatch.c`
-(ZZ_N/ZZ_FIRST: CTS-faithful multi-variable generator, batch link only),
-`zz20_muc.c` (max_uniform_components port, TCS/TES stage, draws + xfb),
-`zz21_isoxfb.c` (minimal TES-output xfb probe).  NOTE zz4_cts_varyings.c has a
-wrong TYPES table (dmat4/dmat4x3 swapped vs the CTS order) — use zz22.
-
-## Rules of engagement reminders
-
-* Max -j4, CTS foreground, chunks < 15 min, one batch at a time, scratch tests
-  under timeout, no background processes, never `git stash`, never `git add -A`
-  (it would commit `external/`, a symlink), never commit symlinks.
-* The fp64 group wildcard run takes ~5.5 min warm; `operators` compiles ~200
-  big kernels, >10 min COLD — run the group twice before judging.
-* Full suite: `tests/headless/run.sh` (~6 min, rc must be 0).
+## Known gaps / notes for MGL_FP64_FAST
+* Whole-column access into a wide double matrix stage variable (`m[c]` where the
+  column is a dvec3/dvec4) is a link error in fp64.c ("whole-column access ... not
+  supported"); the CTS only reads components (`m[c].r`) — fine for conformance, but a
+  real app could hit it.
+* Internal attribute slots are capped at 16 (= MAX_ATTRIBS arrays everywhere); the
+  spec-allowed counting means >8 dvec4s = link error.  Metal allows 31 if ever
+  needed (would require widening the plan arrays).
+* zz26's `notess` mode (VS+GS, dvec attributes) errors 0x502 — not exercised by the
+  CTS (fp64+GS without tess); left unfixed.
+* fp64 groups that remain NotSupported in the full pass are unrelated (uniform block
+  introspection shapes etc., see conformance.md).
+* For MGL_FP64_FAST: the soft-float call set lives in fp64.c (`mgl_dadd` & friends
+  injected as GLSL std.450-ish helpers into the lowered module); a double-single
+  mode would swap the lowering's arithmetic emission, keeping the SAME
+  slot/word-pair interface (which is now CTS-proven end-to-end through
+  VS→TCS→TES→GS→FS and xfb).

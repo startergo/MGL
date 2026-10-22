@@ -233,23 +233,33 @@ static bool framebuffer_complete(GLMContext ctx)
 }
 
 /* returns 0 or the GL error for state-dependent draw validation */
+static GLenum draw_dbg(GLMContext ctx, GLenum mode, bool uses_elements, int why)
+{
+    if (getenv("MGL_DRAW_TRACE"))
+        fprintf(stderr, "MGL draw: rejected by validation check %d (mode=%04x elem=%d prog=%p vao=%p xfb=%u)\n",
+                why, mode, (int)uses_elements, (void *)ctx->state.program,
+                (void *)ctx->state.vao, (unsigned)ctx->state.transform_feedback);
+    (void)ctx;
+    return GL_INVALID_OPERATION;
+}
+
 static GLenum validate_draw_state(GLMContext ctx, GLenum mode, bool uses_elements)
 {
     if (!validate_vao(ctx, uses_elements))
-        return GL_INVALID_OPERATION;
+        return draw_dbg(ctx, mode, uses_elements, 1);
 
     if (!validate_program(ctx))
-        return GL_INVALID_OPERATION;
+        return draw_dbg(ctx, mode, uses_elements, 2);
 
     bool tess = activeStageShader(ctx, _TESS_EVALUATION_SHADER) != NULL ||
                 activeStageShader(ctx, _TESS_CONTROL_SHADER) != NULL;
 
     // PATCHES iff a tessellation stage is active
     if ((mode == GL_PATCHES) != tess)
-        return GL_INVALID_OPERATION;
+        return draw_dbg(ctx, mode, uses_elements, 3);
 
     if (!xfb_mode_ok(ctx, mode))
-        return GL_INVALID_OPERATION;
+        return draw_dbg(ctx, mode, uses_elements, 4);
 
     if (!framebuffer_complete(ctx))
         return GL_INVALID_FRAMEBUFFER_OPERATION;

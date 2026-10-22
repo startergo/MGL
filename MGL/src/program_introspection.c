@@ -77,6 +77,7 @@ static void free_link_tables(MGLIProgram *ip)
 static void reset_record(MGLIProgram *ip)
 {
     free_link_tables(ip);
+    free(ip->attrib_gl); ip->attrib_gl = NULL; ip->nattrib_gl = 0;
     for (int s = 0; s < MGLI_STAGES; s++) { free(ip->dub_leaf[s]); ip->dub_leaf[s] = NULL; ip->dub_leaf_n[s] = 0; }
     for (int i = 0; i < ip->nattrib_binds; i++) free(ip->attrib_binds[i].name);
     free(ip->attrib_binds); ip->attrib_binds = NULL; ip->nattrib_binds = 0;
@@ -138,6 +139,9 @@ static void introspect_pre_link(GLMContext ctx, Program *ptr)
     if (!ip) return;
     ip->prog = ptr;
     mgli_free_inits(ip);
+    /* rebuilt by assign_interface_locations during the per-stage patch */
+    free(ip->attrib_gl); ip->attrib_gl = NULL; ip->nattrib_gl = 0;
+    ip->attrib_conflict = ip->attrib_overflow = 0;
 }
 
 static MGLIShaderRec *find_shader_rec(GLMContext ctx, Shader *sh)
@@ -353,6 +357,40 @@ static bool is_double_type(GLenum t)
     return t == GL_DOUBLE || t == GL_DOUBLE_VEC2 || t == GL_DOUBLE_VEC3 || t == GL_DOUBLE_VEC4;
 }
 
+/* internal (Metal/SPIR-V) slots per array element / matrix column of a double-based
+ * vertex input: dvec3/dvec4 cross two slots (the fp64 word-pair interface), everything
+ * else one.  Returns 0 for non-double types. */
+static int dbl_unit_slots(GLenum t)
+{
+    switch (t) {
+        case GL_DOUBLE: case GL_DOUBLE_VEC2:
+        case GL_DOUBLE_MAT2: case GL_DOUBLE_MAT3x2: case GL_DOUBLE_MAT4x2:      /* dvec2 columns */
+            return 1;
+        case GL_DOUBLE_VEC3: case GL_DOUBLE_VEC4:
+        case GL_DOUBLE_MAT2x3: case GL_DOUBLE_MAT2x4:                            /* dvec3/dvec4 columns */
+        case GL_DOUBLE_MAT3: case GL_DOUBLE_MAT3x4:
+        case GL_DOUBLE_MAT4: case GL_DOUBLE_MAT4x3:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
+/* total internal slot span of a vertex input (arrays multiply, matrices per column) */
+static int dbl_slot_span(GLenum t, GLint size)
+{
+    int unit = dbl_unit_slots(t);
+    if (!unit) return 0;
+    int per_var = unit;
+    switch (t) {
+        case GL_DOUBLE_MAT2: case GL_DOUBLE_MAT2x3: case GL_DOUBLE_MAT2x4: per_var = 2 * unit; break;
+        case GL_DOUBLE_MAT3: case GL_DOUBLE_MAT3x2: case GL_DOUBLE_MAT3x4: per_var = 3 * unit; break;
+        case GL_DOUBLE_MAT4: case GL_DOUBLE_MAT4x2: case GL_DOUBLE_MAT4x3: per_var = 4 * unit; break;
+        default: break;
+    }
+    return per_var * (size > 0 ? size : 1);
+}
+
 GLenum mgl_introspect_slot_owner(GLMContext ctx, GLuint program, GLint loc, GLint *owner, GLint *cbase)
 {
     if (cbase) *cbase = 0;
@@ -363,24 +401,21 @@ GLenum mgl_introspect_slot_owner(GLMContext ctx, GLuint program, GLint loc, GLin
     for (int i = 0; i < ip->ninputs; i++)
     {
         MGLIVar *v = &ip->inputs[i];
-        if (v->location != loc || v->location < 0) continue;
-        if (owner) *owner = loc;
+        if (v->slot < 0) continue;
+        int unit = dbl_unit_slots(v->type);
+        int span = unit ? dbl_slot_span(v->type, v->size) : 1;
+        if (loc < v->slot || loc >= v->slot + span) continue;
+        if (!unit)
+        {
+            if (owner) *owner = v->location + (loc - v->slot);
+            if (cbase) *cbase = 0;
+            return v->type;
+        }
+        /* double input: the slot carries u32 word pairs of components [cbase, cbase+2) */
+        if (owner) *owner = v->location + (loc - v->slot) / unit;
+        if (cbase) *cbase = (int)(((loc - v->slot) % unit) * 2);
         return v->type;
     }
-    /* second word slot of a two-location double attribute */
-    if (loc > 0)
-        for (int i = 0; i < ip->ninputs; i++)
-        {
-            MGLIVar *v = &ip->inputs[i];
-            if (v->location != loc - 1 || v->location < 0) continue;
-            if (is_double_type(v->type) && v->size >= 1 &&
-                (v->type == GL_DOUBLE_VEC3 || v->type == GL_DOUBLE_VEC4))
-            {
-                if (owner) *owner = loc - 1;
-                if (cbase) *cbase = 2;
-                return v->type;
-            }
-        }
     return 0;
 }
 

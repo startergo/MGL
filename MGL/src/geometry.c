@@ -568,6 +568,7 @@ static GLenum spv_scalar_base(SpvModule *m, const SpvType *t)
     const SpvType *s = t;
     if (!s) return GL_FLOAT;
     if (s->kind == SPVT_VEC || s->kind == SPVT_MAT) s = spv_find_type(m, s->elem);
+    if (s && s->kind == SPVT_VEC) s = spv_find_type(m, s->elem);   /* dmat: element is a dvec */
     if (!s) return GL_FLOAT;
     if (s->kind == SPVT_FLOAT) return s->bits == 64 ? GL_DOUBLE : GL_FLOAT;
     if (s->kind == SPVT_INT) return s->is_signed ? GL_INT : GL_UNSIGNED_INT;
@@ -616,17 +617,27 @@ static const char *word_store(GLenum base, const char *e)
 static GLuint comp_words(GLenum base) { return base == GL_DOUBLE ? 2 : 1; }
 
 /* the fp64 interface representation of a double varying (fp64.c: iface_ty):
- * uvec2 for a scalar, uvec4 for dvec2, and a flat uvec4 array of
- * elems * cols * ceil(rows/2) slots otherwise (dvec3/dvec4 members, matrices,
- * and any array element wider than one location, which SPIRV-Cross unrolls
- * into one location each).  Returns the slot count and writes the GLSL type
- * (without array suffix) into buf. */
+ * uvec2 for a scalar, uvec4 for dvec2, a flat uvec2 array for arrays of
+ * scalars, and a flat uvec4 array of elems * cols * ceil(rows/2) slots
+ * otherwise (dvec3/dvec4 members, matrices, and any array element wider than
+ * one location, which SPIRV-Cross unrolls into one location each — matrices
+ * and wide vectors use whole uvec4 slots even when a column holds a single
+ * double).  Returns the slot count and writes the GLSL type (without array
+ * suffix) into buf.  The raster-facing side must match fp64.c's slot types
+ * bit for bit: Metal rejects a stage pair whose user attributes differ in
+ * type. */
 static GLuint geom_double_iface(GLuint rows, GLuint cols, GLuint elems, char *buf, size_t bufsz)
 {
     if (elems <= 1 && cols <= 1)
     {
         if (rows <= 1) { snprintf(buf, bufsz, "uvec2"); return 1; }
         if (rows == 2) { snprintf(buf, bufsz, "uvec4"); return 1; }
+    }
+    if (cols <= 1 && rows <= 1)
+    {
+        /* array of scalar doubles: one uvec2 slot per element */
+        snprintf(buf, bufsz, "uvec2");
+        return elems;
     }
     snprintf(buf, bufsz, "uvec4");
     return elems * (cols ? cols : 1) * ((rows + 1) / 2);
@@ -1971,11 +1982,16 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 mbase = mt->kind == SPVT_FLOAT ? (mt->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                         mt->kind == SPVT_INT ? (mt->is_signed ? GL_INT : GL_UNSIGNED_INT) :
                         mt->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, mt);
-                mrows = mt->kind == SPVT_VEC || mt->kind == SPVT_MAT ? mt->n : 1;
-                mcols = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n : 1;
-                /* GLSL 4.60 4.4.1: a double (and its vectors) consumes two locations, a
-                 * matrix one per column, an array one per element */
-                consumed = melems * mcols * (mbase == GL_DOUBLE ? 2u : 1u);
+                /* rows = components per column, cols = number of columns.  An
+                 * OpTypeMatrix' own n is the COLUMN COUNT and its element is the
+                 * column vector — non-square matrices were transposed here (rows
+                 * and cols coincide for square ones, which hid it). */
+                mrows = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n :
+                        mt->kind == SPVT_VEC ? mt->n : 1;
+                mcols = mt->kind == SPVT_MAT ? mt->n : 1;
+                /* GLSL 4.60 4.4.1: a double element (or matrix column) consumes
+                 * ceil(rows/2) 128-bit locations, an array one set per element */
+                consumed = melems * mcols * (mbase == GL_DOUBLE ? (mrows + 1) / 2 : 1u);
 
                 out = &vars[n++];
                 memset(out, 0, sizeof(*out));
@@ -2022,8 +2038,11 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         out->base = t->kind == SPVT_FLOAT ? (t->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                     t->kind == SPVT_INT ? (t->is_signed ? GL_INT : GL_UNSIGNED_INT) :
                     t->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, t);
-        out->rows = t->kind == SPVT_VEC || t->kind == SPVT_MAT ? t->n : 1;
-        out->cols = t->kind == SPVT_MAT ? spv_find_type(m, t->elem)->n : 1;
+        /* rows = components per column, cols = number of columns (see the block
+         * member path above: OpTypeMatrix' n is the column count) */
+        out->rows = t->kind == SPVT_MAT ? spv_find_type(m, t->elem)->n :
+                    t->kind == SPVT_VEC ? t->n : 1;
+        out->cols = t->kind == SPVT_MAT ? t->n : 1;
         out->elems = elems;
         out->words = elems * out->cols * out->rows * base_words(out->base);
         out->flat = spv_deco(m, v->id, SpvDecorationFlat, NULL);
@@ -3405,29 +3424,39 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
             snprintf(name, sizeof(name), "%s", v->name);
         if (v->base == GL_DOUBLE)
         {
-            /* fill the u32-slot representation: slot (e,c,p) of the interface
-             * holds doubles 2p and 2p+1 of column c of element e */
+            /* fill the u32-slot representation the fp64 lowering reads: one uint4
+             * slot per (element, column, row pair), as_type<ulong2>(slot).x = double
+             * 2p, .y = double 2p+1 — the record itself stores doubles densely as
+             * (lo,hi) u32 pairs */
             char ty[32];
             GLuint slots = geom_double_iface(v->rows, v->cols, v->elems > 0 ? v->elems : 1, ty, sizeof(ty));
             GLuint cs = (v->cols ? v->cols : 1) * ((v->rows + 1) / 2);   /* slots per element */
+            GLuint ew = (v->cols ? v->cols : 1) * v->rows * 2;           /* record words per element */
             for (GLuint e = 0; e < (v->elems > 0 ? v->elems : 1u); e++)
             for (GLuint c = 0; c < (v->cols ? v->cols : 1u); c++)
             for (GLuint p = 0; p < ((v->rows + 1) / 2); p++)
             {
-                GLuint base = v->offset + e * v->cols * v->rows * 2;
-                GLuint w0 = base + (c * v->rows + 2 * p) * 2;
-                GLuint w1 = base + (c * v->rows + 2 * p + 1) * 2;
-                char dst[192], one[64];
+                GLuint base = v->offset + e * ew;
+                GLuint w = base + (c * v->rows + 2 * p) * 2;
+                char dst[192], one[96];
+                if (v->rows == 1)
+                {
+                    /* scalar double: the uint2 slot the fp64 interface uses */
+                    if (slots == 1)
+                        snprintf(dst, sizeof(dst), "%s = uvec2(mgl_draw[r+%u], mgl_draw[r+%u]);", name, w, w + 1);
+                    else
+                        snprintf(dst, sizeof(dst), "%s[%u] = uvec2(mgl_draw[r+%u], mgl_draw[r+%u]);", name, e * cs + c, w, w + 1);
+                    sb_put(&b, "    %s\n", dst);
+                    continue;
+                }
                 if (2 * p + 1 < v->rows)
-                    snprintf(one, sizeof(one), "uvec2(mgl_draw[r + %u], mgl_draw[r + %u])", w0, w1);
+                    snprintf(one, sizeof(one), "uvec4(mgl_draw[r+%u], mgl_draw[r+%u], mgl_draw[r+%u], mgl_draw[r+%u])", w, w + 1, w + 2, w + 3);
                 else
-                    snprintf(one, sizeof(one), "uvec2(mgl_draw[r + %u], 0u)", w0);
-                if (slots == 1 && strcmp(ty, "uvec2") == 0)
+                    snprintf(one, sizeof(one), "uvec4(mgl_draw[r+%u], mgl_draw[r+%u], 0u, 0u)", w, w + 1);
+                if (slots == 1)
                     snprintf(dst, sizeof(dst), "%s = %s;", name, one);
-                else if (slots == 1)
-                    snprintf(dst, sizeof(dst), "%s = uvec4(%s, 0u, 0u);", name, one);
                 else
-                    snprintf(dst, sizeof(dst), "%s[%u] = uvec4(%s, 0u, 0u);", name, e * cs + c * ((v->rows + 1) / 2) + p, one);
+                    snprintf(dst, sizeof(dst), "%s[%u] = %s;", name, e * cs + c * ((v->rows + 1) / 2) + p, one);
                 sb_put(&b, "    %s\n", dst);
             }
             continue;
@@ -4965,42 +4994,150 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     d.tess_pairs[d.tess_npairs++] = 3; d.tess_pairs[d.tess_npairs++] = 3;
     for (int i = 0; i < gp->n_in; i++)
     {
-        int j = -1;
+        int j = -1, jspan = 1;
+        uint32_t jw = 0;     /* words of the matched span (>= one member when the
+                              * capture flattened an array into "name_q" members) */
 
         /* the consumer matches the tess capture's members by name: a linkable program has the
          * same names for the evaluation stage's outputs and the geometry stage's inputs.
          * A block member arrives flattened by SPIRV-Cross as "<instance>_<member>" (the
-         * instance names of the two stages may differ: blocks match by block name) */
+         * instance names of the two stages may differ: blocks match by block name), an
+         * ARRAY member further as "<...>_<member>_<q>", one member per element */
         for (int m = 0; m < c->members; m++)
         {
             const char *want = gp->in_v[i].member[0] ? gp->in_v[i].member : gp->in_v[i].name;
             size_t wl = strlen(want), cl = strlen(c->member[m].name);
             int hit = !strcmp(c->member[m].name, want);
+            int flat = 0;
+
             if (!hit && gp->in_v[i].member[0] && cl > wl + 1 &&
                 c->member[m].name[cl - wl - 1] == '_' &&
                 !strcmp(c->member[m].name + cl - wl, want))
                 hit = 1;               /* "<instance>_<member>" */
-            if (hit && c->member[m].words >= gp->in_v[i].words)
+            if (!hit && cl > wl + 2)
             {
-                j = m;
-                break;
+                /* "<...>_<member>_<digits>": strip the element index, then the
+                 * instance prefix (either or both may be present) */
+                const char *e = c->member[m].name + cl;
+                const char *d = e;
+
+                while (d > c->member[m].name && d[-1] >= '0' && d[-1] <= '9') d--;
+                if (d < e && d > c->member[m].name + 1 && d[-1] == '_' &&
+                    (size_t)(d - c->member[m].name) - 1 >= wl)
+                {
+                    char base[160];
+                    size_t bl = (size_t)(d - c->member[m].name) - 1;   /* without the trailing '_' */
+
+                    if (bl >= sizeof base) bl = sizeof base - 1;
+                    snprintf(base, sizeof base, "%.*s", (int)bl, c->member[m].name);
+                    if (!strcmp(base, want) ||
+                        (bl > wl + 1 && base[bl - wl - 1] == '_' && !strcmp(base + bl - wl, want)))
+                    {
+                        hit = 1;
+                        flat = 1;
+                    }
+                }
+            }
+            if (hit)
+            {
+                uint32_t mw = c->member[m].words;
+                int span = 1;
+
+                if (flat)
+                {
+                    /* merge the sibling elements' words (SPIRV-Cross emits the
+                     * flattened members consecutively, "name_0", "name_1", ...) */
+                    size_t blen = (size_t)(strrchr(c->member[m].name, '_') - c->member[m].name);
+
+                    for (int q = m + 1; q < c->members; q++)
+                    {
+                        const char *qn = c->member[q].name;
+                        size_t ql = strlen(qn), i2;
+                        int digits = 0;
+
+                        if (ql <= blen || strncmp(qn, c->member[m].name, blen) || qn[blen] != '_')
+                            break;
+                        for (i2 = blen + 1; i2 < ql; i2++)
+                            if (qn[i2] < '0' || qn[i2] > '9') { digits = 0; break; }
+                            else digits = 1;
+                        if (!digits)
+                            break;
+                        mw += c->member[q].words;
+                        span++;
+                    }
+                }
+                if (mw >= gp->in_v[i].words)
+                {
+                    j = m;
+                    jw = mw;
+                    jspan = span;
+                    break;
+                }
             }
         }
         if (j < 0)
         {
+            if (geom_env(0))
+                fprintf(stderr, "geom: tess import: no capture member for %s/%s (want %u words)\n",
+                        gp->in_v[i].name, gp->in_v[i].member, gp->in_v[i].words);
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             return false;
         }
-        if (c->member[j].words != gp->in_v[i].words ||
+        if (jw < gp->in_v[i].words ||
             d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS)
         {
+            if (geom_env(0))
+                fprintf(stderr, "geom: tess import: %s words mismatch (cap %u vs want %u)\n",
+                        gp->in_v[i].name, jw, gp->in_v[i].words);
             ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             return false;
         }
-        for (uint32_t w = 0; w < gp->in_v[i].words; w++)
+        if (gp->in_v[i].base == GL_DOUBLE)
         {
-            d.tess_pairs[d.tess_npairs++] = c->member[j].offset + w;   /* word offset */
-            d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + w;
+            /* the doubles sit two per uint4 capture slot (one per uint2 slot),
+             * column-major, with a padded tail in the last slot of an odd-width
+             * dvec3-style column: gather them compactly — double d of element
+             * e / column c / row r is in slot e*cols*ceil(rows/2) + c*ceil + r/2,
+             * half r&1 of it.  Flattened captures (one member per slot) are
+             * addressed member-wise. */
+            uint32_t D = gp->in_v[i].elems * gp->in_v[i].cols * gp->in_v[i].rows;
+            uint32_t rows = gp->in_v[i].rows ? gp->in_v[i].rows : 1;
+            uint32_t cols = gp->in_v[i].cols ? gp->in_v[i].cols : 1;
+            uint32_t cslots = (rows + 1) / 2;           /* slots per column */
+            uint32_t stride = (cols <= 1 && rows <= 1) ? 2u : 4u;   /* uint2 / uint4 slot */
+
+            if (d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS ||
+                (jspan <= 1 && jw < gp->in_v[i].words))
+            {
+                ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+                return false;
+            }
+            for (uint32_t dd = 0; dd < D; dd++)
+            {
+                uint32_t e = dd / (cols * rows), rem = dd % (cols * rows);
+                uint32_t cc = rem / rows, r = rem % rows;
+                uint32_t slot = e * cols * cslots + cc * cslots + r / 2;
+                uint32_t pr = r & 1;
+                uint32_t src = (jspan > 1 && (int)slot < jspan)
+                                   ? c->member[j + (int)slot].offset
+                                   : c->member[j].offset + slot * stride;
+
+                if (jspan > 1 && (int)slot >= jspan)
+                    src = c->member[j + jspan - 1].offset;   /* defensive: padded tail */
+                for (uint32_t half = 0; half < 2; half++)
+                {
+                    d.tess_pairs[d.tess_npairs++] = src + pr * 2 + half;
+                    d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + dd * 2 + half;
+                }
+            }
+        }
+        else
+        {
+            for (uint32_t w = 0; w < gp->in_v[i].words; w++)
+            {
+                d.tess_pairs[d.tess_npairs++] = c->member[j].offset + w;   /* word offset */
+                d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + w;
+            }
         }
     }
 

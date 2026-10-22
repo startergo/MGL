@@ -513,14 +513,92 @@ static uint32_t tess_name_hash(const char *s)
  * "not found" is tracked separately from the key value. Arrayed varyings are
  * flattened by SPIRV-Cross into "name_0", "name_1" members: they resolve to the
  * base varying's location with their element index recorded separately */
-static void tess_annotate_keys(struct MslStruct *s, const SpirvResourceList *rl)
+/* does the stage's GL-view module declare a variable or interface-block
+ * member of this name?  (The reflection lists carry the block INSTANCE name
+ * only, so members are resolved through OpMemberName/OpName.  Block members
+ * carry no Location decorations in the module, so the canonical key for them
+ * is a stable hash of the resolved name — identical on every side of a
+ * linkable program.) */
+static bool tess_stage_var_named(GLMContext ctx, MGLTessProgram *tp, int stage,
+                                  const char *name)
+{
+    Program *prog = tp ? tp->program : NULL;
+    uint32_t *ir;
+    size_t n;
+
+    if (!ctx || !prog || !name || stage < 0 || stage >= _MAX_SHADER_TYPES)
+        return false;
+    ir = prog->spirv[stage].ir;
+    n = prog->spirv[stage].size;
+    if (!ir || n < 8)
+        return false;
+
+    /* 1) find the name: OpMemberName -> (struct type, member), OpName -> id */
+    {
+        size_t m = 5;
+        int found_member = -1;
+        uint32_t found_type = 0, found_id = 0;
+
+        while (m + 3 < n)
+        {
+            uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+            if (wc == 0) break;
+            if (op == 5 /* OpName */ || op == 6 /* OpMemberName */)
+            {
+                char buf[128];
+                size_t o = 0;
+                const uint32_t *w = ir + m + (op == 5 ? 2 : 3);
+                const uint32_t *we = ir + m + wc;
+
+                for (; w < we && o + 4 < sizeof buf; w++)
+                    for (int b = 0; b < 4; b++)
+                    {
+                        char c = (char)((*w >> (8 * b)) & 255);
+                        if (!c) { w = we; break; }
+                        buf[o++] = c;
+                    }
+                buf[o] = 0;
+                if (!strcmp(buf, name))
+                {
+                    if (op == 6)
+                    {
+                        found_member = (int)ir[m + 2];
+                        found_type = ir[m + 1];
+                    }
+                    else
+                        found_id = ir[m + 1];
+                    break;
+                }
+            }
+            m += wc;
+        }
+        if (!found_type && !found_id)
+            return false;
+
+    }
+    return true;
+}
+
+static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
+                               struct MslStruct *s, const SpirvResourceList *rl)
 {
     for (int i = 0; i < s->count; i++)
     {
         MGLTessPatchMember *m = &s->members[i];
         uint32_t key = 0;
         bool found = false;
+        char base[128];                 /* the bare GL name of the varying */
+        uint32_t idx = m->array_idx;
 
+        /* builtins first: gl_Position & co must key to their fixed slots on every
+         * side of the record.  The generic path below would otherwise name-hash
+         * them whenever the stage module declares the variable at top level
+         * (the vertex stage's gl_Position output), splitting the record into a
+         * producer-written and a consumer-read copy that never alias. */
+        key = tess_builtin_key(m->name);
+        if (key) { m->key = key; continue; }
+
+        base[0] = 0;
         if (rl)
             for (GLuint j = 0; j < rl->count; j++)
                 if (rl->list && !strcmp(rl->list[j].name, m->name))
@@ -529,28 +607,87 @@ static void tess_annotate_keys(struct MslStruct *s, const SpirvResourceList *rl)
                     found = true;
                     break;
                 }
-        if (!found && rl)
+        if (!found)
         {
-            /* flattened array element: strip "_<digits>" and retry */
-            size_t n = strlen(m->name);
+            /* flattened array element ("<name>_<q>") and/or interface-block
+             * member reached with the instance prefix ("<instance>_<member>",
+             * anonymous blocks as "m_<id>_<member>").  GL varying names
+             * commonly end in digits themselves ("variable0"), so both the
+             * plain and the element-stripped reading are tried, validated
+             * against the stage module's declared names — the same varying
+             * then annotates to the same key on every side of the record and
+             * the array/flattened merge in tess_canon_union can fire */
+            uint32_t fidx = m->array_idx;
 
-            while (n > 1 && m->name[n - 1] >= '0' && m->name[n - 1] <= '9')
-                n--;
-            if (n > 1 && m->name[n - 1] == '_')
+            base[0] = 0;
+            for (const char *b = m->name; !base[0] && (b = strchr(b, '_')); b++)
             {
-                char base[128];
-                uint32_t idx = 0;
+                const char *suf = b + 1;
+                size_t n = strlen(suf);
+                char b2[128];
 
-                snprintf(base, sizeof base, "%.*s", (int)(n - 1), m->name);
-                idx = (uint32_t)atoi(m->name + n);
-                for (GLuint j = 0; j < rl->count; j++)
-                    if (rl->list && !strcmp(rl->list[j].name, base))
+                if (tess_stage_var_named(ctx, tp, stage, suf))
+                {
+                    snprintf(base, sizeof base, "%s", suf);
+                    break;
+                }
+                while (n > 1 && suf[n - 1] >= '0' && suf[n - 1] <= '9')
+                    n--;
+                if (n > 1 && suf[n - 1] == '_')
+                {
+                    snprintf(b2, sizeof b2, "%.*s", (int)(n - 1), suf);
+                    if (tess_stage_var_named(ctx, tp, stage, b2))
                     {
-                        key = (uint32_t)rl->list[j].location;
-                        m->array_idx = idx;
-                        found = true;
-                        break;
+                        snprintf(base, sizeof base, "%s", b2);
+                        fidx = (uint32_t)atoi(suf + n);
                     }
+                }
+            }
+            if (!base[0])
+            {
+                char b2[128];
+                size_t n = strlen(m->name);
+
+                if (tess_stage_var_named(ctx, tp, stage, m->name))
+                    snprintf(base, sizeof base, "%s", m->name);
+                else
+                {
+                    while (n > 1 && m->name[n - 1] >= '0' && m->name[n - 1] <= '9')
+                        n--;
+                    if (n > 1 && m->name[n - 1] == '_')
+                    {
+                        snprintf(b2, sizeof b2, "%.*s", (int)(n - 1), m->name);
+                        if (tess_stage_var_named(ctx, tp, stage, b2))
+                        {
+                            snprintf(base, sizeof base, "%s", b2);
+                            fidx = (uint32_t)atoi(m->name + n);
+                        }
+                    }
+                }
+            }
+            if (base[0])
+            {
+                /* the split base may itself be a reflected varying: key by its
+                 * location so the producer's whole-array member (keyed by the
+                 * same location) aliases these flattened elements */
+                bool matched = false;
+                if (rl)
+                    for (GLuint j = 0; j < rl->count; j++)
+                    if (rl->list)
+                    {
+                        const char *n = rl->list[j].name;
+                        size_t nl = n ? strlen(n) : 0, bl = strlen(base);
+                        if (!n || !strcmp(n, base) ||
+                            (nl == bl + 3 && !strncmp(n, base, bl) && !strcmp(n + bl, "[0]")))
+                        {
+                            key = (uint32_t)rl->list[j].location;   /* 0 is a valid location */
+                            matched = true;
+                            break;
+                        }
+                    }
+                if (!matched) key = tess_name_hash(base);
+                m->array_idx = fidx;
+                found = true;
             }
         }
         if (!found)
@@ -635,6 +772,7 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
             MGLTessPatchMember *m = &in[s]->members[i];
             bool m_arr = strstr(m->type, "spvUnsafeArray") != NULL;
             int found = -1;
+            bool absorbed = false;
 
             if (m->size == 0)
                 continue;               /* patch_control_point reference and friends */
@@ -650,13 +788,29 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                     found = j;          /* same varying (whole array or an element) */
                     if (!o_arr && m_arr)
                     {
-                        /* the array covers the elements already registered */
+                        /* the array covers the elements already registered —
+                         * including the other flattened elements of the same
+                         * varying registered as their own slots */
                         out->m[j] = *m;
                         out->m[j].offset = 0;
+                        for (int q = 0; q < out->n; q++)
+                        {
+                            if (q == j || out->m[q].key != m->key) continue;
+                            if (strstr(out->m[q].type, "spvUnsafeArray") != NULL) continue;
+                            memmove(&out->m[q], &out->m[q + 1],
+                                    (out->n - q - 1) * sizeof(out->m[0]));
+                            out->n--;
+                            if (q < j) j--;
+                            q--;
+                        }
                     }
                     break;
                 }
+                if (o_arr && !m_arr && m->array_idx != 0)
+                    absorbed = true;   /* element of an array slot already present */
             }
+            if (absorbed)
+                continue;
             if (found < 0)
             {
                 if (out->n >= MGL_TESS_MAX_PATCH_MEMBERS)
@@ -2436,6 +2590,20 @@ static bool tess_msl_type_words(const char *type, uint32_t *words)
     uint32_t base = 1, cols = 1, rows = 1;
     const char *d;
 
+    if (!strncmp(type, "spvUnsafeArray<", 15) && (d = strchr(type + 15, ',')) != NULL)
+    {
+        /* a flat slot array: N elements of the element type */
+        char elem[32];
+        uint32_t n = 0, w = 0;
+        int k = (int)(d - (type + 15));
+
+        if (k < 0 || k >= (int)sizeof elem) return false;
+        snprintf(elem, sizeof elem, "%.*s", k, type + 15);
+        if (sscanf(d + 1, "%u", &n) != 1) return false;
+        if (!tess_msl_type_words(elem, &w)) return false;
+        *words = w * n;
+        return true;
+    }
     if (!strncmp(type, "float", 5) || !strncmp(type, "int", 3) || !strncmp(type, "uint", 4) ||
         !strncmp(type, "bool", 4) || !strncmp(type, "short", 5) || !strncmp(type, "half", 4))
         base = 1;
@@ -2463,12 +2631,158 @@ static bool tess_msl_type_words(const char *type, uint32_t *words)
  * kernel storing the packed output record (see the MGLTessCapture contract).
  * Fills tp->cap_members[] / tp->cap_stride; NULL when the output interface has
  * something unsupported. Caller frees. */
+/* number of doubles behind a TES output member, from the GL-view module: the
+ * capture record's MSL repr pads each dvecR column to whole uint4 slots, but
+ * every consumer of the capture (the geometry domain's import and the xfb
+ * publish) reads the doubles compactly, two words each.  0 = not a double
+ * varying (u32/float members keep their natural size). */
+static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char *name)
+{
+    Program *prog = tp->program;
+    uint32_t *ir;
+    size_t n, m;
+
+    if (!prog || !name || !*name)
+        return 0;
+    ir = prog->spirv[_TESS_EVALUATION_SHADER].ir;
+    n = prog->spirv[_TESS_EVALUATION_SHADER].size;
+    if (!ir || n < 8 || !ctx)
+        return 0;
+
+    /* find the member/variable by name: OpName (variables) or OpMemberName
+     * (interface block members) */
+    m = 5;
+    while (m + 3 < n)
+    {
+        uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+        uint32_t tid = 0;
+
+        if (wc == 0) break;
+        if (op == 5 /* OpName */)
+            tid = ir[m + 1];
+        else if (op == 6 /* OpMemberName */)
+            tid = 0;                 /* handled below: need the member index */
+        if (op == 5 || op == 6)
+        {
+            char buf[128];
+            size_t o = 0;
+            const uint32_t *w = ir + m + (op == 5 ? 2 : 3);
+            const uint32_t *we = ir + m + wc;
+
+            for (; w < we && o + 4 < sizeof buf; w++)
+            {
+                for (int b = 0; b < 4; b++)
+                {
+                    char c = (char)((*w >> (8 * b)) & 255);
+                    if (!c) { w = we; break; }
+                    buf[o++] = c;
+                }
+            }
+            buf[o] = 0;
+            if (!strcmp(buf, name))
+            {
+                /* resolve the type: the variable itself, or the struct member */
+                uint32_t ty = 0;
+
+                if (op == 5)
+                {
+                    /* OpName names the variable; find its OpVariable */
+                    size_t v = 5;
+                    while (v + 4 < n)
+                    {
+                        uint32_t wv = ir[v] >> 16, ov = ir[v] & 0xffff;
+                        if (wv == 0) break;
+                        if (ov == 59 && ir[v + 2] == tid && ir[v + 3] == SpvStorageClassOutput)
+                        {
+                            ty = ir[v + 1];   /* the pointer type */
+                            break;
+                        }
+                        v += wv;
+                    }
+                }
+                else
+                {
+                    /* OpMemberName: (struct type, member index) -> member type */
+                    size_t v = 5;
+                    uint32_t midx = ir[m + 2];
+
+                    while (v + 3 < n)
+                    {
+                        uint32_t wv = ir[v] >> 16, ov = ir[v] & 0xffff;
+                        if (wv == 0) break;
+                        if (ov == 30 /* OpTypeStruct */ && ir[v + 1] == tid)
+                        {
+                            if (midx + 2 < wv)
+                                ty = ir[v + 2 + midx];
+                            break;
+                        }
+                        v += wv;
+                    }
+                }
+                /* walk the (pointer-stripped) type: array * matrix columns *
+                 * vector rows doubles */
+                {
+                    uint32_t elems = 1, cols = 1, rows = 1, isdbl = 0, pass = 0;
+
+                    while (ty && pass++ < 8)
+                    {
+                        size_t v = 5;
+
+                        while (v + 3 < n)
+                        {
+                            uint32_t wv = ir[v] >> 16, ov = ir[v] & 0xffff;
+                            if (wv == 0) break;
+                            if (ov >= 19 && ov <= 33 && ir[v + 1] == ty)
+                            {
+                                if (ov == 32) { ty = ir[v + 3]; break; }             /* pointer */
+                                if (ov == 28)                                        /* array */
+                                {
+                                    size_t c = 5;
+                                    uint32_t alen = 1;
+                                    while (c + 3 < n)
+                                    {
+                                        uint32_t wcc = ir[c] >> 16, oc = ir[c] & 0xffff;
+                                        if (wcc == 0) break;
+                                        if (oc == 43 && ir[c + 2] == ir[v + 3])
+                                        {
+                                            alen = ir[c + 3];
+                                            break;
+                                        }
+                                        c += wcc;
+                                    }
+                                    elems *= alen;
+                                    ty = ir[v + 2];
+                                    break;
+                                }
+                                if (ov == 24) { cols = ir[v + 3]; ty = ir[v + 2]; break; }   /* matrix */
+                                if (ov == 23) { rows = ir[v + 3]; ty = ir[v + 2]; break; }   /* vector */
+                                if (ov == 22) { isdbl = (ir[v + 2] == 64); ty = 0; break; }  /* float */
+                                ty = 0;
+                                break;
+                            }
+                            v += wv;
+                        }
+                    }
+                    if (isdbl)
+                        return elems * cols * rows;
+                    return 0;
+                }
+            }
+        }
+        m += wc;
+    }
+    return 0;
+}
+
 char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
 {
     char *plain = mgl_tess_plain_msl(ctx, tp);
     char *out = NULL, *k = NULL;
     const char *sig, *name, *open, *vid, *body, *p;
     char types[MGL_TESS_CAPTURE_MAX][48];
+    uint32_t dbls[MGL_TESS_CAPTURE_MAX];    /* per member: double count (0 = plain u32/float member) */
+    uint32_t slotsz[MGL_TESS_CAPTURE_MAX];  /* ... words per fp64 slot: 2 (uint2) or 4 (uint4) */
+    uint32_t slotn[MGL_TESS_CAPTURE_MAX];   /* ... slots in the MSL repr (1 for a bare uint2/uint4) */
     char cap_retname[96];
     struct MslStruct rec;
     const char *cursor;
@@ -2518,6 +2832,9 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             continue;
         uint32_t w;
 
+        dbls[tp->cap_members_n] = 0;
+        slotsz[tp->cap_members_n] = 0;
+        slotn[tp->cap_members_n] = 1;
         if (!strcmp(m, "gl_Position"))
         {
             w = 4;
@@ -2535,8 +2852,31 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         }
         else
         {
-            snprintf(types[tp->cap_members_n], 48, "%s", rec.members[i].type);
+            const char *t = rec.members[i].type;
+            uint32_t d = tess_out_doubles(ctx, tp, m);
+
+            snprintf(types[tp->cap_members_n], 48, "%s", t);
             tp->cap_members[tp->cap_members_n].offset = off;
+            if (d)
+            {
+                /* fp64 repr: the doubles sit two per uint4 slot (one per uint2
+                 * slot), possibly with a padded tail — the capture record
+                 * carries them COMPACTLY, matching the geometry import and the
+                 * xfb publish */
+                uint32_t wsz = strstr(t, "uint2") ? 2 : 4;
+
+                dbls[tp->cap_members_n] = d;
+                slotsz[tp->cap_members_n] = wsz;
+                {
+                    const char *nm = strstr(t, "spvUnsafeArray<");
+                    uint32_t cnt = 1;
+
+                    if (nm && sscanf(strchr(nm, ',') + 1, "%u", &cnt) != 1)
+                        cnt = 1;
+                    slotn[tp->cap_members_n] = cnt;
+                }
+                w = 2 * d;
+            }
         }
 
         snprintf(tp->cap_members[tp->cap_members_n].name, 64, "%s", m);
@@ -2635,14 +2975,53 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         for (int i = 0; i < tp->cap_members_n; i++)
         {
             const MGLTessCaptureMember *cm = &tp->cap_members[i];
+            const char *t = types[i];
+            const char *arr = strstr(t, "spvUnsafeArray<");
 
-            slen += snprintf(store + slen, sizeof store - (size_t)slen,
-                             "%s*(device %s*)((device uchar*)mgl_cap + (size_t)mgl_vid * %uu + %uu) = %s.%s;\n",
-                             i == 0 ? "{ " : "", types[i],
-                             tp->cap_stride * 4u, cm->offset * 4u, varname, cm->name);
+            str_append(&k, &len, &cap, "%s", i == 0 ? "{ " : "");
+            if (dbls[i])
+            {
+                /* the doubles sit two per uint4 slot (one per uint2 slot) with
+                 * a possibly padded tail: copy them out compactly, two words
+                 * per double */
+                uint32_t sw = slotsz[i];     /* words per slot: 2 or 4 */
+                uint32_t spdbl = sw / 2;     /* doubles per slot: 1 or 2 */
+
+                str_append(&k, &len, &cap,
+                           "device uint* mgl_w = (device uint*)((device uchar*)mgl_cap + "
+                           "(size_t)mgl_vid * %uu + %uu); (void)mgl_w;\n",
+                           tp->cap_stride * 4u, cm->offset * 4u);
+                for (uint32_t d = 0; d < dbls[i]; d++)
+                {
+                    uint32_t slot = d / spdbl;
+                    const char *lo = (spdbl == 2 && (d & 1)) ? ".z" : ".x";
+                    const char *hi = (spdbl == 2 && (d & 1)) ? ".w" : ".y";
+                    char ix[16];
+
+                    ix[0] = 0;
+                    if (arr) snprintf(ix, sizeof ix, "[%u]", slot);
+                    str_append(&k, &len, &cap, "mgl_w[%u] = %s.%s%s%s; mgl_w[%u] = %s.%s%s%s;\n",
+                               2 * d, varname, cm->name, ix, lo,
+                               2 * d + 1, varname, cm->name, ix, hi);
+                }
+            }
+            else if (arr)
+            {
+                /* plain (non-double) slot array: element-wise copy — a struct
+                 * copy across address spaces would not compile */
+                str_append(&k, &len, &cap,
+                           "device uint* mgl_w = (device uint*)((device uchar*)mgl_cap + "
+                           "(size_t)mgl_vid * %uu + %uu);\n",
+                           tp->cap_stride * 4u, cm->offset * 4u);
+                for (uint32_t q = 0; q < slotn[i] && q < 32; q++)
+                    str_append(&k, &len, &cap, "mgl_w[%u] = %s.%s[%u];\n", q, varname, cm->name, q);
+            }
+            else
+                str_append(&k, &len, &cap,
+                           "*(device %s*)((device uchar*)mgl_cap + (size_t)mgl_vid * %uu + %uu) = %s.%s;\n",
+                           t, tp->cap_stride * 4u, cm->offset * 4u, varname, cm->name);
         }
-        slen += snprintf(store + slen, sizeof store - (size_t)slen, "}\nreturn;\n");
-        str_append(&k, &len, &cap, "%s", store);
+        str_append(&k, &len, &cap, "}\nreturn;\n");
         cursor = semi + 1;
     }
     str_append(&k, &len, &cap, "%s", cursor);
@@ -2827,17 +3206,17 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
     }
 
     /* attach varying locations to every member */
-    tess_annotate_keys(&vs_out, have_vs ?
+    tess_annotate_keys(ctx, tp, _VERTEX_SHADER, &vs_out, have_vs ?
         &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(&tcs_in, have_tcs_in ?
+    tess_annotate_keys(ctx, tp, _VERTEX_SHADER, &tcs_in, have_tcs_in ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
-    tess_annotate_keys(&tcs_out, have_tcs_out ?
+    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tcs_out, have_tcs_out ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(&tes_cp, have_cp ?
+    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tes_cp, have_cp ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
-    tess_annotate_keys(&tcs_po, have_tcs_po ?
+    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tcs_po, have_tcs_po ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(&tes_pi, have_pi ?
+    tess_annotate_keys(ctx, tp, _TESS_EVALUATION_SHADER, &tes_pi, have_pi ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
 
     /* pair flattened interface-block members that no reflected name matched.
@@ -3330,10 +3709,19 @@ bool mgl_tess_draw_patches(GLMContext ctx, bool indexed, GLenum type, size_t off
 
     tp = mgl_tess_active_program(ctx);
     if (!tp)
+    {
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: draw rejected: no active tess program (prog=%p)\n",
+                    (void *)ctx->state.program);
         return false;
+    }
 
     if (!ctx->mtl_funcs.ext_tess || !ctx->mtl_funcs.ext_tess->draw_patches)
+    {
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: draw rejected: no draw hook\n");
         return false;
+    }
 
     return ctx->mtl_funcs.ext_tess->draw_patches(ctx, indexed, type, offset, first, count,
                                                  instances ? instances : 1, basevertex, baseinstance);
