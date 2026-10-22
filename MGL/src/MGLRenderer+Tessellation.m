@@ -3130,4 +3130,30 @@ static MTLVertexFormat tessMemberFormat(const char *type)
     desc.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
     desc.tessellationOutputWindingOrder = tp->vertex_order_ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
 }
+
+/* Compile options for MSL emitted by MGL's shader toolchain.
+ *
+ * The fp64 double-single library (MGL_FP64_FAST=1, MGL/src/fp64_df64.glsl) is
+ * built from Knuth-style error-free transformations: quick-two-sum,
+ * two-sum, fma-recovered product error.  Metal's default fast-math
+ * REASSOCIATES those float expressions (e.g. e - (hi - s) -> (e - hi) + s),
+ * which rounds away the low float of every pair and halves the precision;
+ * observed live on M4 Pro.  When the MSL carries the library's df64_*
+ * identifiers (they survive glslang -> SPIR-V -> SPIRV-Cross), compile with
+ * precise math instead.  All other sources keep the historic default
+ * (options:nil), so the default fp64 path is unaffected.
+ */
+- (MTLCompileOptions *) mslCompileOptionsForSource: (NSString *) src
+{
+    if (!src || [src rangeOfString: @"df64_"].location == NSNotFound)
+        return nil;
+
+    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 15.0, *))
+    {
+        opt.mathMode = MTLMathModeSafe;
+        opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    }
+    return opt;
+}
 @end

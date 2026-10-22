@@ -154,6 +154,8 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 - (int) getProgramBinding: (int) stage type: (int) type index: (int) index;
 - (int) getProgramLocation: (int) stage type: (int) type index: (int) index;
 - (id<MTLLibrary>) compileShader: (const char *) str;
+/* tess domain: precise-math options for MSL carrying the fp64 df64 library */
+- (MTLCompileOptions *) mslCompileOptionsForSource: (NSString *) src;
 -(bool)bindMTLProgram:(Program *)ptr;
 - (id)newDrawBuffer:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil;
 - (id)newDrawBufferWithCustomSize:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil customSize:(CGSize)size;

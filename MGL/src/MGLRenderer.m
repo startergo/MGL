@@ -2362,8 +2362,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 {
     id<MTLLibrary> library;
     __autoreleasing NSError *error = nil;
+    NSString *src = [NSString stringWithUTF8String: str];
 
-    library = [_device newLibraryWithSource: [NSString stringWithUTF8String: str] options: nil error: &error];
+    /* tess domain: precise math when the MSL embeds the fp64 double-single library */
+    library = [_device newLibraryWithSource: src options: [self mslCompileOptionsForSource: src] error: &error];
     if(!library) {
         NSLog(@"MGL ERROR: Failed to compile shader: %@ ", [error localizedDescription] );
         NSLog(@"MGL ERROR: Shader source: %s", str);

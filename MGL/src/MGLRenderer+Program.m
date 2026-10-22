@@ -55,7 +55,8 @@ static void mtlProgramReleaseObj(GLMContext glm_ctx, void *obj)
             return false;
         }
 
-        lib = [_device newLibraryWithSource:src options:nil error:&error];
+        /* tess domain: precise math when the MSL embeds the fp64 double-single library */
+        lib = [_device newLibraryWithSource:src options:[self mslCompileOptionsForSource:src] error:&error];
         if (!lib)
         {
             if (error_log)

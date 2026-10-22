@@ -17,6 +17,9 @@
 #include "GLSL.std.450.h"
 #include "fp64.h"
 #include "fp64_softfloat.h"
+#include "fp64_df64.h"
+
+struct Lib;   /* selected arithmetic library (defined in the library section) */
 
 #if defined(__has_include)
 #if __has_include(<glslang_c_interface.h>) && __has_include(<glslang_c_shader_types.h>)
@@ -164,6 +167,8 @@ typedef struct {
 
     uint32_t moved[32];   /* module type defs relocated into `pre` */
     size_t nmoved;
+
+    const struct Lib *lib; /* selected arithmetic library (soft-float / df64) */
 } F64;
 
 /* ------------------------------------------------------------------ out -- */
@@ -982,7 +987,7 @@ static bool struct_uses(F64 *f, uint32_t sid, uint32_t tid)
 
 typedef struct { char name[48]; uint32_t id; } LibFn;
 
-typedef struct {
+typedef struct Lib {
     uint32_t *w;
     size_t n;
     uint32_t bound;
@@ -991,20 +996,34 @@ typedef struct {
     size_t nfns;
 } Lib;
 
-static Lib g_lib;
-static bool g_lib_tried = false;
+static Lib g_lib_soft, g_lib_fast;
+static bool g_lib_tried[2] = { false, false };
+
+/*
+ * MGL_FP64_FAST=1 selects the double-single (float-float) arithmetic library
+ * instead of exact SoftFloat.  Opt-in only: with the variable unset (or "0")
+ * the exact SoftFloat path is used and the lowering is byte-for-byte the
+ * historic one.  The two libraries expose the same entry-point names and
+ * signatures, so nothing else in this pass changes.  Accuracy limits of the
+ * fast library are documented in agents/tess_report.md (~48 significant bits,
+ * |x| < 2^127, no double subnormals).
+ */
+static int fp64_lib_mode(void)
+{
+    const char *v = getenv("MGL_FP64_FAST");
+    return (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+}
 
 extern const glslang_resource_t *glslang_default_resource(void);
 
-static bool compile_lib(Lib *out, char *log, size_t logsz)
+static bool compile_lib(Lib *out, const char *src_lib, char *log, size_t logsz)
 {
     const char *wrap =
         "#version 460 core\n"
         "#extension GL_ARB_gpu_shader_int64 : require\n";
-    size_t n1 = strlen(wrap), n2 = strlen(MGL_FP64_LIB_GLSL);
-    char *src = malloc(n1 + n2 + 1);
+    size_t n1 = strlen(wrap), n2 = strlen(src_lib);    char *src = malloc(n1 + n2 + 1);
     memcpy(src, wrap, n1);
-    memcpy(src + n1, MGL_FP64_LIB_GLSL, n2);
+    memcpy(src + n1, src_lib, n2);
     src[n1 + n2] = 0;
 
     glslang_input_t input;
@@ -1076,24 +1095,28 @@ static void scan_lib(Lib *lib)
     }
 }
 
-static bool ensure_lib(char *log, size_t logsz)
+/* select + compile the library for the current mode; NULL on failure */
+static const Lib *ensure_lib(char *log, size_t logsz)
 {
-    if (g_lib_tried) return g_lib.w != NULL;
-    g_lib_tried = true;
-    if (!compile_lib(&g_lib, log, logsz)) {
-        memset(&g_lib, 0, sizeof(g_lib));
-        return false;
+    int mode = fp64_lib_mode();
+    Lib *lib = mode ? &g_lib_fast : &g_lib_soft;
+    if (g_lib_tried[mode]) return lib->w ? lib : NULL;
+    g_lib_tried[mode] = true;
+    if (!compile_lib(lib, mode ? MGL_FP64_DF64_LIB_GLSL : MGL_FP64_LIB_GLSL, log, logsz)) {
+        memset(lib, 0, sizeof(*lib));
+        return NULL;
     }
-    scan_lib(&g_lib);
-    return true;
+    scan_lib(lib);
+    return lib;
 }
 
 static uint32_t lib_fn(F64 *f, const char *fn)
 {
+    const Lib *lib = f->lib;
     size_t n = strlen(fn);
-    for (size_t i = 0; i < g_lib.nfns; i++)
-        if (!strncmp(g_lib.fns[i].name, fn, n) && (g_lib.fns[i].name[n] == 0 || g_lib.fns[i].name[n] == '('))
-            return g_lib.fns[i].id + f->libshift;
+    for (size_t i = 0; i < lib->nfns; i++)
+        if (!strncmp(lib->fns[i].name, fn, n) && (lib->fns[i].name[n] == 0 || lib->fns[i].name[n] == '('))
+            return lib->fns[i].id + f->libshift;
     fail(f, "fp64: soft-float function %s missing", fn);
     return 0;
 }
@@ -1215,7 +1238,7 @@ static spv_result_t merge_cb(void *user, const spv_parsed_instruction_t *inst)
     uint32_t rid = inst->result_id;
 
     if (op == SpvOpFunction && c->target != &f->libfns) c->target = &f->libfns;
-    if (op == SpvOpFunction && g_lib.main_id && rid == g_lib.main_id) {
+    if (op == SpvOpFunction && c->f->lib->main_id && rid == c->f->lib->main_id) {
         c->dropping = true;
         return SPV_SUCCESS;
     }
@@ -1243,6 +1266,17 @@ static spv_result_t merge_cb(void *user, const spv_parsed_instruction_t *inst)
                     }
                     return SPV_SUCCESS;   /* deduped onto the module's type */
                 }
+            }
+            /* New type the module does not declare (float in a double-only
+             * module, say).  It is emitted below with its id shifted, so
+             * register that mapping: derived keys (vectors, pointers,
+             * functions) hash the base type through remap_of, and leaving the
+             * raw library id there let it collide with an unrelated module id
+             * (observed: vec2 keyed onto the module's v2ulong). */
+            if (c->nremap < 256) {
+                c->remap_from[c->nremap] = inst->result_id;
+                c->remap_to[c->nremap] = inst->result_id + c->shift;
+                c->nremap++;
             }
         }
     }
@@ -1278,26 +1312,26 @@ static void merge_lib(F64 *f)
 
     /* pre-scan: globals to drop (the keep-alive main's out variable); their
        decorations come earlier in the stream than the variables themselves */
-    for (size_t i = 5; i < g_lib.n; i += g_lib.w[i] >> 16) {
-        uint32_t op = g_lib.w[i] & 0xffff, wc = g_lib.w[i] >> 16;
-        if (op == SpvOpVariable && wc >= 3 && g_lib.w[i + 3] != SpvStorageClassFunction) {
-            if (c.nskipped < 8) c.skipped[c.nskipped++] = g_lib.w[i + 2];
+    for (size_t i = 5; i < f->lib->n; i += f->lib->w[i] >> 16) {
+        uint32_t op = f->lib->w[i] & 0xffff, wc = f->lib->w[i] >> 16;
+        if (op == SpvOpVariable && wc >= 3 && f->lib->w[i + 3] != SpvStorageClassFunction) {
+            if (c.nskipped < 8) c.skipped[c.nskipped++] = f->lib->w[i + 2];
         }
     }
 
     /* map library imports (GLSL.std.450) onto the module's own import;
        imports the module lacks are added to the header */
-    for (size_t i = 5; i < g_lib.n; i += g_lib.w[i] >> 16) {
-        uint32_t op = g_lib.w[i] & 0xffff;
+    for (size_t i = 5; i < f->lib->n; i += f->lib->w[i] >> 16) {
+        uint32_t op = f->lib->w[i] & 0xffff;
         if (op != SpvOpExtInstImport) continue;
-        const char *name = (const char *)&g_lib.w[i + 2];
+        const char *name = (const char *)&f->lib->w[i + 2];
         bool found = false;
         for (size_t j = 0; j < f->nins; j++) {
             if (f->ins[j].op != SpvOpExtInstImport) continue;
             const char *tname = (const char *)(f->w + f->ins[j].off + 2);
             if (!strcmp(name, tname)) {
                 if (c.nremap < 8) {
-                    c.remap_from[c.nremap] = g_lib.w[i + 1];
+                    c.remap_from[c.nremap] = f->lib->w[i + 1];
                     c.remap_to[c.nremap] = f->w[f->ins[j].off + 1];
                     c.nremap++;
                 }
@@ -1316,13 +1350,13 @@ static void merge_lib(F64 *f)
                 if ((k & 3) == 0) bpush(&f->hdradd, ch);
                 else f->hdradd.w[f->hdradd.n - 1] |= ch << ((k & 3) * 8);
             }
-            c.remap_from[c.nremap] = g_lib.w[i + 1];
+            c.remap_from[c.nremap] = f->lib->w[i + 1];
             c.remap_to[c.nremap] = newid;
             c.nremap++;
         }
     }
 
-    if (spvBinaryParse(ctx, &c, g_lib.w, g_lib.n, NULL, merge_cb, &diag) != SPV_SUCCESS) {
+    if (spvBinaryParse(ctx, &c, f->lib->w, f->lib->n, NULL, merge_cb, &diag) != SPV_SUCCESS) {
         if (diag && diag->error) fail(f, "fp64: library parse: %s", diag->error);
         else fail(f, "fp64: library parse failed");
     }
@@ -3825,6 +3859,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
              log && logsz && log[0] ? ": " : "", log && logsz && log[0] ? log : "");
         goto done;
     }
+    f.lib = fp64_lib_mode() ? &g_lib_fast : &g_lib_soft;
 
     f.next_id = f.bound;
     f.libshift = f.bound + 4096;
@@ -3835,7 +3870,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
      * bounds — heap corruption that surfaced as flaky SPIRV-Cross parser
      * crashes and garbled lowered modules. */
     {
-        uint32_t full = f.libshift + g_lib.bound + 2;
+        uint32_t full = f.libshift + f.lib->bound + 2;
         void *p = NULL;
         #define F64_GROW(field, T) do { \
             p = realloc(f.field, (size_t)full * sizeof(T)); \
@@ -3902,8 +3937,28 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     uint4_of(&f);
     ulong2_of(&f);
     merge_lib(&f);
-    f.id_limit = f.libshift + g_lib.bound + 1;
+    f.id_limit = f.libshift + f.lib->bound + 1;
     if (f.failed) goto done;
+
+    /* Fast-mode marker: re-add OpNames (merge_lib drops them, SPIRV-Cross
+       would rename the functions to _NNNN) with a df64_ prefix for every
+       merged library function.  Any shader that performs double arithmetic
+       calls at least one of them, so the generated MSL always carries a
+       df64_* identifier, which MGLRenderer detects to compile the module
+       with precise math: Metal's default fast-math reassociates the
+       error-free transformations the double-single library is built from. */
+    if (fp64_lib_mode() == 1) {
+        for (size_t i = 0; i < f.lib->nfns; i++) {
+            char nm[80];
+            snprintf(nm, sizeof nm, "df64_%s", f.lib->fns[i].name);
+            size_t nb = strlen(nm) + 1, nw = (nb + 3) / 4;
+            uint32_t onw[2 + 24] = {0};
+            onw[0] = (uint32_t)(2 + nw) << 16 | 5 /* OpName */;
+            onw[1] = f.lib->fns[i].id + f.libshift;
+            memcpy(onw + 2, nm, nb);
+            for (size_t k = 0; k < 2 + nw; k++) bpush(&f.preann, onw[k]);
+        }
+    }
 
     /* vertex attributes -> raw word slots; other double stage IO -> u32 pairs */
     fp64_attr_slots(&f);
@@ -4011,7 +4066,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
 
     {
         uint32_t nb = f.next_id;
-        if (f.libshift + g_lib.bound > nb) nb = f.libshift + g_lib.bound;
+        if (f.libshift + f.lib->bound > nb) nb = f.libshift + f.lib->bound;
         out.w[3] = nb;
     }
     if (out_nwords) *out_nwords = out.n;

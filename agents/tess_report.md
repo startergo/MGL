@@ -1,89 +1,66 @@
-# tess — fp64 round 8 — HANDOFF
+# tess — round 9: MGL_FP64_FAST (double-single fp64) + tessellation conformance
 
-Branch `gl46/tess`, HEAD **4b02364** (merge 0f8e970 = gl46-port 01ec14a + d3db0af +
-4b02364).  **DONE this round: `KHR-GL46.gpu_shader_fp64` 9/9 (varyings was the last
-one), full headless suite 433 PASS / 0 FAIL.**  Next: the optional `MGL_FP64_FAST=1`
-double-single mode.
+Branch `gl46/tess`, HEAD **807903c** (= gl46-port 0b49dfd + 2d34339 fp64-fast).
+Suite: **438 PASS / 0 FAIL** default; **433 PASS** with `MGL_FP64_FAST=1`.
 
-## What was fixed (all in d3db0af unless noted)
+## 1. MGL_FP64_FAST=1 — opt-in double-single (float-float) fp64
 
-1. **Conformant double vertex-attribute locations** (ARB_vertex_attrib_64bit):
-   dvec3/dvec4 VERTEX INPUTS — and every array element / matrix column of them —
-   consume **ONE GL location** (`layout(location=4) in dvec4 a[4]` → attributes 4-7);
-   the SPIR-V `Location` decoration is the *internal Metal slot* (two per dvec3/dvec4
-   element) that the fp64 word-pair interface and the vattrib plans use.
-   * `introspect_spirv.c assign_interface_locations`: dual allocation (GL map
-     `ip->attrib_gl` + internal slot map), conflict check in GL space, `attrib_overflow`
-     (vectors > MAX_VERTEX_ATTRIBS, dvec3/dvec4 counting two — spec-allowed) → link
-     error in program.c ("too many vertex attribute components").
-   * `MGLIVar.slot` (mgl_ext_introspect.h) carries the internal slot; reflect_io fills
-     it for vertex inputs; `mgl_introspect_slot_owner` (program_introspection.c) maps
-     any internal slot → owning GL location + component base (unit = 2 slots for
-     dvec3/dvec4-based inputs).
-   * `mglGetAttribLocation` (program.c) consults the introspection table first.
-   * Plans: `MGLVattribDrawPlan.owner_gl[]` (mgl_ext_vattrib.h) +
-     `TessAttribSlot.glloc` (MGLRenderer+Tessellation.m) — the const/current-value
-     path reads `current[owner_gl]` (one `glVertexAttribL*d` call holds all four
-     doubles and feeds both word slots).
-2. **fp64.c chain walk**: (a) the generic AccessChain rewrite now sets
-   `f->vty[rid] = newrt` (stale ptr-to-double type made rw_load_store emit
-   `OpLoad v2uint` from a uint4 slot pointer + an illegal `OpBitcast v2uint→v2ulong`
-   which SPIRV-Cross renders as a zero-extending *conversion* — struct-member double
-   reads returned 0/garbage); (b) the dvec3/dvec4 element-component fold and the
-   matrix column fold add the recorded `elemslice` offset (`elemidx*elemstride`,
-   an `OpIAdd` for dynamic column indices) — array element [1]/matrix column c read
-   their own slots; (c) scalar-double array attribute elements bitcast directly
-   (`as_type<ulong>(uint2)`), not through ulong2.
-3. **geometry.c pass-through reader** (`geom_gen_draw_glsl`): emits whole uint4 slots
-   as `(lo,hi,lo',hi')` word quadruples from the densely-packed record, with the
-   correct per-element stride (the old code emitted `uvec4(uvec2(lo,lo'),0,0)` and a
-   zero stride for vectors) and `uvec2` slots for `double[N]` members.
-4. **4b02364 — canonical-record keying** (pre-existing failures, present at 9eacc94
-   and through the gl46-port merges — the round-7 "422/0" note was wrong):
-   * builtins (`gl_Position` & co) key through the fixed table FIRST; the vertex
-     stage's top-level `gl_Position` variable was otherwise name-hashed while the TES
-     side used the builtin key → the vs→tcs record had TWO gl_Position members and
-     the no-TCS (default-levels) hardware path rasterized nothing
-     (TessDefaultLevels, EmuDefaultLevelsGpu).
-   * flattened consumer members (`tc_arr_0/1` from arrays-of-arrays) re-check the
-     stage varying list for the base name (exact or `name[0]`) and key by that
-     LOCATION (0 is valid — matched flag, not `key != 0`) so they alias the
-     producer's whole-array member (TessArrayedVarying).
-   * test_fp64c's conflict subtest now uses `location = 0` twice (a dvec4 at 0 plus a
-     vec2 at 1 is legal under the one-location rule).
+`MGL_FP64_FAST=1` (any value except `0`) selects a second arithmetic backend
+for MGL's software fp64: **double-single** arithmetic — a double is carried
+as a pair of floats (hi, lo) with x = hi + lo, computed with Dekker/Knuth
+error-free transformations plus fused multiply-add (the approach of A. Thall,
+*"Extended-Precision Floating-Point Numbers for GPU Computation"*, also used
+by github.com/philipturner/metal-float64).  Default (unset / `0`) is the
+historic exact SoftFloat path, **byte-for-byte unchanged** (verified: full
+suite green, exact battery in test_fp64fast checks bit-exactness vs the CPU).
 
-## Verification
-* `KHR-GL46.gpu_shader_fp64.fp64.*`: **9/9 Pass** (varyings 31 s; operators ~13 min —
-  needs a >240 s timeout).
-* Full `tests/headless/run.sh`: **433 PASS / 0 FAIL** (incl. the gl46-port merge's
-  new tests).
-* `python3 agents/stub_scanner.py --list "EMPTY|NOOP|ASSERT"` clean for
-  tessellation.c / MGLRenderer+Tessellation.m / fp64.c / geometry.c / test_tess.c.
+Files: `MGL/src/fp64_df64.glsl` (+ generated `fp64_df64.h`), selection in
+`fp64.c`, precise-math compile in `MGLRenderer.m`/`MGLRenderer+Program.m`
+via `mslCompileOptionsForSource:` (MGLRenderer+Tessellation.m).
 
-## Scratch repros (untracked; do not commit)
-`tests/headless/zz26_varval2.c` (CTS-faithful dvec3[2]+dvec4 chain, xfb + FS pixel,
-modes: default/nogs/notess/pix), `zz27_varyarr.c` (flat varying arrays/matrices,
-26 checks), `zz28_smallvar.c` (the CTS small-types multi-variable batch),
-`zz29_dattr.c` (double[2] attribute current values), `zz30_deflvl.c` (no-TCS default
-levels isolation), zz31/zz32 (bisect leftovers — deletable).
-Debug knobs: `MGL_TESS_DEBUG`, `MGL_GEOM_DUMP=<dir>` (generated GLSL/MSL),
-`MGL_FP64_DUMP` (writes /tmp/fp64msl<stage>.metal + /tmp/fp64lower<stage>.spv,
-disassemble with `external/SPIRV-Tools/build/tools/spirv-dis`), `MGL_LOC_DEBUG`.
+### How it works
+* Same 39 entry points/signatures as `fp64_softfloat.glsl`; every entry
+  point takes/returns **IEEE-754 double bit patterns**, unpacks to (hi, lo)
+  with a few integer ops, computes in floats, packs back.  Memory contents,
+  constants, uniforms, xfb capture, stage IO and vertex attributes therefore
+  stay exact IEEE doubles; only arithmetic results are approximate.
+* Metal compiles MSL with **fast math** by default, which reassociates the
+  two-sum EFTs (e.g. `e - (hi - s)` -> `(e - hi) + s`) and silently drops the
+  low float (verified live).  The fast library's internal helpers are named
+  `df64_*`; `fp64.c` re-adds `OpName` markers for the merged functions
+  (merge drops them), the identifier survives glslang -> SPIR-V ->
+  SPIRV-Cross into the MSL, and the renderer compiles such sources with
+  `mathMode = MTLMathModeSafe` + precise FP functions.
+* Also fixed (generic, mode-independent): a type-dedup collision in
+  `merge_lib` — when the module lacks a type the library needs (e.g. `float`
+  in a double-only compute shader), the new type is emitted with a shifted
+  id but derived keys (vectors/pointers/function types) still hashed the
+  unshifted library id, which could collide with an unrelated module id
+  (observed: the library's `vec2` keyed onto the module's `v2ulong`,
+  producing `sqrt(ulong)` compile errors in compute).
 
-## Known gaps / notes for MGL_FP64_FAST
-* Whole-column access into a wide double matrix stage variable (`m[c]` where the
-  column is a dvec3/dvec4) is a link error in fp64.c ("whole-column access ... not
-  supported"); the CTS only reads components (`m[c].r`) — fine for conformance, but a
-  real app could hit it.
-* Internal attribute slots are capped at 16 (= MAX_ATTRIBS arrays everywhere); the
-  spec-allowed counting means >8 dvec4s = link error.  Metal allows 31 if ever
-  needed (would require widening the plan arrays).
-* zz26's `notess` mode (VS+GS, dvec attributes) errors 0x502 — not exercised by the
-  CTS (fp64+GS without tess); left unfixed.
-* fp64 groups that remain NotSupported in the full pass are unrelated (uniform block
-  introspection shapes etc., see conformance.md).
-* For MGL_FP64_FAST: the soft-float call set lives in fp64.c (`mgl_dadd` & friends
-  injected as GLSL std.450-ish helpers into the lowered module); a double-single
-  mode would swap the lowering's arithmetic emission, keeping the SAME
-  slot/word-pair interface (which is now CTS-proven end-to-end through
-  VS→TCS→TES→GS→FS and xfb).
+### Accuracy / range limits (MGL_FP64_FAST=1)
+* ~48 significant bits: relative error < 2^-46 for add/sub/mul/fma,
+  slightly worse for div/sqrt/rcp (one Markstein/Newton refinement).
+* Cancellation-heavy results (fract, mod) are accurate to ~2^-44 * |inputs|
+  absolute, not relative to the small result (inherent to float-float).
+* |x| < 2^127 (~1.7e38): doubles beyond the float range clamp to ±inf;
+  values below 2^-126 flush to ±0 (no double subnormals); results below
+  ~2^-126 keep only single-float precision.
+* Exact in fast mode: compares (ordered/unordered), isnan/isinf, abs, neg,
+  sign, min/max, ldexp, frexp (integer/bit operations), float<->double
+  conversions, double<->int64 conversions of integral values < 2^48,
+  floor/ceil/trunc/round/roundeven of values that fit 48 bits.
+* The precise-math compile applies to the whole program's MSL, so the user
+  shader's own float code is also compiled with IEEE semantics (no fast
+  approximations) while the flag is set.
+* CTS `KHR-GL46.gpu_shader_fp64` targets exact IEEE behavior and will NOT
+  pass in fast mode by design; the three bit-exactness headless tests
+  (test_fp64/b/c) fail on last-bit assertions, all other 433 tests pass.
+
+### Tests
+`tests/headless/test_fp64fast.c` — 298 checks, both modes in one binary
+(mode is read per lowering): 24-operator battery vs CPU double (exact mode
+bit-exact; fast mode within 2^-44, input-scaled for fract/mod), NaN/inf
+classification + compares via select chains (bit-exact both modes), and a
+`distinct` check proving the two modes lower differently.
