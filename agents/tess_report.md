@@ -1,91 +1,73 @@
-# tess — round 9 handoff: tessellation_shader conformance (in progress)
+# tess — round 11 handoff: KHR-GL46.tessellation_shader (in progress)
 
-Branch `gl46/tess`, HEAD **952a232** (= gl46-port 769277d merged + tess work).
-**Full headless suite: 438 PASS / 0 FAIL.**  `MGL_FP64_FAST=1`: 433 PASS (only
-the three bit-exactness fp64 tests differ — documented, merged by supervisor).
+Branch `gl46/tess`, HEAD = merge of gl46-port (geom r39, 8949387) after 0141b1c.
+**Headless suite 438 PASS / 0 FAIL; test_geom 593 checks / 0 failures; test_tess 499/0.**
+CTS `tessellation_control_to_tessellation_evaluation.gl_MaxPatchVertices_Position_PointSize`
+advanced: position + te_value1 + te_value2 now EXACT (was "Invalid gl_Position data");
+now fails only the LAST check (pointsize uniqueness, esextcTessellationShaderTCTE.cpp:3072).
 
-**Mergeable now: `READY 952a232`** — tess query-count fix + command-buffer
-guards + trace dumps; no regressions (suite green), CTS improves 25→29 Pass.
+## Done this round (all committed)
 
-## KHR-GL46.tessellation_shader current state (58 cases)
+1. **Pipeline pair records** (round-10 item 1, `MGLTessProgram.pair` in mgl_ext_tess.h +
+   `tess_build_pair/tess_free_pair` in tessellation.c): when a pipeline pairs the TES with a
+   tc-only program, `mgl_tess_active_program()` returns a DERIVED record: a copy of the TES's
+   tp with has_tcs=1, the tc program's out-vertex count, and the interface layouts
+   canonicalized across BOTH modules (union of tcs_out/tes_cp, tcs_po/tes_pi; TCS kernel
+   recompiled with canonical structs + tri-domain factor fixups + GL float-level copy; VS
+   kernel gets a pair variant when its raw record differs; blob map rebuilt). Pair-aware
+   `tessVsPSO(..., draw_tp)`; `mgl_tess_set_capture` keeps base+pair in sync; pairs die with
+   either side (delete/relink). Pipeline GL_PATCHES draws now run the TCS (they previously
+   silently used default levels).
+2. **TCS out-record parse fix** (`msl_tcs_record_names`): a TCS that reads NONE of its cp
+   inputs has no spvIn param — the out record is still found (out-only signature accepted).
+   This is what made gl_MaxPatchVertices positions AND the interface-block varyings
+   (value1/value2) cross TCS→TES: without it the TCS kernel kept its raw SPIRV-Cross struct
+   while the TES read canonical offsets (gl_Position aligned by luck; block members garbled).
+3. **`tess_annotate_keys` takes an explicit names-Program** (was tp->program): pair members
+   resolve through the module that DECLARES them (block member names live in the TCS module)
+   — keys now alias exactly like a single-program link. te-only programs no longer
+   name-hash flattened block members.
+4. **Separable vs-kernel cache hardening** (ext_tess->vs_kernel, 32 slots): compaction on
+   program delete (dead slots leaked capacity — after ~16 links the cache filled SILENTLY and
+   pipeline draws bailed "VS stage function is not a kernel" → the in-batch
+   GL_INVALID_OPERATION leak from round 10!), eviction when >32 live, and the kernel MSL is
+   kept so pair rewrites recompile from it (`mgl_tess_vs_kernel_msl`).
+5. Repros (scratch, not for commit): tests/headless/zz50_pair.c (mono vs pipeline XFB
+   byte-identical, CTS gl_MaxPatchVertices shape), zz51_pt.c (uniform-level point-mode sweep),
+   zz52_cts.c (verbatim CTS shaders + mono/pipe COUNT comparison + GetTransformFeedbackVarying).
+   All pass. Diagnostics kept env-gated: MGL_TESS_DUMP_CAP (tessxfb route + capdump capture +
+   tfmap map), MGL_DUMP_MSL (pair_tcs.metal, cap_tes.metal dumps).
 
-29 Pass / 25 Fail / 2 "TIMEOUT" (they RUN, just slower than the 180 s harness
-limit — the counting-query fix makes the CTS vertex-counter draws take the
-exact-count CPU route) / 1 NotSupported (`max_in_out_attributes`, needs
-MAX_..._ATTRIBUTES limit work) / 1 crash (`single.primitive_coverage`).
+## Where the next session should pick up
 
-### Done this round
-* **Counting queries on tessellated output**: `mgl_queries_tess_counts_active()`
-  (queries.c); while PRIMITIVES_GENERATED(stream 0) / TESS_EVALUATION_-
-  INVOCATIONS / clipping counters are active the tess draw takes the exact-count
-  CPU reference path (hardware tess factors are GPU-computed; CPU cannot know
-  the counts).  This fixed the whole CTS `glMapBufferRange() failed:
-  GL_INVALID_OPERATION` cluster: the CTS sizes its TF buffers from a
-  PRIMITIVES_GENERATED query (with RASTERIZER_DISCARD), got 0, mapped length 0
-  (spec: INVALID_OPERATION).  Now `tessellation_shader_tessellation.{TES,TCS_TES}`,
-  `gl_InvocationID...`, `vertex_spacing/ordering` run their real assertions.
-* **Committed command buffer guards**: CPU readbacks commit the command buffer;
-  the geom tess-xfb route must not ask a committed buffer for an encoder
-  (Metal asserts).  A nil encoder is handled as "no work".  (Do NOT call
-  newCommandBuffer there — its event/serial re-arm deadlocks the GPU,
-  verified.)
-* xfb-trace dumps (geometry.c): `MGL_GEOM_XFB_TRACE=1` prints the tess capture
-  member table and the TF varying mapping (run headless tests DIRECTLY —
-  `tests/headless/run.sh` swallows stderr!).
+**The remaining gl_MaxPatchVertices failure is fully diagnosed:** CTS point-mode runs read
+`n_data_vertices` records from the xfb buffer, but the buffer only contains ~2 written
+records + zero/stale tail (dumps: "tfmap: 47 ps outliers of 49 records"; records 0-1 correct,
+2..48 zero). Meanwhile the tess capture published HEALTHY counts and factors
+(capdump: count/stride/pointsize correct, factors half/float exact, pair=1 dom=2). So the
+count the ENCODE kernel sees is wrong, not the tessellation:
 
-### Where the next session should pick up (active investigation)
-**Multi-varying TF capture corrupts data** — the root of
-`tcs_to_tes.gl_in/gl_tessLevel/data_pass_through/...` ("Invalid component at
-index 0 (found:0 expected:22)").  Repro: `tests/headless/zz31_glin.c` (untracked
-scratch; run `./build/tests/zz31_glin` directly, env `MGL_GEOM_XFB_TRACE=1`).
-Findings so far:
-* ONE TF varying → whole chain (VS block/plain → TCS gl_in/patches → TES →
-  capture → TF) is CORRECT.
-* TWO SEPARATE_ATTRIBS varyings (vec4 + ivec4) → second buffer all zeros AND
-  the FIRST varying's y component becomes 0.
-* Routing/matching is correct (trace: members result0@4, result1@8,
-  gl_Position@0, stride 12; vars buf/off sane; `mgl_geom_xfb_tess` pack kernel
-  in MGLRenderer+Geometry.m:900 looks word-correct).
-* Next suspects: the post-link stride/offset recompute in
-  `mgl_geom_tess_xfb_route` (geometry.c ~6425, "words may have been filled in
-  from the published capture member table") and the CAPTURE kernel's record
-  packing for ivec4 members (tessellation.c `mgl_tess_capture_layout`), or the
-  vars[] table field order vs the MSL `struct mgl_geom_xfb_var`.
+  a) `geomXfbTessEncode` (MGLRenderer+Geometry.m:1288) dispatches its OWN command buffer that
+     reads the tess ring (records + counts) — check whether it waits on the tess capture's
+     serial (the route passes `c->serial`... see MGLTessCapture). A missing wait = the encode
+     races the tess cb and reads a stale/zero count.
+  b) ring-slot reuse: verify the capture slot is held until the ENCODE consumed it (contract
+     "valid until the next capture draw"): mgl_tess_publish / tessRingRelease / retire.
+  c) The failing runs are PIPELINE draws (pair=1) — mono runs of the same config pass, so
+     compare the encode's inputs (in[0] capacity, counts[0]) between mono and pair draws
+     with MGL_TESS_DUMP_CAP=1 (tessxfb lines give tfsize=N*44 = n_data; capdump gives the
+     published count — mismatch = the encode's count read).
 
-### Remaining failures, grouped with hints
-* `vertex.vertex_ordering` — real assertion now: "Clockwise ordering was
-  expected but retrieved tessellation coordinates are laid out in
-  counter-clockwise order" → tessellationOutputWindingOrder mirroring
-  (y-flip) in the CPU + GPU tessellator paths (MGLRenderer+Tessellation.m
-  `vertex_order_ccw`, tessellation.c CPU tessellator).
-* `single.primitive_coverage` — CRASHES (assert or hang under 180 s; reproduce
-  with `bash agents/conformance/one.sh` + longer window).
-* `quads.inner_tessellation_level_rounding`, `triangles.degenerate_triangle` —
-  "Zero vertices were generated": degenerate/negative levels must still
-  generate vertices (negative → clamp to 0 per-edge rules; inner 1/2 with
-  equal spacing still generates the interior).
-* `tc_barriers.*` (3) — TCS barrier semantics (reads of other invocations'
-  outputs).
-* `point_mode.*` (2) — point rendering verification.
-* `invariance_rule1..7` — tessellation invariance (needs deterministic
-  per-vertex output; likely follows the plumbing fixes).
-* `compilation_and_linking_errors.tc_invalid_output_patch_vertex_count` —
-  missing link error (TCS output vertices > MAX_PATCH_VERTICES).
-* `single.xfb_captures_data_from_correct_stage` — "Separable program should
-  have succeeded": separable TES program + glCreateShaderProgramv link failure
-  (esextcTessellationShaderXFB.cpp:228).
-* `single.max_patch_vertices` — 32-vertex patches: captured vec4 wrong scale
-  (explicit-length gl_in arrays; patch vertex count wiring).
-* `single.isolines_tessellation` — isolines rendering check.
-* `max_in_out_attributes` NotSupported — MAX_GEOMETRY.../limit queries; decide
-  real limits vs genuine gap.
+Then: single.isolines count, single.primitive_coverage pixels,
+single.xfb_captures_data_from_correct_stage ("Separable program should have succeeded",
+esextcTessellationShaderXFB.cpp:228 — a separable TCS/TES link refusal to chase),
+data_pass_through (tc_pointSize; gl_in "Invalid rendered value") — unchanged from round 10.
 
-### Harness notes
-* Case list: `build/tess_list.txt`; per-case: `bash agents/conformance/one.sh
-  '<case>'` (180 s timeout, prints `== name: status` on stdout, glcts output
-  on stderr).
-* `MGL_TESS_DEBUG=1`, `MGL_GEOM_XFB_TRACE=1` for traces; CTS runs print them
-  (one.sh passes stderr through).
-* The CPU reference route is slow (per-draw readback); the two "TIMEOUT" cases
-  need a longer window or the counter program sped up later (the count query
-  is what forces the CPU path).
+## Incident (supervisor note)
+
+I mistakenly ran `git stash pop` + `git stash drop` while recovering from a checkout
+experiment and dropped the GEOM agent's stash@{0} ("WIP on gl46/geom: 9a42d48 geom: plain
+(default-block) uniforms in the geometry emulation + fresh vertex-attrib plan for the capture
+pass"). Recovered from the dangling commit (83f4cbc, newest WIP-on-9a42d48) via
+`git stash store`; the stash list is back to its original two entries. geom should sanity-
+check their stash still applies. Rule violation (never stash) acknowledged.

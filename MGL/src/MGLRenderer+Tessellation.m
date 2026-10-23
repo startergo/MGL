@@ -764,7 +764,8 @@ static id<MTLFunction> tessPipelineVsKernel(GLMContext ctx, id<MTLDevice> device
     return nil;
 }
 
-static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> device, Program *program, TessVSPlan *plan)
+static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> device, Program *program,
+                                             TessVSPlan *plan, MGLTessProgram *draw_tp)
 {
     id<MTLFunction> fn = tessStageFunction(program, _VERTEX_SHADER);
     MGLTessProgram *vs_tp = mgl_tess_program(ctx, program);
@@ -774,8 +775,12 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     MTLStageInputOutputDescriptor *sd;
 
     /* canonical-record variant of the kernel (link-time recompile) when the
-     * SPIRV-Cross output struct was rewritten to the canonical control point record */
-    if (vs_tp && vs_tp->vs_function && vs_tp->program == program)
+     * SPIRV-Cross output struct was rewritten to the canonical control point record.
+     * A pipeline PAIR record (draw_tp) carries its own variant compiled against the
+     * pair's layouts — it wins for the program it was built from */
+    if (draw_tp && draw_tp->vs_function && draw_tp->pair_vs == program)
+        fn = (__bridge id<MTLFunction>)draw_tp->vs_function;
+    else if (vs_tp && vs_tp->vs_function && vs_tp->program == program)
         fn = (__bridge id<MTLFunction>)vs_tp->vs_function;
     if ((!fn || fn.functionType != MTLFunctionTypeKernel))
     {
@@ -1549,7 +1554,7 @@ static void tessRetireCapture(GLMContext ctx)
             NSLog(@"MGL tess: draw bail: VS plan");
         return false;
     }
-    vs_pso = tessVsPSO(ctx, _device, prog_vs, &plan);
+    vs_pso = tessVsPSO(ctx, _device, prog_vs, &plan, tp);
     if (!vs_pso)
     {
         if (tTrace())
@@ -2108,6 +2113,10 @@ static void tessRetireCapture(GLMContext ctx)
             [cenc setBuffer: ring offset: off_levels_f atIndex: 30];   /* GL's float level copy */
         [cenc setBytes: iparams length: sizeof iparams atIndex: MGL_TESS_TCS_PARAMS];
         [cenc dispatchThreadgroups: MTLSizeMake(threads, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        if (getenv("MGL_TESS_DUMP_CAP"))
+        {
+            /* one-off diagnostics: printed later, once emu_cb completed below */
+        }
 
         if (tTrace() && gpu_indexed)
         {
@@ -2513,6 +2522,44 @@ static void tessRetireCapture(GLMContext ctx)
             id<MTLEvent> ev2 = [_device newEvent];
             [emu_cb encodeSignalEvent: ev2 value: 1];
             [emu_cb commit];
+            if (getenv("MGL_TESS_DUMP_CAP") && cap_pub_records && tp->capture_pso)
+            {
+                /* one-off diagnostics: read the published capture records back and
+                 * print the te_pointsize column (chasing a CTS point-mode mismatch) */
+                uint32_t psw = 0xffffffff;
+                unsigned nrec = 30;
+
+                for (int i = 0; i < tp->cap_members_n; i++)
+                    if (!strcmp(tp->cap_members[i].name, "te_pointsize"))
+                        psw = tp->cap_members[i].offset;
+                [emu_cb waitUntilCompleted];
+                if (psw != 0xffffffff)
+                {
+                    const float *base = (const float *)((uint8_t *)ring.contents + cap_pub_records);
+                    const volatile uint32_t *cntp =
+                        (const volatile uint32_t *)((uint8_t *)ring.contents + cap_pub_count);
+                    const unsigned short *hf =
+                        (const unsigned short *)((uint8_t *)ring.contents + off_factors);
+                    const float *ff = (const float *)((uint8_t *)ring.contents + off_levels_f);
+
+                    NSLog(@"capdump: stride=%uw count=%u ps@%u members=%d pair=%d dom=%d"
+                          @" | factors half %u %u %u %u|%u %u float %.2f %.2f %.2f %.2f|%.2f %.2f",
+                          tp->cap_stride, *cntp, psw, tp->cap_members_n, tp->pair_program != NULL,
+                          tp->domain, hf[0], hf[1], hf[2], hf[3], hf[4], hf[5],
+                          ff[0], ff[1], ff[2], ff[3], ff[4], ff[5]);
+                    if (nrec > *cntp) nrec = *cntp;
+                    for (unsigned r = 0; r < nrec; r++)
+                    {
+                        const float *rec = (const float *)((const uint8_t *)base +
+                                                           (size_t)r * tp->cap_stride * 4u);
+
+                        if (r < 2 || rec[psw] != base[psw])
+                            NSLog(@"  rec %3u/%u: ps=%.4f pos=(%.1f,%.1f,%.1f,%.1f) v1=%.4f v2=%d",
+                                  r, *cntp, rec[psw], rec[0], rec[1], rec[2], rec[3], rec[4],
+                                  *(const int *)(const void *)&rec[6]);
+                    }
+                }
+            }
             if (_currentCommandBuffer && _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
             {
                 [self endRenderEncoding];

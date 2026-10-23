@@ -1445,6 +1445,20 @@ static void *mapBufferRange(GLMContext ctx, Buffer *ptr, GLintptr offset, GLsize
     ptr->mapped_offset = offset;
     ptr->mapped_length = length;
 
+    if ((access & GL_MAP_READ_BIT) && getenv("MGL_TESS_DUMP_CAP"))
+    {
+        /* one-off diagnostics: the first interleaved xfb records (chasing the CTS
+         * point-mode pointsize mismatch) */
+        const float *f = (const float *)(void *)(vm_address_t)ptr->data.buffer_data;
+
+        for (int r = 0; r < 4 && (size_t)(r * 11 + 10) * 4 < (size_t)ptr->size; r++)
+            fprintf(stderr, "tfmap: rec %d: %.4f %.4f %.4f %.4f | %.4f %.4f | %d %d %d %d | ps=%.4f\n",
+                    r, f[r * 11 + 0], f[r * 11 + 1], f[r * 11 + 2], f[r * 11 + 3],
+                    f[r * 11 + 4], f[r * 11 + 5],
+                    (int)f[r * 11 + 6], (int)f[r * 11 + 7], (int)f[r * 11 + 8], (int)f[r * 11 + 9],
+                    f[r * 11 + 10]);
+    }
+
     return (char *)ptr->data.buffer_data + offset;
 }
 

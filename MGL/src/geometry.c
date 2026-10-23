@@ -6575,5 +6575,33 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
     src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
 
+    memset(&src, 0, sizeof src);
+    src.ring = c->buffer_object;
+    src.records = c->records_offset;
+    src.counts = c->count_offset;
+    src.stride = c->stride;
+    src.capacity = c->records ? c->records : 1;
+    /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
+    src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
+
+    if (getenv("MGL_TESS_DUMP_CAP") && c->buffer_object && c->stride)
+    {
+        /* one-off diagnostics: the published capture as the xfb encode kernel sees
+         * it (chasing CTS point-mode count mismatches; pair=true means the draw ran
+         * through a separable-pipeline pair record) */
+        MGLTessProgram *atp = mgl_tess_active_program(ctx);
+
+        fprintf(stderr, "tessxfb: capstride=%uw per_prim=%u records=%u prim=%s nvars=%d bstride=%u"
+                " tfsize=%d tp=%p pair=%d has_tcs=%d dom=%d pm=%d:",
+                c->stride, src.per_prim, c->records,
+                c->prim == GL_TRIANGLES ? "TRI" : c->prim == GL_LINES ? "LINE" : "PTS", xp->count,
+                xp->stride[0], (int)tfb[0].size, (void *)atp, atp->pair_program != NULL,
+                atp->has_tcs, atp->domain, atp->point_mode);
+        for (GLsizei i = 0; i < xp->count; i++)
+            fprintf(stderr, " %s(w%u src%u off%u)", xp->vars[i].name ? xp->vars[i].name : "?",
+                    xp->vars[i].words, xp->vars[i].src_word, xp->vars[i].offset);
+        fprintf(stderr, "\n");
+    }
+
     return geom_xfb_tess_encode(ctx, o, xp, tfb, &src);
 }

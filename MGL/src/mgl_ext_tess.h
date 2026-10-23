@@ -214,10 +214,25 @@ typedef struct MGLTessProgram_t {
      * the SPIRV-Cross layout already matches and the stage function is used as-is */
     void   *vs_function;
     void   *vs_library;
+
+    /* ---- separable pipeline pairing (built at draw time) ----
+     * A pipeline can pair this TES with a tc-only program (the TCS lives in the
+     * pipeline's TESS_CONTROL stage while this program supplies the TES).  The TES
+     * program's link saw no TCS, so this record says has_tcs=0 — such a draw runs
+     * through a DERIVED record instead: a copy of this one with has_tcs=1, the
+     * pipeline TCS's output-vertex count and the PAIR's canonical interface layouts
+     * (the union of the tc program's structs and this program's TES structs), plus
+     * its own compiled kernel variants.  mgl_tess_active_program() returns it while
+     * that pipeline draws; it is never linked into the program hash and is rebuilt
+     * when either side relinks (or is deleted). */
+    struct MGLTessProgram_t *pair;     /* derived record of the active pipeline pair */
+    Program *pair_program;             /* the tc-only program it was built from */
+    const void *pair_key;              /* that program's TCS MSL pointer at build time */
+    Program *pair_vs;                  /* (pair only) program its vs_function was built from */
 } MGLTessProgram;
 
 #define MGL_TESS_PROGRAM_HASH 257
-#define MGL_TESS_VS_KERNEL_CACHE 16   /* separable pipeline vertex-kernel variants */
+#define MGL_TESS_VS_KERNEL_CACHE 32   /* separable pipeline vertex-kernel variants */
 
 struct MGLExtState_tess {
     MGLTessProgram *programs[MGL_TESS_PROGRAM_HASH];
@@ -251,11 +266,15 @@ struct MGLExtState_tess {
     /* draw-time vertex-kernel variants for SEPARABLE pipeline vertex programs: a
      * vs-only program linked alone keeps the plain vertex function (rstate fixup
      * baked in), and the tess draw path needs the compute-kernel rewrite of it.
-     * Compiled on first use, released when the program's tess record goes away. */
+     * Compiled on first use, released when the program's tess record goes away.
+     * The kernel MSL is kept too: a pipeline pair (MGLTessProgram.pair) re-compiles
+     * canonical-record variants of it against the pair's interface layouts. */
     struct {
         GLuint name;           /* program name the kernel belongs to */
         void  *library;        /* id<MTLLibrary>  (bridged-retain) */
         void  *function;       /* id<MTLFunction> (bridged-retain) */
+        char  *msl;            /* kernel MSL (owned by the cache) */
+        char   entry[128];     /* its entry point name */
     } vs_kernel[MGL_TESS_VS_KERNEL_CACHE];
     unsigned vs_kernel_n;
 };
@@ -320,6 +339,10 @@ bool mgl_tess_cp_record_size(const char *msl, char *patchin_name, size_t patchin
 /* MGL_TESS_CPU (reference-path override), evaluated once per process: the renderer's
  * pipeline selection picks the plain TES instead of the post-tessellation variant */
 bool mgl_tess_cpu_reference(void);
+
+/* the cached separable vertex-kernel MSL of a vs-only program (NULL when absent);
+ * a pipeline pair re-compiles canonical-record variants from it */
+const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry);
 
 
 

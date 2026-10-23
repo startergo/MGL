@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
@@ -229,6 +230,7 @@ uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
 
 struct MslStruct;
 static bool tess_cp_record_name(const char *msl, char *out, size_t out_len);
+static void tess_free_pair(GLMContext ctx, MGLTessProgram *pair);
 static bool msl_patch_in_name(const char *msl, char *out, size_t out_len);
 static bool msl_cp_struct_name(const char *msl, const char *patchin_name, char *out, size_t out_len);
 static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out, char *name, size_t name_len);
@@ -520,10 +522,9 @@ static uint32_t tess_name_hash(const char *s)
  * carry no Location decorations in the module, so the canonical key for them
  * is a stable hash of the resolved name — identical on every side of a
  * linkable program.) */
-static bool tess_stage_var_named(GLMContext ctx, MGLTessProgram *tp, int stage,
+static bool tess_stage_var_named(GLMContext ctx, Program *prog, int stage,
                                   const char *name)
 {
-    Program *prog = tp ? tp->program : NULL;
     uint32_t *ir;
     size_t n;
 
@@ -580,7 +581,7 @@ static bool tess_stage_var_named(GLMContext ctx, MGLTessProgram *tp, int stage,
     return true;
 }
 
-static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
+static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                                struct MslStruct *s, const SpirvResourceList *rl)
 {
     for (int i = 0; i < s->count; i++)
@@ -627,7 +628,7 @@ static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
                 size_t n = strlen(suf);
                 char b2[128];
 
-                if (tess_stage_var_named(ctx, tp, stage, suf))
+                if (tess_stage_var_named(ctx, names_prog, stage, suf))
                 {
                     snprintf(base, sizeof base, "%s", suf);
                     break;
@@ -637,7 +638,7 @@ static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
                 if (n > 1 && suf[n - 1] == '_')
                 {
                     snprintf(b2, sizeof b2, "%.*s", (int)(n - 1), suf);
-                    if (tess_stage_var_named(ctx, tp, stage, b2))
+                    if (tess_stage_var_named(ctx, names_prog, stage, b2))
                     {
                         snprintf(base, sizeof base, "%s", b2);
                         fidx = (uint32_t)atoi(suf + n);
@@ -649,7 +650,7 @@ static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
                 char b2[128];
                 size_t n = strlen(m->name);
 
-                if (tess_stage_var_named(ctx, tp, stage, m->name))
+                if (tess_stage_var_named(ctx, names_prog, stage, m->name))
                     snprintf(base, sizeof base, "%s", m->name);
                 else
                 {
@@ -658,7 +659,7 @@ static void tess_annotate_keys(GLMContext ctx, MGLTessProgram *tp, int stage,
                     if (n > 1 && m->name[n - 1] == '_')
                     {
                         snprintf(b2, sizeof b2, "%.*s", (int)(n - 1), m->name);
-                        if (tess_stage_var_named(ctx, tp, stage, b2))
+                        if (tess_stage_var_named(ctx, names_prog, stage, b2))
                         {
                             snprintf(base, sizeof base, "%s", b2);
                             fidx = (uint32_t)atoi(m->name + n);
@@ -2334,6 +2335,12 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
         head = &(*head)->next;
     if (*head)
         *head = tp->next;
+    /* a derived pipeline pair dies with its base record */
+    if (tp->pair)
+    {
+        tess_free_pair(ctx, tp->pair);
+        tp->pair = NULL;
+    }
     /* release the bridged Metal objects of the compile-once variants */
     if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
     {
@@ -2364,8 +2371,19 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
         return;
     while ((tp = mgl_tess_program(ctx, program)) != NULL)
         tess_free_program(ctx, tp);
+    /* pairs DERIVED from this program (it played the tc-only side of a pipeline
+     * pairing): drop them, the tc program they were canonicalized against is gone */
+    for (unsigned h = 0; h < MGL_TESS_PROGRAM_HASH; h++)
+        for (tp = S->programs[h]; tp; tp = tp->next)
+            if (tp->pair && tp->pair_program == program)
+            {
+                tess_free_pair(ctx, tp->pair);
+                tp->pair = NULL;
+                tp->pair_program = NULL;
+                tp->pair_key = NULL;
+            }
     /* drop the program's cached separable vertex kernel (name reuse must not find it) */
-    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+    for (unsigned slot = 0; slot < S->vs_kernel_n; )
         if (S->vs_kernel[slot].name == program->name)
         {
             if (S->vs_kernel[slot].library && ctx->mtl_funcs.ext_program &&
@@ -2374,8 +2392,15 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
             if (S->vs_kernel[slot].function && ctx->mtl_funcs.ext_program &&
                 ctx->mtl_funcs.ext_program->release_obj)
                 ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].function);
-            memset(&S->vs_kernel[slot], 0, sizeof S->vs_kernel[slot]);
+            free(S->vs_kernel[slot].msl);
+            /* compact: deleted programs must not waste cache capacity (a CTS case
+             * links hundreds of short-lived single-stage programs) */
+            if (slot + 1 < S->vs_kernel_n)
+                S->vs_kernel[slot] = S->vs_kernel[S->vs_kernel_n - 1];
+            memset(&S->vs_kernel[--S->vs_kernel_n], 0, sizeof S->vs_kernel[0]);
         }
+        else
+            slot++;
 }
 
 /* post-link: parse the tessellation modes and the patch data layouts */
@@ -2790,8 +2815,7 @@ static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char 
 char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
 {
     char *plain = mgl_tess_plain_msl(ctx, tp);
-    char *out = NULL, *k = NULL;
-    const char *sig, *name, *open, *vid, *body, *p;
+    char *out = NULL, *k = NULL;    const char *sig, *name, *open, *vid, *body, *p;
     char types[MGL_TESS_CAPTURE_MAX][48];
     uint32_t dbls[MGL_TESS_CAPTURE_MAX];    /* per member: double count (0 = plain u32/float member) */
     uint32_t slotsz[MGL_TESS_CAPTURE_MAX];  /* ... words per fp64 slot: 2 (uint2) or 4 (uint4) */
@@ -3075,6 +3099,21 @@ done:
         tp->cap_members_n = 0;
         tp->cap_stride = 0;
     }
+    else if (getenv("MGL_DUMP_MSL"))
+    {
+        FILE *df = fopen("/tmp/cap_tes.metal", "w");
+
+        if (df)
+        {
+            fputs(out, df);
+            fclose(df);
+        }
+        fprintf(stderr, "==== capture TES MSL (%u members, stride %u words) ====\n",
+                tp->cap_members_n, tp->cap_stride);
+        for (int i = 0; i < tp->cap_members_n && i < 12; i++)
+            fprintf(stderr, "  capmember %-24s words=%u@%u\n", tp->cap_members[i].name,
+                    tp->cap_members[i].words, tp->cap_members[i].offset);
+    }
     free(plain);
     return out;
 }
@@ -3100,11 +3139,17 @@ bool mgl_tess_plain_render(GLMContext ctx)
 
 void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable){
     MGLTessProgram *tp = mgl_tess_active_program(ctx);
+    MGLTessProgram *base;
 
     if (!tp)
         return;
     (void)program;
     tp->capture = enable;
+    /* keep the base record in agreement: an active pair is rebuilt lazily (a tc
+     * relink) and must not resurrect a stale capture flag */
+    base = mgl_tess_program(ctx, tp->program);
+    if (base && base != tp)
+        base->capture = enable;
 }
 
 /* Compile + cache the compute-kernel variant of a SEPARABLE vs-only program's vertex
@@ -3142,16 +3187,51 @@ bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, cons
     if (slot >= S->vs_kernel_n)
     {
         if (S->vs_kernel_n >= MGL_TESS_VS_KERNEL_CACHE)
-            return false;      /* cache full: the transient function is dropped with lib */
-        slot = S->vs_kernel_n++;
+        {
+            /* more live vs-only programs than cache slots: evict the oldest (its
+             * draw would rebuild a plain-vertex fallback — a degenerate case no
+             * real workload hits; deleting programs compacts the cache) */
+            if (ctx->mtl_funcs.ext_program->release_obj)
+            {
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[0].library);
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[0].function);
+            }
+            free(S->vs_kernel[0].msl);
+            memmove(&S->vs_kernel[0], &S->vs_kernel[1],
+                    (S->vs_kernel_n - 1) * sizeof S->vs_kernel[0]);
+            memset(&S->vs_kernel[--S->vs_kernel_n], 0, sizeof S->vs_kernel[0]);
+            slot = S->vs_kernel_n;
+        }
+        else
+            slot = S->vs_kernel_n++;
         S->vs_kernel[slot].name = name;
     }
     S->vs_kernel[slot].library = lib;      /* owned (CFBridgingRetain) */
     S->vs_kernel[slot].function = fn;
+    free(S->vs_kernel[slot].msl);
+    S->vs_kernel[slot].msl = strdup(msl);  /* pair rewrites re-compile from it */
+    snprintf(S->vs_kernel[slot].entry, sizeof S->vs_kernel[slot].entry, "%s",
+             entry ? entry : "main0");
     if (tess_trace())
         fprintf(stderr, "MGL tess: sep-vs kernel cached for program %u (slot %u fn=%p)\n",
                 name, slot, fn);
     return true;
+}
+
+const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    if (!S)
+        return NULL;
+    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == name && S->vs_kernel[slot].msl)
+        {
+            if (entry)
+                *entry = S->vs_kernel[slot].entry;
+            return S->vs_kernel[slot].msl;
+        }
+    return NULL;
 }
 
 const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx)
@@ -3213,6 +3293,15 @@ static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
         }
         at += strlen("device ");
     }
+    /* a TCS that reads NONE of its control point inputs gets no spvIn parameter at
+     * all (SPIRV-Cross drops the unused buffer): the OUTPUT record must still be
+     * canonicalized — return success with an empty in-name, the caller then skips
+     * the (nonexistent) input rewrite only */
+    if (!got_in && got_out)
+    {
+        in_name[0] = 0;
+        return true;
+    }
     return got_in && got_out;
 }
 
@@ -3252,7 +3341,8 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
         if (msl_tcs_record_names(tcs_msl, tcs_in_name, sizeof tcs_in_name,
                                  tcs_out_name, sizeof tcs_out_name))
         {
-            have_tcs_in = msl_parse_struct(tcs_msl, tcs_in_name, &tcs_in);
+            have_tcs_in = tcs_in_name[0] &&
+                          msl_parse_struct(tcs_msl, tcs_in_name, &tcs_in);
             have_tcs_out = msl_parse_struct(tcs_msl, tcs_out_name, &tcs_out);
         }
         have_tcs_po = msl_parse_struct_entry(tcs_msl, &tcs_po, po_name, sizeof po_name);
@@ -3266,17 +3356,17 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
     }
 
     /* attach varying locations to every member */
-    tess_annotate_keys(ctx, tp, _VERTEX_SHADER, &vs_out, have_vs ?
+    tess_annotate_keys(ctx, program, _VERTEX_SHADER, &vs_out, have_vs ?
         &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(ctx, tp, _VERTEX_SHADER, &tcs_in, have_tcs_in ?
+    tess_annotate_keys(ctx, program, _VERTEX_SHADER, &tcs_in, have_tcs_in ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
-    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tcs_out, have_tcs_out ?
+    tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tcs_out, have_tcs_out ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tes_cp, have_cp ?
+    tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tes_cp, have_cp ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
-    tess_annotate_keys(ctx, tp, _TESS_CONTROL_SHADER, &tcs_po, have_tcs_po ?
+    tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tcs_po, have_tcs_po ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(ctx, tp, _TESS_EVALUATION_SHADER, &tes_pi, have_pi ?
+    tess_annotate_keys(ctx, program, _TESS_EVALUATION_SHADER, &tes_pi, have_pi ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
 
     /* pair flattened interface-block members that no reflected name matched.
@@ -3632,7 +3722,433 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
     }
 }
 
-/* ------------------------------------------------------------------ MSL name helpers */
+/* ------------------------------------------------------------------ pipeline pairs */
+
+/* release a derived pipeline-pair record (never in the program hash) */
+static void tess_free_pair(GLMContext ctx, MGLTessProgram *pair)
+{
+    if (!pair)
+        return;
+    if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
+    {
+        void **owned[8] = { &pair->capture_function, &pair->capture_library, &pair->capture_pso,
+                            &pair->plain_function, &pair->tcs_function, &pair->tcs_library,
+                            &pair->vs_function, &pair->vs_library };
+        void *extra[2] = { pair->plain_library, pair->tes_hw_function };
+        void *extra2 = pair->tes_hw_library;
+
+        for (int i = 0; i < 8; i++)
+            if (*owned[i])
+                ctx->mtl_funcs.ext_program->release_obj(ctx, *owned[i]);
+        for (int i = 0; i < 2; i++)
+            if (extra[i])
+                ctx->mtl_funcs.ext_program->release_obj(ctx, extra[i]);
+        if (extra2)
+            ctx->mtl_funcs.ext_program->release_obj(ctx, extra2);
+    }
+    free(pair->plain_msl);
+    free(pair);
+}
+
+/* Build the derived record of a (TES program, tc-only program) pipeline pair: a copy
+ * of the TES program's own record with has_tcs=1 and the interface layouts
+ * canonicalized across BOTH programs — the union of the tc program's TCS structs and
+ * the TES's patch-in/cp structs, exactly like a single-program link does it
+ * (tess_canonicalize_records), but with the structs coming from two SPIR-V modules.
+ * The TCS kernel is recompiled against those layouts (plus the domain factor fixups
+ * and the GL float-level copy); the VS kernel gets a pair variant when its raw
+ * output record differs. */
+static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Program *tc)
+{
+    MGLTessProgram *pair;
+    Program *tes = tp->program;
+    Program *vs_prog = NULL;
+    const char *vs_msl = NULL, *tcs_msl = NULL, *tes_msl = NULL;
+    struct MslStruct vs_out, tcs_in, tcs_out, tes_cp, tcs_po, tes_pi;
+    char vs_name[160] = "", tcs_in_name[160] = "", tcs_out_name[160] = "";
+    char po_name[160] = "", pi_name[160] = "", cp_name[160] = "";
+    bool have_vs = false, have_tcs_in = false, have_tcs_out = false;
+    bool have_tcs_po = false, have_pi = false, have_cp = false;
+    struct CanonRec canon, canon_tcs, canon_patch;
+
+    memset(&vs_out, 0, sizeof vs_out);
+    memset(&tcs_in, 0, sizeof tcs_in);
+    memset(&tcs_out, 0, sizeof tcs_out);
+    memset(&tes_cp, 0, sizeof tes_cp);
+    memset(&tcs_po, 0, sizeof tcs_po);
+    memset(&tes_pi, 0, sizeof tes_pi);
+
+    tcs_msl = tc->spirv[_TESS_CONTROL_SHADER].msl_str;
+    tes_msl = tes->spirv[_TESS_EVALUATION_SHADER].msl_str;
+    if (!tcs_msl || !tes_msl)
+        return NULL;
+
+    /* the vertex stage of the same pipeline (the draw's own resolution) */
+    if (ctx->state.program_pipeline)
+        vs_prog = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER];
+    if (!vs_prog)
+        vs_prog = tes;                   /* a vs+tes program in the TES slot */
+    if (vs_prog == tes)
+        vs_msl = tes->spirv[_VERTEX_SHADER].msl_str;
+    else if (vs_prog->spirv[_VERTEX_SHADER].msl_str)
+    {
+        /* a vs-only program keeps a plain vertex function as its stage MSL — its
+         * tessellation kernel form lives in the separable-kernel cache */
+        const char *entry = NULL;
+        const char *kmsl = mgl_tess_vs_kernel_msl(ctx, vs_prog->name, &entry);
+
+        vs_msl = kmsl;                   /* owned by the cache (never freed here) */
+    }
+
+    if (vs_msl && tess_cp_record_name(vs_msl, vs_name, sizeof vs_name))
+        have_vs = msl_parse_struct(vs_msl, vs_name, &vs_out);
+    if (msl_tcs_record_names(tcs_msl, tcs_in_name, sizeof tcs_in_name,
+                             tcs_out_name, sizeof tcs_out_name))
+    {
+        have_tcs_in = tcs_in_name[0] &&
+                      msl_parse_struct(tcs_msl, tcs_in_name, &tcs_in);
+        have_tcs_out = msl_parse_struct(tcs_msl, tcs_out_name, &tcs_out);
+    }
+    have_tcs_po = msl_parse_struct_entry(tcs_msl, &tcs_po, po_name, sizeof po_name);
+    if (msl_patch_in_name(tes_msl, pi_name, sizeof pi_name))
+        have_pi = msl_parse_struct(tes_msl, pi_name, &tes_pi);
+    if (have_pi && msl_cp_struct_name(tes_msl, pi_name, cp_name, sizeof cp_name))
+        have_cp = msl_parse_struct(tes_msl, cp_name, &tes_cp);
+
+    /* interface keys from each module's own reflection.  Names resolve through the
+     * module that DECLARES the interface (a te-only program has no TCS module, so
+     * its patch members must not be looked up there — the block's member names live
+     * in the tc program's TCS module, exactly where a single-program link finds
+     * them, which keeps the keys identical on both sides of the pair) */
+    tess_annotate_keys(ctx, vs_prog, _VERTEX_SHADER, &vs_out, have_vs ?
+        &vs_prog->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(ctx, tc, _TESS_CONTROL_SHADER, &tcs_in, have_tcs_in ?
+        &tc->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+    tess_annotate_keys(ctx, tc, _TESS_CONTROL_SHADER, &tcs_out, have_tcs_out ?
+        &tc->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(ctx, tc, _TESS_CONTROL_SHADER, &tcs_po, have_tcs_po ?
+        &tc->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
+    tess_annotate_keys(ctx, tc, _TESS_CONTROL_SHADER, &tes_cp, have_cp ?
+        &tes->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+    tess_annotate_keys(ctx, tes, _TESS_EVALUATION_SHADER, &tes_pi, have_pi ?
+        &tes->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
+
+    {
+        struct MslStruct *vs_side[2] = { have_vs ? &vs_out : NULL, have_tcs_in ? &tcs_in : NULL };
+        struct MslStruct *tes_side[2] = { have_tcs_out ? &tcs_out : NULL, have_cp ? &tes_cp : NULL };
+        struct MslStruct *patch_side[2] = { have_tcs_po ? &tcs_po : NULL, have_pi ? &tes_pi : NULL };
+
+        if (!tess_canon_union(&canon, vs_side, 2) ||
+            !tess_canon_union(&canon_tcs, tes_side, 2) ||
+            !tess_canon_union(&canon_patch, patch_side, 2))
+        {
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: pair canonical union failed (tc=%p tes=%p)\n",
+                        (void *)tc, (void *)tes);
+            return NULL;
+        }
+    }
+
+    pair = (MGLTessProgram *)calloc(1, sizeof *pair);
+    if (!pair)
+        return NULL;
+    *pair = *tp;                         /* program, domain, spacing, capture flag, ... */
+    pair->next = NULL;
+    pair->pair = NULL;
+    pair->pair_program = NULL;
+    pair->pair_key = NULL;
+    pair->has_tcs = 1;
+    pair->tcs_out_vertices = mgl_tess_program_out_vertices(ctx, tc);
+    pair->hw_cp_count = pair->tcs_out_vertices;
+    /* every compile-once variant of the base record embeds ITS layouts (or a baked
+     * control point count) — the pair rebuilds its own on first use */
+    pair->tes_hw_function = NULL;
+    pair->tes_hw_library = NULL;
+    pair->tes_hw_n = 0;
+    pair->plain_msl = NULL;
+    pair->plain_msl_dumped = false;
+    pair->plain_function = NULL;
+    pair->plain_library = NULL;
+    pair->capture_function = NULL;
+    pair->capture_library = NULL;
+    pair->capture_pso = NULL;
+    pair->capture_fc_fixup = false;
+    pair->vs_function = NULL;
+    pair->vs_library = NULL;
+
+    /* canonical cp record of the pair: the TES reads its members at these offsets */
+    pair->num_cp_record = canon_tcs.n;
+    pair->cp_record_full_size = canon_tcs.size;
+    pair->cp_record_size = canon_tcs.size;
+    for (int i = 0; i < canon_tcs.n && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
+        pair->cp_record[i] = canon_tcs.m[i];
+    /* the pair's TES member keys must be the ones resolved HERE (against the tc
+     * program's modules, like a single-program link): the te-only program's own
+     * link had no TCS module to resolve block-member bases through, so its keys
+     * name-hash the flattened members and would never alias the producer side */
+    for (int i = 0; i < pair->num_tes_cp; i++)
+        for (int j = 0; j < tes_cp.count; j++)
+            if (!strcmp(pair->tes_cp[i].name, tes_cp.members[j].name))
+            {
+                pair->tes_cp[i].key = tes_cp.members[j].key;
+                break;
+            }
+    for (int i = 0; i < pair->num_tes_patch_in; i++)
+        for (int j = 0; j < tes_pi.count; j++)
+            if (!strcmp(pair->tes_patch_in[i].name, tes_pi.members[j].name))
+            {
+                pair->tes_patch_in[i].key = tes_pi.members[j].key;
+                break;
+            }
+    for (int i = 0; i < pair->num_tes_cp; i++)
+    {
+        for (int j = 0; j < canon_tcs.n; j++)
+            if (pair->tes_cp[i].key == canon_tcs.m[j].key)
+            {
+                pair->tes_cp[i].offset = canon_tcs.m[j].offset;
+                if (pair->tes_cp[i].array_idx && strstr(canon_tcs.m[j].type, "spvUnsafeArray"))
+                {
+                    size_t align = 1, size = 0;
+
+                    if (msl_element_type(canon_tcs.m[j].type, &align, &size))
+                        pair->tes_cp[i].offset = canon_tcs.m[j].offset +
+                            pair->tes_cp[i].array_idx * (size / msl_array_len(canon_tcs.m[j].type));
+                }
+                break;
+            }
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: pair tes_cp[%d] %-22s key=%08x -> offset %zu\n",
+                    i, pair->tes_cp[i].name, pair->tes_cp[i].key, pair->tes_cp[i].offset);
+    }
+
+    /* canonical per-patch record: TES patch-in offsets, blob layout and the TCS
+     * patchOut members all use it */
+    for (int i = 0; i < pair->num_tes_patch_in; i++)
+        for (int j = 0; j < canon_patch.n; j++)
+            if (pair->tes_patch_in[i].key == canon_patch.m[j].key)
+            {
+                pair->tes_patch_in[i].offset = canon_patch.m[j].offset;
+                break;
+            }
+    pair->tes_patch_in_size = canon_patch.size;
+    pair->tcs_patch_out_size = canon_patch.size;
+    pair->num_tcs_patch_out = 0;
+    for (int i = 0; i < tcs_po.count && pair->num_tcs_patch_out < MGL_TESS_MAX_PATCH_MEMBERS; i++)
+    {
+        MGLTessPatchMember *m = &tcs_po.members[i];
+
+        for (int j = 0; j < canon_patch.n; j++)
+            if (m->key == canon_patch.m[j].key)
+            {
+                pair->tcs_patch_out[pair->num_tcs_patch_out++] = *m;
+                pair->tcs_patch_out[pair->num_tcs_patch_out - 1].offset = canon_patch.m[j].offset;
+                break;
+            }
+    }
+
+    /* the TCS kernel: recompiled with the pair's canonical structs, the domain's
+     * factor-record form and the GL float-level copy (same rewrite sequence a
+     * single-program link applies) */
+    {
+        char *msl = strdup(tcs_msl);
+        bool changed = false;
+        char body[4096];
+
+        if (have_tcs_in && !tess_canon_matches(&tcs_in, &canon))
+        {
+            char *nw;
+            tess_canon_body(body, sizeof body, &tcs_in, &canon);
+            nw = msl_rewrite_struct_body(msl, tcs_in_name, body);
+            if (nw) { free(msl); msl = nw; changed = true; }
+        }
+        if (have_tcs_out && !tess_canon_matches(&tcs_out, &canon_tcs))
+        {
+            char *nw;
+            tess_canon_body(body, sizeof body, &tcs_out, &canon_tcs);
+            nw = msl_rewrite_struct_body(msl, tcs_out_name, body);
+            if (nw) { free(msl); msl = nw; changed = true; }
+        }
+        if (have_tcs_po && !tess_canon_matches(&tcs_po, &canon_patch))
+        {
+            char *nw;
+            tess_canon_body(body, sizeof body, &tcs_po, &canon_patch);
+            nw = msl_rewrite_struct_body(msl, po_name, body);
+            if (nw) { free(msl); msl = nw; changed = true; }
+        }
+
+        /* triangle domains: write MTLTriangleTessellationFactorsHalf (8-byte factor
+         * records) instead of the quad struct (see mgl_tess_factor_stride) */
+        if (pair->domain == MGL_TESS_DOMAIN_TRIANGLES)
+        {
+            char *step = strstr(msl, "device MTLQuadTessellationFactorsHalf*");
+            if (step)
+            {
+                size_t oldlen = strlen("device MTLQuadTessellationFactorsHalf*");
+                size_t newlen = strlen("device MTLTriangleTessellationFactorsHalf*");
+                size_t at = (size_t)(step - msl);
+                char *grown = (char *)realloc(msl, strlen(msl) + newlen - oldlen + 1);
+
+                if (grown)
+                {
+                    char *p;
+                    msl = grown;
+                    p = msl + at;
+                    memmove(p + newlen, p + oldlen, strlen(p + oldlen) + 1);
+                    memcpy(p, "device MTLTriangleTessellationFactorsHalf*", newlen);
+                    for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[0]")) != NULL; )
+                    {
+                        size_t tail = strlen(w + strlen(".insideTessellationFactor[0]")) + 1;
+                        memmove(w + strlen(".insideTessellationFactor"),
+                                w + strlen(".insideTessellationFactor[0]"), tail);
+                        w += strlen(".insideTessellationFactor");
+                    }
+                    for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[1]")) != NULL; )
+                    {
+                        size_t tail = strlen(w + strlen(".insideTessellationFactor[1]")) + 1;
+                        memmove(w + strlen(".insideTessellationFactor"),
+                                w + strlen(".insideTessellationFactor[1]"), tail);
+                        w += strlen(".insideTessellationFactor");
+                    }
+                    for (char *w = msl; (w = strstr(w, ".edgeTessellationFactor[3]")) != NULL; )
+                    {
+                        char *ls = w, *semi = strchr(w, ';'), *eq, *rhs;
+                        char repl[512];
+                        while (ls > msl && ls[-1] != '\n' && ls[-1] != ';' &&
+                               ls[-1] != '{' && ls[-1] != '}')
+                            ls--;
+                        if (!semi) { w += strlen(".edgeTessellationFactor"); continue; }
+                        eq = semi;
+                        while (eq > ls && eq[-1] != '=') eq--;
+                        if (eq == ls) { w = semi; continue; }
+                        rhs = eq;
+                        while (*rhs == ' ' || *rhs == '=') rhs++;
+                        snprintf(repl, sizeof repl, "(void)(%.*s);", (int)(semi - rhs), rhs);
+                        {
+                            size_t span = (size_t)(semi - ls + 1);
+                            memset(ls, ' ', span);
+                            memcpy(ls, repl, strlen(repl) <= span ? strlen(repl) : span);
+                            w = ls + span;
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+
+        {
+            char *lvl = tcs_inject_float_levels(msl);
+
+            if (lvl) { free(msl); msl = lvl; pair->tcs_levels_float = 1; changed = true; }
+        }
+        if (getenv("MGL_DUMP_MSL"))
+        {
+            FILE *df = fopen("/tmp/pair_tcs.metal", "w");
+
+            if (df) { fputs(msl, df); fclose(df); }
+        }
+        if (changed && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+        {
+            void *lib = NULL, *fn = NULL;
+            char *err = NULL;
+            const char *entry = tc->spirv[_TESS_CONTROL_SHADER].entry_point;
+
+            if (!entry || !*entry)
+                entry = "main0";
+            if (ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, entry, &lib, &fn, &err))
+            {
+                pair->tcs_function = fn;
+                pair->tcs_library = lib;
+                if (tess_trace())
+                    fprintf(stderr, "MGL tess: pair TCS kernel compiled (cp %zu b, patch %zu b, outv %d)\n",
+                            canon_tcs.size, canon_patch.size, pair->tcs_out_vertices);
+            }
+            else
+            {
+                fprintf(stderr, "MGL ERROR: tess: pair TCS recompile failed: %s\n", err ? err : "?");
+                free(err);
+            }
+        }
+        else if (!changed)
+        {
+            /* the raw kernel already matches the canonical layouts: still needs the
+             * float-level copy writer, which tcs_inject_float_levels added above */
+            pair->tcs_levels_float = 1;
+        }
+        free(msl);
+    }
+
+    /* the pair's VS kernel: recompiled when the raw output record differs from the
+     * canonical (vs -> TCS) record — the source MSL is the program's kernel form
+     * (a vs+tes program) or the separable-kernel cache (a vs-only program) */
+    if (have_vs && vs_msl && !tess_canon_matches(&vs_out, &canon))
+    {
+        char body[4096];
+        char *nw;
+        struct MslStruct own = vs_out;
+
+        tess_canon_body(body, sizeof body, &own, &canon);
+        nw = msl_rewrite_struct_body(vs_msl, vs_name, body);
+        if (nw)
+        {
+            tess_widen_double_stores(&nw, &own, &canon);
+            if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+            {
+                void *lib = NULL, *fn = NULL;
+                char *err = NULL;
+                const char *entry = "main0";
+                char kentry[128] = "main0";
+                const char *kd = strstr(nw, "kernel void ");
+
+                if (kd)
+                {
+                    const char *ks = kd + strlen("kernel void ");
+                    size_t kl = 0;
+
+                    while (ks[kl] && (isalnum((unsigned char)ks[kl]) || ks[kl] == '_'))
+                        kl++;
+                    if (kl && kl < sizeof kentry)
+                    {
+                        memcpy(kentry, ks, kl);
+                        kentry[kl] = 0;
+                    }
+                }
+                entry = kentry;
+                if (vs_prog == tes && tes->spirv[_VERTEX_SHADER].entry_point &&
+                    *tes->spirv[_VERTEX_SHADER].entry_point && !strcmp(entry, "main0"))
+                    entry = tes->spirv[_VERTEX_SHADER].entry_point;
+                if (ctx->mtl_funcs.ext_program->compile_msl(ctx, nw, entry, &lib, &fn, &err))
+                {
+                    pair->vs_function = fn;
+                    pair->vs_library = lib;
+                    pair->pair_vs = vs_prog;
+                    if (tess_trace())
+                        fprintf(stderr, "MGL tess: pair VS kernel compiled (record %zu b)\n",
+                                canon.size);
+                }
+                else
+                {
+                    fprintf(stderr, "MGL ERROR: tess: pair VS recompile failed: %s\n",
+                            err ? err : "?");
+                    free(err);
+                }
+            }
+            free(nw);
+        }
+    }
+
+    /* the GPU blob map of the pair: TES patch-in layout, sources from the tc
+     * program's patchOut members at the canonical offsets */
+    mgl_tess_build_blob_map(ctx, pair);
+
+    if (tess_trace())
+    {
+        fprintf(stderr, "MGL tess: pair built: tes prog %u + tc prog %u: canon vs->tcs %zu b, "
+                "tcs->tes %zu b, patch %zu b, outv=%d tcs_fn=%p\n",
+                tp->program_name, tc->name, canon.size, canon_tcs.size, canon_patch.size,
+                pair->tcs_out_vertices, pair->tcs_function);
+    }
+    return pair;
+}
 
 /* name of the TES patch input struct: the type of the "patchIn" parameter (hardware
  * form: "<patchIn> patchIn [[stage_in]]") or of the prologue local (plain form) */
@@ -3823,6 +4339,7 @@ GLint mgl_tess_program_out_vertices(GLMContext ctx, Program *program)
 MGLTessProgram *mgl_tess_active_program(GLMContext ctx)
 {
     Program *tes = NULL;
+    MGLTessProgram *tp;
 
     if (ctx->state.program)
     {
@@ -3838,7 +4355,44 @@ MGLTessProgram *mgl_tess_active_program(GLMContext ctx)
 
     if (!tes)
         return NULL;
-    return mgl_tess_program(ctx, tes);
+    tp = mgl_tess_program(ctx, tes);
+    if (!tp)
+        return NULL;
+
+    /* a pipeline can pair this TES with a tc-only program: the TES program's own
+     * record was linked without a TCS (has_tcs=0), but such a draw must run the
+     * pipeline's TCS. Hand out the DERIVED pair record instead — built on first
+     * use with has_tcs=1 and the two programs' canonical interface layouts (see
+     * tess_build_pair); rebuilt when the tc program relinks. */
+    if (ctx->state.program_pipeline && !tp->has_tcs)
+    {
+        Program *tc = ctx->state.program_pipeline->stage_programs[_TESS_CONTROL_SHADER];
+
+        if (tc && tc->spirv[_TESS_CONTROL_SHADER].ir && tc != tp->program)
+        {
+            const void *key = (const void *)tc->spirv[_TESS_CONTROL_SHADER].msl_str;
+
+            if (tp->pair && (tp->pair_program != tc || tp->pair_key != key))
+            {
+                tess_free_pair(ctx, tp->pair);
+                tp->pair = NULL;
+                tp->pair_program = NULL;
+                tp->pair_key = NULL;
+            }
+            if (!tp->pair)
+            {
+                tp->pair = tess_build_pair(ctx, tp, tc);
+                if (tp->pair)
+                {
+                    tp->pair_program = tc;
+                    tp->pair_key = key;
+                }
+            }
+            if (tp->pair)
+                return tp->pair;
+        }
+    }
+    return tp;
 }
 
 /* record size of the TES control-point struct (rewritten TES MSL), so the Metal side
