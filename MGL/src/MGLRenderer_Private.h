@@ -176,6 +176,11 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 /* geometry domain (MGLRenderer+Geometry.m): Metal requires inputPrimitiveTopology when the
  * vertex stage writes render_target_array_index / viewport_array_index */
 - (void) geomConfigureTopology: (MTLRenderPipelineDescriptor *) pd;
+/* geom: the Metal texture an image unit (glBindImageTexture) must expose to a shader —
+ * a view selecting the unit's mip level and, for a non-layered binding, its layer;
+ * returns `base` unchanged when no slicing is needed.  Shared by the render, compute,
+ * geometry and tessellation image-binding paths. */
+- (id<MTLTexture>) geomImageUnitView: (const ImageUnit *) iu base: (id<MTLTexture>) base;
 /* geom: SSBO runtime-array .length() — bind SPIRV-Cross's spvBufferSizeConstants
  * (bound-range byte size of the SSBO at each Metal buffer index) to the render or
  * compute tables; no-op when the stage MSL does not reference it */

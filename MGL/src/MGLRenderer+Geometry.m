@@ -22,6 +22,7 @@
 #include "mgl_ext_program.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
+#include "mgl_ext_queries.h"   /* discard-skip: active pre-raster query counters */
 #include "MGLRenderer_Private.h"
 
 /* rstate's vertex/fragment function-constant specialization is declared privately inside
@@ -1884,6 +1885,154 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
 /* ---- resources of the geometry stage (uniforms, storage, textures) ---- */
 
+/* glBindImageTexture binds exactly ONE mip level of a texture (and, when layered is
+ * GL_FALSE on an arrayed target, ONE layer), so the MSL image argument must see a view
+ * of that level / slice: handing it the base texture makes imageSize() report level-0
+ * dimensions and imageStore land at level 0 (KHR-GL46.shader_image_size binds level 1/2
+ * of mip chains).  A layered binding keeps every slice of the level, with the texture
+ * type matching the arrayed image type the shader declared (texture2d_array,
+ * texturecube_array, texture3d ...); a non-layered binding of an arrayed target becomes
+ * a single-slice 2D/1D view for the shader's non-arrayed image type.  Returns `base`
+ * unchanged when no slicing is needed (level-0, whole texture, buffer textures). */
+- (id<MTLTexture>) geomImageUnitView: (const ImageUnit *) iu base: (id<MTLTexture>) base
+{
+    MTLTextureType type, view_type;
+    NSUInteger level, layer, levels, array_len;
+    NSRange level_range, slice_range;
+
+    if (!base)
+        return nil;
+    type = base.textureType;
+    if (type == MTLTextureTypeTextureBuffer)
+        return base;                       /* buffer textures have no levels or layers */
+
+    levels = base.mipmapLevelCount;
+    array_len = base.arrayLength;
+    level = (iu->level > 0) ? (NSUInteger)iu->level : 0;
+    layer = (iu->layer > 0) ? (NSUInteger)iu->layer : 0;
+    if (level >= levels) level = levels ? levels - 1 : 0;
+    level_range = NSMakeRange(level, 1);
+
+    BOOL layered = (iu->layered != GL_FALSE);
+
+    switch (type)
+    {
+        case MTLTextureType2D:
+            if (level == 0) return base;
+            view_type = MTLTextureType2D;
+            slice_range = NSMakeRange(0, 1);
+            break;
+        case MTLTextureType2DMultisample:
+            /* MS textures have a single level; a layered binding is the whole texture */
+            return base;
+        case MTLTextureType1D:
+            if (level == 0) return base;
+            view_type = MTLTextureType1D;
+            slice_range = NSMakeRange(0, 1);
+            break;
+        case MTLTextureType1DArray:
+            if (layered)
+            {
+                if (level == 0) return base;
+                view_type = MTLTextureType1DArray;
+                slice_range = NSMakeRange(0, array_len);
+            }
+            else
+            {
+                view_type = MTLTextureType1D;
+                slice_range = NSMakeRange(MIN(layer, array_len ? array_len - 1 : 0), 1);
+            }
+            break;
+        case MTLTextureType2DArray:
+        case MTLTextureType2DMultisampleArray:
+            if (layered)
+            {
+                if (level == 0 && type == MTLTextureType2DArray) return base;
+                view_type = type;
+                slice_range = NSMakeRange(0, array_len);
+            }
+            else
+            {
+                view_type = (type == MTLTextureType2DArray) ? MTLTextureType2D : MTLTextureType2DMultisample;
+                slice_range = NSMakeRange(MIN(layer, array_len ? array_len - 1 : 0), 1);
+            }
+            break;
+        case MTLTextureType3D:
+            if (layered)
+            {
+                /* a texture3d view spans the LEVEL's depth (imageSize().z): the depth
+                 * halves per level, so the base texture's full depth would overflow
+                 * Metal's view validation */
+                NSUInteger depth = base.depth >> level;
+
+                if (level == 0) return base;
+                if (!depth) depth = 1;
+                view_type = MTLTextureType3D;
+                slice_range = NSMakeRange(0, depth);
+            }
+            else
+            {
+                /* GL wants an image2D view of one 3D slice, but a 3D texture can only
+                 * alias as 3D (Metal texture-view rules) — hand the whole texture and
+                 * let the MSL's texture2d argument read the slice-0 plane.  Documented
+                 * emulation gap (non-layered 3D image bindings read the wrong plane). */
+                return base;
+            }
+            break;
+        case MTLTextureTypeCube:
+            if (layered)
+            {
+                if (level == 0) return base;
+                view_type = MTLTextureTypeCube;
+                slice_range = NSMakeRange(0, 6);
+            }
+            else
+            {
+                view_type = MTLTextureType2D;
+                slice_range = NSMakeRange(MIN(layer, 5), 1);
+            }
+            break;
+        case MTLTextureTypeCubeArray:
+            if (layered)
+            {
+                if (level == 0) return base;
+                view_type = MTLTextureTypeCubeArray;
+                slice_range = NSMakeRange(0, array_len * 6);
+            }
+            else
+            {
+                view_type = MTLTextureType2D;
+                slice_range = NSMakeRange(MIN(layer, array_len * 6 ? array_len * 6 - 1 : 0), 1);
+            }
+            break;
+        default:
+            return base;
+    }
+
+    id<MTLTexture> view = nil;
+    @try {
+        view = [base newTextureViewWithPixelFormat: base.pixelFormat
+                                        textureType: view_type
+                                             levels: level_range
+                                           slices: slice_range];
+    } @catch (NSException *e) {
+        NSLog(@"MGL WARNING: image-unit view (level %d layer %d layered %d) failed: %@",
+              iu->level, iu->layer, iu->layered, e);
+        return base;
+    }
+    return view ? view : base;
+}
+
+/* the generated variants number their texture arguments themselves (geom_build_pins):
+ * the walks look up the Metal slot by resource name; msl_binding is only the fallback */
+static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
+{
+    if (!name) return -1;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(slots[i].name, name)) return slots[i].msl;
+    return -1;
+}
+
 /* the capture pass runs the vertex stage as a render encoder of its own: realize the
  * stage's textures before that encoder exists (a deferred upload opens a blit encoder,
  * which Metal forbids while another encoder is encoding) */
@@ -1921,8 +2070,10 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
 /* bind one stage's textures to the capture pass's render encoder (vertex slots only: the
  * pass has no fragment function).  Consecutive units feed array elements (GL sampler
- * convention: base..base+N-1 at consecutive Metal argument slots). */
+ * convention: base..base+N-1 at consecutive Metal argument slots).  The capture variant's
+ * argument indices come from its own pinning (gp->tex_slots_vs). */
 - (void) geomBindRenderStageTextures: (id<MTLRenderCommandEncoder>) enc stage: (int) stage
+                                geomProgram: (MGLGeomProgram *) gp
 {
     struct { int spvc_type; bool image; } types[] = {
         { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
@@ -1939,7 +2090,9 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         {
             SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][types[t].spvc_type].list[i];
             int spirv_binding = [self getProgramBinding: stage type: types[t].spvc_type index: i];
-            NSUInteger mtl_index = (NSUInteger)sres->msl_binding;
+            NSUInteger mtl_index = (NSUInteger)geomTexSlot(gp->tex_slots_vs, gp->n_tex_slots_vs,
+                                                           sres->name ? sres->name : "");
+            if (mtl_index == (NSUInteger)-1) mtl_index = (NSUInteger)sres->msl_binding;
             int cnt = sres->array_size ? (int)sres->array_size : 1;
 
             if (spirv_binding < 0) continue;
@@ -1958,7 +2111,16 @@ void geom_xfb_gpu_reset(GLMContext ctx)
                     texture = [self texparamTextureForTex: tex base: texture];
                     if (sampler) [enc setVertexSamplerState: sampler atIndex: mtl_index + e];
                 }
+                else
+                {
+                    /* an image unit binds one mip level / layer (glBindImageTexture) */
+                    texture = [self geomImageUnitView: &STATE(image_units[unit]) base: texture];
+                }
                 [enc setVertexTexture: texture atIndex: mtl_index + e];
+                if (gEnv.debug)
+                    fprintf(stderr, "geom: debug vs capture %s[%u] '%s' unit %d at msl %lu x%d\n",
+                            types[t].image ? "image" : "tex", (unsigned)i,
+                            sres->name ? sres->name : "?", unit, (unsigned long)mtl_index, cnt);
             }
         }
     }
@@ -2031,12 +2193,13 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
 
-    /* textures and images of the geometry stage: the same mapping the render encoders use
-     * (bindTexturesToCurrentRenderEncoder): sres->msl_binding is the kernel's Metal argument
-     * index, the SPIR-V binding selects the GL texture unit — they are not the enumeration
-     * index.  A sampler ARRAY spans consecutive Metal slots fed by consecutive units
-     * (base..base+N-1, MGL's sampler-uniform convention).  Sampler objects bound to the
-     * unit override the texture's own sampler state. */
+    /* textures and images of the geometry stage: the SPIR-V binding selects the GL texture
+     * unit; the kernel's Metal argument index comes from its own SPIRV-Cross pinning
+     * (gp->tex_slots_gs, recorded by geom_build_pins — the stage list's msl_binding is a
+     * different numbering for the geometry stage, where program.c never refines it with a
+     * Metal GS compile).  A sampler ARRAY spans consecutive Metal slots fed by consecutive
+     * units (base..base+N-1, MGL's sampler-uniform convention).  Sampler objects bound to
+     * the unit override the texture's own sampler state. */
     {
         struct { int spvc_type; bool image; } types[] = {
             { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
@@ -2051,7 +2214,9 @@ void geom_xfb_gpu_reset(GLMContext ctx)
             {
                 SpirvResource *sres = &STATE(program)->spirv_resources_list[_GEOMETRY_SHADER][types[t].spvc_type].list[i];
                 int spirv_binding = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
-                NSUInteger mtl_index = (NSUInteger)sres->msl_binding;
+                NSUInteger mtl_index = (NSUInteger)geomTexSlot(gp->tex_slots_gs, gp->n_tex_slots_gs,
+                                                               sres->name ? sres->name : "");
+                if (mtl_index == (NSUInteger)-1) mtl_index = (NSUInteger)sres->msl_binding;
                 int n = 1;
 
                 for (int a = 0; a < gp->n_tex_arrays; a++)
@@ -2077,12 +2242,19 @@ void geom_xfb_gpu_reset(GLMContext ctx)
                         texture = [self texparamTextureForTex: tex base: texture];
                         if (sampler) [enc setSamplerState: sampler atIndex: mtl_index + e];
                     }
+                    else
+                    {
+                        /* an image unit binds one mip level / layer (glBindImageTexture) */
+                        texture = [self geomImageUnitView: &STATE(image_units[unit]) base: texture];
+                    }
                     [enc setTexture: texture atIndex: mtl_index + e];
                     if (gEnv.debug && e == 0)
-                        fprintf(stderr, "geom: debug gs %s[%u] '%s' unit %d bound at msl %lu x%d\n",
+                        fprintf(stderr, "geom: debug gs %s[%u] '%s' unit %d bound at msl %lu x%d type=%lu len=%lu\n",
                                 types[t].image ? "image" : "tex", (unsigned)i,
                                 sres->name ? sres->name : "?", spirv_binding,
-                                (unsigned long)mtl_index, n);
+                                (unsigned long)mtl_index, n,
+                                texture ? (unsigned long)texture.textureType : 999,
+                                texture ? (unsigned long)texture.width : 0);
                 }
             }
         }
@@ -2374,6 +2546,36 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     }
 }
 
+/* RASTERIZER_DISCARD optimization (GL 4.6 10.4.4): with discard on and no transform
+ * feedback, a geometry stage whose only outputs feed rasterization is unobservable —
+ * unless it writes images / SSBOs / atomics, or a pre-raster query is counting it
+ * (PRIMITIVES_GENERATED and the stage-invocation counters stay live under discard). */
+static bool geom_discard_skippable(GLMContext ctx, Program *program)
+{
+    static const int side[3] = { SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
+                                 SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
+                                 SPVC_RESOURCE_TYPE_ATOMIC_COUNTER };
+
+    if (ctx->state.caps.rasterizer_discard != GL_TRUE) return false;
+    if (mgl_xfb_capturing(ctx)) return false;
+
+    if (ctx->state.ext_queries)
+    {
+        struct MGLExtState_queries *S = ctx->state.ext_queries;
+
+        for (int i = MGL_QB_PRIMITIVES_GENERATED; i <= MGL_QB_GEOMETRY_SHADER_PRIMITIVES_EMITTED; i++)
+            if (S->active[i]) return false;
+    }
+
+    if (program)
+    {
+        for (int t = 0; t < 3; t++)
+            if (program->spirv_resources_list[_GEOMETRY_SHADER][side[t]].count)
+                return false;
+    }
+    return true;
+}
+
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
     if ((geomEnvRead(), gEnv.draw))
@@ -2404,8 +2606,12 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     }
 
     if (!_device || !_commandQueue || !program || !gp || !gp->linked) return false;
-    if (ctx->state.caps.rasterizer_discard == GL_TRUE && !mgl_xfb_capturing(ctx))
-        return false;                       /* nothing to do */
+    /* RASTERIZER_DISCARD still runs the whole vertex + geometry pipeline when anything is
+     * observable from it (GL 4.6 10.4.4: the stage's side effects — image / SSBO / atomic
+     * writes — are observable, transform feedback keeps recording, and the pre-raster
+     * query counters stay live); geom_discard_skippable decides when the stage's only
+     * consumer (the raster pass below) is off and nothing else watches. */
+    if (geom_discard_skippable(ctx, program)) return false;
 
     if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace geomDraw gp=%p linked=%d mode=%u first=%u count=%u inst=%u\n",
@@ -2918,7 +3124,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
 
         /* the vertex stage's textures sample in the capture variant just like in the
          * raster pass (GL allows the VS to sample; the CTS limits tests use 16 units) */
-        [self geomBindRenderStageTextures: enc stage: _VERTEX_SHADER];
+        [self geomBindRenderStageTextures: enc stage: _VERTEX_SHADER geomProgram: gp];
         ctx->state.program = saved_program;
         [enc setVertexBuffer: gVsout offset: gVsoutOff atIndex: MGL_GEOM_MSL_VSOUT];
 
@@ -2988,7 +3194,14 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                 { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
                 { 0, false }
             };
+            /* the walk reads STATE(program)'s resource lists: a program-pipeline draw
+             * enters geomDraw with ctx->state.program == NULL (the composite is only
+             * published inside the kernel section below), and without the switch the
+             * walk binds nothing — the first deferred upload would then fire from
+             * geomBindStageBuffers, into the already-open compute encoder */
+            Program *saved_tex_program = ctx->state.program;
 
+            ctx->state.program = program;
             for (int t = 0; types[t].spvc_type; t++)
             {
                 GLuint n = [self getProgramBindingCount: _GEOMETRY_SHADER type: types[t].spvc_type];
@@ -3014,6 +3227,7 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
                     }
                 }
             }
+            ctx->state.program = saved_tex_program;
         }
 
         /* the tess import kernel's encoder is still open: joining it keeps the import's
@@ -3249,7 +3463,12 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         fprintf(stderr, "\n");
     }
     /* ---- 3. raster pass ---- */
-    if (ctx->state.caps.rasterizer_discard == GL_TRUE)
+    /* skipped under RASTERIZER_DISCARD (GL 4.6 10.4.4) and when the active program has no
+     * fragment stage: without an FS nothing observable rasterizes (no color / depth
+     * outputs — Metal cannot even build the pipeline: rasterizationEnabled=NO demands a
+     * void vertex function, which the pass-through vertex function is not). */
+    if (ctx->state.caps.rasterizer_discard == GL_TRUE ||
+        !program->shader_slots[_FRAGMENT_SHADER])
     {
         geomMarkPools(_currentCommandBuffer);   /* the pack above was this draw's last consumer */
         return true;

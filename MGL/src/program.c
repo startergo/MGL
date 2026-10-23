@@ -1080,7 +1080,6 @@ static size_t mgl_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_w
      *    downstream of them, and count how many words the rebuild needs */
     size_t need = 5;
     if (n < 5) { *out_words = NULL; *out_n = 0; return 0; }
-
     ids = (uint32_t *)calloc(n, sizeof(uint32_t));
     if (!ids) { *out_words = NULL; *out_n = 0; return 0; }
     /* ids[id] tags: 1 = rect image type, 2 = rect sampled-image type,
@@ -1171,6 +1170,13 @@ static size_t mgl_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_w
     *out_words = o;
     *out_n = j;
     return patched;
+}
+
+/* the same rect→2D patch for modules compiled outside compile_stage (the geometry
+ * domain's generated kernels share program.c's DimRect limitation) */
+size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_words, size_t *out_n)
+{
+    return mgl_spirv_rect_to_2d(w, n, out_words, out_n);
 }
 
 /* GL texture target a sampler/image uniform of this SPIR-V type samples: the

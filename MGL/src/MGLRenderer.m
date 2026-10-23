@@ -2053,7 +2053,15 @@ static char kComputeFallbackKey;
             ImageUnit *iu;
 
             if (unit >= TEXTURE_UNITS) continue;
-            iu = &STATE(image_units[unit]);
+
+            /* an image ARRAY (image2D g[2]) spans array_size consecutive Metal slots fed
+             * by the image units base..base+array_size-1, exactly like sampler arrays */
+            GLuint elems = sres->array_size ? sres->array_size : 1;
+
+            for (GLuint e = 0; e < elems; e++)
+            {
+            if (unit + e >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit + e]);
             ptr = iu->tex;
             if (!ptr) continue;                       /* unbound unit: legal GL, undefined results */
 
@@ -2061,25 +2069,16 @@ static char kComputeFallbackKey;
             if (!ptr->mtl_data) continue;
             texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
 
-            /* a non-layered binding of an array / 3D texture selects one slice: hand the shader
-             * a view of that slice when the MSL type is a single 2D image.  A layered binding
-             * (or a plain 2D texture) uses the texture as it is. */
-            if (!iu->layered && (iu->layer > 0 || iu->level > 0) &&
-                (ptr->target == GL_TEXTURE_2D_ARRAY || ptr->target == GL_TEXTURE_1D_ARRAY ||
-                 ptr->target == GL_TEXTURE_3D || ptr->target == GL_TEXTURE_CUBE_MAP ||
-                 ptr->target == GL_TEXTURE_CUBE_MAP_ARRAY))
-            {
-                id<MTLTexture> view = [texture newTextureViewWithPixelFormat: texture.pixelFormat
-                                                                    textureType: MTLTextureType2D
-                                                                         levels: NSMakeRange((NSUInteger)iu->level, 1)
-                                                                       slices: NSMakeRange((NSUInteger)iu->layer, 1)];
-                if (view) texture = view;
-            }
+            /* the unit binds exactly one mip level (and, non-layered on an arrayed
+             * target, one layer): hand the MSL a view of that level / slice —
+             * geomImageUnitView (shared with the compute / tess / geometry paths) */
+            texture = [self geomImageUnitView: iu base: texture];
 
             if (stage == _VERTEX_SHADER)
-                [_currentRenderEncoder setVertexTexture: texture atIndex: mtl_index];
+                [_currentRenderEncoder setVertexTexture: texture atIndex: mtl_index + e];
             else
-                [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index];
+                [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index + e];
+            }
         }
     }
 
@@ -3768,7 +3767,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                         ptr = mgl_texture_for_sampler(ctx, spirv_binding, sres ? sres->target : 0);
                         break;
                     }
-                    case _IMAGE_TEXTURE: ptr = STATE(image_units[spirv_binding].tex); break;
+                    case _IMAGE_TEXTURE:
+                    {
+                        if (spirv_binding >= TEXTURE_UNITS) ptr = NULL;
+                        else ptr = STATE(image_units[spirv_binding].tex);
+                        break;
+                    }
                     default:
                         ptr = NULL;
                         // CRITICAL FIX: Handle assertion gracefully instead of crashing
@@ -3776,22 +3780,54 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             return NULL;
                 }
 
+                /* SPIRV-Cross numbers the MSL texture arguments itself (declaration
+                 * order, not the GL binding): the resource's refined msl_binding is the
+                 * argument's real Metal index; spirv_binding only selects the unit.
+                 * Binding at the unit index worked only while both orders coincided. */
+                NSUInteger mtl_index = (NSUInteger)-1;
+                GLuint elems = 1;
+                if ((GLuint)i < [self getProgramBindingCount: _COMPUTE_SHADER type:spvc_type])
+                {
+                    SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][spvc_type].list[i];
+
+                    mtl_index = (NSUInteger)sres->msl_binding;
+                    if (sres->array_size) elems = sres->array_size;
+                }
+                if (mtl_index == (NSUInteger)-1) mtl_index = (NSUInteger)spirv_binding;
+
                 if (ptr)
                 {
-                    RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
-                    assert(ptr->mtl_data);
+                    /* an arrayed resource (sampler2D g[2] / image2D g[2]) spans elems
+                     * consecutive Metal slots fed by the units base..base+elems-1 */
+                    for (GLuint e = 0; e < elems; e++)
+                    {
+                        Texture *tex_e = ptr;
+                        id<MTLTexture> texture;
+                        id<MTLSamplerState> sampler;
 
-                    id<MTLTexture> texture;
-                    texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
-                    assert(texture);
+                        if (e && gl_texture_type == _IMAGE_TEXTURE)
+                            tex_e = (spirv_binding + e < TEXTURE_UNITS)
+                                        ? STATE(image_units[spirv_binding + e].tex) : NULL;
+                        else if (e)
+                            tex_e = mgl_texture_for_sampler(ctx, spirv_binding + e, 0);
+                        if (!tex_e || !tex_e->mtl_data) continue;
 
-                    id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding texture:ptr];
-                    if (gl_texture_type == _TEXTURE)
-                        texture = [self texparamTextureForTex:ptr base:texture];
-                    assert(sampler);
+                        RETURN_FALSE_ON_FAILURE([self bindMTLTexture: tex_e]);
+                        texture = (__bridge id<MTLTexture>)(tex_e->mtl_data);
+                        sampler = [self texparamSamplerForUnit: spirv_binding + e texture: tex_e];
+                        if (gl_texture_type == _TEXTURE)
+                            texture = [self texparamTextureForTex: tex_e base: texture];
+                        else if (spirv_binding + e < TEXTURE_UNITS)
+                        {
+                            /* an image unit binds one mip level / layer: view of that
+                             * level (geomImageUnitView, shared with the render path) */
+                            texture = [self geomImageUnitView: &STATE(image_units[spirv_binding + e]) base: texture];
+                        }
+                        if (!sampler) continue;   /* no sampler state: skip, MSL default applies */
 
-                    [computeCommandEncoder setTexture:texture atIndex:spirv_binding];
-                    [computeCommandEncoder setSamplerState: sampler atIndex:spirv_binding];
+                        [computeCommandEncoder setTexture:texture atIndex:mtl_index + e];
+                        [computeCommandEncoder setSamplerState: sampler atIndex:mtl_index + e];
+                    }
 
                     textures_to_be_mapped--;
                 }
@@ -3802,7 +3838,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     id<MTLTexture> fallback = [self computeFallbackTexture];
                     RETURN_FALSE_ON_FAILURE(fallback != NULL);
 
-                    [computeCommandEncoder setTexture: fallback atIndex: spirv_binding];
+                    [computeCommandEncoder setTexture: fallback atIndex: mtl_index];
 
                     if (gl_texture_type == _TEXTURE)
                     {

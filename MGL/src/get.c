@@ -553,7 +553,11 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_FRAMEBUFFER_HEIGHT: PUT1(LIMIT(STATE_VAR(max_framebuffer_height), 16384));
         case GL_MAX_FRAMEBUFFER_LAYERS: PUT1(LIMIT(STATE_VAR(max_framebuffer_layers), 2048));
         case GL_MAX_FRAMEBUFFER_SAMPLES: PUT1(LIMIT(STATE_VAR(max_framebuffer_samples), 4));
-        case GL_MAX_SAMPLES: PUT1(4);
+        /* multisample image units work through Metal texture2d_ms / texture2d_ms_array
+         * arguments (glBindImageTexture of an MS texture binds the whole texture — one
+         * level, all samples), verified by test_geom / the CTS shader_image_size ms cases */
+        case GL_MAX_SAMPLES:
+        case GL_MAX_IMAGE_SAMPLES: PUT1(4);
         case GL_MAX_COLOR_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_color_texture_samples), 4));
         case GL_MAX_DEPTH_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_depth_texture_samples), 4));
         case GL_MAX_INTEGER_SAMPLES: PUT1(LIMIT(STATE_VAR(max_integer_samples), 4));
@@ -574,11 +578,14 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET: PUT1(7);
         case GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(texture_buffer_offset_alignment), 256));
         case GL_MAX_IMAGE_UNITS: PUT1(MGL_MAX_IMAGE_UNITS);
-        case GL_MAX_IMAGE_SAMPLES: PUT1(0);
         /* the geometry kernel is a compute pass and binds image units like the compute path
-         * (MGLRenderer+Geometry.m's resource walk), so it supports the full set of image units */
-        case GL_MAX_GEOMETRY_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
-        case GL_MAX_VERTEX_IMAGE_UNIFORMS:
+         * (MGLRenderer+Geometry.m's resource walk), so it supports the full set of image units;
+         * the vertex stage is a real Metal vertex function taking image arguments (bound by
+         * bindTexturesToCurrentRenderEncoder with the level/layer image-unit view) — both
+         * support all 8 units (KHR-GL46.shader_image_size basic-*-gs/vs).  TCS/TES keep 0
+         * until the tess kernels bind image units (their resource walk covers samplers). */
+        case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
+        case GL_MAX_VERTEX_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
         case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(0);
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:

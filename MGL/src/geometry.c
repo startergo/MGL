@@ -953,10 +953,75 @@ static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
     memset(gp, 0, sizeof(*gp));
 }
 
+/* remove `layout(location = N) ` prefixes from uniform/buffer BLOCK members of a
+ * decompiled GLSL source (SPIRV-Cross emits them; glslang only accepts locations on
+ * in/out block members).  Mutates the buffer in place; block-scoped, brace-counted. */
+static void geom_strip_block_member_locations(char *src)
+{
+    char *p = src;
+    int in_block = 0;      /* 1 inside a uniform/buffer block */
+    int brace_depth = 0;
+
+    while (*p)
+    {
+        if (in_block && brace_depth == 1 && !strncmp(p, "layout(location", 15))
+        {
+            /* only strip when the layout starts a member declaration */
+            char *q = p;
+
+            while (*q && *q != ')') q++;
+            if (*q == ')')
+            {
+                q++;
+                if (*q == ' ') q++;
+                memmove(p, q, strlen(q) + 1);
+                continue;
+            }
+        }
+
+        if (!in_block && (!strncmp(p, "uniform", 7) || !strncmp(p, "buffer", 6)))
+        {
+            /* a block starts at "uniform <name> {" / "buffer <name> {" / "uniform {" */
+            char *q = p + ((p[0] == 'u') ? 7 : 6);
+            int names = 0;
+
+            while (*q && *q != '{' && *q != ';')
+            {
+                if (*q != ' ' && *q != '\t' && *q != '\n')
+                {
+                    names++;
+                    if (names > 1) break;
+                    while (*q && *q != '{' && *q != ';' && *q != ' ' && *q != '\t' && *q != '\n') q++;
+                    continue;
+                }
+                q++;
+            }
+            if (*q == '{' && names <= 1)
+            {
+                in_block = 1;
+                brace_depth = 0;
+                p = q;             /* point at '{' */
+            }
+        }
+
+        if (*p == '{') brace_depth++;
+        else if (*p == '}')
+        {
+            brace_depth--;
+            if (in_block && brace_depth <= 0)
+            {
+                in_block = 0;
+                brace_depth = 0;
+            }
+        }
+        p++;
+    }
+}
+
 static void geom_fail(GLMContext ctx, MGLGeomProgram *gp, const char *fmt, ...)
 {
     va_list ap;
-    char buf[512];
+    char buf[4096];
 
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -965,8 +1030,8 @@ static void geom_fail(GLMContext ctx, MGLGeomProgram *gp, const char *fmt, ...)
     free(gp->fail);
     gp->fail = xstrdup(buf);
     gp->linked = false;
-    if (getenv("MGL_GEOM_TRACE_DRAW"))
-        fprintf(stderr, "geom: build failed: %s\n", buf);
+    if (getenv("MGL_GEOM_DEBUG") || getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: kernel build failed: %s\n", buf);
 }
 
 /* ------------------------------------------------------------------ glslang / SPIRV-Cross wrappers */
@@ -1251,7 +1316,8 @@ static void geom_record_tex_arrays(const uint32_t *ir, size_t words, MGLGeomProg
 static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *ir, size_t words,
                                const char *entry, bool disable_rasterization, char **log,
                                int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count,
-                               const GeomPin *pins2, int npins2)
+                               const GeomPin *pins2, int npins2,
+                               MGLGeomTexSlot *slots, int *nslots, int max_slots)
 {
     spvc_context sctx;
     spvc_parsed_ir pir;
@@ -1264,7 +1330,27 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
     r = spvc_context_create(&sctx);
     if (r != SPVC_SUCCESS) return NULL;
 
-    if (spvc_context_parse_spirv(sctx, ir, words, &pir) != SPVC_SUCCESS)
+    /* GL rectangle storage images (image2DRect) have no MSL mapping — SPIRV-Cross emits
+     * `unknown_texture_type`, which never compiles.  compile_stage patches the raster
+     * stages' modules; the geometry domain's generated kernels need it too (program.c's
+     * mgl_program_spirv_rect_to_2d).  The parser copies the words, so the patch buffer
+     * can go as soon as it returns. */
+    {
+        const uint32_t *parse_ir = ir;
+        size_t parse_words = words;
+        uint32_t *fixed = NULL;
+        size_t fixed_words = 0;
+
+        if (mgl_program_spirv_rect_to_2d(ir, words, &fixed, &fixed_words) > 0 && fixed)
+        {
+            parse_ir = fixed;
+            parse_words = fixed_words;
+        }
+        r = spvc_context_parse_spirv(sctx, parse_ir, parse_words, &pir);
+        free(fixed);
+    }
+
+    if (r != SPVC_SUCCESS)
     {
         mgl_append_log(log, "ERROR: geometry: SPIR-V parse failed (%s)\n", spvc_context_get_last_error_string(sctx));
         spvc_context_destroy(sctx);
@@ -1284,7 +1370,7 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
         if (disable_rasterization)
             spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_DISABLE_RASTERIZATION, SPVC_TRUE);
         spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE);
-        spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_FALSE);
+        spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE);
         spvc_compiler_install_compiler_options(comp, opt);
     }
 
@@ -1351,6 +1437,40 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
     }
 
     char *out = xstrdup(msl);
+
+    /* the bind walks need the Metal texture indices this variant ACTUALLY uses: the
+     * pins above may be unreachable (a user image and the packed default-uniform block
+     * can share SPIR-V binding 0 — MSLResourceBinding is keyed by set/binding alone, so
+     * one of the two registrations is lost and SPIRV-Cross falls back to its own
+     * numbering).  Query the final index per resource instead of guessing. */
+    if (slots && nslots)
+    {
+        spvc_resources res = NULL;
+        spvc_reflected_resource *list;
+        size_t n = 0;
+
+        if (spvc_compiler_create_shader_resources(comp, &res) == SPVC_SUCCESS)
+        {
+            static const int tex_types[2] = { SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
+                                              SPVC_RESOURCE_TYPE_SAMPLED_IMAGE };
+
+            *nslots = 0;
+            for (int t = 0; t < 2 && *nslots < max_slots; t++)
+            {
+                if (spvc_resources_get_resource_list_for_type(res, tex_types[t], &list, &n) != SPVC_SUCCESS)
+                    continue;
+                for (size_t i = 0; i < n && *nslots < max_slots; i++)
+                {
+                    const char *nm = spvc_compiler_get_name(comp, list[i].id);
+
+                    if (!nm || !*nm) continue;
+                    snprintf(slots[*nslots].name, sizeof slots[0].name, "%s", nm);
+                    slots[(*nslots)++].msl = (int)spvc_compiler_msl_get_automatic_resource_binding(comp, list[i].id);
+                }
+            }
+        }
+    }
+
     spvc_context_destroy(sctx);
 
     /* fp64: the soft-float library functions take scalar parameters by
@@ -2998,7 +3118,8 @@ static bool spv_var_is_buffer_block(SpvModule *m, SpvVar *v)
 }
 
 static int geom_build_pins(SpvModule *prog, SpvModule *mine,
-                           GeomPin *pins, int *npins, int max)
+                           GeomPin *pins, int *npins, int max,
+                           MGLGeomTexSlot *slots, int *nslots, int max_slots)
 {
     uint32_t ub[32], uc[32], sb[32];
     int nub = 0, nuc = 0, nsb = 0, total = 0, ub_span = 0;
@@ -3006,6 +3127,7 @@ static int geom_build_pins(SpvModule *prog, SpvModule *mine,
     bool has_dub = false;
 
     *npins = 0;
+    if (slots && nslots) *nslots = 0;
 
     /* Classify exactly like SPIRV-Cross's reflection (and hence like the renderer's
      * mapGLBuffersToMTLBufferMap enumerates the resource types): a Uniform-storage
@@ -3121,6 +3243,11 @@ pin:
                             (flat == dub_flat && has_dub) ? " (DUB)" : "");
                 (*npins)++;
             }
+
+            /* texture (sampler / image) argument indices are NOT recorded here: the
+             * MSLResourceBinding pins can be unreachable (binding collisions with the
+             * packed uniform block), so geom_spirv_to_msl records the ACTUAL index of
+             * every image/sampler resource into the slot table after compiling */
         }
     }
 
@@ -3360,6 +3487,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     char gl_in_name[64];
     char *gs_expanded = geom_preprocess_source(ctx, GL_GEOMETRY_SHADER, gs_src);
     const char *gs_base = gs_expanded ? gs_expanded : gs_src;
+    geom_dump("gs.src.glsl", gs_src);
     char *main_renamed = rename_main(gs_base, "mgl_gs_main");
     char *stripped_src = NULL;
     char *removed_src = NULL;
@@ -4460,6 +4588,13 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             gs_src = geom_spirv_to_glsl(program->spirv[_GEOMETRY_SHADER].ir,
                                         program->spirv[_GEOMETRY_SHADER].size, 460, &log);
             if (!gs_src) GEOM_FAIL("no geometry shader source: %s", log ? log : "?");
+            /* SPIRV-Cross's GLSL output re-declares the introspect domain's packed
+             * default-uniform block with a layout(location) per member — legal for
+             * in/out blocks only, so re-compiling the decompiled source fails with
+             * "location on block member" (the subroutine selectors carry 39xx).  The
+             * kernel re-emits the block with explicit std430 offsets anyway, so the
+             * member locations are meaningless: strip them. */
+            geom_strip_block_member_locations(gs_src);
         }
     }
 
@@ -4524,7 +4659,8 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             int span;
 
             npins2 = 0;
-            span = geom_build_pins(p_vs, c_vs, pins2, &npins2, 8);
+            span = geom_build_pins(p_vs, c_vs, pins2, &npins2, 8,
+                                   gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
             if (span > MGL_GEOM_KERNEL_USER_SLOTS)
             {
                 spv_free(c_vs);
@@ -4540,7 +4676,8 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     pins_gl[0] = MGL_GEOM_SSBO_VSOUT;
     pins_msl[0] = MGL_GEOM_MSL_VSOUT;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->capture_entry, true, &log,
-                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, pins2, npins2);
+                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, pins2, npins2,
+                            gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
     /* the renamed vertex main is called from the generated entry point */
@@ -4586,7 +4723,8 @@ build:
         {
             /* the kernel's own buffers live at fixed Metal slots (MGL_GEOM_MSL_*): the
              * stage's program resources must fit in the slots below them */
-            int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8);
+            int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
+                                       gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
 
             if (span > MGL_GEOM_KERNEL_USER_SLOTS)
                 GEOM_FAIL("geometry stage resources span %d argument slots; the compute "
@@ -4605,7 +4743,8 @@ build:
     pins_gl[6] = MGL_GEOM_SSBO_CNT;      pins_msl[6] = MGL_GEOM_MSL_CNT;
     pins_gl[7] = MGL_GEOM_SSBO_LSCR;     pins_msl[7] = MGL_GEOM_MSL_LSCR;
     msl = geom_spirv_to_msl(ctx, GL_COMPUTE_SHADER, ir, words, gp->kernel_entry, false, &log,
-                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 8, pins2, npins2);
+                            SpvExecutionModelGLCompute, pins_gl, pins_msl, 8, pins2, npins2,
+                            gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
 
@@ -4651,7 +4790,7 @@ build:
     free(glsl);
     pins_gl[0] = MGL_GEOM_SSBO_DRAW;     pins_msl[0] = MGL_GEOM_MSL_DRAW;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->draw_entry, false, &log,
-                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, NULL, 0);
+                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, NULL, 0, NULL, NULL, 0);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("pass-through vertex function MSL failed: %s", log ? log : "?");
 

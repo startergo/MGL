@@ -734,6 +734,26 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         const char *info_log = glslang_shader_get_info_log(glsl_shader);
         if (info_log && *info_log)
             mgl_set_info_log(&ptr->log, "%s", info_log);
+
+        /* glslang reports "an extension's feature is used without the extension being
+         * enabled" as a warning and still compiles; the GLSL spec makes it a compile
+         * error (KHR-GL46.shader_image_size.negative-compileTime: imageSize on an image
+         * in #version 420 without GL_ARB_shader_image_size).  Turn exactly those
+         * feature warnings into errors. */
+        static const char *feature_exts[] = {
+            "GL_ARB_shader_image_size is being used",
+            NULL,
+        };
+        for (int e = 0; feature_exts[e] && info_log; e++)
+        {
+            if (strstr(info_log, feature_exts[e]))
+            {
+                mgl_set_info_log(&ptr->log, "ERROR: extension %s without #extension enabled\n%s",
+                                 feature_exts[e], info_log);
+                glslang_shader_delete(glsl_shader);
+                return;
+            }
+        }
     }
 
     release_glslang_shader(ctx, ptr);

@@ -570,6 +570,40 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     [self extBufEnsureCommandBuffer];
     [self endRenderEncoding];
 
+    /* realize the compute stage's textures before the compute encoder exists: a deferred
+     * upload (texdataEncodeUpload) opens a blit encoder, which Metal forbids while an
+     * encoder is encoding — bindTexturesToComputeEncoder below binds the images (units)
+     * and would trip exactly that (KHR-GL46.shader_image_size basic-*-cs) */
+    {
+        struct { int spvc_type; bool image; } types[] = {
+            { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+            { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+            { 0, false }
+        };
+
+        for (int t = 0; types[t].spvc_type; t++)
+        {
+            GLuint n = [self getProgramBindingCount: _COMPUTE_SHADER type: types[t].spvc_type];
+
+            for (GLuint i = 0; i < n; i++)
+            {
+                SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][types[t].spvc_type].list[i];
+                int b = [self getProgramBinding: _COMPUTE_SHADER type: types[t].spvc_type index: i];
+                GLuint elems = sres->array_size ? sres->array_size : 1;
+
+                for (GLuint e = 0; e < elems && b >= 0; e++)
+                {
+                    GLuint unit = (GLuint)(b + e);
+
+                    if (unit >= TEXTURE_UNITS) break;
+                    Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                                  : mgl_texture_for_sampler(ctx, unit, sres->target);
+                    if (tex) [self bindMTLTexture: tex];
+                }
+            }
+        }
+    }
+
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc)
         return false;

@@ -149,6 +149,8 @@ typedef struct MGLGeomVar {
     GLuint  xfb_offset;     /* shader-declared capture byte offset (xfb_offset=) */
 } MGLGeomVar;
 
+typedef struct { char name[64]; int msl; } MGLGeomTexSlot;
+
 typedef struct MGLGeomProgram {
     Program  *program;      /* owner (link-time program; NULL when the entry is free) */
     GLuint    name;
@@ -166,6 +168,16 @@ typedef struct MGLGeomProgram {
      * N texture units base..base+N-1 (MGL's sampler-uniform convention, program.c). */
     struct { char name[64]; int n; } tex_arrays[8];
     int n_tex_arrays;
+
+    /* the generated kernels number their texture (sampler & image) arguments themselves
+     * (SPIRV-Cross pins from geom_build_pins), which is NOT the stage resource list's
+     * msl_binding — for the geometry stage that list still carries the GL image-unit
+     * number (program.c has no Metal GS compile to refine it), and declaration order
+     * need not match layout(binding) order (KHR-GL46.shader_image_size advanced-nonMS-gs
+     * binds its result imageBuffer at unit 7 but declares it first).  The bind walks look
+     * the slot up here by resource name and fall back to msl_binding. */
+    MGLGeomTexSlot tex_slots_gs[64];   int n_tex_slots_gs;   /* the geometry kernel */
+    MGLGeomTexSlot tex_slots_vs[64];   int n_tex_slots_vs;   /* the vertex capture variant */
 
     GLenum    in_type;      /* GL_POINTS / GL_LINES / GL_LINES_ADJACENCY / GL_TRIANGLES / GL_TRIANGLES_ADJACENCY */
     GLenum    out_type;     /* GL_POINTS / GL_LINE_STRIP / GL_TRIANGLE_STRIP */
@@ -294,6 +306,8 @@ bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data);
 /* geometry stage compilation hook called by program.c's compile_stage() */
 bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj, int stage,
                             const uint32_t *words, size_t nwords, const char *entry, char **log);
+/* program.c: the rect→2D SPIR-V patch (GL image2DRect / sampler2DRect have no MSL type) */
+size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_words, size_t *out_n);
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);
