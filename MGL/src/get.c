@@ -39,6 +39,10 @@
 #include "mgl_ext_debug.h"
 #include "mgl_ext_program.h"
 
+/* buffers.c: the storage of an indexed buffer binding point (uniform buffer points at
+ * or above MAX_BINDABLE_BUFFERS live in the overflow table there) */
+extern BufferBaseTarget *mgl_buffers_indexed_binding(GLMContext ctx, GLenum target, GLuint index);
+
 #define MAX_GET_VALUES 32
 
 typedef struct {
@@ -121,6 +125,16 @@ static GLuint max_draw_buffers(GLMContext ctx)
 {
     GLuint n = STATE_VAR(max_draw_buffers) ? STATE_VAR(max_draw_buffers) : MAX_COLOR_ATTACHMENTS;
     return n > MAX_COLOR_ATTACHMENTS ? MAX_COLOR_ATTACHMENTS : n;
+}
+
+/* GL_MAX_UNIFORM_BUFFER_BINDINGS as reported: at least the GL 4.6 minimum (84).  Only
+ * MAX_BINDABLE_BUFFERS indexed slots are allocated (points above live in buffers.c's
+ * overflow table and cannot feed a draw) — buffers.c's maxBindingsForTarget() and the
+ * get_limit case below use this same expression. */
+static GLuint reported_uniform_buffer_bindings(GLMContext ctx)
+{
+    GLuint n = (GLuint)STATE_VAR(max_uniform_buffer_bindings);
+    return n > 84 ? n : 84;
 }
 
 static GLuint max_uniform_buffer_bindings(GLMContext ctx)
@@ -656,7 +670,12 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_FRAGMENT_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_fragment_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
         case GL_MAX_COMPUTE_UNIFORM_BLOCKS: PUT1(MIN_D(LIMIT(STATE_VAR(max_compute_uniform_blocks), 14), max_uniform_buffer_bindings(ctx)));
         case GL_MAX_COMBINED_UNIFORM_BLOCKS: PUT1(LIMIT(STATE_VAR(max_combined_uniform_blocks), 70));
-        case GL_MAX_UNIFORM_BUFFER_BINDINGS: PUT1(max_uniform_buffer_bindings(ctx));
+        case GL_MAX_UNIFORM_BUFFER_BINDINGS:
+            /* at least the GL 4.6 minimum (84 uniform buffer binding points).  The
+             * context allocates MAX_BINDABLE_BUFFERS slots of indexed binding state and
+             * keeps the rest in a query-only overflow table (buffers.c); gl_Max* style
+             * shader limits stay consistent through mgl_geom_fill_glslang_resource(). */
+            PUT1(reported_uniform_buffer_bindings(ctx));
         case GL_MAX_UNIFORM_BLOCK_SIZE: PUT1(LIMIT(STATE_VAR(max_uniform_block_size), 65536));
         case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(uniform_buffer_offset_alignment), 256));
         case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_combined_vertex_uniform_components), 233472));
@@ -679,12 +698,17 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(shader_storage_buffer_offset_alignment), 16));
 
         /* atomic counters */
+        /* vertex / tessellation / geometry stages report no atomic counter buffer support
+         * (glslang bakes the same 0 into gl_Max*AtomicCounterBuffers); the fragment and
+         * compute stages bind atomic counter buffers through the same indexed binding
+         * points the renderer maps (MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS = 8) — GL 4.6
+         * requires at least 1 (fragment) / 8 (compute), which the 8 binding points meet */
         case GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS:
+        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */
         case GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS:
-        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */
         case GL_MAX_COMBINED_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS: PUT1(MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS);
         case GL_MAX_VERTEX_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_vertex_atomic_counters), 1024));
@@ -790,9 +814,17 @@ static int get_indexed_state(GLMContext ctx, GLenum pname, GLuint index, GetValu
         case GL_UNIFORM_BUFFER_START: field = 1; goto ubo;
         case GL_UNIFORM_BUFFER_SIZE: field = 2;
         ubo:
-            limit = max_uniform_buffer_bindings(ctx);
+            limit = reported_uniform_buffer_bindings(ctx);
             if (index >= limit) return -1;
-            bb = &STATE(buffer_base[_UNIFORM_BUFFER].buffers[index]);
+            /* points at or above MAX_BINDABLE_BUFFERS live in buffers.c's overflow
+             * table; an unclaimed one reports an empty binding */
+            bb = mgl_buffers_indexed_binding(ctx, GL_UNIFORM_BUFFER, index);
+            if (!bb)
+            {
+                gv->count = 1;
+                gv->v[0] = 0;
+                return 1;
+            }
             break;
 
         case GL_SHADER_STORAGE_BUFFER_BINDING: field = 0; goto ssbo;

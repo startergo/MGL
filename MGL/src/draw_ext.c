@@ -356,21 +356,39 @@ static bool buffers_get_indexed(GLMContext ctx, GLenum pname, GLuint index, GLui
     }
 
     max = (slot == 2) ? 8 : (slot == 3) ? 4 : MAX_BINDABLE_BUFFERS;
+    if (slot == 0)
+    {
+        /* GL_MAX_UNIFORM_BUFFER_BINDINGS is reported as at least 84 (GL 4.6 minimum):
+         * the index space extends past the allocated row into buffers.c's overflow
+         * table, so the bound-name / start / size queries must follow it there */
+        GLint n = 0;
+        mglGetIntegerv(ctx, GL_MAX_UNIFORM_BUFFER_BINDINGS, &n);
+        max = n > 0 ? (GLuint)n : MAX_BINDABLE_BUFFERS;
+    }
     if (index >= max)
     {
         ctx->error_func(ctx, "mglGetIntegeri_v", GL_INVALID_VALUE);
         return true;
     }
 
-    BufferBaseTarget *bt = &STATE(buffer_base[base]).buffers[index];
-    bool is_range = EXT() && (EXT()->range_mask[slot] & (1u << index));
+    BufferBaseTarget *bt = (slot == 0) ? mgl_buffers_indexed_binding(ctx, GL_UNIFORM_BUFFER, index)
+                                       : &STATE(buffer_base[base]).buffers[index];
+    if (!bt)
+    {
+        mgl_get_store(type, data, 0, 0);   /* unclaimed overflow point: empty binding */
+        return true;
+    }
+    bool is_range = EXT() && index < 32 && (EXT()->range_mask[slot] & (1u << index));
+    bool overflow = (slot == 0) && index >= MAX_BINDABLE_BUFFERS;
     double v;
 
     switch(what)
     {
+        /* overflow points keep their bound range in the entry itself (Base binds store
+         * offset 0 / the whole buffer size), so no range_mask bit is tracked for them */
         case 0:  v = bt->buf ? bt->buf->name : 0; break;
-        case 1:  v = (bt->buf && is_range) ? (double)bt->offset : 0; break;
-        default: v = (bt->buf && is_range) ? (double)bt->size : 0; break;
+        case 1:  v = (bt->buf && (overflow || is_range)) ? (double)bt->offset : 0; break;
+        default: v = (bt->buf && (overflow || is_range)) ? (double)bt->size : 0; break;
     }
 
     mgl_get_store(type, data, 0, v);

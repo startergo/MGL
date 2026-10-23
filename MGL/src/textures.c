@@ -1403,21 +1403,6 @@ static void glToMetalStorage(Texture *tex, TDStorage *st)
 }
 
 /* upload client pixels into a GL region of a level */
-/* the uncompressed equivalent MGL stores for a compressed internal format given
- * UNCOMPRESSED client data (GL 4.6 8.5: compress "if possible"; 0 = none, the upload is
- * rejected) */
-static GLenum rgtcUncompressed(GLenum ifmt)
-{
-    switch (ifmt)
-    {
-        case GL_COMPRESSED_RED_RGTC1:          return GL_R8;
-        case GL_COMPRESSED_SIGNED_RED_RGTC1:   return GL_R8_SNORM;
-        case GL_COMPRESSED_RG_RGTC2:           return GL_RG8;
-        case GL_COMPRESSED_SIGNED_RG_RGTC2:    return GL_RG8_SNORM;
-        default:                               return 0;
-    }
-}
-
 static void uploadClient(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
                          GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
                          GLenum format, GLenum type, const uint8_t *src, bool is3d)
@@ -1572,6 +1557,11 @@ static bool compressedAllowedOnTarget(const TDFormat *f, GLenum tt)
 }
 
 /* proxy state lives in texparam's proxy objects (queried by GetTexLevelParameter) */
+static bool storeCompressed(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                            GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, const uint8_t *blocks);
+static bool uploadRGTC(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLint ifmt,
+                       GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels);
+
 static void setProxy(GLMContext ctx, Texture *proxy, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d, bool ok)
 {
     if (!proxy || !ensureLevels(ctx, proxy))
@@ -1609,6 +1599,7 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
 {
     TDTarget t;
     GLenum err;
+    bool rgtc_online = false;
 
     TD_CHECK(texImageTarget(target, dims, &t), GL_INVALID_ENUM);
     TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, t.tex_target), GL_INVALID_VALUE);
@@ -1619,6 +1610,10 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     GLenum ifmt = tdResolveInternalFormat(internalformat, format, type);
     TD_CHECK(ifmt != 0, GL_INVALID_VALUE);
     const TDFormat *f = tdFormatInfo(ifmt);
+    const TDFormat *req = tdFormatInfo(internalformat);   /* as requested, before any
+                                                           * resolution to an emulated format */
+    if (!req)
+        req = f;   /* unknown to the table: behave as before the resolution */
 
     TD_CHECK(border == 0, GL_INVALID_VALUE);
 
@@ -1639,20 +1634,26 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     if (f->flags & (TDF_DEPTH | TDF_STENCIL))
         TD_CHECK(depthFormatAllowedOnTarget(t.tex_target), GL_INVALID_OPERATION);
 
-    if (f->flags & TDF_COMPRESSED)
+    if (req->flags & TDF_COMPRESSED)
     {
-        TD_CHECK(compressedAllowedOnTarget(f, t.tex_target), GL_INVALID_OPERATION);
+        /* uncompressed client data given to a compressed internal format has to be
+         * compressed by the GL ("online compression", GL 4.6 8.5.3).  MGL compresses
+         * the RGTC family on the CPU (tdEncodeRGTC) - the level then keeps the
+         * compressed internal format and the real BC4/BC5 storage, so
+         * GL_TEXTURE_COMPRESSED / _IMAGE_SIZE report compressed values and
+         * glGetCompressedTexImage returns exactly the encoded blocks.  The remaining
+         * families (BPTC, ETC2/EAC, S3TC) have no encoder: the upload is rejected,
+         * a documented gap. */
+        TD_CHECK(compressedAllowedOnTarget(req, t.tex_target), GL_INVALID_OPERATION);
         if (pixels || STATE(buffers[_PIXEL_UNPACK_BUFFER]))
         {
-            /* GL 4.6 8.5: uncompressed client data given to a compressed internal format
-             * is compressed "if possible".  MGL has no BC/ETC encoder, and a real BC4 /
-             * BC5 encode is lossy by ~10/255 - more than the 1/127 the CTS compares with -
-             * so store the RGTC families in their uncompressed equivalent instead (what
-             * drivers without a compressor do); the other families (BPTC, ETC2, S3TC)
-             * reject the upload, a documented gap. */
-            TD_CHECK(rgtcUncompressed(ifmt) != 0, GL_INVALID_OPERATION);
-            ifmt = rgtcUncompressed(ifmt);
-            f = tdFormatInfo(ifmt);
+            if ((req->flags & TDF_BC) && (req->base == GL_RED || req->base == GL_RG))
+            {
+                rgtc_online = true;
+                ifmt = internalformat;   /* define the level with the compressed format */
+            }
+            else
+                TD_CHECK(0, GL_INVALID_OPERATION);
         }
     }
 
@@ -1683,7 +1684,12 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
         tex->access = GL_READ_ONLY;
 
     if (src)
-        uploadClient(ctx, tex, t.face, level, 0, 0, 0, width, height, depth, format, type, src, dims == 3);
+    {
+        if (rgtc_online)
+            uploadRGTC(ctx, tex, t.face, level, ifmt, width, height, depth, format, type, src);
+        else
+            uploadClient(ctx, tex, t.face, level, 0, 0, 0, width, height, depth, format, type, src, dims == 3);
+    }
 }
 
 /* used by framebuffers.c for renderbuffer storage */
@@ -1705,6 +1711,79 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
         uploadClient(ctx, tex, face, level, 0, 0, 0, width, height, depth, format, type, (const uint8_t *)pixels, depth > 1);
 
     return true;
+}
+
+static bool uploadRGTC(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLint ifmt,
+                       GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels)
+{
+    const TDFormat *f = tdFormatInfo(ifmt);
+    TDStorage st;
+    const uint8_t *src = (const uint8_t *)pixels;
+    TDPixelStore ps;
+    uint8_t *planes[2] = { NULL, NULL };
+    size_t need = (size_t)width * height * (depth > 0 ? (size_t)depth : 1);
+    size_t row = (size_t)width * 4;
+    uint8_t *blocks = NULL;
+    uint8_t *heap = NULL;
+    int nch = (f->base == GL_RG) ? 2 : 1;
+    size_t pr = (size_t)width;
+    bool snorm = (f->flags & TDF_SIGNED) != 0;
+
+    if (!need || need > SIZE_MAX / 4)
+        return false;
+
+    /* client (format, type) -> RGBA8, then split the channel(s) into planes for the
+     * encoder (it takes one or two 8-bit sample planes with row / image pitch) */
+    ps = pixelStore(ctx, true);
+    st.row_pitch = row;
+    st.image_pitch = row * height;
+    st.s_row_pitch = st.s_image_pitch = 0;
+    st.data = st.stencil = NULL;
+
+    if (need * 4 > 64 * 1024 * 1024)
+        return false;                       /* guard: absurd "uncompressed" uploads */
+
+    heap = (uint8_t *)malloc(need * 4);
+    planes[0] = (uint8_t *)malloc(need);
+    if (nch == 2) planes[1] = (uint8_t *)malloc(need);
+    if (!heap || !planes[0] || (nch == 2 && !planes[1]))
+    {
+        free(heap); free(planes[0]); free(planes[1]);
+        return false;
+    }
+    st.data = heap;
+    {
+        size_t c_off, c_row, c_img;
+        bool wd = true, ws = true;
+        tdClientLayout(&ps, format, type, width, height, depth, depth > 1, &c_off, &c_row, &c_img);
+        tdUnpack(tdFormatInfo(GL_RGBA8), src + c_off, c_row, c_img, format, type, ps.swap_bytes,
+                 width, height, depth, &st, &wd, &ws);
+    }
+
+    for (GLsizei z = 0; z < (depth > 0 ? depth : 1); z++)
+        for (GLsizei y = 0; y < height; y++)
+        {
+            const uint8_t *r = heap + (size_t)z * st.image_pitch + (size_t)y * st.row_pitch;
+            uint8_t *d0 = planes[0] + (size_t)z * pr * height + (size_t)y * pr;
+            uint8_t *d1 = planes[1] ? planes[1] + (size_t)z * pr * height + (size_t)y * pr : NULL;
+
+            for (GLsizei x = 0; x < width; x++)
+            {
+                d0[x] = r[x * 4];
+                if (d1) d1[x] = r[x * 4 + 1];
+            }
+        }
+
+    blocks = tdEncodeRGTC(planes[0], planes[1], width, height, depth, pr, pr * height, nch == 2, snorm);
+    free(heap);
+    free(planes[0]);
+    free(planes[1]);
+    if (!blocks)
+        return false;
+
+    bool ok = storeCompressed(ctx, tex, face, level, 0, 0, 0, width, height, depth, blocks);
+    free(blocks);
+    return ok;
 }
 
 void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
@@ -2630,6 +2709,30 @@ void mglGetnTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, 
     getTexImage(ctx, tex, face, level, 0, 0, 0, 0, 0, 0, format, type, bufSize, pixels, true, getTargetIs3D(tt), 0);
 }
 
+/* GL cube completeness (spec 9.14): a cube map is cube complete at `level` when all six
+ * face images at that level exist with identical internal formats and dimensions.
+ * glGetTextureImage / glGetTextureSubImage must raise GL_INVALID_OPERATION for an
+ * incomplete cube before any other validation (the per-face read would surface
+ * GL_INVALID_VALUE instead — KHR-GL46.direct_state_access.textures_image_query_errors). */
+static bool cubeCompleteAtLevel(Texture *tex, GLint level)
+{
+    TextureLevel *first;
+
+    if (level < 0 || level >= TD_MAX_LEVELS)
+        return false;
+    first = texLevel(tex, 0, level);
+    if (!first || !first->complete)
+        return false;
+    for (GLuint f = 1; f < 6; f++)
+    {
+        TextureLevel *l = texLevel(tex, f, level);
+        if (!l || !l->complete || l->width != first->width || l->height != first->height ||
+            l->mtl_format != first->mtl_format)
+            return false;
+    }
+    return true;
+}
+
 void mglGetTextureImage(GLMContext ctx, GLuint texture, GLint level, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
 {
     Texture *tex = findTexture(ctx, texture);
@@ -2637,6 +2740,13 @@ void mglGetTextureImage(GLMContext ctx, GLuint texture, GLint level, GLenum form
     TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
     TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
              tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+        TD_CHECK(cubeCompleteAtLevel(tex, level), GL_INVALID_OPERATION);
+    if (tex->target == GL_TEXTURE_CUBE_MAP_ARRAY)
+    {
+        TextureLevel *l = texLevel(tex, 0, level);
+        TD_CHECK(l && l->complete, GL_INVALID_OPERATION);   /* cube array complete */
+    }
 
     if (tex->target == GL_TEXTURE_CUBE_MAP)
     {
@@ -2671,6 +2781,13 @@ void mglGetTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xo
     TD_CHECK(bufSize >= 0, GL_INVALID_VALUE);
     TD_CHECK(tex->target != GL_TEXTURE_BUFFER && tex->target != GL_TEXTURE_2D_MULTISAMPLE &&
              tex->target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_INVALID_OPERATION);
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+        TD_CHECK(cubeCompleteAtLevel(tex, level), GL_INVALID_OPERATION);
+    if (tex->target == GL_TEXTURE_CUBE_MAP_ARRAY)
+    {
+        TextureLevel *l = texLevel(tex, 0, level);
+        TD_CHECK(l && l->complete, GL_INVALID_OPERATION);   /* cube array complete */
+    }
 
     if (tex->target == GL_TEXTURE_CUBE_MAP)
     {

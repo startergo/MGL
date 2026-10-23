@@ -96,6 +96,9 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 void mgl_buffers_forget(GLMContext ctx, Buffer *buf);
 MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create);
 uint32_t *mgl_buffers_range_mask(GLMContext ctx, int slot);
+/* buffers.c: storage of an indexed binding point — uniform buffer points at or above
+ * MAX_BINDABLE_BUFFERS live in the query-only overflow table (see buffers.c) */
+BufferBaseTarget *mgl_buffers_indexed_binding(GLMContext ctx, GLenum target, GLuint index);
 /* one draw without pre-draw / xfb hooks (called back by the xfb capture wrappers) */
 void mgl_buffers_raw_draw(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                           GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);

@@ -531,6 +531,12 @@ GLenum mgl_fb_status(GLMContext ctx, Framebuffer *fbo)
         else if (samples != s) return GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE;
 
         int l = fx->layered[i] ? 1 : 0;
+        /* a 3D texture image spans layers, so even a layer-attached one counts as a
+         * layered attachment for this rule (mixing it with a non-layered attachment is
+         * FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS —
+         * KHR-GL46.direct_state_access.framebuffers_check_status) */
+        if (!l && att->textarget == GL_TEXTURE_3D)
+            l = 1;
         if (layered < 0) layered = l;
         else if (layered != l) return GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS;
         if (l)

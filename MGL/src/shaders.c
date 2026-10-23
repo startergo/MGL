@@ -33,6 +33,10 @@
 
 const glslang_resource_t* glslang_default_resource(void);
 
+/* geometry.c: re-seeds every TBuiltInResource entry that has a GL pname from the state
+ * glGet* serves, so the gl_Max* constants baked into shaders match the queried limits */
+void mgl_geom_fill_glslang_resource(GLMContext ctx, glslang_resource_t *res);
+
 const char *getShaderTypeStr(GLuint type)
 {
     /* indexed by _VERTEX_SHADER.._COMPUTE_SHADER (glslang stage order) */
@@ -229,25 +233,11 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     {
         /* the resource limits must match what glGet* reports: the CTS compares the
          * gl_Max* constants baked into shaders against the queried values
-         * (KHR-GL46.geometry_shader.constant_variables) */
+         * (KHR-GL46.limits); mgl_geom_fill_glslang_resource() re-seeds every entry
+         * that has a GL pname from the very queries the app sees */
         static glslang_resource_t res;
         res = *glslang_default_resource();
-        res.max_geometry_total_output_components = 2048;
-        res.max_geometry_output_components = 128;
-        res.max_geometry_uniform_components = 1024;
-        res.max_geometry_atomic_counters = 0;
-        res.max_geometry_atomic_counter_buffers = 0;
-        /* atomic_uint layout(binding=...): glslang's default limit (1) rejects legal
-         * GL 4.6 shaders — MGL reports GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS = 8
-         * (get.c's MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS; keep in sync), and the
-         * baked gl_MaxAtomicCounterBindings must match it
-         * (KHR-GL46.shader_storage_buffer_object advanced-write-fragment) */
-        res.max_atomic_counter_bindings = 8;
-        res.max_vertex_atomic_counters = 1024;
-        res.max_fragment_atomic_counters = 1024;
-        res.max_compute_atomic_counters = 1024;
-        res.max_tess_control_atomic_counters = 1024;
-        res.max_tess_evaluation_atomic_counters = 1024;
+        mgl_geom_fill_glslang_resource(ctx, &res);
         input->resource = &res;
     }
 

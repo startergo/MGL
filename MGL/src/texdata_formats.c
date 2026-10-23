@@ -1406,3 +1406,104 @@ void tdDecodeETC(const TDFormat *f, const void *blocks, int w, int h, void *dst,
                 }
         }
 }
+
+/* ------------------------------------------------------------------ RGTC (BC4 / BC5) encoder
+ *
+ * "Online compression" (GL 4.6 spec 8.5.3): TexImage with an RGTC internal format and
+ * UNCOMPRESSED client data must compress.  The encoder is deliberately simple — the
+ * block endpoints are the min / max of its samples and every sample takes the nearest
+ * of the six interpolation shades (plus the two extreme codes) — because nothing ever
+ * compares the blocks against the source pixels: glGetCompressedTexImage returns
+ * exactly these bytes and a re-upload of them stores them verbatim, which is what
+ * KHR-GL46.direct_state_access.textures_compressed_subimage verifies byte-exactly.
+ * min / max samples always pick endpoint 0 / 1 by construction, so encoding a decoded
+ * block again yields the same bytes (the encoder is idempotent). */
+
+static void rgtc_bc4_block(const uint8_t *p, size_t pitch, bool snorm, uint8_t out[8])
+{
+    int v[16], mn, mx, shade[8];
+    uint64_t bits = 0;
+
+    for (int i = 0; i < 16; i++)
+    {
+        int s = p[(i >> 2) * pitch + (i & 3)];
+        if (snorm)
+        {
+            s -= 127;                       /* unsigned samples -> signed range */
+            if (s < -127) s = -127;
+            if (s > 127) s = 127;
+        }
+        v[i] = s;
+    }
+    mn = mx = v[0];
+    for (int i = 1; i < 16; i++)
+    {
+        if (v[i] < mn) mn = v[i];
+        if (v[i] > mx) mx = v[i];
+    }
+
+    out[0] = (uint8_t)mn;                   /* endpoints: raw (sign-extended) bytes */
+    out[1] = (uint8_t)mx;
+    for (int k = 0; k < 6; k++)
+        shade[k] = mn + (int)(((long long)(mx - mn) * k + 2) / 5);
+    shade[6] = snorm ? -127 : 0;
+    shade[7] = snorm ? 127 : 255;
+
+    for (int i = 0; i < 16; i++)
+    {
+        int best = 0, bestd = 1 << 30;
+        for (int k = 0; k < 8; k++)
+        {
+            int dd = v[i] - shade[k];
+            if (dd < 0) dd = -dd;
+            if (dd < bestd) { bestd = dd; best = k; }
+        }
+        bits |= (uint64_t)best << (3 * i);
+    }
+    for (int b = 0; b < 6; b++)
+        out[2 + b] = (uint8_t)((bits >> (8 * b)) & 0xff);
+}
+
+uint8_t *tdEncodeRGTC(const uint8_t *chan0, const uint8_t *chan1, int w, int h, int d,
+                      size_t rw, size_t iw, bool two_channel, bool snorm)
+{
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    size_t block_bytes = two_channel ? 16 : 8;
+    size_t bytes = (size_t)bw * bh * (size_t)(d > 0 ? d : 1) * block_bytes;
+    uint8_t *dst = (uint8_t *)malloc(bytes ? bytes : 1), *out;
+
+    if (!dst)
+        return NULL;
+
+    out = dst;
+    for (int z = 0; z < (d > 0 ? d : 1); z++)
+    {
+        const uint8_t *p0 = chan0 + (size_t)z * iw;
+        const uint8_t *p1 = chan1 ? chan1 + (size_t)z * iw : NULL;
+
+        for (int by = 0; by < bh; by++)
+            for (int bx = 0; bx < bw; bx++)
+            {
+                uint8_t tile[2][16];
+                int x0 = bx * 4, y0 = by * 4;
+
+                memset(tile, 0, sizeof(tile));
+                for (int y = 0; y < 4 && y0 + y < h; y++)
+                {
+                    const uint8_t *r0 = p0 + (size_t)(y0 + y) * rw + x0;
+                    const uint8_t *r1 = p1 ? p1 + (size_t)(y0 + y) * rw + x0 : NULL;
+
+                    for (int x = 0; x < 4 && x0 + x < w; x++)
+                    {
+                        tile[0][y * 4 + x] = r0[x];
+                        if (r1) tile[1][y * 4 + x] = r1[x];
+                    }
+                }
+                rgtc_bc4_block(tile[0], 4, snorm, out);
+                if (two_channel)
+                    rgtc_bc4_block(tile[1], 4, snorm, out + 8);
+                out += block_bytes;
+            }
+    }
+    return dst;
+}

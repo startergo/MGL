@@ -30,6 +30,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,118 @@
 /* shaders.c helpers (declared locally, as transform_feedback.c does) */
 void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t *input);
 glslang_stage_t getGLSLStage(GLuint type);
+
+/* ------------------------------------------------------------------ glslang resource limits
+ *
+ * KHR-GL46.limits compiles a shader that stores gl_Max* into an SSBO and compares it with
+ * the value glGet* reports, so the TBuiltInResource handed to glslang must be seeded from
+ * the same state the queries serve.  Every pname below is one get.c (or an ext domain
+ * ahead of it) really answers; an unanswered query would raise GL_INVALID_ENUM as a side
+ * effect of compiling a shader, so nothing may be added to the table that is not served. */
+void mgl_geom_fill_glslang_resource(GLMContext ctx, glslang_resource_t *res)
+{
+    static const struct { GLenum pname; size_t off; } ints[] = {
+        { GL_MAX_CLIP_DISTANCES,                         offsetof(glslang_resource_t, max_clip_distances) },
+        { GL_MAX_CULL_DISTANCES,                         offsetof(glslang_resource_t, max_cull_distances) },
+        { GL_MAX_COMBINED_CLIP_AND_CULL_DISTANCES,       offsetof(glslang_resource_t, max_combined_clip_and_cull_distances) },
+        { GL_MAX_VIEWPORTS,                              offsetof(glslang_resource_t, max_viewports) },
+        { GL_MAX_VERTEX_ATTRIBS,                         offsetof(glslang_resource_t, max_vertex_attribs) },
+        { GL_MAX_VERTEX_UNIFORM_COMPONENTS,              offsetof(glslang_resource_t, max_vertex_uniform_components) },
+        { GL_MAX_VERTEX_UNIFORM_VECTORS,                 offsetof(glslang_resource_t, max_vertex_uniform_vectors) },
+        { GL_MAX_VERTEX_OUTPUT_COMPONENTS,               offsetof(glslang_resource_t, max_vertex_output_components) },
+        { GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS,             offsetof(glslang_resource_t, max_vertex_texture_image_units) },
+        { GL_MAX_TEXTURE_IMAGE_UNITS,                    offsetof(glslang_resource_t, max_texture_image_units) },
+        { GL_MAX_FRAGMENT_UNIFORM_COMPONENTS,            offsetof(glslang_resource_t, max_fragment_uniform_components) },
+        { GL_MAX_FRAGMENT_UNIFORM_VECTORS,               offsetof(glslang_resource_t, max_fragment_uniform_vectors) },
+        { GL_MAX_FRAGMENT_INPUT_COMPONENTS,              offsetof(glslang_resource_t, max_fragment_input_components) },
+        { GL_MAX_DRAW_BUFFERS,                           offsetof(glslang_resource_t, max_draw_buffers) },
+        { GL_MIN_PROGRAM_TEXEL_OFFSET,                   offsetof(glslang_resource_t, min_program_texel_offset) },
+        { GL_MAX_PROGRAM_TEXEL_OFFSET,                   offsetof(glslang_resource_t, max_program_texel_offset) },
+        { GL_MAX_VARYING_COMPONENTS,                     offsetof(glslang_resource_t, max_varying_components) },
+        { GL_MAX_VARYING_VECTORS,                        offsetof(glslang_resource_t, max_varying_vectors) },
+        { GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,           offsetof(glslang_resource_t, max_combined_texture_image_units) },
+        { GL_MAX_IMAGE_UNITS,                            offsetof(glslang_resource_t, max_image_units) },
+        { GL_MAX_IMAGE_SAMPLES,                          offsetof(glslang_resource_t, max_image_samples) },
+        { GL_MAX_VERTEX_IMAGE_UNIFORMS,                  offsetof(glslang_resource_t, max_vertex_image_uniforms) },
+        { GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS,            offsetof(glslang_resource_t, max_tess_control_image_uniforms) },
+        { GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS,         offsetof(glslang_resource_t, max_tess_evaluation_image_uniforms) },
+        { GL_MAX_GEOMETRY_IMAGE_UNIFORMS,                offsetof(glslang_resource_t, max_geometry_image_uniforms) },
+        { GL_MAX_FRAGMENT_IMAGE_UNIFORMS,                offsetof(glslang_resource_t, max_fragment_image_uniforms) },
+        { GL_MAX_COMPUTE_IMAGE_UNIFORMS,                 offsetof(glslang_resource_t, max_compute_image_uniforms) },
+        { GL_MAX_COMBINED_IMAGE_UNIFORMS,                offsetof(glslang_resource_t, max_combined_image_uniforms) },
+        { GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES,       offsetof(glslang_resource_t, max_combined_shader_output_resources) },
+        { GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS,           offsetof(glslang_resource_t, max_geometry_texture_image_units) },
+        { GL_MAX_TESS_CONTROL_TEXTURE_IMAGE_UNITS,       offsetof(glslang_resource_t, max_tess_control_texture_image_units) },
+        { GL_MAX_TESS_EVALUATION_TEXTURE_IMAGE_UNITS,    offsetof(glslang_resource_t, max_tess_evaluation_texture_image_units) },
+        { GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS,            offsetof(glslang_resource_t, max_compute_texture_image_units) },
+        { GL_MAX_GEOMETRY_OUTPUT_VERTICES,               offsetof(glslang_resource_t, max_geometry_output_vertices) },
+        { GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS,       offsetof(glslang_resource_t, max_geometry_total_output_components) },
+        { GL_MAX_GEOMETRY_UNIFORM_COMPONENTS,            offsetof(glslang_resource_t, max_geometry_uniform_components) },
+        { GL_MAX_GEOMETRY_INPUT_COMPONENTS,              offsetof(glslang_resource_t, max_geometry_input_components) },
+        { GL_MAX_GEOMETRY_OUTPUT_COMPONENTS,             offsetof(glslang_resource_t, max_geometry_output_components) },
+        { GL_MAX_TESS_CONTROL_INPUT_COMPONENTS,          offsetof(glslang_resource_t, max_tess_control_input_components) },
+        { GL_MAX_TESS_CONTROL_OUTPUT_COMPONENTS,         offsetof(glslang_resource_t, max_tess_control_output_components) },
+        { GL_MAX_TESS_CONTROL_TOTAL_OUTPUT_COMPONENTS,   offsetof(glslang_resource_t, max_tess_control_total_output_components) },
+        { GL_MAX_TESS_EVALUATION_INPUT_COMPONENTS,       offsetof(glslang_resource_t, max_tess_evaluation_input_components) },
+        { GL_MAX_TESS_EVALUATION_OUTPUT_COMPONENTS,      offsetof(glslang_resource_t, max_tess_evaluation_output_components) },
+        { GL_MAX_TESS_PATCH_COMPONENTS,                  offsetof(glslang_resource_t, max_tess_patch_components) },
+        { GL_MAX_TESS_CONTROL_UNIFORM_COMPONENTS,        offsetof(glslang_resource_t, max_tess_control_uniform_components) },
+        { GL_MAX_TESS_EVALUATION_UNIFORM_COMPONENTS,     offsetof(glslang_resource_t, max_tess_evaluation_uniform_components) },
+        { GL_MAX_COMPUTE_UNIFORM_COMPONENTS,             offsetof(glslang_resource_t, max_compute_uniform_components) },
+        { GL_MAX_PATCH_VERTICES,                         offsetof(glslang_resource_t, max_patch_vertices) },
+        { GL_MAX_TESS_GEN_LEVEL,                         offsetof(glslang_resource_t, max_tess_gen_level) },
+        { GL_MAX_VERTEX_ATOMIC_COUNTERS,                 offsetof(glslang_resource_t, max_vertex_atomic_counters) },
+        { GL_MAX_TESS_CONTROL_ATOMIC_COUNTERS,           offsetof(glslang_resource_t, max_tess_control_atomic_counters) },
+        { GL_MAX_TESS_EVALUATION_ATOMIC_COUNTERS,        offsetof(glslang_resource_t, max_tess_evaluation_atomic_counters) },
+        { GL_MAX_GEOMETRY_ATOMIC_COUNTERS,               offsetof(glslang_resource_t, max_geometry_atomic_counters) },
+        { GL_MAX_FRAGMENT_ATOMIC_COUNTERS,               offsetof(glslang_resource_t, max_fragment_atomic_counters) },
+        { GL_MAX_COMPUTE_ATOMIC_COUNTERS,                offsetof(glslang_resource_t, max_compute_atomic_counters) },
+        { GL_MAX_COMBINED_ATOMIC_COUNTERS,               offsetof(glslang_resource_t, max_combined_atomic_counters) },
+        { GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS,          offsetof(glslang_resource_t, max_vertex_atomic_counter_buffers) },
+        { GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS,    offsetof(glslang_resource_t, max_tess_control_atomic_counter_buffers) },
+        { GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS, offsetof(glslang_resource_t, max_tess_evaluation_atomic_counter_buffers) },
+        { GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS,        offsetof(glslang_resource_t, max_geometry_atomic_counter_buffers) },
+        { GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS,        offsetof(glslang_resource_t, max_fragment_atomic_counter_buffers) },
+        { GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS,         offsetof(glslang_resource_t, max_compute_atomic_counter_buffers) },
+        { GL_MAX_COMBINED_ATOMIC_COUNTER_BUFFERS,        offsetof(glslang_resource_t, max_combined_atomic_counter_buffers) },
+        { GL_MAX_ATOMIC_COUNTER_BUFFER_SIZE,             offsetof(glslang_resource_t, max_atomic_counter_buffer_size) },
+        { GL_MAX_TRANSFORM_FEEDBACK_BUFFERS,             offsetof(glslang_resource_t, max_transform_feedback_buffers) },
+        { GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS,
+                                                         offsetof(glslang_resource_t, max_transform_feedback_interleaved_components) },
+    };
+    static const struct { GLenum pname; size_t off[3]; } indexed[] = {
+        { GL_MAX_COMPUTE_WORK_GROUP_COUNT, {
+            offsetof(glslang_resource_t, max_compute_work_group_count_x),
+            offsetof(glslang_resource_t, max_compute_work_group_count_y),
+            offsetof(glslang_resource_t, max_compute_work_group_count_z) } },
+        { GL_MAX_COMPUTE_WORK_GROUP_SIZE, {
+            offsetof(glslang_resource_t, max_compute_work_group_size_x),
+            offsetof(glslang_resource_t, max_compute_work_group_size_y),
+            offsetof(glslang_resource_t, max_compute_work_group_size_z) } },
+    };
+
+    if (!ctx || !res)
+        return;
+
+    for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]); i++)
+    {
+        GLint v = *(int *)((char *)res + ints[i].off);
+        mglGetIntegerv(ctx, ints[i].pname, &v);
+        *(int *)((char *)res + ints[i].off) = v;
+    }
+    for (size_t i = 0; i < sizeof(indexed) / sizeof(indexed[0]); i++)
+        for (int axis = 0; axis < 3; axis++)
+        {
+            GLint v = *(int *)((char *)res + indexed[i].off[axis]);
+            mglGetIntegeri_v(ctx, indexed[i].pname, axis, &v);
+            *(int *)((char *)res + indexed[i].off[axis]) = v;
+        }
+
+    /* gl_MaxAtomicCounterBindings has no core GL pname; get.c reports
+     * GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS = MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS (8),
+     * which glslang's default (1) would contradict (KHR-GL46.limits requires >= 4). */
+    res->max_atomic_counter_bindings = 8;
+}
 
 #define GEOM()   ((struct MGLExtState_geom *)ctx->state.ext_geom)
 #define METAL()  (ctx->mtl_funcs.ext_geom)

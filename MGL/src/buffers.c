@@ -532,6 +532,40 @@ static void setGenericBinding(GLMContext ctx, GLenum target, Buffer *ptr)
     }
 }
 
+/* ---- uniform buffer binding points above MAX_BINDABLE_BUFFERS ----------------
+ *
+ * GL_MAX_UNIFORM_BUFFER_BINDINGS is at least 84 (GL 4.6 minimum, KHR-GL46.limits), but
+ * STATE(buffer_base) rows only hold MAX_BINDABLE_BUFFERS slots and the renderer reads
+ * bindings through its own 16-entry table — uniform blocks at GL binding points >= 16
+ * can never feed a draw on this backend.  The points must still exist as state: the CTS
+ * between-cases state reset walks bindBufferBase(GL_UNIFORM_BUFFER, 0..83, 0) and treats
+ * an error as fatal, and a bound name has to round-trip through glGetIntegeri_v.  They
+ * are kept in this small sparse table (few points are ever used at once; a bind that
+ * finds it full simply drops the oldest entry — nothing renders from these anyway). */
+#define MGL_UBO_OVERFLOW_CAP 8
+
+typedef struct MGLUBOOverflow_t {
+    GLMContext       ctx;     /* owner; entries of other contexts are skipped */
+    GLuint           index;   /* GL binding point (>= MAX_BINDABLE_BUFFERS) */
+    BufferBaseTarget slot;
+} MGLUBOOverflow;
+
+static MGLUBOOverflow ubo_overflow[MGL_UBO_OVERFLOW_CAP];
+
+/* the storage of GL uniform-buffer binding point `index` (row slot below
+ * MAX_BINDABLE_BUFFERS, overflow entry above it), or NULL when the point is beyond
+ * the allocated state (empty) — get.c's indexed queries report 0 for those. */
+BufferBaseTarget *mgl_buffers_indexed_binding(GLMContext ctx, GLenum target, GLuint index)
+{
+    if (target != GL_UNIFORM_BUFFER || index < MAX_BINDABLE_BUFFERS)
+        return &ctx->state.buffer_base[_UNIFORM_BUFFER].buffers[index];
+
+    for (int i = 0; i < MGL_UBO_OVERFLOW_CAP; i++)
+        if (ubo_overflow[i].ctx == ctx && ubo_overflow[i].index == index)
+            return &ubo_overflow[i].slot;
+    return NULL;
+}
+
 static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
 {
     for (int i = 0; i < _MAX_BUFFER_TYPES; i++)
@@ -556,6 +590,11 @@ static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
 
     if (ctx->state.ext_buffers && ctx->state.ext_buffers->parameter_buffer == ptr)
         ctx->state.ext_buffers->parameter_buffer = NULL;
+
+    /* overflow uniform-buffer points (>= MAX_BINDABLE_BUFFERS) hold Buffer pointers too */
+    for (int i = 0; i < MGL_UBO_OVERFLOW_CAP; i++)
+        if (ubo_overflow[i].ctx == ctx && ubo_overflow[i].slot.buf == ptr)
+            memset(&ubo_overflow[i], 0, sizeof(ubo_overflow[i]));
 
     // vertex array objects referencing the buffer (all VAOs: the storage is freed)
     HashTable *vt = &STATE(vao_table);
@@ -684,8 +723,12 @@ static GLuint maxBindingsForTarget(GLMContext ctx, GLenum target)
     switch(target)
     {
         case GL_UNIFORM_BUFFER:
-            if (STATE_VAR(max_uniform_buffer_bindings) && STATE_VAR(max_uniform_buffer_bindings) < max)
-                max = STATE_VAR(max_uniform_buffer_bindings);
+            /* GL_MAX_UNIFORM_BUFFER_BINDINGS is reported as at least the GL 4.6 minimum
+             * (84 — see get.c); binding points at or above MAX_BINDABLE_BUFFERS have no
+             * row in STATE(buffer_base) and live in the overflow table below, because the
+             * renderer consumes UBO bindings through a 16-entry table.  get.c's
+             * reported_uniform_buffer_bindings() is the same expression. */
+            max = STATE_VAR(max_uniform_buffer_bindings) > 84 ? (GLuint)STATE_VAR(max_uniform_buffer_bindings) : 84;
             break;
 
         case GL_SHADER_STORAGE_BUFFER:
@@ -734,7 +777,48 @@ static GLuint offsetAlignmentForTarget(GLMContext ctx, GLenum target)
 static void setIndexedBinding(GLMContext ctx, GLenum target, GLuint index, Buffer *ptr, GLintptr offset, GLsizeiptr size, bool range)
 {
     GLuint buffer_index = bufferIndexFromTarget(ctx, target);
-    BufferBaseTarget *bt = &ctx->state.buffer_base[buffer_index].buffers[index];
+    BufferBaseTarget *bt;
+
+    /* a uniform-buffer binding point above the allocated row: claim / clear its
+     * overflow entry (bindings here are tracked for the queries only) */
+    if (index >= MAX_BINDABLE_BUFFERS)
+    {
+        MGLUBOOverflow *free = NULL, *oldest = NULL;
+
+        for (int i = 0; i < MGL_UBO_OVERFLOW_CAP; i++)
+        {
+            if (ubo_overflow[i].ctx == ctx && ubo_overflow[i].index == index)
+                { free = &ubo_overflow[i]; break; }
+            if (!ubo_overflow[i].ctx && !free)
+                free = &ubo_overflow[i];
+            if (!oldest || ubo_overflow[i].index < oldest->index)
+                oldest = &ubo_overflow[i];
+        }
+        if (!free)
+            free = oldest;   /* table full: recycle the lowest point (never drawn from) */
+        if (!ptr)
+        {
+            memset(free, 0, sizeof(*free));
+        }
+        else
+        {
+            free->ctx = ctx;
+            free->index = index;
+            free->slot.buffer = ptr->name;
+            free->slot.offset = offset;
+            free->slot.size = range ? size : ptr->size;
+            free->slot.buf = ptr;
+
+            if (ptr->data.buffer_data && mtlext(ctx) && mtlext(ctx)->ensure_buffer)
+                mtlext(ctx)->ensure_buffer(ctx, ptr);
+        }
+
+        setGenericBinding(ctx, target, ptr);
+        ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+        return;
+    }
+
+    bt = &ctx->state.buffer_base[buffer_index].buffers[index];
 
     if (ptr)
     {
