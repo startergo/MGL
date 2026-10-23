@@ -1530,7 +1530,9 @@ static bool legacy_upload(GLMContext ctx, GLenum target, GLint level, GLenum kin
         type = GL_FLOAT;
     }
 
-    if (depth)
+    if (target == GL_TEXTURE_1D)
+        mglTexImage1D(ctx, target, level, iformat, w, border, client_format, type, data);
+    else if (depth)
         mglTexImage3D(ctx, target, level, iformat, w, h, depth, border, client_format, type, data);
     else
         mglTexImage2D(ctx, target, level, iformat, w, h, border, client_format, type, data);
@@ -1578,7 +1580,33 @@ void compat_tex_image2D(GLMContext ctx, GLenum target, GLint level, GLint intern
 void compat_tex_image1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
                         GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
 {
-    compat_tex_image2D(ctx, target, level, internalformat, width, 1, border, format, type, pixels);
+    GLenum kind = legacy_tex_kind((GLenum)internalformat);
+
+    if (kind && legacy_type_bpc(type) &&
+        legacy_upload(ctx, target, level, kind, width, 1, 0, border, format, type, pixels,
+                      (GLenum)internalformat))
+        return;
+
+    mglTexImage1D(ctx, target, level, internalformat, width, border, format, type, pixels);
+
+    if (kind)
+        legacy_tex_record(ctx, bound_tex_name(ctx, target), kind, type, (GLenum)internalformat);
+    else
+    {
+        /* re-specified with a core format: drop the legacy swizzle/record */
+        GLuint name = bound_tex_name(ctx, target);
+        struct MGLExtState_compat *s = CS();
+
+        for (int i = 0; i < s->legacy_tex_count; i++)
+            if (s->legacy_tex[i].name == name && s->legacy_tex[i].kind)
+            {
+                s->legacy_tex[i].kind = 0;
+                s->legacy_tex[i].iformat = 0;
+                legacy_reset_swizzle(ctx, target);
+            }
+    }
+
+    compat_after_upload(ctx, target, level);
 }
 
 void compat_tex_image3D(GLMContext ctx, GLenum target, GLint level, GLint internalformat,
@@ -1848,9 +1876,10 @@ void compat_get_tex_parameteriv(GLMContext ctx, GLenum target, GLenum pname, GLi
         if (s->legacy_tex[i].name == name)
             slot = i;
 
-    if (slot >= 0 && pname == GL_GENERATE_MIPMAP)
+    if (pname == GL_GENERATE_MIPMAP)
     {
-        *params = s->legacy_tex[slot].gmm;
+        /* every texture has the parameter; default GL_FALSE (SGIS_generate_mipmap) */
+        *params = (slot >= 0) ? s->legacy_tex[slot].gmm : GL_FALSE;
         return;
     }
 
@@ -1874,9 +1903,9 @@ void compat_get_tex_parameterfv(GLMContext ctx, GLenum target, GLenum pname, GLf
         if (s->legacy_tex[i].name == name)
             slot = i;
 
-    if (slot >= 0 && pname == GL_GENERATE_MIPMAP)
+    if (pname == GL_GENERATE_MIPMAP)
     {
-        *params = s->legacy_tex[slot].gmm ? 1.0f : 0.0f;
+        *params = (slot >= 0 && s->legacy_tex[slot].gmm) ? 1.0f : 0.0f;
         return;
     }
 

@@ -314,6 +314,217 @@ TEST(pixel_map)
     glPixelTransferi(GL_MAP_COLOR, GL_FALSE);
 }
 
+/* ------------------------------------------------------------------ */
+/* line stipple                                                        */
+/* ------------------------------------------------------------------ */
+
+/* pattern 0x00FF, factor 1, immediate GL_LINES: fragments 0..7 of every line
+ * pass, 8..15 fail, 16..23 pass ... (LSB-first, see Mesa's line stipple) */
+TEST(line_stipple_per_line_restart)
+{
+    setup_2d(64, 64);
+    glColor4f(0, 1, 0, 1);
+    glLineStipple(1, 0x00FF);
+    glEnable(GL_LINE_STIPPLE);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    /* horizontal line covers window row y-1 (diamond rule, see line_diamond_rule) */
+    glBegin(GL_LINES); glVertex2f(4, 16); glVertex2f(60, 16); glEnd();
+
+    /* distances 0..7 on */
+    EXPECT_PIXEL(4, 15, 0, 255, 0, 255, 4);
+    EXPECT_PIXEL(10, 15, 0, 255, 0, 255, 4);
+    /* distances 8..15 off */
+    EXPECT_PIXEL(12, 15, 0, 0, 0, 255, 4);
+    EXPECT_PIXEL(18, 15, 0, 0, 0, 255, 4);
+    /* distances 16..23 on */
+    EXPECT_PIXEL(21, 15, 0, 255, 0, 255, 4);
+
+    /* second line in the same glBegin: the counter restarts per line */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES);
+    glVertex2f(40, 16); glVertex2f(60, 16);
+    glVertex2f(4, 32); glVertex2f(24, 32);
+    glEnd();
+    EXPECT_PIXEL(44, 15, 0, 255, 0, 255, 4);   /* dist 4: on */
+    EXPECT_PIXEL(52, 15, 0, 0, 0, 255, 4);     /* dist 12: off */
+    EXPECT_PIXEL(8, 31, 0, 255, 0, 255, 4);    /* new line: dist 4 on again */
+
+    glDisable(GL_LINE_STIPPLE);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(4, 16); glVertex2f(60, 16); glEnd();
+    EXPECT_PIXEL(12, 15, 0, 255, 0, 255, 4);   /* disabled: continuous */
+
+    EXPECT_NO_GL_ERROR();
+}
+
+/* pattern 0x0001, factor 4: fragments 0..3 on, everything else off */
+TEST(line_stipple_factor)
+{
+    setup_2d(64, 64);
+    glColor4f(0, 1, 0, 1);
+    glLineStipple(4, 0x0001);
+    glEnable(GL_LINE_STIPPLE);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINES); glVertex2f(4, 16); glVertex2f(60, 16); glEnd();
+
+    EXPECT_PIXEL(4, 15, 0, 255, 0, 255, 4);    /* dist 0..3 */
+    EXPECT_PIXEL(6, 15, 0, 255, 0, 255, 4);
+    EXPECT_PIXEL(8, 15, 0, 0, 0, 255, 4);      /* dist 4..63: bit 1..15 of 0x0001 */
+    EXPECT_PIXEL(30, 15, 0, 0, 0, 255, 4);
+    EXPECT_PIXEL(58, 15, 0, 0, 0, 255, 4);
+
+    /* GL_LINE_STRIP: distances accumulate across the whole strip */
+    glLineStipple(1, 0x00FF);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_LINE_STRIP);
+    glVertex2f(4, 16); glVertex2f(20, 16);   /* 16 px */
+    glVertex2f(20, 40);                      /* 24 px more */
+    glEnd();
+    /* segment 1: dist 0..15 → x 4..19 all on (bits 0..7 and 8..15? 0x00FF: bits 0..7 only) */
+    EXPECT_PIXEL(4, 15, 0, 255, 0, 255, 4);    /* dist 0 */
+    EXPECT_PIXEL(11, 15, 0, 255, 0, 255, 4);   /* dist 7 */
+    EXPECT_PIXEL(12, 15, 0, 0, 0, 255, 4);     /* dist 8 */
+    /* vertical segment: fragment centers x=19 (diamond rule), dist 16..39 */
+    EXPECT_PIXEL(19, 19, 0, 255, 0, 255, 4);   /* dist 16+3=19 → bit 3: on */
+    EXPECT_PIXEL(19, 27, 0, 0, 0, 255, 4);     /* dist ~27 → bit 11: off */
+
+    glDisable(GL_LINE_STIPPLE);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* client arrays: glDrawArrays(GL_LINES) with stipple */
+TEST(line_stipple_arrays)
+{
+    setup_2d(64, 64);
+    glColor4f(0, 1, 0, 1);
+    glLineStipple(1, 0x00FF);
+    glEnable(GL_LINE_STIPPLE);
+
+    const float v[] = { 4, 16,  60, 16,   4, 40,  60, 40 };
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, v);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_LINES, 0, 4);
+
+    EXPECT_PIXEL(6, 15, 0, 255, 0, 255, 4);
+    EXPECT_PIXEL(14, 15, 0, 0, 0, 255, 4);
+    EXPECT_PIXEL(6, 39, 0, 255, 0, 255, 4);    /* second line restarts */
+    EXPECT_PIXEL(14, 39, 0, 0, 0, 255, 4);
+
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisable(GL_LINE_STIPPLE);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* indexed glDrawElements: the stipple distance follows INDEX order, not the
+ * order the vertices happen to be stored in the array */
+TEST(line_stipple_indexed)
+{
+    setup_2d(64, 64);
+    glColor4f(0, 1, 0, 1);
+    glLineStipple(1, 0x00FF);
+    glEnable(GL_LINE_STIPPLE);
+
+    /* vertices stored in increasing-x order; the strip runs right-to-left */
+    const float v[] = { 4, 16,  20, 16,  40, 16,  56, 16 };
+    const GLushort idx[] = { 3, 2, 1, 0 };
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, v);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElements(GL_LINE_STRIP, 4, GL_UNSIGNED_SHORT, idx);
+
+    /* fragments run x = 56,55,...,41 (dist 0..15), 40,...,21 (dist 16..35), 20,...,4 */
+    EXPECT_PIXEL(52, 15, 0, 255, 0, 255, 4);   /* dist ~4: on */
+    EXPECT_PIXEL(50, 15, 0, 255, 0, 255, 4);   /* dist ~6: on */
+    EXPECT_PIXEL(46, 15, 0, 0, 0, 255, 4);     /* dist ~10: off */
+    EXPECT_PIXEL(42, 15, 0, 0, 0, 255, 4);     /* dist ~14: off */
+    /* second segment dist 16..: bit 0 of 0x00FF again */
+    EXPECT_PIXEL(37, 15, 0, 255, 0, 255, 4);   /* dist ~21: on */
+    EXPECT_PIXEL(35, 15, 0, 255, 0, 255, 4);   /* dist ~23: on */
+    EXPECT_PIXEL(31, 15, 0, 0, 0, 255, 4);     /* dist ~27: off */
+    EXPECT_PIXEL(23, 15, 0, 255, 0, 255, 4);   /* third segment: dist ~48: on */
+
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisable(GL_LINE_STIPPLE);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* ------------------------------------------------------------------ */
+/* GL_GENERATE_MIPMAP (SGIS_generate_mipmap compat semantics)          */
+/* ------------------------------------------------------------------ */
+
+TEST(generate_mipmap_on_teximage)
+{
+    setup_2d(64, 64);
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    GLint gmm = -1;
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, &gmm);
+    EXPECT_EQ_INT(gmm, GL_FALSE);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_TRUE);
+    gmm = -1;
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, &gmm);
+    EXPECT_EQ_INT(gmm, GL_TRUE);
+
+    /* 8x8: four solid quadrants; mip level 3 is 1x1 = the average of all */
+    GLubyte img[8 * 8 * 3];
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++)
+        {
+            GLubyte *p = &img[(y * 8 + x) * 3];
+            if (y < 4) { if (x < 4) { p[0]=255; p[1]=0;   p[2]=0; }   /* red */
+                         else       { p[0]=0;   p[1]=255; p[2]=0; } } /* green */
+            else       { if (x < 4) { p[0]=0;   p[1]=0;   p[2]=255; } /* blue */
+                         else       { p[0]=255; p[1]=255; p[2]=255; } } /* white */
+        }
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 8, 8, 0, GL_RGB, GL_UNSIGNED_BYTE, img);
+
+    /* the mipmap chain must exist: level 3 present */
+    GLint w = -1;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 3, GL_TEXTURE_WIDTH, &w);
+    EXPECT_EQ_INT(w, 1);
+
+    /* complete texture (mipmap filter + full chain): draw 1 pixel of level 3 =
+     * the average of all quadrants (0.5, 0.5, 0.5) */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glEnable(GL_TEXTURE_2D);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(0, 0);
+    glTexCoord2f(1, 0); glVertex2f(1, 0);
+    glTexCoord2f(1, 1); glVertex2f(1, 1);
+    glTexCoord2f(0, 1); glVertex2f(0, 1);
+    glEnd();
+    EXPECT_PIXEL(0, 0, 128, 128, 128, 255, 10);
+
+    /* GENERATE_MIPMAP off: a level-0 upload on a fresh texture must NOT add levels */
+    GLuint tex2 = 0;
+    glGenTextures(1, &tex2);
+    glBindTexture(GL_TEXTURE_2D, tex2);
+    glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, GL_FALSE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 8, 8, 0, GL_RGB, GL_UNSIGNED_BYTE, img);
+    w = -1;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 1, GL_TEXTURE_WIDTH, &w);
+    EXPECT_EQ_INT(w, 0);    /* level 1 does not exist */
+
+    glDisable(GL_TEXTURE_2D);
+    glDeleteTextures(1, &tex);
+    glDeleteTextures(1, &tex2);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     void *ctx = mglCompatCreateContext();
@@ -328,6 +539,13 @@ int main(void)
     RUN(texenv_combine_variants);
     RUN(copy_pixels);
     RUN(pixel_map);
+
+    /* added 2026-10-23: per-line restart, factor, arrays, indexed, GENERATE_MIPMAP */
+    RUN(line_stipple_per_line_restart);
+    RUN(line_stipple_factor);
+    RUN(line_stipple_arrays);
+    RUN(line_stipple_indexed);
+    RUN(generate_mipmap_on_teximage);
 
     return mgl_test_summary();
 }

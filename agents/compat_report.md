@@ -1,11 +1,32 @@
 # compat domain — progress log
 
-READY 4bb5fe2 (gl46/compat: milestones 1-8 complete; gl46-port merged through tess round 13; full headless suite 442 cases / 6506 checks / 0 failures; uniform-block CPU/GPU race fixed)
+READY 80e40ff (gl46/compat: milestones 1-8 + CTS compat; KHR-GL42-COMPAT.shaders42 14/14; gl46-port merged through f9984b7; full headless suite green)
 
 Session log for the GL 4.6 compatibility-profile work (task: agents/tasks/compat.md).
 Update this file at every commit so a fresh session can continue.
 
 ## Session 2026-10-23 (fresh session, phase 2)
+
+* **CTS compatibility contexts + KHR-GL42-COMPAT.shaders42.*: 14/14 PASS.**
+  - glcts platform glue (`agents/conformance/glue/framework/platform/mgl/tcuMGLPlatform.cpp`,
+    installed into ~/MGL-cts by setup.sh; rebuild: `ninja -C ~/MGL-cts/build glcts`):
+    PROFILE_COMPATIBILITY requests are no longer NotSupported; the render context calls
+    `mglCompatCreateContext()` (exported by libmgl) and remembers it; makeCurrent() re-asserts it.
+    Run: `bash tests/cts_one.sh 'KHR-GL42-COMPAT.shaders42.*' /tmp/cts_compat`
+    (`--deqp-gl-context-type=mgl`; the COMPAT profile comes from the test package, not the flag).
+  - Fixes the CTS found in MGL compat:
+    1. `glTexImage1D` in a compat context raised GL_INVALID_ENUM (compat_tex_image1D forwarded
+       to glTexImage2D with target GL_TEXTURE_1D) — killed every CTS case at the gluStateReset
+       (it does texImage1D). Now a real 1D path (mglTexImage1D + legacy_upload 1D branch).
+    2. Core-profile shaders (#version > 140 without "compatibility") were translated, so the
+       negative cases (gl_FragColor under `#version 420` must fail) wrongly compiled. A
+       version/profile pre-scan (scan_glsl_version) now leaves core shaders untouched.
+    3. Translator gaps: texture{1,2,3}DProj{,Lod}, textureCubeLod, gl_MaxVaryingFloats →
+       gl_MaxVaryingComponents, the full shadow1D/2D family with bias overloads; shadow
+       implicit-LOD helpers are emitted for fragment shaders only (defining
+       texture(sampler2DShadow,...) in a vertex shader is illegal core GLSL).
+  - gl46-master.txt has no compatibility-profile cases (its 7 "compat" name hits are unrelated
+    core tests owned by other domains). gl30..gl43-compat master lists = remaining CTS work.
 
 * Merged gl46-port twice (fp64, geom rounds 32-41, tess rounds 9-13). **IMPORTANT pitfall: after
   `git merge gl46-port`, `rm -rf build/MGL && make -j2 lib`** — a plain incremental build left
@@ -18,11 +39,16 @@ Update this file at every commit so a fresh session can continue.
   `mgli_upload_uniform` wrote the per-stage default-uniform MTLBuffer contents without the
   `mgl_buffers_prepare_cpu_write` hazard step required by mgl_ext_buffers.h (rename/wait against a
   still-queued draw). Shared-file edit: MGL/src/uniforms.c (+include, +1 call) — flagged to lead.
+  (Merged into gl46-port as f9984b7.)
 * test_compat_render2.c gained `immediate_mode_stress` (60 frames x 1024 translated quads,
   verified per frame; ~35 s, keeps the binary under the run.sh timeout). test_compat_gears.c now
   renders into an explicit FBO so the reference is display-scale independent.
 * Full suite on the clean build: 59 binaries, 442 PASS / 0 FAIL, 6506 checks, 0 failures;
   test_geom 59/59; stress repro (80 frames) OK twice.
+* render3 additions: line-stipple GL_LINES per-line restart fix (the second line of a batch
+  started mid-pattern because the reset leaked the distance from the previous vertex), stipple
+  factor/strip/array/indexed-order coverage, GENERATE_MIPMAP default query (was GL_INVALID_ENUM
+  with untouched output for textures never touched by compat params) and pixel checks.
 
 ## How to build/test fast
 

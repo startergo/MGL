@@ -196,13 +196,29 @@ static bool tr_subst_ident(Tr *t, const char *id, size_t n)
     if (match(id, n, "gl_Point")) { tr_adds(t, "mglPoint"); t->used |= U_LIGHTS; return (t->subst++, true); }
 
     /* deprecated texture functions */
+    if (match(id, n, "texture2DProjLod")) { tr_adds(t, "textureProjLod"); return (t->subst++, true); }
+    if (match(id, n, "texture2DLod")) { tr_adds(t, "textureLod"); return (t->subst++, true); }
     if (match(id, n, "texture2D")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "texture3DProjLod")) { tr_adds(t, "textureProjLod"); return (t->subst++, true); }
+    if (match(id, n, "texture3DProj")) { tr_adds(t, "textureProj"); return (t->subst++, true); }
+    if (match(id, n, "texture3DLod")) { tr_adds(t, "textureLod"); return (t->subst++, true); }
     if (match(id, n, "texture3D")) { tr_adds(t, "texture"); return (t->subst++, true); }
+    if (match(id, n, "textureCubeLod")) { tr_adds(t, "textureLod"); return (t->subst++, true); }
     if (match(id, n, "textureCube")) { tr_adds(t, "texture"); return (t->subst++, true); }
     if (match(id, n, "texture2DProj")) { tr_adds(t, "textureProj"); return (t->subst++, true); }
+    if (match(id, n, "texture1DProjLod")) { tr_adds(t, "textureProjLod"); return (t->subst++, true); }
+    if (match(id, n, "texture1DProj")) { tr_adds(t, "textureProj"); return (t->subst++, true); }
+    if (match(id, n, "texture1DLod")) { tr_adds(t, "textureLod"); return (t->subst++, true); }
     if (match(id, n, "texture1D")) { tr_adds(t, "texture"); return (t->subst++, true); }
-    if (match(id, n, "shadow2D")) { tr_adds(t, "mgl_shadow2D"); return (t->subst++, true); }
+    if (match(id, n, "shadow1DProjLod")) { tr_adds(t, "mgl_shadow1DProjLod"); return (t->subst++, true); }
+    if (match(id, n, "shadow1DProj")) { tr_adds(t, "mgl_shadow1DProj"); return (t->subst++, true); }
+    if (match(id, n, "shadow1DLod")) { tr_adds(t, "mgl_shadow1DLod"); return (t->subst++, true); }
+    if (match(id, n, "shadow1D")) { tr_adds(t, "mgl_shadow1D"); return (t->subst++, true); }
+    if (match(id, n, "shadow2DProjLod")) { tr_adds(t, "mgl_shadow2DProjLod"); return (t->subst++, true); }
     if (match(id, n, "shadow2DProj")) { tr_adds(t, "mgl_shadow2DProj"); return (t->subst++, true); }
+    if (match(id, n, "shadow2DLod")) { tr_adds(t, "mgl_shadow2DLod"); return (t->subst++, true); }
+    if (match(id, n, "shadow2D")) { tr_adds(t, "mgl_shadow2D"); return (t->subst++, true); }
+    if (match(id, n, "gl_MaxVaryingFloats")) { tr_adds(t, "gl_MaxVaryingComponents"); return (t->subst++, true); }
 
     return false;
 }
@@ -219,6 +235,88 @@ static bool after_dot(Tr *t)
 }
 
 #pragma mark the translation
+
+/* scan a joined source for the (optional) #version directive, skipping
+ * comments; returns the number and whether the profile keyword is
+ * "compatibility" (out_compat_kw = 1) or "es" (2). */
+static void scan_glsl_version(const char *src, size_t len, int *out_version, int *out_compat_kw)
+{
+    size_t pos = 0;
+    int in_comment = 0, in_line_comment = 0;
+
+    *out_version = 0;
+    *out_compat_kw = 0;
+
+    while (pos < len)
+    {
+        char c = src[pos];
+
+        if (!in_line_comment && !in_comment && c == '/' && pos + 1 < len && src[pos + 1] == '*')
+        {
+            in_comment = 1;
+            pos += 2;
+            continue;
+        }
+        if (in_comment)
+        {
+            if (c == '*' && pos + 1 < len && src[pos + 1] == '/')
+            {
+                in_comment = 0;
+                pos += 2;
+            }
+            else
+                pos++;
+            continue;
+        }
+        if (!in_line_comment && c == '/' && pos + 1 < len && src[pos + 1] == '/')
+        {
+            in_line_comment = 1;
+            pos += 2;
+            continue;
+        }
+        if (in_line_comment)
+        {
+            if (c == '\n')
+                in_line_comment = 0;
+            pos++;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            pos++;
+            continue;
+        }
+        if (c == '#' && pos + 8 <= len && strncmp(src + pos, "#version", 8) == 0)
+        {
+            char line[128];
+            size_t e = pos;
+
+            while (e < len && src[e] != '\n')
+                e++;
+            {
+                size_t n = e - pos;
+
+                if (n >= sizeof line) n = sizeof line - 1;
+                memcpy(line, src + pos, n);
+                line[n] = 0;
+                int v = 110;
+                char prof[32] = { 0 };
+
+                if (sscanf(line, "#version %d %31s", &v, prof) >= 1)
+                {
+                    *out_version = v;
+                    if (strcmp(prof, "compatibility") == 0)
+                        *out_compat_kw = 1;
+                    else if (strcmp(prof, "es") == 0)
+                        *out_compat_kw = 2;
+                }
+            }
+            return;
+        }
+        /* any other token before #version: per spec #version is gone */
+        return;
+    }
+}
 
 char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
                                   const GLchar *const *string, const GLint *length)
@@ -259,6 +357,21 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
     t.out = NULL;
     t.ocap = 0;
     t.olen = 0;
+
+    /* Core-profile shaders must pass through untouched: gl_FragColor et al.
+     * are only legal when the shader asks for the compatibility profile
+     * (#version <= 140 or "#version N compatibility"), and glslang must be
+     * allowed to reject them in core shaders (the CTS negative cases). */
+    {
+        int v = 0, compat_kw = 0;
+
+        scan_glsl_version(joined, total, &v, &compat_kw);
+        if (v > 140 && !compat_kw)
+        {
+            free(joined);
+            return NULL;    /* not a legacy/compat shader */
+        }
+    }
 
     /* pass 1: scan (rewrites identifiers, notes usage, strips the version) */
     bool in_comment = false, in_line_comment = false, in_preprocessor = false;
@@ -556,10 +669,25 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
             p += sprintf(p, "uniform mgl_PointParameters mglPoint;\n");
         }
 
-        /* shadow helper functions */
+        /* shadow helper functions (GL compat returns vec4; core returns float).
+         * The implicit-LOD and bias forms are fragment-only in GLSL, so they
+         * are only emitted (and only legal) in fragment shaders; the Lod
+         * forms carry an explicit level and work in every stage. */
         p += sprintf(p,
-            "vec4 mgl_shadow2D(sampler2DShadow s, vec3 c) { return vec4(texture(s, c)); }\n"
-            "vec4 mgl_shadow2DProj(sampler2DShadow s, vec4 c) { return vec4(textureProj(s, c)); }\n");
+            "vec4 mgl_shadow2DLod(sampler2DShadow s, vec3 c, float l) { return vec4(textureLod(s, c, l)); }\n"
+            "vec4 mgl_shadow2DProjLod(sampler2DShadow s, vec4 c, float l) { return vec4(textureProjLod(s, c, l)); }\n"
+            "vec4 mgl_shadow1DLod(sampler1DShadow s, vec3 c, float l) { return vec4(textureLod(s, c, l)); }\n"
+            "vec4 mgl_shadow1DProjLod(sampler1DShadow s, vec4 c, float l) { return vec4(textureProjLod(s, c, l)); }\n");
+        if (t.stage == GL_FRAGMENT_SHADER)
+            p += sprintf(p,
+                "vec4 mgl_shadow2D(sampler2DShadow s, vec3 c) { return vec4(texture(s, c)); }\n"
+                "vec4 mgl_shadow2D(sampler2DShadow s, vec3 c, float b) { return vec4(texture(s, c, b)); }\n"
+                "vec4 mgl_shadow2DProj(sampler2DShadow s, vec4 c) { return vec4(textureProj(s, c)); }\n"
+                "vec4 mgl_shadow2DProj(sampler2DShadow s, vec4 c, float b) { return vec4(textureProj(s, c, b)); }\n"
+                "vec4 mgl_shadow1D(sampler1DShadow s, vec3 c) { return vec4(texture(s, c)); }\n"
+                "vec4 mgl_shadow1D(sampler1DShadow s, vec3 c, float b) { return vec4(texture(s, c, b)); }\n"
+                "vec4 mgl_shadow1DProj(sampler1DShadow s, vec4 c) { return vec4(textureProj(s, c)); }\n"
+                "vec4 mgl_shadow1DProj(sampler1DShadow s, vec4 c, float b) { return vec4(textureProj(s, c, b)); }\n");
 
         p += sprintf(p, "%s", body ? body : "");
 

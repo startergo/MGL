@@ -17,7 +17,7 @@
  *
  * Known limitations (single-context library):
  *   - shared contexts alias the one global MGL context;
- *   - ES / compatibility-profile context requests are NotSupported.
+ *   - ES context requests are NotSupported.
  *--------------------------------------------------------------------*/
 
 #include "tcuMGLPlatform.hpp"
@@ -103,6 +103,7 @@ private:
     de::DynamicLibrary m_library;
     glw::Functions m_functions;
     tcu::RenderTarget m_renderTarget;
+    void *m_ownContext;
     MGLGetCurrentContextFunc m_getCurrentContext;
     MGLSetCurrentContextFunc m_setCurrentContext;
 };
@@ -112,17 +113,33 @@ MglRenderContext::MglRenderContext(const glu::RenderConfig &config)
     , m_library(getLibraryPath())
     , m_functions()
     , m_renderTarget()
+    , m_ownContext(DE_NULL)
     , m_getCurrentContext(DE_NULL)
     , m_setCurrentContext(DE_NULL)
 {
     // Loading the library has already created (and made current) MGL's
-    // headless Metal context.
+    // headless Metal context.  Compatibility-profile requests build the
+    // fixed-function context instead: mglCompatCreateContext() makes it the
+    // current (global) MGL context, so every gl* entry point now runs in it.
     MglFunctionLoader loader(&m_library);
+
+    if (config.type.getAPI().getProfile() == glu::PROFILE_COMPATIBILITY)
+    {
+        typedef void *(*MGLCompatCreateContextFunc)(void);
+        MGLCompatCreateContextFunc createCompat =
+            reinterpret_cast<MGLCompatCreateContextFunc>(m_library.getFunction("mglCompatCreateContext"));
+        if (createCompat == DE_NULL)
+            throw tcu::NotSupportedError("libmgl does not export mglCompatCreateContext", DE_NULL, __FILE__,
+                                         __LINE__);
+        if (createCompat() == DE_NULL)
+            throw tcu::InternalError("mglCompatCreateContext() failed", DE_NULL, __FILE__, __LINE__);
+    }
 
     m_getCurrentContext =
         reinterpret_cast<MGLGetCurrentContextFunc>(m_library.getFunction("MGLgetCurrentContext"));
     m_setCurrentContext =
         reinterpret_cast<MGLSetCurrentContextFunc>(m_library.getFunction("MGLsetCurrentContext"));
+    m_ownContext = (m_getCurrentContext != DE_NULL) ? m_getCurrentContext() : DE_NULL;
 
     glu::initFunctions(&m_functions, &loader, config.type.getAPI());
     glu::initExtensionFunctions(&m_functions, &loader, config.type.getAPI());
@@ -156,13 +173,10 @@ void MglRenderContext::postIterate(void)
 
 void MglRenderContext::makeCurrent(void)
 {
-    // MGL keeps one global context; re-assert it as current.
-    if (m_setCurrentContext != DE_NULL && m_getCurrentContext != DE_NULL)
-    {
-        void *ctx = m_getCurrentContext();
-        if (ctx != DE_NULL)
-            m_setCurrentContext(ctx);
-    }
+    // MGL keeps one global context; re-assert ours (the library auto-created a
+    // core context at load; a compatibility run swapped in a compat context).
+    if (m_setCurrentContext != DE_NULL && m_ownContext != DE_NULL)
+        m_setCurrentContext(m_ownContext);
 }
 
 glw::GenericFuncType MglRenderContext::getProcAddress(const char *name) const
@@ -198,9 +212,8 @@ glu::RenderContext *MglContextFactory::createContext(const glu::RenderConfig &co
         throw tcu::NotSupportedError("MGL is a desktop GL implementation (no ES contexts)", DE_NULL, __FILE__,
                                      __LINE__);
 
-    if (api.getProfile() == glu::PROFILE_COMPATIBILITY)
-        throw tcu::NotSupportedError("MGL implements the core profile only", DE_NULL, __FILE__, __LINE__);
-
+    // Compatibility-profile requests are honoured: MGL builds a compat context
+    // (fixed-function pipeline) through the same dylib; see MglRenderContext.
     if (api.getMajorVersion() > 4 || (api.getMajorVersion() == 4 && api.getMinorVersion() > 6))
         throw tcu::NotSupportedError("MGL implements OpenGL 4.6", DE_NULL, __FILE__, __LINE__);
 

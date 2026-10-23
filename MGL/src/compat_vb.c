@@ -385,8 +385,15 @@ static void upload_line_stipple(GLMContext ctx, GLenum mode, const float *pos, G
 
     for (GLuint i = 0; i < n; i++)
     {
+        /* GL_LINES: every pair is its own primitive — the stipple distance
+         * restarts at 0 for the first vertex of each line, so the distance
+         * to the previous vertex must not leak into the new line */
         if (mode == GL_LINES && (i & 1) == 0)
-            run = 0.0f;     /* each pair is its own primitive */
+        {
+            run = 0.0f;
+            li[i] = 0.0f;
+            continue;
+        }
 
         if (i > 0)
         {
