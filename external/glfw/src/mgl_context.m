@@ -25,11 +25,24 @@ GLMContext createGLMContext(GLenum format, GLenum type,
                         GLenum depth_format, GLenum depth_type,
                         GLenum stencil_format, GLenum stencil_type);
 
+GLMContext createGLMContextProfile(GLenum format, GLenum type,
+                        GLenum depth_format, GLenum depth_type,
+                        GLenum stencil_format, GLenum stencil_type,
+                        GLenum profile);
+
+#ifndef GL_CONTEXT_COMPATIBILITY_PROFILE_BIT
+#define GL_CONTEXT_COMPATIBILITY_PROFILE_BIT 0x00000002
+#endif
+
 void MGLsetCurrentContext(GLMContext ctx);
 void MGLswapBuffers(GLMContext ctx);
 
 static void makeContextCurrentMGL(_GLFWwindow* window)
 {
+    // keep one throwaway context for the "no current window" state so the GL
+    // entry points still have jump tables (created once, not per call)
+    static GLMContext null_ctx = NULL;
+
     @autoreleasepool {
 
     if (window)
@@ -40,10 +53,16 @@ static void makeContextCurrentMGL(_GLFWwindow* window)
     }
     else
     {
-        // just so we have jump tables
-        MGLsetCurrentContext(createGLMContext(0, 0,
-                                              0, 0,
-                                              0, 0));
+        if (null_ctx == NULL)
+            null_ctx = createGLMContext(0, 0,
+                                        0, 0,
+                                        0, 0);
+        MGLsetCurrentContext(null_ctx);
+
+        // the slot must actually be cleared: glfwDestroyWindow() relies on
+        // glfwMakeContextCurrent(NULL) detaching the window, and a stale
+        // pointer to a freed window crashes the next window creation
+        _glfwPlatformSetTls(&_glfw.contextSlot, NULL);
     }
 
     } // autoreleasepool
@@ -129,23 +148,50 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
         return GLFW_FALSE;
     }
 
-    if (ctxconfig->major < 4)
+    /* Compatibility profile: requested explicitly, or implicitly by a legacy
+     * app that asks for any profile at a version below 3.2 (GLFW's default
+     * hints are 1.0, so apps that set nothing at all get a compat context). */
+    GLFWbool compat =
+        (ctxconfig->profile == GLFW_OPENGL_COMPAT_PROFILE) ||
+        (ctxconfig->profile == GLFW_OPENGL_ANY_PROFILE &&
+         (ctxconfig->major < 3 || (ctxconfig->major == 3 && ctxconfig->minor < 2)));
+
+    if (!compat)
+    {
+        if (ctxconfig->major < 4)
+        {
+            _glfwInputError(GLFW_VERSION_UNAVAILABLE,
+                            "MGL: OpenGL 4.6 and above supported on MGL");
+            return GLFW_FALSE;
+        }
+
+        if (ctxconfig->minor < 6)
+        {
+            _glfwInputError(GLFW_VERSION_UNAVAILABLE,
+                            "MGL: OpenGL 4.6 and above supported on MGL");
+            return GLFW_FALSE;
+        }
+    }
+    else if (ctxconfig->major > 4 || (ctxconfig->major == 4 && ctxconfig->minor > 6))
     {
         _glfwInputError(GLFW_VERSION_UNAVAILABLE,
-                        "MGL: OpenGL 4.6 and above supported on MGL");
+                        "MGL: OpenGL versions above 4.6 are not supported on MGL");
         return GLFW_FALSE;
     }
 
-    if (ctxconfig->minor < 6)
+    if (compat)
     {
-        _glfwInputError(GLFW_VERSION_UNAVAILABLE,
-                        "MGL: OpenGL 4.6 and above supported on MGL");
-        return GLFW_FALSE;
+        window->context.mgl.ctx = createGLMContextProfile(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+                                                          GL_DEPTH_COMPONENT, GL_FLOAT,
+                                                          0, 0,
+                                                          GL_CONTEXT_COMPATIBILITY_PROFILE_BIT);
     }
-
-    window->context.mgl.ctx = createGLMContext(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                                               GL_DEPTH_COMPONENT, GL_FLOAT,
-                                               0, 0);
+    else
+    {
+        window->context.mgl.ctx = createGLMContext(GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+                                                   GL_DEPTH_COMPONENT, GL_FLOAT,
+                                                   0, 0);
+    }
     assert(window->context.mgl.ctx);
 
     if (window->context.mgl.ctx == nil)
