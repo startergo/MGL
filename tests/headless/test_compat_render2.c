@@ -662,6 +662,78 @@ TEST(feedback_current_values)
     }
 }
 
+/* stress: 60 frames x 1024 quads, every quad through its own matrix
+ * translate, each verified in the same frame.  Guards the class of
+ * intermittent failures seen once with matrix_transforms (a CPU write racing
+ * a still-queued command buffer's uniform data under GPU load; fixed by the
+ * mgl_buffers_prepare_cpu_write in mgli_upload_uniform).  Frame count keeps
+ * the whole binary under the run.sh per-test timeout. */
+TEST(immediate_mode_stress)
+{
+    setup_2d(64, 64);
+
+    for (int frame = 0; frame < 60; frame++)
+    {
+        GLubyte img[64 * 64 * 4];
+
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor4f(0, 1, 0, 1);
+
+        for (int ty = 0; ty < 32; ty++)
+            for (int tx = 0; tx < 32; tx++)
+            {
+                glPushMatrix();
+                glTranslatef((float)tx * 2, (float)ty * 2, 0);
+                glBegin(GL_QUADS);
+                glVertex2f(0.25f, 0.25f);
+                glVertex2f(1.75f, 0.25f);
+                glVertex2f(1.75f, 1.75f);
+                glVertex2f(0.25f, 1.75f);
+                glEnd();
+                glPopMatrix();
+            }
+
+        glFinish();
+        glReadPixels(0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, img);
+
+        int bad = 0;
+        for (int ty = 0; ty < 32 && bad < 4; ty++)
+            for (int tx = 0; tx < 32 && bad < 4; tx++)
+            {
+                const GLubyte *p = &img[((ty * 2) * 64 + tx * 2) * 4];
+
+                if (p[1] < 200 || p[0] > 50)
+                {
+                    if (bad == 0)
+                    {
+                        int mag = 0, blk = 0, oth = 0;
+
+                        printf("  frame %d failed, cell (%d,%d) px=%d,%d,%d\n", frame, tx, ty, p[0], p[1], p[2]);
+                        for (int yy = 0; yy < 32; yy++)
+                            for (int xx = 0; xx < 32; xx++)
+                            {
+                                const GLubyte *q = &img[((yy * 2) * 64 + xx * 2) * 4];
+
+                                if (q[1] < 200 || q[0] > 50)
+                                {
+                                    if (q[0] > 200 && q[2] > 200) mag++;
+                                    else if (q[0] < 30 && q[1] < 30) blk++;
+                                    else oth++;
+                                }
+                            }
+                        printf("  failing frame: magenta cells=%d black cells=%d other=%d\n", mag, blk, oth);
+                    }
+                    bad++;
+                }
+            }
+        EXPECT_TRUE(bad == 0);
+        if (bad)
+            break;
+    }
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     compat_ctx = mglCompatCreateContext();
@@ -670,6 +742,7 @@ int main(void)
         return 1;
 
     RUN(matrix_transforms);
+    RUN(immediate_mode_stress);
     RUN(positional_light_and_colormaterial);
     RUN(specular_shininess);
     RUN(texenv_modes);

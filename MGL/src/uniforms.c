@@ -38,6 +38,7 @@
 
 #include "shaders.h"
 #include "programs.h"
+#include "mgl_ext_buffers.h"
 #include "buffers.h"
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
@@ -64,6 +65,10 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
         }
         Buffer *b = ip->dub[s];
         if (!b || !b->data.buffer_data) continue;
+        /* buffer_data aliases a managed MTLBuffer the last draw may still be
+         * reading: order this CPU write against it (rename or wait) per the
+         * 'buffers' domain memory model */
+        mgl_buffers_prepare_cpu_write(ctx, b, true);
         uint8_t *dst = (uint8_t *)b->data.buffer_data;
         const uint8_t *src = u->shadow;
         for (int e = 0; e < u->size; e++)

@@ -1,7 +1,28 @@
 # compat domain — progress log
 
+READY 4bb5fe2 (gl46/compat: milestones 1-8 complete; gl46-port merged through tess round 13; full headless suite 442 cases / 6506 checks / 0 failures; uniform-block CPU/GPU race fixed)
+
 Session log for the GL 4.6 compatibility-profile work (task: agents/tasks/compat.md).
 Update this file at every commit so a fresh session can continue.
+
+## Session 2026-10-23 (fresh session, phase 2)
+
+* Merged gl46-port twice (fp64, geom rounds 32-41, tess rounds 9-13). **IMPORTANT pitfall: after
+  `git merge gl46-port`, `rm -rf build/MGL && make -j2 lib`** — a plain incremental build left
+  ~113 stale objects compiled against the old `glm_context.h` layout and produced an
+  ABI-inconsistent dylib. Symptoms looked like GPU races: test_xfb scatter lost varyings,
+  test_debug SIGSEGV'd in mglDebugResetStatus reading `ctx->state.ext_debug` as NULL
+  (offset 0x99e0 vs the value actually initialized), lldb DWARF offsets disagreed with the asm.
+  Clean rebuild: all green. If a "flake" survives a relink, suspect stale objects first.
+* Fixed the real bug the immediate-mode stress test found (commit ac835b8):
+  `mgli_upload_uniform` wrote the per-stage default-uniform MTLBuffer contents without the
+  `mgl_buffers_prepare_cpu_write` hazard step required by mgl_ext_buffers.h (rename/wait against a
+  still-queued draw). Shared-file edit: MGL/src/uniforms.c (+include, +1 call) — flagged to lead.
+* test_compat_render2.c gained `immediate_mode_stress` (60 frames x 1024 translated quads,
+  verified per frame; ~35 s, keeps the binary under the run.sh timeout). test_compat_gears.c now
+  renders into an explicit FBO so the reference is display-scale independent.
+* Full suite on the clean build: 59 binaries, 442 PASS / 0 FAIL, 6506 checks, 0 failures;
+  test_geom 59/59; stress repro (80 frames) OK twice.
 
 ## How to build/test fast
 

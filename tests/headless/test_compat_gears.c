@@ -26,6 +26,44 @@
 static void *compat_ctx;
 static GLuint gear_lists[3];
 
+/* the frame renders into an explicit framebuffer: the headless default
+ * drawable is only as large as the dummy 100x100 view times the display
+ * backing scale (100..200 px, machine dependent), and pixels outside it are
+ * undefined per GL.  A 160x120 FBO makes the reference machine independent. */
+static GLuint gears_fbo;
+
+static void setup_framebuffer(void)
+{
+    GLuint color, depth;
+    GLenum status;
+
+    glGenFramebuffers(1, &gears_fbo);
+    glGenTextures(1, &color);
+    glGenRenderbuffers(1, &depth);
+
+    glBindTexture(GL_TEXTURE_2D, color);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, W, H);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, gears_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    if (status != GL_FRAMEBUFFER_COMPLETE)
+    {
+        gears_fbo = 0;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+}
+
 /* one gear, drawn in immediate mode (design after the classic glxgears gear):
  * inner_radius..outer_radius ring, `teeth` trapezoid teeth of tooth_depth,
  * thickness `width`.  The faces use per-vertex normals (smooth shading), the
@@ -293,6 +331,7 @@ int main(int argc, char **argv)
         return 1;
 
     glViewport(0, 0, W, H);
+    setup_framebuffer();
     build_lists();
 
     if (argc > 1 && strcmp(argv[1], "--dump") == 0)

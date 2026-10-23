@@ -196,7 +196,6 @@ static void upload_stream(GLMContext ctx, VertexArray *vao, GLuint attrib,
                           GLint size, GLenum type, GLboolean normalized,
                           GLsizei stride, const void *pointer, GLuint count)
 {
-    struct MGLExtState_compat *s = CS();
     size_t esz = mgl_va_element_size(type, size);
     size_t st = stride ? (size_t)stride : esz;
     const char *src = (const char *)pointer;
@@ -218,7 +217,7 @@ static void upload_stream(GLMContext ctx, VertexArray *vao, GLuint attrib,
 
     mglEnableVertexAttribArray(ctx, attrib);
 
-    (void)vao; (void)s;
+    (void)vao;
 }
 
 /* save / restore of the vertex array binding around internal draws */
