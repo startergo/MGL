@@ -2394,6 +2394,165 @@ char *mgl_geom_strip_msl_volatile(const char *msl)
     return out;
 }
 
+/* Does the MSL entry function return void?  Metal requires rasterization to be
+ * disabled for void vertex functions and enabled otherwise (an Apple-GPU pipeline
+ * validation rule both ways), and a GL vertex-only program can legitimately be
+ * either: a shader writing only SSBOs/images has no rasterization outputs and
+ * SPIRV-Cross emits `vertex void f(...)`, while one that still assigns
+ * gl_Position gets `vertex F_out f(...)`.  Finds `<entry>(` with an identifier
+ * boundary and inspects the return-type token in front of it. */
+bool mgl_msl_vertex_returns_void(const char *msl, const char *entry)
+{
+    size_t elen;
+
+    if (!msl || !entry || !(elen = strlen(entry)))
+        return false;
+
+    for (const char *p = msl; (p = strstr(p, entry)) != NULL; p += 1)
+    {
+        if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+            continue;
+        const char *after = p + elen;
+        if (*after != '(')
+            continue;
+
+        /* the token ending right before the entry name is the return type */
+        const char *e = p;
+        while (e > msl && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n'))
+            e--;
+        const char *s = e;
+        while (s > msl && (isalnum((unsigned char)s[-1]) || s[-1] == '_'))
+            s--;
+        return (e - s == 4) && strncmp(s, "void", 4) == 0;
+    }
+    return false;
+}
+
+/* ---------------------------------------------------------------- atomic counters
+ * SPIRV-Cross's MSL backend does not declare GL atomic-counter (atomic_uint) variables
+ * as entry-point arguments: the emitted MSL references `g_counter` without any
+ * declaration (`atomic_load_explicit((thread atomic_uint*)&g_counter, ...)`) and every
+ * stage using an atomic counter fails to compile.  mgl_msl_inject_atomic_counters()
+ * adds the declaration MGL itself needs:
+ *   * one `volatile device atomic_uint* <name> [[buffer(N)]]` argument is appended to
+ *     the entry function's parameter list.  N is the ordinal the renderer's buffer map
+ *     binds the atomic-counter group at: uniform blocks, the default uniform block and
+ *     SSBOs are emitted (and bound) first — those are exactly the `[[buffer(i)]]`
+ *     arguments with an index below 24 (24..30 are pinned by the tessellation /
+ *     transform-feedback / vertex-attribute domains).
+ *   * every use `(thread atomic_uint*)&<name>` is rewritten to
+ *     `(volatile device atomic_uint*)&<name>[offset/4]` so counters placed by the GLSL
+ *     `offset` layout qualifier address the right word of the buffer (the GL atomic
+ *     counter buffer is bound at base offset 0).
+ * Returns a malloc'd replacement MSL, or NULL on failure (entry not found / out of
+ * buffer slots).  *indices_out (if not NULL) receives the chosen Metal buffer index
+ * per variable. */
+char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
+                                     const MGLAtomicCounterVar *vars, int nvars,
+                                     int *indices_out)
+{
+    if (!msl || !entry || !vars || nvars <= 0)
+        return NULL;
+
+    /* the entry function definition: <ret> <entry>(<params>) — require an identifier
+     * boundary so a name that prefixes another identifier is not matched */
+    size_t elen = strlen(entry);
+    const char *sig = NULL;
+
+    for (const char *p = msl; (p = strstr(p, entry)) != NULL; p += 1)
+    {
+        if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+            continue;
+        const char *after = p + elen;
+        while (*after == ' ' || *after == '\t')
+            after++;
+        if (*after == '(')
+        {
+            sig = after;
+            break;
+        }
+    }
+    if (!sig)
+        return NULL;
+
+    /* balanced-paren scan to the closing paren of the parameter list */
+    const char *close = sig;
+    int depth = 0;
+    while (*close)
+    {
+        if (*close == '(') depth++;
+        else if (*close == ')') { if (--depth == 0) break; }
+        close++;
+    }
+    if (depth != 0 || *close != ')')
+        return NULL;
+
+    /* how many buffer arguments SPIRV-Cross emitted below the pinned range */
+    int base = 0;
+    for (const char *q = sig; (q = strstr(q, "[[buffer(")) != NULL && q < close; )
+    {
+        int idx = atoi(q + 9);
+        if (idx >= 0 && idx < 24)
+            base++;
+        q += 9;
+    }
+    if (base + nvars > 24)
+        return NULL;   /* would run into the tessellation / xfb pinned indices */
+
+    /* build the parameter declarations to insert before the closing paren */
+    size_t add_len = 2;
+    char add[4096];
+    add[0] = 0;
+    for (int i = 0; i < nvars; i++)
+    {
+        int idx = base + i;
+        char one[256];
+        snprintf(one, sizeof one, "%svolatile device atomic_uint* %s [[buffer(%d)]]",
+                 (i || sig + 1 < close) ? ", " : "", vars[i].name, idx);
+        if (strlen(add) + strlen(one) + 1 > sizeof add)
+            return NULL;
+        strcat(add, one);
+        if (indices_out)
+            indices_out[i] = idx;
+        add_len += strlen(one) + 32;
+    }
+
+    size_t len = strlen(msl);
+    size_t insert_at = (size_t)(close - msl);
+    char *out = (char *)malloc(len + add_len);
+    if (!out)
+        return NULL;
+    memcpy(out, msl, insert_at);
+    memcpy(out + insert_at, add, strlen(add));
+    memcpy(out + insert_at + strlen(add), msl + insert_at, len - insert_at + 1);
+
+    /* re-point the atomic expressions at the declared arguments */
+    for (int i = 0; i < nvars; i++)
+    {
+        char bad[300], good[320];
+        snprintf(bad, sizeof bad, "(thread atomic_uint*)&%s", vars[i].name);
+        if (vars[i].offset)
+            snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u]",
+                     vars[i].name, vars[i].offset / 4);
+        else
+            snprintf(good, sizeof good, "(volatile device atomic_uint*)%s", vars[i].name);
+        if (!strstr(out, bad))
+        {
+            free(out);
+            return NULL;
+        }
+        for (char *q = out; (q = strstr(q, bad)) != NULL; )
+        {
+            size_t bl = strlen(bad), gl = strlen(good);
+            memmove(q + gl, q + bl, strlen(q + bl) + 1);
+            memcpy(q, good, gl);
+            q += gl;
+        }
+    }
+
+    return out;
+}
+
 static struct { int read; bool draw, xfb, cpu_xfb, cpu_assembly; } gEnv = { 0, false, false, false, false };
 
 static bool geom_env(int which)

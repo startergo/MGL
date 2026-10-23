@@ -311,6 +311,19 @@ size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);
+/* MSL pass (program.c): declare GL atomic-counter (atomic_uint) arguments SPIRV-Cross
+ * omits — see geometry.c for the buffer-index scheme */
+#define MGL_MAX_ATOMIC_VARS 32
+typedef struct MGLAtomicCounterVar
+{
+    const char *name;      /* points at name_buf once collected in program.c */
+    char name_buf[256];
+    unsigned offset;       /* SpvDecorationOffset, byte offset into the counter buffer */
+} MGLAtomicCounterVar;
+char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
+                                     const MGLAtomicCounterVar *vars, int nvars,
+                                     int *indices_out);
+bool mgl_msl_vertex_returns_void(const char *msl, const char *entry);
 /* post-link hook: replaces the vertex stage with the pass-through function */
 void mgl_geom_post_link(GLMContext ctx, struct Program_t *program);
 bool mgl_geom_link_failed(GLMContext ctx, struct Program_t *program, const char **reason);

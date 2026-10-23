@@ -3576,9 +3576,33 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
  * geometry stage's pass-through vertex function owns the vertex table, whose slot
  * MGL_SSBO_SIZE_BUFFER_INDEX is MGL_GEOM_MSL_VSOUT — the pass-through never reads
  * sizes (the program's vertex stage runs as a capture kernel before the pass). */
-- (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex
+/* an empty fragment function for vertex-only pipelines: Apple GPUs reject a render
+ * pipeline with rasterizationEnabled=NO whose vertex function has a non-void return
+ * (every GL vertex-only program still declares gl_Position), so the pipeline keeps
+ * rasterization enabled with this no-output fragment function and no attachments —
+ * nothing can be rasterized, and the vertex stage's side effects (SSBO / image /
+ * atomic-counter writes, the whole point of a vertex-only draw) still execute.
+ * Rasterizer discard collapses the vertices through the same fixup constant. */
+- (id<MTLFunction>) geomEmptyFragmentFunction
 {
-    Program *p = ctx->state.program;
+    static id<MTLFunction> fn = nil;
+    static bool tried = false;
+
+    if (!fn && !tried)
+    {
+        tried = true;
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                        @"fragment void mgl_empty_fragment() { }\n";
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:src options:nil error:&err];
+        if (lib)
+            fn = [lib newFunctionWithName:@"mgl_empty_fragment"];
+    }
+    return fn;
+}
+
+- (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex
+{    Program *p = ctx->state.program;
 
     if (!p || stage < 0 || !p->spirv[stage].msl_str) return;
     if (!strstr(p->spirv[stage].msl_str, "spvBufferSizeConstants")) return;

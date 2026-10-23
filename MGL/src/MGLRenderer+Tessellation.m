@@ -1215,6 +1215,35 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
         [enc setTexture: mtl atIndex: (NSUInteger)r];
     }
+
+    /* storage images (glBindImageTexture): the image unit's level/layer view bound at the
+     * MSL slot SPIRV-Cross assigned (msl_binding — texture slots continue after the
+     * sampled images).  Mirrors the render path's storage-image binding (MGLRenderer.m /
+     * geomImageUnitView, shared with the compute and geometry paths). */
+    SpirvResourceList *slist = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+
+    for (int r = 0; r < slist->count && r < 16; r++)
+    {
+        SpirvResource *sres = &slist->list[r];
+        int unit = sres->binding;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+
+        for (GLuint e = 0; e < elems; e++)
+        {
+            if (unit < 0 || (GLuint)(unit + e) >= TEXTURE_UNITS) continue;
+            ImageUnit *iu = &STATE(image_units[unit + e]);
+            Texture *tex = iu->tex;
+
+            if (!tex) continue;             /* unbound unit: legal GL, undefined results */
+            [self2 bindMTLTexture: tex];
+            if (!tex->mtl_data) continue;
+            id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
+
+            texture = [self2 geomImageUnitView: iu base: texture];
+            if (sres->msl_binding < 31)
+                [enc setTexture: texture atIndex: (NSUInteger)(sres->msl_binding + e)];
+        }
+    }
 }
 
 /* ---- index-scan cache ------------------------------------------------------------

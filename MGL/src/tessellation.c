@@ -4657,7 +4657,11 @@ MGLTessProgram *mgl_tess_active_program(GLMContext ctx)
     Program *tes = NULL;
     MGLTessProgram *tp;
 
-    if (ctx->state.program)
+    /* geom: a bound program pipeline installs its COMPOSITE as state.program during
+     * processGLState (MGL_PIPELINE_PROGRAM_SCOPE); the composite (name 0) has no
+     * tess record of its own — resolve through the pipeline's stage programs below
+     * or the TES render pass builds its pipeline with the plain vertex function */
+    if (ctx->state.program && ctx->state.program->name != 0)
     {
         tes = ctx->state.program;
     }

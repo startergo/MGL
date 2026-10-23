@@ -582,12 +582,12 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
          * (MGLRenderer+Geometry.m's resource walk), so it supports the full set of image units;
          * the vertex stage is a real Metal vertex function taking image arguments (bound by
          * bindTexturesToCurrentRenderEncoder with the level/layer image-unit view) — both
-         * support all 8 units (KHR-GL46.shader_image_size basic-*-gs/vs).  TCS/TES keep 0
-         * until the tess kernels bind image units (their resource walk covers samplers). */
+         * support all 8 units (KHR-GL46.shader_image_size basic-*-gs/vs).  The TCS/TES
+         * kernels bind image units too (tessBindStageTextures storage-image loop). */
         case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
-        case GL_MAX_VERTEX_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
+        case GL_MAX_VERTEX_IMAGE_UNIFORMS:
         case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
-        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(0);
+        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
         case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
         case GL_MAX_COMBINED_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
@@ -705,12 +705,13 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(shader_storage_buffer_offset_alignment), 16));
 
         /* atomic counters */
-        /* vertex / tessellation / geometry stages report no atomic counter buffer support
-         * (glslang bakes the same 0 into gl_Max*AtomicCounterBuffers); the fragment and
-         * compute stages bind atomic counter buffers through the same indexed binding
-         * points the renderer maps (MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS = 8) — GL 4.6
-         * requires at least 1 (fragment) / 8 (compute), which the 8 binding points meet */
-        case GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS:
+        /* vertex / fragment / compute stages declare the atomic_uint argument MGL itself
+         * injects into the MSL (SPIRV-Cross declares none — see geometry.c's
+         * mgl_msl_inject_atomic_counters) and bind atomic counter buffers through the
+         * same indexed binding points the renderer maps (8).  Tessellation and geometry
+         * stages run as hand-authored kernels where the argument is not injected, so
+         * they report 0 (glslang bakes the same 0 into gl_Max*AtomicCounterBuffers). */
+        case GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS: PUT1(MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS); /* see above */
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */

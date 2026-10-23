@@ -1655,6 +1655,11 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         goto done;
     }
 
+    /* atomic counters: names + SPIR-V offsets, for the MSL argument injection below
+     * (SPIRV-Cross declares no atomic_uint arguments at all) */
+    MGLAtomicCounterVar atvars[MGL_MAX_ATOMIC_VARS];
+    int natvars = 0;
+
     for (int res_type = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER; res_type < SPVC_RESOURCE_TYPE_ACCELERATION_STRUCTURE && res_type < _MAX_SPIRV_RES; res_type++)
     {
         const spvc_reflected_resource *list = NULL;
@@ -1751,6 +1756,15 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                         if (acc->atomic_bindings[k] == r->binding) known = 1;
                     if (!known && acc->num_atomic < 64)
                         acc->atomic_bindings[acc->num_atomic++] = r->binding;
+                    /* remember name + offset for the MSL argument injection */
+                    if (natvars < MGL_MAX_ATOMIC_VARS && strlen(rname) < sizeof atvars[0].name_buf)
+                    {
+                        MGLAtomicCounterVar *v = &atvars[natvars++];
+                        memset(v, 0, sizeof *v);
+                        v->name = v->name_buf;
+                        snprintf(v->name_buf, sizeof v->name_buf, "%s", rname);
+                        v->offset = (unsigned)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationOffset);
+                    }
                     break;
                 }
 
@@ -1823,6 +1837,24 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             tess_owned = stripped;
             result = stripped;
         }
+    }
+
+    /* atomic counters: declare the atomic_uint arguments (geometry.c — see the
+     * buffer-index scheme there) at the ordinals the renderer's buffer map binds
+     * the atomic-counter group at */
+    int atidx[MGL_MAX_ATOMIC_VARS];
+    if (natvars > 0)
+    {
+        char *injected = mgl_msl_inject_atomic_counters(result, msl_entry, atvars, natvars, atidx);
+        if (!injected)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: atomic counter buffer arguments could not be "
+                                     "declared (out of Metal buffer indices?)\n", stage_label(stage));
+            goto done;
+        }
+        if (tess_owned != result) free(tess_owned);
+        tess_owned = injected;
+        result = injected;
     }
 
     /* AGX: gather_compare AND plain gather are broken in vertex and compute
@@ -1921,6 +1953,15 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             if (msl_b < 31)
                 rl->list[i].msl_binding = msl_b;
         }
+    }
+
+    /* atomic counters: SPIRV-Cross assigned no argument index (it emitted none); the
+     * indices chosen by the MSL injection above are the real ones */
+    if (natvars > 0)
+    {
+        SpirvResourceList *arl = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_ATOMIC_COUNTER];
+        for (GLuint i = 0; i < arl->count && (int)i < natvars; i++)
+            arl->list[i].msl_binding = (GLuint)atidx[i];
     }
 
     /*

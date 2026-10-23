@@ -2074,7 +2074,10 @@ static char kComputeFallbackKey;
              * geomImageUnitView (shared with the compute / tess / geometry paths) */
             texture = [self geomImageUnitView: iu base: texture];
 
-            if (stage == _VERTEX_SHADER)
+            /* the first entry of bindTextures' stage list is always a vertex-side
+             * function (the plain vertex stage, or the TES running as the post-
+             * tessellation vertex function): its image arguments are vertex slots */
+            if (stage != _FRAGMENT_SHADER)
                 [_currentRenderEncoder setVertexTexture: texture atIndex: mtl_index + e];
             else
                 [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index + e];
@@ -3047,13 +3050,26 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if (vertex_only)
     {
         /* nothing rasterizes: keep the descriptor free of attachment formats the
-         * absent fragment stage would have to match, and disable rasterization so
-         * Metal accepts the nil fragment function */
+         * absent fragment stage would have to match.  geom: Apple GPUs demand
+         * rasterization disabled exactly for void vertex functions — a GL
+         * vertex-only program can be either shape (a shader writing only
+         * SSBOs/images emits `vertex void f(...)`, one that still assigns
+         * gl_Position emits a struct return).  Void: rasterization stays off
+         * (rstateConfigurePipelineDescriptor derives it from the nil fragment
+         * function).  Non-void: the cached empty fragment function keeps
+         * rasterization enabled; with no attachments nothing can be rasterized
+         * while the vertex stage's side effects (SSBO / image / atomic writes)
+         * still run. */
         for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
             pipelineStateDescriptor.colorAttachments[i].pixelFormat = MTLPixelFormatInvalid;
         pipelineStateDescriptor.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
         pipelineStateDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
-        pipelineStateDescriptor.rasterizationEnabled = NO;
+
+        int vstage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+        const char *vmsl = program->spirv[vstage].msl_str;
+        const char *ventry = program->spirv[vstage].entry_point;
+        if (!mgl_msl_vertex_returns_void(vmsl, ventry))
+            pipelineStateDescriptor.fragmentFunction = [self geomEmptyFragmentFunction];
     }
 
     // blend / masks / raster / shader-variant state (rstate category)

@@ -186,6 +186,11 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * compute tables; no-op when the stage MSL does not reference it */
 - (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex;
 - (void) geomBindSSBOSizesCompute: (id <MTLComputeCommandEncoder>) enc;
+/* geom: a cached empty fragment function (no outputs) used for vertex-only pipelines —
+ * Apple GPUs reject rasterizationEnabled=NO with a non-void vertex function, so a
+ * program without a fragment stage renders nothing (no attachments) through it while
+ * its vertex-stage side effects (SSBO / image / atomic writes) still run */
+- (id<MTLFunction>) geomEmptyFragmentFunction;
 /* geom: when the pass-through vertex override is active, a specialized copy of it (the same
  * rstate vertex function constants — it is the last pre-rasterization stage); NULL when the
  * override is inactive, so the caller leaves the descriptor's vertex function alone */
