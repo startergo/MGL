@@ -304,6 +304,9 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
             uint64_t v = 0;
             ctx->mtl_funcs.ext_geom->query_read(ctx, word, &v);
             q->cpu_count += v;
+            if (getenv("MGL_TESS_DEBUG") && target == GL_PRIMITIVES_GENERATED)
+                fprintf(stderr, "MGL tess: end PG query id=%u cpu=%llu geom_word%u=%llu\n",
+                        q->name, (unsigned long long)q->cpu_count, word, (unsigned long long)v);
         }
     }
 

@@ -2409,6 +2409,8 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
         obj->link_status = GL_FALSE;
         if (source == LINK_FROM_EXECUTABLES)
             exec_free(ctx, obj);
+        if (getenv("MGL_SHADER_DUMP") && log)
+            fprintf(stderr, "MGL: program %u link failed: %s\n", obj->base.name, log);
     }
 
     obj->validate_status = GL_FALSE;

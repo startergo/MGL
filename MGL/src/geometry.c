@@ -965,6 +965,8 @@ static void geom_fail(GLMContext ctx, MGLGeomProgram *gp, const char *fmt, ...)
     free(gp->fail);
     gp->fail = xstrdup(buf);
     gp->linked = false;
+    if (getenv("MGL_GEOM_TRACE_DRAW"))
+        fprintf(stderr, "geom: build failed: %s\n", buf);
 }
 
 /* ------------------------------------------------------------------ glslang / SPIRV-Cross wrappers */
@@ -2110,6 +2112,13 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 memset(out, 0, sizeof(*out));
                 snprintf(out->name, sizeof(out->name), "%s", anon ? mn : inst);
                 snprintf(out->member, sizeof(out->member), "%s", anon ? "" : mn);
+                /* the block NAME (a non-anonymous interface block's type name) names the
+                 * member through the API: glTransformFeedbackVaryings writes "Block.member" */
+                if (!anon)
+                {
+                    const char *bn = spv_name(m, t->id);
+                    if (bn && bn[0]) snprintf(out->block, sizeof(out->block), "%s", bn);
+                }
                 out->elems = melems;
                 out->xfb_buffer = -1;
                 out->xfb_offset = 0xffffffffu;
@@ -3210,6 +3219,141 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     return sb_take(&b);
 }
 
+/* Remove duplicate "struct NAME { ... }; NAME <instance>..." declarations: a shader's input
+ * and output interface blocks may share the block NAME, and the per-statement emitter of
+ * the transformed kernel source writes one "struct" per block.  Returns a malloc'd deduped
+ * source, or NULL when nothing needed removing. */
+static char *geom_dedupe_iface_structs(const char *src)
+{
+    if (!src)
+        return NULL;
+
+    struct { char name[64]; char body[512]; } seen[32];
+    int nseen = 0, edits = 0;
+    char *out = NULL;
+    size_t out_len = 0;
+    FILE *mem = open_memstream(&out, &out_len);
+    size_t i = 0;
+
+    if (!mem)
+        return NULL;
+    while (src[i])
+    {
+        const char *st = strstr(src + i, "struct ");
+        if (!st)
+        {
+            fputs(src + i, mem);
+            break;
+        }
+        size_t at = (size_t)(st - src);
+        fwrite(src + i, 1, at - i, mem);
+        /* parse "struct NAME {" */
+        size_t p = at + strlen("struct ");
+        char name[64] = "";
+        size_t k = 0;
+        while (isalnum((unsigned char)src[p]) || src[p] == '_' && k + 1 < sizeof(name))
+            name[k++] = src[p++];
+        name[k] = 0;
+        while (src[p] == ' ' || src[p] == '\t') p++;
+        if (!name[0] || src[p] != '{')
+        {
+            /* not a struct definition: copy the keyword and continue after it */
+            fwrite(src + at, 1, p - at, mem);
+            i = p;
+            continue;
+        }
+        /* find the matching close brace */
+        size_t b = p + 1;
+        int depth = 1;
+        while (src[b] && depth)
+        {
+            if (src[b] == '{') depth++;
+            else if (src[b] == '}') depth--;
+            if (src[b]) b++;
+        }
+        /* the emitter writes "}; NAME inst..." right after: the declaration ends at the
+         * next ';' after '}' */
+        size_t e = b;
+        while (src[e] && src[e] != ';') e++;
+        char body[512] = "";
+        {
+            size_t n = b - (p + 1);
+            if (n >= sizeof(body)) n = sizeof(body) - 1;
+            memcpy(body, src + p + 1, n);
+            body[n] = 0;
+        }
+        int dup = -1;
+        for (int s = 0; s < nseen; s++)
+            if (!strcmp(seen[s].name, name))
+            {
+                dup = strcmp(seen[s].body, body) ? 0x100 /* differs: keep both, see below */
+                                                  : s;
+                break;
+            }
+        if (dup >= 0 && dup != 0x100)
+        {
+            /* identical redefinition: drop the whole "struct NAME { ... };" — anything
+             * after the struct's own ';' (the instance declaration) flows through */
+            size_t semi = b;                      /* first char after '}' */
+            while (src[semi] && isspace((unsigned char)src[semi])) semi++;
+            if (src[semi] == ';')
+            {
+                i = semi + 1;                     /* skip "struct ... };" plus its ';' */
+            }
+            else
+            {
+                /* "struct N { ... } inst;" (instance attached): keep the type reference */
+                fwrite(name, 1, strlen(name), mem);    /* "NAME" in place of the struct */
+                i = b + 1;                             /* continue after '}' */
+            }
+            edits++;
+            continue;
+        }
+        if (dup == 0x100)
+        {
+            /* same NAME, different members: rename the second struct (and its declaration
+             * on this line) so both can coexist */
+            char renamed[64], line[1024];
+            snprintf(renamed, sizeof(renamed), "%s_2", name);
+            size_t n = e + 1 - at;
+            if (n >= sizeof(line)) n = sizeof(line) - 1;
+            memcpy(line, src + at, n);
+            line[n] = 0;
+            for (char *q = line; (q = strstr(q, name)); )
+            {
+                size_t pos = q - line;
+                if ((pos == 0 || !isalnum((unsigned char)q[-1]) && q[-1] != '_') &&
+                    !isalnum((unsigned char)q[strlen(name)]) && q[strlen(name)] != '_')
+                {
+                    memmove(q + strlen(renamed), q + strlen(name), strlen(q + strlen(name)) + 1);
+                    memcpy(q, renamed, strlen(renamed));
+                    q += strlen(renamed);
+                }
+                else q += strlen(name);
+            }
+            fputs(line, mem);
+            i = e + 1;
+            edits++;
+            continue;
+        }
+        if (nseen < (int)(sizeof(seen) / sizeof(seen[0])))
+        {
+            snprintf(seen[nseen].name, sizeof(seen[0].name), "%s", name);
+            snprintf(seen[nseen].body, sizeof(seen[0].body), "%s", body);
+            nseen++;
+        }
+        fwrite(src + at, 1, e + 1 - at, mem);
+        i = e + 1;
+    }
+    fclose(mem);
+    if (!edits)
+    {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src,
                                   const SpvModule *gs_m, char **log)
 {
@@ -3241,6 +3385,18 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
         return NULL;
     }
     geom_dump("gs.transformed.glsl", transformed);
+    {
+        /* a shader's input and output interface blocks may share a block NAME ("in B {..}
+         * user_in[]; out B {..} user_out;"): the per-statement emitter writes a "struct B"
+         * for each, and GLSL rejects the redefinition.  Drop the duplicates (keeping the
+         * first definition; the bodies are member-identical when the stages match). */
+        char *dedup = geom_dedupe_iface_structs(transformed);
+        if (dedup)
+        {
+            free(transformed);
+            transformed = dedup;
+        }
+    }
     nover = strip_version(transformed);
     free(transformed);
     {
@@ -4901,6 +5057,8 @@ bool mgl_program_check_geom_link(GLMContext ctx, Program *program)
     if (!mgl_geom_link_failed(ctx, program, &glog)) return true;
 
     obj->link_status = false;
+    if (getenv("MGL_SHADER_DUMP"))
+        fprintf(stderr, "MGL: program %u geom link failed: %s\n", obj->base.name, glog ? glog : "?");
     if (glog && glog[0])
     {
         size_t len = strlen(glog) + (obj->info_log ? strlen(obj->info_log) : 0) + 8;
@@ -5931,6 +6089,10 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
     xp->vars = calloc(n, sizeof(MGLXfbVarying));
     if (!xp->vars) return;
     xp->count = n;
+    if (getenv("MGL_TESS_DUMP_CAP"))
+        for (int k = 0; k < nvars; k++)
+            fprintf(stderr, "tessxfb-var: name='%s' block='%s' member='%s' elems=%u words=%u off=%u\n",
+                    vars[k].name, vars[k].block, vars[k].member, vars[k].elems, vars[k].words, vars[k].offset);
 
     for (GLuint i = 0; i < n; i++)
     {
@@ -6038,7 +6200,11 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             if (dot)
             {
                 size_t ilen = (size_t)(dot - match);
-                if (!strncmp(vars[k].name, match, ilen) && vars[k].name[ilen] == 0 &&
+                /* a member is named "<instance>.<member>" in shader sources but "<block>.<member>"
+                 * through the API (glTransformFeedbackVaryings names interface-block members by
+                 * their BLOCK name), so accept either prefix */
+                if ((!strncmp(vars[k].name, match, ilen) && vars[k].name[ilen] == 0 ||
+                     vars[k].block[0] && !strncmp(vars[k].block, match, ilen) && vars[k].block[ilen] == 0) &&
                     !strcmp(vars[k].member, dot + 1))
                 { j = k; break; }
             }
@@ -6149,6 +6315,37 @@ void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program)
     /* gl_Position is the first word of every capture record; the tess output capture does not
      * record gl_PointSize (a TES writing it would be dropped) */
     geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage");
+}
+
+/* transform feedback varyings on a SEPARABLE TCS-only program (no vs/tes/gs): the names
+ * resolve against the control stage's outputs, which are per-vertex arrays (and per-patch
+ * outs).  Such a program can never feed a draw by itself (GL_PATCHES needs a TES), so the
+ * link only fills the varying table — no capture is built. */
+void mgl_geom_tcs_xfb_link(GLMContext ctx, Program *program)
+{
+    MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
+    MGLGeomVar vars[MGL_GEOM_MAX_VARYINGS];
+    SpvModule *m = NULL;
+    const char *err = NULL;
+    int n = 0;
+
+    if (!xp || !program || !program->spirv[_TESS_CONTROL_SHADER].ir) return;
+    m = spv_parse(program->spirv[_TESS_CONTROL_SHADER].ir,
+                  program->spirv[_TESS_CONTROL_SHADER].size, &err);
+    if (!m)
+    {
+        char *log = NULL;
+        mgl_append_info_log(&log, "ERROR: transform feedback: TCS reflection failed (%s)\n",
+                            err ? err : "SPIR-V parse failed");
+        free(xp->link_log);
+        xp->link_log = log;
+        xp->link_failed = true;
+        return;
+    }
+    if (!geom_reflect_stage(m, false, vars, &n, NULL))
+        n = 0;
+    spv_free(m);
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation control stage");
 }
 
 /* the active transform feedback object (the xfb domain's current-object rule) */
@@ -6480,12 +6677,38 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     MGLXfbObject *o = geom_xfb_object(ctx);
     MGLXfbProgram *xp = geom_xfb_prog(ctx, program, false);
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
+    BufferBaseTarget live[4];           /* base binds re-sized after binding (below) */
     const MGLTessCapture *c;
     MGLGeomTessXfbSource src;
     GLuint b;
     bool ok;
 
-    if (!program || !o || !o->active || !xp || !xp->count) return false;
+    if (!program || !o || !o->active || !xp || !xp->count)
+    {
+        if (getenv("MGL_TESS_DUMP_CAP"))
+            fprintf(stderr, "tessxfb-skip: program=%p obj=%p active=%d xp=%p count=%d\n",
+                    (void *)program, (void *)o, o ? (int)o->active : -1,
+                    (void *)xp, xp ? (int)xp->count : -1);
+        return false;
+    }
+    /* A *Base binding refers to the buffer's whole CURRENT store: glBufferData re-defines
+     * it, and the context's base table only snapshots the size at bind time.  The CTS
+     * re-sizes the transform feedback buffer between draws (bind once, bufferData per
+     * draw), so the pack's fill test must see the live size or every draw after a resize
+     * loses records beyond the stale bound. */
+    for (b = 0; b < 4; b++)
+    {
+        live[b] = tfb[b];
+        if (b < MGL_XFB_MAX_BUFFERS && tfb[b].buf && o->is_base[b])
+        {
+            GLsizeiptr total = (GLsizeiptr)tfb[b].buf->size;
+            if (tfb[b].buf->data.buffer_size &&
+                (GLsizeiptr)tfb[b].buf->data.buffer_size < total)
+                total = (GLsizeiptr)tfb[b].buf->data.buffer_size;
+            live[b].size = (tfb[b].offset < total) ? (total - tfb[b].offset) : 0;
+        }
+    }
+    tfb = live;
     if (geom_env(2)) return false;
     if (mgl_geom_xfb_pending(ctx) && !geom_xfb_gpu_valid(ctx, o->name)) mgl_geom_xfb_flush(ctx);
     if (xp->count > MGL_GEOM_XFB_MAX_VARS) return false;
@@ -6506,7 +6729,14 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     if (!ok) return false;
 
     c = mgl_tess_get_capture(ctx);
-    if (!c || !c->valid || !c->buffer_object || !c->stride) return true;   /* nothing captured */
+    if (!c || !c->valid || !c->buffer_object || !c->stride)
+    {
+        if (getenv("MGL_TESS_DUMP_CAP"))
+            fprintf(stderr, "tessxfb-nocap: c=%p valid=%d buf=%p stride=%u\n",
+                    (const void *)c, c ? (int)c->valid : -1,
+                    c ? (void *)c->buffer_object : NULL, c ? c->stride : 0u);
+        return true;   /* nothing captured */
+    }
     if (geom_env(1))
         for (uint32_t k = 0; k < c->members; k++)
             fprintf(stderr, "geom: tess capture member[%u] '%s' off=%u words=%u\n",
@@ -6528,13 +6758,57 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
 
         if (!strcmp(nm, "gl_Position")) { v->src_word = 0; continue; }   /* always first */
         for (uint32_t k = 0; k < c->members; k++)
-            if (!strcmp(c->member[k].name, nm))
+        {
+            const char *cn = c->member[k].name;
+            bool hit = !strcmp(cn, nm);
+            if (!hit)
+            {
+                /* the TF varying may name the member through the BLOCK name while the
+                 * capture records the MSL record field ("BLOCK_INOUT.value" vs
+                 * "user_out_value"): match the member suffix after the final separator */
+                const char *cd = strrchr(cn, '.'), *nd = strrchr(nm, '.');
+                if (cd && nd && !strcmp(cd, nd))
+                    hit = true;
+                if (!hit)
+                {
+                    const char *cu = strrchr(cn, '_'), *nd2 = strrchr(nm, '.');
+                    if (cu && nd2 && !strcmp(cu + 1, nd2 + 1))
+                        hit = true;
+                }
+            }
+            if (hit)
             {
                 v->src_word = c->member[k].offset;
                 if (!w) w = c->member[k].words;
                 found = true;
                 break;
             }
+        }
+        if (!found)
+        {
+            /* matrices (and flattened array elements) are recorded as split members
+             * "<name>_<i>": consume all of them, starting at the lowest offset */
+            size_t nl = strlen(nm);
+            uint32_t lo = ~0u, tw = 0;
+
+            for (uint32_t k = 0; k < c->members; k++)
+            {
+                const char *cn = c->member[k].name;
+
+                if (strlen(cn) > nl + 1 && !strncmp(cn, nm, nl) && cn[nl] == '_' &&
+                    cn[nl + 1] >= '0' && cn[nl + 1] <= '9')
+                {
+                    if (c->member[k].offset < lo) lo = c->member[k].offset;
+                    tw += c->member[k].words;
+                }
+            }
+            if (tw)
+            {
+                v->src_word = lo;
+                if (!w) w = tw;
+                found = true;
+            }
+        }
         if (!found && v->type != GL_NONE)
         {
             /* a varying the capture does not record (e.g. gl_PointSize): record nothing for it
@@ -6592,10 +6866,13 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
         MGLTessProgram *atp = mgl_tess_active_program(ctx);
 
         fprintf(stderr, "tessxfb: capstride=%uw per_prim=%u records=%u prim=%s nvars=%d bstride=%u"
-                " tfsize=%d tp=%p pair=%d has_tcs=%d dom=%d pm=%d:",
+                " tfsize=%d bufsz=%d bufname=%u tp=%p pair=%d has_tcs=%d dom=%d pm=%d:",
                 c->stride, src.per_prim, c->records,
                 c->prim == GL_TRIANGLES ? "TRI" : c->prim == GL_LINES ? "LINE" : "PTS", xp->count,
-                xp->stride[0], (int)tfb[0].size, (void *)atp, atp->pair_program != NULL,
+                xp->stride[0], (int)tfb[0].size,
+                tfb[0].buf ? (int)tfb[0].buf->size : -1,
+                tfb[0].buf ? tfb[0].buf->name : 0,
+                (void *)atp, atp->pair_program != NULL,
                 atp->has_tcs, atp->domain, atp->point_mode);
         for (GLsizei i = 0; i < xp->count; i++)
             fprintf(stderr, " %s(w%u src%u off%u)", xp->vars[i].name ? xp->vars[i].name : "?",

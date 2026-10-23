@@ -108,7 +108,8 @@ typedef struct MGLTessPatchMember_t {
  * uint32 at index_offset. */
 #define MGL_TESS_CAPTURE_MAX 16
 typedef struct MGLTessCaptureMember {
-    char     name[64];
+    char     name[64];       /* record field name, as the MSL kernel writes it */
+    char     api[64];        /* the API-facing name ("Block.member"), when it differs */
     uint32_t words;       /* packed word count of this member */
     uint32_t offset;      /* word offset within the record */
 } MGLTessCaptureMember;
@@ -132,6 +133,13 @@ typedef struct MGLTessCapture {
 } MGLTessCapture;
 
 void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable);
+/* GLSL compat: gl_PerVertex (gl_in/gl_out) may be redeclared as a SUBSET of the default
+ * members (GLSL 4.60 §7.1.2), but glslang's cross-stage link rejects the interface unless
+ * both sides declare the same member set — which the CTS tessellation shaders exercise
+ * across vs/tcs/te/gs.  The rewrite expands any gl_PerVertex redeclaration to the full
+ * built-in set (added outputs are never written, added inputs never read).
+ * Returns a malloc'd rewritten source, or NULL when no rewrite is needed. */
+char *mgl_tess_glsl_compat(GLenum type, const char *src);
 const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx);   /* last capture */
 
 typedef struct MGLTessProgram_t {

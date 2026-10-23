@@ -1882,6 +1882,13 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         mgl_geom_tess_xfb_link(ctx, p);
         return;
     }
+    if (p->shader_slots[_TESS_CONTROL_SHADER]) {
+        /* a separable TCS-only program: the varyings resolve against the control stage's
+         * outputs; no capture is built (GL_PATCHES needs a TES, so the program can never
+         * feed a draw on its own) but the link must succeed */
+        mgl_geom_tcs_xfb_link(ctx, p);
+        return;
+    }
 
     if (!vs || !vs->src) {
         xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);

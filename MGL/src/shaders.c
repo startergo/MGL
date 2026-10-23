@@ -30,6 +30,7 @@
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_tess.h"
 
 const glslang_resource_t* glslang_default_resource(void);
 
@@ -662,6 +663,17 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     /* GL-legal but SPIR-V-hostile constructs (layout(shared)/layout(packed) blocks, ...) are
      * rewritten first: cts_glsl_compat.c.  Freed after glslang has copied the source. */
     char *compat = mgl_cts_glsl_compat(mgl_introspect_shader_source(ctx, ptr));
+    {
+        /* tess: a gl_PerVertex (gl_in) redeclared as a subset of the producer's members is
+         * legal GL; glslang's cross-stage link rejects it — expand it (mgl_ext_tess.h) */
+        const char *cur = compat ? compat : mgl_introspect_shader_source(ctx, ptr);
+        char *tcompat = mgl_tess_glsl_compat(ptr->type, cur);
+        if (tcompat)
+        {
+            free(compat);
+            compat = tcompat;
+        }
+    }
     initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
 
     glsl_shader = glslang_shader_create(&glsl_input);

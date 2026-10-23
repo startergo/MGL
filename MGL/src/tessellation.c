@@ -69,6 +69,156 @@ static void tess_reset_scratch(struct MGLExtState_tess *t)
     t->patch_count = 0;
 }
 
+/* ------------------------------------------------------------------ GLSL compat
+ * GLSL 4.60 §7.1.2: a tessellation shader may redeclare gl_in/gl_out (gl_PerVertex) with a
+ * SUBSET of the default members, and the interface stays legal when both sides declare the
+ * same subset.  glslang's cross-stage link instead demands the two blocks carry the SAME
+ * member set ("vertex block member has no corresponding member in tessellation control
+ * block").  Expanding every gl_PerVertex redeclaration of a tessellation stage to the full
+ * built-in set is semantically identical (added outputs are never written, added inputs
+ * never read), so the rewrite splices the missing members in. */
+static const char *tess_pervtx_name[4] = {
+    "gl_Position", "gl_PointSize", "gl_ClipDistance", "gl_CullDistance",
+};
+
+/* find the matching close brace, skipping // and /* comments */
+static size_t tess_skip_ws_comments(const char *s, size_t i)
+{
+    for (;;)
+    {
+        while (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') i++;
+        if (s[i] == '/' && s[i + 1] == '/') { while (s[i] && s[i] != '\n') i++; continue; }
+        if (s[i] == '/' && s[i + 1] == '*')
+        {
+            i += 2;
+            while (s[i] && !(s[i] == '*' && s[i + 1] == '/')) i++;
+            i = s[i] ? i + 2 : i;
+            continue;
+        }
+        return i;
+    }
+}
+
+char *mgl_tess_glsl_compat(GLenum type, const char *src)
+{
+    if (!src ||
+        (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
+         type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
+        return NULL;
+    if (!strstr(src, "gl_PerVertex"))
+        return NULL;
+
+    /* gl_CullDistance is an ARB extension before GLSL 4.50: expanding a subset
+     * redeclaration with it would fail ("block redeclaration has extra members") */
+    int version = 0;
+    {
+        const char *v = strstr(src, "#version");
+        if (v)
+            version = atoi(v + strlen("#version"));
+    }
+    const char *pervtx_member[4] = {
+        "vec4 gl_Position",
+        "float gl_PointSize",
+        "float gl_ClipDistance[]",
+        version >= 450 ? "float gl_CullDistance[]" : NULL,
+    };
+
+    char *out = NULL;
+    size_t out_len = 0;
+    FILE *mem = open_memstream(&out, &out_len);
+    char *tokctx = NULL, *tokctx2 = NULL;
+    if (!mem)
+        return NULL;
+
+    size_t i = 0;
+    while (src[i])
+    {
+        const char *pv = strstr(src + i, "gl_PerVertex");
+        if (!pv)
+        {
+            fputs(src + i, mem);
+            break;
+        }
+        size_t at = (size_t)(pv - src);
+        size_t b = tess_skip_ws_comments(src, at + strlen("gl_PerVertex"));
+        if (src[b] != '{')
+        {
+            /* not a redeclaration (a comment, or an unrelated identifier): copy through */
+            fwrite(src + i, 1, at + strlen("gl_PerVertex") - i, mem);
+            i = at + strlen("gl_PerVertex");
+            continue;
+        }
+        /* find the closing brace of the member list */
+        size_t e = b + 1;
+        int depth = 1;
+        while (src[e] && depth)
+        {
+            e = tess_skip_ws_comments(src, e);
+            if (src[e] == '{') depth++;
+            else if (src[e] == '}') depth--;
+            else if (src[e]) e++;
+        }
+        if (!src[e])
+        {
+            /* unterminated: copy one character and continue */
+            fwrite(src + i, 1, at - i, mem);
+            i = at;
+            fputc(src[i++], mem);
+            continue;
+        }
+        /* collect the declared member names, preserving order */
+        char body[1024];
+        size_t n = e - (b + 1);
+        if (n >= sizeof(body)) n = sizeof(body) - 1;
+        memcpy(body, src + b + 1, n);
+        body[n] = 0;
+        int have[4] = { 0, 0, 0, 0 };
+        for (char *decl = strtok_r(body, ";", &tokctx); decl; decl = strtok_r(NULL, ";", &tokctx))
+        {
+            char name[64] = "";
+            char last[64] = "";
+            /* the member name is the final identifier of the declaration (an array's
+             * "float gl_ClipDistance[]" tokenizes as "gl_ClipDistance[]") */
+            for (char *t = strtok_r(decl, " \t\r\n", &tokctx2); t; t = strtok_r(NULL, " \t\r\n", &tokctx2))
+                snprintf(last, sizeof(last), "%s", t);
+            size_t ln = strlen(last);
+            if (ln && last[ln - 1] == ']')
+            {
+                last[ln - 1] = 0;
+                while (ln > 1 && last[ln - 2] == ' ') { last[ln - 2] = 0; ln--; }
+            }
+            snprintf(name, sizeof(name), "%s", last);
+            for (int k = 0; k < 4; k++)
+                if (!strcmp(name, tess_pervtx_name[k]))
+                    have[k] = 1;
+        }
+        int missing = 0;
+        for (int k = 0; k < 4; k++) missing += !have[k];
+        if (!missing)
+        {
+            fwrite(src + i, 1, e + 1 - i, mem);
+            i = e + 1;
+            continue;
+        }
+        /* splice: original member list + the missing built-ins */
+        fwrite(src + i, 1, e - i, mem);          /* up to (not including) '}' */
+        for (int k = 0; k < 4; k++)
+            if (!have[k] && pervtx_member[k])
+                fprintf(mem, "%s    %s;\n", n ? "" : "\n", pervtx_member[k]);
+        fputc('}', mem);
+        i = e + 1;
+    }
+    fclose(mem);
+    if (!out)
+        return NULL;
+    if (tess_trace())
+    {
+        fprintf(stderr, "MGL tess: expanded a subset gl_PerVertex redeclaration (stage %x):\n%s\n",
+                (unsigned)type, out);
+    }
+    return out;
+}
+
 /* ------------------------------------------------------------------ SPIR-V
  * Minimal walker: execution modes of the tessellation stages.
  */
@@ -277,9 +427,9 @@ static bool msl_scalar_type(const char *t, size_t *align, size_t *size)
 static bool msl_matrix_type(const char *t, size_t *align, size_t *size)
 {
     int c, r;
-    if (strlen(t) != 8 + 1 || t[5] != 'x' || strncmp(t, "float", 5))
+    if (strlen(t) != 8 || t[6] != 'x' || strncmp(t, "float", 5))
         return false;
-    c = t[6] - '0'; r = t[7] - '0';
+    c = t[5] - '0'; r = t[7] - '0';
     if (c < 2 || c > 4 || r < 2 || r > 4)
         return false;
     static const size_t colalign[5] = { 0, 4, 8, 16, 16 };
@@ -436,8 +586,70 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         }
 
         size_t align = 0, size = 0;
+        size_t malign = 0, msize = 0;
+        if (msl_matrix_type(type, &malign, &msize))
+        {
+            /* the stages whose MSL flattens interfaces split a matrix into its columns
+             * ("<name>_<i>"): split it here too so both sides of the record agree */
+            int c = type[5] - '0', r = type[7] - '0';
+            char coltype[16];
+            size_t ca = 0, cs = 0;
+
+            snprintf(coltype, sizeof coltype, "float%d", r);
+            msl_element_type(coltype, &ca, &cs);
+            for (int col = 0; col < c; col++)
+            {
+                if (out->count >= MGL_TESS_MAX_PATCH_MEMBERS) break;
+                cursor = round_up(cursor, ca);
+                out->members[out->count].offset = cursor;
+                out->members[out->count].size = cs;
+                out->members[out->count].attr = attr_num;
+                out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
+                out->members[out->count].is_tess_level = 0;
+                snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", coltype);
+                snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s_%d", namebuf, col);
+                cursor += cs;
+                out->count++;
+            }
+            continue;
+        }
         if (!msl_element_type(type, &align, &size))
+        {
+            /* a struct-typed member ("<Struct> inst;"): inline the struct's own fields
+             * ("<inst>_<field>"), matching the flattened form the other stages use */
+            struct MslStruct sub;
+
+            if (msl_parse_struct(msl, type, &sub))
+            {
+                size_t salign = 1;
+
+                for (int f = 0; f < sub.count; f++)
+                {
+                    size_t fa = 0, fs = 0;
+
+                    if (sub.members[f].size == 0) continue;
+                    if (msl_element_type(sub.members[f].type, &fa, &fs) && fa > salign)
+                        salign = fa;
+                }
+                cursor = round_up(cursor, salign);
+                for (int f = 0; f < sub.count; f++)
+                {
+                    if (out->count >= MGL_TESS_MAX_PATCH_MEMBERS) break;
+                    if (sub.members[f].size == 0) continue;
+                    out->members[out->count].offset = cursor + sub.members[f].offset;
+                    out->members[out->count].size = sub.members[f].size;
+                    out->members[out->count].attr = attr_num;
+                    out->members[out->count].array_idx = 0; /* set by tess_annotate_keys */
+                    out->members[out->count].is_tess_level = 0;
+                    snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", sub.members[f].type);
+                    snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s_%s", namebuf, sub.members[f].name);
+                    out->count++;
+                }
+                cursor = round_up(cursor + sub.size, salign);
+                continue;
+            }
             continue;   /* unsupported member type: skip (shader did not use it in a layout we know) */
+        }
 
         cursor = round_up(cursor, align);
         out->members[out->count].offset = cursor;
@@ -993,7 +1205,8 @@ static void tess_canon_member_lines(char **buf, size_t *len, size_t *cap,
 
         if (stage)
             for (int j = 0; j < nstage; j++)
-                if (stage[j].key == cm->key && stage[j].size > 0)
+                if (stage[j].key == cm->key && stage[j].size > 0 &&
+                    (cm->array_idx == 0 || stage[j].array_idx == cm->array_idx))
                 {
                     nm = stage[j].name;
                     break;
@@ -3243,6 +3456,9 @@ const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx)
 
 void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, GLuint tessellated_primitives)
 {
+    if (tess_trace())
+        fprintf(stderr, "MGL tess: note_draw patches=%u tes_inv=%u prims=%u\n",
+                patches, tes_invocations, tessellated_primitives);
     mgl_queries_note_tess(ctx, tes_invocations, tessellated_primitives);
 }
 
@@ -3426,6 +3642,31 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                             break;
                         }
             }
+        }
+    }
+
+    if (tess_trace())
+    {
+        struct { const char *tag; struct MslStruct *s; } dumps[] = {
+            { "vs_out", have_vs ? &vs_out : NULL },
+            { "tcs_in", have_tcs_in ? &tcs_in : NULL },
+            { "tcs_out", have_tcs_out ? &tcs_out : NULL },
+            { "tes_cp", have_cp ? &tes_cp : NULL },
+            { "tcs_po", have_tcs_po ? &tcs_po : NULL },
+            { "tes_pi", have_pi ? &tes_pi : NULL },
+        };
+        for (size_t d = 0; d < sizeof(dumps) / sizeof(dumps[0]); d++)
+        {
+            if (!dumps[d].s)
+                continue;
+            fprintf(stderr, "MGL tess: stage struct %s (%d members):\n", dumps[d].tag, dumps[d].s->count);
+            if (dumps[d].s->body)
+                fprintf(stderr, "MGL tess:   body: %s\n", dumps[d].s->body);
+            for (int i = 0; i < dumps[d].s->count; i++)
+                fprintf(stderr, "MGL tess:   %-14s %-24s key=%08x idx=%u off=%zu\n",
+                        dumps[d].s->members[i].type, dumps[d].s->members[i].name,
+                        dumps[d].s->members[i].key, dumps[d].s->members[i].array_idx,
+                        dumps[d].s->members[i].offset);
         }
     }
 

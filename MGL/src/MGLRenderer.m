@@ -2379,6 +2379,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 {
     id<MTLLibrary> library;
     __autoreleasing NSError *error = nil;
+    if (!str)
+        return nil;         /* a stage with no MSL source (e.g. an emulation-only slot of a
+                             * pipeline composite): the caller must skip it gracefully */
     NSString *src = [NSString stringWithUTF8String: str];
 
     /* tess domain: precise math when the MSL embeds the fp64 double-single library */

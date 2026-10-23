@@ -133,6 +133,8 @@ static inline int mgl_geom_shadow_op_of(GLenum compare_func)
 typedef struct MGLGeomVar {
     char    name[128];      /* declared name, as written in the source */
     char    member[64];     /* interface block member ("a" of "v[i].a"); empty for a plain varying */
+    char    block[64];      /* interface block NAME ("" for a plain varying or anonymous block):
+                             * the API names block members "<block>.<member>" */
     GLuint  location;
     GLenum  base;           /* GL_FLOAT / GL_INT / GL_UNSIGNED_INT / GL_DOUBLE / GL_BOOL */
     GLuint  rows;           /* vector components (1..4) */
@@ -326,6 +328,10 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
  * route runs the tessellated draw with the output capture on and packs the captured records
  * into the transform feedback buffers (one thread per record, all on stream 0). */
 void mgl_geom_tess_xfb_link(GLMContext ctx, struct Program_t *program);
+/* a separable TCS-only program with transform feedback varyings: the names resolve against
+ * the control stage's outputs (arrays); no capture is built — GL_PATCHES needs a TES, so
+ * the program can never feed a draw by itself, but the link must succeed (GL 4.6 13.3.2) */
+void mgl_geom_tcs_xfb_link(GLMContext ctx, struct Program_t *program);
 bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t offset,
                              GLint first, GLsizei count, GLsizei instances,
                              GLint basevertex, GLuint baseinstance);
