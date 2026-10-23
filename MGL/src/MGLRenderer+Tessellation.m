@@ -152,7 +152,7 @@ static void tessRingRelease(int slot)
     }
 }
 static id<MTLLibrary> tKernelLib;
-static id<MTLComputePipelineState> tCountPso, tEmitPso, tArgsPso, tBlobPso;
+static id<MTLComputePipelineState> tCountPso, tEmitPso, tArgsPso, tBlobPso, tPermutePso;
 
 static NSMutableDictionary *tVsPsoCache;    /* VS kernel PSO, per program+VAO */
 static NSMutableDictionary *tTcsPsoCache;   /* TCS kernel PSO, per program    */
@@ -745,6 +745,25 @@ static NSString *tessVSKey(GLMContext ctx, Program *program, TessVSPlan *plan)
     return key;
 }
 
+/* Vertex-kernel variant of a SEPARABLE vs-only pipeline program: compiled at LINK time
+ * by compile_stage (the SPIRV-Cross vertex-for-tessellation options cannot be applied to
+ * the already-generated plain vertex MSL) and cached in the tess ext state, keyed by the
+ * program's name.  The plain vertex function (with the rstate fixup) stays the program's
+ * own for normal draws; the kernel carries NO fixup — the pipeline's TES is the last
+ * pre-rasterization stage and applies it there. */
+static id<MTLFunction> tessPipelineVsKernel(GLMContext ctx, id<MTLDevice> device, Program *program)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    (void)device;
+    if (!S)
+        return nil;
+    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == program->name && S->vs_kernel[slot].function)
+            return (__bridge id<MTLFunction>)S->vs_kernel[slot].function;
+    return nil;
+}
+
 static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> device, Program *program, TessVSPlan *plan)
 {
     id<MTLFunction> fn = tessStageFunction(program, _VERTEX_SHADER);
@@ -758,6 +777,18 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
      * SPIRV-Cross output struct was rewritten to the canonical control point record */
     if (vs_tp && vs_tp->vs_function && vs_tp->program == program)
         fn = (__bridge id<MTLFunction>)vs_tp->vs_function;
+    if ((!fn || fn.functionType != MTLFunctionTypeKernel))
+    {
+        /* a SEPARABLE vs-only program (pipeline draw) keeps the plain vertex function:
+         * the tessellation kernel variant was compiled at its link time */
+        if (MGL_PROGRAM_OBJ(program)->separable == GL_TRUE)
+        {
+            id<MTLFunction> kfn = tessPipelineVsKernel(ctx, device, program);
+
+            if (kfn && kfn.functionType == MTLFunctionTypeKernel)
+                fn = kfn;
+        }
+    }
     if (!fn || fn.functionType != MTLFunctionTypeKernel)
     {
         NSLog(@"MGL ERROR: tess VS stage function is not a kernel (fn=%@ type=%ld)",
@@ -1061,6 +1092,29 @@ static void tessBindStageUniforms(GLMContext ctx, id<MTLComputeCommandEncoder> e
     if (!program)
         return;
 
+    /* default-block uniforms: MGL's introspection exposes them as UNIFORM_CONSTANT
+     * resources backed by a per-program per-stage buffer (the "dub") — the render path
+     * binds it in mapGLBuffersToMTLBufferMap.  Without it the TCS/TES kernels read
+     * zeroed uniforms (gl_TessLevel* written from a uniform tessellated at level 0). */
+    {
+        SpirvResourceList *list = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+
+        for (int r = 0; r < list->count && r < 24; r++)
+        {
+            Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, program, stage, r);
+
+            if (!dub || !dub->data.buffer_data)
+                continue;
+            if (mtlextB(ctx)->ensure_buffer)
+                mtlextB(ctx)->ensure_buffer(ctx, dub);
+            if (!dub->data.mtl_data)
+                continue;
+            [enc setBuffer: (__bridge id<MTLBuffer>)dub->data.mtl_data
+                   offset: 0
+                  atIndex: (NSUInteger)list->list[r].msl_binding];
+        }
+    }
+
     for (int t = 0; t < 3; t++)
     {
         SpirvResourceList *list = &program->spirv_resources_list[stage][types[t].spvc];
@@ -1351,6 +1405,23 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     c->valid = true;
 }
 
+/* Retire the published TES-output capture: the contract is "valid until the next
+ * GL_PATCHES draw", and a draw that tessellates no patch (count < GL_PATCH_VERTICES)
+ * records NOTHING — leaving the previous capture published made the xfb route repack
+ * an earlier draw's records into the current transform feedback object. */
+static void tessRetireCapture(GLMContext ctx)
+{
+    struct MGLExtState_tess *S2 = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    MGLTessCapture *c;
+
+    if (!S2 || !S2->capture.valid)
+        return;
+    c = &S2->capture;
+    if (c->buffer_object && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, c->buffer_object);
+    memset(c, 0, sizeof *c);      /* valid = false, no dangling pointers */
+}
+
 - (bool) extTessActive
 {
     return mgl_tess_active_program(ctx) != NULL;
@@ -1364,7 +1435,19 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     Program *prog_vs = ctx->state.program, *prog_tcs = NULL, *prog_tes = NULL;
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
-    GLsizei patch_verts_in = mgl_tess_patch_vertices_in(ctx, tp);
+
+    /* this draw's capture supersedes the published one — including when it captures
+     * nothing (an early return below: 0 patches, bad vertex setup), which must leave
+     * NO capture for consumers to pack */
+    tessRetireCapture(ctx);
+    /* INPUT patch size: GL_PATCH_VERTICES decides how many vertex-shader outputs form
+     * one patch.  With a TCS present gl_PatchVerticesOut (what the TES sees as
+     * gl_PatchVerticesIn) is a DIFFERENT number — using it here merged patches when
+     * the two disagreed (CTS data_pass_through: GL_PATCH_VERTICES=1, TCS out=2). */
+    GLsizei patch_verts_in = ctx->state.ext_rstate ?
+        ((struct MGLExtState_rstate *)ctx->state.ext_rstate)->patch_vertices : 3;
+    if (patch_verts_in < 1)
+        patch_verts_in = 1;
     GLsizei patches, total_patches;
     size_t cp_record = tp->cp_record_size;
     size_t patch_record = tp->tcs_patch_out_size ? tp->tcs_patch_out_size : 16;
@@ -1403,6 +1486,8 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     bool have_restart = false;
     size_t off_vsparams = 0, off_scanout = 0;   /* GPU-written VS parameter block + scan atomics */
     size_t off_capture = 0;         /* TES-output capture records (tp->capture) */
+    size_t off_capture_perm = 0;    /* capture-only: coordinates in emission order */
+    size_t off_levels_f = 0;        /* float copy of the tess levels per patch */
     size_t cap_pub_records = 0, cap_pub_idx = 0, cap_pub_count = 0;   /* published offsets */
     uint32_t cap_pub_recs_cap = 0, cap_pub_idx_cap = 0;               /* and their capacities */
     id<MTLBuffer> tess_gather_ib = nil;
@@ -1627,6 +1712,10 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                 }
                 off_factors = need;
                 need += tessRingAlign((size_t)total_patches * fstride);
+                /* float copy of the levels (GL: the TES reads back the TCS's exact
+                 * floats; the half factor record quantises them) */
+                off_levels_f = need;
+                need += tessRingAlign((size_t)total_patches * 24);
                 /* patch-data blob for every path (see the layout note in the
                  * non-restart branch) */
                 off_patch_data = need;
@@ -1635,6 +1724,32 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                 {
                     off_gpu_emu = need;
                     need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
+                }
+                /* the TES-output capture records live in the SAME ring block, appended
+                 * after the emulated scratch — the block must be sized for them, or the
+                 * capture kernel writes past the pool buffer (records for big draws are
+                 * megabytes).  The record layout is built on first use; build it now. */
+                if (!use_hardware && tp->capture)
+                {
+                    char *cm = mgl_tess_capture_msl(ctx, tp);
+                    free(cm);
+                    if (tp->cap_stride && total_patches)
+                    {
+                        /* one record per EMITTED vertex: triangles/quads emit far more
+                         * indices than grid vertices (e.g. triangles 12288 vs 2145) */
+                        off_capture = need;
+                        need += tessRingAlign((size_t)total_patches *
+                                  (tp->point_mode ? 4225 :
+                                   tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                                   tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
+                                  (size_t)tp->cap_stride * 4);
+                        /* coordinates re-gathered into emission order for the capture */
+                        off_capture_perm = need;
+                        need += tessRingAlign((size_t)total_patches *
+                                  (tp->point_mode ? 4225 :
+                                   tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                                   tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                    }
                 }
                 /* the plain TES's parameter words (16 B) live in this draw's ring block:
                  * a shared singleton would be overwritten by the next draw while the GPU
@@ -1693,6 +1808,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             }
             off_factors = need;
             need += tessRingAlign((size_t)total_patches * fstride);
+            /* float copy of the levels (see the widened-index branch) */
+            off_levels_f = need;
+            need += tessRingAlign((size_t)total_patches * 24);
             /* patch-data blob for every path (see the layout note in the widened branch) */
             off_patch_data = need;
             need += tessRingAlign((size_t)total_patches * tp->tes_patch_in_size);
@@ -1700,6 +1818,28 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             {
                 off_gpu_emu = need;
                 need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
+            }
+            /* capture records: see the widened-index branch above (same in-block sizing
+             * rule — the records follow the emulated scratch) */
+            if (!use_hardware && tp->capture)
+            {
+                char *cm = mgl_tess_capture_msl(ctx, tp);
+                free(cm);
+                if (tp->cap_stride && total_patches)
+                {
+                    /* one record per EMITTED vertex (see the widened-index branch) */
+                    off_capture = need;
+                    need += tessRingAlign((size_t)total_patches *
+                              (tp->point_mode ? 4225 :
+                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
+                              (size_t)tp->cap_stride * 4);
+                    off_capture_perm = need;
+                    need += tessRingAlign((size_t)total_patches *
+                              (tp->point_mode ? 4225 :
+                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                }
             }
             /* the plain TES's parameter words (16 B) live in this draw's ring block:
              * a shared singleton would be overwritten by the next draw while the GPU
@@ -1771,6 +1911,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             }
             off_factors = need;
             need += tessRingAlign((size_t)total_patches * fstride);
+            /* float copy of the levels (see the widened-index branch) */
+            off_levels_f = need;
+            need += tessRingAlign((size_t)total_patches * 24);
             /* patch-data blob for every path (see the indexed branch above) */
             off_patch_data = need;
             need += tessRingAlign((size_t)total_patches * tp->tes_patch_in_size);
@@ -1778,6 +1921,27 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             {
                 off_gpu_emu = need;
                 need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
+            }
+            /* capture records: see the indexed branch above (same in-block sizing rule) */
+            if (!use_hardware && tp->capture)
+            {
+                char *cm = mgl_tess_capture_msl(ctx, tp);
+                free(cm);
+                if (tp->cap_stride && total_patches)
+                {
+                    /* one record per EMITTED vertex (see the widened-index branch) */
+                    off_capture = need;
+                    need += tessRingAlign((size_t)total_patches *
+                              (tp->point_mode ? 4225 :
+                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
+                              (size_t)tp->cap_stride * 4);
+                    off_capture_perm = need;
+                    need += tessRingAlign((size_t)total_patches *
+                              (tp->point_mode ? 4225 :
+                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                }
             }
 
             /* the plain TES's parameter words (16 B) live in this draw's ring block:
@@ -1940,6 +2104,8 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
         [cenc setBuffer: ring offset: off_tcs_out atIndex: MGL_TESS_TCS_OUT];
         [cenc setBuffer: ring offset: off_tcs_patch atIndex: MGL_TESS_TCS_PATCH_OUT];
         [cenc setBuffer: ring offset: off_factors atIndex: MGL_TESS_TCS_FACTORS];
+        if (tp->tcs_levels_float)
+            [cenc setBuffer: ring offset: off_levels_f atIndex: 30];   /* GL's float level copy */
         [cenc setBytes: iparams length: sizeof iparams atIndex: MGL_TESS_TCS_PARAMS];
         [cenc dispatchThreadgroups: MTLSizeMake(threads, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
@@ -1991,6 +2157,10 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
             for (int i = ne; i < (int)fhalfs; i++)
                 hf[(size_t)p * fhalfs + i] = tessFloatToHalf(factors[p * 6 + 4 + (i - ne)]);
         }
+        /* the float copy of the same levels (GL's exact-precision contract): memcpy the
+         * whole [outer4, inner2] array into the draw's ring block */
+        memcpy((uint8_t *)ring.contents + off_levels_f, factors,
+               (size_t)total_patches * 6 * sizeof(float));
 
         if (use_cpu_reference)
         {
@@ -2010,7 +2180,12 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
      * result to the tessellator kernels and the render pass without any CPU round-trip.
      * The hardware path with a TCS does not need it: the TES reads the TCS patch output
      * struct directly. */
-    if (!use_cpu_reference && !(use_hardware && tp->has_tcs) && tBlobPso && tp->tes_patch_in_size)
+    /* the blob kernel must run from the FIRST capture draw: tessKernels() compiles the
+     * static kernel set lazily (it is otherwise first needed by the emulated path below,
+     * which runs AFTER this dispatch — on a first draw the blob PSO did not exist yet
+     * and the TES patch-in blob stayed zero, zeroing every per-patch capture member) */
+    if (!use_cpu_reference && !(use_hardware && tp->has_tcs) && tp->tes_patch_in_size &&
+        (tBlobPso || tessKernels(ctx)))
     {
         struct MGLTessBlobCfg cfg;
 
@@ -2033,6 +2208,7 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
         [cenc setBuffer: ring offset: (tp->has_tcs ? off_tcs_patch : 0) atIndex: 1];   /* only read with a TCS */
         [cenc setBuffer: ring offset: off_factors atIndex: 2];
         [cenc setBuffer: ring offset: off_patch_data atIndex: 3];
+        [cenc setBuffer: ring offset: off_levels_f atIndex: 4];   /* GL's exact float levels */
         [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)total_patches, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
         if (tTrace())
@@ -2108,7 +2284,7 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
 
             [enc setVertexBuffer: ring offset: cp_source_off atIndex: MGL_TESS_VD_CP];
             [enc setVertexBuffer: ring offset: patch_off atIndex: MGL_TESS_VD_PATCH];
-            [enc setVertexBuffer: ring offset: off_factors atIndex: MGL_TESS_VD_FACTORS];
+            [enc setVertexBuffer: ring offset: off_levels_f atIndex: MGL_TESS_VD_FACTORS];
             [enc setTessellationFactorBuffer: ring offset: off_factors instanceStride: 0];
 
             if (tTrace())
@@ -2191,7 +2367,11 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
 
             if (tp->cap_stride)
             {
-                off_capture = emu_off + need;   /* records appended to the emulated scratch */
+                /* the records were reserved inside the draw's ring block when it was
+                 * sized (see the layout blocks); appending them after the emulated
+                 * scratch is only the fallback for a capture that appeared later */
+                if (!off_capture)
+                    off_capture = emu_off + need;
                 need += coords_cap * (size_t)tp->cap_stride * 4;
             }
             free(cap_msl);      /* the compile step below rebuilds it if needed */
@@ -2241,6 +2421,20 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
 
             [cenc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
+            /* capture permute: transform feedback records the vertices in GENERATION
+             * order (GL 4.6 13.4) — the coordinates re-gathered through the index list.
+             * The bound count is the GPU-written totals array (guard on totals[1]). */
+            if (off_capture_perm && tPermutePso)
+            {
+                [cenc setComputePipelineState: tPermutePso];
+                [cenc setBuffer: ring offset: coords_off atIndex: 0];
+                [cenc setBuffer: ring offset: coords_off + coords_cap * 16 atIndex: 1];
+                [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4 atIndex: 2];
+                [cenc setBuffer: ring offset: off_capture_perm atIndex: 3];
+                [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)(indices_cap + 63) / 64, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+            }
+
             /* TES-output capture (tess -> geometry / transform feedback producer):
              * the plain TES rewritten as a kernel, one record per tessellated vertex,
              * dispatched after the tessellator in the same encoder. The vertex count
@@ -2253,28 +2447,42 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                     [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_pso];
                     tessBindStageUniforms(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
                     tessBindStageTextures(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
-                    [cenc setBuffer: ring offset: coords_off atIndex: MGL_TESS_TES_COORDS];
+                    [cenc setBuffer: ring offset: (off_capture_perm ? off_capture_perm : coords_off)
+                             atIndex: MGL_TESS_TES_COORDS];
                     [cenc setBuffer: ring offset: cp_source_off atIndex: MGL_TESS_TES_CP];
                     [cenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
                     {
                         uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
                         [cenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
                     }
-                    [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4
+                    [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4 +
+                                       (tp->point_mode ? 0 : 4)
                              atIndex: MGL_TESS_TES_CAP_COUNT];
                     [cenc setBuffer: ring offset: off_capture atIndex: MGL_TESS_TES_CAP_RECS];
-                    [cenc dispatchThreadgroups: MTLSizeMake(((NSUInteger)cc + 63) / 64, 1, 1)
-                          threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+                    /* the guard is the EMITTED vertex count (totals[1]); triangles and
+                     * quads emit more vertices than the coordinate grid holds */
+                    {
+                        NSUInteger nthr = (NSUInteger)coords_cap;
+                        if (nthr < indices_cap) nthr = indices_cap;
+                        [cenc dispatchThreadgroups: MTLSizeMake((nthr + 63) / 64, 1, 1)
+                              threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+                    }
                     cap_pub_records = off_capture;
                     /* the consumer's primitive slots come from the tessellator's uint32 index
                      * list (global coordinate indices, i.e. exactly the capture's record
                      * indices) — NOT off_indices, which is the CPU path's list and stays 0 */
                     cap_pub_idx = coords_off + coords_cap * 16;
-                    cap_pub_recs_cap = (uint32_t)coords_cap;
+                    /* the capacity is in EMITTED vertices: the index list can be longer
+                     * than the coordinate grid (triangles: 12288 indices vs 2145 coords) */
+                    cap_pub_recs_cap = (uint32_t)(coords_cap > indices_cap ? coords_cap : indices_cap);
                     cap_pub_idx_cap = (uint32_t)indices_cap;
                     /* totals[0] is the GPU-written VERTEX count and totals[1] the index count
                      * (args[0] would be the index count: 3x the records for triangle domains) */
-                    cap_pub_count = emu_off + (size_t)(total_patches * 2) * 4;
+                    /* the count consumers read: totals[1] (emitted vertices) except
+                     * point_mode, which captures the tessellated POINTS (totals[0]) —
+                     * the same rule the args kernel uses for the indirect draw */
+                    cap_pub_count = emu_off + (size_t)(total_patches * 2) * 4 +
+                                    (tp->point_mode ? 0 : 4);
                 }
                 else if (tTrace())
                     NSLog(@"MGL tess: draw bail: capture PSO failed to build (off_capture=%zu)",
@@ -2413,6 +2621,17 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
                     for (int p = 0; p < total_patches; p++)
                         fprintf(stderr, " [%.2f %.2f %.2f %.2f]", blob[p * 4 + 0], blob[p * 4 + 1],
                                 blob[p * 4 + 2], blob[p * 4 + 3]);
+                    if (cap_pub_records && tp->cap_stride)
+                    {
+                        const unsigned *cr = (const unsigned *)((uint8_t *)ring.contents + cap_pub_records);
+                        fprintf(stderr, "\nMGL tess: trace caprec(stride %u):", tp->cap_stride);
+                        for (int q = 0; q < 3 * (int)tp->cap_stride && q < 96; q++)
+                            fprintf(stderr, " %08x", cr[q]);
+                        fprintf(stderr, "\nMGL tess: trace caprec25:");
+                        for (int q = 25 * (int)tp->cap_stride; q < 27 * (int)tp->cap_stride; q++)
+                            fprintf(stderr, " %08x", cr[q]);
+                        fprintf(stderr, "\n");
+                    }
                     fprintf(stderr, "\nMGL tess: trace factors(half):");
                     for (int p = 0; p < total_patches; p++)
                         fprintf(stderr, " [%x %x %x %x %x %x]", hf[p * 6 + 0], hf[p * 6 + 1], hf[p * 6 + 2],
@@ -2476,31 +2695,42 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     if (need_readback)
     {
         {
-            const uint16_t *hf = (const uint16_t *)((uint8_t *)ring.contents + off_factors);
             float *factors = (float *)calloc((size_t)total_patches, 6 * sizeof(float));
 
-            for (int p = 0; p < total_patches; p++)
+            if (tp->tcs_levels_float)
             {
-                const uint16_t *f = hf + p * (fstride / 2);  /* 4 halfs tri / 6 halfs quad */
-                if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+                /* exact: the TCS also wrote a float copy (GL's level contract); the half
+                 * factor record would quantise e.g. 2.7 to 2.69922 */
+                memcpy(factors, (uint8_t *)ring.contents + off_levels_f,
+                       (size_t)total_patches * 6 * sizeof(float));
+            }
+            else
+            {
+                const uint16_t *hf = (const uint16_t *)((uint8_t *)ring.contents + off_factors);
+
+                for (int p = 0; p < total_patches; p++)
                 {
-                    /* MTLTriangleTessellationFactorsHalf: { edge[3], inside } — the
-                     * outer[3] slot a triangle patch never uses stays 0 */
-                    factors[p * 6 + 0] = tessHalfToFloat(f[0]);
-                    factors[p * 6 + 1] = tessHalfToFloat(f[1]);
-                    factors[p * 6 + 2] = tessHalfToFloat(f[2]);
-                    factors[p * 6 + 3] = 0.0f;
-                    factors[p * 6 + 4] = tessHalfToFloat(f[3]);
-                    factors[p * 6 + 5] = 0.0f;
-                }
-                else
-                {
-                    factors[p * 6 + 0] = tessHalfToFloat(f[0]);
-                    factors[p * 6 + 1] = tessHalfToFloat(f[1]);
-                    factors[p * 6 + 2] = tessHalfToFloat(f[2]);
-                    factors[p * 6 + 3] = tessHalfToFloat(f[3]);
-                    factors[p * 6 + 4] = tessHalfToFloat(f[4]);
-                    factors[p * 6 + 5] = tessHalfToFloat(f[5]);
+                    const uint16_t *f = hf + p * (fstride / 2);  /* 4 halfs tri / 6 halfs quad */
+                    if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
+                    {
+                        /* MTLTriangleTessellationFactorsHalf: { edge[3], inside } — the
+                         * outer[3] slot a triangle patch never uses stays 0 */
+                        factors[p * 6 + 0] = tessHalfToFloat(f[0]);
+                        factors[p * 6 + 1] = tessHalfToFloat(f[1]);
+                        factors[p * 6 + 2] = tessHalfToFloat(f[2]);
+                        factors[p * 6 + 3] = 0.0f;
+                        factors[p * 6 + 4] = tessHalfToFloat(f[3]);
+                        factors[p * 6 + 5] = 0.0f;
+                    }
+                    else
+                    {
+                        factors[p * 6 + 0] = tessHalfToFloat(f[0]);
+                        factors[p * 6 + 1] = tessHalfToFloat(f[1]);
+                        factors[p * 6 + 2] = tessHalfToFloat(f[2]);
+                        factors[p * 6 + 3] = tessHalfToFloat(f[3]);
+                        factors[p * 6 + 4] = tessHalfToFloat(f[4]);
+                        factors[p * 6 + 5] = tessHalfToFloat(f[5]);
+                    }
                 }
             }
             mgl_tess_build_patch_blob(ctx, tp, (const unsigned char *)((uint8_t *)ring.contents + off_tcs_patch),
@@ -2905,7 +3135,7 @@ static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_
 /* compile the GPU tessellator kernels (once) */
 static bool tessKernels(GLMContext ctx)
 {
-    if (tCountPso && tEmitPso && tArgsPso && tBlobPso)
+    if (tCountPso && tEmitPso && tArgsPso && tBlobPso && tPermutePso)
         return true;
 
     MGLRenderer *self2 = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
@@ -2924,7 +3154,8 @@ static bool tessKernels(GLMContext ctx)
     if (!tEmitPso)  tEmitPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_emit"]  error: &err];
     if (!tArgsPso)  tArgsPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_args"]  error: &err];
     if (!tBlobPso)  tBlobPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_blob"]  error: &err];
-    if (!tCountPso || !tEmitPso || !tArgsPso || !tBlobPso)
+    if (!tPermutePso) tPermutePso = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_permute"] error: &err];
+    if (!tCountPso || !tEmitPso || !tArgsPso || !tBlobPso || !tPermutePso)
     {
         NSLog(@"MGL ERROR: tess: tessellator kernel PSO failed: %@", err.localizedDescription);
         return false;
@@ -3073,8 +3304,9 @@ static MTLVertexFormat tessMemberFormat(const char *type)
 
         if (m->is_tess_level == 1)
         {
-            /* gl_TessLevelOuter / packed gl_TessLevel: half4 at the head of the factor record */
-            vd.attributes[m->attr].format = MTLVertexFormatHalf4;
+            /* gl_TessLevelOuter / packed gl_TessLevel: float4 at the head of the float
+             * level copy (GL needs the exact values; the half factor record quantises) */
+            vd.attributes[m->attr].format = MTLVertexFormatFloat4;
             vd.attributes[m->attr].offset = 0;
             vd.attributes[m->attr].bufferIndex = MGL_TESS_VD_FACTORS;
             any_factors = true;
@@ -3082,9 +3314,9 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         }
         if (m->is_tess_level == 2)
         {
-            /* gl_TessLevelInner: half2 at byte 8 (after the four half edge factors) */
-            vd.attributes[m->attr].format = MTLVertexFormatHalf2;
-            vd.attributes[m->attr].offset = 8;
+            /* gl_TessLevelInner: float2 at byte 16 (after the four outer floats) */
+            vd.attributes[m->attr].format = MTLVertexFormatFloat2;
+            vd.attributes[m->attr].offset = 16;
             vd.attributes[m->attr].bufferIndex = MGL_TESS_VD_FACTORS;
             any_factors = true;
             continue;
@@ -3111,7 +3343,7 @@ static MTLVertexFormat tessMemberFormat(const char *type)
     }
     if (any_factors)
     {
-        vd.layouts[MGL_TESS_VD_FACTORS].stride = 12;   /* MTL{Triangle,Quad}TessellationFactorsHalf */
+        vd.layouts[MGL_TESS_VD_FACTORS].stride = 24;  /* mgl_tess_levels_f: float o[4], in[2] */
         vd.layouts[MGL_TESS_VD_FACTORS].stepFunction = MTLVertexStepFunctionPerPatch;
         vd.layouts[MGL_TESS_VD_FACTORS].stepRate = 1;
     }

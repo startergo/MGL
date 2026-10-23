@@ -235,6 +235,7 @@ static bool msl_parse_struct_entry(const char *msl, struct MslStruct *out, char 
 static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
                                  char *out_name, size_t out_len);
 static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp);
+static char *tcs_inject_float_levels(const char *msl);
 
 /* ------------------------------------------------------------------ MSL struct layout
  * Parse an MSL interface struct declaration and compute the byte layout Metal
@@ -2363,6 +2364,18 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
         return;
     while ((tp = mgl_tess_program(ctx, program)) != NULL)
         tess_free_program(ctx, tp);
+    /* drop the program's cached separable vertex kernel (name reuse must not find it) */
+    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == program->name)
+        {
+            if (S->vs_kernel[slot].library && ctx->mtl_funcs.ext_program &&
+                ctx->mtl_funcs.ext_program->release_obj)
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].library);
+            if (S->vs_kernel[slot].function && ctx->mtl_funcs.ext_program &&
+                ctx->mtl_funcs.ext_program->release_obj)
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].function);
+            memset(&S->vs_kernel[slot], 0, sizeof S->vs_kernel[slot]);
+        }
 }
 
 /* post-link: parse the tessellation modes and the patch data layouts */
@@ -3094,6 +3107,53 @@ void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable){
     tp->capture = enable;
 }
 
+/* Compile + cache the compute-kernel variant of a SEPARABLE vs-only program's vertex
+ * stage (produced by compile_stage from the same SPIR-V with the tessellation options).
+ * The tessellation draw path finds it by program name when a pipeline supplies the
+ * vertex stage.  Returns true when the kernel is available (now or cached). */
+bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, const char *entry)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    void *lib = NULL, *fn = NULL;
+    char *err = NULL;
+    unsigned slot;
+
+    if (!S || !msl || !ctx->mtl_funcs.ext_program || !ctx->mtl_funcs.ext_program->compile_msl)
+        return false;
+    for (slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == name)
+        {
+            if (S->vs_kernel[slot].function)
+                return true;      /* already cached (a relink recompiles below) */
+            break;
+        }
+    if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, entry ? entry : "main", &lib, &fn, &err))
+    {
+        if (tess_trace())
+        {
+            FILE *df = fopen("/tmp/sepvs_fail.metal", "w");
+            if (df) { fputs(msl, df); fclose(df); }
+            fprintf(stderr, "MGL tess: separable vs-kernel compile failed: %s\n", err ? err : "?");
+        }
+        free(err);
+        return false;
+    }
+    free(err);
+    if (slot >= S->vs_kernel_n)
+    {
+        if (S->vs_kernel_n >= MGL_TESS_VS_KERNEL_CACHE)
+            return false;      /* cache full: the transient function is dropped with lib */
+        slot = S->vs_kernel_n++;
+        S->vs_kernel[slot].name = name;
+    }
+    S->vs_kernel[slot].library = lib;      /* owned (CFBridgingRetain) */
+    S->vs_kernel[slot].function = fn;
+    if (tess_trace())
+        fprintf(stderr, "MGL tess: sep-vs kernel cached for program %u (slot %u fn=%p)\n",
+                name, slot, fn);
+    return true;
+}
+
 const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
@@ -3536,6 +3596,15 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 }
             }
 
+            {
+                /* GL's exact float levels: the half factor record alone quantises them
+                 * (2.7 -> 2.69922 in the TES); add the TCS-side float copy.  This runs
+                 * even when the record layout needed no rewriting — a levels-only TCS
+                 * has no patchOut struct to canonicalize, but still must write floats */
+                char *lvl = tcs_inject_float_levels(msl);
+
+                if (lvl) { free(msl); msl = lvl; tp->tcs_levels_float = 1; changed = true; }
+            }
             if (changed && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
             {
                 if (getenv("MGL_DUMP_MSL"))
@@ -3727,6 +3796,29 @@ bool mgl_tess_draw_patches(GLMContext ctx, bool indexed, GLenum type, size_t off
                                                  instances ? instances : 1, basevertex, baseinstance);
 }
 
+/* GL_TESS_CONTROL_OUTPUT_VERTICES for a linked program: the tess link record's value
+ * when one exists (programs with a TES); a separable tc-only program has no record, so
+ * read the declaration straight from the TCS SPIR-V (matches the link-time parse) */
+GLint mgl_tess_program_out_vertices(GLMContext ctx, Program *program)
+{
+    MGLTessProgram *tp = mgl_tess_program(ctx, program);
+
+    if (tp)
+        return tp->tcs_out_vertices;
+    if (ctx && program && program->spirv[_TESS_CONTROL_SHADER].ir)
+    {
+        int modes[16], count = 0, out_vertices = 0;
+
+        if (spv_tess_modes(program->spirv[_TESS_CONTROL_SHADER].ir,
+                           program->spirv[_TESS_CONTROL_SHADER].size,
+                           1 /* SpvExecutionModelTessellationControl */,
+                           modes, &count, &out_vertices) &&
+            out_vertices >= 1 && out_vertices <= MGL_TESS_MAX_PATCH_VERTICES)
+            return out_vertices;
+    }
+    return 3;    /* the link-time fallback for an unparseable declaration */
+}
+
 /* the tessellation program of the current GL state (program object or separable pipeline) */
 MGLTessProgram *mgl_tess_active_program(GLMContext ctx)
 {
@@ -3776,6 +3868,150 @@ bool mgl_tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors,
 {
     tess_cpu_generate_runs++;
     return tess_generate(ctx, tp, factors, patches);
+}
+
+/* ------------------------------------------------------------------ float tessellation levels
+ * GL promises the TES reads back the EXACT float levels the TCS wrote (GL 4.6
+ * 11.1.3.2); Metal's factor record stores halfs, which loses e.g. 2.7 to 2.69922.
+ * The canonicalized TCS kernel additionally writes a float copy per patch: every
+ * `spvTessLevel[gl_PrimitiveID].edgeTessellationFactor[i] = half(EXPR);` gains
+ * ` mgl_levels[gl_PrimitiveID].o[i] = float(EXPR);` (inside -> .in[i]), and the
+ * kernel signature gains `device mgl_tess_levels_f* mgl_levels [[buffer(30)]]`.
+ * Returns a fresh string (caller frees) or NULL when nothing could be injected. */
+static char *tcs_inject_float_levels(const char *msl)
+{
+    const char *sig = strstr(msl, "spvTessLevel [[buffer(27)]]");
+    const char *kdecl = strstr(msl, "kernel void ");
+    size_t cap, len = 0;
+    char *out;
+
+    if (!sig || !kdecl || !strstr(msl, "TessellationFactor"))
+        return NULL;
+
+    cap = strlen(msl) + 4096;
+    out = (char *)malloc(cap);
+    if (!out)
+        return NULL;
+
+    for (const char *p = msl; *p; )
+    {
+        const char *edge = strstr(p, ".edgeTessellationFactor");
+        const char *ins  = strstr(p, ".insideTessellationFactor");
+        const char *hit  = NULL;
+        int is_edge = 0;
+
+        if (edge && (!ins || edge < ins)) { hit = edge; is_edge = 1; }
+        else if (ins)                      { hit = ins; }
+        if (!hit)
+        {
+            str_append(&out, &len, &cap, "%s", p);
+            break;
+        }
+
+        /* copy up to the member */
+        str_append(&out, &len, &cap, "%.*s", (int)(hit - p), p);
+
+        /* index: [N] after the member (absent for the scalar triangle inside level) */
+        const char *q = hit + strlen(is_edge ? ".edgeTessellationFactor" : ".insideTessellationFactor");
+        char idx[32] = "0";
+        const char *assign = q;
+
+        if (*q == '[')
+        {
+            const char *cl = strchr(q, ']');
+            if (cl && (size_t)(cl - q - 1) < sizeof idx)
+            {
+                memcpy(idx, q + 1, (size_t)(cl - q - 1));
+                idx[cl - q - 1] = 0;
+                assign = cl + 1;
+            }
+        }
+        while (*assign == ' ')
+            assign++;
+
+        /* the statement must be `= half(EXPR);` — extract EXPR to keep the float copy */
+        const char *semi = strchr(assign, ';');
+        if (!semi || strncmp(assign, "= half(", 7) != 0)
+        {
+            /* not a recognised half store: copy the member text verbatim and continue */
+            str_append(&out, &len, &cap, "%.*s", (int)(q - hit), hit);
+            p = q;
+            continue;
+        }
+        {
+            int depth = 0;
+            const char *hp = assign + 6;      /* at "half(" open paren */
+            const char *e = NULL;
+
+            for (const char *r = hp; *r && r < semi + 1; r++)
+            {
+                if (*r == '(') depth++;
+                else if (*r == ')') { if (--depth == 0) { e = r; break; } }
+            }
+            if (!e || e > semi)
+            {
+                str_append(&out, &len, &cap, "%.*s", (int)(q - hit), hit);
+                p = q;
+                continue;
+            }
+            /* write the member + the original `= half(EXPR)` (its `;` follows below),
+             * then the appended float store */
+            str_append(&out, &len, &cap, "%.*s%.*s; mgl_levels[gl_PrimitiveID].%s[%s] = float(%.*s);",
+                       (int)(q - hit), hit,
+                       (int)(semi - q), q,
+                       is_edge ? "o" : "in", idx,
+                       (int)(e - (hp + 1)), hp + 1);
+            p = semi + 1;
+        }
+    }
+
+    /* the signature parameter + the record struct.  NOTE: "kernel void" precedes the
+     * parameter list, so the two insert points can be in either order — splice by
+     * ascending offset */
+    {
+        char *sig_at = strstr(out, "spvTessLevel [[buffer(27)]]");
+        char *k_at = strstr(out, "kernel void ");
+
+        if (sig_at && k_at)
+        {
+            size_t sig_off = (size_t)(sig_at - out) + strlen("spvTessLevel [[buffer(27)]]");
+            size_t k_off = (size_t)(k_at - out);
+            const char *ins_sig = ", device mgl_tess_levels_f* mgl_levels [[buffer(30)]]";
+            const char *ins_str = "struct mgl_tess_levels_f { float o[4]; float in[2]; };\n";
+            size_t L1 = strlen(ins_sig), L2 = strlen(ins_str);
+            size_t nlen = len + L1 + L2 + 16;
+            char *n = (char *)malloc(nlen);
+            char *w;
+            const char *r = out;
+            size_t rem = len + 1;      /* including the NUL */
+
+            if (!n) { free(out); return NULL; }
+            w = n;
+            /* struct before the kernel declaration ... */
+            if (k_off < sig_off)
+            {
+                memcpy(w, r, k_off); w += k_off;
+                memcpy(w, ins_str, L2); w += L2;
+                r += k_off; rem -= k_off;
+                memcpy(w, r, sig_off - k_off); w += sig_off - k_off;
+                memcpy(w, ins_sig, L1); w += L1;
+                r += sig_off - k_off; rem -= sig_off - k_off;
+            }
+            else                        /* ... or after it, if the signature came first */
+            {
+                memcpy(w, r, sig_off); w += sig_off;
+                memcpy(w, ins_sig, L1); w += L1;
+                r += sig_off; rem -= sig_off;
+                memcpy(w, r, k_off - sig_off); w += k_off - sig_off;
+                memcpy(w, ins_str, L2); w += L2;
+                r += k_off - sig_off; rem -= k_off - sig_off;
+            }
+            memcpy(w, r, rem);           /* the rest, including the NUL */
+            free(out);
+            return n;
+        }
+    }
+    return out;
 }
 
 /* precompute, once per program, how the GPU blob kernel must assemble each patch's

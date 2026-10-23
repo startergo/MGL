@@ -687,7 +687,10 @@ TEST(TessOutputCapture)
         else
         {
             printf("capture(quad): prim=0x%x stride=%u count=%u\n", pqm, sq, cq);
-            EXPECT_EQ_INT(cq, 4);
+            /* TF captures the vertices in GENERATION order (GL 4.6 13.4): a filled quad
+             * cell at level 1 is 2 triangles = 6 emitted vertices (the 4 corners each
+             * appearing once per triangle that uses them) */
+            EXPECT_EQ_INT(cq, 6);
             EXPECT_EQ_INT(pqm, GL_TRIANGLES);
             {
                 const float *rq = (const float *)((const uint8_t *)bq + oq);
@@ -698,9 +701,9 @@ TEST(TessOutputCapture)
                         if (rq[(size_t)i * sq + 0] == qpos[k][0] &&
                             rq[(size_t)i * sq + 1] == qpos[k][1])
                             okq++;
-                EXPECT_TRUE(okq == 4);
-                if (okq != 4)
-                    printf("capture(quad): %d/4 corners found\n", okq);
+                EXPECT_TRUE(okq == 6);      /* a, b, c each in 1 triangle, d in 2 */
+                if (okq != 6)
+                    printf("capture(quad): %d/6 corner records found\n", okq);
             }
         }
     }

@@ -1323,13 +1323,24 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     in[12] = src->per_prim;                /* captured vertices per primitive */
 
     memset(vars, 0, sizeof vars);
+    /* stride MUST be MGL_GEOM_XFB_VAR_WORDS (5): the kernel's mgl_geom_xfb_var has a
+     * trailing stream field the tess path leaves 0 (the TES captures one stream), and a
+     * 4-word pack shifted every var past the first onto the wrong fields — the second
+     * varying copied one word of gl_Position.x into the first buffer's y slot. */
     for (GLuint v = 0; v < xp->count && v < MGL_GEOM_XFB_MAX_VARS; v++)
     {
-        vars[v * 4 + 0] = (uint32_t)xp->vars[v].src_word;   /* the capture record's word offset */
-        vars[v * 4 + 1] = (uint32_t)xp->vars[v].offset;
-        vars[v * 4 + 2] = (uint32_t)xp->vars[v].words;
-        vars[v * 4 + 3] = (uint32_t)xp->vars[v].buffer;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 0] = (uint32_t)xp->vars[v].src_word;   /* the capture record's word offset */
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 1] = (uint32_t)xp->vars[v].offset;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 2] = (uint32_t)xp->vars[v].words;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 3] = (uint32_t)xp->vars[v].buffer;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 4] = 0u;                               /* stream 0 */
     }
+    if (geomEnvRead(), gEnv.xfb)
+        for (GLuint v = 0; v < xp->count && v < 8; v++)
+            fprintf(stderr, "geom: tess pack vars[%u]: src_word=%u dst_off=%u words=%u buffer=%u stride=%u tfsize=%u\n",
+                    v, vars[v * MGL_GEOM_XFB_VAR_WORDS + 0], vars[v * MGL_GEOM_XFB_VAR_WORDS + 1],
+                    vars[v * MGL_GEOM_XFB_VAR_WORDS + 2], vars[v * MGL_GEOM_XFB_VAR_WORDS + 3],
+                    in[3 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]], in[8 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]]);
 
     if (!gXfbFence) gXfbFence = [_device newFence];
 
@@ -1338,8 +1349,12 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
      * have been COMMITTED under us (CPU readback in the tessellation draw, query result):
      * Metal asserts when an encoder is requested on a committed buffer; the commit paths
      * leave _currentCommandBuffer == nil, and a nil buffer yields a nil encoder, which the
-     * geometry capture path treats as "no work done this pass". */
+     * geometry capture path treats as "no work done this pass".  A non-nil but COMMITTED
+     * buffer asserts the same way, so it is treated as no work too (the only caller that
+     * can reach here that way consumed a stale capture — nothing was recorded). */
     [self endRenderEncoding];
+    if (_currentCommandBuffer && _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        return false;
     enc = _currentCommandBuffer ? [_currentCommandBuffer computeCommandEncoder] : nil;
     if (!enc) return false;
     [enc pushDebugGroup: @"MGL geometry xfb tess pack"];
@@ -1505,6 +1520,10 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
 
         if (!enc)
         {
+            /* a committed buffer cannot take an encoder (Metal asserts): treat as no work */
+            if (!_currentCommandBuffer ||
+                _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+                return false;
             enc = [_currentCommandBuffer computeCommandEncoder];
             if (!enc) return false;
             [enc pushDebugGroup: @"MGL geometry xfb pack"];

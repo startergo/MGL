@@ -146,6 +146,7 @@ typedef struct MGLTessProgram_t {
     int     point_mode;
 
     int     tcs_out_vertices;   /* GL_TESS_CONTROL_OUTPUT_VERTICES */
+    int     tcs_levels_float;   /* TCS kernel also writes a float level copy (buffer 30) */
 
     /* hardware TES post-tessellation function: Metal validates that the
      * [[patch(domain, N)]] control point count equals drawPatches' N, and
@@ -216,6 +217,7 @@ typedef struct MGLTessProgram_t {
 } MGLTessProgram;
 
 #define MGL_TESS_PROGRAM_HASH 257
+#define MGL_TESS_VS_KERNEL_CACHE 16   /* separable pipeline vertex-kernel variants */
 
 struct MGLExtState_tess {
     MGLTessProgram *programs[MGL_TESS_PROGRAM_HASH];
@@ -245,6 +247,17 @@ struct MGLExtState_tess {
     GLsizei tess_index_count;
     GLsizei patch_count;    /* patches in the current draw (all instances) */
     GLuint  mtl_flags;      /* (unused) */
+
+    /* draw-time vertex-kernel variants for SEPARABLE pipeline vertex programs: a
+     * vs-only program linked alone keeps the plain vertex function (rstate fixup
+     * baked in), and the tess draw path needs the compute-kernel rewrite of it.
+     * Compiled on first use, released when the program's tess record goes away. */
+    struct {
+        GLuint name;           /* program name the kernel belongs to */
+        void  *library;        /* id<MTLLibrary>  (bridged-retain) */
+        void  *function;       /* id<MTLFunction> (bridged-retain) */
+    } vs_kernel[MGL_TESS_VS_KERNEL_CACHE];
+    unsigned vs_kernel_n;
 };
 
 /* Metal hooks of the tess domain */
@@ -262,6 +275,11 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program);
 MGLTessProgram *mgl_tess_program(GLMContext ctx, Program *program);
 MGLTessProgram *mgl_tess_active_program(GLMContext ctx);
 bool mgl_tess_plain_render(GLMContext ctx);
+bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, const char *entry);
+/* GL_TESS_CONTROL_OUTPUT_VERTICES of a linked program: the tess link record when it has
+ * one (a program with a TES), otherwise the TCS's own declaration — a separable tc-only
+ * program links without a tess record (the TES comes from the pipeline at draw time) */
+GLint mgl_tess_program_out_vertices(GLMContext ctx, Program *program);
 
 /* called from program.c during link: MSL variants for the tessellation stages.
  * returns a malloc'd replacement for msl (caller frees the original), or NULL to keep it */

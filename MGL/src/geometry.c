@@ -6358,7 +6358,12 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                              GLint first, GLsizei count, GLsizei instances,
                              GLint basevertex, GLuint baseinstance)
 {
-    Program *program = ctx->state.program ? getProgram(ctx, ctx->state.program->name) : NULL;
+    /* the captured stage is the tessellation evaluation program: with a pipeline bound
+     * (useProgram(0)) that is the pipeline's TES stage program — the varyings live there,
+     * not on any single ctx->state.program */
+    Program *program = ctx->state.program;
+    if (!program && ctx->state.program_pipeline)
+        program = ctx->state.program_pipeline->stage_programs[_TESS_EVALUATION_SHADER];
     MGLXfbObject *o = geom_xfb_object(ctx);
     MGLXfbProgram *xp = geom_xfb_prog(ctx, program, false);
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;

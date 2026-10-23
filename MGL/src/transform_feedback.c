@@ -185,7 +185,18 @@ static void xfb_clear_linked(GLMContext ctx, MGLXfbProgram *xp)
 static Program *xfb_active_program(GLMContext ctx)
 {
     if (STATE(program)) return STATE(program);
-    if (STATE(program_pipeline)) return STATE(program_pipeline)->stage_programs[_VERTEX_SHADER];
+    /* a pipeline: the varyings were recorded on one of the stage programs — the CTS puts
+     * them on the tessellation evaluation program.  Resolve to the LAST pre-rasterization
+     * stage program that has a transform feedback table (TES -> GS -> VS), so the capture
+     * picks the program the varyings actually live on. */
+    if (STATE(program_pipeline)) {
+        static const int order[] = { _TESS_EVALUATION_SHADER, _GEOMETRY_SHADER, _VERTEX_SHADER };
+        for (int i = 0; i < 3; i++) {
+            Program *p = STATE(program_pipeline)->stage_programs[order[i]];
+            if (p && xfb_prog(ctx, p, false)) return p;
+        }
+        return STATE(program_pipeline)->stage_programs[_VERTEX_SHADER];
+    }
     return NULL;
 }
 

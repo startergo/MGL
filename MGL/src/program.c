@@ -1590,6 +1590,82 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     dst->linked_mask |= SHADER_MASK_BIT(stage);
     ok = true;
 
+    /* A SEPARABLE vs-only program can feed a tessellation PIPELINE (the TES lives in
+     * another program).  The tessellation draw needs this stage as a COMPUTE kernel,
+     * which only SPIRV-Cross can produce (vertex-for-tessellation options at MSL
+     * generation) — compile that variant now, from the same SPIR-V, and hand it to the
+     * tess domain's cache.  The plain vertex function stays the program's own (normal
+     * draws of the same program use it). */
+    if (getenv("MGL_TESS_DEBUG") && stage == _VERTEX_SHADER)
+        fprintf(stderr, "MGL tess: sep-vs? stage=%d tess_pipe=%d sep=%d has_ep=%d\n",
+                stage, (int)tess_pipeline, (int)dst->separable,
+                (int)(ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl));
+    if (stage == _VERTEX_SHADER && !tess_pipeline && dst->separable == GL_TRUE &&
+        ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+    {
+        /* a FRESH compiler: re-installing options on the used one mixes the plain and
+         * captured entry-point lowerings (redefinition of the out local) */
+        spvc_compiler c2 = NULL;
+        spvc_compiler_options o2 = NULL;
+        spvc_parsed_ir ir2 = NULL;
+        const char *cleansed = NULL;
+
+        /* re-parse: the first compiler owns (and lowers) the parsed IR, so a second
+         * compiler must start from the module again */
+        if (spvc_context_parse_spirv(context, prepared, prepared_words, &ir2) == SPVC_SUCCESS &&
+            spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir2, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c2) == SPVC_SUCCESS &&
+            spvc_compiler_set_entry_point(c2, entry, model) == SPVC_SUCCESS &&
+            (cleansed = spvc_compiler_get_cleansed_entry_point_name(c2, entry, model)) != NULL &&
+            spvc_compiler_create_compiler_options(c2, &o2) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE) == SPVC_SUCCESS &&
+            spvc_compiler_msl_add_discrete_descriptor_set(c2, 3) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION, SPVC_TRUE) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) == SPVC_SUCCESS &&
+            spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_VS_OUT_BUF) == SPVC_SUCCESS &&
+            spvc_compiler_install_compiler_options(c2, o2) == SPVC_SUCCESS)
+        {
+            const char *tmsl = NULL;
+
+            if (spvc_compiler_compile(c2, &tmsl) == SPVC_SUCCESS && tmsl)
+            {
+                char *k = mgl_tess_rewrite_stage_msl(ctx, _VERTEX_SHADER, true, tmsl);
+
+                if (k)
+                {
+                    /* SPIRV-Cross names the kernel after the entry (e.g. "main0") when
+                     * it is not renamed: take the actual function name from the MSL */
+                    char kentry[128] = "main";
+                    const char *kd = strstr(k, "kernel void ");
+
+                    if (kd)
+                    {
+                        const char *ks = kd + strlen("kernel void ");
+                        size_t kl = 0;
+
+                        while (ks[kl] && (isalnum((unsigned char)ks[kl]) || ks[kl] == '_'))
+                            kl++;
+                        if (kl && kl < sizeof kentry)
+                        {
+                            memcpy(kentry, ks, kl);
+                            kentry[kl] = 0;
+                        }
+                    }
+                    mgl_tess_cache_vs_kernel(ctx, ptr->name, k, kentry);
+                    free(k);
+                }
+                else if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL tess: sep-vs kernel: rewrite failed (head: %.100s)\n", tmsl);
+            }
+            else if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL tess: sep-vs kernel: second SPIRV-Cross compile failed\n");
+        }
+        else if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess: sep-vs kernel: fresh compiler/options rejected\n");
+    }
+
 done:
     spvc_context_destroy(context);
     free(prepared);
@@ -1643,10 +1719,16 @@ static bool check_stage_mask(GLuint mask, char **log, bool separable)
     if ((mask & SHADER_MASK_BIT(_TESS_CONTROL_SHADER)) && !(mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)))
     {
         /* GL 4.6 §7.3: a program fails to link if it contains a tessellation control
-           shader but no tessellation evaluation shader */
-        mgl_append_info_log(log, "ERROR: program contains a tessellation control shader "
-                            "but no tessellation evaluation shader\n");
-        return false;
+           shader but no tessellation evaluation shader — EXCEPT when it is separable:
+           a pipeline object then supplies the TES from another program at draw time
+           (KHR-GL46.tessellation_shader links tc-only separable programs and expects
+           success; glCreateShaderProgramv implies separable too) */
+        if (!separable)
+        {
+            mgl_append_info_log(log, "ERROR: program contains a tessellation control shader "
+                                "but no tessellation evaluation shader\n");
+            return false;
+        }
     }
 
     return true;
@@ -1873,6 +1955,9 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
         return false;
     }
     scratch->base.name = obj->base.name;
+    /* GL_PROGRAM_SEPARABLE semantics must be visible inside the link (the tess domain
+     * compiles the separable vertex stage's compute-kernel variant for pipelines) */
+    scratch->separable = obj->separable;
 
     if (source == LINK_FROM_ATTACHED)
     {
@@ -2230,9 +2315,9 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
                 return;
             }
         {
-            /* tess domain: recorded from the TCS SPIR-V execution modes at link */
-            MGLTessProgram *tp = mgl_tess_program(ctx, pptr);
-            *params = tp ? tp->tcs_out_vertices : 3;
+            /* tess domain: the link record's value, or the TCS's own declaration for a
+             * separable tc-only program (no tess record — the TES is in the pipeline) */
+            *params = mgl_tess_program_out_vertices(ctx, pptr);
         }
             break;
         case GL_TESS_GEN_MODE:
