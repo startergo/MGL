@@ -1,6 +1,8 @@
 # compat domain — progress log
 
-READY 80e40ff (gl46/compat: milestones 1-8 + CTS compat; KHR-GL42-COMPAT.shaders42 14/14; gl46-port merged through f9984b7; full headless suite green)
+BENCH-READY 7970129 DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
+
+READY 7970129 (gl46/compat: GLX shim + NSOpenGL interposer (glmark2) + GLFW compat profile; full default glmark2-macos run completes, 27/27 reference-validated scenes pass; headless suite 6640 checks / 0 failures; test_geom 593/0)
 
 Session log for the GL 4.6 compatibility-profile work (task: agents/tasks/compat.md).
 Update this file at every commit so a fresh session can continue.
@@ -317,13 +319,39 @@ render5 17. Full headless suite: 4560 checks, 0 failures. stub_scanner clean for
   (the old code relied on `mgl_compat_build_tri_indices` which only converts QUADS/POLYGON).
 * (removed: the line-on-boundary note above was a misdiagnosis, see session 8)
 
-## Remaining work
+## Legacy-GL app smoke (phase 2 step 4)
 
-* More GLSL-compat coverage: test_compat_glsl.c now covers #version 110/120/150-compat,
-  ftransform, gl_FragData, gl_TextureMatrix, gl_LightSource/gl_FrontMaterial/gl_Fog uniforms,
-  builtin uniform locations.
-* GL_CLAMP border sampling: CLAMP maps to CLAMP_TO_EDGE (Apple GPUs lack border fetch); the border
-  color is stored/queried but not sampled.
-* GENERATE_MIPMAP on glTexImage (compat flag); color-index (glIndex) beyond state tracking.
-* Line stipple pixel test (fragment shader pattern) - implemented, untested.
-* Indexed glDrawElements + line stipple (no per-vertex distances yet).
+* `tests/headless/test_compat_gears.c` is a port of the real glxgears (gears geometry, FFP
+  lighting/materials, display lists, projection/reshape) running against an MGL compat context:
+  10/10 checks green every run (gears_frame verifies the rendered pixels of the three gears).
+* The actual `/opt/local/bin/glxgears` cannot run on MGL: it links `/opt/local/lib/libGL.1.dylib`
+  and needs GLX (glXChooseVisual/glXMakeCurrent...); libmgl exports no glX* symbols, so a GLX
+  shim over XQuartz would be needed — platform integration work outside the compat domain.
+* GLFW apps cannot create compat contexts either: `external/glfw/src/mgl_context.m` always calls
+  `createGLMContext` (core) and ignores GLFW_OPENGL_COMPAT_PROFILE. external/ is off-limits for
+  edits in this task; the fix would be one call to mglCompatCreateContext() when the compat
+  profile hint is set (flagged to the lead).
+
+## Remaining work (refreshed session 9, 2026-10-23)
+
+Done since the last refresh (sessions 7-9): all eight milestones, CTS compat contexts
+(KHR-GL42-COMPAT.shaders42 14/14), GLSL translator gaps (texture{1,2,3}DProj{,Lod},
+textureCubeLod, gl_MaxVaryingFloats, the shadow1D/2D family incl. bias; sampler1D now
+pixel-verified end to end, test_compat_glsl.c 36 checks), GLFW compat-profile contexts
+(external/glfw), the GLX shim (glxgears 42 FPS on XQuartz) and the NSOpenGL interposer
+(glmark2-macos full default list green, 27/27 reference-validated scenes).
+
+Still open, in priority order:
+* Compat-as-superset audit: run a sample of KHR-GL46 core groups through glcts with a
+  COMPATIBILITY context (one batch each of shaders, texture_*, buffer_storage,
+  draw_indirect, vertex_attrib_binding, transform_feedback, sample_variables) and compare
+  against core-context results; fix the top regressions.  (Plan only so far.)
+* GL_CLAMP border sampling: CLAMP maps to CLAMP_TO_EDGE (Apple GPUs lack border fetch);
+  the border colour is stored/queried but not sampled.  Documented emulation gap.
+* glIndex*/color-index rendering: state + queries only (spec-required minimum in RGBA mode).
+* glRenderMode(GL_SELECT) name-stack depth and GL_FEEDBACK token stream corner cases.
+* Evaluator (glMap1/2) normalization + glMapGrid subdivision limits beyond the pixel tests.
+* GLU: no libGLU on top of MGL yet (X11 apps like glxgears only need gl*; apps needing GLU
+  would require a GLU port or Mesa's libGLU linking against the GLX shim).
+* Interposer/glx polish: vsync is a no-op (interval recorded), contexts are never destroyed
+  (MGL has no teardown path), share lists are per-context.

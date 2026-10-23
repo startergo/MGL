@@ -68,12 +68,37 @@ void getMacOSDefaults(GLMContext glm_ctx)
     CGLPixelFormatObj pix;
     CGLError errorCode;
     GLint num; // stores the number of possible pixel formats
-    errorCode = CGLChoosePixelFormat( attributes, &pix, &num ); assert(errorCode == kCGLNoError);
-    // add error checking here
-    errorCode = CGLCreateContext( pix, NULL, &ctx ); assert(errorCode == kCGLNoError);
+    errorCode = CGLChoosePixelFormat( attributes, &pix, &num );
+    if (errorCode != kCGLNoError)
+    {
+        /* CGL is not available right now (this runs during library
+         * initialization, where the window-server connection may not exist
+         * yet, e.g. when libmgl is loaded through DYLD_INSERT_LIBRARIES):
+         * keep the caller's existing limits instead of aborting; the next
+         * context creation retries the probe (see the shared-file note in
+         * agents/compat_report.md). */
+        dlclose(OpenGL);
+        dlclose(libGL);
+        return;
+    }
+    errorCode = CGLCreateContext( pix, NULL, &ctx );
+    if (errorCode != kCGLNoError)
+    {
+        CGLDestroyPixelFormat( pix );
+        dlclose(OpenGL);
+        dlclose(libGL);
+        return;
+    }
     CGLDestroyPixelFormat( pix );
 
-    errorCode = CGLSetCurrentContext( ctx ); assert(errorCode == kCGLNoError);
+    errorCode = CGLSetCurrentContext( ctx );
+    if (errorCode != kCGLNoError)
+    {
+        CGLDestroyContext( ctx );
+        dlclose(OpenGL);
+        dlclose(libGL);
+        return;
+    }
 
     glGetFloatv(GL_POINT_SIZE,&glm_ctx->state.var.point_size);
     glGetIntegerv(GL_POINT_SIZE_RANGE,&glm_ctx->state.var.point_size_range);

@@ -224,6 +224,60 @@ lib: $(mgl_lib) $(build_dir)/libglfw.dylib
 
 toolchain: $(mgl_toolchain_lib)
 
+# --- GLX shim (libGL.1.dylib for X11 apps; see MGL/glx/) ---
+# X11 location: XQuartz (/opt/X11) or MacPorts (/opt/local) — whichever has
+# libX11; the app's own libX11 must be the same one to avoid two Xlib copies.
+X11_DIRS ?= /opt/local /opt/X11
+X11_DIR := $(firstword $(foreach d,$(X11_DIRS),$(if $(wildcard $(d)/lib/libX11.6.dylib),$(d),)))
+GLX_DIR := $(build_dir)/glx
+glx_lib := $(GLX_DIR)/libGL.1.dylib
+glx_srcs := MGL/glx/glx_shim.c MGL/glx/glx_config.c
+
+glx: $(glx_lib)
+
+$(glx_lib): $(glx_srcs) $(mgl_lib)
+	@test -n "$(X11_DIR)" || { echo "no X11 found in $(X11_DIRS)"; exit 2; }
+	@mkdir -p $(GLX_DIR)
+	$(CC) -shared -fPIC -dynamiclib \
+		-Wall -Wno-deprecated-declarations -arch $(shell uname -m) \
+		-IMGL/include -IMGL/include/GL -IMGL/glx \
+		-I$(X11_DIR)/include \
+		$(glx_srcs) -o $@ \
+		-L$(build_dir) -lmgl -Wl,-reexport_library,$(mgl_lib) \
+		-L$(X11_DIR)/lib -lX11 -lXext \
+		-install_name @rpath/libGL.1.dylib \
+		-Wl,-rpath,@loader_path \
+		-compatibility_version 4.0 -current_version 4.6.0
+	@# libmgl's install name is a relative path; refer to it via @rpath so the
+	@# reexport resolves wherever the shim is loaded from
+	install_name_tool -change build/libmgl.dylib @rpath/libmgl.dylib $@
+	@# libmgl.dylib sits next to the shim so the reexport resolves for apps
+	@# that set only DYLD_LIBRARY_PATH=<build>/glx
+	ln -sf ../libmgl.dylib $(GLX_DIR)/libmgl.dylib
+	@echo "GLX shim built: $@ (X11: $(X11_DIR))"
+
+# --- NSOpenGL interposer (runs NSOpenGL apps on MGL; see MGL/nsgl/) ---
+NSGL_DIR := $(build_dir)/nsgl
+nsgl_lib := $(NSGL_DIR)/libmgl_nsgl.dylib
+
+nsgl: $(nsgl_lib)
+
+$(nsgl_lib): MGL/nsgl/mgl_nsgl.m $(mgl_lib)
+	@mkdir -p $(NSGL_DIR)
+	$(CC) -shared -fPIC -dynamiclib \
+		-Wall -Wno-deprecated-declarations -arch $(shell uname -m) \
+		-fobjc-arc -fmodules \
+		-IMGL/include -IMGL/include/GL -IMGL/nsgl \
+		MGL/nsgl/mgl_nsgl.m -o $@ \
+		-L$(build_dir) -lmgl -Wl,-reexport_library,$(mgl_lib) \
+		-framework AppKit -framework QuartzCore -framework Metal \
+		-install_name @rpath/libmgl_nsgl.dylib \
+		-Wl,-rpath,@loader_path \
+		-compatibility_version 1.0 -current_version 1.0.0
+	@# libmgl.dylib sits next to the interposer (resolved via @loader_path)
+	ln -sf ../libmgl.dylib $(NSGL_DIR)/libmgl.dylib
+	@echo "NSOpenGL interposer built: $@"
+
 test: $(test_exe)
 	$(test_exe)
 
