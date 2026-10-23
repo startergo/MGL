@@ -1808,20 +1808,20 @@ static void tessRetireCapture(GLMContext ctx)
                     free(cm);
                     if (tp->cap_stride && total_patches)
                     {
-                        /* one record per EMITTED vertex: triangles/quads emit far more
-                         * indices than grid vertices (e.g. triangles 12288 vs 2145) */
+                        /* one record per EMITTED vertex: the D3D11 layout's worst case
+                         * (see the emulated block below for the derivations) */
+                        uint32_t vcaps = tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
+                                         tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200;
+                        uint32_t icaps = tp->point_mode ? vcaps :
+                                         tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                                         tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432;
                         off_capture = need;
                         need += tessRingAlign((size_t)total_patches *
-                                  (tp->point_mode ? 4225 :
-                                   tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                                   tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
-                                  (size_t)tp->cap_stride * 4);
+                                  (size_t)icaps * (size_t)tp->cap_stride * 4);
                         /* coordinates re-gathered into emission order for the capture */
                         off_capture_perm = need;
                         need += tessRingAlign((size_t)total_patches *
-                                  (tp->point_mode ? 4225 :
-                                   tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                                   tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                                  (size_t)icaps * 16);
                     }
                 }
                 /* the plain TES's parameter words (16 B) live in this draw's ring block:
@@ -1901,17 +1901,17 @@ static void tessRetireCapture(GLMContext ctx)
                 if (tp->cap_stride && total_patches)
                 {
                     /* one record per EMITTED vertex (see the widened-index branch) */
+                    uint32_t vcaps = tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
+                                     tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200;
+                    uint32_t icaps = tp->point_mode ? vcaps :
+                                     tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                                     tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432;
                     off_capture = need;
                     need += tessRingAlign((size_t)total_patches *
-                              (tp->point_mode ? 4225 :
-                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
-                              (size_t)tp->cap_stride * 4);
+                              (size_t)icaps * (size_t)tp->cap_stride * 4);
                     off_capture_perm = need;
                     need += tessRingAlign((size_t)total_patches *
-                              (tp->point_mode ? 4225 :
-                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                              (size_t)icaps * 16);
                 }
             }
             /* the plain TES's parameter words (16 B) live in this draw's ring block:
@@ -2003,17 +2003,17 @@ static void tessRetireCapture(GLMContext ctx)
                 if (tp->cap_stride && total_patches)
                 {
                     /* one record per EMITTED vertex (see the widened-index branch) */
+                    uint32_t vcaps = tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
+                                     tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200;
+                    uint32_t icaps = tp->point_mode ? vcaps :
+                                     tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
+                                     tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432;
                     off_capture = need;
                     need += tessRingAlign((size_t)total_patches *
-                              (tp->point_mode ? 4225 :
-                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) *
-                              (size_t)tp->cap_stride * 4);
+                              (size_t)icaps * (size_t)tp->cap_stride * 4);
                     off_capture_perm = need;
                     need += tessRingAlign((size_t)total_patches *
-                              (tp->point_mode ? 4225 :
-                               tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                               tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288) * 16);
+                              (size_t)icaps * 16);
                 }
             }
 
@@ -2436,10 +2436,14 @@ static void tessRetireCapture(GLMContext ctx)
         dbg_coords_off = coords_off;
         dbg_ctl_off = emu_off;
         size_t coords_cap = (size_t)total_patches * (tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
-                            tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 2145);
-        size_t indices_cap = (size_t)total_patches * (tp->point_mode ? 4225 :
+                            tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200);
+        /* D3D11-layout worst case per patch: quads 4x65-4 + 63^2 = 4225 vertices /
+           24576 indices; triangles 192 + 3*31*32 + 1 = 3169 vertices / 18432 indices;
+           isolines 64 x 65 vertices / 8192 indices (64 lines of 64 segments) */
+        size_t indices_cap = (size_t)total_patches * (tp->point_mode ? (tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
+                             tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200) :
                              tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
-                             tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 12288);
+                             tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432);
         size_t need = (coords_off - emu_off) + coords_cap * 16 + indices_cap * 4;
         if (tp->capture)
         {
@@ -2479,7 +2483,7 @@ static void tessRetireCapture(GLMContext ctx)
 
             [cenc setComputePipelineState: tCountPso];
             [cenc setBytes: &kp length: sizeof kp atIndex: 0];
-            [cenc setBuffer: ring offset: off_factors atIndex: 1];
+            [cenc setBuffer: ring offset: off_levels_f atIndex: 1];   /* GL's exact float levels */
             [cenc setBuffer: ring offset: emu_off atIndex: 2];
             [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4 atIndex: 3];
             [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)total_patches, 1, 1)
@@ -2495,7 +2499,7 @@ static void tessRetireCapture(GLMContext ctx)
 
             [cenc setComputePipelineState: tEmitPso];
             [cenc setBytes: &kp length: sizeof kp atIndex: 0];
-            [cenc setBuffer: ring offset: off_factors atIndex: 1];
+            [cenc setBuffer: ring offset: off_levels_f atIndex: 1];   /* GL's exact float levels */
             [cenc setBuffer: ring offset: emu_off atIndex: 2];
             [cenc setBuffer: ring offset: coords_off atIndex: 4];
             [cenc setBuffer: ring offset: coords_off + coords_cap * 16 atIndex: 5];

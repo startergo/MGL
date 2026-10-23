@@ -38,4 +38,18 @@ void mgl_tess_diag_capture(GLuint program, int enable);
 bool mgl_tess_diag_capture_info(void **buffer, uint32_t *records_offset, uint32_t *stride_words,
                                 uint32_t *prim, uint32_t *count);
 
+/* Run the CPU (D3D11 reference) tessellator for ONE patch and return its vertex
+ * and index counts: the emulated GPU stream and the query counters must produce
+ * exactly these.  domain/spacing use MGL_TESS_DOMAIN_* / MGL_TESS_SPACING_*.
+ * Test-only. */
+bool mgl_tess_diag_cpu_counts(int domain, int spacing, int ccw, int point_mode,
+                              const float levels[6], uint32_t *nvertices, uint32_t *nindices);
+
+/* ... and the full stream: coords is 4 floats per vertex (u, v, w, 0), indices
+ * the emitted primitive list (or the point list for point_mode).  Returns the
+ * vertex count, -1 if the buffers are too small. */
+int mgl_tess_diag_cpu_mesh(int domain, int spacing, int ccw, int point_mode,
+                           const float levels[6], float *coords, int max_coords,
+                           uint32_t *indices, int max_indices, int *out_index_count);
+
 #endif

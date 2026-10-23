@@ -2195,187 +2195,870 @@ static void mesh_index(struct TessMesh *m, unsigned a, unsigned b, unsigned c)
     m->indices[m->nindices++] = c;
 }
 
-/* spacing rules (GL 4.6 table 11.2): round a level to an integer segment count */
-static int tess_round_level(float level, int spacing)
-{
-    if (isnan(level) || level < 1.0f)
-        level = 1.0f;
-    if (level > (float)MGL_TESS_MAX_LEVEL)
-        level = (float)MGL_TESS_MAX_LEVEL;
-
-    switch (spacing)
-    {
-        case MGL_TESS_SPACING_EQUAL:
-            return (int)ceilf(level);
-        case MGL_TESS_SPACING_FRACTIONAL_EVEN:
-        {
-            if (level < 2.0f) level = 2.0f;
-            int n = (int)ceilf(level);
-            return (n & 1) ? n + 1 : n;         /* round up to even */
-        }
-        default:                                /* fractional odd */
-        {
-            if (level > 63.0f) level = 63.0f;
-            int n = (int)ceilf(level);
-            return (n & 1) ? n : n + 1;         /* round up to odd */
-        }
-    }
-}
-
-/* signed area of the domain-space triangle; triangles/quads use different 2D charts:
- *  triangles (barycentric u,v,w): 2D point = (w, u)  [corner 0 top, 1 left, 2 right]
- *  quads:                          2D point = (u, v)  [u right, v up]
+/* ------------------------------------------------------------------ D3D11 tessellator
+ * Port of Microsoft's D3D11 fixed-function tessellator reference (May 7, 2012,
+ * amar.patel@microsoft.com) as adapted for GPU execution by Mesa's "poly"
+ * library (.agent/ref/poly/cl/tessellator.h; Copyright (c) Microsoft Corporation
+ * and Copyright 2023-2024 Valve Corporation, MIT licensed).  Mesa runs it on
+ * Apple GPUs to pass GL 4.6 tessellation conformance; MGL runs the same
+ * algorithm as the CPU reference (this file) and, transcribed 1:1, as the GPU
+ * compute tessellator of MGLTessKernels.h (isolines + point_mode + capture).
+ *
+ * Differences from the reference, all of them API-facing rather than algorithmic:
+ *   - GL domains: the point writer emits barycentric (u, v, w) for triangles and
+ *     (u, v) for quads/isolines as floats, instead of packed fixed-point pairs.
+ *   - GL winding: reference triangles are counter-clockwise in the (u, v) chart
+ *     (the reference is "clockwise" only under D3D's V-down convention), so the
+ *     last two indices are swapped when the TES declares cw.
+ *   - GL culling: a patch with any relevant outer level <= 0 (or NaN) generates
+ *     nothing, matching the reference and Mesa's GL driver.
+ * The traversal order, the ring layout (outer edges subdivided ONLY by their own
+ * outer level, stitched to the inner rings with the ruler-function order) and the
+ * exact vertex/index count formulas are unchanged, so the output is bit-identical
+ * to the reference up to the float conversion of the n.16 coordinates.
  */
-static void tess_triangles(struct TessMesh *m, const float outer[3], float inner, int spacing,
-                           float pid, bool ccw)
+
+typedef unsigned D3D_FXP;
+
+#define D3D_FXP_FRACTION_BITS 16
+#define D3D_FXP_FRACTION_MASK 0x0000ffffu
+#define D3D_FXP_INTEGER_MASK  0x7fff0000u
+#define D3D_FXP_ONE           (1u << D3D_FXP_FRACTION_BITS)
+#define D3D_FXP_ONE_THIRD     0x00005555u
+#define D3D_FXP_TWO_THIRDS    0x0000aaaau
+#define D3D_FXP_ONE_HALF      0x00008000u
+
+#define D3D_MIN_ODD  1.0f
+#define D3D_MAX_ODD  63.0f
+#define D3D_MIN_EVEN 2.0f
+#define D3D_MAX_EVEN 64.0f
+#define D3D_MIN_ODD_PLUS_HALF_EPS (D3D_MIN_ODD + 0.0000152587890625f / 2.0f)
+
+/* spacing -> reference partitioning */
+#define D3D_PARTITIONING_INTEGER          0
+#define D3D_PARTITIONING_FRACTIONAL_EVEN  1
+#define D3D_PARTITIONING_FRACTIONAL_ODD   2
+
+struct D3DFactorCtx {
+    D3D_FXP fraction;    /* fxpHalfTessFactorFraction */
+    int     num_half;    /* numHalfTessFactorPoints */
+    int     split_point; /* splitPointOnFloorHalfTessFactor */
+    D3D_FXP inv_floor;   /* fxpInvNumSegmentsOnFloorTessFactor */
+    D3D_FXP inv_ceil;    /* fxpInvNumSegmentsOnCeilTessFactor */
+};
+
+/* per-patch generator state (count mode fills ncoord/nindex only) */
+struct D3DTess {
+    struct TessMesh *mesh;
+    float  pid;
+    unsigned base;        /* index of this patch's first vertex in the stream */
+    bool    ccw;
+    bool    tri;          /* triangles: emit w = 1 - u - v */
+    bool    count_only;
+    unsigned ncoord, nindex;
+    /* index patching (see the ring stitching below) */
+    bool patched, patched2;
+    int ipc_inside_delta, ipc_inside_bad, ipc_inside_repl;
+    int ipc_outside_base, ipc_outside_delta, ipc_outside_bad, ipc_outside_repl;
+    int ipc2_base_invert, ipc2_inv_end, ipc2_corner_bad, ipc2_corner_repl;
+};
+
+static D3D_FXP d3d_float_to_fixed(float input)
 {
-    int n[3], N;
-    int rows_capacity;
+    return (D3D_FXP)(input * 65536.0f + 0.5f);
+}
 
-    for (int i = 0; i < 3; i++)
-        n[i] = tess_round_level(outer[i], spacing);
-    N = tess_round_level(inner, spacing);
-    for (int i = 0; i < 3; i++)
-        if (n[i] > N) N = n[i];
-    if (N < 1) N = 1;
+static bool d3d_is_odd(float input)
+{
+    return ((int)input) & 1;
+}
 
-    rows_capacity = N + 1;
+static D3D_FXP d3d_ceil(D3D_FXP input)
+{
+    if (input & D3D_FXP_FRACTION_MASK)
+        return (input & D3D_FXP_INTEGER_MASK) + D3D_FXP_ONE;
+    return input;
+}
 
-    /* row j: points with barycentric u = j/N from edge 0 up to corner 0.
-     * row 0 is the domain edge 0 (between corners 1 and 2), subdivided exactly n[0] times. */
-    unsigned *row_prev = (unsigned *)malloc((rows_capacity + 1) * sizeof(unsigned));
-    unsigned *row_cur = (unsigned *)malloc((rows_capacity + 1) * sizeof(unsigned));
-    float p[3];
+static D3D_FXP d3d_floor(D3D_FXP input)
+{
+    return input & D3D_FXP_INTEGER_MASK;
+}
 
-    /* row 0: exact outer edge 0 from corner 1 (0,1,0) to corner 2 (0,0,1) */
-    int prev_count = 0;
-    for (int k = 0; k <= n[0]; k++)
-    {
-        float t = (n[0] > 0) ? (float)k / (float)n[0] : 0.0f;
-        p[0] = 0.0f; p[1] = 1.0f - t; p[2] = t;
-        row_prev[prev_count++] = mesh_vertex(m, p[0], p[1], p[2], pid);
+static unsigned d3d_remove_msb(unsigned val)
+{
+    unsigned bit = val ? (1u << (31 - __builtin_clz(val))) : 0;
+    return val & ~bit;
+}
+
+static float d3d_clamp_factor(float factor, int partitioning, float maxf)
+{
+    float lower = (partitioning == D3D_PARTITIONING_FRACTIONAL_EVEN) ? D3D_MIN_EVEN : D3D_MIN_ODD;
+    float upper = (partitioning == D3D_PARTITIONING_FRACTIONAL_ODD) ? D3D_MAX_ODD : D3D_MAX_EVEN;
+
+    /* if any factor ends up > 1, force the inside factors > 1 so a picture
+     * frame is generated (fractional-odd only) */
+    if (partitioning == D3D_PARTITIONING_FRACTIONAL_ODD && maxf > D3D_MIN_ODD_PLUS_HALF_EPS)
+        lower = D3D_MIN_ODD + 0.0000152587890625f;
+
+    factor = factor < lower ? lower : (factor > upper ? upper : factor);
+    if (partitioning == D3D_PARTITIONING_INTEGER)
+        factor = ceilf(factor);
+    return factor;
+}
+
+static int d3d_num_points_for_factor(bool odd, D3D_FXP fxp)
+{
+    D3D_FXP f = fxp + (odd ? (D3D_FXP_ONE + 1) : 1);
+    int r = (int)(d3d_ceil(f / 2) >> (D3D_FXP_FRACTION_BITS - 1));
+    return odd ? r : r + 1;
+}
+
+static void d3d_compute_factor_ctx(bool odd, D3D_FXP fxp, struct D3DFactorCtx *c)
+{
+    D3D_FXP half = (fxp + 1) / 2;
+    D3D_FXP fl, ce;
+    int nfloor, nceil;
+
+    /* half == 1/2 if the factor is 1, but we are pretending we are even */
+    if (odd || half == D3D_FXP_ONE_HALF)
+        half += D3D_FXP_ONE_HALF;
+    fl = d3d_floor(half);
+    ce = d3d_ceil(half);
+    c->fraction = half - fl;
+    c->num_half = (int)(ce >> D3D_FXP_FRACTION_BITS);
+    if (ce == fl)
+        c->split_point = c->num_half + 1;               /* ignored by the test below */
+    else if (odd)
+        c->split_point = (fl == D3D_FXP_ONE) ? 0 : (int)((d3d_remove_msb((unsigned)(fl >> D3D_FXP_FRACTION_BITS) - 1u) << 1) + 1);
+    else
+        c->split_point = (int)((d3d_remove_msb((unsigned)(fl >> D3D_FXP_FRACTION_BITS)) << 1) + 1);
+    nfloor = (int)((fl * 2) >> D3D_FXP_FRACTION_BITS);
+    nceil = (int)((ce * 2) >> D3D_FXP_FRACTION_BITS);
+    if (odd) { nfloor -= 1; nceil -= 1; }
+    c->inv_floor = d3d_float_to_fixed(1.0f / (float)nfloor);
+    c->inv_ceil = d3d_float_to_fixed(1.0f / (float)nceil);
+}
+
+static D3D_FXP d3d_place_point_in_1d(const struct D3DFactorCtx *c, bool odd, int point)
+{
+    bool flip = point >= c->num_half;
+    D3D_FXP loc;
+    unsigned idx_ceil, idx_floor;
+
+    if (flip)
+        point = (c->num_half << 1) - point - odd;
+    /* the middle point cannot be reproduced by the 16-bit fixed math below */
+    if (point == c->num_half)
+        return D3D_FXP_ONE_HALF;
+
+    idx_ceil = (unsigned)point;
+    idx_floor = idx_ceil;
+    if (point > c->split_point)
+        idx_floor -= 1;
+    loc = (idx_floor * c->inv_floor) * (D3D_FXP_ONE - c->fraction) +
+          (idx_ceil * c->inv_ceil) * c->fraction;
+    loc = (loc + D3D_FXP_ONE_HALF) >> D3D_FXP_FRACTION_BITS;
+    if (flip)
+        loc = D3D_FXP_ONE - loc;
+    return loc;
+}
+
+/* ---- output: one domain point / one triangle, with GL winding ---- */
+
+static unsigned d3d_point(struct D3DTess *t, D3D_FXP u, D3D_FXP v)
+{
+    float uf = (float)u / 65536.0f;
+    float vf = (float)v / 65536.0f;
+
+    if (t->count_only)
+        return t->ncoord++;
+    return mesh_vertex(t->mesh, uf, vf, t->tri ? 1.0f - uf - vf : 0.0f, t->pid) - t->base;
+}
+
+static int d3d_patch_index(const struct D3DTess *t, int index)
+{
+    if (t->patched) {
+        if (index >= t->ipc_outside_base) {
+            if (index == t->ipc_outside_bad)
+                return t->ipc_outside_repl;
+            return index + t->ipc_outside_delta;
+        }
+        if (index == t->ipc_inside_bad)
+            return t->ipc_inside_repl;
+        return index + t->ipc_inside_delta;
+    }
+    if (t->patched2) {
+        if (index == t->ipc2_corner_bad)
+            return t->ipc2_corner_repl;
+        if (index >= t->ipc2_base_invert)
+            return t->ipc2_inv_end - index;
+    }
+    return index;
+}
+
+static void d3d_triangle(struct D3DTess *t, int i0, int i1, int i2)
+{
+    if (t->count_only) { t->nindex += 3; return; }
+    i0 = (int)d3d_patch_index(t, i0) + (int)t->base;
+    i1 = (int)d3d_patch_index(t, i1) + (int)t->base;
+    i2 = (int)d3d_patch_index(t, i2) + (int)t->base;
+    if (t->ccw)
+        mesh_index(t->mesh, (unsigned)i0, (unsigned)i1, (unsigned)i2);
+    else
+        mesh_index(t->mesh, (unsigned)i0, (unsigned)i2, (unsigned)i1);
+}
+
+/* ---- ring stitching (identical to the reference) ---- */
+
+static void d3d_line(struct D3DTess *t, int i0, int i1)
+{
+    if (t->count_only) { t->nindex += 2; return; }
+    if (!mesh_reserve(t->mesh, 0, 2))
+        return;
+    t->mesh->indices[t->mesh->nindices++] =
+        (unsigned)((int)d3d_patch_index(t, i0) + (int)t->base);
+    t->mesh->indices[t->mesh->nindices++] =
+        (unsigned)((int)d3d_patch_index(t, i1) + (int)t->base);
+}
+
+#define D3D_DIAG_INSIDE_TO_OUTSIDE              0
+#define D3D_DIAG_INSIDE_TO_OUTSIDE_EXCEPT_MID   1
+#define D3D_DIAG_MIRRORED                       2
+
+static void d3d_stitch_regular(struct D3DTess *t, bool trapezoid, int diagonals,
+                               int base_index_offset, int num_inside_edge_points,
+                               int inside_base, int outside_base)
+{
+    int inside = inside_base, outside = outside_base, p;
+
+    if (trapezoid) {
+        d3d_triangle(t, outside, outside + 1, inside);
+        base_index_offset += 3;
+        outside++;
+    }
+    switch (diagonals) {
+    case D3D_DIAG_INSIDE_TO_OUTSIDE:
+        for (p = 0; p < num_inside_edge_points - 1; p++) {
+            d3d_triangle(t, inside, outside, outside + 1);
+            d3d_triangle(t, inside, outside + 1, inside + 1);
+            inside++; outside++;
+        }
+        break;
+    case D3D_DIAG_INSIDE_TO_OUTSIDE_EXCEPT_MID:
+        for (p = 0; p < num_inside_edge_points / 2 - 1; p++) {
+            d3d_triangle(t, outside, outside + 1, inside);
+            d3d_triangle(t, inside, outside + 1, inside + 1);
+            inside++; outside++;
+        }
+        d3d_triangle(t, outside, inside + 1, inside);
+        d3d_triangle(t, outside, outside + 1, inside + 1);
+        inside++; outside++;
+        p += 2;
+        for (; p < num_inside_edge_points; p++) {
+            d3d_triangle(t, outside, outside + 1, inside);
+            d3d_triangle(t, inside, outside + 1, inside + 1);
+            inside++; outside++;
+        }
+        break;
+    default: /* mirrored */
+        for (p = 0; p < num_inside_edge_points / 2; p++) {
+            d3d_triangle(t, outside, inside + 1, inside);
+            d3d_triangle(t, outside, outside + 1, inside + 1);
+            inside++; outside++;
+        }
+        for (; p < num_inside_edge_points - 1; p++) {
+            d3d_triangle(t, inside, outside, outside + 1);
+            d3d_triangle(t, inside, outside + 1, inside + 1);
+            inside++; outside++;
+        }
+        break;
+    }
+    if (trapezoid) {
+        d3d_triangle(t, outside, outside + 1, inside);
+        base_index_offset += 3;
+    }
+}
+
+static int d3d_loop_start(int n)
+{
+    if (n < 2) return 1;
+    else if (n == 2) return 17;
+    else if (n < 5) return 9;
+    else if (n < 9) return 5;
+    else if (n < 17) return 3;
+    else return 2;
+}
+
+static int d3d_loop_end(int n)
+{
+    if (n < 2) return 0;
+    else if (n < 4) return 17;
+    else if (n < 8) return 25;
+    else if (n < 16) return 29;
+    else if (n < 32) return 31;
+    else return 32;
+}
+
+/* where vertex i [0..33] ends up on the half edge at the maximum tessellation
+ * amount, given the ruler-function split order (odd factors up to 65, even up
+ * to 64) */
+static unsigned d3d_final_point_position(unsigned x)
+{
+    unsigned shift, items, shifted, bias;
+
+    if (x == 0) return 0;
+    if (x == 1) return 0x20;
+    if ((x & 1) == 0) shift = 1;
+    else if ((x & 3) == 3) shift = 2;
+    else if ((x & 7) == 5) shift = 3;
+    else if (x != 17) shift = 4;
+    else shift = 5;
+
+    items = x | (0x20u << 16);
+    shifted = items >> shift;
+    bias = (shifted >> 16) < 0xfu ? (shifted >> 16) : 0xfu;
+    return bias + (shifted & 0xffffu);
+}
+
+static void d3d_stitch_transition(struct D3DTess *t, int inside_base,
+                                  int inside_num_half_points, bool inside_odd,
+                                  int outside_base, int outside_num_half_points,
+                                  bool outside_odd)
+{
+    int outside, inside, i, i_start, i_end;
+
+    if (inside_odd) inside_num_half_points -= 1;
+    if (outside_odd) outside_num_half_points -= 1;
+
+    outside = outside_base;
+    inside = inside_base;
+    i_start = d3d_loop_start(inside_num_half_points) < d3d_loop_start(outside_num_half_points) ?
+              d3d_loop_start(inside_num_half_points) : d3d_loop_start(outside_num_half_points);
+    i_end = d3d_loop_end(inside_num_half_points > outside_num_half_points ?
+                         inside_num_half_points : outside_num_half_points);
+
+    if (0 < outside_num_half_points) {          /* advance outside */
+        d3d_triangle(t, outside, outside + 1, inside);
+        outside++;
+    }
+    for (i = i_start; i <= i_end; i++) {
+        int bound = (int)d3d_final_point_position((unsigned)i);
+        if (bound < inside_num_half_points) {   /* advance inside */
+            d3d_triangle(t, inside, outside, inside + 1);
+            inside++;
+        }
+        if (bound < outside_num_half_points) {  /* advance outside */
+            d3d_triangle(t, outside, outside + 1, inside);
+            outside++;
+        }
+    }
+    if ((inside_odd != outside_odd) || inside_odd) {
+        if (inside_odd == outside_odd) {        /* quad in the middle */
+            d3d_triangle(t, inside, outside, inside + 1);
+            d3d_triangle(t, inside + 1, outside, outside + 1);
+            inside++; outside++;
+        } else if (!inside_odd) {               /* triangle pointing inside */
+            d3d_triangle(t, inside, outside, outside + 1);
+            outside++;
+        } else {                                /* triangle pointing outside */
+            d3d_triangle(t, inside, outside, inside + 1);
+            inside++;
+        }
+    }
+    for (i = i_end; i >= i_start; i--) {
+        int bound = (int)d3d_final_point_position((unsigned)i);
+        if (bound < outside_num_half_points) {  /* advance outside */
+            d3d_triangle(t, outside, outside + 1, inside);
+            outside++;
+        }
+        if (bound < inside_num_half_points) {   /* advance inside */
+            d3d_triangle(t, inside, outside, inside + 1);
+            inside++;
+        }
+    }
+    if (0 < outside_num_half_points) {
+        d3d_triangle(t, outside, outside + 1, inside);
+        outside++;
+    }
+}
+
+/* ---- isolines: levels [density, detail], lines run along u ---- */
+
+static void d3d_isoline_process(struct D3DTess *t, int partitioning, const float *factors)
+{
+    float density = factors[0], detail = factors[1];
+    bool density_odd, detail_odd;
+    struct D3DFactorCtx density_ctx, detail_ctx;
+    D3D_FXP fxp_detail, fxp_density;
+    int num_points_per_line, num_lines, num_points, line, point;
+
+    if (!(density > 0.0f) || !(detail > 0.0f)) {
+        t->ncoord = 0; t->nindex = 0;                     /* culled */
+        return;
+    }
+    density = density < 1.0f ? 1.0f : (density > 64.0f ? 64.0f : density);
+    detail = d3d_clamp_factor(detail, partitioning, 0.0f);
+
+    if (partitioning == D3D_PARTITIONING_INTEGER)
+        detail_odd = d3d_is_odd(detail);
+    else
+        detail_odd = (partitioning == D3D_PARTITIONING_FRACTIONAL_ODD);
+
+    fxp_detail = d3d_float_to_fixed(detail);
+    d3d_compute_factor_ctx(detail_odd, fxp_detail, &detail_ctx);
+    num_points_per_line = d3d_num_points_for_factor(detail_odd, fxp_detail);
+
+    density = ceilf(density);
+    density_odd = d3d_is_odd(density);
+    fxp_density = d3d_float_to_fixed(density);
+    d3d_compute_factor_ctx(density_odd, fxp_density, &density_ctx);
+    num_lines = d3d_num_points_for_factor(density_odd, fxp_density) - 1;
+
+    num_points = num_points_per_line * num_lines;
+    if (t->count_only) {
+        t->ncoord = (unsigned)num_points;
+        t->nindex = (unsigned)(num_lines * (num_points_per_line - 1) * 2);
+        return;
     }
 
-    for (int j = 1; j <= N; j++)
-    {
-        float u = (float)j / (float)N;
-        int count = N - j + 1;
-        int cur_count = 0;
+    for (line = 0; line < num_lines; line++) {
+        D3D_FXP v = d3d_place_point_in_1d(&density_ctx, density_odd, line);
+        for (point = 0; point < num_points_per_line; point++)
+            d3d_point(t, d3d_place_point_in_1d(&detail_ctx, detail_odd, point), v);
+    }
+    /* connectivity: a strip per line, in vertex order */
+    for (line = 0; line < num_lines; line++) {
+        int base = line * num_points_per_line;
+        for (point = 1; point < num_points_per_line; point++)
+            d3d_line(t, base + point - 1, base + point);
+    }
+}
 
-        for (int k = 0; k < count; k++)
-        {
-            float t = (count > 1) ? (float)k / (float)(count - 1) : 0.0f;
-            /* point on the segment from (u, 1-u, 0) to (u, 0, 1-u) */
-            p[0] = u;
-            p[1] = (1.0f - u) * (1.0f - t);
-            p[2] = (1.0f - u) * t;
-            row_cur[cur_count++] = mesh_vertex(m, p[0], p[1], p[2], pid);
+/* ---- triangles: factors [outer_u0, outer_v0, outer_w0, -, inner, -] ---- */
+
+static void d3d_tri_process(struct D3DTess *t, int partitioning, const float *factors)
+{
+    float outer_f[3], inner_f;
+    D3D_FXP outer[3], inner;
+    bool outer_odd[3], inner_odd;
+    struct D3DFactorCtx outer_ctx[3], inner_ctx;
+    int num_outer[3], num_inner, inside_base, num_points, i;
+    int num_rings;
+    int point_offset, inside_offset, outside_base, ring, edge;
+
+    for (i = 0; i < 3; i++) {
+        outer_f[i] = factors[i];
+        if (!(outer_f[i] > 0.0f)) {                /* culled (NaN passes) */
+            t->ncoord = 0; t->nindex = 0;
+            return;
         }
+    }
+    inner_f = factors[4];
 
-        /* stitch row_prev (n+1 points) to row_cur (n points) */
-        int a = 0, b = 0;
-        while (a < prev_count - 1 || b < cur_count - 1)
-        {
-            float fa = (prev_count > 1) ? (float)a / (float)(prev_count - 1) : 1.0f;
-            float fb = (cur_count > 1) ? (float)b / (float)(cur_count - 1) : 1.0f;
+    for (i = 0; i < 3; i++)
+        outer_f[i] = d3d_clamp_factor(outer_f[i], partitioning, 0.0f);
+    {
+        float maxf = outer_f[0] > outer_f[1] ? outer_f[0] : outer_f[1];
+        maxf = maxf > outer_f[2] ? maxf : outer_f[2];
+        inner_f = d3d_clamp_factor(inner_f, partitioning, maxf);
+    }
 
-            if (a >= prev_count - 1)
-            {
-                if (ccw) mesh_index(m, row_prev[a], row_cur[b], row_cur[b + 1]);
-                else     mesh_index(m, row_prev[a], row_cur[b + 1], row_cur[b]);
-                b++;
+    if (partitioning == D3D_PARTITIONING_INTEGER) {
+        for (i = 0; i < 3; i++)
+            outer_odd[i] = d3d_is_odd(outer_f[i]);
+        inner_odd = d3d_is_odd(inner_f) && (1.0f != inner_f);
+    } else {
+        bool odd = (partitioning == D3D_PARTITIONING_FRACTIONAL_ODD);
+        for (i = 0; i < 3; i++)
+            outer_odd[i] = odd;
+        inner_odd = odd;
+    }
+    for (i = 0; i < 3; i++)
+        outer[i] = d3d_float_to_fixed(outer_f[i]);
+    inner = d3d_float_to_fixed(inner_f);
+
+    /* minimum tessellation: a single triangle */
+    if (partitioning != D3D_PARTITIONING_FRACTIONAL_EVEN &&
+        inner == D3D_FXP_ONE && outer[0] == D3D_FXP_ONE &&
+        outer[1] == D3D_FXP_ONE && outer[2] == D3D_FXP_ONE) {
+        if (t->count_only) { t->ncoord = 3; t->nindex = 3; return; }
+        /* V=1 (start of the Ueq0 edge VW), W=1 (start of Veq0 edge WU),
+         * U=1 (start of the Weq0 edge UV) */
+        d3d_point(t, 0, D3D_FXP_ONE);
+        d3d_point(t, 0, 0);
+        d3d_point(t, D3D_FXP_ONE, 0);
+        d3d_triangle(t, 0, 1, 2);
+        return;
+    }
+
+    for (i = 0; i < 3; i++)
+        d3d_compute_factor_ctx(outer_odd[i], outer[i], &outer_ctx[i]);
+    d3d_compute_factor_ctx(inner_odd, inner, &inner_ctx);
+
+    num_points = 0;
+    for (i = 0; i < 3; i++) {
+        num_outer[i] = d3d_num_points_for_factor(outer_odd[i], outer[i]);
+        num_points += num_outer[i];
+    }
+    num_points -= 3;
+
+    num_inner = d3d_num_points_for_factor(inner_odd, inner);
+    {
+        int min_points = inner_odd ? 4 : 3;
+        /* max() allows degenerate transition regions when the inner factor == 1 */
+        num_inner = min_points > num_inner ? min_points : num_inner;
+    }
+    inside_base = num_points;
+    {
+        int interior_rings = (num_inner >> 1) - 1;
+        int even = inner_odd ? 0 : 1;
+        num_points += 3 * (interior_rings * (interior_rings + even)) + even;
+    }
+
+    if (t->count_only) {
+        int outer_pts = num_outer[0] + num_outer[1] + num_outer[2];
+        int rings18, num_indices;
+        num_rings = (num_inner + 1) >> 1;
+        rings18 = num_rings * 18;
+        num_indices = ((rings18 - 27) * num_inner) + (3 * outer_pts) -
+                      (rings18 * (num_rings - 1)) + (inner_odd ? 3 : 0);
+        t->ncoord = (unsigned)num_points;
+        t->nindex = (unsigned)num_indices;
+        return;
+    }
+
+    /* exterior ring: clockwise starting from point V, i.e. edge0 = VW (u == 0) */
+    point_offset = 0;
+    for (edge = 0; edge < 3; edge++) {
+        int odd = edge & 1;
+        int end_point = num_outer[edge] - 1;   /* next edge starts with the last */
+        int p;
+        for (p = 0; p < end_point; p++, point_offset++) {
+            /* edge0 VW has v decreasing -> reverse; edge1 WU has u increasing;
+             * edge2 UV has u decreasing -> reverse */
+            int q = odd ? p : end_point - p;
+            D3D_FXP param = d3d_place_point_in_1d(&outer_ctx[edge], outer_odd[edge], q);
+            d3d_point(t, edge == 0 ? 0 : param,
+                         edge == 0 ? param : (edge == 2 ? D3D_FXP_ONE - param : 0));
+        }
+    }
+
+    /* interior rings, clockwise spiralling in */
+    num_rings = num_inner >> 1;
+    for (ring = 1; ring < num_rings; ring++) {
+        int start = ring, end = num_inner - 1 - start;
+        int perp = start;
+        D3D_FXP fxp_perp = d3d_place_point_in_1d(&inner_ctx, inner_odd, perp);
+        fxp_perp *= D3D_FXP_TWO_THIRDS;
+        fxp_perp = (fxp_perp + D3D_FXP_ONE_HALF) >> D3D_FXP_FRACTION_BITS;
+
+        for (edge = 0; edge < 3; edge++) {
+            int odd = edge & 1;
+            int p;
+            for (p = start; p < end; p++, point_offset++) {
+                int q = odd ? p : end - (p - start);
+                D3D_FXP param = d3d_place_point_in_1d(&inner_ctx, inner_odd, q);
+                D3D_FXP tmp = param - (fxp_perp + 1) / 2;
+                d3d_point(t, edge > 0 ? tmp : fxp_perp,
+                             edge == 0 ? tmp : (edge == 1 ? fxp_perp : D3D_FXP_ONE - tmp - fxp_perp));
             }
-            else if (b >= cur_count - 1)
-            {
-                if (ccw) mesh_index(m, row_prev[a], row_prev[a + 1], row_cur[b]);
-                else     mesh_index(m, row_prev[a], row_cur[b], row_prev[a + 1]);
-                a++;
+        }
+    }
+    if (!inner_odd)
+        d3d_point(t, D3D_FXP_ONE_THIRD, D3D_FXP_ONE_THIRD);   /* the centre */
+
+    /* connectivity: concentric rings, one side at a time */
+    num_rings = (num_inner + 1) >> 1;
+    inside_offset = inside_base;
+    outside_base = 0;
+    for (ring = 1; ring < num_rings; ring++) {
+        int num_inside_edge = num_inner - 2 * ring;
+        int edge0_inside_base = inside_offset;
+        int edge0_outside_base = outside_base;
+        for (edge = 0; edge < 3; edge++) {
+            int outside_points = (ring == 1) ? num_outer[edge] : (num_inside_edge + 2);
+            int inside_base, obase;
+
+            if (edge == 2) {
+                /* wrap-around: patch the indices so the stitch sees two
+                 * sequentially increasing rows */
+                t->patched = true;
+                t->ipc_inside_delta = inside_offset;
+                t->ipc_inside_bad = num_inside_edge - 1;
+                t->ipc_inside_repl = edge0_inside_base;
+                t->ipc_outside_base = t->ipc_inside_bad + 1;
+                t->ipc_outside_delta = outside_base - t->ipc_outside_base;
+                t->ipc_outside_bad = t->ipc_outside_base + outside_points - 1;
+                t->ipc_outside_repl = edge0_outside_base;
+                inside_base = 0;
+                obase = t->ipc_outside_base;
+            } else {
+                inside_base = inside_offset;
+                obase = outside_base;
             }
-            else if (fa <= fb)
-            {
-                if (ccw) mesh_index(m, row_prev[a], row_prev[a + 1], row_cur[b]);
-                else     mesh_index(m, row_prev[a], row_cur[b], row_prev[a + 1]);
-                a++;
-            }
+            if (ring == 1)
+                d3d_stitch_transition(t, inside_base, inner_ctx.num_half, inner_odd,
+                                      obase, outer_ctx[edge].num_half, outer_odd[edge]);
             else
-            {
-                if (ccw) mesh_index(m, row_prev[a], row_cur[b], row_cur[b + 1]);
-                else     mesh_index(m, row_prev[a], row_cur[b + 1], row_cur[b]);
-                b++;
-            }
+                d3d_stitch_regular(t, true, D3D_DIAG_MIRRORED, 0, num_inside_edge,
+                                   inside_base, obase);
+            t->patched = false;
+            outside_base += outside_points - 1;
+            inside_offset += num_inside_edge - 1;
         }
+    }
+    if (inner_odd) {                       /* the centre is a single triangle */
+        d3d_triangle(t, outside_base, outside_base + 1, outside_base + 2);
+    }
+}
 
-        memcpy(row_prev, row_cur, cur_count * sizeof(unsigned));
-        prev_count = cur_count;
+/* ---- quads: factors [outer_u0, outer_v0, outer_u1, outer_v1, inner_u, inner_v] ---- */
+
+static void d3d_quad_process(struct D3DTess *t, int partitioning, const float *factors)
+{
+    float outer_f[4], inner_f[2], maxf;
+    D3D_FXP outer[4], inner[2];
+    bool outer_odd[4], inner_odd[2];
+    struct D3DFactorCtx outer_ctx[4], inner_ctx[2];
+    int num_outer[4], num_inner[2], inside_base, num_points, i;
+    int num_rings, num_rows_center[2], ring, edge, point_offset;
+    int inside_offset, outside_base, degenerate_ring[2];
+
+    for (i = 0; i < 4; i++) {
+        outer_f[i] = factors[i];
+        if (!(outer_f[i] > 0.0f)) {                /* culled (NaN passes) */
+            t->ncoord = 0; t->nindex = 0;
+            return;
+        }
+    }
+    inner_f[0] = factors[4];
+    inner_f[1] = factors[5];
+
+    for (i = 0; i < 4; i++)
+        outer_f[i] = d3d_clamp_factor(outer_f[i], partitioning, 0.0f);
+    maxf = outer_f[0];
+    for (i = 1; i < 4; i++) maxf = maxf > outer_f[i] ? maxf : outer_f[i];
+    for (i = 0; i < 2; i++) maxf = maxf > inner_f[i] ? maxf : inner_f[i];
+    inner_f[0] = d3d_clamp_factor(inner_f[0], partitioning, maxf);
+    inner_f[1] = d3d_clamp_factor(inner_f[1], partitioning, maxf);
+
+    if (partitioning == D3D_PARTITIONING_INTEGER) {
+        for (i = 0; i < 4; i++)
+            outer_odd[i] = d3d_is_odd(outer_f[i]);
+        for (i = 0; i < 2; i++)
+            inner_odd[i] = d3d_is_odd(inner_f[i]) && (1.0f != inner_f[i]);
+    } else {
+        bool odd = (partitioning == D3D_PARTITIONING_FRACTIONAL_ODD);
+        for (i = 0; i < 4; i++)
+            outer_odd[i] = odd;
+        inner_odd[0] = inner_odd[1] = odd;
+    }
+    for (i = 0; i < 4; i++)
+        outer[i] = d3d_float_to_fixed(outer_f[i]);
+    for (i = 0; i < 2; i++)
+        inner[i] = d3d_float_to_fixed(inner_f[i]);
+
+    /* minimum tessellation: a single quad */
+    if (partitioning != D3D_PARTITIONING_FRACTIONAL_EVEN &&
+        inner[0] == D3D_FXP_ONE && inner[1] == D3D_FXP_ONE &&
+        outer[0] == D3D_FXP_ONE && outer[1] == D3D_FXP_ONE &&
+        outer[2] == D3D_FXP_ONE && outer[3] == D3D_FXP_ONE) {
+        if (t->count_only) { t->ncoord = 4; t->nindex = 6; return; }
+        d3d_point(t, 0, 0);
+        d3d_point(t, D3D_FXP_ONE, 0);
+        d3d_point(t, D3D_FXP_ONE, D3D_FXP_ONE);
+        d3d_point(t, 0, D3D_FXP_ONE);
+        d3d_triangle(t, 0, 1, 3);
+        d3d_triangle(t, 1, 2, 3);
+        return;
     }
 
-    free(row_prev);
-    free(row_cur);
-}
+    for (i = 0; i < 4; i++)
+        d3d_compute_factor_ctx(outer_odd[i], outer[i], &outer_ctx[i]);
+    for (i = 0; i < 2; i++)
+        d3d_compute_factor_ctx(inner_odd[i], inner[i], &inner_ctx[i]);
 
-static void tess_quads(struct TessMesh *m, const float outer[4], const float inner[2], int spacing,
-                       float pid, bool ccw)
-{
-    int nu = tess_round_level(inner[0], spacing);
-    int nv = tess_round_level(inner[1], spacing);
-    if (tess_round_level(outer[2], spacing) > nu) nu = tess_round_level(outer[2], spacing);
-    if (tess_round_level(outer[3], spacing) > nu) nu = tess_round_level(outer[3], spacing);
-    if (tess_round_level(outer[0], spacing) > nv) nv = tess_round_level(outer[0], spacing);
-    if (tess_round_level(outer[1], spacing) > nv) nv = tess_round_level(outer[1], spacing);
-    if (nu < 1) nu = 1;
-    if (nv < 1) nv = 1;
+    num_points = 0;
+    for (i = 0; i < 4; i++) {
+        num_outer[i] = d3d_num_points_for_factor(outer_odd[i], outer[i]);
+        num_points += num_outer[i];
+    }
+    num_points -= 4;
 
-    unsigned *grid = (unsigned *)malloc((size_t)(nu + 1) * (nv + 1) * sizeof(unsigned));
-    for (int j = 0; j <= nv; j++)
-        for (int i = 0; i <= nu; i++)
-            grid[j * (nu + 1) + i] = mesh_vertex(m, (float)i / (float)nu, (float)j / (float)nv, 0.0f, pid);
+    for (i = 0; i < 2; i++) {
+        int min_points;
+        num_inner[i] = d3d_num_points_for_factor(inner_odd[i], inner[i]);
+        min_points = inner_odd[i] ? 4 : 3;
+        num_inner[i] = min_points > num_inner[i] ? min_points : num_inner[i];
+    }
+    inside_base = num_points;
+    num_points += (num_inner[0] - 2) * (num_inner[1] - 2);
 
-    for (int j = 0; j < nv; j++)
-        for (int i = 0; i < nu; i++)
+    if (t->count_only) {
+        int outer_pts = num_outer[0] + num_outer[1] + num_outer[2] + num_outer[3];
+        int inner_pts = num_inner[0] + num_inner[1];
+        int num_indices;
+        num_rows_center[0] = (num_inner[0] + 1) >> 1;
+        num_rows_center[1] = (num_inner[1] + 1) >> 1;
+        num_rings = num_rows_center[0] < num_rows_center[1] ? num_rows_center[0] : num_rows_center[1];
+        num_indices = (outer_pts * 3) + (12 * num_rings * inner_pts) -
+                      (inner_pts * 18) - (24 * num_rings * (num_rings - 1));
         {
-            unsigned a = grid[j * (nu + 1) + i];
-            unsigned b = grid[j * (nu + 1) + i + 1];
-            unsigned c = grid[(j + 1) * (nu + 1) + i + 1];
-            unsigned dd = grid[(j + 1) * (nu + 1) + i];
-            if (ccw)
-            {
-                mesh_index(m, a, b, c);
-                mesh_index(m, a, c, dd);
-            }
-            else
-            {
-                mesh_index(m, a, c, b);
-                mesh_index(m, a, dd, c);
+            int M, m;                       /* major / minor axis */
+            M = num_inner[0] > num_inner[1] ? 0 : 1;
+            m = 1 - M;
+            if (inner_odd[m]) {
+                num_indices += 12 * ((num_inner[M] >> 1) - (num_inner[m] >> 1));
+                num_indices += inner_odd[M] ? 6 : 12;
             }
         }
-    free(grid);
-}
+        t->ncoord = (unsigned)num_points;
+        t->nindex = (unsigned)num_indices;
+        return;
+    }
 
-static void tess_isolines(struct TessMesh *m, const float outer[2], int spacing, float pid)
-{
-    int n0 = (int)ceilf(outer[0] < 1.0f ? 1.0f : (outer[0] > 64.0f ? 64.0f : outer[0]));
-    int n1 = tess_round_level(outer[1], spacing);
+    /* exterior ring: clockwise from top-left (u == 0, v == 1) */
+    point_offset = 0;
+    for (edge = 0; edge < 4; edge++) {
+        int odd = edge & 1;
+        int end_point = num_outer[edge] - 1;
+        int p;
+        for (p = 0; p < end_point; p++, point_offset++) {
+            int q = (edge == 1 || edge == 2) ? p : end_point - p;
+            D3D_FXP param = d3d_place_point_in_1d(&outer_ctx[edge], outer_odd[edge], q);
+            d3d_point(t, odd ? param : (edge == 2 ? D3D_FXP_ONE : 0),
+                         odd ? (edge == 3 ? D3D_FXP_ONE : 0) : param);
+        }
+    }
 
-    for (int i = 0; i < n0; i++)
+    /* interior rings, clockwise from (u == 0, v == 1) spiralling in */
     {
-        float v = ((float)i + 0.5f) / (float)n0;
-        unsigned prev = 0;
-        for (int k = 0; k <= n1; k++)
-        {
-            float u = (n1 > 0) ? (float)k / (float)n1 : 0.0f;
-            unsigned vtx = mesh_vertex(m, u, v, 0.0f, pid);
-            if (k == 0) { prev = vtx; continue; }
-            if (!mesh_reserve(m, 0, 2)) return;
-            m->indices[m->nindices++] = prev;
-            m->indices[m->nindices++] = vtx;
-            prev = vtx;
+        int min_inner = num_inner[0] < num_inner[1] ? num_inner[0] : num_inner[1];
+        num_rings = min_inner >> 1;
+    }
+    for (ring = 1; ring < num_rings; ring++) {
+        int start = ring;
+        int end[2];
+        end[0] = num_inner[0] - 1 - start;
+        end[1] = num_inner[1] - 1 - start;
+        for (edge = 0; edge < 4; edge++) {
+            int odd0 = edge & 1, odd1 = (edge + 1) & 1;
+            int perp = (edge < 2) ? start : end[odd0];
+            D3D_FXP fxp_perp = d3d_place_point_in_1d(&inner_ctx[odd0], inner_odd[odd0], perp);
+            int p;
+            for (p = start; p < end[odd1]; p++, point_offset++) {
+                int q = (edge == 1 || edge == 2) ? p : end[odd1] - (p - start);
+                D3D_FXP param = d3d_place_point_in_1d(&inner_ctx[odd1], inner_odd[odd1], q);
+                d3d_point(t, odd1 ? fxp_perp : param, odd1 ? param : fxp_perp);
+            }
         }
+    }
+    /* for even tessellation the innermost "ring" degenerates to a row of points */
+    if (num_inner[0] > num_inner[1] && !inner_odd[1]) {
+        int start = num_rings, end = num_inner[0] - 1 - start, p;
+        for (p = start; p <= end; p++)
+            d3d_point(t, d3d_place_point_in_1d(&inner_ctx[0], inner_odd[0], p), D3D_FXP_ONE_HALF);
+    } else if (num_inner[1] >= num_inner[0] && !inner_odd[0]) {
+        int start = num_rings, end = num_inner[1] - 1 - start, p;
+        for (p = end; p >= start; p--)
+            d3d_point(t, D3D_FXP_ONE_HALF, d3d_place_point_in_1d(&inner_ctx[1], inner_odd[1], p));
+    }
+
+    /* connectivity */
+    num_rows_center[0] = (num_inner[0] + 1) >> 1;
+    num_rows_center[1] = (num_inner[1] + 1) >> 1;
+    num_rings = num_rows_center[0] < num_rows_center[1] ? num_rows_center[0] : num_rows_center[1];
+    degenerate_ring[0] = !inner_odd[1] ? num_rows_center[1] - 1 : -1;
+    degenerate_ring[1] = !inner_odd[0] ? num_rows_center[0] - 1 : -1;
+
+    inside_offset = inside_base;
+    outside_base = 0;
+    for (ring = 1; ring < num_rings; ring++) {
+        int num_inside_edge[2];
+        int edge0_inside_base = inside_offset;
+        int edge0_outside_base = outside_base;
+
+        num_inside_edge[0] = num_inner[0] - 2 * ring;
+        num_inside_edge[1] = num_inner[1] - 2 * ring;
+
+        for (edge = 0; edge < 4; edge++) {
+            int odd = (edge + 1) & 1;
+            int num_outside = num_outer[edge];
+            int inside_base, obase;
+
+            if (edge == 3) {
+                if (ring == degenerate_ring[odd]) {
+                    t->patched2 = true;
+                    t->ipc2_base_invert = inside_offset + 1;
+                    t->ipc2_corner_bad = outside_base + num_outside - 1;
+                    t->ipc2_corner_repl = edge0_outside_base;
+                    t->ipc2_inv_end = (t->ipc2_base_invert << 1) - 1;
+                    inside_base = t->ipc2_base_invert;
+                    obase = outside_base;
+                } else {
+                    t->patched = true;
+                    t->ipc_inside_delta = inside_offset;
+                    t->ipc_inside_bad = num_inside_edge[odd] - 1;
+                    t->ipc_inside_repl = edge0_inside_base;
+                    t->ipc_outside_base = t->ipc_inside_bad + 1;
+                    t->ipc_outside_delta = outside_base - t->ipc_outside_base;
+                    t->ipc_outside_bad = t->ipc_outside_base + num_outside - 1;
+                    t->ipc_outside_repl = edge0_outside_base;
+                    inside_base = 0;
+                    obase = t->ipc_outside_base;
+                }
+            } else if (edge == 2 && ring == degenerate_ring[odd]) {
+                t->patched2 = true;
+                t->ipc2_base_invert = inside_offset;
+                t->ipc2_corner_bad = -1;
+                t->ipc2_corner_repl = -1;
+                t->ipc2_inv_end = t->ipc2_base_invert << 1;
+                inside_base = t->ipc2_base_invert;
+                obase = outside_base;
+            } else {
+                inside_base = inside_offset;
+                obase = outside_base;
+            }
+            if (ring == 1)
+                d3d_stitch_transition(t, inside_base, inner_ctx[odd].num_half, inner_odd[odd],
+                                      obase, outer_ctx[edge].num_half, outer_odd[edge]);
+            else
+                d3d_stitch_regular(t, true, D3D_DIAG_MIRRORED, 0, num_inside_edge[odd],
+                                   inside_base, obase);
+            t->patched = false;
+            t->patched2 = false;
+            outside_base += num_outside - 1;
+            if (edge == 2 && ring == degenerate_ring[odd])
+                inside_offset -= num_inside_edge[odd] - 1;
+            else
+                inside_offset += num_inside_edge[odd] - 1;
+            num_outer[edge] = num_inside_edge[odd];
+        }
+    }
+    /* the centre: a row of quads if odd */
+    if (num_inner[0] > num_inner[1] && inner_odd[1]) {
+        int strip_quads = (((num_inner[0] >> 1) - (num_inner[1] >> 1)) << 1) + (inner_odd[0] ? 1 : 2);
+        t->patched2 = true;
+        t->ipc2_base_invert = outside_base + strip_quads + 2;
+        t->ipc2_corner_bad = t->ipc2_base_invert;
+        t->ipc2_corner_repl = outside_base;
+        t->ipc2_inv_end = t->ipc2_base_invert + t->ipc2_base_invert + strip_quads;
+        d3d_stitch_regular(t, false, D3D_DIAG_INSIDE_TO_OUTSIDE, 0, strip_quads + 1,
+                           t->ipc2_base_invert, outside_base + 1);
+        t->patched2 = false;
+    } else if (num_inner[1] >= num_inner[0] && inner_odd[0]) {
+        int strip_quads = (((num_inner[1] >> 1) - (num_inner[0] >> 1)) << 1) + (inner_odd[1] ? 1 : 2);
+        int diag = inner_odd[1] ? D3D_DIAG_INSIDE_TO_OUTSIDE_EXCEPT_MID : D3D_DIAG_INSIDE_TO_OUTSIDE;
+        t->patched2 = true;
+        t->ipc2_base_invert = outside_base + strip_quads + 1;
+        t->ipc2_corner_bad = -1;
+        t->ipc2_inv_end = t->ipc2_base_invert + t->ipc2_base_invert + strip_quads;
+        d3d_stitch_regular(t, false, diag, 0, strip_quads + 1, t->ipc2_base_invert, outside_base);
+        t->patched2 = false;
     }
 }
 
-/* generate the tessellated geometry of every patch of a draw.
- * factors: per patch {outer0..3, inner0..1} (6 floats per patch), patch ids are
- * consecutive from 0. Point mode emits one point per tessellated vertex. */
 static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors,
                           unsigned patches)
 {
@@ -2389,23 +3072,25 @@ static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *facto
     for (unsigned p = 0; p < patches; p++)
     {
         const float *f = factors + p * 6;
+        struct D3DTess t;
 
-        if ((tp->domain == MGL_TESS_DOMAIN_ISOLINES && f[0] <= 0.0f && f[1] <= 0.0f) ||
-            (tp->domain == MGL_TESS_DOMAIN_TRIANGLES &&
-             f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f) ||
-            (tp->domain == MGL_TESS_DOMAIN_QUADS &&
-             f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f && f[3] <= 0.0f))
-            continue;                          /* patch discarded: emits nothing */
+        memset(&t, 0, sizeof t);
+        t.mesh = &mesh;
+        t.pid = (float)p;
+        t.ccw = tp->vertex_order_ccw != 0;
+        t.tri = (tp->domain == MGL_TESS_DOMAIN_TRIANGLES);
+        t.base = mesh.ncoords;
+        /* spacing and partitioning use the same values (equal=integer, even, odd) */
         switch (tp->domain)
         {
             case MGL_TESS_DOMAIN_TRIANGLES:
-                tess_triangles(&mesh, f, f[4], tp->spacing, (float)p, tp->vertex_order_ccw != 0);
+                d3d_tri_process(&t, tp->spacing, f);
                 break;
             case MGL_TESS_DOMAIN_ISOLINES:
-                tess_isolines(&mesh, f, tp->spacing, (float)p);
+                d3d_isoline_process(&t, tp->spacing, f);
                 break;
             default:
-                tess_quads(&mesh, f, f + 4, tp->spacing, (float)p, tp->vertex_order_ccw != 0);
+                d3d_quad_process(&t, tp->spacing, f);
                 break;
         }
     }
@@ -2818,66 +3503,33 @@ void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *facto
     for (unsigned p = 0; p < patches; p++)
     {
         const float *f = factors + p * 6;
-        GLuint pc = 0, pi = 0;
+        struct D3DTess t;
 
-        if (tp->domain == MGL_TESS_DOMAIN_ISOLINES)
+        memset(&t, 0, sizeof t);
+        t.mesh = NULL;
+        t.pid = (float)p;
+        t.ccw = tp->vertex_order_ccw != 0;
+        t.tri = (tp->domain == MGL_TESS_DOMAIN_TRIANGLES);
+        t.base = 0;
+        t.count_only = true;
+
+        /* count-only run of the same generator the GPU tessellator uses (a culled
+         * patch reports 0/0 and adds nothing) */
+        switch (tp->domain)
         {
-            if (f[0] <= 0.0f && f[1] <= 0.0f)
-                continue;                      /* patch discarded (all outer <= 0) */
-            int n0 = (int)ceilf(f[0] < 1.0f ? 1.0f : (f[0] > 64.0f ? 64.0f : f[0]));
-            int n1 = tess_round_level(f[1], tp->spacing);
-
-            pc = (GLuint)n0 * (GLuint)(n1 + 1);
-            pi = 2u * (GLuint)n0 * (GLuint)n1;
-        }
-        else if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
-        {
-            if (f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f)
-                continue;                      /* patch discarded (all outer <= 0) */
-            int n[3], N, j;
-            unsigned prev, cur;
-
-            n[0] = tess_round_level(f[0], tp->spacing);
-            n[1] = tess_round_level(f[1], tp->spacing);
-            n[2] = tess_round_level(f[2], tp->spacing);
-            N = tess_round_level(f[4], tp->spacing);
-            for (int i = 0; i < 3; i++)
-                if (n[i] > N)
-                    N = n[i];
-            if (N < 1)
-                N = 1;
-
-            prev = (unsigned)n[0] + 1u;
-            pc = prev;
-            for (j = 1; j <= N; j++)
-            {
-                cur = (unsigned)(N - j + 1);
-                pc += cur;
-                pi += (prev - 1u) + (cur - 1u);
-                prev = cur;
-            }
-            pi *= 3u;
-        }
-        else
-        {
-            if (f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f && f[3] <= 0.0f)
-                continue;                      /* patch discarded (all outer <= 0) */
-            int nu = tess_round_level(f[4], tp->spacing), nv = tess_round_level(f[5], tp->spacing);
-            int o;
-
-            o = tess_round_level(f[2], tp->spacing); if (o > nu) nu = o;
-            o = tess_round_level(f[3], tp->spacing); if (o > nu) nu = o;
-            o = tess_round_level(f[0], tp->spacing); if (o > nv) nv = o;
-            o = tess_round_level(f[1], tp->spacing); if (o > nv) nv = o;
-
-            pc = (GLuint)(nu + 1) * (GLuint)(nv + 1);
-            pi = 6u * (GLuint)nu * (GLuint)nv;
+            case MGL_TESS_DOMAIN_ISOLINES:
+                d3d_isoline_process(&t, tp->spacing, f);
+                break;
+            case MGL_TESS_DOMAIN_TRIANGLES:
+                d3d_tri_process(&t, tp->spacing, f);
+                break;
+            default:
+                d3d_quad_process(&t, tp->spacing, f);
+                break;
         }
 
-        if (tp->point_mode)
-            pi = pc;
-        ncoords += pc;
-        nindex += pi;
+        ncoords += t.ncoord;
+        nindex += (tp->point_mode) ? t.ncoord : t.nindex;
     }
 
     if (ncoords || nindex)
@@ -5117,4 +5769,91 @@ bool mgl_tess_diag_capture_info(void **buffer, uint32_t *records_offset, uint32_
                     (size_t)S->capture.records_offset, (size_t)S->capture.index_offset);
     }
     return true;
+}
+
+/* test-only: the CPU (D3D11 reference) tessellator's counts for one patch */
+bool mgl_tess_diag_cpu_counts(int domain, int spacing, int ccw, int point_mode,
+                              const float levels[6], uint32_t *nvertices, uint32_t *nindices)
+{
+    struct D3DTess t;
+
+    if (domain < 0 || domain > 2 || spacing < 0 || spacing > 2 || !levels)
+        return false;
+    memset(&t, 0, sizeof t);
+    t.mesh = NULL;
+    t.pid = 0.0f;
+    t.ccw = ccw != 0;
+    t.tri = (domain == MGL_TESS_DOMAIN_TRIANGLES);
+    t.base = 0;
+    t.count_only = true;
+    switch (domain)
+    {
+        case MGL_TESS_DOMAIN_ISOLINES:  d3d_isoline_process(&t, spacing, levels); break;
+        case MGL_TESS_DOMAIN_TRIANGLES: d3d_tri_process(&t, spacing, levels); break;
+        default:                        d3d_quad_process(&t, spacing, levels); break;
+    }
+    if (nvertices) *nvertices = t.ncoord;
+    if (nindices) *nindices = point_mode ? t.ncoord : t.nindex;
+    return true;
+}
+
+/* test-only: the CPU (D3D11 reference) tessellator's full stream for ONE patch.
+ * coords gets 4 floats per vertex (u, v, w, 0), indices the triangle/line list;
+ * returns the vertex count (or -1 when the buffers are too small). */
+int mgl_tess_diag_cpu_mesh(int domain, int spacing, int ccw, int point_mode,
+                           const float levels[6], float *coords, int max_coords,
+                           uint32_t *indices, int max_indices, int *out_index_count)
+{
+    struct TessMesh mesh = { NULL, 0, 0, NULL, 0, 0 };
+    struct D3DTess t;
+    unsigned nv, ni;
+    int r = -1;
+
+    memset(&t, 0, sizeof t);
+    t.mesh = &mesh;
+    t.pid = 0.0f;
+    t.ccw = ccw != 0;
+    t.tri = (domain == MGL_TESS_DOMAIN_TRIANGLES);
+    t.base = 0;
+    t.count_only = true;
+    switch (domain)
+    {
+        case MGL_TESS_DOMAIN_ISOLINES:  d3d_isoline_process(&t, spacing, levels); break;
+        case MGL_TESS_DOMAIN_TRIANGLES: d3d_tri_process(&t, spacing, levels); break;
+        default:                        d3d_quad_process(&t, spacing, levels); break;
+    }
+    nv = t.ncoord;
+    ni = point_mode ? t.ncoord : t.nindex;
+    if ((int)nv > max_coords || (int)ni > max_indices)
+    {
+        if (out_index_count) *out_index_count = -1;
+        return -1;
+    }
+    t.count_only = false;
+    switch (domain)
+    {
+        case MGL_TESS_DOMAIN_ISOLINES:  d3d_isoline_process(&t, spacing, levels); break;
+        case MGL_TESS_DOMAIN_TRIANGLES: d3d_tri_process(&t, spacing, levels); break;
+        default:                        d3d_quad_process(&t, spacing, levels); break;
+    }
+    if (point_mode)
+    {
+        if (!mesh_reserve(&mesh, 0, nv))
+            goto out;
+        for (unsigned i = 0; i < nv; i++)
+            mesh.indices[mesh.nindices++] = i;
+    }
+    if (mesh.ncoords != nv || mesh.nindices != ni)
+        goto out;                         /* internal inconsistency */
+    if (coords)
+        memcpy(coords, mesh.coords, (size_t)nv * 4 * sizeof(float));
+    if (indices)
+        memcpy(indices, mesh.indices, (size_t)ni * sizeof(uint32_t));
+    if (out_index_count)
+        *out_index_count = (int)ni;
+    r = (int)nv;
+out:
+    free(mesh.coords);
+    free(mesh.indices);
+    return r;
 }

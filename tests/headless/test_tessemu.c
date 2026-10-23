@@ -203,9 +203,10 @@ TEST(IsolinesGpu)
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
 
-    /* expected: n0 = 3 isolines at v = (i + 0.5) / 3 -> NDC y = -0.5, 0, +0.5
-     * -> window y = h/4, h/2, 3h/4 (an exact pixel edge goes to the LOWER row,
-     * the same tie rule the point_mode test verified against Apple GL). */
+    /* expected: n0 = 3 isolines at v = i / 3 -- the D3D11 reference placement,
+     * which is also the CTS reference layout (vktTessellationUtil.cpp) -> NDC
+     * y = -0.75, -0.25, +0.25 -> window y = h/8, 3h/8, 5h/8 (an exact pixel edge
+     * goes to the LOWER row, the same tie rule verified against Apple GL). */
     int rows[8], nrow = 0;
     for (int y = 0; y < h; y++)
     {
@@ -218,7 +219,7 @@ TEST(IsolinesGpu)
     EXPECT_TRUE(nrow == 3);
     if (nrow == 3)
     {
-        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        int ey[3] = { h / 8, h * 3 / 8, h * 5 / 8 };
         for (int k = 0; k < 3; k++)
         {
             int d = rows[k] - (ey[k] - 1);     /* exact edge -> lower row */
@@ -453,7 +454,7 @@ TEST(EmuPatchDataGpu)
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
 
-    /* 3 isolines at v=(i+0.5)/3 -> window y = h/4, h/2, 3h/4 (lower row on the tie) */
+    /* 3 isolines at v = i/3 (D3D11 reference placement) -> window y = h/8, 3h/8, 5h/8 (lower row on the tie) */
     int rows[8], nrow = 0;
     for (int y = 0; y < h; y++)
     {
@@ -465,7 +466,7 @@ TEST(EmuPatchDataGpu)
     EXPECT_TRUE(nrow == 3);
     if (nrow == 3)
     {
-        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        int ey[3] = { h / 8, h * 3 / 8, h * 5 / 8 };
         for (int k = 0; k < 3; k++)
             EXPECT_TRUE(rows[k] >= ey[k] - 2 && rows[k] <= ey[k]);
 
@@ -510,7 +511,7 @@ TEST(EmuPatchDataGpu)
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
 
     {
-        int y = h / 2;                        /* the middle isoline: window y = h/2 */
+        int y = h * 3 / 8;                  /* the middle isoline: v = 1/3 -> y = 3h/8 */
         int ry = -1;
         for (int dy = -2; dy <= 1 && ry < 0; dy++)
         {
@@ -581,7 +582,7 @@ TEST(EmuDefaultLevelsGpu)
     EXPECT_TRUE(nrow == 3);
     if (nrow == 3)
     {
-        int ey[3] = { h / 4, h / 2, h * 3 / 4 };
+        int ey[3] = { h / 8, h * 3 / 8, h * 5 / 8 };
         for (int k = 0; k < 3; k++)
             EXPECT_TRUE(rows[k] >= ey[k] - 2 && rows[k] <= ey[k]);
 
@@ -710,6 +711,348 @@ TEST(TessOutputCapture)
     glDeleteProgram(p);
 }
 
+
+/* ---- KHR-GL46.tessellation_shader.tessellation_invariance.invariance_rule7
+ * reproduction: quads with big, uneven levels (inner 63/62, outer 61/60/59/58).
+ * The capture must hold one valid record per EMITTED vertex: no stale/garbage
+ * records (denormal coordinates), and the coordinate multiset must equal the
+ * CPU tessellator's, i.e. the GPU stream is the D3D11 reference layout. */
+static const char *kTcsQuadBig =
+    "#version 450 core\n"
+    "layout(vertices=4) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=61.0; gl_TessLevelOuter[1]=60.0;\n"
+    "    gl_TessLevelOuter[2]=59.0; gl_TessLevelOuter[3]=58.0;\n"
+    "    gl_TessLevelInner[0]=63.0; gl_TessLevelInner[1]=62.0; }\n"
+    "}\n";
+static const char *kTesQuadCoord =
+    "#version 450 core\n"
+    "layout(quads, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+    "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+    "  f_col = vec4(gl_TessCoord.xy, 0.0, 1.0);\n"
+    "}\n";
+static const char *kTesQuadCoordW =
+    "#version 450 core\n"
+    "layout(quads, equal_spacing, cw) in;\n"
+    "layout(location=0) in vec4 tc_col[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+    "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+    "  f_col = vec4(gl_TessCoord.xy, 0.0, 1.0);\n"
+    "}\n";
+
+static int cap_dump_records(const char *tag, float *out, int max)
+{
+    void *buf = NULL;
+    uint32_t off = 0, cstride = 0, prim = 0, count = 0;
+    const float *r;
+    int bad = 0, n;
+
+    if (!mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count))
+    {
+        printf("%s: capture not published\n", tag);
+        return -1;
+    }
+    printf("%s: prim=0x%x stride=%uw count=%u\n", tag, (unsigned)prim, cstride, (unsigned)count);
+    n = (int)count < max ? (int)count : max;
+    r = (const float *)((const uint8_t *)buf + off);
+    for (int i = 0; i < n; i++)
+    {
+        float x = r[(size_t)i * cstride + 4], y = r[(size_t)i * cstride + 5];
+        /* coordinates must be n.16 values: exactly 0 or a multiple of 1/65536,
+         * never a denormal (stale memory) */
+        if (!(x >= 0.0f && x <= 1.0f) || !(y >= 0.0f && y <= 1.0f) ||
+            (x != 0.0f && x < 1e-6f) || (y != 0.0f && y < 1e-6f) ||
+            fabsf(x * 65536.0f - roundf(x * 65536.0f)) > 0.05f ||
+            fabsf(y * 65536.0f - roundf(y * 65536.0f)) > 0.05f)
+        {
+            if (bad < 4)
+                printf("%s: bad record %d: coord=(%g,%g)\n", tag, i, x, y);
+            bad++;
+        }
+        else
+        {
+            out[i * 2 + 0] = x;
+            out[i * 2 + 1] = y;
+        }
+    }
+    if (bad)
+        printf("%s: %d of %d records are invalid\n", tag, bad, n);
+    return bad;
+}
+
+/* the emulated GPU stream must equal the CPU (D3D11 reference) stream EXACTLY:
+ * one capture record per emitted vertex, in generation order, so record i must be
+ * cpu_coords[cpu_indices[i]].  This is what the CTS invariance tests rely on. */
+static const char *kTcsQuadVar =
+    "#version 450 core\n"
+    "layout(vertices=4) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "uniform vec4 lv_outer;\n"
+    "uniform vec2 lv_inner;\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  gl_TessLevelOuter[0] = lv_outer.x; gl_TessLevelOuter[1] = lv_outer.y;\n"
+    "  gl_TessLevelOuter[2] = lv_outer.z; gl_TessLevelOuter[3] = lv_outer.w;\n"
+    "  gl_TessLevelInner[0] = lv_inner.x; gl_TessLevelInner[1] = lv_inner.y;\n"
+    "}\n";
+
+TEST(TessEmuStreamEqualsCpu)
+{
+    static const struct { const char *name; const char *layout; } sp[3] = {
+        { "equal_spacing", "quads, equal_spacing" },
+        { "fractional_even_spacing", "quads, fractional_even_spacing" },
+        { "fractional_odd_spacing", "quads, fractional_odd_spacing" },
+    };
+    static const float sets[][6] = {
+        { 61.0f, 60.0f, 59.0f, 58.0f, 63.0f, 62.0f },   /* CTS invariance_rule7's set */
+        { 4.0f, 1.0f, 1.0f, 1.0f, 2.0f, 2.0f },          /* outer-only subdivision */
+        { 2.0f, 3.0f, 4.0f, 5.0f, 4.0f, 5.0f },
+        { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f },
+        { 8.0f, 1.0f, 8.0f, 1.0f, 4.0f, 4.0f },
+        { 2.5f, 3.5f, 4.5f, 5.5f, 3.5f, 4.5f },
+        { 4.0f, 4.0f, 4.0f, 4.0f, 1.0f, 4.0f },
+        { 6.0f, 6.0f, 6.0f, 6.0f, 2.0f, 5.0f },
+        { 33.0f, 1.0f, 1.0f, 1.0f, 32.0f, 31.0f },
+    };
+    const float qpos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 },
+                               { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
+    const float qcol[4][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 }, { 1,1,0,1 } };
+    static float coords[20000 * 4];
+    static uint32_t indices[60000];
+    static float rec[60000 * 2];
+    int nfail = 0;
+
+    for (int si = 0; si < 3; si++)
+        for (int ci = 0; ci < (int)(sizeof sets / sizeof sets[0]); ci++)
+        {
+            char tes[1024];
+            GLuint p;
+            int nv, ni = 0;
+            uint32_t count = 0, off = 0, cstride = 0, prim = 0;
+            void *buf = NULL;
+            const float *r;
+            int bad = 0;
+
+            snprintf(tes, sizeof tes,
+                     "#version 450 core\n"
+                     "layout(%s, ccw) in;\n"
+                     "layout(location=0) in vec4 tc_col[];\n"
+                     "layout(location=0) out vec4 f_col;\n"
+                     "void main() {\n"
+                     "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+                     "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+                     "  f_col = vec4(gl_TessCoord.xy, 0.0, 1.0); }\n", sp[si].layout);
+            p = prog2(kTcsQuadVar, tes);
+            glUseProgram(p);
+            {
+                GLint lo = glGetUniformLocation(p, "lv_outer");
+                GLint li = glGetUniformLocation(p, "lv_inner");
+                glUniform4f(lo, sets[ci][0], sets[ci][1], sets[ci][2], sets[ci][3]);
+                glUniform2f(li, sets[ci][4], sets[ci][5]);
+            }
+            setup(qpos, qcol, 4, 4);
+            mgl_tess_diag_capture(p, 1);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDrawArrays(GL_PATCHES, 0, 4);
+            EXPECT_NO_GL_ERROR();
+            glFinish();
+            mgl_tess_diag_capture(p, 0);
+            if (!mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count))
+            {
+                printf("%s set%d: no capture\n", sp[si].name, ci);
+                nfail++;
+                continue;
+            }
+            nv = mgl_tess_diag_cpu_mesh(1, si, 1, 0, sets[ci], coords, 20000, indices, 60000, &ni);
+            if (nv < 0 || (int)count != ni)
+            {
+                printf("%s set%d: count mismatch gpu=%u cpu=%d\n", sp[si].name, ci,
+                       (unsigned)count, ni);
+                nfail++;
+                continue;
+            }
+            r = (const float *)((const uint8_t *)buf + off);
+            for (int i = 0; i < ni; i++)
+            {
+                int v = (int)indices[i];
+                float ex = coords[v * 4], ey = coords[v * 4 + 1];
+                float gx = r[(size_t)i * cstride + 4], gy = r[(size_t)i * cstride + 5];
+                if (gx != ex || gy != ey)
+                {
+                    if (bad < 4)
+                        printf("%s set%d: record %d gpu=(%g,%g) cpu=(%g,%g)\n",
+                               sp[si].name, ci, i, gx, gy, ex, ey);
+                    bad++;
+                }
+            }
+            if (bad)
+                nfail++;
+            else
+                printf("%s set%d: %d records == CPU stream\n", sp[si].name, ci, ni);
+        }
+    EXPECT_TRUE(nfail == 0);
+}
+
+TEST(TessCaptureCounts)
+{
+    /* the captured record count must equal the CPU (D3D11 reference) tessellator's
+     * emitted-vertex count for every spacing -- a mismatch leaves stale records in
+     * the capture buffer, which the CTS invariance tests read as garbage triangles */
+    static const struct { const char *name; const char *layout; } sp[3] = {
+        { "equal_spacing", "quads, equal_spacing" },
+        { "fractional_even_spacing", "quads, fractional_even_spacing" },
+        { "fractional_odd_spacing", "quads, fractional_odd_spacing" },
+    };
+    const float lv[6] = { 61.0f, 60.0f, 59.0f, 58.0f, 63.0f, 62.0f };
+    const float qpos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 },
+                               { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
+    const float qcol[4][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 }, { 1,1,0,1 } };
+    char tes[2048];
+
+    for (int i = 0; i < 3; i++)
+    {
+        GLuint p;
+        uint32_t nv = 0, ni = 0, count = 0, off = 0, cstride = 0, prim = 0;
+        void *buf = NULL;
+
+        snprintf(tes, sizeof tes,
+                 "#version 450 core\n"
+                 "layout(%s, ccw) in;\n"
+                 "layout(location=0) in vec4 tc_col[];\n"
+                 "layout(location=0) out vec4 f_col;\n"
+                 "void main() {\n"
+                 "  gl_Position = mix(mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x),\n"
+                 "                    mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x), gl_TessCoord.y);\n"
+                 "  f_col = vec4(gl_TessCoord.xy, 0.0, 1.0); }\n", sp[i].layout);
+        p = prog2(kTcsQuadBig, tes);
+        glUseProgram(p);
+        setup(qpos, qcol, 4, 4);
+        mgl_tess_diag_capture(p, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawArrays(GL_PATCHES, 0, 4);
+        EXPECT_NO_GL_ERROR();
+        glFinish();
+        mgl_tess_diag_capture(p, 0);
+        EXPECT_TRUE(mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count));
+        EXPECT_TRUE(mgl_tess_diag_cpu_counts(1, i, 1, 0, lv, &nv, &ni));
+        printf("%s: captured=%u cpu vertices=%u indices=%u\n", sp[i].name,
+               (unsigned)count, (unsigned)nv, (unsigned)ni);
+        EXPECT_EQ_INT((int)count, (int)ni);
+
+        /* the primitives-generated query must agree with the same generator */
+        {
+            GLuint q = 0;
+            GLint pg = -1;
+
+            glGenQueries(1, &q);
+            glBeginQuery(GL_PRIMITIVES_GENERATED, q);
+            glDrawArrays(GL_PATCHES, 0, 4);
+            glEndQuery(GL_PRIMITIVES_GENERATED);
+            glFinish();
+            glGetQueryObjectiv(q, GL_QUERY_RESULT, &pg);
+            glDeleteQueries(1, &q);
+            printf("%s: PRIMITIVES_GENERATED=%d (expected %u)\n", sp[i].name, pg, ni / 3);
+            EXPECT_EQ_INT(pg, (int)(ni / 3));
+        }
+    }
+}
+
+TEST(TessCaptureHigh)
+{
+    const float qpos[4][4] = { { -0.5f,-0.5f,0,1 }, { 0.5f,-0.5f,0,1 },
+                               { 0.5f,0.5f,0,1 }, { -0.5f,0.5f,0,1 } };
+    const float qcol[4][4] = { { 1,0,0,1 }, { 0,1,0,1 }, { 0,0,1,1 }, { 1,1,0,1 } };
+    static float ccw[40000 * 2], cw[40000 * 2];
+    int b1, b2, n = 0;
+    GLuint p;
+
+    /* ccw */
+    p = prog2(kTcsQuadBig, kTesQuadCoord);
+    {
+        GLint link = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &link);
+        EXPECT_EQ_INT(link, GL_TRUE);
+    }
+    glUseProgram(p);
+    setup(qpos, qcol, 4, 4);
+    mgl_tess_diag_capture(p, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    mgl_tess_diag_capture(p, 0);
+    b1 = cap_dump_records("ccw", ccw, 40000);
+    EXPECT_TRUE(b1 == 0);
+    if (b1 < 0) return;
+
+    /* cw: the SAME triangles in reversed order (invariance rule 7) */
+    p = prog2(kTcsQuadBig, kTesQuadCoordW);
+    {
+        GLint link = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &link);
+        EXPECT_EQ_INT(link, GL_TRUE);
+    }
+    glUseProgram(p);
+    setup(qpos, qcol, 4, 4);
+    mgl_tess_diag_capture(p, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    mgl_tess_diag_capture(p, 0);
+    b2 = cap_dump_records("cw", cw, 40000);
+    EXPECT_TRUE(b2 == 0);
+    if (b2 < 0) return;
+
+    /* the two vertex streams must hold the same coordinates: for each ccw
+     * triangle (i,i+1,i+2) the cw stream must hold (i,i+2,i+1) */
+    {
+        void *buf = NULL;
+        uint32_t off = 0, cstride = 0, prim = 0, count = 0;
+        int mism = 0;
+
+        mgl_tess_diag_capture_info(&buf, &off, &cstride, &prim, &count);
+        n = (int)count;
+        EXPECT_TRUE(n > 1000);                     /* really tessellated */
+        EXPECT_TRUE(n % 3 == 0);
+        for (int i = 0; i + 2 < n; i += 3)
+        {
+            /* ccw triangle (i, i+1, i+2) vs the cw triangle at the same record */
+            float a0[2] = { ccw[i*2], ccw[i*2+1] }, a1[2] = { ccw[(i+1)*2], ccw[(i+1)*2+1] },
+                  a2[2] = { ccw[(i+2)*2], ccw[(i+2)*2+1] };
+            float b0[2] = { cw[i*2], cw[i*2+1] }, b1[2] = { cw[(i+1)*2], cw[(i+1)*2+1] },
+                  b2[2] = { cw[(i+2)*2], cw[(i+2)*2+1] };
+            /* the generator only swaps the last two indices for cw */
+            if (a0[0] != b0[0] || a0[1] != b0[1] || a1[0] != b2[0] || a1[1] != b2[1] ||
+                a2[0] != b1[0] || a2[1] != b1[1])
+            {
+                if (mism < 4)
+                    printf("ccw/cw mismatch at triangle %d: (%g,%g)(%g,%g)(%g,%g)"
+                           " vs (%g,%g)(%g,%g)(%g,%g)\n", i / 3,
+                           a0[0],a0[1],a1[0],a1[1],a2[0],a2[1], b0[0],b0[1],b1[0],b1[1],b2[0],b2[1]);
+                mism++;
+            }
+        }
+        printf("high-levels capture: %d records, invalid ccw=%d cw=%d, ccw/cw mismatches=%d\n",
+               n, b1, b2, mism);
+        EXPECT_TRUE(mism == 0);
+        (void)prim;
+    }
+}
+
 int main(void)
 {
     RUN(IsolinesGpu);
@@ -718,6 +1061,10 @@ int main(void)
     RUN(EmuPatchDataGpu);
     RUN(EmuDefaultLevelsGpu);
     RUN(TessOutputCapture);
+    RUN(TessEmuStreamEqualsCpu);
+    RUN(TessCaptureCounts);
+    RUN(TessCaptureHigh);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }
+
