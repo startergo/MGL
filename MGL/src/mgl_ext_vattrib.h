@@ -19,9 +19,16 @@
 #define MGL_VA_MAX_RELATIVE_OFFSET  2047            /* GL_MAX_VERTEX_ATTRIB_RELATIVE_OFFSET */
 #define MGL_VA_MAX_STRIDE           2048            /* GL_MAX_VERTEX_ATTRIB_STRIDE */
 
-/* Metal vertex buffer indices reserved by this domain (MGL's buffer map grows upward from 0). */
-#define MGL_VA_CONST_BUFFER_INDEX   30              /* current generic values (constant step) */
-#define MGL_VA_SHADOW_BUFFER_TOP    29              /* CPU-converted attribute streams, downward */
+/* Metal vertex buffer indices reserved by this domain (MGL's buffer map grows upward from 0).
+ * Slot 30 belongs to the xfb capture scratch (MGL_XFB_MSL_BUFFER_INDEX): while transform
+ * feedback is active, MGLRenderer+TransformFeedback.m binds it on the SAME render encoder
+ * right after the constants, so the two must never share a slot (KHR-GL46
+ * vertex_attrib_binding basic-input-case1/case2 in one process: case2's disabled attribute
+ * read the scratch bytes — stale vertex data from case1 — instead of its current value).
+ * Slot 30 is also MGL_TESS_VS_OUT_BUF (the tess raster pass reads it), but no tess draw
+ * has vertex attributes, so only the xfb capture collides in practice. */
+#define MGL_VA_CONST_BUFFER_INDEX   29              /* current generic values (constant step) */
+#define MGL_VA_SHADOW_BUFFER_TOP    28              /* CPU-converted attribute streams, downward */
 
 /* kind of a current generic attribute value */
 enum { MGL_VA_KIND_FLOAT = 0, MGL_VA_KIND_INT = 1, MGL_VA_KIND_UINT = 2, MGL_VA_KIND_DOUBLE = 3 };

@@ -24,6 +24,7 @@
 #include "mgl_ext_gpuaudit.h"
 #import "mgl_ext_vattrib.h"
 #import "mgl_ext_introspect.h"
+#import "mgl_ext_geom.h"      /* MGL_SSBO_SIZE_BUFFER_INDEX: attribute ordinals must skip it */
 
 #define F4(_a_, _b_, _c_, _d_) switch (n) { case 1: return _a_; case 2: return _b_; case 3: return _c_; case 4: return _d_; } break
 
@@ -176,6 +177,26 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
             return false;
         }
 
+        /* ordinal MGL_SSBO_SIZE_BUFFER_INDEX carries SPIRV-Cross's
+         * spvBufferSizeConstants argument when the vertex stage reads .length() on
+         * an SSBO runtime array (geomBindSSBOSizes binds it on the render encoder):
+         * never hand that slot to an attribute — pad the map with an unused entry
+         * (no buffer, so every binder skips it) and allocate past it.  Round-44
+         * buffer-slot audit; same class as the fixed slot-30 const/xfb collision. */
+        if (buffer_map->count == MGL_SSBO_SIZE_BUFFER_INDEX &&
+            ctx->state.program &&
+            ctx->state.program->spirv[_VERTEX_SHADER].msl_str &&
+            strstr(ctx->state.program->spirv[_VERTEX_SHADER].msl_str, "spvBufferSizeConstants"))
+        {
+            BufferMap *pad = &buffer_map->buffers[buffer_map->count];
+            pad->attribute_mask = 0;
+            pad->buffer_base_index = 0;
+            pad->buf = NULL;
+            pad->offset = 0;
+            pad->size = 0;
+            buffer_map->count++;
+        }
+
         BufferMap *m = &buffer_map->buffers[buffer_map->count];
         m->attribute_mask = mask;
         m->buffer_base_index = 0;
@@ -211,6 +232,10 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
     int next_shadow = MGL_VA_SHADOW_BUFFER_TOP;
     int max_binding_index = -1;
     bool layout_done[MGL_VA_MAX_BINDINGS] = { false };
+    /* the SSBO size-constant slot (see vattribMapVertexBuffers) is off limits for a
+     * converted shadow stream as well */
+    bool skip_size_slot = program->spirv[_VERTEX_SHADER].msl_str != NULL &&
+                          strstr(program->spirv[_VERTEX_SHADER].msl_str, "spvBufferSizeConstants") != NULL;
 
     for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
         if (plan->binding_index[b] > max_binding_index)
@@ -329,6 +354,8 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
                 }
                 if (plan->dbl[loc] == 1)
                 {
+                    if (skip_size_slot && next_shadow - 1 == MGL_SSBO_SIZE_BUFFER_INDEX)
+                        next_shadow--;
                     plan->shadow_index[loc] = --next_shadow;
                     plan->shadow_stride[loc] = (elem + 15) & ~15;
                 }
@@ -422,6 +449,8 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
             return nil;
         }
 
+        if (skip_size_slot && next_shadow == MGL_SSBO_SIZE_BUFFER_INDEX)
+            next_shadow--;
         int sidx = next_shadow--;
 
         desc.attributes[loc].format = (kind == MGL_VA_KIND_INT) ? MTLVertexFormatInt4 :
