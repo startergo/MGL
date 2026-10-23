@@ -379,6 +379,10 @@ typedef struct Spirv_t {
     char *entry_point;
     void *mtl_function;
     void *mtl_library;
+    uint32_t shadow_slots;  /* geom: bitmask of Metal texture slots whose VERTEX MSL emulates
+                             * shadow sampling (AGX returns raw values for sample_compare in
+                             * vertex functions) — those slots bind a NON-compare sampler and
+                             * take the unit's compare function as a function constant */
 } Spirv;
 
 typedef struct SpirvResource_t {

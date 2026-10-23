@@ -3406,4 +3406,59 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
     [enc setBytes: sizes length: (NSUInteger)n * sizeof(uint32_t) atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
 }
 
+#pragma mark - vertex-stage shadow-sampling emulation (mgl_fix_shadow_vs)
+
+/* the compare ops the last specialization baked in, for the per-draw staleness
+ * check (a GL_TEXTURE_COMPARE_FUNC change alone does not dirty the pipeline) */
+static struct { void *program; bool valid; int ops[32]; } gShadowSpec;
+
+- (void) geomShadowFCValues:(MTLFunctionConstantValues *)cv stage:(int)stage hash:(uint64_t *)hash
+{
+    Program *p = ctx->state.program;
+    if (!p || stage != _VERTEX_SHADER) return;
+    uint32_t mask = p->spirv[_VERTEX_SHADER].shadow_slots;
+    if (!mask) return;
+
+    SpirvResourceList *rl = &p->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+    int ops[32];
+    for (int i = 0; i < 32; i++) ops[i] = -1;
+
+    for (GLuint i = 0; i < rl->count; i++)
+    {
+        GLuint slot = rl->list[i].msl_binding;
+        if (slot >= 32 || !(mask & (1u << slot))) continue;
+        GLuint unit = rl->list[i].binding;
+        Texture *tex = mgl_texture_for_sampler(ctx, unit, rl->list[i].target);
+        if (!tex) continue;
+        Sampler *gs = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
+        TextureParameter *pp = gs ? &gs->params : &tex->params;
+        int op = mgl_geom_shadow_op_of(pp->compare_func);
+        ops[slot] = op;
+        int32_t v = op;
+        [cv setConstantValue:&v type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + slot];
+        if (hash) { *hash ^= (uint64_t)(op + 1) << (slot & 7); *hash *= 1099511628211ULL; }
+    }
+
+    gShadowSpec.program = (void *)p;
+    gShadowSpec.valid = true;
+    memcpy(gShadowSpec.ops, ops, sizeof ops);
+}
+
+/* called on the texture-binding path (before the PSO build of the same draw): if the
+ * compare function of a shadow-sampled unit changed since the last specialization,
+ * the vertex function must be re-specialized — dirty the program so processGLState
+ * rebuilds the pipeline (the constants are baked into the Metal function) */
+- (void) geomShadowCheckStale:(GLuint)unit texture:(Texture *)tex slot:(GLuint)slot
+{
+    if (!gShadowSpec.valid || gShadowSpec.program != (void *)ctx->state.program || slot >= 32) return;
+    if (!(ctx->state.program->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot))) return;
+    Sampler *gs = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
+    TextureParameter *pp = gs ? &gs->params : &tex->params;
+    if (mgl_geom_shadow_op_of(pp->compare_func) != gShadowSpec.ops[slot])
+    {
+        gShadowSpec.valid = false;   /* the rebuild that follows re-records it */
+        ctx->state.dirty_bits |= DIRTY_PROGRAM;
+    }
+}
+
 @end

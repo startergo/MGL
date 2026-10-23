@@ -2005,6 +2005,12 @@ static char kComputeFallbackKey;
 
             if (stage == _VERTEX_SHADER)
             {
+                /* geom: the vertex stage's shadow-sampling emulation samples the depth
+                 * texture as a plain texture2d, which must not see a compare sampler —
+                 * bind the compare-stripped sampler of the unit at those slots
+                 * (mgl_fix_shadow_vs / spirv[VS].shadow_slots) */
+                if (mgl_geom_vs_shadow_slot(STATE(program), mtl_index + e))
+                    [self geomShadowCheckStale:spirv_binding + e texture:ptr slot:mtl_index + e];
                 [_currentRenderEncoder setVertexTexture:texture atIndex:mtl_index + e];
                 [_currentRenderEncoder setVertexSamplerState:sampler atIndex:mtl_index + e];
             }

@@ -345,6 +345,19 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     return cache;
 }
 
+/* the MTLSamplerState cached in a TextureParameter's mtl_data: after
+ * texparamCacheFor runs, mtl_data holds an MGLTexParamCache instead of a bare
+ * sampler state, so callers must not cast it blindly (type confusion crash —
+ * seen in texextRefreshStage) */
+- (id<MTLSamplerState>) texparamCachedSampler:(TextureParameter *)p
+{
+    if (!p || !p->mtl_data) return nil;
+    id obj = (__bridge id)p->mtl_data;
+    if ([obj isKindOfClass:[MGLTexParamCache class]])
+        return ((MGLTexParamCache *)obj).sampler;
+    return (id<MTLSamplerState>)obj;
+}
+
 /* sampler for a texture unit: a bound sampler object overrides the texture's own sampler state */
 - (id<MTLSamplerState>) texparamSamplerForUnit:(GLuint)unit texture:(Texture *)tex
 {

@@ -349,7 +349,12 @@ static bool rs_mode_is_polygon(GLenum m)
     bool is_vertex_like = (stage == _VERTEX_SHADER) ||
                           (stage != _FRAGMENT_SHADER && stage_msl && strstr(stage_msl, "mgl_rs_vertex_fixup"));
     const char *msl = program ? program->spirv[stage].msl_str : NULL;
-    if (!mgl_rstate_msl_is_patched(msl)) return (__bridge id<MTLFunction>)shader->mtl_data.function;
+    /* geom: the vertex stage's shadow-sampling emulation carries its own function
+     * constants (32010+slot) that must be specialized even when the rstate fixups
+     * did not patch this MSL (e.g. a vertex function without a [[position]] output) */
+    if (!mgl_rstate_msl_is_patched(msl) &&
+        !(msl && strstr(msl, "mgl_shadow_op_") != NULL))
+        return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
     id<MTLFunction> base = (__bridge id<MTLFunction>)shader->mtl_data.function;
@@ -369,6 +374,11 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&psz type:MTLDataTypeFloat atIndex:MGL_RS_FC_POINT_SIZE];
         bool rd = ctx->state.caps.rasterizer_discard;
         [cv setConstantValue:&rd type:MTLDataTypeBool atIndex:MGL_RS_FC_RASTERIZER_DISCARD];
+        /* geom: shadow-compare function constants of the vertex stage's emulation
+         * (a no-op unless spirv[VS].shadow_slots is set) — the values are part of
+         * the cache key below, a compare-function change re-specializes */
+        uint64_t shash = 0;
+        [self geomShadowFCValues:cv stage:stage hash:&shash];
         /* the key must not collide when a program is deleted and a later one's Metal
          * objects land on the same addresses: the specialized entry would hand the dead
          * program's function to the new one and it would render with the wrong shader
@@ -377,7 +387,7 @@ static bool rs_mode_is_polygon(GLenum m)
          * impossible. */
         uint64_t h = 1469598103934665603ULL;
         if (msl) { for (const char *q = msl; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; } }
-        key = [NSString stringWithFormat:@"%p:%p:%llx:v:%d%d%d%d:%g", lib, base, (unsigned long long)h, z01, ul, pps, rd, psz];
+        key = [NSString stringWithFormat:@"%p:%p:%llx:v:%d%d%d%d:%g:%llx", lib, base, (unsigned long long)h, z01, ul, pps, rd, psz, (unsigned long long)shash];
     } else {
         NSUInteger samples = [self rstateSampleCount];
         bool lower = rs->point_sprite_coord_origin == GL_LOWER_LEFT;

@@ -119,6 +119,14 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
     return obj;
 }
 
+
+/* geom: true when the program's VERTEX MSL emulates shadow sampling at Metal texture slot N
+ * (mgl_fix_shadow_vs); those slots bind the compare-stripped sampler */
+static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Program *p, GLuint slot)
+{
+    return p && slot < 32 && (p->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot));
+}
+
 @interface MGLRenderer ()
 {
     NSView *_view;
@@ -177,6 +185,15 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
  * rstate vertex function constants — it is the last pre-rasterization stage); NULL when the
  * override is inactive, so the caller leaves the descriptor's vertex function alone */
 - (id<MTLFunction>) geomSpecializeVertexOverride;
+/* geom: the vertex stage's shadow gather (spirv[VS].shadow_slots) reads the compare
+ * function of the unit as a function constant, see geomShadowFCValues below *//* geom: fill the shadow-compare function constants (32010+slot) of a stage's MSL from the
+ * GL_TEXTURE_COMPARE_FUNC of the units feeding its shadow-sampled texture slots, and mix a
+ * checksum of the values into *hash (the rstate specialization cache key must cover them) */
+- (void) geomShadowFCValues:(MTLFunctionConstantValues *)cv stage:(int)stage hash:(uint64_t *)hash;
+/* geom: re-specialize the vertex function when a shadow-sampled unit's compare function
+ * changed since the last specialization (called on the texture-binding path, which runs
+ * before the PSO build of the same draw, so dirtying the program takes effect there) */
+- (void) geomShadowCheckStale:(GLuint)unit texture:(Texture *)tex slot:(GLuint)slot;
 
 - (void) bindMTLBuffer:(Buffer *) ptr;- (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage;
 - (bool) mapBuffersToMTL;
@@ -288,6 +305,10 @@ static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const
 @interface MGLRenderer (TextureParams)
 - (id<MTLSamplerState>) texparamCreateSampler:(TextureParameter *)p target:(GLenum)target;
 - (id<MTLSamplerState>) texparamSamplerForUnit:(GLuint)unit texture:(Texture *)tex;
+/* texparam: the sampler state cached in a TextureParameter's mtl_data — which holds an
+ * MGLTexParamCache (not a bare sampler) once texparamCacheFor has run; casting blindly
+ * is a type-confusion crash */
+- (id<MTLSamplerState>) texparamCachedSampler:(TextureParameter *)p;
 - (id<MTLTexture>) texparamTextureForTex:(Texture *)tex base:(id<MTLTexture>)base;
 - (void) texparamPrepareTextureDescriptor:(MTLTextureDescriptor *)desc forTex:(Texture *)tex;
 - (MTLTextureSwizzleChannels) texparamSwizzleForParams:(TextureParameter *)p;

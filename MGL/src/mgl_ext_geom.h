@@ -94,6 +94,40 @@ enum {
 #define MGL_SSBO_SIZE_BUFFER_INDEX 25
 #define MGL_GEOM_KERNEL_SIZE_BUFFER 21
 
+/* Vertex-stage shadow-sampling emulation (mgl_fix_shadow_vs, program.c): the GL
+ * texture-compare function of the unit feeding Metal texture slot N is passed to
+ * the vertex function as function constant MGL_GEOM_FC_SHADOW_OP_BASE+N.  Values:
+ * 0 LEQUAL (the GL default), 1 GEQUAL, 2 LESS, 3 GREATER, 4 EQUAL, 5 NOTEQUAL,
+ * 6 ALWAYS, 7 NEVER (see mgl_cmp_do in program.c).  The rstate fixups own
+ * 32000..32009. */
+#define MGL_GEOM_FC_SHADOW_OP_BASE 32010
+#define MGL_GEOM_SHADOW_OP_LEQUAL   0
+#define MGL_GEOM_SHADOW_OP_GEQUAL   1
+#define MGL_GEOM_SHADOW_OP_LESS     2
+#define MGL_GEOM_SHADOW_OP_GREATER  3
+#define MGL_GEOM_SHADOW_OP_EQUAL    4
+#define MGL_GEOM_SHADOW_OP_NOTEQUAL 5
+#define MGL_GEOM_SHADOW_OP_ALWAYS   6
+#define MGL_GEOM_SHADOW_OP_NEVER    7
+
+/* the GL_TEXTURE_COMPARE_FUNC of a texture unit's effective sampler state, as the
+ * function-constant encoding above (a bound sampler object overrides the texture's
+ * own state, like texparamSamplerForUnit) */
+static inline int mgl_geom_shadow_op_of(GLenum compare_func)
+{
+    switch (compare_func)
+    {
+        case GL_GEQUAL:   return MGL_GEOM_SHADOW_OP_GEQUAL;
+        case GL_LESS:     return MGL_GEOM_SHADOW_OP_LESS;
+        case GL_GREATER:  return MGL_GEOM_SHADOW_OP_GREATER;
+        case GL_EQUAL:    return MGL_GEOM_SHADOW_OP_EQUAL;
+        case GL_NOTEQUAL: return MGL_GEOM_SHADOW_OP_NOTEQUAL;
+        case GL_ALWAYS:   return MGL_GEOM_SHADOW_OP_ALWAYS;
+        case GL_NEVER:    return MGL_GEOM_SHADOW_OP_NEVER;
+        default:          return MGL_GEOM_SHADOW_OP_LEQUAL;
+    }
+}
+
 /* one interface varying of the geometry stage (canonical word layout shared by the
  * VS capture variant, the GS kernel and the pass-through vertex function) */
 typedef struct MGLGeomVar {

@@ -625,47 +625,133 @@ static GLuint sampler_type_key(spvc_compiler c, spvc_type_id type_id)
 }
 
 /* ------------------------------------------------------------------ */
-/* AGX workaround: gather_compare in VERTEX/COMPUTE functions returns the
- * RAW depth values (the comparison is never applied) on Apple GPUs —
- * fragment functions are unaffected.  KHR-GL46.texture_gather
- * plain/offset/offsets-gather-depth-* exercise all three stages, so the
- * vertex and compute stages must not use the hardware gather_compare.
+/* Gather emulation for the non-fragment stages (AGX: the hardware gather
+ * returns raw values / zeros in vertex and compute functions; fragment
+ * functions are unaffected).
  *
- * Rewrite every `OBJ.gather_compare(S, COORD, REF[, OFF])` into a call to a
- * helper that performs four explicit texel-centre sample_compare taps at
- * level 0.  At an exact texel centre bilinear filtering puts all weight on
- * that tap, so the result equals the hardware comparison for ANY filter
- * setting, and the sampler's wrap modes apply exactly as for gather.
+ * Plain gathers become mgl_gath_vs: four explicit texel reads of the 2x2 tap
+ * block, channel-selected.  A gather selects its own taps (no filtering), so
+ * reads are exact; the block base is `floor(uv * size - 0.5 + off)' for
+ * normalized samplers and `floor(uv - 0.5 + off)' for rectangle (unnormalized)
+ * ones — mgl_spirv_rect_to_2d marks those variables with the _mglrect suffix.
  * Tap order = the GL/CTS convention measured from hardware gathers:
- * (x0,y1) (x1,y1) (x1,y0) (x0,y0) of the 2x2 block floor(uv*size-0.5+off).
+ * (x0,y1) (x1,y1) (x1,y0) (x0,y0) of the 2x2 block.
  *
- * depthcube/depthcube_array gathers keep the (broken) hardware path: their
- * tap quads are face-layout dependent and the CTS cube cases are documented
- * as a gap. */
-static const char *k_gcmp_helpers =
+ * Shadow (depth) gathers additionally need the comparison.  In VERTEX
+ * functions sample_compare itself is broken (the sampler's compare function is
+ * ignored and the raw depth is returned) AND sampling a depth texture through a
+ * plain texture2d with a compare sampler is unreliable there, so the vertex
+ * stage compares in the shader: mgl_gcmp_vs does four depth2d.read() fetches
+ * plus a manual `ref OP d', where OP is GL_TEXTURE_COMPARE_FUNC of the unit
+ * that feeds the texture slot, passed as a function constant 32010+slot
+ * (mgl_shadow_op_N, see mgl_ext_geom.h).  Function constants work at any scope
+ * (the CTS calls textureGather from a nested function) and rstateSpecialize
+ * fills them from the GL sampler state when the pipeline is built.  In COMPUTE
+ * functions sample_compare works, so mgl_gcmp_vs there keeps hardware
+ * comparison taps at exact texel centres (bilinear puts all weight on one tap,
+ * so any filter setting gives the same answer as the hardware gather_compare).
+ *
+ * depthcube / depthcube_array gathers keep the (broken) hardware path: their
+ * tap quads are face-layout dependent and the CTS cube cases are documented as
+ * a gap.  Plain `.sample_compare' in a vertex function also stays hardware:
+ * it cannot be emulated with texel reads when the min filter is LINEAR. */
+
+static const char *k_gath_helpers =
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off)\n"
+"static inline __attribute__((always_inline)) T mgl_gsel(vec<T,4> v, component c)\n"
+"{\n"
+"    if (c == component::x) return v.x;\n"
+"    if (c == component::y) return v.y;\n"
+"    if (c == component::z) return v.z;\n"
+"    return v.w;\n"
+"}\n"
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor(uv * sz - float2(0.5)) + float2(off));\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = t.sample_compare(s, (float2(b + int2(0, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
-"    r[1] = t.sample_compare(s, (float2(b + int2(1, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
-"    r[2] = t.sample_compare(s, (float2(b + int2(1, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
-"    r[3] = t.sample_compare(s, (float2(b + int2(0, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[0] = mgl_gsel(t.read(uint2(b + int2(0, 1)), 0), c);\n"
+"    r[1] = mgl_gsel(t.read(uint2(b + int2(1, 1)), 0), c);\n"
+"    r[2] = mgl_gsel(t.read(uint2(b + int2(1, 0)), 0), c);\n"
+"    r[3] = mgl_gsel(t.read(uint2(b + int2(0, 0)), 0), c);\n"
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float3 uv, T ref, int2 off)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d_array<T> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor(uv.xy * sz - float2(0.5)) + float2(off));\n"
-"    uint layer = uint(uv.z + 0.5);\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = t.sample_compare(s, float3((float2(b + int2(0, 1)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
-"    r[1] = t.sample_compare(s, float3((float2(b + int2(1, 1)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
-"    r[2] = t.sample_compare(s, float3((float2(b + int2(1, 0)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
-"    r[3] = t.sample_compare(s, float3((float2(b + int2(0, 0)) + float2(0.5)) / sz, float(layer)), ref, level(0.0));\n"
+"    r[0] = mgl_gsel(t.read(uint2(b + int2(0, 1)), layer, 0), c);\n"
+"    r[1] = mgl_gsel(t.read(uint2(b + int2(1, 1)), layer, 0), c);\n"
+"    r[2] = mgl_gsel(t.read(uint2(b + int2(1, 0)), layer, 0), c);\n"
+"    r[3] = mgl_gsel(t.read(uint2(b + int2(0, 0)), layer, 0), c);\n"
+"    return r;\n"
+"}\n";
+
+/* shadow gathers in the VERTEX stage: texel reads + the emulated comparison */
+static const char *k_gcmp_read_helpers =
+"static inline float mgl_cmp_do(float ref, float d, int op)\n"
+"{\n"
+"    if (op == 1) return ref >= d;\n"    /* GL_GEQUAL */
+"    if (op == 2) return ref < d;\n"     /* GL_LESS */
+"    if (op == 3) return ref > d;\n"     /* GL_GREATER */
+"    if (op == 4) return ref == d;\n"    /* GL_EQUAL */
+"    if (op == 5) return ref != d;\n"    /* GL_NOTEQUAL */
+"    if (op == 6) return 1.0;\n"         /* GL_ALWAYS */
+"    if (op == 7) return 0.0;\n"         /* GL_NEVER */
+"    return ref <= d;\n"                 /* 0 = GL_LEQUAL (the GL default) */
+"}\n"
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, int op, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    vec<T,4> r;\n"
+"    r[0] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 1)), 0), op);\n"
+"    r[1] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 1)), 0), op);\n"
+"    r[2] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 0)), 0), op);\n"
+"    r[3] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 0)), 0), op);\n"
+"    return r;\n"
+"}\n"
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, int op, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    vec<T,4> r;\n"
+"    r[0] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 1)), layer, 0), op);\n"
+"    r[1] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 1)), layer, 0), op);\n"
+"    r[2] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 0)), layer, 0), op);\n"
+"    r[3] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 0)), layer, 0), op);\n"
+"    return r;\n"
+"}\n";
+
+/* shadow gathers in the COMPUTE stage: hardware sample_compare taps */
+static const char *k_gcmp_sc_helpers =
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    vec<T,4> r;\n"
+"    r[0] = t.sample_compare(s, unorm ? (float2(b + int2(0, 1)) + float2(0.5)) : (float2(b + int2(0, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[1] = t.sample_compare(s, unorm ? (float2(b + int2(1, 1)) + float2(0.5)) : (float2(b + int2(1, 1)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[2] = t.sample_compare(s, unorm ? (float2(b + int2(1, 0)) + float2(0.5)) : (float2(b + int2(1, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    r[3] = t.sample_compare(s, unorm ? (float2(b + int2(0, 0)) + float2(0.5)) : (float2(b + int2(0, 0)) + float2(0.5)) / sz, ref, level(0.0));\n"
+"    return r;\n"
+"}\n"
+"template <typename T>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    vec<T,4> r;\n"
+"    r[0] = t.sample_compare(s, unorm ? (float2(b + int2(0, 1)) + float2(0.5)) : (float2(b + int2(0, 1)) + float2(0.5)) / sz, layer, ref, level(0.0));\n"
+"    r[1] = t.sample_compare(s, unorm ? (float2(b + int2(1, 1)) + float2(0.5)) : (float2(b + int2(1, 1)) + float2(0.5)) / sz, layer, ref, level(0.0));\n"
+"    r[2] = t.sample_compare(s, unorm ? (float2(b + int2(1, 0)) + float2(0.5)) : (float2(b + int2(1, 0)) + float2(0.5)) / sz, layer, ref, level(0.0));\n"
+"    r[3] = t.sample_compare(s, unorm ? (float2(b + int2(0, 0)) + float2(0.5)) : (float2(b + int2(0, 0)) + float2(0.5)) / sz, layer, ref, level(0.0));\n"
 "    return r;\n"
 "}\n";
 
@@ -675,6 +761,7 @@ static bool mgl_is_idchar(int c)
            c == '_' || c == '.' || c == '[' || c == ']';
 }
 
+/* ------------------------------------------------------------------ */
 /* length of the balanced-paren argument list starting at open (the '(') */
 static size_t mgl_arglist_len(const char *open)
 {
@@ -690,7 +777,7 @@ static size_t mgl_arglist_len(const char *open)
 }
 
 /* split the top-level comma-separated args of "(a, b, c)" into out[4] */
-static int mgl_split_args(const char *args, size_t len, char out[5][256])
+static int mgl_split_args(const char *args, size_t len, char (*out)[256])
 {
     int n = 0;
     size_t depth = 0, start = 1;    /* skip '(' */
@@ -711,123 +798,380 @@ static int mgl_split_args(const char *args, size_t len, char out[5][256])
                 out[n][end - a] = 0;
                 n++;
             }
+
+
             start = i + 1;
         }
     }
     return n;
 }
 
-static char *mgl_fix_gather_compare_vs(const char *msl)
+
+/* one gather object of the stage: name, its Metal texture slot and shape
+ * (depth => a shadow gather that also needs the compare-op function constant) */
+typedef struct MGLShadowObj {
+    char    name[128];
+    int     slot;
+    bool    array;
+    bool    depth;
+} MGLShadowObj;
+
+/* find `depth2d[_array]<float> NAME [[texture(N)]]' or the plain
+ * `texture2d[_array]<float> NAME [[texture(N)]]' in the MSL and return the slot
+ * (and whether the object is an array texture); -1 when the object is not
+ * declared that way at the entry point (cube / cube_array / depthcube stay on
+ * the hardware path — there is no read()-based emulation for them) */
+static int mgl_shadow_slot_of(const char *msl, const char *name, bool *is_array, bool *depth)
 {
-    if (!msl || !strstr(msl, ".gather_compare("))
+    char pat[192];
+    static const char *k_types[4][2] = {
+        { "depth2d_array", "depth2d" },
+        { "texture2d_array", "texture2d" },
+    };
+    /* float/int/uint channels (GLSL sampler2D/Rect/2DArray and the shadow
+     * depth forms; half-float gathers are not exercised by the CTS) */
+    static const char *k_channels[3] = { "float", "int", "uint" };
+    for (int t = 0; t < 2; t++)
+    for (int ch = 0; ch < 3; ch++)
+    for (int arr = 1; arr >= 0; arr--)
+    {
+        snprintf(pat, sizeof pat, "%s<%s> %s", arr ? k_types[t][0] : k_types[t][1], k_channels[ch], name);
+        const char *p = msl;
+        while ((p = strstr(p, pat)) != NULL)
+        {
+            const char *q = p + strlen(pat);
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (strncmp(q, "[[texture(", 10) == 0)
+            {
+                int slot = atoi(q + 10);
+                if (slot >= 0 && slot < 32)
+                {
+                    *is_array = arr != 0;
+                    *depth = t == 0;
+                    return slot;
+                }
+            }
+            p += strlen(pat);
+        }
+    }
+    return -1;
+}
+
+static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compute)
+{
+    if (!msl || (!strstr(msl, ".gather_compare(") && !strstr(msl, ".gather(")))
         return NULL;
 
-    /* count rewrites first for a single allocation */
-    int calls = 0;
+    /* 1) collect the objects used by gather calls and their slots */
+    MGLShadowObj objs[32];
+    int nobjs = 0;
     const char *p = msl;
-    while ((p = strstr(p, ".gather_compare(")) != NULL) { calls++; p += 10; }
-    if (!calls) return NULL;
+    while (nobjs < 32)
+    {
+        const char *gc = strstr(p, ".gather_compare(");
+        const char *g = strstr(p, ".gather(");
+        const char *hit;
+        bool shadow;
+        if (gc && (!g || gc < g)) { hit = gc; shadow = true; }
+        else if (g)               { hit = g; shadow = false; }
+        else break;
+        if (gc && g && g < gc) { hit = g; shadow = false; }   /* plain call first */
 
-    size_t need = strlen(msl) + strlen(k_gcmp_helpers) + (size_t)calls * 96 + 16;
+        const char *obj = hit;
+        while (obj > msl && mgl_is_idchar((unsigned char)obj[-1])) obj--;
+        char name[128];
+        size_t nl = (size_t)(hit - obj);
+        if (nl == 0 || nl >= sizeof name) { p = hit + 10; continue; }
+        memcpy(name, obj, nl);
+        name[nl] = 0;
+
+        bool known = false;
+        for (int i = 0; i < nobjs; i++)
+            if (strcmp(objs[i].name, name) == 0) { known = true; break; }
+        if (!known)
+        {
+            bool arr = false, dep = false;
+            int slot = mgl_shadow_slot_of(msl, name, &arr, &dep);
+            if (slot < 0) { p = hit + 10; continue; }   /* not a 2D/array [[texture(N)]] argument: keep hardware path */
+            snprintf(objs[nobjs].name, sizeof objs[nobjs].name, "%s", name);
+            objs[nobjs].slot = slot;
+            objs[nobjs].array = arr;
+            objs[nobjs].depth = dep;   /* declared depth2d[_array]: shadow gathers */
+            nobjs++;
+        }
+        else if (shadow)
+        {
+            /* the same object may gather both ways; a shadow use of a plain
+             * texture cannot happen (GL types are distinct), but a depth object
+             * that was first seen as `depth2d' keeps its depth flag either way */
+            for (int i = 0; i < nobjs; i++)
+                if (strcmp(objs[i].name, name) == 0 && objs[i].depth) break;
+        }
+        p = hit + 10;
+    }
+    if (!nobjs) return NULL;
+
+    /* 2) rewrite the calls into a fresh buffer */
+    const char *helpers = compute ? k_gcmp_sc_helpers : k_gcmp_read_helpers;
+    size_t need = strlen(msl) * 2 + strlen(k_gath_helpers) + strlen(helpers) + nobjs * 192 + 4096;
     char *out = (char *)malloc(need);
     if (!out) return NULL;
     out[0] = 0;
 
     const char *src = msl;
-    const char *inserted = NULL;
-    while (1)
+    while (*src)
     {
-        const char *hit = strstr(src, ".gather_compare(");
-        if (!hit)
-        {
-            strcat(out, src);
-            break;
-        }
-        /* object expression before the dot */
+        const char *gc = strstr(src, ".gather_compare(");
+        const char *g = strstr(src, ".gather(");
+        const char *hit;
+        bool shadow;
+        if (gc && (!g || gc < g)) { hit = gc; shadow = true; }
+        else if (g)               { hit = g; shadow = false; }
+        else { strcat(out, src); break; }
+
         const char *obj = hit;
         while (obj > src && mgl_is_idchar((unsigned char)obj[-1])) obj--;
 
-        /* full call = ".gather_compare(" + arglist */
-        size_t alen = mgl_arglist_len(hit + 15);   /* hit[15] == '(' */
+        size_t open_at = shadow ? 15 : 7;   /* the '(' of .gather_compare( / .gather( */
+        size_t alen = mgl_arglist_len(hit + open_at);
         if (alen == 0 || obj == hit)
         {
-            /* malformed: copy verbatim up to and including the dot-call and continue */
-            strncat(out, src, (size_t)(hit - src) + 16 + 1);
-            src = hit + 17;
+            /* malformed or not a simple OBJ.method(args) call: copy up to (but not
+             * including) the '(' so the list itself is copied verbatim below and the
+             * scan cannot re-match the same call */
+            strncat(out, src, (size_t)(hit - src) + open_at);
+            src = hit + open_at;
             continue;
         }
 
-        /* append the untouched prefix */
+        char name[128];
+        size_t nl = (size_t)(hit - obj);
+        if (nl >= sizeof name) nl = sizeof name - 1;
+        memcpy(name, obj, nl);
+        name[nl] = 0;
+
+        MGLShadowObj *o = NULL;
+        for (int i = 0; i < nobjs; i++)
+            if (strcmp(objs[i].name, name) == 0) { o = &objs[i]; break; }
+
         strncat(out, src, (size_t)(obj - src));
-
-        /* inject helpers once, right before the first rewritten call */
-        if (!inserted)
+        if (o)
         {
-            strcat(out, "\n");
-            strcat(out, k_gcmp_helpers);
-            strcat(out, "\n");
-            inserted = out + strlen(out);
-        }
+            char args[6][256];
+            int nargs = mgl_split_args(hit + open_at, alen, args);
+            /* (s, xy[, uint layer], ref[, off]) for shadow calls and
+             * (s, xy[, uint layer][, off][, component::x]) for plain gathers */
+            int base = o->array ? 3 : 2;
+            /* gather_compare only ever happens on depth2d[_array], plain gather
+             * only on texture2d[_array] (GL sampler types are distinct) */
+            bool ok = shadow == o->depth && nargs >= (shadow ? base + 1 : base);
+            if (ok)
+            {
+                char buf[2048];
+                size_t at = (size_t)snprintf(buf, sizeof buf, "%s(%s",
+                                             shadow ? "mgl_gcmp_vs" : "mgl_gath_vs", name);
+                for (int a = 0; a < base; a++)
+                {
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s", args[a]);
+                    if (at >= sizeof buf - 1) at = sizeof buf - 1;   /* snprintf returns the untruncated length */
+                }
 
-        char args[5][256];
-        int nargs = mgl_split_args(hit + 15, alen, args);
-        /* SPIRV-Cross emits (sampler, coord, ref[, int2 offset]) */
-        if (nargs >= 3)
-        {
-            char objname[128];
-            size_t ol = (size_t)(hit - obj);
-            if (ol >= sizeof objname) ol = sizeof objname - 1;
-            memcpy(objname, obj, ol);
-            objname[ol] = 0;
-
-            char buf[512];
-            if (nargs >= 4)
-                snprintf(buf, sizeof buf, "mgl_gcmp_vs(%s, %s, %s, %s, %s)", objname,
-                         args[0], args[1], args[2], args[3]);
+                const char *off = "int2(0)";
+                const char *comp = "component::x";
+                for (int a = base; a < nargs; a++)
+                {
+                    if (strncmp(args[a], "component::", 11) == 0) comp = args[a];
+                    else off = args[a];
+                }
+                size_t rl = strlen(o->name);
+                const char *rect = (rl > 8 && strcmp(o->name + rl - 8, "_mglrect") == 0) ? "true" : "false";
+                if (shadow && !compute)
+                {
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, mgl_shadow_op_%d, %s)",
+                                           args[base], off, o->slot, rect);
+                    if (slots_out) *slots_out |= 1u << o->slot;
+                }
+                else if (shadow)
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)",
+                                           args[base], off, rect);
+                else
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)", off, comp, rect);
+                if (at >= sizeof buf) at = sizeof buf - 1;
+                (void)at;
+                strcat(out, buf);
+            }
             else
-                snprintf(buf, sizeof buf, "mgl_gcmp_vs(%s, %s, %s, %s, int2(0))", objname,
-                         args[0], args[1], args[2]);
-            strcat(out, buf);
+                strncat(out, obj, (size_t)(hit - obj) + open_at + alen);
+        }
+        else
+            strncat(out, obj, (size_t)(hit - obj) + open_at + alen);
+        src = hit + open_at + alen;
+    }
+
+    /* 3) prepend the helper preamble (+ per-slot compare-op function constants
+     * in the vertex stage) at file scope, right after `using namespace metal;' */
+    {
+        char *pre = (char *)malloc(strlen(k_gath_helpers) + strlen(helpers) + nobjs * 192 + 32);
+        if (!pre) { free(out); return NULL; }
+        pre[0] = 0;
+        for (int i = 0; i < nobjs && !compute; i++)
+        {
+            if (!objs[i].depth) continue;
+            char line[256];
+            int dup = 0;
+            for (int j = 0; j < i; j++) if (objs[j].slot == objs[i].slot) dup = 1;
+            if (dup) continue;
+            snprintf(line, sizeof line,
+                     "constant int mgl_shadow_op_%d_ [[function_constant(%d)]];\n"
+                     "constant int mgl_shadow_op_%d = is_function_constant_defined(mgl_shadow_op_%d_) ? mgl_shadow_op_%d_ : 0;\n",
+                     objs[i].slot, MGL_GEOM_FC_SHADOW_OP_BASE + objs[i].slot,
+                     objs[i].slot, objs[i].slot, objs[i].slot);
+            strcat(pre, line);
+        }
+        strcat(pre, k_gath_helpers);
+        strcat(pre, helpers);
+
+        const char *anchor = strstr(out, "using namespace metal;");
+        char *full;
+        if (anchor)
+        {
+            size_t at = (size_t)(anchor - out) + strlen("using namespace metal;");
+            full = (char *)malloc(strlen(out) + strlen(pre) + 4);
+            if (!full) { free(pre); free(out); return NULL; }
+            memcpy(full, out, at);
+            full[at] = '\n';
+            strcpy(full + at + 1, pre);
+            strcat(full, out + at);
         }
         else
         {
-            /* unexpected arg count: keep the original call */
-            strncat(out, obj, (size_t)(hit - obj) + 15 + alen);
+            full = (char *)malloc(strlen(out) + strlen(pre) + 4);
+            if (!full) { free(pre); free(out); return NULL; }
+            strcpy(full, pre);
+            strcat(full, out);
         }
-        src = hit + 15 + alen;
+        free(pre);
+        free(out);
+        return full;
     }
-
-    /* the helpers must appear at file scope: move them before the first
-     * function if the call site was inside one — simplest robust placement is
-     * right after the "using namespace metal;" preamble when present. */
-    if (inserted)
-    {
-        const char *anchor = strstr(out, "using namespace metal;");
-        if (anchor)
-        {
-            size_t tail_at = (size_t)(anchor - out) + strlen("using namespace metal;");
-            char *moved = (char *)malloc(need);
-            if (moved)
-            {
-                memcpy(moved, out, tail_at);
-                strcpy(moved + tail_at, "\n");
-                strcat(moved, k_gcmp_helpers);
-                strcat(moved, out + tail_at);
-                /* strip the inline copy appended earlier (first occurrence after tail) */
-                char *dup = strstr(moved + tail_at + strlen(k_gcmp_helpers), k_gcmp_helpers);
-                if (dup)
-                {
-                    size_t rl = strlen(k_gcmp_helpers);
-                    memmove(dup, dup + rl, strlen(dup + rl) + 1);
-                }
-                free(out);
-                out = moved;
-            }
-        }
-    }
-    return out;
 }
 
+/* rewrite the image Dim of every OpTypeImage from Rect to 2D in a SPIR-V
+ * module (in place); returns how many image types were patched.  OpTypeImage
+ * packs Dim(3) | Depth(2) | Arrayed(1) | MS(1) | Sampled(2) | Format(5) into
+ * its 4th word (bits from the LSB up).  See the caller for why.
+ *
+ * Every sampled-image variable built on such a type is additionally marked by
+ * extending its OpName with the suffix "_mglrect": SPIRV-Cross uses OpName for
+ * the MSL argument name, so the MSL-side gather rewrites (mgl_fix_shadow_vs)
+ * can tell an unnormalized rectangle sampler from a normalized one — the
+ * texel-block base for a gather is `floor(uv * size - 0.5)' for normalized
+ * coordinates but `floor(uv - 0.5)' for raw rectangle coordinates.  The module
+ * is rebuilt word by word because the longer string needs more words. */
+static size_t mgl_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_words, size_t *out_n)
+{
+    enum { kSpvOpName = 5, kSpvOpTypeImage = 25, kSpvOpTypeSampledImage = 27,
+           kSpvOpTypePointer = 32, kSpvOpVariable = 59 };
+    enum { kSpvDim2D = 1, kSpvDimRect = 4 };
+    uint32_t *ids = NULL;
+    size_t patched = 0;
+
+    /* 1) walk the module once: find the rect image types and everything
+     *    downstream of them, and count how many words the rebuild needs */
+    size_t need = 5;
+    if (n < 5) { *out_words = NULL; *out_n = 0; return 0; }
+
+    ids = (uint32_t *)calloc(n, sizeof(uint32_t));
+    if (!ids) { *out_words = NULL; *out_n = 0; return 0; }
+    /* ids[id] tags: 1 = rect image type, 2 = rect sampled-image type,
+     * 3 = pointer to it, 4 = variable of it */
+    size_t i = 5;
+    while (i < n)
+    {
+        uint32_t wc = w[i] >> 16;
+        uint32_t op = w[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        switch (op)
+        {
+            case kSpvOpTypeImage:
+                if (wc >= 4 && (w[i + 3] & 0x7u) == kSpvDimRect && w[i + 1] < n)
+                    ids[w[i + 1]] = 1;
+                break;
+            case kSpvOpTypeSampledImage:
+                if (wc >= 3 && w[i + 2] < n && ids[w[i + 2]] == 1 && w[i + 1] < n)
+                    ids[w[i + 1]] = 2;
+                break;
+            case kSpvOpTypePointer:
+                if (wc >= 4 && w[i + 3] < n && ids[w[i + 3]] == 2 && w[i + 1] < n)
+                    ids[w[i + 1]] = 3;
+                break;
+            case kSpvOpVariable:
+                if (wc >= 4 && w[i + 1] < n && ids[w[i + 1]] == 3 && w[i + 2] < n)
+                    ids[w[i + 2]] = 4;
+                break;
+            default:
+                break;
+        }
+        if (op == kSpvOpName && wc >= 2 && w[i + 1] < n && ids[w[i + 1]] == 4)
+            need += 2;   /* "_mglrect" = 8 chars = 2 words */
+        else
+            need += wc;
+        i += wc;
+    }
+
+    uint32_t *o = (uint32_t *)malloc(need * sizeof(uint32_t));
+    if (!o) { free(ids); *out_words = NULL; *out_n = 0; return 0; }
+    size_t j = 0;
+    i = 5;
+    memcpy(o, w, 5 * sizeof(uint32_t));
+    j = 5;
+    while (i < n)
+    {
+        uint32_t wc = w[i] >> 16;
+        uint32_t op = w[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        if (op == kSpvOpTypeImage && wc >= 4 && (w[i + 3] & 0x7u) == kSpvDimRect)
+        {
+            memcpy(o + j, w + i, wc * sizeof(uint32_t));
+            o[j + 3] = (w[i + 3] & ~0x7u) | kSpvDim2D;
+            j += wc;
+            patched++;
+        }
+        else if (op == kSpvOpName && wc >= 2 && w[i + 1] < n && ids[w[i + 1]] == 4)
+        {
+            /* rebuild the literal with the suffix, keeping the padding rules
+             * (NUL-terminated, zero-padded to a word multiple) */
+            const char *str = (const char *)(w + i + 2);
+            size_t slen = strnlen(str, (wc - 2) * 4);
+            size_t newlen = slen + strlen("_mglrect");
+            size_t newwords = 2 + (newlen / 4 + 1);
+            if (j + newwords <= need)
+            {
+                o[j] = (uint32_t)((newwords << 16) | kSpvOpName);
+                o[j + 1] = w[i + 1];
+                memset(o + j + 2, 0, (newwords - 2) * sizeof(uint32_t));
+                memcpy(o + j + 2, str, slen);
+                memcpy((char *)(o + j + 2) + slen, "_mglrect", strlen("_mglrect"));
+                j += newwords;
+            }
+            else
+            {
+                memcpy(o + j, w + i, wc * sizeof(uint32_t));
+                j += wc;
+            }
+        }
+        else
+        {
+            memcpy(o + j, w + i, wc * sizeof(uint32_t));
+            j += wc;
+        }
+        i += wc;
+    }
+    free(ids);
+    *out_words = o;
+    *out_n = j;
+    return patched;
+}
 
 /* GL texture target a sampler/image uniform of this SPIR-V type samples: the
  * GLSL sampler dimension picks WHICH of the unit's per-target bindings feeds it
@@ -1194,6 +1538,29 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* GL rectangle textures: SPIRV-Cross's MSL backend has no DimRect mapping
+     * (it emits `unknown_texture_type`, which never compiles), so the MSL-facing
+     * module rewrites the image Dim of every OpTypeImage from Rect to 2D.  The
+     * unnormalized coordinates come from the sampler (texparamCreateSampler
+     * builds it from the RECTANGLE target) and a Metal texture2d with an
+     * unnormalized sampler is exactly rectangle semantics.  The GL view in
+     * ptr->spirv[stage].ir keeps DimRect, so introspection still reports
+     * GL_TEXTURE_RECTANGLE and the unit lookup finds the right binding. */
+    {
+        uint32_t *rect_fixed = NULL;
+        size_t rect_words = 0;
+        if (mgl_spirv_rect_to_2d(prepared, prepared_words, &rect_fixed, &rect_words) > 0 && rect_fixed)
+        {
+            free(prepared);
+            prepared = rect_fixed;
+            prepared_words = rect_words;
+        }
+        else
+        {
+            free(rect_fixed);
+        }
+    }
+
     if (spvc_context_create(&context) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: SPIRV-Cross context creation failed\n");
@@ -1452,11 +1819,42 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
-    /* AGX: gather_compare is broken in vertex/compute functions (raw values,
-     * no comparison) — rewrite those calls to explicit sample_compare taps. */
-    if (stage == _VERTEX_SHADER || stage == _COMPUTE_SHADER)
+    /* AGX: gather_compare AND plain gather are broken in vertex and compute
+     * functions (raw values / zeros; fragment functions are fine), and in the
+     * vertex stage sample_compare itself is broken too.  mgl_fix_gathers_vs
+     * rewrites both gather kinds to explicit-tap helpers: plain gathers become
+     * texel reads, shadow gathers compare in the shader in the vertex stage
+     * (the compare op rides in as a function constant) and keep hardware
+     * sample_compare taps in compute, where it works. */
+    if (stage == _COMPUTE_SHADER || (stage == _VERTEX_SHADER && tess_pipeline))
     {
-        char *fixed_gc = mgl_fix_gather_compare_vs(result);
+        char *fixed_gc = mgl_fix_gathers_vs(result, NULL, true);
+        if (fixed_gc)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = fixed_gc;
+            result = fixed_gc;
+        }
+    }
+    else if (stage == _VERTEX_SHADER)
+    {
+        uint32_t shadow_slots = 0;
+        char *fixed_sh = mgl_fix_gathers_vs(result, &shadow_slots, false);
+        if (fixed_sh)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = fixed_sh;
+            result = fixed_sh;
+            ptr->spirv[stage].shadow_slots = shadow_slots;
+        }
+    }
+    else if (stage == _TESS_CONTROL_SHADER || stage == _TESS_EVALUATION_SHADER)
+    {
+        /* the tessellation stages run as post-tessellation vertex functions /
+         * kernels, where the hardware gather is equally broken: same texel-read
+         * rewrite (the shadow-compare function constants are not filled for
+         * these stages, so only plain gathers are fully covered) */
+        char *fixed_gc = mgl_fix_gathers_vs(result, NULL, false);
         if (fixed_gc)
         {
             if (tess_owned != result) free(tess_owned);

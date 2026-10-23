@@ -729,18 +729,29 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
         Sampler *gl_sampler = ctx->state.texture_samplers[binding];
         if (gl_sampler && gl_sampler->mtl_data)
             sampler = (__bridge id<MTLSamplerState>)(gl_sampler->mtl_data);
-        else if (ptr->params.mtl_data)
-            sampler = (__bridge id<MTLSamplerState>)(ptr->params.mtl_data);
+        else
+            sampler = [self texparamCachedSampler:&ptr->params];   /* mtl_data may hold the param cache, not a sampler */
+
+        /* bind at the program's Metal texture/sampler slot, NOT the GL unit:
+         * SPIRV-Cross assigns them independently of the units, and a sampler
+         * index >= 16 (unit numbers reach 31) crashes the encoder */
+        GLuint msl_slot = (GLuint)binding;
+        if (STATE(program))
+        {
+            SpirvResourceList *rl = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+            if ((GLuint)i < rl->count && rl->list[i].msl_binding != 0xffffffffu)
+                msl_slot = rl->list[i].msl_binding;
+        }
 
         if (stage == _FRAGMENT_SHADER)
         {
-            [enc setFragmentTexture: texture atIndex: binding];
-            if (sampler) [enc setFragmentSamplerState: sampler atIndex: binding];
+            [enc setFragmentTexture: texture atIndex: msl_slot];
+            if (sampler) [enc setFragmentSamplerState: sampler atIndex: msl_slot];
         }
         else
         {
-            [enc setVertexTexture: texture atIndex: binding];
-            if (sampler) [enc setVertexSamplerState: sampler atIndex: binding];
+            [enc setVertexTexture: texture atIndex: msl_slot];
+            if (sampler) [enc setVertexSamplerState: sampler atIndex: msl_slot];
         }
     }
 }

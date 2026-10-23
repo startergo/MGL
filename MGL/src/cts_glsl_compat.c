@@ -312,14 +312,303 @@ static char *reject_buffer_layout_decl(const char *src)
     return out.buf;
 }
 
+static char *rewrite_gather_offsets(const char *src);
+
 char *mgl_cts_glsl_compat(const char *src)
 {
     if (!src) return NULL;
-    char *a = strip_gl_block_packings(src);
-    char *b = reject_buffer_layout_decl(a);
-    if (!b) return a;
-    free(a);
-    return b;   /* further rewrites chain here */
+    /* every step returns a malloc'd copy or NULL when it changed nothing, so the
+     * chain keeps the latest non-NULL text and falls back to the original when
+     * no rewrite fired at all */
+    char *cur = strip_gl_block_packings(src);
+    char *next = reject_buffer_layout_decl(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    char *g = rewrite_gather_offsets(cur ? cur : src);
+    if (g)
+    {
+        free(cur);
+        return g;
+    }
+    return cur;
+}
+
+/* ================================================================== textureGatherOffsets
+ *
+ * SPIRV-Cross's MSL backend silently DROPS the ConstOffsets image operand of
+ * OpImageGather/OpImageDrefGather (Metal has no multi-offset gather), so a
+ * textureGatherOffsets call would sample the wrong texels in every stage.
+ * The call is therefore rewritten at the GLSL level into four
+ * textureGatherOffset calls: per ARB_texture_gather, the i-th result channel
+ * is the selected component of the texel at (base + offset[i]), which is
+ * exactly channel (.w == (x0,y0)) of the single-offset gather of the block at
+ * that offset.  textureGatherOffset keeps a (runtime) offset in SPIR-V, and
+ * MGL's gather emulation for the vertex/compute stages already handles it.
+ *
+ * Limitations (same as the GLSL construct itself): the offsets argument must
+ * be an array expression indexable with [0..3], the component argument is
+ * inlined (so it must be constant, which GL requires anyway), and the sampler
+ * and coordinate expressions are evaluated four times — fine for the uniform
+ * and parameter expressions GL allows here. */
+
+/* constructor matching the sampler's channel type: vec4 / ivec4 / uvec4.
+ * The base identifier of the sampler argument is looked up in the source and
+ * its declared type's leading 'i'/'u' decides; anything unrecognized is float.
+ */
+static const char *gather_offsets_ctor(const char *src, size_t len, const char *arg0, size_t a0len)
+{
+    char id[128];
+    size_t idlen = 0;
+    for (size_t i = 0; i < a0len && idlen + 1 < sizeof id; i++)
+        if (is_ident_char((unsigned char)arg0[i])) id[idlen++] = arg0[i];
+        else if (idlen) break;
+    id[idlen] = 0;
+    if (!idlen) return "vec4";
+
+    /* find `<type> <id>' (uniform declarations and function parameters alike) */
+    char pat[192];
+    snprintf(pat, sizeof pat, " %s", id);
+    const char *p = src;
+    while ((p = strstr(p, pat)) != NULL)
+    {
+        if (p + strlen(pat) <= src + len &&
+            (p[strlen(pat)] == ';' || p[strlen(pat)] == '[' || p[strlen(pat)] == ',' ||
+             p[strlen(pat)] == '=' || p[strlen(pat)] == ')' || isspace((unsigned char)p[strlen(pat)])))
+        {
+            /* walk back over whitespace to the type token */
+            const char *t = p;
+            while (t > src && isspace((unsigned char)t[-1])) t--;
+            const char *te = t;
+            while (te > src && is_ident_char((unsigned char)te[-1])) te--;
+            if (te < t && strncmp(te, "isampler", 8) == 0) return "ivec4";
+            if (te < t && strncmp(te, "usampler", 8) == 0) return "uvec4";
+            if (te < t && strncmp(te, "sampler", 7) == 0) return "vec4";
+        }
+        p += strlen(pat);
+    }
+    return "vec4";
+}
+
+/* try to resolve `arr' as a constant ivec2[4] initializer and return the four
+ * offset expressions (allocated, NULL when not resolvable):
+ *     const ivec2 arr[4] = ivec2[](E0, E1, E2, E3);
+ *     const ivec2 arr[4] = ivec2[4](E0, E1, E2, E3);
+ *     const ivec2 arr[4] = { E0, E1, E2, E3 };      (GLSL 4.20)
+ * SPIRV-Cross only forwards compile-time-constant gather offsets to MSL, so the
+ * array elements must be inlined into the four textureGatherOffset calls. */
+static char **gather_offsets_resolve(const char *src, size_t len, const char *arr, size_t alen)
+{
+    if (alen == 0 || alen >= 128) return NULL;
+    char id[130];
+    memcpy(id, arr, alen);
+    id[alen] = 0;
+
+    char pat[160];
+    snprintf(pat, sizeof pat, "%s[4]", id);
+    const char *p = strstr(src, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+
+    while (p < src + len && *p != '=') p++;
+    if (p >= src + len) return NULL;
+    p++;
+
+    /* skip the constructor head up to its '(' (ivec2[] / ivec2[4]( / { ) */
+    const char *open = NULL;
+    for (const char *q = p; q < src + len; q++)
+    {
+        if (*q == '(' || *q == '{') { open = q; break; }
+        if (*q == ';') break;
+    }
+    if (!open) return NULL;
+    size_t close = match_paren(src, len, (size_t)(open - src));
+    if (close >= len) return NULL;
+
+    char **offs = calloc(4, sizeof(char *));
+    if (!offs) return NULL;
+    int n = 0;
+    size_t start = (size_t)(open - src) + 1, depth = 0;
+    for (size_t j = start; j <= close && n < 4; j++)
+    {
+        if (j < close && (src[j] == '(' || src[j] == '[')) depth++;
+        else if (j < close && (src[j] == ')' || src[j] == ']')) depth--;
+        if (j == close || (src[j] == ',' && depth == 0))
+        {
+            size_t s = start, e = j;
+            while (s < e && isspace((unsigned char)src[s])) s++;
+            while (e > s && isspace((unsigned char)src[e - 1])) e--;
+            offs[n] = malloc(e - s + 1);
+            if (!offs[n]) { for (int k = 0; k < 4; k++) free(offs[k]); free(offs); return NULL; }
+            memcpy(offs[n], src + s, e - s);
+            offs[n][e - s] = 0;
+            n++;
+            start = j + 1;
+        }
+    }
+    if (n != 4)
+    {
+        for (int k = 0; k < 4; k++) free(offs[k]);
+        free(offs);
+        return NULL;
+    }
+    return offs;
+}
+
+static char *rewrite_gather_offsets(const char *src)
+{
+    if (!strstr(src, "textureGatherOffsets")) return NULL;
+    size_t len = strlen(src);
+    Str out = {0};
+    size_t i = 0;
+
+    while (i < len)
+    {
+        if (!at_word(src, len, i, "textureGatherOffsets"))
+        {
+            str_push(&out, src[i++]);
+            continue;
+        }
+        size_t w = i + strlen("textureGatherOffsets");
+        size_t open = skip_ws_comments(src, len, w);
+        if (open >= len || src[open] != '(')
+        {
+            str_append(&out, src + i, w - i);
+            i = w;
+            continue;
+        }
+        size_t close = match_paren(src, len, open);
+        if (close >= len)
+        {
+            str_append(&out, src + i, w - i);
+            i = w;
+            continue;
+        }
+
+        /* split the top-level arguments */
+        char args[4][512];
+        int nargs = 0;
+        {
+            size_t a0 = open + 1, depth = 0;
+            size_t start = a0;
+            for (size_t j = a0; j <= close; j++)
+            {
+                if (j < close && (src[j] == '(' || src[j] == '[')) depth++;
+                else if (j < close && (src[j] == ')' || src[j] == ']')) depth--;
+                if (j == close || (src[j] == ',' && depth == 0))
+                {
+                    if (nargs < 4)
+                    {
+                        size_t s = start, e = j;
+                        while (s < e && isspace((unsigned char)src[s])) s++;
+                        while (e > s && isspace((unsigned char)src[e - 1])) e--;
+                        size_t n = e - s;
+                        if (n >= sizeof args[0]) n = sizeof args[0] - 1;
+                        memcpy(args[nargs], src + s, n);
+                        args[nargs][n] = 0;
+                    }
+                    nargs++;
+                    start = j + 1;
+                }
+            }
+        }
+
+        if (nargs < 3)
+        {
+            /* leave anything unexpected (including the optional sampler+coord
+             * overload split into two calls) untouched */
+            str_append(&out, src + i, close + 1 - i);
+            i = close + 1;
+            continue;
+        }
+
+        const char *ctor = gather_offsets_ctor(src, len, args[0], strlen(args[0]));
+
+        /* argument order: non-shadow (S, P, offsets[, component]), shadow
+         * (S, P, refZ, offsets) — find which argument is the const array */
+        char **offs = NULL;
+        int off_arg = 2;
+        if (nargs >= 4)
+        {
+            offs = gather_offsets_resolve(src, len, args[2], strlen(args[2]));
+            if (!offs)
+            {
+                offs = gather_offsets_resolve(src, len, args[3], strlen(args[3]));
+                off_arg = 3;
+            }
+        }
+        else
+        {
+            offs = gather_offsets_resolve(src, len, args[2], strlen(args[2]));
+        }
+        const char *comp = (nargs >= 4) ? args[off_arg == 2 ? 3 : 2] : "0";
+        const char *arr = (nargs >= 4) ? args[off_arg] : args[2];
+
+        /* constant offsets: inline the four literal expressions so SPIRV-Cross
+         * forwards them (Metal's gather offset must be compile-time constant) */
+        char buf[2400];
+        if (offs)
+        {
+            /* non-shadow: (S, P, offset, [comp]); shadow: (S, P, refZ, offset) */
+            if (off_arg == 3)
+                snprintf(buf, sizeof buf,
+                         "%s(textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w)",
+                         ctor,
+                         args[0], args[1], comp, offs[0],
+                         args[0], args[1], comp, offs[1],
+                         args[0], args[1], comp, offs[2],
+                         args[0], args[1], comp, offs[3]);
+            else
+                snprintf(buf, sizeof buf,
+                         "%s(textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w,"
+                         " textureGatherOffset(%s, %s, %s, %s).w)",
+                         ctor,
+                         args[0], args[1], offs[0], comp,
+                         args[0], args[1], offs[1], comp,
+                         args[0], args[1], offs[2], comp,
+                         args[0], args[1], offs[3], comp);
+            for (int k = 0; k < 4; k++) free(offs[k]);
+            free(offs);
+        }
+        else
+        {
+            /* dynamic offsets: SPIRV-Cross drops them (Metal cannot gather with
+             * a runtime offset), so approximate with the block at offset[0] —
+             * documented limitation, no CTS case reaches this */
+            if (off_arg == 3)
+                snprintf(buf, sizeof buf,
+                         "%s(textureGatherOffset(%s, %s, %s, %s[0]).w,"
+                         " textureGatherOffset(%s, %s, %s, %s[1]).w,"
+                         " textureGatherOffset(%s, %s, %s, %s[2]).w,"
+                         " textureGatherOffset(%s, %s, %s, %s[3]).w)",
+                         ctor,
+                         args[0], args[1], comp, arr,
+                         args[0], args[1], comp, arr,
+                         args[0], args[1], comp, arr,
+                         args[0], args[1], comp, arr);
+            else
+                snprintf(buf, sizeof buf,
+                         "%s(textureGatherOffset(%s, %s, %s[0], %s).w,"
+                         " textureGatherOffset(%s, %s, %s[1], %s).w,"
+                         " textureGatherOffset(%s, %s, %s[2], %s).w,"
+                         " textureGatherOffset(%s, %s, %s[3], %s).w)",
+                         ctor,
+                         args[0], args[1], arr, comp,
+                         args[0], args[1], arr, comp,
+                         args[0], args[1], arr, comp,
+                         args[0], args[1], arr, comp);
+        }
+        str_append(&out, buf, strlen(buf));
+        i = close + 1;
+    }
+
+    if (!out.buf) { free(out.buf); return NULL; }
+    str_push(&out, '\0');
+    return out.buf;
 }
 
 /* ================================================================== bool block members
