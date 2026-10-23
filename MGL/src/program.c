@@ -2475,6 +2475,7 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         mgl_ext_post_link(ctx, pptr);
         mgl_program_check_xfb_link(ctx, pptr);
         mgl_program_check_geom_link(ctx, pptr);
+        mgl_program_check_tess_link(ctx, pptr);
     }
 }
 
@@ -2491,7 +2492,8 @@ bool mgl_program_link_spirv_stages(GLMContext ctx, Program *program, const uint3
     if (ok)
     {
         mgl_ext_post_link(ctx, program);
-        ok = mgl_program_check_xfb_link(ctx, program) && mgl_program_check_geom_link(ctx, program);
+        ok = mgl_program_check_xfb_link(ctx, program) && mgl_program_check_geom_link(ctx, program) &&
+             mgl_program_check_tess_link(ctx, program);
     }
 
     return ok;

@@ -103,7 +103,7 @@ static size_t tessRingAlign(size_t v) { return (v + 255) & ~(size_t)255; }
 /* acquire a block of `bytes` from the ring; returns the buffer and sets *offset.
  * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched). */
 static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t *offset,
-                                     int *slot)
+                                     int *slot, MGLRenderer *self)
 {
     for (int i = 0; i < MGL_TESS_RING; i++)
     {
@@ -124,7 +124,45 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
         if (!tRingBusy[i] && (best < 0 || tRingCap[i] > tRingCap[best]))
             best = i;
     if (best < 0)
-        return nil;                    /* all busy: caller must give up */
+    {
+        /* All slots are busy: earlier draws hold them and their command buffers are
+         * already committed (each tess draw commits its own), so their completion
+         * handlers are about to release.  A burst of tiny draws with no readback in
+         * between (e.g. discarded patches, 0 records) can outrun the GPU — wait for a
+         * slot instead of failing the draw.  If a slot does not free up quickly, the
+         * last open command buffer may still be sitting uncommitted (nothing forced a
+         * flush): commit it so its completion handlers can retire the slots.  Bounded
+         * to ~2 s, then give up. */
+        for (int spin = 0; spin < 20000; spin++)
+        {
+            bool any = false;
+
+            for (int i = 0; i < MGL_TESS_RING && !any; i++)
+                any = !tRingBusy[i];
+            if (any)
+                return tessRingAcquire(device, bytes, offset, slot, self);
+            if (spin == 50 && self && !self->_currentRenderEncoder &&
+                self->_currentCommandBuffer &&
+                self->_currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+            {
+                [self->_currentCommandBuffer commit];
+                self->_currentCommandBuffer = nil;
+            }
+            if (spin == 19999 && !self->_currentCommandBuffer && !self->_currentRenderEncoder)
+            {
+                /* 2 s with no progress, no open encoder and no uncommitted command
+                 * buffer: there is no in-flight GPU work that could still fire the
+                 * pending completion handlers, so the busy flags are stale (a draw
+                 * that exited without registering its release).  Retire them rather
+                 * than failing every later draw. */
+                for (int i = 0; i < MGL_TESS_RING; i++)
+                    tessRingRelease(i);
+                return tessRingAcquire(device, bytes, offset, slot, self);
+            }
+            usleep(100);
+        }
+        return nil;                    /* genuinely stuck: caller must give up */
+    }
     {
         size_t cap = tRingCap[best] + tessRingAlign(bytes) + (1u << 20);
         id<MTLBuffer> nb = [device newBufferWithLength: cap
@@ -151,8 +189,9 @@ static void tessRingRelease(int slot)
         tRingPos[slot] = 0;            /* reuse from the start once retired */
     }
 }
+
 static id<MTLLibrary> tKernelLib;
-static id<MTLComputePipelineState> tCountPso, tEmitPso, tArgsPso, tBlobPso, tPermutePso;
+static id<MTLComputePipelineState> tCountPso, tScanPso, tEmitPso, tArgsPso, tBlobPso, tPermutePso;
 
 static NSMutableDictionary *tVsPsoCache;    /* VS kernel PSO, per program+VAO */
 static NSMutableDictionary *tTcsPsoCache;   /* TCS kernel PSO, per program    */
@@ -1762,7 +1801,7 @@ static void tessRetireCapture(GLMContext ctx)
                 off_params = need;
                 need += 16;
 
-                ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
+                ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
                 if (!ring)
                 {
                     NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -1852,7 +1891,7 @@ static void tessRetireCapture(GLMContext ctx)
             off_params = need;
             need += 16;
 
-            ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
+            ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -1955,7 +1994,7 @@ static void tessRetireCapture(GLMContext ctx)
             off_params = need;
             need += 16;
 
-            ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot);
+            ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -2090,7 +2129,11 @@ static void tessRetireCapture(GLMContext ctx)
     /* TCS kernel */
     if (tp->has_tcs)
     {
-        uint32_t iparams[2] = { (uint32_t)patch_verts_in, (uint32_t)total_patches };
+        /* [0] = gl_PatchVerticesIn, [1] = total patches (instances included; the
+         * record writes index by the global patch), [2] = patches per instance —
+         * gl_PrimitiveID restarts at 0 for each instance (see tcs_patch_primid) */
+        uint32_t iparams[3] = { (uint32_t)patch_verts_in, (uint32_t)total_patches,
+                                (uint32_t)patches };
         NSUInteger threads = (NSUInteger)total_patches * (NSUInteger)tp->tcs_out_vertices;
 
         /* the triangle-domain kernel writes 8-byte factor records (recompiled at link:
@@ -2413,6 +2456,14 @@ static void tessRetireCapture(GLMContext ctx)
             [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)total_patches, 1, 1)
                   threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
+            /* deterministic patch order: prefix-scan the per-patch counts into
+             * bases before the emit (see mgl_tess_scan) */
+            [cenc setComputePipelineState: tScanPso];
+            [cenc setBytes: &kp length: sizeof kp atIndex: 0];
+            [cenc setBuffer: ring offset: emu_off atIndex: 2];
+            [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4 atIndex: 3];
+            [cenc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
             [cenc setComputePipelineState: tEmitPso];
             [cenc setBytes: &kp length: sizeof kp atIndex: 0];
             [cenc setBuffer: ring offset: off_factors atIndex: 1];
@@ -2461,7 +2512,8 @@ static void tessRetireCapture(GLMContext ctx)
                     [cenc setBuffer: ring offset: cp_source_off atIndex: MGL_TESS_TES_CP];
                     [cenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
                     {
-                        uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
+                        /* [1] = patches per instance: gl_PrimitiveID restarts per instance */
+                        uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
                         [cenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
                     }
                     [cenc setBuffer: ring offset: emu_off + (size_t)(total_patches * 2) * 4 +
@@ -2633,7 +2685,7 @@ static void tessRetireCapture(GLMContext ctx)
                 /* the plain TES takes mgl_tess_params as a buffer POINTER: the words must
                  * come from a real buffer (setVertexBytes would pass them by value) —
                  * this draw's exclusive ring slot, never overwritten by a later draw */
-                uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
+                uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
 
                 memcpy((uint8_t *)ring.contents + off_params, tes_params, sizeof tes_params);
                 [enc setVertexBuffer: ring offset: off_params atIndex: MGL_TESS_TES_PARAMS];
@@ -2714,6 +2766,9 @@ static void tessRetireCapture(GLMContext ctx)
                         (void)b;
                         tessRingRelease(rslot);
                     }];
+                else
+                    tessRingRelease(rslot);   /* the block's buffers were already
+                                                * committed and waited on above */
             }
 
             if (tTrace() && dbg_ctl_off)
@@ -2819,7 +2874,7 @@ static void tessRetireCapture(GLMContext ctx)
     {
         size_t coord_bytes = (size_t)S->tess_vertex_count * 16;
         size_t index_bytes = (size_t)S->tess_index_count * sizeof(uint32_t);
-        uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
+        uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
         id<MTLRenderCommandEncoder> enc;
         MTLPrimitiveType prim = tp->point_mode ? MTLPrimitiveTypePoint :
                                 (tp->domain == MGL_TESS_DOMAIN_ISOLINES && !tp->point_mode) ?
@@ -2891,7 +2946,8 @@ static void tessRetireCapture(GLMContext ctx)
                         [ccenc setBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
                         [ccenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
                         {
-                            uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), 0, 0, 0 };
+                            /* [1] = patches per instance: gl_PrimitiveID restarts per instance */
+                        uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
 
                             [ccenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
                         }
@@ -2943,6 +2999,8 @@ static void tessRetireCapture(GLMContext ctx)
                     (void)b;
                     tessRingRelease(rslot);
                 }];
+            else
+                tessRingRelease(rslot);   /* the wait above completed this buffer */
         }
         ctx->state.dirty_bits = DIRTY_ALL;
     }   /* CPU reference path */
@@ -3182,7 +3240,7 @@ static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_
 /* compile the GPU tessellator kernels (once) */
 static bool tessKernels(GLMContext ctx)
 {
-    if (tCountPso && tEmitPso && tArgsPso && tBlobPso && tPermutePso)
+    if (tCountPso && tScanPso && tEmitPso && tArgsPso && tBlobPso && tPermutePso)
         return true;
 
     MGLRenderer *self2 = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
@@ -3198,11 +3256,12 @@ static bool tessKernels(GLMContext ctx)
         }
     }
     if (!tCountPso) tCountPso = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_count"] error: &err];
+    if (!tScanPso)  tScanPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_scan"]  error: &err];
     if (!tEmitPso)  tEmitPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_emit"]  error: &err];
     if (!tArgsPso)  tArgsPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_args"]  error: &err];
     if (!tBlobPso)  tBlobPso  = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_blob"]  error: &err];
     if (!tPermutePso) tPermutePso = [self2->_device newComputePipelineStateWithFunction: [tKernelLib newFunctionWithName: @"mgl_tess_permute"] error: &err];
-    if (!tCountPso || !tEmitPso || !tArgsPso || !tBlobPso || !tPermutePso)
+    if (!tCountPso || !tScanPso || !tEmitPso || !tArgsPso || !tBlobPso || !tPermutePso)
     {
         NSLog(@"MGL ERROR: tess: tessellator kernel PSO failed: %@", err.localizedDescription);
         return false;

@@ -388,6 +388,7 @@ static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
                                  char *out_name, size_t out_len);
 static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp);
 static char *tcs_inject_float_levels(const char *msl);
+static char *tcs_patch_primid(const char *msl);
 
 /* ------------------------------------------------------------------ MSL struct layout
  * Parse an MSL interface struct declaration and compute the byte layout Metal
@@ -1903,7 +1904,8 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
         char params[768];
         snprintf(params, sizeof params, "%.*s", (int)(sig_close - sig_open - 1), sig_open + 1);
         if (strstr(params, "[[patch_id]]"))
-            str_append(&out, &len, &cap, "    uint gl_PrimitiveID = (uint)mgl_tess_coords[mgl_vid].w;\n");
+            str_append(&out, &len, &cap,
+                       "    uint gl_PrimitiveID = (uint)mgl_tess_coords[mgl_vid].w %% max(mgl_tess_params[1], 1u);\n");
         if (strstr(params, "float2 gl_TessCoordIn [[position_in_patch]]"))
             str_append(&out, &len, &cap, "    float2 gl_TessCoordIn = mgl_tess_coords[mgl_vid].xy;\n");
         else if (strstr(params, "float3 gl_TessCoord [[position_in_patch]]"))
@@ -2387,6 +2389,13 @@ static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *facto
     for (unsigned p = 0; p < patches; p++)
     {
         const float *f = factors + p * 6;
+
+        if ((tp->domain == MGL_TESS_DOMAIN_ISOLINES && f[0] <= 0.0f && f[1] <= 0.0f) ||
+            (tp->domain == MGL_TESS_DOMAIN_TRIANGLES &&
+             f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f) ||
+            (tp->domain == MGL_TESS_DOMAIN_QUADS &&
+             f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f && f[3] <= 0.0f))
+            continue;                          /* patch discarded: emits nothing */
         switch (tp->domain)
         {
             case MGL_TESS_DOMAIN_TRIANGLES:
@@ -2754,6 +2763,50 @@ bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data)
     return false;
 }
 
+/* GL 4.6 §11.1.3.1/§7.3 link validation: the tessellation control shader's
+ * layout(vertices=N) output patch size must lie in [1, GL_MAX_TESS_CONTROL_OUTPUT_
+ * VERTICES]; outside, the program must FAIL to link (glslang accepts any N, the
+ * limit is implementation-dependent — this is where MGL enforces it). */
+bool mgl_program_check_tess_link(GLMContext ctx, Program *program)
+{
+    MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
+    const uint32_t *ir;
+    size_t ir_size;
+    int modes[16], count = 0, out_vertices = 0;
+
+    if (!program->spirv[_TESS_CONTROL_SHADER].ir)
+        return true;
+
+    ir = program->spirv[_TESS_CONTROL_SHADER].ir;
+    ir_size = program->spirv[_TESS_CONTROL_SHADER].size;
+    if (!spv_tess_modes(ir, ir_size, 1 /* SpvExecutionModelTessellationControl */,
+                        modes, &count, &out_vertices))
+        return true;            /* no execution modes parsed: nothing to enforce */
+
+    if (out_vertices >= 1 && out_vertices <= MGL_TESS_MAX_PATCH_VERTICES)
+        return true;
+
+    obj->link_status = false;
+    {
+        char log[256];
+
+        snprintf(log, sizeof log,
+                 "ERROR: tessellation control shader output patch vertex count %d is outside "
+                 "the supported range [1, %d]\n", out_vertices, MGL_TESS_MAX_PATCH_VERTICES);
+        {
+            size_t len = strlen(log) + (obj->info_log ? strlen(obj->info_log) : 0) + 8;
+            char *old_log = obj->info_log;
+
+            obj->info_log = (char *)malloc(len);
+            if (obj->info_log)
+                snprintf(obj->info_log, len, "%s%s%s", old_log ? old_log : "",
+                         old_log ? "\n" : "", log);
+            free(old_log);
+        }
+    }
+    return false;
+}
+
 /* note exact tessellation statistics to the query domain */
 /* query bookkeeping for GPU-path draws (no CPU tessellation): the tessellated output
  * counts, computed from the levels with exactly the arithmetic of the GPU tessellator's
@@ -2769,6 +2822,8 @@ void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *facto
 
         if (tp->domain == MGL_TESS_DOMAIN_ISOLINES)
         {
+            if (f[0] <= 0.0f && f[1] <= 0.0f)
+                continue;                      /* patch discarded (all outer <= 0) */
             int n0 = (int)ceilf(f[0] < 1.0f ? 1.0f : (f[0] > 64.0f ? 64.0f : f[0]));
             int n1 = tess_round_level(f[1], tp->spacing);
 
@@ -2777,6 +2832,8 @@ void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *facto
         }
         else if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
         {
+            if (f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f)
+                continue;                      /* patch discarded (all outer <= 0) */
             int n[3], N, j;
             unsigned prev, cur;
 
@@ -2803,6 +2860,8 @@ void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *facto
         }
         else
         {
+            if (f[0] <= 0.0f && f[1] <= 0.0f && f[2] <= 0.0f && f[3] <= 0.0f)
+                continue;                      /* patch discarded (all outer <= 0) */
             int nu = tess_round_level(f[4], tp->spacing), nv = tess_round_level(f[5], tp->spacing);
             int o;
 
@@ -3931,10 +3990,20 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 /* GL's exact float levels: the half factor record alone quantises them
                  * (2.7 -> 2.69922 in the TES); add the TCS-side float copy.  This runs
                  * even when the record layout needed no rewriting — a levels-only TCS
-                 * has no patchOut struct to canonicalize, but still must write floats */
+                 * has no patchOut struct to canonicalize, but still must write floats.
+                 * (Runs BEFORE the per-instance gl_PrimitiveID rewrite: it matches the
+                 * SPIRV-Cross store spelling `spvTessLevel[gl_PrimitiveID].`.) */
                 char *lvl = tcs_inject_float_levels(msl);
 
                 if (lvl) { free(msl); msl = lvl; tp->tcs_levels_float = 1; changed = true; }
+            }
+
+            {
+                /* per-instance gl_PrimitiveID (a third indirect-params word carries the
+                 * patches-per-instance count; see the dispatcher) */
+                char *pd = tcs_patch_primid(msl);
+
+                if (pd) { free(msl); msl = pd; changed = true; }
             }
             if (changed && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
             {
@@ -4280,6 +4349,12 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
             char *lvl = tcs_inject_float_levels(msl);
 
             if (lvl) { free(msl); msl = lvl; pair->tcs_levels_float = 1; changed = true; }
+        }
+
+        {
+            char *pd = tcs_patch_primid(msl);
+
+            if (pd) { free(msl); msl = pd; changed = true; }
         }
         if (getenv("MGL_DUMP_MSL"))
         {
@@ -4663,6 +4738,115 @@ bool mgl_tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *factors,
 {
     tess_cpu_generate_runs++;
     return tess_generate(ctx, tp, factors, patches);
+}
+
+/* ------------------------------------------------------------------ per-instance gl_PrimitiveID
+ * GL restarts gl_PrimitiveID at 0 for every instance (GL 4.6 table 11.1 "PrimitiveID
+ * restarts for each instance"); SPIRV-Cross's multi-patch TCS kernel derives it from
+ * the global thread index (thread = patch*out_vertices + invocation), which counts
+ * instances too.  Rename that derivation to mgl_pid_g — the record writes below it
+ * (tess factors, float levels, patch outputs) must keep the GLOBAL patch index, one
+ * record per (instance, patch) — and define the builtin as the per-instance index,
+ * taken from a third indirect-params word (patches per instance, == total when the
+ * draw is not instanced).  Returns a fresh string (caller frees), NULL if the
+ * derivation pattern was not found. */
+static char *tcs_patch_primid(const char *msl)
+{
+    static const char head[] = "uint gl_PrimitiveID = min(gl_GlobalInvocationID.x / ";
+    const char *at = strstr(msl, head);
+    char *out;
+    char po_name[96];
+    const char *po;
+    size_t cap, len = 0, nlen;
+
+    if (!at)
+        return NULL;
+    {
+        /* the divisor: out-vertex count baked into the kernel */
+        const char *d = at + sizeof head - 1;
+        size_t dn = strspn(d, "0123456789");
+
+        if (!dn || strncmp(d + dn, ", spvIndirectParams[1] - 1);", 28) != 0)
+            return NULL;
+        nlen = dn;
+    }
+
+    /* the patch-output buffer's parameter name (buffer 26): its [gl_PrimitiveID]
+     * stores must keep the global index */
+    po_name[0] = 0;
+    for (po = strstr(msl, "[[buffer(26)]]"); po; po = strstr(po + 1, "[[buffer(26)]]"))
+    {
+        const char *star = po, *nm = po;
+        size_t nn = 0;
+
+        while (star > msl && star[-1] != ',' && star[-1] != '\n')
+            star--;
+        if (strncmp(star, "device ", 7) != 0)
+            continue;
+        nm = star + 7;
+        nm += strspn(nm, " \t");
+        nm = strchr(nm, '*');
+        if (!nm)
+            continue;
+        nm = nm + 1 + strspn(nm + 1, " \t");
+        nn = strcspn(nm, " ,[];");
+        if (nn && nn < sizeof po_name)
+        {
+            snprintf(po_name, sizeof po_name, "%.*s", (int)nn, nm);
+            break;
+        }
+    }
+
+    cap = strlen(msl) + 1024;
+    out = (char *)malloc(cap);
+    if (!out)
+        return NULL;
+
+    /* everything before the derivation */
+    str_append(&out, &len, &cap, "%.*s", (int)(at - msl), msl);
+    str_append(&out, &len, &cap,
+               "uint mgl_pid_g = min(gl_GlobalInvocationID.x / %.*s, spvIndirectParams[1] - 1);\n"
+               "    uint gl_PrimitiveID = mgl_pid_g %% max(spvIndirectParams[2], 1u);",
+               (int)nlen, at + sizeof head - 1);
+    str_append(&out, &len, &cap, "%s", at + (sizeof head - 1) + nlen + 28);
+
+    /* record stores keep the global patch index */
+    {
+        const char *names[3];
+        int n = 0;
+
+        names[n++] = "spvTessLevel";
+        names[n++] = "mgl_levels";
+        if (po_name[0])
+            names[n++] = po_name;
+        for (int i = 0; i < n; i++)
+        {
+            char *nw, *w;
+            char pat[160];
+
+            snprintf(pat, sizeof pat, "%s[gl_PrimitiveID]", names[i]);
+            while ((w = strstr(out, pat)) != NULL)
+            {
+                char repl[160];
+                size_t off = (size_t)(w - out);
+                size_t tail_len = len - off - strlen(pat);   /* bytes behind the pattern */
+
+                snprintf(repl, sizeof repl, "%s[mgl_pid_g]", names[i]);
+                nw = (char *)malloc(off + strlen(repl) + tail_len + 1);
+                if (!nw)
+                    break;
+                memcpy(nw, out, off);
+                memcpy(nw + off, repl, strlen(repl));
+                memcpy(nw + off + strlen(repl), w + strlen(pat), tail_len + 1);  /* + NUL */
+                free(out);
+                out = nw;
+                len = off + strlen(repl) + tail_len;
+                cap = len + 1;
+                w = out;
+            }
+        }
+    }
+    return out;
 }
 
 /* ------------------------------------------------------------------ float tessellation levels

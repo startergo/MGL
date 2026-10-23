@@ -213,6 +213,13 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_geometry_texture_image_units);
     glGetIntegerv(GL_MAX_GEOMETRY_UNIFORM_COMPONENTS,&glm_ctx->state.var.max_geometry_uniform_components);
     glGetIntegerv(GL_MAX_VERTEX_OUTPUT_COMPONENTS,&glm_ctx->state.var.max_vertex_output_components);
+    /* tess: MGL's vertex stage of a tessellation pipeline is a compute kernel writing an
+     * output buffer (MGLRenderer+Tessellation.m), so the legacy GL limit (64) is not the
+     * real cap — report the GL 4.6 tess hardware minimum 128 so it matches
+     * GL_MAX_TESS_CONTROL_INPUT/OUTPUT_COMPONENTS, which the CTS compares it against
+     * (tess domain edit; geometry keeps its own input/output component caps). */
+    if (glm_ctx->state.var.max_vertex_output_components < 128)
+        glm_ctx->state.var.max_vertex_output_components = 128;
     glGetIntegerv(GL_MAX_GEOMETRY_INPUT_COMPONENTS,&glm_ctx->state.var.max_geometry_input_components);
     glGetIntegerv(GL_MAX_GEOMETRY_OUTPUT_COMPONENTS,&glm_ctx->state.var.max_geometry_output_components);
     glGetIntegerv(GL_MAX_FRAGMENT_INPUT_COMPONENTS,&glm_ctx->state.var.max_fragment_input_components);

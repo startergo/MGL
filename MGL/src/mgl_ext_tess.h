@@ -363,5 +363,6 @@ void mgl_tess_note_restart_check(void);
 /* query bookkeeping without CPU tessellation: the tessellated output counts from
  * the levels alone (used by the GPU paths when the levels are CPU-known) */
 void mgl_tess_note_counts(GLMContext ctx, MGLTessProgram *tp, const float *factors, unsigned patches);
+bool mgl_program_check_tess_link(GLMContext ctx, struct Program_t *program);
 
 #endif /* MGL_EXT_TESS_H */
