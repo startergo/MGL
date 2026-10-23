@@ -222,6 +222,14 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
         plan->fetch[a] = MGL_VA_FETCH_NONE;
         plan->shadow_index[a] = -1;
         plan->owner_gl[a] = -1;
+        /* dbl/dbl_words/shadow_stride are per-plan too: a stale dbl[] from a
+           previous program made the bind path convert a plain int/float shadow
+           stream as double words (24-32 byte writes into 16-byte elements,
+           heap overflow) and read a stale shadow_stride (calloc of 0 bytes).
+           Round-40 crash hunt: heap corruption behind the flaky CTS aborts. */
+        plan->dbl[a] = 0;
+        plan->dbl_words[a] = 0;
+        plan->shadow_stride[a] = 0;
     }
 
     /* pass 1: record what the shader consumes at every attribute index (the
@@ -504,16 +512,29 @@ static bool isUnsignedIntType(GLenum t) { return t == GL_UNSIGNED_BYTE || t == G
 - (void) vattribBindShadow: (int) attrib index: (int) index encoder: (id<MTLRenderCommandEncoder>) enc
 {
     MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
-    MGLVertexAttribFormat *f = &va->fmt[attrib];
-    MGLVertexBinding *b = &va->binding[f->binding];
     struct MGLExtState_vattrib *s = [self vattribState];
+    /* a double word slot reads the GL attribute that feeds it (owner_gl), which is
+       the slot itself except for dvec3/dvec4 whose high slot shares the low one */
+    int owner = s->plan.owner_gl[attrib];
+    if (owner < 0 || owner >= MAX_ATTRIBS) owner = attrib;
+    MGLVertexAttribFormat *f = &va->fmt[owner];
+    MGLVertexBinding *b = &va->binding[f->binding];
     int kind = s->plan.shader_kind[attrib];
     bool dbl = s->plan.dbl[attrib] != 0;   /* the plan marked this slot as a double word slot */
 
     const GLubyte *base = [self vattribCPUData: b->buffer];
     GLsizeiptr size = b->buffer->size;
     GLsizei elem = dbl ? (GLsizei)f->size * 8 : mgl_va_element_size(f->type, f->size);
-    size_t stride_out = dbl ? (size_t)s->plan.shadow_stride[attrib] : 16;
+    /* dbl: derive the element stride from the format (the same formula the plan
+       uses), never from the plan table — a stale/zero entry made this calloc a
+       0-byte buffer and then write 8*size bytes into it (heap overflow). */
+    size_t stride_out = dbl ? (size_t)(((size_t)f->size * 8 + 15) & ~(size_t)15) : 16;
+    if (dbl && stride_out < 16) stride_out = 16;
+    if (getenv("MGL_VATTRIB_DEBUG"))
+        NSLog(@"vattrib: shadow bind a=%d dbl=%d owner=%d kind=%d size=%d type=0x%x long=%d stride=%d reloff=%d "
+              "shadow_stride=%d elem=%d bufoff=%ld bufsize=%ld", attrib, dbl, s->plan.owner_gl[attrib], kind,
+              f->size, f->type, f->is_long, b->stride, f->relativeoffset, s->plan.shadow_stride[attrib], elem,
+              (long)b->offset, (long)size);
     GLsizeiptr start = b->offset + f->relativeoffset;
     size_t n = 0;
 

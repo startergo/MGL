@@ -1,82 +1,113 @@
-READY 666b07b (KHR-GL46.limits 123 -> 140/140 Pass; direct_state_access 367 -> 370/371 Pass, the one left is vertex_arrays_attribute_format; headless suite 438 PASS lines, test_geom 593/593; no new flake beyond the known round-38 heap crash)
+READY 04e4fba (branch tip; fix commit 627bc49 + regression test 95f6fbc, both after merging gl46-port 8949387 and 4087ad8). Round-40 heap crash FOUND+FIXED: stale vattrib plan dbl[]/shadow_stride[] overflowed converted attribute streams; KHR-GL46.direct_state_access 370 -> 371/371 Pass — vertex_arrays_attribute_format fixed by the same change; headless suite 442 PASS lines / 59 files 0 failures, test_geom 593/593, new test_vafmt 84/84; 4 full CTS cluster runs with zero crashes and zero ASan reports
 
-# geom domain — round 39 handoff (KHR-GL46.limits, KHR-GL46.direct_state_access leftovers)
+# geom domain — round 40 handoff (the flaky heap crash, vertex_arrays_attribute_format)
 
-Round 39 (this session). Round 38 was merged into gl46-port as aab4e0b; this branch
-merged gl46-port at e0f22a6 before the work. Commit: 666b07b.
+Round 40. Merged gl46-port twice mid-round (8949387 = geom round 39, then
+4087ad8 = tess round 11). Commits: 8c8a7e2, 627bc49 (fix), test_vafmt.c, this report.
 
-## 1. KHR-GL46.limits — 123/140 -> 140/140 (results: `~/MGL-cts/geom39lim2`, one glcts chain, no batch aborts)
+## 1. The flaky heap crash — FOUND and FIXED
 
-Root cause (confirmed round 38's hypothesis): the cluster's 17 fails were
-`gl_Max*` builtin vs `glGet*` mismatches plus 3 limits below the GL 4.6 minimum.
-glslang was compiled with its default `TBuiltInResource`.
+Method (reproducible for future hunts):
+* `~/Library/Logs/DiagnosticReports/glcts-*.ips` (137 files) bucketed by first
+  libmgl frame. Two families: (a) `_xzm_xzone_malloc_freelist` aborts — classic
+  heap-corruption-with-random-victim (SPIRV-Cross parse, strdup, os_log, xpc,
+  glslang SpvBuilder) — these are the "1 in 3 batch" flake; (b) Metal
+  `MTLReleaseAssertionFailure` aborts (see §3).
+* ASan build of libmgl: copy Makefile -> `Makefile.asan` with
+  `build_dir := build-asan`, `CFLAGS/LIBS += -fsanitize=address`; build with
+  `make -j4 -f Makefile.asan lib`; run the CTS case with
+  `MGL_LIBRARY=.../build-asan/libmgl.dylib DYLD_INSERT_LIBRARIES=$(clang
+  -print-file-name=libclang_rt.asan_osx_dynamic.dylib)`. Note: glcts dlopens the
+  library; passing the env through `perl -e 'alarm N; exec @ARGV' env ... glcts`
+  works, plain prefix-env + perl exec sometimes hits "interceptors not
+  installed"/dlopen deadlock — retry or use the `env` form. ASan heap addresses
+  are >16TB, so the `MGL_PLAUSIBLE_PTR_MAX` bound in MGLRenderer.m had to become
+  `__has_feature(address_sanitizer)`-aware (commit 8c8a7e2) or nothing renders.
+* First ASan run of `KHR-GL46.direct_state_access.vertex_arrays_attribute_format`
+  produced the report in seconds: heap-buffer-overflow WRITE of 8 bytes, victim a
+  **1-byte** `calloc` in `vattribBindShadow:` (MGLRenderer+VertexAttrib.m),
+  writer `mgl_va_fetch_dbl_words` (vertex_attrib.c:185), path
+  `xfbCaptureAsync -> extVattribPreDraw -> vattribBindShadow`.
+* A standalone local repro (`tests/headless/zz_vaf.c`, scratch) reproduced the
+  full sequence with the normal build: doubles pass, then "int" variants return
+  garbage and the process aborts with "BUG IN CLIENT OF LIBMALLOC: memory
+  corruption of free block" inside glslang — the same crash signature as the CTS
+  batches.
 
-Fix: `mgl_geom_fill_glslang_resource()` (new, geometry.c) re-seeds every resource
-entry that has a GL pname from the very queries the app sees (`mglGetIntegerv` /
-`mglGetIntegeri_v`, i.e. through `mgl_ext_get` first — ext_xfb serves
-MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS = 128). `initGLSLInput` (shaders.c) now
-calls it instead of hand-maintaining overrides; the whole table (70 pnames) lives in
-my file so shared-file churn is one call. Nothing un-served may be added to the table
-(an unanswered query would raise GL_INVALID_ENUM as a side effect of compiling).
+Root cause: the vattrib draw plan is rebuilt per draw, but the reset loop only
+cleared `fetch/shadow_index/owner_gl` — **not `dbl[]`, `dbl_words[]` or
+`shadow_stride[]`**. Any program with double vertex inputs marks its slots
+`dbl=1`; the NEXT program (same context, same attribute indices) that needs a
+CPU-converted ("shadow") attribute stream inherits `dbl=1`, so
+`vattribBindShadow` converted int/float data with `mgl_va_fetch_dbl_words`
+(writes 8 bytes per component: 24–32 bytes) into `count*16`-byte buffers, and
+computed `stride_out` from the stale `shadow_stride[]` (calloc(count, 0)). One
+small calloc overflow per draw ⇒ malloc metadata trashed ⇒ the process aborts
+much later at an arbitrary allocation. This is why victims looked random
+(SPIRV-Cross/glslang/os_log/xpc) and why ASan pointed somewhere else than the
+crash stacks.
 
-- GL_MAX_FRAGMENT/COMPUTE_ATOMIC_COUNTER_BUFFERS: 0 -> 8 (the indexed atomic-counter
-  binding points the renderer really binds; minimums are 1 / 8).
-- GL_MAX_UNIFORM_BUFFER_BINDINGS: 16 -> 84 (GL 4.6 minimum). Points 16..83 exist only
-  for state: binds/queries round-trip through a small overflow table in buffers.c
-  (sparse, keyed by ctx, cleared in unbindEverywhere), but uniform blocks bound there
-  can never feed a draw — the renderer consumes a 16-entry table and Metal has ~31
-  buffer slots/stage. Documented gap; nothing in the CTS binds real buffers that high
-  (the between-case state reset only binds 0, and it now must not error: glcts aborts
-  the whole run otherwise — gluStateReset.cpp:1121).
-- Files touched: geometry.c (mine), shaders.c (initGLSLInput block replaced), get.c
-  (two cases + helper + indexed UBO query), buffers.c (maxBindingsForTarget UBO cap,
-  overflow table, mgl_buffers_indexed_binding), draw_ext.c (buffers_get_indexed UBO
-  slots), mgl_ext_buffers.h (1 prototype).
+Fix (commit 627bc49):
+* plan reset zeroes `dbl/dbl_words/shadow_stride`;
+* `vattribBindShadow` derives the double element stride from the owner format
+  (same `(size*8+15)&~15` formula the plan uses) instead of trusting the plan
+  table, and reads the format of `plan->owner_gl[attrib]` (the GL attribute
+  that actually feeds the slot);
+* validation: `test_vafmt.c` (committed) fails 28/84 without the fix, 84/84
+  with it. Two full texture_gather clusters (71/75 = the 4 pre-existing
+  texture_gather fails), dsa vertex_arrays 19/19, geometry_shader 134/136 (the
+  2 long-standing fails) — zero crashes, zero "bad" results; the attribute-format
+  case also Passes under the ASan build with no reports.
 
-## 2. direct_state_access — 367/371 -> 370/371 (`~/MGL-cts/geom39dsa`, full cluster, one invocation)
+## 2. direct_state_access.vertex_arrays_attribute_format — Pass
 
-- textures_compressed_subimage (Fail) -> Pass. Two pieces:
-  * online compression for the RGTC family: new CPU encoder `tdEncodeRGTC`
-    (BC4/BC5, unsigned+signed; endpoints = block min/max, nearest of 6 shades +
-    the two extreme codes; idempotent by construction) in texdata_formats.c — it was
-    already declared in the header, never implemented. `texImage` (textures.c) now
-    keeps the RGTC internalformat, encodes and stores real BC4/BC5 blocks, so
-    GL_TEXTURE_COMPRESSED/_IMAGE_SIZE and glGetCompressedTexImage are exact.
-  * the other compressed families (BPTC/ETC2/EAC/S3TC) reject uncompressed uploads
-    with GL_INVALID_OPERATION (no encoder — documented gap; the CTS tolerates this
-    and uses its own block tables). Previously ETC2-RGB silently stored RGBA8 and
-    reported compressed=0, which is what failed the case (imageSize=0).
-  * fixed a NULL-deref of mine on the way: `tdFormatInfo(internalformat)` can be
-    NULL (some CTS enum unknown to the table) — guard added.
-- textures_image_query_errors (Fail) -> Pass: glGetTextureImage/-SubImage raise
-  GL_INVALID_OPERATION for a cube map that is not cube complete, before any other
-  check (new cubeCompleteAtLevel in textures.c).
-- framebuffers_check_status (CompatibilityWarning) -> Pass: mgl_fb_status
-  (framebuffers.c) counts a GL_TEXTURE_3D attachment as layered, so mixing one with a
-  non-layered attachment is FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS (matches the CTS/
-  Khronos expectation; the query GL_FRAMEBUFFER_ATTACHMENT_LAYERED is unchanged).
-- vertex_arrays_attribute_format: STILL FAILING (deterministic wrong XFB values
-  "[0, 30802336] instead of [1,5]" + the flaky round-38 heap crash). The case uses
-  two vertex bindings with offset/stride into one buffer, vecN attributes of many
-  types, and reads the results back through transform feedback; vertex_arrays/xfb
-  territory, not cheap — left as a gap. Scratch path to repro: run it under lldb
-  (crashes vanish there) and read /tmp/vaf2.qpa.
+Same bug (it was both the corruptor and returned wrong XFB values: the int
+streams were converted as double words). Now `KHR-GL46.direct_state_access`
+371/371 (the group 19/19 in `~/MGL-cts/geom40vaf`).
 
-## 3. Unchanged / known gaps
+## 3. Remaining crash families (NOT heap corruption; not fixed this round)
 
-- texture_gather: 70/75 Pass + 1 Crash (offset-gather-float-2drect) = the known
-  flaky heap corruption + the 4 triaged-not-cheap cases from round 38
-  (base-level VM quirk, gather-tesselation-shader, incomplete-texture x2).
-- Online compression exists only for RGTC; BPTC/ETC2/S3TC uncompressed uploads error.
-- UBO binding points 16..83 are query-only (see above).
-- The flaky heap crash (round 38 handoff section) is still open — it hits ~1 in 3
-  full-cluster batches at random cases (this round: texture_gather crash).
+Bucketed from the same 137 reports, for whoever owns them:
+* `MTLReleaseAssertionFailure` when `[buf computeCommandEncoder]` creates a
+  second encoder on a buffer that still has an active one — 13×, ALL in
+  tessellation CTS cases (TessellationShaderTCTEgl_MaxPatchVertices*,
+  Invariance, PatchVerticesIn, VertexOrdering), deepest libmgl frame
+  `geomXfbTessEncode` (my file; geometry.c:6460 route). geomXfbTessEncode ends
+  the render encoder and rejects committed buffers, but cannot see/end an
+  encoder left open by another path (`MGLRenderer+Tessellation.m` creates
+  compute encoders on `_currentCommandBuffer` in several places; there is no
+  public API to query a buffer's active encoder). Suggested owner fix: a
+  renderer-wide `_currentComputeEncoder` ivar that every creator sets and
+  `endRenderEncoding` also ends. 26 more of the same abort sit in
+  `texdataEncodeUpload` (TextureData domain), 11 in `generatePipelineDescriptor`
+  (Oct 20 only), 3 in `geomSubAlloc` doesNotRecognizeSelector (Oct 20 only,
+  likely fixed by round-36+ type-confusion work).
+* `mapBufferRange [buffers.c:~1377]` SIGSEGV in
+  `glcts::TessellationShaderUtils::captureTessellationData` (3×, Oct 22 21:49+,
+  tess verification): a buffer whose backing is gone/GPU-only being mapped.
+* `texextRefreshStage:743` -> `setVertexSamplerState` (2×, Oct 22 20:03/20:08):
+  a garbage `MTLSamplerState` passed to Metal — either the texture domain's
+  `Sampler->mtl_data` holds a non-sampler object or it is another downstream
+  victim of the vattrib overflow (same batched process). Re-run the cluster that
+  hit it; if it still reproduces, it is real.
 
-## 4. Test results (this round)
+## 4. Test/build state
 
-- `tests/headless/run.sh` (full): 438 PASS lines, zero failures/blocks.
-- `test_geom`: 593 checks, 0 failures. `zz_lim` (74 checks), `zz_cub`, `zz_lay`,
-  `zz_etc`, `zz_rgtc`, `zz_bcc` scratch repros all green (left uncommitted per rules).
-- CTS: limits 140/140; direct_state_access 370/371; texture_gather 70/75+1 crash.
-- Scratch files (zz_*.c) and .-cts/ results dirs are untracked; no secrets, no
-  absolute paths, no symlinks in the commit; make -j4 used throughout.
+* `make -j4 lib` clean; headless `tests/headless/run.sh`: 442 PASS lines, 59
+  executables, 0 failures (new: test_vafmt 84 checks, 17s). test_geom 593/593.
+* `python3 agents/stub_scanner.py --list EMPTY|NOOP|ASSERT` clean for
+  MGL/src/geometry.c and MGLRenderer+Geometry.m.
+* Shared-file edits this round (both surgical): `MGLRenderer.m` — the
+  plausible-pointer bound macro (ASan-aware; 12 call sites mechanically renamed
+  to it); `MGLRenderer+VertexAttrib.m` is the vattrib domain's file (not mine)
+  but the fix is entirely in it — listed here because it is the round's main
+  change: plan reset + vattribBindShadow stride/owner-format fix.
+* Scratch kept out of commits: `Makefile.asan`, `build-asan/`,
+  `tests/headless/zz_vaf.c` (local repro; ask if you want it), `TestResults.qpa`,
+  `/tmp/mgl_asan.*` reports, `/tmp/*.qpa`.
+
+## 5. Suggested next clusters
+
+texture_gather 71/75: the 4 left are plain-gather-float-2d-rgb(-alpha) style
+value mismatches (round-38 notes have per-case detail). Then whatever the
+supervisor picks; limits and direct_state_access are now fully green.
