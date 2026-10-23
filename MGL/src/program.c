@@ -1646,6 +1646,18 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         ptr->local_workgroup_size.x = spvc_compiler_get_execution_mode_argument_by_index(compiler, SpvExecutionModeLocalSize, 0);
         ptr->local_workgroup_size.y = spvc_compiler_get_execution_mode_argument_by_index(compiler, SpvExecutionModeLocalSize, 1);
         ptr->local_workgroup_size.z = spvc_compiler_get_execution_mode_argument_by_index(compiler, SpvExecutionModeLocalSize, 2);
+
+        /* geom: the compute stage owns the whole buffer table except slot 30, so
+         * move SPIRV-Cross's buffer-size constants (default 25, shared with the
+         * render stages) out of the program's argument range — up to 29 program
+         * buffer arguments must fit (KHR-GL46.compute_shader.resources-max) */
+        if (spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_BUFFER_SIZE_BUFFER_INDEX,
+                                           MGL_CS_SSBO_SIZE_BUFFER_INDEX) != SPVC_SUCCESS ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: SPIRV-Cross MSL options rejected\n", stage_label(stage));
+            goto done;
+        }
     }
 
     /* reflection */
@@ -1841,11 +1853,34 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
     /* atomic counters: declare the atomic_uint arguments (geometry.c — see the
      * buffer-index scheme there) at the ordinals the renderer's buffer map binds
-     * the atomic-counter group at */
+     * the atomic-counter group at: the map's uniform-block + default-uniform +
+     * shader-storage total (declared blocks count, even when SPIRV-Cross never
+     * emitted an argument for an unused one).  Render stages must stay below 24
+     * (the tessellation / xfb / geometry emulation pins); the compute stage may
+     * span to 29 — its only reserved slot is the buffer-size slot at 30 */
     int atidx[MGL_MAX_ATOMIC_VARS];
     if (natvars > 0)
     {
-        char *injected = mgl_msl_inject_atomic_counters(result, msl_entry, atvars, natvars, atidx);
+        /* the map's ordinal for the atomic-counter group: one entry per element
+         * of every uniform-block / default-uniform / shader-storage resource —
+         * block instance arrays (uniform UB {..} ub[12]) expand to one entry
+         * each, see mapGLBuffersToMTLBufferMap */
+        int ac_base = 0;
+        for (int t = 0; t < 3; t++)
+        {
+            int type = t == 0 ? SPVC_RESOURCE_TYPE_UNIFORM_BUFFER
+                    : t == 1 ? SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT
+                             : SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
+            for (GLuint i = 0; i < ptr->spirv_resources_list[stage][type].count; i++)
+            {
+                unsigned as = ptr->spirv_resources_list[stage][type].list[i].array_size;
+                ac_base += as ? (int)as : 1;
+            }
+        }
+        char *injected = mgl_msl_inject_atomic_counters(result, msl_entry, atvars, natvars,
+                                                        stage == _COMPUTE_SHADER ?
+                                                        MGL_CS_SSBO_SIZE_BUFFER_INDEX : 24,
+                                                        ac_base, atidx);
         if (!injected)
         {
             mgl_append_info_log(log, "ERROR: %s stage: atomic counter buffer arguments could not be "
@@ -1901,6 +1936,31 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* Apple GPUs: a write through an access::read_write texture (GL image2D) is
+     * not visible to a later read of the same texel in the same invocation
+     * without tex.fence() — insert it after every such write (geometry.c) */
+    {
+        char *fenced = mgl_msl_insert_image_fences(result);
+        if (fenced)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = fenced;
+            result = fenced;
+        }
+    }
+
+    /* SPIRV-Cross's array-copy helpers cannot bind spvUnsafeArray struct members
+     * (whole-array assignment to a shared variable's member, shared-max) */
+    {
+        char *copied = mgl_msl_add_unsafearray_copies(result);
+        if (copied)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = copied;
+            result = copied;
+        }
+    }
+
     /* SPIRV-Cross gives soft-float64 library functions `thread const T&`
      * scalar parameters; a `constant`-space buffer member cannot bind to
      * those.  mgl_fp64_fix_msl_scalar_params() takes them by value instead —
@@ -1947,11 +2007,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         {
             if (list[i].id != rl->list[i]._id) continue;
             unsigned msl_b = spvc_compiler_msl_get_automatic_resource_binding(compiler, list[i].id);
-            /* 0 is a legitimate Metal buffer index (and the common one): it must not be
-             * treated as "no binding", or the resource is bound at its GL binding point
-             * instead and the shader reads an unbound buffer */
-            if (msl_b < 31)
-                rl->list[i].msl_binding = msl_b;
+            /* the automatic binding is the resource's real Metal argument index.
+             * UINT32_MAX (returned for a variable SPIRV-Cross stripped from the
+             * MSL — declared but unused, e.g. the readonly g_input_image
+             * KHR-GL46.compute_shader.pipeline-post-fs pass 1 never reads) is the
+             * established "no Metal binding" sentinel (0xffffffffu, see
+             * MGLRenderer+TextureExt.m): buffers keep indices < 31, textures < 128 */
+            {
+                bool is_buffer = res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER ||
+                                 res_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT ||
+                                 res_type == SPVC_RESOURCE_TYPE_STORAGE_BUFFER ||
+                                 res_type == SPVC_RESOURCE_TYPE_ATOMIC_COUNTER;
+                unsigned cap = is_buffer ? 31u : 128u;
+                rl->list[i].msl_binding = (msl_b < cap) ? msl_b : 0xffffffffu;
+            }
+            if (getenv("MGL_GEOM_DEBUG"))
+                fprintf(stderr, "MGL geom: %s stage resource %s (id %u) auto msl binding %u\n",
+                        stage_label(stage), rl->list[i].name, list[i].id, msl_b);
         }
     }
 
@@ -2273,7 +2345,18 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             if (!(mask & SHADER_MASK_BIT(stage)))
                 continue;
 
-            glslang_program_SPIRV_generate(glsl_program, (glslang_stage_t)stage);
+            /* generate without glslang's built-in SPIRV-Tools validation: it
+             * applies Vulkan rules to GLSL that GL allows.  Implicit-derivative
+             * textureProjOffset() on a sampler2DRect in a non-fragment stage
+             * (legal GL, undefined LOD) is emitted as an explicit Lod operand,
+             * which the validator rejects for rectangular textures
+             * (KHR-GL46.compute_shader.resource-texture).  SPIRV-Cross still
+             * rejects modules it cannot translate, so malformed output is not
+             * silently accepted */
+            {
+                glslang_spv_options_t spv_options = { 0 };
+                glslang_program_SPIRV_generate_with_options(glsl_program, (glslang_stage_t)stage, &spv_options);
+            }
 
             msgs = glslang_program_SPIRV_get_messages(glsl_program);
             if (msgs && *msgs)
@@ -2428,6 +2511,59 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
             if (mask & SHADER_MASK_BIT(stage))
                 ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log,
                               (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
+    }
+
+    /* GL link rule: a program with a compute shader must have a work group size.
+     * Multiple compute shaders link as one unit — none of them declaring a
+     * local size (KHR-GL46.compute_shader.glsl-link-time-errors) fails the link,
+     * as does a size given only through spec constants' LocalSizeId mode. */
+    /* GL link rule: a program with a compute shader must have a work group size
+     * (KHR-GL46.compute_shader.glsl-link-time-errors links two compute shaders,
+     * neither declaring one).  glslang defaults the linked intermediate's size
+     * to (1,1,1), so the SPIR-V cannot tell "declared 1,1,1" from "not declared"
+     * — check whether any attached compute shader's source declares a
+     * local_size qualifier (also covers local_size_*_id) */
+    if (ok && (mask & SHADER_MASK_BIT(_COMPUTE_SHADER) || scratch->base.shader_slots[_COMPUTE_SHADER]))
+    {
+        bool declared = false, any_spirv_cs = false;
+        for (int i = 0; i < obj->num_attached && !declared; i++)
+        {
+            Shader *s = obj->attached[i];
+            if ((int)s->glm_type != _COMPUTE_SHADER)
+                continue;
+            if (MGL_SHADER_OBJ(s)->spirv_binary)
+            {
+                /* glShaderBinary SPIR-V: the module's own execution modes are
+                 * authoritative (LocalSize / LocalSizeId).  The binary is parsed
+                 * by the SPIR-V link driver; the linked stage module ends up in
+                 * the scratch, checked below */
+                any_spirv_cs = true;
+                continue;
+            }
+            if (!s->src)
+                continue;
+            /* a `local_size' identifier in the source: outside comments this only
+             * occurs in the in/out layout qualifier */
+            for (const char *q = s->src; (q = strstr(q, "local_size")) != NULL; q++)
+                if (q == s->src || (!isalnum((unsigned char)q[-1]) && q[-1] != '_'))
+                    declared = true;   /* local_size, local_size_x/_y/_z(+_id) */
+        }
+        if (!declared && (!obj->num_attached || any_spirv_cs))
+        {
+            /* glProgramBinary / glShaderBinary SPIR-V: no GLSL sources — the
+             * linked compute SPIR-V's execution modes are authoritative */
+            unsigned *ir = scratch->base.spirv[_COMPUTE_SHADER].ir;
+            size_t n = scratch->base.spirv[_COMPUTE_SHADER].size;
+            for (size_t w = 5; w + 3 < n; w++)
+                if ((ir[w] == 16 && ir[w + 3] == 17) ||   /* OpExecutionMode LocalSize */
+                    (ir[w] == 17 && ir[w + 3] == 18))     /* OpExecutionModeId LocalSizeId */
+                    declared = true;
+        }
+        if (!declared)
+        {
+            mgl_append_info_log(&log, "ERROR: no local work group size was specified for the compute shader\n");
+            ok = false;
+        }
     }
 
     if (ok)

@@ -3806,10 +3806,28 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 {
                     SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][spvc_type].list[i];
 
+                    if (sres->msl_binding == 0xffffffffu)
+                    {
+                        /* no MSL argument exists: SPIRV-Cross stripped the declared-but-
+                         * unused image/sampler (KHR-GL46.compute_shader.pipeline-post-fs
+                         * declares a readonly g_input_image pass 1 never reads).  Binding
+                         * the GL unit's texture anyway — at the unit index — would clobber
+                         * the real argument, which may reuse that index after the gap */
+                        textures_to_be_mapped--;
+                        continue;
+                    }
                     mtl_index = (NSUInteger)sres->msl_binding;
                     if (sres->array_size) elems = sres->array_size;
                 }
-                if (mtl_index == (NSUInteger)-1) mtl_index = (NSUInteger)spirv_binding;
+                if (mtl_index == (NSUInteger)-1)
+                {
+                    /* no MSL argument exists: SPIRV-Cross stripped the declared-but-
+                     * unused image/sampler (KHR-GL46.compute_shader.pipeline-post-fs
+                     * declares a readonly g_input_image pass 1 never reads).  Binding
+                     * the GL unit's texture at the unit index would clobber the real
+                     * argument, which may reuse that index after the gap */
+                    continue;
+                }
 
                 if (ptr)
                 {

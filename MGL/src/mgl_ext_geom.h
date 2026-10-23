@@ -322,7 +322,20 @@ typedef struct MGLAtomicCounterVar
 } MGLAtomicCounterVar;
 char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
                                      const MGLAtomicCounterVar *vars, int nvars,
-                                     int *indices_out);
+                                     int max_metal_index, int forced_base, int *indices_out);
+/* Metal buffer index of the plain-compute path's buffer-size slot: the compute
+ * stage is compiled with SPIRV-Cross's buffer_size_buffer_index set to this, so
+ * the program's own buffers (UBOs / DUB / SSBOs / atomic counters — up to 14+1+8+8
+ * = 31 GL-declared blocks fit) span 0..29 while the render stages keep the shared
+ * slot 25 (KHR-GL46.compute_shader.resources-max uses 12+8+8+1 = 29 arguments) */
+#define MGL_CS_SSBO_SIZE_BUFFER_INDEX 30
+/* Apple GPUs need tex.fence() between a write and a read of the same
+ * access::read_write (GL image2D) texel inside one invocation — see
+ * mgl_msl_insert_image_fences() in geometry.c */
+char *mgl_msl_insert_image_fences(const char *msl);
+/* SPIRV-Cross's array-copy helpers don't accept spvUnsafeArray<T,A> struct
+ * members — see mgl_msl_add_unsafearray_copies() in geometry.c */
+char *mgl_msl_add_unsafearray_copies(const char *msl);
 bool mgl_msl_vertex_returns_void(const char *msl, const char *entry);
 /* post-link hook: replaces the vertex stage with the pass-through function */
 void mgl_geom_post_link(GLMContext ctx, struct Program_t *program);

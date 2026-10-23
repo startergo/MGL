@@ -318,7 +318,7 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
             char **pd = NULL; int np = split_params(t ? t->params : "", &pd);
             sprintf_(&o, "%s _mgl_sr_call_%s(", t ? t->ret : "void", u->name);
             bool first = true;
-            if (u->size > 1) { sput(&o, "int _mgl_i"); first = false; }
+            if (u->size > 1) { sput(&o, "uint _mgl_i"); first = false; }
             for (int k = 0; k < np; k++) { if (!first) sput(&o, ", "); sput(&o, pd[k]); first = false; free(pd[k]); }
             free(pd);
             sput(&o, ");");
@@ -359,7 +359,7 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
         char **pd = NULL; int np = split_params(t ? t->params : "", &pd);
         sprintf_(&o, "%s _mgl_sr_call_%s(", ret, unis[u].name);
         bool first = true;
-        if (unis[u].size > 1) { sput(&o, "int _mgl_i"); first = false; }
+        if (unis[u].size > 1) { sput(&o, "uint _mgl_i"); first = false; }
         for (int k = 0; k < np; k++) { if (!first) sput(&o, ", "); sput(&o, pd[k]); first = false; free(pd[k]); }
         free(pd);
         Str args = { 0 }; sput(&args, "");

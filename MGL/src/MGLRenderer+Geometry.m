@@ -3646,7 +3646,10 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         }
     }
     if (!n) return;
-    [enc setBytes: sizes length: (NSUInteger)n * sizeof(uint32_t) atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
+    /* the compute stage is compiled with its buffer-size slot at 30 (out of the
+     * program's argument range — see MGL_CS_SSBO_SIZE_BUFFER_INDEX), unlike the
+     * render stages' shared slot 25 */
+    [enc setBytes: sizes length: (NSUInteger)n * sizeof(uint32_t) atIndex: MGL_CS_SSBO_SIZE_BUFFER_INDEX];
 }
 
 #pragma mark - vertex-stage shadow-sampling emulation (mgl_fix_shadow_vs)

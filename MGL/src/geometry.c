@@ -2440,19 +2440,460 @@ bool mgl_msl_vertex_returns_void(const char *msl, const char *entry)
  *     SSBOs are emitted (and bound) first — those are exactly the `[[buffer(i)]]`
  *     arguments with an index below 24 (24..30 are pinned by the tessellation /
  *     transform-feedback / vertex-attribute domains).
- *   * every use `(thread atomic_uint*)&<name>` is rewritten to
- *     `(volatile device atomic_uint*)&<name>[offset/4]` so counters placed by the GLSL
- *     `offset` layout qualifier address the right word of the buffer (the GL atomic
- *     counter buffer is bound at base offset 0).
+ *   * every use `(thread atomic_uint*)&<name>` is rewritten to a `volatile device`
+ * pointer into the argument buffer so counters placed by the GLSL `offset`
+ * layout qualifier address the right word (the GL atomic counter buffer is bound
+ * at base offset 0): a scalar becomes `(volatile device atomic_uint*)&n[w]`
+ * (w = offset/4), an array element `(thread atomic_uint*)&n[expr]` becomes
+ * `(volatile device atomic_uint*)&n[(w)+(expr)]` — the bracketed index is kept
+ * inside the address expression, not left outside the cast
+ * (KHR-GL46.compute_shader.pipeline-compute-chain indexes ac[i]).
  * Returns a malloc'd replacement MSL, or NULL on failure (entry not found / out of
  * buffer slots).  *indices_out (if not NULL) receives the chosen Metal buffer index
- * per variable. */
+ * per variable.  `max_metal_index` is the first Metal buffer index the stage must
+ * not use: 24 for the render stages (24..30 are pinned by the tessellation /
+ * transform-feedback / geometry emulation and SPIRV-Cross's buffer-size slot), 30
+ * for the compute stage, whose only reserved slot is the buffer-size slot 30. */
+static char *inject_atomic_counters_core(const char *msl, const char *entry,
+                                         const MGLAtomicCounterVar *vars, int nvars,
+                                         int max_metal_index, int forced_base, int *indices_out);
+static char *msl_msl_counters_to_helper_params(const char *msl, const char *entry,
+                                               const MGLAtomicCounterVar *vars, int nvars);
+
 char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
                                      const MGLAtomicCounterVar *vars, int nvars,
-                                     int *indices_out)
+                                     int max_metal_index, int forced_base, int *indices_out)
+{
+    /* counters referenced inside non-entry functions first become trailing
+     * parameters of those functions and of their callers (see
+     * msl_msl_counters_to_helper_params) — the entry arguments below then feed
+     * the chain from the top */
+    char *xformed = msl_msl_counters_to_helper_params(msl, entry, vars, nvars);
+    if (!xformed)
+        return NULL;
+
+    char *out = inject_atomic_counters_core(xformed, entry, vars, nvars,
+                                            max_metal_index, forced_base, indices_out);
+    free(xformed);
+    return out;
+}
+
+/* Apple GPUs do not make a write through a `texture2d<..., access::read_write>`
+ * (GL image2D with read+write access) visible to a later read of the same texel
+ * in the same shader invocation: the load hits the texture cache.  Metal's
+ * `tex.fence()` is the required synchronization.  SPIRV-Cross does not emit it,
+ * so this pass inserts `<base>.fence();` after every write statement on a
+ * read_write texture (KHR-GL46.compute_shader.resource-image stores to a
+ * coherent image2D and immediately loads it back; the draw then compares the
+ * two images).  Returns a malloc'd copy, or NULL on allocation failure. */
+char *mgl_msl_insert_image_fences(const char *msl)
+{
+    if (!msl)
+        return NULL;
+
+    /* 1. names of read_write textures (also inside array<...> declarations) */
+    char names[64][256];
+    int nnames = 0;
+    for (const char *p = msl; (p = strstr(p, "access::read_write")) != NULL; )
+    {
+        const char *q = p + strlen("access::read_write");
+        while (*q == ' ' || *q == '\t' || *q == '>') q++;   /* `> name` / `, N> name` */
+        const char *e = q;
+        while (*e && (isalnum((unsigned char)*e) || *e == '_')) e++;
+        if (e > q && nnames < 64 && (size_t)(e - q) < sizeof names[0])
+        {
+            memcpy(names[nnames], q, (size_t)(e - q));
+            names[nnames][e - q] = 0;
+            for (int i = 0; i < nnames; i++)
+                if (!strcmp(names[i], names[nnames])) goto next;
+            nnames++;
+        }
+    next:
+        p = q;
+    }
+    if (!nnames)
+        return strdup(msl);
+
+    /* 2. every `NAME[expr].write(...)` / `NAME.write(...)` statement */
+    struct { size_t at; char *text; } edits[512];
+    int nedits = 0;
+    size_t len = strlen(msl);
+
+    for (int i = 0; i < nnames; i++)
+    {
+        size_t nl = strlen(names[i]);
+        for (const char *p = msl; (p = strstr(p, names[i])) != NULL; p++)
+        {
+            if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+                continue;                       /* longer identifier */
+            const char *q = p + nl;
+            /* optional [index] groups (array-of-texture arguments) */
+            while (*q == '[')
+            {
+                int d = 0;
+                const char *r = q;
+                while (*r)
+                {
+                    if (*r == '[') d++;
+                    else if (*r == ']' && --d == 0) { r++; break; }
+                    r++;
+                }
+                if (d) { q = NULL; break; }
+                q = r;
+            }
+            if (!q || strncmp(q, ".write(", 7) != 0)
+                continue;
+
+            /* statement end: the matching ')' of write(, then ';' */
+            int d = 0;
+            const char *r = q + 6;              /* at '(' */
+            while (*r)
+            {
+                if (*r == '(') d++;
+                else if (*r == ')') { if (--d == 0) { r++; break; } }
+                r++;
+            }
+            if (d) continue;
+            while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+            if (*r != ';')
+                continue;                       /* not a simple statement */
+
+            char *ins = malloc((size_t)(q - p) + 32);
+            if (!ins) continue;
+            memcpy(ins, " ", 1);
+            memcpy(ins + 1, p, (size_t)(q - p));       /* NAME or NAME[index] */
+            strcpy(ins + 1 + (q - p), ".fence();");
+            if (nedits < 512)
+            {
+                edits[nedits].at = (size_t)(r + 1 - msl);
+                edits[nedits].text = ins;
+                nedits++;
+            }
+            else
+                free(ins);
+            p = r;
+        }
+    }
+    if (!nedits)
+        return strdup(msl);
+
+    /* 3. apply in ascending order (offsets refer to the original string) */
+    for (int a = 0; a < nedits; a++)
+        for (int b = a + 1; b < nedits; b++)
+            if (edits[b].at < edits[a].at)
+            {
+                size_t ta = edits[a].at; char *tt = edits[a].text;
+                edits[a].at = edits[b].at; edits[a].text = edits[b].text;
+                edits[b].at = ta; edits[b].text = tt;
+            }
+
+    char *out = malloc(len + 1);
+    if (out)
+    {
+        out[0] = 0;
+        size_t src = 0;
+        for (int a = 0; a < nedits; a++)
+        {
+            strncat(out, msl + src, edits[a].at - src);
+            strcat(out, edits[a].text);
+            src = edits[a].at;
+        }
+        strcat(out, msl + src);
+    }
+    for (int a = 0; a < nedits; a++) free(edits[a].text);
+    return out ? out : NULL;
+}
+/* MSL has no mutable program-scope variables (only `constant` globals), so a GL
+ * atomic counter referenced inside a non-entry function cannot see the entry
+ * function's injected [[buffer(N)]] argument.  Give every function that uses a
+ * counter — directly, or by calling one that does — the counter pointers as
+ * trailing parameters, and pass them at every call site.  The entry function is
+ * left alone (its arguments come from inject_atomic_counters_core); its callers
+ * don't exist.  Returns a malloc'd copy of the MSL, unchanged when no non-entry
+ * function references a counter (the common case: counters used in main only). */
+
+typedef struct {
+    size_t id_off;        /* offset of the function-name identifier */
+    size_t id_len;
+    size_t params_close;  /* offset of the ')' closing the parameter list */
+    size_t body_open;     /* offset of '{' */
+    size_t body_close;    /* offset of the matching '}' */
+    bool is_entry;
+    bool need[MGL_MAX_ATOMIC_VARS];      /* direct counter uses in the body */
+    bool need_all[MGL_MAX_ATOMIC_VARS];  /* transitive, through calls */
+} MSLFunction;
+
+static bool msl_ac_ident(char c)
+{
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+static char *msl_msl_counters_to_helper_params(const char *msl, const char *entry,
+                                               const MGLAtomicCounterVar *vars, int nvars)
 {
     if (!msl || !entry || !vars || nvars <= 0)
         return NULL;
+
+    size_t len = strlen(msl);
+    MSLFunction fns[256];
+    int nfns = 0;
+
+    /* 1. top-level function definitions: <ret> name(<params>) { <body> } */
+    int depth = 0;
+    for (size_t i = 0; i < len && nfns < 256; i++)
+    {
+        if (msl[i] == '{') { depth++; continue; }
+        if (msl[i] == '}' && depth > 0) { depth--; continue; }
+        if (msl[i] != '(' || depth != 0)
+            continue;
+
+        /* identifier before the '(' (whitespace allowed) */
+        size_t j = i;
+        while (j > 0 && strchr(" \t\r\n", msl[j - 1])) j--;
+        size_t e = j;
+        while (j > 0 && msl_ac_ident(msl[j - 1])) j--;
+        if (e == j)
+            continue;    /* not preceded by an identifier */
+
+        /* control keywords are not functions */
+        static const char *const kw[] = { "if", "for", "while", "switch", "return", "sizeof", "alignas", NULL };
+        bool is_kw = false;
+        for (int k = 0; kw[k]; k++)
+            if (e - j == strlen(kw[k]) && !strncmp(msl + j, kw[k], e - j)) { is_kw = true; break; }
+        if (is_kw)
+            continue;
+
+        /* matching ')' of the parameter list */
+        int d2 = 1;
+        size_t k = i + 1;
+        while (k < len && d2)
+        {
+            if (msl[k] == '(') d2++;
+            else if (msl[k] == ')') d2--;
+            k++;
+        }
+        if (d2)
+            continue;
+        size_t pc = k - 1;
+
+        /* a definition is followed (after whitespace) by '{' */
+        size_t b = k;
+        while (b < len && strchr(" \t\r\n", msl[b])) b++;
+        if (b >= len || msl[b] != '{')
+            continue;
+
+        int d3 = 0;
+        size_t bc;
+        for (bc = b; bc < len; bc++)
+        {
+            if (msl[bc] == '{') d3++;
+            else if (msl[bc] == '}' && --d3 == 0) break;
+        }
+        if (d3 != 0)
+            continue;
+
+        MSLFunction *fn = &fns[nfns];
+        memset(fn, 0, sizeof *fn);
+        fn->id_off = j;
+        fn->id_len = e - j;
+        fn->params_close = pc;
+        fn->body_open = b;
+        fn->body_close = bc;
+        fn->is_entry = (fn->id_len == strlen(entry) && !strncmp(msl + j, entry, fn->id_len));
+        nfns++;
+        i = bc;    /* continue scanning after the body */
+    }
+
+    /* 2. direct counter uses per function body */
+    for (int f = 0; f < nfns; f++)
+        for (int v = 0; v < nvars; v++)
+        {
+            char pat[320];
+            size_t pl = (size_t)snprintf(pat, sizeof pat, "(thread atomic_uint*)&%s", vars[v].name);
+            for (const char *h = msl + fns[f].body_open + 1;
+                 (h = strstr(h, pat)) != NULL && h < msl + fns[f].body_close; )
+            {
+                if (!msl_ac_ident(h[pl]))
+                {
+                    fns[f].need[v] = fns[f].need_all[v] = true;
+                    break;
+                }
+                h++;
+            }
+        }
+
+    /* 3. propagate through calls (no recursion in GLSL; iterate to a fixed point) */
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (int f = 0; f < nfns; f++)
+        {
+            if (fns[f].is_entry) continue;
+            for (int g = 0; g < nfns; g++)
+            {
+                if (g == f) continue;
+                bool g_needs = false;
+                for (int v = 0; v < nvars; v++) g_needs |= fns[g].need_all[v];
+                if (!g_needs) continue;
+
+                /* does f's body call g?  \b<name>\s*\( */
+                for (size_t p = fns[f].body_open + 1; p + fns[g].id_len < fns[f].body_close; p++)
+                {
+                    if (strncmp(msl + p, msl + fns[g].id_off, fns[g].id_len) != 0) continue;
+                    if (p > 0 && msl_ac_ident(msl[p - 1])) continue;
+                    size_t q = p + fns[g].id_len;
+                    while (q < fns[f].body_close && strchr(" \t\r\n", msl[q])) q++;
+                    if (q >= fns[f].body_close || msl[q] != '(') continue;
+                    /* the definition's own identifier is not a call */
+                    if (p == fns[g].id_off) continue;
+
+                    for (int v = 0; v < nvars; v++)
+                        if (fns[g].need_all[v] && !fns[f].need_all[v]) { fns[f].need_all[v] = true; changed = true; }
+                    break;
+                }
+            }
+        }
+    }
+
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: ac-helper scan: %d functions, entry=%d\n", nfns,
+                nfns ? fns[0].is_entry : -1);
+    /* 4. anything to do?  (entry functions get [[buffer]] arguments in the core) */
+    bool any = false;
+    for (int f = 0; f < nfns && !any; f++)
+        if (!fns[f].is_entry)
+            for (int v = 0; v < nvars; v++) any |= fns[f].need_all[v];
+    if (!any)
+        return strdup(msl);
+
+    /* overloads share a name: same signature change, so union their sets */
+    for (int f = 0; f < nfns; f++)
+        for (int g = 0; g < nfns; g++)
+            if (g != f && fns[f].id_len == fns[g].id_len &&
+                !strncmp(msl + fns[f].id_off, msl + fns[g].id_off, fns[f].id_len))
+                for (int v = 0; v < nvars; v++)
+                    if (fns[g].need_all[v]) fns[f].need_all[v] = true;
+
+    /* 5. collect the edits (all positions refer to the original string):
+     *    a. helper definitions gain the trailing parameters
+     *    b. every call site of a changed function passes them along */
+    struct { size_t at; char *text; } edits[1024];
+    int nedits = 0;
+
+    for (int f = 0; f < nfns; f++)
+    {
+        bool needs[MGL_MAX_ATOMIC_VARS] = { false };
+        bool any_need = false;
+        for (int v = 0; v < nvars; v++) { needs[v] = fns[f].need_all[v]; any_need |= needs[v]; }
+        if (!any_need) continue;
+
+        /* a. the definition (entry ones keep their [[buffer]] form for the core) */
+        if (!fns[f].is_entry)
+        {
+            char ins[4096];
+            size_t off = 0;
+            bool empty = true;
+            for (size_t q = fns[f].params_close; q > 0; q--)
+                if (!strchr(" \t\r\n", msl[q - 1])) { empty = msl[q - 1] == '('; break; }
+            for (int v = 0; v < nvars && off + 128 < sizeof ins; v++)
+            {
+                if (!needs[v]) continue;
+                off += (size_t)snprintf(ins + off, sizeof ins - off, "%svolatile device atomic_uint* %s",
+                                        (empty && off == 0) ? "" : ", ", vars[v].name);
+            }
+            if (off && nedits < 1024)
+            {
+                edits[nedits].at = fns[f].params_close;
+                edits[nedits].text = strdup(ins);
+                nedits++;
+            }
+        }
+
+        /* b. call sites of this function (anywhere, including inside the entry) */
+        for (size_t p = 0; p + fns[f].id_len < len; p++)
+        {
+            if (strncmp(msl + p, msl + fns[f].id_off, fns[f].id_len) != 0) continue;
+            if (p > 0 && msl_ac_ident(msl[p - 1])) continue;
+            size_t q = p + fns[f].id_len;
+            while (q < len && strchr(" \t\r\n", msl[q])) q++;
+            if (q >= len || msl[q] != '(') continue;
+            if (p == fns[f].id_off) continue;   /* the definition */
+
+            /* matching ')' of the argument list */
+            int d4 = 1;
+            size_t r = q + 1;
+            while (r < len && d4)
+            {
+                if (msl[r] == '(') d4++;
+                else if (msl[r] == ')') d4--;
+                r++;
+            }
+            if (d4) continue;
+            size_t close_at = r - 1;
+
+            bool empty_args = true;
+            for (size_t s = q + 1; s < close_at; s++)
+                if (!strchr(" \t\r\n", msl[s])) { empty_args = false; break; }
+
+            char ins[4096];
+            size_t off = 0;
+            for (int v = 0; v < nvars && off + 128 < sizeof ins; v++)
+            {
+                if (!needs[v]) continue;
+                off += (size_t)snprintf(ins + off, sizeof ins - off, "%s%s",
+                                        (empty_args && off == 0) ? "" : ", ", vars[v].name);
+            }
+            if (off && nedits < 1024)
+            {
+                edits[nedits].at = close_at;
+                edits[nedits].text = strdup(ins);
+                nedits++;
+            }
+            p = r;   /* past the call */
+        }
+    }
+
+    if (!nedits)
+        return strdup(msl);
+
+    /* 6. apply the edits in ascending position order — all offsets refer to the
+     * original string, so no shifting is needed */
+    for (int i = 0; i < nedits; i++)
+        for (int k = i + 1; k < nedits; k++)
+            if (edits[k].at < edits[i].at)
+            {
+                size_t ta = edits[i].at; char *tt = edits[i].text;
+                edits[i].at = edits[k].at; edits[i].text = edits[k].text;
+                edits[k].at = ta; edits[k].text = tt;
+            }
+
+    char *out = malloc(len + 1);
+    if (out)
+    {
+        out[0] = 0;
+        size_t src = 0;
+        for (int i = 0; i < nedits; i++)
+        {
+            strncat(out, msl + src, edits[i].at - src);
+            strcat(out, edits[i].text);
+            src = edits[i].at;
+        }
+        strcat(out, msl + src);
+    }
+
+    for (int i = 0; i < nedits; i++) free(edits[i].text);
+    return out ? out : NULL;
+}
+
+static char *inject_atomic_counters_core(const char *msl, const char *entry,
+                                         const MGLAtomicCounterVar *vars, int nvars,
+                                         int max_metal_index, int forced_base, int *indices_out)
+{
+    if (!msl || !entry || !vars || nvars <= 0)
+        return NULL;
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: atomic-counter injection, pre-MSL:\n%s\n", msl);
 
     /* the entry function definition: <ret> <entry>(<params>) — require an identifier
      * boundary so a name that prefixes another identifier is not matched */
@@ -2487,17 +2928,30 @@ char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
     if (depth != 0 || *close != ')')
         return NULL;
 
-    /* how many buffer arguments SPIRV-Cross emitted below the pinned range */
-    int base = 0;
-    for (const char *q = sig; (q = strstr(q, "[[buffer(")) != NULL && q < close; )
+    /* the first Metal buffer index of the atomic-counter group.  The renderer's
+     * buffer map enumerates uniform blocks, default-uniform (uniform-constant)
+     * buffers, shader-storage buffers and then the atomic-counter group in the
+     * SPIRV-Cross reflection order, and binds entry i at Metal buffer index i —
+     * that total is the group's index.  SPIRV-Cross's MSL signature keeps the
+     * declared ordinals but may leave gaps where a declared-but-unused block was
+     * never emitted, so counting the signature's arguments (the fallback when no
+     * forced base is given) can drift below the map's ordinal
+     * (KHR-GL46.compute_shader.pipeline-compute-chain declares g_buffer3/4 that
+     * p0 never touches). */
+    int base = forced_base;
+    if (base < 0)
     {
-        int idx = atoi(q + 9);
-        if (idx >= 0 && idx < 24)
-            base++;
-        q += 9;
+        base = 0;
+        for (const char *q = sig; (q = strstr(q, "[[buffer(")) != NULL && q < close; )
+        {
+            int idx = atoi(q + 9);
+            if (idx >= 0 && idx < max_metal_index)
+                base++;
+            q += 9;
+        }
     }
-    if (base + nvars > 24)
-        return NULL;   /* would run into the tessellation / xfb pinned indices */
+    if (base + nvars > max_metal_index)
+        return NULL;   /* would overlap the emulation's pinned / reserved slots */
 
     /* build the parameter declarations to insert before the closing paren */
     size_t add_len = 2;
@@ -2526,24 +2980,65 @@ char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
     memcpy(out + insert_at, add, strlen(add));
     memcpy(out + insert_at + strlen(add), msl + insert_at, len - insert_at + 1);
 
-    /* re-point the atomic expressions at the declared arguments */
+    /* re-point the atomic expressions at the declared arguments.  Two shapes:
+     *   (thread atomic_uint*)&n           scalar counter
+     *   (thread atomic_uint*)&n[expr]     element of an atomic_uint array (the index
+     *                                     expression is arbitrary — keep it verbatim)
+     * the GLSL `offset` qualifier is the base offset of element 0 in bytes.
+     * A counter that is declared but never used was stripped from the MSL by
+     * SPIRV-Cross: its argument is still declared (the renderer's buffer map
+     * enumerates it — the ordinals must stay aligned) but there is nothing to
+     * rewrite (KHR-GL46.compute_shader.pipeline-compute-chain p1). */
     for (int i = 0; i < nvars; i++)
     {
-        char bad[300], good[320];
+        char bad[300];
+        unsigned w = vars[i].offset / 4;
+
         snprintf(bad, sizeof bad, "(thread atomic_uint*)&%s", vars[i].name);
-        if (vars[i].offset)
-            snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u]",
-                     vars[i].name, vars[i].offset / 4);
-        else
-            snprintf(good, sizeof good, "(volatile device atomic_uint*)%s", vars[i].name);
         if (!strstr(out, bad))
-        {
-            free(out);
-            return NULL;
-        }
+            continue;
         for (char *q = out; (q = strstr(q, bad)) != NULL; )
         {
-            size_t bl = strlen(bad), gl = strlen(good);
+            const char *after = q + strlen(bad);
+            char good[512];
+            size_t bl = strlen(bad), gl;
+
+            /* a longer variable name sharing this prefix (a / ac): not a match */
+            if (isalnum((unsigned char)*after) || *after == '_')
+            {
+                q += bl;
+                continue;
+            }
+
+            if (*after == '[')
+            {
+                /* copy the whole bracket group: &n[i] -> &n[(w)+(i)] — the group
+                 * itself is part of the replaced span (e points one past `]`) */
+                const char *e = after + 1;
+                int depth = 1;
+                while (*e)
+                {
+                    if (*e == '[') depth++;
+                    else if (*e == ']' && --depth == 0) { e++; break; }
+                    e++;
+                }
+                if (depth != 0 || (size_t)(e - after) > 200)
+                {
+                    free(out);
+                    return NULL;
+                }
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u+(%.*s)]",
+                         vars[i].name, w, (int)(e - after - 2), after + 1);
+                bl += (size_t)(e - after);
+            }
+            else if (w)
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u]",
+                         vars[i].name, w);
+            else
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)%s",
+                         vars[i].name);
+
+            gl = strlen(good);
             memmove(q + gl, q + bl, strlen(q + bl) + 1);
             memcpy(q, good, gl);
             q += gl;
@@ -7179,4 +7674,57 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     }
 
     return geom_xfb_tess_encode(ctx, o, xp, tfb, &src);
+}
+
+/* SPIRV-Cross emits its array-copy helpers for native C arrays only
+ * (`template<T, A> void spvArrayCopyFromConstantToThreadGroup1(threadgroup T (&dst)[A], ...)`)
+ * but struct members it lays out as spvUnsafeArray<T,A> — assigning a whole array
+ * to a member of a shared variable (GL `g_shared[id].v = vec4[2](...)`,
+ * KHR-GL46.compute_shader.shared-max) then calls the helper with an spvUnsafeArray
+ * destination, which cannot bind to a C-array reference; the runtime Metal compiler
+ * rejects the module (the command-line `metal` accepts it — do not rely on that).
+ * This pass appends element-wise overloads for spvUnsafeArray destinations/sources
+ * right after the struct's definition.  Returns a malloc'd copy (or NULL). */
+char *mgl_msl_add_unsafearray_copies(const char *msl)
+{
+    /* spvUnsafeArray's size parameter is size_t (unsigned long): the overloads
+     * must take size_t A or template deduction fails with "deduced non-type
+     * template argument does not have the same type" */
+    static const char overloads[] =
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromConstantToThreadGroup1(threadgroup spvUnsafeArray<T, A>& dst, constant T (&src)[A])\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n"
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromStackToThreadGroup1(threadgroup spvUnsafeArray<T, A>& dst, thread const T (&src)[A])\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n"
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromThreadGroupToThreadGroup1(threadgroup spvUnsafeArray<T, A>& dst, threadgroup const spvUnsafeArray<T, A>& src)\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n"
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromConstantToStack1(thread spvUnsafeArray<T, A>& dst, constant T (&src)[A])\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n"
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromStackToStack1(thread spvUnsafeArray<T, A>& dst, thread const spvUnsafeArray<T, A>& src)\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n"
+        "template<typename T, size_t A>\n"
+        "inline void spvArrayCopyFromThreadGroupToStack1(thread spvUnsafeArray<T, A>& dst, threadgroup const spvUnsafeArray<T, A>& src)\n"
+        "{\n    for (size_t i = 0; i < A; ++i) dst[i] = src[i];\n}\n";
+
+    if (!msl || !strstr(msl, "struct spvUnsafeArray") || !strstr(msl, "spvArrayCopyFrom"))
+        return msl ? strdup(msl) : NULL;
+
+    /* insert after the `};` that closes struct spvUnsafeArray */
+    const char *s = strstr(msl, "struct spvUnsafeArray");
+    const char *e = s ? strstr(s, "};") : NULL;
+    if (!e)
+        return strdup(msl);
+    size_t at = (size_t)(e + 2 - msl);
+
+    char *out = malloc(strlen(msl) + sizeof overloads);
+    if (!out)
+        return NULL;
+    memcpy(out, msl, at);
+    memcpy(out + at, overloads, sizeof overloads);
+    strcpy(out + at + sizeof overloads - 1, msl + at);
+    return out;
 }

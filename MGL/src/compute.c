@@ -53,6 +53,11 @@ void mglDispatchCompute(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y
 
     ERROR_CHECK_RETURN(ctx->mtl_funcs.ext_buffers && ctx->mtl_funcs.ext_buffers->dispatch, GL_INVALID_OPERATION);
 
+    /* glBeginConditionalRender gates compute dispatches as well as draws: the
+     * dispatch (and its query accounting) is skipped when the condition fails */
+    if (!mgl_queries_render_allowed(ctx))
+        return;
+
     if (!ctx->mtl_funcs.ext_buffers->dispatch(ctx, num_groups_x, num_groups_y, num_groups_z, NULL, 0))
         return;
 
@@ -80,6 +85,10 @@ void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
     ERROR_CHECK_RETURN(computeProgramActive(ctx), GL_INVALID_OPERATION);
 
     ERROR_CHECK_RETURN(ctx->mtl_funcs.ext_buffers && ctx->mtl_funcs.ext_buffers->dispatch, GL_INVALID_OPERATION);
+
+    /* glBeginConditionalRender gates compute dispatches as well as draws */
+    if (!mgl_queries_render_allowed(ctx))
+        return;
 
     // group counts are read by the GPU (values above the limits are undefined behaviour in GL)
     ctx->mtl_funcs.ext_buffers->dispatch(ctx, 0, 0, 0, buf, (size_t)indirect);

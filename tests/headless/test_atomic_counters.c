@@ -290,6 +290,104 @@ TEST(sso_pipeline_atomic_vs)
     EXPECT_TRUE(px[0] > 200);   /* i_color red + texel0.x = -1 pushed R up */
 }
 
+/* atomic_uint ARRAYS indexed dynamically (KHR-GL46.compute_shader.pipeline-compute-chain
+ * shape) — the injected MSL keeps the index expression inside the address expression:
+ * `(thread atomic_uint*)&ac[i]` -> `(volatile device atomic_uint*)&ac[0+(i)]`.  Also
+ * covers a declared-but-unused block before the counter group: the MSL argument list
+ * keeps gaps at declared ordinals, so the injected argument must be placed at the
+ * renderer's buffer-map ordinal (uniform+default+SSBO totals), not after the last
+ * emitted argument. */
+static const char *cs_array_src =
+    "#version 460 core\n"
+    "layout(local_size_x = 4) in;\n"
+    "layout(std430, binding = 1) buffer Unused0 { int x; } g_unused0;\n"
+    "layout(std430, binding = 2) buffer Unused1 { int x; } g_unused1;\n"
+    "layout(std430, binding = 3) buffer Out { uint v[4]; } o;\n"
+    "layout(binding = 0, offset = 0) uniform atomic_uint ac[4];\n"
+    "void main() {\n"
+    "    uint i = gl_GlobalInvocationID.x;\n"
+    "    o.v[i] = atomicCounterIncrement(ac[i]);\n"
+    "}\n";
+
+TEST(cs_atomic_array)
+{
+    GLuint prog = glCreateProgram();
+    GLuint c = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(c, 1, &cs_array_src, NULL);
+    glCompileShader(c);
+    glAttachShader(prog, c);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, 1);
+
+    GLuint acbo, ssbo, u0, u1;
+    glGenBuffers(1, &acbo);
+    glGenBuffers(1, &ssbo);
+    glGenBuffers(1, &u0);
+    glGenBuffers(1, &u1);
+    { static const GLuint z[4] = {0, 0, 0, 0}; glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 0, acbo); glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof z, z, GL_DYNAMIC_COPY); }
+    { glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, u0); glBufferData(GL_SHADER_STORAGE_BUFFER, 4, NULL, GL_STATIC_COPY); }
+    { glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, u1); glBufferData(GL_SHADER_STORAGE_BUFFER, 4, NULL, GL_STATIC_COPY); }
+    { glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo); glBufferData(GL_SHADER_STORAGE_BUFFER, 16, NULL, GL_DYNAMIC_COPY); }
+
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_NO_GL_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    GLuint out[4] = {9, 9, 9, 9}, cnt[4] = {9, 9, 9, 9};
+    glGetNamedBufferSubData(ssbo, 0, sizeof out, out);
+    glGetNamedBufferSubData(acbo, 0, sizeof cnt, cnt);
+    for (int i = 0; i < 4; i++)
+    {
+        EXPECT_EQ_INT(out[i], 0);      /* one increment per element */
+        EXPECT_EQ_INT(cnt[i], 1);
+    }
+}
+
+/* a counter referenced inside a helper function (and through a second helper): the
+ * counter pointers become trailing parameters of those functions and every call
+ * site passes them along — MSL has no mutable program-scope variables.  Also uses
+ * a non-zero offset layout qualifier (word 2). */
+static const char *cs_helper_src =
+    "#version 460 core\n"
+    "layout(local_size_x = 1) in;\n"
+    "layout(std430, binding = 0) buffer Out { uint v; } o;\n"
+    "layout(binding = 1, offset = 8) uniform atomic_uint ac;\n"
+    "uint Bump(uint n) { return atomicCounterIncrement(ac) * n; }\n"
+    "uint Twice(uint n) { return Bump(n) + Bump(n); }\n"
+    "void main() { o.v = Twice(3u); }\n";
+
+TEST(cs_atomic_helper)
+{
+    GLuint prog = glCreateProgram();
+    GLuint c = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(c, 1, &cs_helper_src, NULL);
+    glCompileShader(c);
+    glAttachShader(prog, c);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, 1);
+
+    GLuint acbo, ssbo;
+    glGenBuffers(1, &acbo);
+    glGenBuffers(1, &ssbo);
+    { static const GLuint z[4] = {0, 0, 0, 0}; glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 1, acbo); glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof z, z, GL_DYNAMIC_COPY); }
+    { glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo); glBufferData(GL_SHADER_STORAGE_BUFFER, 4, NULL, GL_DYNAMIC_COPY); }
+
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_NO_GL_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    GLuint out = 9, words[4] = {9, 9, 9, 9};
+    glGetNamedBufferSubData(ssbo, 0, 4, &out);
+    glGetNamedBufferSubData(acbo, 0, sizeof words, words);
+    EXPECT_EQ_INT(out, 3);      /* 0*3 + 1*3 */
+    EXPECT_EQ_INT(words[0], 0);
+    EXPECT_EQ_INT(words[2], 2); /* the offset-8 counter is word 2 */
+}
+
 int main(void)
 {
     RUN(vs_atomic_counter);
@@ -297,5 +395,7 @@ int main(void)
     RUN(fs_atomic_increment);
     RUN(cs_atomic_counter);
     RUN(sso_pipeline_atomic_vs);
+    RUN(cs_atomic_array);
+    RUN(cs_atomic_helper);
     return mgl_test_summary();
 }
