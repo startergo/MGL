@@ -48,6 +48,14 @@ extern void *createGLMContextProfile(GLenum format, GLenum type,
 extern void *CppCreateMGLRendererHeadless(void *glm_ctx);
 extern void MGLsetCurrentContext(void *ctx);
 extern void *MGLgetCurrentContext(void);
+extern void MGLswapBuffers(void *ctx);
+
+/* MGLRenderer lives in libmgl (no public header): the windowed bind is what
+ * the GLFW platform uses — it creates the CAMetalLayer on the view and makes
+ * MGLswapBuffers present the drawable (zero-copy present path) */
+@protocol MGLRendererBind <NSObject>
+- (void)createMGLRendererAndBindToContext:(void *)glm_ctx view:(NSView *)view;
+@end
 
 #ifndef GL_CONTEXT_CORE_PROFILE_BIT
 #define GL_CONTEXT_CORE_PROFILE_BIT          0x00000001
@@ -187,8 +195,11 @@ typedef struct {
     unsigned view_w, view_h;
     unsigned fb_w, fb_h;       /* union of viewports (readback clamp) */
     int swap_interval;
+    int renderer_bound;        /* 1 once a renderer exists for glm */
+    int windowed;              /* 1 when bound to the view via MGLRenderer */
     unsigned char *read_buf;
     size_t read_buf_size;
+    int param_values[512];     /* setValues params recorded for getValues */
 } NSGLState;
 
 static const void *kNSGLPFKey = &kNSGLPFKey;
@@ -204,6 +215,44 @@ static NSGLState *nsgl_ctx_state(NSOpenGLContext *ctx)
 {
     NSMutableData *d = objc_getAssociatedObject(ctx, kNSGLCtxKey);
     return d ? (NSGLState *)[d mutableBytes] : NULL;
+}
+
+static const void *kNSGLRendererKey = &kNSGLRendererKey;
+
+/* the renderer object is retained as an associated object of the context so
+ * it outlives the bind call (MGL keeps no list of renderers) */
+/* vsync: interval 0 turns the layer's display sync off (see the swap-interval
+ * parameter notes at nsgl_ctx_setValues) */
+static void nsgl_apply_swap_interval(NSGLState *st)
+{
+    if (st->view)
+    {
+        CALayer *layer = [st->view layer];
+        if ([layer isKindOfClass:[CAMetalLayer class]])
+            ((CAMetalLayer *)layer).displaySyncEnabled = (st->swap_interval != 0);
+    }
+}
+
+static void nsgl_bind_windowed_renderer(NSOpenGLContext *self, NSGLState *st, NSView *view)
+{
+    id<MGLRendererBind> r = (id<MGLRendererBind>)[[objc_getClass("MGLRenderer") alloc] init];
+    if (!r)
+        return;
+    [r createMGLRendererAndBindToContext:st->glm view:view];
+    objc_setAssociatedObject(self, kNSGLRendererKey, (id)r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    st->renderer_bound = 1;
+    st->windowed = 1;
+
+    nsgl_apply_swap_interval(st);
+}
+
+static void nsgl_bind_headless_renderer(NSGLState *st)
+{
+    if (st->renderer_bound)
+        return;
+    CppCreateMGLRendererHeadless(st->glm);
+    st->renderer_bound = 1;
+    st->windowed = 0;
 }
 
 static void *s_init_ctx;                  /* libmgl's auto core context */
@@ -293,6 +342,7 @@ static id nsgl_ctx_initWithFormat(NSOpenGLContext *self, SEL _cmd,
 {
     NSGLPixelFormatInfo *info = nsgl_pf_info(format);
     NSGLState st = { 0 };
+    for (int i = 0; i < 512; i++) st.param_values[i] = -1;
 
     (void)share;    /* share lists not implemented (documented gap) */
     st.is_compat = info ? info->compat : 1;
@@ -305,7 +355,9 @@ static id nsgl_ctx_initWithFormat(NSOpenGLContext *self, SEL _cmd,
                                                   : GL_CONTEXT_CORE_PROFILE_BIT);
     if (!st.glm)
         return nil;
-    CppCreateMGLRendererHeadless(st.glm);
+    /* the renderer is bound lazily: to the view when one is attached (the
+     * windowed Metal path, like GLFW), headless as a fallback for GL calls
+     * that happen before any setView: */
 
     objc_setAssociatedObject(self, kNSGLCtxKey,
                              [NSMutableData dataWithBytes:&st length:sizeof st],
@@ -343,6 +395,69 @@ static void nsgl_ctx_dealloc(NSOpenGLContext *__unsafe_unretained self, SEL _cmd
         ((void (*)(id, SEL))s_ctx_orig_dealloc)(self, nsgl_dealloc_sel());
 }
 
+/* view -> context registry for setWantsBestResolutionOpenGLSurface: tracking */
+#define NSGL_MAX_VIEWS 8
+static NSView *s_views[NSGL_MAX_VIEWS];
+static NSOpenGLContext *s_view_ctx[NSGL_MAX_VIEWS];
+static pthread_mutex_t s_view_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nsgl_register_view(NSView *view, NSOpenGLContext *ctx)
+{
+    pthread_mutex_lock(&s_view_lock);
+    int slot = -1;
+    for (int i = 0; i < NSGL_MAX_VIEWS; i++)
+    {
+        if (s_views[i] == view) { slot = i; break; }
+        if (!s_views[i] && slot < 0) slot = i;
+    }
+    if (slot >= 0)
+    {
+        s_views[slot] = view;
+        s_view_ctx[slot] = ctx;
+    }
+    pthread_mutex_unlock(&s_view_lock);
+}
+
+static void nsgl_unregister_view(NSOpenGLContext *ctx)
+{
+    pthread_mutex_lock(&s_view_lock);
+    for (int i = 0; i < NSGL_MAX_VIEWS; i++)
+        if (s_view_ctx[i] == ctx) { s_views[i] = nil; s_view_ctx[i] = nil; }
+    pthread_mutex_unlock(&s_view_lock);
+}
+
+/* rescale the Metal layer of a bound context to the view's
+ * wantsBestResolutionOpenGLSurface: NO (glmark2-macos) -> POINTS surface
+ * (contentsScale 1), YES -> backing pixels.  Called from setView: and from the
+ * swizzled NSView setter — apps flip the flag after binding, and the macOS
+ * default for the property is now YES. */
+static void nsgl_sync_surface_scale(NSView *view)
+{
+    if (!view)
+        return;
+    BOOL best = [view respondsToSelector:@selector(wantsBestResolutionOpenGLSurface)]
+                ? view.wantsBestResolutionOpenGLSurface : NO;
+    CGFloat scale = best ? (view.window ? view.window.backingScaleFactor
+                                         : [[NSScreen mainScreen] backingScaleFactor])
+                         : (CGFloat)1.0;
+    if (scale <= 0) scale = 1.0;
+    CALayer *layer = [view layer];
+    if ([layer isKindOfClass:[CAMetalLayer class]] && layer.contentsScale != scale)
+        layer.contentsScale = scale;    /* drives drawableSize -> default framebuffer */
+}
+
+static IMP s_view_orig_setBestRes;
+
+/* NSView.wantsBestResolutionOpenGLSurface decides POINTS vs PIXELS for the GL
+ * surface; the swizzled setter keeps a bound context's layer in sync */
+static void nsgl_view_setWantsBestResolution(NSView *self, SEL _cmd, BOOL best)
+{
+    if (s_view_orig_setBestRes)
+        ((void (*)(id, SEL, BOOL))s_view_orig_setBestRes)(
+            self, @selector(setWantsBestResolutionOpenGLSurface:), best);
+    nsgl_sync_surface_scale(self);
+}
+
 static void nsgl_ctx_setView(NSOpenGLContext *self, SEL _cmd, NSView *view)
 {
     NSGLState *st = nsgl_ctx_state(self);
@@ -351,25 +466,19 @@ static void nsgl_ctx_setView(NSOpenGLContext *self, SEL _cmd, NSView *view)
     st->view = view;
     if (view)
     {
-        /* host a layer we can blit the framebuffer into */
-        view.wantsLayer = YES;
-        if (!view.layer)
-            view.layer = [CAMetalLayer layer];
+        /* bind the windowed MGL renderer: it hosts its own CAMetalLayer on
+         * the view and sizes the default framebuffer from the drawable */
+        nsgl_bind_windowed_renderer(self, st, view);
+        nsgl_register_view(view, self);
         NSRect b = [view bounds];
         st->view_w = (unsigned)b.size.width;
         st->view_h = (unsigned)b.size.height;
         if (!st->view_w) st->view_w = 1;
         if (!st->view_h) st->view_h = 1;
-        if (st->fb_w == 0 || st->fb_h == 0)
-        {
-            MGLsetCurrentContext(st->glm);
-            glViewport(0, 0, (GLsizei)st->view_w, (GLsizei)st->view_h);
-            glScissor(0, 0, (GLsizei)st->view_w, (GLsizei)st->view_h);
-            st->fb_w = st->view_w;
-            st->fb_h = st->view_h;
-        }
     }
 }
+
+
 
 static NSView *nsgl_ctx_view(NSOpenGLContext *self, SEL _cmd)
 {
@@ -384,6 +493,8 @@ static void nsgl_ctx_makeCurrent(NSOpenGLContext *self, SEL _cmd)
     s_current_nsgl = st ? self : nil;
     MGLsetCurrentContext(st ? st->glm : s_init_ctx);
     pthread_mutex_unlock(&s_lock);
+    if (st)
+        nsgl_bind_headless_renderer(st);   /* only when setView: never came */
 }
 
 static void nsgl_ctx_clearCurrent(NSOpenGLContext *self, SEL _cmd)
@@ -401,16 +512,25 @@ static NSOpenGLContext *nsgl_ctx_current(NSOpenGLContext *self, SEL _cmd)
 
 static void nsgl_ctx_update(NSOpenGLContext *self, SEL _cmd)
 {
+    {
+        NSGLState *st = nsgl_ctx_state(self);
+        if (st && st->view)
+        {
+            /* rescale if the app flipped wantsBestResolutionOpenGLSurface (the
+             * swizzled setter already does; update re-syncs after window changes) */
+            nsgl_sync_surface_scale(st->view);
+        }
+    }
     NSGLState *st = nsgl_ctx_state(self);
     if (!st || !st->view)
         return;
     NSRect b = [st->view bounds];
     st->view_w = (unsigned)b.size.width;
     st->view_h = (unsigned)b.size.height;
-    if (st->view_w && st->view_h &&
+    if (!st->windowed && st->view_w && st->view_h &&
         (st->view_w > st->fb_w || st->view_h > st->fb_h))
     {
-        /* the view grew beyond what any viewport covers: cover it */
+        /* headless fallback: the view grew beyond what any viewport covers */
         MGLsetCurrentContext(st->glm);
         glViewport(0, 0, (GLsizei)st->view_w, (GLsizei)st->view_h);
         if (st->view_w > st->fb_w) st->fb_w = st->view_w;
@@ -418,14 +538,63 @@ static void nsgl_ctx_update(NSOpenGLContext *self, SEL _cmd)
     }
 }
 
+/* NSOpenGLContext -setValues:forParameter: / -getValues:forParameter: parameter
+ * names.  The SDK's NSOpenGLContextParameterSwapInterval is 222 (NSOpenGL.h);
+ * 196 is the legacy NSOpenGLCPSwapInterval constant that older code (and code
+ * compiled against the deprecated CGL-level name kCGLCPSwapInterval) still
+ * passes — both must toggle the layer's display sync, or an interval-0
+ * request (glmark2) is silently ignored and everything is pinned to vsync. */
+#define NSGL_PARAM_SWAP_INTERVAL_LEGACY 196  /* NSOpenGLCPSwapInterval */
+#define NSGL_PARAM_SWAP_INTERVAL        222  /* NSOpenGLContextParameterSwapInterval */
+
 static void nsgl_ctx_setValues(NSOpenGLContext *self, SEL _cmd,
                                const GLint *vals, NSUInteger param)
 {
     NSGLState *st = nsgl_ctx_state(self);
-    /* NSOpenGLContextParameterSwapInterval: recorded (reported by nothing
-     * here, but the state is real); vsync is a no-op in the interposer */
-    if (st && param == 196 /* NSOpenGLContextParameterSwapInterval */ && vals)
+    if (!st || !vals)
+        return;
+    if (param == NSGL_PARAM_SWAP_INTERVAL || param == NSGL_PARAM_SWAP_INTERVAL_LEGACY)
+    {
         st->swap_interval = *vals;
+        nsgl_apply_swap_interval(st);
+    }
+    else if (param == 235 /* SurfaceOrder */ || param == 236 /* SurfaceOpacity */ ||
+             param == 201 /* SwapRectangleEnable */ || param == 306 /* SurfaceVolatile */)
+    {
+        /* compositing parameters of the real NSOpenGL surface, which the
+         * interposer never creates: recorded so -getValues:forParameter:
+         * reports the state back, nothing to apply */
+        st->param_values[param] = *vals;
+    }
+    /* SurfaceBackingSize (304, 2 values) and SwapRectangle (200, 4 values):
+     * recorded without effect for the same reason */
+    else if ((param == 304 || param == 200) && vals[0] >= 0)
+    {
+        st->param_values[param] = vals[0];
+    }
+}
+
+static void nsgl_ctx_getValues(NSOpenGLContext *self, SEL _cmd,
+                               GLint *vals, NSUInteger param)
+{
+    NSGLState *st = nsgl_ctx_state(self);
+    if (!st || !vals)
+        return;
+    if (param == NSGL_PARAM_SWAP_INTERVAL || param == NSGL_PARAM_SWAP_INTERVAL_LEGACY)
+        *vals = st->swap_interval;
+    else if (param == 235 /* SurfaceOrder */)
+        *vals = st->param_values[235] != -1 ? st->param_values[235] : 1;
+    else if (param == 236 /* SurfaceOpacity */)
+        *vals = st->param_values[236] != -1 ? st->param_values[236] : 1;
+    else if (param == 314 /* HasDrawable */)
+        *vals = (st->view != nil);
+    else if (param == 304 /* SurfaceBackingSize */ && st->view)
+    {
+        vals[0] = (GLint)st->view_w;
+        vals[1] = (GLint)st->view_h;
+    }
+    else if (st->param_values[param] != -1 && param < 512)
+        *vals = st->param_values[param];
 }
 
 static void nsgl_ctx_flushBuffer(NSOpenGLContext *self, SEL _cmd)
@@ -433,6 +602,14 @@ static void nsgl_ctx_flushBuffer(NSOpenGLContext *self, SEL _cmd)
     NSGLState *st = nsgl_ctx_state(self);
     if (!st || !st->view)
         return;
+
+    /* windowed renderer bound to the view: present the CAMetalLayer drawable
+     * (zero copy; same path glfwSwapBuffers takes on the MGL platform) */
+    if (st->windowed)
+    {
+        MGLswapBuffers(st->glm);
+        return;
+    }
 
     /* clamp the readback to what the GL framebuffer covers (union of
      * viewports, tracked in fb_w/fb_h) */
@@ -530,6 +707,14 @@ static void nsgl_init(void)
     s_ctx_orig_dealloc = nsgl_swizzle(ct, nsgl_dealloc_sel(),
                                       (IMP)nsgl_ctx_dealloc, NO);
     nsgl_swizzle(ct, @selector(setView:), (IMP)nsgl_ctx_setView, NO);
+
+    /* POINTS vs PIXELS: keep bound Metal layers in sync with the app's
+     * wantsBestResolutionOpenGLSurface (glmark2-macos flips it after setView:) */
+    {
+        Class nsview = objc_getClass("NSView");
+        s_view_orig_setBestRes = nsgl_swizzle(nsview, @selector(setWantsBestResolutionOpenGLSurface:),
+                                              (IMP)nsgl_view_setWantsBestResolution, NO);
+    }
     nsgl_swizzle(ct, @selector(view), (IMP)nsgl_ctx_view, NO);
     nsgl_swizzle(ct, @selector(makeCurrentContext), (IMP)nsgl_ctx_makeCurrent, NO);
     nsgl_swizzle(ct, @selector(clearCurrentContext), (IMP)nsgl_ctx_clearCurrent, NO);
@@ -537,7 +722,14 @@ static void nsgl_init(void)
     nsgl_swizzle(ct, @selector(update), (IMP)nsgl_ctx_update, NO);
     nsgl_swizzle(ct, @selector(setValues:forParameter:),
                  (IMP)nsgl_ctx_setValues, NO);
+    nsgl_swizzle(ct, @selector(getValues:forParameter:),
+                 (IMP)nsgl_ctx_getValues, NO);
     nsgl_swizzle(ct, @selector(flushBuffer), (IMP)nsgl_ctx_flushBuffer, NO);
+
+    /* the present path uses IOSurface + layer.contents (no drawable blocking)
+     * — see MGLRenderer+Compat.m; set before any renderer is created */
+    if (!getenv("MGL_SURFACE_PRESENT"))
+        setenv("MGL_SURFACE_PRESENT", "1", 0);
 
     fprintf(stderr, "mgl_nsgl: NSOpenGL -> MGL interposer active\n");
 }

@@ -34,6 +34,9 @@
 #include <math.h>
 
 #include "glm_context.h"
+/* MGL_PROFILE=1 per-draw profiler (MGLRenderer.m) */
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
 #include "buffers.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
@@ -1034,6 +1037,7 @@ void mglNamedBufferData(GLMContext ctx, GLuint buffer, GLsizeiptr size, const vo
 void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr size, const void *data)
 {
     Buffer *ptr;
+    uint64_t t15 = mgl_prof_begin(15);
 
     ERROR_CHECK_RETURN(checkTarget(ctx, target), GL_INVALID_ENUM);
 
@@ -1041,6 +1045,7 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
     ERROR_CHECK_RETURN(ptr != NULL, GL_INVALID_OPERATION);
 
     bufferSubData(ctx, ptr, offset, size, data);
+    mgl_prof_end(15, t15);
 }
 
 void mglNamedBufferSubData(GLMContext ctx, GLuint buffer, GLintptr offset, GLsizeiptr size, const void *data)
@@ -1508,7 +1513,16 @@ void *mglMapNamedBuffer(GLMContext ctx, GLuint buffer, GLenum access)
     return p;
 }
 
+static void *mglMapBufferRangeInner(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access_flags);
+static GLboolean mglUnmapBufferInner(GLMContext ctx, GLenum target);
 void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access_flags)
+{
+    uint64_t t20 = mgl_prof_begin(20);
+    void *r = mglMapBufferRangeInner(ctx, target, offset, length, access_flags);
+    mgl_prof_end(20, t20);
+    return r;
+}
+static void *mglMapBufferRangeInner(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access_flags)
 {
     ERROR_CHECK_RETURN_VALUE(checkTarget(ctx, target), GL_INVALID_ENUM, NULL);
 
@@ -1537,6 +1551,13 @@ static GLboolean unmapBuffer(GLMContext ctx, Buffer *ptr)
 }
 
 GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
+{
+    uint64_t t21 = mgl_prof_begin(21);
+    GLboolean r = mglUnmapBufferInner(ctx, target);
+    mgl_prof_end(21, t21);
+    return r;
+}
+static GLboolean mglUnmapBufferInner(GLMContext ctx, GLenum target)
 {
     ERROR_CHECK_RETURN_VALUE(checkTarget(ctx, target), GL_INVALID_ENUM, GL_FALSE);
 

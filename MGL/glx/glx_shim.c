@@ -400,8 +400,19 @@ static void mglx_swap_buffers(Display *dpy, MGLXDrawableRec *d)
     if (!mglx_ensure_image(ds, d, w, h))
         return;
 
-    glFinish();
-    while (glGetError() != GL_NO_ERROR) {}
+    /* GPU-side barrier before the CPU readback: a fence is enough (glFinish
+     * would flush every pending command buffer on the queue) */
+    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (fence)
+    {
+        while (glGetError() != GL_NO_ERROR) {}
+        GLenum fs;
+        do {
+            fs = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000ULL /* 1 ms */);
+        } while (fs == GL_TIMEOUT_EXPIRED);
+        glDeleteSync(fence);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
 
     /* BGRA + 8_8_8_8_REV is exactly the X11 TrueColor byte order on
      * little-endian; fall back to RGBA + CPU swizzle if a server needs MSB */

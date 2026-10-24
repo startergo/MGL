@@ -444,6 +444,60 @@ static bool rs_mode_is_polygon(GLenum m)
     return fn;
 }
 
+/* compact content hash of everything rstate bakes into the MTLRenderPipelineState
+ * (blend per attachment, write masks, alpha coverage, the default framebuffer's
+ * depth/stencil attachment flip, and the shader function constants rstateSpecialize
+ * specializes over).  Used as a PSO-cache key component by the compat pipeline
+ * fast path (MGLRenderer+Compat.m): a monotonic generation counter there made
+ * alternating state (glmark2 toggles blend per object) miss the cache on every
+ * change, walking the full descriptor path ~13x per frame.  Hashing the CONTENT
+ * instead makes an A/B/A/B round-trip two stable keys.  Extra components beyond
+ * generation_pipeline's dirty envelope only add misses, never stale reuse. */
+- (uint64_t) rstatePipelineContentHash
+{
+    struct MGLExtState_rstate *rs = ctx->state.ext_rstate;
+    uint64_t h = 1469598103934665603ULL;
+    #define RS_MIXV(v) do { h ^= (uint64_t)(v); h *= 1099511628211ULL; } while (0)
+    if (rs)
+    {
+        for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++) {
+            RS_MIXV(rs->blend[i]);
+            RS_MIXV(ctx->state.var.blend_src_rgb[i]);  RS_MIXV(ctx->state.var.blend_dst_rgb[i]);
+            RS_MIXV(ctx->state.var.blend_src_alpha[i]); RS_MIXV(ctx->state.var.blend_dst_alpha[i]);
+            RS_MIXV(ctx->state.var.blend_equation_rgb[i]); RS_MIXV(ctx->state.var.blend_equation_alpha[i]);
+            for (int c = 0; c < 4; c++) RS_MIXV(rs->color_mask[i][c]);
+        }
+        RS_MIXV(rs->clip_depth_mode);
+        RS_MIXV(rs->clip_origin);
+        RS_MIXV(rs->point_sprite_coord_origin);
+        RS_MIXV(rs->sample_mask[0]);
+        RS_MIXV(rs->sample_coverage_value);
+        RS_MIXV(rs->sample_coverage_invert);
+        RS_MIXV(rs->min_sample_shading);
+    }
+    RS_MIXV(ctx->state.caps.multisample);
+    RS_MIXV(ctx->state.caps.sample_alpha_to_coverage);
+    RS_MIXV(ctx->state.caps.sample_alpha_to_one);
+    RS_MIXV(ctx->state.caps.sample_mask);
+    RS_MIXV(ctx->state.caps.sample_coverage);
+    RS_MIXV(ctx->state.caps.sample_shading);
+    RS_MIXV(ctx->state.caps.program_point_size);
+    RS_MIXV(ctx->state.caps.rasterizer_discard);
+    /* the default framebuffer's depth/stencil attachments appear/disappear with
+     * the tests (rstateConfigurePipelineDescriptor starts a new encoder for it) */
+    RS_MIXV(ctx->state.caps.depth_test);
+    RS_MIXV(ctx->state.caps.stencil_test);
+    {
+        float psz = ctx->state.var.point_size;
+        if (psz < 1.0f) psz = 1.0f;
+        if (psz > 511.0f) psz = 511.0f;
+        uint32_t bits; memcpy(&bits, &psz, 4);
+        RS_MIXV(bits);
+    }
+    #undef RS_MIXV
+    return h;
+}
+
 - (void) rstateConfigurePipelineDescriptor:(MTLRenderPipelineDescriptor *)desc
 {
     struct MGLExtState_rstate *rs = ctx->state.ext_rstate;

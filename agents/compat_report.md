@@ -1,11 +1,134 @@
 # compat domain — progress log
 
-BENCH-READY 7970129 DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
+BENCH-READY aa2adea (score 11932 @ load 3.8-4.0, supervisor run 23:40-23:47; native 6558,
+bar 6000, Parallels ~14000).  --validate 27 Success / 0 Failure.
+Session-3 deltas that got here (from 4349): encoder bind shadow + streaming argument ring
+(88% of per-draw argument binds skipped), PSO fast path keyed on rstate content hash
+(17 -> 4 descriptor walks/frame), ffp user-program-unbind correctness fix.
+NEXT (supervisor targets, vs native): desktop shadow 1032|4592, ideas 1631|3582,
+desktop blur 1745|2979, gl41-geometry 982|2668, gl41-streaming-sync 846|867
+(+ ClientWaitSync GL_TIMEOUT_EXPIRED warning), verify light scenes ~2x native are real.
 
-READY 7970129 (gl46/compat: GLX shim + NSOpenGL interposer (glmark2) + GLFW compat profile; full default glmark2-macos run completes, 27/27 reference-validated scenes pass; headless suite 6640 checks / 0 failures; test_geom 593/0)
+BENCH-REQUEST 2aa2adea (full default glmark2 list, windowed 800x600, swap interval 0 as in
+sessions 1+2; env must NOT contain MGL_PROFILE — note the empty string enables the profiler)
+BENCH-RESULT aa2adea score=11932 load=3.8-4.0 (supervisor run 23:40-23:47 EDT, full default list, swap 0; --validate: 27 Success, 0 Failure, rest Unknown=no reference; log ~/MGL-cts/glmark2-bench/mglR1.log)
+
+PROGRESS d3cbfd6 (perf session 3 continued, 2026-10-23 23:00): still no clean benchmark
+(load 9-12 all day: user's UTM/Parallels VM; measure only when load < 3).  Landed:
+1. b2595ec encoder bind shadow + streaming argument ring: 88% of per-draw argument binds
+   skipped (1592/frame), ring carries 270 KB/frame with offset-only updates; per-draw
+   Metal encode calls now ~1 draw + ~0.6 binds.  Kill switch MGL_BIND_SHADOW=0.
+2. 4f3885d PSO fast path keyed on rstate CONTENT hash (was the monotonic generation):
+   pipeline-descriptor walks 17 -> 4/frame (the 4 unavoidable declines), 175 hits/frame.
+3. d3cbfd6 CORRECTNESS FIX found by the new tests: bind_ffp returned NULL for a bound
+   user program, so unbind_ffp issued glUseProgram(0) after EVERY compat draw — the
+   app's program was silently unbound, next draw fell back to fixed-function (white)
+   and glUniform* failed 0x502.  Apps that rebind per draw (glmark2) never noticed.
+   Read-verify loops did (tests/headless/test_compat_perf.c: 127 checks — ring wrap
+   over 2 MB, client arrays per draw, CPU indices, program alternation, texture
+   content changes).  Suite fully green.
+Design borrowed from ANGLE's Metal backend (src/libANGLE/renderer/metal/:
+mtl_command_buffer.mm state cache keyed by content, mtl_buffer_pool.mm streaming
+pools fenced by command-buffer serial, ProgramMtl default-uniform pool).
+CAUTION: the bind shadow must see EVERY bind to the shared encoder; the xfb/geometry
+capture paths swap _currentRenderEncoder around their own encoder (compatBindInvalidate
+guards the swap) — test_xfb catches violations.
+Baseline to beat when quiet: 4349 @ load 4.5 (b5df6c6); bar 6000; native 6558; Parallels ~14000.
+Sanity (not a benchmark): ideas+desktop @ load 10 renders correctly, 217 FPS windowed.
+
+PROGRESS 4f3885d (perf session 3, 2026-10-23 20:55): **no clean benchmark yet — machine load
+10-12 all session (user's UTM/Parallels VM active); measure only when load < 3.** Two Metal-call
+reductions landed (both profiler-verified on ideas @ load 8, counts are load-independent):
+1. b2595ec encoder bind shadow + streaming argument ring: 88% of per-draw argument binds
+   skipped (1592/frame), ring carries 270 KB/frame (uniforms/client arrays/const attribs/
+   copied indices/SSBO sizes) with offset-only updates; per-draw Metal encode calls are now
+   ~1 draw + ~0.6 binds (was ~4.5 binds).  Kill switch MGL_BIND_SHADOW=0.
+2. 4f3885d PSO fast path keyed on rstate CONTENT hash (was monotonic generation_pipeline ->
+   every blend/mask change minted a new key): pipeline-descriptor walks 17 -> 4/frame (the 4
+   unavoidable declines), 175 fast-path hits/frame.
+Design borrowed from ANGLE's Metal backend (src/libANGLE/renderer/metal/: mtl_command_buffer.mm
+state cache, mtl_buffer_pool.mm ring with serial fencing, ProgramMtl default-uniform pool).
+CAUTION for later sessions: the shadow must see EVERY bind to the shared encoder — the xfb /
+geometry capture paths swap _currentRenderEncoder around their own encoder and reuse the
+category's bind code (compatBindInvalidate guards the swap); test_xfb catches violations.
+Baseline to beat when quiet: 4349 @ load 4.5 (b5df6c6); bar 6000; native 6558; Parallels ~14000.
+
+PROGRESS b5df6c6 (perf session 1+2, 2026-10-23 18:30): glmark2 full default list (swap interval 0)
+**4349 @ machine load 4.5 / 3709 @ load 8** — the Mac is shared with other agents' verify loops
+(earlier clean-machine measurement of older code: 4160 @ load ~1; expect >= that when quiet).
+Score path this session: 37 (vsync bug) -> 1929 -> 3865 -> 4160 -> 4349.  Native 6558, Parallels
+~14000, user bar 6000 (not met yet — do NOT write BENCH-READY below 6000).
+CPU profile (user-reported 180% CPU on classic scenes): after this session's fixes the classic
+scenes run at ~102-111% CPU (ideas/desktop; single GL thread, CPU-bound) and gl41 scenes at 185%
+(Metal driver threads at 6000+ FPS) — the inversion is fixed.  xctrace Time Profiler on ideas
+(7.6 s, 480k draws): per-draw MGL code is now ~100-300 ns per frame item; the remaining mass is
+unsymbolized AGX driver encode internals (setVertexBytes/drawIndexedPrimitives) — the per-draw
+Metal API cost is the ideas/desktop/buffer bottleneck (ideas 353 draws/frame).
+Done this session (each commit suite-green, 473 PASS): NSOpenGL swap-interval 222/196 +
+getValues:; msl_binding sentinel guard (terrain SIGSEGV in AGX setTexture, regression test);
+IOSurface present path (CGL-like async swap: blit-copy via MTLBlitCommandEncoder + one-time
+CALayer y-flip transform, validated by a CALayer-flip calibration in nsgl_smoke) — killed the
+nextDrawable block (36 -> 3518 FPS on build); compat pipeline-key cache (content-keyed MSL hash
++ VAO hash + rstate generation_pipeline + FBO ptr; separate pipeline generation counter added to
+mgl_ext_rstate.h); no encoder rebuild for dirty VAO; memoized spvBufferSizeConstants strstr
+(geom round 44 re-added two full-MSL scans per draw); skip redundant setRenderPipelineState;
+vaoChanged no-op for identical re-specified layouts; points-vs-pixels fix
+(wantsBestResolutionOpenGLSurface swizzle + per-bind headless flag — the user-visible
+"quarter of the window" bug); MGL_PROFILE=1 per-draw profiler (noinline+barriers — microsecond
+attribution is unreliable on this virtualized Mac, use A/B FPS).
+Top remaining per-frame costs: (1) pipeline-descriptor slow path on real program/blend/FBO
+switches (~80-150 us each, 17-21/frame ideas); (2) per-draw AGX encode (~5-10 us/draw, needs
+denser batching to beat); (3) the buffer scene's single big draw at 10x native (GPU-side,
+vertex-throughput bench in tests/headless/test_compat_thru.c reproduces ~20M tri/s).
+Next: bench clean (score target 6000+), buffer/desktop GPU-side mystery, reduce descriptor-path
+cost (rstateSpecialize/gaPSOKey), gl41-streaming-sync waits.
+
+BENCH-READY c74797c DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
+
+BENCH-READY c74797c DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
+(zero-copy present: flushBuffer -> MGLswapBuffers -> GPU blit + presentDrawable; stderr is quiet by default: ~27 KB/min vs ~5 MB/min before; gl41-pipeline now runs; gl46-port merged incl. geom round 98a20cf)
+
+READY c74797c (gl46/compat: NSOpenGL interposer zero-copy present + quiet logging + gl_PerVertex fix; GLX shim fence swap; headless suite 6667 checks / 0 failures; test_geom 593/0; glmark2-macos --validate green)
 
 Session log for the GL 4.6 compatibility-profile work (task: agents/tasks/compat.md).
 Update this file at every commit so a fresh session can continue.
+
+## Session 9b (2026-10-23 12:15-13:00) — supervisor follow-ups: zero-copy present, dylib paths, logging, gl41-pipeline
+1. ZERO-COPY PRESENT (MGL/nsgl/mgl_nsgl.m): -setView: now binds a real MGLRenderer to the view
+   through the entry GLFW uses (objc MGLRenderer -createMGLRendererAndBindToContext:view:,
+   declared via a protocol; the renderer is retained as an associated object): CAMetalLayer on
+   the view, default framebuffer sized from the drawable, -flushBuffer = MGLswapBuffers() =
+   fbSwapBuffers -> GPU blit + presentDrawable (zero CPU copies; the CGImage readback path
+   stays as a fallback for view-less contexts).  setValues:forParameter: SwapInterval toggles
+   layer.displaySyncEnabled (0 = no display sync); makeCurrentContext binds the headless
+   renderer lazily so GL-before-setView still works.  glmark2 --validate still green.
+   NOTE: on this Mac the display is asleep/locked, so nextDrawable stalls ~30 ms/frame (sample
+   shows the block inside nextDrawable — nothing consumes the drawables); on a visible display
+   the path is drawable-recycle bound and the old 7.6 ms readback floor is gone.
+2. DYLIB PATHS: both shims re-export libmgl as @rpath/libmgl.dylib with LC_RPATH @loader_path
+   and a libmgl.dylib symlink beside them (install_name_tool -change; NSGL got it now) — they
+   load from any cwd.
+3. LOGGING (shared MGLRenderer.m, logging-only): per-frame INFO/DEBUG NSLogs gated behind
+   MGL_DEBUG (render-encoder create/end pair, tess-pipeline creation cluster incl. the
+   vertex-descriptor dump).  Root cause of the "already gated" cmdbuf lines still firing:
+   `static BOOL mgl_log_cmdbuf = -1;` — BOOL is C99 bool on modern SDKs so -1 becomes true and
+   the `< 0` sentinel never triggers; changed to `static int`.  glmark2 stderr ~5 MB/min ->
+   ~27 KB/min (what remains is one-time init logs and spec-correct
+   glGetString(GL_EXTENSIONS)=GL_INVALID_ENUM on core contexts).
+4. gl41-pipeline "Set up failed" FIXED: its #version 150 vertex shader redeclares
+   `out gl_PerVertex { vec4 gl_Position; };` which glslang rejects below GLSL 4.10 without
+   GL_ARB_separate_shader_objects (Mesa and Apple's 4.1 core accept it).  shaders.c (shared,
+   compiler-only edit): if the source redeclares gl_PerVertex at < 4.10 and does not already
+   request the extension, inject `#extension GL_ARB_separate_shader_objects : enable` after
+   the #version line.  Regression tests: glsl_150_gl_per_vertex_redeclaration
+   (test_compat_glsl.c, 38 checks); the scene now runs (Validation: Unknown = no reference
+   checksum, not a failure).
+5. CTS compat-superset sampling (started): KHR-GL46.draw_indirect.* core 68/70 vs compat
+   66/70 — the two extra failures are negative-noVAO-* which EXPECT GL_INVALID_OPERATION for
+   VAO 0; correct for core but legal in a compat context (the default vertex array exists), so
+   not an MGL bug.  buffer_storage 6/9 == 6/9 (same three core failures).  The ~/MGL-cts MGL
+   platform gained MGL_CTS_FORCE_COMPAT=1 to force a compat context for core packages
+   (glu::ApiType::compatibility rewrite in MglContextFactory::createContext, ninja rebuilt).
 
 ## Session 2026-10-23 (fresh session, phase 2)
 

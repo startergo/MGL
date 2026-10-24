@@ -542,8 +542,40 @@ void mgl_compat_init_state(GLMContext ctx)
     s->state_serial = 1;
 }
 
-void mgl_ext_init_compat(GLMContext ctx)
+/* ------------------------------------------------------------------ */
+/* per-draw fast path: is the bound VAO's layout exactly the one we saw at
+ * the last vaoChanged()?  glmark2's Mesh::draw re-specifies its attributes
+ * before EVERY draw with identical values; marking dirty drove a per-draw
+ * vattrib-plan rebuild + buffer rebind + pipeline rehash (~15 us/draw).
+ * Mirrors compatVAOHash in MGLRenderer+Compat.m (same fields). */
+bool mgl_compat_vao_unchanged(GLMContext ctx, VertexArray *vao)
 {
+    if (!ctx->state.ext_compat)
+        return false;                       /* core context: old behaviour */
+    struct MGLExtState_compat *s = ctx->state.ext_compat;
+
+    uint64_t h = 1469598103934665603ULL;
+    #define MIX(v) do { h ^= (uint64_t)(uintptr_t)(v); h *= 1099511628211ULL; } while (0)
+    MIX(vao);
+    MIX(vao->enabled_attribs);
+    for (GLuint i = 0; i < MGLC_VAO_HASH_ATTRIBS; i++)
+    {
+        VertexAttrib *a = &vao->attrib[i];
+        MIX(a->buffer); MIX(a->size); MIX(a->type); MIX(a->normalized);
+        MIX(a->stride); MIX(a->divisor); MIX(a->relativeoffset);
+    }
+    MIX(vao->element_array.buffer);
+    #undef MIX
+
+    if (s->vao_hash_valid && s->vao_hash_vao == (void *)vao && s->vao_hash == h)
+        return true;
+    s->vao_hash_vao = (void *)vao;
+    s->vao_hash = h;
+    s->vao_hash_valid = GL_TRUE;
+    return false;
+}
+
+void mgl_ext_init_compat(GLMContext ctx){
     if (mglNextContextProfile() != GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
         return;     /* core context: compat entry points stay stubs */
 

@@ -6,4 +6,6 @@
 - (void) rstateApplyEncoderState:(id<MTLRenderCommandEncoder>) enc;
 /* blend, masks, rasterizer discard, default-FB attachment formats, shader fixup specialization */
 - (void) rstateConfigurePipelineDescriptor:(MTLRenderPipelineDescriptor *)desc;
+/* compat perf: content hash of everything baked into the pipeline (PSO cache key) */
+- (uint64_t) rstatePipelineContentHash;
 @end

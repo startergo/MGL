@@ -38,6 +38,12 @@
 #define MGLC_SELECT_HITS       4096
 #define MGLC_FEEDBACK_FLOATS   (256 * 1024)
 
+/* per-draw fast path: glmark2-style apps re-specify the identical vertex
+ * attrib layout on every draw; vaoChanged() consults this to skip the dirty
+ * marks (and with them the per-draw plan rebuild / buffer rebind /
+ * pipeline-key rehash).  The cache holds the bound VAO's layout hash. */
+#define MGLC_VAO_HASH_ATTRIBS  32
+
 /* ---- fixed locations shared by generated and translated shaders ---------- */
 #define MGLC_ATTR_VERTEX      0
 #define MGLC_ATTR_LINE_I      1      /* line stipple: distance along the line (pixels) */
@@ -224,6 +230,11 @@ typedef struct {
 
 struct MGLExtState_compat {
     GLboolean is_compat;          /* set at context creation */
+
+    /* bound-VAO layout hash (per-draw fast path, see MGLC_VAO_HASH_ATTRIBS) */
+    void     *vao_hash_vao;
+    uint64_t  vao_hash;
+    GLboolean vao_hash_valid;
 
     /* profile-visible version strings */
     char      version[64];
@@ -419,10 +430,11 @@ struct MGLExtState_compat {
     GLboolean texture_target_enabled[4];   /* GL_TEXTURE_{1D,2D,3D,CUBE_MAP} global */
 };
 
-/* Metal hooks of the compat domain (only the profile flag is needed). */
-struct MGLExtMetal_compat {
-    int unused;                   /* fixed-function runs entirely through core paths */
-};
+/* Metal hooks of the compat domain: perf session 3 state (encoder bind
+ * shadow + streaming upload ring; the definitions live in mgl_compat_perf.h
+ * so the renderer category can include them without this header's macro
+ * redefinitions). */
+#include "mgl_compat_perf.h"
 
 #pragma mark entry points implemented by the domain (internal use)
 

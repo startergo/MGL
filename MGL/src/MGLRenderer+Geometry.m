@@ -27,6 +27,7 @@
 #include "mgl_ext_texdata.h"    /* mgl_texdata_level_geometry: image-unit level completeness */
 #include "texdata_formats.h"   /* tdFormatInfo: image-unit format reinterpretation */
 #include "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow (perf session 3) */
 
 /* rstate's vertex/fragment function-constant specialization is declared privately inside
  * MGLRenderer+RenderState.m; the geometry pass-through function needs the vertex half of it
@@ -4041,7 +4042,8 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                                                              : MTLPrimitiveTypeTriangle;
         if (!_currentRenderEncoder) return false;
 
-        [_currentRenderEncoder setVertexBuffer: gOutv offset: gOutvOff atIndex: MGL_GEOM_MSL_DRAW];
+        /* compat perf: shadow-filtered bind */
+        [self compatBindVertexBuffer:gOutv offset:gOutvOff atIndex:MGL_GEOM_MSL_DRAW];
 
         if ((geomEnvRead(), gEnv.draw))
         {
@@ -4125,11 +4127,52 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     return fn;
 }
 
+/* "does this stage's MSL read spvBufferSizeConstants" is immutable after link —
+ * the per-draw strstr over the full MSL source was the single biggest per-draw
+ * cost in glmark2 (ideas: ~4 ms/frame in two strstr scans per draw); memoize.
+ * Shared with the vertex-attribute planner (round 44 added two scans of its
+ * own, one per plan rebuild) via mgl_msl_has_size_constants(). */
+static bool geomSSBOSizesNeeded(Program *p, int stage)
+{
+    static struct { const void *p, *msl; size_t len; int stage; bool needed; } cache[32];
+    static int next;
+    const char *msl = p->spirv[stage].msl_str;
+    size_t len = strlen(msl);
+    for (int i = 0; i < 32; i++)
+        if (cache[i].p == (void *)p && cache[i].msl == (void *)msl && cache[i].len == len &&
+            cache[i].stage == stage)
+            return cache[i].needed;
+    bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
+    cache[next] = (typeof(cache[0])){ (void *)p, (void *)msl, len, stage, needed };
+    next = (next + 1) & 31;
+    return needed;
+}
+
+/* public form for code holding only the MSL text (per-draw hot paths must not
+ * strstr the whole source): memoized on the string pointer, which is unique
+ * and immutable per compiled stage */
+bool mgl_msl_has_size_constants(const char *msl)
+{
+    /* content-keyed, not pointer-keyed: a freed program's MSL string address
+     * can be recycled for different text (test_fp64 link loops), which must
+     * not alias the memoized answer */
+    static struct { const void *msl; size_t len; bool needed; } cache[64];
+    static int next;
+    if (!msl) return false;
+    size_t len = strlen(msl);
+    for (int i = 0; i < 64; i++)
+        if (cache[i].msl == (void *)msl && cache[i].len == len) return cache[i].needed;
+    bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
+    cache[next] = (typeof(cache[0])){ (void *)msl, len, needed };
+    next = (next + 1) & 63;
+    return needed;
+}
+
 - (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex
 {    Program *p = ctx->state.program;
 
     if (!p || stage < 0 || !p->spirv[stage].msl_str) return;
-    if (!strstr(p->spirv[stage].msl_str, "spvBufferSizeConstants")) return;
+    if (!geomSSBOSizesNeeded(p, stage)) return;
     if (vertex && ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
         return;
     if (!_currentRenderEncoder) return;
@@ -4138,12 +4181,12 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     GLuint n = 0;
     [self geomFillSSBOSizes: sizes list: list count: &n];
     if (!n) return;
+    /* compat perf: stream through the argument ring (the memcmp inside skips
+     * the encode call whenever the SSBO sizes are unchanged between draws) */
     if (vertex)
-        [_currentRenderEncoder setVertexBytes: sizes length: (NSUInteger)n * sizeof(uint32_t)
-                                     atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
+        [self compatRingVertexBytes:sizes length:(NSUInteger)n * sizeof(uint32_t) atIndex:MGL_SSBO_SIZE_BUFFER_INDEX];
     else
-        [_currentRenderEncoder setFragmentBytes: sizes length: (NSUInteger)n * sizeof(uint32_t)
-                                       atIndex: MGL_SSBO_SIZE_BUFFER_INDEX];
+        [self compatRingFragmentBytes:sizes length:(NSUInteger)n * sizeof(uint32_t) atIndex:MGL_SSBO_SIZE_BUFFER_INDEX];
 }
 
 /* compute pass: glDispatchCompute's own encoder binding (not the geometry kernels) */
@@ -4152,7 +4195,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     Program *p = ctx->state.program;
 
     if (!enc || !p || !p->spirv[_COMPUTE_SHADER].msl_str) return;
-    if (!strstr(p->spirv[_COMPUTE_SHADER].msl_str, "spvBufferSizeConstants")) return;
+    if (!geomSSBOSizesNeeded(p, _COMPUTE_SHADER)) return;
 
     uint32_t sizes[MAX_MAPPED_BUFFERS];
     GLuint n = 0;

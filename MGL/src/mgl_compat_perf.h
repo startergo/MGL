@@ -1,0 +1,95 @@
+/* mgl_compat_perf.h — per-renderer Metal argument-bind shadow + streaming
+ * upload ring (compat perf session 3; see agents/compat_report.md).
+ *
+ * Plain C, no GLMContext dependency, so both mgl_ext_compat.h (which embeds it
+ * in struct MGLExtMetal_compat) and the renderer category can include it.
+ *
+ * Two mechanisms, both keyed on the identity of the current render encoder:
+ *
+ *  - bind shadow: one entry per Metal argument index (buffers, textures,
+ *    samplers; 0..30) recording which object+offset the *encoder* last
+ *    received.  Re-issuing an identical setter is skipped, so a draw that
+ *    changes nothing between binds costs zero Metal encode calls.  The shadow
+ *    is invalidated wholesale by the encoder-generation counter, which is
+ *    bumped every time a render encoder is created (extCompatRenderEncoderCreated:).
+ *
+ *  - upload ring: per-draw byte payloads that used to go through
+ *    setVertexBytes/setFragmentBytes (default uniform blocks, client vertex
+ *    arrays, constant vertex attributes, copied index lists) are memcpy'd
+ *    into one of MGLC_RING_SLOTS shared MTLBuffers instead, 256-byte aligned,
+ *    and handed to the encoder with offset-only updates
+ *    (setVertexBufferOffset/setFragmentBufferOffset), which are much cheaper
+ *    to encode than a by-value bytes argument.  The previous allocation of an
+ *    argument index is memcmp'd first: unchanged bytes skip the bind entirely.
+ *    A ring slot is recycled only after the command buffer serial that read
+ *    it has completed (extBufWaitSerial), so the GPU never observes
+ *    overwritten bytes.
+ */
+#ifndef mgl_compat_perf_h
+#define mgl_compat_perf_h
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* Metal argument table indices (buffers/textures/samplers) run 0..30 */
+#define MGLC_BIND_SLOTS 32
+
+/* upload ring geometry: 4 x 512 KB = 2 MB of streaming argument data before a
+ * slot is recycled; the trailing 4 KB of each slot stay unused as an
+ * over-read guard for shaders that pad their argument structs */
+#define MGLC_RING_SLOTS 4
+#define MGLC_RING_SLOT_BYTES (512u * 1024u)
+#define MGLC_RING_GUARD_BYTES 4096u
+
+/* payloads above this stay on the by-value setBytes path (matches the
+ * historical 4 KB cap of the small-buffer binds the ring replaces) */
+#define MGLC_RING_MAX_BYTES 4096u
+
+struct MGLCompatBindShadow {
+    void    *obj;                   /* id<MTLBuffer/MTLTexture/MTLSamplerState> (not retained) */
+    size_t   offset;                /* buffer offset (ring sub-allocation or GL bind offset) */
+    uint64_t gen;                   /* encoder generation the entry was recorded in */
+    void    *encoder;               /* encoder the entry was recorded for */
+};
+
+struct MGLCompatRing {
+    void    *slot[MGLC_RING_SLOTS]; /* retained id<MTLBuffer> (CFBridgingRetain) */
+    uint8_t *cpu[MGLC_RING_SLOTS];  /* slot contents pointer */
+    uint64_t serial[MGLC_RING_SLOTS]; /* command-buffer serial that last read the slot */
+    unsigned cur;                   /* slot receiving allocations */
+    size_t   used;                  /* bytes allocated in the current slot */
+};
+
+/* Metal hooks of the compat domain.  Allocated in
+ * -bindExtCompatFuncsToGLMContext: (MGLRenderer+Compat.m) for every renderer,
+ * both profiles; NULL until then (helpers fall back to unfiltered binds). */
+struct MGLExtMetal_compat {
+    int      enabled;               /* kill switch: 0 = plain binds (MGL_BIND_SHADOW=0) */
+    int      ring_on;               /* ring slots created and usable */
+    uint64_t encoder_gen;           /* bumped on every render encoder creation */
+
+    struct MGLCompatBindShadow vbuf[MGLC_BIND_SLOTS];
+    struct MGLCompatBindShadow fbuf[MGLC_BIND_SLOTS];
+    struct MGLCompatBindShadow vtex[MGLC_BIND_SLOTS];
+    struct MGLCompatBindShadow ftex[MGLC_BIND_SLOTS];
+    struct MGLCompatBindShadow vsamp[MGLC_BIND_SLOTS];
+    struct MGLCompatBindShadow fsamp[MGLC_BIND_SLOTS];
+
+    void    *seen_encoder;           /* last encoder the shadow recorded binds for */
+
+    /* pipeline fast path: content hash of the pipeline-baked rstate, cached
+     * against generation_pipeline (see compatPipelineFastPath) */
+    uint64_t rstate_hash;
+    uint64_t rstate_hash_gen;
+
+    /* pipeline fast path: attachment formats + sample count of the current
+     * encoder, hashed once per encoder generation (attachment changes always
+     * end the encoder) */
+    uint64_t fmt_hash;
+    uint64_t fmt_hash_gen;
+    uint64_t fmt_fbo;
+
+    struct MGLCompatRing ring;
+};
+
+#endif /* mgl_compat_perf_h */

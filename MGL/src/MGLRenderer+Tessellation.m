@@ -26,6 +26,7 @@
  */
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow (perf session 3) */
 #import "MGLTessKernels.h"
 #import "glm_context.h"
 #import "mgl_ext_gpuaudit.h"   /* per-buffer content serial for the scan cache */
@@ -2488,9 +2489,11 @@ static void tessRetireCapture(GLMContext ctx)
                  return false;
             }
 
-            [enc setVertexBuffer: ring offset: cp_source_off atIndex: MGL_TESS_VD_CP];
-            [enc setVertexBuffer: ring offset: patch_off atIndex: MGL_TESS_VD_PATCH];
-            [enc setVertexBuffer: ring offset: off_levels_f atIndex: MGL_TESS_VD_FACTORS];
+            /* compat perf: shadow-filtered binds (the tess rings change offset per
+             * draw; the shadow re-issues only what actually changed) */
+            [self compatBindVertexBuffer:ring offset:cp_source_off atIndex:MGL_TESS_VD_CP];
+            [self compatBindVertexBuffer:ring offset:patch_off atIndex:MGL_TESS_VD_PATCH];
+            [self compatBindVertexBuffer:ring offset:off_levels_f atIndex:MGL_TESS_VD_FACTORS];
             [enc setTessellationFactorBuffer: ring offset: off_factors instanceStride: 0];
 
             if (tTrace())
@@ -2862,10 +2865,11 @@ static void tessRetireCapture(GLMContext ctx)
                  return false;
             }
 
-            [enc setVertexBuffer: (__bridge id<MTLBuffer>)S->gpu_scratch offset: S->gpu_coords_offset atIndex: MGL_TESS_TES_COORDS];
+            /* compat perf: shadow-filtered bind */
+            [self compatBindVertexBuffer:(__bridge id<MTLBuffer>)S->gpu_scratch offset:S->gpu_coords_offset atIndex:MGL_TESS_TES_COORDS];
             /* the TES reads the control points where the VS kernel (no TCS) or the TCS
              * kernel wrote them — cp_source_off, like the hardware path's binding */
-            [enc setVertexBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
+            [self compatBindVertexBuffer:cp_source offset:cp_source_off atIndex:MGL_TESS_TES_CP];
             if (tTrace())
             {
                 void *cpPtr = (__bridge void *)cp_source;
@@ -2875,7 +2879,7 @@ static void tessRetireCapture(GLMContext ctx)
                       S->gpu_scratch, (unsigned long)S->gpu_coords_offset,
                       cpPtr, (unsigned long)cp_source_off, ringPtr, (unsigned long)ring.length);
             }
-            [enc setVertexBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
+            [self compatBindVertexBuffer:ring offset:off_patch_data atIndex:MGL_TESS_TES_PATCH];
             {
                 /* the plain TES takes mgl_tess_params as a buffer POINTER: the words must
                  * come from a real buffer (setVertexBytes would pass them by value) —
@@ -2883,7 +2887,7 @@ static void tessRetireCapture(GLMContext ctx)
                 uint32_t tes_params[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
 
                 memcpy((uint8_t *)ring.contents + off_params, tes_params, sizeof tes_params);
-                [enc setVertexBuffer: ring offset: off_params atIndex: MGL_TESS_TES_PARAMS];
+                [self compatBindVertexBuffer:ring offset:off_params atIndex:MGL_TESS_TES_PARAMS];
 
                 if (tTrace())
                 {

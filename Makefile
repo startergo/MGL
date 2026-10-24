@@ -274,6 +274,9 @@ $(nsgl_lib): MGL/nsgl/mgl_nsgl.m $(mgl_lib)
 		-install_name @rpath/libmgl_nsgl.dylib \
 		-Wl,-rpath,@loader_path \
 		-compatibility_version 1.0 -current_version 1.0.0
+	@# libmgl's install name is a relative path; refer to it via @rpath so the
+	@# reexport resolves wherever the interposer is loaded from
+	install_name_tool -change build/libmgl.dylib @rpath/libmgl.dylib $@
 	@# libmgl.dylib sits next to the interposer (resolved via @loader_path)
 	ln -sf ../libmgl.dylib $(NSGL_DIR)/libmgl.dylib
 	@echo "NSOpenGL interposer built: $@"

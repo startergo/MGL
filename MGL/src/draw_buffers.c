@@ -35,6 +35,11 @@
 #include <string.h>
 
 #include "glm_context.h"
+/* MGL_PROFILE=1 per-draw profiler (MGLRenderer.m) */
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
+void mgl_profile_dump(void);
+void mgl_prof_frame(void);
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_buffers.h"
@@ -855,8 +860,12 @@ void mgl_buffers_raw_draw(GLMContext ctx, GLenum mode, bool indexed, GLenum type
 static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexed, GLenum type, size_t offset,
                       GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
+    uint64_t p7 = mgl_prof_begin(7);
     if (count <= 0 || instances <= 0)
+    {
+        mgl_prof_end(7, p7);
         return;
+    }
 
     /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active */
     if (mode != GL_PATCHES && mgl_tess_active_program(ctx))
@@ -866,7 +875,10 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     }
 
     if (!mgl_ext_pre_draw(ctx, mode, count, instances))
+    {
+        mgl_prof_end(7, p7);
         return;
+    }
 
     /* a geometry stage runs through its own path: capture pass + kernel + pass-through
      * raster (it also performs the transform feedback capture of the geometry output) */
@@ -874,6 +886,7 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     {
         batch_end(ctx, batch);
         mgl_geom_route(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+        mgl_prof_end(7, p7);
         return;
     }
 
@@ -888,14 +901,17 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
             batch_end(ctx, batch);
             mgl_geom_tess_xfb_route(ctx, indexed, type, offset, first, count, instances,
                                     basevertex, baseinstance);
+            mgl_prof_end(7, p7);
             return;
         }
         batch_end(ctx, batch);
         route_xfb(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+        mgl_prof_end(7, p7);
         return;
     }
 
     exec_draw_raw(ctx, batch, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+    mgl_prof_end(7, p7);
 }
 
 static void draw_arrays_common(GLMContext ctx, GLenum mode, GLint first, GLsizei count, GLsizei instances, GLuint baseinstance)

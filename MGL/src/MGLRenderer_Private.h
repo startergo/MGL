@@ -33,6 +33,13 @@ typedef struct SyncList_t {
 
 MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
 
+/* MGL_PROFILE=1 per-draw cost attribution (MGLRenderer.m); mgl_profile_dump is
+ * called from the swap path / interposer to log rolling per-frame averages */
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
+void mgl_profile_dump(void);
+void mgl_prof_frame(void);
+
 /* MGLRenderer+VertexAttrib.m — binds the vattrib plan's per-attribute vertex
  * buffers to an encoder.  Declared here because the transform-feedback capture
  * path has no processGLState pass and must call it directly. */

@@ -20,11 +20,15 @@
  */
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow + upload ring (perf session 3) */
 // gpuaudit: cached shadow attribute streams (CPU format conversion off the draw path)
 #include "mgl_ext_gpuaudit.h"
 #import "mgl_ext_vattrib.h"
 #import "mgl_ext_introspect.h"
 #import "mgl_ext_geom.h"      /* MGL_SSBO_SIZE_BUFFER_INDEX: attribute ordinals must skip it */
+/* memoized spvBufferSizeConstants probe (MGLRenderer+Geometry.m) — the raw
+ * strstr here runs per plan rebuild, i.e. per draw in glmark2 */
+extern bool mgl_msl_has_size_constants(const char *msl);
 #import "mgl_ext_program.h"   /* MGL_PIPELINE_OBJ: a bound pipeline's composite has no name */
 
 #define F4(_a_, _b_, _c_, _d_) switch (n) { case 1: return _a_; case 2: return _b_; case 3: return _c_; case 4: return _d_; } break
@@ -236,8 +240,7 @@ static GLsizei vattribDblShadowSpan(MGLVattribDrawPlan *plan, int lo, int size)
          * buffer-slot audit; same class as the fixed slot-30 const/xfb collision. */
         if (buffer_map->count == MGL_SSBO_SIZE_BUFFER_INDEX &&
             ctx->state.program &&
-            ctx->state.program->spirv[_VERTEX_SHADER].msl_str &&
-            strstr(ctx->state.program->spirv[_VERTEX_SHADER].msl_str, "spvBufferSizeConstants"))
+            mgl_msl_has_size_constants(ctx->state.program->spirv[_VERTEX_SHADER].msl_str))
         {
             BufferMap *pad = &buffer_map->buffers[buffer_map->count];
             pad->attribute_mask = 0;
@@ -304,8 +307,7 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
     bool layout_done[MGL_VA_MAX_BINDINGS] = { false };
     /* the SSBO size-constant slot (see vattribMapVertexBuffers) is off limits for a
      * converted shadow stream as well */
-    bool skip_size_slot = program->spirv[_VERTEX_SHADER].msl_str != NULL &&
-                          strstr(program->spirv[_VERTEX_SHADER].msl_str, "spvBufferSizeConstants") != NULL;
+    bool skip_size_slot = mgl_msl_has_size_constants(program->spirv[_VERTEX_SHADER].msl_str);
 
     for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
         if (plan->binding_index[b] > max_binding_index)
@@ -639,7 +641,9 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
 
         if ((NSUInteger)offset < mtl.length)
         {
-            [enc setVertexBuffer: mtl offset: offset atIndex: index];
+            /* compat perf: shadow-filtered (skip when this buffer+offset is
+             * already bound at this index of the current encoder) */
+            [self compatBindVertexBuffer:mtl offset:(NSUInteger)offset atIndex:(NSUInteger)index];
             return;
         }
     }
@@ -647,11 +651,12 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
     {
         NSUInteger len = (NSUInteger)(buf->size - offset);
         if (len > 4096) len = 4096;
-        [enc setVertexBytes: (const void *)(buf->data.buffer_data + offset) length: len atIndex: index];
+        /* compat perf: client-array payload through the argument ring */
+        [self compatRingVertexBytes:(const void *)(buf->data.buffer_data + offset) length:len atIndex:(NSUInteger)index];
         return;
     }
 
-    [enc setVertexBytes: zeros length: sizeof(zeros) atIndex: index];
+    [self compatRingVertexBytes:zeros length:sizeof(zeros) atIndex:(NSUInteger)index];
 }
 
 - (const GLubyte *) vattribCPUData: (Buffer *) buf
@@ -716,7 +721,7 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
                                               dbl ? MGL_VA_KIND_DOUBLE : kind) : NULL;
     if (cached)
     {
-        [enc setVertexBuffer: (__bridge id<MTLBuffer>)cached offset: 0 atIndex: index];
+        [self compatBindVertexBuffer:(__bridge id<MTLBuffer>)cached offset:0 atIndex:(NSUInteger)index];
         return;
     }
 
@@ -778,12 +783,12 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
 
     if (len <= 4096)
     {
-        [enc setVertexBytes: out length: len atIndex: index];
+        [self compatRingVertexBytes:out length:len atIndex:(NSUInteger)index];
     }
     else
     {
         id<MTLBuffer> tmp = [_device newBufferWithBytes: out length: len options: MTLResourceStorageModeShared];
-        [enc setVertexBuffer: tmp offset: 0 atIndex: index];
+        [self compatBindVertexBuffer:tmp offset:0 atIndex:(NSUInteger)index];
     }
 
     free(out);
@@ -846,7 +851,10 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
         }
     }
 
-    [enc setVertexBytes: data length: sizeof(data) atIndex: MGL_VA_CONST_BUFFER_INDEX];
+    /* compat perf: constant attribs stream through the argument ring; the
+     * memcmp in compatRingVertexBytes skips the encode call whenever the
+     * current-attribute block is unchanged between draws */
+    [self compatRingVertexBytes:data length:sizeof(data) atIndex:(NSUInteger)MGL_VA_CONST_BUFFER_INDEX];
 }
 
 /* auto-called at the end of processGLState(draw_command = true) */

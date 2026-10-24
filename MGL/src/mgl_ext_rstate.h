@@ -70,6 +70,9 @@ struct MGLExtState_rstate {
     GLenum    point_sprite_coord_origin;
 
     GLuint    generation;               /* bumped on every encoder-state change */
+    GLuint    generation_pipeline;      /* bumped only on pipeline-baked state (blend, masks,
+                                           function constants) — not viewport/scissor/raster, which
+                                           never change MTLRenderPipelineState */
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_rstate; filled by MGLRenderer (RenderState). */
@@ -93,7 +96,11 @@ static inline void mgl_rs_dirty_encoder(GLMContext ctx)
 static inline void mgl_rs_dirty_pipeline(GLMContext ctx)
 {
     ctx->state.dirty_bits |= DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE;
-    if (ctx->state.ext_rstate) ctx->state.ext_rstate->generation++;
+    if (ctx->state.ext_rstate)
+    {
+        ctx->state.ext_rstate->generation++;
+        ctx->state.ext_rstate->generation_pipeline++;
+    }
 }
 #endif
 

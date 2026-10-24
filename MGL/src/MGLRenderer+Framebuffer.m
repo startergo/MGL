@@ -21,6 +21,7 @@
  */
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"
 #import "MGLRenderer+Framebuffer.h"
 #include "mgl_ext_fb.h"
 #include "mgl_ext_rstate.h"    /* RS(): indexed viewports (default-fb sizing) */
@@ -1822,6 +1823,15 @@ typedef struct DSBlitParams {
 {
     [self endRenderEncoding];
     [self fbEnsureCommandBuffer];
+
+    /* compat domain: IOSurface present (CGL-like async swap, no drawable
+     * blocking) when the renderer opted in — MGLRenderer+Compat.m */
+    if ([self compatSurfacePresentEnabled])
+    {
+        id<MTLTexture> color = [self fbEnsureDefaultFramebuffer];
+        if (color && [self compatSurfacePresent:color])
+            return;
+    }
 
     id<MTLTexture> color = [self fbEnsureDefaultFramebuffer];
     id<CAMetalDrawable> drawable = _layer ? [_layer nextDrawable] : nil;

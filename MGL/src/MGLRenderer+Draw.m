@@ -12,6 +12,8 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow + upload ring (perf session 3) */
+
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_xfb.h"
 
@@ -327,9 +329,9 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
                 [self extBufDidModify: buf offset: buf->mapped_offset length: buf->mapped_length];
 
             if (vertex)
-                [_currentRenderEncoder setVertexBuffer: mb offset: offset atIndex: i];
+                [self compatBindVertexBuffer:mb offset:offset atIndex:i];
             else
-                [_currentRenderEncoder setFragmentBuffer: mb offset: offset atIndex: i];
+                [self compatBindFragmentBuffer:mb offset:offset atIndex:i];
         }
         else
         {
@@ -338,10 +340,13 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
             size_t len = buf->size - offset;
 
+            /* compat perf: small payloads stream through the argument ring
+             * (offset-only update; skipped when bytes unchanged) instead of a
+             * by-value setBytes per draw */
             if (vertex)
-                [_currentRenderEncoder setVertexBytes: (const char *)buf->data.buffer_data + offset length: len atIndex: i];
+                [self compatRingVertexBytes:(const char *)buf->data.buffer_data + offset length:len atIndex:i];
             else
-                [_currentRenderEncoder setFragmentBytes: (const char *)buf->data.buffer_data + offset length: len atIndex: i];
+                [self compatRingFragmentBytes:(const char *)buf->data.buffer_data + offset length:len atIndex:i];
         }
     }
 
@@ -350,10 +355,18 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (bool) extBufBeginDraw
 {
+    uint64_t prof_t0 = mgl_prof_begin(0);
     [self extBufEnsureCommandBuffer];
 
+    uint64_t t12 = mgl_prof_begin(12);
     if (![self processGLState: true])
+    {
+        mgl_prof_end(12, t12);
+        mgl_prof_end(0, prof_t0);
         return false;
+    }
+    mgl_prof_end(12, t12);
+    mgl_prof_end(0, prof_t0);
 
     if (!_currentRenderEncoder)
     {
@@ -366,19 +379,29 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!_currentRenderEncoder || !_pipelineState)
         return false;
 
+    uint64_t t13 = mgl_prof_begin(13);
     if (![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true])
+    {
+        mgl_prof_end(13, t13);
         return false;
+    }
 
     if (![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+    {
+        mgl_prof_end(13, t13);
         return false;
+    }
+    mgl_prof_end(13, t13);
 
     /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25).
      * The vertex table's stage is the evaluation shader while tessellation is active
      * (mapBuffersToMTL mirrors this). */
+    uint64_t t14 = mgl_prof_begin(14);
     [self geomBindSSBOSizes: &ctx->state.vertex_buffer_map_list
                      stage: [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER
                     vertex: true];
     [self geomBindSSBOSizes: &ctx->state.fragment_buffer_map_list stage: _FRAGMENT_SHADER vertex: false];
+    mgl_prof_end(14, t14);
 
     return true;
 }
@@ -405,6 +428,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (void) extBufEndDraw
 {
+    uint64_t t8 = mgl_prof_begin(8);
     uint64_t serial = [self extBufSerial];
 
     [self extBufStampList: &ctx->state.vertex_buffer_map_list serial: serial];
@@ -426,6 +450,8 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
             if (b) mgl_buffers_mark_gpu_use(ctx, b, true);
         }
     }
+
+    mgl_prof_end(8, t8);
 }
 
 - (void) extBufDrawArrays: (int) prim first: (GLint) first count: (GLsizei) count instances: (GLsizei) instances baseInstance: (GLuint) base_instance
@@ -470,9 +496,22 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         if (!cpu)
             return;
 
-        index_buffer = [_device newBufferWithBytes: cpu length: (size_t)count * isize options: MTLResourceStorageModeShared];
-        if (!index_buffer)
-            return;
+        /* compat perf: copied index lists stream through the argument ring
+         * instead of allocating an MTLBuffer per draw */
+        NSUInteger ring_off = 0;
+        id<MTLBuffer> ring_idx = [self compatRingIndexBytes:cpu length:(NSUInteger)count * isize offset:&ring_off];
+
+        if (ring_idx)
+        {
+            index_buffer = ring_idx;
+            index_offset = ring_off;
+        }
+        else
+        {
+            index_buffer = [_device newBufferWithBytes: cpu length: (size_t)count * isize options: MTLResourceStorageModeShared];
+            if (!index_buffer)
+                return;
+        }
     }
 
     [_currentRenderEncoder drawIndexedPrimitives: (MTLPrimitiveType)prim indexCount: count indexType: itype
@@ -852,14 +891,18 @@ static void c_end_draw(GLMContext c) { [RENDERER(c) extBufEndDraw]; }
 
 static void c_draw_arrays(GLMContext c, int prim, GLint first, GLsizei count, GLsizei inst, GLuint base_inst)
 {
+    uint64_t t9 = mgl_prof_begin(9);
     [RENDERER(c) extBufDrawArrays: prim first: first count: count instances: inst baseInstance: base_inst];
+    mgl_prof_end(9, t9);
 }
 
 static void c_draw_indexed(GLMContext c, int prim, GLenum type, Buffer *ibuf, size_t offset, const void *cpu,
                            GLsizei count, GLsizei inst, GLint base_vertex, GLuint base_inst)
 {
+    uint64_t t9 = mgl_prof_begin(9);
     [RENDERER(c) extBufDrawIndexed: prim type: type buffer: ibuf offset: offset cpu: cpu count: count
                          instances: inst baseVertex: base_vertex baseInstance: base_inst];
+    mgl_prof_end(9, t9);
 }
 
 static void c_draw_indirect(GLMContext c, int prim, Buffer *indirect, size_t offset, GLenum type, Buffer *ibuf)

@@ -9,6 +9,7 @@
  */
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow (perf session 3) */
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_buffers.h"   /* gpuaudit: GPU-write serial tracking for the xfb scatter */
 
@@ -201,6 +202,10 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     /* reuse the renderer's binding code on our encoder */
     id<MTLRenderCommandEncoder> saved = _currentRenderEncoder;
     _currentRenderEncoder = enc;
+    /* compat perf: the bind shadow must not leak entries between this capture
+     * encoder and the GL encoder (a recycled encoder address would otherwise
+     * inherit stale skips) */
+    [self compatBindInvalidate];
     bool ok = [self bindVertexBuffersToCurrentRenderEncoder];
     if (ok)
     {
@@ -213,6 +218,7 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
         [self extVattribPreDraw: enc];
     }
     _currentRenderEncoder = saved;
+    [self compatBindInvalidate];
     if (!ok) { [enc endEncoding]; return NULL; }
 
     [enc setVertexBuffer: xfbScratch offset: 0 atIndex: MGL_XFB_MSL_BUFFER_INDEX];

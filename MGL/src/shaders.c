@@ -232,6 +232,41 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     //input->messages = 0xFFFF & ~GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
     {
+        /* glslang rejects gl_PerVertex block redeclarations below GLSL 4.10
+         * unless GL_ARB_separate_shader_objects is enabled, while Mesa and
+         * Apple's 4.1 core GL accept them directly (glmark2's gl41-pipeline
+         * ships a #version 150 shader doing exactly that).  MGL is GL 4.6, so
+         * the extension's semantics are always available: enable it for the
+         * compiler and leave the shader source otherwise untouched.
+         * (Shared-file edit, shaders.c — see agents/compat_report.md.) */
+        const char *code = input->code;
+        if (glsl_version < 410 && strstr(code, "gl_PerVertex") &&
+            !strstr(code, "GL_ARB_separate_shader_objects"))
+        {
+            const char *p = strstr(code, "#version");
+            char *out;
+            size_t off, need;
+
+            if (p) p = strchr(p, '\n');
+            if (p) p++;
+            else p = code;
+            off = (size_t)(p - code);
+            need = strlen(code) + 64;
+            /* build out of line: code may already be modified_src */
+            out = (char *)malloc(need);
+            if (out)
+            {
+                snprintf(out, need,
+                         "%.*s#extension GL_ARB_separate_shader_objects : enable\n%s",
+                         (int)off, code, p);
+                free(modified_src);
+                modified_src = out;
+                modified_src_size = need;
+                input->code = modified_src;
+            }
+        }
+    }
+    {
         /* the resource limits must match what glGet* reports: the CTS compares the
          * gl_Max* constants baked into shaders against the queried values
          * (KHR-GL46.limits); mgl_geom_fill_glslang_resource() re-seeds every entry

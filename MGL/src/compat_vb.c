@@ -439,7 +439,14 @@ static Program *bind_ffp(GLMContext ctx)
     if (user)
     {
         mgl_compat_sync_builtin_uniforms(ctx, user);
-        return NULL;
+        /* keep returning the user program: unbind_ffp re-selects it after the
+         * draw (a no-op) — returning NULL here made unbind_ffp issue
+         * glUseProgram(0), silently unbinding the application's program after
+         * every fixed-function-path draw (caught by test_compat_perf: the
+         * second draw of a read-verify loop fell back to the white default
+         * fixed-function pipeline and glUniform* began failing with
+         * GL_INVALID_OPERATION) */
+        return user;
     }
 
     GLuint prog = mgl_compat_ffp_program(ctx);

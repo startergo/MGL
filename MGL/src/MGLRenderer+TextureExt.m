@@ -8,6 +8,7 @@
 
 #import <objc/runtime.h>
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat: bind shadow (perf session 3) */
 #import "MGLRenderer+TextureExt.h"
 
 #include "hash_table.h"
@@ -743,15 +744,16 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
                 msl_slot = rl->list[i].msl_binding;
         }
 
+        /* compat perf: shadow-filtered setters */
         if (stage == _FRAGMENT_SHADER)
         {
-            [enc setFragmentTexture: texture atIndex: msl_slot];
-            if (sampler) [enc setFragmentSamplerState: sampler atIndex: msl_slot];
+            [self compatSetFragmentTexture:texture atIndex:msl_slot];
+            if (sampler) [self compatSetFragmentSamplerState:sampler atIndex:msl_slot];
         }
         else
         {
-            [enc setVertexTexture: texture atIndex: msl_slot];
-            if (sampler) [enc setVertexSamplerState: sampler atIndex: msl_slot];
+            [self compatSetVertexTexture:texture atIndex:msl_slot];
+            if (sampler) [self compatSetVertexSamplerState:sampler atIndex:msl_slot];
         }
     }
 }

@@ -161,6 +161,36 @@ TEST(glsl_sampler1d_renders)
     glDeleteTextures(1, &t);
 }
 
+
+/* #version 150 with an `out gl_PerVertex` redeclaration — legal through
+ * GL_ARB_separate_shader_objects (accepted by Mesa and Apple's 4.1 core;
+ * glmark2's gl41-pipeline ships exactly this shader).  The compiler enables
+ * the extension when it sees the redeclaration below GLSL 4.10. */
+TEST(glsl_150_gl_per_vertex_redeclaration)
+{
+    const char *vs =
+        "#version 150\n"
+        "out gl_PerVertex { vec4 gl_Position; };\n"
+        "in vec3 position;\n"
+        "out vec3 vN;\n"
+        "void main() { vN = position; gl_Position = vec4(position, 1.0); }\n";
+    const char *fs =
+        "#version 150\nout vec4 FragColor;\n"
+        "in vec3 vN;\nvoid main() { FragColor = vec4(normalize(vN) * 0.5 + 0.5, 1.0); }\n";
+    char log[512] = { 0 };
+    GLuint p = build(vs, fs, log, sizeof log);
+    EXPECT_TRUE(p != 0);
+    if (!p) printf("     build log: %s\n", log);
+    glDeleteProgram(p);
+
+    /* without the redeclaration the same shader must of course still work */
+    const char *vs2 =
+        "#version 150\nin vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }\n";
+    GLuint p2 = build(vs2, fs, log, sizeof log);
+    EXPECT_TRUE(p2 != 0);
+    glDeleteProgram(p2);
+}
+
 /* #version 110 with ftransform, gl_Color, gl_TexCoord and gl_FragData[0] */
 TEST(glsl_110_ftransform_fragdata)
 {
@@ -405,6 +435,59 @@ TEST(glsl_program_uniform_compat)
     EXPECT_NO_GL_ERROR();
 }
 
+/* glmark2 [terrain] crash regression: a sampler that is declared but never
+ * sampled is stripped from the MSL by SPIRV-Cross (msl_binding = 0xffffffff
+ * sentinel, program.c).  A texture bound to that unit must not be handed to
+ * setFragmentTexture:atIndex:0xffffffff — that indexed the AGX bind table out
+ * of range and killed the driver (SIGSEGV inside AGXMetalG16X setTexture). */
+TEST(glsl_unused_sampler_no_crash)
+{
+    setup_2d(8, 8);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const char *vs = "#version 120\n"
+                     "void main() { gl_Position = ftransform(); gl_TexCoord[0] = gl_MultiTexCoord0; }\n";
+    const char *fs = "#version 110\n"
+                     "uniform sampler2D used_tex;   /* sampled */\n"
+                     "uniform sampler2D unused_tex; /* declared, never read */\n"
+                     "void main() { gl_FragColor = texture2D(used_tex, gl_TexCoord[0].xy); }\n";
+    char log[1024] = { 0 };
+    GLuint p = build(vs, fs, log, sizeof log);
+    EXPECT_TRUE(p != 0);
+    if (!p) { printf("     build log: %s\n", log); return; }
+    glUseProgram(p);
+
+    GLuint tex[2];
+    glGenTextures(2, tex);
+    GLubyte px[4] = { 40, 90, 160, 255 };
+    for (int i = 0; i < 2; i++)          /* a real texture on BOTH units */
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(p, "used_tex"), 0);
+    glUniform1i(glGetUniformLocation(p, "unused_tex"), 1);
+
+    EXPECT_NO_GL_ERROR();
+
+    setup_2d(8, 8);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.5f, 0.5f); glVertex2f(0, 0);
+    glTexCoord2f(0.5f, 0.5f); glVertex2f(8, 0);
+    glTexCoord2f(0.5f, 0.5f); glVertex2f(8, 8);
+    glTexCoord2f(0.5f, 0.5f); glVertex2f(0, 8);
+    glEnd();
+    EXPECT_PIXEL(4, 4, 40, 90, 160, 255, 3);
+
+    glDeleteTextures(2, tex);
+    glUseProgram(0);
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     void *ctx = mglCompatCreateContext();
@@ -412,6 +495,7 @@ int main(void)
     if (!ctx)
         return 1;
 
+    RUN(glsl_150_gl_per_vertex_redeclaration);
     RUN(glsl_deprecated_texture_builtins);
     RUN(glsl_sampler1d_renders);
     RUN(glsl_110_ftransform_fragdata);
@@ -420,6 +504,7 @@ int main(void)
     RUN(glsl_builtin_uniform_locations);
     RUN(glsl_scalar_uniform_sandwich);
     RUN(glsl_program_uniform_compat);
+    RUN(glsl_unused_sampler_no_crash);
 
     return mgl_test_summary();
 }

@@ -24,6 +24,8 @@
 #include <strings.h>
 
 #include "glm_context.h"
+#include "mgl_ext_compat.h"
+bool mgl_compat_vao_unchanged(GLMContext ctx, VertexArray *vao);
 #include "vertex_arrays.h"
 #include "mgl_ext_vattrib.h"
 
@@ -118,6 +120,12 @@ void mgl_va_sync_all(VertexArray *vao)
 /* a VAO changed: re-derive the Metal vertex descriptor if it is the bound one */
 static void vaoChanged(GLMContext ctx, VertexArray *vao)
 {
+    /* compat fast path: re-specifying the IDENTICAL layout (glmark2 does this
+     * per draw) changes nothing downstream — skip the dirty marks entirely
+     * (mgl_compat_vao_unchanged caches the layout hash, compat.c) */
+    if (vao == ctx->state.vao && mgl_compat_vao_unchanged(ctx, vao))
+        return;
+
     vao->dirty_bits |= DIRTY_VAO_ATTRIB | DIRTY_VAO_BUFFER_BASE;
 
     if (vao == ctx->state.vao)

@@ -53,6 +53,7 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "spirv_cross_c.h"
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"
 #import "mgl_ext_introspect.h"
 #import "mgl_ext_geom.h"
 #import "mgl_ext_program.h"
@@ -165,6 +166,100 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
 
     for (unsigned int i = 0; i < c->count; i++)
         c->imps[i](self, c->sels[i], arg);
+}
+
+/* ------------------------------------------------------------------ */
+/* MGL_PROFILE=1: per-draw cost attribution, dumped by mgl_profile_dump
+ * (called from the swap path / the NSOpenGL interposer every 120 frames).
+ * ids: 0=extBufBeginDraw (per-draw GL->Metal state) 1=newRenderEncoder
+ * 2=pipeline descriptor walk 3=newRenderPipelineState (cache miss)
+ * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
+#include <mach/mach_time.h>
+#include <pthread.h>
+uint64_t mgl_prof_ns[22], mgl_prof_cnt[22];   /* shared with the Compat category counters */
+static int mgl_prof_on = -1;
+static double mgl_prof_scale = 0;
+/* NOINLINE + compiler barriers: mach_absolute_time is a pure intrinsic, and
+ * the optimizer sinks/hoists it ACROSS the timed region unless blocked — a
+ * trivial block "measured" 16 us/draw before the barriers */
+__attribute__((noinline)) uint64_t mgl_prof_begin(int id)
+{
+    (void)id;
+    if (mgl_prof_on < 0)
+    {
+        mgl_prof_on = getenv("MGL_PROFILE") != NULL && getenv("MGL_PROFILE")[0] != '0';
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        mgl_prof_scale = (double)tb.numer / tb.denom / 1e6;   /* ms */
+    }
+    if (!mgl_prof_on) return 0;
+    {
+        static pthread_t t_main = NULL;
+        if (!t_main) t_main = pthread_self();
+        else if (!pthread_equal(t_main, pthread_self()) && (mgl_prof_cnt[19]++ % 1000) == 0)
+            fprintf(stderr, "MGL PROFILE: prof_begin called off the first thread!\n");
+    }
+    asm volatile("" ::: "memory");
+    uint64_t t = mach_absolute_time();
+    asm volatile("" ::: "memory");
+    return t;
+}
+__attribute__((noinline)) void mgl_prof_end(int id, uint64_t t0)
+{
+    asm volatile("" ::: "memory");
+    uint64_t t = t0 ? mach_absolute_time() : 0;
+    asm volatile("" ::: "memory");
+    if (t0)
+    {
+        mgl_prof_ns[id] += t - t0;
+        mgl_prof_cnt[id]++;
+    }
+}
+void mgl_profile_dump(void)
+{
+    if (mgl_prof_on <= 0) return;
+    static pthread_t first = NULL;
+    if (!first) first = pthread_self();
+    else if (!pthread_equal(first, pthread_self()))
+        fprintf(stderr, "MGL PROFILE: MULTI-THREAD use detected!\n");
+    static const char *names[22] = { "dirtyState-block", "newRenderEncoder",
+                                    "pipeline-descriptor", "vao-buflists",
+                                    "updateEncoder", "bindTextures", "swap", "draw",
+                                    "enddraw-stamp", "encode-draw", "mapBuffers", "11",
+                                    "processGLState", "bindList", "ssboSizes", "setPipelineState+PreDraw",
+                                    "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "bufferSubData", "map", "unmap" };
+    double tot = 0;
+    for (int i = 0; i < 22; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
+    fprintf(stderr, "MGL PROFILE(ms total | ms/frame | calls/frame):");
+    for (int i = 0; i < 22; i++)
+        if (mgl_prof_cnt[i])
+            fprintf(stderr, " %s=%.1f|%.3f|%.1f", names[i],
+                    mgl_prof_ns[i] * mgl_prof_scale,
+                    mgl_prof_ns[i] * mgl_prof_scale / 120.0,
+                    (double)mgl_prof_cnt[i] / 120.0);
+    fprintf(stderr, " (sum %.1f ms)\n", tot);
+    /* compat perf session 3: Metal argument-bind accounting (MGLRenderer+Compat.m) */
+    {
+        extern uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
+        uint64_t tot2 = mgl_compat_bind_skip + mgl_compat_bind_set;
+        fprintf(stderr, "MGL PROFILE binds/frame: issued=%.1f skipped=%.1f (%.0f%%) ring=%.1f KB\n",
+                tot2 ? (double)mgl_compat_bind_set / 120.0 : 0.0,
+                tot2 ? (double)mgl_compat_bind_skip / 120.0 : 0.0,
+                tot2 ? 100.0 * (double)mgl_compat_bind_skip / (double)tot2 : 0.0,
+                (double)mgl_compat_ring_bytes / 120.0 / 1024.0);
+        mgl_compat_bind_skip = mgl_compat_bind_set = mgl_compat_ring_bytes = 0;
+    }
+    memset(mgl_prof_ns, 0, sizeof mgl_prof_ns);
+    memset(mgl_prof_cnt, 0, sizeof mgl_prof_cnt);
+}
+
+/* swap boundaries: dump every 120 presents */
+void mgl_prof_frame(void)
+{
+    if (mgl_prof_on <= 0) return;
+    static uint64_t frames;
+    if (++frames % 120 == 0)
+        mgl_profile_dump();
 }
 
 @interface MGLNullShaderBufferBox : NSObject
@@ -716,7 +811,10 @@ static char kComputeFallbackKey;
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
-            [_currentRenderEncoder setVertexBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
+            /* compat perf: stream through the argument ring (offset-only
+             * encoder update, skipped when the bytes are unchanged) instead
+             * of a by-value setVertexBytes per draw */
+            [self compatRingVertexBytes:(const void *)ptr->data.buffer_data length:(NSUInteger)ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
             ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
@@ -728,7 +826,9 @@ static char kComputeFallbackKey;
             id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             assert(buffer);
 
-            [_currentRenderEncoder setVertexBuffer:buffer offset:offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i) ];
+            /* compat perf: skip the encode call when this buffer+offset is
+             * already bound at this index of the current encoder */
+            [self compatBindVertexBuffer:buffer offset:(NSUInteger)offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
         }
     }
 
@@ -764,7 +864,9 @@ static char kComputeFallbackKey;
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
-            [_currentRenderEncoder setFragmentBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
+            /* compat perf: stream through the argument ring (see the vertex
+             * stage twin above) */
+            [self compatRingFragmentBytes:(const void *)ptr->data.buffer_data length:(NSUInteger)ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
             ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
@@ -776,7 +878,8 @@ static char kComputeFallbackKey;
             id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             assert(buffer);
             
-            [_currentRenderEncoder setFragmentBuffer:buffer offset:offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i) ];
+            /* compat perf: skip the encode call when identical (see above) */
+            [self compatBindFragmentBuffer:buffer offset:(NSUInteger)offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
         }
     }
 
@@ -2005,6 +2108,12 @@ static char kComputeFallbackKey;
             /* the shader always reads its own Metal texture slot: the GL sampler uniform only
              * picks WHICH texture feeds it, never the argument index */
             GLuint mtl_index = sres->msl_binding;
+            /* msl_binding 0xffffffff = SPIRV-Cross stripped the declaration from the MSL
+             * (sampler declared but never sampled — glmark2 terrain's fragment shaders):
+             * passing it to setTexture would index the AGX bind table at UINT_MAX and
+             * crash the driver (glmark2 [terrain] SIGSEGV, see agents/compat_report.md) */
+            if (mtl_index == 0xffffffffu)
+                continue;
 
             if (spirv_binding >= TEXTURE_UNITS)
                 continue;
@@ -2043,13 +2152,15 @@ static char kComputeFallbackKey;
                  * (mgl_fix_shadow_vs / spirv[VS].shadow_slots) */
                 if (mgl_geom_vs_shadow_slot(STATE(program), mtl_index + e))
                     [self geomShadowCheckStale:spirv_binding + e texture:ptr slot:mtl_index + e];
-                [_currentRenderEncoder setVertexTexture:texture atIndex:mtl_index + e];
-                [_currentRenderEncoder setVertexSamplerState:sampler atIndex:mtl_index + e];
+                /* compat perf: bind-shadow filtered setters (skip identical
+                 * rebinds per encoder) */
+                [self compatSetVertexTexture:texture atIndex:mtl_index + e];
+                [self compatSetVertexSamplerState:sampler atIndex:mtl_index + e];
             }
             else
             {
-                [_currentRenderEncoder setFragmentTexture:texture atIndex:mtl_index + e];
-                [_currentRenderEncoder setFragmentSamplerState:sampler atIndex:mtl_index + e];
+                [self compatSetFragmentTexture:texture atIndex:mtl_index + e];
+                [self compatSetFragmentSamplerState:sampler atIndex:mtl_index + e];
             }
             }
         }
@@ -2071,6 +2182,9 @@ static char kComputeFallbackKey;
             SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
             GLuint unit = sres->binding;              /* the GL image unit */
             GLuint mtl_index = sres->msl_binding;
+            /* stripped-from-MSL sentinel: same guard as the sampled-image loop above */
+            if (mtl_index == 0xffffffffu)
+                continue;
             Texture *ptr;
             id<MTLTexture> texture;
             ImageUnit *iu;
@@ -2104,9 +2218,9 @@ static char kComputeFallbackKey;
              * function (the plain vertex stage, or the TES running as the post-
              * tessellation vertex function): its image arguments are vertex slots */
             if (stage != _FRAGMENT_SHADER)
-                [_currentRenderEncoder setVertexTexture: texture atIndex: mtl_index + e];
+                [self compatSetVertexTexture:texture atIndex:mtl_index + e];
             else
-                [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index + e];
+                [self compatSetFragmentTexture:texture atIndex:mtl_index + e];
             }
         }
 
@@ -2630,7 +2744,13 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         return false;
     }
 
-    NSLog(@"MGL DEBUG: About to create render encoder with descriptor and command buffer");
+    /* per-encoder INFO/DEBUG logging is opt-in (MGL_DEBUG): render encoders
+     * are created every frame (logging-only change, see agents/compat_report.md) */
+    static int mgl_encoder_log = -1;
+    if (mgl_encoder_log < 0)
+        mgl_encoder_log = getenv("MGL_DEBUG") != NULL;
+    if (mgl_encoder_log)
+        NSLog(@"MGL DEBUG: About to create render encoder with descriptor and command buffer");
     @try {
         mglCallExtHooks(self, "RenderPassDescriptor:", _renderPassDescriptor); // extHookRenderPassDescriptor
         _currentRenderEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor: _renderPassDescriptor];
@@ -2640,7 +2760,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             [self recordGPUError];
             return false;
         }
-        NSLog(@"MGL INFO: Successfully created Metal render encoder");
+        if (mgl_encoder_log)
+            NSLog(@"MGL INFO: Successfully created Metal render encoder");
         [self recordGPUSuccess];
     } @catch (NSException *exception) {
         NSLog(@"MGL ERROR: Exception creating render encoder: %@ - continuing with degraded functionality", exception);
@@ -2866,7 +2987,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
         /* per-create logging is opt-in (see MGL_DEBUG_CMDBUF in commit:) */
         {
-            static BOOL mgl_log_cmdbuf = -1;
+            static int mgl_log_cmdbuf = -1;
             if (mgl_log_cmdbuf < 0) mgl_log_cmdbuf = getenv("MGL_DEBUG_CMDBUF") ? YES : NO;
             if (mgl_log_cmdbuf)
                 NSLog(@"MGL INFO: Successfully created new Metal command buffer (AGX validated)");
@@ -3231,10 +3352,17 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if (_currentRenderEncoder)
     {
         @try {
-            NSLog(@"MGL DEBUG: Ending render encoder");
+            /* per-frame logging is opt-in (MGL_DEBUG): endRenderEncoding runs
+             * every pass (logging-only change, see agents/compat_report.md) */
+            static int mgl_encoder_end_log = -1;
+            if (mgl_encoder_end_log < 0)
+                mgl_encoder_end_log = getenv("MGL_DEBUG") != NULL;
+            if (mgl_encoder_end_log)
+                NSLog(@"MGL DEBUG: Ending render encoder");
             [_currentRenderEncoder endEncoding];
             _currentRenderEncoder = NULL;
-            NSLog(@"MGL DEBUG: Render encoder ended successfully");
+            if (mgl_encoder_end_log)
+                NSLog(@"MGL DEBUG: Render encoder ended successfully");
         } @catch (NSException *exception) {
             NSLog(@"MGL ERROR: Exception ending render encoder: %@ - ignoring", exception.reason);
             // Force clear the encoder even if ending failed
@@ -3386,6 +3514,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     if (ctx->state.dirty_bits)
     {
+        uint64_t t10 = mgl_prof_begin(10);
         // dirty state covers all rendering attachments and general state
         if (ctx->state.dirty_bits & DIRTY_STATE)
         {
@@ -3396,7 +3525,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 {
                     if (ctx->state.framebuffer->dirty_bits & DIRTY_FBO_BINDING)
                     {
+                        uint64_t t18 = mgl_prof_begin(18);
                         RETURN_FALSE_ON_FAILURE([self bindFramebufferAttachmentTextures]);
+                        mgl_prof_end(18, t18);
 
                         // Additional validation after binding
                         if (ctx->state.framebuffer) {  // Re-validate in case binding corrupted memory
@@ -3410,6 +3541,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
             ctx->state.dirty_bits &= ~DIRTY_STATE;
         }
+        mgl_prof_end(10, t10);
 
         // check for dirty program and vao
         // leave program / vao state dirty, buffers need to be mapped before used below
@@ -3422,7 +3554,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             //assert(ctx->state.program->mtl_data); //
 
             // figure out vertex shader uniforms / buffer mappings
+            uint64_t t11 = mgl_prof_begin(11);
             RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+            mgl_prof_end(11, t11);
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER_BASE_STATE;
         }
@@ -3431,7 +3565,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER))
         {
             RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
+            uint64_t p5 = mgl_prof_begin(5);
             RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);
+            mgl_prof_end(5, p5);
 
             // textures / active textures and samplers are all handled in bindActiveTexturesToMTL
             ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER);
@@ -3440,21 +3576,35 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         // a dirty vao needs to update the render encoder and buffer list
         if (ctx->state.dirty_bits & DIRTY_VAO)
         {
-            // we have a dirty VAO, all the renderbuffer bindings are invalid so we need a new renderbuffer
-            // with new renderbuffer bindings
-
-            // always end encoding and start a new encoder and bind new vertex buffers
-            // end encoding on current render encoder
-            [self endRenderEncoding];
-
-            // updateDirtyBaseBufferList binds new mtl buffers or updates old ones
+            /* compat domain: a vertex-layout change never changes the render
+             * pass — Metal vertex buffers are (re)bound per draw and the
+             * layout lives in the cached pipeline state — so the encoder is
+             * only rebuilt when there is none (glmark2 re-specifies attribs
+             * every draw; the old teardown cost ~60 us per draw) */
+            uint64_t t3 = mgl_prof_begin(3);
+            if (mgl_prof_on && (mgl_prof_cnt[10] % 500) == 0)
+                fprintf(stderr, "MGL PROFILE vao-branch list counts v=%d f=%d\n",
+                        ctx->state.vertex_buffer_map_list.count,
+                        ctx->state.fragment_buffer_map_list.count);
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]);
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
+            mgl_prof_end(3, t3);
 
-            // get a new renderer encoder
-            RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+            if (_currentRenderEncoder == NULL)
+            {
+                uint64_t p1 = mgl_prof_begin(1);
+                RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+                mgl_prof_end(1, p1);
+            }
+            else if (ctx->state.dirty_bits & DIRTY_RENDER_STATE)
+            {
+                uint64_t p4 = mgl_prof_begin(4);
+                [self updateCurrentRenderEncoder];
+                mgl_prof_end(4, p4);
+            }
 
-            // clear dirty render state
+            // clear dirty render state; DIRTY_VAO stays set — the pipeline
+            // block below still consumes it to rebuild the vertex descriptor
             ctx->state.dirty_bits &= ~DIRTY_RENDER_STATE;
         }
         else if (ctx->state.dirty_bits & DIRTY_BUFFER)
@@ -3468,20 +3618,26 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // the previous encoder may have been ended by a flush / readback
             if (_currentRenderEncoder == NULL)
             {
+                uint64_t p1 = mgl_prof_begin(1);
                 RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+                mgl_prof_end(1, p1);
             }
         }
         else if ((ctx->state.dirty_bits & DIRTY_RENDER_STATE) || _currentRenderEncoder == NULL)
         {
             if (_currentRenderEncoder == NULL)
             {
+                uint64_t p1 = mgl_prof_begin(1);
                 RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+                mgl_prof_end(1, p1);
             }
 
             // a dirty render state may just be something like alpha changes which don't require a new renderbuffer
 
             // updateCurrentRenderEncoder will update the renderstate outside of creating a new one
+            uint64_t p4 = mgl_prof_begin(4);
             [self updateCurrentRenderEncoder];
+            mgl_prof_end(4, p4);
 
             ctx->state.dirty_bits &= ~DIRTY_RENDER_STATE;
         }
@@ -3489,6 +3645,20 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         // new pipeline / vertex / renderbuffer and pipelinestate descriptor, should probably make this a single dirty bit
         if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE))
         {
+            /* compat domain fast path: the trigger is only VAO / render-state
+             * dirt and a pipeline for exactly this state is already cached —
+             * skip the descriptor rebuild + content hash (MGLRenderer+Compat.m) */
+            if ([self compatPipelineFastPath])
+            {
+                ctx->state.dirty_bits &= ~DIRTY_VAO;
+            }
+            else
+            {
+            uint64_t p2 = mgl_prof_begin(2);
+            if (mgl_prof_on && (mgl_prof_cnt[2] % 200) == 0)
+                fprintf(stderr, "MGL PROFILE pipeline-block dirty=0x%llx sel=0x%llx\n",
+                        (unsigned long long)ctx->state.dirty_bits,
+                        (unsigned long long)(ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE)));
             // create pipeline descriptor
             MTLRenderPipelineDescriptor *pipelineStateDescriptor;
 
@@ -3551,6 +3721,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // gpuaudit: pipeline states are cached by descriptor content (MGLRenderer+Gpuaudit.m);
             // a hit skips the descriptor walk and newRenderPipelineStateWithDescriptor entirely
             id<MTLRenderPipelineState> gpuauditCached = [self gpuauditPipelineForDescriptor: pipelineStateDescriptor];
+            mgl_prof_end(2, p2);
             if (gpuauditCached)
             {
                 _pipelineState = gpuauditCached;
@@ -3560,27 +3731,38 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // PROPER AGX VIRTUALIZATION COMPATIBILITY: Fix root cause while maintaining Metal functionality
             NSError *error;
 
+            /* pipeline-creation INFO logging is opt-in (MGL_DEBUG): it fires
+             * for every pipeline created and was ~5 MB/min of stderr under
+             * glmark2 (logging-only change, see agents/compat_report.md) */
+            static int mgl_pipeline_log = -1;
+            if (mgl_pipeline_log < 0)
+                mgl_pipeline_log = getenv("MGL_DEBUG") != NULL;
+
             @try {
-                NSLog(@"MGL INFO: Creating Metal pipeline state with AGX virtualization compatibility...");
+                if (mgl_pipeline_log) {
+                    NSLog(@"MGL INFO: Creating Metal pipeline state with AGX virtualization compatibility...");
 
-                // ROOT CAUSE FIX: The issue is with async shader compilation in virtualized environments
-                // Force synchronous pipeline creation to avoid completion queue crashes
-                NSLog(@"MGL INFO: Using synchronous pipeline creation to prevent virtualization crashes");
+                    // ROOT CAUSE FIX: The issue is with async shader compilation in virtualized environments
+                    // Force synchronous pipeline creation to avoid completion queue crashes
+                    NSLog(@"MGL INFO: Using synchronous pipeline creation to prevent virtualization crashes");
 
-                // PROPER FIX: Disable async compilation that causes completion queue crashes
-                if ([_device name] && ([[_device name] containsString:@"AGX"])) {
-                    NSLog(@"MGL INFO: AGX virtualization detected - using safe synchronous compilation");
+                    // PROPER FIX: Disable async compilation that causes completion queue crashes
+                    if ([_device name] && ([[_device name] containsString:@"AGX"])) {
+                        NSLog(@"MGL INFO: AGX virtualization detected - using safe synchronous compilation");
+                    }
+
+                    NSLog(@"MGL tess: pipeline: tessActive=%d vfn=%@ ffn=%@ vd=%@",
+                              (int)[self extTessActive],
+                              pipelineStateDescriptor.vertexFunction.name,
+                              pipelineStateDescriptor.fragmentFunction.name,
+                              pipelineStateDescriptor.vertexDescriptor);
                 }
 
-                NSLog(@"MGL tess: pipeline: tessActive=%d vfn=%@ ffn=%@ vd=%@",
-                          (int)[self extTessActive],
-                          pipelineStateDescriptor.vertexFunction.name,
-                          pipelineStateDescriptor.fragmentFunction.name,
-                          pipelineStateDescriptor.vertexDescriptor);
-
+                uint64_t p3 = mgl_prof_begin(3);
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
-                NSLog(@"MGL tess: newRenderPipelineState returned %@ err=%@", _pipelineState, error);
-                fflush(stderr);
+                mgl_prof_end(3, p3);
+                if (mgl_pipeline_log)
+                    NSLog(@"MGL tess: newRenderPipelineState returned %@ err=%@", _pipelineState, error);
 
                 if (!_pipelineState) {
                     NSLog(@"MGL ERROR: Pipeline creation failed: %@", error);
@@ -3656,13 +3838,16 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 NSLog(@"MGL ERROR: Skipping pipeline creation to prevent crashes");
                 return false;
             } else {
-                NSLog(@"MGL INFO: Pipeline state created successfully");
+                if (mgl_pipeline_log)
+                    NSLog(@"MGL INFO: Pipeline state created successfully");
                 // gpuaudit: remember this configuration so the next identical one is a lookup
                 [self gpuauditStorePipeline: _pipelineState forDescriptor: pipelineStateDescriptor];
             }
             }
 
+            [self compatPipelineStore];
             ctx->state.dirty_bits &= ~(DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO);
+            }
         }
 
         //if (ctx->state.dirty_bits)
@@ -3709,7 +3894,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
 
     // Create a render command encoder.
-    [_currentRenderEncoder setRenderPipelineState: _pipelineState];
+    /* compat domain: skip the ObjC call when the encoder already has this
+     * pipeline (glmark2 switches programs per object; the state is unchanged
+     * for most draws) — MGLRenderer+Compat.m tracks the last binding */
+    if ([self compatPipelineBindNeeded])
+        [_currentRenderEncoder setRenderPipelineState: _pipelineState];
 
     if (draw_command)
         mglCallExtHooks(self, "PreDraw:", _currentRenderEncoder);
@@ -5611,6 +5800,9 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
 
     mgl_headless_context = true;
     [renderer createMGLRendererAndBindToContext: glm_ctx view: view];
+    mgl_headless_context = false;     /* per-bind flag: a later windowed bind must not inherit it
+                                       * (this leak gave every NSOpenGL window a 2x drawable ->
+                                       * glmark2 rendering into the bottom-left quarter) */
     return  (__bridge void *)(renderer);
 }
 
@@ -5695,7 +5887,29 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     // default drawable is always 200x200: [[NSScreen mainScreen] backingScaleFactor] is
     // 2.0 with a display attached but 1.0 over a bare SSH session, which silently halved
     // the default framebuffer and broke every pixel test that reads y >= 100.
-    int scaleFactor = mgl_headless_context ? 2 : [[NSScreen mainScreen] backingScaleFactor];
+    //
+    // NSOpenGL surface semantics (compat): a view with
+    // wantsBestResolutionOpenGLSurface == NO (the AppKit default) gets a GL surface in
+    // POINTS — the app sizes its viewport in points, so the layer must be 1:1
+    // (contentsScale 1, drawableSize = bounds) or rendering lands in the bottom-left
+    // quarter of the window on a 2x Retina screen (user-visible glmark2 bug).  YES
+    // gives a backing-sized surface like NSOpenGL does.
+    int scaleFactor;
+    if (mgl_headless_context)
+        scaleFactor = 2;
+    else
+    {
+        BOOL best = NO;
+        if ([view respondsToSelector: @selector(wantsBestResolutionOpenGLSurface)])
+            best = [(NSView *)view wantsBestResolutionOpenGLSurface];
+        if (getenv("MGL_DEBUG"))
+            NSLog(@"MGL DEBUG: windowed bind best=%d headless=%d", (int)best, (int)mgl_headless_context);
+        CGFloat s = best ? (view.window ? view.window.backingScaleFactor
+                                        : [[NSScreen mainScreen] backingScaleFactor])
+                         : (CGFloat)1.0;
+        scaleFactor = (int)(s * (s > 0 ? 1.0 : 0.0) + 0.5);
+        if (scaleFactor < 1) scaleFactor = 1;
+    }
     [_layer setContentsScale: scaleFactor];
 
     // AGX-safe layer attachment
@@ -6121,7 +6335,7 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     // Commit with exception handling
     @try {
         /* per-commit logging is opt-in: it is 1000+ lines per frame for some workloads */
-        static BOOL mgl_log_cmdbuf = -1;
+        static int mgl_log_cmdbuf = -1;
         if (mgl_log_cmdbuf < 0) mgl_log_cmdbuf = getenv("MGL_DEBUG_CMDBUF") ? YES : NO;
         if (mgl_log_cmdbuf)
             NSLog(@"MGL AGX: Committing command buffer (status: %ld)", (long)status);
