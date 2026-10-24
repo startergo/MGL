@@ -244,6 +244,7 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 
 - (void) bindMTLBuffer:(Buffer *) ptr;- (bool) mapGLBuffersToMTLBufferMap:(BufferMapList *)buffer_map stage: (int) stage;
 - (bool) mapBuffersToMTL;
+- (Buffer *) nullShaderBuffer;   /* MGLRenderer.m: zero-filled dummy for unbound [[buffer(n)]] slots */
 - (bool) updateDirtyBuffer:(Buffer *)ptr;
 - (bool) checkForDirtyBufferData: (BufferMapList *)buffer_map_list;
 - (bool) updateDirtyBaseBufferList: (BufferMapList *)buffer_map_list;

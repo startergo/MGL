@@ -151,6 +151,17 @@ typedef struct MGLGeomVar {
 
 typedef struct { char name[64]; int msl; } MGLGeomTexSlot;
 
+/* GL atomic-counter (atomic_uint) declaration of a stage, for the MSL argument
+ * injection below — program.c collects them from the stage's SPIR-V; geometry.c
+ * from the geometry stage's module for the emulation kernel */
+#define MGL_MAX_ATOMIC_VARS 32
+typedef struct MGLAtomicCounterVar
+{
+    const char *name;      /* points at name_buf once collected in program.c */
+    char name_buf[256];
+    unsigned offset;       /* SpvDecorationOffset, byte offset into the counter buffer */
+} MGLAtomicCounterVar;
+
 typedef struct MGLGeomProgram {
     Program  *program;      /* owner (link-time program; NULL when the entry is free) */
     GLuint    name;
@@ -182,6 +193,34 @@ typedef struct MGLGeomProgram {
      * rebases its `<name>_atomic [[buffer(N)]]` arguments into the span above the user
      * pins; geomBindStageBuffers binds the per-unit sidecar through this map */
     MGLGeomTexSlot atom_slots_gs[32];  int n_atom_slots_gs;
+
+    /* atomic counters of the geometry stage (see geometry.c): the kernel's MSL gets the
+     * atomic_uint arguments mgl_msl_inject_atomic_counters appends, ONE per GLSL
+     * declaration, at the flat ordinals the renderer's buffer map gives the
+     * atomic-counter group (the uniform-block + uniform-constant + storage-buffer totals).
+     * geomBindStageBuffers binds them itself — the map's own atomic-counter entries expand
+     * a declaration (atomic_uint acs[N]) into one entry per ELEMENT, which does not match
+     * the one-pointer-per-declaration arguments and can run past the user slot range into
+     * the emulation's pinned buffers. */
+    MGLAtomicCounterVar ac_vars[MGL_MAX_ATOMIC_VARS];
+    GLuint ac_binding[MGL_MAX_ATOMIC_VARS];  /* GL atomic-counter buffer binding point */
+    int    ac_msl[MGL_MAX_ATOMIC_VARS];      /* Metal buffer index of the kernel argument */
+    int    n_ac_vars;
+    int    ac_base;                          /* the buffer map's ordinal of the group (the
+                                                  renderer skips the map's own entries there,
+                                                  which expand arrays one slot per element) */
+    bool   array_len;                        /* the kernel uses SSBO .length() (slot 21 is
+                                                  then reserved for the size constants) */
+
+    /* atomic counters of the VERTEX stage: the capture variant is the only vertex
+     * function of a geometry program (the normal vertex MSL is not), so ITS MSL gets the
+     * injected atomic_uint arguments (geom_build) and geomCapturePass binds the GL atomic
+     * counter buffers at the recorded indices */
+    MGLAtomicCounterVar vs_ac_vars[MGL_MAX_ATOMIC_VARS];
+    GLuint vs_ac_binding[MGL_MAX_ATOMIC_VARS];
+    int    vs_ac_msl[MGL_MAX_ATOMIC_VARS];
+    int    n_vs_ac_vars;
+    int    vs_ac_map_base;                   /* the vertex buffer map's ordinal of the group */
 
     GLenum    in_type;      /* GL_POINTS / GL_LINES / GL_LINES_ADJACENCY / GL_TRIANGLES / GL_TRIANGLES_ADJACENCY */
     GLenum    out_type;     /* GL_POINTS / GL_LINE_STRIP / GL_TRIANGLE_STRIP */
@@ -342,14 +381,11 @@ uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);
 /* MSL pass (program.c): declare GL atomic-counter (atomic_uint) arguments SPIRV-Cross
- * omits — see geometry.c for the buffer-index scheme */
-#define MGL_MAX_ATOMIC_VARS 32
-typedef struct MGLAtomicCounterVar
-{
-    const char *name;      /* points at name_buf once collected in program.c */
-    char name_buf[256];
-    unsigned offset;       /* SpvDecorationOffset, byte offset into the counter buffer */
-} MGLAtomicCounterVar;
+ * omits — see geometry.c for the buffer-index scheme (MGLAtomicCounterVar above) */
+int  mgl_geom_stage_ac_arg_base(Program *program, int stage);   /* geometry.c: the Metal
+    buffer index program.c's injected atomic-counter arguments of `stage` start at, -1 if
+    none — a recompiled variant of the stage (the XFB capture variant) shares the normal
+    MSL's argument order and takes the arguments at the same indices */
 char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
                                      const MGLAtomicCounterVar *vars, int nvars,
                                      int max_metal_index, int forced_base, int *indices_out);

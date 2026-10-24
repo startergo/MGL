@@ -1819,6 +1819,52 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     snprintf(entry, sizeof(entry), "mgl_xfb_vertex_%u", xp->name);
     xp->msl = xfb_spirv_to_msl(ctx, ir, words, entry);
     if (!xp->msl) { xfb_fail(xp, "capture variant MSL translation failed", NULL, NULL); goto done; }
+    /* atomic counters of the vertex stage: SPIRV-Cross declares no atomic_uint arguments
+     * at all (see geometry.c's mgl_msl_inject_atomic_counters), so the capture variant's
+     * MSL gets the same injected arguments as the normal vertex MSL, at the same Metal
+     * buffer indices — the capture pass binds the vertex buffer map, whose
+     * atomic-counter entries carry those indices (bindVertexBuffersToCurrentRenderEncoder).
+     * The names/offsets come from the original stage compiler; the variant recompiles the
+     * same declarations in the same order, so the arguments line up declaration for
+     * declaration (KHR-GL46.shader_atomic_counters basic-usage-vs) */
+    {
+        const spvc_reflected_resource *aclist = NULL;
+        size_t naclist = 0;
+
+        spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_ATOMIC_COUNTER,
+                                                  &aclist, &naclist);
+        if (naclist > 0)
+        {
+            int base = mgl_geom_stage_ac_arg_base(xp->program, _VERTEX_SHADER);
+
+            if (base >= 0)
+            {
+                MGLAtomicCounterVar atvars[MGL_MAX_ATOMIC_VARS];
+                int idx[MGL_MAX_ATOMIC_VARS], n = 0;
+
+                for (size_t k = 0; k < naclist && n < MGL_MAX_ATOMIC_VARS; k++)
+                {
+                    snprintf(atvars[n].name_buf, sizeof atvars[n].name_buf, "%s",
+                             aclist[k].name ? aclist[k].name : "");
+                    atvars[n].name = atvars[n].name_buf;
+                    atvars[n].offset = spvc_compiler_get_decoration(c, aclist[k].id,
+                                                                   SpvDecorationOffset);
+                    n++;
+                }
+                char *injected = mgl_msl_inject_atomic_counters(xp->msl, entry, atvars, n,
+                                                                MGL_XFB_MSL_BUFFER_INDEX,
+                                                                base, idx);
+                if (injected)
+                {
+                    free(xp->msl);
+                    xp->msl = injected;
+                }
+                else
+                    xfb_fail(xp, "capture variant atomic counter arguments could not be "
+                                 "declared", NULL, NULL);
+            }
+        }
+    }
     xp->entry = strdup(entry);
     /* SPIRV-Cross derives gl_VertexID / gl_InstanceID from [[vertex_id]] / [[instance_id]],
      * which in Metal include vertexStart / baseInstance unless it subtracts the bases itself */

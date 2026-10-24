@@ -5354,6 +5354,48 @@ done:
     return ok;
 }
 
+/* enumerate a stage module's atomic-counter declarations: names, SPIR-V offsets and GL
+ * buffer binding points (glslang emits ONE AtomicCounter variable per declaration, an
+ * array declaration is one variable of OpTypeArray).  Returns the total number of
+ * declarations in the module (filling at most `max`); *n_counters / *n_buffers report
+ * the counters used (array elements count individually) and the distinct buffers. */
+static int geom_module_ac_vars(SpvModule *m, MGLAtomicCounterVar *vars, GLuint *bindings,
+                               int max, int *n_counters, int *n_buffers)
+{
+    uint32_t dbind[MGL_MAX_ATOMIC_VARS];
+    int nac = 0, nacb = 0, nvars = 0;
+
+    for (int i = 0; i < m->n_vars; i++)
+    {
+        SpvVar *v = &m->vars[i];
+        uint32_t bind = 0, asz = 1;
+        bool seen = false;
+
+        if (v->storage != SpvStorageClassAtomicCounter) continue;
+        spv_value_type(m, v->type_id, &asz);
+        spv_deco(m, v->id, SpvDecorationBinding, &bind);
+        nac += (int)asz;
+        for (int k = 0; k < nacb; k++)
+            if (dbind[k] == bind) { seen = true; break; }
+        if (!seen && nacb < MGL_MAX_ATOMIC_VARS)
+            dbind[nacb++] = bind;
+        if (nvars < max)
+        {
+            const char *nm = spv_name(m, v->id);
+
+            snprintf(vars[nvars].name_buf, sizeof vars[nvars].name_buf, "%s", nm ? nm : "");
+            vars[nvars].name = vars[nvars].name_buf;
+            vars[nvars].offset = 0;
+            spv_deco(m, v->id, SpvDecorationOffset, &vars[nvars].offset);
+            bindings[nvars] = bind;
+            nvars++;
+        }
+    }
+    if (n_counters) *n_counters = nac;
+    if (n_buffers) *n_buffers = nacb;
+    return nvars;
+}
+
 bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int stage,                            const uint32_t *words, size_t nwords, const char *entry, char **log)
 {
     MGLProgramObj *obj = (MGLProgramObj *)obj_p;
@@ -5430,37 +5472,43 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         goto done;
     }
 
-    /* link-time limit check: MGL reports MAX_GEOMETRY_ATOMIC_COUNTERS and
-     * MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS as 0 (see get.c - the geometry emulation has no
-     * atomic counter support yet), so a geometry shader that declares ANY atomic counter
-     * must fail the link, exactly as GL 4.6 7.11 does when the stage exceeds its limits
-     * (the CTS linking.more_ACs_in_GS / more_ACBs_in_GS_than_supported shape) */
+    /* link-time limit check + enumeration: the geometry kernel takes the atomic_uint
+     * arguments mgl_msl_inject_atomic_counters declares (see geom_build), so the stage
+     * supports the counters the queries report; a shader that exceeds them must fail the
+     * link, exactly as GL 4.6 7.11 requires when a stage's resources exceed its limits
+     * (the CTS linking.more_ACs_in_GS / more_ACBs_in_GS_than_supported shape). */
     {
-        uint32_t bindings[64];
-        int nac = 0, nacb = 0;
+        int nac = 0, nacb = 0, nvars;
+        GLint max_ac = 0, max_acb = 0;
 
-        for (i = 0; i < m->n_vars; i++)
+        nvars = geom_module_ac_vars(m, gp->ac_vars, gp->ac_binding, MGL_MAX_ATOMIC_VARS,
+                                    &nac, &nacb);
+        mglGetIntegerv(ctx, GL_MAX_GEOMETRY_ATOMIC_COUNTERS, &max_ac);
+        mglGetIntegerv(ctx, GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS, &max_acb);
+        if (nac > max_ac)
         {
-            SpvVar *v = &m->vars[i];
-            uint32_t bind = 0;
-            int k;
-            bool seen = false;
-
-            if (v->storage != SpvStorageClassAtomicCounter) continue;
-            nac++;
-            if (spv_deco(m, v->id, SpvDecorationBinding, &bind))
-                for (k = 0; k < nacb; k++)
-                    if (bindings[k] == bind) { seen = true; break; }
-            if (!seen && nacb < 64) bindings[nacb++] = bind;
-        }
-        if (nac > 0)
-        {
-            mgl_append_log(log, "ERROR: geometry: the geometry stage uses %d atomic counter(s) in "
-                                "%d buffer(s), but MAX_GEOMETRY_ATOMIC_COUNTERS and "
-                                "MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS are 0 (no geometry-stage "
-                                "atomic counter support)\n", nac, nacb);
+            mgl_append_log(log, "ERROR: geometry: the geometry stage uses %d atomic counter(s), "
+                                "but the limit is %d\n", nac, max_ac);
             goto done;
         }
+        if (nacb > max_acb)
+        {
+            mgl_append_log(log, "ERROR: geometry: the geometry stage uses %d atomic counter "
+                                "buffer(s), but the limit is %d\n", nacb, max_acb);
+            goto done;
+        }
+        if (nvars > MGL_MAX_ATOMIC_VARS)
+        {
+            mgl_append_log(log, "ERROR: geometry: the geometry stage declares %d atomic "
+                                "counter variables; the Metal emulation supports %d\n",
+                           nvars, (int)MGL_MAX_ATOMIC_VARS);
+            goto done;
+        }
+        /* recorded for the kernel build (geom_build injects the arguments;
+         * geomBindStageBuffers binds the GL atomic counter buffers there) */
+        gp->n_ac_vars = nvars;
+        gp->ac_base = 0;
+        for (int i = 0; i < nvars; i++) gp->ac_msl[i] = -1;
     }
 
     /* fp64: `words` is already software-double lowered (u32 words).  The
@@ -5711,6 +5759,92 @@ static bool msl_value_parameters(char *msl, const char *entry)
     return removed > 0;
 }
 
+/* the Metal buffer index the renderer's buffer map (mapGLBuffersToMTLBufferMap) gives the
+ * geometry stage's atomic-counter group: after the uniform-block group (one entry per
+ * block, instance arrays expanded), the uniform-constant group (one entry per resource —
+ * the map never expands those: a sampler array is ONE array<texture> argument — including
+ * the default-uniform block wherever the introspect domain's link hook moved it: moving it
+ * between the two groups keeps the total) and the storage-buffer group (instance arrays
+ * expanded).  This mirrors the map's enumeration loop entry for entry, including its
+ * skip-ahead after an expanded instance array. */
+static int geom_stage_ac_base(Program *program, int stage)
+{
+    static const int types[3] = {
+        SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
+        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT,
+        SPVC_RESOURCE_TYPE_STORAGE_BUFFER
+    };
+    int base = 0;
+
+    for (int t = 0; t < 3; t++)
+    {
+        SpirvResourceList *rl = &program->spirv_resources_list[stage][types[t]];
+
+        for (GLuint i = 0; i < rl->count; i++)
+        {
+            GLuint elems = (types[t] == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) ? 1 :
+                           (rl->list[i].array_size ? rl->list[i].array_size : 1);
+
+            base += (int)elems;
+            if (elems > 1)
+            {
+                /* the map skips the flattened instance entries an expanded array covers */
+                GLuint skip = elems - 1;
+
+                if (skip > rl->count - i - 1) skip = rl->count - i - 1;
+                i += skip;
+            }
+        }
+    }
+    return base;
+}
+
+/* the highest [[buffer(n)]] argument index below the kernel pool slots in the kernel
+ * entry's signature — the user resources geom_build_pins placed.  The atomic-counter
+ * arguments are appended above it, so they can not collide with them (the buffer map's
+ * own ordinals — which the renderer binds at, one entry per user resource — do not
+ * count sampler arrays, which the pins pin as TEXTURE arguments in the same numbering,
+ * so the two can differ; the atomic-counter binding is by the indices recorded here). */
+static int geom_msl_kernel_buffer_top(const char *msl, const char *entry)
+{
+    char pat[128];
+    const char *p;
+    int top = -1;
+
+    snprintf(pat, sizeof pat, "void %s(", entry);
+    p = strstr(msl, pat);
+    if (!p) return -1;
+    p += strlen(pat);
+    while (*p && *p != '{' && *p != ';')
+    {
+        if (p[0] == '[' && p[1] == '[' && !strncmp(p + 2, "buffer(", 7))
+        {
+            char *end;
+            long n = strtol(p + 9, &end, 10);
+
+            if (end != p + 9 && n >= 0 && n < MGL_GEOM_KERNEL_USER_SLOTS && (int)n > top)
+                top = (int)n;
+            p = end;
+            continue;
+        }
+        p++;
+    }
+    return top;
+}
+
+int mgl_geom_stage_ac_arg_base(Program *program, int stage)
+{
+    SpirvResourceList *rl;
+
+    if (!program || stage < 0 || stage >= _MAX_SHADER_TYPES) return -1;
+    rl = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_ATOMIC_COUNTER];
+    if (rl->count == 0 || !rl->list) return -1;
+    if (rl->list[0].msl_binding == 0xffffffffu) return -1;
+    /* program.c refined msl_binding[i] to the index mgl_msl_inject_atomic_counters gave
+     * declaration i (ac_base + i), so the first entry carries the group's base */
+    return (int)rl->list[0].msl_binding;
+}
+
 /* build (or rebuild) the emulation for one geometry stage; `program` is the program that
  * owns the vertex + geometry stages (a linked program, or a pipeline's composite) */
 /* forward: defined below mgl_geom_post_link's helpers */
@@ -5786,6 +5920,10 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
          * layout so the output carries the primitive id word */
         geom_layout(gp);
     }
+    /* a relink may drop the atomic counters the previous build recorded (the stages are
+     * recompiled before this runs); mgl_geom_compile_stage fills gp->ac_* again */
+    gp->n_vs_ac_vars = 0;
+    gp->vs_ac_map_base = 0;
 
     if (gp->from_tess)
     {
@@ -5845,6 +5983,20 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             }
             spv_free(c_vs);
         }
+        /* the vertex stage's atomic counters: the capture variant below is the only
+         * vertex function of a geometry program (the normal vertex MSL is not used), so
+         * it needs the injected atomic_uint arguments — enumerate the declarations here
+         * (the module is the program's vertex stage) */
+        gp->n_vs_ac_vars = geom_module_ac_vars(p_vs, gp->vs_ac_vars, gp->vs_ac_binding,
+                                               MGL_MAX_ATOMIC_VARS, NULL, NULL);
+        gp->vs_ac_map_base = geom_stage_ac_base(program, _VERTEX_SHADER);
+        if (gp->n_vs_ac_vars > MGL_MAX_ATOMIC_VARS)
+        {
+            spv_free(p_vs);
+            GEOM_FAIL("vertex stage declares %d atomic counter variables; the Metal "
+                      "emulation supports %d", gp->n_vs_ac_vars, (int)MGL_MAX_ATOMIC_VARS);
+        }
+        for (int i = 0; i < gp->n_vs_ac_vars; i++) gp->vs_ac_msl[i] = -1;
         spv_free(p_vs);
     }
     pins_gl[0] = MGL_GEOM_SSBO_VSOUT;
@@ -5856,6 +6008,30 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
     /* the renamed vertex main is called from the generated entry point */
     msl_value_parameters(msl, "mgl_geom_vs_main(");
+
+    /* atomic counters of the vertex stage: the capture variant's MSL gets the injected
+     * atomic_uint arguments (mgl_msl_inject_atomic_counters, geometry.c), one per GLSL
+     * declaration, placed above the variant's own user buffer arguments;
+     * geomCapturePass binds the GL atomic counter buffers at the recorded indices
+     * (NOT at the vertex buffer map's own atomic-counter ordinals) */
+    if (gp->n_vs_ac_vars > 0)
+    {
+        int idx[MGL_MAX_ATOMIC_VARS];
+        int base = geom_msl_kernel_buffer_top(msl, gp->capture_entry) + 1;
+        int maxidx = strstr(msl, "spvBufferSizeConstants") ? MGL_GEOM_KERNEL_SIZE_BUFFER :
+                                                            MGL_GEOM_KERNEL_USER_SLOTS;
+        char *injected = mgl_msl_inject_atomic_counters(msl, gp->capture_entry,
+                                                        gp->vs_ac_vars, gp->n_vs_ac_vars,
+                                                        maxidx, base, idx);
+
+        if (!injected)
+            GEOM_FAIL("vertex stage atomic counter buffer arguments could not be "
+                      "declared: %d declarations at Metal buffer %d",
+                      gp->n_vs_ac_vars, base);
+        free(msl);
+        msl = injected;
+        for (int i = 0; i < gp->n_vs_ac_vars; i++) gp->vs_ac_msl[i] = idx[i];
+    }
     gp->capture_msl = msl;
     geom_dump("capture.msl", msl);
     gp->vid_absolute = strstr(msl, "[[base_vertex]]") == NULL;
@@ -5899,15 +6075,17 @@ build:
              * stage's program resources must fit in the slots below them */
             int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
                                        gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
+            bool array_len = spv_uses_array_length(ir, words) != 0;
             gs_span = span;
 
+            gp->array_len = array_len;
+            gp->ac_base = geom_stage_ac_base(program, _GEOMETRY_SHADER);
             if (span > MGL_GEOM_KERNEL_USER_SLOTS ||
-                (span > MGL_GEOM_KERNEL_SIZE_BUFFER &&
-                 spv_uses_array_length(ir, words)))
+                (span > MGL_GEOM_KERNEL_SIZE_BUFFER && array_len))
                 GEOM_FAIL("geometry stage resources span %d argument slots; the compute "
                           "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS%s)",
                           span, (int)MGL_GEOM_KERNEL_USER_SLOTS,
-                          spv_uses_array_length(ir, words) ?
+                          array_len ?
                           ", and MGL_GEOM_KERNEL_SIZE_BUFFER is reserved for SSBO "
                           ".length() sizes" : "");
         }
@@ -5967,6 +6145,33 @@ build:
         }
     }
     msl_value_parameters(msl, "mgl_gs_main(");
+
+    /* atomic counters: the kernel's MSL gets the atomic_uint arguments the standard
+     * stages declare (mgl_msl_inject_atomic_counters, geometry.c), one per GLSL
+     * declaration, placed above the kernel's own user buffer arguments (the MSL
+     * compile happens after the entry rename, so the stable kernel name is the entry
+     * the counter uses are threaded into — the GS body is the mgl_gs_main helper the
+     * entry calls, and msl_msl_counters_to_helper_params adds the trailing parameters).
+     * The renderer binds the GL atomic-counter buffers at the recorded indices
+     * (geomBindStageBuffers), NOT at the buffer map's own atomic-counter ordinals. */
+    if (gp->n_ac_vars > 0)
+    {
+        int idx[MGL_MAX_ATOMIC_VARS];
+        int base = geom_msl_kernel_buffer_top(msl, gp->kernel_entry) + 1;
+        int maxidx = gp->array_len ? MGL_GEOM_KERNEL_SIZE_BUFFER :
+                                     MGL_GEOM_KERNEL_USER_SLOTS;
+        char *injected = mgl_msl_inject_atomic_counters(msl, gp->kernel_entry, gp->ac_vars,
+                                                        gp->n_ac_vars, maxidx, base, idx);
+
+        if (!injected)
+            GEOM_FAIL("geometry stage atomic counter buffer arguments could not be "
+                      "declared: %d declarations at Metal buffer %d (the kernel's user "
+                      "arguments span %d slots)", gp->n_ac_vars, base, base);
+        free(msl);
+        msl = injected;
+        for (int i = 0; i < gp->n_ac_vars; i++)
+            gp->ac_msl[i] = idx[i];
+    }
     gp->kernel_msl = msl;
     geom_dump("kernel.msl", msl);
 

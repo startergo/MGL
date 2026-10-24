@@ -3047,6 +3047,14 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         Buffer *b = list.buffers[i].buf;
         GLintptr off = list.buffers[i].offset;
         if (!b) return false;
+        /* geometry-stage atomic counters are bound below, at the kernel's injected
+         * argument slots: the map's own atomic-counter entries expand a declaration
+         * (atomic_uint acs[N]) into one entry per ELEMENT, while the kernel has ONE
+         * pointer argument per declaration (mgl_msl_inject_atomic_counters), and the
+         * expansion can run past the user slot range into the emulation's own pinned
+         * buffers — so the group is never bound from the list */
+        if (gp->n_ac_vars > 0 && i >= gp->ac_base) break;
+        if (i >= MGL_GEOM_KERNEL_USER_SLOTS) break;
         /* glBindBufferRange binds a *slice* of the buffer: the entry's offset is where the
          * resource starts.  Binding offset 0 instead made every range binding of one buffer
          * alias the buffer's start (KHR-GL46.geometry_shader.api.max_shader_storage_blocks
@@ -3081,6 +3089,43 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
 
+    /* geometry-stage atomic counters: one kernel argument per GLSL declaration
+     * (mgl_msl_inject_atomic_counters, geometry.c), bound to the GL atomic-counter
+     * buffer of its layout(binding=) point at the ordinal the map gives the group */
+    for (int i = 0; i < gp->n_ac_vars; i++)
+    {
+        GLuint unit = gp->ac_binding[i];
+        BufferBaseTarget *t = (unit < MAX_BINDABLE_BUFFERS) ?
+            &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER].buffers[unit] : NULL;
+        Buffer *b = t ? t->buf : NULL;
+        GLintptr off = t ? t->offset : 0;
+
+        if (!b)
+        {
+            b = [self nullShaderBuffer];
+            off = 0;
+        }
+        else
+        {
+            if (off < 0 || (GLsizeiptr)off > b->size) off = 0;
+            if (!b->data.mtl_data && b->data.dirty_bits)
+                if (![self updateDirtyBuffer: b]) return false;
+            if (!b->data.mtl_data) [self bindMTLBuffer: b];
+            /* the kernel writes the counters: an inline setBytes binding would
+             * silently drop them, so the buffer must be a real MTLBuffer */
+            if (!b->data.mtl_data) return false;
+            mgl_buffers_mark_gpu_use(ctx, b, true);
+        }
+        if (!b->data.mtl_data) continue;
+        [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
+                offset: (NSUInteger)off
+               atIndex: (NSUInteger)gp->ac_msl[i]];
+        if (getenv("MGL_SSBO_DEBUG"))
+            NSLog(@"MGL geom: gs kernel atomic counter %s: unit=%u at msl %d (off=%ld)",
+                  gp->ac_vars[i].name ? gp->ac_vars[i].name : "?", unit, gp->ac_msl[i],
+                  (long)off);
+    }
+
     /* the kernel variant's .length() sizes: geom_spirv_to_msl pins its
      * spvBufferSizeConstants at MGL_GEOM_KERNEL_SIZE_BUFFER, the one user-range slot the
      * pin span check keeps free when the variant reads .length() on an SSBO runtime
@@ -3092,9 +3137,14 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
     {
         uint32_t sizes[MAX_MAPPED_BUFFERS];
         GLuint n = 0;
+        /* the entries past the kernel's user arguments (the atomic-counter group and
+         * whatever the map's expansion added beyond it) are no SSBOs: their sizes would
+         * only grow the inline binding */
+        GLuint cap = (gp->n_ac_vars > 0 && gp->ac_base < MGL_GEOM_KERNEL_USER_SLOTS) ?
+                     (GLuint)gp->ac_base : MGL_GEOM_KERNEL_USER_SLOTS;
 
         memset(sizes, 0, sizeof sizes);
-        for (GLuint i = 0; i < list.count && i < MAX_MAPPED_BUFFERS; i++)
+        for (GLuint i = 0; i < list.count && i < MAX_MAPPED_BUFFERS && i < cap; i++)
         {
             BufferMap *m = &list.buffers[i];
             GLsizeiptr sz;
@@ -4120,6 +4170,14 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                           (b && b->data.buffer_data) ? *(unsigned *)b->data.buffer_data : 0,
                           (b && b->data.buffer_data && b->size >= 8) ? ((unsigned *)b->data.buffer_data)[1] : 0);
                 if (!b) continue;
+                /* vertex-stage atomic counters are bound below, at the capture variant's
+                 * injected argument slots: the map's own atomic-counter entries expand a
+                 * declaration into one entry per ELEMENT, while the variant has ONE
+                 * pointer argument per declaration, and the expansion can reach into the
+                 * variant's own user argument slots (the map does not count sampler
+                 * arrays, which the variant pins as texture arguments) */
+                if (gp->n_vs_ac_vars > 0 && i >= gp->vs_ac_map_base) break;
+                if (i >= MGL_GEOM_KERNEL_USER_SLOTS) break;
                 if (off < 0 || (GLsizeiptr)off > b->size) off = 0;
                 /* the program's default-uniform block lives in CPU memory until a draw
                  * flushes it; materialise it the way the render encoders do */
@@ -4139,6 +4197,37 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                               offset: (NSUInteger)off
                              atIndex: (NSUInteger)i];
                 mgl_buffers_mark_gpu_use(ctx, b, true);
+            }
+
+            /* vertex-stage atomic counters: one capture-variant argument per GLSL
+             * declaration (mgl_msl_inject_atomic_counters, geometry.c), bound to the GL
+             * atomic-counter buffer of its layout(binding=) point */
+            for (int i = 0; i < gp->n_vs_ac_vars && gp->vs_ac_msl[i] >= 0; i++)
+            {
+                GLuint unit = gp->vs_ac_binding[i];
+                BufferBaseTarget *t = (unit < MAX_BINDABLE_BUFFERS) ?
+                    &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER].buffers[unit] : NULL;
+                Buffer *b = t ? t->buf : NULL;
+                GLintptr off = t ? t->offset : 0;
+
+                if (!b)
+                {
+                    b = [self nullShaderBuffer];
+                    off = 0;
+                }
+                else
+                {
+                    if (off < 0 || (GLsizeiptr)off > b->size) off = 0;
+                    if (!b->data.mtl_data && b->data.dirty_bits)
+                        if (![self updateDirtyBuffer: b]) continue;
+                    if (!b->data.mtl_data) [self bindMTLBuffer: b];
+                    if (!b->data.mtl_data) continue;
+                    mgl_buffers_mark_gpu_use(ctx, b, true);
+                }
+                if (!b->data.mtl_data) continue;
+                [enc setVertexBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
+                              offset: (NSUInteger)off
+                             atIndex: (NSUInteger)gp->vs_ac_msl[i]];
             }
         }
 

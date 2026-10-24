@@ -705,16 +705,17 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(shader_storage_buffer_offset_alignment), 16));
 
         /* atomic counters */
-        /* vertex / fragment / compute stages declare the atomic_uint argument MGL itself
-         * injects into the MSL (SPIRV-Cross declares none — see geometry.c's
+        /* vertex / fragment / compute / geometry stages declare the atomic_uint argument
+         * MGL itself injects into the MSL (SPIRV-Cross declares none — see geometry.c's
          * mgl_msl_inject_atomic_counters) and bind atomic counter buffers through the
-         * same indexed binding points the renderer maps (8).  Tessellation and geometry
+         * same indexed binding points the renderer maps (8); the geometry emulation
+         * kernel gets the same injection (geometry.c: geom_build).  The tessellation
          * stages run as hand-authored kernels where the argument is not injected, so
          * they report 0 (glslang bakes the same 0 into gl_Max*AtomicCounterBuffers). */
         case GL_MAX_VERTEX_ATOMIC_COUNTER_BUFFERS: PUT1(MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS); /* see above */
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTER_BUFFERS:
-        case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS:
-        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */
+        case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTER_BUFFERS: PUT1(0);   /* see above */
+        case GL_MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS: PUT1(MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS); /* see above */
         case GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS:
         case GL_MAX_COMBINED_ATOMIC_COUNTER_BUFFERS:
@@ -722,7 +723,7 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_VERTEX_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_vertex_atomic_counters), 1024));
         case GL_MAX_TESS_CONTROL_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_tess_control_atomic_counters), 1024));
         case GL_MAX_TESS_EVALUATION_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_tess_evaluation_atomic_counters), 1024));
-        case GL_MAX_GEOMETRY_ATOMIC_COUNTERS: PUT1(0);
+        case GL_MAX_GEOMETRY_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_geometry_atomic_counters), 1024));
         case GL_MAX_FRAGMENT_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_fragment_atomic_counters), 1024));
         case GL_MAX_COMPUTE_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_compute_atomic_counters), 1024));
         case GL_MAX_COMBINED_ATOMIC_COUNTERS: PUT1(LIMIT(STATE_VAR(max_combined_atomic_counters), 1024));

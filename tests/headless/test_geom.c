@@ -1844,9 +1844,10 @@ TEST(vs_conditional_declarations)
 
 TEST(gs_atomic_counter_link_fails)
 {
-    /* MGL reports MAX_GEOMETRY_ATOMIC_COUNTERS / MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS = 0
-     * (no geometry-stage atomic counters), so a geometry shader using one must FAIL to
-     * link - the CTS linking.more_ACs_in_GS_than_supported shape */
+    /* geometry-stage atomic counters are implemented on the emulation kernel (geometry.c:
+     * mgl_msl_inject_atomic_counters), so a geometry shader using one LINKS and the
+     * counter counts every invocation; a shader exceeding the reported limits still
+     * fails the link (the CTS linking.more_ACs_in_GS_than_supported shape) */
     const char *gs =
         "#version 460 core\n"
         "layout(points) in;\n"
@@ -1854,7 +1855,27 @@ TEST(gs_atomic_counter_link_fails)
         "layout(binding = 0) uniform atomic_uint counter0;\n"
         "void main()\n"
         "{\n"
-        "    if (atomicCounter(counter0) == 0u) { gl_Position = vec4(0); EmitVertex(); }\n"
+        "    atomicCounterIncrement(counter0);\n"
+        "    gl_Position = vec4(0);\n"
+        "    EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    const char *gs_over =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices=1) out;\n"
+        "layout(binding = 0) uniform atomic_uint c0;\n"
+        "layout(binding = 1) uniform atomic_uint c1;\n"
+        "layout(binding = 2) uniform atomic_uint c2;\n"
+        "layout(binding = 3) uniform atomic_uint c3;\n"
+        "layout(binding = 4) uniform atomic_uint c4;\n"
+        "layout(binding = 5) uniform atomic_uint c5;\n"
+        "layout(binding = 6) uniform atomic_uint c6;\n"
+        "layout(binding = 7) uniform atomic_uint c7;\n"
+        "layout(binding = 8) uniform atomic_uint c8;\n"
+        "void main()\n"
+        "{\n"
+        "    if (atomicCounter(c0) == 0u) { gl_Position = vec4(0); EmitVertex(); }\n"
         "    EndPrimitive();\n"
         "}\n";
     GLuint p = glCreateProgram();
@@ -1866,6 +1887,40 @@ TEST(gs_atomic_counter_link_fails)
     glLinkProgram(p);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok)
+    {
+        char l[512] = "";
+        glGetProgramInfoLog(p, sizeof l, NULL, l);
+        printf("  link log: %s", l);
+    }
+
+    /* the counter must count every geometry invocation */
+    GLuint acb = 0, seed = 0;
+    glGenBuffers(1, &acb);
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, acb);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, 4, &seed, GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 0, acb);
+    glUseProgram(p);
+    { static const float pts[4] = { 0,0,0,0 }; setup(4, pts); }
+    glDrawArrays(GL_POINTS, 0, 4);
+    EXPECT_NO_GL_ERROR();
+    unsigned *m = (unsigned *)glMapBufferRange(GL_ATOMIC_COUNTER_BUFFER, 0, 4, GL_MAP_READ_BIT);
+    EXPECT_TRUE(m && *m == 4);
+    printf("  gs atomic counter = %u (want 4)\n", m ? *m : 0xffffffffu);
+    if (m) glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER);
+    glDeleteProgram(p);
+
+    /* nine atomic counter buffers exceeds MAX_GEOMETRY_ATOMIC_COUNTER_BUFFERS (8) */
+    p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER,
+        "#version 460 core\nlayout(location=0) in vec4 pos;\nvoid main(){ gl_Position = pos; }\n"));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs_over));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER,
+        "#version 460 core\nlayout(location=0) out vec4 c;\nvoid main(){ c = vec4(1); }\n"));
+    glLinkProgram(p);
+    ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
     EXPECT_EQ_INT(ok, GL_FALSE);
     if (ok)
         printf("  link log: (linked, expected failure)\n");
@@ -1876,6 +1931,7 @@ TEST(gs_atomic_counter_link_fails)
         printf("  link log: %s", l);
     }
     glDeleteProgram(p);
+    glDeleteBuffers(1, &acb);
 }
 
 TEST(block_vs_fs_control)
