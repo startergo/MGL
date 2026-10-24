@@ -6988,10 +6988,18 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         if (xhave_elem && dot)
             dot = strchr(match, '.');      /* member part also lost the "[N]" */
         int j = -1;
+        /* pass 1: the name must be an output of the stage — a plain varying, an
+         * interface-block instance (whole block), or "<block|instance>.<member>".
+         * pass 2: GL 4.6 13.3.1 — a member of an output interface block may be named
+         * bare ("tc_position" of the TES's OUT_TE block; the tessellation CTS captures
+         * exactly this way), so fall back to matching a block member by name. */
+        for (int pass = 0; pass < 2 && j < 0; pass++)
         for (int k = 0; k < nvars; k++)
         {
             if (dot)
             {
+                if (pass)
+                    continue;
                 size_t ilen = (size_t)(dot - match);
                 /* a member is named "<instance>.<member>" in shader sources but "<block>.<member>"
                  * through the API (glTransformFeedbackVaryings names interface-block members by
@@ -7002,6 +7010,8 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                 { j = k; break; }
             }
             else if (!strcmp(vars[k].name, match))
+            { j = k; break; }
+            else if (pass && vars[k].block[0] && !strcmp(vars[k].member, match))
             { j = k; break; }
         }
         if (j < 0 || (xhave_elem && xelem >= vars[j].elems))
@@ -7568,6 +7578,16 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                     if (cu && nd2 && !strcmp(cu + 1, nd2 + 1))
                         hit = true;
                 }
+                /* a BARE member name (GL 4.6 13.3.1: interface-block members are named
+                 * without their block) against SPIRV-Cross's flattened "<instance>_<member>"
+                 * capture field ("tc_position" vs "te_data_tc_position") */
+                if (!hit && !strchr(nm, '.') && !strchr(nm, '['))
+                {
+                    size_t nl = strlen(nm);
+                    if (strlen(cn) > nl + 1 && cn[strlen(cn) - nl - 1] == '_' &&
+                        !strcmp(cn + strlen(cn) - nl, nm))
+                        hit = true;
+                }
             }
             if (hit)
             {
@@ -7650,28 +7670,6 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     src.capacity = c->records ? c->records : 1;
     /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
     src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
-
-    if (getenv("MGL_TESS_DUMP_CAP") && c->buffer_object && c->stride)
-    {
-        /* one-off diagnostics: the published capture as the xfb encode kernel sees
-         * it (chasing CTS point-mode count mismatches; pair=true means the draw ran
-         * through a separable-pipeline pair record) */
-        MGLTessProgram *atp = mgl_tess_active_program(ctx);
-
-        fprintf(stderr, "tessxfb: capstride=%uw per_prim=%u records=%u prim=%s nvars=%d bstride=%u"
-                " tfsize=%d bufsz=%d bufname=%u tp=%p pair=%d has_tcs=%d dom=%d pm=%d:",
-                c->stride, src.per_prim, c->records,
-                c->prim == GL_TRIANGLES ? "TRI" : c->prim == GL_LINES ? "LINE" : "PTS", xp->count,
-                xp->stride[0], (int)tfb[0].size,
-                tfb[0].buf ? (int)tfb[0].buf->size : -1,
-                tfb[0].buf ? tfb[0].buf->name : 0,
-                (void *)atp, atp->pair_program != NULL,
-                atp->has_tcs, atp->domain, atp->point_mode);
-        for (GLsizei i = 0; i < xp->count; i++)
-            fprintf(stderr, " %s(w%u src%u off%u)", xp->vars[i].name ? xp->vars[i].name : "?",
-                    xp->vars[i].words, xp->vars[i].src_word, xp->vars[i].offset);
-        fprintf(stderr, "\n");
-    }
 
     return geom_xfb_tess_encode(ctx, o, xp, tfb, &src);
 }

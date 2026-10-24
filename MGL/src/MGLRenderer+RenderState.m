@@ -352,14 +352,25 @@ static bool rs_mode_is_polygon(GLenum m)
     /* geom: the vertex stage's shadow-sampling emulation carries its own function
      * constants (32010+slot) that must be specialized even when the rstate fixups
      * did not patch this MSL (e.g. a vertex function without a [[position]] output) */
+    /* a STANDIN Shader (geometry vertex override, tessellation plain/hardware TES
+     * variant) is compiled from its own MSL, not program->spirv[stage]: this test must
+     * not reject it because the program's stage MSL is unpatched — the standin's own
+     * fixup (clip flip / PROGRAM_POINT_SIZE) is what needs the constants.  Seen as
+     * size-1 points when a GS consumed tessellated points while the program's vertex
+     * MSL had no position output to patch.  Specializing a function that declares no
+     * constants is a harmless rebuild. */
+    bool standinFn = shader && shader->mtl_data.function && program &&
+                     program->shader_slots[stage] &&
+                     shader->mtl_data.function != program->shader_slots[stage]->mtl_data.function;
     if (!mgl_rstate_msl_is_patched(msl) &&
-        !(msl && strstr(msl, "mgl_shadow_op_") != NULL))
+        !(msl && strstr(msl, "mgl_shadow_op_") != NULL) && !standinFn)
         return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
     id<MTLFunction> base = (__bridge id<MTLFunction>)shader->mtl_data.function;
     MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
     NSString *key;
+
 
     if (is_vertex_like) {
         bool z01 = rs->clip_depth_mode == GL_ZERO_TO_ONE;
@@ -506,7 +517,21 @@ static bool rs_mode_is_polygon(GLenum m)
          * the pipeline (built with no tessellation vertex descriptor) fails to create.
          * xfb capture renders through the plain TES as well (mgl_tess_plain_render). */
         if (mgl_tess_plain_render(ctx))
-            desc.vertexFunction = (__bridge id<MTLFunction>)tp->plain_function;
+        {
+            /* specialize the plain TES like the hardware variant below: it carries the
+             * vertex fixup (clip flip + PROGRAM_POINT_SIZE / point size function
+             * constants).  Without this the defaults applied and the TES's gl_PointSize
+             * was dropped (point_mode.point_rendering failed: size-1 points). */
+            Shader standin;
+            Shader *tsh = program->shader_slots[_TESS_EVALUATION_SHADER];
+
+            memset(&standin, 0, sizeof standin);
+            standin.entry_point = tsh ? tsh->entry_point : NULL;
+            standin.mtl_data.function = tp->plain_function;
+            standin.mtl_data.library = tp->plain_library;
+            id<MTLFunction> vf = [self rstateSpecialize: &standin stage: _TESS_EVALUATION_SHADER];
+            desc.vertexFunction = vf ? vf : (__bridge id<MTLFunction>)tp->plain_function;
+        }
         else if (!geomOwnsVertex)
         {
             Shader *vsh = program->shader_slots[vstage];

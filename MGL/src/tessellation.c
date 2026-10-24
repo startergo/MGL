@@ -388,6 +388,7 @@ static bool msl_tcs_record_names(const char *msl, char *in_name, size_t in_len,
                                  char *out_name, size_t out_len);
 static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp);
 static char *tcs_inject_float_levels(const char *msl);
+static char *tcs_redirect_tri_inner1(char *msl);
 static char *tcs_patch_primid(const char *msl);
 
 /* ------------------------------------------------------------------ MSL struct layout
@@ -3207,7 +3208,19 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                     if (tp->tcs_patch_out[j].key == m->key &&
                         tp->tcs_patch_out[j].key != 0)
                     {
-                        memcpy(dst + m->offset, src + tp->tcs_patch_out[j].offset, m->size);
+                        size_t so = tp->tcs_patch_out[j].offset;
+
+                        /* flattened element ("name_N", array_idx N) of a canonical
+                         * spvUnsafeArray patch output: advance the source by the element
+                         * stride (the GPU blob map needed the same fix) */
+                        if (m->array_idx && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
+                        {
+                            size_t align = 1, whole = 0;
+
+                            if (msl_element_type(tp->tcs_patch_out[j].type, &align, &whole))
+                                so += m->array_idx * (whole / msl_array_len(tp->tcs_patch_out[j].type));
+                        }
+                        memcpy(dst + m->offset, src + so, m->size);
                         break;
                     }
                 }
@@ -4487,12 +4500,31 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
      * this way; the hardware descriptor overrides the level members to the factor
      * buffer at draw time) */
     for (int i = 0; i < tp->num_tes_patch_in; i++)
+    {
         for (int j = 0; j < canon_patch.n; j++)
             if (tp->tes_patch_in[i].key == canon_patch.m[j].key)
             {
                 tp->tes_patch_in[i].offset = canon_patch.m[j].offset;
+                /* flattened array element ("name_N", array_idx N) of a canonical
+                 * spvUnsafeArray member: advance by the element stride (mirrors the
+                 * control-point fixup above — without it every element read at the
+                 * array's base offset, and 'patch in int r[16]' returned r[0] always) */
+                if (tp->tes_patch_in[i].array_idx && strstr(canon_patch.m[j].type, "spvUnsafeArray"))
+                {
+                    size_t align = 1, size = 0;
+
+                    if (msl_element_type(canon_patch.m[j].type, &align, &size))
+                        tp->tes_patch_in[i].offset = canon_patch.m[j].offset +
+                            tp->tes_patch_in[i].array_idx *
+                            (size / msl_array_len(canon_patch.m[j].type));
+                }
                 break;
             }
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: tes_patch_in[%d] '%s' key=%x idx=%u off=%zu (stride %zu)\n",
+                    i, tp->tes_patch_in[i].name, tp->tes_patch_in[i].key,
+                    tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].offset, canon_patch.size);
+    }
     tp->tes_patch_in_size = canon_patch.size;
     if (canon_patch.size)
         tp->tcs_patch_out_size = canon_patch.size;  /* the TCS patchOut is rewritten below */
@@ -4602,15 +4634,9 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                                     w + strlen(".insideTessellationFactor[0]"), tail);
                             w += strlen(".insideTessellationFactor");
                         }
-                        /* gl_TessLevelInner[1] is meaningless for triangles; map it onto the
-                         * scalar inside factor MTLTriangleTessellationFactorsHalf has */
-                        for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[1]")) != NULL; )
-                        {
-                            size_t tail = strlen(w + strlen(".insideTessellationFactor[1]")) + 1;
-                            memmove(w + strlen(".insideTessellationFactor"),
-                                    w + strlen(".insideTessellationFactor[1]"), tail);
-                            w += strlen(".insideTessellationFactor");
-                        }
+                        /* gl_TessLevelInner[1] is ignored for triangles (GL 4.6 11.2.3):
+                         * keep its store off the scalar inside factor */
+                        msl = tcs_redirect_tri_inner1(msl);
                         /* gl_TessLevelOuter[3] is unused for triangles and the factor record
                          * only has three edges: drop such stores (keeping the right-hand
                          * side's side effects) */
@@ -4964,13 +4990,9 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
                                 w + strlen(".insideTessellationFactor[0]"), tail);
                         w += strlen(".insideTessellationFactor");
                     }
-                    for (char *w = msl; (w = strstr(w, ".insideTessellationFactor[1]")) != NULL; )
-                    {
-                        size_t tail = strlen(w + strlen(".insideTessellationFactor[1]")) + 1;
-                        memmove(w + strlen(".insideTessellationFactor"),
-                                w + strlen(".insideTessellationFactor[1]"), tail);
-                        w += strlen(".insideTessellationFactor");
-                    }
+                    /* gl_TessLevelInner[1] is ignored for triangles (see
+                     * tcs_redirect_tri_inner1) */
+                    msl = tcs_redirect_tri_inner1(msl);
                     for (char *w = msl; (w = strstr(w, ".edgeTessellationFactor[3]")) != NULL; )
                     {
                         char *ls = w, *semi = strchr(w, ';'), *eq, *rhs;
@@ -5513,6 +5535,84 @@ static char *tcs_patch_primid(const char *msl)
  * ` mgl_levels[gl_PrimitiveID].o[i] = float(EXPR);` (inside -> .in[i]), and the
  * kernel signature gains `device mgl_tess_levels_f* mgl_levels [[buffer(30)]]`.
  * Returns a fresh string (caller frees) or NULL when nothing could be injected. */
+/* Triangle patches: gl_TessLevelInner[1] is IGNORED by GL (only [0] is the inside
+ * factor), but SPIRV-Cross lowers the array onto the scalar insideTessellationFactor
+ * of MTLTriangleTessellationFactorsHalf — a later [1] store would clobber the [0]
+ * value both the hardware tessellator and the emulated paths need (KHR-GL46
+ * point_mode.points_verification: inner written as (33,-1) collapsed to one ring).
+ * Route every [1] access to the float-levels record's in[1] slot, which is unused
+ * for triangles and keeps the expression (and side effects) evaluating.  Requires
+ * another tess-level store so tcs_inject_float_levels adds the mgl_levels buffer
+ * (a TCS writing only inner[1] is degenerate; keep the old behaviour there). */
+static char *tcs_redirect_tri_inner1(char *msl)
+{
+    const char *needle = "spvTessLevel";
+    bool touched = false;
+    char *out, *w;
+    size_t cap, len = 0;
+
+    if (!msl || !strstr(msl, ".insideTessellationFactor[1]"))
+        return msl;
+    if (!strstr(msl, ".insideTessellationFactor[0]") && !strstr(msl, ".edgeTessellationFactor"))
+        return msl;
+
+    cap = strlen(msl) + 4096;
+    out = (char *)malloc(cap);
+    if (!out)
+        return msl;
+    w = msl;
+    for (;;)
+    {
+        char *hit = strstr(w, needle);
+        char *at;
+        if (!hit)
+            break;
+        at = hit + strlen(needle);
+        if (*at != '[')
+        {
+            str_append(&out, &len, &cap, "%.*s", (int)(at - w), w);
+            w = at;
+            continue;
+        }
+        {
+            int depth = 0;
+            for (; *at; at++)
+            {
+                if (*at == '[')
+                    depth++;
+                else if (*at == ']')
+                {
+                    depth--;
+                    if (!depth)
+                    {
+                        at++;
+                        break;
+                    }
+                }
+            }
+        }
+        if (strncmp(at, ".insideTessellationFactor[1]", 28) != 0)
+        {
+            str_append(&out, &len, &cap, "%.*s", (int)(at - w), w);
+            w = at;
+            continue;
+        }
+        str_append(&out, &len, &cap, "%.*s", (int)(hit - w), w);
+        str_append(&out, &len, &cap, "%s",
+                   "mgl_levels[gl_PrimitiveID].in[1]");
+        touched = true;
+        w = at + 28;
+    }
+    if (!touched)
+    {
+        free(out);
+        return msl;
+    }
+    str_append(&out, &len, &cap, "%s", w);
+    free(msl);
+    return out;
+}
+
 static char *tcs_inject_float_levels(const char *msl)
 {
     const char *sig = strstr(msl, "spvTessLevel [[buffer(27)]]");
@@ -5677,7 +5777,21 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
             {
                 if (tp->tcs_patch_out[j].key == m->key)
                 {
+                    size_t elem = 0;
+
                     src = (uint32_t)tp->tcs_patch_out[j].offset;
+                    /* flattened element ("name_N", array_idx N) of a canonical
+                     * spvUnsafeArray patch output: advance the source by the element
+                     * stride — without it every element copied element 0's bytes into
+                     * its slot ('patch out int r[16]' read back as r[0] everywhere) */
+                    if (m->array_idx && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
+                    {
+                        size_t align = 1, whole = 0;
+
+                        if (msl_element_type(tp->tcs_patch_out[j].type, &align, &whole))
+                            elem = whole / msl_array_len(tp->tcs_patch_out[j].type);
+                    }
+                    src += (uint32_t)(m->array_idx * elem);
                     size = (uint32_t)m->size;
                     kind = MGL_TESS_BLOB_COPY;
                     found = true;

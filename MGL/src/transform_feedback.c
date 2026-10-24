@@ -418,16 +418,28 @@ static bool xfb_mode_compatible(GLenum tf_mode, GLenum draw_mode)
         case GL_LINES:
             return draw_mode == GL_LINES || draw_mode == GL_LINE_LOOP || draw_mode == GL_LINE_STRIP ||
                    draw_mode == GL_LINES_ADJACENCY || draw_mode == GL_LINE_STRIP_ADJACENCY;
+        case GL_LINES_ADJACENCY:
+            return draw_mode == GL_LINES_ADJACENCY || draw_mode == GL_LINE_STRIP_ADJACENCY;
         case GL_TRIANGLES:
             return draw_mode == GL_TRIANGLES || draw_mode == GL_TRIANGLE_STRIP || draw_mode == GL_TRIANGLE_FAN ||
                    draw_mode == GL_TRIANGLES_ADJACENCY || draw_mode == GL_TRIANGLE_STRIP_ADJACENCY;
+        case GL_TRIANGLES_ADJACENCY:
+            return draw_mode == GL_TRIANGLES_ADJACENCY || draw_mode == GL_TRIANGLE_STRIP_ADJACENCY;
+        case GL_PATCHES:
+            /* the captured stage is the tessellation evaluation shader: its output is
+             * recorded patch by patch (GL 4.6 13.4.1 + the tessellation chapter) */
+            return draw_mode == GL_PATCHES;
     }
     return false;
 }
 
 void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
 {
-    if (primitiveMode != GL_POINTS && primitiveMode != GL_LINES && primitiveMode != GL_TRIANGLES)
+    /* GL 4.6 13.4.1: POINTS, LINES, TRIANGLES, LINES_ADJACENCY, TRIANGLES_ADJACENCY
+     * or PATCHES (PATCHES captures the tessellation evaluation shader's output). */
+    if (primitiveMode != GL_POINTS && primitiveMode != GL_LINES && primitiveMode != GL_TRIANGLES &&
+        primitiveMode != GL_LINES_ADJACENCY && primitiveMode != GL_TRIANGLES_ADJACENCY &&
+        primitiveMode != GL_PATCHES)
         XFB_ERR(GL_INVALID_ENUM);
 
     MGLXfbObject *o = xfb_current(ctx);

@@ -20,6 +20,7 @@
 #include "mgl_ext_geom.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_tess.h"   /* MGLTessCapture debug dump in geom_xfb_dump */
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_queries.h"   /* discard-skip: active pre-raster query counters */
@@ -95,6 +96,13 @@ static bool gXfbPending;            /* a pack has not been folded into the objec
 static id<MTLCommandBuffer> gXfbCb; /* that command buffer, for a deterministic wait */
 static id<MTLFence> gXfbFence;     /* orders the packs of one block across command buffers */
 static id<MTLCommandBuffer> gXfbFenceCb;   /* the command buffer that last updated it */
+
+/* the geometry kernel's compute encoder, left OPEN when the transform-feedback pack will
+ * join it: Metal only orders dispatches (and their memory effects) WITHIN one compute
+ * encoder — separate encoders of one command buffer may overlap, and the pack reads the
+ * kernel's per-thread emitted counts and records (see the pack block in geomDraw) */
+static id<MTLComputeCommandEncoder> gPackJoinEnc;
+static id<MTLCommandBuffer> gPackJoinCb;
 static GLuint gXfbOwner;            /* the object the counter block belongs to */
 static bool gXfbBegin;              /* the counter block still needs its init kernel */
 static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
@@ -1315,11 +1323,18 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     in[2] = (uint32_t)xp->count;
     for (GLuint b = 0; b < 4; b++)
     {
+        GLsizeiptr live;
         in[3 + b] = (uint32_t)xp->stride[b];
-        /* the bound range, not the Metal backing size: a pooled buffer is rounded up
+        /* the usable range, not the Metal backing size: a pooled buffer is rounded up
          * (4096 for small allocations) and the pack's fill test must use the range the
-         * GL object actually exposes */
-        in[8 + b] = (uint32_t)(tfb[b].buf ? (tfb[b].size ? tfb[b].size : tfb[b].buf->size) : 0);
+         * GL object actually exposes.  A RANGE binding freezes its extent, but a BASE
+         * binding captures into the buffer's LIVE storage (GL 4.6 6.1.1: BindBufferBase
+         * binds the whole buffer, whose size later bufferData calls re-specify — a
+         * bind-time snapshot truncates every capture after the buffer is re-specified;
+         * tcte.data_pass_through lost 50 of 160 records exactly that way).  o->is_base
+         * tells the two apart (mgl_ext_xfb.h). */
+        live = tfb[b].buf ? tfb[b].buf->size : 0;
+        in[8 + b] = (uint32_t)(tfb[b].buf ? ((o->is_base[b] || !tfb[b].size) ? live : tfb[b].size) : 0);
     }
     in[12] = src->per_prim;                /* captured vertices per primitive */
 
@@ -1469,11 +1484,17 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     in[13] = (gp->out_type == GL_LINE_STRIP) ? 1u : (gp->out_type == GL_TRIANGLE_STRIP) ? 2u : 0u;
     for (GLuint b = 0; b < 4; b++)
     {
+        GLsizeiptr live;
         in[4 + b] = (uint32_t)xp->stride[b];
-        /* the bound range, not the Metal backing size: a pooled buffer is rounded up
+        /* the usable range, not the Metal backing size: a pooled buffer is rounded up
          * (4096 for small allocations) and the pack's fill test must use the range the
-         * GL object actually exposes */
-        in[8 + b] = (uint32_t)(tfb[b].buf ? (tfb[b].size ? tfb[b].size : tfb[b].buf->size) : 0);
+         * GL object actually exposes.  A RANGE binding freezes its extent, but a BASE
+         * binding captures into the buffer's LIVE storage (GL 4.6 6.1.1: BindBufferBase
+         * binds the whole buffer, whose size later bufferData calls re-specify — a
+         * bind-time snapshot truncates every capture after the buffer is re-specified).
+         * o->is_base tells the two apart (mgl_ext_xfb.h).*/
+        live = tfb[b].buf ? tfb[b].buf->size : 0;
+        in[8 + b] = (uint32_t)(tfb[b].buf ? ((o->is_base[b] || !tfb[b].size) ? live : tfb[b].size) : 0);
     }
 
     memset(vars, 0, sizeof vars);
@@ -1519,13 +1540,35 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         in[20] = (uint32_t)st;
         in[22] = mask;
 
+        if (getenv("MGL_GEOM_DUMP_CNT"))
+            fprintf(stderr, "geom: pack in[]: threads=%u maxv=%u outwords=%u nvars=%u"
+                    " stride0=%u bufsz0=%u maxvext0=%u tfb0=[%p sz=%zu backing=%zu]\n",
+                    in[0], in[1], in[2], in[3], in[4], in[8], in[14],
+                    (void *)(tfb[0].buf ? tfb[0].buf->data.mtl_data : NULL),
+                    (size_t)tfb[0].size,
+                    (size_t)(tfb[0].buf ? tfb[0].buf->size : 0));
+
         if (!enc)
         {
             /* a committed buffer cannot take an encoder (Metal asserts): treat as no work */
             if (!_currentCommandBuffer ||
                 _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
                 return false;
-            enc = [_currentCommandBuffer computeCommandEncoder];
+            if (gPackJoinEnc && gPackJoinCb == _currentCommandBuffer)
+            {
+                /* join the geometry kernel's encoder (left open for us): dispatches within
+                 * one encoder are ordered, which the pack's reads of the kernel's writes
+                 * rely on.  The cross-buffer fence wait happened at that encoder's creation
+                 * (before any dispatch), so it is not repeated here. */
+                enc = gPackJoinEnc;
+                gPackJoinEnc = nil;
+                gPackJoinCb = nil;
+                if (geomEnvRead(), gEnv.debug)
+                    fprintf(stderr, "geom: pack JOINED the kernel encoder cb=%p\n",
+                            (void *)(__bridge void *)_currentCommandBuffer);
+            }
+            else
+                enc = [_currentCommandBuffer computeCommandEncoder];
             if (!enc) return false;
             [enc pushDebugGroup: @"MGL geometry xfb pack"];
 
@@ -1717,6 +1760,8 @@ void geom_xfb_gpu_wait(GLMContext ctx)
 /* read the pending counters (the caller has synchronised) */
 void geom_xfb_dump(GLMContext ctx)
 {
+    uint32_t *cnt, *xb, *hp;
+
     if (!(geomEnvRead(), gEnv.xfb) || !gOutv) return;
     fprintf(stderr, "geom: out records @%zu:", gOutvOff / 4);
     for (int i = 0; i < 6 * 2; i++)
@@ -1725,6 +1770,42 @@ void geom_xfb_dump(GLMContext ctx)
         fprintf(stderr, " %8.3f", *(float *)&w);
     }
     fprintf(stderr, "\n");
+    if (!getenv("MGL_GEOM_DUMP_CNT")) return;
+    /* post-completion internals: the geometry kernel's per-thread emitted counts, the
+     * pack prefix' ordinals and the assembly header (prims the import computed) */
+    cnt = gCnt ? (uint32_t *)((uint8_t *)gCnt.contents + gCntOff) : NULL;
+    xb = gXbase ? (uint32_t *)gXbase.contents : NULL;
+    hp = gPrim ? (uint32_t *)((uint8_t *)gPrim.contents + gPrimOff) : NULL;
+    fprintf(stderr, "geom: cntcnt:");
+    if (cnt) { for (int i = 0; i < 100; i++) fprintf(stderr, " %u", cnt[i]); }
+    fprintf(stderr, "\ngeom: xbase :");
+    if (xb) { for (int i = 0; i < 24; i++) fprintf(stderr, " %u", xb[i]); }
+    fprintf(stderr, "\ngeom: hdr   :");
+    if (hp) { for (int i = 0; i < 13; i++) fprintf(stderr, " %u", hp[i]); }
+    fprintf(stderr, "\n");
+    if (gXfb)
+    {
+        uint32_t *bp = (uint32_t *)gXfb.contents;
+        fprintf(stderr, "geom: xfb blk:");
+        for (int i = 0; i < 28; i++) fprintf(stderr, " %u", bp[i]);
+        fprintf(stderr, "\n");
+    }
+    /* MGL_TESS_DUMP_CAP: the published tess capture records + count (post-wait) */
+    if (getenv("MGL_TESS_DUMP_CAP"))
+    {
+        const MGLTessCapture *cap = mgl_tess_get_capture(ctx);
+        if (cap && cap->buffer)
+        {
+            const uint32_t *cnt = (const uint32_t *)((const uint8_t *)cap->buffer +
+                                                     cap->count_offset);
+            const uint32_t *rec = (const uint32_t *)((const uint8_t *)cap->buffer +
+                                                     cap->records_offset);
+            fprintf(stderr, "tesscap: count=%u stride=%u rec0:", cnt[0], cap->stride);
+            for (int i = 0; i < 20 && i < (int)cap->stride; i++)
+                fprintf(stderr, " %u(%g)", rec[i], *(const float *)&rec[i]);
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 void geom_xfb_gpu_read(GLMContext ctx, MGLXfbObject *o, uint32_t *dvert, uint32_t *dprim)
@@ -2837,6 +2918,11 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         NSUInteger wg = 64, nt = bound > (NSUInteger)d->count ? bound : (NSUInteger)d->count;
 
         if (!enc) return false;
+        /* the transform-feedback pack below joins this encoder: its counter-block fence
+         * wait must precede the encoder's first dispatch (Metal applies encoder-level
+         * fence waits at encoder granularity), so it goes here, not in the pack */
+        if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+            [enc waitForFence: gXfbFence];
         [enc pushDebugGroup: @"MGL geometry tess import"];
         [enc setComputePipelineState: gTessImportPso];
         [enc setBuffer: ring offset: d->tess_recs_off atIndex: 0];
@@ -2861,9 +2947,6 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
         [enc popDebugGroup];
         kenc = enc;                       /* still open: the geometry kernel joins it */
-        if ((geomEnvRead(), gEnv.draw))
-            fprintf(stderr, "geom: trace tess import encoded (reccap=%u idxcap=%u stride=%u)\n",
-                    bound, d->tess_idx_cap, d->tess_stride);
     }
     else if (gpu_assembly)
     {
@@ -2872,6 +2955,10 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         bool have_eb = false;
 
         if (!enc) return false;
+        /* same as the tess-import branch: the pack joins this encoder, so its counter-block
+         * fence wait belongs here, before the first dispatch */
+        if (gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+            [enc waitForFence: gXfbFence];
         if (eb)
         {
             if (!eb->data.mtl_data) [self bindMTLBuffer: eb];
@@ -3234,6 +3321,12 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * writes ordered before this kernel (and before its indirect dispatch) */
         id<MTLComputeCommandEncoder> enc = kenc ? kenc : [_currentCommandBuffer computeCommandEncoder];
         if (!enc) return false;
+        if (!kenc && gXfbPending && gXfbFenceCb != _currentCommandBuffer)
+        {
+            /* fresh encoder that the pack may join later: take the counter-block fence wait
+             * here, before the first dispatch */
+            [enc waitForFence: gXfbFence];
+        }
 
         Program *saved_program = ctx->state.program;
         ctx->state.program = program;
@@ -3359,7 +3452,16 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         }
 
         [enc popDebugGroup];
-        [enc endEncoding];
+        if (mgl_xfb_capturing(ctx) && !mgl_geom_xfb_paused(ctx))
+        {
+            /* leave the kernel encoder OPEN for the pack that follows (see the transform
+             * feedback block below): it joins this encoder so the pack's reads of the
+             * kernel's writes are ordered */
+            gPackJoinEnc = enc;
+            gPackJoinCb = _currentCommandBuffer;
+        }
+        else
+            [enc endEncoding];
         ctx->state.program = saved_program;
     }
 
@@ -3370,17 +3472,40 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * would advance the object's write offsets on the CPU while the GPU counter block
          * holds its own.  The GPU pack keeps the write offsets and counters in a block the
          * kernels maintain, so the CPU only folds them in when the application can observe
-         * them */
+         * them.
+         *
+         * When the geometry kernel dispatched above, its encoder is left OPEN and handed
+         * over (gPackJoinEnc): Metal orders dispatches — and their memory effects — only
+         * WITHIN one compute encoder; separate encoders of the same command buffer may
+         * overlap, and the pack's prefix/scatter read the kernel's per-thread emitted
+         * counts and records.  CTS tcte.data_pass_through captured 110 of 160 records
+         * deterministically through exactly that gap. */
         if (!mgl_geom_xfb_pack(ctx, gp, program, (uint32_t)threads,
                                gp->max_vertices ? gp->max_vertices : 1, gp->out_words,
                                (uint32_t)outv_cap))
         {
+            /* the GPU pack never ran: close the kernel encoder it would have joined (it is
+             * consumed only at its encoder-creation point) */
+            if (gPackJoinEnc)
+            {
+                if (gPackJoinCb == _currentCommandBuffer) [gPackJoinEnc endEncoding];
+                gPackJoinEnc = nil;
+                gPackJoinCb = nil;
+            }
             BUF()->flush(ctx);
             BUF()->wait_serial(ctx, BUF()->current_serial(ctx));
             mgl_geom_xfb_capture(ctx, gp, (const uint32_t *)gOutv.contents + gOutvOff / 4,
                                  (gOutv.length - gOutvOff) / sizeof(uint32_t), (const uint32_t *)gCtl.contents,
                                  (const uint32_t *)gCnt.contents + gCntOff / 4,
                                  (gCnt.length - gCntOff) / sizeof(uint32_t));
+        }
+        /* the pack either consumed the encoder (and closed it) or never took it: nothing
+         * may hold a still-open encoder past this point */
+        if (gPackJoinEnc)
+        {
+            if (gPackJoinCb == _currentCommandBuffer) [gPackJoinEnc endEncoding];
+            gPackJoinEnc = nil;
+            gPackJoinCb = nil;
         }
     }
 

@@ -100,11 +100,21 @@ static size_t tRingCap[MGL_TESS_RING];
 
 static size_t tessRingAlign(size_t v) { return (v + 255) & ~(size_t)255; }
 
+/* MGL_TESS_RING_TRACE=1: log every acquire/release/retire so a wedged ring (a draw
+ * that never retires its slot) can be found in a CTS log. */
+static int tRingTrace(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("MGL_TESS_RING_TRACE") ? 1 : 0;
+    return v;
+}
+
 /* acquire a block of `bytes` from the ring; returns the buffer and sets *offset.
  * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched). */
 static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t *offset,
                                      int *slot, MGLRenderer *self)
 {
+    tessRingPendPoll();
     for (int i = 0; i < MGL_TESS_RING; i++)
     {
         int idx = (tRingScan + i) % MGL_TESS_RING;
@@ -115,6 +125,9 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
             tRingBusy[idx] = true;
             *slot = idx;
             tRingScan = (idx + 1) % MGL_TESS_RING;
+            if (tRingTrace())
+                fprintf(stderr, "MGL ring: acquire slot=%d bytes=%zu cap=%zu (fast)\n",
+                        idx, bytes, tRingCap[idx]);
             return tRing[idx];
         }
     }
@@ -136,6 +149,19 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
         for (int spin = 0; spin < 20000; spin++)
         {
             bool any = false;
+            tessRingPendPoll();
+            if (tRingTrace() && (spin % 2000) == 0)
+            {
+                unsigned bm = 0;
+                for (int i = 0; i < MGL_TESS_RING; i++) bm |= tRingBusy[i] << i;
+                fprintf(stderr, "MGL ring: SPIN %d busy=%x pos=[%zu %zu %zu %zu %zu %zu %zu %zu]"
+                        " cb=%d enc=%d\n", spin, bm,
+                        tRingPos[0], tRingPos[1], tRingPos[2], tRingPos[3],
+                        tRingPos[4], tRingPos[5], tRingPos[6], tRingPos[7],
+                        self && self->_currentCommandBuffer ?
+                            (int)self->_currentCommandBuffer.status : -1,
+                        self && self->_currentRenderEncoder ? 1 : 0);
+            }
 
             for (int i = 0; i < MGL_TESS_RING && !any; i++)
                 any = !tRingBusy[i];
@@ -178,6 +204,9 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
     tRingBusy[best] = true;
     *slot = best;
     tRingScan = (best + 1) % MGL_TESS_RING;
+    if (tRingTrace())
+        fprintf(stderr, "MGL ring: acquire slot=%d bytes=%zu cap=%zu (grow)\n",
+                best, bytes, tRingCap[best]);
     return tRing[best];
 }
 
@@ -185,9 +214,78 @@ static void tessRingRelease(int slot)
 {
     if (slot >= 0 && slot < MGL_TESS_RING && tRingBusy[slot])
     {
+        if (tRingTrace())
+            fprintf(stderr, "MGL ring: release slot=%d\n", slot);
         tRingBusy[slot] = false;
         tRingPos[slot] = 0;            /* reuse from the start once retired */
     }
+}
+
+/* deferred ring retires: a completion handler must be added BEFORE the command buffer
+ * is committed (Metal asserts otherwise — tessellation_shader_tc_barriers aborts the
+ * process through its link-failure path, where the draw bails AFTER a flush), so a
+ * buffer that is already committed/scheduled parks here and the next ring poll (every
+ * acquire spin) releases its slot once the GPU finished it */
+static id<MTLCommandBuffer> tRingPendCb[MGL_TESS_RING];
+static int tRingPendSlot[MGL_TESS_RING];
+
+static void tessRingPendPoll(void)
+{
+    for (int i = 0; i < MGL_TESS_RING; i++)
+        if (tRingPendCb[i])
+        {
+            id<MTLCommandBuffer> cb = tRingPendCb[i];
+            if (cb.status >= MTLCommandBufferStatusCompleted || cb.status == MTLCommandBufferStatusError)
+            {
+                tRingPendCb[i] = nil;
+                tessRingRelease(tRingPendSlot[i]);
+            }
+        }
+}
+
+/* Retire a ring block on an early exit (draw bailed after the block was acquired).
+ * `cb` is the command buffer that used the block: the CPU reference path has already
+ * committed AND waited on it, so the block is free immediately; the error paths have
+ * at most an in-flight / uncommitted buffer, so the slot retires when it completes.
+ * Without this, a culled patch (all relevant outer levels <= 0 -> 0 indices, a normal
+ * hot path: KHR-GL46 ...single.isolines_tessellation draws level -1 configurations
+ * under a PRIMITIVES_GENERATED query) leaked one slot per draw until the ring wedged
+ * and every later draw burned the 2 s acquire timeout. */
+static void tessRingRetireOn(id<MTLCommandBuffer> cb, int slot)
+{
+    if (slot < 0)
+        return;
+    tessRingPendPoll();
+    if (!cb || cb.status >= MTLCommandBufferStatusCompleted ||
+        cb.status == MTLCommandBufferStatusError)
+    {
+        tessRingRelease(slot);
+        return;
+    }
+    if (cb.status >= MTLCommandBufferStatusCommitted)
+    {
+        /* committed or scheduled: a completion handler would assert (it must be added
+         * before commit) — park the retire for the next ring poll instead */
+        for (int i = 0; i < MGL_TESS_RING; i++)
+        {
+            if (!tRingPendCb[i])
+            {
+                if (tRingTrace())
+                    fprintf(stderr, "MGL ring: retire deferred slot=%d (cb committed)\n", slot);
+                tRingPendCb[i] = cb;
+                tRingPendSlot[i] = slot;
+                return;
+            }
+        }
+        /* the park list is full (eight in-flight draws, none completed): the slot stays
+         * busy until one frees up — the acquire spin polls this list */
+        return;
+    }
+    int s = slot;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)b;
+        tessRingRelease(s);
+    }];
 }
 
 static id<MTLLibrary> tKernelLib;
@@ -1299,6 +1397,8 @@ static void tessTimeCommandBuffer(id<MTLCommandBuffer> cb)
 {
     if (!cb || !tDiagEnabled)
         return;
+    if (cb.status >= MTLCommandBufferStatusCommitted)
+        return;   /* a handler must be added before commit — skip the sample */
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         if (b.GPUEndTime > b.GPUStartTime)
             tGpuTimeUs += (b.GPUEndTime - b.GPUStartTime) * 1e6;
@@ -2074,6 +2174,7 @@ static void tessRetireCapture(GLMContext ctx)
         if (!tessBindVSAttributes(ctx, cenc, &plan, (GLuint)vcount))
         {
             [cenc endEncoding];
+            tessRingRetireOn(compute_cb, ring_slot);
              return false;
         }
         [cenc setBuffer: ring offset: off_vs_out atIndex: MGL_TESS_VS_OUT_BUF];
@@ -2171,6 +2272,7 @@ static void tessRetireCapture(GLMContext ctx)
         if (!tcs_pso)
         {
             [cenc endEncoding];
+            tessRingRetireOn(compute_cb, ring_slot);
              return false;
         }
 
@@ -2184,7 +2286,15 @@ static void tessRetireCapture(GLMContext ctx)
         if (tp->tcs_levels_float)
             [cenc setBuffer: ring offset: off_levels_f atIndex: 30];   /* GL's float level copy */
         [cenc setBytes: iparams length: sizeof iparams atIndex: MGL_TESS_TCS_PARAMS];
-        [cenc dispatchThreadgroups: MTLSizeMake(threads, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        /* one threadgroup per PATCH: barrier() in a TCS synchronises the patch's
+         * invocations, which requires them to share a threadgroup — with one thread
+         * per group (the old shape) glslang's threadgroup_barrier(mem_device|thread)
+         * synchronised nothing and post-barrier cross-invocation reads saw unwritten
+         * records (tessellation_shader_tc_barriers read [0,0,0,0]).  A group of
+         * exactly tcs_out_vertices threads never pads, so the kernel's bounds guard
+         * cannot strand non-invocation threads before the barrier (a deadlock). */
+        [cenc dispatchThreadgroups: MTLSizeMake((NSUInteger)total_patches, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake((NSUInteger)tp->tcs_out_vertices, 1, 1)];
         if (getenv("MGL_TESS_DUMP_CAP"))
         {
             /* one-off diagnostics: printed later, once emu_cb completed below */
@@ -2195,7 +2305,8 @@ static void tessRetireCapture(GLMContext ctx)
             /* debug: dump the GPU-written records once the compute buffer completes */
             __block const uint8_t *base = (const uint8_t *)ring.contents;
             __block size_t dv = off_vsparams, ds = off_scanout, dvo = off_vs_out;
-            [compute_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            if (compute_cb.status < MTLCommandBufferStatusCommitted)
+            [compute_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {   /* handler must precede commit */
                 const uint32_t *v = (const uint32_t *)(base + dv);
                 const uint32_t *so = (const uint32_t *)(base + ds);
                 const float *vo = (const float *)(base + dvo);
@@ -2358,10 +2469,16 @@ static void tessRetireCapture(GLMContext ctx)
             size_t patch_off = tp->has_tcs ? off_tcs_patch : off_patch_data;
 
             if (![self processGLState: true])
+            {
+                tessRingRetireOn(_currentCommandBuffer, ring_slot);
                  return false;
+            }
             enc = _currentRenderEncoder;
             if (!enc)
+            {
+                tessRingRetireOn(_currentCommandBuffer, ring_slot);
                  return false;
+            }
 
             [enc setVertexBuffer: ring offset: cp_source_off atIndex: MGL_TESS_VD_CP];
             [enc setVertexBuffer: ring offset: patch_off atIndex: MGL_TESS_VD_PATCH];
@@ -2407,10 +2524,10 @@ static void tessRetireCapture(GLMContext ctx)
             {
                 int slot = ring_slot;
                 id<MTLCommandBuffer> cb = _currentCommandBuffer;
-                if (cb)
-                    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) { tessRingRelease(slot); }];
-                else
-                    tessRingRelease(slot);
+                if (tRingTrace())
+                    fprintf(stderr, "MGL ring: register(hw) slot=%d cb=%d\n", slot,
+                            cb ? (int)cb.status : -1);
+                tessRingRetireOn(cb, slot);   /* handles committed/completed buffers */
             }
         }
         return true;
@@ -2424,6 +2541,21 @@ static void tessRetireCapture(GLMContext ctx)
     if (!use_cpu_reference && tessKernels(ctx))
     {
         struct TessKParams { uint32_t patches, domain, spacing, point_mode, ccw; } kp;
+        if (tRingTrace())
+            fprintf(stderr, "MGL ring: stage emu-entry slot=%d hw=%d cpu_ref=%d readback=%d cap=%d\n",
+                    ring_slot, use_hardware, use_cpu_reference, need_readback, tp->capture ? 1 : 0);
+
+        /* MGL_TESS_PATCHDBG: dump the TCS patch-out blob of patch 0 once the VS/TCS
+         * command buffer completed (debug stall only) */
+        if (getenv("MGL_TESS_PATCHDBG") && ring && off_tcs_patch < ring.length)
+        {
+            id<MTLCommandBuffer> wcb = compute_cb ? compute_cb : _currentCommandBuffer;
+            if (wcb) [wcb waitUntilCompleted];
+            const int *pb = (const int *)((const uint8_t *)ring.contents + off_tcs_patch);
+            fprintf(stderr, "MGL tess: patch blob @%zu:", off_tcs_patch);
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %d", pb[i]);
+            fprintf(stderr, "\n");
+        }
 
         /* the VS/TCS command buffer is already committed: the tessellator kernels run
          * in their own, event-ordered command buffer (no CPU stall) */
@@ -2516,8 +2648,11 @@ static void tessRetireCapture(GLMContext ctx)
 
             /* capture permute: transform feedback records the vertices in GENERATION
              * order (GL 4.6 13.4) — the coordinates re-gathered through the index list.
-             * The bound count is the GPU-written totals array (guard on totals[1]). */
-            if (off_capture_perm && tPermutePso)
+             * The bound count is the GPU-written totals array (guard on totals[1]).
+             * point_mode emits no index list (totals[1] == 0): every tessellated vertex
+             * is a point and the capture walks the coordinate grid itself, so the
+             * permute would only copy an unwritten buffer. */
+            if (off_capture_perm && !tp->point_mode && tPermutePso)
             {
                 [cenc setComputePipelineState: tPermutePso];
                 [cenc setBuffer: ring offset: coords_off atIndex: 0];
@@ -2540,7 +2675,8 @@ static void tessRetireCapture(GLMContext ctx)
                     [cenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_pso];
                     tessBindStageUniforms(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
                     tessBindStageTextures(ctx, cenc, prog_tes, _TESS_EVALUATION_SHADER);
-                    [cenc setBuffer: ring offset: (off_capture_perm ? off_capture_perm : coords_off)
+                    [cenc setBuffer: ring offset: (off_capture_perm && !tp->point_mode ?
+                                                   off_capture_perm : coords_off)
                              atIndex: MGL_TESS_TES_COORDS];
                     [cenc setBuffer: ring offset: cp_source_off atIndex: MGL_TESS_TES_CP];
                     [cenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
@@ -2591,8 +2727,18 @@ static void tessRetireCapture(GLMContext ctx)
 
             gpu_emulated = true;
         }
-        else if (tTrace())
-            NSLog(@"MGL tess: GPU tessellator scratch too large (%zu bytes), using CPU path", need);
+        else
+        {
+            /* GPU tessellator scratch too large (%zu bytes): CPU path.  The factors live
+             * in ring memory written by compute_cb — which this path committed (event
+             * form), never waited on — so wait for it before the CPU tessellator reads
+             * them; reading right after commit saw zeros and produced empty captures
+             * (tc_barriers draws 1024 patches -> 221 MB scratch -> this fallback). */
+            if (tTrace())
+                NSLog(@"MGL tess: GPU tessellator scratch too large (%zu bytes), using CPU path", need);
+            if (compute_cb && compute_cb.status < MTLCommandBufferStatusCompleted)
+                [compute_cb waitUntilCompleted];
+        }
     }
     if (gpu_emulated && kenc)
     {
@@ -2694,11 +2840,19 @@ static void tessRetireCapture(GLMContext ctx)
         {
             id<MTLRenderCommandEncoder> enc;
 
+            if (tRingTrace())
+                fprintf(stderr, "MGL ring: stage emu-render slot=%d\n", ring_slot);
             if (![self processGLState: true])
+            {
+                tessRingRetireOn(_currentCommandBuffer, ring_slot);
                  return false;
+            }
             enc = _currentRenderEncoder;
             if (!enc)
+            {
+                tessRingRetireOn(_currentCommandBuffer, ring_slot);
                  return false;
+            }
 
             [enc setVertexBuffer: (__bridge id<MTLBuffer>)S->gpu_scratch offset: S->gpu_coords_offset atIndex: MGL_TESS_TES_COORDS];
             /* the TES reads the control points where the VS kernel (no TCS) or the TCS
@@ -2794,14 +2948,11 @@ static void tessRetireCapture(GLMContext ctx)
                 int rslot = ring_slot;
                 id<MTLCommandBuffer> rcb = _currentCommandBuffer;
 
-                if (rcb)
-                    [rcb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-                        (void)b;
-                        tessRingRelease(rslot);
-                    }];
-                else
-                    tessRingRelease(rslot);   /* the block's buffers were already
-                                                * committed and waited on above */
+                if (tRingTrace())
+                    fprintf(stderr, "MGL ring: register(emu) slot=%d cb=%d\n", rslot,
+                            rcb ? (int)rcb.status : -1);
+                tessRingRetireOn(rcb, rslot);   /* the wait above may already have
+                                                 * completed (or committed) the buffer */
             }
 
             if (tTrace() && dbg_ctl_off)
@@ -2809,6 +2960,8 @@ static void tessRetireCapture(GLMContext ctx)
                 const uint8_t *rc = (const uint8_t *)ring.contents;
                 size_t o = dbg_ctl_off;
 
+                if (_currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+                    goto skip_ctl_trace;   /* handler must precede commit */
                 [ _currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> b) {
                     const uint32_t *c = (const uint32_t *)(rc + o);
                     (void)b;
@@ -2816,6 +2969,7 @@ static void tessRetireCapture(GLMContext ctx)
                             c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
                     
                 } ];
+            skip_ctl_trace: ;
             }
 
             ctx->state.dirty_bits = DIRTY_ALL;
@@ -2901,7 +3055,14 @@ static void tessRetireCapture(GLMContext ctx)
     }
 
     if (!S->tess_index_count)
-        return true;                                /* degenerate: nothing to rasterize */
+    {
+        /* degenerate: nothing to rasterize (culled patch / all levels zero) — the
+         * block was only used by the (already completed) compute buffer */
+        tessRingRetireOn(compute_cb, ring_slot);
+        if (tRingTrace())
+            fprintf(stderr, "MGL ring: retire(degenerate) slot=%d\n", ring_slot);
+        return true;
+    }
 
     /* ---- 4. render phase (CPU reference path): TES is the pipeline's vertex function ---- */
     {
@@ -2920,6 +3081,7 @@ static void tessRetireCapture(GLMContext ctx)
             if (tRingCap[ring_slot] < base + need)
             {
                 NSLog(@"MGL ERROR: tess: CPU reference scratch overflow");
+                tessRingRetireOn(compute_cb, ring_slot);
                  return false;
             }
             off_coords = base;
@@ -2998,10 +3160,16 @@ static void tessRetireCapture(GLMContext ctx)
 
         /* processGLState builds the render encoder and the (TES-based) pipeline */
         if (![self processGLState: true])
+        {
+            tessRingRetireOn(_currentCommandBuffer, ring_slot);
              return false;
+        }
         enc = _currentRenderEncoder;
         if (!enc)
+        {
+            tessRingRetireOn(_currentCommandBuffer, ring_slot);
              return false;
+        }
 
         [enc setVertexBuffer: ring offset: off_coords atIndex: MGL_TESS_TES_COORDS];
         [enc setVertexBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
@@ -3027,17 +3195,18 @@ static void tessRetireCapture(GLMContext ctx)
             int rslot = ring_slot;
             id<MTLCommandBuffer> rcb = _currentCommandBuffer;
 
-            if (rcb)
-                [rcb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-                    (void)b;
-                    tessRingRelease(rslot);
-                }];
-            else
-                tessRingRelease(rslot);   /* the wait above completed this buffer */
+            if (tRingTrace())
+                fprintf(stderr, "MGL ring: register(cpu) slot=%d cb=%d\n", rslot,
+                        rcb ? (int)rcb.status : -1);
+            tessRingRetireOn(rcb, rslot);   /* the wait above may already have
+                                            * completed (or committed) the buffer */
         }
         ctx->state.dirty_bits = DIRTY_ALL;
     }   /* CPU reference path */
 
+    if (tRingTrace())
+        fprintf(stderr, "MGL ring: stage fallthrough-return slot=%d gpu_emu=%d\n",
+                ring_slot, gpu_emulated);
     return true;
 }
 
@@ -3399,6 +3568,7 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         return nil;
     vd = [MTLVertexDescriptor vertexDescriptor];
 
+    bool any_cp = false;
     for (int i = 0; i < tp->num_tes_cp; i++)
     {
         MGLTessPatchMember *m = &tp->tes_cp[i];
@@ -3412,12 +3582,19 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         vd.attributes[m->attr].format = fmt;
         vd.attributes[m->attr].offset = (NSUInteger)offset;
         vd.attributes[m->attr].bufferIndex = MGL_TESS_VD_CP;
+        any_cp = true;
     }
-    /* stride: the FULL control point record (TCS/VS output), even if the TES reads a subset */
-    vd.layouts[MGL_TESS_VD_CP].stride = (NSUInteger)(tp->cp_record_full_size ?
-        tp->cp_record_full_size : (tp->cp_record_size ? tp->cp_record_size : 16));
-    vd.layouts[MGL_TESS_VD_CP].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
-    vd.layouts[MGL_TESS_VD_CP].stepRate = 1;
+    /* stride: the FULL control point record (TCS/VS output), even if the TES reads a subset.
+     * Metal validates that every laid-out buffer index carries at least one attribute —
+     * a TES that reads only patch data (no per-vertex ins, like tc_barriers' patch-array
+     * test) leaves buffer 8 empty, and an orphan layout aborts the pipeline build */
+    if (any_cp)
+    {
+        vd.layouts[MGL_TESS_VD_CP].stride = (NSUInteger)(tp->cp_record_full_size ?
+            tp->cp_record_full_size : (tp->cp_record_size ? tp->cp_record_size : 16));
+        vd.layouts[MGL_TESS_VD_CP].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+        vd.layouts[MGL_TESS_VD_CP].stepRate = 1;
+    }
     if (getenv("MGL_TESS_DEBUG"))
     {
         NSMutableString *ds = [NSMutableString string];

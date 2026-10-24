@@ -1,106 +1,98 @@
-# tess — round 14 handoff: D3D11 tessellator layout (ring stitching, per-edge outer levels)
+# tess — round 15 handoff: CTS unblocking (ring wedge, point size, inner[1], isoline point_mode, XFB block members)
 
-Branch `gl46/tess`, HEAD 8d3f852 (= merge of gl46-port b812d2a (GLX/NSGL) + the round-14
-commits).  Note: gl46-port now tracks `external/glfw/*`; the worktree's `external` is a
-symlink to the main checkout, so merge with the link moved aside and restore it after
-(the round-14 sequence: `cp -P external .bck && unlink external && mkdir external &&
- git merge gl46-port && rm -rf external && mv .bck external`).
-**Headless suite 61 files / 616 checks / 0 failures; test_tess 499/0; test_tessemu 117/0; test_geom 593/0.**
+Branch `gl46/tess`, HEAD cd01f98 (= merge of gl46-port eb540d2 (geom r44) + round-15 commits).
+`external` is a symlink to the main checkout's prebuilt deps — `cp -P external .bck && unlink external
+&& mkdir external && git merge gl46-port && rm -rf external && mv .bck external` then clean rebuild
+(`rm -rf build/MGL && make -j4 lib`).
 
-## What landed
+## What round 15 fixed (all verified against KHR-GL46 on the M4 Pro)
 
-1. **D3D11 reference tessellator** (the item left by round 13), ported into the CPU
-   reference (`tessellation.c`) and transcribed 1:1 into the GPU emulated tessellator
-   (`MGLTessKernels.h`), from Mesa's poly library (`.agent/ref/poly/cl/tessellator.h`,
-   Microsoft/Valve, MIT — copyright headers kept, source named in the file comments):
-   * outer edges are subdivided **only** by their own outer level; the outer and inner
-     rings are stitched with the reference's ruler-function order (`stitchTransition` /
-     `stitchRegular`, `finalPointPosition`), so boundary vertex counts/positions no
-     longer follow `max(inner, outer)`;
-   * exact `NumPoints` / `NumIndices` formulas in count mode = the same generator code
-     that emits, so the GPU count pass and emit pass can never disagree;
-   * the kernels now read GL's **exact float tess levels** (the TCS-written / default
-     copy at `off_levels_f`) instead of Metal's half factor record, so generator,
-     `mgl_tess_note_counts` (queries) and the CPU reference agree bit-exactly;
-   * GL culling: a patch with any *relevant* outer level <= 0 (NaN passes) generates
-     nothing — reference + Mesa semantics (round 13's "all <= 0" rule replaced);
-     irrelevant levels (outer[3] for triangles, inner for isolines) are ignored.
-   * isolines now use the reference placement `v = i/n0` (also the CTS reference
-     layout, `vktTessellationUtil.cpp::generateReferenceIsolineTessCoords`), not
-     `(i+0.5)/n0`.  Test expectations updated accordingly.
+1. **Scratch-ring wedge** (`MGLRenderer+Tessellation.m`): a draw that bailed after
+   `tessRingAcquire` — the hot one being a CULLED patch (all relevant outer levels <= 0 ->
+   `!S->tess_index_count -> return true`) — retired its ring slot on NO path. Eight such
+   draws wedged the 8-slot ring; every later draw then burned the 2 s acquire timeout.
+   KHR-GL46 …single.isolines_tessellation looked like a 480 s hang; it was ~24 wedged draws.
+   Fix: `tessRingRetireOn(cb, slot)` — release immediately when the block's command buffer
+   already completed (the CPU reference path waits), else on `addCompletedHandler`; wired
+   into the degenerate exit and every `return false` after a successful acquire.
+   **Result: single.isolines_tessellation Pass (10.4 s; was Timeout > 480 s).**
+   `MGL_TESS_RING_TRACE=1` logs acquire/release/retire/SPIN diagnostics.
 
-   Verified bit-exact against Mesa's reference over 3 domains x 3 partitionings x
-   ~21k level combinations + the extreme sets (all 63/64, mixed), comparing the
-   fixed-point point list, the counts and the index list (`.agent/d3d11/compare.c`,
-   untracked).  Also: every emitted index < NumPoints.
+2. **Point size from the last pre-raster stage** (`MGLRenderer+RenderState.m`): the plain-TES
+   vertex function was bound into the render pipeline UNSPECIALIZED, so the rstate
+   PROGRAM_POINT_SIZE / point-size function constants took their defaults -> size-1 points
+   (point_mode.point_rendering failed at every corner). Fix: specialize it through
+   `rstateSpecialize:` with a standin Shader (like the hardware TES variant). Also
+   `rstateSpecialize` now specializes STANDIN functions (geom vertex override, plain/hw TES)
+   even when the program's own stage MSL is unpatched (a GS consuming tess points with a
+   trivial VS hit that). **Result: tessellation_shader_point_mode.{point_rendering,
+   points_verification} both Pass.**
 
-2. **Two real bugs found by that verification**
-   * the emit kernel added the patch base twice (pointer already pointed into the
-     patch's range), so every patch but the first landed past its range;
-   * the MSL transcription of the quad edge-3 degenerate-ring index patch used
-     `ipc2_inv_end = base<<1` instead of `(base<<1)-1`, emitting indices one vertex
-     past the patch for even-inside quads — the CTS invariance_rule7 "garbage
-     triangle" (denormal gl_TessCoord records).
-   * capture-record / permute reservations now use the D3D11 worst case per patch
-     (quads 4225 v / 24576 i, triangles 3200 v / 18432 i, isolines 4160 v / 8192 i)
-     instead of the old grid caps (triangles were 2145/12288 -> under-sized).
+3. **Triangles ignore gl_TessLevelInner[1]** (`tessellation.c`, `tcs_redirect_tri_inner1`):
+   SPIRV-Cross lowers the gl_TessLevelInner array onto the triangle factor record's SCALAR
+   inside factor, so a later `[1]` store clobbered the `[0]` value the tessellator needs
+   (the CTS always writes both, e.g. (33,-1) -> 36 vertices instead of 803). Every `[1]`
+   access is now rewritten to `mgl_levels[gl_PrimitiveID].in[1]` (the float-levels record's
+   unused second slot). Verified against the round-14 Mesa oracle (.agent/d3d11/oracle.c):
+   triangles (1,33,1)/inner 33 -> 803 verts/1569 prims, (4,4,4)/inner 4 -> 19, quads
+   (4,4,4,4)/inner (8,8) -> 65 — GPU query counts now bit-identical. **points_verification
+   count half now matches.**
 
-3. **New test-only diag API** (`tests/headless/mgl_tess_diag.h`):
-   `mgl_tess_diag_cpu_counts()` and `mgl_tess_diag_cpu_mesh()` run the CPU reference
-   tessellator.  `TessEmuStreamEqualsCpu` (test_tessemu.c) uses it to prove the
-   emulated GPU stream equals the CPU stream **exactly** — one capture record per
-   emitted vertex, in generation order (`record[i] == cpu_coords[cpu_indices[i]]`) —
-   over 27 level sets x 3 spacings, including invariance_rule7's 61/60/59/58 +
-   63/62 quads (23400 records).  This is the regression net for the dual
-   C/MSL implementation; extend the level table if a new layout bug is suspected.
-   Also added `TessCaptureCounts` (per-spacing counts + PRIMITIVES_GENERATED must
-   match the CPU generator) and `TessCaptureHigh` (no stale/garbage records at high
-   levels; ccw/cw streams hold identical triangles with the last two indices swapped).
+4. **glBeginTransformFeedback(GL_PATCHES)** (`transform_feedback.c`): was rejected with
+   GL_INVALID_ENUM, so the whole tessellated XFB capture path never ran
+   (tcte.data_pass_through got 0 records). Now accepts POINTS/LINES/TRIANGLES/
+   LINES_ADJACENCY/TRIANGLES_ADJACENCY/PATCHES (GL 4.6 13.4.1) and `xfb_mode_compatible`
+   knows the new modes.
 
-## CTS (KHR-GL46.tessellation_shader) — before -> after
+5. **Interface-block XFB outputs** (`geometry.c`, geom-agent file, surgical): (a) bare member
+   names in glTransformFeedbackVaryings ("tc_position" of the TES's OUT_TE block — the CTS
+   form) are matched in a second pass of `geom_xfb_resolve`; (b) the tess route's
+   capture-member reconcile now also matches SPIRV-Cross's flattened "<instance>_<member>"
+   capture field ("te_data_tc_position"). Without (b) the varying was dropped (words=0) and
+   the XFB buffer read zeros.
 
-| case | round 13 | now |
+6. **Isolines + point_mode emit** (`MGLTessKernels.h`): `isolineProcess` always emitted the
+   line-segment index list; in point mode that overwrote definePoint's identity list and
+   overflowed the identity-sized alloc — the geometry import / XFB then read a segment list
+   and patch 1+ got patch 0's records. The segment loop is now `if (!ctx.points)`.
+   **zz_tcte_pt (both TES-only and GS variants, 3 patches) is fully correct.**
+
+## CTS state (KHR-GL46.tessellation_shader)
+
+| case | r14 | r15 |
 |---|---|---|
-| quads.inner_tessellation_level_rounding | Fail | **Pass** |
-| triangles.inner_tessellation_level_rounding | Fail | **Pass** |
-| single.primitive_coverage | Fail | **Pass** |
-| tessellation_invariance.invariance_rule2..7 | Fail/flaky (2,3,4,7) | **Pass (all 7)** |
-| quads/triangles degenerate_case, identical_triangles | Pass | Pass |
+| single.isolines_tessellation | Timeout(480s) | **Pass (10.4 s)** |
+| tessellation_shader_point_mode.point_rendering | Fail | **Pass** |
+| tessellation_shader_point_mode.points_verification | Fail | **Pass** |
+| tess…control_to_tess…evaluation.data_pass_through | Fail@idx40 | **Fail@idx110** (progress: the
+isolines+GS runs pass; see open item 1) |
 
-Run with (foreground, one glcts at a time, no alarm — let the runner kill its own batch):
-```
-R=$(pwd)/.agent/cts-tess2
-python3 agents/conformance/run.py --pattern 'KHR-GL46.tessellation_shader.<group>.*' \
-    --results-dir "$R" --refresh-caselist --max-seconds 300 --per-case-timeout 150 --batch 2
-```
-NOTE: `--results-dir` must be **absolute** (glcts's cwd is the CTS build dir) and each
-pattern regenerates the caselist, so use one pattern per invocation.  Kill any leftover
-`glcts` before starting the next batch.
+Repro: `python3 agents/conformance/run.py --pattern '<name>' --results-dir .agent/cts-X
+--refresh-caselist --max-seconds 1500 --per-case-timeout 1450 --batch 1`.
 
-## Open items
+## Open items (next round)
 
-* **`single.isolines_tessellation` no longer finishes in 480 s** (no QPA progress after
-  500 s).  Not reproduced in MGL: a 12k-configuration sweep (no-TCS default levels,
-  and TCS levels with 1 control point + RASTERIZER_DISCARD + XFB capture + counter
-  query run + buffer map, density/detail 1..64 x 3 spacings) is clean and fast, and
-  PRIMITIVES_GENERATED == captured-records/2 everywhere.  The test is one of the LONG
-  ones (a huge level matrix, two draws + a map per iteration); it may simply exceed the
-  480 s budget now that the reference layout emits more vertices for fractional
-  spacing.  Next step: give it a single-case run with a >480 s budget (needs the
-  supervisor's allowance) or instrument the iteration count; if it is a real hang it
-  is in the XFB/TF-buffer interaction (transform_feedback.c / MGLRenderer+Geometry.m),
-  not the tessellator.
-* `point_mode.point_rendering` / `points_verification` (round-13 leftovers) still fail:
-  they need the *fractional-spacing vertex-count formula* in point mode — the D3D11
-  count formula is now in place (`d3d_*` in count mode), so re-check them first.
-* `tcte.data_pass_through` — untouched this round.
+1. **tcte.data_pass_through @ index 110** (`expected [2,2,2,2] found [0,0,0,0]`): the first
+   failing subtest moved 40 -> 110, i.e. the isolines+point_mode runs now pass; a later run
+   (per_patch=55: likely QUADS point_mode or a TRIANGLES ring layout with more patches) still
+   reads patch-0 control points for patch 2+. Start from `tests/headless/zz_tcte_pt.c`
+   (RUN_GS=1 GS_RUN=1 runs both variants; extend with a QUADS GS variant and >3 patches) and
+   the capture diagnostics `MGL_TESS_DUMP_CAP=1` (pack-side) / `MGL_DUMP_MSL=1`.
+2. **test_geom pool_wrap_stress_tiny times out** — PRE-EXISTING at gl46-port eb540d2 (geom
+   round 44), verified by rebuilding the merge point; not a tess regression. Hand to geom.
+3. `.agent/cts-iso*/cts-pm*/cts-tcte*` hold the round's CTS logs; zz_* tests are untracked
+   by design (keep zz10_var.c, *.spv, TestResults.qpa untracked, never commit).
 
-## Notes for the next agent
+## Shared-file edits this round (each surgical, for the merge)
 
-* The algorithm exists twice (C in `tessellation.c`, MSL string in `MGLTessKernels.h`).
-  Keep them in lockstep: any change to one must be mirrored in the other, then extend
-  the level table in `TessEmuStreamEqualsCpu` (and optionally re-run
-  `.agent/d3d11/compare.c` against Mesa's reference, still untracked in `.agent/d3d11`).
-* Scratch: `.agent/d3d11/` holds the oracle harness (untracked, keep it).
-* Shared-file edits this round: none outside my own files (only `MGLTessKernels.h`,
-  `MGLRenderer+Tessellation.m`, `tessellation.c`, `mgl_tess_diag.h`, `test_tessemu.c`).
+- `MGL/src/MGLRenderer+RenderState.m`: specialize the plain-TES vertex function (2 hunks:
+  the standin branch + `standinFn` early-out in `rstateSpecialize`).
+- `MGL/src/transform_feedback.c`: accept PATCHES/adjacency TF modes + `xfb_mode_compatible`
+  cases.
+- `MGL/src/geometry.c`: XFB var resolve pass-2 (bare block members) + the route's
+  flattened-name reconcile fallback.
+- `MGL/src/MGLRenderer+Geometry.m`: none left (debug prints removed).
+- `MGL/src/MGLTessKernels.h`: isoline point_mode emit guard.
+
+Domain files: `MGLRenderer+Tessellation.m` (ring retire + traces), `tessellation.c`
+(tri inner[1] redirect), `mgl_ext_tess.h` (unchanged this round).

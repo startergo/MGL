@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <glslang_c_interface.h>
 #include <glslang_c_shader_types.h>
@@ -2251,6 +2252,76 @@ static bool check_stage_mask(GLuint mask, char **log, bool separable)
     return true;
 }
 
+/* glslang's tessellation cross-stage link has a false positive on sized 'patch' arrays:
+ * isIoResizeArray() (linkValidate.cpp) exempts patch variables on the control side but
+ * not on the evaluation side, so a TES 'patch in T name[N]' loses its only dimension to
+ * the (nonexistent) control-point dimension and every pair with EQUAL sizes is reported
+ * as "Array sizes must be compatible" — printing two identical types.  Detect exactly
+ * that pattern (all errors are tesc/tese array-size mismatches whose printed sizes
+ * match) so link_glsl can continue; genuine mismatches still fail the link. */
+static bool mgl_link_log_is_tess_patch_false_positive(const char *log)
+{
+    const char *p = log;
+    bool saw_block = false;
+
+    while (*p)
+    {
+        const char *eol;
+        const char *next;
+        const char *q1, *q1e, *q2, *q2e, *s1, *s2;
+        long n1, n2;
+
+        if (strncmp(p, "ERROR:", 6) != 0)
+            break;                       /* unexpected line shape: not the pattern */
+
+        if (!strstr(p, "Array sizes must be compatible:"))
+            return false;                /* some other link error */
+
+        eol = strstr(p, "\n");
+        if (!eol)
+            break;
+
+        /* the two stage lines that follow carry quoted type strings */
+        q1 = strchr(eol, '"');
+        if (!q1)
+            return false;
+        q1e = strchr(q1 + 1, '"');
+        if (!q1e)
+            return false;
+        q2 = strchr(q1e + 1, '"');
+        if (!q2)
+            return false;
+        q2e = strchr(q2 + 1, '"');
+        if (!q2e)
+            return false;
+
+        s1 = q1e;
+        while (s1 > q1 && s1[-1] != '[') s1--;   /* last '[N' inside the quoted type */
+        s1 = (s1 > q1) ? s1 - 1 : NULL;
+        s2 = q2e;
+        while (s2 > q2 && s2[-1] != '[') s2--;
+        s2 = (s2 > q2) ? s2 - 1 : NULL;
+        if (!s1 || !s2)
+            return false;
+        n1 = strtol(s1 + 1, NULL, 10);
+        n2 = strtol(s2 + 1, NULL, 10);
+        if (n1 != n2 || n1 <= 0)
+            return false;                /* sizes differ: a genuine mismatch */
+
+        saw_block = true;
+
+        /* advance past the second stage line */
+        next = strchr(q2e, '\n');
+        if (!next)
+            break;
+        p = next + 1;
+        while (*p == ' ' || *p == '\t' || *p == '\n')
+            p++;                         /* log lines are indented; skip separators */
+    }
+
+    return saw_block;
+}
+
 static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, ReflectAcc *acc, char **log)
 {
     glslang_program_t *glsl_program;
@@ -2284,9 +2355,27 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
     if (!glslang_program_link(glsl_program, GLSLANG_MSG_DEFAULT_BIT))
     {
         const char *info = glslang_program_get_info_log(glsl_program);
-        mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL link failed\n");
-        glslang_program_delete(glsl_program);
-        return false;
+        if (info && mgl_link_log_is_tess_patch_false_positive(info))
+        {
+            /* glslang's cross-stage check mis-handles a TES 'patch in' ARRAY:
+             * linkValidate.cpp's isIoResizeArray() drops the patch exemption on the
+             * evaluation side, so the patch array's single dimension is consumed as
+             * the (nonexistent) control-point dimension and every sized TCS patch
+             * out / TES patch in pair with EQUAL sizes is rejected ("Array sizes
+             * must be compatible" printing two identical types).  The stages were
+             * each parsed successfully, per-stage SPIR-V generation below does not
+             * depend on the failed merge, and GL's own patch-in/out size rule is still
+             * enforced later by the interface checks that consume the SPIR-V — continue
+             * with a note instead of failing the link (tessellation_shader_tc_barriers
+             * barrier_guarded_read_write_calls links a 'patch out int r[16]' pair). */
+            mgl_append_info_log(log, "WARNING: %s", info);
+        }
+        else
+        {
+            mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL link failed\n");
+            glslang_program_delete(glsl_program);
+            return false;
+        }
     }
 
     /* assigns locations for legacy (< 330) shaders compiled with AUTO_MAP_LOCATIONS.
