@@ -4835,8 +4835,25 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     /* load one input primitive */
     sb_put(&b, "void mgl_load_inputs(uint mgl_pi, uint mgl_inst)\n{\n");
     sb_put(&b, "    for (uint mgl_k = 0u; mgl_k < %uu; mgl_k++) {\n", gp->in_verts);
-    sb_put(&b, "        uint mgl_r = (mgl_prim[mgl_pi * %uu + mgl_k] - mgl_hdr[12] + mgl_inst * mgl_hdr[6]) * %uu;\n",
-           gp->in_verts, gp->in_words);
+    sb_put(&b, "        /* an affine direct draw (hdr[21]) derives the window's vertex ids\n"
+               "         * arithmetically instead of loading the assembly's primitive slots.\n"
+               "         * hdr[20] codes the window pattern: 1 = plain stride-1 window\n"
+               "         * [p, p+1, ..]; 2/3 = triangle strip whose ODD windows swap the leading\n"
+               "         * vertices (the GL strip winding / provoking-vertex rule: even p ->\n"
+               "         * [p, p+1, p+2]; odd p, last-vertex convention -> [p+1, p, p+2]; odd p,\n"
+               "         * first-vertex -> [p+2, p, p+1]); >= 4 = disjoint windows of (code - 3)\n"
+               "         * vertices. */\n");
+    sb_put(&b, "        uint mgl_s = mgl_hdr[20];\n");
+    sb_put(&b, "        uint mgl_w = mgl_hdr[19] + mgl_pi * ((mgl_s <= 3u) ? 1u : (mgl_s - 3u));\n");
+    sb_put(&b, "        uint mgl_vid;\n");
+    sb_put(&b, "        if (mgl_hdr[21] == 0u) mgl_vid = mgl_prim[mgl_pi * %uu + mgl_k];\n", gp->in_verts);
+    sb_put(&b, "        else if (mgl_s == 2u && (mgl_pi & 1u) != 0u)\n"
+               "            mgl_vid = (mgl_k == 0u) ? (mgl_w + 1u) : ((mgl_k == 1u) ? mgl_w : (mgl_w + 2u));\n");
+    sb_put(&b, "        else if (mgl_s == 3u && (mgl_pi & 1u) != 0u)\n"
+               "            mgl_vid = (mgl_k == 0u) ? (mgl_w + 2u) : (mgl_w + mgl_k - 1u);\n");
+    sb_put(&b, "        else mgl_vid = mgl_w + mgl_k;\n");
+    sb_put(&b, "        uint mgl_r = (mgl_vid - mgl_hdr[12] + mgl_inst * mgl_hdr[6]) * %uu;\n",
+           gp->in_words);
     if (gp->in_has_pos)
         sb_put(&b, "        mgl_in[mgl_k].mgl_gs_pos = vec4(uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]),"
                    " uintBitsToFloat(mgl_vsout[mgl_r + %u]), uintBitsToFloat(mgl_vsout[mgl_r + %u]));\n",
@@ -6866,6 +6883,35 @@ int mgl_geom_mode_code(GLenum mode)
 }
 
 /* is the primitive restart index enabled and what is it? */
+/* affine primitive windows for a direct draw: the window-derivation code the geometry
+ * kernel applies (see MGLGeomDraw.implicit_stride and the kernel's mgl_load_inputs).
+ * LINE_LOOP, TRIANGLE_FAN, POLYGON and TRIANGLE_STRIP_ADJACENCY do not follow a fixed
+ * pattern (the closing segment / shared apex / GL 4.6 table 10.4 adjacency layout), so
+ * they return 0 = assemble.  A triangle strip's odd windows swap their leading vertices
+ * (the GL strip winding / provoking-vertex rule, matching the prep kernel's case 8) -
+ * encodable as a per-parity permutation, so strips use codes 2 (last-vertex convention)
+ * and 3 (first-vertex); plain stride-1 line-strip windows use 1; disjoint list windows
+ * encode their size + 3 (never colliding with the strip codes). */
+static uint32_t geom_affine_stride(GLenum mode, uint32_t in_verts, bool provoking_first)
+{
+    switch (mode)
+    {
+        case GL_POINTS:
+        case GL_LINES:
+        case GL_TRIANGLES:
+        case GL_LINES_ADJACENCY:
+        case GL_TRIANGLES_ADJACENCY:
+            return in_verts + 3;        /* list-like: disjoint windows of in_verts */
+        case GL_LINE_STRIP:
+        case GL_LINE_STRIP_ADJACENCY:
+            return 1;                   /* strip-like: windows advance by one vertex */
+        case GL_TRIANGLE_STRIP:
+            return provoking_first ? 3 : 2;
+        default:
+            return 0;
+    }
+}
+
 static uint32_t geom_restart_index(GLMContext ctx)
 {
     if (!ctx->state.caps.primitive_restart) return 0xffffffffu;
@@ -7185,6 +7231,22 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     d.baseinstance = baseinstance;
     d.restart = geom_restart_index(ctx);
     d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
+    /* affine direct draws (glDrawArrays*): the primitive windows are a fixed stride apart,
+     * so the geometry kernel can derive them arithmetically and the whole prep stage
+     * (one to six GPU launches per draw) is skipped.  Non-indexed draws never restart (the
+     * prep ignores restarts for them, and GL only restarts non-indexed draws through
+     * GL_PRIMITIVE_RESTART_FOR_PRIMITIVES, which this path does not take when enabled). */
+    if (!indexed && !ctx->state.caps.primitive_restart_fixed_index)
+    {
+        d.implicit_stride = geom_affine_stride(mode, gp->in_verts, d.provoking_first);
+        if (d.implicit_stride)
+        {
+            /* the capture pass draws the range directly (no prep kernel): it needs the
+             * same vstart/vcount the CPU route would have supplied */
+            d.vstart = (uint32_t)first;
+            d.vcount = (uint32_t)(count > 0 ? count : 1);
+        }
+    }
 
     if (!METAL() || !METAL()->draw)
     {

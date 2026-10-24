@@ -1,4 +1,70 @@
 # compat domain — progress log
+READY 5efa031 (gl46/compat; gl46-port 9cc5052 merged as 5614538 + the getenv hot-path fix)
+— geometry-shader emulation throughput work + the mglP10 mrt/texarray investigation.
+BENCH-REQUEST: glmark2-macos full default list, background launch, window visible (same
+mode as before).  Focus scenes: gl41-geometry (expect well above the 1114 of mglR9; local
+occluded run went 706->1285 FPS, GPU/draw 1138->901us free-running, serialized latency
+3.3->1.5ms).  mglR9 vs mglP10 gl41-mrt/gl41-texarray: NOT a code regression — see the
+session-7 note below; expect those two scenes back at their load-3-4 numbers.
+
+## session 7 (Oct 24) — gl41-geometry throughput; mrt/texarray regression triage
+
+gl41-geometry (the biggest gap, 1114 vs native 2605) is one 65536-point glDrawArrays per
+frame whose GS expands each point to a 4-vertex strip.  Ground truth came from a new
+opt-in hook, MGL_GEOM_GPUTIME=1 (MGLRenderer+Geometry.m, geom-owned): a completed handler
+per command buffer the geometry path encodes into, printing the running average GPU busy
+time per command buffer and per draw.  Stage ablation knobs MGL_GEOM_SKIP_
+{CAPTURE,KERNEL,ORDER,GS,SCAN,COPY,RASTER} + MGL_GEOM_NO_{BARRIER,IMPLICIT} were added for
+attribution (skipping a stage leaves the consumers reading the same data volume, so run
+differences measure the stage; NO_BARRIER is a perf probe only, results may be wrong).
+
+Findings on this machine (virtualized AGX): (a) the order pass's mgl_geom_lscan was a
+single 32-lane simdgroup walking threads/32 chunks in a dependent load->scan->store chain
+(~1.6ms serialized for 65536 threads); (b) kernel LAUNCH overhead is ~100us per dispatch
+(the whole prep chain is 6 launches); (c) the raster pass is cheap in throughput terms
+(~120us) and overlaps well.
+
+Fixes (commit 3dc2b69 "geom perf: parallel chunk scan + affine implicit-window fast
+path", merged gl46-port 9cc5052 as 5614538):
+- lscan -> mgl_geom_pscan (1024-thread groups: simd prefixes + one threadgroup scan of
+  the 32 simd totals, chunk-local bases) + mgl_geom_pbase (scan of the <= threads/1024
+  chunk totals, writes ctl[1]); lcopy adds the chunk base.  gIdx grows by the chunk-sum
+  words.  Serialized latency 3.3 -> 1.5ms; test_geom_perf assembly wall -38%.
+- affine implicit windows: direct non-indexed draws (glDrawArrays*, no
+  PRIMITIVE_RESTART_FIXED_INDEX) of POINTS/LINES/TRIANGLES(+adjacency) lists,
+  LINE(_STRIP)_ADJACENCY and TRIANGLE_STRIP now skip the ENTIRE prep stage — the kernel
+  derives each primitive window's vertex ids from hdr[19..21] (list/strip/strip-permute
+  codes; the strip's odd windows apply the GL winding/provoking-vertex permutation,
+  matching the prep kernel's case 8), the capture pass draws the vertex range directly
+  (non-indexed), the GS dispatch is exact+direct, and the gPrim pool suballoc shrinks to
+  the header.  geom_affine_stride() in geometry.c classifies; MGLGeomDraw.implicit_stride
+  carries the code.  gl41-geometry: 6 launches fewer per draw.
+- gl41-geometry local (occluded, load ~5): FPS 706 -> 1285; GPU free-running 1138 -> 901
+  us/draw; CPU draw slot 0.9ms with zero pool waits (the geomSubAlloc waitUntilCompleted
+  the earlier sample showed is gone now that the latency halved).
+
+mglP10 gl41-mrt 7780->6552 / gl41-texarray 12356->10168: NOT reproducible as a code
+regression.  Built bf0074e and 9cc5052 side by side (ab/ trees, -j4) and ran them
+SIMULTANEOUSLY (same load, same throttle state): texarray 5781 vs 5729, mrt 1181 vs 1250
+(sign flips between scenes, +-1-6%).  Per-command-buffer GPU time is identical (94.6 vs
+94.4us).  MGL_PROFILE CPU slots are within noise (the machine's load swings 3-5 dominate;
+the P10 bench ran at load ~5 vs 3.1 for mglR9, and mrt/texarray are the two
+highest-FPS/most load-sensitive scenes).  geom r47's only hot-path additions for non-SSBO
+scenes are a 32-compare scan per non-attribute buffer map and — the one real waste — a
+getenv("MGL_BINDMAP_DEBUG") PER BUFFER MAP PER DRAW (environ lock in the hot path).  That
+getenv is now read once into a static (MGLRenderer.m, shared file, surgical; debug print
+behaviour unchanged).  SSBO correctness untouched by it (debug-print guard only); SSBO
+behaviour itself is r47's and was not modified.
+
+Remaining gl41-geometry gap vs native (1285 vs ~2605-equivalent locally): the frame is
+still ~14 launches worth of GPU work + ~0.6ms CPU submit.  Next levers, in order: merge
+mgl_geom_init into mgl_geom_lzero and mgl_geom_finalize into mgl_geom_pbase (-2
+launches); extend the implicit path to drawArraysIndirect and to the tess producer; cut
+CPU submit (the capture pass's descriptor walk + processGLState full-dirty re-walk per
+draw — geomDraw marks DIRTY_VAO|DIRTY_PROGRAM|DIRTY_STATE after the capture pass, so the
+raster pass re-translates everything every draw).
+
+BENCH-RESULT c57f712 (built at HEAD 67074d2) score=14066 native=6608 ratio=2.13 load=3.1 — NOT pinned (0 scenes at 119-121); mglR9 vs native6, 12:08 EDT. Slower than native: ideas 2179/3514, desktop-shadow 4316/4677, gl41-geometry 1114/2605; ~equal: terrain, refract, buffer.
 READY c57f712 (gl46/compat, fixes on top of 1984249 which already contains gl46-port a2f16f4
 via merge 04d3fbd; `git merge gl46-port` confirms "Already up to date").
 BENCH-REQUEST: glmark2-macos full default list, background launch

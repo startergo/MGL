@@ -818,7 +818,11 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
         assert(ptr);
 
-        if (getenv("MGL_BINDMAP_DEBUG"))
+        /* perf: read the knob once - getenv takes the environment lock, and this loop
+         * runs per buffer map per draw per stage */
+        static bool sBindmapDebugInit = false, sBindmapDebug = false;
+        if (!sBindmapDebugInit) { sBindmapDebug = getenv("MGL_BINDMAP_DEBUG") != NULL; sBindmapDebugInit = true; }
+        if (sBindmapDebug)
             fprintf(stderr, "MGL bindmap v[%d] name=%u mtl=%u size=%zu mtl_data=%p storage=%d attr=%x\n",
                     i, ptr->name, map->mtl_index, (size_t)ptr->size, (void *)ptr->data.mtl_data,
                     (int)mgl_writable_binding(ctx, ptr), map->attribute_mask);

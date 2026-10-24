@@ -114,7 +114,7 @@ static size_t gPrimBytes, gVsoutBytes, gOutvBytes, gIdxBytes;
 
 static id<MTLComputePipelineState> gGsPso;
 static id<MTLComputePipelineState> gInitPso;
-static id<MTLComputePipelineState> gLscanPso, gLcopyPso, gLzeroPso;   /* raster list order passes */
+static id<MTLComputePipelineState> gPscanPso, gPbasePso, gLcopyPso, gLzeroPso;   /* raster list order passes */
 /* tile-parallel prep (large draws): per-tile restart counts -> prefix sum -> per-tile run
  * records -> parallel emit; see the comment block in kGeomPrepMSL */
 static id<MTLComputePipelineState> gPrepcPso, gTilesPso, gPrefixPso, gRunsPso, gReducePso, gEmitPso;
@@ -130,18 +130,42 @@ static uint32_t gTiledMin = 4096u;/* the scratch is capped so absurdly large ind
 static struct {
     int  read;
     bool draw, debug, xfb, worst_case, dump, serial_prep;
-} gEnv = { 0, false, false, false, false, false, false };
+    /* stage-skip diagnostics (MGL_GEOM_SKIP_*): GPU-time attribution of the emulation's
+     * stages — the skipped stage's consumers keep reading the same VOLUME of data (a
+     * previous draw's records / counters), so the difference of two runs is the stage's
+     * own cost.  Development diagnostics only; never set by the library itself. */
+    bool skip_capture, skip_kernel, skip_order, skip_raster, gputime, skip_gs, no_barrier, skip_scan, skip_copy, no_implicit;
+    int scan_reps;
+} gEnv = { 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, 0 };
 
 static void geomEnvRead(void)
 {
-    if (gEnv.read) return;
-    gEnv.read = 1;
+    if (gEnv.read) return;    gEnv.read = 1;
     gEnv.draw = getenv("MGL_GEOM_TRACE_DRAW") != NULL;
     gEnv.debug = getenv("MGL_GEOM_DEBUG") != NULL;
     gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
     gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
     gEnv.serial_prep = getenv("MGL_GEOM_SERIAL_PREP") != NULL;   /* A/B the serial kernel */
+    gEnv.skip_capture = getenv("MGL_GEOM_SKIP_CAPTURE") != NULL;
+    gEnv.skip_kernel = getenv("MGL_GEOM_SKIP_KERNEL") != NULL;
+    gEnv.skip_order = getenv("MGL_GEOM_SKIP_ORDER") != NULL;
+    gEnv.skip_raster = getenv("MGL_GEOM_SKIP_RASTER") != NULL;
+    gEnv.skip_gs = getenv("MGL_GEOM_SKIP_GS") != NULL;
+    gEnv.no_barrier = getenv("MGL_GEOM_NO_BARRIER") != NULL;   /* PERF PROBE ONLY: skip the
+                                   * order passes' memory barriers; results may be wrong */
+    gEnv.skip_scan = getenv("MGL_GEOM_SKIP_SCAN") != NULL;
+    gEnv.skip_copy = getenv("MGL_GEOM_SKIP_COPY") != NULL;
+    gEnv.no_implicit = getenv("MGL_GEOM_NO_IMPLICIT") != NULL;   /* A/B: force assembly */
+    {
+        const char *r = getenv("MGL_GEOM_SCAN_REPS");
+        if (r) { int v = atoi(r); if (v >= 1 && v <= 32) gEnv.scan_reps = v; }
+    }
+    /* MGL_GEOM_GPUTIME=1: every command buffer the geometry path encodes into gets a
+     * completed handler that sums its GPU busy time (MTLCommandBuffer GPUStartTime/
+     * GPUEndTime) and reports the average per command buffer — ground truth for where
+     * a scene's frame time goes, independent of CPU starvation */
+    gEnv.gputime = getenv("MGL_GEOM_GPUTIME") != NULL;
     /* the scratch pools' shape is read here once: the per-slot byte cap (how far a batch
      * of draws may run ahead of the GPU before a wait) and the rotation depth.  Test
      * hook: MGL_GEOM_POOL_CAP=<bytes> forces tiny pools so every draw wraps/reclaims. */
@@ -159,6 +183,39 @@ static void geomEnvRead(void)
     const char *tmin = getenv("MGL_GEOM_TILED_MIN");             /* test hook: force the chain */
     if (tmin) { int v = atoi(tmin); gTiledMin = v > 0 ? (uint32_t)v : 0u; }
 }
+
+/* ---- opt-in GPU-time accounting (MGL_GEOM_GPUTIME=1) --------------------------
+ * Every command buffer the geometry path encodes into gets, exactly once and before it
+ * can be committed, a completed handler that sums its GPU busy time and counts it.  The
+ * report line prints the running average — per command buffer, which in a scene with one
+ * draw per frame is the frame's GPU cost.  Mirrors the tess domain's tDiag accounting. */
+static id<MTLCommandBuffer> gTimedCb;
+static _Atomic uint64_t gGpuTimeNs, gGpuTimeCbs, gGpuTimeDraws;
+
+void mgl_geom_gpu_time_reset(void) { gGpuTimeNs = 0; gGpuTimeCbs = 0; gGpuTimeDraws = 0; }
+unsigned long long mgl_geom_gpu_cbs(void) { return gGpuTimeCbs; }
+double mgl_geom_gpu_time_us_per_draw(void)
+{
+    return gGpuTimeDraws ? (double)gGpuTimeNs / 1000.0 / (double)gGpuTimeDraws : 0.0;
+}
+
+static void geomTimeCommandBuffer(id<MTLCommandBuffer> cb)
+{
+    if (!cb || !gEnv.gputime || cb == gTimedCb) return;
+    if (cb.status >= MTLCommandBufferStatusCommitted) return;   /* handler must precede commit */
+    gTimedCb = cb;
+    [cb addCompletedHandler: ^(id<MTLCommandBuffer> b) {
+        if (b.GPUEndTime > b.GPUStartTime)
+            gGpuTimeNs += (uint64_t)((b.GPUEndTime - b.GPUStartTime) * 1e9);
+        uint64_t n = ++gGpuTimeCbs;
+        if (n % 60 == 0)
+            fprintf(stderr, "geom: GPU-TIME %.1f us/command buffer, %.1f us/draw (%llu cbs, %llu draws)\n",
+                    (double)gGpuTimeNs / 1000.0 / (double)n,
+                    gGpuTimeDraws ? (double)gGpuTimeNs / 1000.0 / (double)gGpuTimeDraws : 0.0,
+                    (unsigned long long)n, (unsigned long long)gGpuTimeDraws);
+    }];
+}
+
 
 static id<MTLComputePipelineState> gPrepPso, gTessImportPso;
 static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbBeginPso;
@@ -1018,50 +1075,98 @@ static const char *kGeomCtlMSL =
     "    lc[in[0] + t] = 0u;\n"
     "}\n"
     "\n"
-    "/* order pass 1: exclusive prefix sum of the per-thread list entry counts (lc[t])\n"
-    " * into lc[T + t], and the total into ctl[1].  A single 32-wide simdgroup walks the\n"
-    " * whole thread range in chunks of 32, carrying the running total. */\n"
-    "kernel void mgl_geom_lscan(constant uint* in [[buffer(0)]],\n"
-    "                           device uint* c   [[buffer(1)]],\n"
-    "                           device uint* lc  [[buffer(2)]],\n"
+    "/* order pass 1a: chunk-parallel exclusive prefix scan of the per-thread list counts\n"
+    " * (lc[t]) into lc[T + t].  The old single-32-lane scan walked T/32 chunks in a serial\n"
+    " * dependent chain (load -> scan -> store, ~T/32 round trips); this one scans CHUNK\n"
+    " * entries per 1024-thread group - 32 simds of 32 lanes, each simd prefix-scanned, the\n"
+    " * 32 simd totals scanned by one more simd pass - leaving the chunk-LOCAL exclusive\n"
+    " * base in lc[T+t] and the group's total in sums[g].  Pass 1b then scans the (T/CHUNK)\n"
+    " * group totals, and lcopy adds that chunk base, giving the same global exclusive\n"
+    " * prefix as before at a fraction of the serial latency. */\n"
+    "kernel void mgl_geom_pscan(constant uint* in [[buffer(0)]],\n"
+    "                           device uint* lc   [[buffer(1)]],\n"
+    "                           device uint* sums [[buffer(2)]],\n"
+    "                           uint gid  [[thread_position_in_grid]],\n"
+    "                           uint lid  [[thread_position_in_threadgroup]],\n"
     "                           uint sgid [[thread_index_in_simdgroup]])\n"
     "{\n"
-    "    uint T = in[0], carry = 0u;\n"
-    "    for (uint base = 0u; base < T; base += 32u)\n"
+    "    uint T = in[0];\n"
+    "    uint t = gid;\n"
+    "    uint simd = lid >> 5;                     /* simd lane group within the group */\n"
+    "    threadgroup uint tg[32];\n"
+    "    uint orig = (t < T) ? lc[t] : 0u;\n"
+    "    uint v = orig;\n"
+    "    for (uint o = 1u; o < 32u; o <<= 1)\n"
     "    {\n"
-    "        uint t = base + sgid;\n"
-    "        uint orig = (t < T) ? lc[t] : 0u;\n"
+    "        uint u = simd_shuffle_up(v, o);\n"
+    "        if (sgid >= o) v += u;\n"
+    "    }\n"
+    "    uint loc = v - orig;                      /* exclusive prefix inside the simd */\n"
+    "    uint tot = simd_broadcast(v, 31u);        /* this simd's total */\n"
+    "    if (sgid == 0u) tg[simd] = tot;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    if (lid < 32u)\n"
+    "    {\n"
+    "        uint o2 = tg[lid];\n"
+    "        uint w = o2;\n"
+    "        for (uint o = 1u; o < 32u; o <<= 1)\n"
+    "        {\n"
+    "            uint u = simd_shuffle_up(w, o);\n"
+    "            if (lid >= o) w += u;\n"
+    "        }\n"
+    "        tg[lid] = w - o2;                     /* exclusive prefix over the simds */\n"
+    "    }\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    if (t < T) lc[T + t] = loc + tg[simd];\n"
+    "    if (lid == 1023u) sums[gid >> 10] = tg[31];   /* the group's (chunk's) total */\n"
+    "}\n"
+    "\n"
+    "/* order pass 1b: exclusive scan of the per-chunk totals (pass 1a's sums) into the\n"
+    " * chunk bases, and the grand total into ctl[1] (the indirect draw's indexCount). */\n"
+    "kernel void mgl_geom_pbase(constant uint* in [[buffer(0)]],\n"
+    "                           device uint* c    [[buffer(1)]],\n"
+    "                           device uint* sums [[buffer(2)]],\n"
+    "                           uint sgid [[thread_index_in_simdgroup]])\n"
+    "{\n"
+    "    uint C = in[0], carry = 0u;\n"
+    "    for (uint base = 0u; base < C; base += 32u)\n"
+    "    {\n"
+    "        uint g = base + sgid;\n"
+    "        uint orig = (g < C) ? sums[g] : 0u;\n"
     "        uint v = orig;\n"
     "        for (uint o = 1u; o < 32u; o <<= 1)\n"
     "        {\n"
     "            uint u = simd_shuffle_up(v, o);\n"
     "            if (sgid >= o) v += u;\n"
     "        }\n"
-    "        if (t < T) lc[T + t] = carry + v - orig;    /* exclusive base */\n"
+    "        if (g < C) sums[g] = carry + v - orig;   /* exclusive chunk base */\n"
     "        carry += simd_broadcast(v, 31u);\n"
     "    }\n"
-    "    if (sgid == 0u) c[1] = carry;                   /* total list entries */\n"
+    "    if (sgid == 0u) c[1] = carry;               /* total list entries */\n"
     "}\n"
     "\n"
     "/* order pass 2: copy each thread's scratch segment into the raster list at its\n"
     " * scanned offset - the segments then sit in primitive order, which an atomicAdd\n"
-    " * append could not guarantee */\n"
+    " * append could not guarantee.  The destination is the chunk-local base from pass 1a\n"
+    " * plus the chunk base from pass 1b. */\n"
     "kernel void mgl_geom_lcopy(constant uint* in [[buffer(0)]],\n"
     "                           device uint* lscr [[buffer(1)]],\n"
     "                           device uint* lc   [[buffer(2)]],\n"
     "                           device uint* idx  [[buffer(3)]],\n"
+    "                           device uint* cb   [[buffer(4)]],\n"
     "                           uint t [[thread_position_in_grid]])\n"
     "{\n"
     "    if (t >= in[0]) return;\n"
     "    uint n = lc[t];\n"
     "    if (n == 0u) return;\n"
-    "    uint dst = lc[in[0] + t], src = t * in[1];\n"
+    "    uint dst = lc[in[0] + t] + cb[t >> 10];\n"
+    "    uint src = t * in[1];\n"
     "    for (uint i = 0u; i < n; i++) idx[dst + i] = lscr[src + i];\n"
     "}\n";
 
 static bool geomCtlPipelines(id<MTLDevice> device)
 {
-    if (gInitPso && gFinPso && gPrepPso && gLscanPso && gLcopyPso && gLzeroPso && gQaccPso) return true;
+    if (gInitPso && gFinPso && gPrepPso && gPscanPso && gPbasePso && gLcopyPso && gLzeroPso && gQaccPso) return true;
 
     NSError *error = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomCtlMSL]
@@ -1073,19 +1178,21 @@ static bool geomCtlPipelines(id<MTLDevice> device)
     }
     id<MTLFunction> initfn = [lib newFunctionWithName: @"mgl_geom_init"];
     id<MTLFunction> finfn = [lib newFunctionWithName: @"mgl_geom_finalize"];
-    id<MTLFunction> lscanfn = [lib newFunctionWithName: @"mgl_geom_lscan"];
+    id<MTLFunction> pscanfn = [lib newFunctionWithName: @"mgl_geom_pscan"];
+    id<MTLFunction> pbasefn = [lib newFunctionWithName: @"mgl_geom_pbase"];
     id<MTLFunction> lcopyfn = [lib newFunctionWithName: @"mgl_geom_lcopy"];
     id<MTLFunction> lzerofn = [lib newFunctionWithName: @"mgl_geom_lzero"];
     id<MTLFunction> qaccfn = [lib newFunctionWithName: @"mgl_geom_qacc"];
-    if (!initfn || !finfn || !lscanfn || !lcopyfn || !lzerofn || !qaccfn) return false;
+    if (!initfn || !finfn || !pscanfn || !pbasefn || !lcopyfn || !lzerofn || !qaccfn) return false;
 
     gInitPso = [device newComputePipelineStateWithFunction: initfn error: &error];
     gFinPso = [device newComputePipelineStateWithFunction: finfn error: &error];
-    gLscanPso = [device newComputePipelineStateWithFunction: lscanfn error: &error];
+    gPscanPso = [device newComputePipelineStateWithFunction: pscanfn error: &error];
+    gPbasePso = [device newComputePipelineStateWithFunction: pbasefn error: &error];
     gLcopyPso = [device newComputePipelineStateWithFunction: lcopyfn error: &error];
     gLzeroPso = [device newComputePipelineStateWithFunction: lzerofn error: &error];
     gQaccPso = [device newComputePipelineStateWithFunction: qaccfn error: &error];
-    if (!gInitPso || !gFinPso || !gLscanPso || !gLcopyPso || !gLzeroPso || !gQaccPso) return false;
+    if (!gInitPso || !gFinPso || !gPscanPso || !gPbasePso || !gLcopyPso || !gLzeroPso || !gQaccPso) return false;
 
     /* the prep kernel lives in its own library (it declares its own input struct) */
     id<MTLLibrary> plib = [device newLibraryWithSource: [NSString stringWithUTF8String: kGeomPrepMSL]
@@ -1176,7 +1283,7 @@ static void geomReleaseStatics(void)
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gQacc = nil; gQaccCb = nil; gQaccReset = 0; gQaccRan = false;
     gXfbOwner = 0; gXfbBegin = false;
-    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gLscanPso = gLcopyPso = gLzeroPso = nil; gTessImportPso = nil;
+    gGsPso = nil; gInitPso = nil; gFinPso = nil; gPrepPso = nil; gPscanPso = gPbasePso = gLcopyPso = gLzeroPso = nil; gTessImportPso = nil;
     gXfbPrePso = nil; gXfbScatterPso = nil; gXfbFinPso = nil; gXfbBeginPso = nil;
     gXfbTessPso = nil; gXfbTessFinPso = nil;
 
@@ -3606,6 +3713,20 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         fprintf(stderr, "geom: trace geomDraw enter tess=%d gp=%p\n", d->tess_ring != NULL, (void *)d->gp);
     MGLGeomProgram *gp = d->gp;    Program *program = d->program;
     const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
+    /* affine direct draw: the geometry kernel derives the primitive windows arithmetically;
+     * no prep stage, no capture index list, exact dispatch counts - all CPU-known */
+    const bool implicit = d->implicit_stride != 0 && !(geomEnvRead(), gEnv.no_implicit);
+    /* primitive count of an affine direct draw - the same arithmetic the kernel applies to
+     * the windows: strip codes 1..3 advance one vertex per window (odd triangle-strip
+     * windows only permute their vertices), disjoint codes (size + 3) drop the tail */
+    const uint64_t implicit_prims = (d->implicit_stride >= 1 && d->implicit_stride <= 3)
+        ? (d->count >= (GLsizei)gp->in_verts ? (uint64_t)d->count - gp->in_verts + 1 : 0)
+        : (uint64_t)d->count / (gp->in_verts ? gp->in_verts : 1);
+    if (implicit)
+    {
+        d->prims_count = (uint32_t)implicit_prims;
+        if (!d->prims_count) d->prims_count = 1;      /* keeps the dispatch grid nonzero */
+    }
     uint64_t threads = (uint64_t)(d->prims_count ? d->prims_count : 1)
                        * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations;
     uint32_t bound = d->count_bound ? d->count_bound : (d->count > 0 ? (uint32_t)d->count : 1);
@@ -3647,19 +3768,23 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         /* with GPU assembly the primitive count is only known on the GPU: dispatch (and
          * size) by the mode's worst case, the kernel returns early past the real count.
          * Behind a tessellation stage the bound is the capture's index-list capacity: k
-         * entries make one primitive. */
+         * entries make one primitive.  An implicit (affine) draw knows the exact count on
+         * the CPU, so the pools and the dispatch grid are sized tightly. */
         uint64_t bound_threads = gpu_assembly
-                                 ? (from_tess
-                                    ? (uint64_t)(d->tess_idx_cap ? d->tess_idx_cap : 1)
-                                      / (gp->in_verts ? gp->in_verts : 1)
-                                    : mgl_geom_worst_prims(d->mode, bound))
-                                   * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations
+                                 ? ((from_tess
+                                     ? (uint64_t)(d->tess_idx_cap ? d->tess_idx_cap : 1)
+                                       / (gp->in_verts ? gp->in_verts : 1)
+                                     : (implicit
+                                        ? implicit_prims
+                                        : mgl_geom_worst_prims(d->mode, bound)))
+                                    * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations)
                                  : threads;
         outv_cap = (size_t)bound_threads * (gp->max_vertices ? gp->max_vertices : 1);
         if (outv_cap > max_out) outv_cap = max_out;
         if (!outv_cap) outv_cap = 1;
         idx_cap = outv_cap * 3;
         threads = bound_threads;
+        if (!threads) threads = 1;    /* empty draw: keep every dispatch grid nonzero */
     }
 
     if (from_tess)
@@ -3674,6 +3799,16 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
     else if (gpu_assembly)
     {
+        if (implicit)
+        {
+            /* affine direct draw: no capture index list and no primitive slots - the
+             * capture pass draws the vertex range directly and the geometry kernel derives
+             * the windows from hdr[19..21] */
+            cap_idx = 0;
+            cap_prim = 0;
+        }
+        else
+        {
         /* the prep kernel writes the lists: the capture list holds one entry per vertex
          * of every restart-free run (<= the drawn vertex count), and the primitive slots
          * sit behind it at HDR + cap_idx - the geometry kernel binds that same offset */
@@ -3681,6 +3816,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         cap_prim = (size_t)mgl_geom_worst_prims(d->mode, bound);
         if (!cap_idx) cap_idx = 1;
         if (!cap_prim) cap_prim = 1;
+        }
     }
     else
     {
@@ -3724,7 +3860,9 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     gOutv = geomSubAlloc(self, _device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
     if (!gOutv) { geomReleaseStatics(); return false; }
     /* [ raster list | per-thread strip scratch | per-thread counts and scanned bases ] */
-    gIdx = geomBuffer(_device, gIdx, ((size_t)idx_cap * 2 + (size_t)threads * 2) * sizeof(uint32_t), &gIdxBytes);
+    gIdx = geomBuffer(_device, gIdx, ((size_t)idx_cap * 2 + (size_t)threads * 2 +
+                                      /* the order pass' per-chunk scan totals (pscan/pbase) */
+                                      (size_t)((threads + 1023) / 1024) + 64) * sizeof(uint32_t), &gIdxBytes);
     gCtl = geomBuffer(_device, gCtl, 4096, NULL);
     /* the prep kernel's outputs (the capture draw arguments and the kernel's dispatch count)
      * are read by this draw's capture pass and geometry dispatch: a later draw's prep kernel
@@ -3765,7 +3903,21 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         hdr[10] = (uint32_t)gp->out_words;
         hdr[11] = (uint32_t)d->baseinstance;
 
-        if (gpu_assembly)
+        if (implicit)
+        {
+            /* affine direct draw: the CPU supplies everything the prep kernel would have
+             * computed - the primitive count, the record base (the drawn range starts at
+             * `first`) and the window arithmetic in hdr[19..21] the kernel uses to derive
+             * each primitive's vertex ids without the primitive slots */
+            hdr[0]  = (uint32_t)implicit_prims;
+            hdr[6]  = (uint32_t)(d->count > 0 ? d->count : 1);   /* per-instance records */
+            hdr[8]  = d->first;
+            hdr[12] = d->first;                                  /* record base: (vid - first) */
+            hdr[19] = d->first;                                  /* window base vertex id */
+            hdr[20] = d->implicit_stride;
+            hdr[21] = 1;
+        }
+        else if (gpu_assembly)
         {
             /* the capture index list and the primitive slots come from the prep kernel:
              * only the inputs are uploaded, never the element buffer contents */
@@ -3809,11 +3961,13 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
 
     /* capture variant header lives in its own buffer; with GPU assembly the prep kernel
-     * fills in the vertex range */
+     * fills in the vertex range.  An implicit draw is a direct non-indexed draw: the range
+     * is CPU-known (first..first+count), so the variant gets it here as well */
     {
         uint32_t *ch = (uint32_t *)gVsout.contents + gVsoutOff / 4;
-        ch[0] = !gpu_assembly && gp->vid_absolute ? (uint32_t)d->vstart : 0;
-        ch[1] = (uint32_t)(!gpu_assembly ? d->vcount : 0);
+        const bool cap_direct = !gpu_assembly || implicit;
+        ch[0] = cap_direct && gp->vid_absolute ? (uint32_t)d->first : 0;
+        ch[1] = (uint32_t)(cap_direct ? (d->count > 0 ? d->count : 0) : 0);
         ch[2] = gp->iid_absolute ? (uint32_t)d->baseinstance : 0;
         ch[3] = (uint32_t)gp->in_words;
     }
@@ -3837,6 +3991,8 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         NSLog(@"MGL geom: no command buffer");
         return false;
     }
+    geomTimeCommandBuffer(_currentCommandBuffer);
+    if (gEnv.gputime) gGpuTimeDraws++;   /* per-draw GPU accounting denominator */
 
     /* reserve this command buffer's place in the queue now: the emulation's scratch is
      * shared between draws, so a later draw's kernels must not be allowed to run before an
@@ -3896,7 +4052,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         [enc popDebugGroup];
         kenc = enc;                       /* still open: the geometry kernel joins it */
     }
-    else if (gpu_assembly)
+    else if (gpu_assembly && !implicit)   /* affine direct draws need no assembly at all */
     {
         id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
         Buffer *eb = d->indexed ? (ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL) : NULL;
@@ -4033,7 +4189,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
 
     /* ---- 1. vertex capture pass ---- */
-    if (!from_tess)      /* the tess producer already wrote the records */
+    if (!from_tess && !(geomEnvRead(), gEnv.skip_capture))      /* the tess producer already wrote the records */
     {
         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
         MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
@@ -4253,7 +4409,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                             atIndex: MGL_GEOM_KERNEL_SIZE_BUFFER];
         }
 
-        if (gpu_assembly)
+        if (gpu_assembly && !implicit)
         {
             /* the prep kernel wrote the draw arguments (index count, instances, bases) */
             [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
@@ -4263,7 +4419,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                         indirectBuffer: gPrep
                   indirectBufferOffset: gPrepOff + (32 + 7) * sizeof(uint32_t)];
         }
-        else if (d->indexed)
+        else if (d->indexed && !implicit)
         {
             [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
                              indexCount: (NSUInteger)d->index_count
@@ -4309,7 +4465,10 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
 
     /* ---- 2. geometry kernel ---- */
+    if (!(geomEnvRead(), gEnv.skip_kernel))
     {
+        bool gGsDispatched = true;
+
         /* the geometry stage's textures were realized before the FIRST encoder of this
          * draw opened (geomRealizeKernelStageTextures, right after endRenderEncoding):
          * the tess import encoder opened there stays open across this whole section, so
@@ -4334,6 +4493,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         /* zero the list-order pass' per-thread counts up front: threads beyond this
          * draw's dispatch grid (an indirect draw's exact group count is smaller than the
          * worst-case bound) never run the kernel to publish a zero themselves */
+        if (!(geomEnvRead(), gEnv.skip_order))
         {
             uint32_t zero_in[1] = { (uint32_t)threads };
             NSUInteger zwg = 32;
@@ -4358,6 +4518,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
               threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
         [enc setComputePipelineState: gGsPso];
+        gGsDispatched = !(geomEnvRead(), gEnv.skip_gs);
         /* the primitive slots start behind the capture index list (the prep kernel, the
          * tess import and the CPU route all write them at HDR + cap_idx) */
         [enc setBuffer: gPrim offset: gPrimOff + (MGL_GEOM_HDR_WORDS + cap_idx) * sizeof(uint32_t)
@@ -4373,14 +4534,14 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         [enc setBuffer: gCnt offset: gCntOff atIndex: MGL_GEOM_MSL_CNT];
         [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * sizeof(uint32_t) atIndex: MGL_GEOM_MSL_LSCR];
 
-        if ([self geomBindStageBuffers: enc geomProgram: gp])
+        if ([self geomBindStageBuffers: enc geomProgram: gp] && gGsDispatched)
         {
             NSUInteger wg = 32;
             uint64_t groups = (threads + wg - 1) / wg;
             if (!groups) groups = 1;
             if (groups > 0xffffffffull) groups = 0xffffffffull;
 
-            if (gpu_assembly && !(geomEnvRead(), gEnv.worst_case))
+            if (gpu_assembly && !implicit && !(geomEnvRead(), gEnv.worst_case))
             {
                 /* the prep kernel computed the exact threadgroup count */
                 [enc dispatchThreadgroupsWithIndirectBuffer: gPrep
@@ -4388,6 +4549,8 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                                               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
             }
             else
+                /* an implicit draw's count is exact on the CPU already (the affine window
+                 * arithmetic bounds it); no prep kernel ever wrote the indirect arguments */
                 [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)groups, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];
 
@@ -4395,32 +4558,55 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
              * copy the per-thread scratch segments into the raster list in primitive
              * order (the GL-required emission order); finalize folds the total into the
              * indirect draw arguments */
+            if (!(geomEnvRead(), gEnv.skip_order))
             {
                 uint32_t scan_in[2] = { (uint32_t)threads, (uint32_t)gp->max_vertices * 3u };
-                [enc setComputePipelineState: gLscanPso];
-                [enc setBytes: scan_in length: sizeof scan_in atIndex: 0];
+                uint32_t chunks = (uint32_t)((threads + 1023) / 1024);
+                uint32_t pscan_in[1] = { (uint32_t)threads };
+                uint32_t pbase_in[1] = { chunks };
+                size_t sums_off = ((size_t)idx_cap * 2 + (size_t)threads * 2) * sizeof(uint32_t);
+                /* 1a: chunk-parallel scan of the per-thread counts (chunk-local bases) */
+                [enc setComputePipelineState: gPscanPso];
+                [enc setBytes: pscan_in length: sizeof pscan_in atIndex: 0];
+                [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 1];
+                [enc setBuffer: gIdx offset: sums_off atIndex: 2];
+                if (!(geomEnvRead(), gEnv.skip_scan))
+                [enc dispatchThreadgroups: MTLSizeMake(chunks, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(1024, 1, 1)];
+                if (!(geomEnvRead(), gEnv.no_barrier))
+                    [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+
+                /* 1b: scan the chunk totals into chunk bases (+ the total into ctl[1]) */
+                [enc setComputePipelineState: gPbasePso];
+                [enc setBytes: pbase_in length: sizeof pbase_in atIndex: 0];
                 [enc setBuffer: gCtl offset: 0 atIndex: 1];
-                [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 2];
+                [enc setBuffer: gIdx offset: sums_off atIndex: 2];
                 [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(32, 1, 1)];
-                [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+                if (!(geomEnvRead(), gEnv.no_barrier))
+                    [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
 
                 [enc setComputePipelineState: gLcopyPso];
                 [enc setBytes: scan_in length: sizeof scan_in atIndex: 0];
                 [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * sizeof(uint32_t) atIndex: 1];
                 [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 2];
                 [enc setBuffer: gIdx offset: 0 atIndex: 3];
+                [enc setBuffer: gIdx offset: sums_off atIndex: 4];
                 NSUInteger lwg = 32;
                 uint64_t cgroups = (threads + lwg - 1) / lwg;
                 if (!cgroups) cgroups = 1;
+                if (!(geomEnvRead(), gEnv.skip_copy))
                 [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)cgroups, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(lwg, 1, 1)];
-                [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
+                if (!(geomEnvRead(), gEnv.no_barrier))
+                    [enc memoryBarrierWithScope: MTLBarrierScopeBuffers];
             }
 
             /* fold the counters into the indirect draw arguments (also uses buffer(0),
              * so it runs after the GS dispatch, which is the last user of the stage
              * buffers — no slot is left shadowed for a later kernel) */
+            if (!(geomEnvRead(), gEnv.skip_order))
+            {
             [enc setComputePipelineState: gFinPso];
             [enc setBuffer: gCtl offset: 0 atIndex: 0];
             [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
@@ -4447,6 +4633,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                 [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
             }
+            }   /* !skip_order */
         }
 
         [enc popDebugGroup];
@@ -4596,6 +4783,11 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         geomMarkPools(_currentCommandBuffer);   /* the pack above was this draw's last consumer */
         return true;
     }
+    if ((geomEnvRead(), gEnv.skip_raster))
+    {
+        geomMarkPools(_currentCommandBuffer);   /* diagnostic: skip the pass-through raster */
+        return true;
+    }
 
 
     /* the geometry stage picks the output topology; Metal requires inputPrimitiveTopology
@@ -4635,6 +4827,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     MGLGeomProgram *gp = d->gp;
     if (!BUF()->begin_draw(ctx)) return false;
     geomMarkPools(_currentCommandBuffer);   /* after begin_draw: covers any command buffer it made */
+    geomTimeCommandBuffer(_currentCommandBuffer);
 
     {
         /* the kernel expands every emitted strip into an index *list*, so the raster pass

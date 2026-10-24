@@ -303,6 +303,15 @@ typedef struct MGLGeomDraw {
     bool     provoking_first;
     uint32_t count_bound;       /* upper bound of the vertex count, for sizing only */
 
+    /* affine fast path: a direct (non-indexed) draw whose primitive windows follow a fixed
+     * stride needs no assembly at all - the geometry kernel derives each window's vertex ids
+     * arithmetically (hdr[19] + prim * hdr[20] + k) and the capture pass draws the vertex
+     * range directly.  0 = assemble normally; 1 = strip-like window (prim p covers
+     * [first+p, first+p+in_verts-1]); gp->in_verts = list-like (prim p covers
+     * [first+p*in_verts, first+(p+1)*in_verts-1]).  One kernel launch block less (the whole
+     * prep stage) per draw. */
+    uint32_t implicit_stride;
+
     /* tess producer: instead of a vertex capture pass, the tess domain's TES-output capture
      * feeds the geometry kernel.  tess_recs_off / tess_idx_off / tess_cnt_off are byte
      * offsets into tess_ring (an MTLBuffer the tess domain owns and keeps alive); tess_npairs
