@@ -308,6 +308,54 @@ TEST(shadow_texture_content)
     glDeleteVertexArrays(1, &vao);
 }
 
+/* pipelined fences (glmark2 gl41-streaming-sync pattern): fence every draw,
+ * wait on the fence from N draws ago — a fence whose CPU-side observation
+ * depended on reading MTLSharedEvent.signaledValue alone hit the full 1 s
+ * glClientWaitSync timeout (the shared-event listener path fixed it) */
+TEST(fence_pipeline)
+{
+    GLuint prog = mgl_make_program(k_vs, k_fs);
+    if (!prog) return;
+    GLint loc_c = glGetUniformLocation(prog, "ucolor");
+
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    static const float quad[] = { -1,-1,  1,-1,  1,1,   -1,-1,  1,1,  -1,1 };
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glUseProgram(prog);
+    glUniform1f(glGetUniformLocation(prog, "xoff"), 0.0f);
+    glViewport(0, 0, 64, 64);
+
+    enum { PIPE = 4 };
+    GLsync fence[PIPE] = {0};
+    for (int i = 0; i < 600; i++)
+    {
+        glUniform4f(loc_c, (i & 1) ? 1.0f : 0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        if (fence[i % PIPE])
+        {
+            GLenum r = glClientWaitSync(fence[i % PIPE], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            EXPECT_TRUE(r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED);
+            glDeleteSync(fence[i % PIPE]);
+        }
+        fence[i % PIPE] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+    for (int i = 0; i < PIPE; i++)
+        if (fence[i]) { glClientWaitSync(fence[i], 0, 1000000000ull); glDeleteSync(fence[i]); }
+    EXPECT_NO_GL_ERROR();
+
+    EXPECT_PIXEL(32, 32, (599 & 1) ? 255 : 0, 0, 0, 255, 2);
+
+    glDeleteProgram(prog);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+}
+
 int main(void)
 {
     RUN(ring_uniform_updates);
@@ -315,5 +363,6 @@ int main(void)
     RUN(ring_cpu_indices);
     RUN(shadow_program_alternation);
     RUN(shadow_texture_content);
+    RUN(fence_pipeline);
     return mgl_test_summary();
 }

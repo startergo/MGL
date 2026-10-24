@@ -28,6 +28,8 @@ typedef struct MGLDrawPriv_t {
 
     void *event;                        // retained id<MTLSharedEvent> for fences
     uint64_t event_value;
+    void *fence_listener;               // retained MTLSharedEventListener (CPU fence observation)
+    _Atomic uint64_t signaled_cache;    // last fence value observed on the CPU (listener)
 } MGLDrawPriv;
 
 typedef struct MGLFence_t {
@@ -800,6 +802,21 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     [_currentCommandBuffer encodeSignalEvent: ev value: f->value];
     f->serial = [self extBufSerial];
 
+    /* CPU reads of MTLSharedEvent.signaledValue are not guaranteed to observe
+     * GPU-side signals promptly (glmark2 gl41-streaming-sync hit the full 1 s
+     * glClientWaitSync timeout this way).  A listener notification at the
+     * fence's exact value records it in an atomic the wait side can poll; the
+     * handler captures only the value, so a deleted fence never dangles. */
+    {
+        MTLSharedEventListener *l = (__bridge MTLSharedEventListener *)p->fence_listener;
+        uint64_t v = f->value;
+        [ev notifyListener: l atValue: v
+                     block: ^void(id<MTLSharedEvent> ev_, uint64_t nv) {
+                         (void)ev_;
+                         atomic_max_u64(&p->signaled_cache, nv);
+                     }];
+    }
+
     ctx->state.dirty_bits = DIRTY_ALL;
 
     sync->mtl_event = f;
@@ -812,7 +829,8 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!f)
         return true;
 
-    return [self extBufEvent].signaledValue >= f->value;
+    return [self extBufEvent].signaledValue >= f->value ||
+           atomic_load(&PRIV(ctx)->signaled_cache) >= f->value;
 }
 
 - (GLenum) extBufClientWait: (Sync *) sync flush: (bool) flush timeout: (GLuint64) timeout
@@ -1049,6 +1067,11 @@ static void c_mtl_draw_elements_inst_bv_bi(GLMContext c, GLenum mode, GLsizei co
     p->pub.delete_fence = c_delete_fence;
 
     glm_ctx->mtl_funcs.ext_buffers = &p->pub;
+
+    /* fence observation listener (see extBufFence): one per renderer, its
+     * notifications update p->signaled_cache */
+    if (self && !p->fence_listener)
+        p->fence_listener = (void *)CFBridgingRetain([[MTLSharedEventListener alloc] init]);
 
     // route the legacy buffer / sync / compute / draw hooks through this category
     glm_ctx->mtl_funcs.mtlFlush = c_mtl_flush;

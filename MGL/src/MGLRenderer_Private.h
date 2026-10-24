@@ -154,7 +154,6 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
     BOOL _gpuErrorRecoveryMode;
 
     // PROACTIVE TEXTURE STORAGE - Essential textures created during initialization
-    NSMutableArray *_proactiveTextures;
 
     MGLDrawable _drawBuffers[_MAX_DRAW_BUFFERS];
 
@@ -324,7 +323,6 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 -(void) mtlMultiDrawElementsIndirect: (GLMContext)glm_ctx mode:(GLenum) mode type:(GLenum)type indirect:(const void *)indirect drawcount:(GLsizei) drawcount stride:(GLsizei)stride;
 - (void) bindObjFuncsToGLMContext: (GLMContext) glm_ctx;
 - (void) createMGLRendererAndBindToContext: (GLMContext) glm_ctx view: (NSView *) view;
-- (void)createProactiveTextures;
 - (MTLCaptureDescriptor *)setupCaptureToFile: (id<MTLDevice>)device;
 - (void)startCapture:(MTLCaptureDescriptor *) descriptor;
 - (void)stopCapture;

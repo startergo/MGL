@@ -5936,74 +5936,10 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     // default framebuffer images + initial viewport/scissor (fb domain)
     [self fbInitDefaultFramebuffer];
 
-    // PROACTIVE TEXTURE CREATION: Create essential textures to break sync loop
-    NSLog(@"MGL INFO: PROACTIVE - Creating essential textures to prevent magenta screen");
-    [self createProactiveTextures];
-
     // capture Metal commands in MGL.gputrace
     // necessitates Info.plist in the cwd, see https://stackoverflow.com/a/64172784
     //MTLCaptureDescriptor *descriptor = [self setupCaptureToFile: _device];
     //[self startCapture:descriptor];
-}
-
-// PROACTIVE TEXTURE CREATION: Create essential textures during initialization to break sync loop
-- (void)createProactiveTextures
-{
-    NSLog(@"MGL PROACTIVE: Starting essential texture creation");
-
-    @try {
-        // Create a simple 2D texture with gradient pattern to prevent magenta screens
-        MTLTextureDescriptor *proactiveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                                          width:256
-                                                                                                         height:256
-                                                                                                      mipmapped:NO];
-        proactiveDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-        proactiveDesc.storageMode = MTLStorageModeShared;
-
-        id<MTLTexture> proactiveTexture = [_device newTextureWithDescriptor:proactiveDesc];
-        if (proactiveTexture) {
-            // Create gradient pattern data
-            uint32_t *gradientData = calloc(256 * 256, sizeof(uint32_t));
-            if (gradientData) {
-                // Create blue-green gradient pattern
-                for (NSUInteger y = 0; y < 256; y++) {
-                    for (NSUInteger x = 0; x < 256; x++) {
-                        NSUInteger index = y * 256 + x;
-                        uint8_t r = (uint8_t)((x * 128) / 256 + 64);      // Red: 64-192
-                        uint8_t g = (uint8_t)((y * 128) / 256 + 64);      // Green: 64-192
-                        uint8_t b = 255;                                  // Blue: 255
-                        uint8_t a = 255;                                  // Alpha: 255
-                        gradientData[index] = (a << 24) | (b << 16) | (g << 8) | r;
-                    }
-                }
-
-                MTLRegion region = MTLRegionMake2D(0, 0, 256, 256);
-                [proactiveTexture replaceRegion:region
-                                     mipmapLevel:0
-                                       withBytes:gradientData
-                                     bytesPerRow:256 * sizeof(uint32_t)];
-
-                free(gradientData);
-                NSLog(@"MGL PROACTIVE SUCCESS: Created 256x256 gradient texture (prevents magenta screen)");
-            } else {
-                NSLog(@"MGL PROACTIVE WARNING: Could not allocate gradient data");
-            }
-
-            // Store the proactive texture for future use
-            if (!_proactiveTextures) {
-                _proactiveTextures = [[NSMutableArray alloc] init];
-            }
-            [_proactiveTextures addObject:proactiveTexture];
-
-        } else {
-            NSLog(@"MGL PROACTIVE ERROR: Could not create proactive texture");
-        }
-
-    } @catch (NSException *exception) {
-        NSLog(@"MGL PROACTIVE ERROR: Exception creating proactive textures: %@", exception.reason);
-    }
-
-    NSLog(@"MGL PROACTIVE: Essential texture creation completed");
 }
 
 - (MTLCaptureDescriptor *)setupCaptureToFile: (id<MTLDevice>)device//(nonnull MTLDevice* )device // (nonnull MTKView *)view

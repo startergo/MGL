@@ -1,13 +1,53 @@
 # compat domain — progress log
 
+BENCH-REQUEST e9a376a (code = f8b9c47 after the FBO/alpha PSO fast-path fix; expect
+desktop blur + shadow ~2-3x; ideas/geometry unchanged)
+BENCH-RESULT e9a376a score=12344 load=2.9-7.0 validate=27/0 (supervisor run 00:48-00:55 EDT; log ~/MGL-cts/glmark2-bench/mglR2.log)
+
+READY f8b9c47 (= gl46-port 34381c6 + compat perf through the FBO/alpha PSO fast path;
+clean rebuild, headless suite 478 PASS / 0 FAIL, nsgl interposer smoke renders,
+glx shim builds [no X server on this Mac for a live run]).
+Supervisor BENCH-RESULT for aa2adea: score 11932 @ load 3.8-4.0 (native 6558, bar 6000
+PASSED).  Since then: desktop blur/shadow PSO fast path (see below) — desktop shadow
+128 -> 325 FPS with the profiler running; expect a good chunk of the score gap closed.
+BENCH-READY aa2adea recorded below (score 11932, supervisor run).
+
+NEXT (vs native): desktop shadow 1032|4592 (PSO fix landed, re-measure), ideas 1631|3582,
+desktop blur 1745|2979 (same PSO fix applies), gl41-geometry 982|2668,
+gl41-streaming-sync 846|867 (+ ClientWaitSync GL_TIMEOUT_EXPIRED warning),
+verify light scenes ~2x native are real (--validate already 27 Success / 0 Failure).
+NOTES (analysis for the next session):
+- light scenes verified REAL: build/texture/shading --validate Success locally
+  (conditionals/function have no bundled reference -> Unknown).
+- ideas is CPU-bound when the window is visible; per-draw floor is now
+  ~1 drawIndexedPrimitives + ~1-2 offset binds (uniform data changes per draw by
+  design).  Going materially faster needs draw batching (per-instance UBO indexing
+  via shader rewrite) — architectural.
+- gl41-geometry runs the 3-pass emulation (capture render pass + import kernel +
+  pass-through raster, GPU-built indirect args, no CPU readback): the remaining
+  982-vs-2668 gap is per-draw Metal pass overhead; fusing capture+import would need
+  geom-domain rework.
+- ClientWaitSync: fence.c busy-polls extBufEvent.signaledValue; the glmark2 warning
+  means one fence never signaled within its timeout — likely a fence whose command
+  buffer was dropped/replaced before commit (AGX recovery path); scene is at parity
+  (846 vs 867) so low priority.
+- local FPS runs in this session were occlusion-throttled (background window, ~161
+  FPS); only supervisor-run numbers and MGL_PROFILE counters are trustworthy.
+
+PROGRESS e511d81/f8b9c47 (perf session 3 round 2, 2026-10-24 00:30): PSO fast path now
+covers DIRTY_FBO and DIRTY_ALPHA_STATE draws (desktop blur/shadow: 26 descriptor walks
+per frame, 4.5 ms/frame, EVERY draw).  Key additions: attachment formats + sample counts
+of the current encoder, hashed once per encoder generation (attachment changes always end
+the encoder: framebuffers.c targetsChanged).  desktop shadow @ load 4 WITH profiler:
+128 -> 325 FPS, pipeline-descriptor 4.5 -> 0.03 ms/frame, pipeHit 26/26, processGLState
+5.8 -> 1.0 ms/frame.  Merged gl46-port 34381c6 (geom round 45: mtl_index buffer slots
+routed through the shadow helpers).
+
 BENCH-READY aa2adea (score 11932 @ load 3.8-4.0, supervisor run 23:40-23:47; native 6558,
 bar 6000, Parallels ~14000).  --validate 27 Success / 0 Failure.
 Session-3 deltas that got here (from 4349): encoder bind shadow + streaming argument ring
 (88% of per-draw argument binds skipped), PSO fast path keyed on rstate content hash
 (17 -> 4 descriptor walks/frame), ffp user-program-unbind correctness fix.
-NEXT (supervisor targets, vs native): desktop shadow 1032|4592, ideas 1631|3582,
-desktop blur 1745|2979, gl41-geometry 982|2668, gl41-streaming-sync 846|867
-(+ ClientWaitSync GL_TIMEOUT_EXPIRED warning), verify light scenes ~2x native are real.
 
 BENCH-REQUEST 2aa2adea (full default glmark2 list, windowed 800x600, swap interval 0 as in
 sessions 1+2; env must NOT contain MGL_PROFILE — note the empty string enables the profiler)
@@ -85,7 +125,6 @@ cost (rstateSpecialize/gaPSOKey), gl41-streaming-sync waits.
 
 BENCH-READY c74797c DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
 
-BENCH-READY c74797c DYLD_INSERT_LIBRARIES=$HOME/MGL/wt/compat/build/nsgl/libmgl_nsgl.dylib /tmp/glmark2-native/opt/homebrew/bin/glmark2-macos --data-path /tmp/glmark2-native/opt/homebrew/share/glmark2
 (zero-copy present: flushBuffer -> MGLswapBuffers -> GPU blit + presentDrawable; stderr is quiet by default: ~27 KB/min vs ~5 MB/min before; gl41-pipeline now runs; gl46-port merged incl. geom round 98a20cf)
 
 READY c74797c (gl46/compat: NSOpenGL interposer zero-copy present + quiet logging + gl_PerVertex fix; GLX shim fence swap; headless suite 6667 checks / 0 failures; test_geom 593/0; glmark2-macos --validate green)
