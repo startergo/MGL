@@ -1707,9 +1707,21 @@ static void tessRetireCapture(GLMContext ctx)
 
     if (ctx->state.program_pipeline)
     {
-        prog_tes = ctx->state.program_pipeline->stage_programs[_TESS_EVALUATION_SHADER] ?: ctx->state.program;
-        prog_tcs = ctx->state.program_pipeline->stage_programs[_TESS_CONTROL_SHADER];
-        prog_vs = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER] ?: prog_tes;
+        /* GL 4.6 §7.3: a current program established by glUseProgram() serves the
+         * stages it DEFINES; the bound pipeline only fills the rest.  (The CTS
+         * tessellation utilities draw with useProgram() while a pipeline from an
+         * earlier run is still bound — taking the pipeline's TCS here handed the
+         * kernels a DELETED program whose default-uniform list was empty, so the
+         * tess-level uniforms read zero and the patch tessellated to nothing:
+         * gl_MaxPatchVertices_Position_PointSize.)  The composite a bound pipeline
+         * installs during processGLState has name 0 and defines no stages. */
+        Program *cur = (ctx->state.program && ctx->state.program->name != 0) ? ctx->state.program : NULL;
+        prog_tes = (cur && cur->spirv[_TESS_EVALUATION_SHADER].ir) ? cur
+                 : (ctx->state.program_pipeline->stage_programs[_TESS_EVALUATION_SHADER] ?: ctx->state.program);
+        prog_tcs = (cur && cur->spirv[_TESS_CONTROL_SHADER].ir) ? cur
+                 : ctx->state.program_pipeline->stage_programs[_TESS_CONTROL_SHADER];
+        prog_vs = (cur && cur->spirv[_VERTEX_SHADER].ir) ? cur
+                : (ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER] ?: prog_tes);
     }
     else
     {

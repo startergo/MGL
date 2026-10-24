@@ -2580,6 +2580,17 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 id<MTLLibrary> library;
                 id<MTLFunction> function;
 
+                /* A tessellation-evaluation shader is NEVER bound from its program
+                 * slot: the tessellation path rasterizes through its own canonical
+                 * rewrite of the same source (control points from buffers, not
+                 * [[attribute]] staging).  A TES with more stage inputs than the
+                 * device's post-tessellation attribute limit cannot compile in the
+                 * raw form — skip it here instead of failing the render; the
+                 * canonical compile reports any real error. */
+                if (i == _TESS_EVALUATION_SHADER &&
+                    mgl_tess_tes_msl_exceeds_attributes(ptr->spirv[i].msl_str))
+                    continue;
+
                 library = [self compileShader: ptr->spirv[i].msl_str];
                 if (!library) {
                     NSLog(@"MGL ERROR: Failed to compile %s shader, skipping render", i == _VERTEX_SHADER ? "vertex" : "fragment");

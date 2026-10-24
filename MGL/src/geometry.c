@@ -7944,6 +7944,28 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
         const char *nm = v->name ? v->name : "";
         uint32_t w = v->words;
         bool found = false;
+        /* an indexed block member ("Vertex.value[3]") captures ELEMENT 3 of the
+         * member's array: match on the base name, then advance whole elements */
+        char vbase[256];
+        uint32_t vidx = 0;
+        bool indexed = false;
+
+        if (nm[0])
+        {
+            size_t l = strlen(nm);
+            if (l > 3 && l < sizeof vbase && nm[l - 1] == ']')
+            {
+                const char *ob = strrchr(nm, '[');
+                if (ob && ob > nm)
+                {
+                    memcpy(vbase, nm, ob - nm);
+                    vbase[ob - nm] = 0;
+                    vidx = (uint32_t)strtoul(ob + 1, NULL, 10);
+                    nm = vbase;
+                    indexed = true;
+                }
+            }
+        }
 
         if (geom_env(1))
             fprintf(stderr, "geom: tessxfb var[%d] name='%s' words=%u type=%04x buf=%u off=%u\n",
@@ -7990,16 +8012,34 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
         if (!found)
         {
             /* matrices (and flattened array elements) are recorded as split members
-             * "<name>_<i>": consume all of them, starting at the lowest offset */
-            size_t nl = strlen(nm);
+             * "<name>_<i>": consume all of them, starting at the lowest offset.
+             * The varying may still carry its BLOCK prefix ("Vertex.value") — the
+             * flattened fields are "<instance>_<member>_<i>", so match the bare
+             * member name between the underscores. */
+            const char *bare = strrchr(nm, '.') ? strrchr(nm, '.') + 1 : nm;
+            size_t nl = strlen(nm), bl = strlen(bare);
             uint32_t lo = ~0u, tw = 0;
 
             for (uint32_t k = 0; k < c->members; k++)
             {
                 const char *cn = c->member[k].name;
+                size_t cl = strlen(cn);
+                bool hit = false;
 
-                if (strlen(cn) > nl + 1 && !strncmp(cn, nm, nl) && cn[nl] == '_' &&
-                    cn[nl + 1] >= '0' && cn[nl + 1] <= '9')
+                if (cl > nl + 1 && !strncmp(cn, nm, nl) &&
+                    cn[nl] == '_' && cn[nl + 1] >= '0' && cn[nl + 1] <= '9')
+                    hit = true;                      /* "<name>_<i>" */
+                if (!hit && bl && cl > bl + 2)
+                {
+                    /* "<instance>_<baremember>_<i>": digits after the last '_',
+                     * the bare member right before it */
+                    const char *last = strrchr(cn, '_');
+                    if (last && last > cn && last[1] >= '0' && last[1] <= '9' &&
+                        (size_t)(last - cn) > bl && !strncmp(last - bl, bare, bl) &&
+                        last[-bl - 1] == '_')
+                        hit = true;
+                }
+                if (hit)
                 {
                     if (c->member[k].offset < lo) lo = c->member[k].offset;
                     tw += c->member[k].words;
@@ -8011,6 +8051,12 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                 if (!w) w = tw;
                 found = true;
             }
+        }
+        if (indexed && found && v->words)
+        {
+            /* element `vidx` of the array member: advance by whole elements
+             * (the GL type of "Block.member[i]" is the ELEMENT type) */
+            v->src_word += vidx * v->words;
         }
         if (!found && v->type != GL_NONE)
         {

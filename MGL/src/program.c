@@ -2195,8 +2195,13 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         exec->entry_point = strdup(msl_entry);
         ptr->shader_slots[stage] = exec;
 
-        /* compile to Metal now so Metal compile errors land in the link log */
-        if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+        /* compile to Metal now so Metal compile errors land in the link log.
+         * A TES with more stage-input attributes than the device's slots cannot
+         * compile in its raw form — the tess canonical rewrite (which reads the
+         * control points from buffers) is the real pipeline and compiles there. */
+        if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl &&
+            !(stage == _TESS_EVALUATION_SHADER &&
+              mgl_tess_tes_msl_exceeds_attributes(ptr->spirv[stage].msl_str)))
         {
             char *mtl_err = NULL;
             if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, ptr->spirv[stage].msl_str, msl_entry,

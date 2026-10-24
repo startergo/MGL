@@ -281,9 +281,13 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
     bp = binding_for(target, index);
 
     /* the geometry domain's transform feedback pack keeps its counters on the GPU: fold them
-     * in before the query stops, so the draws it covered are counted */
+     * in before the query stops, so the draws it covered are counted.  The overflow targets
+     * must flush too: their flag is set from the pack's written/needed pair when it lands
+     * (transform_feedback_overflow_query_ARB.multiple-streams-*), which never happens if
+     * the counters sit in the block until a later flush. */
     if (target == GL_PRIMITIVES_GENERATED || target == GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN ||
-        target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED || target == GL_GEOMETRY_SHADER_INVOCATIONS)
+        target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED || target == GL_GEOMETRY_SHADER_INVOCATIONS ||
+        target == GL_TRANSFORM_FEEDBACK_OVERFLOW || target == GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW)
         mgl_geom_xfb_flush(ctx);
 
     q = S->active[bp];

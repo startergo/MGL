@@ -322,8 +322,8 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
 }
 
 /* isolines are emulated on the quad domain: SPIRV-Cross refuses ExecutionModeIsolines.
- * returns a copy of the module with Isolines replaced by Quads, or NULL. */
-uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
+ * returns a copy of the module with Isolines replaced by Quads (and dynamic interface
+ * member-array indices lowered), or NULL when neither applies. */uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
 {
     bool has_isolines = false;
     uint32_t entry_id = 0, *copy;
@@ -356,7 +356,10 @@ uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
     }
 
     if (!has_isolines)
-        return NULL;
+    {
+        /* even without isolines, dynamic member-array indexing may need lowering */
+        return mgl_tess_lower_dynamic_io(words, n, out_n);
+    }
 
     copy = (uint32_t *)malloc(n * sizeof(uint32_t));
     if (!copy)
@@ -374,8 +377,36 @@ uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
         i += wc;
     }
 
+    {
+        /* SPIRV-Cross cannot codegen dynamic indices into interface member
+         * arrays for TES inputs — lower them (tess_spv_lower.c) */
+        size_t ln = 0;
+        uint32_t *lowered = mgl_tess_lower_dynamic_io(copy, n, &ln);
+        if (lowered)
+        {
+            free(copy);
+            copy = lowered;
+            n = ln;
+        }
+    }
+
     *out_n = n;
     return copy;
+}
+
+/* Apple GPUs expose 31 vertex-attribute slots; a GL TES may declare
+ * gl_MaxTessEvaluationInputComponents/4 = 32 vec4s.  Count the SPIRV-Cross
+ * attribute annotations on stage inputs. */
+bool mgl_tess_tes_msl_exceeds_attributes(const char *msl)
+{
+    if (!msl)
+        return false;
+    if (!strstr(msl, "patch_control_point<"))
+        return false;               /* not a post-tessellation function */
+    int n = 0;
+    for (const char *p = msl; (p = strstr(p, "[[attribute(")) != NULL; p += 12)
+        n++;
+    return n > 30;
 }
 
 struct MslStruct;
@@ -4302,7 +4333,15 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
     tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tcs_out, have_tcs_out ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
-    tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tes_cp, have_cp ?
+    /* the TES control-point struct is annotated against the interface's PRODUCER
+     * module: member names are stripped to the bare GL name by checking the module
+     * that declares the block (the TCS normally).  Without a TCS the producer is the
+     * vertex stage — passing the (absent) TCS module here left "inVertex_iv"
+     * unstripped, so it hashed under its full name while the VS's "outVertex_iv"
+     * hashed as "iv": the two never aliased in the canonical record and the TES
+     * read zeros (single.max_patch_vertices case 2). */
+    tess_annotate_keys(ctx, program, tp->has_tcs ? _TESS_CONTROL_SHADER : _VERTEX_SHADER,
+        &tes_cp, have_cp ?
         &program->spirv_resources_list[_TESS_EVALUATION_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT] : NULL);
     tess_annotate_keys(ctx, program, _TESS_CONTROL_SHADER, &tcs_po, have_tcs_po ?
         &program->spirv_resources_list[_TESS_CONTROL_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);

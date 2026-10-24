@@ -37,6 +37,7 @@
 #include "buffers.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_tess.h"        /* mgl_tess_prepare_spirv: isolines test-compile in msl_accepts */
 #include <ctype.h>
 
 #include "cts_glsl_compat.h"   /* bool/bvecN block members: GLSL type recovery (cts domain) */
@@ -1906,18 +1907,48 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
     /* SPIRV-Cross rejects double types in buffers, which the GL view of a
      * software-fp64 module legitimately contains (fp64.c lowers it later). */
     if (module_has_fp64(words, n)) return true;
+
+    /* tess: the link driver compiles the TCS as a multi-patch compute kernel
+     * (gl_in[] becomes a raw buffer: dynamic indexing is legal there), and an
+     * isolines TES is swapped to the quad domain before MSL.  Test-compile with
+     * those transforms so the acceptance gate matches the real pipeline —
+     * otherwise the patched module (with the default-uniform block) is dropped
+     * and the stage's uniforms never bind (tessellation max_in_out_attributes). */
+    uint32_t *swapped = NULL;
+    size_t swapped_n = 0;
+    if (stage == _TESS_EVALUATION_SHADER &&
+        (swapped = mgl_tess_prepare_spirv(words, n, &swapped_n)) != NULL)
+    {
+        words = swapped;
+        n = swapped_n;
+    }
+
     spvc_context c = NULL; spvc_parsed_ir ir = NULL; spvc_compiler comp = NULL; spvc_compiler_options opt = NULL;
     const char *res = NULL;
     bool ok = spvc_context_create(&c) == SPVC_SUCCESS &&
               spvc_context_parse_spirv(c, words, n, &ir) == SPVC_SUCCESS &&
               spvc_context_create_compiler(c, SPVC_BACKEND_MSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) == SPVC_SUCCESS &&
               spvc_compiler_create_compiler_options(comp, &opt) == SPVC_SUCCESS &&
-              spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS &&
-              spvc_compiler_install_compiler_options(comp, opt) == SPVC_SUCCESS &&
-              spvc_compiler_compile(comp, &res) == SPVC_SUCCESS && res;
+              spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS;
+    if (ok && stage == _TESS_CONTROL_SHADER)
+    {
+        /* the same multi-patch options program.c installs for the real compile */
+        ok = spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER,
+                                            SPVC_TRUE) == SPVC_SUCCESS &&
+             spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_MULTI_PATCH_WORKGROUP,
+                                            SPVC_TRUE) == SPVC_SUCCESS &&
+             spvc_compiler_install_compiler_options(comp, opt) == SPVC_SUCCESS &&
+             spvc_compiler_compile(comp, &res) == SPVC_SUCCESS && res;
+    }
+    else if (ok)
+    {
+        ok = spvc_compiler_install_compiler_options(comp, opt) == SPVC_SUCCESS &&
+             spvc_compiler_compile(comp, &res) == SPVC_SUCCESS && res;
+    }
     if (!ok) fprintf(stderr, "MGL introspect: stage %d: patched SPIR-V rejected by SPIRV-Cross (%s), using the original module\n",
                      stage, c ? spvc_context_get_last_error_string(c) : "no context");
     if (c) spvc_context_destroy(c);
+    free(swapped);
     return ok;
 }
 

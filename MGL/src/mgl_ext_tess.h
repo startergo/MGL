@@ -106,7 +106,7 @@ typedef struct MGLTessPatchMember_t {
  * until the next GL_PATCHES draw. The vertex count is GPU-written (at
  * count_offset) for indirect consumers; the tessellated primitive indices are
  * uint32 at index_offset. */
-#define MGL_TESS_CAPTURE_MAX 16
+#define MGL_TESS_CAPTURE_MAX 40
 typedef struct MGLTessCaptureMember {
     char     name[64];       /* record field name, as the MSL kernel writes it */
     char     api[64];        /* the API-facing name ("Block.member"), when it differs */
@@ -314,7 +314,13 @@ char *mgl_tess_rewrite_stage_msl(GLMContext ctx, int stage, bool tess_pipeline, 
 
 /* SPIR-V preparation: isolines are emulated on the quad domain (rewrites the execution mode) */
 uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n);
+uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n);
 
+/* True when a raw (attribute-based) TES MSL needs more Metal attribute slots
+ * than the device has.  MGL never rasterizes from the raw form — the canonical
+ * rewrite moves control points into buffers — so the eager link-time Metal
+ * compile must not reject it; the canonical compile validates the stage. */
+bool mgl_tess_tes_msl_exceeds_attributes(const char *msl);
 /* program.c / queries.c interaction */
 void mgl_tess_note_draw(GLMContext ctx, GLuint patches, GLuint tes_invocations, GLuint tessellated_primitives);
 
