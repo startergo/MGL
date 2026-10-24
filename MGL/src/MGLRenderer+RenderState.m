@@ -27,6 +27,12 @@
 @property (nonatomic, weak)   id<MTLRenderCommandEncoder> appliedEncoder;
 @property (nonatomic) GLuint appliedGeneration;
 @property (nonatomic) GLenum drawMode;
+/* one-entry depth/stencil cache: the state vector of the last lookup (integer key,
+ * see rstateDepthStencilStateHasDepth) — skips the NSString key + dictionary walk
+ * for the common unchanged-state encoder */
+@property (nonatomic, strong) id<MTLDepthStencilState> dsLast;
+@property (nonatomic) unsigned long long dsLastKey;
+@property (nonatomic) BOOL dsLastValid;
 @end
 
 @implementation MGLRSCache
@@ -174,15 +180,43 @@ static bool rs_format_is_integer(MTLPixelFormat f)
     GLMParams *v = &ctx->state.var;
     bool dt = ctx->state.caps.depth_test && hasDepth;
     bool st = ctx->state.caps.stencil_test && hasStencil;
+    MGLRSCache *c = [self rstateCache];
+
+    /* integer key of the whole state vector (the same fields the string key below
+     * uses; the stencil masks truncate to 8 bits exactly like that key — stencil
+     * buffers are 8-bit).  One-entry cache: every encoder of a frame usually needs
+     * the same state, and the string format + dictionary walk costs ~us per encoder
+     * creation (10 encoders/frame in a shadow-map ping-pong scene). */
+    unsigned long long ik =
+        (unsigned long long)dt
+        | ((unsigned long long)(v->depth_func & 7) << 1)
+        | ((unsigned long long)(v->depth_writemask ? 1 : 0) << 4)
+        | ((unsigned long long)st << 5)
+        | ((unsigned long long)(v->stencil_func & 7) << 6)
+        | ((unsigned long long)(v->stencil_fail & 7) << 9)
+        | ((unsigned long long)(v->stencil_pass_depth_fail & 7) << 12)
+        | ((unsigned long long)(v->stencil_pass_depth_pass & 7) << 15)
+        | ((unsigned long long)(v->stencil_value_mask & 0xff) << 18)
+        | ((unsigned long long)(v->stencil_writemask & 0xff) << 26)
+        | ((unsigned long long)(v->stencil_back_func & 7) << 34)
+        | ((unsigned long long)(v->stencil_back_fail & 7) << 37)
+        | ((unsigned long long)(v->stencil_back_pass_depth_fail & 7) << 40)
+        | ((unsigned long long)(v->stencil_back_pass_depth_pass & 7) << 43)
+        | ((unsigned long long)(v->stencil_back_value_mask & 0xff) << 46)
+        | ((unsigned long long)(v->stencil_back_writemask & 0xff) << 54);
+    if (c.dsLastValid && c.dsLastKey == ik && c.dsLast) return c.dsLast;
+
     NSString *key = [NSString stringWithFormat:@"%d:%x:%d|%d:%x:%x:%x:%x:%x:%x|%x:%x:%x:%x:%x:%x",
                      dt, v->depth_func, v->depth_writemask, st,
                      v->stencil_func, v->stencil_fail, v->stencil_pass_depth_fail, v->stencil_pass_depth_pass,
                      v->stencil_value_mask & 0xff, v->stencil_writemask & 0xff,
                      v->stencil_back_func, v->stencil_back_fail, v->stencil_back_pass_depth_fail,
                      v->stencil_back_pass_depth_pass, v->stencil_back_value_mask & 0xff, v->stencil_back_writemask & 0xff];
-    MGLRSCache *c = [self rstateCache];
     id<MTLDepthStencilState> s = c.dsStates[key];
-    if (s) return s;
+    if (s) {
+        c.dsLast = s; c.dsLastKey = ik; c.dsLastValid = YES;
+        return s;
+    }
 
     MTLDepthStencilDescriptor *d = [[MTLDepthStencilDescriptor alloc] init];
     /* GL: with the depth test disabled the depth buffer is neither tested nor written */
@@ -210,6 +244,7 @@ static bool rs_format_is_integer(MTLPixelFormat f)
     if (s) {
         if (c.dsStates.count > 512) [c.dsStates removeAllObjects];
         c.dsStates[key] = s;
+        c.dsLast = s; c.dsLastKey = ik; c.dsLastValid = YES;
     }
     return s;
 }

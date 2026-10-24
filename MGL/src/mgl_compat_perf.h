@@ -89,6 +89,29 @@ struct MGLExtMetal_compat {
     uint64_t fmt_hash_gen;
     uint64_t fmt_fbo;
 
+    /* pipeline fast path: the two expensive key components are cached against
+     * their inputs and revalidated with a pointer + memcmp (an order of
+     * magnitude cheaper than hashing 3x320 bytes of MSL text and walking every
+     * VAO attribute on EVERY draw):
+     *  - MSL content key (compatMSLKey): direct-mapped on the msl_str pointer,
+     *    validated by the first/last 128 bytes (a recycled pointer with equal
+     *    head AND tail but different middle aliases to a stale key — same
+     *    residual risk the uncached pointer+head192+tail128 hash accepted);
+     *  - VAO layout hash (compatVAOHash): single entry, validated by a full
+     *    memcmp of the hashed VertexArray bytes, so it is exact. */
+    struct MGLCompatMSLKeyEnt {
+        const char *msl;
+        uint64_t    key;
+        size_t      len;
+        uint8_t     head[128], tail[128];
+    } mslkey[32];
+    struct {
+        void    *vao;
+        uint64_t hash;
+        size_t   len;
+        uint8_t *snap;              /* malloc'd copy of the hashed bytes */
+    } vaokey;
+
     struct MGLCompatRing ring;
 };
 

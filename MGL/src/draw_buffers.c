@@ -911,6 +911,39 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     }
 
     exec_draw_raw(ctx, batch, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
+
+    /* perf instrumentation (MGL_PROFILE): run lengths of consecutive draws with an
+     * identical draw identity — the merging potential for instanced-draw batching */
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("MGL_PROFILE") != NULL;
+        if (on)
+        {
+            static uint64_t id = 0, run = 1, tot = 0, merged = 0, hist[33] = {0};
+            uint64_t k = (uint64_t)(uintptr_t)ctx->state.program * 31
+                       + (uint64_t)(uintptr_t)ctx->state.vao * 131
+                       + (uint64_t)(uintptr_t)ctx->state.vao->element_array.buffer * 977
+                       + (uint64_t)mode * 7919 + (uint64_t)type * 104729
+                       + (uint64_t)count * 1299709 + (uint64_t)instances * 15485863
+                       + (uint64_t)(uint32_t)basevertex * 32452843 + (uint64_t)baseinstance
+                       + (uint64_t)(indexed ? offset : (size_t)first * 648391);
+            if (k == id)
+                run++;
+            else
+            {
+                if (run < 32) hist[run]++; else hist[32]++;
+                merged += run; tot += run; run = 1; id = k;
+                if (++tot % 4000 == 0)
+                {
+                    fprintf(stderr, "MGL PROFILE draw-run histogram (draws=%llu, batchable=%llu): ",
+                            (unsigned long long)tot, (unsigned long long)merged);
+                    for (int i = 1; i <= 32; i++)
+                        if (hist[i]) fprintf(stderr, "%d:%llu ", i, (unsigned long long)hist[i]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
     mgl_prof_end(7, p7);
 }
 

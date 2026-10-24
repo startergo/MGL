@@ -227,7 +227,7 @@ void mgl_profile_dump(void)
                                     "updateEncoder", "bindTextures", "swap", "draw",
                                     "enddraw-stamp", "encode-draw", "mapBuffers", "11",
                                     "processGLState", "bindList", "ssboSizes", "setPipelineState+PreDraw",
-                                    "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "bufferSubData", "map", "unmap" };
+                                    "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "fbBuildPassDesc", "map", "unmap" };
     double tot = 0;
     for (int i = 0; i < 22; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
     fprintf(stderr, "MGL PROFILE(ms total | ms/frame | calls/frame):");
@@ -2715,10 +2715,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     [self endRenderEncoding];
 
     // render pass for the bound draw framebuffer (fb domain: MGLRenderer+Framebuffer.m)
-    if (![self fbBuildRenderPassDescriptor])
     {
-        NSLog(@"MGL ERROR: no render targets for the bound draw framebuffer");
-        return false;
+        uint64_t tb = mgl_prof_begin(19);
+        bool ok = [self fbBuildRenderPassDescriptor];
+        mgl_prof_end(19, tb);
+        if (!ok)
+        {
+            NSLog(@"MGL ERROR: no render targets for the bound draw framebuffer");
+            return false;
+        }
     }
 
     // create a render encoder from the renderpass descriptor
@@ -2782,6 +2787,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         return false;
     }
     _currentRenderEncoder.label = @"GL Render Encoder";
+    /* perf instrumentation: which framebuffer (and how many encoders this frame)
+     * created the encoder — desktop:shadow creates 10/frame, all needed? */
+    if (mgl_prof_on)
+    {
+        static uint64_t enc_frame = 0, enc_count = 0;
+        if (enc_count < 30 || (++enc_count % 500) == 0)
+            fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p\n",
+                    (unsigned long long)enc_count, (void *)ctx->state.framebuffer,
+                    (void *)(__bridge void *)_currentCommandBuffer);
+        enc_count++;
+        (void)enc_frame;
+    }
     mglCallExtHooks(self, "RenderEncoderCreated:", _currentRenderEncoder);
     // apply all state that isn't included in a renderPassDescriptor into the render encoder
     [self updateCurrentRenderEncoder];

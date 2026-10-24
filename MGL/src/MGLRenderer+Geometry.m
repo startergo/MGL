@@ -92,6 +92,8 @@ static MGLGeomPool gPrepPool; static size_t gPrepOff;
 static id<MTLBuffer> gCnt;          /* per-thread emitted vertex counts (capture order) */
 static MGLGeomPool gOutvPool, gCntPool; static size_t gOutvOff, gCntOff;
 static size_t gPoolCap;              /* per-slot byte cap (MGL_GEOM_POOL_CAP) */
+static size_t gPoolBudget;          /* total bytes the doubling may grow the pools to
+                                      * (MGL_GEOM_POOL_BUDGET; run-ahead runway) */
 static unsigned gPoolN;              /* rotation depth (MGL_GEOM_POOL_SLOTS, <= MGL_GEOM_POOL_N) */
 static id<MTLBuffer> gXbase;        /* compacted transform feedback index per thread */
 static id<MTLBuffer> gXfb;          /* pack counters and write offsets (GPU-owned while pending) */
@@ -120,8 +122,7 @@ static id<MTLBuffer> gPrepScr;       /* its scratch: per-tile counts and per-run
 static size_t gPrepScrWords;
 /* below this index count the serial prep kernel (one dispatch) is cheaper than the chain;
  * overridable so the test suite can exercise the tile-parallel path on every draw */
-static uint32_t gTiledMin = 4096u;
-/* the scratch is capped so absurdly large indirect draws fall back to the serial kernel
+static uint32_t gTiledMin = 4096u;/* the scratch is capped so absurdly large indirect draws fall back to the serial kernel
  * instead of asking for hundreds of megabytes */
 #define MGL_GEOM_TILED_MAX_WORDS (64u * 1024u * 1024u / 4u)
 /* the trace / behaviour switches are read once: this file sits on the draw path and
@@ -145,12 +146,15 @@ static void geomEnvRead(void)
      * of draws may run ahead of the GPU before a wait) and the rotation depth.  Test
      * hook: MGL_GEOM_POOL_CAP=<bytes> forces tiny pools so every draw wraps/reclaims. */
     gPoolCap = 64u << 20;
+    gPoolBudget = 512u << 20;
     gPoolN = MGL_GEOM_POOL_N;
     {
         const char *c = getenv("MGL_GEOM_POOL_CAP");
         const char *n = getenv("MGL_GEOM_POOL_SLOTS");
+        const char *b = getenv("MGL_GEOM_POOL_BUDGET");
         if (c) { unsigned long long v = strtoull(c, NULL, 0); if (v >= 1024) gPoolCap = (size_t)v; }
         if (n) { int v = atoi(n); if (v >= 2 && v <= (int)MGL_GEOM_POOL_N) gPoolN = (unsigned)v; }
+        if (b) { unsigned long long v = strtoull(b, NULL, 0); if (v >= 4096) gPoolBudget = (size_t)v; }
     }
     const char *tmin = getenv("MGL_GEOM_TILED_MIN");             /* test hook: force the chain */
     if (tmin) { int v = atoi(tmin); gTiledMin = v > 0 ? (uint32_t)v : 0u; }
@@ -2869,6 +2873,40 @@ static bool geomPoolSlotDone(MGLGeomPool *pool, unsigned c)
 
 /* hand out a byte range of `need` bytes.  Returns the backing buffer and the range's
  * offset in *start; nil only when Metal refuses the allocation. */
+
+/* the size a (re)created slot should have: at least need*2, and — when the slot ran out
+ * of room while the GPU was still behind (the reclaim found it full) — double its
+ * previous length, so every wrap buys twice the CPU run-ahead before the next
+ * reclaim-wait.  Bounded by the per-slot cap, the global growth budget (gPoolBudget,
+ * summed over every pool's slots: growth beyond need*2 stops once the pools already
+ * hold that much) and "one draw always gets its memory" for draws over the cap.
+ * Returns 0 when no growth is required or affordable — the caller keeps the current
+ * buffer (a declined doubling must NOT fall through to need*2, which would SHRINK
+ * the slot and re-allocate it on every wrap; that allocation thrash cost glmark2
+ * gl41-geometry ~30% on a clean machine).  Without the doubling the slots stayed at
+ * ~2 draws each and every third draw of a geometry-shader scene blocked in
+ * waitUntilCompleted. */
+static size_t geomPoolTotalBytes;   /* live slot bytes over all pools (growth accounting) */
+
+static size_t geomSlotSize(MGLGeomPool *pool, unsigned c, size_t need, bool ran_out)
+{
+    size_t prev = pool->buf[c] ? pool->buf[c].length : 0;
+    size_t sz = 4096, want = need * 2;
+
+    if (ran_out && prev)
+    {
+        size_t dbl = prev * 2;
+        if (dbl <= gPoolCap && dbl > want && geomPoolTotalBytes + prev <= gPoolBudget)
+            want = dbl;                       /* doubling buys run-ahead */
+        else if (prev >= need)
+            return 0;                         /* declined (cap/budget): the slot still fits a draw */
+    }
+    if (want > gPoolCap && need <= gPoolCap) want = gPoolCap;   /* soft cap */
+    while (sz < want) sz *= 2;
+    if (sz > gPoolCap && need > gPoolCap) sz = need;            /* one draw still gets its memory */
+    return sz > prev ? sz : prev;                               /* never shrink a live slot */
+}
+
 static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool, size_t need, size_t *start,
                                   id<MTLCommandBuffer> cur)
 {
@@ -2901,20 +2939,22 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         if (pool->pin[c] || !geomPoolSlotDone(pool, c)) continue;
 
         size_t room = pool->buf[c] ? pool->buf[c].length : 0;
-        if (room < need)
+        bool ran_out = room && pool->used[c] + need > room;
+        if (room < need || ran_out)
         {
-            size_t sz = 4096, want = need * 2;
+            size_t sz = geomSlotSize(pool, c, need, ran_out);
 
-            if (want > gPoolCap && need <= gPoolCap) want = gPoolCap;   /* soft cap */
-            while (sz < want) sz *= 2;
-            if (sz > gPoolCap && need > gPoolCap) sz = need;            /* one draw still gets its memory */
-            if (gEnv.draw)
-                fprintf(stderr, "geom: trace pool %p slot %u grow need=%zu -> %zu\n",
-                        (void *)pool, c, need, sz);
-            id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
-            if (!grown) continue;               /* try the next slot; the old buffer stays usable */
-            pool->buf[c] = grown;
-            room = sz;
+            if (sz)
+            {
+                if (gEnv.draw)
+                    fprintf(stderr, "geom: trace pool %p slot %u grow need=%zu -> %zu\n",
+                            (void *)pool, c, need, sz);
+                id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+                if (!grown) continue;               /* try the next slot; the old buffer stays usable */
+                geomPoolTotalBytes = geomPoolTotalBytes + sz - room;
+                pool->buf[c] = grown;
+                room = sz;
+            }
         }
         pool->cur = c;
         pool->used[c] = 0;
@@ -2963,17 +3003,18 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
             if (pool->pin[c] || !geomPoolSlotDone(pool, c)) continue;
 
             size_t room = pool->buf[c] ? pool->buf[c].length : 0;
-            if (room < need)
+            bool ran_out = room && pool->used[c] + need > room;
+            if (room < need || ran_out)
             {
-                size_t sz = 4096, want = need * 2;
-
-                if (want > gPoolCap && need <= gPoolCap) want = gPoolCap;
-                while (sz < want) sz *= 2;
-                if (sz > gPoolCap && need > gPoolCap) sz = need;
-                id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
-                if (!grown) continue;
-                pool->buf[c] = grown;
-                room = sz;
+                size_t sz = geomSlotSize(pool, c, need, ran_out);
+                if (sz)
+                {
+                    id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
+                    if (!grown) continue;
+                    geomPoolTotalBytes = geomPoolTotalBytes + sz - room;
+                    pool->buf[c] = grown;
+                    room = sz;
+                }
             }
             pool->cur = c;
             pool->used[c] = 0;
@@ -2985,17 +3026,21 @@ static id<MTLBuffer> geomSubAlloc(id r, id<MTLDevice> device, MGLGeomPool *pool,
         }
 
         /* unreachable unless every consumer is still pending after the wait: grow the
-         * current slot (the old buffer keeps the pending ranges alive) */
+         * current slot (the old buffer keeps the pending ranges alive); never smaller
+         * than the buffer it replaces (see geomSlotSize) */
         {
             unsigned c = pool->cur % gPoolN;
+            size_t prev = pool->buf[c] ? pool->buf[c].length : 0;
             size_t sz = 4096, want = need * 2;
 
             while (sz < want) sz *= 2;
+            if (sz < prev) sz = prev;
             if (gEnv.draw)
                 fprintf(stderr, "geom: trace pool %p slot %u forced grow need=%zu -> %zu\n",
                         (void *)pool, c, need, sz);
             id<MTLBuffer> grown = [device newBufferWithLength: sz options: MTLResourceStorageModeShared];
             if (!grown) return nil;
+            geomPoolTotalBytes = geomPoolTotalBytes + sz - prev;
             pool->buf[c] = grown;
             pool->used[c] = 0;
             *start = 0;
@@ -4134,16 +4179,20 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
  * own, one per plan rebuild) via mgl_msl_has_size_constants(). */
 static bool geomSSBOSizesNeeded(Program *p, int stage)
 {
-    static struct { const void *p, *msl; size_t len; int stage; bool needed; } cache[32];
+    /* the cache key is (program, msl pointer, stage) plus the first 32 bytes of the
+     * text: validating with strlen() cost 2 x strlen(30 KB) PER DRAW (the hit path
+     * recomputed it to compare) — a head memcmp catches the recycled-pointer case
+     * for free and no scan of the string is needed to hit */
+    static struct { const void *p, *msl; char head[32]; int stage; bool needed; } cache[32];
     static int next;
     const char *msl = p->spirv[stage].msl_str;
-    size_t len = strlen(msl);
     for (int i = 0; i < 32; i++)
-        if (cache[i].p == (void *)p && cache[i].msl == (void *)msl && cache[i].len == len &&
-            cache[i].stage == stage)
+        if (cache[i].p == (void *)p && cache[i].msl == (void *)msl && cache[i].stage == stage &&
+            memcmp(cache[i].head, msl, 32) == 0)
             return cache[i].needed;
     bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
-    cache[next] = (typeof(cache[0])){ (void *)p, (void *)msl, len, stage, needed };
+    cache[next] = (typeof(cache[0])){ (void *)p, (void *)msl, {0}, stage, needed };
+    memcpy(cache[next].head, msl, 32);
     next = (next + 1) & 31;
     return needed;
 }
@@ -4155,15 +4204,17 @@ bool mgl_msl_has_size_constants(const char *msl)
 {
     /* content-keyed, not pointer-keyed: a freed program's MSL string address
      * can be recycled for different text (test_fp64 link loops), which must
-     * not alias the memoized answer */
-    static struct { const void *msl; size_t len; bool needed; } cache[64];
+     * not alias the memoized answer.  The fingerprint is the first 32 bytes —
+     * validating with strlen() rescanned the whole (tens-of-KB) string on
+     * every hit, and this sits on the per-draw path */
+    static struct { const void *msl; char head[32]; bool needed; } cache[64];
     static int next;
     if (!msl) return false;
-    size_t len = strlen(msl);
     for (int i = 0; i < 64; i++)
-        if (cache[i].msl == (void *)msl && cache[i].len == len) return cache[i].needed;
+        if (cache[i].msl == (void *)msl && memcmp(cache[i].head, msl, 32) == 0) return cache[i].needed;
     bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
-    cache[next] = (typeof(cache[0])){ (void *)msl, len, needed };
+    cache[next] = (typeof(cache[0])){ (void *)msl, {0}, needed };
+    memcpy(cache[next].head, msl, 32);
     next = (next + 1) & 63;
     return needed;
 }

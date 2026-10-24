@@ -327,7 +327,17 @@ static void fbValueAsDoubles(int kind, const void *v, double out[4])
 #pragma mark - C trampolines
 
 static void fbDefaultSizeC(GLMContext c, GLuint *w, GLuint *h) { [FBR(c) fbDefaultSizeW:w h:h]; }
-static void fbTargetsChangedC(GLMContext c) { [FBR(c) endRenderEncoding]; }
+/* perf instrumentation: how often the pass is torn down for a target change
+ * (MGL_PROFILE dumps it; a plain local counter — all profiler slots are in use) */
+static void fbTargetsChangedC(GLMContext c)
+{
+    [FBR(c) endRenderEncoding];
+    static int prof_on = -1;
+    static uint64_t n = 0;
+    if (prof_on < 0) prof_on = getenv("MGL_PROFILE") != NULL;
+    if (prof_on && (++n % 500) == 1)
+        fprintf(stderr, "MGL PROFILE targetsChanged #%llu\n", (unsigned long long)n);
+}
 static void fbClearC(GLMContext c, const MGLFBClearRequest *r) { @autoreleasepool { [FBR(c) fbClear:r]; } }
 static int  fbReadC(GLMContext c, const MGLFBReadRequest *r) { @autoreleasepool { return [FBR(c) fbRead:r]; } }
 static void fbBlitC(GLMContext c, const MGLFBBlitRequest *r) { @autoreleasepool { [FBR(c) fbBlit:r]; } }
@@ -850,18 +860,79 @@ static void fbSetAttachment(MTLRenderPassAttachmentDescriptor *a, const FBTarget
     return rp;
 }
 
-/* called by -newRenderEncoder: sets _renderPassDescriptor for the bound draw framebuffer */
+/* called by -newRenderEncoder: sets _renderPassDescriptor for the bound draw framebuffer.
+ *
+ * perf: a new render encoder needs a fresh MTLRenderPassDescriptor, and the allocation +
+ * per-attachment descriptor writes measured ~4 us per encoder — a shadow ping-pong scene
+ * builds ten per frame.  The last descriptor per (context, framebuffer, targets,
+ * invalid-mask) is cached and reused when nothing changed: the encoder copies the
+ * descriptor it is created from, so reuse is legal, and every mutation path of the FBO's
+ * attachments goes through fbCollectTargets, whose result is part of the cache key (the
+ * invalid-mask is read BEFORE fbRenderPassFor clears its bits, and the exact
+ * (targets, invalid-mask) pair must repeat for a hit). */
 - (bool) fbBuildRenderPassDescriptor
 {
-    FBTargets T;
+    FBTargets T = {0};
     [self fbInitDefaultFramebuffer];
     if (![self fbCollectTargets:ctx->state.framebuffer into:&T renderTarget:true])
     {
         _renderPassDescriptor = nil;
         return false;
     }
+
+    static struct {
+        GLMContext ctx;
+        Framebuffer *fbo;
+        MTLRenderPassDescriptor *rp;    /* retained (the cache owns it under ARC) */
+        FBTargets T;
+        GLuint inv;
+        uint64_t used;
+        bool valid;
+    } cache[4];
+    static uint64_t tick;
+    /* test hook: MGL_FB_PASSDESC_CACHE=0 disables the reuse (A/B) */
+    static int env_cache = -1;
+    if (env_cache < 0) env_cache = getenv("MGL_FB_PASSDESC_CACHE") ? atoi(getenv("MGL_FB_PASSDESC_CACHE")) : 1;
+    MGLFBDrawState *ds = mgl_fb_draw_state(ctx, ctx->state.framebuffer);
+    GLuint inv = ds->invalid_mask;      /* read BEFORE fbRenderPassFor clears bits */
+    int hit = -1, lru = 0;
+
+    tick++;
+    for (int i = 0; i < 4 && env_cache; i++)
+    {
+        if (cache[i].valid && cache[i].ctx == ctx && cache[i].fbo == ctx->state.framebuffer &&
+            cache[i].inv == inv &&
+            memcmp(&cache[i].T, &T, sizeof(FBTargets)) == 0)
+        {
+            hit = i;
+            break;
+        }
+        if (cache[i].used < cache[lru].used)
+            lru = i;
+    }
+    if (hit >= 0)
+    {
+        cache[hit].used = tick;
+        _renderPassDescriptor = cache[hit].rp;
+        ctx->state.clear_bitmask = 0;
+        if (getenv("MGL_DEBUG"))
+            fprintf(stderr, "MGL fb: pass-descriptor cache HIT (fbo=%p)\n", (void *)ctx->state.framebuffer);
+        return _renderPassDescriptor != nil;
+    }
+
     _renderPassDescriptor = [self fbRenderPassFor:ctx->state.framebuffer targets:&T clear:NULL];
     ctx->state.clear_bitmask = 0;
+
+    if (_renderPassDescriptor && env_cache)
+    {
+        cache[lru].ctx = ctx;
+        cache[lru].fbo = ctx->state.framebuffer;
+        cache[lru].rp = _renderPassDescriptor;
+        cache[lru].T = T;
+        cache[lru].inv = inv;
+        cache[lru].used = tick;
+        cache[lru].valid = true;
+    }
     return _renderPassDescriptor != nil;
 }
 

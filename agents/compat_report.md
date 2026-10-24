@@ -1,4 +1,52 @@
 # compat domain — progress log
+BENCH-RESULT 2e20f64 (built at HEAD 109bf4f) score=13415 load=4.4-4.7 validate=27/0 (supervisor run 03:20-03:27 EDT; log ~/MGL-cts/glmark2-bench/mglR3.log)
+
+PROGRESS 2e20f64 (perf session 4, 2026-10-24 03:10): four per-draw/per-encoder CPU costs removed.
+1. PSO fast-path key caches (MGLRenderer+Compat.m + mgl_compat_perf.h, compat-owned):
+   compatMSLKeyCached (direct-mapped on msl_str ptr, 2x128-byte head/tail memcmp validate;
+   index hash is multiplicative — a >>5 mask aliased 4 KB-strided malloc addresses, the
+   desktop:shadow sample showed it re-hashing every draw) and compatVAOHashCached (single
+   entry, exact memcmp of enabled_attribs..element_array; mtl_data excluded).  Was ~320 B of
+   FNV per raster stage + ~130 dependent multiplies per draw.
+2. geom pool exhaustion doubling (MGLRenderer+Geometry.m, geom-owned, flagged): slots grew
+   to need*2 (~2 draws), so gl41-geometry's 9.8 MB/frame of GS scratch exhausted the 4-slot
+   rotation within ~3 draws and every following geomSubAlloc blocked in waitUntilCompleted
+   (~2.7 ms/frame in the sample; 60/66 samples in psynch_cvwait).  A slot reclaimed while it
+   cannot fit the current draw now doubles (per-slot 64 MB cap, global 512 MB growth budget,
+   MGL_GEOM_POOL_BUDGET override).  Local trace: waits/draw 68% -> 46% and falling as the
+   pools reach steady state; test_geom 593/0, forced-tiny-pool tests unchanged.
+3. Per-draw strlen of generated MSL gone: geomSSBOSizesNeeded + mgl_msl_has_size_constants
+   (MGLRenderer+Geometry.m, geom-owned, flagged) validated their memos with strlen(msl) —
+   strlen(30 KB) x2 per draw from geomBindSSBOSizes (ideas profiler: ssboSizes 0.28->~0);
+   fingerprint is now a 32-byte head memcmp.
+4. Depth/stencil one-entry cache (MGLRenderer+RenderState.m, rstate-owned, flagged): the
+   16-arg NSString key + dictionary lookup per render encoder (10/frame in desktop:shadow)
+   is now an integer compare on the unchanged-state fast path.
+Also: profiler slot 19 = fbBuildPassDesc timing (4.4 us/encoder at load 5 — the Metal
+renderCommandEncoderWithDescriptor dominates the ~30-48 us encoder creation, and the 10
+encoders/frame of desktop:shadow are intrinsic: all FBO switches happen by re-attaching
+textures to ONE fbo object, every attach must end the pass).
+Suite 7556/0 after every step; nsgl_smoke renders (present == readback).
+PROGRESS 109bf4f (perf session 4, cont.): fbBuildRenderPassDescriptor now reuses the last
+descriptor per (ctx, fbo, collected targets, pre-pass invalid-mask) — the encoder copies it,
+so reuse is legal; ~4 us/encoder saved on the ~50% hit rate of desktop:shadow (MGL_DEBUG
+prints 'pass-descriptor cache HIT'; targetsChanged counter under MGL_PROFILE showed the 10
+encoder teardowns/frame are all genuine pass switches: 1 command buffer/frame, the scene
+re-attaches textures to one fbo object).  Suite 7556/0 again; gl41-streaming-sync shows no
+ClientWaitSync warnings with the merged fence listener.
+BENCH-RESULT 109bf4f = 13415 (supervisor 03:28 EDT, validate 27/0): ideas 1319 -> 2189,
+desktop shadow 3369 -> 4243, desktop blur 3939 -> 4399, most simple scenes +5-10%.
+gl41-geometry 1000 -> 678: geomSlotSize's need*2 fallback SHRANK the 64 MB slots on every
+wrap after the budget declined the doubling (allocation thrash; the same change was 2x
+FASTER under the local occlusion throttle, where the wait dominated).  FIXED in 36b6031:
+geomSlotSize returns 0 (keep the current buffer) when the doubling is declined and the slot
+still fits a draw, and never returns a smaller size than the buffer it replaces.  Local:
+grows 45/1396 draws (was 48/386), waits 21% of draws, 773-799 FPS locally (was ~500).
+gl41-streaming-sync: no ClientWaitSync warnings locally; the bench's single warning is the
+first-frame PSO-compile stall (fence signalled late), not the listener path.
+MERGED gl46-port 4b71da1 (tess round 17); full suite 7556/0 after merge.
+BENCH-REQUEST df38931 (= 109bf4f + 36b6031 geom-slot fix + tess merge; expect gl41-geometry
+to recover well past 1000, everything else ~flat vs the 13415 run)
 
 BENCH-REQUEST e9a376a (code = f8b9c47 after the FBO/alpha PSO fast-path fix; expect
 desktop blur + shadow ~2-3x; ideas/geometry unchanged)

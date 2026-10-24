@@ -170,6 +170,37 @@ static uint64_t compatVAOHash(GLMContext ctx)
 }
 #undef MIX
 
+/* the hashed bytes of a VertexArray: everything from enabled_attribs through
+ * element_array (mtl_data is not hashed and is excluded, so a memcmp of this
+ * range is an EXACT validator of the hash inputs) */
+#define COMPAT_VAO_SNAP_OFF  offsetof(VertexArray, enabled_attribs)
+#define COMPAT_VAO_SNAP_LEN  (offsetof(VertexArray, mtl_data) - offsetof(VertexArray, enabled_attribs))
+
+/* cached variant: one entry, validated by memcmp against the live struct, so
+ * the per-draw cost is a pointer compare plus ~700 bytes of memcmp instead of
+ * ~130 dependent multiplies */
+static uint64_t compatVAOHashCached(struct MGLExtMetal_compat *m, GLMContext ctx)
+{
+    VertexArray *vao = ctx->state.vao;
+    const uint8_t *live = (const uint8_t *)vao + COMPAT_VAO_SNAP_OFF;
+    if (!m)
+        return compatVAOHash(ctx);
+    if (m->vaokey.vao == (void *)vao && m->vaokey.len == COMPAT_VAO_SNAP_LEN &&
+        m->vaokey.snap && memcmp(m->vaokey.snap, live, COMPAT_VAO_SNAP_LEN) == 0)
+        return m->vaokey.hash;
+    uint64_t h = compatVAOHash(ctx);
+    if (!m->vaokey.snap)
+        m->vaokey.snap = (uint8_t *)malloc(COMPAT_VAO_SNAP_LEN);
+    if (m->vaokey.snap)
+    {
+        memcpy(m->vaokey.snap, live, COMPAT_VAO_SNAP_LEN);
+        m->vaokey.vao = (void *)vao;
+        m->vaokey.len = COMPAT_VAO_SNAP_LEN;
+    }
+    m->vaokey.hash = h;
+    return h;
+}
+
 /* content-identity, not object identity: programs are recreated at
  * recycled addresses during link-test loops (tests/headless/test_fp64.c
  * failed with a program-pointer key), but a linked stage's generated MSL
@@ -177,7 +208,7 @@ static uint64_t compatVAOHash(GLMContext ctx)
  * source per draw is too slow, so the key mixes the string POINTER with a
  * content checksum of its head and tail — an address reused for different
  * text can no longer alias a live entry */
-static inline uint64_t compatMSLKey(const char *msl)
+static uint64_t compatMSLKey(const char *msl)
 {
     if (!msl)
         return 0;
@@ -190,6 +221,35 @@ static inline uint64_t compatMSLKey(const char *msl)
         for (size_t i = len - 128; i < len; i++)
             h = (h ^ (unsigned char)msl[i]) * 1099511628211ULL;
     return h;
+}
+
+/* cached variant for the per-draw fast path: the full hash touches ~320 bytes
+ * of shader text per stage; the cache revalidates with two 128-byte memcmps.
+ * Strings short enough for head/tail to overlap are never cached (hashed
+ * directly — real generated MSL is orders of magnitude longer). */
+#define MGLC_MSL_VALIDATE 128
+static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const char *msl)
+{
+    if (!msl)
+        return 0;
+    if (!m)
+        return compatMSLKey(msl);
+    __typeof__(m->mslkey[0]) *e = &m->mslkey[((uintptr_t)msl * 0x9E3779B97F4A7C15ULL) >> 59];
+    if (e->msl == msl && e->len >= 2 * MGLC_MSL_VALIDATE &&
+        memcmp(e->head, msl, MGLC_MSL_VALIDATE) == 0 &&
+        memcmp(e->tail, msl + e->len - MGLC_MSL_VALIDATE, MGLC_MSL_VALIDATE) == 0)
+        return e->key;
+    uint64_t k = compatMSLKey(msl);
+    size_t len = strlen(msl);
+    if (len >= 2 * MGLC_MSL_VALIDATE)
+    {
+        e->msl = msl;
+        e->key = k;
+        e->len = len;
+        memcpy(e->head, msl, MGLC_MSL_VALIDATE);
+        memcpy(e->tail, msl + len - MGLC_MSL_VALIDATE, MGLC_MSL_VALIDATE);
+    }
+    return k;
 }
 
 - (bool) compatPipelineFastPath
@@ -217,9 +277,9 @@ static inline uint64_t compatMSLKey(const char *msl)
     CompatPipelineKey key;
     /* content-identity (see compatMSLKey): the three raster stages' generated
      * MSL identifies the pipeline functions exactly */
-    key.a = compatMSLKey(ctx->state.program->spirv[_VERTEX_SHADER].msl_str)
-          ^ compatMSLKey(ctx->state.program->spirv[_FRAGMENT_SHADER].msl_str) * 0x100000001B3ULL
-          ^ compatMSLKey(ctx->state.program->spirv[_GEOMETRY_SHADER].msl_str);
+    key.a = compatMSLKeyCached(m, ctx->state.program->spirv[_VERTEX_SHADER].msl_str)
+          ^ compatMSLKeyCached(m, ctx->state.program->spirv[_FRAGMENT_SHADER].msl_str) * 0x100000001B3ULL
+          ^ compatMSLKeyCached(m, ctx->state.program->spirv[_GEOMETRY_SHADER].msl_str);
     /* pipeline-baked rstate by CONTENT hash, not by the monotonic generation
      * counter: alternating blend / mask states must produce the same two keys
      * forever (rstatePipelineContentHash is cached against the generation, so
@@ -234,7 +294,7 @@ static inline uint64_t compatMSLKey(const char *msl)
             m->rstate_hash = h;
         }
     }
-    key.b = compatVAOHash(ctx) ^ ((m ? m->rstate_hash : 1) << 1) ^ ((uint64_t)(uintptr_t)ctx->state.framebuffer * 0x9E3779B97F4A7C15ULL);
+    key.b = compatVAOHashCached(m, ctx) ^ ((m ? m->rstate_hash : 1) << 1) ^ ((uint64_t)(uintptr_t)ctx->state.framebuffer * 0x9E3779B97F4A7C15ULL);
 
     /* attachment formats + sample count of the CURRENT encoder: an attached
      * texture can be re-specified with a different format behind an unchanged
