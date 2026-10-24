@@ -112,6 +112,30 @@ struct MGLExtMetal_compat {
         uint8_t *snap;              /* malloc'd copy of the hashed bytes */
     } vaokey;
 
+    /* per-draw texture RESOLUTION cache (compat perf session 8): the bind
+     * shadow above filters the encoder CALLS; this filters the CPU-side
+     * resolution chain (texextValidate + texdata realize + sampler lookup +
+     * texture-view lookup — five ObjC calls per texture per stage per draw in
+     * glmark2 [ideas]) when the unit still feeds the same realized texture.
+     * Keyed on the identity of everything that chain reads:
+     *   - the GL texture object (the loop's mgl_texture_for_sampler result),
+     *   - tex->mtl_data (re-realization / storage re-specification),
+     *   - tex->params.mtl_data — ANY glTexParameter releases it
+     *     (mglTexParamInvalidate), so a param change always misses,
+     *   - the unit's sampler object and ITS params.mtl_data (same rule),
+     *   - the encoder generation (a fresh encoder has an empty table).
+     * The resolved ids stay unretained: the GL objects own them. */
+    struct MGLCompatTexResolve {
+        uint64_t gen;
+        void    *tex;
+        void    *tex_mtl;
+        void    *tex_params;
+        void    *sampler_obj;
+        void    *sampler_params;
+        void    *view;      /* resolved id<MTLTexture> */
+        void    *samp;      /* resolved id<MTLSamplerState> */
+    } vtexres[2][MGLC_BIND_SLOTS];
+
     struct MGLCompatRing ring;
 };
 

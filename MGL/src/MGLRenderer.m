@@ -532,7 +532,12 @@ static char kComputeFallbackKey;
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
                 {
                     Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stage, i);
-                    if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64bind.txt","a"); if (d_) { fprintf(d_, "stage=%d i=%d spirv_binding=%u type=%d dub=%p:", stage, i, spirv_binding, (int)spvc_type, (void*)dub);
+                    /* perf: latch the knob once — getenv takes the environment lock and
+                     * this runs per default-uniform binding per stage per draw (same class
+                     * as the MGL_BINDMAP_DEBUG fix; debug output unchanged when set) */
+                    static int sFp64DumpInit = 0, sFp64Dump = 0;
+                    if (!sFp64DumpInit) { sFp64Dump = getenv("MGL_FP64_DUMP") != NULL; sFp64DumpInit = 1; }
+                    if (sFp64Dump) { FILE*d_ = fopen("/tmp/fp64bind.txt","a"); if (d_) { fprintf(d_, "stage=%d i=%d spirv_binding=%u type=%d dub=%p:", stage, i, spirv_binding, (int)spvc_type, (void*)dub);
                         unsigned char *dd = (unsigned char *)dub->data.buffer_data;
                         for (int q = 0; q < 32; q++) fprintf(d_, " %02x", dd ? dd[q] : 0);
                         fprintf(d_, "\n"); fclose(d_); } }
@@ -807,7 +812,11 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
     assert(_currentRenderEncoder);
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    /* perf: latch the debug knobs once — getenv takes the environment lock and
+     * these two run per buffer map per draw (the MGL_BINDMAP_DEBUG twin below) */
+    static int sGeomDbgInit = 0, sGeomDbg = 0;
+    if (!sGeomDbgInit) { sGeomDbg = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgInit = 1; }
+    if (sGeomDbg)
         fprintf(stderr, "MGL geom: vertex buffer map: %d entries\n", ctx->state.vertex_buffer_map_list.count);
     for(int i=0; i<ctx->state.vertex_buffer_map_list.count; i++)
     {
@@ -877,7 +886,10 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
     
     assert(_currentRenderEncoder);
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    /* perf: latched once (see the vertex twin above) */
+    static int sGeomDbgFInit = 0, sGeomDbgF = 0;
+    if (!sGeomDbgFInit) { sGeomDbgF = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgFInit = 1; }
+    if (sGeomDbgF)
         fprintf(stderr, "MGL geom: fragment buffer map: %d entries\n", ctx->state.fragment_buffer_map_list.count);
     for(int i=0; i<ctx->state.fragment_buffer_map_list.count; i++)
     {
@@ -2177,6 +2189,15 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             if (!ptr)
                 continue;
 
+            /* compat perf: per-slot texture-resolution cache — when the unit
+             * still feeds the same realized texture (and its texparam caches
+             * are unchanged), replay the resolved texture/sampler pair through
+             * the shadow-filtered setters and skip the validate/realize/
+             * sampler/view chain (MGLRenderer+Compat.m) */
+            if ([self compatTexResolveHit:(stage == _FRAGMENT_SHADER) unit:(spirv_binding + e)
+                                     slot:(mtl_index + e) tex:ptr])
+                continue;
+
             RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
             if (!ptr->mtl_data)
                 continue;
@@ -2188,6 +2209,9 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding + e texture:ptr];
             texture = [self texparamTextureForTex:ptr base:texture];
             assert(sampler);
+
+            [self compatTexResolveRecord:(stage == _FRAGMENT_SHADER) unit:(spirv_binding + e)
+                                    slot:(mtl_index + e) tex:ptr view:texture sampler:sampler];
 
             if (stage == _VERTEX_SHADER)
             {
@@ -3316,7 +3340,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         if (geomVertexFunction)
         {
             pipelineStateDescriptor.vertexFunction = geomVertexFunction;
-            if (getenv("MGL_GEOM_DEBUG"))
+            /* perf: latched once (per-draw descriptor path) */
+            static int sGeomDbgVInit = 0, sGeomDbgV = 0;
+            if (!sGeomDbgVInit) { sGeomDbgV = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgVInit = 1; }
+            if (sGeomDbgV)
                 NSLog(@"MGL geom: PSO vertex function is the pass-through %@", geomVertexFunction.name);
         }
     }

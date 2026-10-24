@@ -741,8 +741,25 @@ static bool rs_is_strip(GLenum mode)
 static bool rs_program_has_flat(GLMContext ctx)
 {
     Program *p = ctx->state.program;
-    if (!p || !p->spirv[_FRAGMENT_SHADER].msl_str) return false;
-    return strstr(p->spirv[_FRAGMENT_SHADER].msl_str, "[[flat]]") != NULL;
+    const char *msl = p ? p->spirv[_FRAGMENT_SHADER].msl_str : NULL;
+    if (!msl) return false;
+    /* perf: memoize the substring probe — rs_provoking_rewrite() runs per draw
+     * (provoking=LAST is the default and every LINES/TRIANGLES mode asks), and a
+     * raw strstr scans the whole (tens-of-KB) MSL source each time.  Content-keyed
+     * like mgl_msl_has_size_constants (MGLRenderer+Geometry.m): a freed program's
+     * MSL address can be recycled for different text, so the first 32 bytes
+     * fingerprint the entry. */
+    static struct { const char *msl; char head[32]; bool has; } cache[64];
+    static int next;
+    for (int i = 0; i < 64; i++)
+        if (cache[i].msl == msl && memcmp(cache[i].head, msl, 32) == 0) return cache[i].has;
+    bool has = strstr(msl, "[[flat]]") != NULL;
+    cache[next].msl = msl;
+    memset(cache[next].head, 0, 32);
+    memcpy(cache[next].head, msl, 32);
+    cache[next].has = has;
+    next = (next + 1) & 63;
+    return has;
 }
 
 static bool rs_provoking_rewrite(GLMContext ctx, GLenum mode)

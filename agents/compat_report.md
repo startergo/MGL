@@ -1,4 +1,74 @@
 # compat domain — progress log
+READY 09e272a (gl46/compat; gl46-port bd31b86 merged as aad7d91 + session-8 per-draw CPU work)
+BENCH-REQUEST: glmark2-macos full default list, background launch, window visible, same mode
+as mglR10.  Changes since bd31b86 are CPU-side per-draw savings (texture-resolution cache,
+7 latched getenv, memoized per-draw MSL strstr): expect small gains on draw-heavy scenes
+(ideas, desktop, jellyfish, terrain) and no regressions; the mrt/texarray numbers should
+return to their load-3-4 values (proven load, not code — see session 8).
+
+## session 8 (Oct 24, 17:00-18:40 EDT) — mrt/texarray proven load; per-draw CPU work; machine oscillation
+
+TASK 1 (gl41-mrt 6049 vs mglR9 7780, gl41-texarray 10569 vs 12356): LOAD, NOT CODE.
+Three independent measurements on bf0074e vs bd31b86 (single-scene):
+1. Interleaved back-to-back (3 rounds/scene): deltas inside round-to-round noise,
+   sign flips (mrt 21192/21074, 21151/21222, 2976/2626; texarray 24449/26171,
+   27328/27395, 21705/23440).
+2. SIMULTANEOUS (identical machine state, launch order alternated, 3 rounds/scene):
+   texarray ratios bd31b86/bf0074e = 0.966/0.999/0.952, mrt = 0.966/1.016/1.033 —
+   no consistent delta beyond ~3%, and the 3-5% first-launched-window penalty is
+   compositing order, not code.
+3. Code audit bf0074e..bd31b86: neither scene enters the geometry-emulation path
+   (MGL_GEOM_TRACE_DRAW=1: zero lines).  Hot-path deltas are a 2xMAX_BINDABLE_BUFFERS
+   pointer scan per non-attribute buffer map (~50 ns), a tess-active guard per draw,
+   minus the removed per-map getenv (environ lock).  Net < 1 us/frame vs the 25-40 us/frame
+   the bench deltas imply.
+
+TASK 2 (below-native scenes) — the machine itself is the dominant variable today:
+the SAME build/scene swings 400 <-> 2900 FPS within minutes (user's VM/Docker
+time-slices the virtualized AGX; I saw ideas 141/211/448/2350/2420 across the session,
+and one simultaneous pair of 21195 vs 2350).  Interleaved native-vs-MGL (alternating
+order, same state) is the only measurement that means anything here:
+  ideas:speed=duration  native 2421/2460/2429/2433  mgl 2302/2435/2366/2362  = 0.95-0.99x
+  terrain               native 2306/2290/2277      mgl 2732/2556/2891      = 1.12-1.27x
+  desktop shadow        native 2446/2388/2484      mgl 2747/2624/2632      = 1.06-1.12x
+  gl41-geometry         native 2247/2377/2350      mgl 2673/2963/21195*    = 1.19-1.25x
+(*one side caught a fast phase).  So the bench's ideas 2177/3789 (0.57x), terrain
+1919/2261 (0.85x), desktop-shadow 4345/4650 (0.93x) are NOT reproducible as code gaps —
+they are sequential-bench artifacts of the machine's oscillation.
+
+CPU-side work done anyway (ideas profile: 353 draws/frame, per-draw ~1.1 us CPU,
+processGLState = 70% of it; sample attribution showed ~40% of draw CPU in the texture
+resolution chain, plus hot getenvs and a per-draw strstr) — commit 09e272a:
+- MGLCompatTexResolve (compat slot, 2x32 entries): skips texextValidate +
+  texdataBindMTLTexture + texparamSamplerForUnit + texparamTextureForTex when the unit
+  still feeds the same realized texture.  Keyed on tex ptr, tex->mtl_data,
+  tex->params.mtl_data (ANY glTexParameter releases it -> mglTexParamInvalidate), the
+  unit's sampler object + its params cache, and encoder generation.  tex->dirty_bits
+  nonzero always takes the full path (the upload lives there).  VS geom-shadow slots
+  bypass the cache (geomShadowCheckStale must run).  Replays through the shadow-filtered
+  compatSet*, so a changed resolved id still rebinds.  [ideas] profiled bindTextures
+  slot 0.331 -> 0.125-0.199 ms/frame.
+- 7 hot-path getenv latched once: MGL_FP64_DUMP (per default-uniform binding per stage
+  per draw), MGL_GEOM_DEBUG x3, MGL_VATTRIB_DEBUG x3, MGL_TESS_NOSPEC.
+- state_ext.c rs_program_has_flat: per-draw strstr over the whole fragment MSL
+  (provoking=LAST default + any LINES/TRIANGLES mode) now memoized content-keyed
+  (mgl_msl_has_size_constants pattern).
+- compat_misc.c clip_visible const fix (clears 10 warnings).
+Measured vs session-8 base (simultaneous A/B): ideas +0-2%, terrain +0-1.6% — real but
+small; today's GPU time-slicing hides CPU wins.  Profiled [ideas] per-frame draw slot
+2.94 -> 1.38-2.58 ms (machine-dependent), mapBuffers slot 0.368 -> 0.157-0.281.
+
+Verification: suite 65 files rc=0, 8184 checks / 0 failures; test_geom 603/0;
+glmark2 --validate 0 Fail/Error (11-12 pre-existing "Validation: Unknown" scenes,
+identical on the old build); stub_scanner EMPTY/NOOP/ASSERT clean for compat files;
+build has no new warnings.
+
+Method for future sessions on this machine: ALWAYS interleave/simultaneous when
+comparing; single sequential numbers are meaningless under load swings of 6x.
+ab/ trees (git-archive copies + external symlink): ab/run_ab_sim.sh (two builds),
+ab/run_ab2.sh (two builds, this one vs ab/aad7d91), ab/run_nat.sh (native vs MGL).
+
+BENCH-RESULT 5efa031 (built at HEAD 244a311) score=14125 native=6591 ratio=2.14 load=5-8 (user Docker/VM busy) — NOT pinned; mglR10 vs native7 16:20 EDT. gl41-geometry 3114 vs native 2637 (was 1114). Still below mglR9: gl41-mrt 6049 (7780), gl41-texarray 10569 (12356), terrain 1919 (2250) — load was higher, recheck on a quiet machine. Below native: ideas 2177/3789, desktop-shadow 4345/4650, terrain 1919/2261.
 READY 5efa031 (gl46/compat; gl46-port 9cc5052 merged as 5614538 + the getenv hot-path fix)
 — geometry-shader emulation throughput work + the mglP10 mrt/texarray investigation.
 BENCH-REQUEST: glmark2-macos full default list, background launch, window visible (same

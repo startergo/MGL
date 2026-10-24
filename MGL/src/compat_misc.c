@@ -308,7 +308,7 @@ static bool point_in_tri(float px, float py, float ax, float ay, float bx, float
     return !(has_neg && has_pos);
 }
 
-static bool clip_visible(GLMContext ctx, float *win)
+static bool clip_visible(GLMContext ctx, const float *win)
 {
     const GLint *vp = STATE(viewport);
     float rx1 = (float)(vp[0] + vp[2]), ry1 = (float)(vp[1] + vp[3]);

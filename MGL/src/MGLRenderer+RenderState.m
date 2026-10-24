@@ -647,8 +647,11 @@ static bool rs_mode_is_polygon(GLenum m)
                 id<MTLFunction> vf = [self rstateSpecialize: vsh stage: vstage];
                 if (vf) desc.vertexFunction = vf;
             }
-            /* DEBUG: unspecialized TES */
-            if (getenv("MGL_TESS_NOSPEC") && vstage == _TESS_EVALUATION_SHADER)
+            /* DEBUG: unspecialized TES (knob latched once — this runs per
+             * pipeline rebuild, i.e. per draw when the descriptor path is hot) */
+            static int sTessNospecInit = 0, sTessNospec = 0;
+            if (!sTessNospecInit) { sTessNospec = getenv("MGL_TESS_NOSPEC") != NULL; sTessNospecInit = 1; }
+            if (sTessNospec && vstage == _TESS_EVALUATION_SHADER)
                 desc.vertexFunction = (__bridge id<MTLFunction>)program->shader_slots[vstage]->mtl_data.function;
         }
         id<MTLFunction> ff = [self rstateSpecialize:program->shader_slots[_FRAGMENT_SHADER] stage:_FRAGMENT_SHADER];

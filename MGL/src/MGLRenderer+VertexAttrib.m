@@ -618,7 +618,11 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
 
     plan->valid = 1;
 
-    if (getenv("MGL_VATTRIB_DEBUG"))
+    /* perf: latch the knob once — plan rebuilds run per draw in glmark2
+     * (attribs are re-specified between draws), and getenv takes the env lock */
+    static int sVattrDbgInit = 0, sVattrDbg = 0;
+    if (!sVattrDbgInit) { sVattrDbg = getenv("MGL_VATTRIB_DEBUG") != NULL; sVattrDbgInit = 1; }
+    if (sVattrDbg)
         for (int i = 0; i < 31; i++)
             if (desc.layouts[i].stride && (i < 8 || i > 26))
                 NSLog(@"vattrib: layout %d stride %lu step %lu rate %lu", i, (unsigned long)desc.layouts[i].stride,
@@ -704,7 +708,9 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
        value too, which can change between draws) */
     int pad_from = dbl ? (int)f->size : 0;
     int pad_to = dbl ? (int)(stride_out / 8) : 0;
-    if (getenv("MGL_VATTRIB_DEBUG"))
+    static int sVattrDbg2Init = 0, sVattrDbg2 = 0;
+    if (!sVattrDbg2Init) { sVattrDbg2 = getenv("MGL_VATTRIB_DEBUG") != NULL; sVattrDbg2Init = 1; }
+    if (sVattrDbg2)
         NSLog(@"vattrib: shadow bind a=%d dbl=%d owner=%d kind=%d size=%d type=0x%x long=%d stride=%d reloff=%d "
               "shadow_stride=%d elem=%d bufoff=%ld bufsize=%ld", attrib, dbl, s->plan.owner_gl[attrib], kind,
               f->size, f->type, f->is_long, b->stride, f->relativeoffset, s->plan.shadow_stride[attrib], elem,
@@ -870,7 +876,10 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
     MGLVertexArrayFull *va = mgl_va_full(vao);
     MGLVattribDrawPlan *plan = &s->plan;
 
-    if (getenv("MGL_VATTRIB_DEBUG"))
+    /* perf: latched once (per draw) */
+    static int sVattrDbg3Init = 0, sVattrDbg3 = 0;
+    if (!sVattrDbg3Init) { sVattrDbg3 = getenv("MGL_VATTRIB_DEBUG") != NULL; sVattrDbg3Init = 1; }
+    if (sVattrDbg3)
     {
         for (int a = 0; a < MAX_ATTRIBS; a++)
             if (plan->fetch[a])

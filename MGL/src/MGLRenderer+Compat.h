@@ -34,6 +34,12 @@
 - (void) compatBindInvalidate;
 - (void) compatBindProfileDump;
 - (void) compatBindProfileReset;
+/* perf session 8: per-draw texture-resolution cache — bindTexturesToCurrentRenderEncoder
+ * calls compatTexResolveHit before the validate/realize/sampler/view chain and
+ * compatTexResolveRecord after it (see mgl_compat_perf.h) */
+- (bool) compatTexResolveHit:(bool)frag unit:(GLuint)unit slot:(GLuint)slot tex:(Texture *)tex;
+- (void) compatTexResolveRecord:(bool)frag unit:(GLuint)unit slot:(GLuint)slot tex:(Texture *)tex
+                           view:(id<MTLTexture>)view sampler:(id<MTLSamplerState>)samp;
 @end
 
 #endif

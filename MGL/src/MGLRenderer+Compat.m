@@ -550,6 +550,77 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 
 /* -------- texture / sampler binds (identity filtered) --------------- */
 
+/* per-draw texture RESOLUTION cache (compat perf session 8; struct
+ * MGLCompatTexResolve in mgl_compat_perf.h).  The chain
+ * texextValidateTexture + texdataBindMTLTexture + texparamSamplerForUnit +
+ * texparamTextureForTex is 5 ObjC calls per texture per stage per draw, and
+ * glmark2 [ideas] spends ~40% of its per-draw CPU there while the unit keeps
+ * feeding the same realized texture.  Keyed on every identity the chain
+ * reads; any glTexParameter / sampler-parameter change releases the
+ * MGLTexParamCache (mglTexParamInvalidate) and misses.  The (view, sampler)
+ * pair is replayed through the normal shadow-filtered setters, so the
+ * encoder still gets a real bind whenever the resolved object changed. */
+- (bool) compatTexResolveHit: (bool)frag unit: (GLuint)unit slot: (GLuint)slot tex: (Texture *)tex
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    if (!m || !m->enabled || slot >= MGLC_BIND_SLOTS || !tex || !tex->mtl_data)
+        return false;
+    /* pending data / level work: bindMTLTexture's chain performs the upload,
+     * so a dirty texture must always take the full path (dirty_bits is also
+     * the re-realization signal: a storage re-specification sets it) */
+    if (tex->dirty_bits)
+        return false;
+    /* a vertex-stage shadow-sampling slot must run geomShadowCheckStale every
+     * draw (the depth texture may be re-bound behind our back) */
+    if (!frag && mgl_geom_vs_shadow_slot(STATE(program), slot))
+        return false;
+    void *so = (unit < TEXTURE_UNITS) ? (void *)STATE(texture_samplers[unit]) : NULL;
+    struct MGLCompatTexResolve *e = &m->vtexres[frag ? 1 : 0][slot];
+    /* the CURRENT generation: a freshly created encoder must not inherit
+     * entries recorded for its predecessor (compatEncGen bumps lazily — the
+     * shadow inside the setters would still catch it, but a miss here keeps
+     * the replayed ids from being trusted at all) */
+    uint64_t gen = compatEncGen(m, (__bridge void *)_currentRenderEncoder);
+    if (e->gen == gen && e->tex == (void *)tex && e->tex_mtl == tex->mtl_data &&
+        e->tex_params == tex->params.mtl_data && e->sampler_obj == so &&
+        (!so || e->sampler_params == ((Sampler *)so)->params.mtl_data) && e->view && e->samp)
+    {
+        id<MTLTexture> view = (__bridge id<MTLTexture>)e->view;
+        id<MTLSamplerState> samp = (__bridge id<MTLSamplerState>)e->samp;
+        if (frag)
+        {
+            [self compatSetFragmentTexture: view atIndex: slot];
+            [self compatSetFragmentSamplerState: samp atIndex: slot];
+        }
+        else
+        {
+            [self compatSetVertexTexture: view atIndex: slot];
+            [self compatSetVertexSamplerState: samp atIndex: slot];
+        }
+        return true;
+    }
+    return false;
+}
+
+/* record the resolution the caller computed, for the next draw's hit check */
+- (void) compatTexResolveRecord: (bool)frag unit: (GLuint)unit slot: (GLuint)slot tex: (Texture *)tex
+                            view: (id<MTLTexture>)view sampler: (id<MTLSamplerState>)samp
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    if (!m || !m->enabled || slot >= MGLC_BIND_SLOTS || !tex || !view || !samp)
+        return;
+    void *so = (unit < TEXTURE_UNITS) ? (void *)STATE(texture_samplers[unit]) : NULL;
+    struct MGLCompatTexResolve *e = &m->vtexres[frag ? 1 : 0][slot];
+    e->gen = compatEncGen(m, (__bridge void *)_currentRenderEncoder);
+    e->tex = (void *)tex;
+    e->tex_mtl = tex->mtl_data;
+    e->tex_params = tex->params.mtl_data;
+    e->sampler_obj = so;
+    e->sampler_params = so ? ((Sampler *)so)->params.mtl_data : NULL;
+    e->view = (__bridge void *)view;
+    e->samp = (__bridge void *)samp;
+}
+
 - (void) compatSetVertexTexture: (id<MTLTexture>)tex atIndex: (NSUInteger)idx
 {
     id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
