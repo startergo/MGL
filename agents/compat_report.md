@@ -1,4 +1,101 @@
 # compat domain — progress log
+READY c57f712 (gl46/compat, fixes on top of 1984249 which already contains gl46-port a2f16f4
+via merge 04d3fbd; `git merge gl46-port` confirms "Already up to date").
+BENCH-REQUEST: glmark2-macos full default list, background launch
+(nohup sh -c "DYLD_INSERT_LIBRARIES=<wt>/build/nsgl/libmgl_nsgl.dylib glmark2-macos
+--data-path ..."), window visible — the exact mode that pinned before.  Expected: no scene at
+120-121 FPS; local full run Score 5075 with every scene free-running ([build] 6813-7980 vs
+6367572 reference 7081 back to back; [buffer] 38-99 is CPU-bound and the reference build reads
+49 in the same conditions — absolute scale tracks machine load, the pin did not).
+Verification on the final build: suite 7557 checks / 0 failures / 65 files / rc=0
+(test_geom 59 checks, 3/3 — was SIGSEGV since bcc0629); nsgl_smoke PASS (present == readback
+byte-identical, CALayer flip calibration ok, present throughput 6305 Hz > 240 Hz floor);
+stub_scanner EMPTY/NOOP/ASSERT clean for compat+nsgl files.
+
+ROOT CAUSE FOUND + FIXED (perf session 6, 10:00-11:00 EDT) — the 120 FPS pin was NEVER the
+direct-present path.  fa528c9 added a compatSurfacePresentEnabled() call to
+fbEnsureDefaultFramebuffer(); the NSOpenGL interposer constructor called
+MGLgetCurrentContext() (libmgl auto-context init -> default-fb ensure, renderer already owns an
+offscreen CAMetalLayer so _layer != nil) BEFORE its setenv("MGL_SURFACE_PRESENT","1") at the end
+of the constructor -> the static env cache in compatSurfacePresentEnabled latched "disabled"
+for the whole process -> EVERY swap fell through to -[CAMetalLayer nextDrawable], which pins to
+the display refresh (120-121 FPS visible window, 27-40 FPS occluded).  That is why bcc0629's
+direct-off default did not help and why single-scene foreground runs looked fine (they also ran
+the drawable path; the pin visibility depends on window order/compositing).
+Evidence (all full default list, background nohup launch, back to back):
+- HEAD build: 27-40 FPS every scene (sampler: 175/193 samples in nextDrawable usleep)
+- 6367572 (gl46-port = beab36b+geom r46, i.e. pre-fa528c9 present path): 5663-7097 FPS
+- HEAD with MGL_SURFACE_PRESENT=1 pre-set in the env: 7633-7980 FPS (same binary!)
+- variants: -D1 (direct-present code removed) free; -D2/-D3 alone still pinned (the D2/D3
+  "revert" builds were no-ops at first — GNU make 3.81 same-second mtime trap; deleted the
+  .o files to force rebuilds before trusting those results)
+FIX (two layers):
+- MGL/nsgl/mgl_nsgl.m: setenv moved to the TOP of the constructor (before MGLgetCurrentContext)
+- MGL/src/MGLRenderer+Compat.m compatSurfacePresentEnabled: only a POSITIVE env result is
+  cached (early "unset" reads no longer latch disabled forever)
+RESULT: full default run, same launch: Score 5075, every scene 38-7980 FPS free-running
+([buffer] 38-99 is CPU-bound under load 4.7 — the 6367572 reference build gets 49 in the same
+conditions; [build] 6813-7980 vs reference 7081).  Direct present (MGL_DIRECT_PRESENT=1) is
+exonerated but stays OFF by default pending a dedicated bench.
+
+SECOND BUG (same session): the bcc0629 texture-walk inlining in bindTexturesToCurrentRenderEncoder
+dropped the accessors' NULL-program guard -> SIGSEGV in test_geom (transform-feedback capture
+encodes with no program bound; crashed at 30/59 checks since bcc0629, "suite 6964/0" was really
+6964/0 + test_geom rc=139).  Fixed by keeping the direct struct read but guarding
+STATE(program) == NULL (accessor contract preserved: count 0, loop skipped).
+Suite now: 7557 checks, 0 failures, 65 files, rc=0 (test_geom 59/59, 3/3 runs).
+LESSON: reverting a default in source is meaningless unless the binary is rebuilt — the 09:19
+nsgl relink reused the 08:34 libmgl (which already had the fix; mtime analysis + disassembly of
+the getenv default proved the binary matched the tree, so the pin was real code, not staleness).
+Also: incremental variant builds with same-second mtimes are no-ops under GNU make 3.81 —
+delete the .o or touch the source.
+
+BENCH-RESULT 50dc9b1 (built at HEAD 1984249) score=NOT-RUN — STILL vsync-PINNED: full default run (mglR8.log/mglR8b.log) = 120-121 FPS on every scene; gl46-port build (beab36b+geom) in the same way = 20340 FPS; supervisor 09:20-09:45 EDT
+
+REGRESSION+REVERT bcc0629 (08:45 EDT): BENCH 04d3fbd = 119 — the direct-present path
+(fa528c9) pinned EVERY scene at 120-121 FPS = display vsync in a visible window
+(cross-process IOSurface sync at commit when the render pass writes the CA-displayed
+surface).  Could NOT be reproduced locally: the nsgl_smoke window is not composited the
+way the bench window is (3.1 kHz both paths; occluded/background windows take no fence).
+Fix: blit path default again (a4f8027 present behaviour); MGL_DIRECT_PRESENT=1 keeps the
+experimental path available.  nsgl_smoke now FAILS if present throughput at swap
+interval 0 is under 240 Hz (2x refresh) — catches gross caps when the window is actually
+composited; note the local repro limitation.  LESSON recorded: local stability runs must
+check FPS magnitudes, not just completion.
+Still in from this session: geom capture-PSO cache (gl41-geometry local +27%), MSL-key
+cache, per-draw strlen removal, depth/stencil one-entry cache, pass-descriptor reuse,
+texture-walk accessor inlining.  gl41-geometry remains the big scene target (MGL ~1000
+vs native 2609; the capture-PSO cache landed after the last clean geometry number).
+READY 50dc9b1 (branch head ad6251d = gl46-port a2f16f4 merged + geom capture-PSO cache + direct-present
+regression reverted to the a4f8027 blit path + texture-walk accessor inlining +
+nsgl_smoke present-throughput check).  Clean rebuild; full suite 6964/0 (65 test files,
+several have timing-dependent check counts); nsgl_smoke PASS with 14 kHz presents;
+--validate Success on texture/shading/desktop-shadow/bump/effect2d/pulsar.
+Expected vs the 10918 run: flat (present path identical to a4f8027), gl41-geometry up
+from the capture-PSO cache.  BENCH when convenient.
+BENCH-RESULT 04d3fbd (built at HEAD bfc5f92) score=119 native=6599 ratio=0.02 load=2.9-5.0 — REGRESSION: every scene pinned at 120-121 FPS (vsync) with direct present; supervisor run mglR7 08:22 EDT
+
+PROGRESS fa528c9 + 04d3fbd (perf session 5, 07:35 EDT): DIRECT PRESENT — the default
+framebuffer renders straight into the IOSurface the swap shows (fbEnsureDefaultFramebuffer
+hands out the pool write slot; compatSurfacePresent then only sets layer.contents — the
+blit encoder + fullscreen copy per frame is gone; it measured ~2.5x the command-buffer
+commit cost locally).  Write-slot rotation is lazy (after a present, at the next ensure),
+so readback-after-present still sees the shown surface; a rotated back buffer loads
+DontCare (GL: post-swap back-buffer content undefined).  fbSourceFor (readback) resolves
+the default FB color WITHOUT the rotating ensure.  MGL_DIRECT_PRESENT=0 is the fallback
+to the blit path.  nsgl_smoke PASS (present == readback), --validate Success (texture,
+shading, desktop:shadow), suite 7557/0 after merging gl46-port a2f16f4 (geom round 46).
+Also landed earlier this session (79e782d): geom capture-PSO cache — geomDraw rebuilt the
+capture-pass pipeline on EVERY geometry draw (4-6% of the gl41-geometry frame; cached on
+MGLGeomProgram keyed on capture-function + vertex-layout hash); local gl41-geometry
+773-799 -> 1010-1015 FPS.
+BENCH-REQUEST 04d3fbd (expect every windowed scene up by the saved blit+encoder, biggest
+on the 1-draw scenes; gl41-geometry up from the PSO cache; watch gl41-instancing/texarray/
+mrt — they read 15-23% below the previous run with no causal change, likely variance)
+STABILITY 08:05 EDT: full local glmark2 run through all scenes with the direct-present
+path — no GPU errors, no crashes, 37 scene results (killed during the last scene);
+--validate Success on every scene that has a reference checksum locally.
+BENCH-RESULT df38931 (built at HEAD a4f8027) score=13458 load=4.8-7.8 validate=27/0 (supervisor run mglR5 04:18-04:25 EDT; an earlier run mglR4 = 11012 was invalid: macOS AddressBook/remindd storm, load 85)
 BENCH-RESULT 2e20f64 (built at HEAD 109bf4f) score=13415 load=4.4-4.7 validate=27/0 (supervisor run 03:20-03:27 EDT; log ~/MGL-cts/glmark2-bench/mglR3.log)
 
 PROGRESS 2e20f64 (perf session 4, 2026-10-24 03:10): four per-draw/per-encoder CPU costs removed.
@@ -45,8 +142,15 @@ grows 45/1396 draws (was 48/386), waits 21% of draws, 773-799 FPS locally (was ~
 gl41-streaming-sync: no ClientWaitSync warnings locally; the bench's single warning is the
 first-frame PSO-compile stall (fence signalled late), not the listener path.
 MERGED gl46-port 4b71da1 (tess round 17); full suite 7556/0 after merge.
-BENCH-REQUEST df38931 (= 109bf4f + 36b6031 geom-slot fix + tess merge; expect gl41-geometry
-to recover well past 1000, everything else ~flat vs the 13415 run)
+BENCH-RESULT df38931 = 13458 (supervisor 04:26 EDT, built at a4f8027): gl41-geometry 678 -> 1151
+(the slot-shrink fix), gl41-streaming-sync 849 -> 956 (above native 867), desktop shadow
+4354 (native 4592).  gl41-instancing/texarray/mrt read 15-23% lower than the previous run
+with no causal change of ours (instancing/texarray/mrt use neither GS pools nor the
+compat fast-path caches; the only non-tess delta was the geom slot fix, which cannot touch
+them) — likely variance at 6-19k FPS; worth watching in the next bench.
+READY a4f8027 (= gl46-port 4b71da1 merged in df38931 + 36b6031 geom slot fix + a4f8027
+MSL-key cache/draw-run histogram).  Clean rebuild, full suite 7556/0, nsgl smoke renders,
+stub scanner clean for compat files.
 
 BENCH-REQUEST e9a376a (code = f8b9c47 after the FBO/alpha PSO fast-path fix; expect
 desktop blur + shadow ~2-3x; ideas/geometry unchanged)

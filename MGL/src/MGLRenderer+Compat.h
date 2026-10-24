@@ -11,6 +11,7 @@
  * into a pooled IOSurface texture, commits and shows it with layer.contents —
  * returns true when it handled the frame (the drawable path must be skipped). */
 - (bool) compatSurfacePresentEnabled;
+- (id<MTLTexture>) compatSurfaceWrite:(NSUInteger)w h:(NSUInteger)h;
 - (bool) compatPipelineBindNeeded;
 - (bool) compatPipelineFastPath;
 - (void) compatPipelineStore;

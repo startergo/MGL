@@ -210,6 +210,12 @@ typedef struct MGLGeomProgram {
     char   *draw_msl, *draw_entry;
     void   *capture_function, *capture_library;     /* retained MTLFunction / MTLLibrary */
     void   *draw_function, *draw_library;           /* pass-through raster vertex function */
+    /* capture-pass pipeline cache: the capture PSO depends only on (capture function,
+     * vertex layout), but geomDraw rebuilt it on EVERY draw (newRenderPipelineState ~
+     * 50-100 us even on the driver's internal cache — 4-6% of a gl41-geometry frame).
+     * Keyed on the vertex-descriptor layout hash + the capture function pointer. */
+    void   *capture_pso;
+    uint64_t capture_pso_key;
 } MGLGeomProgram;
 
 /* per-draw input of the routing helper: either the assembled lists (CPU assembly, the

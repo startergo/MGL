@@ -2099,12 +2099,18 @@ static char kComputeFallbackKey;
     for (int st = 0; st < 2; st++)
     {
         int stage = stages[st];
-        GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+        /* perf: the count/binding accessors validate + deref the same structs this
+         * loop already touches; read them directly (one ObjC call each per resource
+         * per draw otherwise).  The accessors returned 0 when NO program is bound
+         * (some paths encode with the default/capture PSO, e.g. test_geom's
+         * transform-feedback capture) — keep that guard or this deref SIGSEGVs. */
+        Program *prog = STATE(program);
+        GLuint count = prog ? prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].count : 0;
 
         for (GLuint i = 0; i < count; i++)
         {
-            SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].list[i];
-            GLuint spirv_binding = [self getProgramBinding:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index: i];
+            SpirvResource *sres = &prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].list[i];
+            GLuint spirv_binding = sres->binding;
             /* the shader always reads its own Metal texture slot: the GL sampler uniform only
              * picks WHICH texture feeds it, never the argument index */
             GLuint mtl_index = sres->msl_binding;

@@ -693,6 +693,19 @@ __attribute__((constructor))
 static void nsgl_init(void)
 {
     nsgl_cache_exec_path();
+
+    /* The present path uses IOSurface + layer.contents (no drawable blocking)
+     * — see MGLRenderer+Compat.m.  This MUST run before MGLgetCurrentContext()
+     * below: that call initialises libmgl and the renderer caches this env var
+     * on first use (compatSurfacePresentEnabled).  When the setenv came last,
+     * the early init call latched "disabled" for the whole process and every
+     * swap fell through to -[CAMetalLayer nextDrawable], which pins the frame
+     * rate to the display refresh (glmark2 full run: every scene 120-121 FPS
+     * in a visible window / 27-40 FPS occluded; root cause of the mglR7/mglR8
+     * regression, NOT the direct-present path it was first blamed on). */
+    if (!getenv("MGL_SURFACE_PRESENT"))
+        setenv("MGL_SURFACE_PRESENT", "1", 0);
+
     s_init_ctx = MGLgetCurrentContext();
 
     Class pf = objc_getClass("NSOpenGLPixelFormat");
@@ -725,11 +738,6 @@ static void nsgl_init(void)
     nsgl_swizzle(ct, @selector(getValues:forParameter:),
                  (IMP)nsgl_ctx_getValues, NO);
     nsgl_swizzle(ct, @selector(flushBuffer), (IMP)nsgl_ctx_flushBuffer, NO);
-
-    /* the present path uses IOSurface + layer.contents (no drawable blocking)
-     * — see MGLRenderer+Compat.m; set before any renderer is created */
-    if (!getenv("MGL_SURFACE_PRESENT"))
-        setenv("MGL_SURFACE_PRESENT", "1", 0);
 
     fprintf(stderr, "mgl_nsgl: NSOpenGL -> MGL interposer active\n");
 }

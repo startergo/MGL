@@ -611,6 +611,34 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     NSUInteger w = (NSUInteger)sz.width, h = (NSUInteger)sz.height;
     id<MTLTexture> color = (__bridge id<MTLTexture>)m->default_color;
 
+    /* compat domain: when the IOSurface present path is enabled the default
+     * framebuffer renders DIRECTLY into the present surface pool — the swap then
+     * only changes layer.contents (no blit; see compatSurfacePresent).  The write
+     * slot advances lazily here (after the previous present), so readbacks between
+     * a present and the next draw still see the surface that was just shown. */
+    if ([self compatSurfacePresentEnabled])
+    {
+        id<MTLTexture> surf = [self compatSurfaceWrite:w h:h];
+        if (surf && surf == color)
+            return color;                       /* same size, same slot: fast path */
+        if (surf && color && color.width == w && color.height == h)
+        {
+            /* slot rotation: keep the (still correctly sized) depth/stencil, just
+             * rebind the color surface; content of a fresh back buffer is undefined
+             * (GL) — mark it invalid so the first pass loads nothing */
+            if (getenv("MGL_DEBUG"))
+                fprintf(stderr, "MGL fb: default-fb slot rotation (direct present)\n");
+            [self endRenderEncoding];
+            if (m->default_color) CFBridgingRelease(m->default_color);
+            m->default_color = (void *)CFBridgingRetain(surf);
+            ctx->state.dirty_bits |= DIRTY_FBO;
+            mgl_fb_draw_state(ctx, NULL)->invalid_mask |= 1u;
+            return surf;
+        }
+        /* else: fall through to the (re)create path, which prefers the surface
+         * pool over a private texture */
+    }
+
     if (color && color.width == w && color.height == h)
         return color;
     if (!_device)
@@ -625,7 +653,13 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[self fbDefaultColorFormat] width:w height:h mipmapped:NO];
     d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     d.storageMode = MTLStorageModePrivate;
-    color = [_device newTextureWithDescriptor:d];
+    /* compat domain: the color attachment prefers the present surface (render
+     * directly into what compatSurfacePresent shows — the swap is then only a
+     * layer.contents change, no blit); a private texture is the fallback */
+    {
+        id<MTLTexture> surf = [self compatSurfacePresentEnabled] ? [self compatSurfaceWrite:w h:h] : nil;
+        color = surf ? surf : [_device newTextureWithDescriptor:d];
+    }
     color.label = @"MGL default framebuffer color";
     m->default_color = (void *)CFBridgingRetain(color);
 
@@ -1188,8 +1222,13 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     memset(t, 0, sizeof(*t));
     if (!fbo)
     {
-        id<MTLTexture> color = [self fbEnsureDefaultFramebuffer];
-        t->tex = (aspect == MGL_FB_ASPECT_COLOR) ? color : (__bridge id<MTLTexture>)FBM(ctx)->default_depth_stencil;
+        /* readbacks must see the surface that was just presented: do NOT go
+         * through fbEnsureDefaultFramebuffer here — the compat direct-present
+         * path rotates the write slot in it (only writes rotate) */
+        struct MGLExtMetal_fb *fm = FBM(ctx);
+        id<MTLTexture> color = (__bridge id<MTLTexture>)fm->default_color;
+        if (!color) color = [self fbEnsureDefaultFramebuffer];
+        t->tex = (aspect == MGL_FB_ASPECT_COLOR) ? color : (__bridge id<MTLTexture>)fm->default_depth_stencil;
         t->layers = 1;
         return t->tex != nil;
     }

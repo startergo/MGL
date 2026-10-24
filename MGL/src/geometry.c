@@ -942,6 +942,8 @@ static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);
     if (gp->draw_library && ctx->mtl_funcs.ext_program)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_library);
+    if (gp->capture_pso && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_pso);
     free(gp->kernel_msl);
     free(gp->kernel_entry);
     free(gp->final_entry);

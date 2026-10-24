@@ -256,6 +256,42 @@ int main(void)
     /* the same readback the interposer presents can be verified with
      * MGL_NSGL_DUMPDIR=<dir> (debug build path) or by eye; the checks above
      * plus the benchmark runs are the automation here */
+
+    /* present throughput with swap interval 0: a present path that pins the
+     * frame rate to the display refresh (120 Hz here) is a regression — the
+     * direct-render-into-present-surface path did exactly that in a visible
+     * window (every glmark2 scene capped at 120-121 FPS; score 119).  300
+     * full presents must sustain well above 2x the refresh rate. */
+    {
+        p_glClear(GL_COLOR_BUFFER_BIT);
+        p_glFinish();
+        /* window must be frontmost: the vsync pin only reproduces when the
+         * compositor actually schedules the presented surfaces (an occluded
+         * window takes no fence and runs unthrottled — that is why the local
+         * smoke runs missed the 120 FPS cap the visible-window bench hit) */
+        [win orderFrontRegardless];
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int N = 0;
+        const double DUR = 0.75;    /* ~90 presents at a 120 Hz cap, 500+ unthrottled */
+        for (;;)
+        {
+            p_glClearColor(0, 0, (float)(N & 1) * 0.5f, 1);
+            p_glClear(GL_COLOR_BUFFER_BIT);
+            [ctx flushBuffer];
+            N++;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+            if (sec >= DUR) { N = (int)(N / sec); break; }
+        }
+        int capped = N < 240;
+        printf("%s present throughput at swap interval 0: %d Hz (%s)\n",
+               capped ? "FAIL" : "ok  ", N,
+               capped ? "PINNED NEAR THE DISPLAY REFRESH — vsync regression" : "above 2x refresh");
+        if (capped)
+            fails++;
+    }
+
     printf("%s: %d failed checks (presented quad is on screen)\n",
            fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;

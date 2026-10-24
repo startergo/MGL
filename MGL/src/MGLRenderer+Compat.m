@@ -58,7 +58,9 @@ typedef struct {
 @property (nonatomic, strong) NSMutableArray<id<MTLTexture>> *textures;
 @property (nonatomic, strong) NSMutableArray<id> *surfaces;   /* IOSurfaceRef bridged */
 @property (nonatomic, assign) NSUInteger w, h;
-@property (nonatomic, assign) unsigned next;             /* round-robin index */
+@property (nonatomic, assign) unsigned next;             /* round-robin index (blit path) */
+@property (nonatomic, assign) unsigned write;            /* slot the default framebuffer renders into (direct path) */
+@property (nonatomic, assign) BOOL rotate;               /* advance `write` at the next fbEnsureDefaultFramebuffer */
 @end
 
 @implementation MGLCompatSurfacePool
@@ -886,13 +888,20 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
     /* windowed renderers only (a layer exists) and explicitly opted in */
     if (_layer == nil)
         return false;
+    /* Only a POSITIVE result is cached.  A call that happens before the
+     * embedding layer (NSOpenGL/GLX shim) sets MGL_SURFACE_PRESENT — e.g.
+     * during library init, when a renderer already owns an offscreen layer —
+     * must not latch "disabled" for the lifetime of the process: every swap
+     * would then fall through to -[CAMetalLayer nextDrawable] and pin the
+     * frame rate to the display refresh (glmark2 regression mglR7/mglR8).
+     * Re-checking while unset is one getenv per call, only at swap/ensure. */
     static int enabled = -1;
-    if (enabled < 0)
+    if (enabled != 1)
     {
         const char *e = getenv("MGL_SURFACE_PRESENT");
         enabled = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
     }
-    return enabled != 0;
+    return enabled == 1;
 }
 
 /* (re)create the surface pool for w x h */
@@ -977,12 +986,61 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 
 /* present the default framebuffer through an IOSurface: returns true when the
  * frame was handled (the caller must not run the drawable path afterwards) */
+/* the present-pool surface the default framebuffer renders into (direct path):
+ * renders straight into the IOSurface-backed texture that compatSurfacePresent
+ * shows, so the swap is only a layer.contents change — no blit.  The write slot
+ * advances lazily HERE (after a present set `rotate`), so a readback between the
+ * present and the next draw still sees the surface that was just shown. */
+- (id<MTLTexture>) compatSurfaceWrite:(NSUInteger)w h:(NSUInteger)h
+{
+    /* OFF by default: rendering directly into the CA-displayed IOSurface pins the
+     * frame rate to the display refresh (every glmark2 scene 120-121 FPS in a
+     * visible window — cross-process surface sync at commit; score 119 vs 10918).
+     * The blit path (private render texture + one blit encoder per swap) is the
+     * default; MGL_DIRECT_PRESENT=1 re-enables the experimental direct path. */
+    static int env_direct = -1;
+    if (env_direct < 0) env_direct = getenv("MGL_DIRECT_PRESENT") ? atoi(getenv("MGL_DIRECT_PRESENT")) : 0;
+    if (!env_direct) return nil;
+
+    MGLCompatSurfacePool *pool = [self compatSurfacePoolW:w h:h];
+    if (!pool) return nil;
+    if (pool.rotate)
+    {
+        pool.write = (pool.write + 1) % COMPAT_SURFACES;
+        pool.rotate = NO;
+    }
+    return pool.textures.count == COMPAT_SURFACES ? pool.textures[pool.write] : nil;
+}
+
 - (bool) compatSurfacePresent:(id<MTLTexture>)color
 {
     uint64_t p6 = mgl_prof_begin(6);
     MGLCompatSurfacePool *pool = [self compatSurfacePoolW:color.width h:color.height];
     if (!pool)
         return false;
+
+    /* direct mode: the default framebuffer already rendered into this exact pool
+     * texture (fbEnsureDefaultFramebuffer handed out the write slot) — present it
+     * as-is: no blit encoder, just the contents swap.  `rotate` advances the write
+     * slot at the NEXT fbEnsureDefaultFramebuffer, keeping readback-after-present
+     * correct. */
+    unsigned di = COMPAT_SURFACES;
+    for (unsigned k = 0; k < COMPAT_SURFACES; k++)
+        if (pool.textures[k] == color) { di = k; break; }
+    if (di < COMPAT_SURFACES)
+    {
+        [self commitCommandBufferWithAGXRecovery:_currentCommandBuffer];
+
+        if (!CGRectEqualToRect(pool.layer.frame, _layer.bounds))
+            pool.layer.frame = _layer.bounds;
+        pool.layer.contents = pool.surfaces[di];
+        pool.rotate = YES;
+
+        [self newCommandBuffer];
+        mgl_prof_end(6, p6);
+        mgl_prof_frame();
+        return true;
+    }
 
     unsigned i = pool.next;
     pool.next = (pool.next + 1) % COMPAT_SURFACES;

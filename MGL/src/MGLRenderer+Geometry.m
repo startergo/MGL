@@ -3838,14 +3838,49 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
         pd.rasterSampleCount = 1;
 
-        NSError *error = nil;
-        id<MTLRenderPipelineState> pso = [_device newRenderPipelineStateWithDescriptor: pd error: &error];
-        if (!pso)
+        /* the capture PSO only depends on (capture function, vertex layout): cache it on
+         * the geom program instead of rebuilding (newRenderPipelineStateWithDescriptor)
+         * on every draw */
+        uint64_t vdkey = (uint64_t)(uintptr_t)fn;
         {
-            NSLog(@"MGL geom: capture pipeline failed: %@", error);
-            if (saved_vs) saved_vs->mtl_data.function = saved_vs_fn;
-            _currentRenderEncoder = saved;
-            return false;
+            uint64_t h = 1469598103934665603ULL;
+            for (NSUInteger i = 0; i < 31; i++)
+            {
+                MTLVertexAttributeDescriptor *a = vd.attributes[i];
+                if (!a) continue;
+                h = (h ^ (uint64_t)a.format) * 1099511628211ULL;
+                h = (h ^ (uint64_t)a.bufferIndex) * 1099511628211ULL;
+                h = (h ^ (uint64_t)a.offset) * 1099511628211ULL;
+            }
+            for (NSUInteger i = 0; i < 31; i++)
+            {
+                MTLVertexBufferLayoutDescriptor *l = vd.layouts[i];
+                if (!l) continue;
+                h = (h ^ (uint64_t)l.stride) * 1099511628211ULL;
+                h = (h ^ (uint64_t)l.stepFunction) * 1099511628211ULL;
+                h = (h ^ (uint64_t)l.stepRate) * 1099511628211ULL;
+            }
+            vdkey ^= h;
+        }
+        id<MTLRenderPipelineState> pso;
+        if (gp->capture_pso && gp->capture_pso_key == vdkey)
+        {
+            pso = (__bridge id<MTLRenderPipelineState>)gp->capture_pso;
+        }
+        else
+        {
+            NSError *error = nil;
+            pso = [_device newRenderPipelineStateWithDescriptor: pd error: &error];
+            if (!pso)
+            {
+                NSLog(@"MGL geom: capture pipeline failed: %@", error);
+                if (saved_vs) saved_vs->mtl_data.function = saved_vs_fn;
+                _currentRenderEncoder = saved;
+                return false;
+            }
+            if (gp->capture_pso) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_pso);
+            gp->capture_pso = (void *)CFBridgingRetain(pso);
+            gp->capture_pso_key = vdkey;
         }
 
         rp.renderTargetWidth = 1;
