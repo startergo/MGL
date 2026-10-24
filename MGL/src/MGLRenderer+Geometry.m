@@ -2274,6 +2274,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     };
 
     if (!program || !ctx) return;
+    bool uploaded = false;      /* a walked texture had pending CPU data (deferred upload) */
     for (int t = 0; types[t].spvc_type; t++)
     {
         SpirvResourceList *list = &program->spirv_resources_list[stage][types[t].spvc_type];
@@ -2291,10 +2292,77 @@ void geom_xfb_gpu_reset(GLMContext ctx)
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
                                               : mgl_texture_for_sampler(ctx, unit, sres->target);
                 if (!tex) continue;             /* unbound unit: legal GL, no realize */
+                if (tex->dirty_bits & DIRTY_TEXTURE_DATA) uploaded = true;
                 (void)[self bindMTLTexture: tex];
             }
         }
     }
+    /* A deferred upload encodes a blit into _currentCommandBuffer, but the kernels that
+     * consume (and WRITE) these textures may be encoded on a different command buffer
+     * that is committed EARLIER (the tess path's fresh compute_cb): GPU execution then
+     * puts the upload after the kernels' image stores and the initial texel data
+     * clobbers them (shader_image_load_store *GeometryStages). Committing the upload
+     * and waiting here orders it before every later encoder on any buffer. */
+    if (uploaded)
+    {
+        /* same commit+wait sequence as texdataSubmitAndWait (that method is not in the
+         * private header; keep it local so no shared header grows a texdata decl) */
+        [self endRenderEncoding];
+        id<MTLCommandBuffer> cb = _currentCommandBuffer;
+        if (cb && cb.status < MTLCommandBufferStatusCommitted)
+        {
+            [self commitCommandBufferWithAGXRecovery: cb];
+            [cb waitUntilCompleted];
+        }
+        [self newCommandBuffer];
+        ctx->state.dirty_bits = DIRTY_ALL;
+    }
+}
+
+/* The geometry KERNEL's own texture walk (sampled + storage images): unlike the per-stage
+ * helper above it goes through the program-binding introspection (array elements cover
+ * consecutive units) and tolerates a program-pipeline draw entering geomDraw with
+ * ctx->state.program == NULL (the composite is only published inside the kernel section).
+ * Called right after endRenderEncoding in geomDraw: the tess import encoder opened next
+ * stays open across the whole geometry pass, so any deferred upload (texdataEncodeUpload
+ * opens a blit encoder) must happen before it exists. */
+- (void) geomRealizeKernelStageTextures: (Program *) program geomProgram: (MGLGeomProgram *) gp
+{
+    struct { int spvc_type; bool image; } types[] = {
+        { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
+        { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
+        { 0, false }
+    };
+    Program *saved_tex_program = ctx->state.program;
+
+    if (!program) return;
+    ctx->state.program = program;
+    for (int t = 0; types[t].spvc_type; t++)
+    {
+        GLuint n = [self getProgramBindingCount: _GEOMETRY_SHADER type: types[t].spvc_type];
+
+        for (GLuint i = 0; i < n; i++)
+        {
+            SpirvResource *sres = &STATE(program)->spirv_resources_list[_GEOMETRY_SHADER][types[t].spvc_type].list[i];
+            int b = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
+            int cnt = 1;
+
+            for (int a = 0; gp && a < gp->n_tex_arrays; a++)
+                if (!strcmp(gp->tex_arrays[a].name, sres->name ? sres->name : ""))
+                { cnt = gp->tex_arrays[a].n; break; }
+
+            for (int e = 0; e < cnt && b >= 0; e++)
+            {
+                int unit = b + e;
+
+                if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
+                Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                              : mgl_texture_for_sampler(ctx, unit, sres->target);
+                if (tex) [self bindMTLTexture: tex];
+            }
+        }
+    }
+    ctx->state.program = saved_tex_program;
 }
 
 /* ------------------------------------------------------------------ image atomics
@@ -2355,7 +2423,10 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     if (buf && g->img_atom[unit].view == (__bridge void *)view &&
         g->img_atom[unit].fmt == iu->internalformat &&
         g->img_atom[unit].bytes == (size_t)(texels * 4))
+    {
+        g->img_atom[unit].dirty = true;         /* bound to a dispatch: contents may change */
         return buf;                             /* same binding: the contents persist */
+    }
 
     if (buf) { buf = nil; }                     /* ARC release before overwriting */
     buf = [_device newBufferWithLength:texels * 4 options:MTLResourceStorageModeShared];
@@ -2366,6 +2437,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     g->img_atom[unit].view = (__bridge void *)view;
     g->img_atom[unit].fmt = iu->internalformat;
     g->img_atom[unit].bytes = (size_t)(texels * 4);
+    g->img_atom[unit].dirty = true;
     return buf;
 }
 
@@ -2379,7 +2451,191 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         if (g->img_atom[u].buf) { CFBridgingRelease(g->img_atom[u].buf); g->img_atom[u].buf = NULL; }
         g->img_atom[u].view = NULL;
         g->img_atom[u].bytes = 0;
+        g->img_atom[u].dirty = false;
     }
+}
+
+/* ---- atomic sidecar -> texture resolve -------------------------------------------
+ * The sidecar is the ONLY storage imageAtomic operations see (SPIRV-Cross emulation),
+ * so results read back through the texture (glGetTexImage, sampling) need a copy.  The
+ * kernel maps a linear thread index back onto the sidecar layout (spvImage2DAtomicCoord
+ * for 2D — the row pitch is 16-aligned — mgl_msl_fix_image_atomics' helpers for the
+ * rest, all matching geomImageAtomicTexels' length).  Only 32-bit single-channel
+ * formats (r32i/r32ui/r32f) take part: the sidecar is one 32-bit word per texel. */
+- (id<MTLComputePipelineState>) geomAtomResolvePso: (MTLTextureType) tt format: (MTLPixelFormat) pf
+{
+    static NSMutableDictionary<NSString *, id> *cache;
+    NSString *key = [NSString stringWithFormat:@"%lu:%u", (unsigned long)tt, (unsigned)pf];
+    id<MTLComputePipelineState> pso;
+
+    if (!cache) cache = [NSMutableDictionary new];
+    pso = cache[key];
+    if (pso) return pso;
+
+    const char *tex, *body, *ch;
+    bool floatfmt = false;
+
+    switch (pf)
+    {
+        case MTLPixelFormatR32Uint:  ch = "uint";  break;
+        case MTLPixelFormatR32Sint:  ch = "int";   break;
+        case MTLPixelFormatR32Float: ch = "float"; floatfmt = true; break;
+        default: return nil;                     /* multi-channel / non-32-bit: unresolved */
+    }
+
+    switch (tt)
+    {
+        case MTLTextureType2D:
+            tex = "texture2d";
+            body = "uint pitch = (dims.x + 15u) & ~15u; uint x = t % dims.x; uint y = t / dims.x;\n"
+                   "    uint v = side[pitch * y + x]; tex.write(V, uint2(x, y));";
+            break;
+        case MTLTextureType2DArray:
+            tex = "texture2d_array";
+            body = "uint wh = dims.x * dims.y; uint z = t / wh; uint r = t % wh;\n"
+                   "    uint v = side[t]; tex.write(V, uint2(r % dims.x, r / dims.x), z);";
+            break;
+        case MTLTextureType3D:
+            tex = "texture3d";
+            body = "uint wh = dims.x * dims.y; uint z = t / wh; uint r = t % wh;\n"
+                   "    uint v = side[t]; tex.write(V, uint3(r % dims.x, r / dims.x, z));";
+            break;
+        case MTLTextureTypeCube:
+        case MTLTextureTypeCubeArray:
+            tex = "texturecube_array";
+            body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
+                   "    uint v = side[t]; tex.write(V, uint2(r % dims.x, r / dims.x), z);";
+            break;
+        case MTLTextureType1D:
+            tex = "texture1d";
+            body = "uint v = side[t]; tex.write(V, t);";
+            break;
+        case MTLTextureTypeTextureBuffer:
+            tex = "texture_buffer";
+            body = "uint v = side[t]; tex.write(V, t);";
+            break;
+        default:
+            return nil;                          /* MS targets: Metal cannot write them */
+    }
+
+    /* every path assigns v then writes V (bitcast for r32f) — 2D reads the padded row */
+    char src[2048];
+    snprintf(src, sizeof src,
+             "#include <metal_stdlib>\nusing namespace metal;\n"
+             "kernel void mgl_atom_res(device const uint* side [[buffer(0)]],\n"
+             "                        %s<%s, access::write> tex [[texture(0)]],\n"
+             "                        constant uint4& dims [[buffer(1)]],\n"
+             "                        uint t [[thread_position_in_grid]])\n"
+             "{\n"
+             "    if (t >= dims.w) return;\n"
+             "    %s\n"
+             "    (void)v;\n"
+             "}\n",
+             tex, floatfmt ? "float" : ch, body);
+
+    /* splice the write in after the value load (2D: after the padded read) */
+    {
+        char withval[2400];
+        const char *val = floatfmt ? "#define V float4(as_type<float>(v))\n"
+                          : (pf == MTLPixelFormatR32Sint ? "#define V int4(int(v))\n"
+                                                         : "#define V uint4(v)\n");
+        snprintf(withval, sizeof withval, "%s%s", val, src);
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:
+                                 [NSString stringWithUTF8String:withval]
+                                                     options:nil error:&err];
+        if (!lib)
+        {
+            if (gEnv.debug)
+                fprintf(stderr, "geom: image-atomic resolve kernel compile failed: %s\n",
+                        err.localizedDescription.UTF8String);
+            return nil;
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName: @"mgl_atom_res"];
+        if (!fn) return nil;
+        pso = [_device newComputePipelineStateWithFunction: fn error:&err];
+        if (!pso) return nil;
+        cache[key] = pso;
+        return pso;
+    }
+}
+
+/* copy every dirty sidecar back into its texture: called at glMemoryBarrier time (the
+ * CTS's texture-readback tests barrier before glGetTexImage) — cheap when nothing is
+ * dirty, and it ends the render encoder only when a resolve is actually needed */
+- (void) geomResolveImageAtomics
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    bool any = false;
+
+    if (!g) return;
+    for (int u = 0; u < TEXTURE_UNITS && !any; u++)
+        if (g->img_atom[u].buf && g->img_atom[u].dirty) any = true;
+    if (!any) return;
+
+    [self endRenderEncoding];
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        [self newCommandBuffer];
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+
+    for (int u = 0; u < TEXTURE_UNITS; u++)
+    {
+        id<MTLBuffer> buf;
+        id<MTLTexture> view;
+        id<MTLComputePipelineState> pso;
+        uint32_t dims[4];
+        NSUInteger total;
+        MTLTextureType tt;
+        MTLPixelFormat pf;
+
+        if (!g->img_atom[u].buf || !g->img_atom[u].dirty) continue;
+        buf = (__bridge id<MTLBuffer>)(g->img_atom[u].buf);
+        view = (__bridge id<MTLTexture>)(g->img_atom[u].view);
+        g->img_atom[u].dirty = false;
+        if (!buf || !view) continue;
+
+        tt = view.textureType;
+        pf = view.pixelFormat;
+        /* only the REAL texels resolve — the sidecar may carry a padded row (2D pitch
+         * 16) and its tail must not be written back (nor read out of bounds) */
+        dims[0] = (uint32_t)view.width;
+        dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
+        if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
+        else if (tt == MTLTextureTypeCube)        dims[2] = 6;
+        else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)(view.arrayLength * 6);
+        else if (tt == MTLTextureType3D)          dims[2] = (uint32_t)view.depth;
+        else                                     dims[2] = 1;
+        if (!geomImageAtomicTexels(view)) continue;
+        total = (NSUInteger)dims[0] * dims[1] * dims[2];
+        pso = [self geomAtomResolvePso: tt format: pf];
+        if (!pso)
+        {
+            if (gEnv.debug)
+                fprintf(stderr, "geom: image-atomic resolve skipped: unit %d type %lu fmt %u\n",
+                        u, (unsigned long)tt, (unsigned)pf);
+            continue;
+        }
+        dims[3] = (uint32_t)total;
+
+        dims[0] = (uint32_t)view.width;
+        dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
+        if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
+        else if (tt == MTLTextureTypeCube)        dims[2] = 6;
+        else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)(view.arrayLength * 6);
+        else if (tt == MTLTextureType3D)          dims[2] = (uint32_t)view.depth;
+        else                                     dims[2] = 1;
+        dims[3] = (uint32_t)total;
+
+        [enc setComputePipelineState: pso];
+        [enc setBuffer: buf offset: 0 atIndex: 0];
+        [enc setTexture: view atIndex: 0];
+        [enc setBytes: &dims length: sizeof(dims) atIndex: 1];
+        [enc dispatchThreads: MTLSizeMake(total, 1, 1)
+        threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
+                                           pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
+    }
+    [enc endEncoding];
+    ctx->state.dirty_bits |= DIRTY_ALL;      /* the encoder state must be rebuilt */
 }
 
 /* bind the sidecars of a raster stage's storage images (vertex or fragment slots of
@@ -2713,6 +2969,21 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                                                      elemClass: sres->elem_class];
                     }
                     [enc setTexture: texture atIndex: mtl_index + e];
+                    /* image atomics: the kernel's `<name>_atomic` sidecar argument (see
+                     * mgl_msl_fix_image_atomics at the kernel build) */
+                    if (types[t].image && gp->n_atom_slots_gs > 0)
+                    {
+                        int aslot = geomTexSlot(gp->atom_slots_gs, gp->n_atom_slots_gs,
+                                                sres->name ? sres->name : "");
+                        if (aslot >= 0)
+                        {
+                            id<MTLBuffer> abuf = [self geomImageAtomicBuffer: (GLuint)unit
+                                                                        view: texture];
+                            if (abuf)
+                                [enc setBuffer: abuf offset: 0
+                                     atIndex: (NSUInteger)(aslot + e)];
+                        }
+                    }
                     if (gEnv.debug && e == 0)
                         fprintf(stderr, "geom: debug gs %s[%u] '%s' unit %d bound at msl %lu x%d type=%lu len=%lu\n",
                                 types[t].image ? "image" : "tex", (unsigned)i,
@@ -3304,6 +3575,11 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
      * and make sure the buffer can still take encoders (the ring wait above may have
      * committed it) */
     [self endRenderEncoding];
+    /* realize the geometry stage's textures NOW: no encoder is open yet, and the tess
+     * import encoder opened below stays open across the whole geometry pass — a deferred
+     * texture upload inside it would open a blit encoder Metal forbids (seen as
+     * "A command encoder is already encoding" on shader_image_load_store *GeometryStages) */
+    [self geomRealizeKernelStageTextures: program geomProgram: gp];
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
     {
         [self newCommandBuffer];
@@ -3713,50 +3989,10 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
 
     /* ---- 2. geometry kernel ---- */
     {
-        /* realize the geometry stage's textures before any encoder of this kernel exists:
-         * a deferred upload (texdataEncodeUpload) opens a blit encoder, and Metal forbids
-         * that while a compute encoder is encoding (array elements cover consecutive units) */
-        {
-            struct { int spvc_type; bool image; } types[] = {
-                { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, false },
-                { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, true },
-                { 0, false }
-            };
-            /* the walk reads STATE(program)'s resource lists: a program-pipeline draw
-             * enters geomDraw with ctx->state.program == NULL (the composite is only
-             * published inside the kernel section below), and without the switch the
-             * walk binds nothing — the first deferred upload would then fire from
-             * geomBindStageBuffers, into the already-open compute encoder */
-            Program *saved_tex_program = ctx->state.program;
-
-            ctx->state.program = program;
-            for (int t = 0; types[t].spvc_type; t++)
-            {
-                GLuint n = [self getProgramBindingCount: _GEOMETRY_SHADER type: types[t].spvc_type];
-
-                for (GLuint i = 0; i < n; i++)
-                {
-                    SpirvResource *sres = &STATE(program)->spirv_resources_list[_GEOMETRY_SHADER][types[t].spvc_type].list[i];
-                    int b = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
-                    int cnt = 1;
-
-                    for (int a = 0; a < gp->n_tex_arrays; a++)
-                        if (!strcmp(gp->tex_arrays[a].name, sres->name ? sres->name : ""))
-                        { cnt = gp->tex_arrays[a].n; break; }
-
-                    for (int e = 0; e < cnt && b >= 0; e++)
-                    {
-                        int unit = b + e;
-
-                        if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
-                        Texture *tex = types[t].image ? STATE(image_units[unit].tex)
-                                                      : mgl_texture_for_sampler(ctx, unit, sres->target);
-                        if (tex) [self bindMTLTexture: tex];
-                    }
-                }
-            }
-            ctx->state.program = saved_tex_program;
-        }
+        /* the geometry stage's textures were realized before the FIRST encoder of this
+         * draw opened (geomRealizeKernelStageTextures, right after endRenderEncoding):
+         * the tess import encoder opened there stays open across this whole section, so
+         * a deferred upload here would open a blit encoder Metal forbids */
 
         /* the tess import kernel's encoder is still open: joining it keeps the import's
          * writes ordered before this kernel (and before its indirect dispatch) */

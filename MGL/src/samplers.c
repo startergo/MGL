@@ -229,7 +229,7 @@ static void sp_apply(GLMContext ctx, GLuint sampler, GLenum pname, const void *v
     if (!v)
         SP_ERROR(GL_INVALID_VALUE);
 
-    err = mglTexParamSet(&ptr->params, 0, true, pname, v, vt, vector, &changed);
+    err = mglTexParamSet(&ptr->params, 0, true, pname, v, vt, vector, &changed, false);
     if (err != GL_NO_ERROR)
         SP_ERROR(err);
 

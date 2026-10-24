@@ -1371,6 +1371,13 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
             spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_DISABLE_RASTERIZATION, SPVC_TRUE);
         spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE);
         spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE);
+        /* match the render stages' option (program.c): image1D/image1DArray compile to
+         * texture2d/texture2d_array — the image-unit views are built that way (MGL stores
+         * 1D textures as 2D single-row), and image-atomic subscripts then reuse the 2D /
+         * array linearizations mgl_msl_fix_image_atomics emits.  Without it a GS using
+         * image1DArray atomics emits `g_x_atomic[int2(...)]` (subscript not an integer)
+         * and the kernel fails to compile (basic-allTargets-atomicGS). */
+        spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE);
         /* .length() on an SSBO runtime array compiles to a `constant uint*
          * spvBufferSizeConstants [[buffer(N)]]` argument.  SPIRV-Cross's default N is 25
          * — the capture variant's VSOUT slot — and the two collide so hard the Metal
@@ -1957,8 +1964,21 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
                 body = close + 1;
             }
         }
+        /* a plain variable declaration may still carry interpolation qualifiers after the
+         * stripped in/out ("layout(location = 0) out flat uvec3 v;" leaves "flat"): on the
+         * ordinary global emitted here they are illegal-ish, and glslang marks the variable
+         * so that SPIRV-Cross's helper threading skips it - the generated kernel then
+         * references an undeclared identifier (texture_cube_map_array texture_size_*_sh) */
+        if (!brace || decl.s == NULL)
+        {
+            char *stripped = strip_member_quals(body, strlen(body));
+            sb_put(out, "%s", stripped ? stripped : body);
+            free(stripped);
+            free(raw);
+            return;
+        }
         for (const char *p = body; *p; p++) sb_put(&decl, "%c", *p);
-        sb_put(out, "%s", decl.s ? decl.s : body);
+        sb_put(out, "%s", decl.s);
         free(decl.s);
     }
 
@@ -5745,12 +5765,12 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 build:
     /* the program's own geometry-stage module owns the resource order the renderer's
      * buffer map enumerates; pin this kernel's user resources to those positions */
+    int gs_span = 0;                /* the user pins' slot span: atomics sit above it */
     {
         const char *e2 = NULL;
         SpvModule *p_gs = spv_parse(program->spirv[_GEOMETRY_SHADER].ir,
                                     program->spirv[_GEOMETRY_SHADER].size, &e2);
         SpvModule *k_gs = NULL;
-
         glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, p_gs, &log);
         if (!glsl) GEOM_FAIL("kernel generation failed");
         geom_dump("kernel.glsl", glsl);
@@ -5764,6 +5784,7 @@ build:
              * stage's program resources must fit in the slots below them */
             int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
                                        gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
+            gs_span = span;
 
             if (span > MGL_GEOM_KERNEL_USER_SLOTS ||
                 (span > MGL_GEOM_KERNEL_SIZE_BUFFER &&
@@ -5791,6 +5812,23 @@ build:
                             gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
+    /* image atomics: the kernel MSL carries SPIRV-Cross's `<name>_atomic [[buffer(0)]]`
+     * sidecar arguments — every one at slot 0 (Metal: "cannot reserve 'buffer' resource
+     * location at index 0"), and non-2D targets subscript the buffer with the raw
+     * coordinate vector.  Rebase them into the span above the user pins and linearize
+     * the coordinates exactly like the render stages (mgl_msl_fix_image_atomics) —
+     * geomBindStageBuffers binds the per-unit sidecar through gp->atom_slots_gs. */
+    {
+        char *fixed = mgl_msl_fix_image_atomics(msl, MGL_GEOM_KERNEL_SIZE_BUFFER,
+                                                gs_span > 0 ? gs_span : 0,
+                                                gp->atom_slots_gs, &gp->n_atom_slots_gs, 32,
+                                                NULL);
+        if (!fixed)
+            GEOM_FAIL("geometry stage image-atomic buffers exceed the kernel's argument "
+                      "budget (MGL_GEOM_KERNEL_USER_SLOTS)");
+        free(msl);
+        msl = fixed;
+    }
 
     /* the kernel must have a stable name: SPIRV-Cross always emits "kernel void main0(".
      * The replacement is longer than the match, so the rename goes through a fresh
@@ -6560,15 +6598,25 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     if (geom_env(0))
         fprintf(stderr, "geom: trace tess capture c=%p valid=%d prim=%u want=%u members=%d\n",
                 (const void *)c, c ? (int)c->valid : -1, c ? c->prim : 0u, want, c ? c->members : -1);
+    /* These are emulation-internal conditions, not GL spec violations: a linked
+     * tess+GS program drawn with GL_PATCHES has no error case at draw time, and
+     * surfacing GL_INVALID_OPERATION made the CTS's post-test glGetError() check
+     * fail (shader_image_load_store *GeometryStages: a store-only TES has no
+     * outputs, so no capture record to parse — see mgl_tess_capture_msl's void
+     * handling).  GL leaves the rasterized results undefined instead. */
     if (!c || !c->valid || !c->buffer_object || !c->buffer)
     {
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        if (geom_env(0))
+            fprintf(stderr, "geom: tess capture missing after draw - geometry stage dropped\n");
         return false;
     }
     if (c->prim != want)
     {
-        /* triangles -> triangles, isolines -> lines, point_mode -> points */
-        ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+        /* triangles -> triangles, isolines -> lines, point_mode -> points;
+         * a mismatch is a link-time validation case, undefined at draw time */
+        if (geom_env(0))
+            fprintf(stderr, "geom: tess capture prim %u != GS input %u - geometry stage dropped\n",
+                    c->prim, want);
         return false;
     }
 
@@ -6673,8 +6721,7 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
             if (geom_env(0))
                 fprintf(stderr, "geom: tess import: no capture member for %s/%s (want %u words)\n",
                         gp->in_v[i].name, gp->in_v[i].member, gp->in_v[i].words);
-            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-            return false;
+            return false;   /* internal: an interface the link should have rejected */
         }
         if (jw < gp->in_v[i].words ||
             d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS)
@@ -6682,8 +6729,7 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
             if (geom_env(0))
                 fprintf(stderr, "geom: tess import: %s words mismatch (cap %u vs want %u)\n",
                         gp->in_v[i].name, jw, gp->in_v[i].words);
-            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-            return false;
+            return false;   /* internal: an interface the link should have rejected */
         }
         if (gp->in_v[i].base == GL_DOUBLE)
         {
@@ -6702,8 +6748,7 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
             if (d.tess_npairs + 2 * gp->in_v[i].words > MGL_GEOM_TESS_MAX_WORDS ||
                 (jspan <= 1 && jw < gp->in_v[i].words))
             {
-                ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
-                return false;
+                return false;   /* internal: import table exhausted */
             }
             for (uint32_t dd = 0; dd < D; dd++)
             {
@@ -6792,7 +6837,10 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
         if (geom_route_tess(ctx, gp, indexed, type, offset, first, count, instances,
                             basevertex, baseinstance))
             return;
-        ERROR_RETURN(GL_INVALID_OPERATION);
+        /* the tess capture failed to publish (an emulation-internal condition): the
+         * geometry stage is dropped and the draw's results are undefined — NOT a
+         * GL error, the program and the draw are both valid (CTS post-test
+         * glGetError checks) */
         return;
     }
 

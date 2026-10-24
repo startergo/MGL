@@ -3789,6 +3789,7 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     uint32_t slotsz[MGL_TESS_CAPTURE_MAX];  /* ... words per fp64 slot: 2 (uint2) or 4 (uint4) */
     uint32_t slotn[MGL_TESS_CAPTURE_MAX];   /* ... slots in the MSL repr (1 for a bare uint2/uint4) */
     char cap_retname[96];
+    bool void_ret = false;                 /* the entry returns void (store-only TES) */
     struct MslStruct rec;
     const char *cursor;
     uint32_t off = 4;
@@ -3819,11 +3820,28 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     }
     if (!sig || !name || !open || !vid || !body || open > vid)
         { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 1 sig=%p name=%p open=%p vid=%p body=%p\n", (const void*)sig, (const void*)name, (const void*)open, (const void*)vid, (const void*)body); goto done; }
+    void_ret = !strcmp(cap_retname, "void");
 
     /* "vertex <Ret> name(...)": the record type is between 'vertex ' and the name */
     {
-        if (!msl_parse_struct(plain, cap_retname, &rec))
-            { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 3 (%s)\n", cap_retname); goto done; }
+        if (!void_ret)
+        {
+            if (!msl_parse_struct(plain, cap_retname, &rec))
+                { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 3 (%s)\n", cap_retname); goto done; }
+        }
+        else
+        {
+            /* a store-only TES (image/SSBO side effects, no gl_Position, no varyings)
+             * returns void: there is no record struct to parse.  The capture record
+             * degenerates to a zero gl_Position — gl_in[].gl_Position is undefined
+             * per GL when the TES never wrote it, and the geometry stage's user
+             * inputs match nothing (a linkable GS then reads no varyings either).
+             * The kernel still runs the body: its image/SSBO writes must happen. */
+            memset(&rec, 0, sizeof rec);
+            snprintf(rec.members[0].type, sizeof rec.members[0].type, "float4");
+            snprintf(rec.members[0].name, sizeof rec.members[0].name, "gl_Position");
+            rec.count = 1;
+        }
     }
 
     tp->cap_members_n = 0;
@@ -4028,6 +4046,29 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         }
         str_append(&k, &len, &cap, "}\nreturn;\n");
         cursor = semi + 1;
+    }
+    if (void_ret)
+    {
+        /* no return statement carries a record: emit the body up to its closing
+         * brace and store the zero gl_Position record at its end */
+        const char *bclose = NULL;
+        int bdepth = 0;
+
+        for (const char *q = body; *q; q++)
+        {
+            if (*q == '{') bdepth++;
+            else if (*q == '}')
+            {
+                if (--bdepth == 0) { bclose = q; break; }
+            }
+        }
+        if (!bclose || bclose < cursor)
+            { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 7 (void body)\n"); free(k); k = NULL; goto done; }
+        str_append(&k, &len, &cap, "%.*s", (int)(bclose - cursor), cursor);
+        str_append(&k, &len, &cap,
+                   "*(device float4*)((device uchar*)mgl_cap + (size_t)mgl_vid * %uu) = float4(0.0);\n",
+                   tp->cap_stride * 4u);
+        cursor = bclose;
     }
     str_append(&k, &len, &cap, "%s", cursor);
 

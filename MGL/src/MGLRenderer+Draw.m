@@ -753,6 +753,10 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (void) extBufBarrier: (GLbitfield) barriers byRegion: (bool) by_region
 {
+    /* image-atomic sidecars may hold results a later texture read must see: copy them
+     * back into their textures now (glMemoryBarrier is the GL sync point; the method is
+     * free when no sidecar is dirty) */
+    [self geomResolveImageAtomics];
     if (!_currentRenderEncoder)
         return; // encoder boundaries already order compute / blit / render work
 

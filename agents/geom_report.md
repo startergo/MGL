@@ -1,4 +1,100 @@
-READY 10bba4b (code tip: 10bba4b = 1a9119b fp64 padded-element + slot->owner mapping + 10bba4b pipeline composite & converted-stream index collision; full headless suite 0 failures / 63 files / 6822 checks; test_geom 593/0 x10 runs; test_vab_slots 157/0; KHR-GL46.vertex_attrib_binding **30/30 Pass**; KHR-GL46.shader_image_load_store 35/51 Pass, 0 new failures).
+READY 0b826a8 (code tip = cf6e7b5..0b826a8; full headless suite 0 failures / 482 PASS; test_geom 593/0 x10 runs; KHR-GL46.shader_image_load_store **35 -> 38/51**, texture_* **296 -> 302/339**, SSBO baseline 119/124; scratch files untracked, explicit-path adds only).
+
+## Round 46 — image_load_store 35->38, texture_* baseline 296->302, GS image atomics end-to-end
+
+### Commits (gl46/geom)
+* `4398846` untrack ~166 tests/headless/scratch_* / zz_* (kept on disk; explicit adds from now on)
+* `97ff55b` store-only TES capture + deferred-upload clobber + no GL error on internal tess-capture misses
+* `7e48fbf` geometry-kernel image atomics: sidecar slot rebase + bind + sidecar->texture resolve
+* `62dec89` xfb capture binds the vertex stage's textures (realize before the capture encoder)
+* `0102202` strip leftover interpolation qualifiers on output globals in the GS kernel GLSL
+* `dd0a7de`/`cf6e7b5` multisample texParameter error codes (target vs DSA entry points)
+* merges: `8346754` (r45), `da577cd` (compat perf), `1dd1785` (fence listener), `0b826a8` (tess r17) + clean rebuild
+
+### Fixes and mechanisms
+1. **basic-allFormats-{load,store}GeometryStages** (were Crash): three stacked bugs.
+   * A TES with no outputs (image side effects only) compiles to `vertex void` — `mgl_tess_capture_msl`
+     could not parse a record, no capture published, and `geom_route_tess` raised a spurious
+     GL_INVALID_OPERATION.  Now a void TES synthesizes a zero gl_Position record (gl_in[].gl_Position
+     is undefined per GL) and the record store is appended at the end of the body.  All internal
+     tess-capture misses in geometry.c now drop the geometry stage silently (GL error only for
+     spec-level misuse; the CTS post-test glGetError checks were failing on it).
+   * The geometry-kernel texture realize ran INSIDE the tess import encoder (stays open across the
+     whole pass): a deferred upload opened a second encoder -> Metal assertion crash.  Hoisted above
+     the import encoder (geomRealizeKernelStageTextures).
+   * The deferred upload blit (initial texel data) executed AFTER the tess VS/TCS kernels' image
+     stores (they run on an earlier-committed compute_cb) and clobbered them.  geomRealizeStageTextures
+     now commits+waits when it uploaded pending CPU data; the tess file realizes the stages BEFORE
+     compute_cb is picked (would leave a committed buffer).
+2. **basic-allTargets-atomicGS** (Test Run() failed, [0,0,0,0]): image atomics never worked from the
+   geometry kernel.  SPIRV-Cross puts every `<name>_atomic` sidecar at `[[buffer(0)]]` (Metal: cannot
+   reserve buffer 0) and leaves non-2D subscripts un-linearized; the kernel failed to compile and the
+   draw silently dropped.  `mgl_msl_fix_image_atomics` is now applied to the kernel MSL (rebased into
+   the span above the user pins, `gp->atom_slots_gs`), the sidecar buffer is bound in
+   geomBindStageBuffers, and `geomResolveImageAtomics` copies dirty sidecars back into their textures
+   at glMemoryBarrier time (one generated kernel per texture type / 32-bit single-channel format;
+   layouts mirror geomImageAtomicTexels: 2D pitch 16, `spvMglAI3D`, array/cube helpers).
+   Also `SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D` for the kernel compile (matches program.c; without
+   it image1DArray atomics emit `g_x_atomic[int2(..)]`).
+   basic-allTargets-atomic{,CS,GS,VS,FS} 5/5.
+3. **texture_cube_map_array texture_size_{vertex,geometry}_sh**: (a) the XFB capture never bound the
+   vertex stage's textures (bindVertexBuffers... only does buffers) -> textureSize returned 1,1,1;
+   bindTexturesToCurrentRenderEncoder is called on the capture encoder now, with a realize pre-pass
+   (geomRealizeStageTextures) so a deferred upload cannot end the capture encoder twice (crash).
+   (b) `layout(location = N) out flat uvec3 v;` keeps `flat` after the in/out strip; glslang then marks
+   the global so SPIRV-Cross's helper-parameter threading skips it and the GS kernel references an
+   undeclared identifier -> kernel compile failed, draw dropped, textureSize [0][0][0].
+   strip_member_quals on the plain-variable emission.
+4. **texture_border_clamp border_color_errors / texparameteri_errors**: sampler-state pnames on
+   multisample targets — target-based entries generate GL_INVALID_ENUM (GL 4.6 8.21), DSA
+   glTextureParameter* GL_INVALID_OPERATION (both CTS-checked!); `dsa` flag threaded through
+   mglTexParamSet.
+
+### Baselines / CTS final numbers (with tess-17 in)
+* KHR-GL46.shader_image_load_store **38/51** Pass (r45: 35): +store/loadGeometryStages, +atomicGS,
+  +allStages-oneImage values.  Remaining: 5 platform artifacts (see gaps), 2 MS-store link gap,
+  advanced-cast / sync-drawIndirect / sync-bufferUpdate / early-fragment-tests / non-layered_binding,
+  memory-order (crash), multiple-uniforms (crash at VS+FS link, images domain).
+* KHR-GL46.texture_* **302/339** Pass +11 legit NotSupported (baseline was 296): border_clamp 26/32
+  (+2 error cases), cube_map_array 20/27 (+texture_size vertex/geometry; 2 NS legit), gather 8/12,
+  view 10/16, buffer 8/11, swizzle 4/6 (1 crash), filtering 24/24.
+* KHR-GL46.shader_storage_buffer_object **119/124**: advanced-write-tessellation, basic-atomic-case2,
+  basic-syntax{,SSO}, negative-glsl-compileTime.
+* Full headless suite: 482 PASS / 0 FAILED (clean rebuild); test_geom 593/0 x10.
+
+### Shared-file edits (this round)
+* `MGL/src/tessellation.c` (tess): void-TES record synthesis in mgl_tess_capture_msl (+ trace).
+* `MGL/src/MGLRenderer+Tessellation.m` (tess): geomRealizeStageTextures moved above compute_cb pick.
+* `MGL/src/MGLRenderer+Draw.m`: extBufBarrier calls geomResolveImageAtomics first (no-op when clean).
+* `MGL/src/MGLRenderer+TransformFeedback.m` (xfb): capture binds textures + realize pre-pass.
+* `MGL/src/MGLRenderer_Private.h`: declared geomAtomResolvePso / geomResolveImageAtomics.
+* `MGL/src/tex_param.c` + `tex_param_internal.h` + `samplers.c`: dsa flag (signature change of
+  mglTexParamSet; internal header).
+* `MGL/src/mgl_ext_geom.h`: gp->atom_slots_gs, img_atom[].dirty.
+* `tests/headless/test_texparam.c`: expectations updated to the two CTS-checked error codes.
+
+### Known gaps / next
+* **image2DMS / image2DMSArray stores**: Metal cannot write MS textures from shaders; the store
+  program fails to link (basic-allTargets-store, advanced-allStages-oneImage stale GL_INVALID_OPERATION
+  from the failed glUseProgram).  Full emulation needs sidecar storage + sampler-side redirect of
+  sampler2DMS reads — documented gap.
+* **5 image cases are CTS-platform artifacts**: the test itself calls
+  `getPlatform().getVulkanPlatform().getMemoryLimits()` (gl4cShaderImageLoadStoreTests.cpp:194,
+  scaleDimensionsToMemory) and the surfaceless platform throws "Vulkan is not supported" — zero GL
+  executed.  Harness-side fix (outside the worktree) would be to give the surfaceless platform memory
+  limits (copyImage, sync-imageAccess2, sso-simple/subroutine/perSample).
+* Image-atomic sidecar: zero-initialized, only atomic ops see it — imageStore + imageAtomic on the same
+  texel do not alias, and a non-cleared texture's content is not the atomic's base.  MS targets skip
+  the resolve (unwritable).
+* texture_cube_map_array: texture_size_tessellation_{con,ev}_sh = the tess capture binds textures the
+  same way the VS capture did ([1,1,1] fallback, MUTABLE storage iteration) — tess domain, same recipe
+  as 62dec89.  image_op_tessellation_* (imageCubeArray in TCS/TES), sampling (glGetActiveUniform
+  invalid type for samplerCubeArrayShadow), color_depth_attachments (FBO cube-array completeness).
+* texture_border_clamp: 6 integer border-color sampling cases (R32I/R32UI/RG32I/RG32UI/RGBA32I/
+  RGBA32UI) — Metal sampler border colors do not cover arbitrary integer borders; needs shader-side
+  coordinate clamp / border texel emulation (textures domain).
+* texture_view view_classes (glTexSubImageND INVALID_OPERATION on a view), coherency (vertex-shader
+  sampling of a view), reference_counting; texture_swizzle 1 crash; texture_gather base-level tesselation.
 
 ## Round 45 — finish the uncommitted fp64/vattrib work: vertex_attrib_binding 27/30 -> 30/30 (DONE)
 

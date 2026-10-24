@@ -1337,7 +1337,6 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             [self2 bindMTLTexture: tex];
             if (!tex->mtl_data) continue;
             id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
-
             texture = [self2 geomImageUnitViewRes: iu base: texture elemClass: sres->elem_class];
             if (sres->msl_binding < 31)
                 [enc setTexture: texture atIndex: (NSUInteger)(sres->msl_binding + e)];
@@ -2156,6 +2155,18 @@ static void tessRetireCapture(GLMContext ctx)
         tessVSPlanSetOffsets(&plan, (GLuint)vfirst, (GLuint)baseinstance);
 
     bool debug_wait = tTrace() && use_hardware;
+    /* geom: realize the tessellation stages' textures while no encoder is open —
+     * tessBindStageTextures binds them inside the kernels' compute encoder, and a
+     * deferred upload there opens a blit encoder Metal forbids (crash fixed by this
+     * pre-pass; see geomRealizeStageTextures).  This must ALSO run before compute_cb is
+     * picked: geomRealizeStageTextures commits+waits when it uploaded pending CPU data,
+     * and a compute_cb captured before that would be a committed buffer (Metal forbids
+     * encoding into it) — with the uploads ordered before the kernels, the kernels'
+     * image stores are no longer clobbered by the deferred upload. */
+    [self geomRealizeStageTextures: prog_vs stage: _VERTEX_SHADER];
+    if (prog_tcs) [self geomRealizeStageTextures: prog_tcs stage: _TESS_CONTROL_SHADER];
+    if (prog_tes) [self geomRealizeStageTextures: prog_tes stage: _TESS_EVALUATION_SHADER];
+
     if ((need_readback && !use_hardware) || debug_wait)
     {
         compute_cb = [_commandQueue commandBuffer];
@@ -2170,14 +2181,6 @@ static void tessRetireCapture(GLMContext ctx)
         compute_cb = _currentCommandBuffer;
         tessTimeCommandBuffer(compute_cb);   /* shared with the render pass: fires at frame commit */
     }
-
-    /* geom: realize the tessellation stages' textures while no encoder is open —
-     * tessBindStageTextures binds them inside the kernels' compute encoder, and a
-     * deferred upload there opens a blit encoder Metal forbids (crash fixed by this
-     * pre-pass; see geomRealizeStageTextures) */
-    [self geomRealizeStageTextures: prog_vs stage: _VERTEX_SHADER];
-    if (prog_tcs) [self geomRealizeStageTextures: prog_tcs stage: _TESS_CONTROL_SHADER];
-    if (prog_tes) [self geomRealizeStageTextures: prog_tes stage: _TESS_EVALUATION_SHADER];
 
     cenc = [compute_cb computeCommandEncoder];
 

@@ -170,7 +170,7 @@ bool mglTexParamIsSamplerState(GLenum pname)
  * Returns GL_NO_ERROR or the GL error to raise; *changed reports a state change.
  */
 GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenum pname,
-                      const void *v, int vt, bool vector, bool *changed)
+                      const void *v, int vt, bool vector, bool *changed, bool dsa)
 {
     TextureParameter old = *p;
     bool rect = (target == GL_TEXTURE_RECTANGLE);
@@ -178,7 +178,16 @@ GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenu
     *changed = false;
 
     if (!is_sampler && tp_is_multisample_target(target) && mglTexParamIsSamplerState(pname))
-        return GL_INVALID_OPERATION;   /* GL 4.6 8.10: sampler states on multisample targets */
+    {
+        /* Multisample targets reject the sampler states, with a different error per
+         * entry-point family (both CTS-checked): the target-based glTexParameter* /
+         * glTexParameterI*EXT generate GL_INVALID_ENUM (GL 4.6 8.21 errors;
+         * KHR-GL46.texture_border_clamp border_color_errors / texparameteri_errors),
+         * the name-based glTextureParameter* generate GL_INVALID_OPERATION
+         * (ARB_direct_state_access; KHR-GL46.direct_state_access
+         * textures_parameter_setup_errors) */
+        return dsa ? GL_INVALID_OPERATION : GL_INVALID_ENUM;
+    }
 
     switch (pname)
     {
@@ -612,7 +621,8 @@ static Texture *tp_named_tex(GLMContext ctx, GLuint texture, bool for_set)
     return tex;
 }
 
-static void tp_apply(GLMContext ctx, Texture *tex, GLenum pname, const void *v, int vt, bool vector)
+static void tp_apply(GLMContext ctx, Texture *tex, GLenum pname, const void *v, int vt, bool vector,
+                     bool dsa)
 {
     bool changed;
     GLenum err;
@@ -623,7 +633,7 @@ static void tp_apply(GLMContext ctx, Texture *tex, GLenum pname, const void *v, 
     if (!v)
         TP_ERROR(GL_INVALID_VALUE);
 
-    err = mglTexParamSet(&tex->params, tex->target, false, pname, v, vt, vector, &changed);
+    err = mglTexParamSet(&tex->params, tex->target, false, pname, v, vt, vector, &changed, dsa);
     if (err != GL_NO_ERROR)
         TP_ERROR(err);
 
@@ -652,62 +662,62 @@ static void tp_query(GLMContext ctx, Texture *tex, GLenum pname, void *out, int 
 #pragma mark tex param gl calls
 void mglTexParameterf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, &param, TP_FLOAT, false);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, &param, TP_FLOAT, false, false);
 }
 
 void mglTexParameterfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloat *params)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_FLOAT, true);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_FLOAT, true, false);
 }
 
 void mglTexParameteri(GLMContext ctx, GLenum target, GLenum pname, GLint param)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, &param, TP_INT, false);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, &param, TP_INT, false, false);
 }
 
 void mglTexParameteriv(GLMContext ctx, GLenum target, GLenum pname, const GLint *params)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_INT, true);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_INT, true, false);
 }
 
 void mglTexParameterIiv(GLMContext ctx, GLenum target, GLenum pname, const GLint *params)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_PURE_INT, true);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_PURE_INT, true, false);
 }
 
 void mglTexParameterIuiv(GLMContext ctx, GLenum target, GLenum pname, const GLuint *params)
 {
-    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_UINT, true);
+    tp_apply(ctx, tp_bound_tex(ctx, target), pname, params, TP_UINT, true, false);
 }
 
 void mglTextureParameterf(GLMContext ctx, GLuint texture, GLenum pname, GLfloat param)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, &param, TP_FLOAT, false);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, &param, TP_FLOAT, false, true);
 }
 
 void mglTextureParameterfv(GLMContext ctx, GLuint texture, GLenum pname, const GLfloat *param)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, param, TP_FLOAT, true);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, param, TP_FLOAT, true, true);
 }
 
 void mglTextureParameteri(GLMContext ctx, GLuint texture, GLenum pname, GLint param)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, &param, TP_INT, false);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, &param, TP_INT, false, true);
 }
 
 void mglTextureParameteriv(GLMContext ctx, GLuint texture, GLenum pname, const GLint *param)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, param, TP_INT, true);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, param, TP_INT, true, true);
 }
 
 void mglTextureParameterIiv(GLMContext ctx, GLuint texture, GLenum pname, const GLint *params)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, params, TP_PURE_INT, true);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, params, TP_PURE_INT, true, true);
 }
 
 void mglTextureParameterIuiv(GLMContext ctx, GLuint texture, GLenum pname, const GLuint *params)
 {
-    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, params, TP_UINT, true);
+    tp_apply(ctx, tp_named_tex(ctx, texture, true), pname, params, TP_UINT, true, true);
 }
 
 #pragma mark get tex param gl calls

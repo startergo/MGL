@@ -165,6 +165,11 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     /* map uniform / storage / vertex buffers exactly like the real draw does */
     if (![self mapBuffersToMTL]) return NULL;
     if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]) return NULL;
+    /* realize the vertex stage's textures BEFORE the capture encoder exists: the draw
+     * path's bindTexturesToCurrentRenderEncoder (called on the capture encoder below)
+     * would otherwise realize them mid-encode, and a deferred upload commits+waits —
+     * ending this capture encoder twice crashed endEncoding (texture_size_vertex_sh) */
+    [self geomRealizeStageTextures: xfb_prog stage: _VERTEX_SHADER];
 
     MTLVertexDescriptor *vd = [self generateVertexDescriptor];
     if (!vd) return NULL;
@@ -209,6 +214,11 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     bool ok = [self bindVertexBuffersToCurrentRenderEncoder];
     if (ok)
     {
+        /* the capture vertex function samples too: textureSize/sampling in a
+         * transform-feedback-captured vertex shader read the default 1x1 fallback
+         * without this (KHR-GL46.texture_cube_map_array texture_size_vertex_sh /
+         * texture_size_geometry_sh: textureSize returned 1,1,1) */
+        [self bindTexturesToCurrentRenderEncoder];
         /* vattrib: the plan generateVertexDescriptor just built routes each
          * attribute's buffer to its MSL slot; bindVertexBuffersToCurrentRenderEncoder
          * skips attribute_mask entries (they belong to the vattrib plan).  On the

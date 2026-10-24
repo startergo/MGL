@@ -15,7 +15,7 @@ enum {
 
 bool   mglTexParamIsSamplerState(GLenum pname);
 GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenum pname,
-                      const void *v, int vt, bool vector, bool *changed);
+                      const void *v, int vt, bool vector, bool *changed, bool dsa);
 GLenum mglTexParamGet(GLMContext ctx, Texture *tex, TextureParameter *p, bool is_sampler,
                       GLenum pname, void *out, int vt);
 

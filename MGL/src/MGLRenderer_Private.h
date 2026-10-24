@@ -213,6 +213,8 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (bool) geomBindImageAtomicBuffersCompute: (id <MTLComputeCommandEncoder>) encoder;
 - (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view;
 - (void) geomReleaseImageAtomics;
+- (id<MTLComputePipelineState>) geomAtomResolvePso: (MTLTextureType) tt format: (MTLPixelFormat) pf;
+- (void) geomResolveImageAtomics;
 /* geom: SSBO runtime-array .length() — bind SPIRV-Cross's spvBufferSizeConstants
  * (bound-range byte size of the SSBO at each Metal buffer index) to the render or
  * compute tables; no-op when the stage MSL does not reference it */

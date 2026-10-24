@@ -178,6 +178,10 @@ typedef struct MGLGeomProgram {
      * the slot up here by resource name and fall back to msl_binding. */
     MGLGeomTexSlot tex_slots_gs[64];   int n_tex_slots_gs;   /* the geometry kernel */
     MGLGeomTexSlot tex_slots_vs[64];   int n_tex_slots_vs;   /* the vertex capture variant */
+    /* the geometry kernel's image-atomic sidecar argument slots: mgl_msl_fix_image_atomics
+     * rebases its `<name>_atomic [[buffer(N)]]` arguments into the span above the user
+     * pins; geomBindStageBuffers binds the per-unit sidecar through this map */
+    MGLGeomTexSlot atom_slots_gs[32];  int n_atom_slots_gs;
 
     GLenum    in_type;      /* GL_POINTS / GL_LINES / GL_LINES_ADJACENCY / GL_TRIANGLES / GL_TRIANGLES_ADJACENCY */
     GLenum    out_type;     /* GL_POINTS / GL_LINE_STRIP / GL_TRIANGLE_STRIP */
@@ -280,8 +284,10 @@ struct MGLExtState_geom {
      * id<MTLBuffer> / id<MTLTexture>), reallocated whenever the unit's bound view or
      * unit format changes.  Only atomic operations see this storage — an imageStore
      * before an imageAtomic on the same texel is an emulation gap (the texture and the
-     * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer) */
-    struct { void *buf, *view; GLuint fmt; size_t bytes; } img_atom[TEXTURE_UNITS];
+     * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer).
+     * dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
+     * geomResolveImageAtomics copies it back into the texture at barrier time. */
+    struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty; } img_atom[TEXTURE_UNITS];
 
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
