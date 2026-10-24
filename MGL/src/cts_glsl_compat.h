@@ -8,6 +8,9 @@
 /* Returns a malloc'd rewritten copy of `src`, or NULL when it can be compiled as is.
  * The caller frees the result. */
 char *mgl_cts_glsl_compat(const char *src);
+/* the capture-variant path: the binding-range / std430 rejections are skipped
+ * (MGL-authored GLSL uses its own renumbered binding points) */
+char *mgl_cts_glsl_compat_generated(const char *src);
 
 /*
  * The GLSL-to-SPIR-V convention (glslang: "'shared' : not allowed..."; ARB_gl_spirv)

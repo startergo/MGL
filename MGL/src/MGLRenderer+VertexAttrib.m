@@ -26,6 +26,7 @@
 #import "mgl_ext_vattrib.h"
 #import "mgl_ext_introspect.h"
 #import "mgl_ext_geom.h"      /* MGL_SSBO_SIZE_BUFFER_INDEX: attribute ordinals must skip it */
+#import "mgl_ext_tess.h"      /* tess: the render vertex function is the TES, not the VS */
 /* memoized spvBufferSizeConstants probe (MGLRenderer+Geometry.m) — the raw
  * strstr here runs per plan rebuild, i.e. per draw in glmark2 */
 extern bool mgl_msl_has_size_constants(const char *msl);
@@ -892,13 +893,22 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
     }
 
     // vertex buffer bindings, with their binding offsets
-    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+    // tess: the VS runs as a compute kernel, so the render pipeline's vertex
+    // function is the (rewritten) evaluation shader — it has no [[stage_in]]
+    // inputs, and its uniform/storage buffer slots start at 0.  Binding the
+    // vertex array's attribute streams to the render encoder would clobber the
+    // evaluation shader's SSBO/UBO arguments (KHR-GL46.shader_storage_buffer_object
+    // basic-atomic-case2: the TES's first storage buffer at slot 0 was overwritten
+    // by the vertex buffer of attribute 0).  The kernel consumes the attributes
+    // through the compute encoder instead.
+    bool tess_render_stage = (ctx->mtl_funcs.ext_tess && mgl_tess_active_program(ctx) != NULL);
+    for (int b = 0; b < MGL_VA_MAX_BINDINGS && !tess_render_stage; b++)
     {
         if (plan->binding_index[b] >= 0 && va->binding[b].buffer)
             [self vattribBindBuffer: va->binding[b].buffer offset: va->binding[b].offset index: plan->binding_index[b] encoder: enc];
     }
 
-    for (int a = 0; a < MAX_ATTRIBS; a++)
+    for (int a = 0; a < MAX_ATTRIBS && !tess_render_stage; a++)
     {
         if (plan->fetch[a] != MGL_VA_FETCH_SHADOW)
             continue;
@@ -919,7 +929,7 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
         [self vattribBindShadow: a index: plan->shadow_index[a] encoder: enc];
     }
 
-    if (plan->const_mask)
+    if (plan->const_mask && !tess_render_stage)   /* slot 29 is the tess patch blob (MGL_TESS_TES_PATCH) */
         [self vattribBindConstants: enc];
 }
 

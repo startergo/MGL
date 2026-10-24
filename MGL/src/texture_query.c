@@ -281,7 +281,7 @@ MGLTexParamRecord *mgl_texparam_record(GLMContext ctx, GLuint name, bool create)
     return rec;
 }
 
-void mgl_texparam_record_view(GLMContext ctx, Texture *tex, GLuint min_level, GLuint num_levels, GLuint min_layer, GLuint num_layers)
+void mgl_texparam_record_view(GLMContext ctx, Texture *tex, GLuint min_level, GLuint num_levels, GLuint min_layer, GLuint num_layers, GLuint immutable_levels)
 {
     MGLTexParamRecord *rec = tex ? mgl_texparam_record(ctx, tex->name, true) : NULL;
 
@@ -293,6 +293,7 @@ void mgl_texparam_record_view(GLMContext ctx, Texture *tex, GLuint min_level, GL
     rec->view_num_levels = num_levels;
     rec->view_min_layer = min_layer;
     rec->view_num_layers = num_layers;
+    rec->view_immutable_levels = immutable_levels;
 }
 
 void mgl_texparam_record_buffer(GLMContext ctx, Texture *tex, GLuint buffer, GLintptr offset, GLsizeiptr size)
@@ -587,11 +588,16 @@ void mglTexParamGetLevel(GLMContext ctx, Texture *tex, GLenum target, GLint leve
             if (rec && rec->is_buffer)
             {
                 GLsizeiptr size = rec->buffer_size;
-                if (size < 0)
+                Buffer *b = (Buffer *)searchHashTable(&STATE(buffer_table), rec->buffer);
+                if (b)
                 {
-                    Buffer *b = (Buffer *)searchHashTable(&STATE(buffer_table), rec->buffer);
-                    size = b ? b->size - rec->buffer_offset : 0;
+                    /* a resize after the binding is visible in the query (the CTS
+                     * re-uploads the store and re-queries without rebinding) */
+                    if (size < 0 || (GLsizeiptr)b->size != rec->buffer_offset + size)
+                        size = b->size > rec->buffer_offset ? b->size - rec->buffer_offset : 0;
                 }
+                else if (size < 0)
+                    size = 0;
                 val = (GLint)size;
             }
             else if (have_info && info.has_buffer) val = (GLint)info.buffer_length;

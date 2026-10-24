@@ -274,7 +274,9 @@ TEST(texture_view_errors)
     glTextureView(0, GL_TEXTURE_2D, orig, GL_RGBA8, 0, 1, 0, 1);
     EXPECT_GL_ERROR(GL_INVALID_VALUE);                          /* texture 0 */
     glTextureView(0x7FFFFF, GL_TEXTURE_2D, orig, GL_RGBA8, 0, 1, 0, 1);
-    EXPECT_GL_ERROR(GL_INVALID_VALUE);                          /* name never generated */
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);                      /* name never generated
+                                                                 * (GL 4.6 8.18: INVALID_OPERATION, like
+                                                                 * the CTS texture_view.errors case) */
     glTextureView(mut, GL_TEXTURE_2D, orig, GL_RGBA8, 0, 1, 0, 1);
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);                      /* name already a texture object */
     glTextureView(v[0], 0x1234, orig, GL_RGBA8, 0, 1, 0, 1);
@@ -283,7 +285,9 @@ TEST(texture_view_errors)
     /* valid: 32-bit class reinterpretations, view of view */
     glTextureView(v[1], GL_TEXTURE_2D_ARRAY, orig, GL_R32F, 0, 4, 0, 1);  /* numlevels clamped */
     EXPECT_NO_GL_ERROR();
-    glTextureView(v[2], GL_TEXTURE_2D, v[1], GL_RGBA8UI, 0, 1, 0, 5);     /* view of a view, layers clamped */
+    glTextureView(v[2], GL_TEXTURE_2D, orig, GL_RGBA8, 0, 1, 0, 5);
+    EXPECT_GL_ERROR(GL_INVALID_VALUE);                          /* a 2D view must pass numlayers 1 */
+    glTextureView(v[2], GL_TEXTURE_2D, v[1], GL_RGBA8UI, 0, 1, 0, 1);     /* view of a view */
     EXPECT_NO_GL_ERROR();
     EXPECT_TRUE(glIsTexture(v[2]));
 

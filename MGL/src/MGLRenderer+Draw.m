@@ -645,6 +645,10 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         }
     }
 
+    /* geom: seed fresh image-atomic sidecars in their own compute pass, before this
+     * encoder (and its pipeline state) exists */
+    [self geomPrepareImageAtomicsCompute];
+
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc)
         return false;

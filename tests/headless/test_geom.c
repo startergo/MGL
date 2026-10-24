@@ -4173,6 +4173,200 @@ TEST(sample_mask_single_sample_ignored)
     glViewport(0, 0, 512, 512);
 }
 
+/* r48: SSBO block offsets after glslang's implicit array growth.
+ *
+ * A non-final unsized buffer-block member is sized by the largest constant index
+ * that touches it (glslang's updateImplicitArraySize), but glslang does not move the
+ * offsets of the members that follow it — the block then self-overlaps and the second
+ * runtime array reads the wrong bytes.  mgl_spirv_fix_block_offsets pushes the later
+ * members past the grown array's declared span (KHR-GL46.shader_storage_buffer_object
+ * basic-syntax / basic-syntaxSSO variant 8). */
+TEST(r48_ssbo_two_runtime_arrays)
+{
+    static const char *vs =
+        "#version 460 core\n"
+        "layout(std430) coherent buffer Buffer {\n"
+        "  coherent vec4 position01[];\n"
+        "  vec4 position2[];\n"
+        "} g_buffer;\n"
+        "void main() {\n"
+        "  switch (gl_VertexID) {\n"
+        "    case 0: gl_Position = g_buffer.position01[0]; break;\n"
+        "    case 1: gl_Position = g_buffer.position01[1]; break;\n"
+        "    case 2: gl_Position = g_buffer.position2[gl_VertexID - 2]; break;\n"
+        "  }\n"
+        "}\n";
+    static const char *fs =
+        "#version 460 core\nlayout(location = 0) out vec4 o_color;\n"
+        "void main() { o_color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const float data[12] = {-1.0f, -1.0f, 0.0f, 1.0f,   /* position01[0] */
+                            3.0f, -1.0f, 0.0f, 1.0f,    /* position01[1] */
+                            -1.0f, 3.0f, 0.0f, 1.0f};   /* position2[0]  */
+    GLuint vao, buf, p = mgl_make_program(vs, fs);
+
+    if (!p) return;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &buf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buf);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof data, data, GL_STATIC_DRAW);
+
+    glUseProgram(p);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+
+    /* the whole viewport is covered only when position2[0] reads the third vec4 */
+    GLubyte px[4];
+    mgl_read_rgba(0, 0, px);
+    mgl_read_rgba(1, 1, px);
+    EXPECT_TRUE(px[1] == 255 && px[0] == 0 && px[2] == 0);
+
+    glDeleteBuffers(1, &buf);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
+/* r48: the SSBO binding-point range and std430-on-uniform-block are compile-time
+ * errors (glslang does not check them for OpenGL clients) */
+TEST(r48_ssbo_layout_compile_errors)
+{
+    const char *bad1[] = { "#version 460 core\n",
+                           "layout(binding = 8) buffer Buffer { int x; };\n"
+                           "void main() { x = 0; }" };
+    const char *bad2[] = { "#version 460 core\n",
+                           "layout(binding = 6) buffer Buffer { int x; } g[4];\n"
+                           "void main() { g[0].x = 0; }" };
+    const char *bad3[] = { "#version 460 core\n",
+                           "layout(std430) uniform UBO { int x; };\n"
+                           "void main() { }" };
+    const char *good[] = { "#version 460 core\n",
+                           "layout(std430, binding = 2) readonly buffer Buffer { int x; } g[4];\n"
+                           "void main() { if (g[0].x == 0) discard; }" };
+    GLuint s;
+
+    s = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(s, 2, bad1, NULL);
+    glCompileShader(s);
+    { GLint ok_ = 1; glGetShaderiv(s, GL_COMPILE_STATUS, &ok_); EXPECT_TRUE(ok_ == 0); }
+    glDeleteShader(s);
+
+    s = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(s, 2, bad2, NULL);
+    glCompileShader(s);
+    { GLint ok_ = 1; glGetShaderiv(s, GL_COMPILE_STATUS, &ok_); EXPECT_TRUE(ok_ == 0); }
+    glDeleteShader(s);
+
+    s = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(s, 2, bad3, NULL);
+    glCompileShader(s);
+    { GLint ok_ = 1; glGetShaderiv(s, GL_COMPILE_STATUS, &ok_); EXPECT_TRUE(ok_ == 0); }
+    glDeleteShader(s);
+
+    s = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(s, 2, good, NULL);
+    glCompileShader(s);
+    { GLint ok_ = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok_); EXPECT_TRUE(ok_ == 1); }
+    glDeleteShader(s);
+}
+
+/* r48: TES-side SSBO writes must land in the GL buffer.  The evaluation shader is
+ * the render pipeline's vertex function, so its SSBO slots start at 0 — the vertex
+ * array's attribute streams may not be bound to the render encoder, and a small SSBO
+ * must alias the GL buffer instead of the read-only argument ring
+ * (KHR-GL46.shader_storage_buffer_object basic-atomic-case2). */
+TEST(r48_tes_ssbo_atomics)
+{
+    static const char *vs = "#version 460 core\n"
+                            "layout(location = 0) in vec4 p;\n"
+                            "void main() { gl_Position = p; }\n";
+    static const char *tcs = "#version 460 core\n"
+                             "layout(vertices = 1) out;\n"
+                             "void main() {\n"
+                             "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+                             "  if (gl_InvocationID == 0) {\n"
+                             "    gl_TessLevelInner[0] = 1.0;\n"
+                             "    gl_TessLevelInner[1] = 1.0;\n"
+                             "    gl_TessLevelOuter[0] = 1.0;\n"
+                             "    gl_TessLevelOuter[1] = 1.0;\n"
+                             "    gl_TessLevelOuter[2] = 1.0;\n"
+                             "    gl_TessLevelOuter[3] = 1.0;\n"
+                             "  }\n"
+                             "}\n";
+    static const char *tes = "#version 460 core\n"
+                             "layout(quads, point_mode) in;\n"
+                             "layout(std430, binding = 0) buffer TCSuint { uint out_u[1]; };\n"
+                             "layout(std430, binding = 1) buffer TCSint { int out_i[1]; };\n"
+                             "void main() {\n"
+                             "  gl_Position = gl_in[0].gl_Position;\n"
+                             "  out_u[0] = 7u;\n"
+                             "  out_i[0] = 9;\n"
+                             "}\n";
+    static const char *fs = "#version 460 core\n"
+                            "layout(location = 0) out vec4 o;\n"
+                            "void main() { o = vec4(0, 1, 0, 1); }\n";
+    GLuint vao, vbo, sbuf[2], p;
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), tc = glCreateShader(GL_TESS_CONTROL_SHADER),
+           te = glCreateShader(GL_TESS_EVALUATION_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+    p = glCreateProgram();
+    glShaderSource(v, 1, &vs, NULL);  glCompileShader(v);
+    glShaderSource(tc, 1, &tcs, NULL); glCompileShader(tc);
+    glShaderSource(te, 1, &tes, NULL); glCompileShader(te);
+    glShaderSource(f, 1, &fs, NULL);  glCompileShader(f);
+    glAttachShader(p, v); glAttachShader(p, tc); glAttachShader(p, te); glAttachShader(p, f);
+    for (GLuint sh_ = 0; sh_ < 4; sh_++)
+    {
+        GLuint so_ = (GLuint[]){v, tc, te, f}[sh_];
+        GLint ok_ = 0; glGetShaderiv(so_, GL_COMPILE_STATUS, &ok_);
+        if (!ok_) { char log_[2048] = ""; glGetShaderInfoLog(so_, sizeof log_, NULL, log_);
+                    MGL_FAIL("shader %u compile: %s", so_, log_); return; }
+    }
+    glLinkProgram(p);
+    { GLint ok_ = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok_);
+      if (!ok_) { char log_[2048] = ""; glGetProgramInfoLog(p, sizeof log_, NULL, log_);
+                  MGL_FAIL("link: %s", log_); return; } }
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    {
+        const float quad[2] = {0.0f, 0.0f};
+        glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    }
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+
+    glGenBuffers(2, sbuf);
+    for (int i = 0; i < 2; i++)
+    {
+        const GLuint zero = 0;
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)i, sbuf[i]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 4, &zero, GL_DYNAMIC_DRAW);
+    }
+
+    glUseProgram(p);
+    glPatchParameteri(GL_PATCH_VERTICES, 1);
+    glDrawArrays(GL_PATCHES, 0, 1);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+    {
+        GLuint u = 0, i = 0;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbuf[0]);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4, &u);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbuf[1]);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4, &i);
+        EXPECT_TRUE(u == 7 && i == 9);
+    }
+
+    glDeleteBuffers(2, sbuf);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+    glDeleteShader(v); glDeleteShader(tc); glDeleteShader(te); glDeleteShader(f);
+}
+
 int main(void)
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
@@ -4237,5 +4431,8 @@ int main(void)
     RUN_IF(r31_layered_blending);
     RUN_IF(r31_layered_fbo_no_attachment);
     RUN_IF(r31_gs_image_reads);
+    RUN_IF(r48_ssbo_two_runtime_arrays);
+    RUN_IF(r48_ssbo_layout_compile_errors);
+    RUN_IF(r48_tes_ssbo_atomics);
     return mgl_test_summary();
 }

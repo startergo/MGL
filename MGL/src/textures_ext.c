@@ -126,7 +126,7 @@ static void texext_mark_dirty(GLMContext ctx, Texture *tex)
 }
 
 /* allocate per-face level arrays so code that inspects tex->faces[f].levels[l] sees storage */
-static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLuint width, GLuint height, GLuint depth, GLboolean is_3d)
+static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLuint width, GLuint height, GLuint depth, GLboolean is_3d, GLenum fmt)
 {
     for (int face = 0; face < _CUBE_MAP_MAX_FACE; face++)
     {
@@ -151,6 +151,10 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
             tex->faces[face].levels[l].height = h;
             tex->faces[face].levels[l].depth = d;
             tex->faces[face].levels[l].complete = true;
+            /* levelFormat() reads mtl_format: without it, TexSubImage* / copy /
+             * GetTexImage into the object report GL_INVALID_OPERATION
+             * (KHR-GL46.texture_view.view_classes uploads into a view) */
+            tex->faces[face].levels[l].mtl_format = fmt;
             w = MAX(1, w >> 1);
             if (tex->target != GL_TEXTURE_1D_ARRAY)
                 h = MAX(1, h >> 1);
@@ -350,7 +354,7 @@ static void texBufferCommon(GLMContext ctx, const char *func, Texture *tex, GLen
     tex->is_array = false;
     tex->mipmapped = 0;
     tex->access = GL_READ_WRITE;
-    if (!texext_alloc_levels(ctx, tex, 1, tex->width, 1, 1, false))
+    if (!texext_alloc_levels(ctx, tex, 1, tex->width, 1, 1, false, internalformat))   /* texel buffer */
         return;
     tex->complete = buf != NULL;
 
@@ -503,7 +507,7 @@ static void texMultisampleCommon(GLMContext ctx, const char *func, Texture *tex,
     tex->access = GL_READ_ONLY;
     tex->mtl_requires_private_storage = true;
     tex->is_render_target = true;
-    if (!texext_alloc_levels(ctx, tex, 1, width, height, tex->depth, false))
+    if (!texext_alloc_levels(ctx, tex, 1, width, height, tex->depth, false, internalformat))   /* multisample */
         return;
     tex->complete = (width > 0 && height > 0);
 
@@ -722,12 +726,18 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
 {
     Texture *orig, *tex;
 
+    if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: enter texture=%u orig=%u target=%x fmt=%x %u/%u %u/%u\n",
+                                          texture, origtexture, target, internalformat, minlevel, numlevels, minlayer, numlayers);
     /* texture must be a name returned by GenTextures that has not yet been bound */
-    if (texture == 0 || texture >= STATE(texture_table).current_name)
+    if (texture == 0)
         TEXEXT_ERROR(GL_INVALID_VALUE);
 
+    if (texture >= STATE(texture_table).current_name)
+        TEXEXT_ERROR(GL_INVALID_OPERATION);   /* never handed out by GenTextures */
+
     if (findTexture(ctx, texture))
-        TEXEXT_ERROR(GL_INVALID_OPERATION);
+    { if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: name %u already exists\n", texture);
+        TEXEXT_ERROR(GL_INVALID_OPERATION); }
 
     orig = origtexture ? findTexture(ctx, origtexture) : NULL;
     if (!orig)
@@ -737,13 +747,16 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
         TEXEXT_ERROR(GL_INVALID_ENUM);
 
     if (!orig->immutable_storage)
-        TEXEXT_ERROR(GL_INVALID_OPERATION);
+    { if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: parent not immutable\n");
+        TEXEXT_ERROR(GL_INVALID_OPERATION); }
 
     if (!texext_view_targets_compatible(orig->target, target))
-        TEXEXT_ERROR(GL_INVALID_OPERATION);
+    { if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: target %x -> %x\n", orig->target, target);
+        TEXEXT_ERROR(GL_INVALID_OPERATION); }
 
     if (!texext_view_formats_compatible(orig->internalformat, internalformat))
-        TEXEXT_ERROR(GL_INVALID_OPERATION);
+    { if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: format %x -> %x\n", orig->internalformat, internalformat);
+        TEXEXT_ERROR(GL_INVALID_OPERATION); }
 
     GLuint orig_levels = texext_levels(ctx, orig);
     GLuint orig_layers = texext_layers(ctx, orig);
@@ -751,8 +764,11 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
     if (minlevel >= orig_levels || minlayer >= orig_layers)
         TEXEXT_ERROR(GL_INVALID_VALUE);
 
-    numlevels = MIN(numlevels, orig_levels - minlevel);
-    numlayers = MIN(numlayers, orig_layers - minlayer);
+    /* the spec's <numlayers> validation uses the caller's value, before the view is
+     * clamped to the parent's layer count (a 1D/2D/3D/RECTANGLE/2D_MULTISAMPLE view
+     * must pass exactly 1) */
+    if (numlevels == 0 || numlayers == 0)
+        TEXEXT_ERROR(GL_INVALID_VALUE);
 
     switch (target)
     {
@@ -773,8 +789,8 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
             break;
     }
 
-    if (numlevels == 0 || numlayers == 0)
-        TEXEXT_ERROR(GL_INVALID_VALUE);
+    numlevels = MIN(numlevels, orig_levels - minlevel);
+    numlayers = MIN(numlayers, orig_layers - minlayer);
 
     if ((target == GL_TEXTURE_CUBE_MAP || target == GL_TEXTURE_CUBE_MAP_ARRAY) && orig->width != orig->height)
         TEXEXT_ERROR(GL_INVALID_OPERATION);
@@ -800,7 +816,10 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
     info->view_num_levels = numlevels;
     info->view_min_layer = base_layer + minlayer;
     info->view_num_layers = numlayers;
-    info->immutable_levels = numlevels;
+    info->immutable_levels = (oinfo && oinfo->immutable_levels) ?
+                                 oinfo->immutable_levels :   /* ARB_texture_view: a view reports
+                                                               * the ORIGINAL's TEXTURE_IMMUTABLE_LEVELS */
+                                 orig_levels;
     {
         bool upgrade = !rinfo->has_views;
 
@@ -845,18 +864,20 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
                      target == GL_TEXTURE_CUBE_MAP_ARRAY || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY);
     tex->access = orig->access ? orig->access : GL_READ_ONLY;
     tex->mtl_requires_private_storage = orig->mtl_requires_private_storage;
-    if (!texext_alloc_levels(ctx, tex, numlevels, w, h, d, target == GL_TEXTURE_3D))
+    if (!texext_alloc_levels(ctx, tex, numlevels, w, h, d, target == GL_TEXTURE_3D, internalformat))
         return;
     tex->mipmapped = numlevels > 1;
     tex->complete = true;
     tex->immutable_storage = BUFFER_IMMUTABLE_STORAGE_FLAG;
 
+    GLuint orig_immutable_levels = (oinfo && oinfo->immutable_levels) ? oinfo->immutable_levels : orig_levels;
     mgl_texparam_record_view(ctx, tex, info->view_min_level, info->view_num_levels,
-                             info->view_min_layer, info->view_num_layers);
+                             info->view_min_layer, info->view_num_layers, orig_immutable_levels);
     if (info->samples)
         mgl_texparam_record_multisample(ctx, tex, info->samples, info->fixed_sample_locations);
 
     texext_mark_dirty(ctx, tex);
+    if (getenv("MGL_VIEW_DEBUG")) { fprintf(stderr, "MGL view: done name=%u levels=%u\n", tex->name, info->view_num_levels); }
 }
 
 #pragma mark - invalidation
@@ -1060,13 +1081,18 @@ bool mgl_texext_get_tex_level_parameter(GLMContext ctx, Texture *tex, GLint leve
         case GL_TEXTURE_BUFFER_SIZE:
             if (info && info->kind == MGL_TEXEXT_BUFFER && info->buffer_name)
             {
-                if (info->buffer_ranged)
+                /* the spec derives the size from the data store of the bound buffer:
+                 * a resize after the binding shows up here (KHR-GL46.texture_buffer
+                 * texture_buffer_parameters re-uploads and re-queries without rebinding).
+                 * A ranged binding keeps its range while the store still matches it. */
+                Buffer *buf = (Buffer *)searchHashTable(&STATE(buffer_table), info->buffer_name);
+                if (!buf)
+                    *out = 0;
+                else if (info->buffer_ranged &&
+                         (GLsizeiptr)buf->size == info->buffer_offset + (GLsizeiptr)info->buffer_size)
                     *out = (GLint)info->buffer_size;
                 else
-                {
-                    Buffer *buf = (Buffer *)searchHashTable(&STATE(buffer_table), info->buffer_name);
-                    *out = buf ? (GLint)buf->size : 0;
-                }
+                    *out = (buf->size > info->buffer_offset) ? (GLint)(buf->size - info->buffer_offset) : 0;
             }
             else
                 *out = 0;

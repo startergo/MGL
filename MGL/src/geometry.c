@@ -691,6 +691,119 @@ static GLenum spv_scalar_base(SpvModule *m, const SpvType *t)
 
 /* ------------------------------------------------------------------ varying layout */
 
+/* ---------------------------------------------------- storage block offset repair */
+
+/* ArrayStride is an OpDecorate on the array type id */
+static bool spv_deco_stride(SpvModule *m, uint32_t tid, uint32_t *stride)
+{
+    for (int i = 0; i < m->n_decos; i++)
+        if (m->decos[i].id == tid && m->decos[i].deco == SpvDecorationArrayStride)
+        {
+            *stride = m->decos[i].value;
+            return true;
+        }
+    return false;
+}
+
+/* the byte span a block member occupies, using only the decorations glslang itself
+ * emitted: for an array member the declared constant length times the declared
+ * ArrayStride.  Every other member returns 0 ("span unknown, leave the offsets
+ * alone") so the repair can never second-guess a layout glslang computed right. */
+static uint32_t spv_member_span(SpvModule *m, uint32_t member_type)
+{
+    SpvType *t = spv_find_type(m, member_type);
+    if (!t || t->kind != SPVT_ARRAY || t->len_is_spec || t->n == 0)
+        return 0;                                   /* runtime array / not an array */
+    uint32_t stride = 0;
+    if (!spv_deco_stride(m, member_type, &stride) || !stride)
+        return 0;
+    return t->n * stride;
+}
+
+/* glslang sizes an unsized non-final buffer-block member from the offset of the
+ * member that follows it, but then lets a constant index into that member grow the
+ * array implicitly ("updateImplicitArraySize"): the member type becomes array[2]
+ * while the later members keep the offsets computed for array[1].  The block then
+ * self-overlaps and the members after it read the wrong bytes
+ * (KHR-GL46.shader_storage_buffer_object basic-syntax / basic-syntaxSSO variant 8:
+ * the trailing runtime array landed at offset 16 instead of 32).  Push every member
+ * that starts inside the previous member's declared array span past that span, and
+ * shift the members after it along.  Returns a malloc'd module, or NULL when nothing
+ * changed. */
+uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_n)
+{
+    const char *err = NULL;
+    SpvModule *m = spv_parse(in, n, &err);
+    if (!m || !m->ok) { spv_free(m); return NULL; }
+
+    uint32_t *mod = NULL;
+    bool changed = false;
+
+    /* struct types that are interface blocks (Block / BufferBlock decoration) */
+    for (int ti = 0; ti < m->n_types; ti++)
+    {
+        SpvType *t = &m->types[ti];
+        if (t->kind != SPVT_STRUCT) continue;
+
+        bool block = false, buffer_block = false;
+        for (int d = 0; d < m->n_decos; d++)
+            if (m->decos[d].id == t->id)
+            {
+                if (m->decos[d].deco == SpvDecorationBlock) block = true;
+                else if (m->decos[d].deco == SpvDecorationBufferBlock) buffer_block = true;
+            }
+        if (block == buffer_block) continue;      /* not an interface block */
+
+        /* running "first byte the next member may start at" */
+        uint32_t limit = 0;
+        for (int mem = 0; mem < t->n_members; mem++)
+        {
+            uint32_t have = 0;
+            if (!spv_member_deco(m, t->id, (uint32_t)mem, SpvDecorationOffset, &have))
+            {
+                limit = 0;                          /* packed block: no offsets to repair */
+                break;
+            }
+
+            uint32_t want = have > limit ? have : limit;
+            uint32_t span = spv_member_span(m, t->members[mem]);
+            if (want + span > limit) limit = want + span;
+
+            if (getenv("MGL_BLOCK_DEBUG"))
+                fprintf(stderr, "MGL block: type %u %s member %d have=%u want=%u span=%u\n",
+                        t->id, buffer_block ? "ssbo" : "ubo", mem, have, want, span);
+            if (want == have) continue;
+
+            if (!mod)
+            {
+                mod = xmalloc(n * sizeof(uint32_t));
+                memcpy(mod, in, n * sizeof(uint32_t));
+            }
+            /* patch the OpMemberDecorate Offset word of (type, member): the words are
+             * [0]=opcode/len [1]=type [2]=member [3]=decoration [4]=literal */
+            for (size_t o = 5; o + 5 <= n; o++)
+            {
+                uint32_t op = mod[o];
+                if ((op & 0xffff) != SpvOpMemberDecorate) continue;
+                uint32_t len = op >> 16;
+                if (o + len > n) break;
+                if (mod[o + 1] == t->id && mod[o + 2] == (uint32_t)mem &&
+                    mod[o + 3] == SpvDecorationOffset && len >= 5)
+                {
+                    mod[o + 4] = want;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    spv_free(m);
+    if (!changed) { free(mod); return NULL; }
+    *out_n = n;
+    return mod;
+}
+
 static const char *glsl_type_name(GLenum base, GLuint rows, GLuint cols)
 {
     static const char *scalar[5] = { "float", "double", "int", "uint", "bool" };
@@ -1100,7 +1213,7 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
      * must be rewritten the same way the program's own compile does
      * (shaders.c: mgl_cts_glsl_compat).  glslang copies the source; the string
      * must stay alive until then. */
-    char *compat = mgl_cts_glsl_compat(src);
+    char *compat = mgl_cts_glsl_compat_generated(src);
     initGLSLInput(ctx, glm_type, compat ? compat : src, &input);
     if (force_version && input.default_version < force_version)
     {

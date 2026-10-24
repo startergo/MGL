@@ -19,6 +19,9 @@ typedef struct MGLTexParamRecord {
     GLboolean   valid;
     GLboolean   is_view;
     GLuint      view_min_level, view_num_levels, view_min_layer, view_num_layers;
+    GLuint      view_immutable_levels;  /* TEXTURE_IMMUTABLE_LEVELS of the ORIGINAL
+                                         * texture (ARB_texture_view: the view reports
+                                         * the parent's level count, not numlevels) */
     GLboolean   is_buffer;
     GLuint      buffer;
     GLintptr    buffer_offset;
@@ -86,7 +89,7 @@ void mglTexParamInvalidate(GLMContext ctx, TextureParameter *p);
 
 /* metadata recording for other domains */
 MGLTexParamRecord *mgl_texparam_record(GLMContext ctx, GLuint name, bool create);
-void mgl_texparam_record_view(GLMContext ctx, Texture *tex, GLuint min_level, GLuint num_levels, GLuint min_layer, GLuint num_layers);
+void mgl_texparam_record_view(GLMContext ctx, Texture *tex, GLuint min_level, GLuint num_levels, GLuint min_layer, GLuint num_layers, GLuint immutable_levels);
 void mgl_texparam_record_buffer(GLMContext ctx, Texture *tex, GLuint buffer, GLintptr offset, GLsizeiptr size);
 void mgl_texparam_record_multisample(GLMContext ctx, Texture *tex, GLsizei samples, GLboolean fixed_sample_locations);
 Texture *mgl_texparam_proxy_texture(GLMContext ctx, GLenum proxy_target);

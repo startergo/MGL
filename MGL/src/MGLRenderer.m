@@ -782,6 +782,23 @@ static char kComputeFallbackKey;
     return true;
 }
 
+/* buffers domain: a buffer bound to a GL_SHADER_STORAGE_BUFFER / atomic-counter
+ * binding point is writable by the shader — it must never be streamed through the
+ * read-only argument ring (the writes would land in ring memory, invisible to the
+ * GL buffer).  Same predicate as extBufStorageBinding (MGLRenderer+Draw.m). */
+static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
+{
+    if (!ptr)
+        return false;
+    for (int t = 0; t < 2; t++) {
+        int base = t ? _ATOMIC_COUNTER_BUFFER : _SHADER_STORAGE_BUFFER;
+        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+            if (ctx->state.buffer_base[base].buffers[i].buf == ptr)
+                return true;
+    }
+    return false;
+}
+
 - (bool) bindVertexBuffersToCurrentRenderEncoder
 {
     BufferMap *map;
@@ -795,21 +812,34 @@ static char kComputeFallbackKey;
     for(int i=0; i<ctx->state.vertex_buffer_map_list.count; i++)
     {
         map = &ctx->state.vertex_buffer_map_list.buffers[i];
-        
+
         ptr = map->buf;
         offset = map->offset;
 
         assert(ptr);
+
+        if (getenv("MGL_BINDMAP_DEBUG"))
+            fprintf(stderr, "MGL bindmap v[%d] name=%u mtl=%u size=%zu mtl_data=%p storage=%d attr=%x\n",
+                    i, ptr->name, map->mtl_index, (size_t)ptr->size, (void *)ptr->data.mtl_data,
+                    (int)mgl_writable_binding(ctx, ptr), map->attribute_mask);
 
         /* same 4 KB setVertexBytes cap as the fragment path: large default
          * uniform blocks need a real MTLBuffer (created lazily here) */
         if (ptr->size >= 4096 && !ptr->data.mtl_data)
             [self bindMTLBuffer: ptr];
 
+        /* geom/tess: a storage (SSBO) binding must alias the GL buffer, whatever
+         * its size — the shader's writes have to be visible to glGetBufferSubData
+         * (KHR-GL46.shader_storage_buffer_object basic-atomic-case2: a 4-byte SSBO
+         * written by the evaluation stage went to the ring and the readback saw 0) */
+        if (map->attribute_mask == 0 && mgl_writable_binding(ctx, ptr))
+            [self bindMTLBuffer: ptr];
+
         // for buffers less than 4k we should use this call
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
+
 
             /* compat perf: stream through the argument ring (offset-only
              * encoder update, skipped when the bytes are unchanged) instead
@@ -858,6 +888,11 @@ static char kComputeFallbackKey;
          * cap (4096 fp32 components, halved for doubles); materialize a real
          * MTLBuffer on demand instead of trapping (fp64 CTS max_uniform_components) */
         if (ptr->size >= 4096 && !ptr->data.mtl_data)
+            [self bindMTLBuffer: ptr];
+
+        /* geom: storage (SSBO) bindings always alias the GL buffer (see the
+         * vertex twin above) */
+        if (map->attribute_mask == 0 && mgl_writable_binding(ctx, ptr))
             [self bindMTLBuffer: ptr];
 
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)

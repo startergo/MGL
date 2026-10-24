@@ -1470,6 +1470,10 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     ptr->spirv[stage].stage = stage;
     ptr->spirv[stage].size = nwords;
     ptr->spirv[stage].dub_msl = 0xffffffffu;   /* geom: set by mgl_msl_fix_image_atomics */
+    if (getenv("MGL_SPIRV_DUMP")) {
+        char p_[128]; snprintf(p_, sizeof p_, "%s/stage%d.spv", getenv("MGL_SPIRV_DUMP"), stage);
+        FILE *f_ = fopen(p_, "wb"); if (f_) { fwrite(words, 4, nwords, f_); fclose(f_); }
+    }
     ptr->spirv[stage].ir = (unsigned int *)malloc(nwords * sizeof(uint32_t));
     if (!ptr->spirv[stage].ir)
     {
@@ -1566,6 +1570,21 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         else
         {
             free(rect_fixed);
+        }
+    }
+
+    /* geom: glslang's implicit array growth ("position[1]" in a buffer block sizes the
+     * array to 2) does not update the offsets of the members that follow it, so a block
+     * can self-overlap and the app reads the wrong bytes.  mgl_spirv_fix_block_offsets
+     * recomputes the member offsets of every interface block and bumps the disagreeing
+     * OpMemberDecorate Offset words (KHR-GL46.shader_storage_buffer_object
+     * basic-syntax / basic-syntaxSSO). */
+    {
+        uint32_t *off_fixed = mgl_spirv_fix_block_offsets(prepared, prepared_words, &prepared_words);
+        if (off_fixed)
+        {
+            free(prepared);
+            prepared = off_fixed;
         }
     }
 

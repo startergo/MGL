@@ -1,4 +1,80 @@
-READY 0b826a8 (code tip = cf6e7b5..0b826a8; full headless suite 0 failures / 482 PASS; test_geom 593/0 x10 runs; KHR-GL46.shader_image_load_store **35 -> 38/51**, texture_* **296 -> 302/339**, SSBO baseline 119/124; scratch files untracked, explicit-path adds only).
+READY 896ec80 (code tip = 6e99bb6..896ec80, gl46-port merged at bf0074e; full headless suite 0 failures / 485 PASS; test_geom 600/0 x10 runs; KHR-GL46.shader_storage_buffer_object **119 -> 124/124**, texture_view **1 -> 3/7**, texture_buffer **14 -> 15/16**; image_load_store re-verified 38/51 (1 case was a load-under-contention kill); scratch files untracked, explicit-path adds only).
+
+## Round 47 — SSBO 119 -> 124/124, texture_view +2, texture_buffer +1
+
+### KHR-GL46.shader_storage_buffer_object 124/124 (was 119)
+Fixed: basic-atomic-case1/2/3, advanced-write-tessellation, basic-syntax, basic-syntaxSSO,
+negative-glsl-compileTime. Four root causes:
+
+1. **TES SSBO slots were clobbered by the vertex array.** With tessellation active the
+   render pipeline's vertex function is the (rewritten) evaluation shader, whose UBO/SSBO
+   arguments start at Metal buffer slot 0; `extVattribPreDraw` still bound the vertex
+   array's attribute streams (and the const-attrib ring at slot 29 = MGL_TESS_TES_PATCH)
+   onto that encoder. The evaluation shader's storage bindings were overwritten before the
+   draw — with an SSBO at slot 0 its writes went into the vertex buffer of attribute 0 and
+   `glGetBufferSubData` read the untouched GL buffer. Fix: `MGLRenderer+VertexAttrib.m`
+   skips the vattrib render binds (streams + shadow + constants) when
+   `mgl_tess_active_program(ctx)` is set — the VS kernel already consumes the attributes
+   through `tessBindVSAttributes` on the compute encoder (that path is unchanged).
+2. **Small SSBOs were streamed through the argument ring.** A 4-byte SSBO bound at the
+   vertex stage took the `compatRingVertexBytes` fast path (read-only ring), so shader
+   writes landed in ring memory. Fix: `bindVertexBuffersToCurrentRenderEncoder` /
+   `bindFragmentBuffersToCurrentRenderEncoder` force a real aliasing MTLBuffer for
+   bindings whose Buffer is on a GL_SHADER_STORAGE_BUFFER / atomic-counter binding point
+   (new local helper `mgl_writable_binding`, same predicate as extBufStorageBinding).
+3. **glslang's implicit array growth breaks buffer-block offsets** (basic-syntax /
+   basic-syntaxSSO): an unsized non-final buffer-block member is sized by the largest
+   constant index that touches it (`updateImplicitArraySize`) but the offsets of the
+   members that follow it are not recomputed, so the block self-overlaps. New
+   `mgl_spirv_fix_block_offsets()` (geometry.c, SPIR-V walk over the interface-block
+   structs) pushes every member that starts inside the previous member's declared array
+   span (constant length x declared ArrayStride) past that span; anything glslang laid
+   out consistently is reproduced exactly (arrays only — no second-guessing of matrix or
+   struct layouts). Hooked in program.c after the Rect->2D pass, MSL path only.
+4. **Compile-time layout rules glslang does not check for OpenGL clients**
+   (negative-glsl-compileTime): `layout(binding >= MAX_SHADER_STORAGE_BUFFER_BINDINGS)
+   buffer ...` / `binding + block-array size > max` and `layout(std430) uniform Block`
+   are rejected with a `#error` line in cts_glsl_compat.c (new `reject_ssbo_binding_range`
+   and `reject_std430_uniform_block`). MGL-authored capture variants (geometry.c
+   `geom_glsl_to_spirv`) call the new `mgl_cts_glsl_compat_generated()` which skips the
+   two rejections — their blocks sit at MGL's own renumbered binding points (21+).
+
+Also added `MGL_SPIRV_DUMP` (per-stage SPIR-V dump) and `MGL_BINDMAP_DEBUG` /
+`MGL_VIEW_DEBUG` env-gated diagnostics.
+
+### KHR-GL46.texture_view 3/7 (was 1) and texture_buffer 15/16 (was 14)
+* `errors`: a name never handed out by GenTextures is GL_INVALID_OPERATION (was
+  INVALID_VALUE), and the `<numlayers>` target rules are validated on the caller's value
+  *before* the view is clamped to the parent's layer count (a 2D view must pass 1).
+* `gettexparameter`: a texture view reports the ORIGINAL's GL_TEXTURE_IMMUTABLE_LEVELS —
+  `mgl_texparam_record_view()` gained the parent's level count (new record field
+  `view_immutable_levels`, used by both query paths).
+* `view_classes`: texel-buffer / view level descriptors now carry their internal format
+  (`texext_alloc_levels` grew a `fmt` argument), so `levelFormat()` is no longer 0 and
+  TexSubImage* into a view / texel buffer is accepted.
+* texture_buffer `parameters`: GL_TEXTURE_BUFFER_SIZE follows the data store of the bound
+  buffer (a resize after glTexBuffer shows up in the query without rebinding); a ranged
+  binding keeps its range while the store still matches it.
+* image-atomic sidecars are now **seeded** from the image's contents: `geomPrepareImageAtomicsCompute`
+  creates the dispatch's sidecars and runs the new seed kernel (geomAtomSeedPso, the
+  resolve kernel's mirror) in its own compute pass before the dispatch's encoder is
+  opened, so imageAtomicCompSwap compares the real old texel. (texture_buffer
+  `atomic_functions` still fails: imageLoad/imageStore read the texture while atomics read
+  the sidecar — a mixed-use image is not coherent yet; the test's final compSwap leg needs
+  that. Seeding alone made the atomicAdd leg correct.)
+
+### Verification
+* full headless suite: **485 PASS / 0 failures** (test_texext updated to the spec-correct
+  glTextureView errors: never-generated name -> INVALID_OPERATION, 2D view numlayers!=1 ->
+  INVALID_VALUE).
+* test_geom: **600 checks / 0 failures x 10 runs** (593 -> 600: r48_ssbo_two_runtime_arrays,
+  r48_ssbo_layout_compile_errors, r48_tes_ssbo_atomics).
+* CTS after the final merge: SSBO 124/124, texture_view 3/7 (coherency, reference_counting,
+  view_classes, view_sampling remain), texture_buffer 15/16, tessellation_shader 58/58
+  (one Timeout was load-induced: the case passes in 186 s with a longer timeout),
+  geometry_shader 133 Pass + 2 NotSupported (GS atomics) + 1 load-induced kill, and
+  image_load_store unchanged at 38/51.
+
 
 ## Round 46 — image_load_store 35->38, texture_* baseline 296->302, GS image atomics end-to-end
 

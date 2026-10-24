@@ -314,6 +314,289 @@ static char *reject_buffer_layout_decl(const char *src)
 
 static char *rewrite_gather_offsets(const char *src);
 
+/* SSBO binding-point range checking (GLSL 4.60 4.4.5 / ARB_shading_language_420pack):
+ * "layout(binding = N) buffer Block { ... } name[M];" is a compile-time error when
+ * N >= GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS or when N + M exceeds it.  glslang
+ * does not check that for OpenGL clients, so the declaration is rejected with a
+ * #error line here (KHR-GL46.shader_storage_buffer_object negative-glsl-compileTime;
+ * keep this in sync with MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS in get.c). */
+#define MGL_CTS_MAX_SSBO_BINDINGS 8
+
+/* walk backward over whitespace, comments and the block qualifier words that may
+ * sit between "layout(...)" and the "buffer" keyword ("readonly buffer B {...}") */
+static const char *back_over_qualifiers(const char *src, const char *p)
+{
+    static const char *const quals[] = { "coherent", "volatile", "restrict", "readonly",
+                                         "writeonly", "std140", "std430", "shared", "packed", NULL };
+    for (;;)
+    {
+        while (p > src && isspace((unsigned char)p[-1])) p--;
+        if (p == src || p[-1] != ')') return p;
+        bool cut = false;
+        for (int i = 0; quals[i]; i++)
+        {
+            size_t n = strlen(quals[i]);
+            if ((size_t)(p - src) >= n && strncmp(p - n, quals[i], n) == 0 &&
+                (p - n == src || !is_ident_char((unsigned char)p[-n - 1])))
+            {
+                p -= n;
+                cut = true;
+                break;
+            }
+        }
+        if (!cut) return p;
+    }
+}
+
+static int layout_binding_value(const char *lp, const char *rp)
+{
+    /* the integer of "binding = N" inside [lp, rp) — -1 when absent */
+    for (const char *q = lp; q + 7 < rp; q++)
+    {
+        if ((q == lp || !is_ident_char((unsigned char)q[-1])) &&
+            strncmp(q, "binding", 7) == 0 && !is_ident_char((unsigned char)q[7]))
+        {
+            const char *e = q + 7;
+            while (e < rp && isspace((unsigned char)*e)) e++;
+            if (e < rp && *e == '=')
+            {
+                e++;
+                while (e < rp && isspace((unsigned char)*e)) e++;
+                if (e < rp && isdigit((unsigned char)*e))
+                {
+                    int v = 0;
+                    while (e < rp && isdigit((unsigned char)*e)) v = v * 10 + (*e++ - '0');
+                    return v;
+                }
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/* index of the '}' matching src[open]=='{' (len when unbalanced) */
+static size_t match_brace(const char *src, size_t len, size_t open)
+{
+    int depth = 0;
+    for (size_t i = open; i < len; i++)
+    {
+        if (src[i] == '{') depth++;
+        else if (src[i] == '}')
+        {
+            if (--depth == 0) return i;
+        }
+    }
+    return len;
+}
+
+static char *reject_ssbo_binding_range(const char *src)
+{
+    const char *q = src, *emitted = src;
+    bool changed = false;
+    Str out = { NULL, 0, 0 };
+
+    if (!src) return NULL;
+
+    while ((q = strstr(q, "buffer")) != NULL)
+    {
+        const char *b = q;
+        q += strlen("buffer");
+        if (!(b == src || !is_ident_char((unsigned char)b[-1])) ||
+            is_ident_char((unsigned char)*q))
+            continue;                              /* inside an identifier */
+
+        /* a block: "buffer Name {" (anonymous blocks are named too) */
+        const char *p = q;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || !(isalpha((unsigned char)*p) || *p == '_')) continue;
+        while (*p && is_ident_char((unsigned char)*p)) p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != '{') continue;
+
+        /* the closing brace of the block, then the optional instance array size */
+        long array_size = 0;
+        const char *scan_from = q;                 /* where strstr() resumes */
+        {
+            size_t len = strlen(p);
+            size_t close = match_brace(p, len, 0);
+            if (close >= len) continue;
+            const char *after = p + close + 1;
+            const char *a = after;
+            while (*a && isspace((unsigned char)*a)) a++;
+            while (*a && is_ident_char((unsigned char)*a)) a++;   /* instance name */
+            while (*a && isspace((unsigned char)*a)) a++;
+            if (*a == '[')
+            {
+                const char *d = a + 1;
+                while (*d && isspace((unsigned char)*d)) d++;
+                if (isdigit((unsigned char)*d))
+                {
+                    array_size = strtol(d, (char **)&d, 10);
+                    while (*d && isspace((unsigned char)*d)) d++;
+                    if (*d != ']') array_size = 0;                /* not a plain literal */
+                }
+            }
+            scan_from = after;                     /* past the declaration either way */
+        }
+
+        /* layout(...) list in front of the declaration */
+        const char *pq = back_over_qualifiers(src, b);
+        if (pq == src || pq[-1] != ')') continue;
+        {
+            int depth = 0;
+            const char *po = pq - 1;                 /* at ')' */
+            while (po > src)
+            {
+                if (*po == ')') depth++;
+                else if (*po == '(' && --depth == 0) break;
+                po--;
+            }
+            if (po <= src || *po != '(') continue;
+            /* "layout" must directly precede the '(' */
+            if (!((size_t)(po - src) >= 6 && strncmp(po - 6, "layout", 6) == 0 &&
+                  (po - 6 == src || !is_ident_char((unsigned char)po[-7]))))
+                continue;
+
+            int binding = layout_binding_value(po + 1, pq - 1);
+            if (binding < 0) continue;
+            if (binding < MGL_CTS_MAX_SSBO_BINDINGS &&
+                (array_size <= 0 || binding + array_size <= MGL_CTS_MAX_SSBO_BINDINGS))
+                continue;
+
+            /* reject: emit everything up to "layout" and raise a preprocessor error */
+            str_append(&out, emitted, (size_t)(po - 6 - emitted));
+            if (getenv("MGL_SSBO_BIND_DEBUG"))
+                fprintf(stderr, "MGL: reject ssbo binding=%d array=%ld at off=%ld (emitted off=%ld)\n",
+                        binding, array_size, (long)(po - 6 - src), (long)(emitted - src));
+            str_append(&out, "\n#error MGL: ", 13);
+            {
+                char msg[128];
+                int n = snprintf(msg, sizeof msg,
+                                 "binding point %d%s%s is out of range (0..%d)\n", binding,
+                                 array_size > 0 ? " + array size " : "",
+                                 array_size > 0 ? "..." : "",
+                                 MGL_CTS_MAX_SSBO_BINDINGS - 1);
+                str_append(&out, msg, (size_t)n);
+            }
+            emitted = po - 6;
+            q = scan_from;                          /* never walk back: no infinite loop */
+            changed = true;
+        }
+    }
+
+    if (!changed)
+    {
+        free(out.buf);
+        return NULL;
+    }
+    str_append(&out, emitted, strlen(emitted));
+    str_push(&out, 0);
+    return out.buf;
+}
+
+/* "layout(std430) uniform Block { ... }" is not valid GLSL — std430 applies to
+ * buffer blocks only (GLSL 4.60 4.4.5).  glslang accepts it with a warning, so the
+ * declaration is rejected here (KHR-GL46.shader_storage_buffer_object
+ * negative-glsl-compileTime). */
+static bool layout_has_std430(const char *lp, const char *rp)
+{
+    for (const char *q = lp; q + 6 <= rp; q++)
+    {
+        if ((q == lp || !is_ident_char((unsigned char)q[-1])) &&
+            strncmp(q, "std430", 6) == 0 && (q + 6 == rp || !is_ident_char((unsigned char)q[6])))
+            return true;
+    }
+    return false;
+}
+
+static char *reject_std430_uniform_block(const char *src)
+{
+    const char *q = src, *emitted = src;
+    bool changed = false;
+    Str out = { NULL, 0, 0 };
+
+    if (!src) return NULL;
+
+    while ((q = strstr(q, "uniform")) != NULL)
+    {
+        const char *b = q;
+        q += strlen("uniform");
+        if (!(b == src || !is_ident_char((unsigned char)b[-1])) ||
+            is_ident_char((unsigned char)*q))
+            continue;                              /* inside an identifier */
+
+        /* a block: "uniform Name {" */
+        const char *p = q;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || !(isalpha((unsigned char)*p) || *p == '_')) continue;
+        while (*p && is_ident_char((unsigned char)*p)) p++;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != '{') continue;
+
+        const char *scan_from = q;
+        {
+            size_t len = strlen(p);
+            size_t close = match_brace(p, len, 0);
+            if (close < len) scan_from = p + close + 1;
+        }
+
+        const char *pq = back_over_qualifiers(src, b);
+        if (pq == src || pq[-1] != ')') continue;
+        {
+            int depth = 0;
+            const char *po = pq - 1;                 /* at ')' */
+            while (po > src)
+            {
+                if (*po == ')') depth++;
+                else if (*po == '(' && --depth == 0) break;
+                po--;
+            }
+            if (po <= src || *po != '(') continue;
+            if (!((size_t)(po - src) >= 6 && strncmp(po - 6, "layout", 6) == 0 &&
+                  (po - 6 == src || !is_ident_char((unsigned char)po[-7]))))
+                continue;
+            if (!layout_has_std430(po + 1, pq - 1)) continue;
+
+            str_append(&out, emitted, (size_t)(po - 6 - emitted));
+            str_append(&out, "\n#error MGL: layout(std430) cannot be used with a uniform block\n", 61);
+            emitted = po - 6;
+            q = scan_from;
+            changed = true;
+        }
+    }
+
+    if (!changed)
+    {
+        free(out.buf);
+        return NULL;
+    }
+    str_append(&out, emitted, strlen(emitted));
+    str_push(&out, 0);
+    return out.buf;
+}
+
+char *mgl_cts_glsl_compat_generated(const char *src)
+{
+    /* the geometry / tess / xfb capture variants are MGL-authored GLSL: their
+     * buffer blocks sit at the renumbered binding points MGL chose for its own
+     * record layout (well past GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS), and they
+     * are never handed to the app — the compile-time binding-range and std430
+     * checks do not apply to them. */
+    if (!src) return NULL;
+    char *cur = strip_gl_block_packings(src);
+    char *next = reject_buffer_layout_decl(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    char *g = rewrite_gather_offsets(cur ? cur : src);
+    if (g)
+    {
+        if (cur && cur != src) free(cur);
+        cur = g;
+    }
+    return (cur && cur != src) ? cur : NULL;
+}
+
 char *mgl_cts_glsl_compat(const char *src)
 {
     if (!src) return NULL;
@@ -322,6 +605,12 @@ char *mgl_cts_glsl_compat(const char *src)
      * no rewrite fired at all */
     char *cur = strip_gl_block_packings(src);
     char *next = reject_buffer_layout_decl(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    next = reject_ssbo_binding_range(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    next = reject_std430_uniform_block(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;
     char *g = rewrite_gather_offsets(cur ? cur : src);

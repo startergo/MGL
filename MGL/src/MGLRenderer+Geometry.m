@@ -2438,6 +2438,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     g->img_atom[unit].fmt = iu->internalformat;
     g->img_atom[unit].bytes = (size_t)(texels * 4);
     g->img_atom[unit].dirty = true;
+    g->img_atom[unit].needs_seed = true;        /* seed from the texture before the next dispatch */
     return buf;
 }
 
@@ -2452,6 +2453,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         g->img_atom[u].view = NULL;
         g->img_atom[u].bytes = 0;
         g->img_atom[u].dirty = false;
+        g->img_atom[u].needs_seed = false;
     }
 }
 
@@ -2560,6 +2562,146 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     }
 }
 
+/* ---- texture -> sidecar seed ------------------------------------------------------
+ * The sidecar is the only storage imageAtomic* sees, so it has to start from the
+ * image's current contents: imageAtomicCompSwap compares the OLD value
+ * (KHR-GL46.texture_buffer texture_buffer_atomic_functions swaps the buffer's own
+ * contents through the sidecar).  The kernel is the resolve's mirror image: same
+ * padded sidecar layout, read from the texture instead of writing it. */
+- (id<MTLComputePipelineState>) geomAtomSeedPso: (MTLTextureType) tt format: (MTLPixelFormat) pf
+{
+    static NSMutableDictionary<NSString *, id> *cache;
+    NSString *key = [NSString stringWithFormat:@"seed:%lu:%u", (unsigned long)tt, (unsigned)pf];
+    id<MTLComputePipelineState> pso;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    @synchronized (cache) { pso = cache[key]; }
+    if (pso) return pso;
+
+    const char *tex = NULL, *body = NULL;
+    bool floatfmt = (pf == MTLPixelFormatR32Float);
+    const char *ch = floatfmt ? "float" : (pf == MTLPixelFormatR32Sint ? "int" : "uint");
+
+    switch (tt)
+    {
+        case MTLTextureType2D:
+            tex = "texture2d";
+            body = "uint pitch = (dims.x + 15u) & ~15u; uint x = t % dims.x; uint y = t / dims.x;\n"
+                   "    T v = tex.read(uint2(x, y)).x; side[pitch * y + x] = W;";
+            break;
+        case MTLTextureType2DArray:
+            tex = "texture2d_array";
+            body = "uint wh = dims.x * dims.y; uint z = t / wh; uint r = t % wh;\n"
+                   "    T v = tex.read(uint2(r % dims.x, r / dims.x), z).x; side[t] = W;";
+            break;
+        case MTLTextureType3D:
+            tex = "texture3d";
+            body = "uint wh = dims.x * dims.y; uint z = t / wh; uint r = t % wh;\n"
+                   "    T v = tex.read(uint3(r % dims.x, r / dims.x, z)).x; side[t] = W;";
+            break;
+        case MTLTextureTypeCube:
+        case MTLTextureTypeCubeArray:
+            tex = "texturecube_array";
+            body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
+                   "    T v = tex.read(uint2(r % dims.x, r / dims.x), z).x; side[t] = W;";
+            break;
+        case MTLTextureType1D:
+            tex = "texture1d";
+            body = "T v = tex.read(t).x; side[t] = W;";
+            break;
+        case MTLTextureTypeTextureBuffer:
+            tex = "texture_buffer";
+            body = "T v = tex.read(t).x; side[t] = W;";
+            break;
+        default:
+            return nil;                          /* MS targets: the sidecar is unused */
+    }
+
+    char src[2400];
+    {
+        const char *val = floatfmt ? "#define T float\n#define W as_type<uint>(v)\n"
+                        : (pf == MTLPixelFormatR32Sint ? "#define T int\n#define W as_type<uint>(v)\n"
+                                                       : "#define T uint\n#define W v\n");
+        snprintf(src, sizeof src,
+                 "%s#include <metal_stdlib>\nusing namespace metal;\n"
+                 "kernel void mgl_atom_seed(device uint* side [[buffer(0)]],\n"
+                 "                        %s<%s, access::read> tex [[texture(0)]],\n"
+                 "                        constant uint4& dims [[buffer(1)]],\n"
+                 "                        uint t [[thread_position_in_grid]])\n"
+                 "{\n"
+                 "    if (t >= dims.w) return;\n"
+                 "    %s\n"
+                 "    (void)0;\n"
+                 "}\n",
+                 val, tex, ch, body);
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:
+                                 [NSString stringWithUTF8String:src]
+                                                     options:nil error:&err];
+        if (!lib)
+        {
+            if (gEnv.debug)
+                fprintf(stderr, "geom: image-atomic seed kernel compile failed: %s\n",
+                        err ? [[err localizedDescription] UTF8String] : "?");
+            return nil;
+        }
+        id<MTLFunction> fn = [lib newFunctionWithName: @"mgl_atom_seed"];
+        if (!fn) return nil;
+        pso = [_device newComputePipelineStateWithFunction: fn error:&err];
+        if (!pso) return nil;
+        @synchronized (cache) { cache[key] = pso; }
+        return pso;
+    }
+}
+
+/* copy the texture into a freshly created sidecar on the given compute encoder
+ * (returns true when it encoded something) */
+- (bool) geomSeedImageAtomic: (int) unit
+                    encoder: (id <MTLComputeCommandEncoder>) encoder
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    id<MTLTexture> view;
+    id<MTLBuffer> buf;
+    MTLTextureType tt;
+    MTLPixelFormat pf;
+    NSUInteger total;
+    uint32_t dims[4];
+
+    if (!g || !encoder || unit < 0 || unit >= TEXTURE_UNITS) return false;
+    if (!g->img_atom[unit].buf || !g->img_atom[unit].needs_seed) return false;
+
+    buf = (__bridge id<MTLBuffer>)(g->img_atom[unit].buf);
+    view = (__bridge id<MTLTexture>)(g->img_atom[unit].view);
+    if (!buf || !view) { g->img_atom[unit].needs_seed = false; return false; }
+
+    tt = view.textureType;
+    pf = view.pixelFormat;
+    total = geomImageAtomicTexels(view);
+    if (!total) { g->img_atom[unit].needs_seed = false; return false; }
+
+    id<MTLComputePipelineState> pso = [self geomAtomSeedPso: tt format: pf];
+    if (!pso) { g->img_atom[unit].needs_seed = false; return false; }
+
+    dims[0] = (uint32_t)view.width;
+    dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
+    if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
+    else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)view.arrayLength;
+    else if (tt == MTLTextureTypeCube)        dims[2] = 6;
+    else if (tt == MTLTextureType3D)          dims[2] = (uint32_t)view.depth;
+    else                                      dims[2] = 1;
+    dims[3] = (uint32_t)total;
+
+    [encoder setComputePipelineState: pso];
+    [encoder setBuffer: buf offset: 0 atIndex: 0];
+    [encoder setTexture: view atIndex: 0];
+    [encoder setBytes: &dims length: sizeof(dims) atIndex: 1];
+    [encoder dispatchThreads: MTLSizeMake(total, 1, 1)
+              threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+    g->img_atom[unit].needs_seed = false;
+    return true;
+}
+
 /* copy every dirty sidecar back into its texture: called at glMemoryBarrier time (the
  * CTS's texture-readback tests barrier before glGetTexImage) — cheap when nothing is
  * dirty, and it ends the render encoder only when a resolve is actually needed */
@@ -2630,6 +2772,9 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         [enc setBuffer: buf offset: 0 atIndex: 0];
         [enc setTexture: view atIndex: 0];
         [enc setBytes: &dims length: sizeof(dims) atIndex: 1];
+        if (getenv("MGL_GEOM_DEBUG"))
+            fprintf(stderr, "MGL geom: img-atom resolve unit=%d type=%lu w=%u total=%u\n", u,
+                    (unsigned long)tt, dims[0], dims[3]);
         [enc dispatchThreads: MTLSizeMake(total, 1, 1)
         threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
                                            pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
@@ -2710,6 +2855,58 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         }
     }
     return true;
+}
+
+/* create (and seed) this dispatch's image-atomic sidecars BEFORE the dispatch's own
+ * compute encoder is opened: the seed runs as its own compute pass on the same
+ * command buffer, so it precedes the program's kernel without disturbing the
+ * pipeline state the caller is about to install */
+- (void) geomPrepareImageAtomicsCompute
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    GLuint count = [self getProgramBindingCount: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+    int pending[TEXTURE_UNITS];
+    int n_pending = 0;
+    id<MTLComputeCommandEncoder> enc = NULL;
+
+    if (!g || !count) return;
+
+    for (GLuint i = 0; i < count; i++)
+    {
+        SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER]
+                                                    [SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+        int b = [self getProgramBinding: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE index: i];
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+        GLuint mtl = sres->msl_atomic;
+
+        if (mtl == 0xffffffffu) continue;
+
+        for (GLuint e = 0; e < elems && b >= 0; e++)
+        {
+            GLuint unit = (GLuint)(b + e);
+            ImageUnit *iu;
+            Texture *ptr;
+            id<MTLTexture> view;
+
+            if (unit >= TEXTURE_UNITS) break;
+            iu = &STATE(image_units[unit]);
+            ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            view = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            if (![self geomImageAtomicBuffer: unit view: view]) continue;   /* creates + flags */
+            if (g->img_atom[unit].needs_seed && n_pending < TEXTURE_UNITS)
+                pending[n_pending++] = (int)unit;
+        }
+    }
+
+    if (!n_pending) return;
+
+    /* one compute pass seeds every unit that got a fresh sidecar this dispatch */
+    enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc) return;
+    for (int i = 0; i < n_pending; i++)
+        [self geomSeedImageAtomic: pending[i] encoder: enc];
+    [enc endEncoding];
 }
 
 /* the generated variants number their texture arguments themselves (geom_build_pins):

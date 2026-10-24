@@ -211,6 +211,9 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * from bindTextures / bindTexturesToComputeEncoder after the image-unit textures. */
 - (bool) geomBindImageAtomicBuffersRender: (int) stage;
 - (bool) geomBindImageAtomicBuffersCompute: (id <MTLComputeCommandEncoder>) encoder;
+/* geom: create + seed the image-atomic sidecars of the pending compute dispatch
+ * (own compute pass, before the dispatch's encoder is opened) */
+- (void) geomPrepareImageAtomicsCompute;
 - (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view;
 - (void) geomReleaseImageAtomics;
 - (id<MTLComputePipelineState>) geomAtomResolvePso: (MTLTextureType) tt format: (MTLPixelFormat) pf;

@@ -494,7 +494,7 @@ GLenum mglTexParamGet(GLMContext ctx, Texture *tex, TextureParameter *p, bool is
         {
             MGLTexParamRecord *rec = mgl_texparam_record(ctx, tex->name, false);
             if (rec && rec->is_view)
-                tp_store(out, vt, 0, rec->view_num_levels);
+                tp_store(out, vt, 0, rec->view_immutable_levels);
             else
                 tp_store(out, vt, 0, tex->immutable_storage ? tex->num_levels : 0);
             break;

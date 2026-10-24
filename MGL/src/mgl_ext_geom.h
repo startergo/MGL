@@ -293,7 +293,7 @@ struct MGLExtState_geom {
      * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer).
      * dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
      * geomResolveImageAtomics copies it back into the texture at barrier time. */
-    struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty; } img_atom[TEXTURE_UNITS];
+    struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty, needs_seed; } img_atom[TEXTURE_UNITS];
 
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
@@ -334,6 +334,10 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj, int sta
                             const uint32_t *words, size_t nwords, const char *entry, char **log);
 /* program.c: the rect→2D SPIR-V patch (GL image2DRect / sampler2DRect have no MSL type) */
 size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_words, size_t *out_n);
+
+/* geometry.c: repair interface-block member offsets after glslang's implicit
+ * array growth (see mgl_spirv_fix_block_offsets); returns NULL when unchanged */
+uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_n);
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);
