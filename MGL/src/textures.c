@@ -522,10 +522,38 @@ void mglBindTexture(GLMContext ctx, GLenum target, GLuint texture)
 void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum internalformat)
 {
     Texture *ptr = NULL;
+    GLint max_image_units = 0;
 
-    TD_CHECK(unit < TEXTURE_UNITS, GL_INVALID_VALUE);
+    /* GL 4.6 §8.26: <unit> is checked against GL_MAX_IMAGE_UNITS (not the larger
+     * sampler-unit count) — KHR-GL46.shader_image_load_store negative-bind binds
+     * unit 100 and expects GL_INVALID_VALUE */
+    ctx->dispatch.get_integerv(ctx, GL_MAX_IMAGE_UNITS, &max_image_units);
+    TD_CHECK(unit < (GLuint)(max_image_units > 0 ? max_image_units : 1), GL_INVALID_VALUE);
     TD_CHECK(level >= 0, GL_INVALID_VALUE);
     TD_CHECK(layer >= 0, GL_INVALID_VALUE);
+
+    /* <internalformat> must be one of the image-unit formats (GL 4.6 §8.25 Table 8.26);
+     * any other value — a random enum or a legal-but-unlisted texture internal format —
+     * is GL_INVALID_VALUE, and the check applies even when <texture> is 0
+     * (KHR-GL46.shader_image_load_store negative-bind binds unit 1, texture 0 with a
+     * garbage format) */
+    {
+        static const GLint kImageFormats[] = {
+            GL_RGBA32F, GL_RGBA16F, GL_RG32F, GL_RG16F, GL_R11F_G11F_B10F, GL_R32F,
+            GL_R16F, GL_RGBA32UI, GL_RGBA16UI, GL_RGB10_A2UI, GL_RGBA8UI, GL_RG32UI,
+            GL_RG16UI, GL_RG8UI, GL_R32UI, GL_R16UI, GL_R8UI, GL_RGBA32I, GL_RGBA16I,
+            GL_RGBA8I, GL_RG32I, GL_RG16I, GL_RG8I, GL_R32I, GL_R16I, GL_R8I, GL_RGBA16,
+            GL_RGB10_A2, GL_RGBA8, GL_RG16, GL_RG8, GL_R16, GL_R8,
+            GL_RGBA16_SNORM, GL_RGBA8_SNORM, GL_RG16_SNORM, GL_RG8_SNORM, GL_R16_SNORM,
+            GL_R8_SNORM
+        };
+        size_t f;
+
+        for (f = 0; f < sizeof kImageFormats / sizeof kImageFormats[0]; f++)
+            if ((GLint)internalformat == kImageFormats[f])
+                break;
+        TD_CHECK(f < sizeof kImageFormats / sizeof kImageFormats[0], GL_INVALID_VALUE);
+    }
 
     switch(access)
     {

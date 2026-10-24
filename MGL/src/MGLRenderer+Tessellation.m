@@ -1337,7 +1337,7 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             if (!tex->mtl_data) continue;
             id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
 
-            texture = [self2 geomImageUnitView: iu base: texture];
+            texture = [self2 geomImageUnitViewRes: iu base: texture elemClass: sres->elem_class];
             if (sres->msl_binding < 31)
                 [enc setTexture: texture atIndex: (NSUInteger)(sres->msl_binding + e)];
         }
@@ -2157,6 +2157,14 @@ static void tessRetireCapture(GLMContext ctx)
         compute_cb = _currentCommandBuffer;
         tessTimeCommandBuffer(compute_cb);   /* shared with the render pass: fires at frame commit */
     }
+
+    /* geom: realize the tessellation stages' textures while no encoder is open —
+     * tessBindStageTextures binds them inside the kernels' compute encoder, and a
+     * deferred upload there opens a blit encoder Metal forbids (crash fixed by this
+     * pre-pass; see geomRealizeStageTextures) */
+    [self geomRealizeStageTextures: prog_vs stage: _VERTEX_SHADER];
+    if (prog_tcs) [self geomRealizeStageTextures: prog_tcs stage: _TESS_CONTROL_SHADER];
+    if (prog_tes) [self geomRealizeStageTextures: prog_tes stage: _TESS_EVALUATION_SHADER];
 
     cenc = [compute_cb computeCommandEncoder];
 

@@ -181,6 +181,32 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * returns `base` unchanged when no slicing is needed.  Shared by the render, compute,
  * geometry and tessellation image-binding paths. */
 - (id<MTLTexture>) geomImageUnitView: (const ImageUnit *) iu base: (id<MTLTexture>) base;
+/* geom: like geomImageUnitView, then reinterpret the texels as the image unit's `format`
+ * argument (glBindImageTexture) through a Metal pixel-format view when it differs from
+ * the texture's internal format — GL 4.6 §8.26 lets a unit read, say, an R32I texture as
+ * rg16f; elem_class (SpirvResource.elem_class, 0xffffffff unknown) keeps the plain view
+ * when the SPIR-V image's sampled type disagrees with that format */
+- (id<MTLTexture>) geomImageUnitViewRes: (const ImageUnit *) iu base: (id<MTLTexture>) base
+                              elemClass: (GLuint) elem_class;
+/* geom: realize a stage's sampled images and image units (deferred texture uploads) while
+ * NO encoder is open on the current command buffer — bindMTLTexture's upload path opens a
+ * blit encoder, which Metal forbids while an encoder is encoding.  Call before the first
+ * encoder of a draw that binds stage textures after opening it (tess kernel path) */
+- (void) geomRealizeStageTextures: (Program *) program stage: (int) stage;
+/* geom: shared 1x1 zero texture for an image unit bound to an incomplete texture
+ * (no image): reads are zero and stores drop, GL 4.6 §8.26 */
+- (id<MTLTexture>) geomImageEmptyTexture: (GLenum) internalformat;
+/* geom: disable rasterization when the pipeline's vertex stage is void (no outputs) —
+ * Metal rejects a rasterizing pipeline for such functions (see the implementation) */
+- (void) geomRasterizationForVertexStage: (MTLRenderPipelineDescriptor *) desc;
+/* geom: SPIRV-Cross's image-atomic emulation — bind one zero-initialized sidecar
+ * MTLBuffer per image unit at the `<name>_atomic` argument slots the stage's storage
+ * images reflected (SpirvResource.msl_atomic; see mgl_msl_fix_image_atomics).  Called
+ * from bindTextures / bindTexturesToComputeEncoder after the image-unit textures. */
+- (bool) geomBindImageAtomicBuffersRender: (int) stage;
+- (bool) geomBindImageAtomicBuffersCompute: (id <MTLComputeCommandEncoder>) encoder;
+- (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view;
+- (void) geomReleaseImageAtomics;
 /* geom: SSBO runtime-array .length() — bind SPIRV-Cross's spvBufferSizeConstants
  * (bound-range byte size of the SSBO at each Metal buffer index) to the render or
  * compute tables; no-op when the stage MSL does not reference it */

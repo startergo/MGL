@@ -1,4 +1,70 @@
-READY 65d6862 (code tip: 65d6862 = d87ac3a slot fix + e988be0 external blob + e616c0e/e3bd815 merges of gl46-port 98a20cf & f2bbd51; headless suite 0 failures / 63 files / 6797 checks; test_geom 593/593; test_vab_slots 132/0; KHR-GL46.vertex_attrib_binding 27/30 Pass).
+READY 10bba4b (code tip: 10bba4b = 1a9119b fp64 padded-element + slot->owner mapping + 10bba4b pipeline composite & converted-stream index collision; full headless suite 0 failures / 63 files / 6822 checks; test_geom 593/0 x10 runs; test_vab_slots 157/0; KHR-GL46.vertex_attrib_binding **30/30 Pass**; KHR-GL46.shader_image_load_store 35/51 Pass, 0 new failures).
+
+## Round 45 — finish the uncommitted fp64/vattrib work: vertex_attrib_binding 27/30 -> 30/30 (DONE)
+
+The two dirty files at session start (`MGL/src/fp64.c`, `MGL/src/MGLRenderer+VertexAttrib.m`) were
+the round-44 leftovers: whole dvec-array-element access in the fp64 lowering + the padded
+size 3/2/1 double formats.  Finished, root-caused three further bugs, closed the group.
+
+### Fixes (all in the vattrib/fp64 domain files I own; no shared-file edits this round)
+
+1. `fp64.c`: whole dvec3/dvec4 ARRAY elements (`vs_in_attrib[i]`, constant index) load through the
+   flattened uint4 slot array — element k reads slots 2k/2k+1 and reassembles the vector (the
+   dvec3 tail slot only carries .z).  Limits: constant indices only (a dynamic index still errors
+   with "copy it to a local first"); the CTS unrolls.
+2. `MGLRenderer+VertexAttrib.m` **order dependence**: the whole-attribute pad decision
+   (`vattribDblNeedsPad`/`vattribDblShadowSpan`) reads `owner_gl[]` of BOTH word slots of a
+   dvec3/dvec4, but `vfunc.vertexAttributes` is an unordered set — a low slot enumerated before its
+   high slot saw `owner_gl[] == -1`, split the attribute across a raw-word slot and a converted
+   stream, and the stream was never bound.  `owner_gl[]` is now filled in pass 1 (order-free).
+3. Same file **internal-slot -> owning-GL-attribute mapping** (4 sites): the interface-location pass
+   renumbers inputs (a dvec3 takes the two LOWEST free slots; a vec4 position can land on MSL slot
+   5).  The enabled-array test, the format lookup, the shadow-stream bind and the
+   const-current-value fill all used the SLOT index as a GL location — slot 5 read disabled
+   attribute 5's constant and nothing rasterized.  Also: a stride-0 binding's converted stream is
+   `MTLVertexStepFunctionConstant` (the stream holds ONE element; PerVertex read past it).
+4. Same file **pipeline composite**: with a bound program pipeline, `MGL_PIPELINE_PROGRAM_SCOPE`
+   substitutes an ANONYMOUS composite (name 0) for ctx->state.program, so the introspection
+   resolved nothing.  `vattribIntrospectProgram()` resolves the pipeline's vertex STAGE program.
+5. Same file **converted-stream index collision**: the double path allocated with `--next_shadow`
+   and the float/int path with `next_shadow--`, so the first converted stream of each kind in one
+   draw SHARED a Metal vertex buffer index (dvec3 read color_b's float bytes = zeros).  Both now
+   allocate identically from `MGL_VA_SHADOW_BUFFER_TOP` down, SSBO-size skip included.
+
+`tests/headless/test_vab_slots.c` now 5 tests / **157 checks**: case3 basic-inputL verbatim
+(padded components from the current generic value, stride-0 double), case4 dvec3@3+ivec2@4 draws
+green, case5 unaligned stride 62 (every attribute converted; dvec3 and float streams must keep
+their own buffer indices).  `tests/headless/scratch_inputL{,2,3}.c` committed as CTS repros.
+
+### CTS counts (fresh single-batch runs, `.agent/cts-vab-r45`, `.agent/cts-img-r45`)
+
+* `KHR-GL46.vertex_attrib_binding` — **30 cases Pass=30 (100%)** (was 27/30; advanced-bindingUpdate
+  + basic-inputL-case1/2 fixed).
+* `KHR-GL46.shader_image_load_store` — 51 cases **Pass=35 Fail=16** (was 27/23/1 Crash; the
+  round-45 image-atomics commits of the main branch fixed 8, **0 new failures**; 6 of the 16 are
+  the CTS's own "Vulkan is not supported" platform line).
+
+### Verification
+
+* `make -j8 lib` clean, no new warnings.  Stub scanner clean (0 EMPTY/NOOP/ASSERT) for
+  geometry.c, MGLRenderer+Geometry.m, MGLRenderer+VertexAttrib.m, fp64.c.
+* Full `tests/headless/run.sh`: **0 failures, 63 files, 6822 checks**.  `test_geom` x10:
+  **593/0 every run**.  `test_vab_slots` 157/0.
+
+### Handoff
+
+1. shader_image_load_store 16 Fail: 4 x stale GL_INVALID_OPERATION "after test execution" in the
+   *GeometryStages* variants (allFormats-load/store, allTargets-store/atomic) — smells like the GS
+   capture/draw path leaving an error behind (query glGetError after the draw in a GS program);
+   6 x "Test Run() failed" (negative-bind, uniform-limits now pass; early-fragment-tests,
+   non-layered_binding, advanced-sync-drawIndirect/bufferUpdate, basic-allTargets-atomicGS);
+   6 x CTS-platform "Vulkan is not supported" (ignore).
+2. 420pack backlog unchanged (see round 44 handoff): invariant-on-inputs strip (5), raster-stage
+   `layout(binding=N)` (7).
+3. fp64 remaining: dynamic-index whole-element dvec array access; dvec3 slot renumbering now
+   handled via owner_gl, so nothing known open there.
+
+
 
 ## Round 44 — vertex_attrib_binding slot-30 collision (15 Fail -> 3), buffer-slot audit, image/420pack baselines
 
@@ -110,9 +176,11 @@ r43's "40/42" was a partial resume (r42 entries left in place); this is the firs
 
 ### Handoff — pick next (ranked by value/cost)
 
+(r44 handoff; see the round-45 handoff above for the current ranking)
+
 1. 420pack `invariant`-on-inputs strip (5 cases, ~1 pre-pass edit) + `layout(binding=N)` for
    raster-stage samplers/images (7 cases, mirror r43's compute fix) -> up to 12 cases.
 2. image atomics emulation buffers (`<name>_atomic` binding + image3D coordinate linearization)
    — biggest image_load_store block (10+ cases), needs a binding mechanism like the SSBO-size one.
 3. fp64: whole-element dvec array access + the dvec3/ivec4 slot renumbering (vab inputL x2 +
-   advanced-bindingUpdate + more in other groups).
+   advanced-bindingUpdate + more in other groups).  [DONE in round 45 — see above.]

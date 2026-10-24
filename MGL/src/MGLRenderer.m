@@ -448,6 +448,13 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].buf = dub;
                         buffer_map->buffers[buffer_map->count].offset = 0;
                         buffer_map->buffers[buffer_map->count].size = dub->size;
+                        /* geom: the packed default-uniform block's real MSL argument
+                         * index (mgl_DefaultUniforms — see mgl_msl_fix_image_atomics) */
+                        buffer_map->buffers[buffer_map->count].mtl_index =
+                            (STATE(program) && stage >= 0 &&
+                             STATE(program)->spirv[stage].dub_msl != 0xffffffffu) ?
+                                STATE(program)->spirv[stage].dub_msl :
+                                (GLuint)buffer_map->count;
                         buffer_map->count++;
                         buffers_to_be_mapped--;
                         continue;
@@ -474,6 +481,16 @@ static char kComputeFallbackKey;
                                                    buffers[spirv_binding + e].buf : NULL);
                     GLintptr eoff = (e == 0) ? buffers[spirv_binding].offset : buffers[spirv_binding + e].offset;
                     GLsizeiptr esz = (e == 0) ? buffers[spirv_binding].size : buffers[spirv_binding + e].size;
+                    /* geom: this resource's real Metal argument index (array elements
+                     * span consecutive slots).  Falls back to the map's ordinal when the
+                     * resource list has no recorded MSL binding (0xffffffff = stripped). */
+                    GLuint mtl_idx = (GLuint)buffer_map->count;
+                    if (STATE(program) &&
+                        i < (int)STATE(program)->spirv_resources_list[stage][spvc_type].count)
+                    {
+                        GLuint m = STATE(program)->spirv_resources_list[stage][spvc_type].list[i].msl_binding;
+                        if (m != 0xffffffffu) mtl_idx = m + e;
+                    }
 
                     if (!eb)
                     {
@@ -486,6 +503,7 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].buf = nullbuf;
                         buffer_map->buffers[buffer_map->count].offset = 0;
                         buffer_map->buffers[buffer_map->count].size = 0;
+                        buffer_map->buffers[buffer_map->count].mtl_index = mtl_idx;
                         buffer_map->count++;
                         continue;
                     }
@@ -495,6 +513,7 @@ static char kComputeFallbackKey;
                     buffer_map->buffers[buffer_map->count].buf = eb;
                     buffer_map->buffers[buffer_map->count].offset = eoff;
                     buffer_map->buffers[buffer_map->count].size = esz;
+                    buffer_map->buffers[buffer_map->count].mtl_index = mtl_idx;
                     buffer_map->count++;
 
                     /* shader storage / atomic counter buffers may be written by the shader:
@@ -673,9 +692,11 @@ static char kComputeFallbackKey;
     BufferMap *map;
     Buffer *ptr;
     GLintptr offset;
-    
+
     assert(_currentRenderEncoder);
 
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: vertex buffer map: %d entries\n", ctx->state.vertex_buffer_map_list.count);
     for(int i=0; i<ctx->state.vertex_buffer_map_list.count; i++)
     {
         map = &ctx->state.vertex_buffer_map_list.buffers[i];
@@ -695,7 +716,7 @@ static char kComputeFallbackKey;
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
-            [_currentRenderEncoder setVertexBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:i];
+            [_currentRenderEncoder setVertexBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
             ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
@@ -707,7 +728,7 @@ static char kComputeFallbackKey;
             id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             assert(buffer);
 
-            [_currentRenderEncoder setVertexBuffer:buffer offset:offset atIndex:i ];
+            [_currentRenderEncoder setVertexBuffer:buffer offset:offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i) ];
         }
     }
 
@@ -722,6 +743,8 @@ static char kComputeFallbackKey;
     
     assert(_currentRenderEncoder);
 
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: fragment buffer map: %d entries\n", ctx->state.fragment_buffer_map_list.count);
     for(int i=0; i<ctx->state.fragment_buffer_map_list.count; i++)
     {
         map = &ctx->state.fragment_buffer_map_list.buffers[i];
@@ -741,7 +764,7 @@ static char kComputeFallbackKey;
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;
 
-            [_currentRenderEncoder setFragmentBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:i];
+            [_currentRenderEncoder setFragmentBytes:(const void *)ptr->data.buffer_data length:ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
             ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
@@ -753,7 +776,7 @@ static char kComputeFallbackKey;
             id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             assert(buffer);
             
-            [_currentRenderEncoder setFragmentBuffer:buffer offset:offset atIndex:i ];
+            [_currentRenderEncoder setFragmentBuffer:buffer offset:offset atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i) ];
         }
     }
 
@@ -2053,6 +2076,9 @@ static char kComputeFallbackKey;
             ImageUnit *iu;
 
             if (unit >= TEXTURE_UNITS) continue;
+            /* SPIRV-Cross strips a declared-but-unused image from the MSL: its
+             * automatic binding is 0xffffffff and there is no argument to bind */
+            if (mtl_index == 0xffffffffu) continue;
 
             /* an image ARRAY (image2D g[2]) spans array_size consecutive Metal slots fed
              * by the image units base..base+array_size-1, exactly like sampler arrays */
@@ -2072,7 +2098,7 @@ static char kComputeFallbackKey;
             /* the unit binds exactly one mip level (and, non-layered on an arrayed
              * target, one layer): hand the MSL a view of that level / slice —
              * geomImageUnitView (shared with the compute / tess / geometry paths) */
-            texture = [self geomImageUnitView: iu base: texture];
+            texture = [self geomImageUnitViewRes: iu base: texture elemClass: sres->elem_class];
 
             /* the first entry of bindTextures' stage list is always a vertex-side
              * function (the plain vertex stage, or the TES running as the post-
@@ -2083,6 +2109,10 @@ static char kComputeFallbackKey;
                 [_currentRenderEncoder setFragmentTexture: texture atIndex: mtl_index + e];
             }
         }
+
+        /* geom: the image-atomic sidecar buffers of this stage — SPIRV-Cross's
+         * <name>_atomic arguments (a no-op when the stage MSL has none) */
+        [self geomBindImageAtomicBuffersRender: stages[st]];
     }
 
     return true;
@@ -3103,6 +3133,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // gl_ViewportIndex), which Metal requires
     [self geomConfigureTopology: pipelineStateDescriptor];
 
+    // geom: a void vertex function (stage writes only images/buffers) cannot rasterize;
+    // last — rstateConfigurePipelineDescriptor runs again through
+    // bindBlendStateToPipelineStateDescriptor and re-enables rasterization
+    [self geomRasterizationForVertexStage: pipelineStateDescriptor];
+
     return pipelineStateDescriptor;
 }
 
@@ -3699,6 +3734,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         ctx->state.dirty_bits &= ~DIRTY_BUFFER;
     }
 
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: compute buffer map: %d entries (dub_msl=%u)\n",
+                ctx->state.compute_buffer_map_list.count,
+                STATE(program) ? STATE(program)->spirv[_COMPUTE_SHADER].dub_msl : 0xffffu);
     for(int i=0; i<ctx->state.compute_buffer_map_list.count; i++)
     {
         Buffer *ptr;
@@ -3717,7 +3756,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         GLintptr off = ctx->state.compute_buffer_map_list.buffers[i].offset;
         if (off < 0 || (size_t)off >= buffer.length) off = 0;
 
-        [computeCommandEncoder setBuffer:buffer offset:(NSUInteger)off atIndex:i ];
+        {
+            GLuint mtl_idx = ctx->state.compute_buffer_map_list.buffers[i].mtl_index;
+            [computeCommandEncoder setBuffer:buffer offset:(NSUInteger)off atIndex:(mtl_idx ? mtl_idx : (GLuint)i)];
+        }
     }
 
     /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25) */
@@ -3765,6 +3807,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                // GLuint spirv_location;
                 GLuint spirv_binding;
                 Texture *ptr;
+                SpirvResource *sres = NULL;   /* set below when the index is in range */
 
                 spirv_binding = [self getProgramLocation:_COMPUTE_SHADER type:spvc_type index: i];
                 spirv_binding = [self getProgramBinding:_COMPUTE_SHADER type:spvc_type index: i];
@@ -3775,7 +3818,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     {
                         /* GL sampler semantics: dimension selects the unit's
                          * per-target binding (mgl_texture_for_sampler) */
-                        SpirvResource *sres = NULL;
                         GLuint cnt = [self getProgramBindingCount:_COMPUTE_SHADER type:spvc_type];
                         for (GLuint k = 0; k < cnt; k++)
                             if ([self getProgramBinding:_COMPUTE_SHADER type:spvc_type index:k] == spirv_binding)
@@ -3804,7 +3846,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 GLuint elems = 1;
                 if ((GLuint)i < [self getProgramBindingCount: _COMPUTE_SHADER type:spvc_type])
                 {
-                    SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][spvc_type].list[i];
+                    sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][spvc_type].list[i];
 
                     if (sres->msl_binding == 0xffffffffu)
                     {
@@ -3854,14 +3896,22 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                         else if (spirv_binding + e < TEXTURE_UNITS)
                         {
                             /* an image unit binds one mip level / layer: view of that
-                             * level (geomImageUnitView, shared with the render path) */
-                            texture = [self geomImageUnitView: &STATE(image_units[spirv_binding + e]) base: texture];
+                             * level, reinterpreted as the unit's format when it differs
+                             * from the texture's internal format (geomImageUnitViewRes) */
+                            texture = [self geomImageUnitViewRes: &STATE(image_units[spirv_binding + e])
+                                                            base: texture
+                                                       elemClass: (sres ? sres->elem_class : 0xffffffffu)];
                         }
                         if (!sampler) continue;   /* no sampler state: skip, MSL default applies */
 
                         [computeCommandEncoder setTexture:texture atIndex:mtl_index + e];
                         [computeCommandEncoder setSamplerState: sampler atIndex:mtl_index + e];
                     }
+
+                    /* geom: the image-atomic sidecar buffers of the compute stage —
+                     * SPIRV-Cross's <name>_atomic arguments */
+                    if (gl_texture_type == _IMAGE_TEXTURE)
+                        [self geomBindImageAtomicBuffersCompute: computeCommandEncoder];
 
                     textures_to_be_mapped--;
                 }
@@ -5779,6 +5829,9 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
 
         // End any active rendering
         [self endRenderEncoding];
+
+        // Cleanup
+        [self geomReleaseImageAtomics];   /* geom: image-atomic sidecar buffers */
 
         // Cleanup command buffer and encoder
         if (_currentCommandBuffer) {

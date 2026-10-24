@@ -2449,6 +2449,23 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
                     f->attrcomp[iw[2]] = (base << 4) | ((row % 2) + 1);
                     return;
                 }
+                /* whole dvec2/dvec3/dvec4 array element (KHR-GL46.vertex_attrib_binding
+                 * basic-inputL copies vs_in_attrib[i] whole, one dvec4 per element):
+                 * record the element's FIRST slot and no pair — rw_load reads slot and
+                 * slot+1 of the flattened slot array and reassembles the vector.  Only
+                 * plain vectors land here: a matrix element (K_MAT) is still rejected */
+                if (good && f->ins[j].op == SpvOpAccessChain && ei < nelem && col < cols &&
+                    row < rows && f->ty[cur].kind == K_VEC &&
+                    veclen(f, cur) >= 2 && veclen(f, cur) <= 4 &&
+                    rows == veclen(f, cur))
+                {
+                    uint32_t spc = attr_slots_per_col(rows);
+                    uint32_t slot = ei * cols * spc + col * spc;
+
+                    f->attrslotidx[iw[2]] = slot;
+                    f->attrcomp[iw[2]] = (base << 4);            /* low nibble 0: no pair */
+                    return;
+                }
             }
             fail(f, "fp64: element access into a double vertex attribute "
                     "is not supported (copy it to a local first)");
@@ -2961,6 +2978,53 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
             if (comp == 0xffffffff) {
                 if (elemty == uint2_of(f)) res = bitcast(f, f->f64ty, lo);
                 else if (f->ty[rt].kind == K_VEC && f->ty[rt].n == 2) res = bitcast(f, ulong2_of(f), lo);
+                else if (f->ty[rt].kind == K_VEC && (f->ty[rt].n == 3 || f->ty[rt].n == 4) &&
+                         elemty == uint4_of(f))
+                {
+                    /* whole dvec3/dvec4 array element: two consecutive slots of the
+                     * flattened slot array (each one Metal location = one dvec2, so the
+                     * array's elements are uniformly uint4) — reassemble like the
+                     * whole-attribute load above (the LAST slot of a dvec3 element is
+                     * padded, only .x is meaningful) */
+                    uint32_t jconst2 = nid(f), ap2 = nid(f), hiv = nid(f);
+                    uint32_t pty2 = ptr_for(f, storage, elemty);
+                    uint32_t e[4];
+
+                    f->vty[jconst2] = f->u32ty;
+                    f->isconst[jconst2] = 1;
+                    f->cval[jconst2] = slotarr + 1;
+                    {
+                        uint32_t oc[4] = {f->u32ty, jconst2, slotarr + 1};
+                        binst(&f->pre, SpvOpConstant, oc, 3);
+                    }
+                    f->vty[ap2] = pty2;
+                    {
+                        uint32_t oa[5] = {pty2, ap2, var, jconst2};
+                        binst(&f->body, SpvOpAccessChain, oa, 4);
+                    }
+                    {
+                        uint32_t ol[3] = {elemty, hiv, ap2};
+                        binst(&f->body, SpvOpLoad, ol, 3);
+                    }
+                    {
+                        uint32_t bl = bitcast(f, ulong2_of(f), lo);
+
+                        e[0] = xcomp(f, f->f64ty, bl, 0);
+                        e[1] = xcomp(f, f->f64ty, bl, 1);
+                        if (f->ty[rt].n == 3)
+                        {
+                            uint32_t bh = bitcast(f, ulong2_of(f), hiv);
+                            e[2] = xcomp(f, f->f64ty, bh, 0);
+                        }
+                        else
+                        {
+                            uint32_t bh = bitcast(f, ulong2_of(f), hiv);
+                            e[2] = xcomp(f, f->f64ty, bh, 0);
+                            e[3] = xcomp(f, f->f64ty, bh, 1);
+                        }
+                    }
+                    res = cstruct(f, rt, e, f->ty[rt].n);
+                }
                 else { fail(f, "fp64: only scalar / dvec2 array attribute elements are read whole"); return; }
             } else if (elemty == uint2_of(f)) {
                 /* the slot element IS one scalar double: the uint2 pair, not a uint4 */

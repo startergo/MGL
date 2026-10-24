@@ -1371,6 +1371,15 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
             spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_DISABLE_RASTERIZATION, SPVC_TRUE);
         spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE);
         spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE);
+        /* .length() on an SSBO runtime array compiles to a `constant uint*
+         * spvBufferSizeConstants [[buffer(N)]]` argument.  SPIRV-Cross's default N is 25
+         * — the capture variant's VSOUT slot — and the two collide so hard the Metal
+         * compiler rejects the variant ("cannot reserve 'buffer' resource location at
+         * index 25", the round-45 VSOUT@25 pin): move it into the user slot range, whose
+         * last slot MGL_GEOM_KERNEL_SIZE_BUFFER geom_build_pins keeps free for exactly
+         * this argument (kernel and capture variants alike) */
+        spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_BUFFER_SIZE_BUFFER_INDEX,
+                                       MGL_GEOM_KERNEL_SIZE_BUFFER);
         spvc_compiler_install_compiler_options(comp, opt);
     }
 
@@ -2603,6 +2612,356 @@ char *mgl_msl_insert_image_fences(const char *msl)
     for (int a = 0; a < nedits; a++) free(edits[a].text);
     return out ? out : NULL;
 }
+
+/* ------------------------------------------------------------------ image atomics
+ * SPIRV-Cross emulates GL image atomics (OpImageTexelPointer + OpAtomic*) with a side
+ * `device atomic_<T>* <name>_atomic [[buffer(N)]]` argument per storage image, next to
+ * the texture argument itself: only OpImageRead/OpImageWrite go through the texture,
+ * every atomic operation reads/writes the buffer.  Of the GL image targets it
+ * linearizes the coordinate correctly for Dim2D alone (the spvImage2DAtomicCoord
+ * macro, 16-texel row pitch) — and for image2DArray it applies that same macro, which
+ * silently drops the layer.  1D and buffer images use a scalar subscript (valid), but
+ * 3D / 1DArray / 2DArray / Cube / CubeArray end up with an int2/int3 subscript, which
+ * is not even compilable MSL.
+ *
+ * This pass rewrites every `<name>_atomic[<coord>]` subscript of those targets into a
+ * call of a generated helper that linearizes the coordinate with the row-major layout
+ * the renderer's sidecar buffer uses (geomImageAtomicBuffer in MGLRenderer+Geometry.m);
+ * plain image2D / image2DRect keep SPIRV-Cross's own macro (and its pitch), so the
+ * renderer sizes their sidecar with the same 16-texel alignment.
+ *
+ * The `<name>_atomic` argument indices are SPIRV-Cross's automatic buffer ordinals:
+ * they share the counter with the stage's own auto-assigned UBO/SSBO arguments, so they
+ * cannot collide with those — but explicitly pinned resources do not advance the
+ * counter, and the geometry-emulation kernels pin the user's blocks.  There the indices
+ * are rebased (forced_base >= 0) onto the free slots past the pinned user range.
+ *
+ * kind 0 = plain 2D (or 1D/buffer/unknown): the subscript is left as written.
+ */
+enum { MGL_AI_2D = 0, MGL_AI_3D, MGL_AI_ARR2, MGL_AI_CUBE, MGL_AI_CUBEARR };
+
+char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
+                                MGLGeomTexSlot *slots_out, int *nslots_out, int max_slots,
+                                int *dub_out)
+{
+    struct { char name[128]; int auto_idx, index, kind; } imgs[32];
+    int nimgs = 0;
+    struct { size_t at, len; char *text; } edits[256];
+    int nedits = 0;
+
+    if (!msl) return NULL;
+    if (nslots_out) *nslots_out = 0;
+    if (dub_out) *dub_out = -1;
+    if (dub_out)
+    {
+        /* the packed default-uniform block argument: `mgl_DefaultUniforms_1 [[buffer(N)]]`
+         * (SPIRV-Cross numbers it after the image-atomic buffers, which shifts it off the
+         * renderer's map ordinal — the renderer binds it at the index reported here) */
+        static const char *dubnames[2] = { "mgl_DefaultUniforms_", "gl_DefaultUniformBlock" };
+        for (int k = 0; k < 2; k++)
+        {
+            const char *q = msl;
+            while ((q = strstr(q, dubnames[k])) != NULL)
+            {
+                const char *b = strstr(q, "[[buffer(");
+                if (b && (size_t)(b - q) < 48)
+                {
+                    *dub_out = atoi(b + 9);
+                    break;
+                }
+                q += strlen(dubnames[k]);
+            }
+            if (*dub_out >= 0) break;
+        }
+    }
+
+    /* 1. the `device atomic_<T>* <name>_atomic [[buffer(N)]]` arguments */
+    for (const char *p = msl; (p = strstr(p, "_atomic [[buffer(")) != NULL; )
+    {
+        const char *nm_end = p;
+        const char *nm = nm_end;
+        while (nm > msl && (isalnum((unsigned char)nm[-1]) || nm[-1] == '_')) nm--;
+        int idx = atoi(p + strlen("_atomic [[buffer("));
+        if (nm_end > nm && nimgs < 32 && (size_t)(nm_end - nm) < sizeof imgs[0].name)
+        {
+            int dup = 0;
+            for (int i = 0; i < nimgs; i++)
+                if (!strncmp(imgs[i].name, nm, (size_t)(nm_end - nm))) dup = 1;
+            if (!dup)
+            {
+                memcpy(imgs[nimgs].name, nm, (size_t)(nm_end - nm));
+                imgs[nimgs].name[nm_end - nm] = 0;
+                imgs[nimgs].auto_idx = idx;
+                imgs[nimgs].kind = MGL_AI_2D;
+                nimgs++;
+            }
+        }
+        p += strlen("_atomic [[buffer(");
+    }
+    if (!nimgs)
+        return strdup(msl);
+
+    /* 2. the texture argument of each name: its MSL type names the target.  Walk back
+     * over the parameter list to the previous ',' or '(' at angle-bracket depth zero
+     * (texture2d<uint, access::read_write> has a comma inside the template). */
+    for (const char *p = msl; (p = strstr(p, "[[texture(")) != NULL; )
+    {
+        const char *attr = p;
+        const char *nm_end = p;
+        while (nm_end > msl && (nm_end[-1] == ' ' || nm_end[-1] == '\t')) nm_end--;
+        const char *nm = nm_end;
+        while (nm > msl && (isalnum((unsigned char)nm[-1]) || nm[-1] == '_')) nm--;
+        if (nm_end == nm) { p += 10; continue; }
+
+        int angle = 0;
+        const char *t = nm;
+        while (t > msl)
+        {
+            char c = t[-1];
+            if (c == '>') angle++;
+            else if (c == '<') { if (angle) angle--; }
+            else if (!angle && (c == ',' || c == '(')) break;
+            t--;
+        }
+        while (t < nm && (*t == ' ' || *t == '\t')) t++;
+        size_t tlen = (size_t)(nm - t);
+
+        for (int i = 0; i < nimgs; i++)
+        {
+            size_t nl = strlen(imgs[i].name);
+            if (nl != (size_t)(nm_end - nm) || strncmp(imgs[i].name, nm, nl)) continue;
+            int kind = MGL_AI_2D;
+            if (tlen >= 10 && !strncmp(t, "texture3d<", 10)) kind = MGL_AI_3D;
+            else if (tlen >= 16 && !strncmp(t, "texture2d_array<", 16)) kind = MGL_AI_ARR2;
+            else if (tlen >= 18 && !strncmp(t, "texturecube_array<", 18)) kind = MGL_AI_CUBEARR;
+            else if (tlen >= 12 && !strncmp(t, "texturecube<", 12)) kind = MGL_AI_CUBE;
+            imgs[i].kind = kind;
+        }
+        p = attr + 10;
+    }
+
+    /* 3. final buffer indices */
+    for (int i = 0; i < nimgs; i++)
+    {
+        imgs[i].index = (forced_base >= 0) ? forced_base + i : imgs[i].auto_idx;
+        if (imgs[i].index < 0 || imgs[i].index >= max_index)
+            return NULL;            /* the caller reports the failure */
+        if (slots_out && nslots_out && *nslots_out < max_slots)
+        {
+            snprintf(slots_out[*nslots_out].name, sizeof slots_out[0].name, "%s", imgs[i].name);
+            slots_out[(*nslots_out)++].msl = imgs[i].index;
+        }
+    }
+
+    /* 4. re-base the argument declarations */
+    if (forced_base >= 0)
+    {
+        for (int i = 0; i < nimgs; i++)
+        {
+            if (imgs[i].index == imgs[i].auto_idx) continue;
+            char pat[192], *rep;
+            snprintf(pat, sizeof pat, "%s_atomic [[buffer(%d)]]", imgs[i].name, imgs[i].auto_idx);
+            const char *q = strstr(msl, pat);
+            if (!q) continue;
+            rep = malloc(192);
+            if (!rep) continue;
+            snprintf(rep, 192, "%s_atomic [[buffer(%d)]]", imgs[i].name, imgs[i].index);
+            if (nedits < 256)
+            {
+                edits[nedits].at = (size_t)(q - msl);
+                edits[nedits].len = strlen(pat);
+                edits[nedits].text = rep;
+                nedits++;
+            }
+            else free(rep);
+        }
+    }
+
+    /* 5. rewrite the subscripts whose coordinate needs linearizing */
+    for (int i = 0; i < nimgs; i++)
+    {
+        char sub[160];
+        const char *helper = NULL;
+        snprintf(sub, sizeof sub, "%s_atomic[", imgs[i].name);
+
+        for (const char *p = msl; (p = strstr(p, sub)) != NULL; )
+        {
+            if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+            { p += strlen(sub); continue; }
+
+            const char *cs = p + strlen(sub);            /* coordinate start */
+            const char *ce = cs;
+            size_t span;                                 /* <name>_atomic[<coord>] overall */
+            {
+                int d = 1;                               /* inside the subscript's '[' */
+                while (*ce)
+                {
+                    if (*ce == '[' || *ce == '(') d++;
+                    else if (*ce == ']' || *ce == ')') { if (--d == 0) { ce++; break; } }
+                    ce++;
+                }
+                if (d) { p = cs; continue; }
+            }
+            span = (size_t)(ce - p);
+            size_t clen = span - strlen(sub) - 1;        /* the subscript, without ']' */
+
+            /* a 2DArray coordinate arrives wrapped in SPIRV-Cross's macro, which spans
+             * the whole subscript: strip it and use the inner coordinate */
+            const char *w = NULL;
+            if (imgs[i].kind == MGL_AI_ARR2 && clen > 24 &&
+                !strncmp(cs, "spvImage2DAtomicCoord(", 22))
+            {
+                int dd = 0;
+                const char *r = cs + 21;
+                while (*r)
+                {
+                    if (*r == '(') dd++;
+                    else if (*r == ')') { if (--dd == 0) { r++; break; } }
+                    r++;
+                }
+                if (!dd && (size_t)(r - cs) == clen)
+                {
+                    const char *c2 = cs + clen - 1;      /* the macro's ')' */
+                    while (c2 > cs && *c2 != ',') c2--;  /* the macro's <tex> argument */
+                    if (c2 > cs) { w = cs + 22; clen = (size_t)(c2 - cs - 22); }
+                }
+            }
+
+            switch (imgs[i].kind)
+            {
+                case MGL_AI_3D:     helper = "spvMglAI3D"; break;
+                case MGL_AI_CUBE:
+                case MGL_AI_CUBEARR: helper = "spvMglAICB"; break;
+                case MGL_AI_ARR2:
+                    /* overloads pick the layout: int2 is a 1D array (the layer in y),
+                     * int3 a 2D array (the layer in z) */
+                    helper = "spvMglAIA";
+                    break;
+                default:
+                    helper = NULL;
+                    break;
+            }
+            if (!helper) { p = ce; continue; }
+
+            /* keep the `&<name>_atomic[...]` lvalue (SPIRV-Cross takes its address):
+             * only the subscript expression is replaced — the full interior, including
+             * SPIRV-Cross's macro wrapper when there is one */
+            char *rep = malloc(strlen(helper) + strlen(imgs[i].name) + clen + 16);
+            if (rep)
+            {
+                snprintf(rep, strlen(helper) + strlen(imgs[i].name) + clen + 16,
+                         "%s(%s, %.*s)", helper, imgs[i].name, (int)clen, w ? w : cs);
+                if (nedits < 256)
+                {
+                    edits[nedits].at = (size_t)(cs - msl);
+                    edits[nedits].len = span - strlen(sub) - 1;
+                    edits[nedits].text = rep;
+                    nedits++;
+                }
+                else free(rep);
+            }
+            p = ce;
+        }
+    }
+
+    /* the helper definitions this MSL actually uses */
+    char helpers[2400];
+    helpers[0] = 0;
+    {
+        static const struct { const char *name; const char *body; } h[4] = {
+            { "spvMglAI3D(",
+              "template <typename T> static inline __attribute__((always_inline)) "
+              "uint spvMglAI3D(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
+              "return uint(tc.x) + w * (uint(tc.y) + h * uint(tc.z)); }\n" },
+            /* texture2d_array carries both image1DArray (an int2 coordinate: the layer in
+             * y) and image2DArray (int3: the layer in z) — the overloads pick the layout */
+            { "spvMglAIA(",
+              "template <typename T> static inline __attribute__((always_inline)) "
+              "uint spvMglAIA(T tex, int2 tc) { return uint(tc.x) + tex.get_width() * uint(tc.y); }\n"
+              "template <typename T> static inline __attribute__((always_inline)) "
+              "uint spvMglAIA(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
+              "return uint(tc.x) + w * (uint(tc.y) + h * uint(tc.z)); }\n" },
+            /* a cube face — and a cube-array slice: glslang packs layer*6+face into z */
+            { "spvMglAICB(",
+              "template <typename T> static inline __attribute__((always_inline)) "
+              "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); "
+              "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" }
+        };
+        for (int k = 0; k < 3; k++)
+        {
+            int used = 0;
+            for (int a = 0; a < nedits && !used; a++)
+                used = !strncmp(edits[a].text, h[k].name, strlen(h[k].name));
+            if (used && strlen(helpers) + strlen(h[k].body) + 1 < sizeof helpers)
+                strcat(helpers, h[k].body);
+        }
+    }
+    if (!helpers[0] && !nedits)
+        return strdup(msl);
+
+    /* 6. splice: edits at ascending offsets of the ORIGINAL string; the helpers go
+     * right after `using namespace metal;` (SPIRV-Cross always emits it) */
+    for (int a = 0; a < nedits; a++)
+        for (int b = a + 1; b < nedits; b++)
+            if (edits[b].at < edits[a].at)
+            {
+                size_t ta = edits[a].at, tl = edits[a].len;
+                char *tt = edits[a].text;
+                edits[a] = edits[b]; edits[b].at = ta; edits[b].len = tl; edits[b].text = tt;
+            }
+
+    size_t helper_at = 0;
+    {
+        const char *u = strstr(msl, "using namespace metal;");
+        if (u)
+            helper_at = (size_t)(u - msl) + strlen("using namespace metal;");
+        else
+        {
+            const char *inc = msl;
+            while ((inc = strstr(inc, "#include")) != NULL)
+            {
+                const char *e = strchr(inc, '\n');
+                if (e) inc = e + 1;
+            }
+            if (inc > msl) helper_at = (size_t)(inc - msl);
+        }
+    }
+
+    size_t out_len = strlen(msl) + strlen(helpers) + 32;
+    for (int a = 0; a < nedits; a++) out_len += strlen(edits[a].text) + 16;
+    char *out = malloc(out_len);
+    if (!out)
+    {
+        for (int a = 0; a < nedits; a++) free(edits[a].text);
+        return NULL;
+    }
+
+    size_t src = 0, dst = 0;
+    for (int a = 0; a <= nedits; a++)
+    {
+        size_t upto = (a < nedits) ? edits[a].at : strlen(msl);
+        if (helper_at > src && helper_at <= upto)
+        {
+            memcpy(out + dst, msl + src, helper_at - src); dst += helper_at - src;
+            memcpy(out + dst, helpers, strlen(helpers)); dst += strlen(helpers);
+            src = helper_at;
+        }
+        memcpy(out + dst, msl + src, upto - src); dst += upto - src;
+        if (a < nedits)
+        {
+            memcpy(out + dst, edits[a].text, strlen(edits[a].text));
+            dst += strlen(edits[a].text);
+            src = edits[a].at + edits[a].len;
+        }
+        else src = upto;
+    }
+    memcpy(out + dst, msl + src, strlen(msl) - src); dst += strlen(msl) - src;
+    out[dst] = 0;
+
+    for (int a = 0; a < nedits; a++) free(edits[a].text);
+    return out;
+}
+
 /* MSL has no mutable program-scope variables (only `constant` globals), so a GL
  * atomic counter referenced inside a non-entry function cannot see the entry
  * function's injected [[buffer(N)]] argument.  Give every function that uses a
@@ -3769,6 +4128,27 @@ static bool spv_var_is_buffer_block(SpvModule *m, SpvVar *v)
     SpvType *t = spv_value_type(m, v->type_id, NULL);
 
     return t && t->kind == SPVT_STRUCT && spv_deco(m, t->id, SpvDecorationBufferBlock, NULL);
+}
+
+/* does the module read .length() on a runtime-sized SSBO array (OpArrayLength)?  The
+ * MSL variants then need SPIRV-Cross's `spvBufferSizeConstants` argument, which
+ * geom_spirv_to_msl pins at MGL_GEOM_KERNEL_SIZE_BUFFER — the slot is kept out of the
+ * user pin range (see the span checks at the geom_build_pins call sites). */
+static bool spv_uses_array_length(const uint32_t *ir, size_t words)
+{
+    size_t i;
+
+    if (!ir || words < 5)
+        return false;
+    for (i = 5; i < words; )                 /* skip the 5-word header */
+    {
+        uint32_t w = ir[i];
+
+        if ((w & 0xffffu) == 117)            /* OpArrayLength */
+            return true;
+        i += (w >> 16) ? (w >> 16) : 1;
+    }
+    return false;
 }
 
 static int geom_build_pins(SpvModule *prog, SpvModule *mine,
@@ -5315,13 +5695,18 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             npins2 = 0;
             span = geom_build_pins(p_vs, c_vs, pins2, &npins2, 8,
                                    gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
-            if (span > MGL_GEOM_KERNEL_USER_SLOTS)
+            if (span > MGL_GEOM_KERNEL_USER_SLOTS ||
+                (span > MGL_GEOM_KERNEL_SIZE_BUFFER &&
+                 spv_uses_array_length(ir, words)))
             {
                 spv_free(c_vs);
                 spv_free(p_vs);
                 GEOM_FAIL("vertex stage resources span %d argument slots; the compute "
-                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS)",
-                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS);
+                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS%s)",
+                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS,
+                          spv_uses_array_length(ir, words) ?
+                          ", and MGL_GEOM_KERNEL_SIZE_BUFFER is reserved for SSBO "
+                          ".length() sizes" : "");
             }
             spv_free(c_vs);
         }
@@ -5380,10 +5765,15 @@ build:
             int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
                                        gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
 
-            if (span > MGL_GEOM_KERNEL_USER_SLOTS)
+            if (span > MGL_GEOM_KERNEL_USER_SLOTS ||
+                (span > MGL_GEOM_KERNEL_SIZE_BUFFER &&
+                 spv_uses_array_length(ir, words)))
                 GEOM_FAIL("geometry stage resources span %d argument slots; the compute "
-                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS)",
-                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS);
+                          "emulation supports %d (MGL_GEOM_KERNEL_USER_SLOTS%s)",
+                          span, (int)MGL_GEOM_KERNEL_USER_SLOTS,
+                          spv_uses_array_length(ir, words) ?
+                          ", and MGL_GEOM_KERNEL_SIZE_BUFFER is reserved for SSBO "
+                          ".length() sizes" : "");
         }
         spv_free(k_gs);
         spv_free(p_gs);

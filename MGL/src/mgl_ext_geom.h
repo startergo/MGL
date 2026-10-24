@@ -275,9 +275,23 @@ struct MGLExtState_geom {
     MGLGeomProgram  *progs;
     int              n_progs, progs_cap;
 
+    /* image-atomic emulation sidecar buffers (SPIRV-Cross's `<name>_atomic` device
+     * pointers): one zero-initialized MTLBuffer per image unit (void* are retained
+     * id<MTLBuffer> / id<MTLTexture>), reallocated whenever the unit's bound view or
+     * unit format changes.  Only atomic operations see this storage — an imageStore
+     * before an imageAtomic on the same texel is an emulation gap (the texture and the
+     * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer) */
+    struct { void *buf, *view; GLuint fmt; size_t bytes; } img_atom[TEXTURE_UNITS];
+
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
     MGLGeomProgram *vertex_override_gp;   /* its owner, for the rstate specialization */
+
+    /* shared 1x1 zero textures per image-unit format: an image unit bound to a texture
+     * with no image reads zeros and drops stores (GL 4.6 §8.26) — geomImageEmptyTexture
+     * hands these out instead of realizing the texture (void* are retained
+     * id<MTLTexture>) */
+    struct { void *tex; GLuint fmt; } img_empty[8];
 };
 
 struct MGLExtMetal_geom {
@@ -333,6 +347,15 @@ char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
  * access::read_write (GL image2D) texel inside one invocation — see
  * mgl_msl_insert_image_fences() in geometry.c */
 char *mgl_msl_insert_image_fences(const char *msl);
+/* SPIRV-Cross's image-atomic emulation (`device atomic_<T>* <name>_atomic` side
+ * buffers): linearize the coordinate of every non-2D image target (3D / 1DArray /
+ * 2DArray / Cube / CubeArray; SPIRV-Cross writes an int2/int3 array subscript there,
+ * which does not compile) and optionally re-base the argument slots.  The renderer
+ * binds one zero-initialized sidecar MTLBuffer per image unit at the recorded index
+ * (geomImageAtomicBuffer) — see geometry.c */
+char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
+                                MGLGeomTexSlot *slots_out, int *nslots_out, int max_slots,
+                                int *dub_out);
 /* SPIRV-Cross's array-copy helpers don't accept spvUnsafeArray<T,A> struct
  * members — see mgl_msl_add_unsafearray_copies() in geometry.c */
 char *mgl_msl_add_unsafearray_copies(const char *msl);

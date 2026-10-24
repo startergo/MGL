@@ -628,7 +628,13 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
         id<MTLBuffer> mb = (__bridge id<MTLBuffer>)buf->data.mtl_data;
         if (off < mb.length)
-            [enc setBuffer: mb offset: off atIndex: i];
+        {
+            /* geom: bind at the buffer's real Metal argument index — SPIRV-Cross
+             * numbers the image-atomic emulation buffers before the blocks, shifting
+             * the default-uniform block/UBO/SSBO indices off the map's ordinal */
+            GLuint mtl_idx = list->buffers[i].mtl_index;
+            [enc setBuffer: mb offset: off atIndex:(mtl_idx ? mtl_idx : i)];
+        }
     }
 
     /* geom: SSBO runtime-array .length() sizes (spvBufferSizeConstants, slot 25) */

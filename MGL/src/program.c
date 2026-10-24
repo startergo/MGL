@@ -1469,6 +1469,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
     ptr->spirv[stage].stage = stage;
     ptr->spirv[stage].size = nwords;
+    ptr->spirv[stage].dub_msl = 0xffffffffu;   /* geom: set by mgl_msl_fix_image_atomics */
     ptr->spirv[stage].ir = (unsigned int *)malloc(nwords * sizeof(uint32_t));
     if (!ptr->spirv[stage].ir)
     {
@@ -1709,9 +1710,36 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             r->msl_binding = r->binding; /* refined with the real Metal index after MSL emission */
             r->array_size = n;           /* sampler/image arrays: consecutive units + argument slots */
             r->location = spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationLocation);
+            r->msl_atomic = 0xffffffffu;  /* geom: filled for storage images after MSL emission */
             if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE || res_type == SPVC_RESOURCE_TYPE_SEPARATE_IMAGE ||
                 res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE)
+            {
                 r->target = sampler_gl_target(compiler, list[i].type_id);
+                /* the image's sampled type (float / int / uint) picks the Metal texture
+                 * type SPIRV-Cross declares; geomImageUnitView:elem_class: reinterprets
+                 * the bound texture when the image unit's format disagrees with it */
+                if (res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE && rtype)
+                {
+                    spvc_basetype bt = spvc_type_get_basetype(rtype);
+
+                    if (bt == SPVC_BASETYPE_IMAGE)
+                    {
+                        /* an image's type is OpTypeImage: the element kind is the SAMPLED
+                         * type's.  spvc_type_get_image_sampled_type returns the sampled
+                         * type's SPIR-V <id>, NOT a basetype — comparing it against
+                         * SPVC_BASETYPE_* misreads whatever type happens to carry that id
+                         * (KHR-GL46.shader_image_load_store multiple-uniforms: the float
+                         * type's id 8 == SPVC_BASETYPE_UINT32 turned every float image
+                         * into a uint one and the unit-format views off) */
+                        spvc_type_id stid = spvc_type_get_image_sampled_type(rtype);
+                        spvc_type stype = spvc_compiler_get_type_handle(compiler, stid);
+
+                        bt = stype ? spvc_type_get_basetype(stype) : SPVC_BASETYPE_UNKNOWN;
+                    }
+                    r->elem_class = (bt == SPVC_BASETYPE_INT32 || bt == SPVC_BASETYPE_INT64) ? 1u :
+                                    (bt == SPVC_BASETYPE_UINT32 || bt == SPVC_BASETYPE_UINT64) ? 2u : 0u;
+                }
+            }
 
             switch (res_type)
             {
@@ -1783,6 +1811,41 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
                 default:
                     break;
+            }
+        }
+    }
+
+    /* KHR-GL46.shader_image_load_store uniform-limits: glslang does not enforce
+     * max_*_image_uniforms for every stage (a 9th geometry image uniform links fine),
+     * so reject a stage that declares more image uniforms than the query it serves —
+     * GL 4.6 §11.1.3.11 "link will fail if ... the number of active image uniforms
+     * referenced by any shader stage exceeds the limit for that stage".  The combined
+     * limit is checked once all stages are linked (mgl_link_program). */
+    {
+        static const GLenum stage_img_limit[_MAX_SPIRV_RES] = {
+            [_VERTEX_SHADER]           = GL_MAX_VERTEX_IMAGE_UNIFORMS,
+            [_TESS_CONTROL_SHADER]     = GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS,
+            [_TESS_EVALUATION_SHADER]  = GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS,
+            [_GEOMETRY_SHADER]         = GL_MAX_GEOMETRY_IMAGE_UNIFORMS,
+            [_FRAGMENT_SHADER]         = GL_MAX_FRAGMENT_IMAGE_UNIFORMS,
+            [_COMPUTE_SHADER]          = GL_MAX_COMPUTE_IMAGE_UNIFORMS,
+        };
+        GLuint imgs = 0;
+        SpirvResourceList *il = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+
+        for (GLuint i = 0; i < il->count; i++)
+            imgs += il->list[i].array_size ? il->list[i].array_size : 1;
+        if (stage_img_limit[stage])
+        {
+            GLint lim = 0;
+
+            ctx->dispatch.get_integerv(ctx, stage_img_limit[stage], &lim);
+            if (lim > 0 && imgs > (GLuint)lim)
+            {
+                mgl_append_info_log(log,
+                    "ERROR: %s stage: %u image uniforms exceed the limit of %d\n",
+                    stage_label(stage), imgs, lim);
+                goto done;
             }
         }
     }
@@ -1948,6 +2011,49 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             tess_owned = fenced;
             result = fenced;
         }
+    }
+
+    /* image atomics: SPIRV-Cross emulates them with a side `device atomic_*` buffer
+     * argument per storage image, whose subscript only image2D linearizes correctly —
+     * mgl_msl_fix_image_atomics (geometry.c) fixes the other targets' coordinates and
+     * reports the argument slots, which become the resource list's msl_atomic (the
+     * renderer binds a zero-initialized sidecar MTLBuffer per image unit there).
+     * Render stages must keep the slot below the emulation pins (24), the compute
+     * stage below its buffer-size slot (30). */
+    {
+        MGLGeomTexSlot aslots[32];
+        int naslots = 0, dub_msl = -1;
+        char *fixed = mgl_msl_fix_image_atomics(result,
+                                                stage == _COMPUTE_SHADER ?
+                                                    MGL_CS_SSBO_SIZE_BUFFER_INDEX : 24,
+                                                -1, aslots, &naslots, 32, &dub_msl);
+        if (!fixed)
+        {
+            mgl_append_info_log(log, "ERROR: %s stage: image-atomic buffer argument slots exceed the "
+                                     "Metal buffer index budget\n", stage_label(stage));
+            goto done;
+        }
+        if (naslots > 0)
+        {
+            SpirvResourceList *srl = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+            for (GLuint i = 0; i < srl->count; i++)
+            {
+                srl->list[i].msl_atomic = 0xffffffffu;
+                for (int k = 0; k < naslots; k++)
+                    if (srl->list[i].name && !strcmp(srl->list[i].name, aslots[k].name))
+                    { srl->list[i].msl_atomic = (GLuint)aslots[k].msl; break; }
+                if (srl->list[i].msl_atomic == 0xffffffffu && getenv("MGL_GEOM_DEBUG") && srl->list[i].name)
+                    fprintf(stderr, "MGL geom: %s stage image %s: no _atomic argument matched\n",
+                            stage_label(stage), srl->list[i].name);
+            }
+        }
+        /* the packed default-uniform block's real argument index (also meaningful when
+         * the stage has no image atomics — 0xffffffff keeps the map's ordinal) */
+        if (dub_msl >= 0)
+            ptr->spirv[stage].dub_msl = (uint32_t)dub_msl;
+        if (tess_owned != result) free(tess_owned);
+        tess_owned = fixed;
+        result = fixed;
     }
 
     /* SPIRV-Cross's array-copy helpers cannot bind spvUnsafeArray struct members
@@ -2612,6 +2718,36 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
      * to (1,1,1), so the SPIR-V cannot tell "declared 1,1,1" from "not declared"
      * — check whether any attached compute shader's source declares a
      * local_size qualifier (also covers local_size_*_id) */
+
+    /* GL 4.6 §11.1.3.11: the program as a whole may not declare more image uniforms
+     * than GL_MAX_COMBINED_IMAGE_UNIFORMS; the per-stage limits are enforced in
+     * compile_stage (glslang does not check them for every stage) */
+    if (ok)
+    {
+        GLuint total = 0;
+
+        for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++)
+        {
+            SpirvResourceList *il = &scratch->base.spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+
+            for (GLuint i = 0; i < il->count; i++)
+                total += il->list[i].array_size ? il->list[i].array_size : 1;
+        }
+        if (total)
+        {
+            GLint lim = 0;
+
+            ctx->dispatch.get_integerv(ctx, GL_MAX_COMBINED_IMAGE_UNIFORMS, &lim);
+            if (lim > 0 && total > (GLuint)lim)
+            {
+                mgl_append_info_log(&log,
+                    "ERROR: %u image uniforms exceed GL_MAX_COMBINED_IMAGE_UNIFORMS (%d)\n",
+                    total, lim);
+                ok = false;
+            }
+        }
+    }
+
     if (ok && (mask & SHADER_MASK_BIT(_COMPUTE_SHADER) || scratch->base.shader_slots[_COMPUTE_SHADER]))
     {
         bool declared = false, any_spirv_cs = false;

@@ -383,6 +383,11 @@ typedef struct Spirv_t {
                              * shadow sampling (AGX returns raw values for sample_compare in
                              * vertex functions) — those slots bind a NON-compare sampler and
                              * take the unit's compare function as a function constant */
+    uint32_t dub_msl;      /* geom: Metal buffer index of the packed default-uniform block
+                             * argument (`mgl_DefaultUniforms`); SPIRV-Cross numbers it after
+                             * the image-atomic emulation buffers, which shifts it off the
+                             * renderer's buffer-map ordinal — mgl_msl_fix_image_atomics
+                             * records it and the map binds it here (0xffffffff = none) */
 } Spirv;
 
 typedef struct SpirvResource_t {
@@ -396,6 +401,11 @@ typedef struct SpirvResource_t {
     GLuint  msl_binding; /* Metal argument index SPIRV-Cross chose (differs from the GL unit for textures) */
     GLuint  array_size;  /* elements for arrayed resources (sampler/image arrays span that many argument slots and units) */
     GLuint  target;      /* GL texture target this sampler/image type reads (GL_TEXTURE_2D, ..._2D_MULTISAMPLE, ...); 0 = none */
+    GLuint  msl_atomic;  /* geom: storage images only — Metal buffer index of SPIRV-Cross's
+                          * `<name>_atomic` emulation argument (0xffffffff when the image has
+                          * no atomics / was stripped); the renderer binds a sidecar buffer */
+    GLuint  elem_class;  /* geom: storage images only — element kind of the SPIR-V image's
+                          * sampled type: 0 float, 1 int, 2 uint (the unit-format view) */
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {
@@ -412,6 +422,11 @@ typedef struct BufferMap_t {
      * size for glBindBufferRange): SPIRV-Cross's spvBufferSizeConstants — the
      * runtime-array .length() implementation — reads it per bound SSBO */
     GLsizeiptr  size;
+    GLuint      mtl_index;  /* geom: the Metal argument index the stage MSL gives this
+                             * buffer (SpirvResource.msl_binding + array element) — the
+                             * map's ordinal only coincides with it while no image-atomic
+                             * emulation buffer interleaves in the MSL signature; the
+                             * encoder binds here (falls back to the ordinal) */
 } BufferMap;
 
 typedef struct BufferMapList_t {

@@ -24,6 +24,8 @@
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_queries.h"   /* discard-skip: active pre-raster query counters */
+#include "mgl_ext_texdata.h"    /* mgl_texdata_level_geometry: image-unit level completeness */
+#include "texdata_formats.h"   /* tdFormatInfo: image-unit format reinterpretation */
 #include "MGLRenderer_Private.h"
 
 /* rstate's vertex/fragment function-constant specialization is declared privately inside
@@ -1983,6 +1985,30 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
     if (!base)
         return nil;
+
+    /* incomplete: the unit's bound level has no image.  Reads must be zero and stores
+     * must drop (GL 4.6 §8.26) — hand the shared 1x1 zero texture in the unit's format
+     * instead of the texture's (realized default) storage, whose contents the store
+     * would change (KHR-GL46.shader_image_load_store incomplete_textures: a 64x64
+     * texture bound at a level with no image).  Every image binding path funnels through
+     * here (render, tessellation kernels, geometry kernel, compute dispatch, the blit
+     * compute path). */
+    if (iu && iu->tex)
+    {
+        GLuint lw = 0, lh = 0, ld = 0;
+        bool no_image = !iu->tex->width;
+
+        if (!no_image)
+            mgl_texdata_level_geometry((Texture *)iu->tex, 0, iu->level, &lw, &lh, &ld);
+        if (no_image || !lw)
+        {
+            id<MTLTexture> empty = [self geomImageEmptyTexture: iu->internalformat];
+
+            if (empty)
+                return empty;
+        }
+    }
+
     type = base.textureType;
     if (type == MTLTextureTypeTextureBuffer)
         return base;                       /* buffer textures have no levels or layers */
@@ -2104,6 +2130,327 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     return view ? view : base;
 }
 
+/* An image unit's `format` argument (glBindImageTexture) is how the shader sees the
+ * texels — it does not have to be the texture's internal format, only to occupy the
+ * same number of bytes (GL 4.6 §8.26: "the data in the texture is interpreted as if it
+ * were the format named by <format>").  CTS multiple-uniforms binds ONE R32I texture to
+ * eight units with eight different formats, whose MSL declares texture2d<float>/int/…
+ * arguments — binding the R32Sint texture there is a Metal pixel-format mismatch.
+ * A newTextureViewWithPixelFormat: view performs the reinterpretation (allowed between
+ * formats of one texel size); elem_class is the SPIR-V image's sampled-type kind
+ * (0 float, 1 int, 2 uint — SpirvResource.elem_class) so a format whose kind disagrees
+ * with the shader keeps the plain view (GL would reject that draw anyway). */
+- (id<MTLTexture>) geomImageUnitViewRes: (const ImageUnit *) iu base: (id<MTLTexture>) base
+                              elemClass: (GLuint) elem_class
+{
+    id<MTLTexture> view = [self geomImageUnitView: iu base: base];
+    const TDFormat *fi;
+
+    geomEnvRead();                             /* MGL_GEOM_DEBUG gates the trace below */
+    if (!view || !iu || iu->internalformat == 0 || view.sampleCount > 1)
+        return view;
+    fi = tdFormatInfo(iu->internalformat);
+    if (!fi || fi->mtl == 0 || (MTLPixelFormat)fi->mtl == view.pixelFormat)
+        return view;
+    if (elem_class != 0xffffffffu)
+    {
+        GLuint kind = (fi->comp_type == GL_INT) ? 1u :
+                      (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u;
+        if (kind != elem_class)
+            return view;                     /* the shader's image type says otherwise */
+    }
+    @try {
+        id<MTLTexture> rv = [view newTextureViewWithPixelFormat: (MTLPixelFormat)fi->mtl];
+        if (gEnv.debug)
+            NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
+                  iu->unit, (int)view.pixelFormat, fi->mtl, elem_class,
+                  (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
+                  rv ? "" : " FAILED");
+        if (rv) return rv;
+    } @catch (NSException *e) {
+        NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
+              (int)view.pixelFormat, fi->mtl, e);
+    }
+    return view;
+}
+
+/* ------------------------------------------------------------------ void vertex stages
+ * A rasterizing vertex stage that writes NO outputs (GLSL whose main() only stores to
+ * images/buffers — KHR-GL46.shader_image_load_store multiple-uniforms' VS and TES
+ * variants never assign gl_Position) compiles to `vertex void ...`, and Apple GPUs
+ * reject the pipeline outright: "RasterizationEnabled is true but the vertex shader's
+ * return type is void".  GL leaves rasterizing such a program undefined, so the draw
+ * stays legal and the stage's side effects (the image writes the test measures) still
+ * run when rasterization is disabled for the pipeline — exactly what the vertex-only
+ * path already does (see generatePipelineDescriptor).  Call AFTER
+ * rstateConfigurePipelineDescriptor, which derives rasterizationEnabled from the
+ * fragment function.  The geometry pass-through override always returns a position
+ * struct, so it is never affected. */
+- (void) geomRasterizationForVertexStage: (MTLRenderPipelineDescriptor *) desc
+{
+    Program *program = ctx->state.program;
+    int vstage = [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+
+    if (!desc || !desc.rasterizationEnabled || !program)
+        return;
+    if (ctx->state.ext_geom &&
+        ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
+        return;                      /* the pass-through vertex function returns a struct */
+    if (mgl_msl_vertex_returns_void(program->spirv[vstage].msl_str,
+                                    program->spirv[vstage].entry_point))
+    {
+        if (gEnv.debug)
+            NSLog(@"MGL geom: stage %d has no rasterization outputs: disabling "
+                  @"rasterization (void vertex function)", vstage);
+        desc.rasterizationEnabled = NO;
+    }
+}
+
+/* ------------------------------------------------------------------ incomplete images
+ * GL 4.6 §8.26: an image unit bound to a texture with no image (a texture that never
+ * got a glTexImage / glTexStorage level — "incomplete") does not fail the draw:
+ * imageLoad reads zeros and imageStore is dropped.  Realizing the texture (its default
+ * storage) made the store land and the readback change —
+ * KHR-GL46.shader_image_load_store incomplete_textures.  geomImageEmptyTexture hands
+ * out a shared 1x1 zero texture in the unit's bound format, so both the load and the
+ * store behave and the texture's own contents stay untouched.  The 8-entry cache covers
+ * the formats a program actually reinterprets one texture as. */
+- (id<MTLTexture>) geomImageEmptyTexture: (GLenum) internalformat
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    const TDFormat *fi = tdFormatInfo(internalformat);
+
+    if (!g || !fi || !fi->mtl)
+        return nil;
+
+    for (int i = 0; i < 8; i++)
+        if (g->img_empty[i].fmt == (GLuint)internalformat && g->img_empty[i].tex)
+            return (__bridge id<MTLTexture>)g->img_empty[i].tex;
+
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                  (MTLPixelFormat)fi->mtl width:1 height:1 mipmapped:NO];
+    if (!d)
+        return nil;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    d.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> t = [_device newTextureWithDescriptor:d];
+    if (!t)
+        return nil;
+
+    int slot = -1;
+    for (int i = 0; i < 8; i++)
+        if (!g->img_empty[i].tex) { slot = i; break; }
+    if (slot < 0) slot = 0;                   /* overwrite: formats are few */
+    g->img_empty[slot].tex = (void *)CFBridgingRetain(t);
+    g->img_empty[slot].fmt = (GLuint)internalformat;
+    return t;
+}
+
+/* ------------------------------------------------------------------ deferred-texture realize
+ * bindMTLTexture may run a deferred CPU-side upload (texdataEncodeUpload), which opens a
+ * BLIT encoder — Metal forbids a second encoder on a command buffer while one is still
+ * encoding.  The plain render path binds its stage textures before the render encoder
+ * exists, but a tessellated draw opens the compute encoders of its kernels FIRST and
+ * binds stage textures inside (tessBindStageTextures), so the first deferred upload of
+ * the draw aborted with "A command encoder is already encoding to this command buffer"
+ * (KHR-GL46.shader_image_load_store multiple-uniforms: eight image units over one R32I
+ * texture, first bound for the tess VS kernel).
+ * geomRealizeStageTextures walks the same units tessBindStageTextures /
+ * bindTexturesToComputeEncoder bind and realizes them while no encoder is open — call it
+ * before the first encoder of the draw.  Mirrors the pre-passes in extBufEncodeDispatch
+ * (MGLRenderer+Draw.m) and the geometry-kernel section of this file. */
+- (void) geomRealizeStageTextures: (Program *) program stage: (int) stage
+{
+    struct { int spvc_type; int image; } types[] = {
+        { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, 0 },
+        { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, 1 },
+        { 0, 0 }
+    };
+
+    if (!program || !ctx) return;
+    for (int t = 0; types[t].spvc_type; t++)
+    {
+        SpirvResourceList *list = &program->spirv_resources_list[stage][types[t].spvc_type];
+
+        for (GLuint r = 0; r < list->count; r++)
+        {
+            SpirvResource *sres = &list->list[r];
+            GLuint elems = sres->array_size ? sres->array_size : 1;
+
+            for (GLuint e = 0; e < elems; e++)
+            {
+                GLuint unit = sres->binding + e;
+
+                if (unit >= TEXTURE_UNITS) continue;
+                Texture *tex = types[t].image ? STATE(image_units[unit].tex)
+                                              : mgl_texture_for_sampler(ctx, unit, sres->target);
+                if (!tex) continue;             /* unbound unit: legal GL, no realize */
+                (void)[self bindMTLTexture: tex];
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ image atomics
+ * SPIRV-Cross emulates GL image atomics with a side `device atomic_<T>* <name>_atomic
+ * [[buffer(N)]]` argument (mgl_msl_fix_image_atomics linearizes the non-2D targets'
+ * coordinates into the row-major layout computed here).  The buffer is a separate
+ * zero-initialized MTLBuffer per image unit — only atomic operations see it: the
+ * texture argument carries imageLoad/imageStore, so a mix of imageStore and an atomic
+ * on the same texel does not alias (an emulation gap; GL tests that only use
+ * imageAtomic* sequences — every CTS `*atomic*` case — read the old value back from
+ * the atomic itself and never touch the texture). */
+
+/* texel count of the sidecar of one bound image-unit view: the layout the MSL helpers
+ * (and SPIRV-Cross's spvImage2DAtomicCoord macro for plain image2D, whose row pitch is
+ * 16-texel aligned) index into */
+static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
+{
+    if (!view) return 0;
+    NSUInteger w = view.width, h = view.height;
+    switch (view.textureType)
+    {
+        case MTLTextureType2D:
+        case MTLTextureType2DMultisample:
+        {
+            /* image2D / image2DRect — and image1D, which the MSL realizes as a
+             * single-row 2D texture (spvImage2DAtomicCoord aligns the row to 16) */
+            NSUInteger pitch = (w + 15u) & ~15u;
+            return pitch * h;
+        }
+        case MTLTextureType3D:
+            return w * h * view.depth;
+        case MTLTextureType2DArray:
+            return w * h * view.arrayLength;      /* a 1D array is a 2D array of height 1 */
+        case MTLTextureTypeCube:
+            return 6u * w * w;                   /* faces are square */
+        case MTLTextureTypeCubeArray:
+            return 6u * view.arrayLength * w * w;
+        case MTLTextureTypeTextureBuffer:
+            return w;
+        default:
+            return w * h;
+    }
+}
+
+- (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    ImageUnit *iu;
+    id<MTLBuffer> buf;
+    NSUInteger texels;
+
+    if (!g || !view || unit >= TEXTURE_UNITS) return nil;
+    iu = &STATE(image_units[unit]);
+    texels = geomImageAtomicTexels(view);
+    if (!texels) return nil;
+
+    buf = (g->img_atom[unit].buf) ? (__bridge id<MTLBuffer>)(g->img_atom[unit].buf) : nil;
+    if (buf && g->img_atom[unit].view == (__bridge void *)view &&
+        g->img_atom[unit].fmt == iu->internalformat &&
+        g->img_atom[unit].bytes == (size_t)(texels * 4))
+        return buf;                             /* same binding: the contents persist */
+
+    if (buf) { buf = nil; }                     /* ARC release before overwriting */
+    buf = [_device newBufferWithLength:texels * 4 options:MTLResourceStorageModeShared];
+    if (!buf) return nil;
+    memset(buf.contents, 0, buf.length);        /* atomics start from a cleared image */
+
+    g->img_atom[unit].buf = (void *)CFBridgingRetain(buf);
+    g->img_atom[unit].view = (__bridge void *)view;
+    g->img_atom[unit].fmt = iu->internalformat;
+    g->img_atom[unit].bytes = (size_t)(texels * 4);
+    return buf;
+}
+
+/* context teardown: release every unit's sidecar */
+- (void) geomReleaseImageAtomics
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    if (!g) return;
+    for (int u = 0; u < TEXTURE_UNITS; u++)
+    {
+        if (g->img_atom[u].buf) { CFBridgingRelease(g->img_atom[u].buf); g->img_atom[u].buf = NULL; }
+        g->img_atom[u].view = NULL;
+        g->img_atom[u].bytes = 0;
+    }
+}
+
+/* bind the sidecars of a raster stage's storage images (vertex or fragment slots of
+ * the current render encoder); called from bindTextures (MGLRenderer.m) right after
+ * the image-unit textures are bound */
+- (bool) geomBindImageAtomicBuffersRender: (int) stage
+{
+    if (!_currentRenderEncoder) return false;
+    GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: img-atom bind render stage %d: %u storage images\n", stage, count);
+    for (GLuint i = 0; i < count; i++)
+    {
+        SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+        GLuint unit = sres->binding, mtl_index = sres->msl_atomic;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+
+        if (mtl_index == 0xffffffffu) continue;         /* no atomic argument in the MSL */
+        for (GLuint e = 0; e < elems; e++)
+        {
+            if (getenv("MGL_GEOM_DEBUG"))
+                fprintf(stderr, "MGL geom: img-atom bind stage %d unit %u slot %u (tex %s)\n",
+                        stage, unit + e, mtl_index + e, sres->name ? sres->name : "?");
+            ImageUnit *iu;
+            Texture *ptr;
+            id<MTLTexture> texture;
+            id<MTLBuffer> buf;
+
+            if (unit + e >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit + e]);
+            ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            texture = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) continue;
+            if (stage != _FRAGMENT_SHADER)
+                [_currentRenderEncoder setVertexBuffer: buf offset: 0 atIndex: mtl_index + e];
+            else
+                [_currentRenderEncoder setFragmentBuffer: buf offset: 0 atIndex: mtl_index + e];
+        }
+    }
+    return true;
+}
+
+/* the compute stage's version (bindTexturesToComputeEncoder, MGLRenderer.m) */
+- (bool) geomBindImageAtomicBuffersCompute: (id <MTLComputeCommandEncoder>) encoder
+{
+    if (!encoder) return false;
+    GLuint count = [self getProgramBindingCount: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+    for (GLuint i = 0; i < count; i++)
+    {
+        SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+        GLuint unit = sres->binding, mtl_index = sres->msl_atomic;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+
+        if (mtl_index == 0xffffffffu) continue;
+        for (GLuint e = 0; e < elems; e++)
+        {
+            ImageUnit *iu;
+            Texture *ptr;
+            id<MTLTexture> texture;
+            id<MTLBuffer> buf;
+
+            if (unit + e >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit + e]);
+            ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            texture = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) continue;
+            [encoder setBuffer: buf offset: 0 atIndex: mtl_index + e];
+        }
+    }
+    return true;
+}
+
 /* the generated variants number their texture arguments themselves (geom_build_pins):
  * the walks look up the Metal slot by resource name; msl_binding is only the fallback */
 static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
@@ -2194,8 +2541,10 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                 }
                 else
                 {
-                    /* an image unit binds one mip level / layer (glBindImageTexture) */
-                    texture = [self geomImageUnitView: &STATE(image_units[unit]) base: texture];
+                    /* an image unit binds one mip level / layer (glBindImageTexture),
+                     * reinterpreted as the unit's format (geomImageUnitViewRes) */
+                    texture = [self geomImageUnitViewRes: &STATE(image_units[unit]) base: texture
+                                                 elemClass: sres->elem_class];
                 }
                 [enc setVertexTexture: texture atIndex: mtl_index + e];
                 if (gEnv.debug)
@@ -2274,6 +2623,34 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         mgl_buffers_mark_gpu_use(ctx, b, true);
     }
 
+    /* the kernel variant's .length() sizes: geom_spirv_to_msl pins its
+     * spvBufferSizeConstants at MGL_GEOM_KERNEL_SIZE_BUFFER, the one user-range slot the
+     * pin span check keeps free when the variant reads .length() on an SSBO runtime
+     * array (OpArrayLength).  The kernel's SSBO arguments sit at their pin flats, which
+     * this walk itself binds at the map index — so the sizes array is indexed by the map
+     * index too (geomFillSSBOSizes indexes by the RASTER msl_binding, which the pins
+     * renumber) */
+    if (gp->kernel_msl && strstr(gp->kernel_msl, "spvBufferSizeConstants"))
+    {
+        uint32_t sizes[MAX_MAPPED_BUFFERS];
+        GLuint n = 0;
+
+        memset(sizes, 0, sizeof sizes);
+        for (GLuint i = 0; i < list.count && i < MAX_MAPPED_BUFFERS; i++)
+        {
+            BufferMap *m = &list.buffers[i];
+            GLsizeiptr sz;
+
+            if (!m->buf) continue;
+            sz = m->size > 0 ? m->size : (m->buf->size - (m->offset > 0 ? m->offset : 0));
+            sizes[i] = sz > 0 ? (uint32_t)sz : 0;
+            n = i + 1;
+        }
+        if (n)
+            [enc setBytes: sizes length: (NSUInteger)n * sizeof *sizes
+                 atIndex: MGL_GEOM_KERNEL_SIZE_BUFFER];
+    }
+
     /* textures and images of the geometry stage: the SPIR-V binding selects the GL texture
      * unit; the kernel's Metal argument index comes from its own SPIRV-Cross pinning
      * (gp->tex_slots_gs, recorded by geom_build_pins — the stage list's msl_binding is a
@@ -2325,8 +2702,10 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     }
                     else
                     {
-                        /* an image unit binds one mip level / layer (glBindImageTexture) */
-                        texture = [self geomImageUnitView: &STATE(image_units[unit]) base: texture];
+                        /* an image unit binds one mip level / layer (glBindImageTexture),
+                         * reinterpreted as the unit's format (geomImageUnitViewRes) */
+                        texture = [self geomImageUnitViewRes: &STATE(image_units[unit]) base: texture
+                                                     elemClass: sres->elem_class];
                     }
                     [enc setTexture: texture atIndex: mtl_index + e];
                     if (gEnv.debug && e == 0)
@@ -3215,6 +3594,22 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         ctx->state.program = saved_program;
         [enc setVertexBuffer: gVsout offset: gVsoutOff atIndex: MGL_GEOM_MSL_VSOUT];
 
+        /* the capture variant's own .length() sizes: its spvBufferSizeConstants is
+         * compiled at MGL_GEOM_KERNEL_SIZE_BUFFER (geom_spirv_to_msl moved it off the
+         * VSOUT slot), and geomBindSSBOSizes skips the vertex table for a geometry
+         * program (the RASTER pass's vertex function is the pass-through, which reads no
+         * SSBO) — bind them for the capture pass itself */
+        if (gp->capture_msl && strstr(gp->capture_msl, "spvBufferSizeConstants"))
+        {
+            uint32_t sizes[MAX_MAPPED_BUFFERS];
+            GLuint n = 0;
+
+            [self geomFillSSBOSizes: sizes list: &ctx->state.vertex_buffer_map_list count: &n];
+            if (n)
+                [enc setVertexBytes: sizes length: (NSUInteger)n * sizeof *sizes
+                            atIndex: MGL_GEOM_KERNEL_SIZE_BUFFER];
+        }
+
         if (gpu_assembly)
         {
             /* the prep kernel wrote the draw arguments (index count, instances, bases) */
@@ -3691,8 +4086,12 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         /* base binding records the whole buffer size, a range binding its size;
          * a zero (unset) record falls back to buffer end - offset */
         GLsizeiptr sz = m->size > 0 ? m->size : (m->buf->size - (m->offset > 0 ? m->offset : 0));
-        sizes[i] = sz > 0 ? (uint32_t)sz : 0;
-        n = i + 1;
+        /* spvBufferSizeConstants[] is indexed by the resource's Metal argument index
+         * (SpirvResource.msl_binding), which shifts off the map's ordinal as soon as
+         * an image-atomic emulation buffer interleaves in the MSL signature */
+        GLuint si = (m->mtl_index && m->mtl_index < MAX_MAPPED_BUFFERS) ? m->mtl_index : i;
+        sizes[si] = sz > 0 ? (uint32_t)sz : 0;
+        n = (si >= n) ? si + 1 : n;
     }
     *out_count = n;
 }
