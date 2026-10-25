@@ -2830,6 +2830,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         _currentRenderEncoder = nil;
     }
 
+    /* compat CS: the worker must be done with the previous encoder before a
+     * new one is created on this command buffer */
+    [self compatCSDrain];
+
     // Validate command buffer status - cannot create encoders on committed/buffer
     MTLCommandBufferStatus bufferStatus = _currentCommandBuffer.status;
     if (bufferStatus >= MTLCommandBufferStatusCommitted) {
@@ -2847,7 +2851,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         NSLog(@"MGL DEBUG: About to create render encoder with descriptor and command buffer");
     @try {
         mglCallExtHooks(self, "RenderPassDescriptor:", _renderPassDescriptor); // extHookRenderPassDescriptor
-        _currentRenderEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor: _renderPassDescriptor];
+        id<MTLRenderCommandEncoder> mtlEnc =
+            [_currentCommandBuffer renderCommandEncoderWithDescriptor: _renderPassDescriptor];
+        _currentRenderEncoder = mtlEnc;
         if (!_currentRenderEncoder) {
             NSLog(@"MGL ERROR: Failed to create render encoder - invalid render pass descriptor or command buffer");
             NSLog(@"MGL DEBUG: Command buffer: %@, Render pass descriptor: %@", _currentCommandBuffer, _renderPassDescriptor);
@@ -2864,6 +2870,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         _currentRenderEncoder = NULL;
         return false;
     }
+    /* compat CS: while the encoder thread runs, _currentRenderEncoder is a
+     * recording proxy — the worker replays the packets against the real encoder */
+    _currentRenderEncoder = [self compatCSEncoderProxyFor: _currentRenderEncoder];
     _currentRenderEncoder.label = @"GL Render Encoder";
     /* perf instrumentation: which framebuffer (and how many encoders this frame)
      * created the encoder — desktop:shadow creates 10/frame, all needed? */
@@ -2929,6 +2938,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             _currentRenderEncoder = nil; // Force clear even on exception
         }
     }
+
+    /* compat CS: the worker must be idle before the GL thread retires this
+     * command buffer (commits, encoder creation of other kinds below) */
+    [self compatCSDrain];
 
     // STEP 1: Clean up any existing sync events safely
     if (_currentCommandBufferSyncList)
@@ -6103,6 +6116,9 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
 
         // End any active rendering
         [self endRenderEncoding];
+
+        /* compat CS: stop the encoder worker before any Metal object goes away */
+        [self compatCSStop];
 
         // Cleanup
         [self geomReleaseImageAtomics];   /* geom: image-atomic sidecar buffers */

@@ -1,4 +1,15 @@
 # compat domain — progress log
+READY 4dfce4d (CS encoder-thread prototype, default OFF; gl46-port merged through 74185cd; suite 250/0, test_geom 603/0, both with and without MGL_ENCODER_THREAD=1)
+BENCH-REQUEST: two runs of the full default list (same mode as mglR12), one with
+MGL_ENCODER_THREAD=1 exported.  The flag adds one worker thread that replays recorded
+render-encoder packets; under load 6-8 it is score-neutral but cuts GL-thread user CPU
+~10% on ideas (9.5s vs 10.6s per run, 45us/frame).  At low load (3-4) that CPU saving
+should convert to +8-12% on draw-heavy scenes (ideas, shadow, gl41-mrt, conditionals).
+Also worth reading: MGL_PROFILE=1 with the flag prints "MGL CS: packets=… drains=… sleeps=…".
+Recheck note (done this session): shadow 13029->11018 and terrain 2220->2045 in mglR12 are
+LOAD, not code — simultaneous A/B vs bf0074e: shadow 0.966/1.005/0.977, terrain
+0.997/1.023/0.997 (alternating launch order).
+BENCH-RESULT beb4a3a (built at HEAD 25dcabe) score=14249 native=6575 ratio=2.17 load=6-7 (user Docker) — NOT pinned; mglR12 vs native9 21:34 EDT. Flat vs mglR11 14255 (noise). ideas 2371->2900 (native 3640), gl41-mrt 7754, gl41-texarray 10435; down vs mglR11: shadow 13029->11018, terrain 2220->2045 (load 6-7 vs 3.5 — recheck).
 READY beb4a3a (all code + study; this report line is the only later commit — bench the branch tip of gl46/compat; gl46-port 1335928 + 2657647 merged; session-9 per-draw CPU work)
 BENCH-REQUEST: glmark2-macos full default list, background launch, window visible, same mode
 as mglR11.  Changes since 09e272a are CPU-side per-draw savings (DIRTY_PROGRAM consumption on
@@ -7,7 +18,68 @@ shadow, gl41-mrt), noise-level elsewhere.  Matched-phase interleaved native-vs-M
 0.91-1.04x (was 0.91-0.94x); the bench-table ideas 2371/3623 was machine-phase skew.
 BENCH-RESULT 09e272a (built at HEAD 4106e66) score=14255 native=6550 ratio=2.18 load=3.5-9 — NOT pinned; mglR11 vs native8 19:14 EDT. desktop-shadow 4804 > native 4642 (was 4345); gl41-mrt 7337; terrain 2220 ~ native 2274; still below native: ideas 2371/3623, refract 3599/3660 (~equal).
 
+## session 10 (Oct 24, 22:00-01:00 EDT) — shadow/terrain recheck (load, not code) + CS encoder-thread prototype
+
+Branch: 8e86b40 (gl46-port merged) -> 5d3ad2b; gl46-port 74185cd (geom r48-49) merged after.
+
+### 1. shadow/terrain regression recheck (mglR12 table)
+Simultaneous A/B current-vs-ab/bf0074e, alternating launch order (ab/run_ab_s10.sh):
+shadow 0.966 / 1.005 / 0.977; terrain 0.997 / 1.023 / 0.997.  The 13029->11018 and
+2220->2045 deltas were machine load (6-8 vs 3.5), not code.  Closed.
+
+### 2. MGL_ENCODER_THREAD=1: one encoder worker thread (DXVK CS-thread, Apple ACC)
+New file MGL/src/MGLRenderer+CompatCS.m (+~700 lines), category MGLRenderer (CompatCS),
+declaration in MGLRenderer+Compat.h.  Default OFF (env MGL_ENCODER_THREAD or MGL_CS_THREAD).
+
+Design:
+* newRenderEncoder() wraps the real encoder in MGLCSEncoderProxy and stores it in
+  _currentRenderEncoder.  All shared code keeps calling encoder methods unchanged; the
+  proxy records: PSO, vertex/fragment buffer(+offset/bytes), textures, samplers,
+  viewport(s)/scissor(s) (arrays snapshotted into the arena), cull/winding/fill/clip,
+  depth bias, depth-stencil + stencil refs, blend color, visibility result, all 6
+  drawPrimitives/drawIndexedPrimitives variants incl. baseVertex/baseInstance and both
+  indirect variants, memoryBarrier, useResource, tess factor buffer/scale.  Rare
+  protocol methods (debug groups etc.) drain + call through (NSObject forwarding).
+* One worker (pthread, per renderer via associated object) replays packets against the
+  real encoder in order => Metal stream == GL stream.  Objects are CFRetained into
+  packets; worker consumes with __bridge_transfer.  Ring: 16k packets, 512KB byte arena.
+* Drains (GL thread must see all encoding done): proxy endEncoding (pass boundary —
+  every compute/blit/encoder-creation path goes through it), newRenderEncoder,
+  newCommandBuffer, extBuffersWillCommit (every commit), geomDraw:, extTessDrawPatches:,
+  compatSurfacePresent blit, renderer dealloc, mgl_buffers_prepare_cpu_write (buffer
+  write-after-draw ordering; the GPU serial stamps are taken at record time so the
+  existing rename/wait tracking then handles the rest).  No buffers.c edits needed.
+* Shared-file edits (all small): MGLRenderer.m (newRenderEncoder drain+proxy,
+  newCommandBuffer drain, dealloc stop), MGLRenderer+Draw.m (extBuffersWillCommit drain),
+  MGLRenderer+Geometry.m (geomDraw: drain), MGLRenderer+Tessellation.m (extTessDrawPatches
+  drain), MGL/src/draw_ext.c (mgl_buffers_prepare_cpu_write drain), MGLRenderer+Compat.m
+  (surface-present blit drain), MGLRenderer+Compat.h (declarations).
+
+Bugs found and fixed during bring-up (worth remembering):
+* drawIndexedPrimitives …baseVertex:baseInstance: is THE hot indexed path; leaving it on
+  the forwarding fallback made every draw a condvar handshake (5x crawl, looked like a hang).
+* Two deadlock holes in the handshake: (a) the drain must signal cv_work under the same
+  mutex the worker parks on (a kick before the park is lost); (b) the worker must
+  broadcast cv_done under its mutex after EVERY batch — a lock-free waiters check reads a
+  stale 0 and parks the producer forever (lldb: written==executed==head with both parked).
+* Ring-full / arena-full / any worker exception => recorder faults permanently; the proxy
+  then drains + calls through = previous synchronous behaviour.
+
+Results (load 6-8, user Docker):
+* Correctness: suite 250/0 and test_geom 603/0 with the flag ON and OFF; ideas stress x5,
+  jellyfish/terrain/desktop single runs: no hangs, no Metal exceptions.
+* ideas user CPU: 9.5s (on) vs 10.6s (off) per fixed run = ~45us/frame off the GL thread.
+* ideas score at load 8: neutral to -4% (the ~0.5 frame-end sleeps/frame + worker
+  scheduling under load eat the saving; frame rate not GL-CPU-bound there).
+* Profile counters (MGL_PROFILE=1): ~482 packets/frame, ~2.2 drains/frame, 21% of drains
+  need a cv handshake — the hot path records without syncing, as designed.
+* Next lever if we want more: also defer processGLState decisions (needs GL state
+  snapshots per draw, Apple-ACC style), or drain less at frame end (encode the present
+  path as packets too).
+
 ## session 9 (Oct 24, 19:34-21:00 EDT) — Apple-driver study (mtlcount), DXVK study, DIRTY_PROGRAM + encoder-state wins
+
+
 
 Merged gl46-port 1335928 (start) and 2657647 (tess r19) before READY. Suite 250/0, test_geom 603/0.
 

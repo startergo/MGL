@@ -1123,6 +1123,9 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
     if (color.width == dst.width && color.height == dst.height &&
         color.pixelFormat == dst.pixelFormat)
     {
+        /* compat CS: this blit runs on the GL thread — the encoder worker
+         * must be done before a second encoder opens on this command buffer */
+        [self compatCSDrain];
         id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
         [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                   sourceSize:MTLSizeMake(color.width, color.height, 1)

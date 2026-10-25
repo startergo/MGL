@@ -17,6 +17,11 @@
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
 #include "mgl_buffers_err.h"
 
+/* compat CS (MGLRenderer+CompatCS.m): drains the encoder worker before a CPU
+ * write touches buffer storage.  Declared here in plain C; a no-op unless
+ * MGL_ENCODER_THREAD=1 is set for the renderer. */
+void mgl_compat_cs_drain(GLMContext glm_ctx);
+
 #define EXT() (ctx->state.ext_buffers)
 #define MTLX() (ctx->mtl_funcs.ext_buffers)
 
@@ -205,6 +210,12 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 {
     if (!buf || !MTLX() || !MTLX()->completed_serial)
         return;
+
+    /* compat CS: a draw recorded before this write must read the old contents,
+     * so every deferred encode has to be on its way first (the GPU serial
+     * stamps below were taken at record time on the GL thread, but the worker
+     * may still hold the draw itself).  No-op unless MGL_ENCODER_THREAD=1. */
+    mgl_compat_cs_drain(ctx);
 
     MGLBufferTrack *t = mgl_buffers_track(ctx, buf, false);
     if (!t)

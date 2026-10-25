@@ -4,6 +4,25 @@
 
 #import "MGLRenderer_Private.h"
 
+/* compat perf session 10: single encoder (CS) worker thread
+ * (MGLRenderer+CompatCS.m).  MGL_ENCODER_THREAD=1 makes newRenderEncoder()
+ * install a recording proxy as _currentRenderEncoder: every encoder method the
+ * shared code calls becomes a compact packet replayed in order by one worker
+ * thread, so GL-thread time is not spent inside Metal encoding.  Points that
+ * must touch Metal directly (encoder/encoder teardown, new command buffer,
+ * commit, compute/blit encoders, geometry/tess passes, renderer teardown) call
+ * compatCSDrain first; buffer writes keep their record-time serial stamping, so
+ * the existing wait/rename tracking orders them against deferred draws. */
+@interface MGLRenderer (CompatCS)
+- (bool) compatCSOn;
+- (id<MTLRenderCommandEncoder>) compatCSEncoderProxyFor: (id<MTLRenderCommandEncoder>) real;
+- (void) compatCSDrain;
+- (void) compatCSStop;
+@end
+
+/* C bridge (GL-side buffer write paths etc.) — no-op unless the env flag is on */
+void mgl_compat_cs_drain(GLMContext glm_ctx);
+
 @interface MGLRenderer (Compat)
 /* IOSurface present path (CGL-like async swap): enabled per renderer with
  * MGL_SURFACE_PRESENT=1 and only while a windowed Metal layer exists; see

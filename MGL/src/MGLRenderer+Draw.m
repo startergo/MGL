@@ -106,6 +106,9 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!p)
         return;
 
+    /* compat CS: every recorded packet must be encoded before this commit */
+    [self compatCSDrain];
+
     if ((__bridge void *)cmdbuf == (__bridge void *)_currentCommandBuffer)
         [self extBufSerial];
 

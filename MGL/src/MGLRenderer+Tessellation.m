@@ -1643,6 +1643,11 @@ static void tessRetireCapture(GLMContext ctx)
                 basevertex: (GLint) basevertex baseinstance: (GLint) baseinstance
 {
     MGLTessProgram *tp = mgl_tess_active_program(ctx);
+
+    /* compat CS: the tess pass drives the command buffer directly (its own
+     * render/compute encoders, occasional commits); the worker must be idle */
+    [self compatCSDrain];
+
     Program *prog_vs = ctx->state.program, *prog_tcs = NULL, *prog_tes = NULL;
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);

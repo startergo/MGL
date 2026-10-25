@@ -3711,6 +3711,11 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
 {
     if ((geomEnvRead(), gEnv.draw))
         fprintf(stderr, "geom: trace geomDraw enter tess=%d gp=%p\n", d->tess_ring != NULL, (void *)d->gp);
+
+    /* compat CS: this pass drives the command buffer directly (prep/capture/
+     * raster encoders of its own); the encoder worker must be idle for it */
+    [self compatCSDrain];
+
     MGLGeomProgram *gp = d->gp;    Program *program = d->program;
     const bool gpu_assembly = (d->prims == NULL);   /* the CPU path supplies the lists */
     /* affine direct draw: the geometry kernel derives the primitive windows arithmetically;
