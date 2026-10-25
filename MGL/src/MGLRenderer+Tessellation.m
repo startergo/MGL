@@ -64,6 +64,14 @@ static bool tCpuReference(void)
         tCpuFlag = (getenv("MGL_TESS_CPU") != NULL) ? 1 : 0;
     return tCpuFlag != 0;
 }
+
+/* MGLRenderer implements these in its class extension (MGLRenderer.m); declared here so
+ * the tessellation compute-kernel path can feed the shared 1x1 fallbacks. */
+@interface MGLRenderer (TessFallbacks)
+- (id<MTLTexture>) computeFallbackTexture;
+- (id<MTLSamplerState>) computeFallbackSampler;
+@end
+
 static bool tNoFixup(void)
 {
     if (tNoFixupFlag < 0)
@@ -1309,10 +1317,40 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
     for (int r = 0; r < list->count && r < 16; r++)
     {
-        Texture *tex = STATE(active_textures[list->list[r].binding]);
-        id<MTLTexture> mtl = [self2 texparamTextureForTex: tex base: nil];
+        SpirvResource *sres = &list->list[r];
+        GLuint unit = sres->binding;
+        if (sres->msl_binding == 0xffffffffu)
+            continue;   /* SPIRV-Cross stripped the resource: no MSL argument to feed */
+        NSUInteger msl = (NSUInteger)sres->msl_binding;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
 
-        [enc setTexture: mtl atIndex: (NSUInteger)r];
+        for (GLuint e = 0; e < elems; e++)
+        {
+            /* GL sampler semantics: the dimension picks which binding of the unit
+             * feeds the resource (mgl_texture_for_sampler, like the render path) */
+            Texture *tex = mgl_texture_for_sampler(ctx, unit + e, sres->target);
+            if (!tex || !tex->mtl_data)
+            {
+                /* unbound unit: legal GL (fetches undefined) — feed the shared 1x1
+                 * fallback so the dispatch still runs */
+                id<MTLTexture> fb = [self2 computeFallbackTexture];
+                id<MTLSamplerState> fs = [self2 computeFallbackSampler];
+                if (fb) [enc setTexture: fb atIndex: msl + e];
+                if (fs) [enc setSamplerState: fs atIndex: msl + e];
+                continue;
+            }
+            [self2 bindMTLTexture: tex];
+            id<MTLTexture> texture = [self2 texparamTextureForTex: tex base: (__bridge id<MTLTexture>)tex->mtl_data];
+            id<MTLSamplerState> sampler = [self2 texparamSamplerForUnit: unit + e texture: tex];
+            if (texture) [enc setTexture: texture atIndex: msl + e];
+            /* the MSL sampled-image arguments pair texture(N) with sampler(N) */
+            if (sampler) [enc setSamplerState: sampler atIndex: msl + e];
+            if (tTrace())
+                NSLog(@"MGL tess: bindtex stage %d '%s' unit %u tex %p(name %u)->%p samp %p at %lu dirty=%llx", stage,
+                      sres->name ? sres->name : "?", unit + e, (void *)tex, tex->name,
+                      (void *)(__bridge void *)texture, (void *)(__bridge void *)sampler,
+                      (unsigned long)(msl + e), (unsigned long long)tex->dirty_bits);
+        }
     }
 
     /* storage images (glBindImageTexture): the image unit's level/layer view bound at the

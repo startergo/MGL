@@ -777,7 +777,8 @@ TEST(subroutines)
     GLuint got = 0; glGetUniformSubroutineuiv(GL_FRAGMENT_SHADER, lp, &got); EXPECT_EQ_INT(got, iblue);
     /* errors */
     glUniformSubroutinesuiv(GL_FRAGMENT_SHADER, 1, sel); EXPECT_GL_ERROR(GL_INVALID_VALUE);
-    sel[lp] = ione; glUniformSubroutinesuiv(GL_FRAGMENT_SHADER, 2, sel); EXPECT_GL_ERROR(GL_INVALID_VALUE); /* incompatible */
+    /* incompatible subroutine for the uniform's type: GL 4.6 7.12.1 / KHR-GL46.shader_subroutine.subroutine_errors */
+    sel[lp] = ione; glUniformSubroutinesuiv(GL_FRAGMENT_SHADER, 2, sel); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glGetUniformSubroutineuiv(GL_FRAGMENT_SHADER, 7, &got); EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glGetProgramStageiv(p, GL_TEXTURE_2D, GL_ACTIVE_SUBROUTINES, &v); EXPECT_GL_ERROR(GL_INVALID_ENUM);
     glGetActiveSubroutineName(p, GL_FRAGMENT_SHADER, 77, sizeof nm, &len, nm); EXPECT_GL_ERROR(GL_INVALID_VALUE);

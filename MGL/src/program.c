@@ -2958,6 +2958,9 @@ void mglUseProgram(GLMContext ctx, GLuint program)
     mgl_program_ref(pptr);
     STATE_VAR(current_program) = program;
 
+    /* GL 4.6 §7.4.2: making a program active resets its subroutine uniform selection */
+    if (pptr) mgl_introspect_reset_subroutines(ctx, pptr);
+
     if (pptr || STATE(program_pipeline))
     {
         /* binding a program, or falling back to the bound program pipeline */

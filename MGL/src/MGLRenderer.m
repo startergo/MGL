@@ -2157,6 +2157,8 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
          * transform-feedback capture) — keep that guard or this deref SIGSEGVs. */
         Program *prog = STATE(program);
         GLuint count = prog ? prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].count : 0;
+        if (getenv("MGL_BINDTRACE"))
+            fprintf(stderr, "[bindtrace] stage=%d count=%u\n", stage, count);
 
         for (GLuint i = 0; i < count; i++)
         {
@@ -2186,6 +2188,9 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             /* GL sampler semantics: the sampler's dimension selects the unit's
              * binding for that target (mgl_texture_for_sampler) */
             Texture *ptr = mgl_texture_for_sampler(ctx, spirv_binding + e, sres->target);
+            if (getenv("MGL_BINDTRACE"))
+                fprintf(stderr, "[bindtrace]   i=%u binding=%u mtl=%u target=%x tex=%p\n",
+                        i, spirv_binding, mtl_index, sres->target, (void *)ptr);
             if (!ptr)
                 continue;
 
@@ -3934,6 +3939,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             //  from Xcode.)
             if (!_pipelineState) {
                 NSLog(@"MGL ERROR: Failed to create pipeline state: %@", error);
+                if (getenv("MGL_PSODEBUG") && pipelineStateDescriptor)
+                    NSLog(@"MGL PSODEBUG: vertex=%@ fragment=%@", pipelineStateDescriptor.vertexFunction.name,
+                          pipelineStateDescriptor.fragmentFunction.name);
                 NSLog(@"MGL ERROR: This is usually caused by shader compilation failures or invalid texture formats");
                 NSLog(@"MGL ERROR: Skipping pipeline creation to prevent crashes");
                 return false;

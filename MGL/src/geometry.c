@@ -50,6 +50,7 @@
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_tess.h"     /* the TES-output capture producer (geometry behind tessellation) */
 #include "mgl_ext_program.h"
+#include "mgl_ext_introspect.h"   /* subroutine source rewrite for the capture variant */
 #include "fp64.h"             /* software doubles: lower the generated variants like program.c does */
 #include "cts_glsl_compat.h"  /* layout(packed)/layout(shared) block rewrites (as shaders.c does) */
 #include "shaders.h"
@@ -1678,7 +1679,8 @@ static bool is_interface_qualifier(const char *w)
 {
     return !strcmp(w, "layout") || !strcmp(w, "flat") || !strcmp(w, "smooth") ||
            !strcmp(w, "noperspective") || !strcmp(w, "centroid") || !strcmp(w, "sample") ||
-           !strcmp(w, "precise") || !strcmp(w, "invariant") || !strcmp(w, "in") || !strcmp(w, "out");
+           !strcmp(w, "precise") || !strcmp(w, "invariant") || !strcmp(w, "in") || !strcmp(w, "out") ||
+           !strcmp(w, "highp") || !strcmp(w, "mediump") || !strcmp(w, "lowp");
 }
 
 /* skip whitespace and comments, return the new position */
@@ -1933,6 +1935,36 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
 
     /* everything up to and including in/out (plus its qualifiers) is dropped */
     const char *body = raw + info->qual_end;
+
+    /* 420pack allows any qualifier order, so interface qualifiers may also trail the
+     * in/out token ("highp in layout(location=0) smooth invariant vec4 v;"): drop those
+     * too — the kernel declares plain variables */
+    for (;;)
+    {
+        while (*body && isspace((unsigned char)*body)) body++;
+        char qid[24];
+        size_t qn = read_ident(body, qid, sizeof qid);
+        if (qn && is_interface_qualifier(qid))
+        {
+            body += qn;
+            if (!strcmp(qid, "layout"))
+            {
+                while (*body && isspace((unsigned char)*body)) body++;
+                if (*body == '(')
+                {
+                    int qd = 0;
+                    while (*body)
+                    {
+                        if (*body == '(') qd++;
+                        else if (*body == ')') { qd--; if (!qd) { body++; break; } }
+                        body++;
+                    }
+                }
+            }
+            continue;
+        }
+        break;
+    }
 
     /* bare `layout(...) in;` — nothing to declare */
     {
@@ -5267,7 +5299,9 @@ static const char *geom_gs_source(GLMContext ctx, MGLProgramObj *obj)
     {
         Shader *s = obj->attached[i];
         if (s && s->glm_type == _GEOMETRY_SHADER && s->src && s->src[0])
-            return s->src;
+            /* introspect: feed the kernel the subroutine-rewritten source (glslang
+             * cannot compile GLSL subroutines), as the program's own compile does */
+            return mgl_introspect_shader_source(ctx, s);
     }
     return NULL;
 }
@@ -5278,7 +5312,10 @@ static const char *geom_vs_source(GLMContext ctx, MGLProgramObj *obj)
     {
         Shader *s = obj->attached[i];
         if (s && s->glm_type == _VERTEX_SHADER && s->src && s->src[0])
-            return s->src;
+            /* introspect: glslang cannot compile GLSL subroutines / the
+             * #extension GL_ARB_shader_subroutine directive — feed the capture
+             * variant the rewritten source, like the program's own compile */
+            return mgl_introspect_shader_source(ctx, s);
     }
     return NULL;
 }

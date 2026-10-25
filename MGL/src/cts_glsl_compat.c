@@ -576,6 +576,106 @@ static char *reject_std430_uniform_block(const char *src)
     return out.buf;
 }
 
+/* GLSL 4.20 (ARB_shading_language_420pack) allows 'invariant' on *input* declarations
+ * and in any qualifier order; glslang rejects "'invariant': can only apply to an output".
+ * Drop it from input declarations — for SPIR-V it is a no-op there anyway.  Handles both
+ * inline qualifiers ("highp in layout(...) smooth invariant vec4 v;") and the standalone
+ * form ("invariant v;"). */
+static char *strip_invariant_on_input(const char *src)
+{
+    if (!src) return NULL;
+    size_t len = strlen(src);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, src, len + 1);
+    bool changed = false;
+    int depth = 0;
+    for (size_t i = 0; i < len; )
+    {
+        char c = out[i];
+        if (c == '/' && i + 1 < len && out[i + 1] == '/')
+        {
+            while (i < len && out[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < len && out[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < len && !(out[i] == '*' && out[i + 1] == '/')) i++;
+            i = (i + 2 > len) ? len : i + 2;
+            continue;
+        }
+        if (c == '"')
+        {
+            i++;
+            while (i < len && out[i] != '"') i++;
+            i++;
+            continue;
+        }
+        if (c == '{') { depth++; i++; continue; }
+        if (c == '}') { depth--; i++; continue; }
+        if (depth == 0 && at_word(out, len, i, "invariant"))
+        {
+            /* declaration span: from the previous ; { } to the next ; */
+            size_t ds = i;
+            while (ds > 0 && out[ds - 1] != ';' && out[ds - 1] != '{' && out[ds - 1] != '}') ds--;
+            size_t de = i;
+            while (de < len && out[de] != ';') de++;
+            bool has_in = false, has_out = false, has_type = false;
+            for (size_t k = ds; k < de; k++)
+            {
+                if (at_word(out, len, k, "in")) has_in = true;
+                else if (at_word(out, len, k, "out")) has_out = true;
+                else if (at_word(out, len, k, "vec4") || at_word(out, len, k, "vec3") ||
+                         at_word(out, len, k, "vec2") || at_word(out, len, k, "float") ||
+                         at_word(out, len, k, "int") || at_word(out, len, k, "uint") ||
+                         at_word(out, len, k, "mat4") || at_word(out, len, k, "mat3") ||
+                         at_word(out, len, k, "mat2")) has_type = true;
+            }
+            bool strip = false;
+            if (has_type)
+                strip = !has_out;   /* inputs, and direction-less leftovers (kernel-wrapped sources) */
+            else
+            {
+                /* standalone "invariant NAME;": NAME's declaration direction decides */
+                char name[128] = "";
+                if (sscanf(out + i + 9, " %127[a-zA-Z0-9_]", name) == 1)
+                {
+                    size_t nl = strlen(name);
+                    for (size_t k = 0; k + nl + 1 < len; k++)
+                    {
+                        if (at_word(src, len, k, name))
+                        {
+                            size_t ns = k;
+                            while (ns > 0 && src[ns - 1] != ';' && src[ns - 1] != '{' && src[ns - 1] != '}') ns--;
+                            size_t ne = k;
+                            while (ne < len && src[ne] != ';') ne++;
+                            bool pin = false, pout = false;
+                            for (size_t q = ns; q < ne; q++)
+                            {
+                                if (at_word(src, len, q, "in")) pin = true;
+                                else if (at_word(src, len, q, "out")) pout = true;
+                            }
+                            if (pin && !pout) { strip = true; break; }
+                            if (pout) break;
+                        }
+                    }
+                }
+            }
+            if (strip)
+            {
+                memset(out + i, ' ', 9);
+                changed = true;
+            }
+            i += 9;
+            continue;
+        }
+        i++;
+    }
+    if (!changed) { free(out); return NULL; }
+    return out;
+}
+
 char *mgl_cts_glsl_compat_generated(const char *src)
 {
     /* the geometry / tess / xfb capture variants are MGL-authored GLSL: their
@@ -584,8 +684,11 @@ char *mgl_cts_glsl_compat_generated(const char *src)
      * are never handed to the app — the compile-time binding-range and std430
      * checks do not apply to them. */
     if (!src) return NULL;
-    char *cur = strip_gl_block_packings(src);
-    char *next = reject_buffer_layout_decl(cur ? cur : src);
+    char *cur = strip_invariant_on_input(src);
+    char *next = strip_gl_block_packings(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    next = reject_buffer_layout_decl(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;
     char *g = rewrite_gather_offsets(cur ? cur : src);
@@ -603,8 +706,11 @@ char *mgl_cts_glsl_compat(const char *src)
     /* every step returns a malloc'd copy or NULL when it changed nothing, so the
      * chain keeps the latest non-NULL text and falls back to the original when
      * no rewrite fired at all */
-    char *cur = strip_gl_block_packings(src);
-    char *next = reject_buffer_layout_decl(cur ? cur : src);
+    char *cur = strip_invariant_on_input(src);
+    char *next = strip_gl_block_packings(cur ? cur : src);
+    if (next && cur) free(cur);
+    if (next) cur = next;
+    next = reject_buffer_layout_decl(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;
     next = reject_ssbo_binding_range(cur ? cur : src);

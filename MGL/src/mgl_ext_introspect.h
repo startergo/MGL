@@ -102,7 +102,9 @@ typedef struct MGLISubUniform {
     char   *name;
     char   *type_name;
     GLint   location;             /* subroutine uniform location */
-    GLint   size;                 /* array size */
+    GLint   size;                 /* array size (flattened) */
+    int     ndims;                /* arrays of arrays: number of dimensions */
+    int     dims[8];              /* per-dimension size */
     int    *compat; int ncompat;  /* compatible subroutine indices */
     char   *selector;             /* name of the hidden int uniform holding the selection */
 } MGLISubUniform;
@@ -205,6 +207,7 @@ uint32_t *mgl_introspect_patch_stage(GLMContext ctx, Program *program, int stage
 
 /* Shader source to hand to glslang (subroutine-rewritten copy or shader->src).  Called by
  * mglCompileShader (shaders.c). */
+void mgl_introspect_reset_subroutines(GLMContext ctx, Program *p);
 const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader);
 
 /* Attribute location lookup (mglGetAttribLocation in program.c forwards here). */
@@ -241,6 +244,8 @@ void mgli_free_inits(MGLIProgram *ip);
 
 /* subroutine source rewrite (introspect_subroutine.c) */
 char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out);
+/* strip "#extension GL_ARB_shader_subroutine" directives (glslang does not know it) */
+char *mgli_strip_subroutine_extension(const char *src);
 void  mgli_free_stage_sub(MGLIStageSub *s);
 
 #ifdef __cplusplus

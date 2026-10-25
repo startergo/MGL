@@ -1508,7 +1508,10 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
         if (getenv("MGL_XFB_DEBUG"))
             fprintf(stderr, "[xfb] splice: vlen=%zu bodylen=%zu closeoff=%ld stmts=%zu\n",
                     vlen, strlen(body_base), (long)(close - body_base), s.len);
-        xfb_cat(&b, "%.*s\n%s}\n", (int)(close - body), body, s.s ? s.s : "");
+        /* keep everything AFTER main's closing brace too: GLSL allows function
+         * definitions after main (the introspect subroutine rewrite appends its
+         * dispatchers there) */
+        xfb_cat(&b, "%.*s\n%s}\n%s", (int)(close - body), body, s.s ? s.s : "", close + 1);
         out = b.s;
     } else {
         /* no main found: fall back to the legacy wrapper shape */
@@ -1914,7 +1917,7 @@ static void xfb_post_link(GLMContext ctx, Program *p)
             mgl_geom_tess_xfb_link(ctx, p);
             return;
         }
-        xfb_link(ctx, xp, vs->src, false);
+        xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false);
         if (xp->from_shader || xp->link_failed) return;
         xfb_clear_linked(ctx, xp);
         xp->linked = true;
@@ -1952,7 +1955,10 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);
         return;
     }
-    xfb_link(ctx, xp, vs->src, true);
+    /* introspect: the source must run through the subroutine rewrite (glslang cannot
+     * compile GLSL subroutines; mgl_introspect_shader_source also strips the
+     * #extension GL_ARB_shader_subroutine directive) */
+    xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), true);
 }
 
 #pragma mark - capture: primitive assembly

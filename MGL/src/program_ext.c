@@ -16,6 +16,7 @@
 #include "glm_context.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_xfb.h"
+#include "mgl_ext_introspect.h"   /* subroutine selection reset on UseProgramStages/BindProgramPipeline */
 #include "shaders.h"
 #include "spirv.h"
 
@@ -322,6 +323,14 @@ void mglBindProgramPipeline(GLMContext ctx, GLuint pipeline)
     STATE(program_pipeline) = ptr;
     STATE_VAR(program_pipeline_binding) = pipeline;
     STATE(dirty_bits) |= DIRTY_PROGRAM;
+    /* GL 4.6 §7.4.2: the subroutine uniform selection of every program the
+     * pipeline will use is reset when the pipeline is bound */
+    if (ptr)
+    {
+        MGLPipelineObj *po = MGL_PIPELINE_OBJ(ptr);
+        for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+            if (po->base.stage_programs[s]) mgl_introspect_reset_subroutines(ctx, po->base.stage_programs[s]);
+    }
 }
 
 void mglUseProgramStages(GLMContext ctx, GLuint pipeline, GLbitfield stages, GLuint program)
@@ -364,6 +373,10 @@ void mglUseProgramStages(GLMContext ctx, GLuint pipeline, GLbitfield stages, GLu
         /* stages the program has no executable for become empty */
         pipeline_set_stage(ctx, pipe, s, (pobj && (pobj->linked_mask & SHADER_MASK_BIT(s))) ? prog : NULL);
     }
+
+    /* GL 4.6 §7.4.2: UseProgramStages resets the subroutine selection of the
+     * program(s) it installs */
+    if (prog) mgl_introspect_reset_subroutines(ctx, prog);
 
     pipe->validate_status = GL_FALSE;
     if (STATE(program_pipeline) == &pipe->base)

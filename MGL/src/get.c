@@ -226,6 +226,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",
     "GL_ARB_shader_storage_buffer_object",
+    "GL_ARB_shader_subroutine",       /* GLSL rewrite to switch + int selector (introspect_subroutine.c) */
     "GL_ARB_shader_texture_lod",
     "GL_ARB_shading_language_420pack",
     "GL_ARB_shading_language_packing",
@@ -590,8 +591,12 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
         case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
-        case GL_MAX_COMBINED_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
-        case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES: PUT1(MGL_MAX_IMAGE_UNITS + MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
+        case GL_MAX_COMBINED_IMAGE_UNIFORMS:
+            /* per-stage image units stay at 8, but the combined limit is the sum
+             * over the active stages' independent Metal texture tables (GL 4.6
+             * Table 23.55 only floors this at 8) */
+            PUT1(5 * MGL_MAX_IMAGE_UNITS);
+        case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES: PUT1(5 * MGL_MAX_IMAGE_UNITS + MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
 
         /* points / lines (Metal rasterizes 1-pixel lines and points up to 511 px) */
         case GL_POINT_SIZE_RANGE: PUT2(1.0, 511.0);

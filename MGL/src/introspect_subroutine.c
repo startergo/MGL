@@ -29,8 +29,8 @@
 #define SR_SELECTOR_LOCATION_BASE 3900
 
 typedef struct { char *name; char *ret; char *params; } SrType;
-typedef struct { char *name; char **compat; int ncompat; int index; } SrFunc;
-typedef struct { char *name; char *type; int size; int location; size_t at; } SrUni;
+typedef struct { char *name; char **compat; int ncompat; int index; char *ret; char *params; } SrFunc;
+typedef struct { char *name; char *type; int size; int location; size_t at; int ndims; int dims[8]; } SrUni;
 
 typedef struct { char *s; size_t n, cap; } Str;
 static void sputn(Str *b, const char *s, size_t n)
@@ -190,6 +190,68 @@ static int split_params(const char *params, char ***decl)
     return n;
 }
 
+/* Normalize one generated parameter declaration ("in vec4 _mgl_a0") for comparison:
+ * collapse whitespace, default-qualify a bare type. */
+static char *norm_param(const char *decl)
+{
+    static const char *dirs[] = { "in", "out", "inout", NULL };
+    Str d = { 0 };
+    char *copy = strdup(decl ? decl : "");
+    bool first = true, qualified = false;
+    for (char *tk = strtok(copy, " \t\n"); tk; tk = strtok(NULL, " \t\n")) {
+        bool dir = false;
+        for (int k = 0; dirs[k]; k++) if (!strcmp(tk, dirs[k])) dir = true;
+        if (first && dir) qualified = true;
+        if (!first) sput(&d, " ");
+        sput(&d, tk);
+        first = false;
+    }
+    free(copy);
+    char *r;
+    if (!qualified && d.n) {
+        char *q = malloc(d.n + 4);
+        snprintf(q, d.n + 4, "in %s", d.s ? d.s : "");
+        free(d.s);
+        r = q;
+    } else {
+        r = d.s ? d.s : strdup("");
+    }
+    return r;
+}
+
+static char *norm_ret(const char *ret)
+{
+    char *copy = strdup(ret ? ret : "");
+    char *t = trim(copy);
+    /* collapse interior whitespace runs */
+    Str d = { 0 };
+    for (char *tk = strtok(t, " \t\n"); tk; tk = strtok(NULL, " \t\n")) { if (d.n) sput(&d, " "); sput(&d, tk); }
+    free(copy);
+    return d.s ? d.s : strdup("");
+}
+
+/* GL 4.6 §4.7: a subroutine function's signature (return type + parameter types)
+ * must match EVERY subroutine type it is declared compatible with. */
+static bool sig_matches(const char *fret, const char *fparams, const char *tret, const char *tparams)
+{
+    char *fr = norm_ret(fret), *tr = norm_ret(tret);
+    bool ok = !strcmp(fr, tr);
+    free(fr); free(tr);
+    if (!ok) return false;
+    char **fd = NULL, **td = NULL;
+    int nf = split_params(fparams, &fd), nt = split_params(tparams, &td);
+    if (nf != nt) ok = false;
+    for (int i = 0; ok && i < nf; i++) {
+        char *a = norm_param(fd[i]), *b = norm_param(td[i]);
+        if (strcmp(a, b)) ok = false;
+        free(a); free(b);
+    }
+    for (int i = 0; i < nf; i++) free(fd ? fd[i] : NULL);
+    for (int i = 0; i < nt; i++) free(td ? td[i] : NULL);
+    free(fd); free(td);
+    return ok;
+}
+
 void mgli_free_stage_sub(MGLIStageSub *s)
 {
     if (!s) return;
@@ -203,6 +265,89 @@ void mgli_free_stage_sub(MGLIStageSub *s)
     free(s->unis);
     free(s->selection);
     memset(s, 0, sizeof *s);
+}
+
+/* Strip "#extension ..." directives for extensions glslang does not know but MGL
+ * advertises (subroutine syntax is rewritten away below; arrays-of-arrays syntax works
+ * once the version is raised to 430).  A #version line older than a construct the
+ * source uses is raised in step (GL 4.6 accepts the shader, so the rewrite must make
+ * glslang accept it too).  Returns a malloc'd copy, or NULL when nothing changed. */
+char *mgli_strip_subroutine_extension(const char *src)
+{
+    if (!src) return NULL;
+    static const char *unknown_exts[] = { "GL_ARB_shader_subroutine", "GL_ARB_arrays_of_arrays", NULL };
+    bool any = false, needs_430 = false;
+    for (int e = 0; unknown_exts[e]; e++) {
+        for (const char *p = src; (p = strstr(p, "#extension")); ) {
+            const char *ls = p;
+            while (ls > src && (ls[-1] == ' ' || ls[-1] == '\t')) ls--;
+            if (ls == src || ls[-1] == '\n') {
+                const char *en = strchr(p, '\n');
+                size_t n = en ? (size_t)(en - p) : strlen(p);
+                if (memmem(p, n, unknown_exts[e], strlen(unknown_exts[e]))) {
+                    any = true;
+                    if (e == 1) needs_430 = true;
+                }
+            }
+            p += 10;
+        }
+    }
+    if (!any) return NULL;
+    size_t n = strlen(src);
+    char *out = malloc(n + 1);
+    memcpy(out, src, n + 1);
+    /* re-scan on the copy and blank each matching directive line */
+    for (int e = 0; unknown_exts[e]; e++) {
+        for (char *p = out; (p = strstr(p, "#extension")); ) {
+            char *ls = p;
+            while (ls > out && (ls[-1] == ' ' || ls[-1] == '\t')) ls--;
+            if ((ls == out || ls[-1] == '\n') && memmem(p, strcspn(p, "\n"), unknown_exts[e], strlen(unknown_exts[e]))) {
+                while (*p && *p != '\n') *p++ = ' ';
+            } else {
+                p += 10;
+            }
+        }
+    }
+    /* raise #version: "binding" layout qualifiers need 420 (glslang), arrays of
+     * arrays 430.  The rewritten directive keeps the shader's profile word. */
+    {
+        int need = needs_430 ? 430 : 0;
+        if (!need) {
+            for (const char *p = src; (p = strstr(p, "layout")); p += 6) {
+                const char *open = p + 6;
+                while (*open == ' ' || *open == '\t') open++;
+                if (*open != '(') continue;
+                const char *close = strchr(open, ')');
+                if (!close) continue;
+                for (const char *b = open; b < close; b++) {
+                    if (!strncmp(b, "binding", 7) && (b == open || !isalnum((unsigned char)b[-1])) &&
+                        !isalnum((unsigned char)b[7])) { need = 420; break; }
+                }
+                if (need) break;
+            }
+        }
+        if (need && !strncmp(out, "#version", 8)) {
+            char *nl = strchr(out, '\n');
+            size_t linelen = nl ? (size_t)(nl - out) : strlen(out);
+            char line[128];
+            snprintf(line, sizeof line, "%.*s", (int)(linelen < 127 ? linelen : 127), out);
+            int ver = 0, pos = 0;
+            char prof[24] = "", profile[24] = "core";
+            if (sscanf(line, "#version %d %23s%n", &ver, prof, &pos) >= 1 && ver < need && ver >= 140) {
+                if (pos > 0 && (size_t)pos < strlen(line) && prof[0] &&
+                    !strcmp(trim(prof), "compatibility"))
+                    snprintf(profile, sizeof profile, "compatibility");
+                char head[64];
+                snprintf(head, sizeof head, "#version %d %s\n", need, profile);
+                char *res = malloc(strlen(head) + (nl ? strlen(nl + 1) : 0) + 2);
+                strcpy(res, head);
+                strcat(res, nl ? nl + 1 : "");
+                free(out);
+                out = res;
+            }
+        }
+    }
+    return out;
 }
 
 char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
@@ -235,15 +380,23 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
             }
             free(list);
             /* function name: identifier right before the next '(' */
-            size_t k = close + 1, lastid = 0, lastlen = 0;
+            size_t k = close + 1, lastid = 0, lastlen = 0, paren = s.n;
             while (k < s.n) {
                 k = skip_ws(&s, k);
-                if (k < s.n && s.b[k] == '(') break;
+                if (k < s.n && s.b[k] == '(') { paren = k; break; }
                 size_t a = read_ident(&s, k, &len);
                 if (!len) { k++; continue; }
                 lastid = a; lastlen = len; k = a + len;
             }
             f.name = dupn(s.b + lastid, lastlen);
+            /* signature (for the GL §4.7 compatibility check below) */
+            if (paren < s.n && lastid > close + 1) {
+                char *ret = dupn(s.b + close + 1, lastid - (close + 1));
+                f.ret = norm_ret(ret);
+                free(ret);
+                size_t pc = match_close(&s, paren, '(', ')');
+                f.params = dupn(s.b + paren + 1, pc - paren - 1);
+            }
             funcs = realloc(funcs, (size_t)(nfuncs + 1) * sizeof(SrFunc));
             funcs[nfuncs++] = f;
             blank(&s, start, close + 1);
@@ -255,10 +408,23 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
             size_t ta = read_ident(&s, a + len, &len); char *tname = dupn(s.b + ta, len);
             size_t na = read_ident(&s, ta + len, &len); char *uname = dupn(s.b + na, len);
             size_t k = skip_ws(&s, na + len);
+            /* arrays (incl. arrays of arrays): routine[4][4] */
+            int dims[8] = { 0 }, ndims = 0;
+            while (k < s.n && s.b[k] == '[' && ndims < 8) {
+                size_t cb = match_close(&s, k, '[', ']');
+                dims[ndims] = atoi(s.b + k + 1);
+                if (dims[ndims] < 1) dims[ndims] = 1;
+                ndims++;
+                k = skip_ws(&s, cb + 1);
+            }
             int size = 1;
-            if (k < s.n && s.b[k] == '[') { size_t cb = match_close(&s, k, '[', ']'); size = atoi(s.b + k + 1); if (size < 1) size = 1; k = skip_ws(&s, cb + 1); }
+            for (int d = 0; d < ndims; d++) size *= dims[d];
+            if (!ndims) { dims[0] = 1; ndims = 1; }
             while (k < s.n && s.b[k] != ';') k++;
-            SrUni u = { uname, tname, size, loc, start };
+            SrUni u = { 0 };
+            u.name = uname; u.type = tname; u.size = size; u.location = loc; u.at = start;
+            u.ndims = ndims;
+            for (int d = 0; d < ndims; d++) u.dims[d] = dims[d];
             unis = realloc(unis, (size_t)(nunis + 1) * sizeof(SrUni));
             unis[nunis++] = u;
             blank(&s, start, k + 1);
@@ -313,8 +479,11 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
         if (ui < (size_t)nunis && unis[ui].at == i) {
             SrUni *u = &unis[ui];
             SrType *t = NULL; for (int k = 0; k < ntypes; k++) if (!strcmp(types[k].name, u->type)) t = &types[k];
-            if (u->size > 1) sprintf_(&o, "layout(location = %d) uniform int _mgl_sr_%s[%d]; ", SR_SELECTOR_LOCATION_BASE + (int)ui * 64, u->name, u->size);
-            else sprintf_(&o, "layout(location = %d) uniform int _mgl_sr_%s; ", SR_SELECTOR_LOCATION_BASE + (int)ui * 64, u->name);
+            /* No layout(location=...): explicit uniform locations need GLSL 430 /
+             * GL_ARB_explicit_uniform_location and the selector is written by name
+             * (write_selectors), so a plain default-block uniform is enough. */
+            if (u->size > 1) sprintf_(&o, "uniform int _mgl_sr_%s[%d]; ", u->name, u->size);
+            else sprintf_(&o, "uniform int _mgl_sr_%s; ", u->name);
             char **pd = NULL; int np = split_params(t ? t->params : "", &pd);
             sprintf_(&o, "%s _mgl_sr_call_%s(", t ? t->ret : "void", u->name);
             bool first = true;
@@ -331,15 +500,46 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
             for (int k = 0; k < nunis; k++) if (strlen(unis[k].name) == j - i && !strncmp(s.b + i, unis[k].name, j - i)) hit = k;
             if (hit >= 0) {
                 size_t k = skip_ws(&s, j);
-                size_t ia = 0, ib = 0;
-                if (k < s.n && s.b[k] == '[') { size_t cb = match_close(&s, k, '[', ']'); ia = k + 1; ib = cb; k = skip_ws(&s, cb + 1); }
+                /* index expressions (arrays of arrays: routine[j][i]) */
+                size_t ia[8], ib[8];
+                int nidx = 0;
+                while (k < s.n && s.b[k] == '[' && nidx < 8) {
+                    size_t cb = match_close(&s, k, '[', ']');
+                    ia[nidx] = k + 1; ib[nidx] = cb; nidx++;
+                    k = skip_ws(&s, cb + 1);
+                }
                 if (k < s.n && s.b[k] == '(') {
                     size_t after = skip_ws(&s, k + 1);
                     bool noargs = after < s.n && s.b[after] == ')';
                     sprintf_(&o, "_mgl_sr_call_%s(", unis[hit].name);
-                    if (unis[hit].size > 1) { sputn(&o, ib > ia ? s.b + ia : "0", ib > ia ? ib - ia : 1); if (!noargs) sput(&o, ", "); }
+                    if (unis[hit].size > 1) {
+                        if (!nidx) {
+                            sput(&o, "0u");
+                        } else {
+                            /* flatten routine[j][i] -> j * dims[1] + i */
+                            for (int m = 0; m < nidx; m++) {
+                                if (m) sput(&o, " + ");
+                                sputn(&o, s.b + ia[m], ib[m] - ia[m]);
+                                for (int d = m + 1; d < nidx; d++) sprintf_(&o, " * %d", unis[hit].dims[d]);
+                            }
+                        }
+                        if (!noargs) sput(&o, ", ");
+                    }
                     i = k + 1;
                     continue;
+                }
+                /* member access: .length() on (a slice of) the uniform array */
+                if (k < s.n && s.b[k] == '.') {
+                    size_t mlen = 0;
+                    size_t m = read_ident(&s, k + 1, &mlen);
+                    if (mlen == 6 && !strncmp(s.b + m, "length", 6)) {
+                        size_t p = skip_ws(&s, m + mlen);
+                        if (p < s.n && s.b[p] == '(' && nidx < unis[hit].ndims) {
+                            sprintf_(&o, "%d", unis[hit].dims[nidx]);
+                            i = match_close(&s, p, '(', ')') + 1;   /* skip ".length()" */
+                            continue;
+                        }
+                    }
                 }
             }
             sputn(&o, s.b + i, j - i);
@@ -387,18 +587,36 @@ char *mgli_rewrite_subroutines(const char *src, MGLIStageSub *out)
         free(args.s);
     }
 
+    /* GL §4.7: a subroutine's signature must match every type it is compatible
+     * with; a mismatch is a compile-time error, surfaced as #error in the
+     * rewritten source (KHR-GL46.shader_subroutine.subroutines_incompatible_with_subroutine_type) */
+    for (int f = 0; f < nfuncs; f++) {
+        if (!funcs[f].ret) continue;
+        for (int c = 0; c < funcs[f].ncompat; c++) {
+            SrType *t = NULL;
+            for (int k = 0; k < ntypes; k++) if (!strcmp(types[k].name, funcs[f].compat[c])) t = &types[k];
+            if (!t) continue;
+            if (!sig_matches(funcs[f].ret, funcs[f].params, t->ret, t->params))
+                sprintf_(&o, "\n#error subroutine '%s': signature does not match subroutine type '%s'\n",
+                         funcs[f].name, t->name);
+        }
+    }
+
     /* reflection record */
     out->nfuncs = nfuncs;
     out->funcs = calloc((size_t)nfuncs + 1, sizeof(MGLISubFunc));
     for (int f = 0; f < nfuncs; f++) {
         out->funcs[f].name = funcs[f].name; out->funcs[f].index = funcs[f].index;
         out->funcs[f].compat = funcs[f].compat; out->funcs[f].ncompat = funcs[f].ncompat;
+        free(funcs[f].ret); free(funcs[f].params);
     }
     out->nunis = nunis;
     out->unis = calloc((size_t)nunis + 1, sizeof(MGLISubUniform));
     for (int u = 0; u < nunis; u++) {
         MGLISubUniform *d = &out->unis[u];
         d->name = unis[u].name; d->type_name = unis[u].type; d->location = unis[u].location; d->size = unis[u].size;
+        d->ndims = unis[u].ndims;
+        for (int m = 0; m < unis[u].ndims && m < 8; m++) d->dims[m] = unis[u].dims[m];
         char sel[300]; snprintf(sel, sizeof sel, "_mgl_sr_%s", unis[u].name); d->selector = strdup(sel);
         d->compat = calloc((size_t)nfuncs + 1, sizeof(int));
         for (int f = 0; f < nfuncs; f++)

@@ -171,6 +171,8 @@ static void build_subroutines(GLMContext ctx, MGLIProgram *ip, Program *ptr)
             MGLISubUniform *su = &r->sub.unis[i], *du = &d->unis[i];
             du->name = strdup(su->name); du->type_name = strdup(su->type_name); du->selector = strdup(su->selector);
             du->location = su->location; du->size = su->size;
+            du->ndims = su->ndims;
+            for (int m = 0; m < 8 && m < su->ndims; m++) du->dims[m] = su->dims[m];
             du->ncompat = su->ncompat; du->compat = calloc((size_t)su->ncompat + 1, sizeof(int));
             memcpy(du->compat, su->compat, (size_t)su->ncompat * sizeof(int));
             if (du->location + du->size > d->nlocs) d->nlocs = du->location + du->size;
@@ -209,6 +211,30 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
     for (int s = 0; s < MGLI_STAGES; s++) if (ptr->shader_slots[s] && !ptr->spirv[s].ir) return;
     if (!mgli_process_link(ctx, ptr, ip)) return;
     build_subroutines(ctx, ip, ptr);
+    /* GL 4.6 §7.4.2: a subroutine uniform with an empty set of compatible
+     * subroutines fails the link (KHR-GL46.shader_subroutine.subroutine_uniform_wo_matching_subroutines) */
+    for (int s = 0; s < MGLI_STAGES; s++) {
+        for (int i = 0; i < ip->sub[s].nunis; i++) {
+            if (ip->sub[s].unis[i].ncompat) continue;
+            MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+            po->link_status = false;
+            {
+                char msg[256];
+                snprintf(msg, sizeof msg,
+                         "ERROR: subroutine uniform '%s' has no compatible subroutines\n",
+                         ip->sub[s].unis[i].name);
+                size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 8;
+                char *nl = (char *)malloc(len);
+                if (nl) {
+                    nl[0] = 0;
+                    if (po->info_log) { strcpy(nl, po->info_log); free(po->info_log); }
+                    strcat(nl, msg);
+                    po->info_log = nl;
+                }
+            }
+            return;
+        }
+    }
     ip->linked = 1;
     for (int s = 0; s < MGLI_STAGES; s++) if (ip->sub[s].nunis) write_selectors(ctx, ip, s);
 
@@ -226,6 +252,22 @@ Buffer *mgl_introspect_default_uniform_buffer(GLMContext ctx, Program *program, 
     return ip->dub[stage];
 }
 
+/* GL 4.6 §7.4.2: subroutine uniforms revert to their defaults when a program is
+ * (re)made active by UseProgram / UseProgramStages / BindProgramPipeline. */
+void mgl_introspect_reset_subroutines(GLMContext ctx, Program *p)
+{
+    MGLIProgram *ip = p ? find_by_ptr(ctx, p) : NULL;
+    if (!ip || !ip->linked) return;
+    for (int s = 0; s < MGLI_STAGES; s++) {
+        MGLIStageSub *d = &ip->sub[s];
+        if (!d->nunis) continue;
+        for (int i = 0; i < d->nunis; i++)
+            for (int e = 0; e < d->unis[i].size; e++)
+                d->selection[d->unis[i].location + e] = d->unis[i].ncompat ? (GLuint)d->unis[i].compat[0] : 0;
+        write_selectors(ctx, ip, s);
+    }
+}
+
 const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader)
 {
     if (!shader || !shader->src) return shader ? shader->src : NULL;
@@ -233,11 +275,22 @@ const char *mgl_introspect_shader_source(GLMContext ctx, Shader *shader)
     MGLIShaderRec *r = NULL;
     for (MGLIShaderRec *it = e->shaders; it; it = it->next) if (it->shader == shader->name) { r = it; break; }
     MGLIStageSub sub; memset(&sub, 0, sizeof sub);
-    char *rewritten = mgli_rewrite_subroutines(shader->src, &sub);
+    /* glslang does not know GL_ARB_shader_subroutine; strip its #extension directives
+     * whether or not the source also uses subroutine syntax */
+    char *stripped = mgli_strip_subroutine_extension(shader->src);
+    char *rewritten = mgli_rewrite_subroutines(stripped ? stripped : shader->src, &sub);
     if (!rewritten) {
+        if (stripped) {
+            /* keep the directive-stripped source (no subroutine syntax to rewrite) */
+            if (!r) { r = calloc(1, sizeof *r); r->shader = shader->name; r->next = e->shaders; e->shaders = r; }
+            free(r->src); mgli_free_stage_sub(&r->sub);
+            r->ptr = shader; r->src = stripped;
+            return r->src;
+        }
         if (r) { free(r->src); r->src = NULL; mgli_free_stage_sub(&r->sub); r->ptr = shader; }
         return shader->src;
     }
+    free(stripped);
     if (!r) { r = calloc(1, sizeof *r); r->shader = shader->name; r->next = e->shaders; e->shaders = r; }
     free(r->src); mgli_free_stage_sub(&r->sub);
     r->ptr = shader; r->src = rewritten; r->sub = sub;
@@ -1016,7 +1069,24 @@ GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum sha
         MGLISubUniform *su = &s->unis[i];
         if (!strcmp(su->name, name)) return su->location;
         size_t ln = strlen(su->name);
-        if (!strncmp(name, su->name, ln) && name[ln] == '[') { long e = strtol(name + ln + 1, NULL, 10); if (e >= 0 && e < su->size) return su->location + (GLint)e; }
+        if (!strncmp(name, su->name, ln) && name[ln] == '[') {
+            /* "routine[j][i]" (arrays of arrays): flatten against the declared
+             * dimensions so every element gets a distinct consecutive location */
+            const char *p = name + ln;
+            long idx[8];
+            int n = 0;
+            for (; n < 8; n++) {
+                if (*p != '[') break;
+                idx[n] = strtol(p + 1, (char **)&p, 10);
+                if (*p != ']') return -1;
+                p++;
+                if (idx[n] < 0 || idx[n] >= (su->dims[n] ? su->dims[n] : su->size)) return -1;
+            }
+            if (!n) return -1;
+            long e = 0, str = 1;
+            for (int m = n - 1; m >= 0; m--) { e += idx[m] * str; str *= (su->dims[m] ? su->dims[m] : 1); }
+            if (e >= 0 && e < su->size) return su->location + (GLint)e;
+        }
     }
     return -1;
 }
@@ -1063,8 +1133,30 @@ void mglGetActiveSubroutineUniformiv(GLMContext ctx, GLuint program, GLenum shad
 
 static MGLIProgram *current_linked(GLMContext ctx, const char *func)
 {
-    MGLIProgram *ip = find_by_ptr(ctx, ctx->state.program);
-    if (!ctx->state.program || !ip || !ip->linked) { mgli_set_error(ctx, func, GL_INVALID_OPERATION); return NULL; }
+    /* the *active* program: glUseProgram's program, else the pipeline's active
+     * program (glUniformSubroutinesuiv with separable programs, GL §7.3.1) */
+    Program *prog = mgl_program_uniform_target(ctx);
+    MGLIProgram *ip = prog ? find_by_ptr(ctx, prog) : NULL;
+    if (!prog || !ip || !ip->linked) { mgli_set_error(ctx, func, GL_INVALID_OPERATION); return NULL; }
+    return ip;
+}
+
+/* GL §7.4.2: subroutine commands address the program active *for the stage* —
+ * the current program's own stages, or (SSO) the program bound to that stage of
+ * the bound pipeline; INVALID_OPERATION when the stage has no active program. */
+static MGLIProgram *current_stage_linked(GLMContext ctx, int st, const char *func)
+{
+    Program *prog = ctx->state.program;
+    if (!prog && STATE(program_pipeline)) {
+        MGLPipelineObj *pipe = MGL_PIPELINE_OBJ(STATE(program_pipeline));
+        prog = pipe->base.stage_programs[st];
+        if (!prog) prog = pipe->active_program;   /* glActiveShaderProgram target */
+    }
+    MGLIProgram *ip = prog ? find_by_ptr(ctx, prog) : NULL;
+    if (!prog || !ip || !ip->linked || !ip->prog || !ip->prog->shader_slots[st]) {
+        mgli_set_error(ctx, func, GL_INVALID_OPERATION);
+        return NULL;
+    }
     return ip;
 }
 
@@ -1072,19 +1164,24 @@ void mglUniformSubroutinesuiv(GLMContext ctx, GLenum shadertype, GLsizei count, 
 {
     int st = stage_of_shadertype(shadertype);
     if (st < 0) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return; }
-    MGLIProgram *ip = current_linked(ctx, __FUNCTION__);
+    MGLIProgram *ip = current_stage_linked(ctx, st, __FUNCTION__);
     if (!ip) return;
     MGLIStageSub *s = &ip->sub[st];
     if (count != s->nlocs) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     if (!count) return;
     if (!indices) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
-    /* every index must name a subroutine compatible with the uniform at that location */
+    /* every index must name a subroutine compatible with the uniform at that
+     * location (GL §7.4.2: INVALID_OPERATION); an index that is not a subroutine
+     * of this stage at all is INVALID_VALUE */
     for (int i = 0; i < s->nunis; i++)
         for (int e = 0; e < s->unis[i].size; e++) {
             GLuint v = indices[s->unis[i].location + e];
-            bool ok = false;
+            bool known = false, ok = false;
+            for (int g = 0; g < s->nfuncs; g++) if ((GLuint)s->funcs[g].index == v) known = true;
             for (int k = 0; k < s->unis[i].ncompat; k++) if ((GLuint)s->unis[i].compat[k] == v) ok = true;
-            if (!ok) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
+            if (ok) continue;
+            mgli_set_error(ctx, __FUNCTION__, known ? GL_INVALID_OPERATION : GL_INVALID_VALUE);
+            return;
         }
     memcpy(s->selection, indices, (size_t)count * sizeof(GLuint));
     write_selectors(ctx, ip, st);
@@ -1094,7 +1191,7 @@ void mglGetUniformSubroutineuiv(GLMContext ctx, GLenum shadertype, GLint locatio
 {
     int st = stage_of_shadertype(shadertype);
     if (st < 0) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return; }
-    MGLIProgram *ip = current_linked(ctx, __FUNCTION__);
+    MGLIProgram *ip = current_stage_linked(ctx, st, __FUNCTION__);   /* per-stage active program */
     if (!ip) return;
     if (location < 0 || location >= ip->sub[st].nlocs) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     if (params) *params = ip->sub[st].selection[location];
