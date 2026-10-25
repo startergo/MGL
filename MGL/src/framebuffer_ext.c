@@ -526,7 +526,7 @@ static GLenum checkFormatType(GLenum format, GLenum type)
     bool packed = packedType(type, &p);
 
     if (format == GL_DEPTH_STENCIL)
-        return (type == GL_UNSIGNED_INT_24_8 || type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+        return (type == GL_UNSIGNED_INT_24_8 || type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV) ? GL_NO_ERROR : GL_INVALID_ENUM;
 
     if (type == GL_UNSIGNED_INT_24_8 || type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV)
         return GL_INVALID_OPERATION;

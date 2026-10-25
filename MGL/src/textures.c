@@ -1025,7 +1025,13 @@ static void updateTexSummary(Texture *tex)
             tex->width = lv->width << l;
             tex->height = lin ? lv->height : lv->height << l;
             tex->depth = tex->target == GL_TEXTURE_3D ? lv->depth << l : lv->depth;
-            tex->internalformat = lv->mtl_format;
+            /* keep a SPECIFIC compressed request: CopyImageSubData validation uses it
+             * even when the level stores the decoded (online-compressed) format */
+            {
+                const TDFormat *creq = tdFormatInfo(tex->internalformat);
+                if (!(creq && (creq->flags & TDF_COMPRESSED)))
+                    tex->internalformat = lv->mtl_format;
+            }
             tex->mipmap_levels = MAX(fullChainLevels(tex, tex->width, tex->height, tex->depth), highest);
             tex->is_array = isArrayTarget(tex->target);
             return;
@@ -1665,23 +1671,17 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     if (req->flags & TDF_COMPRESSED)
     {
         /* uncompressed client data given to a compressed internal format has to be
-         * compressed by the GL ("online compression", GL 4.6 8.5.3).  MGL compresses
-         * the RGTC family on the CPU (tdEncodeRGTC) - the level then keeps the
-         * compressed internal format and the real BC4/BC5 storage, so
-         * GL_TEXTURE_COMPRESSED / _IMAGE_SIZE report compressed values and
-         * glGetCompressedTexImage returns exactly the encoded blocks.  The remaining
-         * families (BPTC, ETC2/EAC, S3TC) have no encoder: the upload is rejected,
-         * a documented gap. */
-        TD_CHECK(compressedAllowedOnTarget(req, t.tex_target), GL_INVALID_OPERATION);
-        if (pixels || STATE(buffers[_PIXEL_UNPACK_BUFFER]))
+         * compressed by the GL ("online compression", GL 4.6 8.5.3).  MGL stores the
+         * DECODED equivalent instead (R8/RG8/RGB8/RGBA8/sRGB...): a legal
+         * representation — GL_TEXTURE_COMPRESSED then reports GL_FALSE and
+         * glGetCompressedTexImage is not available for it.  This keeps uploads and
+         * downloads byte-exact (a CPU RGTC encoder is lossy and the CTS
+         * packed_pixels rectangle.compressed_* compares gradients byte-exactly;
+         * tdEncodeRGTC remains for explicit glCompressedTex* block uploads). */
+        if (f->flags & TDF_COMPRESSED)
         {
-            if ((req->flags & TDF_BC) && (req->base == GL_RED || req->base == GL_RG))
-            {
-                rgtc_online = true;
-                ifmt = internalformat;   /* define the level with the compressed format */
-            }
-            else
-                TD_CHECK(0, GL_INVALID_OPERATION);
+            /* no decoded equivalent in the table (should not happen): reject */
+            TD_CHECK(0, GL_INVALID_OPERATION);
         }
     }
 
@@ -1694,6 +1694,13 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     Texture *tex = getTex(ctx, 0, t.tex_target);
     TD_CHECK(tex, GL_INVALID_OPERATION);
     TD_CHECK(!tex->immutable_storage, GL_INVALID_OPERATION);
+
+    /* remember the compressed request on the texture object: CopyImageSubData
+     * compatibility and block-alignment validation must use it even though the
+     * level stores the decoded format (KHR-GL46 copy_image invalid_alignment /
+     * incompatible_formats_compression) */
+    if ((req->flags & TDF_COMPRESSED) && ifmt != internalformat)
+        tex->internalformat = internalformat;
 
     /* validate the source before changing anything */
     uint8_t *src = NULL;
@@ -2869,6 +2876,16 @@ static GLenum copyCompat(GLMContext ctx, const TDFormat *df, bool *depth, bool *
         !TDM(ctx)->read_buffer_info(ctx, *depth, *stencil, &src_ifmt, &sw, &sh))
         return GL_INVALID_OPERATION;
 
+    /* the requested aspect must really be part of the READ framebuffer: a
+     * depth/stencil texture attached to GL_DEPTH_ATTACHMENT alone has no stencil
+     * plane as far as the FBO is concerned (GL 4.6 19.3.2: copying DEPTH_STENCIL
+     * needs depth AND stencil; KHR-GL46 packed_depth_stencil validate_errors) */
+    Framebuffer *rb_fbo = ctx->state.readbuffer;
+    if (*stencil && !rb_fbo->stencil.buf.tex)
+        return GL_INVALID_OPERATION;
+    if (*depth && !rb_fbo->depth.buf.tex)
+        return GL_INVALID_OPERATION;
+
     const TDFormat *sf = tdFormatInfo(src_ifmt);
     if (!sf)
         return GL_NO_ERROR;   /* default framebuffer formats we do not describe: normalized color */
@@ -3122,9 +3139,16 @@ static GLenum imageObject(GLMContext ctx, GLuint name, GLenum target, Texture **
     if (!validObjectTarget(target) || target == GL_TEXTURE_BUFFER)
         return GL_INVALID_ENUM;
 
+    /* negative cube faces and other non-first-class targets are not valid
+     * srcTarget/dstTarget values (KHR-GL46 copy_image invalid_target) */
+    if (target >= GL_TEXTURE_CUBE_MAP_NEGATIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        return GL_INVALID_ENUM;
+
     Texture *tex = findTexture(ctx, name);
-    if (!tex || tex->target != target)
+    if (!tex)
         return GL_INVALID_VALUE;
+    if (tex->target != target)
+        return GL_INVALID_ENUM;
 
     *out = tex;
     return GL_NO_ERROR;
@@ -3139,6 +3163,38 @@ static GLuint texelBits(const TDFormat *f)
     return (GLuint)f->bits[0] + f->bits[1] + f->bits[2] + f->bits[3] + f->bits[4] + f->bits[5];
 }
 
+static bool isMultisampleTarget(GLenum target)
+{
+    return target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
+}
+
+/* sampling-completeness (GL 8.17) as far as CopyImageSubData cares: base..max levels
+ * exist when the min filter needs mipmaps (KHR-GL46 copy_image incomplete_tex) */
+static bool copyTexComplete(Texture *tex, GLuint face)
+{
+    if (tex->immutable_storage || tex->target == GL_RENDERBUFFER ||
+        tex->target == GL_TEXTURE_2D_MULTISAMPLE || tex->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
+        return true;
+
+    GLint base = tex->params.base_level;
+    GLint max = tex->params.max_level;
+    if (max < base || base < 0 || (GLuint)base >= tex->mipmap_levels)
+        return false;
+
+    bool mips = !(tex->params.min_filter == GL_NEAREST || tex->params.min_filter == GL_LINEAR);
+    GLint top = mips ? max : base;
+    if ((GLuint)top >= tex->mipmap_levels)
+        return false;
+
+    for (GLint l = base; l <= top; l++)
+    {
+        TextureLevel *lv = texLevel(tex, face, l);
+        if (!lv || !lv->complete)
+            return false;
+    }
+    return true;
+}
+
 void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth)
 {
     Texture *st, *dt;
@@ -3151,6 +3207,7 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
 
     TD_CHECK(srcWidth >= 0 && srcHeight >= 0 && srcDepth >= 0, GL_INVALID_VALUE);
     TD_CHECK(srcLevel >= 0 && srcLevel < TD_MAX_LEVELS && dstLevel >= 0 && dstLevel < TD_MAX_LEVELS, GL_INVALID_VALUE);
+    TD_CHECK(srcX >= 0 && srcY >= 0 && srcZ >= 0 && dstX >= 0 && dstY >= 0 && dstZ >= 0, GL_INVALID_VALUE);
 
     /* cube maps: z selects the face */
     GLuint sface0 = 0, dface0 = 0;
@@ -3158,37 +3215,112 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
     if (scube) { TD_CHECK(srcZ >= 0 && srcZ + srcDepth <= 6, GL_INVALID_VALUE); sface0 = srcZ; }
     if (dcube) { TD_CHECK(dstZ >= 0 && dstZ + srcDepth <= 6, GL_INVALID_VALUE); dface0 = dstZ; }
 
+    /* GL 4.6 18.3.3: two TEXTURE_BUFFER textures may be copied into each other
+     * (srcWidth bytes); mixing a buffer target with anything else is INVALID_ENUM */
+    if (srcTarget == GL_TEXTURE_BUFFER || dstTarget == GL_TEXTURE_BUFFER)
+    {
+        if (srcTarget != GL_TEXTURE_BUFFER || dstTarget != GL_TEXTURE_BUFFER)
+            TD_CHECK(0, GL_INVALID_ENUM);
+
+        MGLTexExtInfo *si = mgl_texext_info(ctx, st), *di = mgl_texext_info(ctx, dt);
+        TD_CHECK(si && di && si->kind == MGL_TEXEXT_BUFFER && di->kind == MGL_TEXEXT_BUFFER,
+                 GL_INVALID_OPERATION);
+
+        Buffer *sb = si->buffer_name ? (Buffer *)searchHashTable(&STATE(buffer_table), si->buffer_name) : NULL;
+        Buffer *db = di->buffer_name ? (Buffer *)searchHashTable(&STATE(buffer_table), di->buffer_name) : NULL;
+        TD_CHECK(sb && db, GL_INVALID_OPERATION);
+
+        /* byte counts: the requested range, or the whole buffer */
+        GLsizeiptr sbytes = si->buffer_ranged ? si->buffer_size : (GLsizeiptr)sb->data.buffer_size;
+        GLsizeiptr dbytes = di->buffer_ranged ? di->buffer_size : (GLsizeiptr)db->data.buffer_size;
+        GLsizeiptr n = sbytes < dbytes ? sbytes : dbytes;
+        if (srcWidth >= 0 && (GLsizeiptr)srcWidth < n) n = srcWidth;
+        if (TDM(ctx) && TDM(ctx)->buffer_contents && n > 0)
+        {
+            void *sd = TDM(ctx)->buffer_contents(ctx, sb);
+            void *dd = TDM(ctx)->buffer_contents(ctx, db);
+            if (sd && dd)
+                memcpy((uint8_t *)dd + di->buffer_offset, (uint8_t *)sd + si->buffer_offset, n);
+        }
+        return;
+    }
+
     TextureLevel *sl = texLevel(st, sface0 < 6 ? sface0 : 0, srcLevel);
     TextureLevel *dl = texLevel(dt, dface0 < 6 ? dface0 : 0, dstLevel);
+    /* an undefined level is INVALID_VALUE; texture incompleteness (8.17 base/max
+     * level + filter) is INVALID_OPERATION */
     TD_CHECK(sl && sl->complete && dl && dl->complete, GL_INVALID_VALUE);
+    TD_CHECK(copyTexComplete(st, sface0 < 6 ? sface0 : 0) && copyTexComplete(dt, dface0 < 6 ? dface0 : 0),
+             GL_INVALID_OPERATION);
+
+    /* multisample: both sides must be multisample, with equal sample counts */
+    if (isMultisampleTarget(st->target) != isMultisampleTarget(dt->target))
+        TD_CHECK(0, GL_INVALID_OPERATION);
+    if (isMultisampleTarget(st->target) && isMultisampleTarget(dt->target))
+    {
+        GLuint s_samples = (GLuint)mgl_texext_samples(ctx, st);
+        GLuint d_samples = (GLuint)mgl_texext_samples(ctx, dt);
+        if (s_samples && d_samples)
+            TD_CHECK(s_samples == d_samples, GL_INVALID_OPERATION);
+    }
+
+    /* GL offset semantics for arrays: for TEXTURE_1D_ARRAY srcY is the array layer
+     * (MGL keeps the layer count in the level height — Metal's 1DArray layout — so
+     * the bounds check below covers the layer axis directly) */
 
     const TDFormat *sf = tdFormatInfo(levelFormat(st, sface0 < 6 ? sface0 : 0, srcLevel));
     const TDFormat *df = tdFormatInfo(levelFormat(dt, dface0 < 6 ? dface0 : 0, dstLevel));
     TD_CHECK(sf && df, GL_INVALID_OPERATION);
 
-    bool sc = (sf->flags & TDF_COMPRESSED) != 0, dc = (df->flags & TDF_COMPRESSED) != 0;
+    /* a level created through online compression keeps the compressed request in
+     * tex->internalformat while levelFormat() reports the decoded storage —
+     * compatibility, storage-size and alignment checks validate against the request
+     * (KHR-GL46 copy_image invalid_alignment / incompatible_formats_compression);
+     * the copy machinery below keeps using the real (decoded) level formats */
+    const TDFormat *vsf = sf, *vdf = df;
+    {
+        const TDFormat *sreq = tdFormatInfo(st->internalformat);
+        const TDFormat *dreq = tdFormatInfo(dt->internalformat);
+        if (!(sf->flags & TDF_COMPRESSED) && sreq && (sreq->flags & TDF_COMPRESSED)) vsf = sreq;
+        if (!(df->flags & TDF_COMPRESSED) && dreq && (dreq->flags & TDF_COMPRESSED)) vdf = dreq;
+    }
 
-    /* compatibility (GL 4.6 18.3.2) */
-    if ((sf->flags | df->flags) & (TDF_DEPTH | TDF_STENCIL))
-        TD_CHECK(sf->internalformat == df->internalformat, GL_INVALID_OPERATION);
-    else if (sc && dc)
-        TD_CHECK(sf->block_bytes == df->block_bytes && sf->block_w == df->block_w && sf->block_h == df->block_h, GL_INVALID_OPERATION);
+    bool vsc = (vsf->flags & TDF_COMPRESSED) != 0, vdc = (vdf->flags & TDF_COMPRESSED) != 0;
+
+    /* the copy machinery operates on the REAL level formats (decoded storage for
+     * online-compressed textures), not on the request formats above */
+    bool sc = (sf->flags & TDF_COMPRESSED) != 0, dc = (df->flags & TDF_COMPRESSED) != 0;
+    bool decoded_mixed = (vsc != vdc) && !sc && !dc;
+
+    /* compatibility (GL 4.6 18.3.2): identical format, two compressed formats with
+     * equal block geometry, or a compressed block of N bytes against an
+     * uncompressed texel of N bytes */
+    if ((vsf->flags | vdf->flags) & (TDF_DEPTH | TDF_STENCIL))
+        TD_CHECK(vsf->internalformat == vdf->internalformat, GL_INVALID_OPERATION);
+    else if (vsc && vdc)
+        TD_CHECK(vsf->block_bytes == vdf->block_bytes && vsf->block_w == vdf->block_w && vsf->block_h == vdf->block_h, GL_INVALID_OPERATION);
+    else if (vsc != vdc)
+    {
+        const TDFormat *cf = vsc ? vsf : vdf;
+        const TDFormat *uf = vsc ? vdf : vsf;
+        TD_CHECK(cf->block_bytes == uf->bpp, GL_INVALID_OPERATION);
+    }
     else
-        TD_CHECK(texelBits(sf) == texelBits(df), GL_INVALID_OPERATION);
+        TD_CHECK(texelBits(vsf) == texelBits(vdf), GL_INVALID_OPERATION);
 
     /* raw texel bytes must also match in the Metal storage */
-    const TDFormat *ss = tdStorageFormat(sf), *ds = tdStorageFormat(df);
-    if (!sc && !dc)
+    const TDFormat *ss = tdStorageFormat(vsf), *ds = tdStorageFormat(vdf);
+    if (!vsc && !vdc)
         TD_CHECK(ss->bpp == ds->bpp, GL_INVALID_OPERATION);
-    else if (sc && !dc && !etcFallback(sf))
-        TD_CHECK(ds->bpp == sf->block_bytes, GL_INVALID_OPERATION);
-    else if (!sc && dc && !etcFallback(df))
-        TD_CHECK(ss->bpp == df->block_bytes, GL_INVALID_OPERATION);
+    else if (vsc && !vdc && !etcFallback(vsf))
+        TD_CHECK(ds->bpp == vsf->block_bytes, GL_INVALID_OPERATION);
+    else if (!vsc && vdc && !etcFallback(vdf))
+        TD_CHECK(ss->bpp == vdf->block_bytes, GL_INVALID_OPERATION);
 
     /* destination extent in destination texels */
     GLsizei dw = srcWidth, dh = srcHeight;
-    if (sc && !dc) { dw = (srcWidth + sf->block_w - 1) / sf->block_w; dh = (srcHeight + sf->block_h - 1) / sf->block_h; }
-    if (!sc && dc) { dw = srcWidth * df->block_w; dh = srcHeight * df->block_h; }
+    if (vsc && !vdc) { dw = (srcWidth + vsf->block_w - 1) / vsf->block_w; dh = (srcHeight + vsf->block_h - 1) / vsf->block_h; }
+    if (!vsc && vdc) { dw = srcWidth * vdf->block_w; dh = srcHeight * vdf->block_h; }
 
     /* regions in range and block aligned */
     GLint sz = scube ? 0 : srcZ, dz = dcube ? 0 : dstZ;
@@ -3197,17 +3329,17 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
     err = checkSubRegion(dt, dface0, dstLevel, dstX, dstY, dz, dw, dh, dcube ? 1 : srcDepth);
     TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
 
-    if (sc)
+    if (vsc)
     {
-        TD_CHECK(srcX % sf->block_w == 0 && srcY % sf->block_h == 0, GL_INVALID_VALUE);
-        TD_CHECK(srcWidth % sf->block_w == 0 || (GLuint)(srcX + srcWidth) == sl->width, GL_INVALID_VALUE);
-        TD_CHECK(srcHeight % sf->block_h == 0 || (GLuint)(srcY + srcHeight) == sl->height, GL_INVALID_VALUE);
+        TD_CHECK(srcX % vsf->block_w == 0 && srcY % vsf->block_h == 0, GL_INVALID_VALUE);
+        TD_CHECK(srcWidth % vsf->block_w == 0 || (GLuint)(srcX + srcWidth) == sl->width, GL_INVALID_VALUE);
+        TD_CHECK(srcHeight % vsf->block_h == 0 || (GLuint)(srcY + srcHeight) == sl->height, GL_INVALID_VALUE);
     }
-    if (dc)
+    if (vdc)
     {
-        TD_CHECK(dstX % df->block_w == 0 && dstY % df->block_h == 0, GL_INVALID_VALUE);
-        TD_CHECK(dw % df->block_w == 0 || (GLuint)(dstX + dw) == dl->width, GL_INVALID_VALUE);
-        TD_CHECK(dh % df->block_h == 0 || (GLuint)(dstY + dh) == dl->height, GL_INVALID_VALUE);
+        TD_CHECK(dstX % vdf->block_w == 0 && dstY % vdf->block_h == 0, GL_INVALID_VALUE);
+        TD_CHECK(dw % vdf->block_w == 0 || (GLuint)(dstX + dw) == dl->width, GL_INVALID_VALUE);
+        TD_CHECK(dh % vdf->block_h == 0 || (GLuint)(dstY + dh) == dl->height, GL_INVALID_VALUE);
     }
 
     if (!srcWidth || !srcHeight || !srcDepth)
@@ -3245,6 +3377,20 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
             raw = (uint8_t *)allocStorage(ss, sr.w, sr.h, sr.d, &tmp);
             TD_CHECK(raw, GL_OUT_OF_MEMORY);
             readRegion(ctx, st, &sr, &tmp);
+            /* online-compressed (decoded) source copied into an uncompressed
+             * request: the destination texel count can exceed the source byte
+             * volume — grow and zero the buffer so writeRegion never over-reads
+             * (values are approximate; there is no encoder for the block data) */
+            if (decoded_mixed)
+            {
+                size_t have = (size_t)sr.w * sr.h * sr.d * ss->bpp;
+                size_t need = (size_t)dr.w * dr.h * dr.d * ds->bpp;
+                if (need > have)
+                {
+                    uint8_t *big = (uint8_t *)calloc(1, need);
+                    if (big) { memcpy(big, raw, have); free(raw); raw = big; }
+                }
+            }
         }
 
         if (dc)

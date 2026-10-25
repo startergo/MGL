@@ -1980,9 +1980,29 @@ typedef struct DSBlitParams {
     }
     d.storageMode = MTLStorageModePrivate;
     d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+
+    /* non-renderable sized formats (RGB9_E5) are legal renderbuffer storage but can
+     * never be attached to a live render pass: keep them sample-only so Metal does not
+     * reject the descriptor; framebuffer completeness reports the GL-level failure */
+    const MGLFBFormatInfo *rfi = mgl_fb_format_info(rb->internalformat);
+    bool renderable = rfi && (rfi->color_renderable || rfi->depth_renderable || rfi->stencil_renderable);
+    if (!renderable)
+        d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [_device newTextureWithDescriptor:d];
     if (!t) return false;
     t.label = [NSString stringWithFormat:@"MGL renderbuffer %u", rb->base.name];
+
+    if (!renderable)
+    {
+        /* no render pass may clear a non-renderable texture; such a renderbuffer can
+         * never be read back through a complete framebuffer, so initial contents stay
+         * undefined rather than zeroed */
+        Texture *tex_nr = rb->base.tex;
+        if (tex_nr->mtl_data) CFBridgingRelease(tex_nr->mtl_data);
+        tex_nr->mtl_data = (void *)CFBridgingRetain(t);
+        tex_nr->dirty_bits = 0;
+        return true;
+    }
 
     /* defined (zero) initial contents */
     if (_currentRenderEncoder) [self endRenderEncoding];

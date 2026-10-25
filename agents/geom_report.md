@@ -1,4 +1,83 @@
-READY 896ec80 (code tip = 6e99bb6..896ec80, gl46-port merged at bf0074e; full headless suite 0 failures / 485 PASS; test_geom 600/0 x10 runs; KHR-GL46.shader_storage_buffer_object **119 -> 124/124**, texture_view **1 -> 3/7**, texture_buffer **14 -> 15/16**; image_load_store re-verified 38/51 (1 case was a load-under-contention kill); scratch files untracked, explicit-path adds only).
+READY 1206ece (gl46-port merged at 76e075e + the four r48 commits; clean rebuild, full headless suite **495 PASS / 0 FAIL**, test_geom **603/0 x8**; r48 CTS groups re-verified with before/after table below; no zz*/scratch_* committed).
+
+## Round 49 — fresh session: merge, clean rebuild, WIP triage, r48 CTS re-verification
+
+Round 48 hit the transcript limit before READY; this round landed the leftover work and
+verified everything against the r18 sweep baseline (`~/MGL-cts/mgl-r18-sweep/summary.txt`).
+
+### Uncommitted round-48 WIP triage (kept, finished, or reverted)
+* `MGL/src/shaders.c` (kept): glslang compile-cache teardown in
+  `mgl_shader_release_compiler_resources` — cache-owned `glslang_shader_t` handles must not
+  outlive `glslang_finalize_process` (exit-order crash in test_debug teardown); plus an
+  `MGL_NO_GLSL_CACHE` env kill-switch for debugging.
+* `MGL/src/get.c` (kept + fixed properly): the round-48 `GL_COMPRESSED_TEXTURE_FORMATS`
+  patch truncated the list to the 32-slot `GetValues` array while
+  `GL_NUM_COMPRESSED_TEXTURE_FORMATS` still reported the true 52 — an app asking for
+  NUM and then the list would have read 20 uninitialised values (and the unpatched code
+  wrote 52 doubles through a 32-slot struct = stack corruption). `MAX_GET_VALUES` is now
+  64 so the full 52-entry list is delivered and both queries agree; the list query still
+  clamps defensively to the slot count.
+* `tests/headless/test_fb.c` (kept + fixed): the RGB9_E5-storage expectation matches the
+  committed r48b behaviour (sized non-renderable formats are legal storage; CTS
+  internalformat.renderbuffer.rgb9_e5 expects no error, completeness fails later), but the
+  storage call was made on the **attached** renderbuffer, which re-specified its storage to
+  RGB9_E5 and left the FBO incomplete for the readback error checks further down. Now done
+  on a spare renderbuffer.
+* `tests/headless/test_texdata.c` (not part of the WIP, but the suite was red because of
+  r48d): `copy_image_sub_data` still assumed the pre-r48d CopyImageSubData semantics.
+  The single-level textures now clamp `GL_TEXTURE_MAX_LEVEL` to 0 (r48d rejects incomplete
+  textures per GL 8.17, matching KHR-GL46 copy_image.incomplete_tex which passes), and the
+  target-mismatch expectation is `GL_INVALID_ENUM` (KHR-GL46 copy_image.target_miss_match).
+* `MGL/src/MGLRenderer+Program.m` (reverted): whitespace-only `{`/`@autoreleasepool`
+  reflow, no content.
+
+### CTS before/after (r18 sweep -> now, one batch at a time, nice/taskpolicy)
+| group | r18 sweep | round 48 | round 49 (now) |
+|---|---|---|---|
+| KHR-GL46.internalformat | 25 Pass / 27 NotSupported | 48 Pass / 4 Fail (48d) -> 51 Pass + 1 NS (48e/f) | **51 Pass / 1 NotSupported** |
+| KHR-GL46.pixelstoragemodes | 736 Pass / 160 NotSupported | 896 Pass (48c) | **896 Pass / 896** |
+| KHR-GL46.packed_pixels | 226 Pass / 24 Fail | 234 Pass / 16 Fail (48j) | **234 Pass / 16 Fail** |
+| KHR-GL46.packed_depth_stencil | 21 Pass / 4 Fail | 25 Pass (48p) | **25 Pass / 25** |
+| KHR-GL46.copy_image | 7 Pass / 6 Fail | 10 Pass / 2 Fail / 1 Timeout (48u) | **12 Pass / 1 Fail** |
+| KHR-GL46.texture_swizzle | 2 Pass / 1 Crash / 1 Fail | 2 Pass / 2 Timeout (48a) | 2 Pass / 2 Timeout |
+| KHR-GL46.texture_view | 1 Pass / 6 Fail | 3 Pass (r47) | **3 Pass / 4 Fail** (unchanged) |
+| KHR-GL46.texture_buffer | 14 Pass / 2 Fail | 15 Pass (r47) | **15 Pass / 1 Fail** (unchanged) |
+
+Notes on the remaining failures:
+* **copy_image.exceeding_boundaries** (the 1 Fail): CTS sub-case for `GL_TEXTURE_1D_ARRAY`
+  — the test allocates a 16-**layer** 1D array (`texImage2D(16,16)`) and then expects
+  `GL_INVALID_VALUE` for a copy at `srcY=14, srcHeight=1`, i.e. layer 14 of 16. Per GL
+  4.6 (y is the array layer, region fits) that copy is legal; the CTS models the 1D-array
+  layer axis as 6 deep (the `depth` constant it uses for 2D_ARRAY/3D). Rejecting it would
+  break legal copies, so MGL keeps the spec behaviour and the sub-case stays red.
+  The two r48d failures (incompatible_formats_compression, invalid_alignment) now pass and
+  `functional` passes with a longer per-case timeout (it was a 305 s deadline kill, not a hang).
+* **texture_swizzle.smoke/.functional** (2 Timeout): not a driver hang — the smoke case
+  walks ~131k sub-cases (8^4 swizzle combos x 4 channels x access routines), each with a
+  fresh output texture + render + readback, and needs far more than the 20 s default
+  per-case budget (killed at 240 s with the test still making progress, ~1370 textures in).
+  A per-sub-case cost reduction (shader/sampler reuse across the swizzle loop) would be the
+  textures-domain follow-up.
+* **internalformat.renderbuffer.rgb9_e5** (1 NotSupported): correct per CTS semantics —
+  storage succeeds, RGB9_E5 is not colour-renderable, so the FBO is incomplete and the
+  case reports NotSupported (allowed outcome).
+* packed_pixels 16 Fails: 8 "Gradient comparison failed ... GL_BGRA / UNSIGNED_INT_10_10_10_2"
+  readback conversions, 4 UNPACK_ROW_LENGTH + 4 UNPACK_IMAGE_HEIGHT on sRGB/RGTC uploads
+  (same clusters as r48; no regression).
+
+### Verification
+* clean rebuild (`rm -rf build`, `make -j4 lib`), no new warnings in the touched files.
+* full headless suite **495 PASS / 0 FAIL** (rc=0; 485 -> 495 tests with the merged
+  compat s9 + tess r19 test additions), run twice.
+* `test_geom` **603 checks / 0 failures x 8 runs**; `test_fb` 293/0 x4, `test_texdata` 240/0 x4.
+* `agents/stub_scanner.py --list EMPTY|NOOP|ASSERT` clean for geometry.c / shaders.c / get.c.
+
+### Shared-file edits this round
+* `MGL/src/get.c` (get domain): MAX_GET_VALUES 32 -> 64 + list clamp (stack-corruption fix,
+  described above).
+* `tests/headless/test_fb.c` (fb), `tests/headless/test_texdata.c` (texdata): expectation
+  updates required to match the already-committed r48b/r48d semantics; both called out above.
+
 
 ## Round 47 — SSBO 119 -> 124/124, texture_view +2, texture_buffer +1
 

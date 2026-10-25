@@ -38,12 +38,15 @@
 #include "mgl_ext.h"
 #include "mgl_ext_debug.h"
 #include "mgl_ext_program.h"
+#include "texdata_formats.h"
 
 /* buffers.c: the storage of an indexed buffer binding point (uniform buffer points at
  * or above MAX_BINDABLE_BUFFERS live in the overflow table there) */
 extern BufferBaseTarget *mgl_buffers_indexed_binding(GLMContext ctx, GLenum target, GLuint index);
 
-#define MAX_GET_VALUES 32
+/* 64 so the whole compressed-format list (52 entries once S3TC + ASTC land) fits;
+ * GL_COMPRESSED_TEXTURE_FORMATS is the only multi-value list query */
+#define MAX_GET_VALUES 64
 
 typedef struct {
     int     count;
@@ -150,8 +153,35 @@ static GLuint max_uniform_buffer_bindings(GLMContext ctx)
 #define MGL_MAX_VERTEX_ATTRIB_BINDINGS          MAX_BINDABLE_BUFFERS
 #define MGL_MAX_VIEWPORTS                       16
 
-/* the 18 compressed formats required by GL 4.6 (RGTC, BPTC, ETC2/EAC), all mapped to Metal formats */
-static const GLenum compressed_formats[] = {
+#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#endif
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
+#ifndef GL_COMPRESSED_SRGB_S3TC_DXT1_EXT
+#define GL_COMPRESSED_SRGB_S3TC_DXT1_EXT 0x8C4C
+#endif
+#ifndef GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT 0x8C4D
+#endif
+#ifndef GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT 0x8C4E
+#endif
+#ifndef GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT
+#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT 0x8C4F
+#endif
+
+/* the 18 compressed formats required by GL 4.6 (RGTC, BPTC, ETC2/EAC) plus the
+ * EXT_texture_compression_s3tc / KHR_texture_compression_astc_ldr sets — an entry is
+ * listed only when the device can store it (tdFormatInfo NULL-check) */
+static const GLenum compressed_formats_all[] = {
     GL_COMPRESSED_RED_RGTC1, GL_COMPRESSED_SIGNED_RED_RGTC1,
     GL_COMPRESSED_RG_RGTC2, GL_COMPRESSED_SIGNED_RG_RGTC2,
     GL_COMPRESSED_RGBA_BPTC_UNORM, GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM,
@@ -161,8 +191,38 @@ static const GLenum compressed_formats[] = {
     GL_COMPRESSED_RGBA8_ETC2_EAC, GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC,
     GL_COMPRESSED_R11_EAC, GL_COMPRESSED_SIGNED_R11_EAC,
     GL_COMPRESSED_RG11_EAC, GL_COMPRESSED_SIGNED_RG11_EAC,
+    GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+    GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
+    GL_COMPRESSED_SRGB_S3TC_DXT1_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT,
+    GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT,
+    GL_COMPRESSED_RGBA_ASTC_4x4_KHR, GL_COMPRESSED_RGBA_ASTC_5x4_KHR,
+    GL_COMPRESSED_RGBA_ASTC_5x5_KHR, GL_COMPRESSED_RGBA_ASTC_6x5_KHR,
+    GL_COMPRESSED_RGBA_ASTC_6x6_KHR, GL_COMPRESSED_RGBA_ASTC_8x5_KHR,
+    GL_COMPRESSED_RGBA_ASTC_8x6_KHR, GL_COMPRESSED_RGBA_ASTC_8x8_KHR,
+    GL_COMPRESSED_RGBA_ASTC_10x5_KHR, GL_COMPRESSED_RGBA_ASTC_10x6_KHR,
+    GL_COMPRESSED_RGBA_ASTC_10x8_KHR, GL_COMPRESSED_RGBA_ASTC_10x10_KHR,
+    GL_COMPRESSED_RGBA_ASTC_12x10_KHR, GL_COMPRESSED_RGBA_ASTC_12x12_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR,
+    GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR, GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR,
 };
-#define NUM_COMPRESSED_FORMATS ((int)(sizeof(compressed_formats) / sizeof(compressed_formats[0])))
+
+static GLenum compressed_formats[sizeof(compressed_formats_all) / sizeof(compressed_formats_all[0])];
+static int NUM_COMPRESSED_FORMATS = -1;
+
+static void buildCompressedFormats(void)
+{
+    if (NUM_COMPRESSED_FORMATS >= 0)
+        return;
+    NUM_COMPRESSED_FORMATS = 0;
+    for (size_t i = 0; i < sizeof(compressed_formats_all) / sizeof(compressed_formats_all[0]); i++)
+        if (tdFormatInfo(compressed_formats_all[i]))
+            compressed_formats[NUM_COMPRESSED_FORMATS++] = compressed_formats_all[i];
+}
 
 #pragma mark - extensions / strings
 
@@ -263,14 +323,31 @@ static const char *mgl_extensions[] = {
     "GL_ARB_vertex_type_10f_11f_11f_rev",
     "GL_ARB_vertex_type_2_10_10_10_rev",
     "GL_ARB_viewport_array",
+    /* internalformat test coverage: promoted-to-core extensions the CTS checks
+     * explicitly (depth textures, shared exponent, integer textures, packed formats) */
+    "GL_ARB_depth_texture",
+    "GL_ARB_depth_buffer_float",
+    "GL_ARB_texture_non_power_of_two",
+    "GL_EXT_texture_shared_exponent",
+    "GL_EXT_texture_integer",
+    "GL_EXT_texture_sRGB",
+    "GL_EXT_packed_float",
+    "GL_EXT_texture_type_2_10_10_10_REV",
     "GL_EXT_texture_filter_anisotropic",
     "GL_KHR_debug",
+    "GL_EXT_texture_compression_s3tc",
+    "GL_KHR_texture_compression_astc_ldr",
 };
 #define NUM_MGL_EXTENSIONS ((GLuint)(sizeof(mgl_extensions) / sizeof(mgl_extensions[0])))
 
-/* compat domain: size / element access of the core extension list */
-GLuint mgl_num_extensions(void) { return NUM_MGL_EXTENSIONS; }
-const char *mgl_extension_name(GLuint i) { return (i < NUM_MGL_EXTENSIONS) ? mgl_extensions[i] : NULL; }
+/* compat domain: size / element access of the core extension list.  The ASTC entry is
+ * last and hidden when the device has no ASTC hardware (Intel Macs). */
+GLuint mgl_num_extensions(void) { return NUM_MGL_EXTENSIONS - (tdDeviceHasASTC() ? 0 : 1); }
+const char *mgl_extension_name(GLuint i)
+{
+    if (i >= mgl_num_extensions()) return NULL;
+    return mgl_extensions[i];
+}
 
 /* GLSL versions accepted by the glslang front end in a core context */
 static const char *mgl_glsl_versions[] = {
@@ -499,7 +576,7 @@ static bool get_state(GLMContext ctx, GLenum pname, GetValues *gv)
         /* ---- context ---- */
         case GL_MAJOR_VERSION: PUT1(4);
         case GL_MINOR_VERSION: PUT1(6);
-        case GL_NUM_EXTENSIONS: PUT1(NUM_MGL_EXTENSIONS);
+        case GL_NUM_EXTENSIONS: PUT1(mgl_num_extensions());
         case GL_NUM_SHADING_LANGUAGE_VERSIONS: PUT1(NUM_GLSL_VERSIONS);
         case GL_NUM_SPIR_V_EXTENSIONS: PUT1(0);
         case GL_CONTEXT_FLAGS:
@@ -520,10 +597,16 @@ static bool get_state(GLMContext ctx, GLenum pname, GetValues *gv)
             PUT1((double)mach_absolute_time() * tb.numer / tb.denom);
         }
 
-        case GL_NUM_COMPRESSED_TEXTURE_FORMATS: PUT1(NUM_COMPRESSED_FORMATS);
+        case GL_NUM_COMPRESSED_TEXTURE_FORMATS:
+            buildCompressedFormats();
+            PUT1(NUM_COMPRESSED_FORMATS);
         case GL_COMPRESSED_TEXTURE_FORMATS:
-            gv->count = NUM_COMPRESSED_FORMATS;
-            for (int i = 0; i < NUM_COMPRESSED_FORMATS; i++) gv->v[i] = compressed_formats[i];
+            buildCompressedFormats();
+            /* the count is the true number; only as many as fit in the value slot
+             * (MAX_GET_VALUES) are returned by the list query — callers passing a
+             * smaller buffer get the truncated list per glGetIntegerv semantics */
+            gv->count = NUM_COMPRESSED_FORMATS > MAX_GET_VALUES ? MAX_GET_VALUES : NUM_COMPRESSED_FORMATS;
+            for (int i = 0; i < gv->count; i++) gv->v[i] = compressed_formats[i];
             return true;
         case GL_NUM_SHADER_BINARY_FORMATS: PUT1(0);
         case GL_SHADER_BINARY_FORMATS: gv->count = 0; return true;
@@ -1077,7 +1160,7 @@ const GLubyte *mglGetStringi(GLMContext ctx, GLenum name, GLuint index)
     switch (name)
     {
         case GL_EXTENSIONS:
-            if (index >= NUM_MGL_EXTENSIONS) break;
+            if (index >= mgl_num_extensions()) break;
             return (const GLubyte *)mgl_extensions[index];
 
         case GL_SHADING_LANGUAGE_VERSION:

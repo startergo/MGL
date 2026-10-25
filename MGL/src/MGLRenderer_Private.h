@@ -266,6 +266,8 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (int) getProgramBinding: (int) stage type: (int) type index: (int) index;
 - (int) getProgramLocation: (int) stage type: (int) type index: (int) index;
 - (id<MTLLibrary>) compileShader: (const char *) str;
+/* program domain: MSL-source -> MTLLibrary cache (compileShader: uses it) */
+- (id<MTLLibrary>) extProgramLibraryForMSL: (const char *)msl key: (NSString *)key error: (char **)error_log;
 /* tess domain: precise-math options for MSL carrying the fp64 df64 library */
 - (MTLCompileOptions *) mslCompileOptionsForSource: (NSString *) src;
 -(bool)bindMTLProgram:(Program *)ptr;

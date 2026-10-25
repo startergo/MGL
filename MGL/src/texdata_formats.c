@@ -162,24 +162,24 @@ static const TDFormat td_formats[] = {
     F(GL_LUMINANCE16_ALPHA16, GL_LUMINANCE_ALPHA, UN, MTLPixelFormatRG16Unorm, TDK_UN16, 2, 4, RF|TDF_LEGACY, 16, 0, 0, 16, 0, 0),
 
     /* RGTC */
-    C(GL_COMPRESSED_RED_RGTC1,        GL_RED,  UN, MTLPixelFormatBC4_RUnorm,  TDF_BC, 4, 4, 8, 0),
-    C(GL_COMPRESSED_SIGNED_RED_RGTC1, GL_RED,  SN, MTLPixelFormatBC4_RSnorm,  TDF_BC|TDF_SIGNED, 4, 4, 8, 0),
-    C(GL_COMPRESSED_RG_RGTC2,         GL_RG,   UN, MTLPixelFormatBC5_RGUnorm, TDF_BC, 4, 4, 16, 0),
-    C(GL_COMPRESSED_SIGNED_RG_RGTC2,  GL_RG,   SN, MTLPixelFormatBC5_RGSnorm, TDF_BC|TDF_SIGNED, 4, 4, 16, 0),
+    C(GL_COMPRESSED_RED_RGTC1,        GL_RED,  UN, MTLPixelFormatBC4_RUnorm,  TDF_BC, 4, 4, 8, GL_R8),
+    C(GL_COMPRESSED_SIGNED_RED_RGTC1, GL_RED,  SN, MTLPixelFormatBC4_RSnorm,  TDF_BC|TDF_SIGNED, 4, 4, 8, GL_R8_SNORM),
+    C(GL_COMPRESSED_RG_RGTC2,         GL_RG,   UN, MTLPixelFormatBC5_RGUnorm, TDF_BC, 4, 4, 16, GL_RG8),
+    C(GL_COMPRESSED_SIGNED_RG_RGTC2,  GL_RG,   SN, MTLPixelFormatBC5_RGSnorm, TDF_BC|TDF_SIGNED, 4, 4, 16, GL_RG8_SNORM),
     /* BPTC */
-    C(GL_COMPRESSED_RGBA_BPTC_UNORM,         GL_RGBA, UN, MTLPixelFormatBC7_RGBAUnorm,      TDF_BC, 4, 4, 16, 0),
-    C(GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM,   GL_RGBA, UN, MTLPixelFormatBC7_RGBAUnorm_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, 0),
-    C(GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT,   GL_RGB,  FL, MTLPixelFormatBC6H_RGBFloat,      TDF_BC|TDF_SIGNED|TDF_BPTC_FLOAT, 4, 4, 16, 0),
-    C(GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT, GL_RGB,  FL, MTLPixelFormatBC6H_RGBUfloat,     TDF_BC|TDF_BPTC_FLOAT, 4, 4, 16, 0),
+    C(GL_COMPRESSED_RGBA_BPTC_UNORM,         GL_RGBA, UN, MTLPixelFormatBC7_RGBAUnorm,      TDF_BC, 4, 4, 16, GL_RGBA8),
+    C(GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM,   GL_RGBA, UN, MTLPixelFormatBC7_RGBAUnorm_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT,   GL_RGB,  FL, MTLPixelFormatBC6H_RGBFloat,      TDF_BC|TDF_SIGNED|TDF_BPTC_FLOAT, 4, 4, 16, GL_RGB16F),
+    C(GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT, GL_RGB,  FL, MTLPixelFormatBC6H_RGBUfloat,     TDF_BC|TDF_BPTC_FLOAT, 4, 4, 16, GL_RGB16F),
     /* S3TC (EXT_texture_compression_s3tc / EXT_texture_sRGB) */
-    C(GL_COMPRESSED_RGB_S3TC_DXT1_EXT,        GL_RGB,  UN, MTLPixelFormatBC1_RGBA,      TDF_BC, 4, 4, 8, 0),
-    C(GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,       GL_RGBA, UN, MTLPixelFormatBC1_RGBA,      TDF_BC, 4, 4, 8, 0),
-    C(GL_COMPRESSED_RGBA_S3TC_DXT3_EXT,       GL_RGBA, UN, MTLPixelFormatBC2_RGBA,      TDF_BC, 4, 4, 16, 0),
-    C(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,       GL_RGBA, UN, MTLPixelFormatBC3_RGBA,      TDF_BC, 4, 4, 16, 0),
-    C(GL_COMPRESSED_SRGB_S3TC_DXT1_EXT,       GL_RGB,  UN, MTLPixelFormatBC1_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 8, 0),
-    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT, GL_RGBA, UN, MTLPixelFormatBC1_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 8, 0),
-    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT, GL_RGBA, UN, MTLPixelFormatBC2_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, 0),
-    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT, GL_RGBA, UN, MTLPixelFormatBC3_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, 0),
+    C(GL_COMPRESSED_RGB_S3TC_DXT1_EXT,        GL_RGB,  UN, MTLPixelFormatBC1_RGBA,      TDF_BC, 4, 4, 8, GL_RGB8),
+    C(GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,       GL_RGBA, UN, MTLPixelFormatBC1_RGBA,      TDF_BC, 4, 4, 8, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_S3TC_DXT3_EXT,       GL_RGBA, UN, MTLPixelFormatBC2_RGBA,      TDF_BC, 4, 4, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,       GL_RGBA, UN, MTLPixelFormatBC3_RGBA,      TDF_BC, 4, 4, 16, GL_RGBA8),
+    C(GL_COMPRESSED_SRGB_S3TC_DXT1_EXT,       GL_RGB,  UN, MTLPixelFormatBC1_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 8, GL_SRGB8),
+    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT, GL_RGBA, UN, MTLPixelFormatBC1_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 8, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT, GL_RGBA, UN, MTLPixelFormatBC2_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT, GL_RGBA, UN, MTLPixelFormatBC3_RGBA_sRGB, TDF_BC|TDF_SRGB, 4, 4, 16, GL_SRGB8_ALPHA8),
     /* ETC2 / EAC (GL 4.3 core) */
     C(GL_COMPRESSED_RGB8_ETC2,                      GL_RGB,  UN, MTLPixelFormatETC2_RGB8,        TDF_ETC, 4, 4, 8,  GL_RGBA8),
     C(GL_COMPRESSED_SRGB8_ETC2,                     GL_RGB,  UN, MTLPixelFormatETC2_RGB8_sRGB,   TDF_ETC|TDF_SRGB, 4, 4, 8, GL_SRGB8_ALPHA8),
@@ -191,6 +191,36 @@ static const TDFormat td_formats[] = {
     C(GL_COMPRESSED_SIGNED_R11_EAC,                 GL_RED,  SN, MTLPixelFormatEAC_R11Snorm,     TDF_ETC|TDF_SIGNED, 4, 4, 8, GL_R16_SNORM),
     C(GL_COMPRESSED_RG11_EAC,                       GL_RG,   UN, MTLPixelFormatEAC_RG11Unorm,    TDF_ETC, 4, 4, 16, GL_RG16),
     C(GL_COMPRESSED_SIGNED_RG11_EAC,                GL_RG,   SN, MTLPixelFormatEAC_RG11Snorm,    TDF_ETC|TDF_SIGNED, 4, 4, 16, GL_RG16_SNORM),
+    /* ASTC LDR (KHR_texture_compression_astc_ldr): every block is 16 bytes.
+     * No CPU decoder — only usable when the device has ASTC (tdDeviceHasASTC). */
+    C(GL_COMPRESSED_RGBA_ASTC_4x4_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_4x4_LDR,   TDF_ASTC, 4, 4, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_5x4_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_5x4_LDR,   TDF_ASTC, 5, 4, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_5x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_5x5_LDR,   TDF_ASTC, 5, 5, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_6x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_6x5_LDR,   TDF_ASTC, 6, 5, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_6x6_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_6x6_LDR,   TDF_ASTC, 6, 6, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_8x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x5_LDR,   TDF_ASTC, 8, 5, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_8x6_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x6_LDR,   TDF_ASTC, 8, 6, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_8x8_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x8_LDR,   TDF_ASTC, 8, 8, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_10x5_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x5_LDR,  TDF_ASTC, 10, 5, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_10x6_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x6_LDR,  TDF_ASTC, 10, 6, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_10x8_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x8_LDR,  TDF_ASTC, 10, 8, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_10x10_KHR, GL_RGBA, UN, MTLPixelFormatASTC_10x10_LDR, TDF_ASTC, 10, 10, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_12x10_KHR, GL_RGBA, UN, MTLPixelFormatASTC_12x10_LDR, TDF_ASTC, 12, 10, 16, GL_RGBA8),
+    C(GL_COMPRESSED_RGBA_ASTC_12x12_KHR, GL_RGBA, UN, MTLPixelFormatASTC_12x12_LDR, TDF_ASTC, 12, 12, 16, GL_RGBA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_4x4_sRGB,   TDF_ASTC|TDF_SRGB, 4, 4, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_5x4_sRGB,   TDF_ASTC|TDF_SRGB, 5, 4, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_5x5_sRGB,   TDF_ASTC|TDF_SRGB, 5, 5, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_6x5_sRGB,   TDF_ASTC|TDF_SRGB, 6, 5, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_6x6_sRGB,   TDF_ASTC|TDF_SRGB, 6, 6, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x5_sRGB,   TDF_ASTC|TDF_SRGB, 8, 5, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x6_sRGB,   TDF_ASTC|TDF_SRGB, 8, 6, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR,   GL_RGBA, UN, MTLPixelFormatASTC_8x8_sRGB,   TDF_ASTC|TDF_SRGB, 8, 8, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x5_sRGB,  TDF_ASTC|TDF_SRGB, 10, 5, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x6_sRGB,  TDF_ASTC|TDF_SRGB, 10, 6, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR,  GL_RGBA, UN, MTLPixelFormatASTC_10x8_sRGB,  TDF_ASTC|TDF_SRGB, 10, 8, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR, GL_RGBA, UN, MTLPixelFormatASTC_10x10_sRGB, TDF_ASTC|TDF_SRGB, 10, 10, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR, GL_RGBA, UN, MTLPixelFormatASTC_12x10_sRGB, TDF_ASTC|TDF_SRGB, 12, 10, 16, GL_SRGB8_ALPHA8),
+    C(GL_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR, GL_RGBA, UN, MTLPixelFormatASTC_12x12_sRGB, TDF_ASTC|TDF_SRGB, 12, 12, 16, GL_SRGB8_ALPHA8),
 };
 
 #define TD_NUM_FORMATS (sizeof(td_formats) / sizeof(td_formats[0]))
@@ -198,14 +228,23 @@ static const TDFormat td_formats[] = {
 const TDFormat *tdFormatInfo(GLenum internalformat)
 {
     for (size_t i = 0; i < TD_NUM_FORMATS; i++)
+    {
         if (td_formats[i].internalformat == internalformat)
+        {
+            /* ASTC is device-only: without hardware ASTC the format is not a legal
+             * internal format at all (as if the extension were absent) */
+            if ((td_formats[i].flags & TDF_ASTC) && !tdDeviceHasASTC())
+                return NULL;
             return &td_formats[i];
+        }
+    }
     return NULL;
 }
 
-static bool td_cap_etc = true, td_cap_bc = true;
+static bool td_cap_etc = true, td_cap_bc = true, td_cap_astc = false;
 
 void tdSetDeviceCaps(bool etc, bool bc) { td_cap_etc = etc; td_cap_bc = bc; }
+void tdSetASTCCap(bool astc) { td_cap_astc = astc; }
 
 bool tdDeviceHasETC(void)
 {
@@ -215,6 +254,13 @@ bool tdDeviceHasETC(void)
 }
 
 bool tdDeviceHasBC(void) { return td_cap_bc; }
+
+bool tdDeviceHasASTC(void)
+{
+    const char *e = getenv("MGL_FORCE_ETC_DECODE");
+    if (e && e[0] == '1') return false;
+    return td_cap_astc;
+}
 
 const TDFormat *tdStorageFormat(const TDFormat *f)
 {
@@ -254,6 +300,18 @@ GLenum tdResolveInternalFormat(GLenum internalformat, GLenum format, GLenum type
         case GL_LUMINANCE:       return GL_LUMINANCE8;
         case GL_LUMINANCE_ALPHA: return GL_LUMINANCE8_ALPHA8;
         default: break;
+    }
+
+    /* a SPECIFIC compressed format given ordinary client data means "the GL will
+     * compress this" (GL 4.6 8.5.4); storing the decoded equivalent is a legal
+     * representation (hardware compression is optional) — this is what the CTS
+     * packed_pixels rectangle.compressed_* cases drive.  Compressed upload paths
+     * pass format == 0 and keep the real compressed format. */
+    if (format && format != GL_NONE)
+    {
+        const TDFormat *cf = tdFormatInfo(internalformat);
+        if (cf && (cf->flags & TDF_COMPRESSED) && cf->decoded)
+            return cf->decoded;
     }
 
     (void)format;
@@ -647,8 +705,24 @@ static inline double clampd(double v, double lo, double hi) { return v < lo ? lo
 
 static inline double un_to_f(double v, int bits) { return v / (double)((1ull << bits) - 1); }
 static inline double sn_to_f(double v, int bits) { double r = v / (double)((1ull << (bits - 1)) - 1); return r < -1.0 ? -1.0 : r; }
-static inline uint64_t f_to_un(double f, int bits)
+/* IEC 61966-2-1 sRGB transfer functions, used when a *linear* client value meets an
+ * sRGB8-family storage (GL 4.6 8.5.4: conversions go through floats; the sRGB
+ * storage keeps the gamma-encoded 8-bit values the GPU texture format expects) */
+static inline double td_srgb_encode(double v)
 {
+    v = clampd(v, 0.0, 1.0);
+    if (v <= 0.0031308) return v * 12.92;
+    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+static inline double td_srgb_decode(double v)
+{
+    v = clampd(v, 0.0, 1.0);
+    if (v <= 0.04045) return v / 12.92;
+    return pow((v + 0.055) / 1.055, 2.4);
+}
+
+static inline uint64_t f_to_un(double f, int bits){
     if (isnan(f)) f = 0;
     return (uint64_t)llround(clampd(f, 0.0, 1.0) * (double)((1ull << bits) - 1));
 }
@@ -864,6 +938,9 @@ static void storage_read_row(const TDFormat *f, const uint8_t *src, const uint8_
         TDPix *p = &out[x];
         pix_default(p);
         const uint8_t *s = src + (size_t)x * f->bpp;
+        /* an sRGB8-family storage converts to linear floats when it leaves the
+         * storage (GL 4.6 8.5.4: conversion goes through floats) */
+        bool srgb = (f->flags & TDF_SRGB) != 0;
 
         switch (f->kind)
         {
@@ -1032,6 +1109,15 @@ static bool td_direct(const TDFormat *f, GLenum format, GLenum type)
     }
 }
 
+/* client types whose values are linear floats (see tdUnpack / tdPack sRGB handling) */
+static bool td_client_type_is_float(GLenum type)
+{
+    return type == GL_FLOAT || type == GL_HALF_FLOAT ||
+           type == GL_UNSIGNED_INT_10F_11F_11F_REV ||
+           type == GL_UNSIGNED_INT_5_9_9_9_REV ||
+           type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
+}
+
 void tdUnpack(const TDFormat *f, const void *src, size_t src_row, size_t src_img,
               GLenum format, GLenum type, bool swap_bytes,
               int w, int h, int d, const TDStorage *dst,
@@ -1062,6 +1148,16 @@ void tdUnpack(const TDFormat *f, const void *src, size_t src_row, size_t src_img
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             client_read_row(s, format, type, swap_bytes, w, tmp);
+            /* GL 4.6 8.5.4: float / half-float client values are LINEAR; an sRGB
+             * storage wants the gamma-encoded bytes.  UNORM client data is copied
+             * through unchanged (its bytes are already in storage space). */
+            if ((f->flags & TDF_SRGB) && (f->kind == TDK_UN8) && td_client_type_is_float(type))
+                for (int x = 0; x < w; x++)
+                {
+                    tmp[x].c[0] = td_srgb_encode(tmp[x].c[0]);
+                    tmp[x].c[1] = td_srgb_encode(tmp[x].c[1]);
+                    tmp[x].c[2] = td_srgb_encode(tmp[x].c[2]);
+                }
             storage_write_row(f, o, so, w, tmp, wd, ws);
         }
     }
@@ -1107,6 +1203,15 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             storage_read_row(f, s, ss, w, tmp);
+            /* GL 4.6 8.5.4: reading sRGB storage into float / half-float clients
+             * returns LINEAR values; UNORM clients get the raw storage bytes back */
+            if ((f->flags & TDF_SRGB) && (f->kind == TDK_UN8) && cf_float_client)
+                for (int x = 0; x < w; x++)
+                {
+                    tmp[x].c[0] = td_srgb_decode(tmp[x].c[0]);
+                    tmp[x].c[1] = td_srgb_decode(tmp[x].c[1]);
+                    tmp[x].c[2] = td_srgb_decode(tmp[x].c[2]);
+                }
             /* a signed-normalized storage read back through any client keeps its value:
              * GL 4.6 8.5.4 converts through floats and clamps to what the CLIENT type
              * represents (an UNSIGNED_BYTE read of -0.5 clamps to 0, it is not biased to

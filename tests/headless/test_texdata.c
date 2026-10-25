@@ -634,6 +634,13 @@ TEST(copy_image_sub_data)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
     GLuint b = new_tex(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    /* CopyImageSubData rejects incomplete textures (GL 8.17): a single-level
+     * texture with the default mipmapped min filter and MAX_LEVEL 1000 is
+     * incomplete (KHR-GL46 copy_image.incomplete_tex) — clamp MAX_LEVEL */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);   /* b is bound */
+    glBindTexture(GL_TEXTURE_2D, a);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glBindTexture(GL_TEXTURE_2D, b);
     glCopyImageSubData(a, GL_TEXTURE_2D, 0, 1, 1, 0, b, GL_TEXTURE_2D, 0, 0, 0, 0, 2, 2, 1);
     EXPECT_NO_GL_ERROR();
     GLubyte o[4 * 4 * 4];
@@ -644,6 +651,7 @@ TEST(copy_image_sub_data)
     /* reinterpretation RGBA8 -> R32UI */
     GLuint c = new_tex(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 4, 4, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glCopyImageSubData(a, GL_TEXTURE_2D, 0, 0, 0, 0, c, GL_TEXTURE_2D, 0, 0, 0, 0, 4, 4, 1);
     EXPECT_NO_GL_ERROR();
     GLuint u[16];
@@ -654,21 +662,26 @@ TEST(copy_image_sub_data)
     GLuint d = new_tex(GL_TEXTURE_2D);
     GLubyte bc1[8] = { 0x00, 0xF8, 0x1F, 0x00, 0, 0, 0, 0 };
     glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, 4, 4, 0, 8, bc1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     GLuint e = new_tex(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32UI, 1, 1, 0, GL_RG_INTEGER, GL_UNSIGNED_INT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glCopyImageSubData(d, GL_TEXTURE_2D, 0, 0, 0, 0, e, GL_TEXTURE_2D, 0, 0, 0, 0, 4, 4, 1);
     EXPECT_NO_GL_ERROR();
     GLuint rg[2] = { 0, 0 };
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RG_INTEGER, GL_UNSIGNED_INT, rg);
     EXPECT_EQ_INT(rg[0], 0x001FF800u);
 
-    /* errors */
+    /* errors: out-of-bounds INVALID_VALUE, target mismatch INVALID_ENUM
+     * (KHR-GL46 copy_image.target_miss_match), incompatible format
+     * INVALID_OPERATION */
     glCopyImageSubData(a, GL_TEXTURE_2D, 0, 3, 3, 0, b, GL_TEXTURE_2D, 0, 0, 0, 0, 2, 2, 1);
     EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glCopyImageSubData(a, GL_TEXTURE_3D, 0, 0, 0, 0, b, GL_TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
-    EXPECT_GL_ERROR(GL_INVALID_VALUE);
+    EXPECT_GL_ERROR(GL_INVALID_ENUM);
     GLuint f = new_tex(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, 4, 4, 0, GL_RG, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     glCopyImageSubData(a, GL_TEXTURE_2D, 0, 0, 0, 0, f, GL_TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     GLuint ts[6] = { a, b, c, d, e, f };

@@ -915,13 +915,23 @@ static void *td_buffer_contents(GLMContext ctx, Buffer *buf)
 
     glm_ctx->mtl_funcs.ext_texdata = &hooks;
 
+    /* the binder also runs at context build, before _device is attached; there it
+     * only leaves the safe defaults (etc decode on, bc on, astc off) */
+    id<MTLDevice> dev = _device;
     bool etc = false, bc = true;
-    if (@available(macOS 11.0, *))
+    if (dev && @available(macOS 11.0, *))
     {
-        etc = [_device supportsFamily:MTLGPUFamilyApple1];
-        bc = _device.supportsBCTextureCompression;
+        etc = [dev supportsFamily:MTLGPUFamilyApple1];
+        bc = dev.supportsBCTextureCompression;
     }
     tdSetDeviceCaps(etc, bc);
+    /* ASTC LDR: Apple-family GPUs (Apple silicon); Intel Macs have none */
+    tdSetASTCCap(dev && [dev supportsFamily:MTLGPUFamilyApple2]);
+}
+
+- (void) texdataSetDeviceCaps
+{
+    [self bindExtTexdataFuncsToGLMContext: ctx];
 }
 
 @end

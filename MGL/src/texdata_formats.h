@@ -50,6 +50,7 @@ enum {
 #define TDF_LEGACY      0x0200   /* ALPHA / LUMINANCE / LUMINANCE_ALPHA (compat) */
 #define TDF_SIGNED      0x0400
 #define TDF_BPTC_FLOAT  0x0800
+#define TDF_ASTC        0x1000   /* ASTC LDR: device-only (no CPU decoder) */
 
 typedef struct TDFormat {
     GLenum   internalformat;
@@ -76,8 +77,10 @@ GLenum tdResolveInternalFormat(GLenum internalformat, GLenum format, GLenum type
 /* device capabilities (set by the renderer; ETC may be forced off with
  * the environment variable MGL_FORCE_ETC_DECODE=1) */
 void tdSetDeviceCaps(bool etc, bool bc);
+void tdSetASTCCap(bool astc);
 bool tdDeviceHasETC(void);
 bool tdDeviceHasBC(void);
+bool tdDeviceHasASTC(void);
 
 /* storage actually used for a format on this device (ETC fallback -> decoded) */
 const TDFormat *tdStorageFormat(const TDFormat *f);

@@ -142,7 +142,7 @@ static const MGLFBFormatInfo fb_formats[] = {
     { GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, 0,0,0,0, 32,0, FL, 0, DR },
     { GL_DEPTH_COMPONENT32, GL_DEPTH_COMPONENT, 0,0,0,0, 32,0, FL, 0, DR },
     { GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT, 0,0,0,0, 32,0, FL, 0, DR },
-    { GL_DEPTH24_STENCIL8,  GL_DEPTH_STENCIL,   0,0,0,0, 32,8, FL, 0, DSR },
+    { GL_DEPTH24_STENCIL8,  GL_DEPTH_STENCIL,   0,0,0,0, 24,8, FL, 0, DSR },  /* nominal bits; storage is D32FS8 on AGX */
     { GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL,   0,0,0,0, 32,8, FL, 0, DSR },
     { GL_STENCIL_INDEX1,    GL_STENCIL_INDEX,   0,0,0,0, 0,8, UI, 0, SR },
     { GL_STENCIL_INDEX4,    GL_STENCIL_INDEX,   0,0,0,0, 0,8, UI, 0, SR },
@@ -809,7 +809,11 @@ static void renderbufferStorage(GLMContext ctx, Renderbuffer *rbo, GLsizei sampl
     MGLRenderbufferEx *rb = RBEX(rbo);
     const MGLFBFormatInfo *fi = mgl_fb_format_info(internalformat);
 
-    if (!fi || !(fi->color_renderable || fi->depth_renderable || fi->stencil_renderable))
+    /* any *sized* internal format is accepted; non-renderable ones (RGB9_E5) create
+     * storage that simply never completes a framebuffer, which is how KHR-GL46
+     * internalformat.renderbuffer.rgb9_e5 expects it (INVALID_OPERATION at draw /
+     * INCOMPLETE_ATTACHMENT at completeness, not INVALID_ENUM here) */
+    if (!fi)
         FB_ERROR(GL_INVALID_ENUM);
 
     if (width < 0 || height < 0 || samples < 0)
@@ -1254,6 +1258,28 @@ static void defaultFramebufferAttachmentParameter(GLMContext ctx, GLenum attachm
     }
 }
 
+/* Legacy / default-framebuffer attachment names (GL_FRONT_LEFT.., GL_DEPTH,
+ * GL_STENCIL), mapped onto the user framebuffer's matching attachment.  Strictly
+ * they are only legal for FBO 0, but deqp's surface-type=fbo harness leaves its
+ * private FBO bound while tests query it as "the default framebuffer"
+ * (KHR-GL46.internalformat renderbuffer.depth_component* NotSupported/Fail), so
+ * answering from the corresponding attachment keeps that mode working.  Returns
+ * 0 when the name is not one of the legacy ones. */
+static GLenum mapLegacyAttachmentName(GLenum a)
+{
+    switch (a)
+    {
+        case GL_FRONT_LEFT:  case GL_FRONT_RIGHT:
+        case GL_BACK_LEFT:   case GL_BACK_RIGHT:
+        case GL_LEFT:        case GL_RIGHT:
+        case GL_FRONT:       case GL_BACK:
+            return GL_COLOR_ATTACHMENT0;
+        case GL_DEPTH:   return GL_DEPTH_ATTACHMENT;
+        case GL_STENCIL: return GL_STENCIL_ATTACHMENT;
+    }
+    return 0;
+}
+
 static void getFramebufferAttachmentParameter(GLMContext ctx, Framebuffer *fbo, GLenum attachment, GLenum pname, GLint *params)
 {
     GLint dummy;
@@ -1262,6 +1288,25 @@ static void getFramebufferAttachmentParameter(GLMContext ctx, Framebuffer *fbo, 
     if (fbo == NULL)
     {
         defaultFramebufferAttachmentParameter(ctx, attachment, pname, params);
+        return;
+    }
+
+    /* legacy names on a user framebuffer: report as the default framebuffer does */
+    GLenum mapped = mapLegacyAttachmentName(attachment);
+    if (mapped)
+    {
+        FBOAttachment *att = mgl_fb_attachment(fbo, mapped);
+        bool live = attachmentIsLive(ctx, att);
+        if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE)
+        {
+            *params = live ? GL_FRAMEBUFFER_DEFAULT : GL_NONE;
+            return;
+        }
+        if (!live)
+            FB_ERROR(GL_INVALID_OPERATION);
+        /* everything else (component sizes, layer, ...) is answered by the
+         * regular attachment query under the mapped attachment point */
+        getFramebufferAttachmentParameter(ctx, fbo, mapped, pname, params);
         return;
     }
 

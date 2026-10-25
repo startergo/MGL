@@ -908,8 +908,18 @@ TEST(error_cases)
     glClear(0x10);
     EXPECT_GL_ERROR(GL_INVALID_VALUE);
 
+    GLuint rb2;
+    glGenRenderbuffers(1, &rb2);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb2);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB9_E5, 4, 4);
-    EXPECT_GL_ERROR(GL_INVALID_ENUM);
+    /* sized non-renderable formats are legal storage (KHR-GL46
+     * internalformat.renderbuffer.rgb9_e5): completeness fails instead of the
+     * storage call — match Mesa, not the strict spec error. Done on a spare
+     * renderbuffer: re-specifying the attached rb's storage would leave the FBO
+     * incomplete for the readback checks below. */
+    EXPECT_NO_GL_ERROR();
+    glDeleteRenderbuffers(1, &rb2);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, -1, 4);
     EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glRenderbufferStorageMultisample(GL_RENDERBUFFER, 1000, GL_RGBA8, 4, 4);

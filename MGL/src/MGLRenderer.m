@@ -2220,6 +2220,10 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
             if (stage == _VERTEX_SHADER)
             {
+                if (getenv("MGL_VTEX_TRACE"))
+                    fprintf(stderr, "MGL vtex: unit %u slot %u tex %p base %p same %d\n",
+                            spirv_binding + e, mtl_index + e, (void *)(__bridge void *)texture,
+                            ptr->mtl_data, texture == (__bridge id<MTLTexture>)ptr->mtl_data);
                 /* geom: the vertex stage's shadow-sampling emulation samples the depth
                  * texture as a plain texture2d, which must not see a compare sampler —
                  * bind the compare-stripped sampler of the unit at those slots
@@ -2598,17 +2602,17 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 - (id<MTLLibrary>) compileShader: (const char *) str
 {
     id<MTLLibrary> library;
-    __autoreleasing NSError *error = nil;
     if (!str)
         return nil;         /* a stage with no MSL source (e.g. an emulation-only slot of a
                              * pipeline composite): the caller must skip it gracefully */
-    NSString *src = [NSString stringWithUTF8String: str];
 
-    /* tess domain: precise math when the MSL embeds the fp64 double-single library */
-    library = [_device newLibraryWithSource: src options: [self mslCompileOptionsForSource: src] error: &error];
-    if(!library) {
-        NSLog(@"MGL ERROR: Failed to compile shader: %@ ", [error localizedDescription] );
-        NSLog(@"MGL ERROR: Shader source: %s", str);
+    /* program domain: source-keyed MTLLibrary cache — this used to re-run
+     * newLibraryWithSource on every program link / rstate re-specialization, which
+     * dominates suites that relink identical shaders (CTS texture_swizzle: ~10k links) */
+    library = [self extProgramLibraryForMSL: str key: nil error: NULL];
+    if (!library)
+    {
+        NSLog(@"MGL ERROR: Failed to compile shader source: %s", str);
         // Return nil instead of asserting - caller must handle this gracefully
         return nil;
     }
@@ -3224,12 +3228,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         if (program)
         {
             if ([self bindMTLProgram:program] == false)
-                return NULL;
+            { if (getenv("MGL_PD_DEBUG")) fprintf(stderr, "MGL pd: bindMTLProgram failed\n"); return NULL; }
         }
         else
-        {
-            return NULL;
-        }
+        { if (getenv("MGL_PD_DEBUG")) fprintf(stderr, "MGL pd: no program\n"); return NULL; }
     }
 
     program = ctx->state.program;
@@ -5955,6 +5957,10 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
     }
 
     NSLog(@"MGL INFO: Metal device created: %@", _device);
+
+    /* texdata: publish device-dependent format caps (ETC2/BC CPU decode, ASTC LDR);
+     * the bindExt* binders ran above, before _device existed (MGLRenderer+TextureData) */
+    [self texdataSetDeviceCaps];
 
     // PROPER AGX VIRTUALIZATION DETECTION: Maintain Metal functionality with virtualization compatibility
     BOOL isVirtualized = NO;

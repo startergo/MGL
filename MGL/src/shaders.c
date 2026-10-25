@@ -445,6 +445,11 @@ GLuint mglCreateShader(GLMContext ctx, GLenum type)
  * compiled glslang shader object exists, so with live shaders it is deferred until the last
  * one is deleted. The next compile or link re-initializes glslang (lazy_init_compiler).
  */
+/* tear down the compile cache before glslang_finalize_process: cache-owned
+ * glslang_shader_t objects must not outlive the glslang process state (exit-order
+ * crash seen in test_debug teardown) */
+static void mgl_glslang_cache_shutdown(void);
+
 void mgl_shader_release_compiler_resources(GLMContext ctx)
 {
     struct MGLExtState_program *st = STATE(ext_program);
@@ -462,16 +467,23 @@ void mgl_shader_release_compiler_resources(GLMContext ctx)
         return;
     }
 
+    mgl_glslang_cache_shutdown();
+
     glslang_finalize_process();
     st->compiler_released = GL_TRUE;
     st->release_pending = GL_FALSE;
 }
 
+bool mgl_glslang_cache_owns(glslang_shader_t *sh);   /* compile cache below */
+
 static void release_glslang_shader(GLMContext ctx, Shader *ptr)
 {
     if (ptr->compiled_glsl_shader)
     {
-        glslang_shader_delete(ptr->compiled_glsl_shader);
+        /* the compile cache shares glslang_shader_t objects between GL shader objects;
+         * cache-owned ones stay alive (see mgl_glslang_cache_* below) */
+        if (!mgl_glslang_cache_owns(ptr->compiled_glsl_shader))
+            glslang_shader_delete(ptr->compiled_glsl_shader);
         ptr->compiled_glsl_shader = NULL;
         if (STATE(ext_program) && STATE(ext_program)->live_glslang_shaders > 0)
         {
@@ -664,12 +676,108 @@ static void lazy_init_compiler(GLMContext ctx)
     }
 }
 
+/* glslang compile cache (program domain perf).  CTS-style suites compile the same
+ * sources thousands of times (texture_swizzle.smoke: ~10k compiles) and BOTH the
+ * glslang compile and its delete (guard-block-checked pool validation) dominate the
+ * run.  Successful compiles are shared: the cache owns the glslang_shader_t and the
+ * compile-time info log; GL shader objects borrow the shared handle at link. */
+#define MGL_GLSLANG_CACHE_MAX 384
+
+typedef struct {
+    uint64_t            hash;
+    char               *key;
+    glslang_shader_t   *shader;     /* cache-owned, shared */
+    char               *log;        /* info-log snapshot at compile time */
+    GLboolean           status;
+} MGLGlslangCacheEnt;
+
+static MGLGlslangCacheEnt mgl_glslang_cache[MGL_GLSLANG_CACHE_MAX];
+static int mgl_glslang_cache_count;
+
+static uint64_t mgl_fnv1a(const char *s)
+{
+    uint64_t h = 1469598103934665603ULL;
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* finalizer for mgl_shader_release_compiler_resources (forward-declared above):
+ * runs only once no GL shader borrows a cached glslang shader any more */
+static void mgl_glslang_cache_shutdown(void)
+{
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+    {
+        if (mgl_glslang_cache[i].shader)
+            glslang_shader_delete(mgl_glslang_cache[i].shader);
+        free(mgl_glslang_cache[i].key);
+        free(mgl_glslang_cache[i].log);
+        mgl_glslang_cache[i].shader = NULL;
+        mgl_glslang_cache[i].key = NULL;
+        mgl_glslang_cache[i].log = NULL;
+    }
+    mgl_glslang_cache_count = 0;
+}
+
+static bool mgl_glslang_cache_owns_impl(glslang_shader_t *sh)
+{
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].shader == sh)
+            return true;
+    return false;
+}
+bool mgl_glslang_cache_owns(glslang_shader_t *sh) { return mgl_glslang_cache_owns_impl(sh); }
+
+/* returns the cache entry for (type, source) or NULL; entry must be used immediately
+ * (no locking: GL objects are bound to the context thread) */
+static MGLGlslangCacheEnt *mgl_glslang_cache_find(GLenum type, const char *src)
+{
+    char key[64];
+    uint64_t h;
+
+    if (!src)
+        return NULL;
+
+    snprintf(key, sizeof key, "%u:", type);
+    /* hash type marker + source together without building the full key string */
+    h = mgl_fnv1a(key);
+    for (const char *p = src; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].hash == h && !strncmp(mgl_glslang_cache[i].key, key, strlen(key)) &&
+            !strcmp(mgl_glslang_cache[i].key + strlen(key), src))
+            return &mgl_glslang_cache[i];
+    return NULL;
+}
+
+static void mgl_glslang_cache_add(GLenum type, const char *src, glslang_shader_t *sh,
+                                  const char *log, GLboolean status)
+{
+    char key[64];
+    MGLGlslangCacheEnt *e;
+
+    if (!src || mgl_glslang_cache_count >= MGL_GLSLANG_CACHE_MAX)
+    {
+        if (sh) glslang_shader_delete(sh);   /* not cacheable: keep old ownership rules */
+        return;
+    }
+
+    snprintf(key, sizeof key, "%u:", type);
+    e = &mgl_glslang_cache[mgl_glslang_cache_count++];
+    e->hash = mgl_fnv1a(key);
+    for (const char *p = src; *p; p++) { e->hash ^= (unsigned char)*p; e->hash *= 1099511628211ULL; }
+    asprintf(&e->key, "%s%s", key, src);
+    e->shader = sh;      /* may be NULL for a failed compile */
+    e->log = log ? strdup(log) : NULL;
+    e->status = status;
+}
+
 void mglCompileShader(GLMContext ctx, GLuint shader)
 {
     Shader *ptr;
     MGLShaderObj *obj;
     glslang_input_t glsl_input;
     glslang_shader_t *glsl_shader;
+    const char *cache_key_src = NULL;
 
     ptr = lookupShader(ctx, shader);
     if (!ptr)
@@ -710,6 +818,30 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         }
     }
     initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
+
+    /* compile cache hit: borrow the shared glslang shader and the compile-time log */
+    {
+        const char *final_src = glsl_input.code ? glsl_input.code
+                                                : (compat ? compat : mgl_introspect_shader_source(ctx, ptr));
+        MGLGlslangCacheEnt *ce = getenv("MGL_NO_GLSL_CACHE") ? NULL : mgl_glslang_cache_find(ptr->type, final_src);
+        if (ce)
+        {
+            free(compat);
+            if (ce->log && *ce->log)
+                mgl_set_info_log(&ptr->log, "%s", ce->log);
+            if (ce->status)
+            {
+                release_glslang_shader(ctx, ptr);
+                ptr->compiled_glsl_shader = ce->shader;
+                if (STATE(ext_program))
+                    STATE(ext_program)->live_glslang_shaders++;
+                ptr->dirty_bits |= DIRTY_SHADER;
+                obj->compile_status = GL_TRUE;
+            }
+            return;
+        }
+        cache_key_src = final_src;
+    }
 
     glsl_shader = glslang_shader_create(&glsl_input);
     if (glsl_shader == NULL)
@@ -797,6 +929,12 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         STATE(ext_program)->live_glslang_shaders++;
     ptr->dirty_bits |= DIRTY_SHADER;
     obj->compile_status = GL_TRUE;
+
+    /* the cache takes ownership of the successful glslang shader; release_glslang_shader
+     * keeps cache-owned handles alive, so sharing is safe across GL shader objects */
+    if (cache_key_src && !getenv("MGL_NO_GLSL_CACHE"))
+        mgl_glslang_cache_add(ptr->type, cache_key_src, glsl_shader,
+                              glslang_shader_get_info_log(glsl_shader), GL_TRUE);
 }
 
 void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)

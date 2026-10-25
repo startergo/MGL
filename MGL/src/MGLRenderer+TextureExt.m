@@ -726,6 +726,12 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
             continue;
 
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
+        /* texparam: swizzle / base+max level / stencil mode select a view of the base
+         * texture — this refresh must bind the same view the core binder
+         * (bindTexturesToCurrentRenderEncoder) binds, or a vertex-stage swizzle is
+         * silently lost when this rebind overwrites that slot (KHR-GL46
+         * texture_swizzle: VS access read the unswizzled base) */
+        texture = [self texparamTextureForTex: ptr base: texture];
         id<MTLSamplerState> sampler = nil;
         Sampler *gl_sampler = ctx->state.texture_samplers[binding];
         if (gl_sampler && gl_sampler->mtl_data)
