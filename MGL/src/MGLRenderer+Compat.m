@@ -1109,6 +1109,7 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 
         [self newCommandBuffer];
         mgl_prof_end(6, p6);
+        [self compatCSFrameStats];   /* compat CS: per-frame stats hook */
         mgl_prof_frame();
         return true;
     }
@@ -1155,6 +1156,7 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 
     [self newCommandBuffer];
     mgl_prof_end(6, p6);
+    [self compatCSFrameStats];       /* compat CS: per-frame stats hook */
     mgl_prof_frame();
     return true;
 }

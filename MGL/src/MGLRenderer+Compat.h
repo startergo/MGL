@@ -17,6 +17,7 @@
 - (bool) compatCSOn;
 - (id<MTLRenderCommandEncoder>) compatCSEncoderProxyFor: (id<MTLRenderCommandEncoder>) real;
 - (void) compatCSDrain;
+- (void) compatCSFrameStats;
 - (void) compatCSStop;
 @end
 

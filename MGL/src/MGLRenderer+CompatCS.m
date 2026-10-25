@@ -75,6 +75,51 @@ typedef struct {
 #define CS_RING_MASK    (CS_RING_CAP - 1)
 #define CS_ARENA_BYTES  (512 * 1024)
 
+/* MGL_CS_SPIN_US (default 50): how long the worker spins for the next packet
+ * before parking.  The build-scene profile (session 11) showed 19 kicks/frame
+ * but only 2 real wakes: the worker re-parked after every catch-up and every
+ * recorded packet paid a mutex+signal kick (~0.3-1.6 us) on the GL thread.
+ * Spinning through the next packet removes that churn; the core stays warm and
+ * the condvar path is left for real idle periods. */
+static uint32_t cs_spin_ticks(void)
+{
+    static int64_t v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_CS_SPIN_US");
+        int64_t us = e ? atoll(e) : 50;
+        if (us < 0) us = 0;
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        v = us * 1000ll * tb.denom / tb.numer;
+    }
+    return (uint32_t)v;
+}
+
+/* MGL_CS_DRAIN_SPIN_US (default 30): how long a draining GL thread spins
+ * before taking the mutex/park handshake with the worker */
+static uint32_t cs_drain_spin_ticks(void)
+{
+    static int64_t v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_CS_DRAIN_SPIN_US");
+        int64_t us = e ? atoll(e) : 30;
+        if (us < 0) us = 0;
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        v = us * 1000ll * tb.denom / tb.numer;
+    }
+    return (uint32_t)v;
+}
+
+static __attribute__((noinline)) uint64_t cs_now(void)
+{
+    uint64_t t = mach_absolute_time();
+    __asm volatile("" ::: "memory");
+    return t;
+}
+
 typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv_work;                    /* worker sleeps here */
@@ -100,6 +145,14 @@ typedef struct {
     /* stats (GL thread only) */
     uint64_t    drains, packets, waits;
     int         dbg;                                   /* MGL_CS_DEBUG: teardown stats */
+
+    /* MGL_CS_STATS=1: where the frame time goes (mach ticks, per owner thread) */
+    int         prof;
+    double      prof_scale_ns;
+    uint64_t    t_drain, t_park, t_kick;               /* GL thread */
+    uint64_t    t_busy, t_idle, t_wake;                /* worker */
+    uint64_t    kicks, wakes, batches, fastdrains, frames;
+    uint64_t    kick_t;                                /* under mu: last kick timestamp */
 } MGLCSState;
 
 /* ------------------------------------------------------------------ */
@@ -107,6 +160,17 @@ typedef struct {
 
 static void cs_kick(MGLCSState *s)
 {
+    if (s->prof)
+    {
+        uint64_t t0 = mach_absolute_time();
+        s->kick_t = t0;
+        s->kicks++;
+        pthread_mutex_lock(&s->mu);
+        pthread_cond_signal(&s->cv_work);
+        pthread_mutex_unlock(&s->mu);
+        s->t_kick += mach_absolute_time() - t0;
+        return;
+    }
     pthread_mutex_lock(&s->mu);
     pthread_cond_signal(&s->cv_work);
     pthread_mutex_unlock(&s->mu);
@@ -116,29 +180,38 @@ static void cs_kick(MGLCSState *s)
 static void cs_drain(MGLCSState *s)
 {
     uint64_t w = atomic_load_explicit(&s->written, memory_order_relaxed);
+    uint64_t pt0 = s->prof ? cs_now() : 0;
 
     if (atomic_load_explicit(&s->executed, memory_order_acquire) >= w)
     {
         /* worker idle and everything executed: the byte arena is free */
         if (s->head == w)
             s->arena_used = 0;
+        if (s->prof) { s->fastdrains++; s->t_drain += cs_now() - pt0; }
         return;                                 /* fast path: worker idle */
     }
 
     s->drains++;
 
-    /* short spin: the worker is usually only a few packets behind */
-    for (int i = 0; i < 64; i++)
+    /* short spin: the worker is usually only a few packets behind.  Time-based
+     * (sched_yield under load hands the quantum to unrelated runnable work) */
+    uint32_t dspin = cs_drain_spin_ticks();
+    if (dspin)
     {
-        if (atomic_load_explicit(&s->executed, memory_order_acquire) >= w)
-            return;
-        if ((i & 7) == 7)
-            sched_yield();
-        else
+        uint64_t dl = cs_now() + dspin;
+        do
+        {
+            if (atomic_load_explicit(&s->executed, memory_order_acquire) >= w)
+            {
+                if (s->prof) s->t_drain += cs_now() - pt0;
+                return;
+            }
             __builtin_arm_yield();
+        } while (cs_now() < dl);
     }
 
     s->waits++;
+    uint64_t p0 = s->prof ? cs_now() : 0;
     pthread_mutex_lock(&s->mu);
     atomic_fetch_add(&s->waiters, 1);
     while (atomic_load_explicit(&s->executed, memory_order_acquire) < w)
@@ -154,11 +227,14 @@ static void cs_drain(MGLCSState *s)
     }
     atomic_fetch_sub(&s->waiters, 1);
     pthread_mutex_unlock(&s->mu);
+    if (s->prof) s->t_park += cs_now() - p0;
 
     /* fully drained: the arena can be reused (every byte payload was copied
      * into its encoder by now) */
     if (atomic_load_explicit(&s->executed, memory_order_acquire) >= atomic_load_explicit(&s->written, memory_order_relaxed))
         s->arena_used = 0;
+
+    if (s->prof) s->t_drain += cs_now() - pt0;
 
     if (s->dbg && (s->drains % 600) == 0)
         fprintf(stderr, "MGL CS: packets=%llu drains=%llu sleeps=%llu spins-ok=%llu\n",
@@ -397,6 +473,21 @@ static void *cs_worker(void *arg)
 
         if (w == seen)
         {
+            /* spin briefly for the next packet before parking: parking after
+             * every catch-up makes every following packet a kick (mutex +
+             * signal) on the GL thread — see cs_spin_ticks() above */
+            uint32_t spin = cs_spin_ticks();
+            if (spin)
+            {
+                uint64_t dl = cs_now() + spin;
+                do
+                {
+                    __builtin_arm_yield();
+                    w = atomic_load_explicit(&s->written, memory_order_acquire);
+                } while (w == seen && !atomic_load_explicit(&s->exit, memory_order_relaxed) && cs_now() < dl);
+            }
+
+            uint64_t i0 = s->prof ? cs_now() : 0;
             pthread_mutex_lock(&s->mu);
             if (atomic_load_explicit(&s->written, memory_order_acquire) == seen &&
                 !atomic_load_explicit(&s->exit, memory_order_relaxed))
@@ -404,15 +495,23 @@ static void *cs_worker(void *arg)
                 atomic_store_explicit(&s->idle, 1, memory_order_relaxed);
                 pthread_cond_wait(&s->cv_work, &s->mu);
                 atomic_store_explicit(&s->idle, 0, memory_order_relaxed);
+                if (s->prof && s->kick_t)
+                {
+                    s->t_wake += cs_now() - s->kick_t;
+                    s->kick_t = 0;
+                    s->wakes++;
+                }
             }
             bool quit = atomic_load_explicit(&s->exit, memory_order_relaxed) != 0;
             pthread_mutex_unlock(&s->mu);
+            if (s->prof) s->t_idle += cs_now() - i0;
 
             if (quit && atomic_load_explicit(&s->written, memory_order_acquire) == seen)
                 break;
             continue;
         }
 
+        uint64_t b0 = s->prof ? cs_now() : 0;
         @try
         {
             while (seen < w)
@@ -431,6 +530,7 @@ static void *cs_worker(void *arg)
         }
 
         atomic_store_explicit(&s->executed, seen, memory_order_release);
+        if (s->prof) { s->t_busy += cs_now() - b0; s->batches++; }
 
         /* always signal under the mutex: reading `waiters` lock-free can miss a
          * producer that just incremented it (stale 0) and park it forever */
@@ -469,6 +569,13 @@ static void *cs_worker(void *arg)
     atomic_init(&st.exit, 0);
     atomic_init(&st.faulted, 0);
     st.dbg = getenv("MGL_PROFILE") != NULL;
+    st.prof = getenv("MGL_CS_STATS") != NULL && getenv("MGL_CS_STATS")[0] != '0';
+    if (st.prof)
+    {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        st.prof_scale_ns = (double)tb.numer / (double)tb.denom;
+    }
 
     if (!st.ring || !st.arena)
     {
@@ -974,6 +1081,51 @@ static int cs_env(void)
     MGLCSBox *box = objc_getAssociatedObject(self, &kCompatCSKey);
     if (box && box->st.started)
         cs_drain(&box->st);
+}
+
+/* MGL_CS_STATS=1: per-120-frame attribution of where the frame time goes.
+ * Called from the present path (compatSurfacePresent) once per frame. */
+- (void) compatCSFrameStats
+{
+    /* env check first: zero cost on the default (no-stats) path */
+    static int prof_on = -1;
+    if (prof_on < 0)
+    {
+        const char *e = getenv("MGL_CS_STATS");
+        prof_on = (e && e[0] != '0') ? 1 : 0;
+    }
+    if (!prof_on)
+        return;
+
+    MGLCSBox *box = objc_getAssociatedObject(self, &kCompatCSKey);
+    if (!box || !box->st.prof)
+        return;
+
+    MGLCSState *s = &box->st;
+    s->frames++;
+    if (s->frames % 120)
+        return;
+
+    double f = 120.0, k = s->prof_scale_ns / 1000.0;   /* us per tick */
+    fprintf(stderr,
+            "MGL CSSTATS[%llu f]: pkts/f=%.0f kicks/f=%.1f wakes/f=%.1f batches/f=%.1f "
+            "drains/f=%.1f(fast %.0f%%)\n"
+            "  GLthread: drain=%.3f ms/f (parked %.3f) kick=%.3f ms/f | worker: busy=%.3f "
+            "idle=%.3f ms/f wake-lat=%.1f us avg, pkts/batch=%.1f\n",
+            (unsigned long long)s->frames,
+            (double)s->packets / f, (double)s->kicks / f, (double)s->wakes / f,
+            (double)s->batches / f,
+            (double)(s->drains + s->fastdrains) / f,
+            100.0 * (double)s->fastdrains / (double)(s->drains + s->fastdrains + 1),
+            s->t_drain * k / 1000.0 / f, s->t_park * k / 1000.0 / f,
+            s->t_kick * k / 1000.0 / f,
+            s->t_busy * k / 1000.0 / f, s->t_idle * k / 1000.0 / f,
+            s->wakes ? (double)s->t_wake * k / (double)s->wakes : 0.0,
+            s->batches ? (double)s->packets / (double)s->batches : 0.0);
+
+    s->packets = s->drains = s->fastdrains = s->waits = 0;
+    s->kicks = s->wakes = s->batches = 0;
+    s->t_drain = s->t_park = s->t_kick = s->t_busy = s->t_idle = s->t_wake = 0;
 }
 
 /* renderer teardown: drain, stop the worker, drop the state */

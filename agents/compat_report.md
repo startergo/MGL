@@ -1,4 +1,64 @@
 # compat domain — progress log
+READY 014f08c (default path byte-identical to 611a380 behaviour; suite 250/0 + test_geom 603/0
+default AND MGL_ENCODER_THREAD=1; new test_csdbg 3/0 both modes).  This commit is a pure
+"keep the default OFF decision + instrumentation" step; no bench needed beyond a sanity run —
+the flag-on path changed (worker spin), the default path only gained an early-returned
+per-present hook call.
+BENCH-REQUEST 014f08c: IF a slot is free, one full default-list run just to confirm no drift
+from 14385 (expect noise); skip otherwise.  Do NOT bench MGL_ENCODER_THREAD=1 again — its fate
+is decided (see session 11).
+
+## session 11 (Oct 25, 01:55-06:15 EDT) — encoder thread: measured, pipelined, reverted
+
+Merged gl46-port (611a380 = my 9c3c52d squashed; merge 85451b0 was content-identical).
+
+### 1. Where the -30% comes from (MGL_CS_STATS=1, added this session)
+`build` scene, 1 draw/frame, 19 packets/frame, flag ON, load 6-15:
+- kicks/f=19.0 but wakes/f=2.0: the worker re-parks after every catch-up, so EVERY
+  packet pays a mutex+signal kick (0.3-1.6us) on the GL thread (cs_kick cost 6-31us/f).
+- worker busy=0.011-0.062 ms/f, GL-thread drain wait 0.001-0.015 ms/f: the Metal encode
+  of a light frame is ~50us — far too small to pay for handshakes.
+- worker wake latency (kick->executing): 90-692us quiet-ish, 0.9-1.6ms under load.  At
+  2040fps (0.49ms frames) one parked-worker wake on the critical path = +20-30% frame
+  time — matches the 20405->13740 regression.
+=> per-packet hand-off can never win on light scenes; fixed the park churn (below) but the
+fundamental "nothing to offload" stands.  ideas MGL_PROFILE=1 (steady, 353 draws/f):
+processGLState 1.2-1.6 ms/f, draw bucket 1.9-2.6, encode-draw only 0.21-0.31 ms/f —
+even a zero-cost thread caps the win at ~0.3ms/f.
+
+### 2. Fixes kept (default OFF, inert unless MGL_ENCODER_THREAD=1)
+- worker spins MGL_CS_SPIN_US (default 50us) before parking; drain spin is time-based
+  MGL_CS_DRAIN_SPIN_US (default 30us; sched_yield removed — it hands the quantum away
+  under load).
+- MGL_CS_STATS=1 + compatCSFrameStats (hooked from compatSurfacePresent): per-120-frame
+  packets/kicks/wakes/batches/drains, GL-thread drain+park+kick time, worker busy/idle/
+  wake-latency.  test_csdbg.c added (block_vs_fs_control clone) — passes with and without
+  the flag.
+
+### 3. Full pipelining (Apple model) — built, half-working, REVERTED
+Idea: zero hand-offs per frame.  CREATE packet (worker builds render encoders from a
+deep-copied pass descriptor — the shared mutable ivar races otherwise), BLIT_COPY+COMMIT
+packets for the present tail, layer.contents deferred one present gated on
+`executed >= commit_seq`, endRenderEncoding/newCommandBuffer drains dropped, the drain
+moved to endRenderEncoding (the shared funnel) for rare direct-encoder paths.
+Correctness status: simple scenes + the 250-suite render right; test_geom fails
+deterministically — the worker drops packets while cur_enc==NULL (fixed), two-open-encoder
+asserts on readback blits (fixed), then a deterministic mtlcompilerd-connection abort in
+r31_layered_fbo_no_attachment + 13-17min livelocks under load (NOT fixed).
+Preserved on branch gl46/compat-cs-pipe (commit e77c606); reverted from this branch
+(014f08c).  If anyone ever retries: the abort smells like heap corruption from the packet
+path — check arena/ring handling of the obj3 field and the deep descriptor copy first.
+
+### 4. Task 2 data (next session): per-draw CPU cuts, no thread
+ideas steady-state per frame (353 draws): dirtyState-block 1.22-1.65 ms (processGLState
+1.19-1.59 of it — ~3.5-4.5us/draw), draw bucket 1.93-2.62, enddraw-stamp 0.14-0.28,
+bindList 0.21-0.28 (353 calls/f), ssboSizes 0.075 (353/f), encode-draw 0.21-0.31,
+updateEncoder 0.04-0.06, vao-buflists 0.02-0.07, swap 0.17-0.32, newRenderEncoder 0.10-0.18.
+Targets ranked: (1) processGLState per-draw work, (2) bindList construction per draw,
+(3) enddraw-stamp, (4) ssboSizes caching (per program+binding, not per draw).
+Apple-ACC-style: record state deltas per draw, validate/encode once per draw batch.
+
+BENCH-RESULT 9c3c52d (code 5d3ad2b) flag OFF score=14385 (best so far) / MGL_ENCODER_THREAD=1 score=10031 (-30%) native=6574 ratio=2.19 load=4.5-7 — NOT pinned; native10/mglR13/mglR13t 01:40 EDT Oct 25. With the thread ON: light scenes 20405->13740 (build), ideas 2962->1357, shadow 13504->8553, jellyfish 15555->10470; slightly up: gl41-mrt 7341->7708, texarray 11430->12747, terrain 2165->2305, refract 3830->3956. Per-frame hand-off latency dominates — keep default OFF.
 READY 4dfce4d (CS encoder-thread prototype, default OFF; gl46-port merged through 74185cd; suite 250/0, test_geom 603/0, both with and without MGL_ENCODER_THREAD=1)
 BENCH-REQUEST: two runs of the full default list (same mode as mglR12), one with
 MGL_ENCODER_THREAD=1 exported.  The flag adds one worker thread that replays recorded
