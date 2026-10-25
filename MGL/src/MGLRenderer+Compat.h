@@ -35,6 +35,22 @@ void mgl_compat_cs_drain(GLMContext glm_ctx);
 - (bool) compatPipelineBindNeeded;
 - (bool) compatPipelineFastPath;
 - (void) compatPipelineStore;
+/* perf session 12 verdicts of compatDrawGate: */
+enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE };
+
+/* perf session 12: per-draw state-walk fast path.  extBufBeginDraw calls
+ * compatDrawGate first: when every state group the walk reads still matches
+ * the exact-content snapshot taken by the last full walk (compatDrawLatch),
+ * the whole walk is a proven no-op and is skipped; when only listed-buffer
+ * content changed, compatDrawFastBuffers re-streams just the buffers.
+ * extBufEndDraw does the same for the GPU-serial stamps. */
+- (int)  compatDrawGate: (bool) allowDirtyListBuffers;
+- (bool) compatDrawFastBuffers;
+- (bool) compatDrawFastRState;
+- (bool) compatDrawFast;
+- (void) compatDrawLatch;
+- (bool) compatEndDrawFast;
+- (void) compatEndDrawLatch;
 - (bool) compatSurfacePresent:(id<MTLTexture>)color;
 /* perf session 3: encoder bind shadow + streaming upload ring (see
  * mgl_compat_perf.h).  Every per-draw Metal argument bind in the shared draw

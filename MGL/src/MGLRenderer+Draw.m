@@ -360,6 +360,32 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (bool) extBufBeginDraw
 {
+    /* compat perf session 12: a draw whose whole state walk (processGLState +
+     * PreDraw hooks + bind lists + SSBO sizes) is a proven no-op against the
+     * last walk's exact-content snapshot skips it entirely; a draw where only
+     * listed-buffer CONTENT changed (uniform upload) re-streams the buffers
+     * and skips everything else */
+    uint64_t t22 = mgl_prof_begin(22);
+    int gate = [self compatDrawGate: true];
+    if (gate == MGL_DF_SKIP)
+    {
+        mgl_prof_end(22, t22);
+        return true;
+    }
+    if (gate == MGL_DF_BUFFERS)
+    {
+        bool ok = [self compatDrawFastBuffers];
+        mgl_prof_end(22, t22);
+        return ok;
+    }
+    if (gate == MGL_DF_RSTATE)
+    {
+        bool ok = [self compatDrawFastRState];
+        mgl_prof_end(22, t22);
+        return ok;
+    }
+    mgl_prof_end(22, t22);
+
     uint64_t prof_t0 = mgl_prof_begin(0);
     [self extBufEnsureCommandBuffer];
 
@@ -408,6 +434,10 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     [self geomBindSSBOSizes: &ctx->state.fragment_buffer_map_list stage: _FRAGMENT_SHADER vertex: false];
     mgl_prof_end(14, t14);
 
+    /* compat perf session 12: everything this walk resolved is now applied —
+     * snapshot it so an unchanged following draw can skip the whole walk */
+    [self compatDrawLatch];
+
     return true;
 }
 
@@ -433,6 +463,11 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (void) extBufEndDraw
 {
+    /* compat perf session 12: the serial stamps are a no-op while the
+     * command-buffer serial and every stamped buffer are unchanged */
+    if ([self compatEndDrawFast])
+        return;
+
     uint64_t t8 = mgl_prof_begin(8);
     uint64_t serial = [self extBufSerial];
 
@@ -456,6 +491,8 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         }
     }
 
+    /* compat perf session 12: snapshot the stamped set (same serial => no-op) */
+    [self compatEndDrawLatch];
     mgl_prof_end(8, t8);
 }
 

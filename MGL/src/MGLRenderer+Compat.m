@@ -18,11 +18,23 @@
 #import "MGLRenderer+Compat.h"
 #import "mgl_ext_rstate.h"
 #import "MGLRenderer+RenderState.h"   /* rstatePipelineContentHash (perf session 3) */
+#import "mgl_ext_vattrib.h"           /* draw plan / VAO layout snapshots (session 12) */
+#import "mgl_ext_texext.h"            /* mgl_texext_info (session 12 texture gate) */
 #include "mgl_compat_perf.h"
 
 /* MGL_PROFILE counters (MGLRenderer.m) */
 extern uint64_t mgl_prof_ns[18];
 extern uint64_t mgl_prof_cnt[18];
+/* MGLRenderer.m (perf session 12): installed PreDraw: hook count */
+extern unsigned mglExtHookCacheCount(id self, const char *suffix);
+
+/* draw-walk pieces (MGLRenderer+Draw.m / MGLRenderer.m) reused by the partial
+ * fast path; declared here, not in the shared private header */
+@interface MGLRenderer (CompatDrawWalk)
+- (bool) extBufBindList: (BufferMapList *)list vertex: (bool)vertex;
+- (bool) updateDirtyBaseBufferList: (BufferMapList *)buffer_map_list;
+- (void) extRstatePreDraw: (id<MTLRenderCommandEncoder>) enc;   /* MGLRenderer+RenderState.m */
+@end
 
 static inline int compatProfOn(void)
 {
@@ -443,6 +455,623 @@ static const void *kCompatPipeBindKey = &kCompatPipeBindKey;
 
 /* per-draw counters for the profiler: skipped vs issued Metal argument binds */
 uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
+/* compat perf session 12: per-draw state-walk fast-path hit/miss counters */
+uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss;
+
+/* ===================== per-draw state-walk fast path =====================
+ * (compat perf session 12)
+ *
+ * Apple's GL driver accumulates each GL draw and re-validates only the state
+ * groups that changed since the previous draw.  MGL's per-draw walk —
+ * processGLState, the three PreDraw: hooks (vattrib / rstate / texext),
+ * extBufBindList, geomBindSSBOSizes and the end-of-draw GPU-serial stamps —
+ * re-reads every group on EVERY draw even when nothing changed: glmark2
+ * [ideas] draws 353x per frame, ~265 of those with zero dirty bits, and that
+ * walk was ~2 us/draw, the largest remaining per-draw CPU cost.
+ *
+ * The fast path serves such draws from exact-content snapshots taken right
+ * after a full walk: every state group the walk reads is recorded (identity
+ * AND content), and the next draw re-verifies those groups with integer
+ * compares + memcmps.  If everything matches, the entire walk is a proven
+ * no-op and is skipped — no ObjC dispatch, no Metal calls.  Because the check
+ * is content-based (not generation-based), a state change can never be missed
+ * by a missing invalidation; anything the check cannot prove stable (mapped
+ * buffers, client-array streams, buffer textures, extra PreDraw hooks)
+ * declines to the full walk.
+ */
+
+struct MGLCompatBufId {
+    const void *buf;
+    void       *mtl;        /* buf->data.mtl_data identity */
+    GLsizeiptr  size;
+};
+
+struct MGLCompatDrawSnap {
+    uint64_t    valid;
+    /* identity of the objects the walk resolved state for */
+    uint64_t    encoder_gen;            /* m->encoder_gen (bind-shadow generation) */
+    const void *encoder, *cmdbuf, *pipe, *program, *vao, *fbo;
+    GLuint      rstate_gen;             /* ext_rstate->generation (encoder-state group) */
+    GLuint      rstate_pipe_gen;        /* ext_rstate->generation_pipeline (PSO content) */
+    ImageUnit   image_units[TEXTURE_UNITS];     /* glBindImageTexture group */
+
+    /* content snapshots */
+    unsigned    tex_mask[4];            /* ctx->state.active_texture_mask */
+    BufferMapList vlist, flist;         /* vertex / fragment buffer maps (identity) */
+    struct MGLCompatBufId vb[MAX_MAPPED_BUFFERS], fb[MAX_MAPPED_BUFFERS];
+    MGLVattribDrawPlan plan;            /* vattrib draw plan */
+    MGLVertexAttribFormat fmt[MAX_ATTRIBS];
+    MGLVertexBinding binding[MGL_VA_MAX_BINDINGS];
+    struct MGLCompatBufId vabuf[MGL_VA_MAX_BINDINGS];
+    MGLCurrentAttrib current[MAX_ATTRIBS];      /* generic vertex attribs (const streams) */
+    const void *tex[TEXTURE_UNITS], *samp[TEXTURE_UNITS];
+    void *tex_mtl[TEXTURE_UNITS], *tex_par[TEXTURE_UNITS], *samp_par[TEXTURE_UNITS];
+};
+
+struct MGLCompatDrawFast {
+    struct MGLCompatDrawSnap snap;
+
+    /* end-of-draw gate: the serial stamps are a no-op while the command-buffer
+     * serial, the stamped buffer set and the write-marker inputs are unchanged */
+    uint64_t    end_valid;
+    uint64_t    end_serial;
+    const void *end_ebuf, *end_indirect, *end_tf;
+    int         end_tf_active, end_tf_paused;
+    const void *end_tf_base[MAX_BINDABLE_BUFFERS];
+    struct MGLCompatBufId end_v[MAX_MAPPED_BUFFERS], end_f[MAX_MAPPED_BUFFERS];
+    GLuint      end_vn, end_fn;
+
+    /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
+    uint64_t    misswhy[24];
+    uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
+    uint64_t    dirtymask_val[8];
+};
+
+static struct MGLCompatDrawFast *compatDrawFastState(GLMContext ctx)
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    if (!m)
+        return NULL;
+    if (!m->draw_fast)
+        m->draw_fast = calloc(1, sizeof(struct MGLCompatDrawFast));
+    return (struct MGLCompatDrawFast *)m->draw_fast;
+}
+
+/* MGL_DRAWFAST_DEBUG: most recent fast-path state (single-renderer processes) */
+static struct MGLCompatDrawFast *s_compat_df_debug;
+static const char *const s_compat_df_why[] = {
+    "no-snap", "dirty-bits", "hook-count", "enc/cb/pipe-id", "cb-committed",
+    "prog/vao/fbo-id", "rstate-gen", "vlist", "vlist-dirty", "flist",
+    "flist-dirty", "no-vattrib", "plan", "vao-fmt/binding", "current-attribs",
+    "va-mapped", "va-dirty", "va-mtl-id", "tex-mask",
+    "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params"
+};
+
+void mgl_compat_drawfast_debug(void)
+{
+    struct MGLCompatDrawFast *df = s_compat_df_debug;
+    if (!df)
+        return;
+    fprintf(stderr, "MGL PROFILE drawfast-miss:");
+    for (unsigned i = 0; i < sizeof(s_compat_df_why) / sizeof(s_compat_df_why[0]); i++)
+        if (df->misswhy[i])
+            fprintf(stderr, " %s=%llu", s_compat_df_why[i], (unsigned long long)df->misswhy[i]);
+    fprintf(stderr, "\n");
+    for (unsigned i = 0; i < 8; i++)
+        if (df->dirtymask_seen[i])
+            fprintf(stderr, "MGL PROFILE drawfast-dirty: 0x%llx x%llu\n",
+                    (unsigned long long)df->dirtymask_val[i], (unsigned long long)df->dirtymask_seen[i]);
+    memset(df->misswhy, 0, sizeof(df->misswhy));
+    memset(df->dirtymask_seen, 0, sizeof(df->dirtymask_seen));
+}
+
+/* per-listed-buffer stability: not mapped, no pending content change, same
+ * Metal storage.  Content changes (glBufferSubData / glUniform into the
+ * default uniform block) set data.dirty_bits and force the full walk, which
+ * re-streams them through the argument ring. */
+static bool compatListStable(const BufferMapList *live, const BufferMapList *snap,
+                             const struct MGLCompatBufId *snapbuf, int *why, bool allow_dirty)
+{
+    if (live->count != snap->count)
+    { *why = 0; return false; }
+    if (live->count && memcmp(live->buffers, snap->buffers, live->count * sizeof(BufferMap)) != 0)
+    { *why = 1; return false; }
+
+    for (GLuint i = 0; i < live->count; i++)
+    {
+        const Buffer *b = live->buffers[i].buf;
+
+        if (!b)
+            continue;
+        if (b->mapped)                    /* coherent / persistent maps need per-draw work */
+        { *why = 2; return false; }
+        if (!allow_dirty && b->data.dirty_bits)   /* content change: full walk re-streams it */
+        { *why = 3; return false; }
+        if (b->data.mtl_data != snapbuf[i].mtl || b->size != snapbuf[i].size)
+        { *why = 4; return false; }
+    }
+
+    return true;
+}
+
+/* after the partial (buffer-only) walk re-streamed the by-value buffers, clear
+ * their content-dirty bits the way bindVertexBuffersToCurrentRenderEncoder does */
+static void compatListClearDataDirty(BufferMapList *live)
+{
+    for (GLuint i = 0; i < live->count; i++)
+    {
+        Buffer *b = live->buffers[i].buf;
+        if (b && b->data.mtl_data == NULL)
+            b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+    }
+}
+
+static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
+                            struct MGLCompatBufId *snapbuf)
+{
+    snap->count = live->count;
+    if (live->count)
+        memcpy(snap->buffers, live->buffers, live->count * sizeof(BufferMap));
+
+    for (GLuint i = 0; i < live->count; i++)
+    {
+        const Buffer *b = live->buffers[i].buf;
+
+        snapbuf[i].buf  = b;
+        snapbuf[i].mtl  = b ? b->data.mtl_data : NULL;
+        snapbuf[i].size = b ? b->size : 0;
+    }
+}
+
+/* true when the whole per-draw walk (processGLState + PreDraw hooks +
+ * extBufBindList + geomBindSSBOSizes) is provably a no-op for this draw */
+/* ctx dirty bits whose processing the content gates below prove to be a no-op:
+ * VAO re-specified with identical layout / texture-unit rebinds that changed
+ * nothing / buffer-base rebinds that remap to the same list / image-unit
+ * writes with identical units (the sampler uniform that drove them lives in a
+ * listed buffer, so a real change shows up as a listed-buffer dirty bit) */
+#define MGL_DF_REDUNDANT (DIRTY_VAO | DIRTY_TEX_BINDING | DIRTY_BUFFER_BASE_STATE | DIRTY_IMAGE_UNIT_STATE)
+
+- (int) compatDrawGate: (bool) allowDirtyListBuffers
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+    const struct MGLCompatDrawSnap *s;
+
+    if (!df)
+    {
+        df = compatDrawFastState(ctx);
+        if (df)
+            s_compat_df_debug = df;
+    }
+
+#define MGL_DF_MISS(_why_) do { if (df) df->misswhy[_why_]++; mgl_compat_fast_miss++; return MGL_DF_FULL; } while (0)
+
+    if (!df || !(s = &df->snap)->valid || !m->enabled)
+        MGL_DF_MISS(0);
+
+    /* only dirty bits whose processing is proven redundant by the content
+     * gates below may stand (they are cleared on a SKIP / BUFFERS verdict) */
+    if (ctx->state.dirty_bits & ~MGL_DF_REDUNDANT)
+    {
+        if (df)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (df->dirtymask_val[i] == ctx->state.dirty_bits || !df->dirtymask_val[i])
+                {
+                    df->dirtymask_val[i] = ctx->state.dirty_bits;
+                    df->dirtymask_seen[i]++;
+                    break;
+                }
+            }
+        }
+        MGL_DF_MISS(1);
+    }
+    /* ...and only for the three PreDraw hooks this gate reasons about */
+    if (mglExtHookCacheCount(self, "PreDraw:") != 3)
+        MGL_DF_MISS(2);
+    /* identity: encoder (incl. the bind-shadow generation), command buffer
+     * (still uncommitted — commit paths set dirty state), pipeline (already
+     * bound to this encoder by the latched walk), program / VAO / FBO */
+    if (m->encoder_gen != s->encoder_gen ||
+        (__bridge const void *)_currentRenderEncoder != s->encoder ||
+        (__bridge const void *)_currentCommandBuffer != s->cmdbuf ||
+        (__bridge const void *)_pipelineState != s->pipe)
+        MGL_DF_MISS(3);
+    if (_currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        MGL_DF_MISS(4);
+    if ((const void *)ctx->state.program != s->program ||
+        (const void *)ctx->state.vao != s->vao ||
+        (const void *)ctx->state.framebuffer != s->fbo)
+        MGL_DF_MISS(5);
+
+    /* encoder-state group (rstate): applied for this generation.  A generation
+     * bump without a pipeline-content change needs only the encoder-state
+     * re-apply (extRstatePreDraw) — flagged here, returned after the texture
+     * epoch is stamped below. */
+    bool rstate_only = false;
+    {
+        struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
+        if (!rs)
+            MGL_DF_MISS(6);
+        if (rs->generation != s->rstate_gen)
+        {
+            if (rs->generation_pipeline != s->rstate_pipe_gen)
+                MGL_DF_MISS(6);
+            rstate_only = true;
+        }
+    }
+
+    /* texture group: unit bindings, the realized Metal texture / view / sampler
+     * ids behind each bound unit, and no pending texture work.  Buffer textures
+     * and texture views follow state this gate cannot see: decline.
+     *
+     * Every path that can change any of this (glBindTexture, glSamplerParameter,
+     * glTexParameter, texture upload / realloc / delete, sampler-uniform writes)
+     * arms one of these bits, so a clean draw needs no texture check at all.
+     * The verdict also feeds the texext PreDraw skip epoch (mgl_compat_perf.h):
+     * a VAO-changed draw with clean texture state skips the sampler-binding
+     * walk in extTexextPreDraw. */
+    {
+        bool tex_clean = !(ctx->state.dirty_bits & (DIRTY_TEX | DIRTY_TEX_PARAM | DIRTY_TEX_BINDING |
+                                                    DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE | DIRTY_PROGRAM));
+        if (!tex_clean)
+        {
+            if (memcmp(ctx->state.image_units, s->image_units, sizeof(s->image_units)) != 0)
+                MGL_DF_MISS(24);
+            if (memcmp(ctx->state.active_texture_mask, s->tex_mask, sizeof(s->tex_mask)) != 0)
+                MGL_DF_MISS(19);
+            for (int w = 0; w < 4; w++)
+            {
+                unsigned bits = ctx->state.active_texture_mask[w];
+                while (bits)
+                {
+                    int u = w * 32 + __builtin_ctz(bits);
+                    Texture *tex = ctx->state.active_textures[u];
+                    Sampler *sam = ctx->state.texture_samplers[u];
+
+                    bits &= bits - 1;
+                    if ((const void *)tex != s->tex[u] || (const void *)sam != s->samp[u])
+                        MGL_DF_MISS(20);
+                    if (tex)
+                    {
+                        if (tex->dirty_bits)
+                            MGL_DF_MISS(21);
+                        if (tex->mtl_data != s->tex_mtl[u] || tex->params.mtl_data != s->tex_par[u] ||
+                            mgl_texext_info(ctx, tex))
+                            MGL_DF_MISS(22);
+                    }
+                    if (sam && sam->params.mtl_data != s->samp_par[u])
+                        MGL_DF_MISS(23);
+                }
+            }
+        }
+        m->texext_epoch_seq++;                                /* serial of this gate run */
+        /* consecutive clean draws share one epoch: the hook skips until a
+         * texture-dirty draw (gate or walk) zeroes it, then runs once */
+        if (!tex_clean)
+            m->texext_skip_epoch = 0;
+        else if (m->texext_skip_epoch == 0)
+            m->texext_skip_epoch = ++m->texext_epoch_seq;
+    }
+
+    /* buffer-map groups: identity of the maps and of every mapped buffer */
+    { int wv = 0, wf = 0;
+      bool vok = compatListStable(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb, &wv, allowDirtyListBuffers);
+      bool fok = vok && compatListStable(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb, &wf, allowDirtyListBuffers);
+      if (!vok) MGL_DF_MISS(7 + (wv == 3));           /* vlist / vlist-dirty */
+      else if (!fok) MGL_DF_MISS(9 + (wf == 3));      /* flist / flist-dirty */
+    }
+
+    /* vertex-array group: the vattrib draw plan, the VAO layout, the generic
+     * attribs (constant-attribute streams), and the Metal storage behind every
+     * binding the plan uses (client-array-style by-value streams decline).
+     * plan / fmt / binding can only be written behind DIRTY_VAO (core) or —
+     * in the compat layout-hash fast path — not at all, so a clean draw only
+     * pays the generic-attrib compare (glVertexAttrib* sets no dirty bit) */
+    {
+        struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+        MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
+
+        if (!vs || !va)
+            MGL_DF_MISS(11);
+        if (ctx->state.dirty_bits & DIRTY_VAO)
+        {
+            if (memcmp(&vs->plan, &s->plan, sizeof(s->plan)) != 0)
+                MGL_DF_MISS(12);
+            if (memcmp(va->fmt, s->fmt, sizeof(s->fmt)) != 0 ||
+                memcmp(va->binding, s->binding, sizeof(s->binding)) != 0)
+                MGL_DF_MISS(13);
+        }
+        if (memcmp(vs->current, s->current, sizeof(s->current)) != 0)
+            MGL_DF_MISS(14);
+
+        for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+        {
+            const Buffer *buf = va->binding[b].buffer;
+
+            if (s->plan.binding_index[b] < 0 || !buf)
+                continue;
+            /* by-value (small, no MTLBuffer) streams re-stream through the ring,
+             * which memcmp-skips unchanged bytes: content changes always set
+             * data.dirty_bits (BufferSubData / Map/Unmap) or leave buf->mapped
+             * set (persistent), so a clean, unmapped, unchanged binding needs
+             * no re-stream — the encoder keeps its ring binding, and ring
+             * slots are only recycled after their reading serial completed */
+            if (buf->mapped)
+                MGL_DF_MISS(16);
+            if (buf->data.dirty_bits)
+                MGL_DF_MISS(17);
+            if ((buf->data.mtl_data != NULL) != (s->vabuf[b].mtl != NULL) ||
+                buf->size != s->vabuf[b].size ||
+                (buf->data.mtl_data && buf->data.mtl_data != s->vabuf[b].mtl))
+                MGL_DF_MISS(18);
+        }
+    }
+
+
+    /* tess routing installs its own pipeline and buffer maps: never skip its walks */
+    if ([self extTessActive])
+        MGL_DF_MISS(25);
+
+    /* everything matched: the walk is a no-op except for listed-buffer content
+     * (a listed buffer with dirty data needs the ring re-stream) */
+    if (rstate_only)
+        return MGL_DF_RSTATE;
+
+    mgl_compat_fast_hit++;
+    if (ctx->state.dirty_bits & MGL_DF_REDUNDANT)
+        ctx->state.dirty_bits &= ~MGL_DF_REDUNDANT;
+
+    if (allowDirtyListBuffers)
+    {
+        bool dirty = false;
+        for (GLuint i = 0; i < ctx->state.vertex_buffer_map_list.count && !dirty; i++)
+        {
+            const Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
+            dirty = b && b->data.dirty_bits != 0;
+        }
+        for (GLuint i = 0; i < ctx->state.fragment_buffer_map_list.count && !dirty; i++)
+        {
+            const Buffer *b = ctx->state.fragment_buffer_map_list.buffers[i].buf;
+            dirty = b && b->data.dirty_bits != 0;
+        }
+        if (dirty)
+            return MGL_DF_BUFFERS;
+    }
+
+    return MGL_DF_SKIP;
+}
+
+/* record the state the just-completed full walk resolved everything for */
+- (void) compatDrawLatch
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+    struct MGLCompatDrawSnap *s;
+
+    if (!df)
+        return;
+    s = &df->snap;
+
+    /* the walk must have produced a bound pipeline on a live encoder */
+    if (!_currentRenderEncoder || !_pipelineState || !_currentCommandBuffer)
+    {
+        s->valid = 0;
+        return;
+    }
+
+    s->valid = 1;
+    s->encoder_gen = m->encoder_gen;
+    s->encoder = (__bridge const void *)_currentRenderEncoder;
+    s->cmdbuf = (__bridge const void *)_currentCommandBuffer;
+    s->pipe = (__bridge const void *)_pipelineState;
+    s->program = (const void *)ctx->state.program;
+    s->vao = (const void *)ctx->state.vao;
+    s->fbo = (const void *)ctx->state.framebuffer;
+
+    {
+        struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
+        s->rstate_gen = rs ? rs->generation : 0;
+        s->rstate_pipe_gen = rs ? rs->generation_pipeline : 0;
+    }
+
+    memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
+
+    compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
+    compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
+
+    {
+        struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+        MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
+
+        if (vs && va)
+        {
+            memcpy(&s->plan, &vs->plan, sizeof(s->plan));
+            memcpy(s->fmt, va->fmt, sizeof(s->fmt));
+            memcpy(s->binding, va->binding, sizeof(s->binding));
+            memcpy(s->current, vs->current, sizeof(s->current));
+            for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+            {
+                const Buffer *buf = va->binding[b].buffer;
+                s->vabuf[b].buf = buf;
+                s->vabuf[b].mtl = buf ? buf->data.mtl_data : NULL;
+                s->vabuf[b].size = buf ? buf->size : 0;
+            }
+        }
+        else
+        {
+            memset(&s->plan, 0, sizeof(s->plan));
+            memset(s->fmt, 0, sizeof(s->fmt));
+            memset(s->binding, 0, sizeof(s->binding));
+            memset(s->current, 0, sizeof(s->current));
+            memset(s->vabuf, 0, sizeof(s->vabuf));
+        }
+    }
+
+    memcpy(s->tex_mask, ctx->state.active_texture_mask, sizeof(s->tex_mask));
+    for (int w = 0; w < 4; w++)
+    {
+        unsigned bits = ctx->state.active_texture_mask[w];
+        while (bits)
+        {
+            int u = w * 32 + __builtin_ctz(bits);
+            Texture *tex = ctx->state.active_textures[u];
+            Sampler *sam = ctx->state.texture_samplers[u];
+
+            bits &= bits - 1;
+            s->tex[u] = tex;
+            s->samp[u] = sam;
+            s->tex_mtl[u] = tex ? tex->mtl_data : NULL;
+            s->tex_par[u] = tex ? tex->params.mtl_data : NULL;
+            s->samp_par[u] = sam ? sam->params.mtl_data : NULL;
+        }
+    }
+
+    /* the end-of-draw snapshot stays valid: it records "what was last stamped";
+     * if this walk changed the stamped set, the end gate's own compares fail */
+}
+
+/* partial fast path (perf session 12): every group except listed-buffer
+ * CONTENT matches the snapshot — e.g. only a uniform upload dirtied the
+ * default uniform block.  Re-stream just the buffers (the ring re-encodes
+ * changed bytes, memcmp-skips unchanged ones) and skip the whole walk: no
+ * PSO check, no hook fan-out, no stamps (their gates still match). */
+- (bool) compatDrawFastBuffers
+{
+    uint64_t t13 = mgl_prof_begin(13);
+
+    if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
+        ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list])
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+
+    if (![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
+        ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+
+    compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
+    compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
+
+    /* identities did not change, the content dirty bits are now clear: the
+     * snapshot is valid again for the next draw */
+    [self compatDrawLatch];
+
+    mgl_prof_end(13, t13);
+    return true;
+}
+
+/* partial fast path (perf session 12): only the rstate encoder-state group
+ * changed (generation bump, no pipeline-content change — e.g. a blend-colour /
+ * stencil-ref / depth-mask write between draws).  Re-apply the encoder state
+ * and skip the rest of the walk. */
+- (bool) compatDrawFastRState
+{
+    [self extRstatePreDraw: _currentRenderEncoder];
+    [self compatDrawLatch];
+    return true;
+}
+
+/* ---- end-of-draw: the GPU-serial stamps are a no-op while the command-buffer
+ * serial and every stamped buffer are unchanged ---- */
+- (bool) compatEndDrawFast
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+
+    if (!df || !df->end_valid || !m->enabled)
+        return false;
+
+    if ([self extBufSerial] != df->end_serial)
+        return false;
+
+    const BufferMapList *lists[2] = { &ctx->state.vertex_buffer_map_list, &ctx->state.fragment_buffer_map_list };
+    const struct MGLCompatBufId *snap[2] = { df->end_v, df->end_f };
+    const GLuint counts[2] = { df->end_vn, df->end_fn };
+
+    for (int l = 0; l < 2; l++)
+    {
+        if (lists[l]->count != counts[l])
+            return false;
+        for (GLuint i = 0; i < lists[l]->count; i++)
+        {
+            const Buffer *b = lists[l]->buffers[i].buf;
+
+            if (b != snap[l][i].buf || (b && b->data.mtl_data != snap[l][i].mtl))
+                return false;
+        }
+    }
+
+    if (VAO() && (const void *)VAO_STATE(element_array.buffer) != df->end_ebuf)
+        return false;
+    if ((const void *)ctx->state.buffers[_DRAW_INDIRECT_BUFFER] != df->end_indirect)
+        return false;
+
+    {
+        TransformFeedback *tf = ctx->state.transform_feedback;
+        if ((const void *)tf != df->end_tf)
+            return false;
+        if (tf && tf->active && !tf->paused)
+        {
+            if (!df->end_tf_active || df->end_tf_paused)
+                return false;
+            for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+                if ((const void *)ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[i].buf != df->end_tf_base[i])
+                    return false;
+        }
+        else if (df->end_tf_active && !df->end_tf_paused)
+            return false;
+    }
+
+    mgl_compat_fast_hit++;
+    return true;
+}
+
+- (void) compatEndDrawLatch
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+
+    if (!df)
+        return;
+
+    df->end_valid = 1;
+    df->end_serial = [self extBufSerial];
+
+    const BufferMapList *lists[2] = { &ctx->state.vertex_buffer_map_list, &ctx->state.fragment_buffer_map_list };
+    struct MGLCompatBufId *snap[2] = { df->end_v, df->end_f };
+    GLuint *counts[2] = { &df->end_vn, &df->end_fn };
+
+    for (int l = 0; l < 2; l++)
+    {
+        *counts[l] = lists[l]->count;
+        for (GLuint i = 0; i < lists[l]->count; i++)
+        {
+            const Buffer *b = lists[l]->buffers[i].buf;
+            snap[l][i].buf = b;
+            snap[l][i].mtl = b ? b->data.mtl_data : NULL;
+            snap[l][i].size = b ? b->size : 0;
+        }
+    }
+
+    df->end_ebuf = VAO() ? (const void *)VAO_STATE(element_array.buffer) : NULL;
+    df->end_indirect = (const void *)ctx->state.buffers[_DRAW_INDIRECT_BUFFER];
+
+    {
+        TransformFeedback *tf = ctx->state.transform_feedback;
+        df->end_tf = tf;
+        df->end_tf_active = tf ? tf->active : 0;
+        df->end_tf_paused = tf ? tf->paused : 0;
+        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+            df->end_tf_base[i] = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[i].buf;
+    }
+}
 
 - (void) bindExtCompatFuncsToGLMContext: (GLMContext) glm_ctx
 {

@@ -137,6 +137,21 @@ struct MGLExtMetal_compat {
     } vtexres[2][MGLC_BIND_SLOTS];
 
     struct MGLCompatRing ring;
+
+    /* compat perf session 12: per-draw state-walk fast path.  Opaque here (it
+     * snapshots GL-side structs this header must not depend on); allocated and
+     * owned by MGLRenderer+Compat.m (struct MGLCompatDrawFast). */
+    void    *draw_fast;
+
+    /* compat perf session 12: texext PreDraw skip epoch.  compatDrawGate proves
+     * the texture state clean for a draw (either no texture dirty bits armed, or
+     * the unit/identity checks pass) and stamps texext_skip_epoch; the texext
+     * PreDraw hook early-outs while the epoch, program and encoder generation
+     * are unchanged (glmark2: 89 VAO-changed draws per frame no longer re-walk
+     * every sampler binding) */
+    uint64_t texext_epoch_seq, texext_skip_epoch, texext_epoch_applied;
+    void    *texext_prog;
+    uint64_t texext_encoder_gen;
 };
 
 #endif /* mgl_compat_perf_h */

@@ -856,6 +856,7 @@ static void setIndexedBinding(GLMContext ctx, GLenum target, GLuint index, Buffe
     setGenericBinding(ctx, target, ptr);
 
     ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+
 }
 
 static bool checkIndexedTarget(GLMContext ctx, GLenum target)

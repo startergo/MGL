@@ -13,6 +13,7 @@
 
 #include "hash_table.h"
 #include "mgl_ext_texext.h"
+#include "mgl_compat_perf.h"           /* texext PreDraw skip epoch (perf session 12) */
 
 /* pixel_utils.c returns its own 32-bit MTLPixelFormat enum */
 extern uint32_t mtlFormatForGLInternalFormat(GLenum internal_format);
@@ -772,8 +773,30 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
     if (!enc || !ctx->state.program)
         return;
 
-    [self texextRefreshStage: _FRAGMENT_SHADER encoder: enc];
-    [self texextRefreshStage: _VERTEX_SHADER encoder: enc];
+    /* compat perf session 12: the per-draw state-walk gate (compatDrawGate in
+     * MGLRenderer+Compat.m) proves the texture state clean for this draw —
+     * either no texture dirty bit is armed or the unit/identity checks passed —
+     * and stamps texext_skip_epoch.  While that epoch, the program and the
+     * encoder generation are unchanged, the refresh below is a no-op: the
+     * sampler bindings, textures and views are exactly what the encoder
+     * already has.  glmark2 [ideas] re-specifies vertex arrays for 89 of 353
+     * draws per frame; those walks no longer re-walk every sampler binding. */
+    {
+        struct MGLExtMetal_compat *m = (struct MGLExtMetal_compat *)ctx->mtl_funcs.ext_compat;
+        if (m && m->texext_skip_epoch != 0 && m->texext_skip_epoch == m->texext_epoch_applied &&
+            m->texext_prog == (void *)ctx->state.program && m->texext_encoder_gen == m->encoder_gen)
+            return;
+
+        [self texextRefreshStage: _FRAGMENT_SHADER encoder: enc];
+        [self texextRefreshStage: _VERTEX_SHADER encoder: enc];
+
+        if (m)
+        {
+            m->texext_epoch_applied = m->texext_skip_epoch;
+            m->texext_prog = (void *)ctx->state.program;
+            m->texext_encoder_gen = m->encoder_gen;
+        }
+    }
 }
 
 @end

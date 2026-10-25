@@ -1,12 +1,58 @@
 # compat domain — progress log
-READY 014f08c (default path byte-identical to 611a380 behaviour; suite 250/0 + test_geom 603/0
-default AND MGL_ENCODER_THREAD=1; new test_csdbg 3/0 both modes).  This commit is a pure
-"keep the default OFF decision + instrumentation" step; no bench needed beyond a sanity run —
-the flag-on path changed (worker spin), the default path only gained an early-returned
-per-present hook call.
-BENCH-REQUEST 014f08c: IF a slot is free, one full default-list run just to confirm no drift
-from 14385 (expect noise); skip otherwise.  Do NOT bench MGL_ENCODER_THREAD=1 again — its fate
-is decided (see session 11).
+
+READY 28386d2 (gl46-port merged as f5607b5 + 3 commits; suite 496/0, test_geom 603/0,
+run twice + test_atomic_counters 3x; default path only — encoder thread untouched, still OFF).
+BENCH-REQUEST 28386d2: full default glmark2 list (must stay >= 14385; ideas expected to rise
+toward native 3635).  Ideas draw-path CPU is down 38-52% vs f5607b5 in interleaved
+MGL_PROFILE rounds (see session 12); under the 4-6 load of this session absolute FPS deltas
+were unmeasurable, so the supervisor bench is the arbiter.
+
+## session 12 (Oct 25, 06:15-09:30 EDT) — per-draw state-walk fast path (CPU/draw)
+
+Goal (supervisor): ideas is per-draw-CPU bound; cut processGLState / bindList / per-draw
+bookkeeping.  Baseline (f5607b5, steady state, interleaved runs): draw bucket 2.75-3.56 us/draw
+(353 draws/frame); processGLState 1.7-2.3 us avg/draw (0.6-0.8 ms/f), bindList 0.33 us/draw,
+enddraw-stamp 0.2-0.25 us/draw, ssboSizes 0.07.
+
+1. FOUND+FIXED: DIRTY_IMAGE_UNIT_STATE was set by glBindImageTexture and by every sampler-
+   uniform write (uniforms.c) but only the COMPUTE path ever cleared it — after the first
+   such write every draw took the dirty-state walk forever (ideas: dirty=0x2000 on all draws).
+   The render path's encoder refresh binds image units, so it now owns and clears the bit
+   (MGLRenderer.m texture branch mask+clear).  This alone turned "clean" draws into clean
+   draws for the first time.
+2. compatDrawGate/compatDrawLatch (MGLRenderer+Compat.m, ext slot draw_fast): exact-content
+   snapshots of every group the per-draw walk reads — buffer maps + per-buffer Metal identity,
+   VAO fmt/binding + vattrib plan + generic attribs, texture units + realized tex/view/sampler
+   ids + image units, rstate generations, encoder/PSO/cmdbuf/ring identity.  Verdicts:
+   SKIP (whole walk skipped; ctx bits DIRTY_VAO|TEX_BINDING|BUFFER_BASE|IMAGE_UNIT proven
+   redundant and cleared), BUFFERS (only listed-buffer content dirty: uniform upload -> ring
+   re-stream + dirty-bit clear, walk skipped), RSTATE (only rstate encoder generation moved:
+   extRstatePreDraw + skip), FULL.  extBufEndDraw gates the serial stamps the same way
+   (stamps 353 -> 19/frame).  Content-based, so no missed invalidation is possible; mapped /
+   coherent buffers, client-array streams, buffer textures, extra PreDraw hooks all decline.
+3. texext PreDraw skip epoch: the gate proves texture state clean and stamps an epoch;
+   extTexextPreDraw early-outs while epoch+program+encoder-gen are unchanged; any
+   texture-dirty walk zeroes it (incl. tess/geom/flush paths that bypass the gate).
+   ideas' 89 VAO-changed draws no longer re-walk both stages' sampler bindings.
+4. Gate slimming: plan/fmt/binding compares behind DIRTY_VAO; tex compares behind the tex
+   dirty bits; profiler buckets 22 (drawFastGate+partial) .. 24 added.
+
+Results (interleaved prof_ab.sh A/B, clean rounds): draw bucket 0.667-0.806 ms/f =
+1.89-2.28 us/draw (vs 2.75-3.56 base); processGLState 89 calls/f (was 353), 3.2-3.9 us each
+(the genuinely-changed draws only); bindList 134/f x 0.4-0.6 us; stamps 19/f; drawfast 86%
+hit; gate 0.22-0.30 us/draw.  drawfast-miss left: 82/f vao-fmt/binding (real per-mesh
+re-specification), 7/f program switches.  Score A/B under load-4..6: 2544 vs 2462 (+3.3%)
+in the one 6-round window where load was comparable; single-run deltas drowned in load noise.
+Draw merging (Apple 353->266): the draw-run histogram says ideas has ZERO consecutive
+identical draws (all runs length 1) — no mergeable runs with a per-draw identity key; skipped.
+
+Remaining known costs: 82 full walks/frame for real VAO re-specification (mapBuffersToMTL
+0.42us + plan rebuild + vattrib hook rebinding — that work is real, Apple pays it too), the
+gate at 0.3us/draw, encode-draw 0.28us/draw.  Files touched this session: MGLRenderer+Compat.{h,m},
+MGLRenderer+Draw.m, MGLRenderer+TextureExt.m, MGLRenderer.m (texture branch bit ownership +
+epoch zeroing + mglExtHookCacheCount + prof buckets), mgl_compat_perf.h, buffers.c (temp debug
+removed).  ab/base12 (f5607b5 build) + ab/run_ab_ideas.sh + ab/prof_ab.sh for repeatable A/B.
+
 
 ## session 11 (Oct 25, 01:55-06:15 EDT) — encoder thread: measured, pipelined, reverted
 

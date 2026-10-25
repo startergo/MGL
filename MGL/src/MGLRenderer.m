@@ -25,6 +25,7 @@
 #import <simd/simd.h>
 #import <MetalKit/MetalKit.h>
 
+#include "mgl_compat_perf.h"            /* texext skip epoch (perf session 12) */
 #include <mach/mach_vm.h>
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
@@ -168,6 +169,15 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
         c->imps[i](self, c->sels[i], arg);
 }
 
+/* compat perf session 12 (MGLRenderer+Compat.m): the per-draw fast path skips
+ * the generic PreDraw hook fan-out, so it must decline when more hooks than
+ * the three it reasons about are installed on the class */
+unsigned mglExtHookCacheCount(id self, const char *suffix)
+{
+    MGLExtHookCache *c = extHookCacheFind([self class], suffix);
+    return c ? c->count : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* MGL_PROFILE=1: per-draw cost attribution, dumped by mgl_profile_dump
  * (called from the swap path / the NSOpenGL interposer every 120 frames).
@@ -176,7 +186,7 @@ static void mglCallExtHooks(id self, const char *suffix, id arg)
  * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
 #include <mach/mach_time.h>
 #include <pthread.h>
-uint64_t mgl_prof_ns[22], mgl_prof_cnt[22];   /* shared with the Compat category counters */
+uint64_t mgl_prof_ns[24], mgl_prof_cnt[24];   /* shared with the Compat category counters */
 static int mgl_prof_on = -1;
 static double mgl_prof_scale = 0;
 /* NOINLINE + compiler barriers: mach_absolute_time is a pure intrinsic, and
@@ -222,16 +232,17 @@ void mgl_profile_dump(void)
     if (!first) first = pthread_self();
     else if (!pthread_equal(first, pthread_self()))
         fprintf(stderr, "MGL PROFILE: MULTI-THREAD use detected!\n");
-    static const char *names[22] = { "dirtyState-block", "newRenderEncoder",
+    static const char *names[24] = { "dirtyState-block", "newRenderEncoder",
                                     "pipeline-descriptor", "vao-buflists",
                                     "updateEncoder", "bindTextures", "swap", "draw",
                                     "enddraw-stamp", "encode-draw", "mapBuffers", "11",
                                     "processGLState", "bindList", "ssboSizes", "setPipelineState+PreDraw",
-                                    "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "fbBuildPassDesc", "map", "unmap" };
+                                    "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "fbBuildPassDesc", "map", "unmap",
+                                    "drawFastGate", "drawFastLatch" };
     double tot = 0;
-    for (int i = 0; i < 22; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
+    for (int i = 0; i < 24; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
     fprintf(stderr, "MGL PROFILE(ms total | ms/frame | calls/frame):");
-    for (int i = 0; i < 22; i++)
+    for (int i = 0; i < 24; i++)
         if (mgl_prof_cnt[i])
             fprintf(stderr, " %s=%.1f|%.3f|%.1f", names[i],
                     mgl_prof_ns[i] * mgl_prof_scale,
@@ -248,6 +259,19 @@ void mgl_profile_dump(void)
                 tot2 ? 100.0 * (double)mgl_compat_bind_skip / (double)tot2 : 0.0,
                 (double)mgl_compat_ring_bytes / 120.0 / 1024.0);
         mgl_compat_bind_skip = mgl_compat_bind_set = mgl_compat_ring_bytes = 0;
+    }
+    /* compat perf session 12: per-draw state-walk fast path coverage */
+    {
+        extern uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss;
+        extern void mgl_compat_drawfast_debug(void);
+        uint64_t tot3 = mgl_compat_fast_hit + mgl_compat_fast_miss;
+        if (tot3)
+            fprintf(stderr, "MGL PROFILE drawfast/frame: hit=%.1f miss=%.1f (%.0f%% hit)\n",
+                    (double)mgl_compat_fast_hit / 120.0,
+                    (double)mgl_compat_fast_miss / 120.0,
+                    100.0 * (double)mgl_compat_fast_hit / (double)tot3);
+        mgl_compat_fast_hit = mgl_compat_fast_miss = 0;
+        mgl_compat_drawfast_debug();
     }
     memset(mgl_prof_ns, 0, sizeof mgl_prof_ns);
     memset(mgl_prof_cnt, 0, sizeof mgl_prof_cnt);
@@ -3682,15 +3706,31 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         }
 
         // dirty tex covers all texture modifications
-        if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER))
+        /* compat perf session 12: DIRTY_IMAGE_UNIT_STATE is set by glBindImageTexture
+         * and by sampler-uniform writes (uniforms.c); it was never consumed by the
+         * render path — only the compute path cleared it — so it stayed armed forever
+         * after the first image/sampler-uniform update and every following draw took
+         * the dirty-state walk (glmark2 [ideas]: every draw, 0x2000).  The encoder
+         * refresh below binds image units (STORAGE_IMAGE loop), so it owns this bit. */
+        if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE))
         {
+            /* compat perf session 12: a texture-state change invalidates the texext
+             * PreDraw skip epoch (MGLRenderer+TextureExt.m): this branch re-binds the
+             * plain textures, and the hook must re-run for its buffer-texture / view
+             * / sampler-array cases (also covers the paths that reach this walk
+             * without the per-draw gate, e.g. tess / geom / flush) */
+            {   /* compat perf session 12 */
+                struct MGLExtMetal_compat *m = (struct MGLExtMetal_compat *)ctx->mtl_funcs.ext_compat;
+                if (m)
+                    m->texext_skip_epoch = 0;
+            }
             RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
             uint64_t p5 = mgl_prof_begin(5);
             RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);
             mgl_prof_end(5, p5);
 
             // textures / active textures and samplers are all handled in bindActiveTexturesToMTL
-            ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER);
+            ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE);
         }
 
         // a dirty vao needs to update the render encoder and buffer list
