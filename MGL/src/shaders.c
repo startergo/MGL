@@ -805,7 +805,15 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     memset(&glsl_input, 0, sizeof(glsl_input));
     /* GL-legal but SPIR-V-hostile constructs (layout(shared)/layout(packed) blocks, ...) are
      * rewritten first: cts_glsl_compat.c.  Freed after glslang has copied the source. */
-    char *compat = mgl_cts_glsl_compat(mgl_introspect_shader_source(ctx, ptr));
+    /* GLSL 4.60 4.4.5: layout(binding=N) at or beyond the reported limit is a
+     * compile-time error; the limits are what glGet reports (get.c) */
+    MGLCompatBindingLimits bl = { 0 };
+    bl.ubo_bindings = mgl_reported_binding_limit(ctx, GL_MAX_UNIFORM_BUFFER_BINDINGS);
+    bl.ssbo_bindings = mgl_reported_binding_limit(ctx, GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS);
+    bl.atomic_bindings = mgl_reported_binding_limit(ctx, GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS);
+    bl.image_units = mgl_reported_binding_limit(ctx, GL_MAX_IMAGE_UNITS);
+    bl.combined_texture_units = mgl_reported_binding_limit(ctx, GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+    char *compat = mgl_cts_glsl_compat_limited(mgl_introspect_shader_source(ctx, ptr), &bl);
     {
         /* tess: a gl_PerVertex (gl_in) redeclared as a subset of the producer's members is
          * legal GL; glslang's cross-stage link rejects it — expand it (mgl_ext_tess.h) */
@@ -818,6 +826,7 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         }
     }
     initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */
+    if (getenv("MGL_SRC_DUMP")) { FILE *f = fopen(getenv("MGL_SRC_DUMP"), "a"); if (f) { fprintf(f, "==== %s\n", ptr->mtl_shader_type_name ? ptr->mtl_shader_type_name : "?"); fputs(glsl_input.code ? glsl_input.code : "", f); fputc('\n', f); fclose(f); } }
 
     /* compile cache hit: borrow the shared glslang shader and the compile-time log */
     {

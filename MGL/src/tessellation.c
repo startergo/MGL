@@ -185,7 +185,15 @@ char *mgl_tess_glsl_compat(GLenum type, const char *src)
             if (ln && last[ln - 1] == ']')
             {
                 last[ln - 1] = 0;
-                while (ln > 1 && last[ln - 2] == ' ') { last[ln - 2] = 0; ln--; }
+                ln--;
+                while (ln > 1 && (last[ln - 1] == ' ' || last[ln - 1] == '\t')) { last[ln - 1] = 0; ln--; }
+                /* unsized arrays declare as "name[]": drop the '[' too, else the
+                 * member name compares as "gl_ClipDistance[" and an existing
+                 * gl_ClipDistance[] member is expanded in twice
+                 * (KHR-GL46.CommonBugs.CommonBug_PerVertexValidation:
+                 * "duplicate member name: gl_ClipDistance") */
+                if (ln && last[ln - 1] == '[')
+                    last[ln - 1] = 0;
             }
             snprintf(name, sizeof(name), "%s", last);
             for (int k = 0; k < 4; k++)
@@ -3496,12 +3504,218 @@ bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data)
  * layout(vertices=N) output patch size must lie in [1, GL_MAX_TESS_CONTROL_OUTPUT_
  * VERTICES]; outside, the program must FAIL to link (glslang accepts any N, the
  * limit is implementation-dependent — this is where MGL enforces it). */
+/* ---------------- gl_PerVertex interface validation (link time) ----------------
+ *
+ * GL 4.6 §11.1.2.5 / GLSL 4.60 §7.1: a shader stage may redeclare the built-in
+ * gl_PerVertex block with a SUBSET of its members; linking then requires every
+ * member the consumer stage declares to be present in the producer stage's output
+ * block (a stage without a redeclaration exports the full built-in set for its
+ * #version).  mgl_tess_glsl_compat expands all redeclarations to the full set
+ * before glslang sees them (glslang demands equal member sets), so the mismatch
+ * is invisible to the compiler - parse the ORIGINAL shader sources here instead
+ * (KHR-GL46.CommonBugs.CommonBug_PerVertexValidation). */
+
+enum { PVM_POSITION = 1u << 0, PVM_POINT_SIZE = 1u << 1, PVM_CLIP = 1u << 2, PVM_CULL = 1u << 3 };
+
+static const char *tess_perv_member_name(unsigned m)
+{
+    switch (m)
+    {
+        case PVM_POSITION:   return "gl_Position";
+        case PVM_POINT_SIZE: return "gl_PointSize";
+        case PVM_CLIP:       return "gl_ClipDistance";
+        case PVM_CULL:       return "gl_CullDistance";
+    }
+    return "?";
+}
+
+static const char *tess_stage_name(int stage)
+{
+    switch (stage)
+    {
+        case _VERTEX_SHADER:            return "vertex";
+        case _TESS_CONTROL_SHADER:      return "tessellation control";
+        case _TESS_EVALUATION_SHADER:   return "tessellation evaluation";
+        case _GEOMETRY_SHADER:          return "geometry";
+        case _FRAGMENT_SHADER:          return "fragment";
+    }
+    return "?";
+}
+
+/* members of the built-in gl_PerVertex block for the source's #version */
+static unsigned tess_perv_full_mask(const char *src)
+{
+    int version = 110;
+    const char *v = strstr(src, "#version");
+    if (v)
+        version = atoi(v + 8);
+    unsigned m = PVM_POSITION | PVM_POINT_SIZE;
+    if (version >= 130) m |= PVM_CLIP;
+    if (version >= 450) m |= PVM_CULL;
+    return m;
+}
+
+/* bitmask of the members an 'in'/'out gl_PerVertex {...}' redeclaration declares.
+ * *found is 0 when the source carries no such redeclaration (full built-in set).
+ * One declaration per direction is assumed (GL requires it). */
+static unsigned tess_perv_declared(const char *src, int want_out, int *found)
+{
+    size_t len = strlen(src);
+    *found = 0;
+    const char *p = src;
+    while ((p = strstr(p, "gl_PerVertex")) != NULL)
+    {
+        size_t at = (size_t)(p - src);
+        /* word boundaries */
+        if ((at == 0 || (isalnum((unsigned char)src[at - 1]) || src[at - 1] == '_')) ||
+            (at + 12 < len && (isalnum((unsigned char)p[12]) || p[12] == '_')))
+        {
+            p += 12;
+            continue;
+        }
+        /* the qualifier directly before the block name */
+        size_t q = at;
+        while (q > 0 && (src[q - 1] == ' ' || src[q - 1] == '\t' || src[q - 1] == '\r' || src[q - 1] == '\n'))
+            q--;
+        int is_out = (q >= 3 && !strncmp(src + q - 3, "out", 3) &&
+                      (q - 3 == 0 || !isalnum((unsigned char)src[q - 4]) && src[q - 4] != '_'));
+        int is_in  = (q >= 2 && !strncmp(src + q - 2, "in", 2) &&
+                      (q - 2 == 0 || !isalnum((unsigned char)src[q - 3]) && src[q - 3] != '_'));
+        if ((want_out && !is_out) || (!want_out && !is_in))
+        {
+            p += 12;
+            continue;
+        }
+        /* the block body */
+        size_t b = at + 12;
+        while (src[b] == ' ' || src[b] == '\t' || src[b] == '\r' || src[b] == '\n') b++;
+        if (src[b] != '{')
+        {
+            p += 12;
+            continue;
+        }
+        int depth = 1;
+        size_t e = b + 1;
+        while (src[e] && depth)
+        {
+            if (src[e] == '{') depth++;
+            else if (src[e] == '}') depth--;
+            if (depth) e++;
+        }
+        if (!src[e])
+            break;
+        char body[1024];
+        size_t n = e - (b + 1);
+        if (n >= sizeof(body)) n = sizeof(body) - 1;
+        memcpy(body, src + b + 1, n);
+        body[n] = 0;
+
+        unsigned mask = 0;
+        char *tokctx = NULL, *tokctx2 = NULL;
+        for (char *decl = strtok_r(body, ";", &tokctx); decl; decl = strtok_r(NULL, ";", &tokctx))
+        {
+            char last[64] = "";
+            for (char *w = strtok_r(decl, " \t\r\n", &tokctx2); w; w = strtok_r(NULL, " \t\r\n", &tokctx2))
+                snprintf(last, sizeof last, "%s", w);
+            size_t ln = strlen(last);
+            if (ln && last[ln - 1] == ']')
+            {
+                last[ln - 1] = 0;
+                ln--;
+                while (ln > 1 && (last[ln - 1] == ' ' || last[ln - 1] == '\t')) { last[ln - 1] = 0; ln--; }
+                if (ln && last[ln - 1] == '[')
+                    last[ln - 1] = 0;
+            }
+            for (int k = 0; k < 4; k++)
+                if (!strcmp(last, tess_pervtx_name[k]))
+                    mask |= 1u << k;
+        }
+        *found = 1;
+        return mask;
+    }
+    return 0;
+}
+
+/* append a message to the program's link log and fail the link */
+static void tess_link_log_fail(MGLProgramObj *obj, const char *msg)
+{
+    size_t len = strlen(msg) + (obj->info_log ? strlen(obj->info_log) : 0) + 8;
+    char *old_log = obj->info_log;
+
+    obj->info_log = (char *)malloc(len);
+    if (obj->info_log)
+        snprintf(obj->info_log, len, "%s%s%s", old_log ? old_log : "",
+                 old_log ? "\n" : "", msg);
+    free(old_log);
+    obj->link_status = false;
+}
+
+/* check every active producer->consumer gl_PerVertex interface of the program */
+static void tess_check_perv_interface(GLMContext ctx, Program *program)
+{
+    (void)ctx;
+    static const int consumers[] = { _TESS_CONTROL_SHADER, _TESS_EVALUATION_SHADER, _GEOMETRY_SHADER, _FRAGMENT_SHADER };
+
+    for (size_t c = 0; c < sizeof(consumers) / sizeof(consumers[0]); c++)
+    {
+        int cs = consumers[c];
+        Shader *csh = program->shader_slots[cs];
+        if (!csh || !csh->src)
+            continue;
+        /* the producer is the highest active stage below the consumer */
+        Shader *psh = NULL;
+        int ps = -1;
+        for (int s = cs - 1; s >= _VERTEX_SHADER; s--)
+            if (program->shader_slots[s] && program->shader_slots[s]->src)
+            {
+                psh = program->shader_slots[s];
+                ps = s;
+                break;
+            }
+        if (!psh)
+            continue;
+
+        int cfound = 0, pfound = 0;
+        unsigned cmask = tess_perv_declared(csh->src, 0, &cfound);
+        unsigned pmask = tess_perv_declared(psh->src, 1, &pfound);
+        if (!pfound)
+            pmask = tess_perv_full_mask(psh->src);
+        /* Only a consumer that EXPLICITLY redeclares gl_PerVertex with a subset
+         * demands those members from the producer; without a redeclaration the
+         * stage reads at most what the built-in declaration provides and the
+         * producer's own subset is fine (a VS exporting only gl_Position links
+         * against any un-redeclared consumer - test_compat_glsl
+         * glsl_150_gl_per_vertex_redeclaration). */
+        if (!cfound)
+            continue;
+        unsigned missing = cmask & ~pmask;
+        if (!missing)
+            continue;
+
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "ERROR: gl_PerVertex interface mismatch: %s shader declares %s but the "
+                 "%s shader does not export it (link failed)\n",
+                 tess_stage_name(cs), tess_perv_member_name(missing & -missing),
+                 tess_stage_name(ps));
+        tess_link_log_fail(MGL_PROGRAM_OBJ(program), msg);
+    }
+}
+
+
 bool mgl_program_check_tess_link(GLMContext ctx, Program *program)
 {
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
     const uint32_t *ir;
     size_t ir_size;
     int modes[16], count = 0, out_vertices = 0;
+
+    /* gl_PerVertex interface validation runs for every program (GL 4.6 §11.1.2.5:
+     * a consumer stage may redeclare gl_PerVertex with a subset, but every member it
+     * declares must be exported by the producer stage).  glslang cannot check this:
+     * mgl_tess_glsl_compat normalizes all redeclarations to the full member set so the
+     * cross-stage blocks always match, so the ORIGINAL sources are parsed here. */
+    tess_check_perv_interface(ctx, program);
 
     if (!program->spirv[_TESS_CONTROL_SHADER].ir)
         return true;

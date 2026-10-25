@@ -312,6 +312,155 @@ static char *reject_buffer_layout_decl(const char *src)
     return out.buf;
 }
 
+static bool gather_offset_is_literal(const char *e)
+{
+    /* blank constructor type keywords, then allow digits/signs/commas/hex only */
+    char tmp[512];
+    size_t n = strlen(e);
+    if (n >= sizeof tmp) n = sizeof tmp - 1;
+    memcpy(tmp, e, n); tmp[n] = 0;
+    for (char *p = tmp; (p = strstr(p, "ivec2")) != NULL; ) memset(p, ' ', 6);
+    for (char *p = tmp; (p = strstr(p, "ivec3")) != NULL; ) memset(p, ' ', 6);
+    for (char *p = tmp; *p; p++)
+    {
+        if (isalpha((unsigned char)*p))
+        {
+            /* 'x' of a hex literal only right after a digit */
+            if ((*p == 'x' || *p == 'X') && p > tmp && isdigit((unsigned char)p[-1])) continue;
+            return false;              /* a runtime identifier */
+        }
+    }
+    return true;
+}
+
+/* the declared sampler dimension for a (simple) sampler expression */
+typedef enum { GATHER_T2D, GATHER_T2DARRAY, GATHER_T2D_SHADOW, GATHER_T2DARRAY_SHADOW, GATHER_T_UNKNOWN } GatherDim;
+
+static GatherDim gather_dim_of(const char *src, const char *expr, size_t len)
+{
+    char name[128];
+    size_t n = len < sizeof name - 1 ? len : sizeof name - 1;
+    memcpy(name, expr, n); name[n] = 0;
+    /* strip a trailing array/struct selection: "uSampler[0]" -> "uSampler" */
+    for (size_t k = 0; k < n; k++)
+        if (name[k] == '[' || name[k] == '.') { name[k] = 0; break; }
+    if (!name[0]) return GATHER_T_UNKNOWN;
+
+    char pat[160];
+    static const struct { const char *kw; GatherDim d; } dims[] = {
+        { "sampler2DArrayShadow", GATHER_T2DARRAY_SHADOW },
+        { "sampler2DShadow",      GATHER_T2D_SHADOW },
+        { "sampler2DArray",       GATHER_T2DARRAY },
+        { "sampler2D",            GATHER_T2D },
+    };
+    for (unsigned d = 0; d < sizeof dims / sizeof dims[0]; d++)
+    {
+        const char *p = strstr(src, dims[d].kw);
+        while (p)
+        {
+            const char *q = p + strlen(dims[d].kw);
+            while (q < src + strlen(src) && (*q == ' ' || *q == '\t' || *q == '\n')) q++;
+            size_t kl = strlen(name);
+            if (strncmp(q, name, kl) == 0 && !is_ident_char((unsigned char)q[kl]))
+                return dims[d].d;          /* exact declaration "kw name" */
+            p = strstr(p + 1, dims[d].kw);
+        }
+    }
+    return GATHER_T_UNKNOWN;
+}
+
+static char *rewrite_gather_var_offset(const char *src)
+{
+    if (getenv("MGL_NO_GATHER_RW")) return NULL;
+    if (!strstr(src, "textureGatherOffset")) return NULL;
+    size_t len = strlen(src);
+    Str out = {0};
+    size_t i = 0;
+    bool changed = false;
+
+    while (i < len)
+    {
+        if (!at_word(src, len, i, "textureGatherOffset"))
+        {
+            str_push(&out, src[i++]);
+            continue;
+        }
+        size_t w = i + strlen("textureGatherOffset");
+        size_t open = skip_ws_comments(src, len, w);
+        size_t close = (open < len && src[open] == '(') ? match_paren(src, len, open) : len;
+        if (close >= len)
+        {
+            str_append(&out, src + i, w - i);
+            i = w;
+            continue;
+        }
+
+        /* split the top-level arguments */
+        char args[5][512];
+        int nargs = 0;
+        {
+            size_t start = open + 1, depth = 0;
+            for (size_t j = open + 1; j <= close; j++)
+            {
+                if (j < close && (src[j] == '(' || src[j] == '[')) depth++;
+                else if (j < close && (src[j] == ')' || src[j] == ']')) depth--;
+                if (j == close || (src[j] == ',' && depth == 0))
+                {
+                    if (nargs < 5)
+                    {
+                        size_t s = start, e = j;
+                        while (s < e && isspace((unsigned char)src[s])) s++;
+                        while (e > s && isspace((unsigned char)src[e - 1])) e--;
+                        size_t n = e - s;
+                        if (n >= sizeof args[0]) n = sizeof args[0] - 1;
+                        memcpy(args[nargs], src + s, n);
+                        args[nargs][n] = 0;
+                    }
+                    nargs++;
+                    start = j + 1;
+                }
+            }
+        }
+
+        GatherDim dim = (nargs >= 3 && nargs <= 4) ? gather_dim_of(src, args[0], strlen(args[0])) : GATHER_T_UNKNOWN;
+        bool shadow = (dim == GATHER_T2D_SHADOW || dim == GATHER_T2DARRAY_SHADOW);
+        int off_arg = shadow ? nargs - 1 : 2;              /* (S,P,off[,comp]) | (S,P,ref,off) */
+        if (dim == GATHER_T_UNKNOWN || off_arg >= nargs ||
+            gather_offset_is_literal(args[off_arg]))
+        {
+            /* constant offsets reach Metal through SPIRV-Cross natively; leave */
+            str_append(&out, src + i, close + 1 - i);
+            i = close + 1;
+            continue;
+        }
+
+        char buf[1400];
+        char shift[640];
+        /* the gather footprint depends only on floor(P*size - 0.5); snap to it and
+         * add the integer offset (float-exact at texel centers, where a plain
+         * coordinate shift can round one texel short) */
+        if (dim == GATHER_T2D || dim == GATHER_T2D_SHADOW)
+            snprintf(shift, sizeof shift,
+                     "((floor((%s) * vec2(textureSize(%s, 0)) - vec2(0.5)) + vec2(%s) + vec2(0.5)) / vec2(textureSize(%s, 0)))",
+                     args[1], args[0], args[off_arg], args[0]);
+        else
+            snprintf(shift, sizeof shift,
+                     "vec3(((floor((%s).xy * vec2(textureSize(%s, 0).xy) - vec2(0.5)) + vec2(%s) + vec2(0.5)) / vec2(textureSize(%s, 0).xy)), (%s).z)",
+                     args[1], args[0], args[off_arg], args[0], args[1]);
+        if (shadow)
+            snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], shift, args[nargs - 2]);
+        else if (nargs == 4)
+            snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], shift, args[3]);
+        else
+            snprintf(buf, sizeof buf, "textureGather(%s, %s)", args[0], shift);
+        str_append(&out, buf, strlen(buf));
+        i = close + 1;
+        changed = true;
+    }
+    if (!changed) { free(out.buf); return NULL; }
+    return out.buf;
+}
+
 static char *rewrite_gather_offsets(const char *src);
 
 /* SSBO binding-point range checking (GLSL 4.60 4.4.5 / ARB_shading_language_420pack):
@@ -676,6 +825,628 @@ static char *strip_invariant_on_input(const char *src)
     return out;
 }
 
+/* ================================================================= GL preprocessor strictness
+ *
+ * glslang is more permissive than the GLSL spec in four shapes the CTS negative
+ * cases exercise (KHR-GL46.shaders.preprocessor.*):
+ *   - a #version directive that is not the first significant statement
+ *     (version_not_first_statement_1/2: glslang accepts "precision ...; #version 330")
+ *   - a #version number that is not a real GLSL version (version_is_less: #version 329
+ *     — MGL's legacy upgrade path rewrote every number below 330 to 330)
+ *   - extra tokens after #if / #elif / #else / #endif (invalid_conditionals.*: the GLSL
+ *     preprocessor requires the directive to end there; glslang ignores the tail)
+ *   - the C stringize operator '#' inside a macro body (basic.stringification: GLSL
+ *     supports ## but has no '#'; glslang only complains when the macro is expanded)
+ * Each is scanned comment- and continuation-aware; on a hit a leading "#error" line is
+ * injected so the compile fails with a spec-shaped message.  Anything the scan cannot
+ * decide is left to glslang. */
+
+typedef struct {
+    const char *p;      /* token start */
+    size_t n;           /* token length */
+    int kind;           /* 0 punctuation, 1 identifier, 2 number */
+} PpTok;
+
+/* tokenize the tail of a conditional directive; returns the token count */
+static int pp_tokenize(const char *p, const char *end, PpTok *tok, int max)
+{
+    int n = 0;
+    while (p < end && n < max)
+    {
+        char c = *p;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { p++; continue; }
+        if (c == '/' && p + 1 < end && p[1] == '*')          /* trailing block comment */
+        {
+            p += 2;
+            while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) p++;
+            p = (p + 2 > end) ? end : p + 2;
+            continue;
+        }
+        if (c == '/' && p + 1 < end && p[1] == '/') break;   /* line comment ends it */
+        if (is_ident_char((unsigned char)c) && !isdigit((unsigned char)c))
+        {
+            const char *s = p;
+            while (p < end && is_ident_char((unsigned char)*p)) p++;
+            tok[n].p = s; tok[n].n = (size_t)(p - s); tok[n].kind = 1; n++;
+            continue;
+        }
+        if (isdigit((unsigned char)c))
+        {
+            const char *s = p;
+            while (p < end && (isalnum((unsigned char)*p) || *p == '.' || *p == '_')) p++;
+            tok[n].p = s; tok[n].n = (size_t)(p - s); tok[n].kind = 2; n++;
+            continue;
+        }
+        /* punctuation: two-character operators first */
+        if (p + 1 < end && (c == '&' && p[1] == '&') || (c == '|' && p[1] == '|') ||
+            (c == '<' && p[1] == '<') || (c == '>' && p[1] == '>') ||
+            (c == '<' && p[1] == '=') || (c == '>' && p[1] == '=') ||
+            (c == '=' && p[1] == '=') || (c == '!' && p[1] == '='))
+        {
+            tok[n].p = p; tok[n].n = 2; tok[n].kind = 0; n++; p += 2;
+            continue;
+        }
+        tok[n].p = p; tok[n].n = 1; tok[n].kind = 0; n++; p++;
+    }
+    return n;
+}
+
+/* recursive-descent structure parse of a pp-expression; returns false when the token
+ * stream is not a well-formed expression (then the caller stays silent and glslang
+ * decides), true when parsed — *leftover reports tokens after the expression */
+static bool pp_parse_expr(PpTok *t, int n, int *pos, bool *leftover);
+
+static bool pp_parse_primary(PpTok *t, int n, int *pos)
+{
+    if (*pos >= n) return false;
+    PpTok *k = &t[*pos];
+    if (k->kind == 1)
+    {
+        (*pos)++;
+        if (k->n == 7 && strncmp(k->p, "defined", 7) == 0)
+        {
+            if (*pos < n && t[*pos].kind == 1) { (*pos)++; return true; }
+            if (*pos + 1 < n && t[*pos].n == 1 && t[*pos].p[0] == '(' &&
+                t[*pos + 1].kind == 1 && *pos + 2 < n && t[*pos + 2].n == 1 && t[*pos + 2].p[0] == ')')
+            { *pos += 3; return true; }
+            return false;
+        }
+        /* a function-like macro reference in a pp-expression (expands before the
+         * expression is evaluated): consume a balanced argument list */
+        if (*pos < n && t[*pos].n == 1 && t[*pos].p[0] == '(')
+        {
+            int depth = 0;
+            while (*pos < n)
+            {
+                if (t[*pos].n == 1 && t[*pos].p[0] == '(') depth++;
+                else if (t[*pos].n == 1 && t[*pos].p[0] == ')') { depth--; (*pos)++; if (!depth) break; continue; }
+                (*pos)++;
+            }
+            if (depth) return false;
+        }
+        return true;
+    }
+    if (k->kind == 2) { (*pos)++; return true; }
+    if (k->n == 1 && k->p[0] == '(')
+    {
+        (*pos)++;
+        bool dummy = false;
+        if (!pp_parse_expr(t, n, pos, &dummy)) return false;
+        if (*pos >= n || t[*pos].n != 1 || t[*pos].p[0] != ')') return false;
+        (*pos)++;
+        return true;
+    }
+    return false;
+}
+
+static bool pp_is_binop(PpTok *k)
+{
+    if (k->kind != 0) return false;
+    if (k->n == 2) return true;                    /* && || << >> <= >= == != */
+    switch (k->p[0])
+    {
+        case '*': case '/': case '%': case '+': case '-':
+        case '<': case '>': case '&': case '^': case '|': case ',': return true;
+        default: return false;
+    }
+}
+
+static bool pp_parse_unary(PpTok *t, int n, int *pos)
+{
+    while (*pos < n && t[*pos].kind == 0 && t[*pos].n == 1 &&
+           (t[*pos].p[0] == '!' || t[*pos].p[0] == '~' ||
+            t[*pos].p[0] == '+' || t[*pos].p[0] == '-'))
+        (*pos)++;
+    return pp_parse_primary(t, n, pos);
+}
+
+static bool pp_parse_expr(PpTok *t, int n, int *pos, bool *leftover)
+{
+    if (!pp_parse_unary(t, n, pos)) return false;
+    while (*pos < n && pp_is_binop(&t[*pos]))
+    {
+        (*pos)++;
+        if (!pp_parse_unary(t, n, pos)) return false;
+    }
+    if (*pos < n && t[*pos].kind == 0 && t[*pos].n == 1 && t[*pos].p[0] == '?')
+    {
+        (*pos)++;
+        if (!pp_parse_expr(t, n, pos, leftover)) return false;
+        if (*pos >= n || t[*pos].n != 1 || t[*pos].p[0] != ':') return false;
+        (*pos)++;
+        if (!pp_parse_expr(t, n, pos, leftover)) return false;
+    }
+    *leftover = (*pos < n);
+    return true;
+}
+
+/* the directive line starting at p (already past '#'), spanning to its end (handles
+ * backslash-newline continuations and stops at a line comment); *word points at the
+ * directive's first letter, *tail at the first character after it */
+static const char *pp_directive_end(const char *p, const char *end, const char **word, const char **tail)
+{
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    const char *w = p;
+    while (p < end && is_ident_char((unsigned char)*p)) p++;
+    *word = w;
+    *tail = p;
+    const char *q = p;
+    while (q < end && *q != '\n')
+    {
+        if (*q == '/' && q + 1 < end && q[1] == '/') break;
+        if (*q == '\\' && q + 1 < end && q[1] == '\n') { q += 2; continue; }
+        q++;
+    }
+    return q;
+}
+
+static bool pp_word_is(const char *w, size_t n, const char *word)
+{
+    return n == strlen(word) && strncmp(w, word, n) == 0;
+}
+
+/* a '#' begins a directive when only blanks separate it from the line start */
+static bool pp_at_line_start(const char *src, const char *p)
+{
+    while (p > src && (p[-1] == ' ' || p[-1] == '\t')) p--;
+    return p == src || p[-1] == '\n';
+}
+
+/* inject a leading "#error" line (keeps the original text for the info log) */
+static char *pp_error_source(const char *src, const char *msg)
+{
+    size_t n = strlen(src);
+    char *out = (char *)malloc(n + 64);
+    if (!out) return NULL;
+    snprintf(out, n + 64, "#error %s\n%s", msg, src);
+    return out;
+}
+
+/* a leftover token ends a #if/#elif/#else/#endif directive; only reject when no macro
+ * expansion could legally consume it: numbers never can, identifiers only when they are
+ * not defined as macros (an object-like macro may expand to nothing, and a macro may
+ * open a bracket the following punctuation closes — expressions.parenthesis_tricky) */
+static bool pp_leftover_is_error(PpTok *t, const char **macros, int nmacros)
+{
+    if (t->kind == 2) return true;               /* number: never expandable */
+    if (t->kind == 1)
+    {
+        for (int i = 0; i < nmacros; i++)
+            if (strlen(macros[i]) == t->n && strncmp(macros[i], t->p, t->n) == 0)
+                return false;                    /* a macro: expansion may consume it */
+        return true;
+    }
+    return false;                                /* punctuation: a macro may bracket it */
+}
+
+static char *reject_pp_strictness(const char *src)
+{
+    if (!src) return NULL;
+    const char *p = src;
+    const char *end = src + strlen(src);
+    bool seen_significant = false;      /* any token before the first #version */
+    bool have_version = false;
+
+    /* defined macro names, for the leftover check above */
+    const char *macros[256];
+    int nmacros = 0;
+    {
+        const char *q = src;
+        while (q < end && nmacros < 256)
+        {
+            if (q[0] == '#' && pp_at_line_start(src, q))
+            {
+                const char *w, *tail, *dend = pp_directive_end(q + 1, end, &w, &tail);
+                size_t wn = (size_t)(tail - w);
+                if (pp_word_is(w, wn, "define"))
+                {
+                    const char *b = tail;
+                    while (b < dend && (*b == ' ' || *b == '\t')) b++;
+                    const char *ns = b;
+                    while (b < dend && is_ident_char((unsigned char)*b)) b++;
+                    if (b > ns) macros[nmacros++] = ns;
+                }
+                q = (*dend == '\n') ? dend + 1 : dend;
+                continue;
+            }
+            q++;
+        }
+    }
+
+    while (p < end)
+    {
+        char c = *p;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { p++; continue; }
+        if (c == '/' && p + 1 < end && p[1] == '*')
+        {
+            p += 2;
+            while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) p++;
+            p = (p + 2 > end) ? end : p + 2;
+            continue;
+        }
+        if (c == '/' && p + 1 < end && p[1] == '/')
+        {
+            while (p < end && *p != '\n') p++;
+            continue;
+        }
+        if (c == '#' && pp_at_line_start(src, p))
+        {
+            const char *w, *tail, *dend;
+            dend = pp_directive_end(p + 1, end, &w, &tail);
+            size_t wn = (size_t)(tail - w);
+
+            if (pp_word_is(w, wn, "version"))
+            {
+                if (seen_significant)
+                    return pp_error_source(src, "#version must be the first statement of the shader");
+                int v = 0;
+                char prof[32] = { 0 };
+                char line[128];
+                size_t ln = (size_t)(dend - w);
+                if (ln >= sizeof line) ln = sizeof line - 1;
+                memcpy(line, w, ln); line[ln] = 0;
+                sscanf(line, "version %d %31s", &v, prof);
+                static const int known[] = { 100, 110, 120, 130, 140, 150, 300, 310, 320,
+                                             330, 400, 410, 420, 430, 440, 450, 460 };
+                bool ok = false;
+                for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
+                    if (known[i] == v) ok = true;
+                if (!ok)
+                    return pp_error_source(src, "unsupported #version number");
+                have_version = true;
+            }
+            else if (pp_word_is(w, wn, "define"))
+            {
+                /* a single '#' (not '##') inside a macro body: GLSL has no stringize */
+                const char *b = tail;
+                while (b < dend && (*b == ' ' || *b == '\t')) b++;
+                while (b < dend && is_ident_char((unsigned char)*b)) b++;   /* macro name */
+                if (b < dend && *b == '(')                                  /* parameter list */
+                {
+                    int d = 0;
+                    do { if (*b == '(') d++; else if (*b == ')') d--; b++; } while (b < dend && d > 0);
+                }
+                for (const char *q = b; q < dend; q++)
+                    if (q[0] == '#' && !(q + 1 < dend && q[1] == '#') &&
+                        !(q > src && q[-1] == '#'))
+                        return pp_error_source(src, "'#' stringize operator is not supported in GLSL");
+                seen_significant = true;
+            }
+            else if (pp_word_is(w, wn, "if") || pp_word_is(w, wn, "elif"))
+            {
+                PpTok tok[128];
+                int n = pp_tokenize(tail, dend, tok, 128);
+                int pos = 0;
+                bool leftover = false;
+                if (n > 0 && n < 128 && pp_parse_expr(tok, n, &pos, &leftover) &&
+                    leftover && pp_leftover_is_error(&tok[pos], macros, nmacros))
+                    return pp_error_source(src, "extra tokens after the preprocessor directive");
+                seen_significant = true;
+            }
+            else if (pp_word_is(w, wn, "else") || pp_word_is(w, wn, "endif"))
+            {
+                PpTok tok[8];
+                int n = pp_tokenize(tail, dend, tok, 8);
+                if (n > 0 && pp_leftover_is_error(&tok[0], macros, nmacros))
+                    return pp_error_source(src, "extra tokens after the preprocessor directive");
+                seen_significant = true;
+            }
+            else
+                seen_significant = true;
+
+            p = (*dend == '\n') ? dend + 1 : dend;
+            (void)have_version;
+            continue;
+        }
+        seen_significant = true;
+        /* skip an ordinary token */
+        if (is_ident_char((unsigned char)c)) { while (p < end && is_ident_char((unsigned char)*p)) p++; }
+        else if (c == '"') { p++; while (p < end && *p != '"') p++; p++; }
+        else if (c == '\'') { p++; while (p < end && *p != '\'') p++; p++; }
+        else p++;
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------- layout(binding=N) range check
+ *
+ * GLSL 4.60 4.4.5: for uniform blocks, buffer blocks, atomic counters and opaque
+ * types, "any binding greater than or equal to the implementation-dependent limit
+ * (for uniform blocks, GL_MAX_UNIFORM_BUFFER_BINDINGS, etc.) is a compile-time error".
+ * glslang does not check buffer blocks against these limits, so KHR-GL46.layout_binding
+ * binding_compilation_errors (which compiles a block with binding == the reported
+ * maximum) links successfully.  Scan the declaration headers and inject a #error. */
+
+typedef struct {
+    const char *p;
+    const char *end;
+} BScan;
+
+static void bs_ws(BScan *s)
+{
+    for (;;)
+    {
+        while (s->p < s->end && isspace((unsigned char)*s->p)) s->p++;
+        if (s->p + 1 < s->end && s->p[0] == '/' && s->p[1] == '*')
+        {
+            s->p += 2;
+            while (s->p + 1 < s->end && !(s->p[0] == '*' && s->p[1] == '/')) s->p++;
+            s->p = s->p + 1 < s->end ? s->p + 2 : s->end;
+            continue;
+        }
+        if (s->p + 1 < s->end && s->p[0] == '/' && s->p[1] == '/')
+        {
+            while (s->p < s->end && *s->p != '\n') s->p++;
+            continue;
+        }
+        break;
+    }
+}
+
+/* read the identifier at the cursor (NULL when none) */
+static const char *bs_ident(BScan *s, size_t *len)
+{
+    bs_ws(s);
+    if (s->p < s->end && (isalpha((unsigned char)*s->p) || *s->p == '_'))
+    {
+        const char *w = s->p;
+        while (s->p < s->end && is_ident_char((unsigned char)*s->p)) s->p++;
+        *len = (size_t)(s->p - w);
+        return w;
+    }
+    return NULL;
+}
+
+static bool bs_word_is(const char *w, size_t n, const char *word)
+{
+    return w && n == strlen(word) && strncmp(w, word, n) == 0;
+}
+
+/* value of a literal (with unary +/- and integer constants) after "binding" '=' */
+static bool bs_binding_value(BScan *s, unsigned *val)
+{
+    bs_ws(s);
+    int sign = 1;
+    if (s->p < s->end && (*s->p == '+' || *s->p == '-'))
+    {
+        if (*s->p == '-') sign = -1;
+        s->p++;
+    }
+    bs_ws(s);
+    if (s->p >= s->end || !isdigit((unsigned char)*s->p)) return false;
+    unsigned long v = 0;
+    const char *d = s->p;
+    if (d + 1 < s->end && d[0] == '0' && (d[1] == 'x' || d[1] == 'X'))
+    {
+        s->p += 2;
+        while (s->p < s->end && isxdigit((unsigned char)*s->p))
+        {
+            v = v * 16 + (unsigned)(strtoul(s->p, (char **)&s->p, 16));
+            if (s->p >= s->end || s->p == d) break;
+        }
+    }
+    else if (d + 1 < s->end && d[0] == '0')          /* octal (CTS 0112 = 74) */
+    {
+        s->p++;
+        while (s->p < s->end && *s->p >= '0' && *s->p <= '7')
+            v = v * 8 + (unsigned)(*s->p++ - '0');
+    }
+    else
+    {
+        while (s->p < s->end && isdigit((unsigned char)*s->p))
+        {
+            v = v * 10 + (unsigned)(*s->p - '0');
+            s->p++;
+        }
+    }
+    *val = (unsigned)(sign < 0 ? -(long)v : v);
+    return true;
+}
+
+static char *reject_binding_range(const char *src, const MGLCompatBindingLimits *lim)
+{
+    BScan s = { src, src + strlen(src) };
+
+    while (s.p < s.end)
+    {
+        size_t n;
+        const char *w = bs_ident(&s, &n);
+        if (!w)
+        {
+            bs_ws(&s);
+            if (s.p < s.end) s.p++;
+            continue;
+        }
+        if (!bs_word_is(w, n, "layout")) continue;
+
+        bs_ws(&s);
+        if (s.p >= s.end || *s.p != '(') continue;
+        s.p++;
+
+        /* qualifiers inside layout(...) */
+        unsigned binding = 0;
+        bool have_binding = false;
+        for (;;)
+        {
+            bs_ws(&s);
+            if (s.p < s.end && *s.p == ')') { s.p++; break; }
+            if (s.p < s.end && *s.p == ',') { s.p++; continue; }
+            size_t qn;
+            const char *q = bs_ident(&s, &qn);
+            if (!q) { if (s.p < s.end) s.p++; continue; }   /* shared/... punctuation */
+            if (bs_word_is(q, qn, "binding"))
+            {
+                bs_ws(&s);
+                if (s.p < s.end && *s.p == '=')
+                {
+                    s.p++;
+                    if (bs_binding_value(&s, &binding)) have_binding = true;
+                }
+            }
+        }
+
+        if (!have_binding) continue;
+
+        /* classify the declaration that follows the layout(...) */
+        bs_ws(&s);
+        size_t a_n, b_n;
+        const char *a = bs_ident(&s, &a_n);
+        for (;;)
+        {
+            if (bs_word_is(a, a_n, "readonly") || bs_word_is(a, a_n, "writeonly") ||
+                bs_word_is(a, a_n, "coherent") || bs_word_is(a, a_n, "restrict") ||
+                bs_word_is(a, a_n, "volatile") || bs_word_is(a, a_n, "precisely"))
+            {
+                bs_ws(&s);
+                a = bs_ident(&s, &a_n);            /* skip storage qualifiers */
+                continue;
+            }
+            break;
+        }
+        const char *b = a ? bs_ident(&s, &b_n) : NULL;
+        bs_ws(&s);
+        char nxt = s.p < s.end ? *s.p : 0;
+
+        char err[96];
+        unsigned limit = 0;
+        if (bs_word_is(a, a_n, "uniform") && bs_word_is(b, b_n, "atomic_uint"))
+            limit = lim->atomic_bindings;
+        else if (bs_word_is(a, a_n, "uniform") && b && nxt == '{')
+            limit = lim->ubo_bindings;                     /* uniform block */
+        else if (bs_word_is(a, a_n, "uniform") && b_n >= 5 && strncmp(b, "image", 5) == 0)
+            limit = lim->image_units;
+        else if (bs_word_is(a, a_n, "uniform") && b_n >= 7 && strncmp(b, "sampler", 7) == 0)
+            limit = lim->combined_texture_units;
+        /* buffer blocks are handled by reject_ssbo_binding_range (array extents
+         * included); block instance arrays are not checked here */
+
+        if (limit && binding >= limit)
+        {
+            snprintf(err, sizeof err,
+                     "layout(binding=%u) exceeds the implementation limit (%u)", binding, limit);
+            return pp_error_source(src, err);
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------ atomic counter layout rules
+ *
+ * GLSL 4.60 4.4.2.4 / ARB_shader_atomic_counters: an atomic counter declaration
+ * with an offset qualifier must also carry a binding qualifier (CTS
+ * ac-binding-examples 3 and 4: "layout(offset=8) uniform atomic_uint ac;" must
+ * not compile), and once any declaration uses a binding qualifier every atomic
+ * counter declaration in the shader must (ac-binding-examples 3).  glslang
+ * accepts both shapes; scan the declaration headers and inject a #error. */
+
+typedef struct {
+    bool has_binding, has_offset;
+} AtomicQuals;
+
+/* read consecutive layout(...) groups preceding a declaration */
+static bool bs_layout_quals(BScan *s, AtomicQuals *q)
+{
+    bool any = false;
+    memset(q, 0, sizeof *q);
+    for (;;)
+    {
+        BScan save = *s;
+        bs_ws(s);
+        size_t n;
+        const char *w = bs_ident(s, &n);
+        if (!bs_word_is(w, n, "layout")) { *s = save; return any; }
+        bs_ws(s);
+        if (s->p >= s->end || *s->p != '(') { *s = save; return any; }
+        s->p++;
+        any = true;
+        for (;;)
+        {
+            bs_ws(s);
+            if (s->p < s->end && *s->p == ')') { s->p++; break; }
+            if (s->p < s->end && *s->p == ',') { s->p++; continue; }
+            size_t qn;
+            const char *qq = bs_ident(s, &qn);
+            if (!qq) { if (s->p < s->end) s->p++; continue; }
+            if (bs_word_is(qq, qn, "binding")) q->has_binding = true;
+            if (bs_word_is(qq, qn, "offset")) q->has_offset = true;
+        }
+    }
+}
+
+static char *reject_atomic_layout_rules(const char *src)
+{
+    BScan s = { src, src + strlen(src) };
+    bool any_binding = false;
+    bool any_unbound = false;
+
+    while (s.p < s.end)
+    {
+        BScan decl = s;
+        AtomicQuals q;
+        if (!bs_layout_quals(&s, &q)) { s = decl; }
+
+        /* storage qualifiers may precede the declaration */
+        for (;;)
+        {
+            bs_ws(&s);
+            size_t st_n;
+            BScan sv = s;
+            const char *st = bs_ident(&s, &st_n);
+            if (bs_word_is(st, st_n, "readonly") || bs_word_is(st, st_n, "writeonly") ||
+                bs_word_is(st, st_n, "coherent") || bs_word_is(st, st_n, "restrict") ||
+                bs_word_is(st, st_n, "volatile"))
+                continue;
+            s = sv;
+            break;
+        }
+
+        bs_ws(&s);
+        size_t u_n;
+        const char *u = bs_ident(&s, &u_n);
+        if (bs_word_is(u, u_n, "uniform"))
+        {
+            size_t t_n;
+            const char *t = bs_ident(&s, &t_n);
+            if (bs_word_is(t, t_n, "atomic_uint"))
+            {
+                if (q.has_offset && !q.has_binding)
+                    return pp_error_source(src,
+                        "atomic counter offset qualifier requires a binding qualifier");
+                if (q.has_binding) any_binding = true;
+                else any_unbound = true;
+            }
+        }
+        if (s.p == decl.p)           /* no progress: skip a token */
+        {
+            if (!bs_ident(&s, &(size_t){0})) { bs_ws(&s); if (s.p < s.end) s.p++; }
+        }
+    }
+    if (any_binding && any_unbound)
+        return pp_error_source(src,
+            "atomic counter declarations must all carry the binding qualifier when any does");
+    return NULL;
+}
+
 char *mgl_cts_glsl_compat_generated(const char *src)
 {
     /* the geometry / tess / xfb capture variants are MGL-authored GLSL: their
@@ -697,12 +1468,38 @@ char *mgl_cts_glsl_compat_generated(const char *src)
         if (cur && cur != src) free(cur);
         cur = g;
     }
+    g = rewrite_gather_var_offset(cur ? cur : src);
+    if (g)
+    {
+        if (cur && cur != src) free(cur);
+        cur = g;
+    }
     return (cur && cur != src) ? cur : NULL;
 }
 
 char *mgl_cts_glsl_compat(const char *src)
 {
+    return mgl_cts_glsl_compat_limited(src, NULL);
+}
+
+char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits *limits)
+{
     if (!src) return NULL;
+    /* spec-shaped rejections first (see reject_pp_strictness): once one fires the
+     * compile must fail, and the other passes are pointless */
+    char *strict = reject_pp_strictness(src);
+    if (strict) return strict;
+    {
+        /* atomic counter layout rules are context-free: run them for generated
+         * sources too */
+        char *atomic = reject_atomic_layout_rules(src);
+        if (atomic) return atomic;
+    }
+    if (limits)
+    {
+        char *bad = reject_binding_range(src, limits);
+        if (bad) return bad;
+    }
     /* every step returns a malloc'd copy or NULL when it changed nothing, so the
      * chain keeps the latest non-NULL text and falls back to the original when
      * no rewrite fired at all */
@@ -720,6 +1517,12 @@ char *mgl_cts_glsl_compat(const char *src)
     if (next && cur) free(cur);
     if (next) cur = next;
     char *g = rewrite_gather_offsets(cur ? cur : src);
+    if (g)
+    {
+        free(cur);
+        cur = g;
+    }
+    g = rewrite_gather_var_offset(cur ? cur : src);
     if (g)
     {
         free(cur);
@@ -1076,7 +1879,28 @@ static void p_raw_advance(P *p)
         }
         if (p->i < p->n && p->s[p->i] == '#')       /* preprocessor line incl. continuations */
         {
-            while (p->i < p->n && (p->s[p->i] != '\n' || (p->i && p->s[p->i - 1] == '\\'))) p->i++;
+            /* comments are removed before directive processing, so a block comment
+             * starting on a directive line continues it across the newline
+             * (CTS function_redefinition_3: a '#define' whose body holds a comment
+             * that spans the line end) */
+            while (p->i < p->n)
+            {
+                if (p->s[p->i] == '/' && p->i + 1 < p->n && p->s[p->i + 1] == '*')
+                {
+                    p->i += 2;
+                    while (p->i + 1 < p->n && !(p->s[p->i] == '*' && p->s[p->i + 1] == '/')) p->i++;
+                    p->i = p->i + 1 < p->n ? p->i + 2 : p->n;
+                    continue;
+                }
+                if (p->s[p->i] == '/' && p->i + 1 < p->n && p->s[p->i + 1] == '/')
+                {
+                    while (p->i < p->n && p->s[p->i] != '\n') p->i++;
+                    break;
+                }
+                if (p->s[p->i] == '\\' && p->i + 1 < p->n && p->s[p->i + 1] == '\n') { p->i += 2; continue; }
+                if (p->s[p->i] == '\n') break;
+                p->i++;
+            }
             continue;
         }
         return;
@@ -1357,6 +2181,13 @@ static void skip_statement(P *p)
             skip_group(p, o, o == '{' ? '}' : (o == '(' ? ')' : ']'));
             continue;
         }
+        if (p->tt == 2 && (p->tok[0] == '}' || p->tok[0] == ')' || p->tok[0] == ']'))
+        {
+            /* entered AT a closer: leave it (and any pending push) to the caller —
+             * consuming/re-pushing here cannot make progress and used to loop forever */
+            if (!p->pushed) p_push(p);
+            return;
+        }
         int done = (p->tt == 2 && p->tok[0] == ';');
         p_next(p);
         if (done) return;
@@ -1435,6 +2266,15 @@ MGLBoolPaths *mgl_cts_bool_block_members(const char *src)
                 }
                 if (c.p.tt) p_next(&c.p);
             }
+            continue;
+        }
+        /* a stray closer at top level (unbalanced text left over from a macro body,
+         * e.g. CTS function_redefinition_3): drop it and move on — skip_statement
+         * deliberately parks closers for its caller */
+        if (c.p.tt == 2 && (c.p.tok[0] == '}' || c.p.tok[0] == ')' || c.p.tok[0] == ']'))
+        {
+            c.p.pushed = 0;
+            p_next(&c.p);
             continue;
         }
         skip_statement(&c.p);

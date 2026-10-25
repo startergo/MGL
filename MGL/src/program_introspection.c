@@ -142,6 +142,9 @@ static void introspect_pre_link(GLMContext ctx, Program *ptr)
     /* rebuilt by assign_interface_locations during the per-stage patch */
     free(ip->attrib_gl); ip->attrib_gl = NULL; ip->nattrib_gl = 0;
     ip->attrib_conflict = ip->attrib_overflow = 0;
+    ip->uniform_loc_conflict = 0;   /* re-detected per link (merge_explicit_loc) */
+    ip->uniform_loc_max = (int)ctx->state.var.max_uniform_locations > 0 ?
+                          (int)ctx->state.var.max_uniform_locations : 1024;
 }
 
 static MGLIShaderRec *find_shader_rec(GLMContext ctx, Shader *sh)
@@ -210,19 +213,96 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
     /* a stage whose SPIR-V is missing failed to link */
     for (int s = 0; s < MGLI_STAGES; s++) if (ptr->shader_slots[s] && !ptr->spirv[s].ir) return;
     if (!mgli_process_link(ctx, ptr, ip)) return;
+    /* GL 4.6 11.1.1: explicit uniform locations beyond GL_MAX_UNIFORM_LOCATIONS or
+     * conflicting explicit locations for one uniform fail the link (detected while
+     * walking the default blocks in mgli_process_link) */
+    if (ip->uniform_loc_overflow || ip->uniform_loc_conflict)
+    {
+        MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+        po->link_status = false;
+        {
+            const char *msg = ip->uniform_loc_overflow
+                ? "ERROR: uniform location beyond GL_MAX_UNIFORM_LOCATIONS\n"
+                : "ERROR: conflicting explicit uniform locations\n";
+            size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 8;
+            char *nl = (char *)malloc(len);
+            if (nl) {
+                nl[0] = 0;
+                if (po->info_log) { strcpy(nl, po->info_log); free(po->info_log); }
+                strcat(nl, msg);
+                po->info_log = nl;
+            }
+        }
+        return;
+    }
     build_subroutines(ctx, ip, ptr);
     /* GL 4.6 §7.4.2: a subroutine uniform with an empty set of compatible
      * subroutines fails the link (KHR-GL46.shader_subroutine.subroutine_uniform_wo_matching_subroutines) */
     for (int s = 0; s < MGLI_STAGES; s++) {
-        for (int i = 0; i < ip->sub[s].nunis; i++) {
-            if (ip->sub[s].unis[i].ncompat) continue;
-            MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
-            po->link_status = false;
+        for (int f = 0; f < ip->sub[s].nfuncs; f++)
+            if (ip->sub[s].funcs[f].index >= 256 /* GL_MAX_SUBROUTINES as reported (get.c) */)
             {
+                /* GL 4.6 §11.1.1: a subroutine function index at/above
+                 * GL_MAX_SUBROUTINES fails the link */
+                MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+                po->link_status = false;
                 char msg[256];
+                snprintf(msg, sizeof msg,
+                         "ERROR: subroutine index %d beyond GL_MAX_SUBROUTINES\n",
+                         ip->sub[s].funcs[f].index);
+                size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 8;
+                char *nl = (char *)malloc(len);
+                if (nl) {
+                    nl[0] = 0;
+                    if (po->info_log) { strcpy(nl, po->info_log); free(po->info_log); }
+                    strcat(nl, msg);
+                    po->info_log = nl;
+                }
+                return;
+            }
+        for (int i = 0; i < ip->sub[s].nunis; i++) {
+            const char *why = NULL;
+            char msg[256];
+            if (!ip->sub[s].unis[i].ncompat)
+            {
+                why = "has no compatible subroutines";
                 snprintf(msg, sizeof msg,
                          "ERROR: subroutine uniform '%s' has no compatible subroutines\n",
                          ip->sub[s].unis[i].name);
+            }
+            else if (ip->sub[s].unis[i].location >= 0 &&
+                     ip->sub[s].unis[i].location + ip->sub[s].unis[i].size > ip->uniform_loc_max)
+            {
+                /* GL 4.6 §11.1.1: an explicit location reaching past
+                 * GL_MAX_UNIFORM_LOCATIONS fails the link */
+                why = "location beyond GL_MAX_UNIFORM_LOCATIONS";
+                snprintf(msg, sizeof msg,
+                         "ERROR: subroutine uniform '%s' location %d beyond GL_MAX_UNIFORM_LOCATIONS\n",
+                         ip->sub[s].unis[i].name, ip->sub[s].unis[i].location);
+            }
+            else
+            {
+                /* two subroutine uniforms in one stage at the same explicit
+                 * location fail the link (GL 4.6 §11.1.1) */
+                for (int j = 0; j < ip->sub[s].nunis && !why; j++)
+                {
+                    if (j == i || ip->sub[s].unis[j].location < 0 || ip->sub[s].unis[i].location < 0)
+                        continue;
+                    if (ip->sub[s].unis[j].location < ip->sub[s].unis[i].location + ip->sub[s].unis[i].size &&
+                        ip->sub[s].unis[i].location < ip->sub[s].unis[j].location + ip->sub[s].unis[j].size)
+                    {
+                        why = "location reused";
+                        snprintf(msg, sizeof msg,
+                                 "ERROR: subroutine uniforms '%s' and '%s' share location %d\n",
+                                 ip->sub[s].unis[i].name, ip->sub[s].unis[j].name,
+                                 ip->sub[s].unis[i].location);
+                    }
+                }
+            }
+            if (!why) continue;
+            MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+            po->link_status = false;
+            {
                 size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 8;
                 char *nl = (char *)malloc(len);
                 if (nl) {
@@ -981,6 +1061,8 @@ void mglGetProgramResourceiv(GLMContext ctx, GLuint program, GLenum programInter
     if (length) *length = w;
 }
 
+static GLint sub_uniform_location_by_name(MGLIStageSub *s, const char *name);
+
 GLint  mglGetProgramResourceLocation(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
@@ -995,13 +1077,9 @@ GLint  mglGetProgramResourceLocation(GLMContext ctx, GLuint program, GLenum prog
         case GL_PROGRAM_INPUT: return var_location(ip->inputs, ip->ninputs, name, NULL);
         case GL_PROGRAM_OUTPUT: return var_location(ip->outputs, ip->noutputs, name, NULL);
         default:
-            for (int i = 0; i < ip->sub[st].nunis; i++) {
-                MGLISubUniform *su = &ip->sub[st].unis[i];
-                if (!strcmp(su->name, name)) return su->location;
-                size_t ln = strlen(su->name);
-                if (!strncmp(name, su->name, ln) && name[ln] == '[') { long e = strtol(name + ln + 1, NULL, 10); if (e >= 0 && e < su->size) return su->location + (GLint)e; }
-            }
-            return -1;
+            /* subroutine uniforms flatten "u[i][j]" against the declared dims,
+             * exactly like glGetUniformLocation / glGetSubroutineUniformLocation */
+            return sub_uniform_location_by_name(&ip->sub[st], name);
     }
 }
 
@@ -1059,19 +1137,17 @@ GLuint mglGetSubroutineIndex(GLMContext ctx, GLuint program, GLenum shadertype, 
     return GL_INVALID_INDEX;
 }
 
-GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
+/* location of a subroutine uniform by GL name: plain names, "u[i]" and
+ * arrays of arrays "u[i][j]" flattened against the declared dimensions so
+ * every element gets a distinct consecutive location (shared by
+ * glGetSubroutineUniformLocation and glGetProgramResourceLocation) */
+static GLint sub_uniform_location_by_name(MGLIStageSub *s, const char *name)
 {
-    MGLIProgram *ip = NULL;
-    MGLIStageSub *s = stage_sub_checked(ctx, __FUNCTION__, program, shadertype, &ip);
-    if (!s || !name) return -1;
-    if (!ip->linked) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
     for (int i = 0; i < s->nunis; i++) {
         MGLISubUniform *su = &s->unis[i];
         if (!strcmp(su->name, name)) return su->location;
         size_t ln = strlen(su->name);
         if (!strncmp(name, su->name, ln) && name[ln] == '[') {
-            /* "routine[j][i]" (arrays of arrays): flatten against the declared
-             * dimensions so every element gets a distinct consecutive location */
             const char *p = name + ln;
             long idx[8];
             int n = 0;
@@ -1089,6 +1165,15 @@ GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum sha
         }
     }
     return -1;
+}
+
+GLint mglGetSubroutineUniformLocation(GLMContext ctx, GLuint program, GLenum shadertype, const GLchar *name)
+{
+    MGLIProgram *ip = NULL;
+    MGLIStageSub *s = stage_sub_checked(ctx, __FUNCTION__, program, shadertype, &ip);
+    if (!s || !name) return -1;
+    if (!ip->linked) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
+    return sub_uniform_location_by_name(s, name);
 }
 
 static void copy_str(const char *src, GLsizei bufSize, GLsizei *length, GLchar *dst)

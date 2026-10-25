@@ -1,185 +1,123 @@
-# tess domain — round 19 report (shader / GLSL / program domain)
+# tess domain — round 21 report (tess / shader-linking / GLSL compat)
 
-**READY** — merge `gl46/tess` HEAD (this commit; the code changes it contains end at
-merge commit `5005b49`, which includes gl46-port through compat session 8 / 1335928)
+READY e4c890d
 
-Session goal (supervisor, round 19): shader/GLSL/program clusters from the r18 sweep
-(`~/MGL-cts/mgl-r18-sweep`, baseline Pass 8364/9035 = 92.6%). Started from a clean
-`git merge gl46-port` (816fbdc), re-merged compat session 7 (dcbee70) and
-compat session 8 (5005b49).
+Merge `gl46/tess`; the branch tip after this report-only commit contains the
+same code as `e4c890d` (merge of compat s12 `159d900`; code ends at `2a054e2`)
 
-## Per-group before/after
+Session goal (supervisor, round 21): finish explicit_uniform_location, then other
+KHR-GL46 Fail cases in the tess/GS/shader-linking domain.
 
-| group | r18 baseline | this session (merged head 5005b49) |
-|---|---|---|
-| KHR-GL46.shader_subroutine | 1 Pass, 27 NotSupported | **27 Pass + 1 flaky** (`same_subroutine_..._used_in_all_stages`: passed 3× earlier this session — including inside two full-group 28/28 runs — now failing consistently; failure mode + fix location documented below) |
-| KHR-GL46.shading_language_420pack | 29 Pass, 13 Fail, 1 Crash (43) | **31 Pass**, 12 fail — qualifier_order + qualifier_override_layout fixed; binding_images now links |
-| KHR-GL46.limits.max_subroutines / max_subroutine_uniform_locations | Pass | Pass |
-| (all other groups) | — | not re-run this session; full `tests/headless/run.sh` green at d786d1c (0 FAILED, rc=0) |
+## Commits this round (on gl46/tess, unmerged)
 
-## What was implemented
+| commit | what |
+|---|---|
+| `9c018e3` | (from round 20 tail, committed this session) textureGatherOffset with runtime offsets rewritten to snapped-coordinate textureGather |
+| `8d0c6c5` | glGetProgramResourceLocation flattens arrays-of-arrays subroutine uniforms |
+| `ddbc249` | merge gl46-port (compat s11 `5e02260`) |
+| `aedf12d` | TES textures bound at vertex slots + commit pending uploads before the private tess compute buffer |
+| `f98eaf9` | gl_PerVertex member parse fix (`[]` strip) + link-time gl_PerVertex interface validation |
+| `2a054e2` | PROGRAM_SEPARABLE latched at link time; pipeline info-log INVALID_VALUE |
+| (merge) | gl46-port compat s12 `159d900` |
 
-### 1. ARB_shader_subroutine, core since GL 4.0 (target #1) — 28/28
+## CTS results (before -> after, verified on hardware this round)
 
-MGL keeps the existing source-level strategy (glslang cannot emit SPIR-V for GLSL
-subroutines): `introspect_subroutine.c` rewrites each stage's GLSL into
-`uniform int _mgl_sr_<name>;` + a `_mgl_sr_call_<name>(uint _mgl_i, args)` dispatcher
-containing a `switch`, and the API entry points live in `program_introspection.c`
-(the `introspect` ext domain, carried in this branch since earlier rounds). This
-round made it actually work and advertised it:
+* `explicit_uniform_location` **16/16** r18-failures now Pass (48/48 total).
+  Last two: `subroutine-loc-arrays-mix` (glGetProgramResourceLocation now
+  flattens `u[i][j]` against the declared dims exactly like
+  glGetUniformLocation), `uniform-loc-mix-with-implicit-max[-array]` (slow, pass
+  with a >150 s per-case timeout).
+* `texture_gather`: `base-level` and **`gather-tesselation-shader`** Fail -> Pass.
+  - `gather-tesselation-shader` (gather inside TCS kernel / TES post-tess vertex
+    function) needed two fixes:
+    1. `bindTexturesToCurrentRenderEncoder` (MGLRenderer.m, shared file): with
+       tessellation active the stage list already reads the TES's resources, but
+       the sampled-image bind keyed on `stage == _VERTEX_SHADER`, so TES textures
+       went to **fragment** slots and the post-tessellation vertex function read
+       an unbound `texture(0)`.  Now any `stage != _FRAGMENT_SHADER` binds at
+       vertex slots (same rule the storage-image loop already used).
+    2. `MGLRenderer+Tessellation.m`: the emulated-tessellator path (every
+       point_mode/isolines draw with a TCS — `need_readback`) builds a private
+       command buffer, but deferred texture uploads / generateMipmap blits can
+       still sit uncommitted on the shared `_currentCommandBuffer`; the queue
+       could run the compute kernels first, so the TCS read zeros.  The shared
+       buffer is now committed first (ordering only, no wait).
+    Reproduced pixel-exact in `tests/headless/test_zz_ctstg.c` (verbatim CTS
+    shaders/texture); `test_zz_tg.c` isolates the TCS gather.
+  - `incomplete-texture[-last-comp]` still Fail: **texdata domain** — MGL
+    silently truncates an inconsistent mipmap chain (level 1 redefined 1x1) and
+    treats the texture as complete; GL requires the incomplete default
+    texture (0,0,0,1).  Needs GL mipmap-completeness (§8.17.3) at bind time.
+* `CommonBugs.CommonBug_PerVertexValidation` Fail -> Pass:
+  - the gl_PerVertex expander stripped only `]` from a member name, leaving
+    `gl_ClipDistance[` — an existing `gl_ClipDistance[]` member was never
+    recognized and expanded in twice ("duplicate member name: gl_ClipDistance").
+  - link-time gl_PerVertex interface validation (GL 4.6 §11.1.2.5): a consumer
+    stage that redeclares the block with a subset demands those members from the
+    producer's output block; mismatch fails the link with a message naming
+    stage+member.  Only explicit consumer redeclarations are checked (an
+    un-redeclared consumer accepts any producer subset —
+    `test_compat_glsl glsl_150_gl_per_vertex_redeclaration` stays green).
+    Implemented in `mgl_program_check_tess_link` (runs for every program), the
+    ORIGINAL shader sources are parsed since the expander normalizes the blocks.
+* `sepshaderobjs`: CreateShadProgApi, PipelineApi Fail -> Pass (3/4 now):
+  - `GL_PROGRAM_SEPARABLE` queries report the value **latched at the last
+    successful link** ("the state of the binary after it was linked"); a failed
+    `glCreateShaderProgramv` link therefore queries FALSE, a never-linked program
+    FALSE.  glUseProgramStages/pipeline validation use the latched value; the
+    live parameter still round-trips through program binaries.
+  - `glGetProgramPipelineInfoLog` with a nonexistent pipeline name returns
+    GL_INVALID_VALUE (CTS-mandated, "error still missing from the spec").
+  - `StateInteraction` still fails: a failed **relink** of a pipeline-referenced
+    program must keep drawing with the last successful binary; MGL discards the
+    stage executables on the failed link (needs link snapshot/restore).
+* `tessellation_shader.gl_InvocationID_PatchVerticesIn_PrimitiveID` (r18
+  "Timeout"): Passes now — it was the 1325 s batch deadline, the case alone
+  takes ~4 s.
 
-- **get.c**: advertise `GL_ARB_shader_subroutine`; `GL_MAX_COMBINED_IMAGE_UNIFORMS`
-  raised from 8 (== per-stage) to 40 (per-stage sum over the 5 raster stages —
-  `binding_images` needs 15 combined images and each stage's Metal texture table is
-  independent); `GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES` adjusted to match.
-- **introspect_subroutine.c**
-  - strip `#extension GL_ARB_shader_subroutine` / `GL_ARB_arrays_of_arrays`
-    directives (glslang does not know either), and raise `#version` to 420/430 when
-    the source uses `binding` layout qualifiers / arrays-of-arrays (GL 4.6 accepts
-    the shader, so the rewrite must make glslang accept it too).
-  - multi-dimensional subroutine uniform arrays (`routine[4][4]`): flattened selector
-    `_mgl_sr_routine[16]`, call sites `routine[j][i](...)` →
-    `_mgl_sr_call_routine(j*4+i, ...)`, `.length()` (and `routine[j].length()`)
-    resolved to the corresponding dimension constant.
-  - GLSL §4.7 signature check: a subroutine function's return/parameter types must
-    match **every** compatible type; a mismatch is surfaced as `#error` in the
-    rewritten source (compile error), which is what
-    `subroutines_incompatible_with_subroutine_type` requires.
-  - the selector uniform is emitted **without** `layout(location=N)` — explicit
-    uniform locations are illegal below GLSL 430 and the selector is looked up by
-    name anyway.
-- **program_introspection.c**
-  - `current_stage_linked()`: subroutine commands address the program active *for
-    the stage* — `glUseProgram`'s program, else the pipeline's stage program
-    (SSO: `useProgramStages`/`ActiveShaderProgram`), else INVALID_OPERATION
-    (`subroutines_with_separate_shader_objects`, `subroutine_errors`).
-  - `glGetSubroutineUniformLocation("name[j][i]")` flattens against the declared
-    dimensions so every array-of-arrays element has a distinct location
-    (`arrays_of_arrays_of_uniforms`).
-  - `glUniformSubroutinesuiv`: incompatible-but-existing subroutine index →
-    GL_INVALID_OPERATION (was INVALID_VALUE).
-  - `glGetUniformSubroutineuiv`: GL_INVALID_OPERATION when the stage is absent from
-    the active program.
-  - link failure when a subroutine uniform has **no** compatible subroutines
-    (`subroutine_uniform_wo_matching_subroutines`).
-  - `mgl_introspect_reset_subroutines()`: the selection reverts to defaults on
-    UseProgram / UseProgramStages / BindProgramPipeline (GL 4.6 §7.4.2) — hooked in
-    `program.c` / `program_ext.c` (`subroutine_uniform_reset`).
-- **geometry.c / transform_feedback.c**: the geometry-kernel and XFB-capture variants
-  recompile the *user's* source, so they now feed it through
-  `mgl_introspect_shader_source` (subroutine rewrite + extension strip); the XFB
-  capture splice additionally keeps function definitions that follow `main()`
-  (the rewrite appends its dispatchers there).
+## Verification
 
-### 2. shading_language_420pack (+2 net, binding family root-caused)
+* `make -j4 lib`, `make -j4 glx nsgl` clean (the two `incomplete-implementation`
+  warnings about `extProgramLibraryForMSL` predate this branch — present with and
+  without these changes, introduced by compat s11's category split).
+* `tests/headless/run.sh`: **86 test binaries, 0 failures** (test_zz_gcts 4/4
+  stable; earlier single flake re-ran green).  `test_tess` 499/0, `test_geom`
+  603/0, `test_compat_glsl` 42/0, `test_cts` 71/0.
+* Scratch tests added under tests/headless: test_zz_ctstg.c, test_zz_tg.c,
+  test_zz_pv.c, test_zz_csp.c, test_zz_pil.c (all green, committed).
 
-- `cts_glsl_compat.c`: new `strip_invariant_on_input()` pass in both entry chains
-  (`mgl_cts_glsl_compat` / `_generated`): GLSL 4.20 allows `invariant` on **inputs**
-  and in any qualifier order; glslang rejects it ("can only apply to an output").
-  Handles inline (`highp in layout(...) smooth invariant vec4 v;`) and standalone
-  (`invariant v;`) forms.
-- `geometry.c`: `highp/mediump/lowp` added to `is_interface_qualifier()` and
-  `emit_interface` now also drops qualifiers that *trail* the in/out token
-  (`highp in layout(location=1) smooth invariant vec4 v;`), so the geometry
-  emulation kernel builds (`qualifier_order`, `qualifier_order_block` still fails —
-  invariant on **block members** is not handled yet).
-- `MGLRenderer+Tessellation.m` (my domain file): `tessBindStageTextures` rewritten —
-  VS/TCS/TES compute kernels now get **sampler states** bound (they were never bound
-  before), textures bound at the SPIRV-Cross MSL index (was list order), arrays and
-  unbound units handled (shared 1×1 fallbacks), and the texture resolved via
-  `mgl_texture_for_sampler` like the render path. Needed for any tessellation
-  program whose VS/TCS samples textures (`binding_sampler_single` shape).
-- `get.c` image limits (see above) fixed the `binding_images` link failure.
+## Shared-file edits (this round)
 
-## Root causes found but NOT yet fixed (next session, highest-value items)
+* `MGL/src/MGLRenderer.m` — `bindTexturesToCurrentRenderEncoder`: TES-stage
+  sampled textures bind at VERTEX slots (`stage != _FRAGMENT_SHADER`), see above.
+* `MGL/src/program.c` — latch `separable_latched` on successful link;
+  `GL_PROGRAM_SEPARABLE` query returns the latch.
+* (round-20 tail committed here: `MGL/src/cts_glsl_compat.c` gather-offset
+  rewrite, `MGL/src/shaders.c` MGL_SRC_DUMP debug hook, now in append mode.)
+* All other changes are in my own files: `MGL/src/tessellation.c`,
+  `MGL/src/MGLRenderer+Tessellation.m`, `MGL/src/program_introspection.c`,
+  `MGL/src/program_ext.c`, `MGL/src/mgl_ext_program.h`.
 
-1. **Merged opaque-uniform initial value** (unlocks the 420pack `binding_sampler_*` /
-   `binding_image_*` family, 9 cases): the merged default-block uniform's initial
-   value must come from any stage's `layout(binding=N)` declaration (GLSL 4.20
-   §4.4.5 — the uniform is shared program-wide, so *every* stage samples unit N).
-   MGL/glslang's per-stage SPIR-V loses this: `glGetUniformiv(prog, "goku")`
-   returns **0** where GL requires **2** (verified with a local 5-stage repro,
-   `tests/headless/test_bind_diag.c`, `RUN5=1` / `STAGE=vs|tcs|tes|gs|fs`; the
-   failing stages are exactly the VS/TCS compute kernels, which bind the texture of
-   `sres->binding`==0 instead of unit 2). Fix location: the uniform merge /
-   initial-value seeding at link (introspect domain `uniforms.c` /
-   `mgli_process_link`) — seed each merged opaque uniform's value from any stage's
-   binding decoration, and/or keep the render/compute binders on the *uniform
-   value* instead of the per-stage SPIR-V decoration when they differ. The
-   `minimal_vs_sampler` repro (binding in one stage only) already passes.
+## Parked / leftovers
 
-2. **`same_subroutine_..._used_in_all_stages` flakiness** (tess + GS + subroutines in
-   all stages): the failing draw pairs the post-tessellation TES *vertex function*
-   with the 4-input FS at PSO-creation time — the geometry emulation's
-   `vertex_override` is not yet set when that PSO is first created, the creation
-   fails, and the draw only succeeds when MGL's AGX-recovery retry re-creates it
-   with the override. That makes the outcome timing/state dependent (passed 3× with
-   fresh process/GPU state earlier this session, now failing consistently — it also
-   fails at 127d752, the commit where the 28/28 runs were measured, so it is not a
-   regression). Diagnosis: `MGL_PSODEBUG=1` prints
-   `tess_evaluation_N_main + fragment_N` for the failing PSO. Fix direction: make
-   the render-pipeline creation honor the geometry `vertex_override` for the *first*
-   creation too (or key the PSO cache on the override) in
-   `MGLRenderer.m`/`MGLRenderer+Geometry.m` — that is the shared draw path (compat
-   owns the fast paths), so coordinate with compat.
+* `.agent/test_zz_vssparse.c.bak` — round-20 scratch: `BindBufferRange` (offset
+  256, size 8) UBO binds return no data in the VS (buffers domain).
+* `.agent/test_zz_gather2.c.bak` — round-20 WIP gather-vs-CPU-reference scratch;
+  its own harness was broken (constant output for every offset/uv, also for the
+  un-rewritten no-offset program).  The committed rewrite is validated by
+  test_zz_gcts.c (5 exact cases) and the CTS texture_gather group.
+* `.agent/test_zz_si.c.bak` — StateInteraction repro sketch (pipeline draw black
+  even before the relink; superseded by the CTS finding above).
+* Raw-Metal probes kept for reference: `.agent/probe_tcsread.m`,
+  `.agent/probe_tcsread2.m` (compute-kernel texture reads with a 6-level
+  RGBA32F texture work fine on AGX — isolated the MGL-side ordering bug).
 
-Also not fixed this session: `utf8_characters`, `line_continuation`,
-`length_of_vector_and_matrix`, `qualifier_order_block` (block-member invariant),
-`subroutine_uniform_reset`'s `ssbo_atomic_image_load_store`-style remaining
-iterations (the CTS crash entries are the same flaky glcts exit-code issue, see
-below).
+## Known gaps (not fixed this round)
 
-## Shared-file edits (all surgical)
-
-- `MGL/src/get.c` — advertise the extension; combined image uniform limits.
-- `MGL/src/program.c` — one-line hook: `mgl_introspect_reset_subroutines` in
-  `mglUseProgram`.
-- `MGL/src/program_ext.c` — two hooks: reset on `mglBindProgramPipeline` /
-  `mglUseProgramStages`; include of `mgl_ext_introspect.h`.
-- `MGL/src/transform_feedback.c` — the two `xfb_link` call sites feed the source
-  through `mgl_introspect_shader_source`; the capture splice keeps text after
-  `main`'s closing brace (function definitions may legally follow `main`).
-- `MGL/src/geometry.c` — `geom_vs_source`/`geom_gs_source` route through
-  `mgl_introspect_shader_source`; `highp/mediump/lowp` in the interface-qualifier
-  list; `emit_interface` drops trailing qualifiers (420pack order freedom).
-- `MGL/src/cts_glsl_compat.c` — `strip_invariant_on_input` prepended to both chains.
-- `MGL/src/MGLRenderer.m` — env-gated `MGL_BINDTRACE` (texture bind trace) and
-  `MGL_PSODEBUG` (failing PSO's vertex/fragment function names) diagnostics; no
-  behavior change.
-
-My files: `introspect_subroutine.c`, `mgl_ext_introspect.h`,
-`program_introspection.c`, `MGLRenderer+Tessellation.m`, plus new scratch/diagnostic
-tests `test_sr_diag.c`, `test_sr_diag2.c` (failing local-only shapes gated behind
-`SRDRAW=1`), `test_tg_diag.c`, `test_bind_diag.c` (the binding repro; the 5-stage
-case is gated behind `RUN5=1`).
-
-## Tests
-
-- `tests/headless/run.sh` full suite at d786d1c (pre-merge-compat8): **rc=0, 0 FAILED**
-  (re-verified after the compat-8 merge: test_tess 499/0, test_introspect 331/0,
-  test_bind_diag, test_sr_diag, test_sr_diag2, test_smoke green).
-- KHR-GL46 CTS (one batch at a time, `nice -n 10 taskpolicy -c utility`):
-  - `shader_subroutine`: 28/28 in two full-group runs earlier in the session;
-    27/28 at the final merged head (the 28th = the flaky tess+GS case, see above;
-    it also passes/fails independently of this session's changes).
-  - `shading_language_420pack`: 31/43 Pass (r18: 29/43 + 1 Crash).
-
-## Known gaps / leftovers for the next session
-
-1. Merged opaque-uniform initial value from `layout(binding=N)` (see above) —
-   unlocks the 420pack binding_* family.
-2. The tess+GS PSO-pairing flakiness (see above) — also affects the local
-   `sr_all_stages_draw` shapes (kept behind `SRDRAW=1` in test_sr_diag2).
-3. `invariant` on interface **block members** (qualifier_order_block).
-4. Remaining 420pack singles not yet triaged: `utf8_characters`,
-   `line_continuation`, `length_of_vector_and_matrix`.
-
-## Commits (this session, branch `gl46/tess`)
-
-- `ef35bd9` subroutines: advertise ARB_shader_subroutine, compile+link+draw path (24/28)
-- `127d752` subroutines: full KHR-GL46.shader_subroutine 28/28
-- `496b83a` get.c: raise GL_MAX_COMBINED_IMAGE_UNIFORMS to per-stage sum (40)
-- `d786d1c` 420pack: invariant-on-input strip, qualifier-order freedom in the
-  geometry kernel, tess kernel sampler-state binding (31/43) + test_introspect
-  INVALID_OPERATION expectation
-- `5005b49` merge gl46-port (compat session 8) — **READY sha**
+1. `texture_gather.incomplete-texture[-last-comp]`: mipmap-completeness
+   (inconsistent chain sizes) not evaluated at bind time — texdata domain.
+2. `sepshaderobjs.StateInteraction`: failed relink must preserve the last good
+   binary for pipeline draws.
+3. `shaders.struct.uniform.sampler*` (6) / `uniform_block.random.*` (7) /
+   `program_interface_query` (13) / `packed_pixels` (24): not started
+   (some are other domains).

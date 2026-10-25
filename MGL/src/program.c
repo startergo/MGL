@@ -1501,6 +1501,22 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             free(prepared);
             return false;
         }
+        /* the same uniform declared with two different explicit locations in
+           different stages is a link error (GL 4.6, 11.1.1) */
+        if (ip && ip->uniform_loc_conflict)
+        {
+            mgl_append_info_log(log, "ERROR: conflicting explicit uniform locations\n");
+            free(prepared);
+            return false;
+        }
+        /* an explicit location reaching past GL_MAX_UNIFORM_LOCATIONS is a link
+           error (GL 4.6, 11.1.1) */
+        if (ip && ip->uniform_loc_overflow)
+        {
+            mgl_append_info_log(log, "ERROR: uniform location beyond GL_MAX_UNIFORM_LOCATIONS\n");
+            free(prepared);
+            return false;
+        }
         /* more attribute vectors than MAX_VERTEX_ATTRIBS (dvec3/dvec4 count two,
            ARB_vertex_attrib_64bit) — the slots exceed the Metal attribute limit */
         if (ip && ip->attrib_overflow)
@@ -2832,6 +2848,11 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
         obj->base.linked_glsl_program = glslang_program_create();
 
         obj->link_status = GL_TRUE;
+        /* GL_PROGRAM_SEPARABLE queries report the value latched at the last
+         * successful link — "the state of the binary after it was linked"
+         * (KHR-GL46.sepshaderobjs.PipelineApi); glCreateShaderProgramv's implicit
+         * TRUE only sticks when the link succeeds (CreateShadProgApi) */
+        obj->separable_latched = obj->separable;
         /* Metal functions are fresh: the renderer must not release/recompile them */
         obj->base.dirty_bits &= ~DIRTY_PROGRAM;
     }
@@ -3117,7 +3138,8 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             params[2] = pptr->local_workgroup_size.z;
             break;
         case GL_PROGRAM_SEPARABLE:
-            *params = obj->separable ? GL_TRUE : GL_FALSE;
+            /* latched at the last successful link (never-linked programs query FALSE) */
+            *params = obj->separable_latched ? GL_TRUE : GL_FALSE;
             break;
         case GL_PROGRAM_BINARY_RETRIEVABLE_HINT:
             *params = obj->binary_retrievable_hint ? GL_TRUE : GL_FALSE;

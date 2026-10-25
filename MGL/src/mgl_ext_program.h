@@ -40,6 +40,7 @@ typedef struct MGLProgramObj {
     GLboolean   link_status;
     GLboolean   validate_status;
     GLboolean   separable;
+    GLboolean   separable_latched;   /* value of 'separable' at the last successful link */
     GLboolean   binary_retrievable_hint;
     GLboolean   in_table;
     char       *info_log;

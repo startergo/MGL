@@ -109,6 +109,20 @@ static size_t match_close(const Src *s, size_t open, char oc, char cc)
     return s->n;
 }
 
+/* GLSL integer literal: optional sign, decimal, 0x hex, leading-0 octal (CTS
+ * subroutine-index-nondecimal: layout(index = 0x0a) / layout(index = 010)) */
+static int glsl_int_literal(const char *p)
+{
+    int sign = 1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '+' || *p == '-') { if (*p == '-') sign = -1; p++; }
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        return sign * (int)strtol(p + 2, NULL, 16);
+    if (p[0] == '0' && p[1] != 0)
+        return sign * (int)strtol(p + 1, NULL, 8);
+    return sign * (int)strtol(p, NULL, 10);
+}
+
 static void blank(Src *s, size_t a, size_t b)
 {
     for (size_t i = a; i < b && i < s->n; i++) if (s->b[i] != '\n') s->b[i] = ' ';
@@ -131,8 +145,9 @@ static size_t layout_before(const Src *s, size_t kw, int *loc, int *index)
     if (k < 6 || strncmp(s->b + k - 6, "layout", 6) || (k > 6 && idc(s->b[k - 7]))) return kw;
     char *inner = dupn(s->b + open + 1, i - 1 - open - 1);
     for (char *t = strtok(inner, ","); t; t = strtok(NULL, ",")) {
-        char key[64] = ""; int v = -1;
-        if (sscanf(t, " %63[a-z_] = %d", key, &v) == 2) {
+        char key[64] = "", val[64] = "";
+        if (sscanf(t, " %63[a-z_] = %63s", key, val) == 2) {
+            int v = glsl_int_literal(val);
             if (!strcmp(key, "location") && loc) *loc = v;
             if (!strcmp(key, "index") && index) *index = v;
         }

@@ -550,7 +550,18 @@ static char kComputeFallbackKey;
                 // get the ubo binding from spirv
                 spirv_binding = [self getProgramBinding:stage type:spvc_type index: i];
 
-                buf = buffers[spirv_binding].buf;
+                /* the state rows only hold MAX_BINDABLE_BUFFERS slots, but GL (and
+                 * MGL's reported GL_MAX_UNIFORM_BUFFER_BINDINGS, 84) allows uniform
+                 * blocks at higher points — those live in the overflow table and
+                 * never fed a draw: KHR-GL46.layout_binding block cases bind up to
+                 * point 83 and rendered black.  buffers.c owns the lookup for every
+                 * point; the other indexed targets are capped below
+                 * MAX_BINDABLE_BUFFERS by the reported limits. */
+                BufferBaseTarget *bt =
+                    (gl_buffer_type == _UNIFORM_BUFFER)
+                        ? mgl_buffers_indexed_binding(ctx, GL_UNIFORM_BUFFER, spirv_binding)
+                        : (spirv_binding < (GLuint)MAX_BINDABLE_BUFFERS ? &buffers[spirv_binding] : NULL);
+                buf = bt ? bt->buf : NULL;
 
                 // introspect: default-block uniforms live in a per-program, per-stage buffer
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
@@ -601,10 +612,13 @@ static char kComputeFallbackKey;
 
                 for (GLuint e = 0; e < elems && buffer_map->count < MAX_MAPPED_BUFFERS; e++)
                 {
-                    Buffer *eb = (e == 0) ? buf : (spirv_binding + e < MAX_BINDABLE_BUFFERS ?
-                                                   buffers[spirv_binding + e].buf : NULL);
-                    GLintptr eoff = (e == 0) ? buffers[spirv_binding].offset : buffers[spirv_binding + e].offset;
-                    GLsizeiptr esz = (e == 0) ? buffers[spirv_binding].size : buffers[spirv_binding + e].size;
+                    BufferBaseTarget *ebt = (e == 0) ? bt :
+                        ((gl_buffer_type == _UNIFORM_BUFFER)
+                            ? mgl_buffers_indexed_binding(ctx, GL_UNIFORM_BUFFER, spirv_binding + e)
+                            : (spirv_binding + e < (GLuint)MAX_BINDABLE_BUFFERS ? &buffers[spirv_binding + e] : NULL));
+                    Buffer *eb = ebt ? ebt->buf : NULL;
+                    GLintptr eoff = ebt ? ebt->offset : 0;
+                    GLsizeiptr esz = ebt ? ebt->size : 0;
                     /* geom: this resource's real Metal argument index (array elements
                      * span consecutive slots).  Falls back to the map's ordinal when the
                      * resource list has no recorded MSL binding (0xffffffff = stripped). */
@@ -2242,28 +2256,33 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             [self compatTexResolveRecord:(stage == _FRAGMENT_SHADER) unit:(spirv_binding + e)
                                     slot:(mtl_index + e) tex:ptr view:texture sampler:sampler];
 
-            if (stage == _VERTEX_SHADER)
-            {
-                if (getenv("MGL_VTEX_TRACE"))
-                    fprintf(stderr, "MGL vtex: unit %u slot %u tex %p base %p same %d\n",
-                            spirv_binding + e, mtl_index + e, (void *)(__bridge void *)texture,
-                            ptr->mtl_data, texture == (__bridge id<MTLTexture>)ptr->mtl_data);
                 /* geom: the vertex stage's shadow-sampling emulation samples the depth
                  * texture as a plain texture2d, which must not see a compare sampler —
                  * bind the compare-stripped sampler of the unit at those slots
                  * (mgl_fix_shadow_vs / spirv[VS].shadow_slots) */
                 if (mgl_geom_vs_shadow_slot(STATE(program), mtl_index + e))
                     [self geomShadowCheckStale:spirv_binding + e texture:ptr slot:mtl_index + e];
+                /* tess: when tessellation is active this stage is the TES running as
+                 * the pipeline's vertex function (post-tessellation or the plain
+                 * variant), so its textures/samplers are VERTEX-side arguments — the
+                 * same rule the storage-image loop below applies (texture_gather.gather-
+                 * tesselation-shader read zeros from the unbound vertex slot) */
+                if (stage != _FRAGMENT_SHADER)
+                {
+                if (getenv("MGL_VTEX_TRACE"))
+                    fprintf(stderr, "MGL vtex: unit %u slot %u tex %p base %p same %d\n",
+                            spirv_binding + e, mtl_index + e, (void *)(__bridge void *)texture,
+                            ptr->mtl_data, texture == (__bridge id<MTLTexture>)ptr->mtl_data);
                 /* compat perf: bind-shadow filtered setters (skip identical
                  * rebinds per encoder) */
                 [self compatSetVertexTexture:texture atIndex:mtl_index + e];
                 [self compatSetVertexSamplerState:sampler atIndex:mtl_index + e];
-            }
-            else
-            {
-                [self compatSetFragmentTexture:texture atIndex:mtl_index + e];
-                [self compatSetFragmentSamplerState:sampler atIndex:mtl_index + e];
-            }
+                }
+                else
+                {
+                    [self compatSetFragmentTexture:texture atIndex:mtl_index + e];
+                    [self compatSetFragmentSamplerState:sampler atIndex:mtl_index + e];
+                }
             }
         }
     }
@@ -3329,6 +3348,16 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
         vertexFunction = (__bridge id<MTLFunction>)((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override;
 
+    // tess: under GL_RASTERIZER_DISCARD the fragment stage never runs (GL 4.6 10.4.4),
+    // but Metal still validates fragment-input/vertex-output linkage when the PSO is
+    // created.  A tess+geometry program's FS is written against the GEOMETRY outputs, so
+    // the tess capture pass (geometry.c forces discard and re-runs the GL_PATCHES draw so
+    // its TES-output capture publishes) builds a TES+FS pair Metal rejects ("Fragment
+    // input(s) user(locnN) not written by vertex shader") — the draw then only succeeded
+    // through the error-recovery retry, i.e. nondeterministically.  Pair the discarded
+    // tess pipeline with the geometry domain's empty fragment function instead: no inputs
+    // to match, and nothing observable rasterizes anyway.  (The geometry pass-through
+    // override writes every FS input, so it keeps the real FS.)
     // Configure a pipeline descriptor that is used to create a pipeline state.
     pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
     assert(pipelineStateDescriptor);
@@ -3864,6 +3893,26 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // (the pass-through function reads a buffer and has no stage-in).
             bool geomOverride = ctx->state.ext_geom &&
                                 ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override != NULL;
+
+            /* tess + GL_RASTERIZER_DISCARD: the fragment stage never runs (GL 4.6
+             * 10.4.4), but Metal still validates fragment-input/vertex-output linkage
+             * at PSO creation.  A tess+geometry program's FS is written against the
+             * GEOMETRY outputs, so the tess capture pass (geometry.c forces discard
+             * and re-runs the GL_PATCHES draw so its TES-output capture publishes)
+             * built a TES+FS pair Metal rejects ("Fragment input(s) user(locnN) not
+             * written by vertex shader") — the draw then only succeeded through the
+             * error-recovery retry, i.e. nondeterministically.  Pair the discarded
+             * tess pipeline with the geometry domain's empty fragment function (no
+             * inputs to match; the specialized program FS installed by
+             * rstateConfigurePipelineDescriptor above is replaced here, after every
+             * other fragment-function mutation).  Nothing observable rasterizes under
+             * discard; the geometry pass-through override writes every FS input, so
+             * the geometry raster pass keeps the real FS. */
+            if (ctx->state.caps.rasterizer_discard == GL_TRUE &&
+                [self extTessActive] && !geomOverride &&
+                pipelineStateDescriptor.fragmentFunction)
+                pipelineStateDescriptor.fragmentFunction = [self geomEmptyFragmentFunction];
+
             if ([self extTessActive] && !geomOverride)
             {
                 /* isolines / point_mode / CPU reference / xfb capture render through

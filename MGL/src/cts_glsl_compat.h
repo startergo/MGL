@@ -5,9 +5,31 @@
 #ifndef MGL_CTS_GLSL_COMPAT_H
 #define MGL_CTS_GLSL_COMPAT_H
 
+#include "glm_context.h"
+
 /* Returns a malloc'd rewritten copy of `src`, or NULL when it can be compiled as is.
  * The caller frees the result. */
 char *mgl_cts_glsl_compat(const char *src);
+
+/* Reported binding-point limits for the layout(binding=N) compile-time range check
+ * (GLSL 4.60 4.4.5): N at or beyond the implementation limit is a compile error.
+ * Zero entries disable the check for that resource class. */
+typedef struct MGLCompatBindingLimits {
+    unsigned ubo_bindings;         /* GL_MAX_UNIFORM_BUFFER_BINDINGS */
+    unsigned ssbo_bindings;        /* GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS */
+    unsigned atomic_bindings;      /* GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS */
+    unsigned image_units;          /* GL_MAX_IMAGE_UNITS */
+    unsigned combined_texture_units; /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */
+} MGLCompatBindingLimits;
+
+/* the binding-point limits as reported by glGet* (implemented in get.c, single
+ * source of truth with its GL_MAX_* cases) */
+GLuint mgl_reported_binding_limit(GLMContext ctx, GLenum pname);
+
+/* as mgl_cts_glsl_compat(), additionally rejecting layout(binding=N) declarations
+ * whose N is out of range for their resource class (filled from
+ * mgl_reported_binding_limit() in get.c).  NULL limits skip the range check. */
+char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits *limits);
 /* the capture-variant path: the binding-range / std430 rejections are skipped
  * (MGL-authored GLSL uses its own renumbered binding points) */
 char *mgl_cts_glsl_compat_generated(const char *src);

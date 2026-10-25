@@ -149,6 +149,9 @@ typedef struct MGLIProgram {
     MGLIStageSub sub[MGLI_STAGES];
 
     int      attrib_conflict;   /* two vertex inputs overlap locations (link error) */
+    int      uniform_loc_conflict; /* same uniform, two different explicit locations (link error) */
+    int      uniform_loc_max;   /* GL_MAX_UNIFORM_LOCATIONS as reported (link check) */
+    int      uniform_loc_overflow; /* an explicit location reaches past uniform_loc_max (link error) */
     int      attrib_overflow;  /* vertex inputs exceed MAX_VERTEX_ATTRIBS vectors (link error) */
     /* conformant GL location per vertex-input variable (var id -> GL location);
        the SPIR-V Location decoration is the internal slot (see MGLIVar.slot) */

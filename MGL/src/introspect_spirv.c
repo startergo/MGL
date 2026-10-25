@@ -1327,6 +1327,25 @@ static int add_uniform(MGLIProgram *ip, const char *name, int *created)
     return ip->nuniforms++;
 }
 
+/* GL 4.6 11.1.1: a uniform declared with an explicit location in one stage uses that
+ * location for the merged program uniform; a same-named declaration without one (in
+ * another stage) must not override it, and two different explicit locations are a
+ * link error.  The location was left as the implicit -2-cursor sentinel when the
+ * uniform was first created by a stage without an explicit location. */
+static void merge_explicit_loc(MGLIProgram *ip, int ui, int explicit_loc, int cursor)
+{
+    if (explicit_loc < 0) return;
+    MGLIUniform *u = &ip->uniforms[ui];
+    int el = explicit_loc + cursor;
+    if (el + u->size > ip->uniform_loc_max) ip->uniform_loc_overflow = 1;
+    if (u->location >= 0)
+    {
+        if (u->location != el) ip->uniform_loc_conflict = 1;
+    }
+    else if (u->location < -1)
+        u->location = el;            /* implicit so far: adopt the explicit location */
+}
+
 /* walk a default-block / opaque uniform variable and create GL uniforms for its leaves */
 /* the GL type a rewritten leaf had originally (bool/bvecN, double/dvecN/dmatNxM) */
 static GLenum leaf_gl_type(uint8_t kind, uint32_t cols, uint32_t rows)
@@ -1344,8 +1363,7 @@ static GLenum leaf_gl_type(uint8_t kind, uint32_t cols, uint32_t rows)
     return GL_NONE;
 }
 
-static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *name, uint32_t t, uint32_t offset,
-                         int explicit_loc, int *loc_cursor, uint32_t spv_id, int res_type, int *elem_cursor, int hidden_prefix,
+static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *name, uint32_t t, uint32_t offset,                         int explicit_loc, int *loc_cursor, uint32_t spv_id, int res_type, int *elem_cursor, int hidden_prefix,
                          const uint8_t *lk, int *lki)
 {
     /* lk[] remembers, per leaf uniform in walk order, whether its GL type was rewritten for
@@ -1370,8 +1388,11 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
                 if (u->opaque_class) u->kind = MGLI_K_INT;
                 u->hidden = hidden_prefix;
                 u->location = explicit_loc >= 0 ? explicit_loc + *loc_cursor : -2 - *loc_cursor; /* resolved later */
+                if (explicit_loc >= 0 && explicit_loc + *loc_cursor + u->size > ip->uniform_loc_max)
+                    ip->uniform_loc_overflow = 1;   /* GL 4.6 11.1.1: beyond GL_MAX_UNIFORM_LOCATIONS */
                 *loc_cursor += u->size;
             }
+            else merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
             u->stages |= 1u << stage;
             u->st[stage].present = 1;
             u->st[stage].offset = offset; u->st[stage].array_stride = stride;
@@ -1407,8 +1428,11 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
         if (u->opaque_class) u->kind = MGLI_K_INT;
         u->hidden = hidden_prefix;
         u->location = explicit_loc >= 0 ? explicit_loc + *loc_cursor : -2 - *loc_cursor;
+        if (explicit_loc >= 0 && explicit_loc + *loc_cursor + 1 > ip->uniform_loc_max)
+            ip->uniform_loc_overflow = 1;           /* GL 4.6 11.1.1: beyond GL_MAX_UNIFORM_LOCATIONS */
         *loc_cursor += 1;
     }
+    else merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
     u->stages |= 1u << stage;
     u->st[stage].present = 1;
     if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64wd.txt","a"); if (d_) { fprintf(d_, "walk %s stage=%d off=%u\n", name, stage, offset); fclose(d_); } }
@@ -1726,7 +1750,12 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
     const SMod *m = s->r;
     /* default block members */
     for (uint32_t k = 0; k < s->ndub && s->dub_var; k++) {
-        if (!s->dub_active[k]) continue;
+        /* GL 4.6 11.1.1 / ARB_explicit_uniform_location: a uniform declared with an
+         * explicit location stays ACTIVE (queryable, settable) even when the shader
+         * never references it — glslang keeps the OpVariable + Location decoration,
+         * SPIRV-Cross just does not list it as an active buffer range.  Members
+         * without an explicit location that are unreferenced stay dropped. */
+        if (!s->dub_active[k] && s->dub[k].explicit_loc < 0) continue;
         DubMember *d = &s->dub[k];
         uint32_t mt = m->t[strip_arrays(m, pointee(m, m->vtype[s->dub_var]))].mem[k];
         int cursor = 0, elem = 0, lki = 0;
@@ -1869,6 +1898,10 @@ static bool assign_uniform_locations(MGLIProgram *ip)
     int n = 0;
     for (int i = 0; i < ip->nuniforms; i++) if (ip->uniforms[i].location >= 0 && ip->uniforms[i].location + ip->uniforms[i].size > n)
         n = ip->uniforms[i].location + ip->uniforms[i].size;
+    /* GL 4.6 11.1.1: the link fails when a uniform (explicit or implicitly
+     * assigned) reaches past GL_MAX_UNIFORM_LOCATIONS — e.g. a 1024-element
+     * array at location 0 leaves no room for one more implicit uniform */
+    if (n > ip->uniform_loc_max) ip->uniform_loc_overflow = 1;
     ip->locs = zalloc((size_t)(n ? n : 1) * sizeof(*ip->locs));
     ip->nlocs = n;
     for (int l = 0; l < n; l++) ip->locs[l].uniform = -1;

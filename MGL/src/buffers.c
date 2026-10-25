@@ -538,13 +538,15 @@ static void setGenericBinding(GLMContext ctx, GLenum target, Buffer *ptr)
 /* ---- uniform buffer binding points above MAX_BINDABLE_BUFFERS ----------------
  *
  * GL_MAX_UNIFORM_BUFFER_BINDINGS is at least 84 (GL 4.6 minimum, KHR-GL46.limits), but
- * STATE(buffer_base) rows only hold MAX_BINDABLE_BUFFERS slots and the renderer reads
- * bindings through its own 16-entry table — uniform blocks at GL binding points >= 16
- * can never feed a draw on this backend.  The points must still exist as state: the CTS
- * between-cases state reset walks bindBufferBase(GL_UNIFORM_BUFFER, 0..83, 0) and treats
- * an error as fatal, and a bound name has to round-trip through glGetIntegeri_v.  They
- * are kept in this small sparse table (few points are ever used at once; a bind that
- * finds it full simply drops the oldest entry — nothing renders from these anyway). */
+ * STATE(buffer_base) rows only hold MAX_BINDABLE_BUFFERS slots.  Points >= 16 are kept
+ * in this small sparse table (few are ever used at once; a bind that finds it full
+ * simply drops the oldest entry — a program would need > 8 simultaneously-bound blocks
+ * past point 15, which nothing does).  mgl_buffers_indexed_binding() resolves both the
+ * row and this table, and the draw path reads UBO slots through it, so blocks at high
+ * GL binding points (KHR-GL46.layout_binding block cases bind up to 83) render.
+ * The CTS between-cases state reset walks bindBufferBase(GL_UNIFORM_BUFFER, 0..83, 0)
+ * and treats an error as fatal, and a bound name has to round-trip through
+ * glGetIntegeri_v — so the points must exist as state as well. */
 #define MGL_UBO_OVERFLOW_CAP 8
 
 typedef struct MGLUBOOverflow_t {
@@ -1082,9 +1084,15 @@ void copyBufferSubData(GLMContext ctx, Buffer *src_buf, Buffer *dst_buf, GLintpt
 
     ERROR_CHECK_RETURN(src_buf->data.buffer_data && dst_buf->data.buffer_data, GL_INVALID_OPERATION);
 
-    if (mtlext(ctx) && mtlext(ctx)->copy_buffer)
+    if (mtlext(ctx) && mtlext(ctx)->copy_buffer &&
+        src_buf->data.mtl_data && dst_buf->data.mtl_data)
     {
-        // ordered with the GL command stream on the GPU (blit encoder)
+        /* GPU blit path — only when both stores are already GPU-resident.  Promoting a
+         * CPU-only store here (bindMTLBuffer's newBufferWithBytes + vm_deallocate) moves
+         * the buffer's CPU address, which breaks anything still holding a pointer into
+         * the old allocation (an unmap'ed mapping read back by the app, CTS
+         * indirect_parameters_tests.ParameterBufferOperations) and can crash on the
+         * deallocated pages.  The CPU path below keeps the address stable. */
         mtlext(ctx)->copy_buffer(ctx, src_buf, dst_buf, readOffset, writeOffset, size);
         return;
     }

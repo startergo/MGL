@@ -2212,6 +2212,17 @@ static void tessRetireCapture(GLMContext ctx)
 
     if ((need_readback && !use_hardware) || debug_wait)
     {
+        /* this draw gets its own command buffer (committed+waited below for the factor
+         * readback).  Pending work on the shared _currentCommandBuffer — deferred
+         * texture uploads, generateMipmap blits — must not end up AFTER it: the queue
+         * runs buffers in commit order, so commit the shared buffer first
+         * (KHR-GL46.texture_gather.gather-tesselation-shader: the TCS kernel read an
+         * uncommitted level-0 upload as zeros).  No wait: pure ordering. */
+        if (_currentCommandBuffer && _currentCommandBuffer.status <= MTLCommandBufferStatusEnqueued)
+        {
+            [self endRenderEncoding];
+            [self commitCommandBufferWithAGXRecovery:_currentCommandBuffer];
+        }
         compute_cb = [_commandQueue commandBuffer];
         tessTimeCommandBuffer(compute_cb);
     }
@@ -2344,6 +2355,9 @@ static void tessRetireCapture(GLMContext ctx)
         }
 
         [cenc setComputePipelineState: tcs_pso];
+        if (tTrace())
+            fprintf(stderr, "MGL tess: tcs dispatch enc=%p pso=%p\n",
+                    (void *)(__bridge void *)cenc, (void *)(__bridge void *)tcs_pso);
         tessBindStageUniforms(ctx, cenc, prog_tcs, _TESS_CONTROL_SHADER);
         tessBindStageTextures(ctx, cenc, prog_tcs, _TESS_CONTROL_SHADER);
         [cenc setBuffer: ring offset: cp_source_off atIndex: MGL_TESS_TCS_IN];

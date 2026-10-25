@@ -434,8 +434,11 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return;
     if (uniformBlockIndex >= (GLuint)ip->nubos) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
-    GLuint max = ctx->state.var.max_uniform_buffer_bindings > 0 ? (GLuint)ctx->state.var.max_uniform_buffer_bindings : MAX_BINDABLE_BUFFERS;
-    if (max > MAX_BINDABLE_BUFFERS) max = MAX_BINDABLE_BUFFERS; /* renderer binding table size */
+    /* GL_MAX_UNIFORM_BUFFER_BINDINGS is reported as >= 84 and the renderer resolves
+     * every point (buffer_base rows for < MAX_BINDABLE_BUFFERS, the overflow table
+     * above), so no renderer-table clamp here: KHR-GL46.layout_binding block
+     * binding_api_update re-points blocks at sparse points up to 83 and draws. */
+    GLuint max = ctx->state.var.max_uniform_buffer_bindings > 84 ? (GLuint)ctx->state.var.max_uniform_buffer_bindings : 84;
     if (uniformBlockBinding >= max) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     MGLIBlock *b = &ip->ubos[uniformBlockIndex];
     b->binding = (GLint)uniformBlockBinding;

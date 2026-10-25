@@ -150,6 +150,24 @@ static GLuint max_uniform_buffer_bindings(GLMContext ctx)
 #define MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  8
 #define MGL_MAX_TRANSFORM_FEEDBACK_BUFFERS      4
 #define MGL_MAX_IMAGE_UNITS                     8
+
+/* the binding-point limits as reported by glGet*, for the GLSL layout(binding=N)
+ * compile-time range check (GLSL 4.60 4.4.5: a binding at or beyond the limit is a
+ * compile error — glslang does not check buffer blocks against these).  Single
+ * source of truth with the GL_MAX_* cases below and reported_uniform_buffer_bindings. */
+GLuint mgl_reported_binding_limit(GLMContext ctx, GLenum pname)
+{
+    switch (pname)
+    {
+        case GL_MAX_UNIFORM_BUFFER_BINDINGS:        return reported_uniform_buffer_bindings(ctx);
+        case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS: return MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+        case GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS: return MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS;
+        case GL_MAX_IMAGE_UNITS:                    return MGL_MAX_IMAGE_UNITS;
+        case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:   return LIMIT(STATE_VAR(max_combined_texture_image_units), 80);
+        default: return 0;
+    }
+}
+
 #define MGL_MAX_VERTEX_ATTRIB_BINDINGS          MAX_BINDABLE_BUFFERS
 #define MGL_MAX_VIEWPORTS                       16
 
@@ -285,6 +303,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_shader_bit_encoding",
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",
+    "GL_ARB_shader_texture_image_samples",  /* textureSamples()/imageSamples(); MSL get_num_samples() */
     "GL_ARB_shader_storage_buffer_object",
     "GL_ARB_shader_subroutine",       /* GLSL rewrite to switch + int selector (introspect_subroutine.c) */
     "GL_ARB_shader_texture_lod",
@@ -671,13 +690,19 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_GEOMETRY_IMAGE_UNIFORMS:
         case GL_MAX_VERTEX_IMAGE_UNIFORMS:
         case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
-        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS: PUT1(MGL_MAX_IMAGE_UNITS);
+        case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
         case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
+            /* every per-stage limit is capped by GL_MAX_IMAGE_UNITS (an active image
+             * variable consumes one unit in its stage — ARB_shader_image_load_store);
+             * KHR-GL46.layout_binding image binding_array_size builds image arrays of
+             * maxArraySize() = the per-stage limit and binds them at
+             * GL_MAX_IMAGE_UNITS - size - 1, which goes negative when a per-stage
+             * value exceeds the unit count. */
+            PUT1(MGL_MAX_IMAGE_UNITS);
         case GL_MAX_COMBINED_IMAGE_UNIFORMS:
-            /* per-stage image units stay at 8, but the combined limit is the sum
-             * over the active stages' independent Metal texture tables (GL 4.6
-             * Table 23.55 only floors this at 8) */
+            /* the combined limit is the sum over the active stages' independent Metal
+             * texture tables (GL 4.6 Table 23.55 only floors this at 8) */
             PUT1(5 * MGL_MAX_IMAGE_UNITS);
         case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES: PUT1(5 * MGL_MAX_IMAGE_UNITS + MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
 

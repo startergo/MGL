@@ -354,7 +354,7 @@ void mglUseProgramStages(GLMContext ctx, GLuint pipeline, GLbitfield stages, GLu
             return;
         pobj = MGL_PROGRAM_OBJ(prog);
 
-        if (!pobj->separable || !pobj->link_status)
+        if (!pobj->separable_latched || !pobj->link_status)
         {
             ERROR_RETURN(GL_INVALID_OPERATION);
             return;
@@ -491,7 +491,7 @@ static bool validate_pipeline(GLMContext ctx, MGLPipelineObj *pipe, char **log)
             ok = false;
         }
 
-        if (!po->separable)
+        if (!po->separable_latched)
         {
             mgl_append_info_log(log, "ERROR: program %u bound to the %s stage is not separable\n", p->name, stage_name(s));
             ok = false;
@@ -594,9 +594,17 @@ void mglGetProgramPipelineInfoLog(GLMContext ctx, GLuint pipeline, GLsizei bufSi
         return;
     }
 
-    pipe = pipeline_for_use(ctx, pipeline);
+    /* a nonexistent pipeline name is INVALID_VALUE here (not INVALID_OPERATION
+     * like the other pipeline entry points) - KHR-GL46.sepshaderobjs.PipelineApi
+     * checks it; the spec text is silent, see the CTS comment "GL_INVALID_VALUE
+     * error (the error is still missing from the spec)" */
+    pipe = MGL_PIPELINE_OBJ(findProgramPipeline(ctx, pipeline));
     if (!pipe)
+    {
+        ERROR_RETURN(GL_INVALID_VALUE);
         return;
+    }
+    pipe->created = GL_TRUE;
 
     mgl_copy_info_log(pipe->info_log, bufSize, length, infoLog);
 }
@@ -980,6 +988,7 @@ void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const
     }
 
     MGL_PROGRAM_OBJ(ptr)->separable = (w[4] & 1) ? GL_TRUE : GL_FALSE;
+    MGL_PROGRAM_OBJ(ptr)->separable_latched = (w[4] & 1) ? GL_TRUE : GL_FALSE;   /* a loaded binary counts as linked */
     MGL_PROGRAM_OBJ(ptr)->binary_retrievable_hint = (w[4] & 2) ? GL_TRUE : GL_FALSE;
 
     mgl_program_link_spirv_stages(ctx, ptr, words, counts, entries, mask);
