@@ -33,6 +33,24 @@
 @property (nonatomic, strong) id<MTLDepthStencilState> dsLast;
 @property (nonatomic) unsigned long long dsLastKey;
 @property (nonatomic) BOOL dsLastValid;
+/* compat perf (session 9, Apple-driver comparison): last values actually pushed to
+ * the encoder.  rstateApplyEncoderState re-ran on every rstate generation bump
+ * (any GL state change) and re-set ALL encoder state — the mtlcount A/B showed
+ * 19.9 setDepthStencilState/viewport/scissor/stencil-ref calls per glmark2-ideas
+ * frame where Apple's translator issues 3.4 (it re-sets only what changed).
+ * Skip the Metal call when the value is unchanged since the last apply on the
+ * same encoder; a new encoder resets appliedEncoder, which invalidates these. */
+@property (nonatomic, weak)   id<MTLRenderCommandEncoder> lastEnc;
+@property (nonatomic, strong) id<MTLDepthStencilState> lastDS;
+@property (nonatomic) uint32_t lastStencilRefF, lastStencilRefB;
+@property (nonatomic) MTLCullMode lastCull;
+@property (nonatomic) MTLWinding lastWinding;
+@property (nonatomic) MTLTriangleFillMode lastFill;
+@property (nonatomic) float lastBiasUnits, lastBiasFactor, lastBiasClamp;
+@property (nonatomic) BOOL lastBiasOn, lastClipClamp, lastBiasValid;
+@property (nonatomic) MTLViewport lastViewport;
+@property (nonatomic) MTLScissorRect lastScissor;
+@property (nonatomic) GLfloat lastBC0, lastBC1, lastBC2, lastBC3;
 @end
 
 @implementation MGLRSCache
@@ -265,6 +283,13 @@ static bool rs_mode_is_polygon(GLenum m)
 
     if (!enc || !rs) return;
 
+    /* session-9 last-applied dedup: locals shadow the MGLRSCache fields, written
+     * back at the end (see the property comment above) */
+    MGLRSCache *c = [self rstateCache];
+    id<MTLRenderCommandEncoder> c_lastEnc = c.lastEnc;
+    id<MTLDepthStencilState> c_lastDS = c.lastDS;
+    uint32_t c_lastRefF = c.lastStencilRefF, c_lastRefB = c.lastStencilRefB;
+
     MTLSize rt = [self rstateRenderTargetSize];
     NSInteger rtw = rt.width, rth = rt.height;
 
@@ -287,9 +312,17 @@ static bool rs_mode_is_polygon(GLenum m)
     bool hasDepth = _renderPassDescriptor.depthAttachment.texture != nil;
     bool hasStencil = _renderPassDescriptor.stencilAttachment.texture != nil;
     id<MTLDepthStencilState> ds = [self rstateDepthStencilStateHasDepth:hasDepth hasStencil:hasStencil];
-    if (ds) [enc setDepthStencilState:ds];
-    [enc setStencilFrontReferenceValue:(uint32_t)v->stencil_ref & 0xff
-                    backReferenceValue:(uint32_t)v->stencil_back_ref & 0xff];
+    bool freshEnc = (c_lastEnc != enc);
+    if (freshEnc) c_lastEnc = enc;
+    if (ds && (freshEnc || ds != c_lastDS)) {
+        [enc setDepthStencilState:ds];
+        c_lastDS = ds;
+    }
+    uint32_t srefF = (uint32_t)v->stencil_ref & 0xff, srefB = (uint32_t)v->stencil_back_ref & 0xff;
+    if (freshEnc || srefF != c_lastRefF || srefB != c_lastRefB) {
+        [enc setStencilFrontReferenceValue:srefF backReferenceValue:srefB];
+        c_lastRefF = srefF; c_lastRefB = srefB;
+    }
 
     /* viewports: memory row == GL window row, so GL y is Metal originY */
     NSUInteger nvp = MIN((NSUInteger)MGL_RSTATE_MAX_VIEWPORTS, (NSUInteger)MAX(ctx->state.var.max_viewports, 1u));
@@ -303,7 +336,12 @@ static bool rs_mode_is_polygon(GLenum m)
         vps[i].zfar    = rs->depth_range[i][1];
     }
     if (nvp > 1) [enc setViewports:vps count:nvp];
-    else         [enc setViewport:vps[0]];
+    else if (freshEnc || vps[0].originX != c.lastViewport.originX || vps[0].originY != c.lastViewport.originY ||
+             vps[0].width != c.lastViewport.width || vps[0].height != c.lastViewport.height ||
+             vps[0].znear != c.lastViewport.znear || vps[0].zfar != c.lastViewport.zfar) {
+        [enc setViewport:vps[0]];
+        c.lastViewport = vps[0];
+    }
 
     /* scissors: Metal always scissors and requires rects inside the render target */
     if (rtw > 0 && rth > 0) {
@@ -319,7 +357,11 @@ static bool rs_mode_is_polygon(GLenum m)
             sr[i] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0) };
         }
         if (nvp > 1) [enc setScissorRects:sr count:nvp];
-        else         [enc setScissorRect:sr[0]];
+        else if (freshEnc || sr[0].x != c.lastScissor.x || sr[0].y != c.lastScissor.y ||
+                 sr[0].width != c.lastScissor.width || sr[0].height != c.lastScissor.height) {
+            [enc setScissorRect:sr[0]];
+            c.lastScissor = sr[0];
+        }
     }
 
     /* culling.  FRONT_AND_BACK (no Metal mode) is handled by skipping polygon draws in the
@@ -329,17 +371,28 @@ static bool rs_mode_is_polygon(GLenum m)
         if (v->cull_face_mode == GL_FRONT) cull = MTLCullModeFront;
         else if (v->cull_face_mode == GL_BACK) cull = MTLCullModeBack;
     }
-    [enc setCullMode:cull];
+    if (freshEnc || cull != c.lastCull) {
+        [enc setCullMode:cull];
+        c.lastCull = cull;
+    }
 
     /* winding: the LOWER_LEFT y-flip mirrors window space, which reverses orientation */
     bool flipped = rs->clip_origin == GL_LOWER_LEFT;
     bool ccw = v->front_face == GL_CCW;
     if (flipped) ccw = !ccw;
-    [enc setFrontFacingWinding: ccw ? MTLWindingCounterClockwise : MTLWindingClockwise];
+    MTLWinding winding = ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
+    if (freshEnc || winding != c.lastWinding) {
+        [enc setFrontFacingWinding:winding];
+        c.lastWinding = winding;
+    }
 
     /* polygon mode: LINE natively; POINT is emulated by the draw path (index rewrite to
      * GL_POINTS via mgl_rstate_index_rewrite_needed), FILL otherwise */
-    [enc setTriangleFillMode: rs->polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+    MTLTriangleFillMode fill = rs->polygon_mode == GL_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+    if (freshEnc || fill != c.lastFill) {
+        [enc setTriangleFillMode:fill];
+        c.lastFill = fill;
+    }
 
     /* polygon offset: only polygons, enable selected by the polygon mode.  Metal's depth bias
      * uses the same units as GL (units * minimum resolvable depth difference r of the depth
@@ -352,16 +405,39 @@ static bool rs_mode_is_polygon(GLenum m)
             default:       offset = ctx->state.caps.polygon_offset_fill; break;
         }
     }
-    if (offset)
-        [enc setDepthBias:rs->polygon_offset_units slopeScale:rs->polygon_offset_factor clamp:rs->polygon_offset_clamp];
-    else
-        [enc setDepthBias:0 slopeScale:0 clamp:0];
+    bool biasSame = !freshEnc && c.lastBiasValid && c.lastBiasOn == offset &&
+        (!offset || (rs->polygon_offset_units == c.lastBiasUnits &&
+                     rs->polygon_offset_factor == c.lastBiasFactor &&
+                     rs->polygon_offset_clamp == c.lastBiasClamp));
+    if (!biasSame) {
+        if (offset)
+            [enc setDepthBias:rs->polygon_offset_units slopeScale:rs->polygon_offset_factor clamp:rs->polygon_offset_clamp];
+        else
+            [enc setDepthBias:0 slopeScale:0 clamp:0];
+        c.lastBiasOn = offset;
+        c.lastBiasUnits = rs->polygon_offset_units;
+        c.lastBiasFactor = rs->polygon_offset_factor;
+        c.lastBiasClamp = rs->polygon_offset_clamp;
+        c.lastBiasValid = YES;
+    }
 
-    [enc setDepthClipMode: ctx->state.caps.depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+    bool clipClamp = ctx->state.caps.depth_clamp;
+    if (freshEnc || clipClamp != c.lastClipClamp) {
+        [enc setDepthClipMode: clipClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+        c.lastClipClamp = clipClamp;
+    }
 
-    [enc setBlendColorRed:v->blend_color[0] green:v->blend_color[1] blue:v->blend_color[2] alpha:v->blend_color[3]];
+    if (freshEnc || v->blend_color[0] != c.lastBC0 || v->blend_color[1] != c.lastBC1 ||
+        v->blend_color[2] != c.lastBC2 || v->blend_color[3] != c.lastBC3) {
+        [enc setBlendColorRed:v->blend_color[0] green:v->blend_color[1] blue:v->blend_color[2] alpha:v->blend_color[3]];
+        c.lastBC0 = v->blend_color[0]; c.lastBC1 = v->blend_color[1];
+        c.lastBC2 = v->blend_color[2]; c.lastBC3 = v->blend_color[3];
+    }
 
-    MGLRSCache *c = [self rstateCache];
+    c.lastEnc = c_lastEnc;
+    c.lastDS = c_lastDS;
+    c.lastStencilRefF = c_lastRefF;
+    c.lastStencilRefB = c_lastRefB;
     c.appliedEncoder = enc;
     c.appliedGeneration = rs->generation;
     c.drawMode = s_rs_draw_mode;

@@ -1,4 +1,90 @@
 # compat domain — progress log
+READY beb4a3a (all code + study; this report line is the only later commit — bench the branch tip of gl46/compat; gl46-port 1335928 + 2657647 merged; session-9 per-draw CPU work)
+BENCH-REQUEST: glmark2-macos full default list, background launch, window visible, same mode
+as mglR11.  Changes since 09e272a are CPU-side per-draw savings (DIRTY_PROGRAM consumption on
+the PSO fast path + encoder-state re-set dedup): expect +2.5-4.5% on draw-heavy scenes (ideas,
+shadow, gl41-mrt), noise-level elsewhere.  Matched-phase interleaved native-vs-MGL ideas is now
+0.91-1.04x (was 0.91-0.94x); the bench-table ideas 2371/3623 was machine-phase skew.
+BENCH-RESULT 09e272a (built at HEAD 4106e66) score=14255 native=6550 ratio=2.18 load=3.5-9 — NOT pinned; mglR11 vs native8 19:14 EDT. desktop-shadow 4804 > native 4642 (was 4345); gl41-mrt 7337; terrain 2220 ~ native 2274; still below native: ideas 2371/3623, refract 3599/3660 (~equal).
+
+## session 9 (Oct 24, 19:34-21:00 EDT) — Apple-driver study (mtlcount), DXVK study, DIRTY_PROGRAM + encoder-state wins
+
+Merged gl46-port 1335928 (start) and 2657647 (tess r19) before READY. Suite 250/0, test_geom 603/0.
+
+### Apple GL-on-Metal reference study (supervisor 19:46)
+`sample` of native glmark2 ideas (GLEngine -> AppleMetalOpenGLRenderer -> AGXMetalG16X):
+draws are 19% of main-thread samples, CGLFlushDrawable/present is 65%. Hot GL-path symbols:
+glDrawElements_ACC_GL3Exec / glDrawArrays_ACC_GL3Exec ("ACC" accumulator records, does NOT
+validate/encode), gleDoDrawDispatchCoreGL3, GLDContextRec::beginRenderPass/buildPipelineState/
+setRenderUniformBuffers/setRenderSamplersAndTextures/addRenderPassResources — i.e. Apple defers
+validation + Metal encoding to flush time and re-sets only what a state group changed.
+xctrace 'Metal System Trace' export failed on this box (Document Missing Template Error,
+383MB trace) — replaced by ab/mtlcount.m: a counting interposer that swizzles a fixed list of
+Metal framework methods (imp_implementationWithBlock passes (self,args...) WITHOUT the SEL —
+capturing the selector per trampoline is required; also every new*PSO/depth-stencil/sampler
+creator takes a trailing NSError** that must be forwarded).
+
+Metal calls per frame, glmark2 ideas steady state (interval counts / measured frames):
+
+| call                        | Apple (391fps, 2346f) | MGL 1335928 (288fps, 1728f) | MGL session-9 (358fps, 2148f) |
+|-----------------------------|----------------------|-----------------------------|-------------------------------|
+| drawIndexedPrimitives (all) | 266.5                | 273.8                       | 312.5                         |
+| drawPrimitives instanced    | (in idx*)            | 32.0                        | 36.7                          |
+| setVertexBytes              | 84.5                 | 0                           | 0                             |
+| setFragmentBytes            | 83.5                 | 0                           | 0                             |
+| setVertexBuffer:offset:     | 104.1                | 4.0                         | 4.5                           |
+| setVertexBufferOffset:      | (n/a***)             | (not counted)               | 207.0                         |
+| setFragmentBuffer(/Offset)  | 0                    | 1.2                         | 0.98+1.4                      |
+| setFragmentTexture/Sampler  | 16.7                 | 0.87                        | 0.98                          |
+| setRenderPipelineState      | 7.5                  | 6.1                         | 6.9                           |
+| setDepthStencilState        | 3.4                  | 19.9                        | 2.2                           |
+| setTriangleFillMode         | 20.9                 | 19.9                        | 0.99                          |
+| setCullMode                 | 20.9                 | 19.9                        | 2.96                          |
+| setFrontFacingWinding       | 20.9                 | 19.9                        | 0.99                          |
+| render encoders / commits   | 2 / 2                | 1.7 / 0.87                  | 1.98 / 0.99                   |
+| PSO/DS/sampler creation     | 0 (steady)           | 0                           | 0                             |
+* Apple also batches: 353 GL draws -> ~266 Metal draws. ** not swizzled in the first run.
+After session 9 MGL makes ~570 Metal calls/frame vs Apple's ~900 at the same draw count.
+
+### Fixes shipped (both validated by simultaneous A/B vs ab/1335928 = session-8 baseline)
+1. MGLRenderer.m compat fast path now consumes DIRTY_PROGRAM like the descriptor path does.
+   The bit was set by glUseProgram and NEVER cleared on a fast-path hit, so every draw after
+   the first program switch re-ran mapBuffersToMTL + bindActiveTexturesToMTL +
+   bindTexturesToCurrentRenderEncoder. ideas MGL_PROFILE (same load): draw 2.52 -> 0.95
+   ms/frame, processGLState 1.85 -> 0.55, bindTextures 0.227 -> 0.005 (7 calls/frame),
+   mapGLBuffers walk 0.254 -> 0.045 (89 real VAO changes). A/B ideas +3.5-4.5%, shadow
+   +0.5-2.6%, gl41-mrt +2.3-3.9%, jellyfish/terrain/refract noise (-2%..+2%).
+2. MGLRenderer+RenderState.m rstateApplyEncoderState dedups re-sets against the last values
+   pushed to the same encoder (depth-stencil object, stencil refs, viewport, scissor, cull,
+   winding, fill mode, depth bias, clip mode, blend color; extRstateRenderEncoderCreated
+   already invalidates per encoder). setDepthStencilState/cull/winding/fill 19.9 -> 1-3/frame.
+
+### DXVK study + CS-thread evaluation (supervisor 20:36)
+Read /tmp/dxvk-master/src/dxvk/dxvk_cs.{h,cpp} + dxvk_context/dxvk_graphics: app thread records
+compact typed commands into 16KB DxvkCsChunks (data copied in), ONE DxvkCsThread executes
+chunks against the context, synchronize(seq)/lastSequenceNumber() for flush points; state is
+dirty-flag tracked per object class; graphics pipelines are content-hashed; constant data
+streams through per-frame staging (discard) rings.
+
+Evaluation for MGL (from today's numbers): MGL's residual per-draw CPU is ~2.7us/draw
+(under load) of which the Metal emission is only ~0.5us (1 drawIndexedPrimitives + 1
+setVertexBufferOffset + stamp); the rest is app-side compute (dirty walk, buffer-list diff +
+memcmp, ring memcpy, serial bookkeeping). A CS thread can therefore hide at most ~0.2ms/frame
+under load (~+8-12% ideas at 2400fps) UNLESS it also owns state translation — which requires
+recording GL state snapshots per draw (DXVK-style chunk copies) because the app thread mutates
+ctx->state for the next draw. Ordering also requires that every app-side encoder mutation
+(newRenderEncoder, rstateApplyEncoderState, bindTextures, bind*BuffersToCurrentRenderEncoder,
+clears, blits, readbacks, queries, xfb, tess/geom passes, commit) drains first — those sites
+are spread over MGLRenderer.m/Framebuffer.m/RenderState.m. Concrete design that keeps it
+contained: record ops only in MGLRenderer+Draw.m (extBufDrawArrays/Indexed/Indirect +
+extBufBindList emission tail), CFRetain the referenced MTL objects, one worker with
+os_unfair_lock+condvar and a seq counter, drain = wait until consumed, eligibility gate
+(no xfb/query/tess/geom active, encoder exists, no client index lists), env MGL_CS_THREAD=1.
+Estimated 400-600 lines across 3 shared files + Draw.m; NOT prototyped this session (bench +
+suite green were the priority) — recommend a dedicated session with the gpuaudit CPU-state
+dumper as the debugging aid.
+
+
 READY 09e272a (gl46/compat; gl46-port bd31b86 merged as aad7d91 + session-8 per-draw CPU work)
 BENCH-REQUEST: glmark2-macos full default list, background launch, window visible, same mode
 as mglR10.  Changes since bd31b86 are CPU-side per-draw savings (texture-resolution cache,

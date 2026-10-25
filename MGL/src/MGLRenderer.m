@@ -3755,7 +3755,17 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
              * skip the descriptor rebuild + content hash (MGLRenderer+Compat.m) */
             if ([self compatPipelineFastPath])
             {
-                ctx->state.dirty_bits &= ~DIRTY_VAO;
+                /* compat perf (session 9): consume DIRTY_PROGRAM exactly like
+                 * the descriptor path below does.  It was left set here, so
+                 * after the first glUseProgram every following draw re-ran
+                 * mapBuffersToMTL + bindActiveTexturesToMTL +
+                 * bindTexturesToCurrentRenderEncoder (glmark2 ideas: 353
+                 * remaps/frame where the scene has ~12 program switches).
+                 * The bit is re-armed by glUseProgram / link / the geom-tess
+                 * emulation paths between draws; bindMTLProgram is not needed
+                 * on a cache hit — the cached PSO already owns functions for
+                 * this exact MSL content key. */
+                ctx->state.dirty_bits &= ~(DIRTY_VAO | DIRTY_PROGRAM);
             }
             else
             {
