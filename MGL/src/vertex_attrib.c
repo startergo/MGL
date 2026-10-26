@@ -223,6 +223,7 @@ static void setF(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z, 
     if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
 
     MGLCurrentAttrib *a = &VS(ctx)->current[index];
+    VS(ctx)->current_serial++;   /* compat draw gate (session 17) */
     a->kind = MGL_VA_KIND_FLOAT;
     a->v.f[0] = x; a->v.f[1] = y; a->v.f[2] = z; a->v.f[3] = w;
     a->d[0] = x; a->d[1] = y; a->d[2] = z; a->d[3] = w;
@@ -233,6 +234,7 @@ static void setI(GLMContext ctx, GLuint index, GLint x, GLint y, GLint z, GLint 
     if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
 
     MGLCurrentAttrib *a = &VS(ctx)->current[index];
+    VS(ctx)->current_serial++;   /* compat draw gate (session 17) */
     a->kind = MGL_VA_KIND_INT;
     a->v.i[0] = x; a->v.i[1] = y; a->v.i[2] = z; a->v.i[3] = w;
     a->d[0] = x; a->d[1] = y; a->d[2] = z; a->d[3] = w;
@@ -243,6 +245,7 @@ static void setU(GLMContext ctx, GLuint index, GLuint x, GLuint y, GLuint z, GLu
     if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
 
     MGLCurrentAttrib *a = &VS(ctx)->current[index];
+    VS(ctx)->current_serial++;   /* compat draw gate (session 17) */
     a->kind = MGL_VA_KIND_UINT;
     a->v.u[0] = x; a->v.u[1] = y; a->v.u[2] = z; a->v.u[3] = w;
     a->d[0] = x; a->d[1] = y; a->d[2] = z; a->d[3] = w;
@@ -253,6 +256,7 @@ static void setL(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble 
     if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
 
     MGLCurrentAttrib *a = &VS(ctx)->current[index];
+    VS(ctx)->current_serial++;   /* compat draw gate (session 17) */
     a->kind = MGL_VA_KIND_DOUBLE;
     a->d[0] = x; a->d[1] = y; a->d[2] = z; a->d[3] = w;
     /* Metal has no fp64 vertex inputs: the value fed to the shader is the float conversion */

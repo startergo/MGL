@@ -78,6 +78,9 @@ typedef struct {
 @property (nonatomic, assign) BOOL rotate;               /* advance `write` at the next fbEnsureDefaultFramebuffer */
 @property (nonatomic, strong) id<MTLComputePipelineState> opaquePso;  /* force-alpha-255 kernel */
 @property (nonatomic, assign) BOOL opaquePsoFailed;
+@property (nonatomic, strong) id<MTLRenderPipelineState> presentPso;  /* copy+force-alpha present pass */
+@property (nonatomic, assign) MTLPixelFormat presentPsoFormat;        /* dst format it was built for */
+@property (nonatomic, assign) BOOL presentPsoFailed;
 @end
 
 /* GL window semantics: the default framebuffer's alpha is DISCARDED at
@@ -100,8 +103,32 @@ static const char *s_mgl_force_opaque_msl =
     "    }\n"
     "}\n";
 
+/* present copy: ONE render pass that copies the frame to the presented
+ * IOSurface AND writes alpha=1, so the surface never holds a half-alpha state
+ * the compositor could catch (replaces the s16d pair "force-opaque kernel on
+ * the source + blit copy" — same single-write transition to CA, half the GPU
+ * work, one encoder instead of two, and the source's GL alpha channel is no
+ * longer clobbered, so readbacks keep GL semantics). */
+static const char *s_mgl_present_copy_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "vertex float4 mgl_present_vert(uint vid [[vertex_id]])\n"
+    "{\n"
+    "    float2 uv = float2(float((vid << 1) & 2u), float(vid & 2u));\n"
+    "    return float4(uv * 2.0f - 1.0f, 0.0f, 1.0f);   /* full-screen triangle */\n"
+    "}\n"
+    "fragment float4 mgl_present_frag(float4 pos [[position]],\n"
+    "                                 texture2d<float> src [[texture(0)]])\n"
+    "{\n"
+    "    uint2 gid = uint2(pos.xy);\n"
+    "    if (gid.x >= src.get_width() || gid.y >= src.get_height())\n"
+    "        return float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+    "    return float4(src.read(gid).rgb, 1.0f);\n"
+    "}\n";
+
 @implementation MGLCompatSurfacePool
 @synthesize layer, textures, surfaces, w, h, next, write, rotate, opaquePso, opaquePsoFailed;
+@synthesize presentPso, presentPsoFormat, presentPsoFailed;
 @end
 
 #define COMPAT_SURFACES 3
@@ -161,6 +188,17 @@ typedef struct {
     uint64_t lastKey_a, lastKey_b;
     BOOL     lastKeyValid;
     uint64_t missCount;
+    /* compat perf (session 17): direct-mapped key->slot memo.  Hits no longer
+     * move-to-front (that memmove shifted up to 512 slot structs — several KB
+     * per first-of-group walk, ~89 per glmark2 [ideas] frame), so slot indices
+     * are STABLE while no miss inserts, and the memo answers a repeated key
+     * with one compare.  The whole table is invalidated by any miss (the only
+     * other place slots shift is the 512-entry eviction, same block). */
+#define MGLC_PIPE_MEMO 16
+    struct MGLCompatPipeMemo {
+        uint64_t a, b;
+        int      slot;
+    } memo[MGLC_PIPE_MEMO];
 }
 @end
 
@@ -457,23 +495,49 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
     {
         cache = [[MGLCompatPipelineCache alloc] init];
         cache->pending = -1;
+        for (unsigned mi = 0; mi < MGLC_PIPE_MEMO; mi++)
+            cache->memo[mi].slot = -1;
         objc_setAssociatedObject(self, kCompatPipeKey, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    /* linear scan with move-to-front (plain loads, no ObjC): the working set
-     * is small per scene but the full glmark2 list touches hundreds of (MSL,
-     * layout) keys, and a short FIFO evicted live entries between sub-tests
-     * (conditionals: 5700 FPS solo vs 780 in-suite with a 64-entry cache) */
+    /* session 17: slot lookup = memo first, then a linear scan.  Hits keep
+     * their slot position (no move-to-front: see the memo comment above — the
+     * scan only runs for a key the memo does not know, i.e. the first use of
+     * a (program content, layout) pair), so memo slot indices stay valid. */
+    int hit = -1;
+    {
+        unsigned mi = (unsigned)((key.a ^ (key.b * 0x9E3779B97F4A7C15ULL)) & (MGLC_PIPE_MEMO - 1));
+        struct MGLCompatPipeMemo *mo = &cache->memo[mi];
+        if (mo->slot >= 0 && (unsigned)mo->slot < cache->count &&
+            cache->slots[mo->slot].pipe_cf &&
+            cache->slots[mo->slot].a == key.a && cache->slots[mo->slot].b == key.b)
+            hit = mo->slot;
+    }
+    if (hit < 0)
     for (unsigned i = 0; i < cache->count; i++)
     {
         if (cache->slots[i].pipe_cf && cache->slots[i].a == key.a && cache->slots[i].b == key.b)
         {
-            if (i)
-            {
-                struct MGLCompatPipeSlot s = cache->slots[i];
-                memmove(&cache->slots[1], &cache->slots[0], i * sizeof(s));
-                cache->slots[0] = s;
-            }
+            hit = (int)i;
+            unsigned mi = (unsigned)((key.a ^ (key.b * 0x9E3779B97F4A7C15ULL)) & (MGLC_PIPE_MEMO - 1));
+            cache->memo[mi].a = key.a;
+            cache->memo[mi].b = key.b;
+            cache->memo[mi].slot = hit;
+            break;
+        }
+        /* perf instrumentation: a matching key whose slot never received a
+         * pipeline (the descriptor path must have bailed before storing) */
+        if (!cache->slots[i].pipe_cf && cache->slots[i].a == key.a && cache->slots[i].b == key.b && compatProfOn())
+        {
+            static uint64_t dead = 0;
+            if (++dead % 200 == 1)
+                compatProfOn() && fprintf(stderr, "MGL PROFILE pipeMiss dead-box (key match, pipe nil) entries=%u\n",
+                        cache->count);
+        }
+    }
+    if (hit >= 0)
+    {
+            unsigned i = (unsigned)hit;
             /* the plan in s->plan must be the one this pipeline was built
              * against: when the scene alternates two cached layouts the plan
              * holds the other draw's fetch/shadow/const analysis — restore
@@ -496,19 +560,9 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
                 cache->plan_live_msl = key.a;
                 cache->plan_live_vao = vao_h;
             }
-            _pipelineState = (__bridge id<MTLRenderPipelineState>)cache->slots[0].pipe_cf;
+            _pipelineState = (__bridge id<MTLRenderPipelineState>)cache->slots[i].pipe_cf;
             mgl_prof_cnt[16]++;
             return true;
-        }
-        /* perf instrumentation: a matching key whose slot never received a
-         * pipeline (the descriptor path must have bailed before storing) */
-        if (!cache->slots[i].pipe_cf && cache->slots[i].a == key.a && cache->slots[i].b == key.b && compatProfOn())
-        {
-            static uint64_t dead = 0;
-            if (++dead % 200 == 1)
-                compatProfOn() && fprintf(stderr, "MGL PROFILE pipeMiss dead-box (key match, pipe nil) entries=%u\n",
-                        cache->count);
-        }
     }
     /* miss: remember the key; the descriptor path stores the pipeline into it
      * (compatPipelineStore below, called by processGLState) */
@@ -523,6 +577,10 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
     cache->slots[0].pipe_cf = NULL;
     cache->pending = 0;
     cache->plan_live_slot = -1;   /* slots shifted; the descriptor path rebuilds the plan */
+    /* session 17: every slot index moved down by one — the memo table must be
+     * re-learned from the scans (also covers the 512-entry eviction) */
+    for (unsigned mi = 0; mi < MGLC_PIPE_MEMO; mi++)
+        cache->memo[mi].slot = -1;
 
     /* perf instrumentation: WHICH key component moved (a = MSL content ids,
      * b = VAO layout / pipeline-baked rstate / FBO identity) */
@@ -864,6 +922,12 @@ struct MGLCompatDrawSnap {
     const void *encoder, *cmdbuf, *pipe, *program, *vao, *fbo;
     GLuint      rstate_gen;             /* ext_rstate->generation (encoder-state group) */
     GLuint      rstate_pipe_gen;        /* ext_rstate->generation_pipeline (PSO content) */
+    /* compat perf (session 17): verdicts that cannot change while the identity
+     * checks above hold — recorded at latch time so a clean draw pays a load
+     * instead of the call: tess routing needs a tess program record for THIS
+     * program (records appear/disappear at link, which arms DIRTY_PROGRAM and
+     * fails the dirty-mask check first) */
+    bool        tess_active;
     ImageUnit   image_units[TEXTURE_UNITS];     /* glBindImageTexture group */
 
     /* content snapshots */
@@ -871,6 +935,7 @@ struct MGLCompatDrawSnap {
     BufferMapList vlist, flist;         /* vertex / fragment buffer maps (identity) */
     struct MGLCompatBufId vb[MAX_MAPPED_BUFFERS], fb[MAX_MAPPED_BUFFERS];
     MGLVattribDrawPlan plan;            /* vattrib draw plan */
+    uint64_t    current_serial;         /* vs->current_serial at latch (gate 14) */
     MGLVertexAttribFormat fmt[MAX_ATTRIBS];
     MGLVertexBinding binding[MGL_VA_MAX_BINDINGS];
     struct MGLCompatBufId vabuf[MGL_VA_MAX_BINDINGS];
@@ -896,6 +961,14 @@ struct MGLCompatDrawFast {
     uint64_t    misswhy[26];
     uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
     uint64_t    dirtymask_val[8];
+
+    /* session 17: PreDraw hook count memo (see compatDrawGate check 2) */
+    uint64_t    hook_gen;
+    unsigned    hook_count;
+
+    /* session 17: current_serial whose content the gate verified unchanged
+     * (see compatDrawGate check 14; s->current_serial is the latch's copy) */
+    uint64_t    gate_current_serial;
 };
 
 static struct MGLCompatDrawFast *compatDrawFastState(GLMContext ctx)
@@ -904,7 +977,11 @@ static struct MGLCompatDrawFast *compatDrawFastState(GLMContext ctx)
     if (!m)
         return NULL;
     if (!m->draw_fast)
-        m->draw_fast = calloc(1, sizeof(struct MGLCompatDrawFast));
+    {
+        struct MGLCompatDrawFast *df = calloc(1, sizeof(struct MGLCompatDrawFast));
+        df->hook_gen = ~(uint64_t)0;   /* force the hook count on the first gate call */
+        m->draw_fast = df;
+    }
     return (struct MGLCompatDrawFast *)m->draw_fast;
 }
 
@@ -996,6 +1073,27 @@ static void compatListClearDataDirty(BufferMapList *live)
 static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
                             struct MGLCompatBufId *snapbuf)
 {
+    /* compat perf (session 17): compare-first — when the list already matches
+     * the snapshot (count, map entries and backing-buffer identities), the
+     * copies are skipped.  The snapshot is only ever compared back, so equal
+     * content needs no re-copy; on a program switch only the entries that
+     * actually moved are written. */
+    if (snap->count == live->count &&
+        (live->count == 0 ||
+         memcmp(snap->buffers, live->buffers, live->count * sizeof(BufferMap)) == 0))
+    {
+        bool same = true;
+        for (GLuint i = 0; i < live->count && same; i++)
+        {
+            const Buffer *b = live->buffers[i].buf;
+            same = snapbuf[i].buf == b &&
+                   snapbuf[i].mtl == (b ? b->data.mtl_data : NULL) &&
+                   snapbuf[i].size == (b ? b->size : 0);
+        }
+        if (same)
+            return;
+    }
+
     snap->count = live->count;
     if (live->count)
         memcpy(snap->buffers, live->buffers, live->count * sizeof(BufferMap));
@@ -1056,7 +1154,15 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
         MGL_DF_MISS(1);
     }
     /* ...and only for the three PreDraw hooks this gate reasons about */
-    if (mglExtHookCacheCount(self, "PreDraw:") != 3)
+    /* session 17: the hook table is filled during context setup; re-count at
+     * most once per encoder generation (a strcmp scan of the cache list,
+     * paid on the first draw of every encoder instead of every draw) */
+    if (df->hook_gen != m->encoder_gen)
+    {
+        df->hook_gen = m->encoder_gen;
+        df->hook_count = mglExtHookCacheCount(self, "PreDraw:");
+    }
+    if (df->hook_count != 3)
         MGL_DF_MISS(2);
     /* identity: encoder (incl. the bind-shadow generation), command buffer
      * (still uncommitted — commit paths set dirty state), pipeline (already
@@ -1171,8 +1277,17 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
                 memcmp(va->binding, s->binding, sizeof(s->binding)) != 0)
                 MGL_DF_MISS(13);
         }
-        if (memcmp(vs->current, s->current, sizeof(s->current)) != 0)
-            MGL_DF_MISS(14);
+        /* session 17: glVertexAttrib* arms no dirty bit, so the gate must
+         * detect generic-attrib writes; every writer bumps current_serial
+         * (mgl_ext_vattrib.h), replacing a ~900 B memcmp per draw.  The memo
+         * in df records the newest serial whose content this gate (or the
+         * latched walk) has already verified unchanged. */
+        if (vs->current_serial != df->gate_current_serial)
+        {
+            if (memcmp(vs->current, s->current, sizeof(s->current)) != 0)
+                MGL_DF_MISS(14);
+            df->gate_current_serial = vs->current_serial;
+        }
 
         for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
         {
@@ -1198,8 +1313,11 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     }
 
 
-    /* tess routing installs its own pipeline and buffer maps: never skip its walks */
-    if ([self extTessActive])
+    /* tess routing installs its own pipeline and buffer maps: never skip its walks.
+     * session 17: the verdict is latched — it can only flip via a link or a
+     * program/pipeline rebind, and both fail an earlier check (dirty mask /
+     * identity), so a clean same-identity draw reads the cached boolean. */
+    if (s->tess_active || [self extTessActive])
         MGL_DF_MISS(25);
 
     /* everything matched: the walk is a no-op except for listed-buffer content
@@ -1257,6 +1375,7 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     s->program = (const void *)ctx->state.program;
     s->vao = (const void *)ctx->state.vao;
     s->fbo = (const void *)ctx->state.framebuffer;
+    s->tess_active = [self extTessActive] ? 1 : 0;
 
     {
         struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
@@ -1264,7 +1383,11 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
         s->rstate_pipe_gen = rs ? rs->generation_pipeline : 0;
     }
 
-    memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
+    /* session 17: compare-first latching — groups whose live content already
+     * equals the snapshot (ideas' 89 same-layout walks per frame) turn into a
+     * memcmp instead of a copy; only changed groups are written back. */
+    if (memcmp(s->image_units, ctx->state.image_units, sizeof(s->image_units)) != 0)
+        memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
 
     compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
     compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
@@ -1275,13 +1398,23 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
 
         if (vs && va)
         {
-            memcpy(&s->plan, &vs->plan, sizeof(s->plan));
-            memcpy(s->fmt, va->fmt, sizeof(s->fmt));
-            memcpy(s->binding, va->binding, sizeof(s->binding));
-            memcpy(s->current, vs->current, sizeof(s->current));
+            if (memcmp(&s->plan, &vs->plan, sizeof(s->plan)) != 0)
+                memcpy(&s->plan, &vs->plan, sizeof(s->plan));
+            if (memcmp(s->fmt, va->fmt, sizeof(s->fmt)) != 0)
+                memcpy(s->fmt, va->fmt, sizeof(s->fmt));
+            if (memcmp(s->binding, va->binding, sizeof(s->binding)) != 0)
+                memcpy(s->binding, va->binding, sizeof(s->binding));
+            if (memcmp(s->current, vs->current, sizeof(s->current)) != 0)
+                memcpy(s->current, vs->current, sizeof(s->current));
+            s->current_serial = vs->current_serial;   /* gate 14 compares this, not the array */
+            df->gate_current_serial = vs->current_serial;
             for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
             {
                 const Buffer *buf = va->binding[b].buffer;
+                if (s->vabuf[b].buf == buf &&
+                    s->vabuf[b].mtl == (buf ? buf->data.mtl_data : NULL) &&
+                    s->vabuf[b].size == (buf ? buf->size : 0))
+                    continue;
                 s->vabuf[b].buf = buf;
                 s->vabuf[b].mtl = buf ? buf->data.mtl_data : NULL;
                 s->vabuf[b].size = buf ? buf->size : 0;
@@ -2006,6 +2139,81 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     [enc endEncoding];
 }
 
+/* present-copy fast path: one render pass copies src -> dst row-for-row (same
+ * orientation as the blit it replaces; the presenting layer's transform does
+ * the y-flip) and writes alpha=1.  dst then goes old-frame -> opaque-new-frame
+ * in a SINGLE write, which is exactly the e4142bb flash-fix property — without
+ * the per-present compute kernel (kernel over the source + blit = two encoders,
+ * two compatCSDrain calls and two full-surface GPU passes; this is one encoder,
+ * one drain, one pass) and without touching the source's alpha (GL readback of
+ * the default framebuffer keeps the blended alpha values).
+ * Returns false when the caller must fall back to blit/fbShaderBlitFrom. */
+- (bool) compatPresentCopyOpaque: (id<MTLTexture>)src to:(id<MTLTexture>)dst
+{
+    MGLCompatSurfacePool *pool = objc_getAssociatedObject(self, kCompatPoolKey);
+    if (!pool || !src || !dst || src.width == 0 || src.height == 0)
+        return false;
+    /* exact-copy cases only (the blit path's own condition); integer/unusual
+     * source formats would need a typed texture2d<> binding — stay out */
+    if (src.width != dst.width || src.height != dst.height ||
+        src.pixelFormat != dst.pixelFormat)
+        return false;
+    switch (src.pixelFormat)
+    {
+        case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatRGBA16Float:
+            break;
+        default:
+            return false;
+    }
+
+    if (!pool.presentPso || pool.presentPsoFormat != dst.pixelFormat)
+    {
+        if (pool.presentPsoFailed && pool.presentPsoFormat == dst.pixelFormat)
+            return false;                                   /* do not retry */
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:[NSString stringWithUTF8String:s_mgl_present_copy_msl]
+                                                   options:nil
+                                                     error:&err];
+        id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"mgl_present_vert"] : nil;
+        id<MTLFunction> fs = lib ? [lib newFunctionWithName:@"mgl_present_frag"] : nil;
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = vs;
+        pd.fragmentFunction = fs;
+        pd.colorAttachments[0].pixelFormat = dst.pixelFormat;
+        id<MTLRenderPipelineState> ps = [_device newRenderPipelineStateWithDescriptor:pd
+                                                                                error:&err];
+        if (!ps)
+        {
+            NSLog(@"MGL INFO: present-copy pipeline failed: %@", err.localizedDescription);
+            pool.presentPsoFailed = YES;                    /* do not retry */
+            pool.presentPsoFormat = dst.pixelFormat;
+            return false;
+        }
+        pool.presentPso = ps;
+        pool.presentPsoFormat = dst.pixelFormat;
+    }
+
+    /* compat CS: this pass runs on the GL thread — the encoder worker must be
+     * done before a second encoder opens on this command buffer */
+    [self compatCSDrain];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;   /* every pixel is written */
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [_currentCommandBuffer renderCommandEncoderWithDescriptor:rp];
+    if (!enc)
+        return false;
+    enc.label = @"MGL present copy";
+    [enc setRenderPipelineState:pool.presentPso];
+    [enc setViewport:(MTLViewport){ 0, 0, (double)dst.width, (double)dst.height, 0.0, 1.0 }];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    return true;
+}
+
 
 - (bool) compatSurfacePresentEnabled
 {
@@ -2180,63 +2388,32 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     pool.next = (pool.next + 1) % COMPAT_SURFACES;
     id<MTLTexture> dst = pool.textures[i];
 
-    /* FLASH ROOT CAUSE (user: "camera flash" frames in [jellyfish]): fix the
-     * SOURCE's alpha BEFORE the copy.  layer.contents on a raw IOSurface is
-     * not synchronized with this command buffer — the compositor samples the
-     * surface at the display refresh, asynchronously.  With the old order
-     * (blit, then force-opaque on the presented surface) one refresh could
-     * land between the two encoders and composite the new frame while its
-     * alpha still held GL's blended value (~0.36 over the bell): the whole
-     * translucent frame over the white window backdrop = one bright flash.
-     * Fixing the source first makes the presented surface transition
-     * old-frame -> opaque-new-frame in the single blit; the intermediate
-     * half-alpha state lives only in the private texture, which CA never
-     * sees.  (MGL_PRESENT_PROBE_US=<us>: debug aid — spin after the blit to
-     * widen any post-blit window and make ordering bugs reproducible.) */
-    /* fix the SOURCE's alpha before the copy (see the flash comment below) —
-     * only when Metal allows it: the kernel is read_write and the texture must
-     * carry MTLTextureUsageShaderWrite (the pool surfaces do; a private default
-     * framebuffer without it would be UB — it showed as magenta garbage). */
-    bool src_forced = false;
-    if (color.usage & MTLTextureUsageShaderWrite)
+    /* FLASH (user: "camera flash" frames in [jellyfish]) — the presented
+     * IOSurface (layer.contents) is sampled by the compositor asynchronously:
+     * the swap command buffer is not synchronized with it, so the surface must
+     * never hold a half-alpha frame the compositor could catch.  e4142bb fixed
+     * that by forcing the copy SOURCE opaque first (one extra compute pass per
+     * present: kernel over the source, then blit); compatPresentCopyOpaque:to:
+     * keeps the property with a SINGLE render pass that copies AND writes
+     * alpha=1 — dst's only write this frame is already opaque, the source's
+     * GL alpha is untouched, and the per-present cost is one encoder + one
+     * full-surface pass instead of two of each. */
+    if (![self compatPresentCopyOpaque:color to:dst])
     {
-        [self compatCSDrain];
-        [self compatForceOpaque:color];
-        src_forced = true;
-    }
-    /* straight copy with a blit encoder — no render pass, no pipeline, no
-     * viewport, no shader bind (the shader-blit present path costs a render
-     * encoder per swap; the y-flip lives in the layer transform instead) */
-    if (color.width == dst.width && color.height == dst.height &&
-        color.pixelFormat == dst.pixelFormat)
-    {
-        /* compat CS: this blit runs on the GL thread — the encoder worker
-         * must be done before a second encoder opens on this command buffer */
-        [self compatCSDrain];
-        id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
-        [blit copyFromTexture:color sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                  sourceSize:MTLSizeMake(color.width, color.height, 1)
-                    toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-    }
-    else
-    {
-        /* format or size change (window resize race): shader-blit WITHOUT the
-         * classic y-flip — the presenting layer's transform already flips, a
-         * flipped copy would land upside down on screen */
+        /* unsupported (size/format race, exotic format): the old path —
+         * shader-blit WITHOUT the classic y-flip (the presenting layer's
+         * transform already flips, a flipped copy would land upside down on
+         * screen), then force the POOL surface's alpha (rare path; its small
+         * compositor window is unchanged) */
         CompatFBTarget src = { color, 0, 0, 0, 1 }, dt = { dst, 0, 0, 0, 1 };
         GLint s[4] = { 0, 0, (GLint)color.width, (GLint)color.height };
         GLint d[4] = { 0, 0, (GLint)dst.width, (GLint)dst.height };
+        [self compatCSDrain];
         [self fbShaderBlitFrom:&src to:&dt src:s dst:d
                         filter:GL_LINEAR
                        scissor:false];
-    }
-
-    /* source could not be pre-fixed (no ShaderWrite): the old post-copy
-     * kernel on the pool surface, which carries ShaderWrite (s15 behaviour;
-     * the small compositor window remains only on this rare path) */
-    if (!src_forced)
         [self compatForceOpaque:dst];
+    }
     id<MTLCommandBuffer> cb = _currentCommandBuffer;
     [self commitCommandBufferWithAGXRecovery:cb];
 

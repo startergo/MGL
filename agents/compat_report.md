@@ -1,4 +1,60 @@
 # compat domain — progress log
+## session 18 (Oct 26, 15:35-17:00 EDT) — s18 task 1: single-pass present copy (be2a894)
+
+Supervisor verdict from the quiet A/B: no ~16% code regression (159d900 itself ~2960 today); the
+only real hit is jellyfish -3% matching e4142bb's per-present compute dispatch.  Tasks: (1) drop
+that dispatch without losing the caustics/flash fix, (2) measure ideas per-draw CPU, (3) gate.
+
+- e4142bb present order was [compatCSDrain + compatForceOpaque kernel over the source (read_write
+  over the whole default framebuffer) + compatCSDrain + blit copy] per present = 2 encoders,
+  2 drains, 2 full-surface GPU passes.  Replaced by compatPresentCopyOpaque:to: (new, in
+  MGLRenderer+Compat.m): a PSO cached per dst pixel format, one render pass, fullscreen triangle
+  from vertex_id (no vertex buffer), fragment does src.read(uint2(pos.xy)) — no sampler state —
+  and writes float4(rgb, 1.0).  Requires same size + same format + float-kind source (BGRA8/RGBA8
+  ±sRGB, RGBA16Float); everything else falls back to fbShaderBlitFrom + post-blit kernel (rare
+  resize-race path, unchanged), and the env-gated direct path keeps its in-place kernel.
+  Bonus: the source's alpha channel is no longer rewritten, so glReadPixels of the default
+  framebuffer after a present returns GL's blended alpha again.
+- Correctness: MGL_PRESENT_DUMP=25 on jellyfish — 81 presented-surface dumps, alpha=255 in every
+  pixel, bell (79,100,161) with blue spread 231 (caustic web).  ab/flash_check.sh PASS (hardened:
+  re-frontmost every 10 captures + INVALID guard when >25% frames are ~240 = window occluded by
+  another agent — first run FAILed on exactly that, frames 70+ constant 240.6, visible frames
+  108-119 clean).
+- Perf (quiet, interleaved, ab/run_quiet_ab_s18.sh; ab/prev=a036e29, ab/gl46port=5178835 built
+  with git archive + external symlink): jellyfish new 24100/24672 vs gl46port 22834/23535 (+5.2%);
+  vs my own old tip a036e29 4176-4745 vs 3916-4298 (+6-10%) in a visible window.  swap bucket CPU
+  0.0326-0.0342 vs 0.0388-0.0392 ms/frame.  ideas neutral as expected (draw-bound).
+- Task 2 (ideas per-draw CPU, ab/run_ideas_cpu_s18.sh + a 3-round bucket diff): tip vs gl46-port —
+  draw 1.204 vs 1.473 (-18.3%), processGLState 0.577 vs 0.709 (-18.6%), encode-draw 0.152 vs
+  0.177 (-14%), newRenderEncoder 0.098 vs 0.126 (-22%), updateEncoder 0.037 vs 0.040, vao-buflists
+  0.009 vs 0.011.  /usr/bin/time user CPU per 10 s scene was NOT usable (load spikes 9-16 from
+  parallel agents swamp user+sys); the MGL_PROFILE buckets are the load-tolerant metric.  All four
+  s17 per-draw commits keep (CPU measurably down ~18% on the draw path).
+- Gate: suite 96 files 0 FAIL, test_geom 10x 603/0, test_fp64fast 3x 298/0, flash_check PASS,
+  window captures: jellyfish (82,111,193) blue-std 66, ideas (68,68,66), 0 magenta px, no logo
+  bleed.  nsgl_smoke: quadrants 4/4, readback byte-identical, present throughput 9418-12592 Hz;
+  its GL_VERSION check FAILs because the honest-strings change (s14) prints "4.6 Metal - 90.5"
+  while the test greps for "compat" — pre-existing, not touched (compat.c:616 / get.c:1158).
+- MGLRenderer+Framebuffer.m: one comment updated (the ShaderWrite flag's reason changed from
+  "force-opaque kernel on the source" to "direct-present kernel"; flags unchanged).
+
+READY be2a894 (supersedes e4142bb; s18 task 1+2 done): the per-present compute pass is GONE —
+compatPresentCopyOpaque:to: is ONE cached fullscreen-triangle render pass that copies the frame
+and writes alpha=1 straight into the pool IOSurface (same e4142bb flash property — the surface's
+only write per frame is already opaque, so CA can never catch a half-alpha frame — and the
+source's GL alpha is no longer clobbered, default-fb readback keeps blended alpha).  Quiet A/B
+(load<1.5, interleaved, 2 rounds): jellyfish 24100/24672 vs gl46-port 5178835 22834/23535 (+5.2%);
+ideas 2471/2456 vs 2484/2427 (neutral, not present-bound).  MGL_PROFILE=1 swap bucket 0.033 vs
+0.039 ms/frame (-15% CPU in the present path).  Ideas per-draw CPU (s18 task 2, tip vs gl46-port):
+draw 1.204 vs 1.473 ms/frame (-18%), processGLState 0.577 vs 0.709 (-19%), encode-draw -14%,
+newRenderEncoder -22%, updateEncoder -8%, vao-buflists -18% — the four s17 per-draw commits STAY
+(CPU measurably down; FPS is GPU/present-bound near 2900 in a visible window).  Gate: suite 96
+files 0 FAIL, test_geom 10x 603/0, test_fp64fast 3x 298/0, ab/flash_check.sh PASS (120 captures
+median 113.6 max 119.4, 0 flash frames), MGL_PRESENT_DUMP 81 frames alpha=255 in every pixel,
+jellyfish window mean (82,111,193) blue-std 66 (caustic web like native), ideas (68,68,66) neutral
+gray, 0 magenta-ish px both scenes, no logo bleed.  NOTE: my A/B windows run occluded (~24k FPS
+scale vs the supervisor's ~12.5k visible-window scale) — the interleaved same-condition RATIO is
+the comparable number, not absolute FPS.
 READY e4142bb (supersedes 30f7bb8/fa2a242; adds the [jellyfish] present-flash fix the user
 reported at 07:00 + everything from 30f7bb8: merge d31c9ba, ONE reserved-word implementation,
 [ideas] layout-keyed PSO cache, DIRTY_FBO gate rule, drawpix sRGB/RGTC; suite 0 FAIL (95
@@ -1319,3 +1375,87 @@ Still open, in priority order:
   would require a GLU port or Mesa's libGLU linking against the GLX shim).
 * Interposer/glx polish: vsync is a no-op (interval recorded), contexts are never destroyed
   (MGL has no teardown path), share lists are per-context.
+
+---
+
+## Session 17 (Oct 26, 12:00-13:35 EDT) — texture_swizzle diagnosis, ideas perf, 4 fast-path commits
+
+Branch: gl46/compat. Tip after this session: `b80fabf` (merge of gl46-port 5178835/tess r25)
+on top of `16179e8`. Full headless suite after everything: **7831 checks, 0 failures**.
+
+### TASK 1 — KHR-GL46.texture_swizzle.smoke "hangs": DIAGNOSED, not a hang, fix is geom's link cache
+
+Causal chain (all runs today, cap times in wall seconds, single case, --deqp-log-images=disable):
+
+| build | result |
+|---|---|
+| my f6a2a46 (no link cache)          | killed at 1032 s, no verdict (CPU 6:44 and rising, progress verified) |
+| my f6a2a46 + geom's geometry.c/mgl_ext_geom.h only (slot map + eager free) | **TIMEOUT at 900 s** — the slot map alone does NOT fix it |
+| geom e767e6a (whole-link executable cache) | **Pass 478 s** |
+| geom e767e6a + MGL_NO_LINK_CACHE=1   | **TIMEOUT at 720 s** — cache off, the same build collapses |
+
+Sampling (30 s / 2.5 m / 5 m / 6 m): main thread walks a continuously CHANGING stack —
+glslang preprocess/parse (mglCompileShader) -> mglLinkProgram -> run_link -> compile_stage ->
+mgl_introspect_patch_stage (SPIRV-Cross) -> extProgramLibraryForMSL (MSL->AIR, waits on the
+Metal compiler service); CPU time monotonically accumulating, no cycle. So it is per-link
+throughput decay, not a deadlock. Why the workload is heavy: the smoke iterates 6^4 = 1296
+swizzle values x n_texture_access x 4 channels x 2 stages — tens of thousands of
+build+link cycles, each of which (without a link cache) redoes glslang, SPIRV-Cross,
+MSL->AIR and a PSO.
+
+Conclusion: the fix that matters is geom's **whole-link executable cache family** —
+bc52d8b (content-keyed link cache, ~20x relinks), 7d0a47e (MSL entry-name content hash ->
+MTLLibrary cache), 0410220 (hit skips the geom record rebuild), efb646c (keeps the glslang
+compile cache hot) — NOT the geometry.c slot map by itself (proven above). All of those are
+in gl46/geom r50-r53, not yet in gl46-port. geometry.c/mgl_ext_geom.h slot map still helps
+(the table walk was quadratic + resurrected zombie programs per dead slot); take both when
+geom's branch merges. No edits made by me to geometry.c.
+
+### FPS task — where ideas lost ~16% (3404 @159d900 -> ~2874 @d31c9ba): INCONCLUSIVE today, environment could not be excluded
+
+What I did:
+* Bisect builds at 159d900 (p0), 64fa3f1 (p1=tess r21), 9485327 (p2), d31c9ba (p3) in /tmp/s17.
+* The machine ran at load 4.9-17 all session (other agents' builds/tests, Docker, WebKit).
+  Every wall-clock method (FPS, /usr/bin/time CPU, sample CPU-shares, MGL_PROFILE bucket
+  medians, native-GL calibration) produced ratios with +-15% spread — the expected signal
+  (~16% for p0->p3, ~3% for mine vs d31c9ba) is inside the noise envelope. One early clean
+  round (load ~8) did show draw=0.791 p0 vs 0.906 p3 ms/frame (+14.5%) — direction matches,
+  but later rounds under higher load reversed. CALL COUNTS ARE IDENTICAL across p0/p3
+  (353 draws, 89 walks, 134 bindList, 352 encode) — if real, the regression is per-call
+  cost, not extra work; r21's only per-walk code changes (mapBuffers UBO rows via
+  mgl_buffers_indexed_binding, sampler-array element loop) are ~tens of ns, which cannot
+  explain 16%. Cross-day comparison risk: yesterday's 3404 was measured with native at
+  3576; today native GL itself was unmeasurable under load.
+* NEEDS: a quiet-machine rerun of /tmp/s17-style A/B (p0 vs p3 vs tip) before blaming tess;
+  scripts preserved in /tmp/s17/{bisect.sh,ratio.py,profmed.py}; the four /tmp builds are
+  159d900/64fa3f1/9485327/d31c9ba + oldT (=7a50188 pre-session).
+
+### Per-draw CPU: 4 commits (suite green after each, 7831/0 at the end)
+
+1. `95a99c1` PSO cache hit path O(1): the hit path paid a linear scan of up to 512 slot
+   structs + a move-to-front memmove of everything above the hit (several KB per
+   first-of-group walk; ideas does 89 program-switch walks/frame). Hits now keep their slot
+   position (stable indices), and a 16-entry direct-mapped key->slot memo answers repeated
+   keys with one compare; the scan runs only for unknown keys; misses/eviction clear the memo.
+2. `993e17b` differential snapshot latch: compatDrawLatch copied the whole ~4 KB snapshot
+   after every walk; groups whose live content already equals the snapshot (ideas: identical
+   fmt/binding/plan/current/image-units/textures across its 89 same-layout walks) now latch
+   as memcmp+skip; the buffer-map list latch compares count+entries+backing ids first.
+3. `0683180` gate drops two per-draw calls: [self extTessActive] (msgSend + tess table hash
+   walk) is latched — it can only flip via link (arms DIRTY_PROGRAM -> dirty-mask miss) or
+   program/pipeline rebind (identity miss), both checked earlier; mglExtHookCacheCount
+   ("PreDraw:") is counted once per encoder generation instead of per draw.
+4. `16179e8` current-attrib serial: the gate memcmp'd 16x56 B of generic attribs on every
+   draw (glVertexAttrib arms no dirty bit). All four current-value writers in
+   vertex_attrib.c bump a new MGLExtState_vattrib.current_serial; the gate compares the
+   serial and only memcmps when it moved (memoizes the verified serial).
+   SHARED-FILE EDITS (called out): mgl_ext_vattrib.h +1 field, vertex_attrib.c +1 line in
+   set{F,I,U,L} (additive; setP delegates to setF). No behaviour change outside the gate.
+
+Expected effect is a few percent of per-draw CPU each; a quiet-machine A/B (oldT vs tip)
+must confirm — under today's load the median ratio was 0.955-1.031 with +-25% spread.
+jellyfish/goal numbers (>=3400 / >=12800) NOT verified today — no quiet window existed.
+
+### Also this session
+* Merged gl46-port twice: 784c480 (my s13-s16 squashed back) as 7a50188, and 5178835
+  (tess r25) as b80fabf; suite green after both merges.

@@ -91,6 +91,10 @@ struct MGLExtState_vattrib {
     uint8_t            *gen_names;      /* VAO names returned by GenVertexArrays and not deleted */
     size_t              gen_names_cap;
     MGLVattribDrawPlan  plan;           /* written by MGLRenderer+VertexAttrib.m */
+    /* compat perf (session 17): bumped by every generic-attrib write (the set*
+     * writers below) so the compat draw gate can replace its ~900 B per-draw
+     * memcmp of current[] with one compare (glVertexAttrib* arms no dirty bit) */
+    uint64_t            current_serial;
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_vattrib; filled by the renderer category. */

@@ -45,7 +45,12 @@ for t in 1 2 3 4 5 6; do
     osascript -e 'tell application "System Events" to set frontmost of process "glmark2-macos" to true' 2>/dev/null
     sleep 2
 done
-for i in $(seq -w 1 150); do screencapture -x -m "$D/$TAG.b$i.png" 2>/dev/null; done
+for i in $(seq -w 1 150); do
+    screencapture -x -m "$D/$TAG.b$i.png" 2>/dev/null
+    # parallel-agent interference guard: keep the window frontmost — a covered
+    # window is a flat 240 (score/info page or another agent's window on top)
+    case $i in *0) osascript -e 'tell application "System Events" to set frontmost of process "glmark2-macos" to true' 2>/dev/null;; esac
+done
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
 
 n=0
@@ -66,6 +71,10 @@ if len(vals) < 50:
     print(f"FAIL: only {len(vals)} usable captures (window not frontmost?)"); sys.exit(1)
 head = vals[:120]                     # skip any end-of-run score page
 vs = sorted(head); med = vs[len(vs) // 2]
+covered = sum(1 for v in head if v > 230)
+if covered > len(head) * 0.25:
+    print(f"INVALID: {covered}/{len(head)} covered frames (>230) — the window was "
+          "occluded during the run (another agent's window / score page); retry"); sys.exit(2)
 # the jellyfish scene must be VISIBLE for the check to mean anything: its
 # window-region mean is ~110-130; a flat ~240 is the info/score page or a
 # covered window (vacuous pass guard)
