@@ -684,6 +684,7 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
 
     int prim = native_prim(mode);
     bool adjacency = is_adjacency(mode);
+    uint64_t t27 = mgl_prof_begin(27);
 
     if (!indexed)
     {
@@ -833,6 +834,7 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
 
     draw_index_list(ctx, batch, mode, type, cpu, count, instances, basevertex, baseinstance,
                     restart, restart_index, client ? NULL : &origin);
+    mgl_prof_end(27, t27);
 }
 
 /* hand a draw to the transform feedback capture wrappers (xfb domain), which capture and
@@ -874,10 +876,16 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
         return;
     }
 
-    if (!mgl_ext_pre_draw(ctx, mode, count, instances))
     {
-        mgl_prof_end(7, p7);
-        return;
+        uint64_t t24 = mgl_prof_begin(24);
+        bool ok = mgl_ext_pre_draw(ctx, mode, count, instances, indexed, indexed ? type : 0,
+                                   indexed ? offset : 0);
+        mgl_prof_end(24, t24);
+        if (!ok)
+        {
+            mgl_prof_end(7, p7);
+            return;
+        }
     }
 
     /* a geometry stage runs through its own path: capture pass + kernel + pass-through
@@ -1167,31 +1175,63 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
                          : mgl_rstate_arrays_rewrite_needed(ctx, mode));
 
     /* a geometry stage can take the command directly as well: the prep kernel reads it from
-     * the app's buffer, so the CPU never sees the counts */
+     * the app's buffer, so the CPU never sees the counts.  An active CPU-counted query
+     * (pipeline statistics) still needs the counts: read the command, run the pre-draw
+     * hook (query counting + conditional rendering), then route. */
+    bool counted = false;   /* queries already counted this draw (don't count twice) */
+
     if (geom && !capturing && prim >= 0 && type != GL_UNSIGNED_BYTE && mode != GL_PATCHES)
     {
-        batch_end(ctx, batch);
-        if (mgl_geom_route_indirect(ctx, mode, type, ibuf, offset))
-            return;
+        bool route = true;
+
+        if (need_counts)
+        {
+            if (read_indirect(ctx, ibuf, offset, cmd, words, true))
+            {
+                counted = true;
+                /* an empty or oversized command draws (and counts) nothing */
+                if (cmd[0] == 0 || cmd[1] == 0 || cmd[0] > INT32_MAX || cmd[1] > INT32_MAX)
+                    return;
+                /* false: conditional rendering discards the draw */
+                if (!mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1], type != 0, type,
+                                      type ? (size_t)cmd[2] * getTypeSize(type) : 0))
+                    return;
+            }
+            else
+            {
+                /* counts unavailable (buffer not CPU-visible): route anyway rather than
+                 * drop the draw — the query result stays approximate, as before */
+                route = false;
+            }
+        }
+
+        if (route)
+        {
+            batch_end(ctx, batch);
+            if (mgl_geom_route_indirect(ctx, mode, type, ibuf, offset))
+                return;
+        }
     }
 
     // read the command when CPU-visible; when nothing needs the counts and Metal can
     // take the command buffer directly, skip the read entirely (gpuaudit)
-    bool known = (gpu_ok && !need_counts) ? false
-                                             : read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok || need_counts);
+    bool known = counted ? true
+                         : ((gpu_ok && !need_counts) ? false
+                                                     : read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok || need_counts));
 
     if (!known && !gpu_ok)
         return;
 
     if (known)
     {
-        if (!mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1]))
+        if (!counted && !mgl_ext_pre_draw(ctx, mode, (GLsizei)cmd[0], (GLsizei)cmd[1], type != 0, type,
+                                          type ? (size_t)cmd[2] * getTypeSize(type) : 0))
             return;
 
         if (cmd[0] == 0 || cmd[1] == 0 || cmd[0] > INT32_MAX || cmd[1] > INT32_MAX)
             return;
     }
-    else if (!mgl_ext_pre_draw(ctx, mode, 0, 0))
+    else if (!mgl_ext_pre_draw(ctx, mode, 0, 0, false, 0, 0))
     {
         // counts are produced on the GPU and not visible yet
         return;

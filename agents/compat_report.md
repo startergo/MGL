@@ -1,4 +1,254 @@
 # compat domain — progress log
+READY e4142bb (supersedes 30f7bb8/fa2a242; adds the [jellyfish] present-flash fix the user
+reported at 07:00 + everything from 30f7bb8: merge d31c9ba, ONE reserved-word implementation,
+[ideas] layout-keyed PSO cache, DIRTY_FBO gate rule, drawpix sRGB/RGTC; suite 0 FAIL (95
+files), test_geom 10x 603/0, test_fp64fast 3x 298/0, jellyfish 4498 FPS caustics intact no
+flashes (ab/flash_check.sh PASS, old order FAILs it), gl41-geometry 2008 FPS no magenta, ideas
+392-422 FPS under load 5.9-7.7 (quiet-machine A/B 485->578; user idle-machine 2887 on fa2a242 —
+the flash fix touches only the present path, not the draw path)).
+NOT-PASSING (pre-existing, not compat): KHR-GL46.texture_swizzle.smoke HANGS before any
+subcase — sampled the stuck glcts: glslang ProcessDeferred/initializeExtensionBehavior
+(external/glslang internal), also NoResult in the r22 sweep.  The compat part of geom's finding
+is in (fast path declines DIRTY_FBO, 30f7bb8); the hang itself is texture/glslang domain.
+BENCH-REQUEST e4142bb: user visual + same-hour A/B as before; watch [jellyfish] for flashes
+(fixed) and confirm ideas/jellyfish/gl41 FPS unchanged vs the fa2a242 run (present-path only).
+BENCH-REQUEST 66f0f1c: same bench as mglR16 (full default list, same-hour A/B).  Diff vs
+c6b8124 = tess merge + reserved-word unification + the [ideas] PSO-layout-key fast path
+(layout-keyed pipeline cache + plan-restore skip; expect [ideas] up, everything else neutral
+— jellyfish/ideas/gl41-geometry visuals verified unchanged this session).
+READY c6b8124 (on 852eee2 + 638e1ed; jellyfish caustics FIXED — see session 15; suite 0 FAIL
+(85 files), test_geom 603/0, test_fp64fast 298/0; glmark2 [jellyfish] FPS 4580 (was 3987 at
+852eee2), bell now dark rich blue with caustic web like native: window-capture bell mean
+(79-92, 90-121, 128-195) grad 5.2-6.2 vs native (81-89, 93-114, 132-180) grad 2.6-8.1; before
+the fix MGL was pale cream (193-230, 176-213, 154-186)).
+BENCH-REQUEST c6b8124: same bench as mglR16 (full default list, same-hour A/B).  The present
+path gained one tiny compute dispatch per present (force-alpha-opaque kernel, 800x600, ~0.03 ms,
+~12-15 presents/s) — expected neutral; verify jellyfish + ideas visuals.
+
+## session 14 (Oct 25, 17:30-20:39 EDT) — CAMetalLayer stacking/opaque, honest GL strings (from the supervisor's summary; commits f5c3256, 852eee2 + uncommitted GLSL scanner work)
+- CAMetalLayer stacking fix (ideas logo no longer drawn into the jellyfish), hash-table delete
+  leak fix, compat-profile GL_EXTENSIONS, silent default build, xctx tests, test_xctx9-12 drafts.
+- CAMetalLayer.opaque=YES (washed colours fixed then), honest GL strings (Vendor Apple, Renderer
+  MTLDevice.name, Version '4.6 Metal - 90.5', GLSL 4.60, env overrides), xctx3-8, test_gsindirect*.
+- Left uncommitted: the GLSL §3.7 reserved-word scanner (false-positived on jellyfish.vert) —
+  finished and committed as 638e1ed in session 15.
+
+## session 16 (Oct 26, 01:15-04:15 EDT) — merge gl46-port (tess r23/r24); ONE reserved-word impl; [ideas] per-draw CPU -20%
+- `git merge gl46-port` (9485327: tess r23/r24) auto-resolved cleanly (e62b50b) but left BOTH
+  reserved-word scanners live: compat's `scan_reserved_names` (638e1ed, shaders.c) and tess's
+  `mgl_reject_reserved_declarators` (aa32719, cts_glsl_compat.c, called on the raw source in
+  mglCompileShader AND from mgl_cts_glsl_compat_limited).
+- Unification decision, driven by measurement not preference: new `tests/headless/test_reserved.c`
+  battery (1463 compiles — 38 reserved words + 95 keywords × 11 declaration slots + positive
+  controls).  With compat's scanner disabled, glslang + tess's reject everything EXCEPT
+  `struct invariant {...}` (struct TYPE name).  So tess's is the survivor (targeted, no heuristic
+  lexer; tess's own report asks for exactly that if only one may live) and the struct-name case
+  was added to it (+10 lines in cts_glsl_compat.c; MGL's compat preamble struct names are all
+  mgl_*, unaffected).  compat's 270-line scanner deleted from shaders.c.
+- test_reserved.c also pins the integer-mix version rule (tess r24's headless test was not on
+  the branch): `mix(ivec2(1), ivec2(2), bvec2(true))` rejected below #version 450, legal at 460,
+  float mix always legal; plus legal-keyword positives (constructor after an identifier operand —
+  the old jellyfish.vert false positive — flow control, qualifier positions, correct subroutine
+  declarations, #version 120 attribute/varying on a compat context).
+- Known gap (documented in the test, pre-existing): a legacy identifier named sample/patch/
+  centroid breaks on the compat path because the translator re-emits the body at #version 460
+  where those words became keywords.  glmark2 doesn't use them; fix would need symbol renaming.
+- **[ideas] per-draw CPU (a6431f2, USER PRIORITY)**: the pipeline-cache key mixed the VAO
+  pointer, the per-attrib buffer pointers and the element-array buffer into key.b.  [ideas]
+  draws ~89 VAOs/frame with identical layouts but different VBOs → 89 PSO entries → every hit
+  was a move-to-front memmove of up to ~44×~512 B slots + a 940 B re-hash/snapshot copy per
+  walk.  Now `compatVAOHashCached` packs exactly the LAYOUT words the descriptor reads (fmt:
+  size/type/normalized/integer/is_long/relativeoffset/binding; binding: buffer-bound/offset/
+  stride/divisor) and validates the single-entry cache by memcmp of the packed words (an EXACT
+  validator — two VAOs with identical layouts validate each other, collapsing 89 draws to ONE
+  PSO entry; pipeHit=89/frame at slot 0).  Plus a plan-restore skip (plan_live_msl/plan_live_vao:
+  the fetch/shadow/const analysis is a pure function of program content + layout; only another
+  key's hit or the descriptor path rewrites it).  test_vattrib float_conversions caught the first
+  cut that hashed the legacy attrib[] mirror instead of fmt[]/binding[] (integer/is_long/
+  binding-offset were missing) — the full-struct pack fixed it.
+- Also fixed in passing: `misswhy[24]` was written at indices 24/25 (OOB counter writes, session
+  13 bug); stale `compatDrawFast` declaration (session 12) removed.
+- **A/B numbers**: draw bucket (MGL_PROFILE tail, identical instrumentation) 1.436 → 1.111
+  ms/frame (-23%); median-of-dumps sequential A/B (base=f608578 built in /tmp, 4 interleaved
+  rounds) draw 0.185 → 0.148 ms/frame (-20%); final-round FPS 485 → 578 (+19%).  Quiet-machine
+  steady state (938 FPS): draw 0.534 ms/frame = 47% state walks (2.8 µs × 89; pipeline-block
+  0.6 µs/walk after the fix, was ~2.0), 15% gate (0.23 µs/draw), 13% encode (0.2), 16% draw
+  prologue (0.25 µs; execDrawRaw = 1 call/frame — the batch path appends without re-entering
+  exec_draw_raw).  Remaining fat if someone continues: the 89 walks' PreDraw-hooks fan-out
+  (0.74 µs/walk) and bindList (0.35 µs/call).
+- Gate (all on the final tip 66f0f1c): suite **93 files 0 FAIL**; test_geom 10× 603/0;
+  test_fp64fast 3× 298/0; KHR-GL46.CommonBugs.CommonBug_ReservedNames **Pass**; KHR-GL46.shaders.*
+  (one glcts batch, tests/cts_group.sh, run on 07cd1f5 before the draw-path-only perf change)
+  **2382 cases: 2370 Pass / 6 Fail (pre-existing uniform_block.random.*, identical set to
+  r22/r24) / 6 NotSupported (integer_mix positives)**.
+- glmark2 visuals after the perf change (ab/xctx_capture.sh): jellyfish bell (74,107,196) ≈
+  before (74,106,194), caustic web, FPS 4606; ideas (74,73,71) ≈ before (80,79,78), no leak;
+  gl41-geometry periodic grid unchanged.  No table-growth messages.
+- Next: remaining r22 partial_fails are all OTHER domains (see the 16b re-sweep below); more
+  [ideas] CPU if the bench still shows headroom (PreDraw-hooks fan-out 0.74 µs/walk, bindList
+  0.35 µs/call).
+
+## session 16b (Oct 26, 04:20-05:20 EDT) — r22 partial_fails re-sweep + glDrawPixels sRGB/RGTC
+- Re-swept all 71 remaining entries of ~/MGL-cts/mgl-r22-sweep/partial_fails.txt on the current
+  build (tests/cts_many.sh): ReservedNames + integer_mix.prototypes-negative already fixed by
+  this session's merge.  Still failing, by owner: cull_distance.functional/coverage (GLSL
+  gl_CullDistance compile/link — shader/tess), draw_indirect twoPass-tf ×2 (draw), fp64
+  inverse_dmat3 (fp64), pipeline_statistics functional_geometry_shader (queries), atomic_
+  counters advanced ×2 (program), image_load_store basic-allTargets (texture), uniform_block.
+  random ×6 (pre-existing, tess), texture_gather incomplete ×2 + texture_swizzle (texture,
+  swizzle NoResult at 75 s), vertex_attrib_64bit limits/vao (vattrib+fp64), viewport_array.
+  scissor_clear (draw).  **packed_pixels ×16 (sRGB/RGTC via glTexImage2D/getTexImage/
+  readback — TEXTURE domain; glctsPackedPixelsTests.cpp never calls glDrawPixels)** — left
+  for the texture agent, noted here for the supervisor.
+- Closed the matching compat gaps anyway (fa2a242): glDrawPixels writes its payload VERBATIM
+  into an sRGB-encoded framebuffer (GL 4.6 §16.4 — the pixel path is a copy; sRGB encoding is
+  for shader-written fragments).  Implementation: blit_upload_pixels uploads through an
+  sRGB8_ALPHA8 view of the blit texture when FBO attachment 0 is sRGB (blit_target_is_srgb —
+  sRGB-ness from the Texture internalformat via FBOAttachment.textarget): sampling decodes,
+  the sRGB attachment re-encodes, decode∘encode is the 8-bit identity.  Plus GL_SRGB8 /
+  GL_COMPRESSED_SRGB input-format grouping (3 components) and CPU block-decode of RGTC1/
+  RGTC2 (signed + unsigned) drawpix payloads (BC4/BC5, code bits at block bytes 2..7 — the
+  first cut read them at offset 8; test_compat_drawpix's pixel-exact RGTC case caught it).
+- New test tests/headless/test_compat_drawpix.c (16 checks, 0 fail; suite now 94 files 0 FAIL).
+
+## session 16d (Oct 26, 07:10-10:05 EDT) — [jellyfish] present-flash fix (user report 07:00)
+- User on fa2a242 (idle machine): ideas 2887, jellyfish 12326, gl41-geometry 2934 -> 6048,
+  logo gone, log silent — but "[jellyfish] has some flashes like from a flash on a camera".
+- Root cause (found with a causal probe, MGL_PRESENT_PROBE_US): layer.contents on a raw
+  IOSurface is composited ASYNCHRONOUSLY — CA does not wait for our swap command buffer.  The
+  s15 present order (blit frame -> surface, THEN force alpha opaque on the surface) left a
+  window in which one display refresh could composite the new frame while its alpha still held
+  GL's blended value: the whole translucent frame over the white window backdrop = one bright
+  flash.  Probe evidence: old order + 50 ms window -> luminance 107 -> 130.7 (flash state);
+  new order with the SAME window -> steady 107.4-109.3.  Real world: old order 10 s video
+  (1661 frames): 7 whole-frame spikes (median 98.8 -> 116); new order: 0 in 150 captures.
+- Fix (e4142bb): force the copy SOURCE's alpha opaque BEFORE the blit — the presented surface
+  transitions old -> opaque-new in one blit; the half-alpha state never reaches an IOSurface
+  CA can see.  Two corrections found while verifying: (a) the private default framebuffer
+  lacked MTLTextureUsageShaderWrite so the read_write kernel on it was UB — the surface showed
+  magenta garbage (FF 00 FF pattern); fbEnsureDefaultFramebuffer adds ShaderWrite and
+  compatSurfacePresent only pre-fixes sources that carry it (else the old post-blit kernel on
+  the pool surface); (b) compatCSDrain before the kernel dispatch (no concurrent encoders).
+- ab/flash_check.sh (new regression check): 150 window captures, per-frame mean must stay
+  within median+15 WITH THE SCENE VISIBLE (flat ~240 median = info page/covered window =
+  INVALID, a vacuous-pass guard added after it passed on the wrong content once).  Old order:
+  FAIL (3 spikes 134/128/127); fixed order: PASS (median 114.3, max 119.1).
+- Gate: suite 95 files 0 FAIL; test_geom 10x 603/0; test_fp64fast 3x 298/0; visuals:
+  jellyfish bell (69,104,195) caustics intact, gl41-geometry (72,98,164), ideas dark-phase
+  matches the old build at the same scene time; no magenta, no flashes.  FPS under load
+  5.9-7.7: jellyfish 4498, gl41-geometry 2008, ideas 392-422.
+- texture_swizzle.smoke: still hangs BEFORE any subcase verdict (sampled glcts: glslang
+  ProcessDeferred / initializeExtensionBehavior — external dependency, also NoResult in r22).
+  The compat part (fast path declines DIRTY_FBO so the descriptor path retargets the encoder
+  to a newly attached FBO texture) is in since 30f7bb8; the hang is texture/glslang domain.
+- Supervisor ownership note (08:42) acknowledged: compat owns MGLRenderer+Compat.m and the
+  pipeline fast path.  The gate rule stays narrowed to DIRTY_FBO-always-declines
+  (ALPHA/RENDER_STATE content is hashed fresh in the fast path; the full mask cost ideas 4
+  descriptor builds/frame — FPS 328 vs 459-578, plus geom's magenta frames were this same
+  ShaderWrite UB class, fixed here).
+
+## session 16c (Oct 26, 05:50-06:40 EDT) — merge gl46-port d31c9ba + geom's fast-path gate rule
+- `git merge gl46-port` (d31c9ba: tess r24 final — xfb capture in the draw path, cull_distance
+  GLSL, msl_reserved table, fp64 matrix_inverse, get.c) auto-merged clean (a0825a5); the compat
+  reserved-word struct-name case survived; test_reserved 21/0.
+- Supervisor relayed geom e767e6a: the compat pipeline fast-path gate must not take DIRTY_FBO/
+  ALPHA/RENDER_STATE triggers (a newly attached FBO texture is never bound → texture_swizzle.
+  smoke wrong pixel).  My gate had the same hole (declined only on DIRTY_SHADER|DIRTY_DRAWABLE).
+  Fixed 30f7bb8 — DIRTY_FBO always declines.  ALPHA/RENDER_STATE kept admissible (see the
+  GATE-DEVIATION NOTE above for the reasoning + the measured cost of the full rule + the
+  one-line re-adoption).
+- KHR-GL46.texture_swizzle.smoke on this tree: HANGS (NoResult) — pre-existing, texture domain
+  (same in the r22 sweep), so geom's exact repro could not be re-run here; the mask change is
+  driven by the rule + the invisible-swap analysis, and test_compat_pipefbo.c pins the
+  observable class (re-attach same-format T1→T2; yellow must land in T2, T1 stays green).
+- Gate on 30f7bb8: suite **95 files 0 FAIL**; test_geom 10× 603/0; test_fp64fast 3× 298/0;
+  CommonBug_ReservedNames Pass; glmark2 jellyfish 4404 FPS bell (73,106,193) caustics intact,
+  ideas neutral no-leak (103,102,97 — animated phase; structure thumbnail unchanged),
+  gl41-geometry periodic grid (74,99,160); [ideas] profile after the gate change: pipeHit=89/
+  frame, 0 descriptor builds.
+
+## session 15 (Oct 25, 20:45-23:30 EDT) — jellyfish caustics: presented-surface alpha
+
+PRIORITY-1 bug (user-visible, blocked the merge): glmark2 [jellyfish] bell pale/flat, no caustic
+web, through the NSOpenGL interposer.  Root cause found and fixed.
+
+Investigation trail (tools committed under .agent/):
+- per-draw texture binding verified live (MGL_BINDTRACE on a real run): unit 1 gets the rotating
+  caustic textures (names cycle, each a distinct 256x256 MTLTexture), unit 0 gets jellyfish256.
+- the linked MSL is correct (MGL_DUMP_MSL): uSampler1 = texture(0) sampled with the world-uv
+  caustic term, uSampler = texture(1) with vTextureCoord.  No swap.
+- headless repro with the real shaders/PNGs/blend on the compat path works (test_xctx13).
+- MGL_PRESENT_DUMP (new, post-commit readback of the presented IOSurface): every presented frame
+  HAS the caustic web — bell mean (82-87, 100-110, 143-170) local-contrast grad 8-10.  The render
+  was never wrong.
+- the WINDOW (screen) showed a washed-out bell (193-230, 176-213, 154-186) while the presented
+  surfaces were rich, and the opaque gradient background matched the screen bit-exactly ->
+  difference only where alpha < 255.  Alpha dump of the presented IOSurface: the jellyfish region
+  has alpha 85..254 — GL leaves dst.a = a*a + (1-a) after SRC_ALPHA/ONE_MINUS_SRC_ALPHA blending.
+  CoreAnimation alpha-composites layer.contents over the (white) window backdrop, so every
+  translucent pixel washed out.  (GL window semantics discard the default framebuffer's alpha at
+  present; Apple's own GL surfaces are opaque.)
+
+Fix (MGLRenderer+Compat.m):
+- mgl_force_opaque compute kernel (built once per pool from MSL source, cached in the pool):
+  rewrites the presented IOSurface's alpha to 1.0 before the commit that shows it.  Dispatched in
+  both present paths (direct render-into-slot and blit).  ~15 dispatches/s of 800x600 threads —
+  glmark2 [jellyfish] FPS 4580 vs 3987 before (noise).
+- pool.layer.opaque = YES (the presenting sublayer; _layer.opaque from 852eee2 only covered the
+  never-presented CAMetalLayer itself).
+- MGL_PRESENT_DUMP=<n> debug: dumps the presented surface (+ alpha channel) after the commit,
+  /tmp/mgl_present_<k>.ppm + mgl_present_alpha_<k>.pgm — this is how the alpha bug was proven.
+- MGL_BINDTRACE extended with the GL name and MTLTexture size (MGLRenderer.m, debug-only).
+
+Also fixed here (blocked the s14 GLSL reserved-word work): the scanner draft rejected legal
+constructor calls after an identifier operand (real jellyfish.vert 'uWorldInvTranspose * vec4(..)'
+-> "'vec4' reserved word").  Now keywords are only rejected in a declared-name slot after a
+type/storage token, always-reserved words anywhere, and the compat translator's output is marked
+/*mgl-compat:<user version>*/ so only the user's body is scanned, and only for #version >= 400.
+Committed as 638e1ed with tests xctx9-12; suite 0 FAIL, test_geom 603/0, test_fp64fast 298/0.
+
+Tests: tests/headless/test_xctx13.c — full jellyfish pipeline on a compat context (real
+jellyfish.vert/frag, real jellyfish256 RGBA + caustics RGB upload, 34 texture names past the
+initial hash-table size, LINEAR + REPEAT set after upload like the scene, SRC_ALPHA blending):
+sanity coverage, caustic contribution (web vs solid black must differ), caustic spread across the
+quad, REPEAT wrap at u=10.0 -> LINEAR 2x2 average 72 (clamp would be 136).  15 checks 0 failures.
+
+## session 13 (Oct 25, 12:30-16:00 EDT) — bindmap prefix cache + PSO cache C slots + plan restore
+
+Machine mostly loaded (sweep/other agents); all numbers interleaved same-instant vs ab/base13
+(= ec592db = session-12 code + 159d900), profile via MGL_PROFILE=1.
+* mapBuffersToMTL (bucket 11, 89 walks/frame in ideas) re-enumerated the program's SPIR-V buffer
+  resources per walk although the UBO/SSBO/atomic/dub PREFIX depends only on (program, link ->
+  DIRTY_PROGRAM, buffer_base content, dub identity).  Now served from an exact cache
+  (struct MGLCompatBindmapCache in MGLRenderer+Compat.m, state slot in mgl_compat_perf.h):
+  validation = program ptr + !DIRTY_PROGRAM + vstage + 4x buffer_base memcmp + nullbuf + per-stage
+  dub pointer revalidation; hit path memcpy-prefix + mgl_buffers_mark_gpu_use for SSBO/ACB entries
+  + vattrib suffix re-runs.  ideas: 85% hit (82/f, misses = the 14 program switches/f).  Kill
+  switch MGL_BINDMAP=0.
+* PSO cache (compatPipelineFastPath/Store): NSMutableArray<CompatPipeBox> -> plain C slots
+  (key a/b + CFBridgingRetained pipe), no ObjC on the hit path; MTF via memmove.
+* REAL BUG found+fixed while instrumenting: on a PSO cache hit, s->plan kept the LAST descriptor
+  build's fetch/shadow/const analysis, but a cache hit only proves the key — scenes alternating
+  two cached layouts (ideas: 2-vs-3 component inputs; "plan diff at +196 (2->3)") drew each mesh
+  with the other layout's plan (wrong const-mask/shadow-slot/dbl handling — same class as the
+  heap-overflow crash fixed earlier in vattrib).  Each slot now stores the MGLVattribDrawPlan it
+  was built with; the hit path memcmps the static part and restores the slot copy (this walk's
+  binding_index preserved).  First attempt (re-run the generator on digest mismatch) refreshed
+  ~every walk in ideas (oscillating digests, +0.08 ms/f) — the memcpy restore costs ~0.1 us.
+* Profiling buckets renamed/added (MGLRenderer.m names[]): 15 texture-bind-walk, 20
+  pipeline-block, 21 tail-pipeBind+PreDraw, 23 PreDraw-hooks; ssboSizes (geomSSBOSizesNeeded)
+  was already cached per program — supervisor item 3 needs nothing.
+* Draw merging (item 5): still not applicable — the run histogram shows zero consecutive draws
+  with equal (PSO, count, first, instance, offset, stride, divisor); Apple's 353->266 must come
+  from elsewhere (their text glyphs / instanced paths).
+* ideas decomposition after this session (quiet-ish hour): draw 0.59 ms/f = gate 0.10 (353),
+  processGLState 0.27 (89; pipeline-block 0.09, tail 0.10 incl PreDraw-hooks 0.08, mapBuffers
+  0.04), bindList 0.06 (134), encode-draw 0.08 (352) — the tail is now dominated by real Metal
+  binds + the vattrib hook's ring write of the changed dub (per-object matrices).
+* Shared-file edits: MGLRenderer.m (mapBuffersToMTL 4-line hook + 3 prof buckets + names[]),
+  MGLRenderer+VertexAttrib.m none this session (plan fix is in my file), glm_context.h none.
+
+BENCH-RESULT 28386d2 (head 15f5af0) 12:15 EDT Oct 25: native13 6492; mglR16 13629 / mglR16b 13684 vs same-hour baseline 5e02260 (mglBase5e) 13711 = -0.4% noise (machine ~5% slower than this morning). ideas 3404/3427 vs baseline 2804 (+22%) vs native 3576 (96%). Not pinned. MERGED. table_R16.txt. (native12/mglR15 at 10:20 = invalid, system degraded.)
 
 READY 28386d2 (gl46-port merged as f5607b5 + 3 commits; suite 496/0, test_geom 603/0,
 run twice + test_atomic_counters 3x; default path only — encoder thread untouched, still OFF).

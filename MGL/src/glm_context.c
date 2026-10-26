@@ -33,6 +33,19 @@
 #include "error.h"
 #include "mgl_ext.h"
 
+/* Default builds must be silent: context-lifecycle chatter is behind MGL_DEBUG */
+static int mgl_dbg_env(void)
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_DEBUG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+
 extern void getMacOSDefaults(GLMContext glm_ctx);
 extern void init_dispatch(GLMContext ctx);
 
@@ -51,7 +64,7 @@ static void mgl_auto_init(void) {
                                GL_DEPTH_COMPONENT24, GL_UNSIGNED_INT,
                                GL_STENCIL_INDEX8, GL_UNSIGNED_BYTE);
         CppCreateMGLRendererHeadless(_ctx);
-        fprintf(stderr, "MGL: Initialized headless Metal renderer\n");
+        if (mgl_dbg_env()) fprintf(stderr, "MGL: Initialized headless Metal renderer\n");
     }
 }
 
@@ -369,7 +382,7 @@ void destroyGLMContext(GLMContext ctx)
     if (ctx == NULL)
         return;
 
-    fprintf(stderr, "MGL INFO: Destroying GLMContext\n");
+    if (mgl_dbg_env()) fprintf(stderr, "MGL INFO: Destroying GLMContext\n");
 
     // CRITICAL FIX: Implement basic cleanup of context resources to prevent major memory leaks
     // Clean up critical hash tables to prevent memory corruption
@@ -433,13 +446,13 @@ __attribute__((destructor))
 static void mgl_auto_cleanup(void)
 {
     if (_ctx != NULL) {
-        fprintf(stderr, "MGL INFO: Auto-cleanup - destroying GLMContext\n");
+        if (mgl_dbg_env()) fprintf(stderr, "MGL INFO: Auto-cleanup - destroying GLMContext\n");
 
         // Signal cleanup to any in-flight operations
         // The MGLRenderer dealloc will handle Metal resource cleanup
 
         _ctx = NULL;
-        fprintf(stderr, "MGL INFO: Auto-cleanup completed\n");
+        if (mgl_dbg_env()) fprintf(stderr, "MGL INFO: Auto-cleanup completed\n");
     }
 }
 

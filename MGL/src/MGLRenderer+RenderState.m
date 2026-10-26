@@ -766,8 +766,10 @@ static void rs_recompile_program(GLMContext glm_ctx, Program *program, unsigned 
 #pragma mark - ext hooks
 
 /* C pre-draw hook (called by every draw entry point before the Metal draw) */
-static bool rs_pre_draw(GLMContext glm_ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count)
+static bool rs_pre_draw(GLMContext glm_ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                        bool indexed, GLenum type, size_t offset)
 {
+    (void)vertex_count; (void)instance_count; (void)indexed; (void)type; (void)offset;
     GLMContext ctx = glm_ctx;
 
     if (mode != s_rs_draw_mode) {

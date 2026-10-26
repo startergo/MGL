@@ -30,6 +30,10 @@
 #include "glm_context.h"
 #include "mgl_ext_queries.h"
 #include "mgl_ext_geom_xfb.h"
+#include "mgl_ext_buffers.h"   /* CPU-ordered element reads for restart counting */
+
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
 
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
 
@@ -536,24 +540,120 @@ static inline void count_active(struct MGLExtState_queries *S, int bp, uint64_t 
         S->active[bp]->cpu_count += v;
 }
 
-static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count)
+/* exact vertex / primitive counts for an indexed draw with primitive restart enabled:
+ * the index stream is split at restart indices, the restart indices themselves are not
+ * submitted, and incomplete primitives at a restart are discarded.  Returns false when
+ * the element range is not CPU-visible right now (caller falls back to the estimate). */
+static bool restart_index_counts(GLMContext ctx, GLenum mode, GLenum type, size_t offset,
+                                 GLsizei count, uint64_t *vertices_out, uint64_t *prims_out)
+{
+    uint32_t restart = 0, index;
+    uint64_t verts = 0, prims = 0, seg = 0;
+    VertexArray *vao = ctx->state.vao;
+    Buffer *eb = vao ? vao->element_array.buffer : NULL;
+    const uint8_t *base;
+    int tsize;
+
+    if (ctx->state.caps.primitive_restart_fixed_index)
+        restart = type == GL_UNSIGNED_BYTE ? 0xFFu : type == GL_UNSIGNED_SHORT ? 0xFFFFu : 0xFFFFFFFFu;
+    else if (ctx->state.caps.primitive_restart)
+        restart = ctx->state.var.primitive_restart_index;
+    else
+        return false;
+
+    if (count <= 0)
+        return true;    /* nothing submitted: both counts stay 0 */
+
+    if (eb)
+    {
+        /* GPU-written element data must be visible before the CPU scan */
+        MGLBufferTrack *t = mgl_buffers_track(ctx, eb, false);
+        if (t && ctx->mtl_funcs.ext_buffers && t->write_serial > ctx->mtl_funcs.ext_buffers->completed_serial(ctx))
+            mgl_buffers_prepare_cpu_read(ctx, eb);
+        base = (const uint8_t *)eb->data.buffer_data;
+        if (!base)
+            return false;
+        if (offset > (uint64_t)eb->size)
+            return false;
+    }
+    else
+    {
+        base = (const uint8_t *)(uintptr_t)offset;    /* client index pointer */
+        offset = 0;
+    }
+
+    tsize = type == GL_UNSIGNED_BYTE ? 1 : type == GL_UNSIGNED_SHORT ? 2 : 4;
+    if (eb && (uint64_t)offset + (uint64_t)count * tsize > (uint64_t)eb->size)
+        return false;
+
+    base += offset;
+    for (GLsizei i = 0; i < count; i++)
+    {
+        switch (type) {
+            case GL_UNSIGNED_BYTE:  index = base[i]; break;
+            case GL_UNSIGNED_SHORT: index = ((const uint16_t *)base)[i]; break;
+            default:                index = ((const uint32_t *)base)[i]; break;
+        }
+
+        if (index == restart)
+        {
+            prims += primitives_for(mode, seg);
+            seg = 0;
+            continue;
+        }
+
+        verts++;
+        seg++;
+    }
+    prims += primitives_for(mode, seg);
+
+    *vertices_out = verts;
+    *prims_out = prims;
+    return true;
+}
+
+static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                             bool indexed, GLenum type, size_t offset)
 {
     struct MGLExtState_queries *S = QS(ctx);
     uint64_t inst, verts, prims;
     bool has_gs, has_tess;
+    uint64_t t26 = mgl_prof_begin(26);
 
     if (!S)
         return true;
 
     if (!mgl_queries_render_allowed(ctx))
+    {
+        mgl_prof_end(26, t26);
         return false;   /* conditional rendering discards the draw */
+    }
 
     if (vertex_count <= 0 || instance_count <= 0)
         return true;
 
     inst = (uint64_t)instance_count;
-    verts = (uint64_t)vertex_count * inst;
-    prims = primitives_for(mode, (uint64_t)vertex_count) * inst;
+
+    if (indexed && (ctx->state.caps.primitive_restart || ctx->state.caps.primitive_restart_fixed_index))
+    {
+        /* exact counts: split the index stream at restart indices */
+        uint64_t rverts = 0, rprims = 0;
+        if (restart_index_counts(ctx, mode, type, offset, vertex_count, &rverts, &rprims))
+        {
+            verts = rverts * inst;
+            prims = rprims * inst;
+        }
+        else
+        {
+            verts = (uint64_t)vertex_count * inst;
+            prims = primitives_for(mode, (uint64_t)vertex_count) * inst;
+        }
+    }
+    else
+    {
+        verts = (uint64_t)vertex_count * inst;
+        prims = primitives_for(mode, (uint64_t)vertex_count) * inst;
+    }
 
     has_gs = program_has_stage(ctx, _GEOMETRY_SHADER);
     has_tess = program_has_stage(ctx, _TESS_EVALUATION_SHADER) && mode == GL_PATCHES;
@@ -585,6 +685,7 @@ static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
         count_active(S, MGL_QB_GEOMETRY_SHADER_INVOCATIONS, prims);
     }
 
+    mgl_prof_end(26, t26);
     return true;
 }
 

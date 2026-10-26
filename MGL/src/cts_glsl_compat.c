@@ -1167,6 +1167,16 @@ static char *reject_reserved_declarators(const char *src)
             }
             continue;
         }
+        /* 'struct <name> {' — the declared struct TYPE name (glslang accepts
+         * 'struct invariant {...}' — GLSL 4.6 3.7; found by the full reserved
+         * word x slot battery, tests/headless/test_reserved.c) */
+        if (!strcmp(tok, "struct")) {
+            char n2[64];
+            mglc_token(src, len, j, n2, sizeof n2);
+            if (n2[0] && mglc_is_reserved(n2))
+                return pp_error_source(src, "reserved word used as a struct name");
+            continue;
+        }
         /* 'invariant' used as a declarator / argument NAME: the token AFTER it
          * ends the declaration (qualifier position is always followed by an
          * identifier) */

@@ -112,6 +112,16 @@ struct MGLExtMetal_compat {
         uint8_t *snap;              /* malloc'd copy of the hashed bytes */
     } vaokey;
 
+    /* per-walk uniform/storage buffer-map PREFIX cache (compat perf session
+     * 13): mapBuffersToMTL re-enumerates the program's SPIR-V buffer
+     * resources on every dirty walk, but the UBO / SSBO / atomic-counter /
+     * default-uniform prefix of the two stage lists only changes with the
+     * program (relink arms DIRTY_PROGRAM) or a buffer_base rebind — never
+     * with the VAO re-specification that triggers most walks.  The layout is
+     * private to MGLRenderer+Compat.m (it needs GL types); this is the
+     * malloc'd struct MGLCompatBindmapCache, NULL until first use. */
+    void    *bindmap_cache;
+
     /* per-draw texture RESOLUTION cache (compat perf session 8): the bind
      * shadow above filters the encoder CALLS; this filters the CPU-side
      * resolution chain (texextValidate + texdata realize + sampler lookup +

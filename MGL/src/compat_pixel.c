@@ -19,6 +19,92 @@
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 #include "vertex_arrays.h"
 
+/* RGTC (BC4/BC5) decode for glDrawPixels payloads — one texel per call.
+ * RGTC1 block: c0,c1 endpoints + 48 bits of 2-bit codes (row-major inside the
+ * 4x4 block, low bit first); RGTC2 = two consecutive 8-byte blocks (R, G). */
+static void rgtc_block_texel(const GLubyte *blk, unsigned ci, GLenum format, float out[2])
+{
+    bool two = (format == GL_COMPRESSED_RG_RGTC2 || format == GL_COMPRESSED_SIGNED_RG_RGTC2);
+    bool sgn = (format == GL_COMPRESSED_SIGNED_RED_RGTC1 || format == GL_COMPRESSED_SIGNED_RG_RGTC2);
+
+    for (int ch = 0; ch < (two ? 2 : 1); ch++)
+    {
+        const GLubyte *b = blk + ch * 8;
+        int p[8];
+
+        if (!sgn)
+        {
+            int c0 = b[0], c1 = b[1];
+            p[0] = c0; p[1] = c1;
+            if (c0 > c1)
+            {
+                for (int i = 2; i <= 6; i++) p[i] = ((8 - i) * c0 + i * c1) / 8;
+                p[7] = 0;
+            }
+            else
+            {
+                for (int i = 2; i <= 5; i++) p[i] = ((8 - i) * c0 + i * c1) / 8;
+                p[6] = 0; p[7] = 255;
+            }
+        }
+        else
+        {
+            int c0 = (GLbyte)b[0], c1 = (GLbyte)b[1];
+            p[0] = c0; p[1] = c1;
+            if (c0 > c1)
+            {
+                for (int i = 2; i <= 6; i++) p[i] = ((8 - i) * c0 + i * c1) / 8;
+                p[7] = 0;
+            }
+            else
+            {
+                for (int i = 2; i <= 5; i++) p[i] = ((8 - i) * c0 + i * c1) / 8;
+                p[6] = 0; p[7] = -128;
+            }
+        }
+
+        unsigned bit = 2 * ci;
+        unsigned code = (b[2 + (bit >> 3)] >> (bit & 7)) & 3;   /* codes: bytes 2..7 */
+        out[ch] = sgn ? (float)p[code] / 127.0f : (float)p[code] / 255.0f;
+    }
+    if (!two) out[1] = 0.0f;
+}
+
+/* glDrawPixels copies its payload into the framebuffer VERBATIM — the sRGB
+ * framebuffer encoding applies to shader-written fragments, not to the pixel
+ * path (KHR-GL46.packed_pixels: sRGB8 in == sRGB8 out, no re-encode).  The
+ * blit renders a quad, so route the payload through an sRGB view of the blit
+ * texture instead: sampling decodes, the sRGB attachment re-encodes, and
+ * decode∘encode is the identity for every 8-bit value. */
+static bool mgl_pixel_internal_is_srgb(GLenum f)
+{
+    switch (f)
+    {
+        case GL_SRGB:
+        case GL_SRGB8:
+        case GL_SRGB8_ALPHA8:
+        case GL_COMPRESSED_SRGB:
+        case GL_COMPRESSED_SRGB_ALPHA:
+        case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
+        case GL_COMPRESSED_SRGB8_ETC2:
+        case GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2:
+        case GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool blit_target_is_srgb(GLMContext ctx)
+{
+    Framebuffer *fb = STATE(framebuffer);
+    if (!fb)
+        return false;   /* default framebuffer: byte path, never re-encoded */
+    FBOAttachment *a = &fb->color_attachments[0];
+    Texture *tex = (a->textarget == GL_RENDERBUFFER && a->buf.rbo) ? a->buf.rbo->tex : a->buf.tex;
+    return tex ? mgl_pixel_internal_is_srgb(tex->internalformat) : false;
+}
+
 static void read_pixel_component(GLenum format, GLenum type, const void *pixels, size_t index, int comp, float *out);
 
 #define CS() (ctx->state.ext_compat)
@@ -426,6 +512,10 @@ static GLuint blit_upload_pixels(GLMContext ctx, GLsizei width, GLsizei height, 
         mglGenTextures(ctx, 1, &s->blit_texture);
     }
 
+    /* when the draw target is sRGB-encoded, upload through an sRGB view so
+     * the blit's linear shader output re-encodes to the original bytes */
+    const GLenum blit_ifmt = blit_target_is_srgb(ctx) ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+
     /* convert to RGBA8 with the transfer ops (CPU, like Mesa's swrast path) */
     const GLfloat rs = s->pixel_transfer[4], gs = s->pixel_transfer[5],
                     bs = s->pixel_transfer[6], as = s->pixel_transfer[7];
@@ -445,8 +535,30 @@ static GLuint blit_upload_pixels(GLMContext ctx, GLsizei width, GLsizei height, 
 
             switch (format)
             {
+                case GL_COMPRESSED_RED_RGTC1:
+                case GL_COMPRESSED_SIGNED_RED_RGTC1:
+                case GL_COMPRESSED_RG_RGTC2:
+                case GL_COMPRESSED_SIGNED_RG_RGTC2:
+                    /* compressed glDrawPixels payload: decode per block
+                     * (RGTC1 8-byte blocks -> R; RGTC2 16-byte -> R,G) */
+                    {
+                        GLuint block_bytes = (format == GL_COMPRESSED_RED_RGTC1 ||
+                                              format == GL_COMPRESSED_SIGNED_RED_RGTC1) ? 8 : 16;
+                        size_t blocks_per_row = ((size_t)width + 3) >> 2;
+                        const GLubyte *blk = (const GLubyte *)pixels +
+                            (((size_t)y >> 2) * blocks_per_row + ((size_t)x >> 2)) * block_bytes;
+                        float v[2];
+                        rgtc_block_texel(blk, (x & 3) + 4 * (y & 3), format, v);
+                        r = v[0];
+                        g = v[1];
+                        b = 0;
+                        a = 1;
+                    }
+                    break;
                 case GL_RGB:
                 case GL_BGR:
+                case GL_SRGB8:
+                case GL_COMPRESSED_SRGB:
                     read_pixel_component(format, type, pixels, (size_t)y * width + x, 0, &r);
                     read_pixel_component(format, type, pixels, (size_t)y * width + x, 1, &g);
                     read_pixel_component(format, type, pixels, (size_t)y * width + x, 2, &b);
@@ -488,7 +600,7 @@ static GLuint blit_upload_pixels(GLMContext ctx, GLsizei width, GLsizei height, 
     mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
 
     mglBindTexture(ctx, GL_TEXTURE_2D, s->blit_texture);
-    mglTexImage2D(ctx, GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    mglTexImage2D(ctx, GL_TEXTURE_2D, 0, blit_ifmt, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     mglTexParameteri(ctx, GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -509,8 +621,9 @@ static void read_pixel_component(GLenum format, GLenum type, const void *pixels,
     {
         case GL_RED: case GL_LUMINANCE: case GL_ALPHA: ncomp = 1; break;
         case GL_LUMINANCE_ALPHA: ncomp = 2; break;
-        case GL_RGB: case GL_BGR: ncomp = 3; break;
-        default: ncomp = 4; break;
+        case GL_RGB: case GL_BGR:
+        case GL_SRGB8: case GL_COMPRESSED_SRGB: ncomp = 3; break;
+        default: ncomp = 4; break;   /* RGBA, BGRA, SRGB8_ALPHA8, ... */
     }
 
     const GLubyte *base = (const GLubyte *)pixels;

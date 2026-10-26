@@ -562,7 +562,10 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
         }
 
         char *p = src;
-        p += sprintf(p, "#version 460 core\n");
+        /* the marker records the user's own #version: mglCompileShader's
+         * reserved-word scan checks the user's body only when the user asked
+         * for GLSL >= 400, and never scans this generated preamble */
+        p += sprintf(p, "#version 460 core\n/*mgl-compat:%d*/\n", t.version);
 
         if (t.stage == GL_VERTEX_SHADER)
         {

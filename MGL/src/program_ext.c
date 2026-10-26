@@ -20,6 +20,9 @@
 #include "shaders.h"
 #include "spirv.h"
 
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
+
 void mgl_program_ref(Program *ptr);
 void mgl_program_unref(GLMContext ctx, Program *ptr);
 void mglFreeProgram(GLMContext ctx, Program *ptr);
@@ -1341,18 +1344,21 @@ void mglGetShaderPrecisionFormat(GLMContext ctx, GLenum shadertype, GLenum preci
 
 #pragma mark - draw-time validation (pre_draw hook)
 
-static bool program_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count)
+static bool program_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                             bool indexed, GLenum type, size_t offset)
 {
-    (void)mode; (void)vertex_count; (void)instance_count;
+    (void)mode; (void)vertex_count; (void)instance_count; (void)indexed; (void)type; (void)offset;
 
     if (ctx->state.program)
     {
         Program *p = ctx->state.program;
         if (MGL_PROGRAM_OBJ(p)->num_samplers > 1)
         {
+            uint64_t t25 = mgl_prof_begin(25);
             char *log = NULL;
             bool ok = mgl_program_validate_samplers(ctx, &p, 1, &log);
             free(log);
+            mgl_prof_end(25, t25);
             if (!ok)
             {
                 ERROR_RETURN(GL_INVALID_OPERATION);

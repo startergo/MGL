@@ -239,6 +239,7 @@ struct MGLExtState_compat {
     /* profile-visible version strings */
     char      version[64];
     char      glsl_version[64];
+    char      extensions[6144];   /* full space-separated list, built on demand */
 
     /* serial bumped by every compat state change (uniform sync cache key) */
     uint64_t  state_serial;

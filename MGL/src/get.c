@@ -301,6 +301,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_separate_shader_objects",
     "GL_ARB_shader_atomic_counters",
     "GL_ARB_shader_bit_encoding",
+    "GL_ARB_tessellation_shader",      /* core in 4.0; tess domain (geometry.c prep kernel) */
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",
     "GL_ARB_shader_texture_image_samples",  /* textureSamples()/imageSamples(); MSL get_num_samples() */
@@ -1131,10 +1132,18 @@ void mglGetFloati_v(GLMContext ctx, GLenum target, GLuint index, GLfloat *data)
 
 #pragma mark - strings
 
+/* Apple's GL_VERSION format on this system: "<major>.<minor> Metal - <build>"
+ * (native example: "4.1 Metal - 90.5").  The build Apple prints comes from the
+ * GL-on-Metal renderer bundle; the AppleMetalOpenGLRenderer bundle on this OS
+ * only reports "1", so the number lives in this single constant (debugging can
+ * override the whole string with MGL_VERSION_STRING). */
+#define MGL_GL_VERSION_BUILD "90.5"
+
 static void build_strings(GLMContext ctx)
 {
     struct MGLExtState_debug *st = ctx->state.ext_debug;
     const char *device = NULL;
+    const char *o;
 
     if (st->renderer[0])
         return;
@@ -1146,21 +1155,21 @@ static void build_strings(GLMContext ctx)
     {
         /* renderer not bound yet: answer generically, retry next time */
         snprintf(st->vendor, sizeof(st->vendor), "Apple");
-        snprintf(st->version, sizeof(st->version), "4.6.0 MGL (Metal)");
+        snprintf(st->version, sizeof(st->version), "4.6 Metal - " MGL_GL_VERSION_BUILD);
         return;
     }
 
-    if (strstr(device, "AMD") || strstr(device, "Radeon"))
-        snprintf(st->vendor, sizeof(st->vendor), "AMD");
-    else if (strstr(device, "Intel"))
-        snprintf(st->vendor, sizeof(st->vendor), "Intel");
-    else if (strstr(device, "NVIDIA"))
-        snprintf(st->vendor, sizeof(st->vendor), "NVIDIA");
+    /* report the hardware the way Apple's driver does: vendor Apple, renderer
+     * the Metal device name (e.g. "Apple M4 Pro") */
+    snprintf(st->vendor, sizeof(st->vendor), "Apple");
+    if ((o = getenv("MGL_RENDERER_STRING")) && *o)
+        snprintf(st->renderer, sizeof(st->renderer), "%s", o);
     else
-        snprintf(st->vendor, sizeof(st->vendor), "Apple");
-
-    snprintf(st->renderer, sizeof(st->renderer), "MGL on Metal (%s)", device);
-    snprintf(st->version, sizeof(st->version), "4.6.0 MGL (Metal)");
+        snprintf(st->renderer, sizeof(st->renderer), "%s", device);
+    if ((o = getenv("MGL_VERSION_STRING")) && *o)
+        snprintf(st->version, sizeof(st->version), "%s", o);
+    else
+        snprintf(st->version, sizeof(st->version), "4.6 Metal - " MGL_GL_VERSION_BUILD);
 }
 
 const GLubyte *mglGetString(GLMContext ctx, GLenum name)
@@ -1175,7 +1184,7 @@ const GLubyte *mglGetString(GLMContext ctx, GLenum name)
             return (const GLubyte *)st->vendor;
 
         case GL_RENDERER:
-            return (const GLubyte *)(st->renderer[0] ? st->renderer : "MGL on Metal");
+            return (const GLubyte *)(st->renderer[0] ? st->renderer : "Apple");
 
         case GL_VERSION:
             return (const GLubyte *)st->version;

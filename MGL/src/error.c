@@ -20,11 +20,25 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #include "error.h"
 #include "mgl_ext_debug.h"
 
+/* Default builds must be silent: apps (and the CTS) make plenty of spec-legal
+ * error probes, so the per-error stderr lines are gated behind MGL_DEBUG. */
+static int mgl_dbg(void)
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_DEBUG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
 
 GLenum  mglGetError(GLMContext ctx)
 {
@@ -32,7 +46,7 @@ GLenum  mglGetError(GLMContext ctx)
 
     err = ctx->state.error;
 
-    if (err != GL_NO_ERROR)
+    if (err != GL_NO_ERROR && mgl_dbg())
         fprintf(stderr, "MGL DEBUG: mglGetError returning 0x%x (%d)\n", err, err);
 
     ctx->state.error = GL_NO_ERROR;
@@ -43,7 +57,8 @@ GLenum  mglGetError(GLMContext ctx)
 
 void error_func(GLMContext ctx, const char *func, GLenum error)
 {
-    fprintf(stderr, "MGL GL Error in %s: 0x%x (%d)\n", func, error, error);
+    if (mgl_dbg())
+        fprintf(stderr, "MGL GL Error in %s: 0x%x (%d)\n", func, error, error);
 
     /* KHR_debug: every error generates a GL_DEBUG_TYPE_ERROR message, even when
        an earlier error is still pending in the sticky error flag */

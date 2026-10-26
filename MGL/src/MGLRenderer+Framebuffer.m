@@ -651,7 +651,10 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     if (m->default_depth_stencil) { CFBridgingRelease(m->default_depth_stencil); m->default_depth_stencil = NULL; }
 
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[self fbDefaultColorFormat] width:w height:h mipmapped:NO];
-    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    /* compat domain: ShaderWrite lets the present path force the copy source's
+     * alpha opaque BEFORE the blit (compatSurfacePresent) so the presented
+     * IOSurface never holds a half-alpha state the compositor could catch */
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     d.storageMode = MTLStorageModePrivate;
     /* compat domain: the color attachment prefers the present surface (render
      * directly into what compatSurfacePresent shows — the swap is then only a

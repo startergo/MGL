@@ -1,5 +1,6 @@
 #include "mgl_toolchain.h"
 
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 #elif __has_include(<spirv_cross_c.h>)
 #define MGL_TOOLCHAIN_HAS_SPVC 1
 #include <spirv_cross_c.h>
+
 #else
 #define MGL_TOOLCHAIN_HAS_SPVC 0
 #endif
@@ -30,6 +32,18 @@
 #if MGL_TOOLCHAIN_HAS_GLSLANG
 const glslang_resource_t* glslang_default_resource(void);
 #endif
+
+/* Default builds must be silent: the per-shader upgrade trace is behind MGL_DEBUG */
+static int mgl_dbg_env(void)
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_DEBUG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
 
 static int mgl_set_error(char **out_error, const char *msg) {
     if (!out_error) {
@@ -65,7 +79,6 @@ static glslang_stage_t mgl_stage_to_glslang(mgl_toolchain_stage stage) {
 static void mgl_init_input(glslang_input_t *input,
                            mgl_toolchain_stage stage,
                            const char *src) {
-    fprintf(stderr, "[MGL DEBUG] mgl_init_input called, src first 50 chars: %.50s\n", src);
     memset(input, 0, sizeof(*input));
     input->language = GLSLANG_SOURCE_GLSL;
     input->stage = mgl_stage_to_glslang(stage);
@@ -94,7 +107,7 @@ static void mgl_init_input(glslang_input_t *input,
 
     /* Log version upgrade for debugging */
     if (original_version < 330) {
-        fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
+        if (mgl_dbg_env()) fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
                 original_version, glsl_version);
     }
 
@@ -131,7 +144,7 @@ static void mgl_init_input(glslang_input_t *input,
                     /* Simple replacement - pad with spaces */
                     memset(version_line, ' ', old_len);
                     memcpy(version_line, version_buf, new_len);
-                    fprintf(stderr, "[MGL] Replaced version line, first 100 chars: %.100s\n", modified_src);
+                    if (mgl_dbg_env()) fprintf(stderr, "[MGL] Replaced version line, first 100 chars: %.100s\n", modified_src);
                 } else {
                     fprintf(stderr, "[MGL] WARNING: New version line too long, skipping replacement\n");
                 }

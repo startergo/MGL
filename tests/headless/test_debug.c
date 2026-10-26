@@ -473,7 +473,7 @@ TEST(strings)
     EXPECT_TRUE(version && strncmp(version, "4.6", 3) == 0);
     EXPECT_STREQ(glGetString(GL_SHADING_LANGUAGE_VERSION), "4.60");
     const char *renderer = (const char *)glGetString(GL_RENDERER);
-    EXPECT_TRUE(renderer && strstr(renderer, "MGL") != NULL);
+    EXPECT_TRUE(renderer && strstr(renderer, "Apple") != NULL);   /* hardware name, Apple style */
     EXPECT_TRUE(glGetString(GL_VENDOR) != NULL);
     printf("  renderer: %s / %s / %s\n", glGetString(GL_VENDOR), renderer, version);
     EXPECT_NO_GL_ERROR();

@@ -108,8 +108,12 @@ bool mgl_ext_get_compat(GLMContext ctx, GLenum pname, GLuint type, void *data);
 struct Program_t;
 typedef bool (*mgl_get_indexed_hook)(GLMContext ctx, GLenum pname, GLuint index, GLuint type, void *data);
 typedef void (*mgl_program_hook)(GLMContext ctx, struct Program_t *program);
-/* return false to skip the draw (e.g. conditional rendering); also used to count primitives */
-typedef bool (*mgl_pre_draw_hook)(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count);
+/* return false to skip the draw (e.g. conditional rendering); also used to count primitives.
+ * For indexed draws: type is the index type and offset the byte offset into the element
+ * buffer (or the client index pointer when no element buffer is bound).  queries uses
+ * these to count primitives exactly when primitive restart is enabled. */
+typedef bool (*mgl_pre_draw_hook)(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                                  bool indexed, GLenum type, size_t offset);
 
 void mgl_ext_register_get_indexed(mgl_get_indexed_hook fn);   /* called by get.c Get*i_v (owner: debug) */
 void mgl_ext_register_pre_link(mgl_program_hook fn);          /* called by mglLinkProgram before linking (owner: program) */
@@ -119,7 +123,8 @@ void mgl_ext_register_pre_draw(mgl_pre_draw_hook fn);         /* called by every
 bool mgl_ext_get_indexed(GLMContext ctx, GLenum pname, GLuint index, GLuint type, void *data);
 void mgl_ext_pre_link(GLMContext ctx, struct Program_t *program);
 void mgl_ext_post_link(GLMContext ctx, struct Program_t *program);
-bool mgl_ext_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count);
+bool mgl_ext_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                      bool indexed, GLenum type, size_t offset);
 
 void mgl_ext_init_all(GLMContext ctx);
 bool mgl_ext_get(GLMContext ctx, GLenum pname, GLuint type, void *data);

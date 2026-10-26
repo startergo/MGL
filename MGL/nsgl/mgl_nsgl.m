@@ -558,13 +558,29 @@ static void nsgl_ctx_setValues(NSOpenGLContext *self, SEL _cmd,
         st->swap_interval = *vals;
         nsgl_apply_swap_interval(st);
     }
-    else if (param == 235 /* SurfaceOrder */ || param == 236 /* SurfaceOpacity */ ||
-             param == 201 /* SwapRectangleEnable */ || param == 306 /* SurfaceVolatile */)
+    else if (param == 235 /* SurfaceOrder */ || param == 201 /* SwapRectangleEnable */ ||
+             param == 306 /* SurfaceVolatile */)
     {
         /* compositing parameters of the real NSOpenGL surface, which the
          * interposer never creates: recorded so -getValues:forParameter:
          * reports the state back, nothing to apply */
         st->param_values[param] = *vals;
+    }
+    else if (param == 236 /* SurfaceOpacity */)
+    {
+        /* opacity IS applied: the CAMetalLayer is opaque by default (matching
+         * the NSOpenGL default); SurfaceOpacity = 0 makes the compositor blend
+         * the surface alpha with what is behind it */
+        st->param_values[236] = *vals;
+        if (st->view)
+        {
+            CALayer *l = [st->view layer];
+            for (CALayer *c in [l.sublayers copy])
+                if ([c isKindOfClass:[CAMetalLayer class]])
+                    c.opaque = (*vals != 0);
+            if ([l isKindOfClass:[CAMetalLayer class]])
+                l.opaque = (*vals != 0);
+        }
     }
     /* SurfaceBackingSize (304, 2 values) and SwapRectangle (200, 4 values):
      * recorded without effect for the same reason */

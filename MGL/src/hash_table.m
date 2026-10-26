@@ -57,7 +57,8 @@ void *searchHashTable(HashTable *table, GLuint name)
     
     if (name >= table->size)
     {
-        fprintf(stderr, "MGL: searchHashTable - name %u exceeds table size %u, returning NULL\n", name, table->size);
+        /* a name past the grown table simply has no object yet (glGen* reserves
+         * names; they enter the table on first bind) — NULL, no log line */
         return NULL;
     }
 
@@ -126,65 +127,39 @@ void deleteHashElement(HashTable *table, GLuint name)
 {
     assert(table);
 
-    if (name >= table->size) {
-        fprintf(stderr, "MGL: deleteHashElement - name %u exceeds table size %u\n", name, table->size);
+    if (name >= table->size)
         return;
-    }
 
     void *obj_data = table->keys[name].data;
 
-    // Perform Metal cleanup for different object types
+    /* Release the Metal object the GL object owned.  These fields were filled
+     * with CFBridgingRetain, so NULLing them without a release leaked every
+     * deleted texture/buffer/program/shader (glmark2 deletes its objects at the
+     * end of every scene).  The table-to-type mapping needs a context; the
+     * tables of the current one cover the common case. */
     if (obj_data) {
         extern GLMContext _ctx;
 
-        // Check if this is a shader object
-        if (table == &_ctx->state.shader_table) {
-            // Shader-specific Metal cleanup
-            Shader *shader = (Shader *)obj_data;
-            if (shader->mtl_data.function || shader->mtl_data.library) {
-                fprintf(stderr, "MGL: Metal cleanup for shader object %u\n", name);
-                // In ARC mode, we just need to set the pointers to nil
-                // The memory will be automatically released
-                shader->mtl_data.function = NULL;
-                shader->mtl_data.library = NULL;
+        if (_ctx)
+        {
+            if (table == &_ctx->state.shader_table) {
+                Shader *shader = (Shader *)obj_data;
+                if (shader->mtl_data.function) { CFRelease(shader->mtl_data.function); shader->mtl_data.function = NULL; }
+                if (shader->mtl_data.library) { CFRelease(shader->mtl_data.library); shader->mtl_data.library = NULL; }
             }
-        }
-        // Check if this is a program object
-        else if (table == &_ctx->state.program_table) {
-            // Program-specific Metal cleanup
-            Program *program = (Program *)obj_data;
-            if (program->mtl_data) {
-                fprintf(stderr, "MGL: Metal cleanup for program object %u\n", name);
-                // In ARC mode, we just need to set the pointer to nil
-                // The memory will be automatically released
-                program->mtl_data = NULL;
+            else if (table == &_ctx->state.program_table) {
+                Program *program = (Program *)obj_data;
+                if (program->mtl_data) { CFRelease(program->mtl_data); program->mtl_data = NULL; }
             }
-        }
-        // Check if this is a texture object
-        else if (table == &_ctx->state.texture_table) {
-            // Texture-specific Metal cleanup
-            Texture *texture = (Texture *)obj_data;
-            if (texture->mtl_data) {
-                fprintf(stderr, "MGL: Metal cleanup for texture object %u\n", name);
-                // In ARC mode, we just need to set the pointer to nil
-                // The memory will be automatically released
-                texture->mtl_data = NULL;
+            else if (table == &_ctx->state.texture_table) {
+                Texture *texture = (Texture *)obj_data;
+                if (texture->mtl_data) { CFRelease(texture->mtl_data); texture->mtl_data = NULL; }
+                if (texture->params.mtl_data) { CFRelease(texture->params.mtl_data); texture->params.mtl_data = NULL; }
             }
-        }
-        // Check if this is a buffer object
-        else if (table == &_ctx->state.buffer_table) {
-            // Buffer-specific Metal cleanup
-            Buffer *buffer = (Buffer *)obj_data;
-            if (buffer->data.mtl_data) {
-                fprintf(stderr, "MGL: Metal cleanup for buffer object %u\n", name);
-                // In ARC mode, we just need to set the pointer to nil
-                // The memory will be automatically released
-                buffer->data.mtl_data = NULL;
+            else if (table == &_ctx->state.buffer_table) {
+                Buffer *buffer = (Buffer *)obj_data;
+                if (buffer->data.mtl_data) { CFRelease(buffer->data.mtl_data); buffer->data.mtl_data = NULL; }
             }
-        }
-        else {
-            // Generic cleanup for unknown object types
-            fprintf(stderr, "MGL: deleteHashElement called for object %u (Metal cleanup implemented)\n", name);
         }
     }
 

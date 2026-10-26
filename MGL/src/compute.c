@@ -25,6 +25,7 @@
 #include "mgl_ext_buffers.h"
 #include "mgl_buffers_err.h"
 #include "mgl_ext_queries.h"
+#include <string.h>
 
 static bool computeProgramActive(GLMContext ctx)
 {
@@ -62,11 +63,16 @@ void mglDispatchCompute(GLMContext ctx, GLuint num_groups_x, GLuint num_groups_y
         return;
 
     // GL_COMPUTE_SHADER_INVOCATIONS (queries domain)
-    if (ctx->state.program)
-        mgl_queries_note_dispatch(ctx, (uint64_t)num_groups_x * num_groups_y * num_groups_z *
-                                  ctx->state.program->local_workgroup_size.x *
-                                  ctx->state.program->local_workgroup_size.y *
-                                  ctx->state.program->local_workgroup_size.z);
+    {
+        Program *cp = ctx->state.program;
+        if (!cp && ctx->state.program_pipeline)
+            cp = ctx->state.program_pipeline->stage_programs[_COMPUTE_SHADER];
+
+        if (cp)
+            mgl_queries_note_dispatch(ctx, (uint64_t)num_groups_x * num_groups_y * num_groups_z *
+                                      cp->local_workgroup_size.x * cp->local_workgroup_size.y *
+                                      cp->local_workgroup_size.z);
+    }
 }
 
 void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
@@ -75,6 +81,7 @@ void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
     ERROR_CHECK_RETURN(indirect >= 0 && (indirect % 4) == 0, GL_INVALID_VALUE);
 
     Buffer *buf = ctx->state.buffers[_DISPATCH_INDIRECT_BUFFER];
+    GLuint num_groups[3] = { 0, 0, 0 };
 
     // GL_INVALID_OPERATION if no buffer is bound, the command is out of range or the buffer is mapped
     ERROR_CHECK_RETURN(buf != NULL, GL_INVALID_OPERATION);
@@ -92,4 +99,24 @@ void mglDispatchComputeIndirect(GLMContext ctx, GLintptr indirect)
 
     // group counts are read by the GPU (values above the limits are undefined behaviour in GL)
     ctx->mtl_funcs.ext_buffers->dispatch(ctx, 0, 0, 0, buf, (size_t)indirect);
+
+    /* GL_COMPUTE_SHADER_INVOCATIONS (queries domain): the counts are read from the same
+     * buffer the GPU reads; GPU-written data is waited for first. */
+    {
+        MGLBufferTrack *t = mgl_buffers_track(ctx, buf, false);
+        if (t && ctx->mtl_funcs.ext_buffers &&
+            t->write_serial > ctx->mtl_funcs.ext_buffers->completed_serial(ctx))
+            mgl_buffers_prepare_cpu_read(ctx, buf);
+
+        memcpy(num_groups, (const uint8_t *)buf->data.buffer_data + indirect, sizeof(num_groups));
+    }
+
+    Program *cp = ctx->state.program;
+    if (!cp && ctx->state.program_pipeline)
+        cp = ctx->state.program_pipeline->stage_programs[_COMPUTE_SHADER];
+
+    if (cp && num_groups[0] && num_groups[1] && num_groups[2])
+        mgl_queries_note_dispatch(ctx, (uint64_t)num_groups[0] * num_groups[1] * num_groups[2] *
+                                  cp->local_workgroup_size.x * cp->local_workgroup_size.y *
+                                  cp->local_workgroup_size.z);
 }

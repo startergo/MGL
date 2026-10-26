@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,20 @@
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_tess.h"
+
+
+
+/* Default builds must be silent: the per-shader upgrade trace is behind MGL_DEBUG */
+static int mgl_dbg_env(void)
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv("MGL_DEBUG");
+        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
 
 const glslang_resource_t* glslang_default_resource(void);
 
@@ -137,7 +152,7 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 
 
     if (original_version < 330) {
-        fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
+        if (mgl_dbg_env()) fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
                 original_version, glsl_version);
 
         size_t src_len = strlen(src);
@@ -166,21 +181,21 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
                     size_t old_len = newline - version_line;
                     size_t new_len = strlen(version_buf);
 
-                    fprintf(stderr, "[MGL] Old version line length: %zu, new: %zu\n", old_len, new_len);
-                    fprintf(stderr, "[MGL] Old line: %.*s\n", (int)old_len, version_line);
+                    if (mgl_dbg_env()) fprintf(stderr, "[MGL] Old version line length: %zu, new: %zu\n", old_len, new_len);
+                    if (mgl_dbg_env()) fprintf(stderr, "[MGL] Old line: %.*s\n", (int)old_len, version_line);
 
                     if (new_len <= old_len) {
                         /* Simple in-place replacement with space padding */
                         memset(version_line, ' ', old_len);
                         memcpy(version_line, version_buf, new_len);
-                        fprintf(stderr, "[MGL] Replaced version line in source (in-place)\n");
+                        if (mgl_dbg_env()) fprintf(stderr, "[MGL] Replaced version line in source (in-place)\n");
                     } else {
                         /* Need to shift the rest of the source */
                         size_t rest_of_src = strlen(newline);
                         memmove(version_line + new_len, newline, rest_of_src + 1); /* +1 for null terminator */
                         memcpy(version_line, version_buf, new_len);
-                        fprintf(stderr, "[MGL] Replaced version line with shift\n");
-                        fprintf(stderr, "[MGL] New line: %.*s\n", (int)new_len, version_line);
+                        if (mgl_dbg_env()) fprintf(stderr, "[MGL] Replaced version line with shift\n");
+                        if (mgl_dbg_env()) fprintf(stderr, "[MGL] New line: %.*s\n", (int)new_len, version_line);
                     }
                 }
             }
@@ -898,6 +913,7 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     }
 
     lazy_init_compiler(ctx);
+
 
     memset(&glsl_input, 0, sizeof(glsl_input));
     /* GL-legal but SPIR-V-hostile constructs (layout(shared)/layout(packed) blocks, ...) are

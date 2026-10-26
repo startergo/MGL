@@ -71,10 +71,11 @@ void mgl_ext_post_link(GLMContext ctx, struct Program_t *program)
     for (int i = 0; i < post_link_count; i++) post_link_hooks[i](ctx, program);
 }
 
-bool mgl_ext_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count)
+bool mgl_ext_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, GLsizei instance_count,
+                      bool indexed, GLenum type, size_t offset)
 {
     bool draw = true;
     for (int i = 0; i < pre_draw_count; i++)
-        if (!pre_draw_hooks[i](ctx, mode, vertex_count, instance_count)) draw = false;
+        if (!pre_draw_hooks[i](ctx, mode, vertex_count, instance_count, indexed, type, offset)) draw = false;
     return draw;
 }

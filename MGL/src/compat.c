@@ -337,7 +337,26 @@ static const GLubyte *compat_get_string(GLMContext ctx, GLenum name)
         case GL_SHADING_LANGUAGE_VERSION:
             return (const GLubyte *)s->glsl_version;
         case GL_EXTENSIONS:
-            return (const GLubyte *)"GL_ARB_compatibility";   /* single-token list */
+            if (!s->extensions[0])
+            {
+                /* a compatibility-profile context returns the full space-
+                 * separated list (only core profile errors here); built once
+                 * per context from the same list glGetStringi serves */
+                size_t len = 0;
+                int n = 0;
+                n = snprintf(s->extensions, sizeof s->extensions, "GL_ARB_compatibility");
+                len = (size_t)n;
+                for (GLuint i = 0; i < mgl_num_extensions(); i++)
+                {
+                    const char *e = mgl_extension_name(i);
+                    if (!e) break;
+                    int m = snprintf(s->extensions + len, sizeof s->extensions - len,
+                                     " %s", e);
+                    if (m < 0 || (size_t)m >= sizeof s->extensions - len) break;
+                    len += (size_t)m;
+                }
+            }
+            return (const GLubyte *)s->extensions;
     }
 
     return mglGetString(ctx, name);
@@ -588,8 +607,15 @@ void mgl_ext_init_compat(GLMContext ctx){
     s->is_compat = GL_TRUE;
 
     s->version[0] = 0;
-    snprintf(s->version, sizeof(s->version), "4.6.0 MGL compat (Metal)");
-    snprintf(s->glsl_version, sizeof(s->glsl_version), "4.60 compatibility");
+    {
+        /* Apple's format (see build_strings in get.c); env override for debugging */
+        const char *o = getenv("MGL_VERSION_STRING");
+        if (o && *o)
+            snprintf(s->version, sizeof(s->version), "%s", o);
+        else
+            snprintf(s->version, sizeof(s->version), "4.6 Metal - 90.5");
+    }
+    snprintf(s->glsl_version, sizeof(s->glsl_version), "4.60");
 
     /* profile-visible state */
     STATE(var.context_profile_mask) = GL_CONTEXT_COMPATIBILITY_PROFILE_BIT;

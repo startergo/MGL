@@ -20,6 +20,8 @@
 #import "MGLRenderer+RenderState.h"   /* rstatePipelineContentHash (perf session 3) */
 #import "mgl_ext_vattrib.h"           /* draw plan / VAO layout snapshots (session 12) */
 #import "mgl_ext_texext.h"            /* mgl_texext_info (session 12 texture gate) */
+#import "mgl_ext_buffers.h"           /* mgl_buffers_mark_gpu_use (bindmap cache, session 13) */
+#import "mgl_ext_introspect.h"        /* default-uniform buffer revalidation (session 13) */
 #include "mgl_compat_perf.h"
 
 /* MGL_PROFILE counters (MGLRenderer.m) */
@@ -63,6 +65,7 @@ typedef struct {
 - (id<MTLTexture>) fbEnsureDefaultFramebuffer;
 - (void) fbEnsureCommandBuffer;
 - (void) fbShaderBlitFrom:(CompatFBTarget *)src to:(CompatFBTarget *)dst src:(const GLint *)s dst:(const GLint *)d filter:(GLenum)filter scissor:(bool)scissor;
+- (void) compatForceOpaque:(id<MTLTexture>)tex;   /* rewrite the presented surface's alpha to 1 */
 @end
 
 @interface MGLCompatSurfacePool : NSObject
@@ -73,9 +76,32 @@ typedef struct {
 @property (nonatomic, assign) unsigned next;             /* round-robin index (blit path) */
 @property (nonatomic, assign) unsigned write;            /* slot the default framebuffer renders into (direct path) */
 @property (nonatomic, assign) BOOL rotate;               /* advance `write` at the next fbEnsureDefaultFramebuffer */
+@property (nonatomic, strong) id<MTLComputePipelineState> opaquePso;  /* force-alpha-255 kernel */
+@property (nonatomic, assign) BOOL opaquePsoFailed;
 @end
 
+/* GL window semantics: the default framebuffer's alpha is DISCARDED at
+ * present — the window is opaque no matter what blending left in dst.a
+ * (glBlendFunc leaves a*a + (1-a)).  CoreAnimation composites layer.contents
+ * with its alpha, so a translucent region washes out against the window's
+ * white backdrop (glmark2 jellyfish: the bell lost all caustic contrast —
+ * every blended pixel was ~60% alpha over white).  -compatForceOpaque:
+ * rewrites the presented IOSurface's alpha to 1.0 before the commit. */
+static const char *s_mgl_force_opaque_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void mgl_force_opaque(texture2d<float, access::read_write> tex [[texture(0)]],\n"
+    "                             uint2 gid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (gid.x < tex.get_width() && gid.y < tex.get_height())\n"
+    "    {\n"
+    "        float4 c = tex.read(gid);\n"
+    "        tex.write(float4(c.rgb, 1.0f), gid);\n"
+    "    }\n"
+    "}\n";
+
 @implementation MGLCompatSurfacePool
+@synthesize layer, textures, surfaces, w, h, next, write, rotate, opaquePso, opaquePsoFailed;
 @end
 
 #define COMPAT_SURFACES 3
@@ -95,26 +121,56 @@ typedef struct {
     uint64_t a, b;
 } CompatPipelineKey;
 
-/* one cached key -> pipeline association */
-@interface CompatPipeBox : NSObject
-@property (nonatomic, assign) CompatPipelineKey key;
-@property (nonatomic, strong) id<MTLRenderPipelineState> pipe;
-@end
-
-@implementation CompatPipeBox
-@end
+/* one cached key -> pipeline association: plain C slots (compat perf session 13).
+ * The hot path used to be an NSMutableArray of CompatPipeBox objects — every
+ * hit paid objectAtIndex: + property msgSends and every move-to-front paid a
+ * remove/insert pair (~0.5 us per VAO-changed walk in glmark2 [ideas], where
+ * the pipeline block runs for each of the 89 re-specification walks per frame).
+ * The pipeline object is retained via CFBridgingRetain so no ObjC object is
+ * touched on a hit. */
+#define MGLC_PIPE_CACHE_SLOTS 512
 
 @interface MGLCompatPipelineCache : NSObject
-@property (nonatomic, strong) NSMutableArray<CompatPipeBox *> *entries;
-@property (nonatomic, strong) CompatPipeBox *pending;   /* key awaiting its pipeline */
-@property (nonatomic, assign) uint64_t encoder_vao_hash;  /* VAO layout the current encoder was built for */
-@property (nonatomic, assign) BOOL encoder_vao_valid;
-@property (nonatomic, assign) CompatPipelineKey lastKey;  /* perf: key-component attribution of misses */
-@property (nonatomic, assign) BOOL lastKeyValid;
-@property (nonatomic, assign) NSUInteger missCount;
+{
+@public
+    struct MGLCompatPipeSlot {
+        uint64_t a, b;
+        void    *pipe_cf;      /* retained id<MTLRenderPipelineState>, NULL until stored */
+        /* the vattrib draw-plan this pipeline was built against (binding_index
+         * excluded: vattribMapVertexBuffers rebuilds it every walk).  A cache
+         * hit proves the (MSL, VAO-layout) matches, but the plan currently in
+         * s->plan can belong to the OTHER cached key when the scene alternates
+         * two layouts (glmark2 [ideas]: shadow/main, 2 components vs 3); the
+         * hit path restores the slot's copy so extVattribPreDraw feeds each
+         * draw its own fetch/shadow/const analysis. */
+        MGLVattribDrawPlan plan;
+    } slots[MGLC_PIPE_CACHE_SLOTS];
+    unsigned count;
+    /* compat perf (session 16): which (program content, VAO layout) the plan
+     * currently live in ext_vattrib's s->plan belongs to.  The plan's fetch /
+     * shadow / const analysis is a pure function of those two, and only a hit
+     * for a different key or the descriptor path (vattribGenerateVertexDe-
+     * scriptor) rewrites it — vattribMapVertexBuffers touches binding_index
+     * only.  When the same (msl, layout) hits again the memcmp/restore is
+     * redundant (glmark2 [ideas]: 89 identical-layout VAOs hit one key all
+     * frame, ~500 B of compare per walk). */
+    int      plan_live_slot;      /* -1 unknown */
+    uint64_t plan_live_msl, plan_live_vao;
+    int      pending;          /* slot index awaiting its pipeline (-1 = none) */
+    /* perf: key-component attribution of misses */
+    uint64_t lastKey_a, lastKey_b;
+    BOOL     lastKeyValid;
+    uint64_t missCount;
+}
 @end
 
 @implementation MGLCompatPipelineCache
+- (void) dealloc
+{
+    for (unsigned i = 0; i < count; i++)
+        if (slots[i].pipe_cf)
+            CFBridgingRelease(slots[i].pipe_cf);
+}
 @end
 
 static const void *kCompatPipeKey = &kCompatPipeKey;
@@ -163,55 +219,81 @@ static inline uint64_t compatEncGen(struct MGLExtMetal_compat *m, void *enc)
 
 @implementation MGLRenderer (Compat)
 
-/* fold the bound VAO's attribute layout into 64 bits (enough entropy to notice
- * any re-specification of the same VAO; a full hash collision only picks a
- * stale-but-identical-layout pipeline) */
+/* fold the bound VAO's attribute LAYOUT into 64 bits: the render pipeline's
+ * vertex descriptor is a function of the attribute formats, strides,
+ * relative offsets, divisors and whether each attrib has a buffer at all —
+ * NOT of which buffer objects feed them (buffer identity only reaches the
+ * encoder's setVertexBuffer, never the PSO).  glmark2 [ideas] draws ~89 VAOs
+ * per frame whose layouts are identical but whose VBOs differ: hashing buffer
+ * identity split the PSO cache into 89 entries and turned every cache hit
+ * into a move-to-front memmove of tens of KB.  A full hash collision only
+ * picks a stale pipeline with an identical vertex layout. */
 static uint64_t compatVAOHash(GLMContext ctx)
 {
     VertexArray *vao = ctx->state.vao;
     uint64_t h = 1469598103934665603ULL;
     #define MIX(v) do { h ^= (uint64_t)(uintptr_t)(v); h *= 1099511628211ULL; } while (0)
-    MIX(vao);
     MIX(vao->enabled_attribs);
     for (GLuint i = 0; i < MAX_ATTRIBS && i < 32; i++)
     {
         VertexAttrib *a = &vao->attrib[i];
-        MIX(a->buffer); MIX(a->size); MIX(a->type); MIX(a->normalized);
+        MIX(a->size); MIX(a->type); MIX(a->normalized);
         MIX(a->stride); MIX(a->divisor); MIX(a->relativeoffset);
+        MIX(a->buffer_bindingindex);
+        MIX(a->buffer != NULL);          /* bufferless attrib -> constant stream */
     }
-    MIX(vao->element_array.buffer);
     return h;
 }
 #undef MIX
 
-/* the hashed bytes of a VertexArray: everything from enabled_attribs through
- * element_array (mtl_data is not hashed and is excluded, so a memcmp of this
- * range is an EXACT validator of the hash inputs) */
-#define COMPAT_VAO_SNAP_OFF  offsetof(VertexArray, enabled_attribs)
-#define COMPAT_VAO_SNAP_LEN  (offsetof(VertexArray, mtl_data) - offsetof(VertexArray, enabled_attribs))
+/* the hashed bytes of a VertexArray: the LAYOUT words below — the exact
+ * fields vattribGenerateVertexDescriptor reads (fmt: size/type/normalized/
+ * integer/is_long/relativeoffset/binding; binding: buffer-bound/offset/
+ * stride/divisor).  A memcmp of them is an EXACT validator of the hash
+ * inputs, so two VAOs with identical layouts validate each other's entry. */
+#define MGLC_VAO_LAYOUT_WORDS  (1 + MAX_ATTRIBS * 3 + MGL_VA_MAX_BINDINGS * 3)
 
-/* cached variant: one entry, validated by memcmp against the live struct, so
- * the per-draw cost is a pointer compare plus ~700 bytes of memcmp instead of
- * ~130 dependent multiplies */
 static uint64_t compatVAOHashCached(struct MGLExtMetal_compat *m, GLMContext ctx)
 {
     VertexArray *vao = ctx->state.vao;
-    const uint8_t *live = (const uint8_t *)vao + COMPAT_VAO_SNAP_OFF;
+    MGLVertexArrayFull *va = mgl_va_full(vao);
+    uint64_t w[MGLC_VAO_LAYOUT_WORDS];
+    w[0] = vao->enabled_attribs;
+    for (GLuint i = 0; i < MAX_ATTRIBS; i++)
+    {
+        MGLVertexAttribFormat *f = &va->fmt[i];
+        uint64_t *a = &w[1 + 3 * i];
+        a[0] = (uint64_t)f->size | ((uint64_t)f->type << 32);
+        a[1] = (uint64_t)f->normalized | ((uint64_t)f->integer << 8) |
+               ((uint64_t)f->is_long << 16) | ((uint64_t)f->binding << 32);
+        a[2] = (uint64_t)f->relativeoffset;
+    }
+    for (GLuint i = 0; i < MGL_VA_MAX_BINDINGS; i++)
+    {
+        MGLVertexBinding *b = &va->binding[i];
+        uint64_t *a = &w[1 + 3 * MAX_ATTRIBS + 3 * i];
+        a[0] = (uint64_t)(b->buffer != NULL);         /* bufferless -> constant stream */
+        a[1] = (uint64_t)b->offset;                   /* %4 feeds the aligned-fetch decision */
+        a[2] = (uint64_t)b->stride | ((uint64_t)b->divisor << 32);
+    }
+    const size_t bytes = sizeof w;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < MGLC_VAO_LAYOUT_WORDS; i++)
+        h = (h ^ w[i]) * 1099511628211ULL;
     if (!m)
-        return compatVAOHash(ctx);
-    if (m->vaokey.vao == (void *)vao && m->vaokey.len == COMPAT_VAO_SNAP_LEN &&
-        m->vaokey.snap && memcmp(m->vaokey.snap, live, COMPAT_VAO_SNAP_LEN) == 0)
+        return h;
+    if (m->vaokey.len == bytes && m->vaokey.snap &&
+        memcmp(m->vaokey.snap, w, bytes) == 0)
         return m->vaokey.hash;
-    uint64_t h = compatVAOHash(ctx);
     if (!m->vaokey.snap)
-        m->vaokey.snap = (uint8_t *)malloc(COMPAT_VAO_SNAP_LEN);
+        m->vaokey.snap = (uint8_t *)malloc(bytes);
     if (m->vaokey.snap)
     {
-        memcpy(m->vaokey.snap, live, COMPAT_VAO_SNAP_LEN);
+        memcpy(m->vaokey.snap, w, bytes);
         m->vaokey.vao = (void *)vao;
-        m->vaokey.len = COMPAT_VAO_SNAP_LEN;
+        m->vaokey.len = bytes;
+        m->vaokey.hash = h;
     }
-    m->vaokey.hash = h;
     return h;
 }
 
@@ -266,6 +348,17 @@ static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const ch
     return k;
 }
 
+/* the descriptor path records the draw-plan it built into the slot it just
+ * filled (see MGLCompatPipelineCache above) */
+static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
+{
+    struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+    if (vs)
+        slot->plan = vs->plan;
+    else
+        memset(&slot->plan, 0, sizeof(slot->plan));
+}
+
 - (bool) compatPipelineFastPath
 {
     /* pipeline-relevant dirty bits VAO / program / render state / FBO / alpha
@@ -278,10 +371,27 @@ static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const ch
     if (ctx->state.dirty_bits & (DIRTY_SHADER | DIRTY_DRAWABLE))
     {
         if (mgl_prof_cnt[17] % 2000 == 0)
-            fprintf(stderr, "MGL PROFILE pipeMiss-decline dirty=0x%llx\n",
+            compatProfOn() && fprintf(stderr, "MGL PROFILE pipeMiss-decline dirty=0x%llx\n",
                     (unsigned long long)ctx->state.dirty_bits);
         mgl_prof_cnt[17]++;   /* declined: a hard bit is set */
         return false;
+    }
+    /* geom e767e6a rule (same fix here, narrowed to the found bug class): a
+     * DIRTY_FBO trigger must go through the descriptor path.  The key covers
+     * the framebuffer POINTER and the attachment FORMATS, so re-attaching a
+     * texture with an identical pixel format leaves the key unchanged — and
+     * it is the descriptor path that binds the new attachment to the render
+     * pass (KHR-GL46.texture_swizzle.smoke drew with the previous texture
+     * bound).  DIRTY_ALPHA_STATE / DIRTY_RENDER_STATE stay admissible: their
+     * PSO-relevant CONTENT is hashed fresh inside this function
+     * (rstatePipelineContentHash: blend/color-mask/clip/sample/alpha-to-
+     * coverage/multisample, cached against generation_pipeline) — measured
+     * full-geom-rule cost: 4 descriptor builds per [ideas] frame, -45% FPS.
+     * To re-adopt the full geom rule, add the two bits back to the mask. */
+    {
+        GLuint d = ctx->state.dirty_bits;
+        if ((d & DIRTY_FBO) || !(d & (DIRTY_VAO | DIRTY_PROGRAM)))
+            return false;
     }
     if (!ctx->state.program)
         return false;
@@ -308,7 +418,8 @@ static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const ch
             m->rstate_hash = h;
         }
     }
-    key.b = compatVAOHashCached(m, ctx) ^ ((m ? m->rstate_hash : 1) << 1) ^ ((uint64_t)(uintptr_t)ctx->state.framebuffer * 0x9E3779B97F4A7C15ULL);
+    uint64_t vao_h = compatVAOHashCached(m, ctx);
+    key.b = vao_h ^ ((m ? m->rstate_hash : 1) << 1) ^ ((uint64_t)(uintptr_t)ctx->state.framebuffer * 0x9E3779B97F4A7C15ULL);
 
     /* attachment formats + sample count of the CURRENT encoder: an attached
      * texture can be re-specified with a different format behind an unchanged
@@ -345,69 +456,98 @@ static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const ch
     if (!cache)
     {
         cache = [[MGLCompatPipelineCache alloc] init];
-        cache.entries = [NSMutableArray array];
+        cache->pending = -1;
         objc_setAssociatedObject(self, kCompatPipeKey, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    /* linear scan with move-to-front: the working set is small per scene but
-     * the full glmark2 list touches hundreds of (MSL, layout) keys, and a
-     * short FIFO evicted live entries between sub-tests (conditionals: 5700
-     * FPS solo vs 780 in-suite with a 64-entry cache) */
-    for (NSUInteger i = 0; i < cache.entries.count; i++)
+    /* linear scan with move-to-front (plain loads, no ObjC): the working set
+     * is small per scene but the full glmark2 list touches hundreds of (MSL,
+     * layout) keys, and a short FIFO evicted live entries between sub-tests
+     * (conditionals: 5700 FPS solo vs 780 in-suite with a 64-entry cache) */
+    for (unsigned i = 0; i < cache->count; i++)
     {
-        CompatPipeBox *box = cache.entries[i];
-        if (box.pipe && box.key.a == key.a && box.key.b == key.b)
+        if (cache->slots[i].pipe_cf && cache->slots[i].a == key.a && cache->slots[i].b == key.b)
         {
             if (i)
             {
-                [cache.entries removeObjectAtIndex:i];
-                [cache.entries insertObject:box atIndex:0];
+                struct MGLCompatPipeSlot s = cache->slots[i];
+                memmove(&cache->slots[1], &cache->slots[0], i * sizeof(s));
+                cache->slots[0] = s;
             }
-            _pipelineState = box.pipe;
+            /* the plan in s->plan must be the one this pipeline was built
+             * against: when the scene alternates two cached layouts the plan
+             * holds the other draw's fetch/shadow/const analysis — restore
+             * the slot's copy (keep this walk's binding_index).  Skipped when
+             * the live plan is already this (program content, layout)'s. */
+            if (cache->plan_live_slot != (int)i ||
+                cache->plan_live_msl != key.a || cache->plan_live_vao != vao_h)
+            {
+                struct MGLExtState_vattrib *vs =
+                    (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+                if (vs && memcmp(&vs->plan.fetch, &cache->slots[i].plan.fetch,
+                                 sizeof(MGLVattribDrawPlan) - offsetof(MGLVattribDrawPlan, fetch)) != 0)
+                {
+                    int bi[MGL_VA_MAX_BINDINGS];
+                    memcpy(bi, vs->plan.binding_index, sizeof(bi));
+                    vs->plan = cache->slots[i].plan;
+                    memcpy(vs->plan.binding_index, bi, sizeof(bi));
+                }
+                cache->plan_live_slot = (int)i;
+                cache->plan_live_msl = key.a;
+                cache->plan_live_vao = vao_h;
+            }
+            _pipelineState = (__bridge id<MTLRenderPipelineState>)cache->slots[0].pipe_cf;
             mgl_prof_cnt[16]++;
             return true;
         }
-        /* perf instrumentation: a matching key whose box never received a
+        /* perf instrumentation: a matching key whose slot never received a
          * pipeline (the descriptor path must have bailed before storing) */
-        if (!box.pipe && box.key.a == key.a && box.key.b == key.b && compatProfOn())
+        if (!cache->slots[i].pipe_cf && cache->slots[i].a == key.a && cache->slots[i].b == key.b && compatProfOn())
         {
             static uint64_t dead = 0;
             if (++dead % 200 == 1)
-                fprintf(stderr, "MGL PROFILE pipeMiss dead-box (key match, pipe nil) entries=%lu\n",
-                        (unsigned long)cache.entries.count);
+                compatProfOn() && fprintf(stderr, "MGL PROFILE pipeMiss dead-box (key match, pipe nil) entries=%u\n",
+                        cache->count);
         }
     }
     /* miss: remember the key; the descriptor path stores the pipeline into it
      * (compatPipelineStore below, called by processGLState) */
-    CompatPipeBox *box = [[CompatPipeBox alloc] init];
-    box.key = key;
-    [cache.entries insertObject:box atIndex:0];
-    if (cache.entries.count > 1024)
-        [cache.entries removeLastObject];
-    cache.pending = box;
+    if (cache->count < MGLC_PIPE_CACHE_SLOTS)
+        cache->count++;
+    else if (cache->slots[MGLC_PIPE_CACHE_SLOTS - 1].pipe_cf)
+        CFBridgingRelease(cache->slots[MGLC_PIPE_CACHE_SLOTS - 1].pipe_cf);
+    memmove(&cache->slots[1], &cache->slots[0],
+            (cache->count - 1) * sizeof(cache->slots[0]));
+    cache->slots[0].a = key.a;
+    cache->slots[0].b = key.b;
+    cache->slots[0].pipe_cf = NULL;
+    cache->pending = 0;
+    cache->plan_live_slot = -1;   /* slots shifted; the descriptor path rebuilds the plan */
 
     /* perf instrumentation: WHICH key component moved (a = MSL content ids,
      * b = VAO layout / pipeline-baked rstate / FBO identity) */
     if (compatProfOn())
     {
-        if (!cache.lastKeyValid)
+        if (!cache->lastKeyValid)
         {
-            cache.lastKey = key;
-            cache.lastKeyValid = YES;
-            cache.missCount = 0;
+            cache->lastKey_a = key.a;
+            cache->lastKey_b = key.b;
+            cache->lastKeyValid = YES;
+            cache->missCount = 0;
         }
-        else if (cache.lastKey.a != key.a || cache.lastKey.b != key.b)
+        else if (cache->lastKey_a != key.a || cache->lastKey_b != key.b)
         {
-            cache.missCount++;
-            if (cache.missCount % 200 == 1)
-                fprintf(stderr, "MGL PROFILE pipeMiss %s (a %llx->%llx b %llx->%llx; vao=%llx gen=%u fbo=%p)\n",
-                        cache.lastKey.a != key.a ? "msl" : "vao/rstate/fbo",
-                        (unsigned long long)cache.lastKey.a, (unsigned long long)key.a,
-                        (unsigned long long)cache.lastKey.b, (unsigned long long)key.b,
+            cache->missCount++;
+            if (cache->missCount % 200 == 1)
+                compatProfOn() && fprintf(stderr, "MGL PROFILE pipeMiss %s (a %llx->%llx b %llx->%llx; vao=%llx gen=%u fbo=%p)\n",
+                        cache->lastKey_a != key.a ? "msl" : "vao/rstate/fbo",
+                        (unsigned long long)cache->lastKey_a, (unsigned long long)key.a,
+                        (unsigned long long)cache->lastKey_b, (unsigned long long)key.b,
                         (unsigned long long)compatVAOHash(ctx),
                         rs ? rs->generation_pipeline : 0,
                         (void *)ctx->state.framebuffer);
-            cache.lastKey = key;
+            cache->lastKey_a = key.a;
+            cache->lastKey_b = key.b;
         }
     }
     return false;
@@ -417,15 +557,19 @@ static inline uint64_t compatMSLKeyCached(struct MGLExtMetal_compat *m, const ch
 - (void) compatPipelineStore
 {
     MGLCompatPipelineCache *cache = objc_getAssociatedObject(self, kCompatPipeKey);
-    if (cache && cache.pending)
+    if (cache && cache->pending >= 0 && cache->pending < (int)cache->count)
     {
-        cache.pending.pipe = _pipelineState;
-        cache.pending = nil;
+        if (cache->slots[cache->pending].pipe_cf)
+            CFBridgingRelease(cache->slots[cache->pending].pipe_cf);
+        cache->slots[cache->pending].pipe_cf = (void *)CFBridgingRetain(_pipelineState);
+        compatPlanStore(ctx, &cache->slots[cache->pending]);
+        cache->plan_live_slot = -1;   /* descriptor path rewrote the plan: let the next hit re-arm */
+        cache->pending = -1;
     }
     else if (compatProfOn())
     {
         /* descriptor path finished but no pending key: the pipeline was built
-         * without a fast-path miss (or the miss's box was already consumed) */
+         * without a fast-path miss (or the miss's slot was already consumed) */
         static uint64_t n = 0;
         if (++n % 200 == 1)
             fprintf(stderr, "MGL PROFILE pipeStore without pending\n");
@@ -457,6 +601,233 @@ static const void *kCompatPipeBindKey = &kCompatPipeBindKey;
 uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 /* compat perf session 12: per-draw state-walk fast-path hit/miss counters */
 uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss;
+
+/* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
+ * mapBuffersToMTL (MGLRenderer.m) re-enumerates the program's SPIR-V buffer
+ * resources for BOTH stage lists on every dirty walk — four resource types
+ * through ObjC getProgramBindingCount/getProgramBinding dispatches — yet the
+ * UBO / SSBO / atomic-counter / default-uniform PREFIX only depends on the
+ * program (identity + link, both covered by DIRTY_PROGRAM) and the
+ * glBindBufferBase/Range targets (buffer_base).  The VAO re-specification
+ * that triggers most walks (glmark2 [ideas]: 82 of 89) cannot change it.
+ * compatBindmapFast serves the prefix from an exact cache and re-runs only
+ * vattribMapVertexBuffers (the attribute suffix); mapBuffersToMTL falls back
+ * to the full enumeration and calls compatBindmapStore to re-arm it. */
+struct MGLCompatBindmapCache {
+    int        valid;
+    const void *prog;               /* ctx->state.program at build time */
+    int        vstage;              /* vertex stage the prefix was built for */
+    /* input shadows: the four buffer_base targets the enumeration reads */
+    BufferBase ub, uc, ssbo, atom;
+    void      *nullbuf;             /* [nullShaderBuffer] seen at build (NULL if unused) */
+    /* outputs: the prefix entries of the two stage lists */
+    BufferMap  v[MAX_MAPPED_BUFFERS];
+    GLuint     vn;
+    BufferMap  f[MAX_MAPPED_BUFFERS];
+    GLuint     fn;
+    uint8_t    v_gpu_write[MAX_MAPPED_BUFFERS];  /* SSBO / ACB: per-walk serial stamp */
+    uint8_t    f_gpu_write[MAX_MAPPED_BUFFERS];
+    /* default-uniform-buffer entries: identity revalidated through the
+     * introspection domain (its dub pointer can change on relink, which also
+     * arms DIRTY_PROGRAM, but be exact anyway) */
+    struct { int stage, index; void *buf; } dub[2 * 8];
+    int        ndub;
+    uint64_t   hits, misses;
+    int        why;                /* last validation failure (profiling) */
+};
+
+static struct MGLCompatBindmapCache *compatBindmapState(GLMContext ctx)
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    if (!m)
+        return NULL;
+    if (!m->bindmap_cache)
+        m->bindmap_cache = calloc(1, sizeof(struct MGLCompatBindmapCache));
+    return (struct MGLCompatBindmapCache *)m->bindmap_cache;
+}
+
+/* exact validation of every input the prefix depends on */
+- (bool) compatBindmapValid: (struct MGLCompatBindmapCache *) c vstage: (int) vstage
+{
+    if (!c->valid || c->prog != (const void *)ctx->state.program || c->vstage != vstage)
+    {
+        if (compatProfOn()) c->why = 1;
+        return false;
+    }
+    /* a relink / program switch since the last build: rebuild.  glLinkProgram,
+     * glUseProgram (and the pipeline-scope composite switch) all arm this bit,
+     * and processGLState consumes it AFTER mapBuffersToMTL. */
+    if (ctx->state.dirty_bits & DIRTY_PROGRAM)
+    {
+        if (compatProfOn()) c->why = 2;
+        return false;
+    }
+    if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &c->ub, sizeof(BufferBase)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &c->uc, sizeof(BufferBase)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &c->ssbo, sizeof(BufferBase)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &c->atom, sizeof(BufferBase)) != 0)
+    {
+        if (compatProfOn()) c->why = 3;
+        return false;
+    }
+    if (c->nullbuf && c->nullbuf != (void *)[self nullShaderBuffer])
+    {
+        if (compatProfOn()) c->why = 4;
+        return false;
+    }
+    for (int i = 0; i < c->ndub; i++)
+        if ((void *)mgl_introspect_default_uniform_buffer(ctx, ctx->state.program,
+                                                           c->dub[i].stage, c->dub[i].index) != c->dub[i].buf)
+        {
+            if (compatProfOn()) c->why = 5;
+            return false;
+        }
+    return true;
+}
+
+- (bool) compatBindmapFast: (int) vertex_stage
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatBindmapCache *c = m ? (struct MGLCompatBindmapCache *)m->bindmap_cache : NULL;
+
+    if (compatProfOn())
+        s_compat_bindmap_dbg_m = m;
+
+    /* kill switch (perf experiments): the prefix cache can be disabled without
+     * touching the store path */
+    {
+        static int off = -1;
+        if (off < 0) off = getenv("MGL_BINDMAP") != NULL && getenv("MGL_BINDMAP")[0] == '0';
+        if (off)
+        {
+            if (c) c->misses++;
+            return false;
+        }
+    }
+
+    if (!m || !m->enabled || !c || ![self compatBindmapValid:c vstage:vertex_stage])
+    {
+        if (c) c->misses++;
+        return false;   /* caller runs the full enumeration */
+    }
+
+    BufferMapList *vl = &ctx->state.vertex_buffer_map_list;
+    BufferMapList *fl = &ctx->state.fragment_buffer_map_list;
+
+    memcpy(vl->buffers, c->v, c->vn * sizeof(BufferMap));
+    vl->count = c->vn;
+    memcpy(fl->buffers, c->f, c->fn * sizeof(BufferMap));
+    fl->count = c->fn;
+
+    /* the enumeration stamps SSBO / ACB reads + writes every walk (CPU-side
+     * read sync): keep that contract for the cached entries */
+    for (GLuint i = 0; i < c->vn; i++)
+        if (c->v_gpu_write[i] && c->v[i].buf)
+            mgl_buffers_mark_gpu_use(ctx, c->v[i].buf, true);
+    for (GLuint i = 0; i < c->fn; i++)
+        if (c->f_gpu_write[i] && c->f[i].buf)
+            mgl_buffers_mark_gpu_use(ctx, c->f[i].buf, true);
+
+    /* vertex stage: the attribute suffix still follows the live VAO */
+    if (vertex_stage == _VERTEX_SHADER &&
+        ![self vattribMapVertexBuffers: vl])
+        return false;
+
+    c->hits++;
+    return true;
+}
+
+/* mapBuffersToMTL calls this after the full enumeration rebuilt both lists */
+- (void) compatBindmapStore: (int) vertex_stage
+{
+    struct MGLCompatBindmapCache *c = compatBindmapState(ctx);
+    if (!c)
+        return;
+
+    /* re-arm (keep the profiling counters across the reset) */
+    c->misses++;
+    c->valid = 1;
+    c->prog = (const void *)ctx->state.program;
+    c->vstage = vertex_stage;
+    memcpy(&c->ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
+    memcpy(&c->uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase));
+    memcpy(&c->ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
+    memcpy(&c->atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
+
+    const Buffer *nullbuf = [self nullShaderBuffer];
+    const BufferMapList *vl = &ctx->state.vertex_buffer_map_list;
+    const BufferMapList *fl = &ctx->state.fragment_buffer_map_list;
+    c->ndub = 0;
+    c->nullbuf = NULL;
+
+    /* default-uniform buffers: at most ONE per stage (introspection's
+     * dub_res_index), recovered exactly by asking the introspection domain
+     * for the stage's UC indices — done once per rebuild, not per walk */
+    struct { int index; void *buf; } dubv = { -1, NULL }, dubf = { -1, NULL };
+    if (ctx->state.program)
+    {
+        const int stages[2] = { vertex_stage, _FRAGMENT_SHADER };
+        for (int s = 0; s < 2; s++)
+        {
+            GLuint n = 0;
+            if (stages[s] >= 0 && stages[s] < _MAX_SHADER_TYPES)
+                n = ctx->state.program->spirv_resources_list[stages[s]][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT].count;
+            for (GLuint i = 0; i < n; i++)
+            {
+                Buffer *d = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stages[s], (int)i);
+                if (d)
+                {
+                    if (s == 0) { dubv.index = (int)i; dubv.buf = d; }
+                    else        { dubf.index = (int)i; dubf.buf = d; }
+                    break;
+                }
+            }
+        }
+    }
+    if (dubv.index >= 0) { c->dub[c->ndub].stage = vertex_stage; c->dub[c->ndub].index = dubv.index; c->dub[c->ndub].buf = dubv.buf; c->ndub++; }
+    if (dubf.index >= 0) { c->dub[c->ndub].stage = _FRAGMENT_SHADER; c->dub[c->ndub].index = dubf.index; c->dub[c->ndub].buf = dubf.buf; c->ndub++; }
+
+    if (compatProfOn())
+    {
+        static uint64_t sn = 0;
+        if (++sn % 2000 == 1)
+            fprintf(stderr, "MGL PROFILE bindmap store: vn=%u fn=%u ndub=%d listv=%u listf=%u nullbuf=%d\n",
+                    c->vn, c->fn, c->ndub, vl->count, fl->count, c->nullbuf ? 1 : 0);
+    }
+
+    c->vn = 0;
+    for (GLuint i = 0; i < vl->count && i < MAX_MAPPED_BUFFERS; i++)
+    {
+        const BufferMap *e = &vl->buffers[i];
+        if (e->attribute_mask != 0 || e->buf == NULL)
+            break;          /* attribute entry or the SSBO-size pad: suffix */
+        if (e->buf == nullbuf) { c->nullbuf = (void *)nullbuf; }
+        c->v[c->vn] = *e;
+        /* SSBO / ACB entry: its Buffer lives in the corresponding buffer_base
+         * slot (buffer_base_index is the array element the enumeration read) */
+        GLuint bbi = e->buffer_base_index < MAX_BINDABLE_BUFFERS ? e->buffer_base_index : 0;
+        c->v_gpu_write[c->vn] =
+            ((e->buf == ctx->state.buffer_base[_SHADER_STORAGE_BUFFER].buffers[bbi].buf ||
+              e->buf == ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER].buffers[bbi].buf) &&
+             e->buf != nullbuf) ? 1 : 0;
+        c->vn++;
+    }
+    c->fn = 0;
+    for (GLuint i = 0; i < fl->count && i < MAX_MAPPED_BUFFERS; i++)
+    {
+        const BufferMap *e = &fl->buffers[i];
+        if (e->attribute_mask != 0 || e->buf == NULL)
+            break;
+        if (e->buf == nullbuf) { c->nullbuf = (void *)nullbuf; }
+        c->f[c->fn] = *e;
+        GLuint bbi = e->buffer_base_index < MAX_BINDABLE_BUFFERS ? e->buffer_base_index : 0;
+        c->f_gpu_write[c->fn] =
+            ((e->buf == ctx->state.buffer_base[_SHADER_STORAGE_BUFFER].buffers[bbi].buf ||
+              e->buf == ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER].buffers[bbi].buf) &&
+             e->buf != nullbuf) ? 1 : 0;
+        c->fn++;
+    }
+}
 
 /* ===================== per-draw state-walk fast path =====================
  * (compat perf session 12)
@@ -522,7 +893,7 @@ struct MGLCompatDrawFast {
     GLuint      end_vn, end_fn;
 
     /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
-    uint64_t    misswhy[24];
+    uint64_t    misswhy[26];
     uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
     uint64_t    dirtymask_val[8];
 };
@@ -538,24 +909,26 @@ static struct MGLCompatDrawFast *compatDrawFastState(GLMContext ctx)
 }
 
 /* MGL_DRAWFAST_DEBUG: most recent fast-path state (single-renderer processes) */
-static struct MGLCompatDrawFast *s_compat_df_debug;
+static struct MGLCompatDrawFast *s_compat_df_debug;      /* last gate's state (MGL_PROFILE dump) */
+static struct MGLExtMetal_compat *s_compat_bindmap_dbg_m; /* last bindmap cache owner (same dump) */
 static const char *const s_compat_df_why[] = {
     "no-snap", "dirty-bits", "hook-count", "enc/cb/pipe-id", "cb-committed",
     "prog/vao/fbo-id", "rstate-gen", "vlist", "vlist-dirty", "flist",
     "flist-dirty", "no-vattrib", "plan", "vao-fmt/binding", "current-attribs",
     "va-mapped", "va-dirty", "va-mtl-id", "tex-mask",
-    "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params"
+    "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params",
+        "tex-image-units", "tess-route"
 };
 
 void mgl_compat_drawfast_debug(void)
 {
     struct MGLCompatDrawFast *df = s_compat_df_debug;
-    if (!df)
-        return;
+    if (df)
+    {
     fprintf(stderr, "MGL PROFILE drawfast-miss:");
     for (unsigned i = 0; i < sizeof(s_compat_df_why) / sizeof(s_compat_df_why[0]); i++)
         if (df->misswhy[i])
-            fprintf(stderr, " %s=%llu", s_compat_df_why[i], (unsigned long long)df->misswhy[i]);
+            fprintf(stderr, " %s=%llu", i < 26 ? s_compat_df_why[i] : "?", (unsigned long long)df->misswhy[i]);
     fprintf(stderr, "\n");
     for (unsigned i = 0; i < 8; i++)
         if (df->dirtymask_seen[i])
@@ -563,6 +936,20 @@ void mgl_compat_drawfast_debug(void)
                     (unsigned long long)df->dirtymask_val[i], (unsigned long long)df->dirtymask_seen[i]);
     memset(df->misswhy, 0, sizeof(df->misswhy));
     memset(df->dirtymask_seen, 0, sizeof(df->dirtymask_seen));
+    }
+    /* compat perf session 13: buffer-map prefix cache coverage */
+    {
+        struct MGLExtMetal_compat *mm = s_compat_bindmap_dbg_m;
+        struct MGLCompatBindmapCache *cc =
+            mm ? (struct MGLCompatBindmapCache *)mm->bindmap_cache : NULL;
+        if (cc && (cc->hits || cc->misses))
+        {
+            fprintf(stderr, "MGL PROFILE bindmap: hit=%.1f miss=%.1f (%.0f%% hit) why=%d\n",
+                    (double)cc->hits / 120.0, (double)cc->misses / 120.0,
+                    100.0 * (double)cc->hits / (double)(cc->hits + cc->misses), cc->why);
+            cc->hits = cc->misses = 0;
+        }
+    }
 }
 
 /* per-listed-buffer stability: not mapped, no pending content change, same
@@ -1583,6 +1970,43 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     mgl_compat_bind_set = mgl_compat_bind_skip = mgl_compat_ring_bytes = 0;
 }
 
+/* dispatch the force-opaque kernel on tex (same command buffer, before the
+ * commit that presents it) */
+- (void) compatForceOpaque: (id<MTLTexture>)tex
+{
+    MGLCompatSurfacePool *pool = objc_getAssociatedObject(self, kCompatPoolKey);
+    if (!pool || !tex || tex.width == 0)
+        return;
+    if (!pool.opaquePso)
+    {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [_device newLibraryWithSource:[NSString stringWithUTF8String:s_mgl_force_opaque_msl]
+                                                   options:nil
+                                                     error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mgl_force_opaque"] : nil;
+        pool.opaquePso = fn ? [_device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!pool.opaquePso)
+        {
+            NSLog(@"MGL INFO: force-opaque kernel failed: %@", err.localizedDescription);
+            pool.opaquePsoFailed = YES;                    /* do not retry */
+            return;
+        }
+    }
+    if (pool.opaquePsoFailed)
+        return;                                             /* kernel unavailable */
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc)
+        return;
+    enc.label = @"MGL force opaque";
+    [enc setComputePipelineState:pool.opaquePso];
+    [enc setTexture:tex atIndex:0];
+    MTLSize tg = MTLSizeMake(16, 16, 1);
+    MTLSize g = MTLSizeMake((tex.width + 15) / 16, (tex.height + 15) / 16, 1);
+    [enc dispatchThreadgroups:g threadsPerThreadgroup:tg];
+    [enc endEncoding];
+}
+
+
 - (bool) compatSurfacePresentEnabled
 {
     /* windowed renderers only (a layer exists) and explicitly opted in */
@@ -1678,6 +2102,13 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
         pool.layer.contentsScale = _layer.contentsScale;
         pool.layer.masksToBounds = YES;
         pool.layer.transform = CATransform3DMakeScale(1, -1, 1);   /* GL bottom-up -> upright */
+        /* GL window semantics: the framebuffer alpha is discarded at present
+         * (the window is opaque).  CA composites layer.contents with its
+         * alpha unless the layer is marked opaque — without this the
+         * translucent jellyfish region (dst alpha = a*a + (1-a) after
+         * blending, e.g. 191) is composited over the white window backdrop
+         * and the whole bell washes out (glmark2 jellyfish caustics). */
+        pool.layer.opaque = YES;
         [_layer addSublayer:pool.layer];
     }
     pool.layer.frame = _layer.bounds;
@@ -1729,6 +2160,8 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
         if (pool.textures[k] == color) { di = k; break; }
     if (di < COMPAT_SURFACES)
     {
+        [self compatCSDrain];   /* see the blit path: no concurrent encoders */
+        [self compatForceOpaque:pool.textures[di]];
         [self commitCommandBufferWithAGXRecovery:_currentCommandBuffer];
 
         if (!CGRectEqualToRect(pool.layer.frame, _layer.bounds))
@@ -1747,6 +2180,30 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
     pool.next = (pool.next + 1) % COMPAT_SURFACES;
     id<MTLTexture> dst = pool.textures[i];
 
+    /* FLASH ROOT CAUSE (user: "camera flash" frames in [jellyfish]): fix the
+     * SOURCE's alpha BEFORE the copy.  layer.contents on a raw IOSurface is
+     * not synchronized with this command buffer — the compositor samples the
+     * surface at the display refresh, asynchronously.  With the old order
+     * (blit, then force-opaque on the presented surface) one refresh could
+     * land between the two encoders and composite the new frame while its
+     * alpha still held GL's blended value (~0.36 over the bell): the whole
+     * translucent frame over the white window backdrop = one bright flash.
+     * Fixing the source first makes the presented surface transition
+     * old-frame -> opaque-new-frame in the single blit; the intermediate
+     * half-alpha state lives only in the private texture, which CA never
+     * sees.  (MGL_PRESENT_PROBE_US=<us>: debug aid — spin after the blit to
+     * widen any post-blit window and make ordering bugs reproducible.) */
+    /* fix the SOURCE's alpha before the copy (see the flash comment below) —
+     * only when Metal allows it: the kernel is read_write and the texture must
+     * carry MTLTextureUsageShaderWrite (the pool surfaces do; a private default
+     * framebuffer without it would be UB — it showed as magenta garbage). */
+    bool src_forced = false;
+    if (color.usage & MTLTextureUsageShaderWrite)
+    {
+        [self compatCSDrain];
+        [self compatForceOpaque:color];
+        src_forced = true;
+    }
     /* straight copy with a blit encoder — no render pass, no pipeline, no
      * viewport, no shader bind (the shader-blit present path costs a render
      * encoder per swap; the y-flip lives in the layer transform instead) */
@@ -1775,6 +2232,11 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
                        scissor:false];
     }
 
+    /* source could not be pre-fixed (no ShaderWrite): the old post-copy
+     * kernel on the pool surface, which carries ShaderWrite (s15 behaviour;
+     * the small compositor window remains only on this rare path) */
+    if (!src_forced)
+        [self compatForceOpaque:dst];
     id<MTLCommandBuffer> cb = _currentCommandBuffer;
     [self commitCommandBufferWithAGXRecovery:cb];
 
@@ -1785,6 +2247,62 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
 
     [self newCommandBuffer];
     mgl_prof_end(6, p6);
+
+    /* MGL_PRESENT_DUMP=<n>: dump the just-presented surface (post-commit, no
+     * encoder is open) to /tmp/mgl_present_<n>.ppm — what the user actually
+     * sees, composited by CA from this IOSurface */
+    {
+        static int pdump_env = -1;
+        if (pdump_env < 0)
+        {
+            const char *e = getenv("MGL_PRESENT_DUMP");
+            pdump_env = e ? atoi(e) : 0;
+        }
+        if (pdump_env > 0)
+        {
+            static int pdump_cnt = 0;
+            if (++pdump_cnt % pdump_env == 0)
+            {
+                MTLRegion r = MTLRegionMake2D(0, 0, dst.width, dst.height);
+                NSUInteger rb = 4 * dst.width;
+                uint8_t *buf = (uint8_t *)malloc(rb * dst.height);
+                if (buf)
+                {
+                    [dst getBytes:buf bytesPerRow:rb fromRegion:r mipmapLevel:0];
+                    char path[128];
+                    snprintf(path, sizeof path, "/tmp/mgl_present_%d.ppm", pdump_cnt / pdump_env);
+                    FILE *f = fopen(path, "wb");
+                    if (f)
+                    {
+                        FILE *fa;
+                        char apath[128];
+                        fprintf(f, "P6\n%u %u\n255\n", (unsigned)dst.width, (unsigned)dst.height);
+                        for (NSUInteger y = 0; y < dst.height; y++)
+                            for (NSUInteger x = 0; x < dst.width; x++)
+                            {
+                                uint8_t *p = &buf[y * rb + x * 4];
+                                fputc(p[0], f); fputc(p[1], f); fputc(p[2], f);
+                            }
+                        fclose(f);
+                        snprintf(apath, sizeof apath, "/tmp/mgl_present_alpha_%d.pgm", pdump_cnt / pdump_env);
+                        fa = fopen(apath, "wb");
+                        if (fa)
+                        {
+                            fprintf(fa, "P5\n%u %u\n255\n", (unsigned)dst.width, (unsigned)dst.height);
+                            for (NSUInteger y = 0; y < dst.height; y++)
+                                for (NSUInteger x = 0; x < dst.width; x++)
+                                    fputc(buf[y * rb + x * 4 + 3], fa);
+                            fclose(fa);
+                        }
+                        fprintf(stderr, "[presentdump] %s %ux%u\n", path,
+                                (unsigned)dst.width, (unsigned)dst.height);
+                    }
+                    free(buf);
+                }
+            }
+        }
+    }
+
     [self compatCSFrameStats];       /* compat CS: per-frame stats hook */
     mgl_prof_frame();
     return true;

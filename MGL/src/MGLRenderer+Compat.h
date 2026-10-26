@@ -35,6 +35,13 @@ void mgl_compat_cs_drain(GLMContext glm_ctx);
 - (bool) compatPipelineBindNeeded;
 - (bool) compatPipelineFastPath;
 - (void) compatPipelineStore;
+/* perf session 13: uniform/storage buffer-map prefix cache.  mapBuffersToMTL
+ * calls compatBindmapFast first — true means both stage lists' prefix was
+ * served from the cache (only the vertex-stage attribute suffix re-ran);
+ * false means the caller runs the full enumeration and then calls
+ * compatBindmapStore to re-arm the cache. */
+- (bool) compatBindmapFast: (int) vertex_stage;
+- (void) compatBindmapStore: (int) vertex_stage;
 /* perf session 12 verdicts of compatDrawGate: */
 enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE };
 
@@ -47,7 +54,6 @@ enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE };
 - (int)  compatDrawGate: (bool) allowDirtyListBuffers;
 - (bool) compatDrawFastBuffers;
 - (bool) compatDrawFastRState;
-- (bool) compatDrawFast;
 - (void) compatDrawLatch;
 - (bool) compatEndDrawFast;
 - (void) compatEndDrawLatch;
