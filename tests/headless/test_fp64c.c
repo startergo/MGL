@@ -313,11 +313,13 @@ TEST(fp64_out_param_fns)
         glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof raw, raw);
         double mant, mfrac, mint;
         int e;
-        memcpy(&mant, raw + 0, 8);    /* interleaved: mant@0, expo@8 (4B),
-                                       * mfrac@16 (8B aligned), mint@24 */
+        /* interleaved xfb is PACKED (r25): mant@0, expo@8 (4B), mfrac@12,
+         * mint@20 — no 8-byte alignment between varyings
+         * (KHR-GL46.vertex_attrib_64bit.vao puts a dvec2 right after an int) */
+        memcpy(&mant, raw + 0, 8);
         memcpy(&e, raw + 8, 4);
-        memcpy(&mfrac, raw + 16, 8);
-        memcpy(&mint, raw + 24, 8);
+        memcpy(&mfrac, raw + 12, 8);
+        memcpy(&mint, raw + 20, 8);
         int ce = 0;
         double cm = frexp(inputs[i], &ce);
         double cip, cf = modf(inputs[i], &cip);

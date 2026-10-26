@@ -2169,6 +2169,20 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         ptr->spirv[stage].msl_str = strdup(result);
     }
+    /* glslang types gl_VertexID / gl_InstanceID as SIGNED int (the GL builtins),
+     * but SPIRV-Cross hardcodes `uint` for the [[vertex_id]]/[[instance_id]]
+     * parameters (Metal requires uint for those attributes) while the
+     * EXPRESSIONS keep the SPIR-V int type.  Any overloaded call mixing the
+     * builtin with an int literal is then ambiguous — `min(4, gl_VertexID)`
+     * fails the Metal compile (KHR-GL46.draw_indirect.advanced-twoPass-
+     * transformFeedback-*).  msl_reserved.c re-declares the GL names as int
+     * locals in the entry body so every expression sees the int type GL uses. */
+    if (stage == _VERTEX_SHADER && ptr->spirv[stage].msl_str)
+    {
+        char *fixed = mgl_msl_fix_vertex_id_builtins(ptr->spirv[stage].msl_str);
+        if (fixed)
+            ptr->spirv[stage].msl_str = fixed;
+    }
     if (getenv("MGL_FP64_DUMP") && ptr->spirv[stage].msl_str) {
         char path[256]; snprintf(path, sizeof path, "/tmp/fp64msl%d.metal", stage);
         FILE *f_ = fopen(path, "w");

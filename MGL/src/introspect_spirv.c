@@ -600,6 +600,8 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
            (one per element/column, ARB_vertex_attrib_64bit) is remembered in
            ip->attrib_gl and reported by introspection */
         free(ip->attrib_gl); ip->attrib_gl = NULL; ip->nattrib_gl = 0;
+        struct { uint32_t v, gl, ng, n; } *vins = NULL;
+        size_t nvins = 0;
         for (int pass = 0; pass < 3; pass++)
             for (uint32_t v = 1; v <= m->bound; v++) {
                 if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != SpvStorageClassInput || is_builtin_var(m, v)) continue;
@@ -620,18 +622,34 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip)
                 if (gl_fixed && loc_taken(&lmg, gl, ng)) { ip->attrib_conflict = 1;
                     if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: conflict var=%u name=%s gl=%u ng=%u n=%u pass=%d\n", v, id_name(m, v), gl, ng, n, pass); }
                 loc_take(&lmg, gl, ng);
-                /* internal slot: prefer the GL location (keeps float attributes at their
-                   own index), otherwise allocate the two-slot span elsewhere */
+                vins = realloc(vins, (nvins + 1) * sizeof *vins);
+                vins[nvins].v = v; vins[nvins].gl = gl; vins[nvins].ng = ng; vins[nvins].n = n;
+                nvins++;
+            }
+        /* internal slot assignment, AFTER all GL locations are known: a double
+           attribute needs n internal slots for ng GL locations (n = 2*ng for
+           dvec3/dvec4 columns).  "Prefer the GL location" only works when the
+           span fits (n <= ng) — otherwise it fragments [0, MAX_ATTRIBS) and a
+           full 16-slot set overflows (KHR-GL46.vertex_attrib_64bit.limits_test).
+           Wide spans are therefore packed first-fit first, everything else
+           keeps its GL index when free. */
+        for (int wide = 1; wide >= 0; wide--) {
+            for (size_t i = 0; i < nvins; i++) {
+                uint32_t v = vins[i].v, gl = vins[i].gl, ng = vins[i].ng, n = vins[i].n;
                 uint32_t slot;
-                if (loc_free(&lm, gl, n)) { slot = gl; loc_take(&lm, slot, n); }
+                if ((n > ng) != (wide == 1)) continue;
+                if (n <= ng && loc_free(&lm, gl, n)) { slot = gl; loc_take(&lm, slot, n); }
                 else { slot = loc_alloc(&lm, n); }   /* loc_alloc takes the range */
                 if (slot + n > MAX_ATTRIBS || gl + ng > MAX_ATTRIBS) ip->attrib_overflow = 1;
+                if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: attr var=%u name=%s gl=%u ng=%u slot=%u n=%u wide=%d\n", v, id_name(m, v), gl, ng, slot, n, wide);
                 stage_set_loc(&sc[_VERTEX_SHADER], v, slot, -1);
                 ip->attrib_gl = realloc(ip->attrib_gl, (size_t)(ip->nattrib_gl + 1) * sizeof(*ip->attrib_gl));
                 ip->attrib_gl[ip->nattrib_gl].var = v;
                 ip->attrib_gl[ip->nattrib_gl].gl = (GLint)gl;
                 ip->nattrib_gl++;
             }
+        }
+        free(vins);
     }
     /* fragment outputs */
     if (sc[_FRAGMENT_SHADER].present) {

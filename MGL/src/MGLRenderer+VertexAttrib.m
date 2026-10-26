@@ -285,6 +285,25 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
     return program ? program->name : 0;
 }
 
+/* a vertex input whose internal slots carry raw u32 double words — doubles,
+   dvecN and the COLUMN vectors of dmatNxM attributes (the column of a matrix
+   has its own GL location, so the per-column slot logic below applies to it
+   exactly like a dvecN input of the same width) */
+static bool vattribIsDoubleType(GLenum t)
+{
+    switch (t)
+    {
+        case GL_DOUBLE: case GL_DOUBLE_VEC2: case GL_DOUBLE_VEC3: case GL_DOUBLE_VEC4:
+        case GL_DOUBLE_MAT2: case GL_DOUBLE_MAT3: case GL_DOUBLE_MAT4:
+        case GL_DOUBLE_MAT2x3: case GL_DOUBLE_MAT2x4:
+        case GL_DOUBLE_MAT3x2: case GL_DOUBLE_MAT3x4:
+        case GL_DOUBLE_MAT4x2: case GL_DOUBLE_MAT4x3:
+            return true;
+        default:
+            return false;
+    }
+}
+
 - (MTLVertexDescriptor *) vattribGenerateVertexDescriptor
 {
     struct MGLExtState_vattrib *s = [self vattribState];
@@ -374,8 +393,7 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
         GLint owner_loc = (GLint)loc, cbase = 0;
         GLenum ity = mgl_introspect_slot_owner(ctx, iprog, (GLint)loc, &owner_loc, &cbase);
         plan->owner_gl[loc] = owner_loc;   /* GL location feeding this internal slot */
-        bool dbl_slot = (kind == MGL_VA_KIND_UINT) &&
-                        (ity == GL_DOUBLE || ity == GL_DOUBLE_VEC2 || ity == GL_DOUBLE_VEC3 || ity == GL_DOUBLE_VEC4);
+        bool dbl_slot = (kind == MGL_VA_KIND_UINT) && vattribIsDoubleType(ity);
         /* the owning GL attribute: the internal slot index is NOT the GL location when
            the fp64 word slots / the interface-location pass renumbered the inputs
            (advanced-bindingUpdate: dvec3@3 takes slots 0-1, the vec4 position ends up at
@@ -441,7 +459,7 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
                     desc.layouts[bidx].stride = b->stride ? b->stride : elem;
                     desc.layouts[bidx].stepFunction = (b->divisor == 0) ? MTLVertexStepFunctionPerVertex
                                                                       : MTLVertexStepFunctionPerInstance;
-                    desc.layouts[bidx].stepRate = 1;
+                    desc.layouts[bidx].stepRate = b->divisor ? b->divisor : 1;
                     layout_done[bidx] = true;
                 }
             }
@@ -494,9 +512,13 @@ static GLuint vattribIntrospectProgram(GLMContext ctx, Program *program)
                 }
                 else
                 {
+                    /* an instanced double attribute advances every `divisor`
+                       instances — the converted stream holds one element per
+                       SOURCE element, so Metal's stepRate must carry the GL
+                       divisor (KHR-GL46.vertex_attrib_64bit.vao, divisor 2) */
                     desc.layouts[sidx].stepFunction = (b->divisor == 0) ? MTLVertexStepFunctionPerVertex
                                                                        : MTLVertexStepFunctionPerInstance;
-                    desc.layouts[sidx].stepRate = 1;
+                    desc.layouts[sidx].stepRate = b->divisor ? b->divisor : 1;
                 }
                 plan->fetch[loc] = MGL_VA_FETCH_SHADOW;
             }

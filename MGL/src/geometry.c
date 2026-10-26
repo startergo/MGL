@@ -8563,17 +8563,18 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     src.counts = c->count_offset;
     src.stride = c->stride;
     src.capacity = c->records ? c->records : 1;
-    /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
-    src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
-
-    memset(&src, 0, sizeof src);
-    src.ring = c->buffer_object;
-    src.records = c->records_offset;
-    src.counts = c->count_offset;
-    src.stride = c->stride;
-    src.capacity = c->records ? c->records : 1;
-    /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts primitives: k captured vertices each */
-    src.per_prim = c->prim == GL_TRIANGLES ? 3 : c->prim == GL_LINES ? 2 : 1;
+    /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts PRIMITIVES: k captured
+     * vertices each.  k comes from the transform feedback primitive mode the
+     * app selected (GL 4.6 13.4.2: POINTS captures one record per vertex from
+     * ANY tessellated output — KHR-GL46.tessellation_shader.vertex.vertex_spacing
+     * captures POINTS from a triangle domain), not from the TES's domain. */
+    {
+        GLenum tfm = o->active ? o->primitive_mode : c->prim;
+        src.per_prim = (tfm == GL_TRIANGLES || tfm == GL_TRIANGLE_STRIP || tfm == GL_TRIANGLE_FAN ||
+                        tfm == GL_TRIANGLES_ADJACENCY) ? 3 :
+                       (tfm == GL_LINES || tfm == GL_LINE_STRIP || tfm == GL_LINE_LOOP ||
+                        tfm == GL_LINES_ADJACENCY) ? 2 : 1;
+    }
 
     return geom_xfb_tess_encode(ctx, o, xp, tfb, &src);
 }

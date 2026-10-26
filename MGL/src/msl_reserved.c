@@ -449,3 +449,66 @@ char *mgl_msl_fix_cull_distance(const char *msl)
     }
     return o;
 }
+
+
+/* See the header.  KHR-GL46.draw_indirect.advanced-twoPass-transformFeedback-*
+ * compiles `min(4, gl_VertexID)' — the mixed int/uint overload is ambiguous. */
+char *mgl_msl_fix_vertex_id_builtins(const char *msl)
+{
+    static const char *kFrom[]  = { "uint gl_VertexID [[vertex_id]]",
+                                    "uint gl_InstanceID [[instance_id]]" };
+    static const char *kParam[] = { "uint mgl_vid_ [[vertex_id]]",
+                                    "uint mgl_iid_ [[instance_id]]" };
+    static const char *kLocal[] = { "int gl_VertexID = int(mgl_vid_);\n    ",
+                                    "int gl_InstanceID = int(mgl_iid_);\n    " };
+    char *out = NULL;
+
+    if (!msl) return NULL;
+    for (unsigned k = 0; k < 2; k++)
+    {
+        const char *hit = strstr(out ? out : msl, kFrom[k]);
+        if (!hit) continue;
+        if (hit > (out ? out : msl))
+        {
+            char prev = (out ? out : msl)[(size_t)(hit - (out ? out : msl)) - 1];
+            if (prev == '_' || isalnum((unsigned char)prev)) continue;
+        }
+        {
+            const char *src = out ? out : msl;
+            size_t off = (size_t)(hit - src), len = strlen(src);
+            size_t fl = strlen(kFrom[k]), pl = strlen(kParam[k]), ll = strlen(kLocal[k]);
+            char *ns = malloc(len - fl + pl + ll + 1);
+            if (!ns) { free(out); return NULL; }
+            memcpy(ns, src, off);
+            memcpy(ns + off, kParam[k], pl);
+            memcpy(ns + off + pl, src + off + fl, len - off - fl + 1);
+            free(out);
+            out = ns;
+
+            /* insert the int local right after the entry function's opening brace;
+               SPIRV-Cross writes single-line entry signatures: ")\n{" then the body */
+            {
+                char *brace = strstr(out + off, ")\n{");
+                size_t ins = 0;
+                if (brace) ins = (size_t)(brace - out) + 3;
+                else
+                {
+                    char *brace2 = strstr(out + off, ") {");
+                    if (brace2) ins = (size_t)(brace2 - out) + 3;
+                }
+                if (ins)
+                {
+                    size_t nlen = strlen(out);
+                    char *ns2 = realloc(out, nlen + ll + 1);
+                    if (ns2)
+                    {
+                        out = ns2;
+                        memmove(out + ins + ll, out + ins, nlen - ins + 1);
+                        memcpy(out + ins, kLocal[k], ll);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}

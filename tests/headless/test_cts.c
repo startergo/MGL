@@ -609,6 +609,32 @@ TEST(cts_tess_control_ssbo_const_expr_array_length)
     EXPECT_EQ_INT(rc, 0);
     EXPECT_EQ_INT((int)out, 2);
 }
+/* KHR-GL46.draw_indirect.advanced-twoPass-transformFeedback-{arrays,elements}:
+ * `min(4, gl_VertexID)` — glslang types gl_VertexID as int, SPIRV-Cross
+ * hardcodes `uint` for the [[vertex_id]] parameter, and the mixed-type
+ * overload was ambiguous for the Metal compiler.  MGL now re-declares the
+ * GL builtin as an int local in the entry body (r25). */
+TEST(cts_min_vertexid_int_literal)
+{
+    GLuint vs = make_shader(GL_VERTEX_SHADER,
+        "#version 450 core\n"
+        "layout(std140) uniform Bl { vec4 m[8]; } b;\n"
+        "layout(location=0) out float o;\n"
+        "void main() { o = b.m[min(4, gl_VertexID)].x; gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n");
+    GLuint fs = make_shader(GL_FRAGMENT_SHADER,
+        "#version 450 core\n"
+        "layout(location=0) in float i;\n"
+        "out vec4 c;\n"
+        "void main() { c = vec4(i); }\n");
+    GLuint p = link(vs, fs);
+    GLint status = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &status);
+    EXPECT_EQ_INT(status, GL_TRUE);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(cts_msl_reserved_sampler_uniform);
@@ -624,5 +650,6 @@ int main(void)
     RUN(cts_ubo_instance_array_vec4);
     RUN(cts_tess_control_ssbo_write_and_map_read);
     RUN(cts_tess_control_ssbo_const_expr_array_length);
+    RUN(cts_min_vertexid_int_literal);
     return mgl_test_summary();
 }

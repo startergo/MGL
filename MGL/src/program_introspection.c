@@ -439,6 +439,27 @@ static bool name_matches_var(const char *res, const char *name)
     return !strncmp(res, name, ln) && !strcmp(res + ln, "[0]");
 }
 
+/* GL locations consumed by ONE element of a vertex input array (or one
+ * non-array input): an N-column matrix takes N locations whether its
+ * components are float or double (GL 4.6 §11.1.1, ARB_vertex_attrib_64bit),
+ * so element i of an array starts at base + i*this — plain +i only holds
+ * for scalar/vector elements. */
+static int attrib_elem_locations(GLenum t)
+{
+    switch (t) {
+        case GL_DOUBLE_MAT2:   case GL_FLOAT_MAT2:
+        case GL_DOUBLE_MAT2x3: case GL_FLOAT_MAT2x3:
+        case GL_DOUBLE_MAT2x4: case GL_FLOAT_MAT2x4:  return 2;
+        case GL_DOUBLE_MAT3:   case GL_FLOAT_MAT3:
+        case GL_DOUBLE_MAT3x2: case GL_FLOAT_MAT3x2:
+        case GL_DOUBLE_MAT3x4: case GL_FLOAT_MAT3x4:  return 3;
+        case GL_DOUBLE_MAT4:   case GL_FLOAT_MAT4:
+        case GL_DOUBLE_MAT4x2: case GL_FLOAT_MAT4x2:
+        case GL_DOUBLE_MAT4x3: case GL_FLOAT_MAT4x3:  return 4;
+        default: return 1;
+    }
+}
+
 /* "a[N]" -> location of "a[0]" + N (N < size) */
 static GLint var_location(const MGLIVar *vars, int n, const char *name, GLint *index_out)
 {
@@ -455,7 +476,7 @@ static GLint var_location(const MGLIVar *vars, int n, const char *name, GLint *i
                 for (int i = 0; i < n; i++)
                     if (!strcmp(vars[i].name, base) && idx < vars[i].size && vars[i].location >= 0) {
                         if (index_out) *index_out = vars[i].index;
-                        return vars[i].location + (GLint)idx;
+                        return vars[i].location + (GLint)idx * attrib_elem_locations(vars[i].type);
                     }
             }
         }

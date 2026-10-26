@@ -141,6 +141,7 @@ typedef struct {
     uint32_t  nattrhi;
     uint32_t *attrcomp;      /* access-chain id -> (attribute var << 4) | comp+1 */
     uint32_t *attrslotidx;   /* access-chain id -> slot index (arrays/matrices), ~0 = n/a */
+    uint8_t  *attrmat;       /* access-chain id -> 1 = lands on a whole matrix (element) */
     uint8_t  *elemslice;     /* chain id: 1 = lands on a member-SLICE (multi-slot element) */
     struct { uint32_t nslots, rows, id; } slotsc[64];
     size_t nslotsc;
@@ -172,6 +173,7 @@ typedef struct {
 } F64;
 
 /* ------------------------------------------------------------------ out -- */
+
 
 static void bpush(Buf *b, uint32_t v)
 {
@@ -2463,6 +2465,20 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
                     f->attrcomp[iw[2]] = (base << 4);            /* low nibble 0: no pair */
                     return;
                 }
+                /* whole matrix (element of an array-of-matrices attribute):
+                 * the element owns slots [base, base + cols*ceil(rows/2)); the
+                 * load reassembles the columns from them (KHR-GL46
+                 * .vertex_attrib_64bit.limits_test reads attribute_N[i] whole) */
+                if (good && f->ins[j].op == SpvOpAccessChain && ei < nelem && col < cols &&
+                    row < rows && f->ty[cur].kind == K_MAT)
+                {
+                    uint32_t spc = attr_slots_per_col(rows);
+
+                    f->attrslotidx[iw[2]] = ei * cols * spc;
+                    f->attrcomp[iw[2]] = (base << 4);            /* the attribute variable; no pair */
+                    f->attrmat[iw[2]] = 1;
+                    return;
+                }
             }
             fail(f, "fp64: element access into a double vertex attribute "
                     "is not supported (copy it to a local first)");
@@ -2913,6 +2929,65 @@ static uint32_t iface_slot_ptr(F64 *f, uint32_t ptr, uint32_t arrty, uint32_t j)
 }
 
 
+/* load one element (uint2/uint4 slot) of a flattened attribute slot array */
+static uint32_t attr_load_slot(F64 *f, uint32_t var, uint32_t storage, uint32_t elemty, uint32_t idx)
+{
+    uint32_t u32t = u32_for_pre(f);   /* the module may have no u32 type (type id 0!) */
+    uint32_t jconst = nid(f);
+    uint32_t oc[4] = {u32t, jconst, idx};
+    uint32_t pty2, ap, v;
+    uint32_t oa[5], ol[3];
+
+    f->vty[jconst] = u32t; f->isconst[jconst] = 1; f->cval[jconst] = idx;
+    binst(&f->pre, SpvOpConstant, oc, 3);
+    pty2 = ptr_for(f, storage, elemty);
+    ap = nid(f);
+    f->vty[ap] = pty2;
+    oa[0] = pty2; oa[1] = ap; oa[2] = var; oa[3] = jconst;
+    binst(&f->body, SpvOpAccessChain, oa, 4);
+    v = nid(f);
+    ol[0] = elemty; ol[1] = v; ol[2] = ap;
+    binst(&f->body, SpvOpLoad, ol, 3);
+    return v;
+}
+
+/* whole ARRAY-of-double / double-MATRIX vertex attribute (or one matrix
+ * element of an array-of-matrices, `base` = its first slot): the slot variable
+ * is the flat array of uint2/uint4 built by attr_slotarr_ty — one slot per
+ * Metal location, ceil(rows/2) slots per column, columns slot-aligned.  This is
+ * the register form of iface_to_reg's flat path, reading the slots straight
+ * from the stage-in variable (attributes are never in an interface block). */
+static uint32_t attr_slot_range_to_reg(F64 *f, uint32_t var, uint32_t storage,
+                                       uint32_t base, uint32_t geom, uint32_t orig)
+{
+    uint32_t nelem = geom >> 16, cols = (geom >> 8) & 0xff, rows = geom & 0xff;
+    uint32_t spc = attr_slots_per_col(rows);
+    uint32_t ety = f->ty[orig].elem;      /* the column / element type (dvecR) */
+    uint32_t comps[16];
+
+    if (rows == 1) {
+        /* one double per uint2 slot */
+        if (nelem > 16) { fail(f, "fp64: double attribute array too large"); return var; }
+        for (uint32_t i = 0; i < nelem; i++)
+            comps[i] = bitcast(f, f->f64ty, attr_load_slot(f, var, storage, uint2_of(f), base + i));
+        return cstruct_n(f, orig, comps, nelem);
+    }
+    if (nelem * cols > 16) { fail(f, "fp64: double attribute too large"); return var; }
+    for (uint32_t c = 0; c < nelem * cols; c++) {
+        uint32_t d[4];
+        for (uint32_t j = 0; j < rows; j++) {
+            uint32_t slot = attr_load_slot(f, var, storage, uint4_of(f), base + c * spc + j / 2);
+            uint32_t u2[2] = {
+                xcomp(f, u32_for_pre(f), slot, (j & 1) * 2),
+                xcomp(f, u32_for_pre(f), slot, (j & 1) * 2 + 1)
+            };
+            d[j] = bitcast(f, f->f64ty, cstruct(f, uint2_of(f), u2, 2));
+        }
+        comps[c] = cstruct_n(f, ety, d, rows);
+    }
+    return cstruct_n(f, orig, comps, nelem * cols);
+}
+
 static void rw_load_store(F64 *f, size_t j, bool isload)
 {
     const uint32_t *iw = f->w + f->ins[j].off;
@@ -2950,10 +3025,20 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
              * fold in rw_access rejects anything else). */
             uint32_t elemty = f->ty[f->ty[ptyv].elem].elem;    /* uint2 or uint4 */
             uint32_t jconst = nid(f);
+            uint32_t u32t = u32_for_pre(f);   /* f->u32ty may be 0 (no u32 in the module) */
 
-            f->vty[jconst] = f->u32ty; f->isconst[jconst] = 1; f->cval[jconst] = slotarr;
+            if (f->attrmat[ptr] && !getenv("MGL_NO_ATTRMAT"))
             {
-                uint32_t oc[4] = {f->u32ty, jconst, slotarr};
+                /* whole matrix element: `cols*ceil(rows/2)` slots from `slotarr`;
+                 * geom with nelem = 1 (one element's worth of columns) */
+                uint32_t geom1 = (f->attrsgeom[ptyv] & 0xffffu) | 0x10000u;
+                uint32_t res = attr_slot_range_to_reg(f, var, storage, slotarr, geom1, rt);
+                emit_result(f, rt, rid, res);
+                return;
+            }
+            f->vty[jconst] = u32t; f->isconst[jconst] = 1; f->cval[jconst] = slotarr;
+            {
+                uint32_t oc[4] = {u32t, jconst, slotarr};
                 binst(&f->pre, SpvOpConstant, oc, 3);
             }
             {
@@ -2987,11 +3072,11 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
                     uint32_t pty2 = ptr_for(f, storage, elemty);
                     uint32_t e[4];
 
-                    f->vty[jconst2] = f->u32ty;
+                    f->vty[jconst2] = u32t;
                     f->isconst[jconst2] = 1;
                     f->cval[jconst2] = slotarr + 1;
                     {
-                        uint32_t oc[4] = {f->u32ty, jconst2, slotarr + 1};
+                        uint32_t oc[4] = {u32t, jconst2, slotarr + 1};
                         binst(&f->pre, SpvOpConstant, oc, 3);
                     }
                     f->vty[ap2] = pty2;
@@ -3037,7 +3122,13 @@ static void rw_load_store(F64 *f, size_t j, bool isload)
         binst(&f->body, SpvOpLoad, o, 3 + extra);
         uint32_t res;
         bool lo_pair = (o[0] == uint2_of(f));   /* scalar-double element: a uint2 pair, not a uint4 slot */
-        if (comp == 0xffffffff) {
+        if (comp == 0xffffffff && f->attrsgeom[ptyv] && !getenv("MGL_NO_WHOLEATTR"))
+        {
+            /* whole array-of-double / double-matrix attribute: the slot variable
+             * is the flat slot array; reassemble every element/column from it */
+            res = attr_slot_range_to_reg(f, var, storage, 0, f->attrsgeom[ptyv], rt);
+        }
+        else if (comp == 0xffffffff) {
             if (n == 1 || lo_pair) {
                 res = bitcast(f, f->f64ty, lo);
             } else if (n == 2) {
@@ -3961,6 +4052,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     for (uint32_t q = 0; q < f.libshift; q++) f.attrslotidx[q] = 0xffffffffu;
     f.attrsgeom = calloc(f.libshift, 4);
     f.attrorig = calloc(f.libshift, 4);
+    f.attrmat = calloc(f.libshift, 1);
     f.elemslice = calloc(f.libshift, 1);
     f.elemidx = calloc(f.libshift, 4);
     f.elemstride = calloc(f.libshift, 4);
@@ -3970,7 +4062,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     f.elemreg = calloc(f.libshift, 4);
     f.expc = calloc(f.libshift, sizeof *f.expc);
     f.warr = calloc(f.libshift, 1);
-    if (!f.attrslot || !f.attrn || !f.attrhi || !f.attrhity || !f.attrcomp || !f.attrslotidx || !f.attrsgeom || !f.attrorig || !f.elemslice || !f.elemidx || !f.elemstride || !f.elemorig || !f.ioiface || !f.arrlane || !f.elemreg || !f.expc || !f.warr) {
+    if (!f.attrslot || !f.attrn || !f.attrhi || !f.attrhity || !f.attrcomp || !f.attrslotidx || !f.attrsgeom || !f.attrorig || !f.attrmat || !f.elemslice || !f.elemidx || !f.elemstride || !f.elemorig || !f.ioiface || !f.arrlane || !f.elemreg || !f.expc || !f.warr) {
         fail(&f, "fp64: out of memory");
         goto done;
     }
@@ -4157,7 +4249,7 @@ done:
     free(f.ty); free(f.vty); free(f.cval); free(f.isconst);
     free(f.decs); free(f.mdecs);
     free(f.iface); free(f.iforig); free(f.rowmajor); free(f.roworig); free(f.rowmap);
-    free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.attrslotidx); free(f.attrsgeom); free(f.attrorig); free(f.elemslice); free(f.elemidx); free(f.elemstride); free(f.elemorig); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
+    free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.attrslotidx); free(f.attrsgeom); free(f.attrorig); free(f.attrmat); free(f.elemslice); free(f.elemidx); free(f.elemstride); free(f.elemorig); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
     free(f.vc);
     free(f.pre.w); free(f.preann.w); free(f.lead.w); free(f.defs.w); free(f.body.w);
     free(f.libdefs.w); free(f.libfns.w); free(f.hdradd.w);

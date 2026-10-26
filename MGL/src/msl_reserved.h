@@ -24,6 +24,19 @@
  * GLSL shader is allowed to use as an identifier but MSL is not. */
 int mgl_msl_is_reserved_name(const char *name);
 
+/*
+ * glslang types gl_VertexID / gl_InstanceID as SIGNED int (the GL builtins), but
+ * SPIRV-Cross hardcodes `uint' for the [[vertex_id]]/[[instance_id]] entry
+ * parameters (Metal requires uint for those attributes) while the EXPRESSIONS
+ * keep the SPIR-V int type.  Any overloaded call mixing the builtin with an int
+ * literal is then ambiguous — `min(4, gl_VertexID)' fails the Metal compile.
+ * The fixup renames the parameter and re-declares the GL name as an int local
+ * at the top of the entry body, so every expression sees the int type GL uses.
+ * Returns a freshly allocated fixed copy (caller frees), or NULL if `msl' needs
+ * no fixup.
+ */
+char *mgl_msl_fix_vertex_id_builtins(const char *msl);
+
 /* Rename every reserved OpName / OpMemberName of `words` (the same module `compiler` was
  * created from) to `<name>_mgl<N>` in the compiler.  Renames never touch `gl_`-prefixed
  * names and are chosen not to collide with any other identifier of the module. */

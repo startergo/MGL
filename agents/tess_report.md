@@ -1,6 +1,47 @@
+# tess domain — round 25 report (tess / shader-linking / GLSL compat)
+
+READY ae3145b
+
+(branch tip = merge of gl46-port 784c480 into r25d 4474ec1; r25 code commits:
+436350e, 28bb686, 06c571b, 4474ec1)
+
+Gate on ae3145b: `tests/headless/run.sh` 121 files / 0 FAIL (suite green),
+10x test_geom 603/0 each, 3x test_fp64fast 298/0 each.
+Perf (glmark2-macos -b ideas -b jellyfish through build/nsgl, default mode,
+interleaved A/B ae3145b vs gl46-port 784c480, load ~8-9 from other agents):
+ideas 578 vs 584 FPS mean (-1%, inside the ±8% run-to-run spread),
+jellyfish median 4600 vs 4527 (+1.6%; means dominated by GPU-contention
+outliers 1380-3035 in both).  r25 does not further slow glmark2.
+
+r25 fixes (4 commits, all KHR-GL46 Fail -> Pass unless noted):
+* r25a 436350e vertex_attrib_64bit limits_test + vao (8 fixes):
+  fp64.c whole-matrix/array-of-double attribute loads reassembled from the
+  flat slot array; matrix element access `attribute_0[i]` of array-of-matrix;
+  OpConstant word type via u32_for_pre.  introspect_spirv.c internal slot
+  assignment packs wide double spans first-fit (16-slot attributes no longer
+  overflow the link).  program_introspection.c: an N-column matrix takes N GL
+  locations per array element.  MGLRenderer+VertexAttrib.m: dmatNxM column
+  attributes are double-word slots (dbl_slot knows GL_DOUBLE_MAT*); double
+  attributes honor glVertexAttribDivisor (Metal stepRate).  transform_
+  feedback.c: API-specified interleaved xfb varyings are PACKED (dvec2 after
+  a 4-byte int at +4) — also fixes word order of consecutive double outs.
+* r25b 28bb686 xfb POINTS capture of tessellated output counts with the TF
+  mode (GL 4.6 13.4.2), not the TES domain — vertex_spacing no longer
+  Timeouts (spun forever in its classification loop); now Pass.
+* r25c 06c571b gl_VertexID/gl_InstanceID MSL type: SPIRV-Cross hardcodes
+  uint for [[vertex_id]]/[[instance_id]] while expressions keep int —
+  ambiguous overloads like min(4, gl_VertexID) failed the Metal compile.
+  Entry parameter kept uint under a private name; GL name re-declared as an
+  int local at the top of the entry body.
+* r25d 4474ec1 the same fixup applied to the transform-feedback capture
+  variant MSL (separate VS recompile): draw_indirect.
+  advanced-twoPass-transformFeedback-{arrays,elements} -> Pass.
+
+---
+
 # tess domain — round 24 report (tess / shader-linking / GLSL compat)
 
-READY 47055c4
+(superseded by READY ae3145b above; kept for history)
 
 (the branch tip after this report-only commit carries the same code as
 `47055c4`; code commits this round: f298996, a72987f, 37994f4, 94c5212,

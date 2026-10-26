@@ -1125,6 +1125,97 @@ TEST(TessQuadDomain)
     glDeleteProgram(prog);
 }
 
+
+/* xfb capture of tessellated output with GL_POINTS: GL 4.6 13.4.2 - POINTS
+ * captures one record per emitted vertex from ANY tessellated primitive type.
+ * The record COUNT and PRIMITIVES_WRITTEN come from the transform feedback
+ * primitive mode the app selected, not from the TES domain (r25: a triangle
+ * domain with GL_POINTS capture wrote 3x too few records - one per triangle -
+ * and KHR-GL46.tessellation_shader.vertex.vertex_spacing spun forever in its
+ * vertex classification loop). */
+TEST(TessXfbPoints)
+{
+    struct Src { int t; const char *s; } srcs[] = {
+        { GL_VERTEX_SHADER, kVs },
+        { GL_TESS_CONTROL_SHADER,
+          "#version 450 core\n"
+          "layout(vertices=3) out;\n"
+          "void main() {\n"
+          "  if (gl_InvocationID == 0) {\n"
+          "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+          "    gl_TessLevelInner[0] = 3.0;\n"
+          "  }\n"
+          "}\n" },
+        { GL_TESS_EVALUATION_SHADER,
+          "#version 450 core\n"
+          "layout(triangles, equal_spacing, ccw) in;\n"
+          "out vec3 tcoord;\n"
+          "void main() { tcoord = gl_TessCoord; gl_Position = vec4(gl_TessCoord, 1.0); }\n" },
+    };
+    GLuint p = glCreateProgram();
+    for (unsigned i = 0; i < sizeof srcs / sizeof srcs[0]; i++) {
+        GLuint so = glCreateShader(srcs[i].t);
+        glShaderSource(so, 1, &srcs[i].s, NULL);
+        glCompileShader(so);
+        glAttachShader(p, so);
+        glDeleteShader(so);
+    }
+    const char *xfb[] = { "tcoord" };
+    glTransformFeedbackVaryings(p, 1, xfb, GL_SEPARATE_ATTRIBS);
+    glLinkProgram(p);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    GLuint xb, q;
+    glGenBuffers(1, &xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 1 << 16, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glGenQueries(1, &q);
+
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    GLint wr = -1;
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &wr);
+    glDeleteQueries(1, &q);
+    /* outer=inner=3: 13 triangles are generated, each contributing 3 points */
+    EXPECT_EQ_INT(wr, 39);
+
+    glBindBuffer(GL_ARRAY_BUFFER, xb);
+    float *m = glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+    EXPECT_TRUE(m != NULL);
+    if (m) {
+        /* the distinct tess coordinates: 3 corners + 6 edge points + 3 interior */
+        int uniq = 0, seen_corners = 0;
+        for (int i = 0; i < wr; i++) {
+            const float *c = m + i * 3;
+            int dup = 0;
+            for (int j = 0; j < i; j++)
+                if (m[j*3] == c[0] && m[j*3+1] == c[1] && m[j*3+2] == c[2]) { dup = 1; break; }
+            if (!dup) {
+                uniq++;
+                if ((c[0] > 0.999f && c[1] < 0.001f) || (c[1] > 0.999f && c[0] < 0.001f) ||
+                    (c[2] > 0.999f && c[0] < 0.001f))
+                    seen_corners++;
+            }
+        }
+        EXPECT_EQ_INT(uniq, 12);          /* 3 + 6 + 3 */
+        EXPECT_EQ_INT(seen_corners, 3);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDeleteBuffers(1, &xb);
+    glDeleteProgram(p);
+}
+
 TEST(TessIndexedAndInstanced)
 {
     /* two patches of 3 vertices, drawn from an index buffer with 2 instances; every
@@ -1275,6 +1366,7 @@ int main(void)
         return mgl_test_failures != 0;
     }
     RUN(TessFourPatches);
+    RUN(TessXfbPoints);
     RUN(TessIndexedAndInstanced);
     RUN(TessIndexedRestart);
     RUN(TessIndexedNoRescan);

@@ -1075,12 +1075,14 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
             v->offset = 0;
             xp->stride[i] = v->words * 4;
         } else {
-            /* GL 4.6 / ARB_gpu_shader_fp64: "each double-precision variable
-             * captured must be aligned to a multiple of eight bytes relative
-             * to the beginning of a vertex" (Mesa: align(xfb_offset, 2) in
-             * float units).  Everything else is packed at 4-byte granularity. */
-            if (v->comp_kind == GL_DOUBLE)
-                offset = (offset + 7u) & ~7u;
+            /* API-specified interleaved varyings are PACKED: each starts
+             * immediately after the previous one, at 4-byte granularity —
+             * KHR-GL46.vertex_attrib_64bit.vao puts a dvec2 at offset 84,
+             * right after a 4-byte int varying (the "8 bytes alignment" its
+             * header comment mentions is the record STRIDE: the test pads the
+             * record with gl_SkipComponents1 to 176 bytes.  The 8-byte rule
+             * only constrains shader-declared layout(xfb_offset=N), which the
+             * shader path below rejects when violated). */
             v->buffer = buffer;
             v->offset = offset;
             offset += v->words * 4;
@@ -1736,6 +1738,13 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
             if (fixed) ret = fixed;
         }
         if (!ret) ret = strdup(result);
+        /* the capture variant is a VERTEX stage entry: give gl_VertexID /
+         * gl_InstanceID the int type GL uses (see msl_reserved.h — the
+         * uint SPIRV-Cross parameter makes `min(4, gl_VertexID)' ambiguous) */
+        {
+            char *fixed = mgl_msl_fix_vertex_id_builtins(ret);
+            if (fixed) { free(ret); ret = fixed; }
+        }
         if (getenv("MGL_XFB_DEBUG")) {
             char path[256];
             static unsigned seq = 0;
