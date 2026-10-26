@@ -1987,10 +1987,7 @@ static uint32_t matrix_inverse(F64 *f, uint32_t rty, uint32_t m, uint32_t n)
             }
             uint32_t minor;
             if (n == 2) minor = s[0][0];
-            else if (n == 3) minor = fadd2(f, fsub2(f,
-                     fmul2(f, s[0][0], det2(f, s[1][1], s[1][2], s[2][1], s[2][2])),
-                     fmul2(f, s[0][1], det2(f, s[1][0], s[1][2], s[2][0], s[2][2]))),
-                     fmul2(f, s[0][2], det2(f, s[1][0], s[1][1], s[2][0], s[2][1])));
+            else if (n == 3) minor = det2(f, s[0][0], s[0][1], s[1][0], s[1][1]);
             else minor = det_of3(f, s);
             uint32_t cof = ((i + j) & 1) ? fcall1(f, "mgl_fneg64", minor) : minor;
             col[i] = fcall2(f, "mgl_fdiv64", cof, d);

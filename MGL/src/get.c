@@ -660,7 +660,15 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
          * arguments (glBindImageTexture of an MS texture binds the whole texture — one
          * level, all samples), verified by test_geom / the CTS shader_image_size ms cases */
         case GL_MAX_SAMPLES:
-        case GL_MAX_IMAGE_SAMPLES: PUT1(4);
+        case GL_MAX_IMAGE_SAMPLES:
+            /* 0, not 4: MSL has no shader writes to multisample textures
+             * (texture2d_ms<access::write> is illegal MSL), so MS image STOREs
+             * cannot exist.  GL allows 0; with 4 reported, the CTS exercises MS
+             * image writes and fails at the Metal compile
+             * (KHR-GL46.shader_image_load_store.basic-allTargets-store WriteMS).
+             * MS image READS do work, but the limit gates both directions.  Keep
+             * glslang's max_image_samples in sync (geometry.c limits table). */
+            PUT1(0);
         case GL_MAX_COLOR_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_color_texture_samples), 4));
         case GL_MAX_DEPTH_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_depth_texture_samples), 4));
         case GL_MAX_INTEGER_SAMPLES: PUT1(LIMIT(STATE_VAR(max_integer_samples), 4));

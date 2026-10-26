@@ -1299,6 +1299,188 @@ static char *reject_integer_mix(const char *src)
     return NULL;
 }
 
+/* ================================================================== GL_ARB_cull_distance
+ *
+ * Cull distance has been core since GLSL 4.50 and glslang carries no ARB
+ * extension entry for it at all (Versions.h: "present for 4.5, but need
+ * extension control over block members"), so a #version 150/420 source with
+ * `#extension GL_ARB_cull_distance : require' — what KHR-GL46.cull_distance.*
+ * compiles against a 4.6 context that advertises the extension — dies with
+ * "extension not supported" before anything else.  The directive is dropped
+ * and the version lifted to 4.50, where gl_CullDistance / gl_MaxCullDistances
+ * / gl_MaxCombinedClipAndCullDistances are core built-ins.  A `#define
+ * GL_ARB_cull_distance 1' stand-in is not allowed (GL_* is reserved), so the
+ * whole-expression macro tests (`#ifndef GL_ARB_cull_distance',
+ * `#if defined(GL_ARB_cull_distance)') are folded to #if 0 / #if 1 — the CTS
+ * guards its error paths with exactly those.  `: disable' only drops the
+ * directive.  Fires only when the directive is present, so unrelated sources
+ * are untouched. */
+/* `#ifndef GL_ARB_cull_distance' and friends: the macro test is rewritten to a
+ * constant — GL_* names are reserved and may not be #defined (glslang rejects
+ * `#define GL_ARB_cull_distance 1'), so the conditionals that test the
+ * extension macro are folded instead: ifdef/defined(...) -> #if 1, ifndef/
+ * !defined(...) -> #if 0.  Only a WHOLE-expression test is folded; anything
+ * combined with && or || is left to the preprocessor.  Returns 0 = no match,
+ * 1 = fold to true, -1 = fold to false. */
+static int cull_conditional_fold(const char *src, size_t len, size_t j)
+{
+    /* j: first token position after the directive word */
+    char t1[24];
+    size_t k = mglc_token(src, len, j, t1, sizeof t1);
+    int negate = 0;
+    if (!strcmp(t1, "!"))
+    {
+        negate = 1;
+        k = mglc_token(src, len, k, t1, sizeof t1);
+    }
+    if (!strcmp(t1, "defined"))
+    {
+        char t2[64];
+        size_t k2 = mglc_token(src, len, k, t2, sizeof t2);
+        if (!strcmp(t2, "("))
+        {
+            k2 = mglc_token(src, len, k2, t2, sizeof t2);
+            size_t k3 = mglc_token(src, len, k2, t1, sizeof t1);   /* ')' */
+            if (strcmp(t1, ")")) return 0;
+            k = k3;
+        }
+        else
+            k = k2;
+        /* nothing but whitespace/comment may follow the whole-expression test */
+        size_t r = skip_ws_comments(src, len, k);
+        if (r < len && src[r] != '\n') return 0;
+        int is_cull = !strcmp(t2, "GL_ARB_cull_distance");
+        return is_cull ? (negate ? -1 : 1) : 0;
+    }
+    return 0;
+}
+
+static char *rewrite_cull_distance_ext(const char *src)
+{
+    if (!src || !strstr(src, "GL_ARB_cull_distance"))
+        return NULL;
+    size_t len = strlen(src);
+    int enable_seen = 0, disable_seen = 0;
+    unsigned version = 0;
+    int have_version = 0;
+
+    /* pass 1: find the directives (only at a line start, after blanks) */
+    for (size_t i = 0; i < len; )
+    {
+        while (i < len && (src[i] == ' ' || src[i] == '\t')) i++;   /* directive column */
+        if (i >= len) break;
+        if (src[i] == '#')
+        {
+            char dir[24];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            if (!strcmp(dir, "version"))
+            {
+                char vs[16];
+                mglc_token(src, len, j, vs, sizeof vs);
+                version = (unsigned)atoi(vs);
+                have_version = 1;
+            }
+            else if (!strcmp(dir, "extension"))
+            {
+                char nm[64], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                k = skip_ws_comments(src, len, k);
+                if (k < len && src[k] == ':') k = mglc_token(src, len, k + 1, beh, sizeof beh);
+                else beh[0] = 0;
+                if (!strcmp(nm, "GL_ARB_cull_distance"))
+                {
+                    if (!strcmp(beh, "disable")) disable_seen = 1;
+                    else enable_seen = 1;         /* require/enable/warn/broken */
+                }
+            }
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        while (i < len && src[i] != '\n') i++;
+        if (i < len) i++;
+    }
+    if (!enable_seen && !disable_seen)
+        return NULL;
+    int bump = enable_seen && (!have_version || version < 450);
+
+    /* pass 2: emit */
+    Str out = {0};
+    size_t i = 0;
+    while (i < len)
+    {
+        size_t ls = i;
+        while (i < len && (src[i] == ' ' || src[i] == '\t')) i++;
+        if (i < len && src[i] == '#')
+        {
+            char dir[24];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            size_t e = j;
+            while (e < len && src[e] != '\n') e++;
+            if (!strcmp(dir, "version") && bump)
+            {
+                /* replace only the number token, keep `core'/`compatibility' */
+                char vs[16];
+                size_t k = mglc_token(src, len, j, vs, sizeof vs);
+                str_append(&out, src + ls, j - ls);
+                str_append(&out, " 450", 4);
+                str_append(&out, src + k, e - k);
+                i = e;
+                continue;
+            }
+            if (!strcmp(dir, "extension"))
+            {
+                char nm[64], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                size_t k2 = skip_ws_comments(src, len, k);
+                if (k2 < len && src[k2] == ':') k2 = mglc_token(src, len, k2 + 1, beh, sizeof beh);
+                else beh[0] = 0;
+                if (!strcmp(nm, "GL_ARB_cull_distance") && beh[0])
+                {
+                    /* the directive disappears: the extension is core from
+                     * 4.50 on (and the version is lifted), a macro definition
+                     * is not allowed on the reserved GL_ prefix */
+                    i = e;
+                    continue;
+                }
+            }
+            if (!strcmp(dir, "ifndef") || !strcmp(dir, "ifdef"))
+            {
+                char nm[64];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                size_t r = skip_ws_comments(src, len, k);
+                if (!strcmp(nm, "GL_ARB_cull_distance") && (r >= len || src[r] == '\n'))
+                {
+                    str_append(&out, src + ls, i - ls);
+                    str_append(&out, dir[1] == 'n' ? "#if 0" : "#if 1", 6);
+                    i = e;
+                    continue;
+                }
+            }
+            if (!strcmp(dir, "if") || !strcmp(dir, "elif"))
+            {
+                int fold = cull_conditional_fold(src, len, j);
+                if (fold)
+                {
+                    str_append(&out, src + ls, i - ls);
+                    str_append(&out, dir[0] == 'e' ? "#elif " : "#if ", dir[0] == 'e' ? 7 : 4);
+                    str_append(&out, fold > 0 ? "1" : "0", 1);
+                    i = e;
+                    continue;
+                }
+            }
+            str_append(&out, src + ls, e - ls);
+            i = e;
+            continue;
+        }
+        /* ordinary line: copy through the newline */
+        while (i < len && src[i] != '\n') i++;
+        if (i < len) i++;
+        str_append(&out, src + ls, i - ls);
+    }
+    str_push(&out, '\0');
+    return out.buf;
+}
+
 static char *reject_pp_strictness(const char *src)
 {
     if (!src) return NULL;
@@ -1716,10 +1898,13 @@ char *mgl_cts_glsl_compat_generated(const char *src)
      * checks do not apply to them. */
     if (!src) return NULL;
     const char *src0 = src;
-    char *hoisted0 = mgl_hoist_struct_samplers(src);
-    if (hoisted0) src0 = hoisted0;
+    char *culled0 = rewrite_cull_distance_ext(src);
+    if (culled0) src0 = culled0;   /* GL_ARB_cull_distance: lift to the 4.50
+                                    * core constructs (glslang has no entry) */
+    char *hoisted0 = mgl_hoist_struct_samplers(src0);
+    if (hoisted0) { free(culled0); src0 = hoisted0; }
     char *cur = strip_invariant_on_input(src0);
-    if (!cur && hoisted0) cur = hoisted0;
+    if (!cur && src0 != src) cur = (char *)src0;
     char *next = strip_gl_block_packings(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;
@@ -2297,19 +2482,26 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
         char *bad = reject_binding_range(src, limits);
         if (bad) return bad;
     }
-    int hoisted_fired = 0;
+    char *owned = NULL;    /* chain-owned copy currently installed in `src' */
+    {
+        /* GL_ARB_cull_distance is core in GLSL 4.50 and absent from glslang's
+         * extension table: lift the version and turn the directive into the
+         * macro the CTS's #ifdef guards expect (see the pass above) */
+        char *culled = rewrite_cull_distance_ext(src);
+        if (culled) { owned = culled; src = owned; }
+    }
     {
         /* samplers inside default-block structs cannot be lowered to MSL
          * (see mgl_hoist_struct_samplers) - hoist them out first so every
          * later pass sees plain sampler uniforms */
         char *hoisted = mgl_hoist_struct_samplers(src);
-        if (hoisted) { src = hoisted; hoisted_fired = 1; }  /* the chain owns it */
+        if (hoisted) { free(owned); owned = hoisted; src = owned; }
     }
     /* every step returns a malloc'd copy or NULL when it changed nothing, so the
      * chain keeps the latest non-NULL text and falls back to the original when
-     * no rewrite fired at all — a hoisted copy must stay alive even then */
+     * no rewrite fired at all — an owned copy must stay alive even then */
     char *cur = strip_invariant_on_input(src);
-    if (!cur && hoisted_fired) cur = (char *)src;
+    if (!cur && owned) cur = owned;
     char *next = strip_gl_block_packings(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;

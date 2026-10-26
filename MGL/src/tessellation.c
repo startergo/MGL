@@ -182,18 +182,17 @@ char *mgl_tess_glsl_compat(GLenum type, const char *src)
             for (char *t = strtok_r(decl, " \t\r\n", &tokctx2); t; t = strtok_r(NULL, " \t\r\n", &tokctx2))
                 snprintf(last, sizeof(last), "%s", t);
             size_t ln = strlen(last);
-            if (ln && last[ln - 1] == ']')
+            if (ln > 1 && last[ln - 1] == ']')
             {
-                last[ln - 1] = 0;
-                ln--;
-                while (ln > 1 && (last[ln - 1] == ' ' || last[ln - 1] == '\t')) { last[ln - 1] = 0; ln--; }
-                /* unsized arrays declare as "name[]": drop the '[' too, else the
-                 * member name compares as "gl_ClipDistance[" and an existing
-                 * gl_ClipDistance[] member is expanded in twice
-                 * (KHR-GL46.CommonBugs.CommonBug_PerVertexValidation:
-                 * "duplicate member name: gl_ClipDistance") */
-                if (ln && last[ln - 1] == '[')
-                    last[ln - 1] = 0;
+                /* an array declarator's "[...]"/"[]" suffix is not part of the
+                 * member name: strip back to the matching '[' so sized and
+                 * unsized redeclarations of gl_ClipDistance / gl_CullDistance
+                 * compare equal ("float gl_CullDistance[8]" left the name as
+                 * "gl_CullDistance[8" and the member was expanded in twice) */
+                size_t o = ln - 1;
+                while (o > 1 && last[o - 1] != '[') o--;
+                if (last[o - 1] == '[') last[o - 1] = 0;   /* cut at '[' */
+                else last[ln - 1] = 0;                     /* no bracket found */
             }
             snprintf(name, sizeof(name), "%s", last);
             for (int k = 0; k < 4; k++)

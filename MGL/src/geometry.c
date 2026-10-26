@@ -93,6 +93,7 @@ void mgl_geom_fill_glslang_resource(GLMContext ctx, glslang_resource_t *res)
         { GL_MAX_VARYING_VECTORS,                        offsetof(glslang_resource_t, max_varying_vectors) },
         { GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,           offsetof(glslang_resource_t, max_combined_texture_image_units) },
         { GL_MAX_IMAGE_UNITS,                            offsetof(glslang_resource_t, max_image_units) },
+        /* 0: see get.c GL_MAX_IMAGE_SAMPLES — no shader writes to MS textures in MSL */
         { GL_MAX_IMAGE_SAMPLES,                          offsetof(glslang_resource_t, max_image_samples) },
         { GL_MAX_VERTEX_IMAGE_UNIFORMS,                  offsetof(glslang_resource_t, max_vertex_image_uniforms) },
         { GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS,            offsetof(glslang_resource_t, max_tess_control_image_uniforms) },

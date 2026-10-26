@@ -29,4 +29,21 @@ int mgl_msl_is_reserved_name(const char *name);
  * names and are chosen not to collide with any other identifier of the module. */
 void mgl_msl_mangle_reserved(spvc_compiler compiler, const uint32_t *words, size_t nwords);
 
+/*
+ * SPIRV-Cross flattens a BuiltInCullDistance stage OUTPUT into individual
+ * `float gl_CullDistance_N [[user(cullN)]]' struct members but — unlike
+ * BuiltInClipDistance (spirv_msl.cpp: the [[clip_distance]] array special case) —
+ * leaves the shader's stores pointing at the non-existent `out.gl_CullDistance[...]'
+ * array and appends an "unflatten" tail reading an undeclared block local:
+ *
+ *     out.gl_CullDistance[i] = d[i];                                  // no array member
+ *     out.gl_CullDistance_0 = _15._RESERVED_IDENTIFIER_FIXUP_gl_CullDistance[0];
+ *
+ * mgl_msl_fix_cull_distance() repairs the emitted MSL text of a vertex-function stage:
+ * constant-index stores/loads are redirected to the flattened members, dynamic ones go
+ * through a local array that is copied back before `return out', and the broken tail is
+ * dropped.  Returns a malloc'd corrected copy, or NULL when nothing needed fixing.
+ */
+char *mgl_msl_fix_cull_distance(const char *msl);
+
 #endif

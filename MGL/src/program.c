@@ -1964,6 +1964,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* SPIRV-Cross leaves BuiltInCullDistance stage OUTPUT stores pointing at a
+     * non-existent `out.gl_CullDistance[...]' array (it flattens to individual
+     * [[user(cullN)]] members only) — repair the emitted text (msl_reserved.c).
+     * Vertex-function stages only: the tessellated VS kernel and the TCS control
+     * point buffer shapes are different and untouched. */
+    if (stage == _VERTEX_SHADER || stage == _TESS_EVALUATION_SHADER)
+    {
+        char *fixed_cull = mgl_msl_fix_cull_distance(result);
+        if (fixed_cull)
+        {
+            if (tess_owned && tess_owned != result)
+                free(tess_owned);
+            tess_owned = fixed_cull;
+            result = fixed_cull;
+        }
+    }
+
     /* geom: SPIRV-Cross maps GLSL `coherent`/`volatile` SSBO qualifiers to a `volatile`
      * address-space qualifier in the MSL parameter declarations (`volatile device
      * Block& ...`).  MSL cannot parse that qualifier order (basic-syntax's coherent

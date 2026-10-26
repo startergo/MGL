@@ -208,6 +208,42 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
         [self flushCommandBuffer: false];
 
     id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
+
+    /* atomic counters: GL runs the vertex stage ONCE per draw — the capture pass is an
+     * MGL re-execution, so its atomicCounterIncrement/... must not hit the real counter
+     * buffer a second time (the render draw below performs the real increments).  Snapshot
+     * each bound counter buffer into a scratch copy (blit runs before the capture encoder)
+     * and bind the copy over the injected atomic slots afterwards.  All vars of one GL
+     * binding point share a snapshot so cross-offset visibility is preserved. */
+    struct { id<MTLBuffer> buf; NSUInteger offset; } acShadow[MGL_MAX_ATOMIC_VARS];
+    for (int i = 0; i < MGL_MAX_ATOMIC_VARS; i++) { acShadow[i].buf = nil; acShadow[i].offset = 0; }
+    if (xp->ac_count > 0 && xp->ac_shadow)
+    {
+        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        for (int i = 0; i < xp->ac_count; i++)
+        {
+            GLuint binding = xp->ac_binding[i];
+            if (binding >= MAX_BINDABLE_BUFFERS) continue;
+            BufferBaseTarget *bt = &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER].buffers[binding];
+            if (!bt->buf || !bt->buf->data.mtl_data) continue;   /* generic bind keeps the
+                                                                    zero-filled placeholder */
+            id<MTLBuffer> src = (__bridge id<MTLBuffer>)bt->buf->data.mtl_data;
+            /* one snapshot per binding point (vars of the same point see each other) */
+            id<MTLBuffer> snap = nil;
+            for (int j = 0; j < i && !snap; j++)
+                if (xp->ac_binding[j] == binding && acShadow[j].buf)
+                    snap = acShadow[j].buf;
+            if (!snap)
+            {
+                snap = [_device newBufferWithLength: src.length options: MTLResourceStorageModeShared];
+                if (!snap) { [be endEncoding]; return NULL; }
+                [be copyFromBuffer: src sourceOffset: 0 toBuffer: snap destinationOffset: 0 size: src.length];
+            }
+            acShadow[i].buf = snap;
+            acShadow[i].offset = (NSUInteger)bt->offset;
+        }
+        [be endEncoding];
+    }
     cb.label = @"MGL transform feedback capture";
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor: rp];
     if (!enc) return NULL;
@@ -239,6 +275,12 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     _currentRenderEncoder = saved;
     [self compatBindInvalidate];
     if (!ok) { [enc endEncoding]; return NULL; }
+
+    /* the injected atomic-counter slots read the snapshots, not the real counters
+     * (only when the render draw re-runs the vertex stage — see the comment above) */
+    for (int i = 0; i < xp->ac_count; i++)
+        if (acShadow[i].buf)
+            [enc setVertexBuffer: acShadow[i].buf offset: acShadow[i].offset atIndex: xp->ac_mtl_index[i]];
 
     [enc setVertexBuffer: xfbScratch offset: 0 atIndex: MGL_XFB_MSL_BUFFER_INDEX];
     [enc drawPrimitives: MTLPrimitiveTypePoint vertexStart: (NSUInteger)vstart vertexCount: (NSUInteger)vcount

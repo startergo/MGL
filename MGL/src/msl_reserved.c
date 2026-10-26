@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "spirv.h"
 #include "msl_reserved.h"
 
@@ -264,4 +265,187 @@ void mgl_msl_mangle_reserved(spvc_compiler compiler, const uint32_t *words, size
     }
 
     nameset_free(&ns);
+}
+
+/* ===== BuiltInCullDistance stage OUTPUT flattening =========================
+ *
+ * See msl_reserved.h.  Shapes repaired in the emitted MSL of a vertex-function stage:
+ *
+ *   out.gl_CullDistance[3] = x;                          -> out.gl_CullDistance_3 = x;
+ *   out.gl_CullDistance[i] = x[i];                       -> mgl_cull_out_fix[i] = x[i];
+ *                                                          (+ copy-back before `return out;')
+ *   out.gl_CullDistance_0 = _15._RESERVED_IDENTIFIER_FIXUP_gl_CullDistance[0];
+ *                                                        -> out.gl_CullDistance_0 = out.gl_CullDistance_0;
+ *                                                          (the tail's undeclared local is gone;
+ *                                                          the self-assignment is a no-op)
+ *
+ * Constant-index accesses (stores AND reads) are redirected to the flattened
+ * `NAME_i [[user(cull<i>)]]' struct members parsed out of the MSL; a dynamic index is
+ * routed through a local array copied back to the members before `return out'. */
+/* the sanitized member name SPIRV-Cross gives the local gl_CullDistance array in the
+ * broken unflatten tail (`out.X_0 = _15._RESERVED_IDENTIFIER_FIXUP_gl_CullDistance[0];') */
+#define CULL_FIXUP_PREFIX "._RESERVED_IDENTIFIER_FIXUP_gl_CullDistance["
+#define CULL_FIXUP_LEN (sizeof CULL_FIXUP_PREFIX - 1)
+
+char *mgl_msl_fix_cull_distance(const char *msl)
+{
+    if (!msl || !strstr(msl, "[[user(cull"))
+        return NULL;
+    /* 1. element i -> flattened member name (from the struct declarations) */
+    char elemname[64][40];          /* gl_CullDistance has at most 8 elements in GL 4.6 */
+    int nelem = 0;
+    for (const char *p = strstr(msl, "[[user(cull"); p; p = strstr(p + 1, "[[user(cull"))
+    {
+        int idx;
+        if (sscanf(p + strlen("[[user(cull"), "%d]]", &idx) != 1 || idx < 0 || idx >= 64)
+            continue;
+        /* the member name ends right where the ` [[user(cull' attribute begins */
+        const char *a = p;
+        while (a > msl && (a[-1] == ' ' || a[-1] == '\t')) a--;
+        const char *n = a;
+        while (n > msl && (isalnum((unsigned char)n[-1]) || n[-1] == '_')) n--;
+        size_t nl = (size_t)(a - n);
+        if (nl == 0 || nl >= sizeof elemname[0])
+            continue;
+        if (idx + 1 > nelem) nelem = idx + 1;
+        memcpy(elemname[idx], n, nl);
+        elemname[idx][nl] = 0;
+    }
+    if (nelem == 0)
+        return NULL;
+    for (int i = 0; i < nelem; i++)
+        if (!elemname[i][0])
+            return NULL;           /* incomplete table: do not touch the MSL */
+
+    const size_t len = strlen(msl);
+    size_t cap = len + 4096;
+    char *o = malloc(cap);
+    if (!o)
+        return NULL;
+    size_t n = 0;
+    int dynamic = 0, changed = 0;
+
+    /* pick a local-array name that cannot collide with shader identifiers */
+    const char *localname = "mgl_cull_out_fix";
+    if (strstr(msl, localname))
+        localname = "mgl_cull_out_fix_mgl";
+
+    /* 2. rewrite both access shapes anywhere in the text */
+    size_t i = 0;
+    while (i < len)
+    {
+        size_t idx = 0;
+        int have = 0;
+        if (i + 20 <= len && !strncmp(msl + i, "out.gl_CullDistance[", 20))
+        {
+            idx = i + 20;
+            have = 1;
+        }
+        else if (strncmp(msl + i, CULL_FIXUP_PREFIX, CULL_FIXUP_LEN))
+        {
+            o[n++] = msl[i++];
+            if (n + 4096 > cap) { cap *= 2; o = realloc(o, cap); if (!o) return NULL; }
+            continue;
+        }
+        else
+        {
+            /* `ID' + CULL_FIXUP_PREFIX: the leading identifier is already in `o' */
+            idx = i + CULL_FIXUP_LEN;
+            have = 2;
+        }
+        (void)have;
+
+        /* index text until ']' */
+        size_t j = idx, k = j;
+        while (k < len && msl[k] != ']' && msl[k] != ';' && msl[k] != '\n') k++;
+        int isconst = (k > j && k < len && msl[k] == ']');
+        for (size_t d = j; d < k && isconst; d++)
+            if (!isdigit((unsigned char)msl[d]))
+                isconst = 0;
+        if (isconst)
+        {
+            int e = atoi(msl + j);
+            if (e >= 0 && e < nelem)
+            {
+                /* `out.gl_CullDistance[': nothing of the token is in `o' yet;
+                 * `ID._RESERVED_...[': trim the already-copied ID first */
+                if (have == 2)
+                    while (n > 0 && (isalnum((unsigned char)o[n - 1]) || o[n - 1] == '_'))
+                        n--;
+                int rl = snprintf(o + n, 64, "out.%s", elemname[e]);
+                n += (size_t)rl;
+                i = k + 1;
+                changed = 1;
+                continue;
+            }
+        }
+        /* dynamic index (or one past the array): route through the local array;
+         * `out.gl_CullDistance[' and `ID._RESERVED_...[' both become `<local>[' */
+        if (have == 2)
+            while (n > 0 && (isalnum((unsigned char)o[n - 1]) || o[n - 1] == '_'))
+                n--;
+        memcpy(o + n, localname, strlen(localname));
+        n += strlen(localname);
+        i = idx - 1;               /* the '[' is copied from the source text */
+        o[n++] = msl[i++];
+        dynamic = 1;
+        changed = 1;
+    }
+    o[n] = 0;
+
+    if (!changed)
+    {
+        free(o);
+        return NULL;
+    }
+
+    if (dynamic)
+    {
+        /* declare the local after the entry function's opening brace, copy it back
+         * before the last `return out;' */
+        const char *vfn = NULL;
+        for (const char *p = o; *p; )
+        {
+            const char *eol = strchr(p, '\n');
+            size_t fl = eol ? (size_t)(eol - p) : strlen(p);
+            if (fl >= 7 && (!strncmp(p, "vertex ", 7) || !strncmp(p, "kernel ", 7)))
+                vfn = p;
+            p = eol ? eol + 1 : p + fl;
+        }
+        const char *brace = vfn ? strchr(vfn, '{') : NULL;
+        if (!brace)
+        {
+            free(o);
+            return NULL;
+        }
+        size_t at = (size_t)(brace - o) + 1;
+        char *ret = NULL;
+        for (char *p = o; (p = strstr(p, "return out;")); p += 5)
+            ret = p;
+        if (!ret)
+        {
+            free(o);
+            return NULL;
+        }
+        char decl[96], copies[64 * 64];
+        snprintf(decl, sizeof decl, "\n    float %s[%d] = {};", localname, nelem);
+        size_t dlen = strlen(decl), clen = 0;
+        for (int e = 0; e < nelem; e++)
+            clen += (size_t)snprintf(copies + clen, sizeof copies - clen,
+                                     "    out.%s = %s[%d];\n", elemname[e], localname, e);
+        char *fin = malloc(n + dlen + clen + 8);
+        if (!fin)
+        {
+            free(o);
+            return NULL;
+        }
+        memcpy(fin, o, at);
+        memcpy(fin + at, decl, dlen);
+        memcpy(fin + at + dlen, o + at, (size_t)(ret - o) - at);
+        memcpy(fin + at + dlen + (size_t)(ret - o) - at, copies, clen);
+        memcpy(fin + at + dlen + (size_t)(ret - o) - at + clen, ret, n - (size_t)(ret - o) + 1);
+        free(o);
+        o = fin;
+    }
+    return o;
 }

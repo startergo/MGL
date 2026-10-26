@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_geom.h"      /* MGL_MAX_ATOMIC_VARS (shared injection limits) */
 
 #define MGL_XFB_MAX_BUFFERS                 4
 #define MGL_XFB_MAX_STREAMS                 4
@@ -83,11 +84,21 @@ typedef struct MGLXfbProgram_t {
     bool     vid_absolute;      /* gl_VertexID in the variant includes vertexStart (subtract vstart) */
     bool     iid_absolute;      /* gl_InstanceID in the variant includes baseInstance */
     char    *msl;
-    char    *entry;
-    void    *mtl_library;       /* owned by MGLRenderer+TransformFeedback.m */
+    char    *entry;    void    *mtl_library;       /* owned by MGLRenderer+TransformFeedback.m */
     void    *mtl_function;
     void    *mtl_pipeline;
     void    *mtl_pipeline_key;
+
+    /* atomic-counter arguments the capture variant injected: GL runs the vertex stage
+     * once per draw, but the capture pass re-executes its side effects, so the capture
+     * dispatch binds scratch snapshots over these slots instead of the real counters
+     * (the render pass below mutates the real buffer exactly once) */
+    GLuint   ac_mtl_index[MGL_MAX_ATOMIC_VARS];
+    GLuint   ac_binding[MGL_MAX_ATOMIC_VARS];   /* GL atomic-counter binding point */
+    int      ac_count;
+    bool     ac_shadow;         /* capture pass must observe snapshots (a render draw
+                                 * re-runs the vertex stage); false with rasterizer
+                                 * discard, where the capture IS the execution */
 } MGLXfbProgram;
 
 /* per transform feedback object (name 0 = default object) */

@@ -26,6 +26,9 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
+#include "cts_glsl_compat.h"     /* mgl_cts_glsl_compat_generated: GL-legal but
+                                  * SPIR-V-hostile constructs in the recompiled
+                                  * user VS (GL_ARB_cull_distance lifting, ...) */
 
 char *mgl_program_fix_vertex_gathers(const char *msl);  /* program.c: AGX vertex gather emulation */
 #include "mgl_ext_geom.h"
@@ -717,7 +720,12 @@ static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version
 {
     glslang_input_t input;
     memset(&input, 0, sizeof(input));
-    initGLSLInput(ctx, GL_VERTEX_SHADER, src, &input);
+    /* match the program's own compile (shaders.c / geometry.c): the user's VS
+     * source carries the same GL-legal-but-SPIR-V-hostile constructs
+     * (GL_ARB_cull_distance lifting, packed blocks, ...) and must be rewritten
+     * the same way before glslang sees it */
+    char *compat = mgl_cts_glsl_compat_generated(src);
+    initGLSLInput(ctx, GL_VERTEX_SHADER, compat ? compat : src, &input);
     if (force_version && input.default_version < force_version) {
         input.default_version = force_version;
         input.client_version = GLSLANG_TARGET_OPENGL_450;
@@ -735,15 +743,17 @@ static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version
     options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS | GLSLANG_SHADER_AUTO_MAP_BINDINGS;
 
     glslang_shader_t *sh = glslang_shader_create(&input);
-    if (!sh) { *log = strdup("glslang_shader_create failed"); return false; }
+    if (!sh) { *log = strdup("glslang_shader_create failed"); free(compat); return false; }
     glslang_shader_set_options(sh, options);
 
     if (!glslang_shader_preprocess(sh, &input) || !glslang_shader_parse(sh, &input)) {
         const char *l = glslang_shader_get_info_log(sh);
         *log = strdup(l ? l : "compile failed");
         glslang_shader_delete(sh);
+        free(compat);
         return false;
     }
+    free(compat);   /* glslang has copied the source by now */
 
     glslang_program_t *prog = glslang_program_create();
     glslang_program_add_shader(prog, sh);
@@ -1873,6 +1883,16 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
                 {
                     free(xp->msl);
                     xp->msl = injected;
+                    /* remember the injected slots + their GL binding points: the capture
+                     * dispatch binds scratch snapshots over them (GL runs the vertex stage
+                     * once; the capture pass must not repeat its atomic side effects) */
+                    for (int i = 0; i < n; i++)
+                    {
+                        xp->ac_mtl_index[xp->ac_count] = (GLuint)idx[i];
+                        xp->ac_binding[xp->ac_count] =
+                            (GLuint)spvc_compiler_get_decoration(c, aclist[i].id, SpvDecorationBinding);
+                        xp->ac_count++;
+                    }
                 }
                 else
                     xfb_fail(xp, "capture variant atomic counter arguments could not be "
@@ -2187,6 +2207,11 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
     bool scattered_on_gpu = false;
 
     if (fit && xp->record_words && xp->msl && M && M->capture) {
+        /* GL runs the vertex stage once: with rasterizer discard (or no fragment stage)
+         * the capture pass IS that execution and its atomic-counter side effects are
+         * real; otherwise the render draw below runs them again and the capture must
+         * observe snapshots instead (see xfbCaptureAsync) */
+        xp->ac_shadow = keep_draw;
         /* gpuaudit: the capture pass is encoded but not waited on, and a compute kernel
          * copies the records straight into the transform feedback buffers on the same
          * queue - no CPU round trip and no per-vertex memcpy.  Everything the kernel
