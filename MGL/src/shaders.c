@@ -475,14 +475,34 @@ void mgl_shader_release_compiler_resources(GLMContext ctx)
 }
 
 bool mgl_glslang_cache_owns(glslang_shader_t *sh);   /* compile cache below */
+static void mgl_glslang_cache_ref(glslang_shader_t *sh, int delta);
+bool mgl_glslang_unshared_release(glslang_shader_t *sh);
+static int  mgl_glslang_unshared_find(glslang_shader_t *sh);
+int  mgl_glslang_cache_unshare(glslang_shader_t *sh);
 
 static void release_glslang_shader(GLMContext ctx, Shader *ptr)
 {
     if (ptr->compiled_glsl_shader)
     {
         /* the compile cache shares glslang_shader_t objects between GL shader objects;
-         * cache-owned ones stay alive (see mgl_glslang_cache_* below) */
-        if (!mgl_glslang_cache_owns(ptr->compiled_glsl_shader))
+         * cache-owned ones stay alive (see mgl_glslang_cache_* below), and a shader
+         * that already went through a program link is refcounted in the unshared
+         * registry (deleted when the last borrower releases it) */
+        if (getenv("MGL_CACHE_TRACE")) fprintf(stderr, "TRACE release ptr=%p sh=%p\n", (void*)ptr, (void*)ptr->compiled_glsl_shader);
+        /* Ownership ladder: (1) unshared registry — a linked shader borrowed by one or
+         * more GL objects: decrement, delete only when the LAST borrower releases it.
+         * (2) compile cache — shared, never deleted here.  (3) private handle.
+         * NB: mgl_glslang_unshared_release() returning false means "refs remain" OR
+         * "not in the registry" — those must NOT fall through to the private delete,
+         * or a shader shared by two GL objects gets deleted twice (test_zz_pil crash). */
+        if (mgl_glslang_unshared_find(ptr->compiled_glsl_shader) >= 0)
+        {
+            if (mgl_glslang_unshared_release(ptr->compiled_glsl_shader))
+                glslang_shader_delete(ptr->compiled_glsl_shader);
+        }
+        else if (mgl_glslang_cache_owns(ptr->compiled_glsl_shader))
+            mgl_glslang_cache_ref(ptr->compiled_glsl_shader, -1);
+        else if (!mgl_glslang_cache_owns(ptr->compiled_glsl_shader))
             glslang_shader_delete(ptr->compiled_glsl_shader);
         ptr->compiled_glsl_shader = NULL;
         if (STATE(ext_program) && STATE(ext_program)->live_glslang_shaders > 0)
@@ -686,13 +706,82 @@ static void lazy_init_compiler(GLMContext ctx)
 typedef struct {
     uint64_t            hash;
     char               *key;
-    glslang_shader_t   *shader;     /* cache-owned, shared */
+    glslang_shader_t   *shader;     /* cache-owned until its first program link */
     char               *log;        /* info-log snapshot at compile time */
     GLboolean           status;
+    int                 refs;       /* GL shader objects holding `shader` */
 } MGLGlslangCacheEnt;
 
 static MGLGlslangCacheEnt mgl_glslang_cache[MGL_GLSLANG_CACHE_MAX];
 static int mgl_glslang_cache_count;
+
+/* A program LINK writes program-wide uniform locations back into every stage
+ * intermediate (glslang's io mapper), so one compiled glslang shader must not be
+ * linked inside two DIFFERENT programs: the second link failed with
+ * "INTERNAL ERROR: Uniform location overlaps across stages"
+ * (KHR-GL46.shaders.indexing.varying_array.* after the compile cache landed).
+ * On the first link the entry leaves the cache and ownership moves to the
+ * borrowing GL shader objects, refcounted here. */
+typedef struct { glslang_shader_t *sh; int refs; } MGLGlslangUnshared;
+static MGLGlslangUnshared *mgl_glslang_unshared;
+static int mgl_glslang_unshared_count, mgl_glslang_unshared_cap;
+
+static int mgl_glslang_unshared_find(glslang_shader_t *sh)
+{
+    for (int i = 0; i < mgl_glslang_unshared_count; i++)
+        if (mgl_glslang_unshared[i].sh == sh) return i;
+    return -1;
+}
+
+/* adjust the borrow count of a cache entry by handle */
+static void mgl_glslang_cache_ref(glslang_shader_t *sh, int delta)
+{
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].shader == sh)
+        {
+            mgl_glslang_cache[i].refs += delta;
+            if (mgl_glslang_cache[i].refs < 0) mgl_glslang_cache[i].refs = 0;
+            return;
+        }
+}
+
+/* called by the link path: `sh` has been linked once — stop sharing it.
+ * Returns the remaining references (0 = nobody borrows it any more: delete). */
+int mgl_glslang_cache_unshare(glslang_shader_t *sh)
+{
+    int idx = -1;
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].shader == sh) { idx = i; break; }
+    if (idx < 0) return -1;                        /* not a cache entry */
+    int refs = mgl_glslang_cache[idx].refs;
+    mgl_glslang_cache[idx].shader = NULL;          /* tombstone: no further reuse */
+    mgl_glslang_cache[idx].refs = 0;
+    if (!refs) return 0;
+    if (mgl_glslang_unshared_count == mgl_glslang_unshared_cap)
+    {
+        int cap = mgl_glslang_unshared_cap ? mgl_glslang_unshared_cap * 2 : 64;
+        MGLGlslangUnshared *grown = realloc(mgl_glslang_unshared, (size_t)cap * sizeof(*grown));
+        if (!grown) return refs;                   /* keep the cache entry alive */
+        mgl_glslang_unshared = grown;
+        mgl_glslang_unshared_cap = cap;
+    }
+    mgl_glslang_unshared[mgl_glslang_unshared_count].sh = sh;
+    mgl_glslang_unshared[mgl_glslang_unshared_count].refs = refs;
+    mgl_glslang_unshared_count++;
+    if (getenv("MGL_CACHE_TRACE")) fprintf(stderr, "TRACE unshare sh=%p refs=%d\n", (void*)sh, refs);
+    return refs;
+}
+
+/* a GL shader object released its handle: returns true when the unshared
+ * glslang shader fell back to zero references (the caller deletes it then) */
+bool mgl_glslang_unshared_release(glslang_shader_t *sh)
+{
+    int i = mgl_glslang_unshared_find(sh);
+    if (i < 0) return false;
+    if (--mgl_glslang_unshared[i].refs > 0) return false;
+    mgl_glslang_unshared[i] = mgl_glslang_unshared[--mgl_glslang_unshared_count];
+    return true;
+}
 
 static uint64_t mgl_fnv1a(const char *s)
 {
@@ -725,7 +814,11 @@ static bool mgl_glslang_cache_owns_impl(glslang_shader_t *sh)
             return true;
     return false;
 }
-bool mgl_glslang_cache_owns(glslang_shader_t *sh) { return mgl_glslang_cache_owns_impl(sh); }
+bool mgl_glslang_cache_owns(glslang_shader_t *sh)
+{
+    if (mgl_glslang_unshared_find(sh) >= 0) return false;   /* linked once: borrowed */
+    return mgl_glslang_cache_owns_impl(sh);
+}
 
 /* returns the cache entry for (type, source) or NULL; entry must be used immediately
  * (no locking: GL objects are bound to the context thread) */
@@ -745,7 +838,7 @@ static MGLGlslangCacheEnt *mgl_glslang_cache_find(GLenum type, const char *src)
     for (int i = 0; i < mgl_glslang_cache_count; i++)
         if (mgl_glslang_cache[i].hash == h && !strncmp(mgl_glslang_cache[i].key, key, strlen(key)) &&
             !strcmp(mgl_glslang_cache[i].key + strlen(key), src))
-            return &mgl_glslang_cache[i];
+            return mgl_glslang_cache[i].shader ? &mgl_glslang_cache[i] : NULL;   /* linked once */
     return NULL;
 }
 
@@ -756,10 +849,13 @@ static void mgl_glslang_cache_add(GLenum type, const char *src, glslang_shader_t
     MGLGlslangCacheEnt *e;
 
     if (!src || mgl_glslang_cache_count >= MGL_GLSLANG_CACHE_MAX)
-    {
-        if (sh) glslang_shader_delete(sh);   /* not cacheable: keep old ownership rules */
+        /* not cacheable.  The caller has ALREADY stored `sh` in its Shader object
+         * (compiled_glsl_shader is assigned before cache_add); deleting it here
+         * left a dangling handle that the next recompile double-freed — this
+         * crashed KHR-GL46.gpu_shader_fp64.fp64.valid_constructors once the cache
+         * filled.  The object keeps sole ownership and releases it through
+         * release_glslang_shader (which skips cache-owned handles). */
         return;
-    }
 
     snprintf(key, sizeof key, "%u:", type);
     e = &mgl_glslang_cache[mgl_glslang_cache_count++];
@@ -769,6 +865,7 @@ static void mgl_glslang_cache_add(GLenum type, const char *src, glslang_shader_t
     e->shader = sh;      /* may be NULL for a failed compile */
     e->log = log ? strdup(log) : NULL;
     e->status = status;
+    e->refs = sh ? 1 : 0;   /* the object that just compiled it */
 }
 
 void mglCompileShader(GLMContext ctx, GLuint shader)
@@ -813,7 +910,11 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     bl.atomic_bindings = mgl_reported_binding_limit(ctx, GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS);
     bl.image_units = mgl_reported_binding_limit(ctx, GL_MAX_IMAGE_UNITS);
     bl.combined_texture_units = mgl_reported_binding_limit(ctx, GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS);
-    char *compat = mgl_cts_glsl_compat_limited(mgl_introspect_shader_source(ctx, ptr), &bl);
+    /* reserved words used as subroutine / declarator names must be rejected on the
+     * RAW source: the introspect pass rewrites subroutines away (cts_glsl_compat.c) */
+    char *reserved_reject = mgl_reject_reserved_declarators(ptr->src);
+    char *compat = mgl_cts_glsl_compat_limited(
+        reserved_reject ? reserved_reject : mgl_introspect_shader_source(ctx, ptr), &bl);
     {
         /* tess: a gl_PerVertex (gl_in) redeclared as a subset of the producer's members is
          * legal GL; glslang's cross-stage link rejects it — expand it (mgl_ext_tess.h) */
@@ -840,7 +941,9 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
                 mgl_set_info_log(&ptr->log, "%s", ce->log);
             if (ce->status)
             {
+                if (getenv("MGL_CACHE_TRACE")) fprintf(stderr, "TRACE borrow ptr=%p old=%p sh=%p\n", (void*)ptr, (void*)ptr->compiled_glsl_shader, (void*)ce->shader);
                 release_glslang_shader(ctx, ptr);
+                mgl_glslang_cache_ref(ce->shader, +1);
                 ptr->compiled_glsl_shader = ce->shader;
                 if (STATE(ext_program))
                     STATE(ext_program)->live_glslang_shaders++;

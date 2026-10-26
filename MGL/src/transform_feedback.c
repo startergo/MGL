@@ -26,6 +26,8 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_xfb.h"
+
+char *mgl_program_fix_vertex_gathers(const char *msl);  /* program.c: AGX vertex gather emulation */
 #include "mgl_ext_geom.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
@@ -1821,6 +1823,16 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     char entry[64];
     snprintf(entry, sizeof(entry), "mgl_xfb_vertex_%u", xp->name);
     xp->msl = xfb_spirv_to_msl(ctx, ir, words, entry);
+    /* the capture runs the vertex stage on its own encoder: gathers there must
+     * use the read/sample emulation too (AGX vertex functions return zeros for
+     * offset gathers) or the captured records are all zero
+     * (KHR-GL46.gpu_shader5 texture_gather_offsets_*) */
+    if (xp->msl)
+    {
+        char *fixed = mgl_program_fix_vertex_gathers(xp->msl);
+        if (fixed) { free(xp->msl); xp->msl = fixed;
+            if (getenv("MGL_XFB_DEBUG")) { FILE *f = fopen("/tmp/xfb_fixed.metal", "w"); if (f) { fputs(xp->msl, f); fclose(f); } } }
+    }
     if (!xp->msl) { xfb_fail(xp, "capture variant MSL translation failed", NULL, NULL); goto done; }
     /* atomic counters of the vertex stage: SPIRV-Cross declares no atomic_uint arguments
      * at all (see geometry.c's mgl_msl_inject_atomic_counters), so the capture variant's

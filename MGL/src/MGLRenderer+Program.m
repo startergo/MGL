@@ -112,8 +112,10 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
         }
 
         /* specialized with no values, like -bindMTLProgram: functions carrying function
-         * constants (rstate fixups) take their GL-default branches */
-        fn = [lib newFunctionWithName:name constantValues:nil error:nil];
+         * constants (rstate fixups) take their GL-default branches.  constantValues must
+         * be non-nil (Metal API validation asserts on nil); an empty set keeps the
+         * function constants' default specializations. */
+        fn = [lib newFunctionWithName:name constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
         if (!fn)
         {
             if (getenv("MGL_MSL_DEBUG"))

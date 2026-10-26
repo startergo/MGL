@@ -2221,11 +2221,20 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
             for (GLuint e = 0; e < elems; e++)
             {
-            if (spirv_binding + e >= TEXTURE_UNITS)
+            /* GL semantics: every sampler-ARRAY element is an independent uniform —
+             * element e samples the unit the app stored with glUniform1i on THAT
+             * element, which need not be base+e (base+e is only the default when
+             * the element was never set; KHR-GL46.shaders.struct.uniform.
+             * sampler_array_* sets s[0].c=1, s[1].c=0).  Element 0's value is
+             * latched into sres->binding at upload (mgli_upload_uniform). */
+            GLuint unit = (e == 0) ? spirv_binding
+                                   : mgli_sampler_elem_unit(ctx, prog, stage, sres->_id, e,
+                                                            spirv_binding + e);
+            if (unit >= TEXTURE_UNITS)
                 continue;
             /* GL sampler semantics: the sampler's dimension selects the unit's
              * binding for that target (mgl_texture_for_sampler) */
-            Texture *ptr = mgl_texture_for_sampler(ctx, spirv_binding + e, sres->target);
+            Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
             if (getenv("MGL_BINDTRACE"))
                 fprintf(stderr, "[bindtrace]   i=%u binding=%u mtl=%u target=%x tex=%p\n",
                         i, spirv_binding, mtl_index, sres->target, (void *)ptr);
@@ -2237,7 +2246,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
              * are unchanged), replay the resolved texture/sampler pair through
              * the shadow-filtered setters and skip the validate/realize/
              * sampler/view chain (MGLRenderer+Compat.m) */
-            if ([self compatTexResolveHit:(stage == _FRAGMENT_SHADER) unit:(spirv_binding + e)
+            if ([self compatTexResolveHit:(stage == _FRAGMENT_SHADER) unit:unit
                                      slot:(mtl_index + e) tex:ptr])
                 continue;
 
@@ -2249,11 +2258,11 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
             // sampler objects bound to the unit override the texture's sampler state;
             // swizzle / base+max level / stencil mode select a texture view (texparam)
-            id<MTLSamplerState> sampler = [self texparamSamplerForUnit:spirv_binding + e texture:ptr];
+            id<MTLSamplerState> sampler = [self texparamSamplerForUnit:unit texture:ptr];
             texture = [self texparamTextureForTex:ptr base:texture];
             assert(sampler);
 
-            [self compatTexResolveRecord:(stage == _FRAGMENT_SHADER) unit:(spirv_binding + e)
+            [self compatTexResolveRecord:(stage == _FRAGMENT_SHADER) unit:unit
                                     slot:(mtl_index + e) tex:ptr view:texture sampler:sampler];
 
                 /* geom: the vertex stage's shadow-sampling emulation samples the depth
@@ -2261,7 +2270,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                  * bind the compare-stripped sampler of the unit at those slots
                  * (mgl_fix_shadow_vs / spirv[VS].shadow_slots) */
                 if (mgl_geom_vs_shadow_slot(STATE(program), mtl_index + e))
-                    [self geomShadowCheckStale:spirv_binding + e texture:ptr slot:mtl_index + e];
+                    [self geomShadowCheckStale:unit texture:ptr slot:mtl_index + e];
                 /* tess: when tessellation is active this stage is the TES running as
                  * the pipeline's vertex function (post-tessellation or the plain
                  * variant), so its textures/samplers are VERTEX-side arguments — the

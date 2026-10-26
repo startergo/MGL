@@ -1148,16 +1148,14 @@ void tdUnpack(const TDFormat *f, const void *src, size_t src_row, size_t src_img
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             client_read_row(s, format, type, swap_bytes, w, tmp);
-            /* GL 4.6 8.5.4: float / half-float client values are LINEAR; an sRGB
-             * storage wants the gamma-encoded bytes.  UNORM client data is copied
-             * through unchanged (its bytes are already in storage space). */
-            if ((f->flags & TDF_SRGB) && (f->kind == TDK_UN8) && td_client_type_is_float(type))
-                for (int x = 0; x < w; x++)
-                {
-                    tmp[x].c[0] = td_srgb_encode(tmp[x].c[0]);
-                    tmp[x].c[1] = td_srgb_encode(tmp[x].c[1]);
-                    tmp[x].c[2] = td_srgb_encode(tmp[x].c[2]);
-                }
+            /* No sRGB gamma conversion here: GL applies the sRGB transfer function
+             * ONLY while sampling/filtering an sRGB internal format (GL 4.6 8.5.1);
+             * pixel transfer (TexImage/TexSubImage/GetTexImage) moves raw storage
+             * values through the canonical float (GL 4.6 8.5.4) — a FLOAT upload of
+             * 0.25 stores byte 64 and a FLOAT readback returns 64/255.  (Encoding
+             * on upload returned decode(encode(v)) from every gather/sample and
+             * failed KHR-GL46.texture_gather plain-gather-float-2d-srgb and the
+             * packed_pixels sRGB mixed-type round trips.) */
             storage_write_row(f, o, so, w, tmp, wd, ws);
         }
     }
@@ -1203,15 +1201,9 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             storage_read_row(f, s, ss, w, tmp);
-            /* GL 4.6 8.5.4: reading sRGB storage into float / half-float clients
-             * returns LINEAR values; UNORM clients get the raw storage bytes back */
-            if ((f->flags & TDF_SRGB) && (f->kind == TDK_UN8) && cf_float_client)
-                for (int x = 0; x < w; x++)
-                {
-                    tmp[x].c[0] = td_srgb_decode(tmp[x].c[0]);
-                    tmp[x].c[1] = td_srgb_decode(tmp[x].c[1]);
-                    tmp[x].c[2] = td_srgb_decode(tmp[x].c[2]);
-                }
+            /* No sRGB decode on readback either (GL 4.6 8.5.1/8.5.4: the gamma
+             * conversion is a sampling-time operation only; GetTexImage moves raw
+             * storage values — FLOAT clients get storage/255, not decode(storage)) */
             /* a signed-normalized storage read back through any client keeps its value:
              * GL 4.6 8.5.4 converts through floats and clamps to what the CLIENT type
              * represents (an UNSIGNED_BYTE read of -0.5 clamps to 0, it is not biased to

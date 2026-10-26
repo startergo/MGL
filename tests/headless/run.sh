@@ -25,7 +25,7 @@ fail=0
 for src in "${SRCS[@]}"; do
     name="$(basename "${src%.c}")"
     exe="$OUT/$name"
-    incs=(-I"$ROOT/tests/headless" -I"$ROOT/MGL/include/GL" -I"$ROOT/MGL/include")
+    incs=(-I"$ROOT/tests/headless" -I"$ROOT/MGL/include/GL" -I"$ROOT/MGL/include" -I"$ROOT/external/glslang/glslang/Include" -I"$ROOT/external/SPIRV-Cross" -I"$ROOT/external/SPIRV-Headers/include" -I"$ROOT/external/SPIRV-Tools/include")
     case "$name" in test_glx_config) incs+=(-I"$ROOT/MGL/glx");; esac
     if ! cc -std=gnu11 -O0 -g -Wall -Wno-unused-function "${incs[@]}" "$src" -o "$exe" \
             -L"$ROOT/build" -lmgl -Wl,-rpath,"$ROOT/build" -lm; then

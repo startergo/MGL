@@ -1,9 +1,44 @@
+# tess domain — round 24 report (tess / shader-linking / GLSL compat)
+
+READY a72987f
+
+(the branch tip after this report-only commit carries the same code as
+`a72987f` — merges of gl46-port plus r23/r24 commits)
+
+Round 24 made the branch mergeable: the uncommitted `cts_glsl_compat.c` work
+from the interrupted r23 session was finished, verified and committed as the
+integer-`mix()` rejection — `mix(ivec2(1), ivec2(2), bvec2(true))` constructor
+forms in `#version < 450` without `GL_EXT_shader_integer_mix` get the usual
+leading `#error` line — turning
+`KHR-GL46.shaders.shader_integer_mix.prototypes-negative` **Fail → Pass**
+(positive variants stay NotSupported: MGL does not advertise the extension
+string); `test_zz_reservednames` grew 6 cases for it (14 checks / 0 fail).
+**Full gate on `a72987f`:** `tests/headless/run.sh` **105 binaries, 0 FAIL**;
+`test_geom` 10× **603/0**; `test_fp64fast` 3× **298/0**; all **23 r22
+regressions** re-run in one glcts batch → **23× Pass** (incl. the two Crashes:
+`gpu_shader_fp64.fp64.valid_constructors`, fixed by `2ab2c75`, and
+`shader_image_load_store.basic-allTargets-loadStoreVS`);
+`KHR-GL46.CommonBugs.CommonBug_ReservedNames` **Pass** (434 s, ~3600 compiles —
+`aa32719`); `KHR-GL46.shaders.*` spot **2382 cases: 2370 Pass / 6 Fail
+(pre-existing `uniform_block.random.*`, unchanged from r22 partial_fails) /
+6 NotSupported (integer_mix positives)**.  **Overlap heads-up (compat
+`638e1ed` reserved-word scan in `shaders.c` vs my `aa32719` in
+`cts_glsl_compat.c`):** the two inserts land in *different* hunks of
+`mglCompileShader` and both scans only ever reject, so keeping **both** is safe
+and complementary — compat's covers general declared-name slots after builtin
+types/storage qualifiers, mine covers the subroutine slots after **user**
+type names (`subroutine uniform T <keyword>;` — exactly the case compat's
+commit message says it cannot catch), plus `invariant`-as-name and blocks
+named `subroutine`.  If only one may survive, keep **mine** (this branch's
+state — mine + glslang's own rejections — is what the gate above verified
+green, CommonBug_ReservedNames included); if mine is dropped instead,
+re-run CommonBug_ReservedNames on the merged tree before trusting it.
+
+---
+
 # tess domain — round 21 report (tess / shader-linking / GLSL compat)
 
-READY e4c890d
-
-Merge `gl46/tess`; the branch tip after this report-only commit contains the
-same code as `e4c890d` (merge of compat s12 `159d900`; code ends at `2a054e2`)
+(e4c890d — superseded by READY a72987f above; kept for history)
 
 Session goal (supervisor, round 21): finish explicit_uniform_location, then other
 KHR-GL46 Fail cases in the tess/GS/shader-linking domain.

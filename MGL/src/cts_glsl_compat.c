@@ -346,7 +346,6 @@ static GatherDim gather_dim_of(const char *src, const char *expr, size_t len)
         if (name[k] == '[' || name[k] == '.') { name[k] = 0; break; }
     if (!name[0]) return GATHER_T_UNKNOWN;
 
-    char pat[160];
     static const struct { const char *kw; GatherDim d; } dims[] = {
         { "sampler2DArrayShadow", GATHER_T2DARRAY_SHADOW },
         { "sampler2DShadow",      GATHER_T2D_SHADOW },
@@ -372,7 +371,7 @@ static GatherDim gather_dim_of(const char *src, const char *expr, size_t len)
 static char *rewrite_gather_var_offset(const char *src)
 {
     if (getenv("MGL_NO_GATHER_RW")) return NULL;
-    if (!strstr(src, "textureGatherOffset")) return NULL;
+    if (!strstr(src, "textureGatherOffset") && !strstr(src, "textureGather(")) return NULL;
     size_t len = strlen(src);
     Str out = {0};
     size_t i = 0;
@@ -380,12 +379,13 @@ static char *rewrite_gather_var_offset(const char *src)
 
     while (i < len)
     {
-        if (!at_word(src, len, i, "textureGatherOffset"))
+        bool plain_gather = at_word(src, len, i, "textureGather");
+        if (!at_word(src, len, i, "textureGatherOffset") && !plain_gather)
         {
             str_push(&out, src[i++]);
             continue;
         }
-        size_t w = i + strlen("textureGatherOffset");
+        size_t w = i + strlen(plain_gather ? "textureGather" : "textureGatherOffset");
         size_t open = skip_ws_comments(src, len, w);
         size_t close = (open < len && src[open] == '(') ? match_paren(src, len, open) : len;
         if (close >= len)
@@ -422,9 +422,30 @@ static char *rewrite_gather_var_offset(const char *src)
             }
         }
 
-        GatherDim dim = (nargs >= 3 && nargs <= 4) ? gather_dim_of(src, args[0], strlen(args[0])) : GATHER_T_UNKNOWN;
+        GatherDim dim = (nargs >= 3 && nargs <= 5) ? gather_dim_of(src, args[0], strlen(args[0])) : GATHER_T_UNKNOWN;
         bool shadow = (dim == GATHER_T2D_SHADOW || dim == GATHER_T2DARRAY_SHADOW);
-        int off_arg = shadow ? nargs - 1 : 2;              /* (S,P,off[,comp]) | (S,P,ref,off) */
+
+        if (plain_gather)
+        {
+            /* plain textureGather: only the shadow-with-component form needs help:
+             * glslang rejects textureGather(S, P, refZ, component) although GL 4.6
+             * accepts and IGNORES the component for shadow samplers.  Everything
+             * else (and any color form) compiles natively. */
+            if (shadow && nargs == 4)
+            {
+                char buf[512];
+                snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], args[1], args[2]);
+                str_append(&out, buf, strlen(buf));
+                changed = true;
+            }
+            else
+                str_append(&out, src + i, close + 1 - i);
+            i = close + 1;
+            continue;
+        }
+
+        /* textureGatherOffset: (S,P,off[,comp]) | (S,P,ref,off) | (S,P,ref,off,comp) */
+        int off_arg = shadow ? 3 : 2;
         if (dim == GATHER_T_UNKNOWN || off_arg >= nargs ||
             gather_offset_is_literal(args[off_arg]))
         {
@@ -448,7 +469,13 @@ static char *rewrite_gather_var_offset(const char *src)
                      "vec3(((floor((%s).xy * vec2(textureSize(%s, 0).xy) - vec2(0.5)) + vec2(%s) + vec2(0.5)) / vec2(textureSize(%s, 0).xy)), (%s).z)",
                      args[1], args[0], args[off_arg], args[0], args[1]);
         if (shadow)
-            snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], shift, args[nargs - 2]);
+            /* keep the reference value after the shifted coordinate:
+             * textureGather(S, P', refZ).  glslang rejects BOTH shadow forms that
+             * carry a component selector (5-arg textureGatherOffset and 4-arg
+             * textureGather) although GL 4.6 allows and ignores it there
+             * (KHR-GL46.gpu_shader5 texture_gather_offset_depth_*), so the
+             * component is dropped for shadow samplers. */
+            snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], shift, args[2]);
         else if (nargs == 4)
             snprintf(buf, sizeof buf, "textureGather(%s, %s, %s)", args[0], shift, args[3]);
         else
@@ -458,6 +485,7 @@ static char *rewrite_gather_var_offset(const char *src)
         changed = true;
     }
     if (!changed) { free(out.buf); return NULL; }
+    str_push(&out, 0);          /* Str never terminates: produce a real C string */
     return out.buf;
 }
 
@@ -770,11 +798,10 @@ static char *strip_invariant_on_input(const char *src)
             while (ds > 0 && out[ds - 1] != ';' && out[ds - 1] != '{' && out[ds - 1] != '}') ds--;
             size_t de = i;
             while (de < len && out[de] != ';') de++;
-            bool has_in = false, has_out = false, has_type = false;
+            bool has_out = false, has_type = false;
             for (size_t k = ds; k < de; k++)
             {
-                if (at_word(out, len, k, "in")) has_in = true;
-                else if (at_word(out, len, k, "out")) has_out = true;
+                if (at_word(out, len, k, "out")) has_out = true;
                 else if (at_word(out, len, k, "vec4") || at_word(out, len, k, "vec3") ||
                          at_word(out, len, k, "vec2") || at_word(out, len, k, "float") ||
                          at_word(out, len, k, "int") || at_word(out, len, k, "uint") ||
@@ -878,10 +905,10 @@ static int pp_tokenize(const char *p, const char *end, PpTok *tok, int max)
             continue;
         }
         /* punctuation: two-character operators first */
-        if (p + 1 < end && (c == '&' && p[1] == '&') || (c == '|' && p[1] == '|') ||
+        if (p + 1 < end && ((c == '&' && p[1] == '&') || (c == '|' && p[1] == '|') ||
             (c == '<' && p[1] == '<') || (c == '>' && p[1] == '>') ||
             (c == '<' && p[1] == '=') || (c == '>' && p[1] == '=') ||
-            (c == '=' && p[1] == '=') || (c == '!' && p[1] == '='))
+            (c == '=' && p[1] == '=') || (c == '!' && p[1] == '=')))
         {
             tok[n].p = p; tok[n].n = 2; tok[n].kind = 0; n++; p += 2;
             continue;
@@ -1037,6 +1064,239 @@ static bool pp_leftover_is_error(PpTok *t, const char **macros, int nmacros)
         return true;
     }
     return false;                                /* punctuation: a macro may bracket it */
+}
+
+static char *pp_error_source(const char *src, const char *msg);
+static size_t mglc_token(const char *s, size_t len, size_t i, char *out, size_t outn);
+
+/* ===== reserved words in positions glslang still accepts ====================
+ *
+ * KHR-GL46.CommonBugs.CommonBug_ReservedNames compiles ~3600 shaders that
+ * declare an identifier with a GLSL keyword / reserved word and requires the
+ * compile to be REJECTED.  glslang (desktop GLSL) rejects nearly all of them
+ * but still accepts:
+ *   - subroutine TYPE names and subroutine UNIFORM names (2003 of the cases):
+ *     'subroutine void attribute(inout vec4);' / 'subroutine uniform void ...;'
+ *   - 'invariant' as a declarator / function-argument name
+ *   - 'subroutine' as a uniform/in/out BLOCK name
+ * Those (and only those) are rejected here, spec-shaped, before any rewrite. */
+
+static const char *const mglc_reserved_words[] = {
+    "active", "asm", "atomic_uint", "attribute", "bool", "break", "buffer",
+    "bvec2", "bvec3", "bvec4", "case", "cast", "centroid", "class",
+    "coherent", "common", "const", "continue", "default", "discard",
+    "dmat2", "dmat2x2", "dmat2x3", "dmat2x4", "dmat3", "dmat3x2", "dmat3x3",
+    "dmat3x4", "dmat4", "dmat4x2", "dmat4x3", "dmat4x4", "do", "double",
+    "dvec2", "dvec3", "dvec4", "else", "enum", "extern", "external", "false",
+    "filter", "fixed", "flat", "float", "for", "fvec2", "fvec3", "fvec4",
+    "goto", "half", "highp", "hvec2", "hvec3", "hvec4", "if", "iimage1D",
+    "iimage1DArray", "iimage2D", "iimage2DArray", "iimage2DMS",
+    "iimage2DMSArray", "iimage2DRect", "iimage3D", "iimageBuffer", "iimageCube",
+    "iimageCubeArray", "image1D", "image1DArray", "image1DArrayShadow",
+    "image1DShadow", "image2D", "image2DArray", "image2DArrayShadow",
+    "image2DMS", "image2DMSArray", "image2DRect", "image2DShadow", "image3D",
+    "imageBuffer", "imageCube", "imageCubeArray", "in", "inline", "inout",
+    "input", "int", "interface", "invariant", "isampler1D", "isampler1DArray",
+    "isampler2D", "isampler2DArray", "isampler2DMS", "isampler2DMSArray",
+    "isampler2DRect", "isampler3D", "isamplerBuffer", "isamplerCube",
+    "isamplerCubeArray", "ivec2", "ivec3", "ivec4", "layout", "long", "lowp",
+    "mat2", "mat2x2", "mat2x3", "mat2x4", "mat3", "mat3x2", "mat3x3", "mat3x4",
+    "mat4", "mat4x2", "mat4x3", "mat4x4", "mediump", "namespace", "noinline",
+    "noperspective", "out", "output", "packed", "partition", "patch",
+    "precise", "precision", "public", "readonly", "resource", "restrict",
+    "return", "row_major", "sample", "sampler1D", "sampler1DArray",
+    "sampler1DArrayShadow", "sampler1DShadow", "sampler2D", "sampler2DArray",
+    "sampler2DArrayShadow", "sampler2DMS", "sampler2DMSArray", "sampler2DRect",
+    "sampler2DRectShadow", "sampler2DShadow", "sampler3D", "sampler3DRect",
+    "samplerBuffer", "samplerCube", "samplerCubeArray",
+    "samplerCubeArrayShadow", "samplerCubeShadow", "shared", "short",
+    "sizeof", "smooth", "static", "struct", "subroutine", "superp", "switch",
+    "template", "this", "true", "typedef", "uimage1D", "uimage1DArray",
+    "uimage2D", "uimage2DArray", "uimage2DMS", "uimage2DMSArray",
+    "uimage2DRect", "uimage3D", "uimageBuffer", "uimageCube",
+    "uimageCubeArray", "uint", "uniform", "union", "unsigned", "usampler1D",
+    "usampler1DArray", "usampler2D", "usampler2DArray", "usampler2DMS",
+    "usampler2DMSArray", "usampler2DRect", "usampler3D", "usamplerBuffer",
+    "usamplerCube", "usamplerCubeArray", "using", "uvec2", "uvec3", "uvec4",
+    "varying", "vec2", "vec3", "vec4", "void", "volatile", "while",
+    "writeonly",
+};
+
+static int mglc_is_reserved(const char *w)
+{
+    int lo = 0, hi = (int)(sizeof mglc_reserved_words / sizeof mglc_reserved_words[0]) - 1;
+    while (lo <= hi) {                       /* the table above is sorted */
+        int mid = (lo + hi) / 2, c = strcmp(w, mglc_reserved_words[mid]);
+        if (!c) return 1;
+        if (c < 0) hi = mid - 1; else lo = mid + 1;
+    }
+    return 0;
+}
+
+char *mgl_reject_reserved_declarators(const char *src);   /* shaders.c: before the
+                                                            * introspect subroutine rewrite */
+static char *reject_reserved_declarators(const char *src)
+{
+    if (!src) return NULL;
+    size_t len = strlen(src);
+    size_t i = 0;
+    while (i < len) {
+        char tok[64];
+        size_t j = i;
+        /* identifier-sized token at a word boundary? */
+        j = skip_ws_comments(src, len, j);
+        if (j >= len) break;
+        if (!is_ident_char((unsigned char)src[j])) { i = j + 1; continue; }
+        size_t n = 0;
+        while (j < len && is_ident_char((unsigned char)src[j]) && n + 1 < sizeof tok)
+            tok[n++] = src[j++];
+        tok[n] = 0;
+        if (n >= sizeof tok - 1) { i = j; continue; }   /* overlong: not a word we track */
+        i = j;
+
+        /* (uniform|in|out|buffer) subroutine {  ->  block named 'subroutine' */
+        if (!strcmp(tok, "uniform") || !strcmp(tok, "in") || !strcmp(tok, "out") ||
+            !strcmp(tok, "buffer")) {
+            char n2[64];
+            size_t k = mglc_token(src, len, j, n2, sizeof n2);
+            if (!strcmp(n2, "subroutine")) {
+                size_t k2 = skip_ws_comments(src, len, k);
+                if (k2 < len && src[k2] == '{')
+                    return pp_error_source(src, "reserved word 'subroutine' "
+                                                 "used as an interface block name");
+            }
+            continue;
+        }
+        /* 'invariant' used as a declarator / argument NAME: the token AFTER it
+         * ends the declaration (qualifier position is always followed by an
+         * identifier) */
+        if (!strcmp(tok, "invariant")) {
+            size_t k = skip_ws_comments(src, len, j);
+            if (k < len && (src[k] == ';' || src[k] == ',' || src[k] == '=' ||
+                            src[k] == '[' || src[k] == ')'))
+                return pp_error_source(src, "reserved word 'invariant' used as a name");
+            continue;
+        }
+        /* subroutine declaration: [ '(' type-list ')' ] [uniform] type... NAME ( | ;
+         * — the declared subroutine TYPE / subroutine UNIFORM name must not be
+         * reserved (glslang accepts those; GLSL 4.6 3.7) */
+        if (!strcmp(tok, "subroutine")) {
+            size_t k = j;
+            k = skip_ws_comments(src, len, k);
+            if (k < len && src[k] == '(') {          /* subroutine (types...) decl */
+                int d = 0;
+                size_t e = k;
+                while (e < len) {
+                    if (src[e] == '(') d++;
+                    else if (src[e] == ')') { d--; if (!d) { e++; break; } }
+                    e++;
+                }
+                /* every identifier inside the list names a subroutine type */
+                size_t q = k + 1;
+                while (q < e) {
+                    char nm[64];
+                    size_t q2 = mglc_token(src, e, q, nm, sizeof nm);
+                    if (nm[0] && mglc_is_reserved(nm))
+                        return pp_error_source(src, "reserved word used as a "
+                                                     "subroutine type name");
+                    q = q2 > q ? q2 : q + 1;
+                }
+                k = skip_ws_comments(src, len, e);
+            }
+            /* optional 'uniform', then the declared name: the last identifier
+             * before the terminating '(' (type decl) or ';' (uniform decl) */
+            char n2[64];
+            size_t k2 = mglc_token(src, len, k, n2, sizeof n2);
+            if (!strcmp(n2, "uniform")) { k = k2; k2 = mglc_token(src, len, k, n2, sizeof n2); }
+            char last[64] = "";
+            for (;;) {
+                size_t kw = skip_ws_comments(src, len, k2);
+                if (kw >= len || src[kw] == '(' || src[kw] == ';') break;
+                char n3[64];
+                size_t k3 = mglc_token(src, len, kw, n3, sizeof n3);
+                if (n3[0]) { snprintf(last, sizeof last, "%s", n3); k2 = k3; }
+                else k2 = kw + 1;          /* punctuation noise */
+            }
+            if (last[0] && mglc_is_reserved(last))
+                return pp_error_source(src, "reserved word used as a subroutine "
+                                             "type or subroutine uniform name");
+            continue;
+        }
+    }
+    return NULL;
+}
+
+/* integer mix(genIType, genIType, genBType) exists in desktop GLSL only from 4.50
+ * on (or with GL_EXT_shader_integer_mix); glslang's built-in mix() accepts the
+ * integer forms at every version, so KHR-GL46.shaders.shader_integer_mix.
+ * prototypes-negative (a #version 330 shader full of mix(ivec2(...), ...)) links
+ * instead of failing.  Rejected when the declared version is older than 450 and
+ * the extension is not enabled.  (Constructor-argument forms only - a mix() over
+ * integer VARIABLES is not detectable without type information.) */
+static char *reject_integer_mix(const char *src)
+{
+    if (!src) return NULL;
+    size_t len = strlen(src);
+    unsigned version = 0;
+    int ext_enabled = 0, have_ext_directive = 0;
+    for (size_t i = 0; i < len; ) {
+        i = skip_ws_comments(src, len, i);
+        if (i >= len) break;
+        if (src[i] == '#') {
+            char dir[32];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            if (!strcmp(dir, "version")) {
+                char vs[16];
+                mglc_token(src, len, j, vs, sizeof vs);
+                version = (unsigned)atoi(vs);
+            } else if (!strcmp(dir, "extension")) {
+                char nm[96], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                k = skip_ws_comments(src, len, k);
+                if (k < len && src[k] == ':') k = mglc_token(src, len, k + 1, beh, sizeof beh);
+                if (!strcmp(nm, "GL_EXT_shader_integer_mix")) {
+                    have_ext_directive = 1;
+                    if (!strcmp(beh, "enable") || !strcmp(beh, "require") || !strcmp(beh, "warn"))
+                        ext_enabled = 1;
+                }
+            }
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        i++;
+    }
+    if (!version || version >= 450) return NULL;      /* core from 4.50 on */
+    if (ext_enabled) return NULL;
+    if (have_ext_directive) return NULL;              /* disable/warn'd: glslang decides */
+    /* mix( <i|u|b>vecN ( ... */
+    for (size_t i = 0; i < len; ) {
+        i = skip_ws_comments(src, len, i);
+        if (i >= len) break;
+        if (is_ident_char((unsigned char)src[i])) {
+            char tok[32];
+            size_t n = 0, j = i;
+            while (j < len && is_ident_char((unsigned char)src[j]) && n + 1 < sizeof tok)
+                tok[n++] = src[j++];
+            tok[n] = 0;
+            if (!strcmp(tok, "mix")) {
+                size_t k = skip_ws_comments(src, len, j);
+                if (k < len && src[k] == '(') {
+                    char t2[16];
+                    size_t k2 = mglc_token(src, len, k + 1, t2, sizeof t2);
+                    size_t k3 = skip_ws_comments(src, len, k2);
+                    if ((!strncmp(t2, "ivec", 4) || !strncmp(t2, "uvec", 4) ||
+                         !strncmp(t2, "bvec", 4)) && isdigit((unsigned char)t2[4]) &&
+                        k3 < len && src[k3] == '(')
+                        return pp_error_source(src, "integer mix() requires GLSL 4.50 or "
+                                                    "GL_EXT_shader_integer_mix");
+                }
+            }
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    return NULL;
 }
 
 static char *reject_pp_strictness(const char *src)
@@ -1455,7 +1715,11 @@ char *mgl_cts_glsl_compat_generated(const char *src)
      * are never handed to the app — the compile-time binding-range and std430
      * checks do not apply to them. */
     if (!src) return NULL;
-    char *cur = strip_invariant_on_input(src);
+    const char *src0 = src;
+    char *hoisted0 = mgl_hoist_struct_samplers(src);
+    if (hoisted0) src0 = hoisted0;
+    char *cur = strip_invariant_on_input(src0);
+    if (!cur && hoisted0) cur = hoisted0;
     char *next = strip_gl_block_packings(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;
@@ -1477,9 +1741,535 @@ char *mgl_cts_glsl_compat_generated(const char *src)
     return (cur && cur != src) ? cur : NULL;
 }
 
+/* ===== hoist opaque members out of default-uniform-block structs =====
+ *
+ * GLSL (4.4+ / ARB-style struct uniforms) allows sampler and image members in
+ * structs used for default-block uniforms:
+ *     struct S { float a; vec3 b; sampler2D c; };
+ *     uniform S s;                       ... texture(s.c, uv) ...
+ * SPIRV-Cross's MSL backend cannot lower that: it emits `texture2d<float> c`
+ * as a member of the [[buffer]] struct but never the paired `sampler cSmplr`
+ * member ("no member named 'cSmplr' in 'S'"), and reflection never reports the
+ * sampler, so no binding is assigned either.  GLSL-side rewrite before
+ * compilation:
+ *     struct S { float a; vec3 b; };
+ *     uniform S s;
+ *     uniform sampler2D s__c;            ... texture(s__c, uv) ...
+ * with arrays preserved in order (`uniform S s[2]` + member c  ->
+ * s_mglhoist_c[2], `s[1].c` -> `s_mglhoist_c[1]`; member array
+ * `sampler2D c[2]` -> `s.c[1]` -> `s_mglhoist_c[1]`).  Nested structs flatten
+ * into the name: `s.b.a` -> `s_mglhoist_b_mglhoist_a` (consecutive
+ * underscores are reserved identifiers in GLSL).
+ * glGetUniformLocation("s.c") / ("s[0].c") is translated back by
+ * mgl_hoist_lookup_name() (uniforms.c) — the active-uniform ENUMERATION keeps
+ * reporting the hoisted spelling (a small introspection infidelity). */
+
+#define MGLC_MAX_STRUCTS 48
+#define MGLC_MAX_MEMBERS 64
+
+typedef struct {
+    char mname[80];
+    char mtype[80];      /* member base type: "sampler2D", "vec3", "S", ... */
+    int  opaque;
+    char mdims[64];      /* raw "[2][3]" suffix, "" when scalar */
+    size_t decl_off, decl_end;   /* span of "type name dims ;" inside the body */
+} MGLCMember;
+
+typedef struct {
+    char tname[80];
+    MGLCMember m[MGLC_MAX_MEMBERS];
+    int nm;
+    int has_opaque;               /* an opaque member somewhere (recursively) */
+    size_t body_off, body_end;    /* span between the struct's { and } */
+} MGLCStruct;
+
+static int mglc_is_opaque_type(const char *t)
+{
+    return !strncmp(t, "sampler", 7) || !strncmp(t, "isampler", 8) ||
+           !strncmp(t, "usampler", 8) || !strncmp(t, "image", 5) ||
+           !strncmp(t, "iimage", 6) || !strncmp(t, "uimage", 6);
+}
+
+static int mglc_is_qualifier(const char *t)
+{
+    return !strcmp(t, "lowp") || !strcmp(t, "mediump") || !strcmp(t, "highp") ||
+           !strcmp(t, "precision") || !strcmp(t, "precise") || !strcmp(t, "invariant");
+}
+
+/* scan a token: identifier-ish or number (no separator handling) */
+static size_t mglc_token(const char *s, size_t len, size_t i, char *out, size_t outn)
+{
+    i = skip_ws_comments(s, len, i);
+    size_t n = 0;
+    while (i < len && is_ident_char((unsigned char)s[i]) && n + 1 < outn)
+        out[n++] = s[i++];
+    out[n] = 0;
+    return i;
+}
+
+/* copy "[..][..]" suffix starting at i (ws-skipped) into dims; returns end */
+static size_t mglc_dims(const char *s, size_t len, size_t i, char *dims, size_t dimn)
+{
+    dims[0] = 0;
+    size_t dn = 0;
+    for (;;) {
+        size_t j = skip_ws_comments(s, len, i);
+        if (j >= len || s[j] != '[') return i;
+        int depth = 0;
+        size_t k = j;
+        while (k < len) {
+            if (s[k] == '[') depth++;
+            else if (s[k] == ']') { depth--; if (!depth) { k++; break; } }
+            k++;
+        }
+        if (k > len) return i;
+        for (size_t x = j; x < k && dn + 1 < dimn; x++) dims[dn++] = s[x];
+        dims[dn] = 0;
+        i = k;
+    }
+}
+
+static int mglc_struct_find(const MGLCStruct *st, int nst, const char *name)
+{
+    for (int i = 0; i < nst; i++) if (!strcmp(st[i].tname, name)) return i;
+    return -1;
+}
+
+/* pass A: collect top-level `struct N { ... };` definitions */
+static int mglc_collect_structs(const char *s, size_t len, MGLCStruct *st, int max)
+{
+    int nst = 0;
+    int depth = 0;
+    for (size_t i = 0; i < len; ) {
+        i = skip_ws_comments(s, len, i);
+        if (i >= len) break;
+        if (s[i] == '{') { depth++; i++; continue; }
+        if (s[i] == '}') { depth--; i++; continue; }
+        if (depth == 0 && at_word(s, len, i, "struct")) {
+            size_t j = mglc_token(s, len, i + 6, st[nst].tname, sizeof st[nst].tname);
+            if (st[nst].tname[0] && j < len) {
+                j = skip_ws_comments(s, len, j);
+                if (j < len && s[j] == '{' && nst < max - 1) {
+                    st[nst].nm = 0;
+                    st[nst].has_opaque = 0;
+                    st[nst].body_off = j + 1;
+                    int d2 = 1;
+                    size_t k = j + 1;
+                    while (k < len && d2 > 0) {
+                        if (s[k] == '{') d2++;
+                        else if (s[k] == '}') { d2--; if (!d2) break; }
+                        k++;
+                    }
+                    st[nst].body_end = k;
+                    /* members: split the body on ';' */
+                    size_t m = st[nst].body_off;
+                    while (m < st[nst].body_end) {
+                        size_t e = m;
+                        int bd = 0;
+                        while (e < st[nst].body_end) {
+                            if (s[e] == '[' || s[e] == '(') bd++;
+                            else if (s[e] == ']' || s[e] == ')') bd--;
+                            else if (s[e] == ';' && bd == 0) break;
+                            e++;
+                        }
+                        if (e > st[nst].body_end) e = st[nst].body_end;
+                        /* parse one member: [qualifiers] TYPE NAME [dims] */
+                        char tok[80];
+                        size_t p = mglc_token(s, e, m, tok, sizeof tok);
+                        while (tok[0] && mglc_is_qualifier(tok))
+                            p = mglc_token(s, e, p, tok, sizeof tok);
+                        char type[80] = "";
+                        if (tok[0] && !mglc_is_qualifier(tok)) {
+                            snprintf(type, sizeof type, "%s", tok);
+                            size_t q = mglc_token(s, e, p, st[nst].m[st[nst].nm].mname,
+                                                  sizeof st[nst].m[0].mname);
+                            if (st[nst].m[st[nst].nm].mname[0] &&
+                                st[nst].nm < MGLC_MAX_MEMBERS) {
+                                MGLCMember *mm = &st[nst].m[st[nst].nm];
+                                snprintf(mm->mtype, sizeof mm->mtype, "%s", type);
+                                mm->opaque = mglc_is_opaque_type(type);
+                                if (mm->opaque) st[nst].has_opaque = 1;
+                                q = mglc_dims(s, e, q, mm->mdims, sizeof mm->mdims);
+                                mm->decl_off = m;
+                                mm->decl_end = e + 1 < st[nst].body_end ? e + 1 : e;
+                                st[nst].nm++;
+                            }
+                        }
+                        m = e + 1;
+                    }
+                    nst++;
+                    i = k + 1;
+                    /* skip the trailing ';' */
+                    size_t j2 = skip_ws_comments(s, len, i);
+                    if (j2 < len && s[j2] == ';') i = j2 + 1;
+                    continue;
+                }
+            }
+            i += 6;
+            continue;
+        }
+        /* skip other tokens wholesale */
+        while (i < len && !isspace((unsigned char)s[i]) && s[i] != '{' && s[i] != '}') i++;
+    }
+    /* propagate has_opaque through nested struct members */
+    for (int pass = 0; pass < 4; pass++)
+        for (int a = 0; a < nst; a++)
+            for (int b = 0; b < st[a].nm; b++) {
+                if (st[a].m[b].opaque) continue;
+                int sub = mglc_struct_find(st, nst, st[a].m[b].mtype);
+                if (sub >= 0 && st[sub].has_opaque) st[a].has_opaque = 1;
+            }
+    return nst;
+}
+
+/* enumerate the opaque member paths of struct si; appends "NAME__m1[..]__mk"
+ * declarations to out, dims accumulating outer-uniform dims first */
+static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *prefix,
+                            const char *dims, Str *out)
+{
+    for (int k = 0; k < st[si].nm; k++) {
+        const MGLCMember *m = &st[si].m[k];
+        char np[256];
+        snprintf(np, sizeof np, "%s_mglhoist_%s", prefix, m->mname);
+        char nd[192];
+        snprintf(nd, sizeof nd, "%s%s", dims, m->mdims);
+        if (m->opaque) {
+            str_append(out, "\nuniform ", 9);
+            str_append(out, m->mtype, strlen(m->mtype));
+            str_append(out, " ", 1);
+            str_append(out, np, strlen(np));
+            str_append(out, nd, strlen(nd));
+            str_append(out, ";", 1);
+        } else {
+            int sub = mglc_struct_find(st, nst, m->mtype);
+            if (sub >= 0 && st[sub].has_opaque)
+                mglc_enum_paths(st, nst, sub, np, nd, out);
+        }
+    }
+}
+
+typedef struct {
+    char var[80];
+    char name[256];   /* hoisted base name (path joined by __) */
+    int  npath;
+    char path[8][80]; /* member identifiers along the path */
+} MGLCHoist;
+
+static int mglc_path_split(const char *name, MGLCHoist *h)  /* "s_mglhoist_b_mglhoist_a" */
+{
+    snprintf(h->name, sizeof h->name, "%s", name);
+    h->npath = 0;
+    const char *p = name;
+    while (*p && h->npath < 8) {
+        const char *q = strstr(p, "_mglhoist_");
+        size_t n = q ? (size_t)(q - p) : strlen(p);
+        if (!n || n >= sizeof h->path[0]) return 0;
+        memcpy(h->path[h->npath], p, n);
+        h->path[h->npath][n] = 0;
+        h->npath++;
+        p = q ? q + 10 : p + n;
+    }
+    snprintf(h->var, sizeof h->var, "%s", h->path[0]);
+    return h->npath >= 2;
+}
+
+/* the whole hoisting pass; returns a malloc'd rewritten source or NULL */
+char *mgl_hoist_struct_samplers(const char *src)
+{
+    if (!src) return NULL;
+    size_t len = strlen(src);
+    MGLCStruct st[MGLC_MAX_STRUCTS];
+    int nst = mglc_collect_structs(src, len, st, MGLC_MAX_STRUCTS);
+    if (getenv("MGL_HOIST_DEBUG")) {
+        fprintf(stderr, "HOIST: nst=%d\n", nst);
+        for (int q = 0; q < nst; q++) {
+            fprintf(stderr, "HOIST: struct %s members=%d opaque=%d:", st[q].tname, st[q].nm, st[q].has_opaque);
+            for (int w = 0; w < st[q].nm; w++)
+                fprintf(stderr, " %s:%s%s", st[q].m[w].mtype, st[q].m[w].mname, st[q].m[w].mdims);
+            fprintf(stderr, "\n");
+        }
+    }
+    /* collect the hoisted paths of every default-block uniform whose struct
+     * type owns an opaque member (they drive the use rewriter) */
+    MGLCHoist hs[128];
+    int nh = 0;
+    int depth = 0;
+    for (size_t i = 0; i < len; ) {
+        i = skip_ws_comments(src, len, i);
+        if (i >= len) break;
+        if (src[i] == '{') { depth++; i++; continue; }
+        if (src[i] == '}') { depth--; i++; continue; }
+        if (depth == 0 && at_word(src, len, i, "uniform")) {
+            char type[80], var[80], dims[64];
+            size_t j = mglc_token(src, len, i + 7, type, sizeof type);
+            j = skip_ws_comments(src, len, j);
+            if (j < len && src[j] == '(') {
+                size_t k = match_paren(src, len, j);
+                if (k < len) { j = k + 1; j = mglc_token(src, len, j, type, sizeof type); }
+            }
+            j = mglc_token(src, len, j, var, sizeof var);
+            if (type[0] && var[0]) {
+                j = mglc_dims(src, len, j, dims, sizeof dims);
+                int si = mglc_struct_find(st, nst, type);
+                if (getenv("MGL_HOIST_DEBUG")) fprintf(stderr, "HOIST: uniform type=%s var=%s dims=%s si=%d\n", type, var, dims, si);
+                if (si >= 0 && st[si].has_opaque) {
+                    Str decls = {0};
+                    mglc_enum_paths(st, nst, si, var, dims, &decls);
+                    if (decls.buf) {
+                        str_push(&decls, 0);
+                        char *p = decls.buf;
+                        while (nh < 128) {
+                            char *q = strstr(p, "uniform ");
+                            if (!q) break;
+                            char *e = strchr(q, ';');
+                            if (!e) break;
+                            char nm[256] = "";
+                            char *sp = strchr(q + 8, ' ');
+                            if (sp && sp < e) {
+                                size_t n = 0;
+                                sp++;
+                                while (*sp && *sp != '[' && *sp != ';' &&
+                                       n + 1 < sizeof nm) nm[n++] = *sp++;
+                                nm[n] = 0;
+                            }
+                            if (nm[0] && mglc_path_split(nm, &hs[nh])) nh++;
+                            p = e + 1;
+                        }
+                        free(decls.buf);
+                    }
+                }
+                while (j < len && src[j] != ';') j++;
+                if (j < len) j++;
+                i = j;
+                continue;
+            }
+            i += 7;
+            continue;
+        }
+        while (i < len && !isspace((unsigned char)src[i]) && src[i] != '{' && src[i] != '}') i++;
+    }
+
+    if (getenv("MGL_HOIST_DEBUG")) fprintf(stderr, "HOIST: nh=%d\n", nh);
+    if (!nh) return NULL;
+
+    /* single verbatim walk: uses of a hoisted path become the joined name, the
+     * hoisted declarations follow their uniform, and opaque members are cut
+     * from the struct bodies (spans refer to this same text) */
+    Str out = {0};
+    int wd = 0;
+    char prev = 0;
+    size_t i = 0;
+    while (i < len) {
+        if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {          /* line comment */
+            while (i < len && src[i] != '\n') str_push(&out, src[i++]);
+            continue;
+        }
+        if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {          /* block comment */
+            str_push(&out, src[i++]); str_push(&out, src[i++]);
+            while (i < len && !(src[i - 1] == '*' && src[i] == '/')) str_push(&out, src[i++]);
+            if (i < len) str_push(&out, src[i++]);
+            continue;
+        }
+        if (src[i] == '{') { wd++; str_push(&out, src[i++]); prev = '{'; continue; }
+        if (src[i] == '}') { wd--; str_push(&out, src[i++]); prev = '}'; continue; }
+
+        if (!is_ident_char((unsigned char)prev) && is_ident_char((unsigned char)src[i])) {
+            /* hoisted use: VAR [idx] .m1 [idx] ... */
+            char tok[80];
+            size_t n = 0, j = i;
+            while (j < len && is_ident_char((unsigned char)src[j]) && n + 1 < sizeof tok)
+                tok[n++] = src[j++];
+            tok[n] = 0;
+            char idxs[6][128];
+            char idents[8][80];
+            int nidx = 0, nid = 0, matched = -1;
+            size_t k = j;
+            for (;;) {
+                size_t k2 = skip_ws_comments(src, len, k);
+                if (k2 < len && src[k2] == '[' && nidx < 6) {
+                    int d = 0; size_t e = k2;
+                    while (e < len) {
+                        if (src[e] == '[') d++;
+                        else if (src[e] == ']') { d--; if (!d) { e++; break; } }
+                        e++;
+                    }
+                    if (e > len) break;
+                    size_t nn = e - k2 - 2;
+                    if (nn >= sizeof idxs[0]) break;
+                    memcpy(idxs[nidx], src + k2 + 1, nn);
+                    idxs[nidx][nn] = 0;
+                    nidx++;
+                    k = e;
+                } else if (k2 < len && src[k2] == '.' && nid < 8) {
+                    size_t k3 = mglc_token(src, len, k2 + 1, idents[nid], sizeof idents[0]);
+                    if (!idents[nid][0]) break;
+                    nid++;
+                    k = k3;
+                } else break;
+            }
+            for (int h = 0; h < nh && matched < 0; h++) {
+                if (strcmp(hs[h].var, tok)) continue;
+                if (hs[h].npath - 1 != nid) continue;
+                int ok = 1;
+                for (int q = 0; q < nid; q++)
+                    if (strcmp(hs[h].path[q + 1], idents[q])) { ok = 0; break; }
+                if (ok) matched = h;
+            }
+            if (matched >= 0) {
+                str_append(&out, hs[matched].name, strlen(hs[matched].name));
+                for (int q = 0; q < nidx; q++) {
+                    char b2[140];
+                    snprintf(b2, sizeof b2, "[%s]", idxs[q]);
+                    str_append(&out, b2, strlen(b2));
+                }
+                i = k;
+                prev = ']';
+                continue;
+            }
+            /* struct definition of a hoisted type: filter the opaque members */
+            if (wd == 0 && !strcmp(tok, "struct")) {
+                char tn[80];
+                size_t j2 = mglc_token(src, len, j, tn, sizeof tn);
+                size_t j3 = skip_ws_comments(src, len, j2);
+                if (tn[0] && j3 < len && src[j3] == '{') {
+                    int si = mglc_struct_find(st, nst, tn);
+                    int d2 = 1;
+                    size_t k = j3 + 1;
+                    while (k < len) {
+                        if (src[k] == '{') d2++;
+                        else if (src[k] == '}') { d2--; if (!d2) break; }
+                        k++;
+                    }
+                    str_append(&out, src + i, j3 + 1 - i);        /* "struct N {" */
+                    if (si >= 0 && st[si].has_opaque) {
+                        int any_kept = 0;
+                        for (int mi = 0; mi < st[si].nm; mi++)
+                            if (!st[si].m[mi].opaque) any_kept = 1;
+                        for (int mi = 0; mi < st[si].nm; mi++) {
+                            const MGLCMember *m = &st[si].m[mi];
+                            if (!m->opaque)
+                                str_append(&out, src + m->decl_off, m->decl_end - m->decl_off);
+                            else if (!any_kept && mi == 0)
+                                str_append(&out, "\n    float mgl_hoist_pad; /* opaque-only struct */\n", 49);
+                        }
+                    } else {
+                        str_append(&out, src + j3 + 1, k - (j3 + 1));
+                    }
+                    str_push(&out, '}');
+                    i = k + 1;
+                    size_t j4 = skip_ws_comments(src, len, i);
+                    if (j4 < len && src[j4] == ';') { str_push(&out, ';'); i = j4 + 1; }
+                    prev = ';';
+                    continue;
+                }
+            }
+            /* uniform of a hoisted struct type: append the hoisted samplers */
+            if (wd == 0 && !strcmp(tok, "uniform")) {
+                char type[80], var[80], dims[64];
+                size_t j2 = mglc_token(src, len, j, type, sizeof type);
+                size_t j3 = skip_ws_comments(src, len, j2);
+                if (j3 < len && src[j3] == '(') {
+                    size_t k = match_paren(src, len, j3);
+                    if (k < len) { j2 = mglc_token(src, len, k + 1, type, sizeof type); j3 = skip_ws_comments(src, len, j2); }
+                }
+                size_t j4 = mglc_token(src, len, j3, var, sizeof var);
+                if (type[0] && var[0]) {
+                    size_t j5 = mglc_dims(src, len, j4, dims, sizeof dims);
+                    size_t j6 = j5;
+                    while (j6 < len && src[j6] != ';') j6++;
+                    if (j6 < len) j6++;
+                    int si = mglc_struct_find(st, nst, type);
+                    str_append(&out, src + i, j6 - i);            /* the declaration */
+                    if (si >= 0 && st[si].has_opaque) {
+                        Str decls = {0};
+                        mglc_enum_paths(st, nst, si, var, dims, &decls);
+                        if (decls.buf) {
+                            str_push(&decls, 0);
+                            str_append(&out, decls.buf, decls.len - 1);  /* no NUL inside */
+                            free(decls.buf);
+                        }
+                    }
+                    i = j6;
+                    prev = ';';
+                    continue;
+                }
+            }
+            /* plain identifier */
+            str_append(&out, src + i, j - i);
+            prev = src[j - 1];
+            i = j;
+            continue;
+        }
+        str_push(&out, src[i]);
+        prev = src[i];
+        i++;
+    }
+    str_push(&out, 0);   /* Str is not NUL-terminated by construction */
+    return out.buf;
+}
+
+/* "s.c" -> "s_mglhoist_c", "s[0].c" -> "s_mglhoist_c[0]",
+ * "s.c[1]" -> "s_mglhoist_c[1]", "s.b.a" -> "s_mglhoist_b_mglhoist_a":
+ * dotted uniform paths become the hoisted spelling with
+ * the array indices moved behind the joined name.  Returns 1 when out holds a
+ * different name than the input. */
+int mgl_hoist_lookup_name(const char *name, char *out, size_t outn)
+{
+    if (!name || !strchr(name, '.') || !out || outn < 2) return 0;
+    const char *p = name;
+    char seg[96];
+    size_t on = 0;
+    int nseg = 0, first = 1;
+    char idxbuf[128];
+    size_t in_ = 0;
+    idxbuf[0] = 0;
+    while (*p) {
+        /* identifier */
+        size_t n = 0;
+        while (*p && is_ident_char((unsigned char)*p) && n + 1 < sizeof seg)
+            seg[n++] = *p++;
+        seg[n] = 0;
+        if (!n) return 0;
+        if (!first) {
+            const char sep[] = "_mglhoist_";
+            if (on + sizeof sep - 1 >= outn) return 0;
+            memcpy(out + on, sep, sizeof sep - 1);
+            on += sizeof sep - 1;
+        }
+        if (on + n >= outn) return 0;
+        memcpy(out + on, seg, n);
+        on += n;
+        first = 0;
+        nseg++;
+        /* indices belong after the full name: collect and continue */
+        while (*p == '[') {
+            const char *q = strchr(p, ']');
+            if (!q) return 0;
+            size_t l = (size_t)(q - p + 1);
+            if (in_ + l >= sizeof idxbuf) return 0;
+            memcpy(idxbuf + in_, p, l);
+            in_ += l;
+            idxbuf[in_] = 0;
+            p = q + 1;
+        }
+        if (*p == '.') { p++; continue; }
+        if (*p) return 0;
+    }
+    if (nseg < 2 || on + in_ + 1 > outn) return 0;
+    memcpy(out + on, idxbuf, in_);
+    out[on + in_] = 0;
+    return strcmp(out, name) != 0;
+}
+
+
 char *mgl_cts_glsl_compat(const char *src)
 {
     return mgl_cts_glsl_compat_limited(src, NULL);
+}
+
+char *mgl_reject_reserved_declarators(const char *src)
+{
+    return reject_reserved_declarators(src);
 }
 
 char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits *limits)
@@ -1489,6 +2279,13 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
      * compile must fail, and the other passes are pointless */
     char *strict = reject_pp_strictness(src);
     if (strict) return strict;
+    {
+        /* reserved words where glslang is still lenient (see the table above) */
+        char *res = reject_reserved_declarators(src);
+        if (res) return res;
+        res = reject_integer_mix(src);
+        if (res) return res;
+    }
     {
         /* atomic counter layout rules are context-free: run them for generated
          * sources too */
@@ -1500,10 +2297,19 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
         char *bad = reject_binding_range(src, limits);
         if (bad) return bad;
     }
+    int hoisted_fired = 0;
+    {
+        /* samplers inside default-block structs cannot be lowered to MSL
+         * (see mgl_hoist_struct_samplers) - hoist them out first so every
+         * later pass sees plain sampler uniforms */
+        char *hoisted = mgl_hoist_struct_samplers(src);
+        if (hoisted) { src = hoisted; hoisted_fired = 1; }  /* the chain owns it */
+    }
     /* every step returns a malloc'd copy or NULL when it changed nothing, so the
      * chain keeps the latest non-NULL text and falls back to the original when
-     * no rewrite fired at all */
+     * no rewrite fired at all — a hoisted copy must stay alive even then */
     char *cur = strip_invariant_on_input(src);
+    if (!cur && hoisted_fired) cur = (char *)src;
     char *next = strip_gl_block_packings(cur ? cur : src);
     if (next && cur) free(cur);
     if (next) cur = next;

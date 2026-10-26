@@ -455,7 +455,13 @@ void mglGetProgramPipelineiv(GLMContext ctx, GLuint pipeline, GLenum pname, GLin
 }
 
 /* GL 4.6 11.1.3.11 program pipeline validation */
-static bool validate_pipeline(GLMContext ctx, MGLPipelineObj *pipe, char **log)
+/* draw_time: consulted by the per-draw pipeline check.  A FAILED relink of a
+ * program leaves its previously linked executable installed (GL 4.6 §7.3.1; only
+ * glProgramBinary discards it), so at draw time such a stage program is usable
+ * through its last successful binary and must not fail the draw
+ * (KHR-GL46.sepshaderobjs.StateInteraction).  glValidateProgramPipeline keeps
+ * the strict LINK_STATUS rule ("a program ... not successfully linked"). */
+static bool validate_pipeline(GLMContext ctx, MGLPipelineObj *pipe, char **log, bool draw_time)
 {
     static const int order[] = {_VERTEX_SHADER, _TESS_CONTROL_SHADER, _TESS_EVALUATION_SHADER,
                                 _GEOMETRY_SHADER, _FRAGMENT_SHADER};
@@ -480,7 +486,7 @@ static bool validate_pipeline(GLMContext ctx, MGLPipelineObj *pipe, char **log)
         if (!dup)
             progs[nprogs++] = p;
 
-        if (!po->link_status)
+        if (!po->link_status && !(draw_time && (po->linked_mask & SHADER_MASK_BIT(s))))
         {
             mgl_append_info_log(log, "ERROR: program %u bound to the %s stage is not successfully linked\n", p->name, stage_name(s));
             ok = false;
@@ -575,7 +581,7 @@ void mglValidateProgramPipeline(GLMContext ctx, GLuint pipeline)
     if (!pipe)
         return;
 
-    ok = validate_pipeline(ctx, pipe, &log);
+    ok = validate_pipeline(ctx, pipe, &log, false);
     if (ok)
         mgl_append_info_log(&log, "Program pipeline %u validated.\n", pipeline);
 
@@ -629,7 +635,13 @@ Program *mgl_program_pipeline_composite(GLMContext ctx)
     {
         Program *p = pipe->base.stage_programs[s];
 
-        if (!p || !MGL_PROGRAM_OBJ(p)->link_status || !p->shader_slots[s])
+        /* GL 4.6 §7.3.1: a FAILED relink leaves the previously linked executable
+         * installed (only glProgramBinary loses it — run_link frees the stages on
+         * that path, which clears shader_slots here).  The pipeline keeps drawing
+         * with the last successful binary even though LINK_STATUS is now FALSE
+         * (KHR-GL46.sepshaderobjs.StateInteraction); installing the program anew
+         * via UseProgramStages is still rejected on link_status. */
+        if (!p || !p->shader_slots[s])
             continue;
 
         c->shader_slots[s] = p->shader_slots[s];
@@ -1353,7 +1365,7 @@ static bool program_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
     if (STATE(program_pipeline))
     {
         char *log = NULL;
-        bool ok = validate_pipeline(ctx, MGL_PIPELINE_OBJ(STATE(program_pipeline)), &log);
+        bool ok = validate_pipeline(ctx, MGL_PIPELINE_OBJ(STATE(program_pipeline)), &log, true);
         if (!ok)
         {
             if (getenv("MGL_DEBUG") && log)

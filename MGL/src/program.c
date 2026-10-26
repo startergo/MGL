@@ -36,6 +36,7 @@
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_program.h"
+int mgl_glslang_cache_unshare(glslang_shader_t *sh);
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom.h"
@@ -665,6 +666,36 @@ static const char *k_gath_helpers =
 "    if (c == component::y) return v.y;\n"
 "    if (c == component::z) return v.z;\n"
 "    return v.w;\n"
+"}\n"
+/* float channels: tap through sample() at exact texel centres.  A texel read
+ * returns the RAW storage of an sRGB texture (Metal only converts on sample),
+ * and read() cannot honour the sampler's wrap/border either; sampling at a tap's
+ * centre puts all bilinear weight on that texel so the tap is exact while the
+ * sRGB decode, the address mode and the border colour all come from the bound
+ * sampler — this is what the hardware gather does (KHR-GL46.texture_gather
+ * plain-gather-*-srgb).  Integer channels keep the read() form below: they can
+ * not be sampled in MSL and have no sRGB variants. */
+"static inline __attribute__((always_inline)) vec<float,4> mgl_gath_vs(texture2d<float> t, sampler s, float2 uv, int2 off, component c, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    float2 b = floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off);\n"
+"    vec<float,4> r;\n"
+"    r[0] = mgl_gsel(t.sample(s, unorm ? b + float2(0.5, 1.5) : (b + float2(0.5, 1.5)) / sz, level(0.0)), c);\n"
+"    r[1] = mgl_gsel(t.sample(s, unorm ? b + float2(1.5, 1.5) : (b + float2(1.5, 1.5)) / sz, level(0.0)), c);\n"
+"    r[2] = mgl_gsel(t.sample(s, unorm ? b + float2(1.5, 0.5) : (b + float2(1.5, 0.5)) / sz, level(0.0)), c);\n"
+"    r[3] = mgl_gsel(t.sample(s, unorm ? b + float2(0.5, 0.5) : (b + float2(0.5, 0.5)) / sz, level(0.0)), c);\n"
+"    return r;\n"
+"}\n"
+"static inline __attribute__((always_inline)) vec<float,4> mgl_gath_vs(texture2d_array<float> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm)\n"
+"{\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    float2 b = floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off);\n"
+"    vec<float,4> r;\n"
+"    r[0] = mgl_gsel(t.sample(s, unorm ? b + float2(0.5, 1.5) : (b + float2(0.5, 1.5)) / sz, layer, level(0.0)), c);\n"
+"    r[1] = mgl_gsel(t.sample(s, unorm ? b + float2(1.5, 1.5) : (b + float2(1.5, 1.5)) / sz, layer, level(0.0)), c);\n"
+"    r[2] = mgl_gsel(t.sample(s, unorm ? b + float2(1.5, 0.5) : (b + float2(1.5, 0.5)) / sz, layer, level(0.0)), c);\n"
+"    r[3] = mgl_gsel(t.sample(s, unorm ? b + float2(0.5, 0.5) : (b + float2(0.5, 0.5)) / sz, layer, level(0.0)), c);\n"
+"    return r;\n"
 "}\n"
 "template <typename T>\n"
 "static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm)\n"
@@ -2498,6 +2529,15 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
     for (int i = 0; i < obj->num_attached; i++)
         glslang_program_add_shader(glsl_program, obj->attached[i]->compiled_glsl_shader);
 
+    /* glslang's link bakes program-wide uniform locations into the stage
+     * intermediates, so a compiled shader shared through the compile cache must
+     * not be linked in a second program: stop sharing every attached stage
+     * (KHR-GL46.shaders.indexing.varying_array.* "Uniform location overlaps
+     * across stages"). */
+    for (int i_ = 0; i_ < obj->num_attached; i_++)
+        if (obj->attached[i_]->compiled_glsl_shader)
+            mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
+
     if (!glslang_program_link(glsl_program, GLSLANG_MSG_DEFAULT_BIT))
     {
         const char *info = glslang_program_get_info_log(glsl_program);
@@ -3236,4 +3276,12 @@ void mglGetProgramInfoLog(GLMContext ctx, GLuint program, GLsizei bufSize, GLsiz
     }
 
     mgl_copy_info_log(MGL_PROGRAM_OBJ(pptr)->info_log, bufSize, length, infoLog);
+}
+
+/* xfb capture: the capture vertex function would run gathers natively, but AGX
+ * vertex functions return zeros for offset gathers — apply the same emulation as
+ * the draw pipeline's vertex stage (called from transform_feedback.c). */
+char *mgl_program_fix_vertex_gathers(const char *msl)
+{
+    return mgl_fix_gathers_vs(msl, NULL, false);
 }

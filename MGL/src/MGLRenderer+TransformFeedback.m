@@ -198,6 +198,15 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     rp.renderTargetHeight = 1;
     rp.defaultRasterSampleCount = 1;
 
+    /* ordering hazard: the pending GL command buffer can still hold texture /
+     * buffer uploads (uncommitted blits).  Metal runs same-queue command buffers
+     * in COMMIT order, so a capture buffer created here would execute BEFORE
+     * that pending work — a vertex stage sampling in the capture read an
+     * un-uploaded (all-zero) texture (KHR-GL46.gpu_shader5 texture_gather_offset).
+     * Commit the GL buffer first (like glFlush would). */
+    if (_currentCommandBuffer && _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+        [self flushCommandBuffer: false];
+
     id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
     cb.label = @"MGL transform feedback capture";
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor: rp];

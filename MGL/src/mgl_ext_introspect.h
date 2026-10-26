@@ -238,6 +238,10 @@ void mgli_get_uniform(GLMContext ctx, const char *func, GLuint program, GLint lo
                       int out_kind, void *params);
 void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u);
 GLint mgli_uniform_location(MGLIProgram *ip, const char *name);
+/* GL texture unit sampler/image ARRAY element e is set to (uniforms.c); `def`
+ * when the program's uniform table does not track the element */
+GLuint mgli_sampler_elem_unit(GLMContext ctx, Program *p, int stage, uint32_t spv_id,
+                              GLuint e, GLuint def);
 int  mgli_uniform_index(MGLIProgram *ip, const char *name);
 
 /* SPIR-V helpers (introspect_spirv.c) */

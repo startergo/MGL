@@ -39,6 +39,7 @@
 #include "shaders.h"
 #include "programs.h"
 #include "mgl_ext_buffers.h"
+#include "cts_glsl_compat.h"
 #include "buffers.h"
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
@@ -213,7 +214,44 @@ int mgli_uniform_index(MGLIProgram *ip, const char *name)
         /* "arr" matches "arr[0]" */
         if (!strncmp(u->name, name, ln) && !strcmp(u->name + ln, "[0]")) return i;
     }
+    /* hoisted sampler/image struct members (see mgli_uniform_location) */
+    if (strchr(name, '.')) {
+        char hoisted[256];
+        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted))
+            return mgli_uniform_index(ip, hoisted);
+    }
     return -1;
+}
+
+/* GL sampler/image ARRAY elements are independent uniforms: element e samples
+ * the unit the app stored on THAT element (glUniform1i on arr[e]), which need not
+ * be base+e.  The renderer's texture binder (MGLRenderer.m) consults this for
+ * array elements > 0; `def` (the resource's base+e convention) is returned when
+ * the program's uniform table has no entry for that element. */
+GLuint mgli_sampler_elem_unit(GLMContext ctx, Program *p, int stage, uint32_t spv_id,
+                              GLuint e, GLuint def)
+{
+    if (!ctx || !p) return def;
+    struct MGLExtState_introspect *ist = ctx->state.ext_introspect;
+    if (!ist) return def;
+    for (MGLIProgram *ip = ist->programs; ip; ip = ip->next) {
+        if (ip->prog != p) continue;
+        for (int i = 0; i < ip->nuniforms; i++) {
+            MGLIUniform *u = &ip->uniforms[i];
+            if (!u->opaque_class || u->opaque_class == 3) continue;
+            if ((GLuint)u->st[stage].spv_id != spv_id) continue;
+            /* the whole array is one uniform: elem_base is its first element and
+             * shadow[] holds each element's unit in order */
+            if (e < (GLuint)u->st[stage].elem_base ||
+                e >= (GLuint)u->st[stage].elem_base + (GLuint)u->size) continue;
+            if (!u->shadow) continue;
+            GLint v;
+            memcpy(&v, u->shadow + (e - (GLuint)u->st[stage].elem_base) * 4, sizeof v);
+            return (GLuint)v;
+        }
+        return def;
+    }
+    return def;
 }
 
 GLint mgli_uniform_location(MGLIProgram *ip, const char *name)
@@ -221,6 +259,14 @@ GLint mgli_uniform_location(MGLIProgram *ip, const char *name)
     if (!ip || !name || !strncmp(name, "gl_", 3)) return -1;
     int i = mgli_uniform_index(ip, name);
     if (i >= 0) return ip->uniforms[i].location;
+    /* sampler/image members hoisted out of default-block structs
+     * (mgl_hoist_struct_samplers) live under the joined name: "s.c" ->
+     * "s_mglhoist_c", "s[0].c" -> "s_mglhoist_c[0]" */
+    if (strchr(name, '.')) {
+        char hoisted[256];
+        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted))
+            return mgli_uniform_location(ip, hoisted);
+    }
     /* "arr[N]" (also "a[i][N]") -> base + N */
     size_t ln = strlen(name);
     if (ln > 3 && name[ln - 1] == ']') {

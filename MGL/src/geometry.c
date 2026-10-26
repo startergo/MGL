@@ -6977,7 +6977,7 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     Program *program = ctx->state.program_pipeline ? mgl_program_pipeline_composite(ctx)
                                                    : ctx->state.program;
     const MGLTessCapture *c;
-    MGLGeomDraw d;
+    MGLGeomDraw d; memset(&d, 0, sizeof d);   /* route fields read by the renderer must never hold stack garbage */
     GLuint saved_discard;
     uint32_t want = gp->in_type;      /* the GS input primitive the capture must produce */
     static const uint32_t kof[3] = { 1u, 2u, 3u };     /* GL_POINTS, GL_LINES, GL_TRIANGLES */
@@ -7205,7 +7205,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
     MGLGeomProgram *gp;
-    MGLGeomDraw d;
+    MGLGeomDraw d; memset(&d, 0, sizeof d);   /* route fields read by the renderer must never hold stack garbage */
     GLenum gs_in;
 
     if (!mgl_geom_present(ctx)) return;
@@ -7461,7 +7461,7 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d)
 bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *ibuf, size_t offset)
 {
     MGLGeomProgram *gp;
-    MGLGeomDraw d;
+    MGLGeomDraw d; memset(&d, 0, sizeof d);   /* route fields read by the renderer must never hold stack garbage */
     uint32_t bound = 0;
 
     if (!mgl_geom_present(ctx)) return false;

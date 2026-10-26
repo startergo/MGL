@@ -51,4 +51,13 @@ MGLBoolPaths *mgl_cts_bool_block_members(const char *src);
 int  mgl_cts_bool_paths_has(const MGLBoolPaths *p, const char *path);  /* "Block.a.b[0]" */
 void mgl_cts_bool_paths_free(MGLBoolPaths *p);
 
+/* hoist sampler/image members of default-uniform-block structs into plain
+ * uniforms (SPIRV-Cross cannot lower them to MSL); returns a malloc'd copy or
+ * NULL when the source has none.  mgl_hoist_lookup_name() maps the GL dotted
+ * spelling ("s.c", "s[0].c") back to the hoisted name ("s_mglhoist_c",
+ * "s_mglhoist_c[0]"). */
+char *mgl_hoist_struct_samplers(const char *src);
+char *mgl_reject_reserved_declarators(const char *src);   /* "#error ..." source or NULL */
+int mgl_hoist_lookup_name(const char *name, char *out, size_t outn);
+
 #endif
