@@ -304,7 +304,11 @@ static const char *kGeomPrepMSL =
     "    uint out_prims = 0, out_idx = 0;\n"
     "\n"
     "    /* the vertex index at position i (arrays derive it, indexed draws load it) */\n"
-    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : (uint)(first + (int)(_i)))\n"
+    "    /* `first' is the firstIndex of an indexed INDIRECT command (the element buffer is\n"
+    "     * bound at its base there — glDrawElementsIndirect's command carries the element\n"
+    "     * offset), and the firstVertex of an arrays draw; direct indexed draws pass 0 and\n"
+    "     * carry their element offset in the binding */\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[first + (_i)] : (idx_size == 2u ? (uint)((const device ushort*)indices)[first + (_i)] : ((const device uint*)indices)[first + (_i)])) : (uint)(first + (int)(_i)))\n"
     "\n"
     "    uint needle = 0, m;\n"
     "    while (needle < count) {\n"
@@ -534,12 +538,12 @@ static const char *kGeomPrepMSL =
     "    uint T = prep[16];\n"
     "    uint t = gid / WG;               /* one 32-thread group per tile: gid is the global thread */\n"
     "    if (t >= T) return;\n"
-    "    uint count = prep[12];\n"
+    "    uint count = prep[12], first = prep[13];\n"
     "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
     "    bool restart_en = c.v[14] != 0u;\n"
     "    uint i = t * WG + slid;\n"
     "    bool valid = i < count;\n"
-    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : 0u)\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[first + (_i)] : (idx_size == 2u ? (uint)((const device ushort*)indices)[first + (_i)] : ((const device uint*)indices)[first + (_i)])) : 0u)\n"
     "    uint vtx = valid ? MGL_IDX(i) : 0u;\n"
     "    bool res = valid && indexed && restart_en && vtx == restart;\n"
     "    uint rb = (uint)(uint64_t)simd_ballot(res);\n"
@@ -587,12 +591,12 @@ static const char *kGeomPrepMSL =
     "    uint T = prep[16];\n"
     "    uint t = gid / WG;               /* one 32-thread group per tile */\n"
     "    if (t >= T) return;\n"
-    "    uint count = prep[12], total = prep[19];\n"
+    "    uint count = prep[12], first = prep[13], total = prep[19];\n"
     "    uint indexed = c.v[3], restart = c.v[7], idx_size = c.v[10];\n"
     "    bool restart_en = c.v[14] != 0u;\n"
     "    uint i = t * WG + slid;\n"
     "    bool valid = i < count;\n"
-    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : 0u)\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[first + (_i)] : (idx_size == 2u ? (uint)((const device ushort*)indices)[first + (_i)] : ((const device uint*)indices)[first + (_i)])) : 0u)\n"
     "    uint vtx = valid ? MGL_IDX(i) : 0u;\n"
     "    bool res = valid && indexed && restart_en && vtx == restart;\n"
     "    uint rb = (uint)(uint64_t)simd_ballot(res);\n"
@@ -706,7 +710,7 @@ static const char *kGeomPrepMSL =
     "    uint cap_idx = c.v[12], cap_prim = c.v[13];\n"
     "    uint T = prep[16], R = prep[27];\n"
     "    uint ro = 5u * T;\n"
-    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[_i] : (idx_size == 2u ? (uint)((const device ushort*)indices)[_i] : ((const device uint*)indices)[_i])) : (uint)(first + (int)(_i)))\n"
+    "#define MGL_IDX(_i) (indexed ? (idx_size == 1u ? (uint)indices[first + (_i)] : (idx_size == 2u ? (uint)((const device ushort*)indices)[first + (_i)] : ((const device uint*)indices)[first + (_i)])) : (uint)(first + (int)(_i)))\n"
     "    if (gid < out_prims) {\n"
     "        if (gid >= cap_prim) return;              /* the serial kernel's guard */\n"
     "        uint lo = 0u, hi = R;                     /* last run with primbase <= gid */\n"
@@ -1050,14 +1054,19 @@ static const char *kGeomCtlMSL =
     " * Word w < 4: PRIMITIVES_GENERATED stream w (ctl[17 + w], the primitives the\n"
     " * rasterizer / transform feedback consume, strips decomposed).  Word 4 + w:\n"
     " * GEOMETRY_SHADER_PRIMITIVES_EMITTED stream w (ctl[13 + w], one per emitted\n"
-    " * primitive as the shader closed it). */\n"
+    " * primitive as the shader closed it).  Word 8: GEOMETRY_SHADER_INVOCATIONS\n"
+    " * (ctl[21], one bump per (input primitive, invocation) thread - the only exact\n"
+    " * source for indirect draws whose vertex/instance counts are GPU-side only,\n"
+    " * KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries). */\n"
     "kernel void mgl_geom_qacc(device mgl_geom_ctl& c [[buffer(0)]],\n"
     "                          device uint* acc [[buffer(1)]],\n"
     "                          constant uint& reset_mask [[buffer(2)]])\n"
     "{\n"
-    "    for (uint w = 0u; w < 8u; w++)\n"
+    "    for (uint w = 0u; w < 16u; w++)\n"
     "    {\n"
-    "        uint v = (w < 4u) ? c.mgl_ctl[17u + w] : c.mgl_ctl[9u + w];\n"
+    "        uint v = (w < 4u) ? c.mgl_ctl[17u + w]\n"
+    "                : (w < 8u) ? c.mgl_ctl[9u + w]\n"
+    "                : (w == 8u) ? c.mgl_ctl[21u] : 0u;   /* w8: GEOMETRY_SHADER_INVOCATIONS */\n"
     "        if ((reset_mask >> w) & 1u) acc[w] = v;\n"
     "        else                        acc[w] += v;\n"
     "    }\n"
@@ -1354,7 +1363,7 @@ bool geom_xfb_gpu_pending(void)
 - (void) geomQueryRead: (unsigned) word out: (uint64_t *) out
 {
     if (!out) return;
-    if (!gQacc || !gQaccRan || word >= 8) { *out = 0; return; }
+    if (!gQacc || !gQaccRan || word >= 16) { *out = 0; return; }
 
     if (gQaccCb == _currentCommandBuffer)
     {
@@ -1375,6 +1384,23 @@ bool geom_xfb_gpu_pending(void)
     }
 
     *out = ((volatile uint32_t *)gQacc.contents)[word];
+    if (getenv("MGL_GEOM_DUMP_CTL") && gCtl && gPrep)
+    {
+        const volatile uint32_t *c = (volatile uint32_t *)gCtl.contents;
+        const volatile uint32_t *pr = (volatile uint32_t *)((char *)gPrep.contents + gPrepOff);
+        const volatile uint32_t *h = (volatile uint32_t *)((char *)gPrim.contents + gPrimOff);
+        fprintf(stderr, "ctl:");
+        for (int i = 0; i < 26; i++) fprintf(stderr, " %u", c[i]);
+        fprintf(stderr, "\nprep:");
+        for (int i = 0; i < 12; i++) fprintf(stderr, " %u", pr[MGL_GEOM_PREP_OUT_OFF + i]);
+        fprintf(stderr, "\nhdr:");
+        for (int i = 0; i < 13; i++) fprintf(stderr, " %u", h[i]);
+        fprintf(stderr, "\ncap:");
+        for (int i = 0; i < 6; i++) fprintf(stderr, " %u", h[MGL_GEOM_HDR_WORDS + i]);
+        fprintf(stderr, "\nprim:");
+        for (int i = 0; i < 6; i++) fprintf(stderr, " %u", h[MGL_GEOM_HDR_WORDS + 8 + i]);
+        fprintf(stderr, "\n");
+    }
     if (getenv("MGL_GEOM_QDEBUG"))
         fprintf(stderr, "geom: qacc read w%u -> %u  [%u %u %u %u | %u %u %u %u] ran=%d\n",
                 word, (unsigned)*out,
@@ -3779,15 +3805,24 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * size) by the mode's worst case, the kernel returns early past the real count.
          * Behind a tessellation stage the bound is the capture's index-list capacity: k
          * entries make one primitive.  An implicit (affine) draw knows the exact count on
-         * the CPU, so the pools and the dispatch grid are sized tightly. */
+         * the CPU, so the pools and the dispatch grid are sized tightly.  An INDIRECT draw
+         * whose command the CPU has read (pipeline-statistics query active, or the buffer
+         * still carries its CPU copy) also sizes exactly — including the REAL instance
+         * count, which the worst-case path could only assume to be 1 and which truncated
+         * the output budget of every primcount > 1 indirect draw. */
         uint64_t bound_threads = gpu_assembly
                                  ? ((from_tess
                                      ? (uint64_t)(d->tess_idx_cap ? d->tess_idx_cap : 1)
                                        / (gp->in_verts ? gp->in_verts : 1)
                                      : (implicit
                                         ? implicit_prims
-                                        : mgl_geom_worst_prims(d->mode, bound)))
-                                    * (uint64_t)(d->instances > 0 ? d->instances : 1) * gp->invocations)
+                                        : (d->known_prims
+                                           ? (uint64_t)d->known_prims
+                                           : mgl_geom_worst_prims(d->mode, bound))))
+                                    * (uint64_t)(d->known_instances
+                                                     ? d->known_instances
+                                                     : (d->instances > 0 ? d->instances : 1))
+                                    * gp->invocations)
                                  : threads;
         outv_cap = (size_t)bound_threads * (gp->max_vertices ? gp->max_vertices : 1);
         if (outv_cap > max_out) outv_cap = max_out;
@@ -3856,8 +3891,17 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         vsout_bytes = (8 + want * gp->in_words) * sizeof(uint32_t);
     }
     else
-        vsout_bytes = (8 + (size_t)bound * (size_t)(d->instances > 0 ? d->instances : 1)
-                           * gp->in_words) * sizeof(uint32_t);
+    {
+        /* the capture pass draws `out_idx' indices per instance; the record pool must
+         * cover the same range in the worst case.  Known counts (read command) size it
+         * exactly, and can only shrink it below the whole-buffer bound */
+        uint64_t vb = bound;
+        uint64_t ib = d->instances > 0 ? (uint64_t)d->instances : 1;
+
+        if (d->known_vcount && (uint64_t)d->known_vcount < vb) vb = d->known_vcount;
+        if (d->known_instances) ib = d->known_instances;
+        vsout_bytes = (8 + (size_t)vb * (size_t)ib * gp->in_words) * sizeof(uint32_t);
+    }
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
      * must never overwrite the records an earlier draw's pack still has to read */
@@ -4626,7 +4670,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
              * (queries.c reads them through the ext_geom query hooks); the dispatch is
              * ordered after the geometry kernel within this encoder */
             if (!gQacc)
-                gQacc = [_device newBufferWithLength: 8 * sizeof(uint32_t)
+                gQacc = [_device newBufferWithLength: 16 * sizeof(uint32_t)
                                              options: MTLResourceStorageModeShared];
             if (gQacc && gQaccPso)
             {
@@ -5034,51 +5078,84 @@ bool mgl_msl_has_size_constants(const char *msl)
 
 /* the compare ops the last specialization baked in, for the per-draw staleness
  * check (a GL_TEXTURE_COMPARE_FUNC change alone does not dirty the pipeline) */
-static struct { void *program; bool valid; int ops[32]; } gShadowSpec;
+static struct { void *program; bool valid; int ops[32]; int wraps[32]; } gShadowSpec;
+
+/* mgl_wco encodings (program.c read()-based gather taps) */
+static inline int mgl_geom_wrap_code(GLenum w)
+{
+    switch (w) {
+        case GL_REPEAT: return 0;
+        case GL_MIRRORED_REPEAT: return 1;
+        default: return 2;   /* CLAMP_TO_EDGE; CLAMP / CLAMP_TO_BORDER / MIRROR_CLAMP_TO_EDGE approximated */
+    }
+}
 
 - (void) geomShadowFCValues:(MTLFunctionConstantValues *)cv stage:(int)stage hash:(uint64_t *)hash
 {
     Program *p = ctx->state.program;
     if (!p || stage != _VERTEX_SHADER) return;
     uint32_t mask = p->spirv[_VERTEX_SHADER].shadow_slots;
-    if (!mask) return;
+
+    /* defaults first: a slot whose sampler has no bound texture must still provide
+     * every function constant its MSL declares, or the Metal function cannot be
+     * specialized at all */
+    for (int s = 0; s < 32; s++) {
+        int32_t zero = 0;
+        [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + s];
+        [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + s];
+    }
 
     SpirvResourceList *rl = &p->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
-    int ops[32];
-    for (int i = 0; i < 32; i++) ops[i] = -1;
+    int ops[32], wraps[32];
+    for (int i = 0; i < 32; i++) { ops[i] = -1; wraps[i] = -1; }
 
     for (GLuint i = 0; i < rl->count; i++)
     {
         GLuint slot = rl->list[i].msl_binding;
-        if (slot >= 32 || !(mask & (1u << slot))) continue;
+        if (slot >= 32) continue;
         GLuint unit = rl->list[i].binding;
         Texture *tex = mgl_texture_for_sampler(ctx, unit, rl->list[i].target);
         if (!tex) continue;
         Sampler *gs = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
         TextureParameter *pp = gs ? &gs->params : &tex->params;
-        int op = mgl_geom_shadow_op_of(pp->compare_func);
-        ops[slot] = op;
-        int32_t v = op;
-        [cv setConstantValue:&v type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + slot];
-        if (hash) { *hash ^= (uint64_t)(op + 1) << (slot & 7); *hash *= 1099511628211ULL; }
+        if (mask & (1u << slot)) {
+            int op = mgl_geom_shadow_op_of(pp->compare_func);
+            ops[slot] = op;
+            int32_t v = op;
+            [cv setConstantValue:&v type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + slot];
+            if (hash) { *hash ^= (uint64_t)(op + 1) << (slot & 7); *hash *= 1099511628211ULL; }
+        }
+        /* address mode of every sampler slot: the read()-based gather taps apply
+         * it themselves, so the wrap mode is baked into the vertex function too */
+        int wrap = mgl_geom_wrap_code(pp->wrap_s) + 16 * mgl_geom_wrap_code(pp->wrap_t);
+        wraps[slot] = wrap;
+        int32_t wv = wrap;
+        [cv setConstantValue:&wv type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + slot];
+        if (hash) { *hash ^= (uint64_t)(wrap + 1) << ((slot + 3) & 7); *hash *= 1099511628211ULL; }
     }
 
     gShadowSpec.program = (void *)p;
     gShadowSpec.valid = true;
     memcpy(gShadowSpec.ops, ops, sizeof ops);
+    memcpy(gShadowSpec.wraps, wraps, sizeof wraps);
 }
 
 /* called on the texture-binding path (before the PSO build of the same draw): if the
- * compare function of a shadow-sampled unit changed since the last specialization,
- * the vertex function must be re-specialized — dirty the program so processGLState
- * rebuilds the pipeline (the constants are baked into the Metal function) */
+ * compare function of a shadow-sampled unit or the address mode of a gather-sampled
+ * unit changed since the last specialization, the vertex function must be
+ * re-specialized — dirty the program so processGLState rebuilds the pipeline (the
+ * constants are baked into the Metal function) */
 - (void) geomShadowCheckStale:(GLuint)unit texture:(Texture *)tex slot:(GLuint)slot
 {
     if (!gShadowSpec.valid || gShadowSpec.program != (void *)ctx->state.program || slot >= 32) return;
-    if (!(ctx->state.program->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot))) return;
+    if (!(ctx->state.program->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot)) &&
+        gShadowSpec.wraps[slot] < 0) return;
     Sampler *gs = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
     TextureParameter *pp = gs ? &gs->params : &tex->params;
-    if (mgl_geom_shadow_op_of(pp->compare_func) != gShadowSpec.ops[slot])
+    int wrap = mgl_geom_wrap_code(pp->wrap_s) + 16 * mgl_geom_wrap_code(pp->wrap_t);
+    if ((mgl_geom_shadow_op_of(pp->compare_func) != gShadowSpec.ops[slot] &&
+         (ctx->state.program->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot))) ||
+        (gShadowSpec.wraps[slot] >= 0 && wrap != gShadowSpec.wraps[slot]))
     {
         gShadowSpec.valid = false;   /* the rebuild that follows re-records it */
         ctx->state.dirty_bits |= DIRTY_PROGRAM;

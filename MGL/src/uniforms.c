@@ -267,13 +267,22 @@ GLint mgli_uniform_location(MGLIProgram *ip, const char *name)
         if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted))
             return mgli_uniform_location(ip, hoisted);
     }
-    /* "arr[N]" (also "a[i][N]") -> base + N */
+    /* "arr[N]" (also "a[i][N]") -> base + N.  The index must be a canonical decimal
+     * integer: no whitespace, no sign, no leading zeros (CTS program_interface_query
+     * array-names: "a[ 0]", "a[01]", "a[0+0]" are NOT valid uniform names) */
     size_t ln = strlen(name);
     if (ln > 3 && name[ln - 1] == ']') {
         const char *lb = strrchr(name, '[');
         if (!lb || lb == name) return -1;
-        char *end; long idx = strtol(lb + 1, &end, 10);
-        if (end == lb + 1 || *end != ']' || idx < 0) return -1;
+        size_t il = (size_t)(&name[ln - 1] - (lb + 1));
+        long idx = -1;
+        if (il == 0 || il > 9) return -1;
+        for (size_t q = 0; q < il; q++) {
+            if (lb[1 + q] < '0' || lb[1 + q] > '9') return -1;
+            if (q == 0 && lb[1] == '0' && il > 1) return -1;   /* "00", "01" */
+        }
+        idx = lb[1] - '0';
+        for (size_t q = 1; q < il; q++) idx = idx * 10 + (lb[1 + q] - '0');
         char base[512];
         size_t bl = (size_t)(lb - name);
         if (bl + 4 > sizeof base) return -1;

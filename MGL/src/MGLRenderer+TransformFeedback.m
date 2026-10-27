@@ -103,33 +103,66 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
 {
     NSError *error = nil;
 
-    if (!xp->mtl_function) {
+    if (!xp->mtl_library) {
         id<MTLLibrary> lib = [_device newLibraryWithSource: [NSString stringWithUTF8String: xp->msl]
                                                    options: nil error: &error];
         if (!lib) {
             NSLog(@"MGL xfb: capture variant failed to compile: %@", error);
             return nil;
         }
-        id<MTLFunction> fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]];
+        xp->mtl_library = (void *)CFBridgingRetain(lib);
+        xp->mtl_function = NULL;    /* specialized per shadow-op state below */
+    }
+    id<MTLLibrary> lib = (__bridge id<MTLLibrary>)xp->mtl_library;
+
+    /* mgl_program_fix_vertex_gathers rewrites VERTEX gathers with explicit compares
+     * because AGX vertex functions return zeros for them; the comparator is a
+     * function constant (32010+slot, MGL_GEOM_FC_SHADOW_OP_BASE) exactly like the
+     * rasterizing vertex stage.  A function carrying function constants cannot be
+     * used to build a pipeline as-is (Metal validation aborts the process), so
+     * specialize it with the current shadow-op values and key the pipeline cache on
+     * them too — a compare-mode change must rebuild (KHR-GL46.gpu_shader5
+     * texture_gather_offset_depth_* crashed here). */
+    uint64_t shash = 0;
+    id<MTLFunction> fn = nil;
+    if (xp->msl && (strstr(xp->msl, "mgl_shadow_op_") || strstr(xp->msl, "mgl_wrap_op_"))) {
+        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+        for (int s = 0; s < 32; s++) {           /* defaults for slots the bound
+                                                  * program does not report */
+            int32_t zero = 0;
+            [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + s];
+            [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + s];
+        }
+        [self geomShadowFCValues:cv stage:_VERTEX_SHADER hash:&shash];
+        fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]
+                        constantValues: cv error: &error];
+        if (!fn) {
+            NSLog(@"MGL xfb: capture variant specialization failed: %@", error);
+            return nil;
+        }
+    } else {
+        fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]];
         if (!fn) {
             NSLog(@"MGL xfb: capture entry point %s not found", xp->entry);
             return nil;
         }
-        xp->mtl_library = (void *)CFBridgingRetain(lib);
-        xp->mtl_function = (void *)CFBridgingRetain(fn);
     }
 
-    /* the pipeline depends on the vertex layout; rebuild when it changes */
-    NSString *key = [vd description];
+    /* the pipeline depends on the vertex layout and the shadow-op state; rebuild when
+     * either changes */
+    NSString *key = [NSString stringWithFormat: @"%@:%p:%llx", [vd description], fn,
+                                                  (unsigned long long)shash];
     if (xp->mtl_pipeline && xp->mtl_pipeline_key) {
         NSString *old = (__bridge NSString *)xp->mtl_pipeline_key;
         if ([old isEqualToString: key])
             return (__bridge id<MTLRenderPipelineState>)xp->mtl_pipeline;
     }
+    if (xp->mtl_function) CFBridgingRelease(xp->mtl_function);
+    xp->mtl_function = (void *)CFBridgingRetain(fn);
 
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
     pd.label = @"MGL transform feedback capture";
-    pd.vertexFunction = (__bridge id<MTLFunction>)xp->mtl_function;
+    pd.vertexFunction = fn;
     pd.fragmentFunction = nil;
     pd.vertexDescriptor = vd;
     pd.rasterizationEnabled = NO;

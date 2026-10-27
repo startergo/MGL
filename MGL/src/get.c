@@ -168,7 +168,9 @@ GLuint mgl_reported_binding_limit(GLMContext ctx, GLenum pname)
     }
 }
 
-#define MGL_MAX_VERTEX_ATTRIB_BINDINGS          MAX_BINDABLE_BUFFERS
+/* vertex-attrib binding points are capped by GL_MAX_VERTEX_ATTRIBS (16); the buffer
+ * array is bigger (MAX_BINDABLE_BUFFERS 84) for the uniform-buffer rows (geom r50d) */
+#define MGL_MAX_VERTEX_ATTRIB_BINDINGS          MAX_ATTRIBS
 #define MGL_MAX_VIEWPORTS                       16
 
 #ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
@@ -999,6 +1001,42 @@ static int get_indexed_state(GLMContext ctx, GLenum pname, GLuint index, GetValu
                     for (int i = 0; i < 4; i++) gv->v[i] = STATE_VAR(color_writemask[index][i]);
                     return 1;
             }
+
+        /* per-unit sampler bindings (indexed getter, ARB_multi_bind) */
+        case GL_SAMPLER_BINDING:
+            if (index >= TEXTURE_UNITS) return -1;
+            gv->count = 1;
+            gv->v[0] = index < TEXTURE_UNITS ? NAME(STATE(texture_samplers[index])) : 0;
+            return 1;
+
+        /* per-texture-unit bindings: the GL_TEXTURE_BINDING_* pnames are indexed by
+         * texture unit in the indexed getters (ARB_multi_bind; KHR-GL46.multi_bind
+         * functional_bind_textures reads them after glBindTextures) */
+        case GL_TEXTURE_BINDING_1D: case GL_TEXTURE_BINDING_2D: case GL_TEXTURE_BINDING_3D:
+        case GL_TEXTURE_BINDING_1D_ARRAY: case GL_TEXTURE_BINDING_2D_ARRAY:
+        case GL_TEXTURE_BINDING_RECTANGLE: case GL_TEXTURE_BINDING_BUFFER:
+        case GL_TEXTURE_BINDING_CUBE_MAP: case GL_TEXTURE_BINDING_CUBE_MAP_ARRAY:
+        case GL_TEXTURE_BINDING_2D_MULTISAMPLE: case GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY: {
+            static const struct { GLenum pname; int slot; } tb[] = {
+                { GL_TEXTURE_BINDING_1D, _TEXTURE_1D }, { GL_TEXTURE_BINDING_2D, _TEXTURE_2D },
+                { GL_TEXTURE_BINDING_3D, _TEXTURE_3D }, { GL_TEXTURE_BINDING_1D_ARRAY, _TEXTURE_1D_ARRAY },
+                { GL_TEXTURE_BINDING_2D_ARRAY, _TEXTURE_2D_ARRAY }, { GL_TEXTURE_BINDING_RECTANGLE, _TEXTURE_RECTANGLE },
+                { GL_TEXTURE_BINDING_BUFFER, _TEXTURE_BUFFER }, { GL_TEXTURE_BINDING_CUBE_MAP, _TEXTURE_CUBE_MAP },
+                { GL_TEXTURE_BINDING_CUBE_MAP_ARRAY, _TEXTURE_CUBE_MAP_ARRAY },
+                { GL_TEXTURE_BINDING_2D_MULTISAMPLE, _TEXTURE_2D_MULTISAMPLE },
+                { GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY, _TEXTURE_2D_MULTISAMPLE_ARRAY },
+            };
+            if (index >= TEXTURE_UNITS) return -1;
+            for (size_t i = 0; i < sizeof tb / sizeof tb[0]; i++)
+                if (tb[i].pname == pname)
+                {
+                    Texture *t = STATE(texture_units[index].textures[tb[i].slot]);
+                    gv->count = 1;
+                    gv->v[0] = t ? (GLint)t->name : 0;
+                    return 1;
+                }
+            return -1;
+        }
 
         /* image units */
         case GL_IMAGE_BINDING_NAME: case GL_IMAGE_BINDING_LEVEL: case GL_IMAGE_BINDING_LAYERED:

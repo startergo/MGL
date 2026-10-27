@@ -72,6 +72,7 @@ static void free_link_tables(MGLIProgram *ip)
     ip->nxfb = 0;
     for (int s = 0; s < MGLI_STAGES; s++) ip->dub_res_index[s] = -1;
     ip->linked = 0;
+    ip->link_failed = 0;
 }
 
 static void reset_record(MGLIProgram *ip)
@@ -120,6 +121,27 @@ static MGLIProgram *find_by_ptr(GLMContext ctx, Program *p)
     return NULL;
 }
 
+/* the program object is being destroyed: unlink and free its introspection
+ * record.  Without this, mgli_find/mgli_get's linked list grows with every
+ * program ever linked (link-heavy CTS cases create and delete 100k+ programs),
+ * making every later link O(live+dead) — the texture_swizzle.smoke decay. */
+void mgl_ext_delete_program_introspect(GLMContext ctx, Program *p)
+{
+    MGLIProgram **it;
+    if (!p) return;
+    for (it = &ext(ctx)->programs; *it; it = &(*it)->next)
+    {
+        if ((*it)->prog == p)
+        {
+            MGLIProgram *dead = *it;
+            *it = dead->next;
+            reset_record(dead);
+            free(dead);
+            return;
+        }
+    }
+}
+
 MGLIProgram *mgli_program_checked(GLMContext ctx, GLuint program, bool need_linked)
 {
     if (!findProgram(ctx, program)) {
@@ -127,8 +149,36 @@ MGLIProgram *mgli_program_checked(GLMContext ctx, GLuint program, bool need_link
         return NULL;
     }
     MGLIProgram *ip = mgli_get(ctx, program);
-    if (need_linked && !ip->linked) { mgli_set_error(ctx, "program", GL_INVALID_OPERATION); return NULL; }
+    if (need_linked && (!ip->linked || ip->link_failed)) { mgli_set_error(ctx, "program", GL_INVALID_OPERATION); return NULL; }
     return ip;
+}
+
+/* drop the active-resource tables of a program whose link FAILED: GL 4.6 §7.3.1
+ * (introspection must report no resources until the next successful link) */
+void mgli_invalidate_program(GLMContext ctx, GLuint program)
+{
+    MGLIProgram *ip = mgli_find(ctx, program);
+    if (ip) free_link_tables(ip);
+}
+
+/* geom r58: true when the program's last (re)link FAILED after an earlier
+ * successful link. Introspection must then behave like a never-linked program
+ * (counts report zero), but the previous executable and its uniform state stay
+ * active for rendering (GL 4.6 7.3.1). */
+bool mgli_link_failed(GLMContext ctx, GLuint program)
+{
+    MGLIProgram *ip = mgli_find(ctx, program);
+    return ip && ip->link_failed;
+}
+
+/* geom r58: a failed RELINK that failed on a previously linked program must keep the
+ * previous executable active (GL 4.6 §7.3.1), so the tables backing its uniform
+ * state stay alive; introspection still has to behave as if the link failed
+ * (mgli_program_checked errors through link_failed). */
+void mgli_mark_relink_failed(GLMContext ctx, GLuint program)
+{
+    MGLIProgram *ip = mgli_find(ctx, program);
+    if (ip) ip->link_failed = 1;
 }
 
 #pragma mark - link hooks
@@ -316,6 +366,7 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
         }
     }
     ip->linked = 1;
+    ip->link_failed = 0;
     for (int s = 0; s < MGLI_STAGES; s++) if (ip->sub[s].nunis) write_selectors(ctx, ip, s);
 
     /* the stage MSL was generated from the patched SPIR-V (mgl_introspect_patch_stage) */
@@ -816,7 +867,18 @@ static int pub_index_of(MGLIProgram *ip, int internal)
 static const char *resource_name(MGLIProgram *ip, GLenum iface, int index)
 {
     int u, st = subroutine_iface(iface, &u);
-    if (st >= 0) return u ? ip->sub[st].unis[index].name : ip->sub[st].funcs[index].name;
+    if (st >= 0) {
+        if (!u) return ip->sub[st].funcs[index].name;
+        MGLISubUniform *su = &ip->sub[st].unis[index];
+        /* an array of subroutine uniforms is a single resource named by its first
+         * element (GL 4.6 §9.2: "b[0]", never "b") */
+        if (su->size > 1) {
+            static char s[256];
+            snprintf(s, sizeof s, "%s[0]", su->name);
+            return s;
+        }
+        return su->name;
+    }
     switch (iface) {
         case GL_UNIFORM: return pub_uniform(ip, index)->name;
         case GL_UNIFORM_BLOCK: return ip->ubos[index].name;
@@ -835,6 +897,10 @@ void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInte
     if (!ip) return;
     xfb_sync(ctx, ip);
     if (!valid_iface(programInterface)) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return; }
+    /* geom r58: a failed relink reports zero resources like a never-linked
+     * program (test_piq link_failure_clears; the CTS link-failure cases accept
+     * both). The previous executable and its uniform state stay active. */
+    if (ip->link_failed) { *params = 0; return; }
     int u, st = subroutine_iface(programInterface, &u);
     int n = resource_count(ip, programInterface);
     GLint v = 0;
@@ -885,6 +951,15 @@ GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum progra
         for (int i = 0; i < n; i++) if (!strcmp(ip->sub[st].funcs[i].name, name)) return (GLuint)ip->sub[st].funcs[i].index;
         return GL_INVALID_INDEX;
     }
+    /* gl_NextBuffer / gl_SkipComponents1..4 are enumerated TRANSFORM_FEEDBACK_VARYING
+     * resources with type GL_NONE, but they are not addressable by name (GL 4.6
+     * 13.4.2: they are layout directives, not varyings) */
+    if (programInterface == GL_TRANSFORM_FEEDBACK_VARYING)
+        for (int i = 0; i < n; i++) {
+            if (xfb_info(ip, i).type != GL_NONE) continue;
+            const char *nm = resource_name(ip, programInterface, i);
+            if (!strcmp(nm, name) || name_matches_var(nm, name)) return GL_INVALID_INDEX;
+        }
     for (int i = 0; i < n; i++) if (!strcmp(resource_name(ip, programInterface, i), name)) return (GLuint)i;
     for (int i = 0; i < n; i++) if (name_matches_var(resource_name(ip, programInterface, i), name)) return (GLuint)i;
     return GL_INVALID_INDEX;
@@ -1091,7 +1166,7 @@ GLint  mglGetProgramResourceLocation(GLMContext ctx, GLuint program, GLenum prog
     int is_su, st = subroutine_iface(programInterface, &is_su);
     if (!(programInterface == GL_UNIFORM || programInterface == GL_PROGRAM_INPUT || programInterface == GL_PROGRAM_OUTPUT ||
           (st >= 0 && is_su))) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return -1; }
-    if (!ip->linked) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
+    if (!ip->linked || ip->link_failed) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
     if (!name || !strncmp(name, "gl_", 3)) return -1;
     switch (programInterface) {
         case GL_UNIFORM: return mgli_uniform_location(ip, name);
@@ -1109,7 +1184,7 @@ GLint  mglGetProgramResourceLocationIndex(GLMContext ctx, GLuint program, GLenum
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
     if (!ip) return -1;
     if (programInterface != GL_PROGRAM_OUTPUT) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_ENUM); return -1; }
-    if (!ip->linked) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
+    if (!ip->linked || ip->link_failed) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_OPERATION); return -1; }
     if (!name || !frag_outputs(ip)) return -1;
     GLint idx = -1;
     if (var_location(ip->outputs, ip->noutputs, name, &idx) < 0) return -1;

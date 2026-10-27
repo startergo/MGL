@@ -806,6 +806,202 @@ uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_
     return mod;
 }
 
+/* ---- arrays-of-matrices stage inputs: lower to per-element attributes ----
+ * SPIRV-Cross refuses to emit an array-of-matrices stage input ("MSL cannot emit
+ * arrays-of-matrices in input and output variables"), which used to fail the
+ * whole link for GLSL-legal attributes like `layout(location=7) in mat2x3 d[2]`
+ * (KHR-GL46.program_interface_query.input-types / input-layout).  This runs at
+ * the MSL boundary only — the GL view of the module keeps the array, so
+ * introspection still reports one input named "d" with GL_ARRAY_SIZE 2.
+ *
+ * The variable becomes N element-typed Input variables at consecutive locations
+ * (each matrix consumes one location per column) plus a Private shadow array of
+ * the original type whose entry-prologue copy makes every reference — including
+ * dynamic indexing and helper functions — work unchanged. */
+typedef struct { uint32_t *w; size_t n, cap; } AomBuf;
+
+static void aom_push(AomBuf *b, uint32_t v)
+{
+    if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 2048; b->w = realloc(b->w, b->cap * sizeof(uint32_t)); }
+    b->w[b->n++] = v;
+}
+
+static void aom_inst(AomBuf *b, uint32_t op, int wc, const uint32_t *ops)
+{
+    aom_push(b, ((uint32_t)wc << 16) | op);
+    for (int i = 0; i < wc - 1; i++) aom_push(b, ops[i]);
+}
+
+uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n)
+{
+    const char *err = NULL;
+    SpvModule *m = spv_parse(in, n, &err);
+    if (!m || !m->ok) { spv_free(m); return NULL; }
+
+    /* Input variables of array-of-matrix type with an explicit Location */
+    struct { uint32_t var, arr_t, elem_t, loc, count, locs; } v[16];
+    int nv = 0;
+    for (int i = 0; i < m->n_vars && nv < 16; i++) {
+        SpvVar *gv = &m->vars[i];
+        if (gv->storage != SpvStorageClassInput) continue;
+        SpvType *pt = spv_find_type(m, gv->type_id);
+        if (!pt || pt->kind != SPVT_PTR) continue;
+        SpvType *arr = spv_find_type(m, pt->elem);
+        if (!arr || arr->kind != SPVT_ARRAY) continue;
+        SpvType *mat = spv_find_type(m, arr->elem);
+        if (!mat || mat->kind != SPVT_MAT) continue;
+        uint32_t loc = 0;
+        if (!spv_deco(m, gv->id, SpvDecorationLocation, &loc)) continue;
+        /* the parser resolves OpTypeArray lengths to their constant value */
+        v[nv].var = gv->id;
+        v[nv].arr_t = pt->elem;
+        v[nv].elem_t = arr->elem;
+        v[nv].loc = loc;
+        v[nv].count = arr->n;
+        v[nv].locs = mat->n ? mat->n : 1;   /* one location per matrix column */
+        if (!v[nv].count || v[nv].count > 64) continue;
+        nv++;
+    }
+    if (!nv) { spv_free(m); return NULL; }
+
+    /* integer result type for the per-element index constants: the type of any
+     * existing OpConstant (all lowered arrays need one for their length anyway),
+     * else a fresh 32-bit unsigned int */
+    uint32_t index_type = 0;
+    for (size_t o = 5; o + 4 <= n; ) {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpConstant) { index_type = in[o + 1]; break; }
+        o += wc;
+    }
+
+    AomBuf out; memset(&out, 0, sizeof out);
+    for (int i = 0; i < 5; i++) aom_push(&out, in[i]);
+
+    uint32_t next_id = in[3] > 5 ? in[3] : 5;    /* module bound (header word 3) */
+    struct { uint32_t shadow, priv_arr_ptr, priv_elem_ptr, in_elem_ptr;
+             uint32_t *elems, *consts, *acs, *ld; } g[16];
+    memset(g, 0, sizeof g);
+    if (!index_type) index_type = next_id++;
+    for (int k = 0; k < nv; k++) {
+        g[k].shadow = next_id++;
+        g[k].priv_arr_ptr = next_id++;
+        g[k].priv_elem_ptr = next_id++;
+        g[k].in_elem_ptr = next_id++;
+        g[k].elems = malloc(v[k].count * sizeof(uint32_t));
+        g[k].consts = malloc(v[k].count * sizeof(uint32_t));
+        g[k].acs = malloc(v[k].count * sizeof(uint32_t));
+        g[k].ld = malloc(v[k].count * sizeof(uint32_t));
+        for (uint32_t e = 0; e < v[k].count; e++) {
+            g[k].elems[e] = next_id++;
+            g[k].consts[e] = next_id++;
+            g[k].acs[e] = next_id++;
+            g[k].ld[e] = next_id++;
+        }
+    }
+
+    bool globals_done = false, in_functions = false, entry_seen = false;
+    bool prologue_pending = false, prologue_done = true;
+    for (size_t o = 5; o < n; ) {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        const uint32_t *w = in + o;
+
+        if (!globals_done && op == SpvOpFunction) {
+            if (index_type >= in[3]) {          /* the fresh uint type we allocated */
+                uint32_t t[3] = { index_type, 32, 0 };
+                aom_inst(&out, SpvOpTypeInt, 4, t);
+            }
+            for (int k = 0; k < nv; k++) {
+                uint32_t p1[3] = { g[k].priv_arr_ptr, SpvStorageClassPrivate, v[k].arr_t };
+                aom_inst(&out, SpvOpTypePointer, 4, p1);
+                uint32_t p2[3] = { g[k].priv_elem_ptr, SpvStorageClassPrivate, v[k].elem_t };
+                aom_inst(&out, SpvOpTypePointer, 4, p2);
+                uint32_t p3[3] = { g[k].in_elem_ptr, SpvStorageClassInput, v[k].elem_t };
+                aom_inst(&out, SpvOpTypePointer, 4, p3);
+                for (uint32_t e = 0; e < v[k].count; e++) {
+                    uint32_t cv[3] = { index_type, g[k].consts[e], e };
+                    aom_inst(&out, SpvOpConstant, 4, cv);
+                    uint32_t vv[3] = { g[k].in_elem_ptr, g[k].elems[e], SpvStorageClassInput };
+                    aom_inst(&out, SpvOpVariable, 4, vv);
+                    uint32_t dv[3] = { g[k].elems[e], SpvDecorationLocation, v[k].loc + e * v[k].locs };
+                    aom_inst(&out, SpvOpDecorate, 4, dv);
+                }
+                uint32_t sv[3] = { g[k].priv_arr_ptr, g[k].shadow, SpvStorageClassPrivate };
+                aom_inst(&out, SpvOpVariable, 4, sv);
+            }
+            globals_done = true;
+        }
+        if (op == SpvOpFunction) {
+            in_functions = true;
+            if (wc >= 4 && w[2] == m->entry) { entry_seen = true; prologue_done = false; prologue_pending = false; }
+        }
+        if (op == SpvOpLabel && entry_seen && !prologue_done) prologue_pending = true;
+
+        if (op == SpvOpVariable) {
+            bool drop = false;
+            for (int k = 0; k < nv; k++) if (w[2] == v[k].var) drop = true;
+            if (drop) { o += wc; continue; }
+        }
+        if ((op == SpvOpName || op == SpvOpDecorate) && wc >= 2) {
+            bool drop = false;
+            for (int k = 0; k < nv; k++) if (w[1] == v[k].var) drop = true;
+            if (drop) { o += wc; continue; }
+        }
+        if (op == SpvOpEntryPoint && wc >= 3) {
+            bool hit = false;
+            for (size_t q = 3; q < (size_t)wc; q++)
+                for (int k = 0; k < nv; k++) if (w[q] == v[k].var) hit = true;
+            if (hit) {
+                uint32_t nw[640]; int nn = 0;
+                nw[nn++] = w[1]; nw[nn++] = w[2];
+                for (size_t q = 3; q < (size_t)wc; q++) {
+                    bool sub = false;
+                    for (int k = 0; k < nv; k++) if (w[q] == v[k].var) {
+                        for (uint32_t e = 0; e < v[k].count && nn < 600; e++) nw[nn++] = g[k].elems[e];
+                        sub = true;
+                    }
+                    if (!sub && nn < 630) nw[nn++] = w[q];
+                }
+                aom_inst(&out, op, nn + 1, nw);
+                o += wc;
+                continue;
+            }
+        }
+        /* prologue: first instruction of the entry block that is not a variable/phi */
+        if (prologue_pending && !prologue_done && op != SpvOpVariable && op != SpvOpPhi && op != SpvOpLabel) {
+            for (int k = 0; k < nv; k++)
+                for (uint32_t e = 0; e < v[k].count; e++) {
+                    uint32_t ac[4] = { g[k].priv_elem_ptr, g[k].acs[e], g[k].shadow, g[k].consts[e] };
+                    aom_inst(&out, SpvOpAccessChain, 5, ac);
+                    uint32_t ld[3] = { v[k].elem_t, g[k].ld[e], g[k].elems[e] };
+                    aom_inst(&out, SpvOpLoad, 4, ld);
+                    uint32_t st[2] = { g[k].acs[e], g[k].ld[e] };
+                    aom_inst(&out, SpvOpStore, 3, st);
+                }
+            prologue_done = true;
+        }
+        /* copy the instruction, re-pointing references at the shadow arrays */
+        aom_push(&out, w[0]);
+        if (in_functions)
+            for (size_t q = 1; q < (size_t)wc; q++) {
+                uint32_t x = w[q];
+                for (int k = 0; k < nv; k++) if (x == v[k].var) { x = g[k].shadow; break; }
+                aom_push(&out, x);
+            }
+        else
+            for (size_t q = 1; q < (size_t)wc; q++) aom_push(&out, w[q]);
+        o += wc;
+    }
+    spv_free(m);
+
+    for (int k = 0; k < nv; k++) { free(g[k].elems); free(g[k].consts); free(g[k].acs); free(g[k].ld); }
+    if (out.n <= 5 || !globals_done || !prologue_done) { free(out.w); return NULL; }
+    out.w[3] = next_id;   /* new bound */
+    *out_n = out.n;
+    return out.w;
+}
+
 static const char *glsl_type_name(GLenum base, GLuint rows, GLuint cols)
 {
     static const char *scalar[5] = { "float", "double", "int", "uint", "bool" };
@@ -1002,49 +1198,153 @@ static void gen_varying_store(SB *b, const MGLGeomVar *v, const char *dest, cons
 
 static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp);
 
+/* ---- name -> slot map: open addressing, linear probing, backward-shift deletion ---- */
+
+static int geom_map_find(struct MGLExtState_geom *g, GLuint name)
+{
+    if (!g || !g->map_cap || !name) return -1;
+    GLuint mask = (GLuint)g->map_cap - 1;
+    for (GLuint i = name & mask; ; i = (i + 1) & mask)
+    {
+        if (!g->map_names[i]) return -1;
+        if (g->map_names[i] == name) return g->map_slots[i] - 1;
+    }
+}
+
+static bool geom_map_insert(struct MGLExtState_geom *g, GLuint name, int slot)
+{
+    if (!g) return false;
+
+    if ((g->map_used + 1) * 4 > g->map_cap * 3)   /* > 75% load: grow */
+    {
+        int ncap = g->map_cap ? g->map_cap * 2 : 128;
+        GLuint *nn = (GLuint *)malloc((size_t)ncap * sizeof(GLuint));
+        int   *ns = (int *)malloc((size_t)ncap * sizeof(int));
+        if (!nn || !ns) { free(nn); free(ns); return false; }
+        memset(nn, 0, (size_t)ncap * sizeof(GLuint));
+        memset(ns, 0, (size_t)ncap * sizeof(int));
+        GLuint nmask = (GLuint)ncap - 1;
+        for (int i = 0; i < g->map_cap; i++)
+        {
+            if (!g->map_names[i]) continue;
+            GLuint j = g->map_names[i] & nmask;
+            while (nn[j]) j = (j + 1) & nmask;
+            nn[j] = g->map_names[i];
+            ns[j] = g->map_slots[i];
+        }
+        free(g->map_names);
+        free(g->map_slots);
+        g->map_names = nn;
+        g->map_slots = ns;
+        g->map_cap = ncap;
+    }
+
+    GLuint mask = (GLuint)g->map_cap - 1;
+    GLuint i = name & mask;
+    while (g->map_names[i]) i = (i + 1) & mask;
+    g->map_names[i] = name;
+    g->map_slots[i] = slot + 1;
+    g->map_used++;
+    return true;
+}
+
+static void geom_map_remove(struct MGLExtState_geom *g, GLuint name)
+{
+    if (!g || !g->map_cap) return;
+    GLuint mask = (GLuint)g->map_cap - 1;
+    GLuint i = name & mask;
+    while (g->map_names[i] && g->map_names[i] != name) i = (i + 1) & mask;
+    if (g->map_names[i] != name) return;
+
+    /* backward-shift deletion keeps probe chains intact without tombstones */
+    g->map_names[i] = 0;
+    g->map_slots[i] = 0;
+    g->map_used--;
+    GLuint j = (i + 1) & mask;
+    while (g->map_names[j])
+    {
+        GLuint k = g->map_names[j] & mask;
+        /* can the entry at j live at i?  (circular interval test) */
+        if ((j > i && (k <= i || k > j)) || (j < i && (k <= i && k > j)))
+        {
+            g->map_names[i] = g->map_names[j];
+            g->map_slots[i] = g->map_slots[j];
+            g->map_names[j] = 0;
+            g->map_slots[j] = 0;
+            i = j;
+        }
+        j = (j + 1) & mask;
+    }
+}
+
 static MGLGeomProgram *geom_prog_slot(GLMContext ctx, Program *p, bool create)
 {
     struct MGLExtState_geom *g = GEOM();
 
     if (!g || !p || !p->name) return NULL;
 
-    /* run_link builds every executable in a scratch object, so the Program pointer differs
-     * between the compile hook and the post-link hook: fall back to the name */
-    for (int i = 0; i < g->n_progs; i++)
+    int slot = geom_map_find(g, p->name);
+    if (slot >= 0)
     {
-        MGLGeomProgram *gp = &g->progs[i];
-        if (gp->name == p->name) return gp;
+        /* names are not recycled today, but if they ever are, the slot must follow the
+         * live object (the link path sees a scratch Program with the same name) */
+        if (g->progs[slot].program != p && g->progs[slot].name == p->name)
+            g->progs[slot].program = findProgram(ctx, p->name);
+        return &g->progs[slot];
     }
     if (!create) return NULL;
 
-    /* re-use slots whose program is gone (deleted, or a new object under the name) */
-    for (int i = 0; i < g->n_progs; i++)
+    /* take a slot from the free list (its program died: mgl_ext_delete_program_geom) */
+    if (g->free_head >= 0)
     {
-        MGLGeomProgram *gp = &g->progs[i];
-        if (gp->name && getProgram(ctx, gp->name)) continue;
-        if (!gp->name) geom_free_prog(ctx, gp);
-        memset(gp, 0, sizeof(*gp));
-        gp->name = p->name;
-        gp->program = getProgram(ctx, p->name);
-        return gp;
+        slot = g->free_head;
+        g->free_head = g->progs[slot].next_free;
+        geom_free_prog(ctx, &g->progs[slot]);
+    }
+    else
+    {
+        if (g->n_progs >= g->progs_cap)
+        {
+            int cap = g->progs_cap ? g->progs_cap * 2 : MGL_GEOM_MAX_PROGRAMS;
+            MGLGeomProgram *grown = realloc(g->progs, (size_t)cap * sizeof(*grown));
+            if (!grown) return NULL;
+            memset(grown + g->n_progs, 0, (size_t)(cap - g->n_progs) * sizeof(*grown));
+            g->progs = grown;
+            g->progs_cap = cap;
+        }
+        slot = g->n_progs++;
     }
 
-    /* no free slot: grow the table */
-    if (g->n_progs >= g->progs_cap)
+    MGLGeomProgram *gp = &g->progs[slot];
+    gp->next_free = -1;
+    gp->name = p->name;
+    /* findProgram, NOT getProgram: getProgram would *create* a Program if the name
+     * were somehow absent, growing the program table as a side effect */
+    gp->program = findProgram(ctx, p->name);
+    if (!geom_map_insert(g, p->name, slot))
     {
-        int cap = g->progs_cap ? g->progs_cap * 2 : MGL_GEOM_MAX_PROGRAMS;
-        MGLGeomProgram *grown = realloc(g->progs, (size_t)cap * sizeof(*grown));
-        if (!grown) return NULL;
-        memset(grown + g->n_progs, 0, (size_t)(cap - g->n_progs) * sizeof(*grown));
-        g->progs = grown;
-        g->progs_cap = cap;
+        memset(gp, 0, sizeof(*gp));
+        if (slot == g->n_progs - 1) g->n_progs--;
+        return NULL;
     }
-    {
-        MGLGeomProgram *gp = &g->progs[g->n_progs++];
-        gp->name = p->name;
-        gp->program = getProgram(ctx, p->name);
-        return gp;
-    }
+    return gp;
+}
+
+/* the GL program object is being destroyed: release its geometry emulation (Metal
+ * functions / PSO / MSL) and recycle the slot through the free list */
+void mgl_ext_delete_program_geom(GLMContext ctx, Program *p)
+{
+    struct MGLExtState_geom *g = GEOM();
+
+    if (!g || !p || !p->name) return;
+
+    int slot = geom_map_find(g, p->name);
+    if (slot < 0) return;
+
+    geom_map_remove(g, p->name);
+    geom_free_prog(ctx, &g->progs[slot]);
+    g->progs[slot].next_free = g->free_head;
+    g->free_head = slot;
 }
 
 static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
@@ -1569,7 +1869,13 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
         return NULL;
     }
 
-    char *out = xstrdup(msl);
+    /* uint-in-MSL / int-in-GL index builtins (msl_reserved.c): `min(4, gl_VertexID)'
+     * is an ambiguous Metal overload — the GS emulation's gl_PrimitiveID /
+     * gl_InvocationID carry the same rule.  The fixed copy is consumed by the strdup
+     * right below (the spvc context owns the original string). */
+    char *vid_fixed = mgl_msl_fix_int_builtins(msl);
+    char *out = xstrdup(vid_fixed ? vid_fixed : msl);
+    free(vid_fixed);
 
     /* the bind walks need the Metal texture indices this variant ACTUALLY uses: the
      * pins above may be unreachable (a user image and the packed default-uniform block
@@ -2552,23 +2858,45 @@ char *mgl_geom_strip_msl_volatile(const char *msl)
         changed = strstr(msl, pats[p].bad) != NULL;
     if (!changed) return NULL;
 
-    char *out = strdup(msl);
-    if (!out) return NULL;
+    /* the replacements do not all shrink (`& restrict ` -> `& __restrict ` grows by
+     * 2 per occurrence), so the result is rebuilt into a growing buffer: rewriting
+     * a strdup in place overflowed the heap whenever an MSL carried `restrict` */
+    char *cur = xstrdup(msl);
+    if (!cur) return NULL;
 
     for (size_t p = 0; p < sizeof pats / sizeof pats[0]; p++)
     {
+        if (!strstr(cur, pats[p].bad))
+            continue;
+        SB b = { 0, 0, 0, false };
         size_t bl = strlen(pats[p].bad), gl = strlen(pats[p].good);
-        char *q = out;
-        while ((q = strstr(q, pats[p].bad)) != NULL)
+        char *q = cur;
+        for (char *m; (m = strstr(q, pats[p].bad)) != NULL; q = m + bl)
         {
-            /* shift the tail first: the replacement may be longer, and writing it
-             * first would clobber the not-yet-moved bytes */
-            memmove(q + gl, q + bl, strlen(q + bl) + 1);
-            memmove(q, pats[p].good, gl);
-            q += gl;
+            sb_reserve(&b, (size_t)(m - q) + gl);
+            if (b.oom) break;
+            memcpy(b.s + b.len, q, (size_t)(m - q));
+            b.len += (size_t)(m - q);
+            memcpy(b.s + b.len, pats[p].good, gl);
+            b.len += gl;
+            b.s[b.len] = 0;
         }
+        if (!b.oom)
+        {
+            sb_reserve(&b, strlen(q));
+            if (!b.oom)
+            {
+                memcpy(b.s + b.len, q, strlen(q) + 1);
+                b.len += strlen(q);
+            }
+        }
+        char *next = sb_take(&b);
+        free(cur);
+        if (!next)
+            return NULL;
+        cur = next;
     }
-    return out;
+    return cur;
 }
 
 /* Does the MSL entry function return void?  Metal requires rasterization to be
@@ -2764,7 +3092,12 @@ char *mgl_msl_insert_image_fences(const char *msl)
                 edits[b].at = ta; edits[b].text = tt;
             }
 
-    char *out = malloc(len + 1);
+    /* the inserts must fit: plain len+1 overflowed the heap (same class as the
+     * atomic-counter helper-param insert) */
+    size_t ins_len = 0;
+    for (int a = 0; a < nedits; a++)
+        ins_len += strlen(edits[a].text);
+    char *out = malloc(len + 1 + ins_len);
     if (out)
     {
         out[0] = 0;
@@ -3395,7 +3728,14 @@ static char *msl_msl_counters_to_helper_params(const char *msl, const char *entr
                 edits[k].at = ta; edits[k].text = tt;
             }
 
-    char *out = malloc(len + 1);
+    /* the edits INSERT text: the allocation must cover their total length (a plain
+     * len+1 buffer overflowed the heap whenever a helper function touched a counter,
+     * which surfaced as a later free() brk in test_atomic_counters) */
+    size_t ins_total = 0;
+    for (int i = 0; i < nedits; i++)
+        ins_total += strlen(edits[i].text);
+
+    char *out = malloc(len + 1 + ins_total);
     if (out)
     {
         out[0] = 0;
@@ -3498,9 +3838,60 @@ static char *inject_atomic_counters_core(const char *msl, const char *entry,
         add_len += strlen(one) + 32;
     }
 
+    /* the expression rewrites below can LENGTHEN the text (`(thread ...` is shorter
+     * than `(volatile device ...`, and the offset/index forms add characters): count
+     * their growth first so the allocation covers it.  Rewriting in place on a buffer
+     * sized for the parameter insert alone overflowed the heap (surfaced as a free()
+     * brk in test_atomic_counters). */
+    size_t grow = 0;
+    for (int i = 0; i < nvars; i++)
+    {
+        char bad[300];
+        unsigned w = vars[i].offset / 4;
+
+        snprintf(bad, sizeof bad, "(thread atomic_uint*)&%s", vars[i].name);
+        for (const char *q = msl; (q = strstr(q, bad)) != NULL; )
+        {
+            const char *after = q + strlen(bad);
+            size_t bl = strlen(bad);
+            char good[512];
+
+            if (isalnum((unsigned char)*after) || *after == '_')
+            {
+                q += bl;
+                continue;
+            }
+            if (*after == '[')
+            {
+                const char *e = after + 1;
+                int bd = 1;
+                while (*e)
+                {
+                    if (*e == '[') bd++;
+                    else if (*e == ']' && --bd == 0) { e++; break; }
+                    e++;
+                }
+                if (bd != 0 || (size_t)(e - after) > 200)
+                    return NULL;    /* the rewrite loop below would reject it too */
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u+(%.*s)]",
+                         vars[i].name, w, (int)(e - after - 2), after + 1);
+                bl += (size_t)(e - after);
+            }
+            else if (w)
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u]",
+                         vars[i].name, w);
+            else
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)%s",
+                         vars[i].name);
+            if (strlen(good) > bl)
+                grow += strlen(good) - bl;
+            q += bl;
+        }
+    }
+
     size_t len = strlen(msl);
     size_t insert_at = (size_t)(close - msl);
-    char *out = (char *)malloc(len + add_len);
+    char *out = (char *)malloc(len + add_len + grow);
     if (!out)
         return NULL;
     memcpy(out, msl, insert_at);
@@ -5044,6 +5435,10 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "    uint mgl_p = mgl_t / mgl_invocations;\n");
     sb_put(&b, "    uint mgl_inv = mgl_t - mgl_p * mgl_invocations;\n");
     sb_put(&b, "    if (mgl_p >= mgl_hdr[0] * mgl_hdr[1]) return;\n");
+    /* GEOMETRY_SHADER_INVOCATIONS: one thread = one (input primitive, invocation)
+     * pair — the exact count for indirect draws too, folded into the query
+     * accumulator word 8 by mgl_geom_qacc (queries.c) */
+    sb_put(&b, "    atomicAdd(mgl_ctl[21u], 1u);\n");
     sb_put(&b, "    uint mgl_inst = mgl_p / mgl_hdr[0];\n");
     sb_put(&b, "    uint mgl_pi = mgl_p - mgl_inst * mgl_hdr[0];\n");
     sb_put(&b, "    mgl_load_inputs(mgl_pi, mgl_inst);\n");
@@ -6554,11 +6949,16 @@ static void geom_patch_fs_primitive_id(GLMContext ctx, MGLGeomProgram *gp, Progr
  * its own (a separable geometry-only program gets it from the pipeline at draw time) */
 void mgl_geom_post_link(GLMContext ctx, Program *program)
 {
-    MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
 
-    if (!gp || !obj) return;
+    /* no geometry stage: the program has no geometry emulation, and creating a slot for
+     * it (the old behaviour) made EVERY link walk/grow the program table — a VS+FS
+     * program per sub-case decayed quadratically (texture_swizzle smoke) */
     if (!program->shader_slots[_GEOMETRY_SHADER]) return;
+
+    MGLGeomProgram *gp = geom_prog_slot(ctx, program, true);
+
+    if (!gp || !obj) return;
 
     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
     gp->deferred = !program->shader_slots[_VERTEX_SHADER];
@@ -7429,6 +7829,9 @@ void mgl_ext_init_geom(GLMContext ctx)
 {
     if (!ctx->state.ext_geom)
         ctx->state.ext_geom = calloc(1, sizeof(struct MGLExtState_geom));
+    /* calloc zeroes free_head; the free list is empty at -1 */
+    if (ctx->state.ext_geom)
+        ((struct MGLExtState_geom *)ctx->state.ext_geom)->free_head = -1;
     mgl_ext_register_post_link(mgl_geom_post_link);
 }
 
@@ -7459,7 +7862,8 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d)
 /* an indirect draw: the prep kernel reads the command from the user's buffer, so the CPU
  * never sees the counts.  Returns false when the buffer sizes cannot be bounded without
  * reading the command (then the caller falls back to the CPU route). */
-bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *ibuf, size_t offset)
+bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *ibuf, size_t offset,
+                             const uint32_t *cmd)
 {
     MGLGeomProgram *gp;
     MGLGeomDraw d; memset(&d, 0, sizeof d);   /* route fields read by the renderer must never hold stack garbage */
@@ -7526,6 +7930,25 @@ bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *i
     d.restart = geom_restart_index(ctx);
     d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
     d.count_bound = bound;
+
+    /* A CPU-known command (read for an active pipeline-statistics query, or the
+     * buffer still carries its CPU copy) gives the EXACT counts: pass them along so
+     * the sizing is exact instead of worst-case-with-one-instance.  Sizing for a
+     * single instance truncated the output vertex buffer (and with it the emitted-
+     * primitives query and the raster list) to a fraction whenever an indirect draw
+     * carried primcount > 1 — KHR-GL46.pipeline_statistics_query_tests_ARB.
+     * functional_geometry_shader_queries saw 6 of 12 (lines) / 3 of 12 (triangles). */
+    if (cmd)
+    {
+        uint64_t vc = cmd[0], prims;
+
+        if (vc > bound) vc = bound;              /* never trust count past the index/data bound */
+        prims = geom_prim_count(GL_TRIANGLES, mode, vc);
+        if (prims > bound) prims = bound;        /* restart runs only shrink it */
+        d.known_prims     = (uint32_t)prims;
+        d.known_instances = cmd[1] ? cmd[1] : 1;
+        d.known_vcount    = (uint32_t)vc;
+    }
 
     if (!d.cmd_buffer) return false;
 

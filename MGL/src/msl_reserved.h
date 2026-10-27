@@ -63,4 +63,13 @@ void mgl_msl_mangle_reserved(spvc_compiler compiler, const uint32_t *words, size
  */
 char *mgl_msl_fix_cull_distance(const char *msl);
 
+/*
+ * Wrap every use of MSL's uint-typed index builtins (gl_VertexID, gl_InstanceID,
+ * gl_BaseVertex, gl_BaseInstance, gl_PrimitiveID) in an int(...) cast: GL declares them
+ * int and SPIRV-Cross emits them uncast, so e.g. `min(4, gl_VertexID)' is an ambiguous
+ * Metal overload.  Declarations of same-named locals and member accesses are skipped.
+ * Returns a malloc'd corrected copy, or NULL when nothing needed fixing.
+ */
+char *mgl_msl_fix_int_builtins(const char *msl);
+
 #endif

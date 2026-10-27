@@ -957,7 +957,11 @@ static void bindBuffersRangeInternal(GLMContext ctx, GLenum target, GLuint first
 
         if (name)
         {
-            if (!isBufferName(ctx, name))
+            /* multi-bind takes only EXISTING buffer objects (GL 4.6 16.2.1: a name
+             * generated but never bound is not an existing object) — the same
+             * definition glIsBuffer uses; KHR-GL46.multi_bind errors_bind_buffers
+             * expects GL_INVALID_OPERATION for such names */
+            if (!isBuffer(ctx, name))
             {
                 error_op = true;   // this binding is skipped, the others proceed
                 continue;

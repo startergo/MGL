@@ -40,6 +40,16 @@ Texture *getTex(GLMContext ctx, GLuint name, GLenum target);
 
 #define TP_ERROR(_e_) do { ERROR_RETURN(_e_); return; } while (0)
 
+#ifndef GL_DEPTH_TEXTURE_MODE
+#define GL_DEPTH_TEXTURE_MODE 0x884B
+#endif
+#ifndef GL_LUMINANCE
+#define GL_LUMINANCE 0x1909
+#endif
+#ifndef GL_INTENSITY
+#define GL_INTENSITY 0x8049
+#endif
+
 #pragma mark defaults
 
 void mglTexParamInitDefaults(TextureParameter *p, GLenum target)
@@ -50,6 +60,10 @@ void mglTexParamInitDefaults(TextureParameter *p, GLenum target)
     p->mtl_data = mtl;
 
     p->depth_stencil_mode = GL_DEPTH_COMPONENT;
+    /* GL 4.6 table 23.22: DEPTH_TEXTURE_MODE initial value is RED in core
+     * profiles ((d,0,0,1) splat). LUMINANCE/ALPHA/INTENSITY stay accepted as
+     * settable values for compatibility contexts (geom r58: texture_swizzle). */
+    p->depth_texture_mode = GL_RED;
     p->base_level = 0;
     p->max_level = 1000;
     p->compare_func = GL_LEQUAL;
@@ -197,6 +211,19 @@ GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenu
             GLint m = tp_value_i(v, vt, 0);
             if (m != GL_DEPTH_COMPONENT && m != GL_STENCIL_INDEX) return GL_INVALID_ENUM;
             p->depth_stencil_mode = m;
+            break;
+        }
+
+        case GL_DEPTH_TEXTURE_MODE:
+        {
+            /* only meaningful for depth textures (GL 4.6 8.26); Metal has no
+             * depth-format restriction at parameter time, so accept the four
+             * legal splat modes and let the view builder apply them */
+            if (is_sampler) return GL_INVALID_ENUM;
+            GLint m = tp_value_i(v, vt, 0);
+            if (m != GL_RED && m != GL_LUMINANCE && m != GL_INTENSITY && m != GL_ALPHA)
+                return GL_INVALID_ENUM;
+            p->depth_texture_mode = m;
             break;
         }
 
@@ -473,6 +500,7 @@ GLenum mglTexParamGet(GLMContext ctx, Texture *tex, TextureParameter *p, bool is
     switch (pname)
     {
         case GL_DEPTH_STENCIL_TEXTURE_MODE: tp_store(out, vt, 0, p->depth_stencil_mode); break;
+        case GL_DEPTH_TEXTURE_MODE: tp_store(out, vt, 0, p->depth_texture_mode); break;
         case GL_TEXTURE_BASE_LEVEL: tp_store(out, vt, 0, p->base_level); break;
         case GL_TEXTURE_MAX_LEVEL:  tp_store(out, vt, 0, p->max_level); break;
         case GL_TEXTURE_SWIZZLE_R:  tp_store(out, vt, 0, p->swizzle_r); break;

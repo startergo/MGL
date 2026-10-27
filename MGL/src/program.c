@@ -30,6 +30,8 @@
 #include <glslang_c_shader_types.h>
 #include "spirv-tools/libspirv.h"
 #include "spirv_cross_c.h"
+#include <pthread.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include "spirv.h"
 
 #include "glm_context.h"
@@ -37,6 +39,11 @@
 #include "mgl_ext.h"
 #include "mgl_ext_program.h"
 int mgl_glslang_cache_unshare(glslang_shader_t *sh);
+uint64_t mgl_glslang_cache_group(glslang_shader_t *sh);
+void mgl_glslang_cache_set_group(glslang_shader_t *sh, uint64_t group);
+
+/* r53: link-group ids for same-set glslang handle reuse (program.c) */
+static uint64_t mgl_link_group_seq;
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom.h"
@@ -315,6 +322,481 @@ static void exec_move(MGLProgramObj *dst, MGLProgramObj *src)
     src->num_samplers = 0;
 }
 
+#pragma mark - whole-link executable cache
+
+/* CTS-style suites relink the same stage-source sets thousands of times per case
+ * (KHR-GL46.texture_swizzle.smoke alone builds ~72k two-stage programs, one per
+ * sub-case).  A link re-runs glslang's linker, SPIR-V generation, the introspection
+ * patch, SPIRV-Cross MSL translation, reflection and the Metal function build —
+ * roughly 10 ms per program even with the MSL-library cache hot, which is what turns
+ * those cases into timeouts.
+ *
+ * This cache keeps a deep snapshot of a successful LINK_FROM_ATTACHED link, keyed by
+ * the attached glslang shader handles (shared through the glslang compile cache in
+ * shaders.c, so equal pointers mean equal stage sources), the attached stage types,
+ * the separable flag and any application-requested attribute / fragment-output
+ * bindings (they change the patched module).  A hit clones the snapshot instead of
+ * relinking.  Everything derived per program is still rebuilt: the post-link hooks
+ * (mgl_ext_post_link) run normally, and the patch-time introspection records
+ * (dub_leaf, inits, attrib_gl — see mgl_introspect_patch_stage) are restored into the
+ * new program's MGLIProgram from the snapshot. */
+
+typedef struct LinkCacheEnt {
+    uint64_t k[2];
+    MGLProgramObj *snap;                          /* owns a full linked executable */
+    struct { uint32_t var; GLint gl; } *attrib_gl; int nattrib_gl;
+    uint8_t *dub_leaf[MGLI_STAGES]; int dub_leaf_n[MGLI_STAGES];
+    struct { char *name; uint32_t *vals; int nvals; int wide; } *inits[MGLI_STAGES];
+    int ninits[MGLI_STAGES];
+} LinkCacheEnt;
+
+static LinkCacheEnt link_cache[256];
+static pthread_mutex_t link_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void link_ent_clear(GLMContext ctx, LinkCacheEnt *e)
+{
+    if (e->snap)
+    {
+        exec_free(ctx, e->snap);
+        free(e->snap);
+        e->snap = NULL;
+    }
+    free(e->attrib_gl); e->attrib_gl = NULL; e->nattrib_gl = 0;
+    for (int s = 0; s < MGLI_STAGES; s++)
+    {
+        free(e->dub_leaf[s]); e->dub_leaf[s] = NULL; e->dub_leaf_n[s] = 0;
+        if (e->inits[s])
+        {
+            for (int i = 0; i < e->ninits[s]; i++)
+            {
+                free(e->inits[s][i].name);
+                free(e->inits[s][i].vals);
+            }
+            free(e->inits[s]);
+            e->inits[s] = NULL;
+        }
+        e->ninits[s] = 0;
+    }
+    memset(e->k, 0, sizeof e->k);
+}
+
+/* deep copy of a linked executable (retains the Metal objects; caller owns the result
+ * and frees it with exec_free) */
+static MGLProgramObj *exec_clone(GLMContext ctx, const MGLProgramObj *src)
+{
+    MGLProgramObj *c = calloc(1, sizeof *c);
+    if (!c)
+        return NULL;
+
+    for (int i = 0; i < _MAX_SHADER_TYPES; i++)
+    {
+        const Spirv *s = &src->base.spirv[i];
+        if (s->ir && s->size)
+        {
+            c->base.spirv[i].ir = malloc(s->size * 4);
+            if (!c->base.spirv[i].ir) goto fail;
+            memcpy((void *)c->base.spirv[i].ir, s->ir, s->size * 4);
+            c->base.spirv[i].size = s->size;
+            c->base.spirv[i].stage = s->stage;
+        }
+        if (s->msl_str)
+        {
+            c->base.spirv[i].msl_str = strdup(s->msl_str);
+            if (!c->base.spirv[i].msl_str) goto fail;
+        }
+        if (s->entry_point)
+        {
+            c->base.spirv[i].entry_point = strdup(s->entry_point);
+            if (!c->base.spirv[i].entry_point) goto fail;
+        }
+        if (s->mtl_function) CFRetain(s->mtl_function);
+        if (s->mtl_library) CFRetain(s->mtl_library);
+        c->base.spirv[i].mtl_function = s->mtl_function;
+        c->base.spirv[i].mtl_library = s->mtl_library;
+        /* scalars the draw / specialization paths read per program: the vertex-stage
+         * gather rewrite records shadow_slots, mgl_msl_fix_image_atomics records the
+         * default-uniform buffer index */
+        c->base.spirv[i].shadow_slots = s->shadow_slots;
+        c->base.spirv[i].dub_msl = s->dub_msl;
+
+        for (int j = 0; j < _MAX_SPIRV_RES; j++)
+        {
+            const SpirvResourceList *rl = &src->base.spirv_resources_list[i][j];
+            if (!rl->list || !rl->count)
+                continue;
+            c->base.spirv_resources_list[i][j].list =
+                malloc(rl->count * sizeof(*rl->list));
+            if (!c->base.spirv_resources_list[i][j].list) goto fail;
+            c->base.spirv_resources_list[i][j].count = rl->count;
+            for (GLuint k = 0; k < rl->count; k++)
+            {
+                c->base.spirv_resources_list[i][j].list[k] = rl->list[k];
+                c->base.spirv_resources_list[i][j].list[k].name =
+                    rl->list[k].name ? strdup(rl->list[k].name) : NULL;
+            }
+        }
+
+        if (src->base.shader_slots[i])
+        {
+            const MGLShaderObj *so = MGL_SHADER_OBJ(src->base.shader_slots[i]);
+            Shader *exec = mgl_shader_new_internal(ctx, i);
+            if (!exec) goto fail;
+            if (so->base.entry_point)
+            {
+                exec->entry_point = strdup(so->base.entry_point);
+                if (!exec->entry_point) goto fail;
+            }
+            if (so->base.src)
+            {
+                exec->src = strdup(so->base.src);
+                if (!exec->src) goto fail;
+                exec->src_len = so->base.src_len;
+            }
+            if (so->base.mtl_data.library) CFRetain(so->base.mtl_data.library);
+            if (so->base.mtl_data.function) CFRetain(so->base.mtl_data.function);
+            exec->mtl_data = so->base.mtl_data;
+            c->base.shader_slots[i] = exec;
+        }
+
+        if (src->stage_entry[i])
+        {
+            c->stage_entry[i] = strdup(src->stage_entry[i]);
+            if (!c->stage_entry[i]) goto fail;
+        }
+    }
+
+    if (src->num_samplers)
+    {
+        c->samplers = malloc(src->num_samplers * sizeof(*c->samplers));
+        if (!c->samplers) goto fail;
+        for (int i = 0; i < src->num_samplers; i++)
+        {
+            c->samplers[i] = src->samplers[i];
+            c->samplers[i].name = src->samplers[i].name ? strdup(src->samplers[i].name) : NULL;
+        }
+        c->num_samplers = src->num_samplers;
+    }
+    c->base.local_workgroup_size = src->base.local_workgroup_size;
+    c->linked_mask = src->linked_mask;
+    c->active_attributes = src->active_attributes;
+    c->active_attribute_max_length = src->active_attribute_max_length;
+    c->active_uniforms = src->active_uniforms;
+    c->active_uniform_max_length = src->active_uniform_max_length;
+    c->active_uniform_blocks = src->active_uniform_blocks;
+    c->active_uniform_block_max_name_length = src->active_uniform_block_max_name_length;
+    c->active_atomic_counter_buffers = src->active_atomic_counter_buffers;
+    return c;
+
+fail:
+    exec_free(ctx, c);
+    free(c);
+    return NULL;
+}
+
+/* true when obj's next LINK_FROM_ATTACHED link is pure GLSL (cacheable); *k gets the
+ * 128-bit content key.  Keyed by the attached stages' SOURCE CONTENT (not object or
+ * glslang-handle pointers: the compile cache in shaders.c shares glslang shaders by
+ * content, and a recycled handle address would alias a different shader) */
+static bool link_cache_key(GLMContext ctx, MGLProgramObj *obj, uint64_t k[2])
+{
+    MGLIProgram *ip = mgli_find(ctx, obj->base.name);
+
+    if (!obj->num_attached)
+        return false;
+    k[0] = 0xcbf29ce484222325ULL;
+    k[1] = 0x9e3779b97f4a7c15ULL;
+    for (int i = 0; i < obj->num_attached; i++)
+    {
+        Shader *a = obj->attached[i];
+        MGLShaderObj *so = MGL_SHADER_OBJ(a);
+        if (so->spirv_binary || !a->compiled_glsl_shader || !so->compile_status || !a->src)
+            return false;   /* SPIR-V shaders / uncompiled stages: full link path */
+        for (const char *p = a->src; *p; p++)
+        {
+            k[0] = (k[0] ^ (uint64_t)(unsigned char)*p) * 0x100000001b3ULL;
+            k[1] = (k[1] ^ (uint64_t)(unsigned char)*p) * 0x9e3779b97f4a7c15ULL;
+        }
+        k[0] = (k[0] ^ (uint64_t)a->glm_type) * 0x100000001b3ULL;
+        k[0] = (k[0] ^ (uint64_t)a->src_len) * 0x100000001b3ULL;
+        k[1] = (k[1] ^ (uint64_t)a->glm_type) * 0xc2b2ae3d27d4eb4fULL;
+        k[1] = (k[1] ^ (uint64_t)a->src_len) * 0xff51afd7ed558ccdULL;
+    }
+    k[0] = (k[0] ^ (uint64_t)obj->num_attached) * 0x100000001b3ULL;
+    k[0] = (k[0] ^ (uint64_t)obj->separable) * 0x100000001b3ULL;
+    k[1] = (k[1] ^ (uint64_t)obj->num_attached) * 0xc2b2ae3d27d4eb4fULL;
+    /* the Metal objects in a snapshot belong to the context's device */
+    k[0] = (k[0] ^ (uint64_t)(uintptr_t)ctx) * 0x100000001b3ULL;
+    k[1] = (k[1] ^ (uint64_t)(uintptr_t)ctx) * 0x9e3779b97f4a7c15ULL;
+    /* ...and the executable depends on process configuration read while
+     * compiling, above all MGL_FP64_FAST: the fp64 lowering pass selects a
+     * different arithmetic library per mode, so the SAME source must link to
+     * two different executables (test_fp64fast's "distinct" case).  Only MGL_*
+     * variables can influence the toolchain (glslang / SPIRV-Cross / the Metal
+     * compiler read no environment), so one walk over environ hashing just
+     * those entries is exact and cheap — a putenv() of any MGL_* switch misses
+     * the cache and relinks, everything else is a constant per process. */
+    {
+        extern char **environ;
+        for (char **ev = environ; ev && *ev; ev++)
+            if ((*ev)[0] == 'M' && (*ev)[1] == 'G' && (*ev)[2] == 'L' && (*ev)[3] == '_')
+                for (const char *p = *ev; *p; p++)
+                {
+                    k[0] = (k[0] ^ (uint64_t)(unsigned char)*p) * 0x100000001b3ULL;
+                    k[1] = (k[1] ^ (uint64_t)(unsigned char)*p) * 0x9e3779b97f4a7c15ULL;
+                }
+    }
+    if (ip)
+    {
+        for (int i = 0; i < ip->nattrib_binds; i++)
+        {
+            for (const char *p = ip->attrib_binds[i].name; p && *p; p++)
+            {
+                k[0] = (k[0] ^ (uint64_t)(unsigned char)*p) * 0x100000001b3ULL;
+                k[1] = (k[1] ^ (uint64_t)(unsigned char)*p) * 0x9e3779b97f4a7c15ULL;
+            }
+            k[0] = (k[0] ^ (uint64_t)ip->attrib_binds[i].index) * 0x100000001b3ULL;
+            k[1] = (k[1] ^ (uint64_t)ip->attrib_binds[i].index) * 0xc2b2ae3d27d4eb4fULL;
+        }
+        for (int i = 0; i < ip->nfrag_binds; i++)
+        {
+            for (const char *p = ip->frag_binds[i].name; p && *p; p++)
+            {
+                k[0] = (k[0] ^ (uint64_t)(unsigned char)*p) * 0x100000001b3ULL;
+                k[1] = (k[1] ^ (uint64_t)(unsigned char)*p) * 0x9e3779b97f4a7c15ULL;
+            }
+            k[0] = (k[0] ^ (uint64_t)ip->frag_binds[i].color) * 0x100000001b3ULL;
+            k[0] = (k[0] ^ (uint64_t)ip->frag_binds[i].index) * 0x100000001b3ULL;
+            k[1] = (k[1] ^ (uint64_t)ip->frag_binds[i].color) * 0xc2b2ae3d27d4eb4fULL;
+            k[1] = (k[1] ^ (uint64_t)ip->frag_binds[i].index) * 0xff51afd7ed558ccdULL;
+        }
+    }
+    /* per-program transform feedback varyings (glTransformFeedbackVaryings) are applied
+     * at link time and can make an otherwise identical link FAIL — they must be part of
+     * the key (test_geom gs_output_block_xfb_errors links a same-source program twice,
+     * once expecting an xfb-driven link error).  mgl_xfb_program_info only reports
+     * successfully linked programs, so walk the xfb records for the pending state. */
+    {
+        struct MGLExtState_xfb *xe = ctx->state.ext_xfb;
+        if (xe && getenv("MGL_LINK_CACHE_DEBUG"))
+            fprintf(stderr, "MGL link cache: xfb recs=%u obj=%p\n", xe->prog_count, (void *)&obj->base);
+        if (xe)
+        {
+            for (int j = 0; j < (int)xe->prog_count; j++)
+            {
+                const MGLXfbProgram *xp = xe->progs[j];
+                if (!xp || xp->name != obj->base.name || !xp->pending_count)
+                    continue;
+                for (GLsizei i = 0; i < xp->pending_count; i++)
+                {
+                    for (const char *p = xp->pending[i]; p && *p; p++)
+                    {
+                        k[0] = (k[0] ^ (uint64_t)(unsigned char)*p) * 0x100000001b3ULL;
+                        k[1] = (k[1] ^ (uint64_t)(unsigned char)*p) * 0x9e3779b97f4a7c15ULL;
+                    }
+                    k[0] = (k[0] ^ 0x1f2e3d4cULL) * 0x100000001b3ULL;
+                }
+                k[0] = (k[0] ^ (uint64_t)xp->pending_count) * 0x100000001b3ULL;
+                k[0] = (k[0] ^ (uint64_t)xp->pending_mode) * 0x100000001b3ULL;
+                k[1] = (k[1] ^ (uint64_t)xp->pending_mode) * 0xff51afd7ed558ccdULL;
+                break;
+            }
+        }
+    }
+    if (getenv("MGL_LINK_CACHE_DEBUG"))
+        fprintf(stderr, "MGL link cache: key prog=%u k0=%016llx k1=%016llx\n",
+                obj->base.name, (unsigned long long)k[0], (unsigned long long)k[1]);
+    return true;
+}
+
+/* restore the patch-time introspection records of a cached link into the program's
+ * MGLIProgram (mgl_introspect_patch_stage would normally record them; the post-link
+ * hooks and uniform upload read them) */
+static void link_isnap_restore(GLMContext ctx, GLuint program, const LinkCacheEnt *e)
+{
+    MGLIProgram *ip = mgli_get(ctx, program);
+    if (!ip)
+        return;
+    if (e->nattrib_gl)
+    {
+        ip->attrib_gl = malloc(e->nattrib_gl * sizeof(*ip->attrib_gl));
+        if (ip->attrib_gl)
+        {
+            memcpy(ip->attrib_gl, e->attrib_gl, e->nattrib_gl * sizeof(*ip->attrib_gl));
+            ip->nattrib_gl = e->nattrib_gl;
+        }
+    }
+    for (int s = 0; s < MGLI_STAGES; s++)
+    {
+        if (e->dub_leaf[s])
+        {
+            ip->dub_leaf[s] = malloc(e->dub_leaf_n[s]);
+            if (ip->dub_leaf[s])
+            {
+                memcpy(ip->dub_leaf[s], e->dub_leaf[s], e->dub_leaf_n[s]);
+                ip->dub_leaf_n[s] = e->dub_leaf_n[s];
+            }
+        }
+        if (e->ninits[s])
+        {
+            ip->inits[s] = malloc(e->ninits[s] * sizeof(*ip->inits[s]));
+            if (ip->inits[s])
+            {
+                for (int i = 0; i < e->ninits[s]; i++)
+                {
+                    ip->inits[s][i].name = e->inits[s][i].name ? strdup(e->inits[s][i].name) : NULL;
+                    ip->inits[s][i].nvals = e->inits[s][i].nvals;
+                    ip->inits[s][i].wide = e->inits[s][i].wide;
+                    ip->inits[s][i].vals = NULL;
+                    if (e->inits[s][i].vals && e->inits[s][i].nvals)
+                    {
+                        ip->inits[s][i].vals = malloc(e->inits[s][i].nvals *
+                                                       (e->inits[s][i].wide ? 8 : 4));
+                        if (ip->inits[s][i].vals)
+                            memcpy(ip->inits[s][i].vals, e->inits[s][i].vals,
+                                   e->inits[s][i].nvals * (e->inits[s][i].wide ? 8 : 4));
+                    }
+                }
+                ip->ninits[s] = e->ninits[s];
+            }
+        }
+    }
+}
+
+/* try to satisfy obj's link from the cache; returns true on a hit (obj holds the
+ * cloned executable, linked_mask set) */
+static bool link_cache_get(GLMContext ctx, MGLProgramObj *obj, uint64_t k[2])
+{
+    LinkCacheEnt *e = &link_cache[k[0] & (256 - 1)];
+    MGLProgramObj *c;
+    bool hit = false;
+
+    if (getenv("MGL_NO_LINK_CACHE"))
+        return false;
+    if (e->snap && e->k[0] == k[0] && e->k[1] == k[1])
+    {
+        c = exec_clone(ctx, e->snap);
+        if (c)
+        {
+            /* rebuild the geometry domain's per-program records: mgl_geom_compile_stage
+             * normally runs from compile_stage (skipped here), and the geom post-link
+             * hook consumes them when it builds the emulation kernels.  Only programs
+             * with a geometry stage need it — the hook parses every stage module. */
+            bool geom_ok = true;
+            if (c->linked_mask & SHADER_MASK_BIT(_GEOMETRY_SHADER))
+            for (int s = 0; s < _MAX_SHADER_TYPES && geom_ok; s++)
+            {
+                if (c->base.spirv[s].ir && c->base.spirv[s].size)
+                {
+                    char *glog = NULL;
+                    if (!mgl_geom_compile_stage(ctx, &obj->base, c, s, c->base.spirv[s].ir,
+                                                c->base.spirv[s].size, "main", &glog))
+                    {
+                        if (glog) free(glog);
+                        geom_ok = false;
+                    }
+                }
+            }
+            if (!geom_ok)
+            {
+                exec_free(ctx, c);
+                free(c);
+                return false;   /* fall back to a full link */
+            }
+            exec_free(ctx, obj);
+            exec_move(obj, c);
+            free(c);
+            if (STATE(ext_program) && STATE(ext_program)->compiler_released)
+            {
+                glslang_initialize_process();
+                STATE(ext_program)->compiler_released = GL_FALSE;
+            }
+            obj->base.linked_glsl_program = glslang_program_create();
+            /* same post-success bookkeeping as run_link's tail */
+            obj->validate_status = GL_FALSE;
+            /* GL_PROGRAM_SEPARABLE latches at every successful link — including this
+             * cached one (the key includes obj->separable, so the cloned executable is
+             * the separable build).  Without it a first link served from the cache
+             * reports SEPARABLE=0 and glUseProgramStages rejects the program with
+             * GL_INVALID_OPERATION (KHR-GL46.geometry_shader.api.fs_gs_draw_call /
+             * pipeline_program_without_active_vs, which link the same dummy GS source
+             * twice across sub-cases). */
+            obj->separable_latched = obj->separable;
+            free(obj->info_log);
+            obj->info_log = NULL;
+            obj->base.dirty_bits &= ~DIRTY_PROGRAM;
+            STATE(dirty_bits) |= DIRTY_PROGRAM;
+            link_isnap_restore(ctx, obj->base.name, e);
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+/* record obj's just-linked executable (and the patch-time records of its program) */
+static void link_cache_put(GLMContext ctx, MGLProgramObj *obj, const uint64_t k[2])
+{
+    LinkCacheEnt *e = &link_cache[k[0] & (256 - 1)];
+    MGLProgramObj *snap = exec_clone(ctx, obj);
+    MGLIProgram *ip;
+
+    if (!snap)
+        return;
+    if (getenv("MGL_LINK_CACHE_DEBUG"))
+        fprintf(stderr, "MGL link cache: PUT prog=%u\n", obj->base.name);
+    link_ent_clear(ctx, e);
+    e->k[0] = k[0];
+    e->k[1] = k[1];
+    e->snap = snap;
+
+    ip = mgli_find(ctx, obj->base.name);
+    if (!ip)
+        return;
+    if (ip->nattrib_gl)
+    {
+        e->attrib_gl = malloc(ip->nattrib_gl * sizeof(*e->attrib_gl));
+        if (e->attrib_gl)
+        {
+            memcpy(e->attrib_gl, ip->attrib_gl, ip->nattrib_gl * sizeof(*e->attrib_gl));
+            e->nattrib_gl = ip->nattrib_gl;
+        }
+    }
+    for (int s = 0; s < MGLI_STAGES; s++)
+    {
+        if (ip->dub_leaf[s] && ip->dub_leaf_n[s])
+        {
+            e->dub_leaf[s] = malloc(ip->dub_leaf_n[s]);
+            if (e->dub_leaf[s])
+            {
+                memcpy(e->dub_leaf[s], ip->dub_leaf[s], ip->dub_leaf_n[s]);
+                e->dub_leaf_n[s] = ip->dub_leaf_n[s];
+            }
+        }
+        if (ip->ninits[s])
+        {
+            e->inits[s] = malloc(ip->ninits[s] * sizeof(*e->inits[s]));
+            if (e->inits[s])
+            {
+                for (int i = 0; i < ip->ninits[s]; i++)
+                {
+                    e->inits[s][i].name = ip->inits[s][i].name ? strdup(ip->inits[s][i].name) : NULL;
+                    e->inits[s][i].nvals = ip->inits[s][i].nvals;
+                    e->inits[s][i].wide = ip->inits[s][i].wide;
+                    e->inits[s][i].vals = NULL;
+                    if (ip->inits[s][i].vals && ip->inits[s][i].nvals)
+                    {
+                        e->inits[s][i].vals = malloc(ip->inits[s][i].nvals *
+                                                     (ip->inits[s][i].wide ? 8 : 4));
+                        if (e->inits[s][i].vals)
+                            memcpy(e->inits[s][i].vals, ip->inits[s][i].vals,
+                                   ip->inits[s][i].nvals * (ip->inits[s][i].wide ? 8 : 4));
+                    }
+                }
+                e->ninits[s] = ip->ninits[s];
+            }
+        }
+    }
+}
+
 static void detach_all(GLMContext ctx, MGLProgramObj *obj)
 {
     for (int i = 0; i < obj->num_attached; i++)
@@ -346,6 +828,12 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
 
     /* tess: drop per-program tessellation metadata */
     mgl_ext_delete_program_tess(ctx, ptr);
+
+    /* geom: drop the program's geometry-emulation slot (O(1) via the name map) */
+    mgl_ext_delete_program_geom(ctx, ptr);
+
+    /* introspect: drop the program's introspection record (keeps mgli_find O(live)) */
+    mgl_ext_delete_program_introspect(ctx, ptr);
 
     free(obj);
 }
@@ -659,6 +1147,16 @@ static GLuint sampler_type_key(spvc_compiler c, spvc_type_id type_id)
  * it cannot be emulated with texel reads when the min filter is LINEAR. */
 
 static const char *k_gath_helpers =
+/* geom: read()-based gather taps must honour the sampler's address mode themselves
+ * (read() cannot); the wrap mode rides in as a function constant (32200+slot),
+ * packed ws | wt<<4 (default 0 = REPEAT, the GL default).  CLAMP_TO_BORDER and
+ * GL_CLAMP fall back to edge texels - the border colour is not plumbed through. */
+"static inline int mgl_wco(int v, int n, int m)\n"
+"{\n"
+"    if (m == 0) { int r = v % n; if (r < 0) r += n; return r; }\n"                     /* GL_REPEAT */
+"    if (m == 1) { int a = v % (2 * n); if (a < 0) a += 2 * n; if (a >= n) a = 2 * n - 1 - a; return a; }\n"  /* MIRRORED_REPEAT */
+"    return clamp(v, 0, n - 1);\n"                                                       /* CLAMP_TO_EDGE (+CLAMP/BORDER/MIRROR approximated) */
+"}\n"
 "template <typename T>\n"
 "static inline __attribute__((always_inline)) T mgl_gsel(vec<T,4> v, component c)\n"
 "{\n"
@@ -698,27 +1196,31 @@ static const char *k_gath_helpers =
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm, int wrap = 0)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
 "    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
+"    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_gsel(t.read(uint2(b + int2(0, 1)), 0), c);\n"
-"    r[1] = mgl_gsel(t.read(uint2(b + int2(1, 1)), 0), c);\n"
-"    r[2] = mgl_gsel(t.read(uint2(b + int2(1, 0)), 0), c);\n"
-"    r[3] = mgl_gsel(t.read(uint2(b + int2(0, 0)), 0), c);\n"
+"    r[0] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
+"    r[1] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
+"    r[2] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
+"    r[3] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d_array<T> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d_array<T> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm, int wrap = 0)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
 "    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
+"    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_gsel(t.read(uint2(b + int2(0, 1)), layer, 0), c);\n"
-"    r[1] = mgl_gsel(t.read(uint2(b + int2(1, 1)), layer, 0), c);\n"
-"    r[2] = mgl_gsel(t.read(uint2(b + int2(1, 0)), layer, 0), c);\n"
-"    r[3] = mgl_gsel(t.read(uint2(b + int2(0, 0)), layer, 0), c);\n"
+"    r[0] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
+"    r[1] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
+"    r[2] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
+"    r[3] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
 "    return r;\n"
 "}\n";
 
@@ -736,27 +1238,31 @@ static const char *k_gcmp_read_helpers =
 "    return ref <= d;\n"                 /* 0 = GL_LEQUAL (the GL default) */
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, int op, bool unorm)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, int op, bool unorm, int wrap = 0)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
 "    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
+"    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 1)), 0), op);\n"
-"    r[1] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 1)), 0), op);\n"
-"    r[2] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 0)), 0), op);\n"
-"    r[3] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 0)), 0), op);\n"
+"    r[0] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
+"    r[1] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
+"    r[2] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
+"    r[3] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, int op, bool unorm)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, int op, bool unorm, int wrap = 0)\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
 "    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
+"    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
+"    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 1)), layer, 0), op);\n"
-"    r[1] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 1)), layer, 0), op);\n"
-"    r[2] = mgl_cmp_do(ref, t.read(uint2(b + int2(1, 0)), layer, 0), op);\n"
-"    r[3] = mgl_cmp_do(ref, t.read(uint2(b + int2(0, 0)), layer, 0), op);\n"
+"    r[0] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
+"    r[1] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
+"    r[2] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
+"    r[3] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
 "    return r;\n"
 "}\n";
 
@@ -1019,15 +1525,17 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
                 const char *rect = (rl > 8 && strcmp(o->name + rl - 8, "_mglrect") == 0) ? "true" : "false";
                 if (shadow && !compute)
                 {
-                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, mgl_shadow_op_%d, %s)",
-                                           args[base], off, o->slot, rect);
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, mgl_shadow_op_%d, %s, mgl_wrap_op_%d)",
+                                           args[base], off, o->slot, rect, o->slot);
                     if (slots_out) *slots_out |= 1u << o->slot;
                 }
                 else if (shadow)
                     at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)",
                                            args[base], off, rect);
-                else
+                else if (compute)
                     at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)", off, comp, rect);
+                else
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s, mgl_wrap_op_%d)", off, comp, rect, o->slot);
                 if (at >= sizeof buf) at = sizeof buf - 1;
                 (void)at;
                 strcat(out, buf);
@@ -1057,6 +1565,22 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
                      "constant int mgl_shadow_op_%d_ [[function_constant(%d)]];\n"
                      "constant int mgl_shadow_op_%d = is_function_constant_defined(mgl_shadow_op_%d_) ? mgl_shadow_op_%d_ : 0;\n",
                      objs[i].slot, MGL_GEOM_FC_SHADOW_OP_BASE + objs[i].slot,
+                     objs[i].slot, objs[i].slot, objs[i].slot);
+            strcat(pre, line);
+        }
+        /* address modes of every read()-based gather (integer textures + shadow
+         * reads): the wrap mode is a runtime sampler state, so it rides in as a
+         * function constant too (default 0 = REPEAT, the GL default). */
+        for (int i = 0; i < nobjs && !compute; i++)
+        {
+            char line[256];
+            int dup = 0;
+            for (int j = 0; j < i; j++) if (objs[j].slot == objs[i].slot) dup = 1;
+            if (dup) continue;
+            snprintf(line, sizeof line,
+                     "constant int mgl_wrap_op_%d_ [[function_constant(%d)]];\n"
+                     "constant int mgl_wrap_op_%d = is_function_constant_defined(mgl_wrap_op_%d_) ? mgl_wrap_op_%d_ : 0;\n",
+                     objs[i].slot, MGL_GEOM_FC_WRAP_BASE + objs[i].slot,
                      objs[i].slot, objs[i].slot, objs[i].slot);
             strcat(pre, line);
         }
@@ -1253,17 +1777,32 @@ static bool add_sampler(MGLProgramObj *obj, GLuint unit, GLuint key, int stage, 
     return true;
 }
 
-static void msl_entry_name(int stage, GLuint program, char *out, size_t len)
+/* The MSL entry-point name is derived from the CONTENT of the final prepared
+ * module (plus the stage and the tessellation-vertex variant flag), not from the
+ * program id: two programs linked from the same stage sources then produce
+ * byte-identical MSL, so the source-keyed MTLLibrary cache (MGLRenderer+Program.m)
+ * and the function/PSO caches above it hit.  Suites that relink identical shaders
+ * thousands of times (KHR-GL46.texture_swizzle.smoke alone builds ~300k programs)
+ * otherwise pay a full Metal library compile per link (~50 ms), which turns the
+ * case into a timeout.  The name only has to be unique inside its own module;
+ * SPIRV-Cross derives the stage_in/out struct names from it, so the hash also
+ * keeps those from colliding across different shaders in one library. */
+static void msl_entry_name(int stage, const uint32_t *words, size_t nwords, bool tess_pipeline,
+                           char *out, size_t len)
 {
-    switch (stage)
+    static const char *pfx[] = {"vertex", "tess_control", "tess_evaluation", "geometry", "fragment", "compute"};
+    uint64_t h = 1469598103934665603ULL;
+
+    h ^= (uint32_t)(stage | (tess_pipeline ? 0x100 : 0));
+    h *= 1099511628211ULL;
+    for (size_t i = 0; i < nwords; i++)
     {
-        case _VERTEX_SHADER: snprintf(out, len, "vertex_%u_main", program); break;
-        case _TESS_CONTROL_SHADER: snprintf(out, len, "tess_control_%u_main", program); break;
-        case _TESS_EVALUATION_SHADER: snprintf(out, len, "tess_evaluation_%u_main", program); break;
-        case _GEOMETRY_SHADER: snprintf(out, len, "geometry_%u", program); break;
-        case _FRAGMENT_SHADER: snprintf(out, len, "fragment_%u", program); break;
-        default: snprintf(out, len, "compute_%u", program); break;
+        h ^= words[i];
+        h *= 1099511628211ULL;
     }
+    snprintf(out, len, "%s_%016llx_main",
+             (stage >= 0 && stage < _MAX_SHADER_TYPES) ? pfx[stage] : "compute",
+             (unsigned long long)h);
 }
 
 /* growable SPIR-V word buffer */
@@ -1466,6 +2005,161 @@ uint32_t *mgl_program_pack_stage_for_msl(GLMContext ctx, Program *program,
  * Translate one stage's SPIR-V module into the executable of dst:
  * SPIRV-Cross reflection + MSL, then a Metal library/function (errors go to *log).
  */
+/* Metal's texture read() does NOT apply the sRGB transfer function, but GL's
+ * texelFetch must decode sRGB textures like every other fetch.  sample() at the
+ * exact texel centre (level(l)) decodes sRGB textures and is the identity for
+ * the rest, so every sampled-image read() of a float-typed texture is routed
+ * through these helpers.  Multisample / cube / depth reads keep read() (no
+ * sample() equivalent); integer textures are never touched. */
+static const char *k_mgl_tf_helpers =
+    "template<typename T> static inline __attribute__((always_inline)) vec<T,4> mgl_tf_2d(texture2d<T> t, sampler s, uint2 c, uint l)\n"
+    "{\n"
+    "    return t.sample(s, (float2(c) + float2(0.5)) / float2(t.get_width(), t.get_height()), level(l));\n"
+    "}\n"
+    "template<typename T> static inline __attribute__((always_inline)) vec<T,4> mgl_tf_2da(texture2d_array<T> t, sampler s, uint2 c, uint a, uint l)\n"
+    "{\n"
+    "    return t.sample(s, (float2(c) + float2(0.5)) / float2(t.get_width(), t.get_height()), a, level(l));\n"
+    "}\n"
+    "template<typename T> static inline __attribute__((always_inline)) vec<T,4> mgl_tf_3d(texture3d<T> t, sampler s, uint3 c, uint l)\n"
+    "{\n"
+    "    return t.sample(s, (float3(c) + float3(0.5)) / float3(t.get_width(), t.get_height(), t.get_depth()), level(l));\n"
+    "}\n";
+
+/* does the MSL declare `texture2d...<float> NAME` (a float-typed sampled image)? */
+static bool msl_float_sampler_named(const char *msl, const char *name, const char *tex_type)
+{
+    char decl[128];
+    snprintf(decl, sizeof decl, "%s<float> %s", tex_type, name);
+    return strstr(msl, decl) != NULL;
+}
+
+/* rewrite NAME.read(args...) -> mgl_tf_N(NAME, NAMESmplr, args...); returns a
+ * malloc'ed new MSL, or NULL when nothing changed */
+static char *mgl_msl_fix_texelfetch_srgb(const char *msl, const char *const *names, const GLenum *targets, int nnames)
+{
+    bool changed = false;
+    size_t cap = strlen(msl) + 4096;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    const char *p = msl;
+
+    while (*p)
+    {
+        bool matched = false;
+        for (int i = 0; i < nnames && !matched; i++)
+        {
+            size_t nl = strlen(names[i]);
+            if (strncmp(p, names[i], nl)) continue;
+            char prev = (p > msl) ? p[-1] : ' ';
+            if (isalnum((unsigned char)prev) || prev == '_') continue;
+            if (strncmp(p + nl, ".read(", 6)) continue;
+
+            /* only float-typed non-MS textures */
+            const char *helper = NULL;
+            if (targets[i] == GL_TEXTURE_2D || targets[i] == GL_TEXTURE_RECTANGLE)
+            {
+                if (msl_float_sampler_named(msl, names[i], "texture2d")) helper = "mgl_tf_2d";
+            }
+            else if (targets[i] == GL_TEXTURE_2D_ARRAY)
+            {
+                if (msl_float_sampler_named(msl, names[i], "texture2d_array")) helper = "mgl_tf_2da";
+            }
+            else if (targets[i] == GL_TEXTURE_3D)
+            {
+                if (msl_float_sampler_named(msl, names[i], "texture3d")) helper = "mgl_tf_3d";
+            }
+            if (!helper) continue;
+
+            /* find the matching ')' (nesting-aware) and split top-level args */
+            const char *a = p + nl + 6;          /* first char after ".read(" */
+            const char *starts[4]; size_t lens[4]; int na = 0;
+            const char *s = a, *arg = a;
+            int depth = 1;
+            while (*s)
+            {
+                char c = *s;
+                if (c == '(' || c == '[') depth++;
+                else if (c == ')' || c == ']')
+                {
+                    depth--;
+                    if (depth == 0) break;
+                }
+                else if (c == ',' && depth == 1)
+                {
+                    if (na < 4) { starts[na] = arg; lens[na] = s - arg; }
+                    na++;
+                    s++; arg = s;
+                    continue;
+                }
+                s++;
+            }
+            if (*s != ')' || depth != 0) continue;   /* unbalanced: leave it */
+            if (na < 4) { starts[na] = arg; lens[na] = s - arg; }
+            na++;
+            /* 2D/3D: (coord, level); 2DArray: (coord, slice, level) */
+            bool ok_shape = !strcmp(helper, "mgl_tf_2da") ? (na == 3) : (na == 2);
+            if (!ok_shape || na > 3) continue;
+
+            size_t need = o + (size_t)(p - msl) + strlen(helper) + nl * 2 + 64 + (size_t)(s - a);
+            if (need + 2 > cap)
+            {
+                cap = need * 2;
+                char *nout = (char *)realloc(out, cap);
+                if (!nout) { free(out); return NULL; }
+                out = nout;
+            }
+            /* the !matched walker has already copied every byte up to p */
+            if (getenv("MGL_TF_DUMP2")) fprintf(stderr, "[tf] name=%s p-msl=%zd o=%zu na=%d a-off=%zd arg0len=%zu\n", names[i], (ssize_t)(p - msl), o, na, (ssize_t)(a - msl), lens[0]);
+            o += (size_t)snprintf(out + o, cap - o, "%s(%s, %sSmplr, ", helper, names[i], names[i]);
+            for (int k = 0; k < na; k++)
+            {
+                const char *st = starts[k];
+                size_t le = lens[k];
+                while (le && (*st == ' ' || *st == '\n' || *st == '\t')) { st++; le--; }
+                while (le && (st[le-1] == ' ' || st[le-1] == '\n' || st[le-1] == '\t')) le--;
+                memcpy(out + o, st, le); o += le;
+                if (k + 1 < na) { out[o++] = ','; out[o++] = ' '; }
+            }
+            out[o++] = ')';
+
+            msl = s + 1;   /* past the closing paren */
+            p = msl;
+            changed = true;
+            matched = true;
+        }
+        if (!matched && *p)
+        {
+            if (o + 1 >= cap)
+            {
+                cap = cap * 2 + 4096;
+                char *nout = (char *)realloc(out, cap);
+                if (!nout) { free(out); return NULL; }
+                out = nout;
+            }
+            out[o++] = *p++;
+        }
+    }
+    out[o] = 0;
+    if (!changed) { free(out); return NULL; }
+    if (getenv("MGL_TF_DUMP2")) { FILE *d2 = fopen("/tmp/tf_out.msl", "w"); if (d2) { fputs(out, d2); fclose(d2); } }
+
+    /* prepend the helpers right after the includes */
+    size_t hlen = strlen(k_mgl_tf_helpers);
+    const char *ins = strstr(out, "using namespace metal;");
+    if (!ins) { free(out); return NULL; }
+    ins += strlen("using namespace metal;");
+    size_t at = (size_t)(ins - out);
+    char *fin = (char *)malloc(o + hlen + 8);
+    if (!fin) { free(out); return NULL; }
+    memcpy(fin, out, at);
+    fin[at] = '\n';
+    memcpy(fin + at + 1, k_mgl_tf_helpers, hlen);
+    memcpy(fin + at + 1 + hlen, out + at, o - at + 1);
+    free(out);
+    return fin;
+}
+
 static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const uint32_t *words,
                           size_t nwords, const char *entry, ReflectAcc *acc, char **log,
                           bool tess_pipeline)
@@ -1635,6 +2329,22 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* geom: arrays-of-matrices stage inputs (`in mat2x3 d[2]`) — SPIRV-Cross's MSL
+     * backend cannot emit them, which fails the whole link.  Lower them to
+     * per-element inputs + a private shadow at the MSL boundary only; the GL view
+     * keeps the array (KHR-GL46.program_interface_query.input-types / input-layout). */
+    if (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER)
+    {
+        size_t aom_words = 0;
+        uint32_t *aom = mgl_spirv_lower_aom_input(prepared, prepared_words, &aom_words);
+        if (aom)
+        {
+            free(prepared);
+            prepared = aom;
+            prepared_words = aom_words;
+        }
+    }
+
     if (spvc_context_create(&context) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: SPIRV-Cross context creation failed\n");
@@ -1658,6 +2368,10 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) != SPVC_SUCCESS ||
         /* texdata: 1D textures are realized as 2D Metal textures (Metal 1D textures cannot be mipmapped) */
         spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE) != SPVC_SUCCESS ||
+        /* Metal requires the fragment function's color outputs to carry every channel of an
+         * RGBA attachment (a scalar output writes 0 to R there); pad vec1..vec3 outputs
+         * to float4 so single/low-component outputs reach the R channel. */
+        spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_PAD_FRAGMENT_OUTPUT_COMPONENTS, SPVC_TRUE) != SPVC_SUCCESS ||
         spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIRV-Cross MSL options rejected\n", stage_label(stage));
@@ -1670,7 +2384,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         goto done;
     }
 
-    msl_entry_name(stage, ptr->name, msl_entry, sizeof(msl_entry));
+    msl_entry_name(stage, prepared, prepared_words, tess_pipeline, msl_entry, sizeof(msl_entry));
     {
         const char *cleansed = spvc_compiler_get_cleansed_entry_point_name(compiler, entry, model);
         if (spvc_compiler_rename_entry_point(compiler, cleansed ? cleansed : entry, msl_entry, model) != SPVC_SUCCESS)
@@ -1781,6 +2495,17 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                 res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE)
             {
                 r->target = sampler_gl_target(compiler, list[i].type_id);
+                /* mgl_spirv_rect_to_2d rewrote Rect images to Dim2D for MSL and
+                 * marked exactly those variables with the _mglrect name suffix.
+                 * Keep reporting GL_TEXTURE_RECTANGLE: the draw-time unit lookup
+                 * (mgl_texture_for_sampler) must use the unit's RECTANGLE binding,
+                 * never its 2D binding (which may hold an unrelated texture). */
+                if (r->target == GL_TEXTURE_2D)
+                {
+                    size_t rnl = strlen(rname);
+                    if (rnl > strlen("_mglrect") && !strcmp(rname + rnl - strlen("_mglrect"), "_mglrect"))
+                        r->target = GL_TEXTURE_RECTANGLE;
+                }
                 /* the image's sampled type (float / int / uint) picks the Metal texture
                  * type SPIRV-Cross declares; geomImageUnitView:elem_class: reinterprets
                  * the bound texture when the image unit's format disagrees with it */
@@ -1950,6 +2675,22 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIR-V → MSL translation failed\n", stage_label(stage));
         goto done;
+    }
+
+    /* MSL's gl_VertexID &c are uint while GL declares them int; SPIRV-Cross emits them
+     * uncast, so `min(4, gl_VertexID)' is an ambiguous Metal overload
+     * (KHR-GL46.draw_indirect.advanced-twoPass-transformFeedback-*).  Applied before the
+     * tess rewrite: that pass declares its own `uint gl_VertexID' kernel local.
+     * (msl_reserved.c) */
+    {
+        char *fixed_vid = mgl_msl_fix_int_builtins(result);
+        if (fixed_vid)
+        {
+            result = fixed_vid;     /* the spvc context owns the original string */
+            if (tess_owned && tess_owned != result)
+                free(tess_owned);
+            tess_owned = fixed_vid;
+        }
     }
 
     /* tess: rewrite the generated MSL of the tessellation stages (tessellation.c) */
@@ -2169,6 +2910,41 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         ptr->spirv[stage].msl_str = strdup(result);
     }
+
+
+    /* GL texelFetch decodes sRGB textures; Metal's read() does not.  Route the
+     * float-typed sampled-image read()s through sample() at the texel centre
+     * (identity for non-sRGB, integer and multisample reads stay read()). */
+    if (ptr->spirv[stage].msl_str && !getenv("MGL_NO_TF_SRGB"))
+    {
+        SpirvResourceList *sl = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+        const char *names[64];
+        GLenum targets[64];
+        int n = 0;
+        for (GLuint i = 0; i < sl->count && n < 64; i++)
+        {
+            names[n] = sl->list[i].name;
+            targets[n] = sl->list[i].target;
+            n++;
+        }
+        if (n)
+        {
+            char *fixed = mgl_msl_fix_texelfetch_srgb(ptr->spirv[stage].msl_str, names, targets, n);
+            if (fixed)
+            {
+                free((void *)ptr->spirv[stage].msl_str);
+                ptr->spirv[stage].msl_str = fixed;
+                if (getenv("MGL_TF_DUMP"))
+                {
+                    char dp[128];
+                    snprintf(dp, sizeof dp, "/tmp/tf%d.msl", stage);
+                    FILE *df = fopen(dp, "w");
+                    if (df) { fputs(fixed, df); fclose(df); }
+                }
+            }
+        }
+    }
+
     /* interpolateAtOffset is fragment-only and center-relative in GLSL while
      * Metal's is corner-relative; SPIRV-Cross's `+ 0.4375' bias is 1/16 px
      * short of the pixel center (see msl_reserved.c). */
@@ -2181,6 +2957,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             ptr->spirv[stage].msl_str = fixed;
         }
     }
+
     /* glslang types gl_VertexID / gl_InstanceID as SIGNED int (the GL builtins),
      * but SPIRV-Cross hardcodes `uint` for the [[vertex_id]]/[[instance_id]]
      * parameters (Metal requires uint for those attributes) while the
@@ -2369,7 +3146,13 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
             if (spvc_compiler_compile(c2, &tmsl) == SPVC_SUCCESS && tmsl)
             {
-                char *k = mgl_tess_rewrite_stage_msl(ctx, _VERTEX_SHADER, true, tmsl);
+                /* uint-in-MSL / int-in-GL index builtins (msl_reserved.c); before the
+                 * tess rewrite, which declares its own `uint gl_VertexID' local */
+                char *tmsl_fixed = mgl_msl_fix_int_builtins(tmsl);
+                char *k;
+                if (tmsl_fixed)
+                    tmsl = tmsl_fixed;
+                k = mgl_tess_rewrite_stage_msl(ctx, _VERTEX_SHADER, true, tmsl);
 
                 if (k)
                 {
@@ -2396,6 +3179,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                 }
                 else if (getenv("MGL_TESS_DEBUG"))
                     fprintf(stderr, "MGL tess: sep-vs kernel: rewrite failed (head: %.100s)\n", tmsl);
+                free(tmsl_fixed);
             }
             else if (getenv("MGL_TESS_DEBUG"))
                 fprintf(stderr, "MGL tess: sep-vs kernel: second SPIRV-Cross compile failed\n");
@@ -2545,6 +3329,7 @@ static bool mgl_link_log_is_tess_patch_false_positive(const char *log)
 static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, ReflectAcc *acc, char **log)
 {
     glslang_program_t *glsl_program;
+    uint64_t ctx_link_group = 0;       /* r53: link-group id (see the reuse rule below) */
     GLuint mask = 0;
     bool ok = true;
 
@@ -2574,12 +3359,35 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
 
     /* glslang's link bakes program-wide uniform locations into the stage
      * intermediates, so a compiled shader shared through the compile cache must
-     * not be linked in a second program: stop sharing every attached stage
-     * (KHR-GL46.shaders.indexing.varying_array.* "Uniform location overlaps
-     * across stages"). */
-    for (int i_ = 0; i_ < obj->num_attached; i_++)
-        if (obj->attached[i_]->compiled_glsl_shader)
-            mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
+     * not be linked in a second program — UNLESS it is the IDENTICAL stage set:
+     * the io-mapper then writes the same deterministic locations, and repeated
+     * identical links (the CTS relinks the same stage sets tens of thousands of
+     * times per case; texture_swizzle alone compiles ~165k stage sources) stay
+     * cache-hot instead of re-parsing glslang on every sub-case.  Any other
+     * combination keeps the varying_array fix: stop sharing every attached
+     * stage (KHR-GL46.shaders.indexing.varying_array.* "Uniform location
+     * overlaps across stages"). */
+    {
+        uint64_t same_group = 0;
+        bool same_set = true;
+        for (int i_ = 0; i_ < obj->num_attached; i_++)
+        {
+            Shader *s_ = obj->attached[i_];
+            if (!s_->compiled_glsl_shader) { same_set = false; break; }
+            uint64_t g_ = mgl_glslang_cache_group(s_->compiled_glsl_shader);
+            if (g_ == 0) continue;                 /* never linked: fresh, safe */
+            if (same_group == 0) same_group = g_;
+            else if (same_group != g_) { same_set = false; break; }
+        }
+        if (!same_set)
+            /* stale intermediates from two DIFFERENT programs are mixed in:
+             * stop sharing every attached stage that carries one */
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+                if (obj->attached[i_]->compiled_glsl_shader &&
+                    mgl_glslang_cache_group(obj->attached[i_]->compiled_glsl_shader))
+                    mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
+        ctx_link_group = ++mgl_link_group_seq;      /* stamped on success below */
+    }
 
     if (!glslang_program_link(glsl_program, GLSLANG_MSG_DEFAULT_BIT))
     {
@@ -2643,6 +3451,16 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             return false;
         }
     }
+
+    /* r53: this exact stage set linked successfully — stamp the group on every
+     * attached cache-owned handle so the NEXT identical link can reuse them
+     * (see the same-set rule above); a different combination finds a foreign id
+     * and takes the unshare+reparse path.  set_group is a no-op for handles the
+     * cache no longer owns. */
+    if (ctx_link_group)
+        for (int i_ = 0; i_ < obj->num_attached; i_++)
+            if (obj->attached[i_]->compiled_glsl_shader)
+                mgl_glslang_cache_set_group(obj->attached[i_]->compiled_glsl_shader, ctx_link_group);
 
     /* Generate every stage's SPIR-V before any stage is compiled to MSL: MGL's
      * per-stage work (introspection rewrite, fp64 lowering, SPIRV-Cross, Metal
@@ -3000,12 +3818,64 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
 
     mgl_ext_pre_link(ctx, pptr);
 
-    if (run_link(ctx, MGL_PROGRAM_OBJ(pptr), LINK_FROM_ATTACHED, NULL, NULL, NULL, 0))
     {
-        mgl_ext_post_link(ctx, pptr);
-        mgl_program_check_xfb_link(ctx, pptr);
-        mgl_program_check_geom_link(ctx, pptr);
-        mgl_program_check_tess_link(ctx, pptr);
+        /* whole-link cache (see above): an identical stage-source set that was linked
+         * before is cloned instead of relinked; the post-link hooks below still run so
+         * every per-program state is rebuilt */
+        uint64_t lkey[2];
+        bool linked = false;
+        bool linked_by_cache = false;
+
+        pthread_mutex_lock(&link_cache_lock);
+        if (link_cache_key(ctx, MGL_PROGRAM_OBJ(pptr), lkey))
+            linked = link_cache_get(ctx, MGL_PROGRAM_OBJ(pptr), lkey);
+        pthread_mutex_unlock(&link_cache_lock);
+        linked_by_cache = linked;
+
+        if (!linked &&
+            run_link(ctx, MGL_PROGRAM_OBJ(pptr), LINK_FROM_ATTACHED, NULL, NULL, NULL, 0))
+            linked = true;
+
+        if (linked)
+        {
+            MGL_PROGRAM_OBJ(pptr)->link_status = GL_TRUE;            mgl_ext_post_link(ctx, pptr);
+            mgl_program_check_xfb_link(ctx, pptr);
+            mgl_program_check_geom_link(ctx, pptr);
+            mgl_program_check_tess_link(ctx, pptr);
+            /* only a link that survived every check is cacheable (an xfb-varying
+             * resolution failure must not be served as success later).  A cache HIT
+             * is not re-snapshotted: the stored entry already holds the canonical
+             * executable of this exact key (the clone the hit installed came from
+             * it), so exec_clone + link_ent_clear here is pure waste. */
+            if (!linked_by_cache &&
+                MGL_PROGRAM_OBJ(pptr)->link_status == GL_TRUE &&
+                link_cache_key(ctx, MGL_PROGRAM_OBJ(pptr), lkey))
+            {
+                pthread_mutex_lock(&link_cache_lock);
+                link_cache_put(ctx, MGL_PROGRAM_OBJ(pptr), lkey);
+                pthread_mutex_unlock(&link_cache_lock);
+            }
+        }
+    }
+
+    /* a link that ends in GL_LINK_STATUS FALSE invalidates the program's active
+     * resources: introspection of a failed link must report none (GL 4.6 §7.3.1;
+     * CTS program_interface_query link-failure / relink-failure) — but a failed
+     * RELINK of a previously linked program must keep the previous executable
+     * active (GL 4.6 §7.3.1: the executables of the last successful link remain
+     * in use, with their uniform values; test_sepshader
+     * StateInteractionFailedRelink), so the tables backing the active
+     * executable's uniform state stay alive in that case. */
+    if (!MGL_PROGRAM_OBJ(pptr)->link_status)
+    {
+        bool had_link = false;
+        for (int st = 0; st < _MAX_SHADER_TYPES && !had_link; st++)
+            if (pptr->spirv[st].msl_str || pptr->spirv[st].size)
+                had_link = true;
+        if (had_link)
+            mgli_mark_relink_failed(ctx, program);
+        else
+            mgli_invalidate_program(ctx, program);
     }
 }
 
@@ -3167,6 +4037,18 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
 
     if (!params)
         return;
+
+    /* geom r58: a failed relink reports zero active resources like a
+     * never-linked program (GL 4.6 7.3.1; test_piq link_failure_clears), while
+     * the previous executable and its uniform state stay active. */
+    if ((pname == GL_ACTIVE_ATTRIBUTES || pname == GL_ACTIVE_ATTRIBUTE_MAX_LENGTH ||
+         pname == GL_ACTIVE_UNIFORMS || pname == GL_ACTIVE_UNIFORM_MAX_LENGTH ||
+         pname == GL_ACTIVE_UNIFORM_BLOCKS) &&
+        mgli_link_failed(ctx, program))
+    {
+        *params = 0;
+        return;
+    }
 
     for (int i = 0; i < num_programiv_hooks; i++)
         if (programiv_hooks[i](ctx, pptr, pname, params))

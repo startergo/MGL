@@ -36,6 +36,14 @@ static inline struct MGLExtMetal_fb *FBM(GLMContext c) { return c->mtl_funcs.ext
 typedef struct FBTarget {
     __unsafe_unretained id<MTLTexture> tex;
     NSUInteger level, slice, plane, layers;
+    /* the attachment's GL NAME (texture or renderbuffer): the render-pass-descriptor
+     * cache compares FBTargets with memcmp, and a Metal texture address alone is NOT
+     * identity — the CTS deletes and re-creates an FBO attachment texture per sub-case,
+     * and a recycled MTLTexture address made the memcmp hit, so the draw encoded into
+     * the OLD texture (texture_swizzle smoke).  Appended last: gpuaudit casts its own
+     * 40-byte MGLGAFBTarget over FBTargets, so tex/level/slice/plane/layers must keep
+     * their offsets (the assert in MGLRenderer+Gpuaudit.m pins the total size). */
+    GLuint name;
 } FBTarget;
 
 typedef struct FBTargets {
@@ -188,12 +196,6 @@ static float fbUFToFloat(uint32_t v, int mbits)
     return ldexpf((float)(m | (1u << mbits)), (int)e - 15 - mbits);
 }
 
-/* IEC 61966-2-1 sRGB transfer-function decode (raw encoded byte -> linear) */
-static float fbSRGBDecode(float c)
-{
-    return (c <= 0.04045f) ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
-}
-
 /* decode one texel to canonical rgba; returns kind */
 static int fbDecodeColor(MTLPixelFormat f, const uint8_t *p, void *out4)
 {
@@ -226,14 +228,16 @@ static int fbDecodeColor(MTLPixelFormat f, const uint8_t *p, void *out4)
             for (int i = 0; i < 4; i++) o[i] = U8(i);
             return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA8Unorm_sRGB:
-            /* GL: reading an sRGB attachment returns linear values (the blit gives
-             * the raw encoded bytes); alpha is never encoded */
-            for (int i = 0; i < 4; i++) o[i] = (i < 3) ? fbSRGBDecode(U8(i)) : U8(i);
+            /* GL: the sRGB transfer function applies at SAMPLING only — pixel
+             * reads (glReadPixels / getTexImage) return the stored bytes raw,
+             * exactly like the non-sRGB format (the CTS packed_pixels and
+             * texture_size_promotion tests assert this). */
+            for (int i = 0; i < 4; i++) o[i] = U8(i);
             return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatBGRA8Unorm:
             o[0] = U8(2); o[1] = U8(1); o[2] = U8(0); o[3] = U8(3); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatBGRA8Unorm_sRGB:
-            o[0] = fbSRGBDecode(U8(2)); o[1] = fbSRGBDecode(U8(1)); o[2] = fbSRGBDecode(U8(0)); o[3] = U8(3);
+            o[0] = U8(2); o[1] = U8(1); o[2] = U8(0); o[3] = U8(3);
             return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA8Snorm: for (int i = 0; i < 4; i++) o[i] = S8(i); return MGL_FB_KIND_FLOAT;
         case MTLPixelFormatRGBA16Unorm: for (int i = 0; i < 4; i++) o[i] = U16(i); return MGL_FB_KIND_FLOAT;
@@ -631,6 +635,7 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
             [self endRenderEncoding];
             if (m->default_color) CFBridgingRelease(m->default_color);
             m->default_color = (void *)CFBridgingRetain(surf);
+            m->default_fb_gen++;    /* new backing texture: descriptor-cache key changes */
             ctx->state.dirty_bits |= DIRTY_FBO;
             mgl_fb_draw_state(ctx, NULL)->invalid_mask |= 1u;
             return surf;
@@ -665,6 +670,7 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     }
     color.label = @"MGL default framebuffer color";
     m->default_color = (void *)CFBridgingRetain(color);
+    m->default_fb_gen++;            /* new backing textures: descriptor-cache key changes */
 
     id<MTLTexture> ds = nil;
     MTLPixelFormat dsf = [self fbDefaultDepthStencilFormat];
@@ -758,6 +764,36 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     id<MTLTexture> t = (__bridge id<MTLTexture>)tex->mtl_data;
     if (rt && !(t.usage & MTLTextureUsageRenderTarget))
         t = [self fbPromoteToRenderTarget:tex];
+
+    /* GL 4.6: writes into an sRGB-encoded color attachment convert linear to
+     * sRGB only while GL_FRAMEBUFFER_SRGB is enabled (it is disabled by
+     * default).  Metal would encode automatically for an _sRGB render target,
+     * so render through a plain-UNORM view until the cap is turned on. */
+    if (rt && !ctx->state.caps.framebuffer_srgb)
+    {
+        MTLPixelFormat plain = MTLPixelFormatInvalid;
+        switch (t.pixelFormat)
+        {
+            case MTLPixelFormatRGBA8Unorm_sRGB: plain = MTLPixelFormatRGBA8Unorm; break;
+            case MTLPixelFormatBGRA8Unorm_sRGB: plain = MTLPixelFormatBGRA8Unorm; break;
+            case MTLPixelFormatR8Unorm_sRGB:    plain = MTLPixelFormatR8Unorm; break;
+            case MTLPixelFormatRG8Unorm_sRGB:   plain = MTLPixelFormatRG8Unorm; break;
+            default: break;
+        }
+        if (plain != MTLPixelFormatInvalid)
+        {
+            NSNumber *key = [NSNumber numberWithUnsignedLongLong:(uintptr_t)(__bridge void *)t];
+            NSMutableDictionary *cache = [self fbCache];
+            NSString *vkey = [NSString stringWithFormat:@"srgbview:%@", key];
+            id<MTLTexture> v = cache[vkey];
+            if (!v)
+            {
+                v = [t newTextureViewWithPixelFormat:plain];
+                if (v) cache[vkey] = v;
+            }
+            if (v) t = v;
+        }
+    }
     return t;
 }
 
@@ -770,6 +806,10 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     t->slice = slice;
     t->plane = plane;
     t->layers = layers;
+    /* GL object names are unique per context (never recycled), so the descriptor
+     * cache cannot alias two different attachments that happen to reuse a Metal
+     * texture address (see FBTarget) */
+    t->name = att->texture;
 }
 
 /* render targets of a draw framebuffer */
@@ -787,14 +827,17 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     {
         id<MTLTexture> color = rt ? [self fbEnsureDefaultFramebuffer] : (__bridge id<MTLTexture>)FBM(ctx)->default_color;
         id<MTLTexture> dst = (__bridge id<MTLTexture>)FBM(ctx)->default_depth_stencil;
+        /* the default framebuffer has no GL name; the generation of its backing
+         * textures is the cache identity (bumped on every re-creation) */
+        GLuint def_name = (GLuint)FBM(ctx)->default_fb_gen;
         if (ds->num_draw_buffers > 0 && ds->draw_buffers[0] != GL_NONE && color)
         {
-            T->color[0].tex = color; T->color[0].layers = 1;
+            T->color[0].tex = color; T->color[0].layers = 1; T->color[0].name = def_name;
             T->color_att_bit[0] = 1u;
             ACCUM(T->color[0]);
         }
-        if (dst && fbFormatHasDepth(dst.pixelFormat)) { T->depth.tex = dst; T->depth.layers = 1; ACCUM(T->depth); }
-        if (dst && fbFormatHasStencil(dst.pixelFormat)) { T->stencil.tex = dst; T->stencil.layers = 1; ACCUM(T->stencil); }
+        if (dst && fbFormatHasDepth(dst.pixelFormat)) { T->depth.tex = dst; T->depth.layers = 1; T->depth.name = def_name; ACCUM(T->depth); }
+        if (dst && fbFormatHasStencil(dst.pixelFormat)) { T->stencil.tex = dst; T->stencil.layers = 1; T->stencil.name = def_name; ACCUM(T->stencil); }
         if (!T->any && color) { w = color.width; h = color.height; layers = 1; T->samples = 1; }
     }
     else
@@ -865,6 +908,10 @@ static void fbSetAttachment(MTLRenderPassAttachmentDescriptor *a, const FBTarget
             int k = fbKindForPixelFormat(T->color[i].tex.pixelFormat);
             if (k == MGL_FB_KIND_UINT) for (int c = 0; c < 4; c++) v[c] = v[c] < 0 ? 0 : floor(v[c]);
             if (k == MGL_FB_KIND_INT) for (int c = 0; c < 4; c++) v[c] = trunc(v[c]);
+            /* geom r58: an alpha-less GL format clears A to 1.0 (GL 4.6: reads of a
+             * missing alpha channel return one); the RGBA Metal backing would
+             * otherwise store the clear color's alpha (texture_swizzle.functional). */
+            if (v[3] != 1.0 && mgl_fb_slot_lacks_alpha(ctx, fbo, (GLuint)i)) v[3] = 1.0;
             rp.colorAttachments[i].clearColor = MTLClearColorMake(v[0], v[1], v[2], v[3]);
             load = MTLLoadActionClear;
         }
@@ -1073,6 +1120,14 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
          T->stencil.tex ? (unsigned long)T->stencil.tex.pixelFormat : 0ul, (unsigned long)T->samples];
     [key appendString:shaderKey];
 
+    /* geom: a layered attachment (whole 2D-array / 3D bound with
+     * glFramebufferTexture) must clear on EVERY layer.  The load-action path
+     * already does (Metal clears all array layers); the scissored/masked
+     * full-screen draw needs a vertex function that writes
+     * render_target_array_index, drawn once per layer (instance count). */
+    const bool layered = T->layers > 1;
+    if (layered) [key appendString:@",L"];
+
     NSMutableDictionary *cache = [self fbCache];
     id<MTLRenderPipelineState> ps = cache[key];
     if (ps) return ps;
@@ -1082,6 +1137,12 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
                     "struct VOut { float4 pos [[position]]; };\n"
                     "vertex VOut fb_clear_vs(uint vid [[vertex_id]], constant float &z [[buffer(0)]]) {\n"
                     "    float2 p = float2((vid << 1) & 2, vid & 2); VOut o; o.pos = float4(p * 2.0 - 1.0, z, 1.0); return o; }\n";
+    if (layered)
+        vs = @"#include <metal_stdlib>\nusing namespace metal;\n"
+              "struct ClearVals { float f[8][4]; int i[8][4]; uint u[8][4]; };\n"
+              "struct VOut { float4 pos [[position]]; uint rtl [[render_target_array_index]]; };\n"
+              "vertex VOut fb_clear_vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant float &z [[buffer(0)]]) {\n"
+              "    float2 p = float2((vid << 1) & 2, vid & 2); VOut o; o.pos = float4(p * 2.0 - 1.0, z, 1.0); o.rtl = iid; return o; }\n";
     NSString *src;
     if (outs.length)
         src = [NSString stringWithFormat:@"%@struct FOut {\n%@};\n"
@@ -1090,7 +1151,8 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     else
         src = [vs stringByAppendingString:@"fragment void fb_clear_fs(VOut in [[stage_in]]) { }\n"];
 
-    id<MTLLibrary> lib = [self fbLibrary:src key:[@"clear" stringByAppendingString:shaderKey]];
+    id<MTLLibrary> lib = [self fbLibrary:src key:(layered ? [@"clearL" stringByAppendingString:shaderKey]
+                                                         : [@"clear" stringByAppendingString:shaderKey])];
     if (!lib) return nil;
 
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1106,6 +1168,7 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     if (T->depth.tex) pd.depthAttachmentPixelFormat = T->depth.tex.pixelFormat;
     if (T->stencil.tex) pd.stencilAttachmentPixelFormat = T->stencil.tex.pixelFormat;
     pd.rasterSampleCount = T->samples;
+    if (layered) pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
 
     NSError *err = nil;
     ps = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
@@ -1214,7 +1277,8 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     float z = req->depth ? req->depth_value : 0.0f;
     [enc setVertexBytes:&z length:sizeof(z) atIndex:0];
     [enc setFragmentBytes:&vals length:sizeof(vals) atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3
+           instanceCount:(T.layers > 1 ? T.layers : 1)];
     [enc endEncoding];
 }
 

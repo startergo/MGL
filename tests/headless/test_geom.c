@@ -4048,6 +4048,147 @@ TEST(r31_layered_fbo_no_attachment)
 }
 
 
+/* KHR-GL46.viewport_array.scissor_clear — glClear of a layered attachment with
+ * the scissor test enabled must clear the scissor-0 box on EVERY array layer
+ * (the scissored clear is a full-screen draw in MGL; its vertex function must
+ * write render_target_array_index and the draw must run once per layer). */
+TEST(r52_layered_scissored_clear)
+{
+    const int W = 8, H = 8, NL = 16;
+    GLint *data = malloc(NL * W * H * sizeof(int));
+    for (int i = 0; i < NL * W * H; i++) data[i] = -1;
+
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R32I, W, H, NL, 0, GL_RED_INTEGER, GL_INT, data);
+
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    /* 4x4 grid of 2x2 viewports / scissor boxes over the 8x8 image (CTS shape) */
+    GLfloat vps[16 * 4];
+    GLint scs[16 * 4];
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            int i = y * 4 + x;
+            vps[i*4+0] = (float)(x * 2); vps[i*4+1] = (float)(y * 2);
+            vps[i*4+2] = 2.0f;           vps[i*4+3] = 2.0f;
+            scs[i*4+0] = x * 2; scs[i*4+1] = y * 2;
+            scs[i*4+2] = 2;     scs[i*4+3] = 2;
+        }
+    glViewportArrayv(0, 16, vps);
+    glScissorArrayv(0, 16, scs);
+    EXPECT_NO_GL_ERROR();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, W, H);
+    glEnable(GL_SCISSOR_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    EXPECT_NO_GL_ERROR();
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    memset(data, 0x7f, NL * W * H * sizeof(int));
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RED_INTEGER, GL_INT, data);
+    int bad_layer = -1;
+    for (int n = 0; n < NL && bad_layer < 0; n++)
+    {
+        const GLint *layer = data + n * W * H;
+        for (int y = 0; y < H && bad_layer < 0; y++)
+            for (int x = 0; x < W; x++) {
+                int inside_scissor0 = (x < 2 && y < 2);
+                int want = inside_scissor0 ? 0 : -1;
+                if (layer[y * W + x] != want) { bad_layer = n; break; }
+            }
+    }
+    EXPECT_EQ_INT(bad_layer, -1);
+
+    /* full clear path (no scissor): Metal load-action clear must cover all layers too */
+    glDisable(GL_SCISSOR_TEST);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RED_INTEGER, GL_INT, data);
+    bad_layer = -1;
+    for (int n = 0; n < NL * W * H; n++)
+        if (data[n] != 0) { bad_layer = n / (W * H); break; }
+    EXPECT_EQ_INT(bad_layer, -1);
+
+    free(data);
+    glDeleteTextures(1, &tex);
+    glDeleteFramebuffers(1, &fbo);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+/* KHR-GL46.texture_size_promotion.functional — two regressions found r52:
+ * (a) sampler2DRect uniforms resolved their texture through the unit's
+ *     GL_TEXTURE_2D binding after the Rect->2D MSL rewrite (an unrelated 2D
+ *     texture bound at the same unit got sampled instead of the RECTANGLE one);
+ * (b) a single-component fragment output ("out float result") wrote 0 to R on
+ *     an RGBA attachment (Metal needs every channel; SPIRV-Cross now pads). */
+TEST(r52_rect_sampler_and_scalar_out)
+{
+    const float src[4] = {0.125f, 0.25f, 0.5f, 0.75f};
+    GLuint stex = 0, dtex = 0, fbo = 0, prog = 0, vao = 0;
+    float pixel = -1.0f;
+
+    const char *vs = "#version 140\nvoid main(){ switch(gl_VertexID){case 0: gl_Position=vec4(-1,-1,0,1);break;case 1: gl_Position=vec4( 1,-1,0,1);break;case 2: gl_Position=vec4(-1, 1,0,1);break;case 3: gl_Position=vec4( 1, 1,0,1);break;} }\n";
+    const char *fs[] = {
+        "#version 140\nout float result;\nuniform sampler2DRect data;\nvoid main(){ result = texelFetch(data, ivec2(0)).r; }\n",
+        "#version 140\nout float result;\nuniform sampler2DRect data;\nvoid main(){ result = texture(data, vec2(0.5, 0.5)).r; }\n",
+        "#version 140\nout vec4 result;\nuniform sampler2DRect data;\nvoid main(){ result = vec4(texture(data, vec2(0.5, 0.5)).r, 0.0, 0.0, 1.0); }\n",
+    };
+
+    glGenTextures(1, &stex);
+    glBindTexture(GL_TEXTURE_RECTANGLE, stex);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_R8, 1, 1, 0, GL_RGBA, GL_FLOAT, src);
+
+    glGenTextures(1, &dtex);
+    glBindTexture(GL_TEXTURE_2D, dtex);   /* also occupies unit 0's 2D slot: the trap */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_FLOAT, NULL);
+
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dtex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 1, 1);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+
+    for (int v = 0; v < 3; v++)
+    {
+        GLuint sh = glCreateShader(GL_VERTEX_SHADER), fh = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(sh, 1, &vs, NULL); glCompileShader(sh);
+        glShaderSource(fh, 1, &fs[v], NULL); glCompileShader(fh);
+        if (prog) glDeleteProgram(prog);
+        prog = glCreateProgram();
+        glAttachShader(prog, sh); glAttachShader(prog, fh); glLinkProgram(prog);
+        glDeleteShader(sh); glDeleteShader(fh);
+        GLint ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, 1);
+        if (!ok) break;
+
+        glUseProgram(prog);
+        glUniform1i(glGetUniformLocation(prog, "data"), 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_RECTANGLE, stex);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        EXPECT_NO_GL_ERROR();
+        glReadPixels(0, 0, 1, 1, GL_RED, GL_FLOAT, &pixel);
+        EXPECT_NEAR(pixel, 0.125f, 1.0f / 128.0f);
+    }
+
+    glDeleteProgram(prog);
+    glDeleteTextures(1, &stex);
+    glDeleteTextures(1, &dtex);
+    glDeleteFramebuffers(1, &fbo);
+}
+
 /* the geometry kernel reads image units like the compute path does
  * (KHR-GL46.geometry_shader.api.max_image_uniforms) */
 TEST(r31_gs_image_reads)
@@ -4423,6 +4564,345 @@ TEST(r48_tes_ssbo_atomics)
     glDeleteShader(v); glDeleteShader(tc); glDeleteShader(te); glDeleteShader(f);
 }
 
+/* r54: MSL's gl_VertexID / gl_InstanceID / gl_PrimitiveID are `uint' while GL declares
+ * them `int'; SPIRV-Cross emits them uncast, so `min(4, gl_VertexID)' compiles to an
+ * ambiguous Metal overload (KHR-GL46.draw_indirect.advanced-twoPass-transformFeedback-*).
+ * Exercise the main link path AND the transform-feedback capture variant. */
+TEST(r54_int_builtins_minmax)
+{
+    const char *vs =
+        "#version 400 core\n"
+        "flat out uint dataOut;\n"
+        "layout(std140) uniform BLOCK { uint m[5]; } b;\n"
+        "in vec4 i_vertex;\n"
+        "void main() {\n"
+        "  dataOut = b.m[min(4, gl_VertexID)] + max(0, 10 - gl_VertexID);\n"
+        "  gl_Position = i_vertex;\n"
+        "}";
+    const char *fs =
+        "#version 400 core\n"
+        "flat in uint dataOut; out vec4 c;\n"
+        "void main() { c = vec4(float(dataOut) / 64.0, 0.0, 0.0, 1.0); }";
+
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
+    static const char *vars[2] = { "dataOut", NULL };
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint ubo = 0;
+    glGenBuffers(1, &ubo);
+    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+    /* std140 uint array: one uint per 16-byte slot */
+    GLuint m5[5 * 4] = { 0 };
+    m5[0] = 10; m5[4] = 20; m5[8] = 30; m5[12] = 40; m5[16] = 50;
+    glBufferData(GL_UNIFORM_BUFFER, sizeof m5, m5, GL_STATIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+
+    GLuint tbuf = 0;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+
+    GLuint vao = 0;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    GLuint vbo = 0;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    /* gl_VertexID has no base-vertex here: 0,1,2 -> m[0..2] = 10,20,30 and +10,+9,+8 */
+    float quad[12] = { -1, -1, 1, -1, 1, 1 };
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glUseProgram(p);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    GLuint out[4] = { 0, 0, 0, 0 };
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    EXPECT_EQ_INT(out[0], 20);
+    EXPECT_EQ_INT(out[1], 29);
+    EXPECT_EQ_INT(out[2], 38);
+
+    /* rasterized path of the same program: the pipeline must also compile */
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+
+    glDeleteProgram(p);
+    glDeleteBuffers(1, &ubo);
+    glDeleteBuffers(1, &tbuf);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* r54: gl_PrimitiveID (int in GL, uint in MSL) in an int min() in the fragment stage */
+TEST(r54_fs_primitiveid_min)
+{
+    const char *vs =
+        "#version 400 core\n"
+        "void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }";
+    const char *fs =
+        "#version 400 core\n"
+        "out vec4 c;\n"
+        "void main() { c = vec4(float(min(gl_PrimitiveID, 1)) + 0.25, 0.0, 0.0, 1.0); }";
+    GLuint p = program(vs, NULL, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    GLuint fbo = 0, tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    GLuint vao = 0;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glViewport(0, 0, 8, 8);
+    glUseProgram(p);
+    /* one primitive: gl_PrimitiveID = 0 -> min(0,1) = 0 -> 0.25 red */
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_PIXEL(4, 4, 64, 0, 0, 255, 2);
+
+    glDeleteProgram(p);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* r54: readback of an sRGB-encoded color attachment must return the RAW encoded
+ * bytes — the GL sRGB decoder applies only when sampling from a shader.  The r52
+ * "srgb_read" linearization for FLOAT clients broke
+ * KHR-GL46.packed_pixels.rectangle.srgb8 / pbo_rectangle.srgb8 (and 10 more). */
+TEST(r54_srgb_readback_raw)
+{
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_RECTANGLE, tex);
+    GLubyte data[4 * 4 * 3];
+    for (int i = 0; i < 16; i++)
+    {
+        data[i * 3 + 0] = (GLubyte)(i * 16);
+        data[i * 3 + 1] = (GLubyte)(255 - i * 16);
+        data[i * 3 + 2] = 36;
+    }
+    glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_SRGB8, 4, 4, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+    EXPECT_NO_GL_ERROR();
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    float out[16 * 4] = {0};
+    glReadPixels(0, 0, 4, 4, GL_BGRA, GL_FLOAT, out);
+    EXPECT_NO_GL_ERROR();
+    /* texel 0: stored bytes (0, 255, 36) — GL_BGRA float read gives (36/255, 1.0, 0, 1) */
+    EXPECT_NEAR(out[0], 36 / 255.0, 1e-5);
+    EXPECT_NEAR(out[1], 1.0, 1e-5);
+    EXPECT_NEAR(out[2], 0.0, 1e-5);
+    EXPECT_NEAR(out[3], 1.0, 1e-5);
+    /* texel 2: stored (32, 223, 36) */
+    EXPECT_NEAR(out[8], 36 / 255.0, 1e-5);
+    EXPECT_NEAR(out[9], 223 / 255.0, 1e-5);
+    EXPECT_NEAR(out[10], 32 / 255.0, 1e-5);
+
+    /* the PBO path must match */
+    GLuint pbo = 0;
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, sizeof out, NULL, GL_STREAM_READ);
+    glReadPixels(0, 0, 4, 4, GL_BGRA, GL_FLOAT, NULL);
+    EXPECT_NO_GL_ERROR();
+    float *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sizeof out, GL_MAP_READ_BIT);
+    EXPECT_TRUE(m != NULL);
+    if (m)
+    {
+        EXPECT_NEAR(m[0], 36 / 255.0, 1e-5);
+        EXPECT_NEAR(m[1], 1.0, 1e-5);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    glDeleteBuffers(1, &pbo);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+}
+
+/* r54: the specific compressed internal formats (table 8.5) are not supported for
+ * 3-dimensional textures — glTexImage3D on TEXTURE_3D / TEXTURE_2D_ARRAY with an
+ * RGTC (or BPTC/S3TC/ETC2) internalformat is INVALID_OPERATION
+ * (KHR-GL46.packed_pixels.varied_rectangle.compressed_*_rgtc*, whose
+ * GL_UNPACK_IMAGE_HEIGHT cases upload to GL_TEXTURE_2D_ARRAY).  2D targets stay
+ * legal (uncompressed client data takes the decoded-storage path). */
+TEST(r54_compressed_no_3d)
+{
+    const GLenum bad[] = {
+        GL_COMPRESSED_RED_RGTC1, GL_COMPRESSED_SIGNED_RED_RGTC1,
+        GL_COMPRESSED_RG_RGTC2, GL_COMPRESSED_SIGNED_RG_RGTC2,
+        GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_BPTC_UNORM,
+    };
+    GLubyte data[64];
+    for (int i = 0; i < 64; i++) data[i] = (GLubyte)(i * 3);
+
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++)
+    {
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+        while (glGetError() != GL_NO_ERROR) {}
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, bad[i], 4, 4, 2, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+        EXPECT_EQ_INT(glGetError(), GL_INVALID_OPERATION);
+        glBindTexture(GL_TEXTURE_3D, tex);
+        glTexImage3D(GL_TEXTURE_3D, 0, bad[i], 4, 4, 2, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+        EXPECT_EQ_INT(glGetError(), GL_INVALID_OPERATION);
+        /* 2D must still succeed for the RGTC formats (online compression ->
+         * decoded storage; the CTS rectangle.compressed_*_rgtc1 cases rely on it);
+         * S3TC/BPTC stay rejected on RECTANGLE like the GL requires */
+        glDeleteTextures(1, &tex);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_RECTANGLE, tex);
+        glTexImage2D(GL_TEXTURE_RECTANGLE, 0, bad[i], 4, 4, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+        GLenum e2d = glGetError();
+        if (bad[i] == GL_COMPRESSED_RED_RGTC1 || bad[i] == GL_COMPRESSED_SIGNED_RED_RGTC1 ||
+            bad[i] == GL_COMPRESSED_RG_RGTC2 || bad[i] == GL_COMPRESSED_SIGNED_RG_RGTC2)
+            EXPECT_EQ_INT(e2d, GL_NO_ERROR);
+        else
+            EXPECT_TRUE(e2d == GL_NO_ERROR || e2d == GL_INVALID_OPERATION);
+        glDeleteTextures(1, &tex);
+    }
+}
+
+/* r55: glDrawElementsIndirect through the geometry emulation — the prep kernel must
+ * honour the command's firstIndex (the element buffer binds at its base for indirect
+ * draws, so the assembly read vertex data as indices: garbage vmin/vmax truncated the
+ * emission), and the output budget must cover the command's primcount (the GPU-only
+ * sizing assumed a single instance).  One shared buffer carries vertices, indices and
+ * both indirect commands at distinct offsets, exactly like the CTS. */
+TEST(r55_indirect_firstindex_and_primcount)
+{
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+
+    static const float vertex_data[] = {
+        -0.1f, 0.2f, 0.2f, -0.7f, 0.5f, -0.5f, 0.1f, -0.2f, -0.2f, 0.7f, -0.5f, 0.5f,
+    };
+    static const GLuint index_data[] = { 2, 1, 0 };
+
+    size_t vsize = sizeof vertex_data, isize = sizeof index_data;
+    GLuint voff = 0, ioff = (GLuint)vsize, aoff = ioff + (GLuint)isize, eoff = aoff + 16;
+    GLuint firstindex = ioff / 4;
+
+    GLuint bo;
+    glGenBuffers(1, &bo);
+    glBindBuffer(GL_ARRAY_BUFFER, bo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, bo);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, bo);
+    glBufferData(GL_ARRAY_BUFFER, eoff + 20, NULL, GL_STATIC_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, voff, vsize, vertex_data);
+    glBufferSubData(GL_ARRAY_BUFFER, ioff, isize, index_data);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void *)(uintptr_t)voff);
+    glEnableVertexAttribArray(0);
+
+    struct { GLenum mode; GLuint count; const char *in; } cases[] = {
+        { GL_POINTS, 1, "points" },
+        { GL_LINES, 2, "lines" },
+        { GL_LINES_ADJACENCY, 4, "lines_adjacency" },
+        { GL_TRIANGLES, 3, "triangles" },
+        { GL_TRIANGLES_ADJACENCY, 6, "triangles_adjacency" },
+    };
+
+    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++)
+    {
+        GLuint arrays_args[4] = { cases[c].count, 4, 0, 1 };
+        GLuint elements_args[5] = { cases[c].count, 4, firstindex, 1, 1 };
+        glBufferSubData(GL_ARRAY_BUFFER, aoff, 16, arrays_args);
+        glBufferSubData(GL_ARRAY_BUFFER, eoff, 20, elements_args);
+
+        /* points -> 1 vertex per emit; the GS emits 3 primitives per invocation and the
+         * command carries primcount=4: 12 emitted primitives, 12 raster points */
+        char gs[1024];
+        snprintf(gs, sizeof gs,
+            "#version 150\n"
+            "layout(%s) in;\n"
+            "layout(points, max_vertices=8) out;\n"
+            "void main() {\n"
+            "    for (int i = 0; i < 3; i++) {\n"
+            "        gl_Position = vec4(-0.9 + 0.3 * float(i), 0.25, 0.0, 1.0);\n"
+            "        EmitVertex();\n"
+            "    }\n"
+            "    EndPrimitive();\n"
+            "}\n", cases[c].in);
+        GLuint prog = glCreateProgram();
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER), g = glCreateShader(GL_GEOMETRY_SHADER),
+               fs = glCreateShader(GL_FRAGMENT_SHADER);
+        const char *vsrc = "#version 150\nin vec4 i_p; void main() { gl_Position = i_p; }\n";
+        const char *fsrc = "#version 150\nout vec4 c; void main() { c = vec4(1.0); }\n";
+        glShaderSource(vs, 1, &vsrc, NULL); glCompileShader(vs);
+        const char *gsrc = gs;
+        glShaderSource(g, 1, &gsrc, NULL); glCompileShader(g);
+        glShaderSource(fs, 1, &fsrc, NULL); glCompileShader(fs);
+        glAttachShader(prog, vs); glAttachShader(prog, g); glAttachShader(prog, fs);
+        glLinkProgram(prog);
+        GLint ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok)
+        {
+            char log[2048];
+            glGetProgramInfoLog(prog, sizeof log, NULL, log);
+            glDeleteProgram(prog);
+            MGL_FAIL("%s: link failed: %s", cases[c].in, log);
+        }
+        glUseProgram(prog);
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        GLuint q = 0;
+        glGenQueries(1, &q);
+        glBeginQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED, q);
+        glDrawElementsIndirect(cases[c].mode, GL_UNSIGNED_INT, (void *)(uintptr_t)eoff);
+        glEndQuery(GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED);
+        GLuint64 emitted = 0;
+        glGetQueryObjectui64v(q, GL_QUERY_RESULT, &emitted);
+        GLuint64 invocations = 0;
+        GLuint qi = 0;
+        glGenQueries(1, &qi);      /* a query object's target is immutable: separate object */
+        glBeginQuery(GL_GEOMETRY_SHADER_INVOCATIONS, qi);
+        glDrawElementsIndirect(cases[c].mode, GL_UNSIGNED_INT, (void *)(uintptr_t)eoff);
+        glEndQuery(GL_GEOMETRY_SHADER_INVOCATIONS);
+        glGetQueryObjectui64v(qi, GL_QUERY_RESULT, &invocations);
+        glDeleteQueries(1, &q);
+        glDeleteQueries(1, &qi);
+        glDeleteProgram(prog);
+
+        EXPECT_EQ_INT(emitted, 12);
+        EXPECT_EQ_INT(invocations, 4);
+    }
+
+    glDeleteBuffers(1, &bo);
+    glDeleteVertexArrays(1, &vao);
+}
+
 int main(void)
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
@@ -4490,5 +4970,12 @@ int main(void)
     RUN_IF(r48_ssbo_two_runtime_arrays);
     RUN_IF(r48_ssbo_layout_compile_errors);
     RUN_IF(r48_tes_ssbo_atomics);
+    RUN_IF(r52_layered_scissored_clear);
+    RUN_IF(r52_rect_sampler_and_scalar_out);
+    RUN_IF(r54_int_builtins_minmax);
+    RUN_IF(r54_fs_primitiveid_min);
+    RUN_IF(r54_srgb_readback_raw);
+    RUN_IF(r54_compressed_no_3d);
+    RUN_IF(r55_indirect_firstindex_and_primcount);
     return mgl_test_summary();
 }

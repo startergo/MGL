@@ -101,6 +101,13 @@ enum {
  * 6 ALWAYS, 7 NEVER (see mgl_cmp_do in program.c).  The rstate fixups own
  * 32000..32009. */
 #define MGL_GEOM_FC_SHADOW_OP_BASE 32010
+
+/* read()-based gather taps must honour the sampler's address mode themselves
+ * (integer-texture and shadow reads in the emulated VERTEX gather path); the
+ * packed wrap mode (ws | wt<<4, encodings in mgl_wco: 0 REPEAT / 1 MIRRORED_
+ * REPEAT / 2 CLAMP_TO_EDGE / ...; default 0 = REPEAT) rides in as function
+ * constant MGL_GEOM_FC_WRAP_BASE+N per gather slot. */
+#define MGL_GEOM_FC_WRAP_BASE 32200
 #define MGL_GEOM_SHADOW_OP_LEQUAL   0
 #define MGL_GEOM_SHADOW_OP_GEQUAL   1
 #define MGL_GEOM_SHADOW_OP_LESS     2
@@ -165,6 +172,7 @@ typedef struct MGLAtomicCounterVar
 typedef struct MGLGeomProgram {
     Program  *program;      /* owner (link-time program; NULL when the entry is free) */
     GLuint    name;
+    int       next_free;    /* free-list link while the entry is dead (-1 = none) */
     bool      linked;       /* the emulation is built and usable */
     bool      deferred;     /* separable program: built from the pipeline at first draw */
     bool      from_tess;   /* a tessellation stage feeds the geometry kernel (TES-output capture) */
@@ -283,6 +291,9 @@ typedef struct MGLGeomDraw {
     GLint    first;
     GLsizei  count;
     GLsizei  instances;
+    uint32_t known_prims;       /* exact input prims per instance (0: unknown -> size worst-case) */
+    uint32_t known_instances;   /* exact instance count (0: unknown -> use `instances') */
+    uint32_t known_vcount;      /* exact vertex/index count (0: unknown -> use the bound) */
     GLint    basevertex;
     GLuint   baseinstance;
 
@@ -333,6 +344,18 @@ struct MGLExtState_geom {
     MGLGeomProgram  *progs;
     int              n_progs, progs_cap;
 
+    /* name -> slot map (open addressing, linear probing, power-of-two size) and a free
+     * list of slots whose program died.  The table used to be walked linearly on every
+     * link, and the reuse scan called the *creating* getProgram() on dead names — which
+     * resurrected a zombie Program per dead slot and made both the walk and the table
+     * grow forever (the texture_swizzle smoke decays quadratically: it links a VS+FS
+     * program per sub-case).  mgl_geom_post_link now also skips programs with no
+     * geometry stage, so a non-geometry program costs nothing at all. */
+    GLuint          *map_names;     /* 0 = empty bucket */
+    int             *map_slots;     /* slot index + 1, 0 with name 0 */
+    int              map_cap, map_used;
+    int              free_head;     /* progs[] index, -1 = none */
+
     /* image-atomic emulation sidecar buffers (SPIRV-Cross's `<name>_atomic` device
      * pointers): one zero-initialized MTLBuffer per image unit (void* are retained
      * id<MTLBuffer> / id<MTLTexture>), reallocated whenever the unit's bound view or
@@ -375,6 +398,9 @@ extern "C" {
 
 /* state (geometry.c) */
 void mgl_ext_init_geom(GLMContext ctx);
+/* the GL program object died: free its geometry slot eagerly (O(1); without it the
+ * slot table only reclaimed lazily, via a full scan) */
+void mgl_ext_delete_program_geom(GLMContext ctx, Program *p);
 bool mgl_ext_get_geom(GLMContext ctx, GLenum pname, GLuint type, void *data);
 
 /* geometry stage compilation hook called by program.c's compile_stage() */
@@ -386,6 +412,11 @@ size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_
 /* geometry.c: repair interface-block member offsets after glslang's implicit
  * array growth (see mgl_spirv_fix_block_offsets); returns NULL when unchanged */
 uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_n);
+
+/* arrays-of-matrices stage inputs (e.g. `in mat2x3 d[2]`): lowers the variable to
+ * N element-typed inputs + a private shadow so SPIRV-Cross can emit MSL; returns
+ * NULL when the module has nothing to lower (or cannot be lowered) */
+uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n);
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);
@@ -433,7 +464,8 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);
 /* an indirect draw: the prep kernel reads the command from `ibuf`; false when the CPU has
  * to read it after all (no bound on the counts) */
-bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, struct Buffer_t *ibuf, size_t offset);
+bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, struct Buffer_t *ibuf, size_t offset,
+                             const uint32_t *cmd /* [5] elements / [4] arrays command, NULL when GPU-only */);
 /* the emulation record of the current program (NULL when absent or unusable) */
 MGLGeomProgram *mgl_geom_current(GLMContext ctx);
 

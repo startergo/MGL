@@ -745,7 +745,10 @@ GLboolean mglIsTexture(GLMContext ctx, GLuint texture)
 void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
     TD_CHECK(count >= 0, GL_INVALID_VALUE);
-    TD_CHECK((GLuint)first + (GLuint)count <= TEXTURE_UNITS, GL_INVALID_OPERATION);
+    /* the image-unit count is GL_MAX_IMAGE_UNITS (get.c reports 8), not the texture
+     * unit count — KHR-GL46.multi_bind errors_bind_image_textures expects
+     * GL_INVALID_OPERATION past it */
+    TD_CHECK((GLuint)first + (GLuint)count <= 8, GL_INVALID_OPERATION);
 
     for (GLsizei i = 0; i < count; i++)
     {
@@ -761,7 +764,18 @@ void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLu
         Texture *tex = findTexture(ctx, tex_name);
         if (!tex)
         {
-            ERROR_RETURN(GL_INVALID_OPERATION);
+            /* multi-bind: the invalid entry is skipped with an error, the other
+             * entries still take effect */
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            continue;
+        }
+
+        /* an entry whose texture has no valid level 0 (invalid internal format /
+         * zero dimensions) is skipped with INVALID_OPERATION as well
+         * (KHR-GL46.multi_bind errors_bind_image_textures) */
+        if (!tex->internalformat || !tex->width || !tex->height)
+        {
+            ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
             continue;
         }
 
@@ -1667,6 +1681,15 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
 
     if (f->flags & (TDF_DEPTH | TDF_STENCIL))
         TD_CHECK(depthFormatAllowedOnTarget(t.tex_target), GL_INVALID_OPERATION);
+
+    /* GL 4.6 table 8.5: the block-compressed / ETC formats are not supported for
+     * 3-dimensional textures — glTexImage3D (TEXTURE_3D / TEXTURE_2D_ARRAY) with
+     * such an internalformat is an INVALID_OPERATION
+     * (KHR-GL46.packed_pixels.varied_rectangle.compressed_*_rgtc*, whose
+     * GL_UNPACK_IMAGE_HEIGHT cases upload to GL_TEXTURE_2D_ARRAY). */
+    if ((t.tex_target == GL_TEXTURE_3D || t.tex_target == GL_TEXTURE_2D_ARRAY) &&
+        (req->flags & (TDF_BC | TDF_ETC)))
+        TD_CHECK(0, GL_INVALID_OPERATION);
 
     if (req->flags & TDF_COMPRESSED)
     {

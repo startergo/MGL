@@ -78,6 +78,23 @@ bool mgl_fb_has_depth(GLMContext ctx, Framebuffer *fbo)
     return fi && fi->d > 0;
 }
 
+/* geom r58 (texture_swizzle.functional Crash->Pass): true when the draw
+ * framebuffer's color slot `slot` writes a format with no alpha channel
+ * (R3_G3_B2, RGB*, RG*, R*, ...). GL discards writes to a missing channel and
+ * reads return 1 for alpha, but Metal has no alpha-less color attachment
+ * format, so those formats are emulated on an RGBA backing — the pipeline must
+ * mask the alpha write or a fill leaks its alpha into the backing and a
+ * GL_TEXTURE_SWIZZLE_* that sources A reads it back instead of 1.0. */
+bool mgl_fb_slot_lacks_alpha(GLMContext ctx, Framebuffer *fbo, GLuint slot)
+{
+    if (!fbo) return false; /* default framebuffer backing is opaque */
+    FBOAttachment *att = slotAttachment(ctx, fbo, slot);
+    if (!attachmentDefined(ctx, att))
+        return false;
+    const MGLFBFormatInfo *fi = mgl_fb_format_info(attachmentFormat(ctx, att));
+    return fi && fi->base != GL_DEPTH_COMPONENT && fi->base != GL_DEPTH_STENCIL && fi->a == 0;
+}
+
 bool mgl_fb_has_stencil(GLMContext ctx, Framebuffer *fbo)
 {
     if (!fbo) return ctx->stencil_format.format != 0;
@@ -583,6 +600,27 @@ static void packLayout(GLMContext ctx, GLsizei width, GLsizei height, GLenum for
     l->span = (width && height) ? l->skip + (size_t)(height - 1) * stride + (size_t)width * group : 0;
 }
 
+/* sRGB-encoded color formats: reads with float-kind clients must decode them
+ * (GL 4.6 18.2.2); UNORM clients get the stored bytes back unchanged */
+static bool fbInternalFormatIsSRGB(GLenum ifmt)
+{
+    switch (ifmt)
+    {
+        case GL_SRGB8:
+        case GL_SRGB8_ALPHA8:
+        case GL_SR8_EXT:
+        case GL_SRG8_EXT:
+        case GL_COMPRESSED_SRGB:
+        case GL_COMPRESSED_SRGB_ALPHA:
+        case GL_COMPRESSED_SRGB8_ETC2:
+        case GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC:
+        case GL_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, void *pixels)
 {
     if (!validReadFormat(format) || !validReadType(type))
@@ -742,12 +780,35 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
 
             if (aspect == MGL_FB_ASPECT_COLOR)
             {
+                /* r54: NO sRGB transfer on readback.  GL 4.6 applies the sRGB decoder
+                 * only when SAMPLING a texture from a shader (and the encoder only
+                 * when writing with FRAMEBUFFER_SRGB on); glReadPixels /
+                 * glGetTexImage of an sRGB-encoded attachment return the raw
+                 * encoded bytes.  (The CTS packed-pixels model has no sRGB transfer
+                 * at all: KHR-GL46.packed_pixels.rectangle.srgb8 /
+                 * pbo_rectangle.srgb8 expect the verbatim byte values for
+                 * GL_FLOAT clients; KHR-GL46.texture_size_promotion.functional
+                 * passes without the decode too — its sRGB sub-cases were fixed by
+                 * the r52 texelFetch-through-sample() and FRAMEBUFFER_SRGB view
+                 * pieces, not by decoding reads.) */
+                const bool srgb_read = false;
                 CompVal src[4];
                 for (int k = 0; k < 4; k++)
                 {
                     if (kind == MGL_FB_KIND_FLOAT)
                     {
                         float f = ((float *)color)[idx * 4 + k];
+                        /* GL 4.6 18.2: reading a signed-normalized color buffer
+                         * clamps the values to [0, 1] (unnormalized reads are
+                         * unaffected; getTexImage is not clamped either) */
+                        if (fi && fi->component_type == GL_SIGNED_NORMALIZED)
+                            f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+                        /* GL 4.6 18.2.2 / ES3 4.3.2: reading an sRGB-encoded color
+                         * buffer converts to linear, unless the client wants the
+                         * bytes themselves (UNORM-normalized client types pass
+                         * through unchanged, e.g. GL_RGBA/GL_UNSIGNED_BYTE) */
+                        else if (srgb_read)
+                            f = (f <= 0.04045f) ? f / 12.92f : powf((f + 0.055f) / 1.055f, 2.4f);
                         src[k].is_int = false;
                         src[k].d = has[k] ? f : (k == 3 ? 1.0 : 0.0);
                     }

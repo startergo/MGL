@@ -537,8 +537,13 @@ typedef struct {
     DubMember *dub; uint32_t ndub;
     uint32_t  dub_size;
     uint32_t  dub_var;         /* id of the default block variable in r */
+#define MGL_BUSED_UNKNOWN UINT64_MAX
     uint8_t  *active;          /* [bound+1] of r: active global variables */
     uint8_t  *dub_active;      /* [ndub] members actually accessed */
+    uint64_t *bused;           /* [bound+1] of r: per UBO/SSBO variable, bitmask of
+                                  top-level members accessed in this stage
+                                  (SPIRV-Cross active buffer ranges); MGL_BUSED_UNKNOWN
+                                  = usage unknown → declaration-based answer */
     /* location assignments to apply: var -> loc / index */
     struct { uint32_t var; uint32_t loc; int index; } *locs; int nlocs;
     MGLIProgram *ip;
@@ -1497,6 +1502,14 @@ typedef struct {
     MGLIProgram *ip; const SMod *m; int stage; int block; bool ssbo;
     int top_level; GLint top_size, top_stride;
     const MGLBoolPaths *bools;   /* GLSL-declared bool block members of this stage */
+    /* REFERENCED_BY_*_SHADER is usage-based (GL 4.6 §9.2: a uniform block / SSBO counts
+     * only when it "contains at least one variable referenced by the corresponding
+     * shader").  used_mask bit i = top-level member i of the block is accessed in this
+     * stage's module (SPIRV-Cross active buffer ranges); used_all = usage unknown
+     * (reflection fallback / >64 members) → keep the declaration-based answer;
+     * cur_used = the current recursion is under a used top-level member. */
+    uint64_t used_mask; bool used_all, cur_used;
+    uint32_t block_type;        /* id of the block's own struct type */
 } BlockWalk;
 
 /*
@@ -1559,7 +1572,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
                     blk->members = realloc(blk->members, (blk->member_count + 1) * sizeof(int));
                     blk->members[blk->member_count++] = found;
                 }
-                ip->bvars[found].stages |= 1u << bw->stage;
+                if (bw->cur_used) ip->bvars[found].stages |= 1u << bw->stage;   /* usage-based (see BlockWalk) */
             } else {
                 int created, ui = add_uniform(bw->ip, nm, &created);
                 MGLIUniform *u = &bw->ip->uniforms[ui];
@@ -1571,7 +1584,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
                     src_bool_leaf_type(bw, nm, et, &u->type, &u->kind, &u->cols, &u->rows);
                 }
                 add_member(&bw->ip->ubos[bw->block], ui);
-                u->stages |= 1u << bw->stage;
+                if (bw->cur_used) u->stages |= 1u << bw->stage;   /* usage-based (see BlockWalk) */
             }
             return;
         }
@@ -1584,6 +1597,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
         return;
     }
     if (ty->kind == T_STRUCT) {
+        bool is_block = (t == bw->block_type);   /* the block's own struct: its members are the top-level ones */
         for (uint32_t i = 0; i < ty->nmem; i++) {
             char nm[512];
             if (name[0]) snprintf(nm, sizeof nm, "%s.%s", name, member_name(m, t, i));
@@ -1592,7 +1606,13 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
             get_dec(m, t, (int32_t)i, SpvDecorationMatrixStride, &ms);
             int rm = get_dec(m, t, (int32_t)i, SpvDecorationRowMajor, NULL);
             if (depth == 0) { bw->top_size = 1; bw->top_stride = 0; }
+            /* entering a top-level member of the block: usage is its mask bit
+             * (SPIRV-Cross reports the top-level member containing any access);
+             * nested members inherit their parent's answer */
+            bool saved = bw->cur_used;
+            if (is_block) bw->cur_used = bw->used_all || ((bw->used_mask >> i) & 1);
             walk_block(bw, nm, ty->mem[i], offset + mo, ms, rm, depth == 0 ? 0 : depth + 1);
+            bw->cur_used = saved;
         }
         return;
     }
@@ -1614,7 +1634,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
             blk->members = realloc(blk->members, (blk->member_count + 1) * sizeof(int));
             blk->members[blk->member_count++] = found;
         }
-        ip->bvars[found].stages |= 1u << bw->stage;
+        ip->bvars[found].stages |= 1u << bw->stage;   /* SSBO members are walked only for stages that use the block */
         return;
     }
     int created, ui = add_uniform(bw->ip, name, &created);
@@ -1626,7 +1646,7 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
         src_bool_leaf_type(bw, name, t, &u->type, &u->kind, &u->cols, &u->rows);
     }
     add_member(&bw->ip->ubos[bw->block], ui);
-    u->stages |= 1u << bw->stage;
+    if (bw->cur_used) u->stages |= 1u << bw->stage;   /* usage-based (see BlockWalk) */
 }
 
 static int add_block(MGLIBlock **arr, int *n, const char *name, int *created)
@@ -1653,11 +1673,93 @@ static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *
     (*n)++;
 }
 
+/* GL-visible name of a SPIR-V BuiltIn id (gl_PerVertex / tess / fragment members) */
+static const char *builtin_gl_name(uint32_t b)
+{
+    switch (b) {
+        case SpvBuiltInPosition: return "gl_Position";
+        case SpvBuiltInPointSize: return "gl_PointSize";
+        case SpvBuiltInClipDistance: return "gl_ClipDistance";
+        case SpvBuiltInCullDistance: return "gl_CullDistance";
+        case SpvBuiltInTessLevelOuter: return "gl_TessLevelOuter";
+        case SpvBuiltInTessLevelInner: return "gl_TessLevelInner";
+        case SpvBuiltInLayer: return "gl_Layer";
+        case SpvBuiltInViewportIndex: return "gl_ViewportIndex";
+        case SpvBuiltInPrimitiveId: return "gl_PrimitiveID";
+        case SpvBuiltInFragDepth: return "gl_FragDepth";
+        case SpvBuiltInSampleMask: return "gl_SampleMask";
+        case 5014 /* SpvBuiltInFragStencilRefEXT */: return "gl_FragStencilRef";
+        default: return NULL;
+    }
+}
+
+/* is `v` an interface block whose members carry BuiltIn decorations (gl_PerVertex,
+ * the tessellation per-patch block)?  glslang emits those as a Block struct type with
+ * BuiltIn member decorations and no BuiltIn on the variable itself. */
+static bool builtin_block_var(const SMod *m, uint32_t v, uint32_t *block_type)
+{
+    uint32_t t = pointee(m, m->vtype[v]);
+    uint32_t st = strip_arrays(m, t);
+    if (m->t[st].kind != T_STRUCT || !get_dec(m, st, -1, SpvDecorationBlock, NULL)) return false;
+    for (uint32_t i = 0; i < m->t[st].nmem; i++)
+        if (get_dec(m, st, (int32_t)i, SpvDecorationBuiltIn, NULL)) { if (block_type) *block_type = st; return true; }
+    return false;
+}
+
+/* bitmask of struct members of built-in block variable `v` referenced in function
+ * bodies; ~0ull when the whole block is referenced or an index is dynamic.  For an
+ * arrayed block (gl_in[] / gl_out[]) the member index is the second AccessChain
+ * index.  OpAccessChain is [op, ResultType, Result, Base, Index...]: Base is w[3],
+ * the first index w[4]; constant indices are OpConstant ids. */
+static uint64_t builtin_block_member_use(const SMod *m, uint32_t v, bool arrayed)
+{
+    uint64_t used = 0;
+    if (m->first_func == (size_t)-1) return 0;
+    for (size_t k = m->first_func; k < m->n; k++) {
+        const uint32_t *w = m->in[k].w;
+        uint32_t op = w[0] & 0xffff;
+        if (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) {
+            if (m->in[k].len < 5 || w[3] != v) continue;
+            uint32_t mi = w[4 + (arrayed ? 1 : 0)];
+            if (m->in[k].len <= 4 + (arrayed ? 1 : 0)) { used = ~(uint64_t)0; continue; }
+            if (mi <= m->bound && m->isconst[mi]) {
+                uint32_t c = m->cval[mi];
+                used |= (c < 64) ? (1ull << c) : ~(uint64_t)0;
+            } else used = ~(uint64_t)0;
+        } else if (op == SpvOpLoad && m->in[k].len >= 4 && w[3] == v) used = ~(uint64_t)0;
+        else if (op == SpvOpStore && m->in[k].len >= 3 && w[1] == v) used = ~(uint64_t)0;
+        else if (op == SpvOpCopyMemory && m->in[k].len >= 4 && (w[1] == v || w[2] == v)) used = ~(uint64_t)0;
+    }
+    return used;
+}
+
+/* highest constant index used on built-in array variable `v` (gl_SampleMask,
+ * gl_ClipDistance): the reported GL_ARRAY_SIZE of a built-in array is the number of
+ * active elements (GL 4.6 §9.2.1), not the glslang-padded declaration size. */
+static uint32_t builtin_array_active_len(const SMod *m, uint32_t v, uint32_t count)
+{
+    uint32_t hi = 0;
+    if (m->first_func == (size_t)-1) return count ? count : 1;
+    for (size_t k = m->first_func; k < m->n; k++) {
+        const uint32_t *w = m->in[k].w;
+        uint32_t op = w[0] & 0xffff;
+        if (op != SpvOpAccessChain && op != SpvOpInBoundsAccessChain) continue;
+        if (m->in[k].len < 5 || w[3] != v) continue;
+        uint32_t idx = w[4];
+        if (idx <= m->bound && m->isconst[idx]) { if (m->cval[idx] > hi) hi = m->cval[idx]; }
+        else return count ? count : 1;
+    }
+    return hi + 1;
+}
+
 static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t *active, bool input, MGLIVar **arr, int *narr)
 {
     uint32_t sc_want = input ? SpvStorageClassInput : SpvStorageClassOutput;
     for (uint32_t v = 1; v <= m->bound; v++) {
-        if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != sc_want || !active[v]) continue;
+        if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != sc_want) continue;
+        uint32_t bt_probe = 0;
+        bool bblock = builtin_block_var(m, v, &bt_probe);
+        if (!active[v] && !bblock) continue;   /* built-in blocks gate per member below */
         uint32_t t = pointee(m, m->vtype[v]);
         bool patch = get_dec(m, v, -1, SpvDecorationPatch, NULL);
         if (stage_is_arrayed_io(stage, input) && !patch && (m->t[t].kind == T_ARRAY || m->t[t].kind == T_RARRAY)) t = m->t[t].elem;
@@ -1665,14 +1767,61 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
         bool is_block = m->t[st].kind == T_STRUCT && get_dec(m, st, -1, SpvDecorationBlock, NULL);
         uint32_t bi;
         if (get_dec(m, v, -1, SpvDecorationBuiltIn, &bi)) {
-            add_io(arr, narr, m, stage, id_name(m, v), t, -1, -1, 0, patch, -1);
+            /* individual built-in variable (gl_VertexID, gl_FragDepth, gl_SampleMask...).
+             * Built-in arrays are named by their first element with the element type and
+             * the number of ACTIVE elements as the array size (GL 4.6 §9.2.1). */
+            if (m->t[t].kind == T_ARRAY || m->t[t].kind == T_RARRAY) {
+                uint32_t cnt = (m->t[t].kind == T_ARRAY) ? m->t[t].count : 0;
+                char nm[512];
+                const char *cn = builtin_gl_name(bi); if (!cn) cn = id_name(m, v);
+                snprintf(nm, sizeof nm, "%s[0]", cn);
+                add_io(arr, narr, m, stage, nm, t, -1, -1, 0, patch, -1);
+                (*arr)[*narr - 1].size = (GLint)builtin_array_active_len(m, v, cnt ? cnt : 1);
+            } else {
+                add_io(arr, narr, m, stage, id_name(m, v), t, -1, -1, 0, patch, -1);
+            }
             continue;
         }
         if (is_block) {
-            /* built-in blocks (gl_PerVertex) are not enumerated; user blocks list "Block.member" */
-            bool builtin = false;
-            for (uint32_t i = 0; i < m->t[st].nmem; i++) if (get_dec(m, st, (int32_t)i, SpvDecorationBuiltIn, NULL)) builtin = true;
-            if (builtin) continue;
+            if (bblock) {
+                uint32_t bt = bt_probe;
+                /* gl_PerVertex / per-patch built-in block: its members ARE program
+                 * inputs/outputs (GL 4.6 §11.1.1).  Arrayed instances (gl_in[]/gl_out[])
+                 * name them "<block>.<member>", plain instances name them "<member>".
+                 * Members only appear when this stage actually references them. */
+                uint32_t vt = pointee(m, m->vtype[v]);
+                bool arrayed = (m->t[vt].kind == T_ARRAY || m->t[vt].kind == T_RARRAY);
+                const char *bname = id_name(m, bt);
+                if (!bname || !*bname) bname = "gl_PerVertex";
+                uint64_t used = builtin_block_member_use(m, v, arrayed);
+                if (getenv("MGL_IO_DEBUG"))
+                    fprintf(stderr, "IODBG st%d %s bblock var %u '%s' arrayed=%d used=%llx active=%d\n",
+                            stage, input ? "in" : "out", v, id_name(m, v), arrayed,
+                            (unsigned long long)used, active[v]);
+                for (uint32_t i = 0; i < m->t[bt].nmem; i++) {
+                    uint32_t mb;
+                    if (!get_dec(m, bt, (int32_t)i, SpvDecorationBuiltIn, &mb)) continue;
+                    if (used != ~(uint64_t)0 && !((used >> i) & 1)) continue;
+                    const char *cn = member_name(m, bt, i);
+                    const char *canon = builtin_gl_name(mb);
+                    if (!cn || !*cn) cn = canon;
+                    if (!cn) continue;
+                    uint32_t mt = m->t[bt].mem[i];
+                    bool mpatch = patch || get_dec(m, bt, (int32_t)i, SpvDecorationPatch, NULL);
+                    if (m->t[mt].kind == T_ARRAY || m->t[mt].kind == T_RARRAY) {
+                        char nm[560];
+                        snprintf(nm, sizeof nm, "%s%s%s[0]", arrayed ? bname : "", arrayed ? "." : "", cn);
+                        add_io(arr, narr, m, stage, nm, mt, -1, -1, 0, mpatch, -1);
+                        if ((*arr)[*narr - 1].size < 1) (*arr)[*narr - 1].size = 1;   /* unsized gl_ClipDistance[] */
+                    } else {
+                        char nm[560];
+                        snprintf(nm, sizeof nm, "%s%s%s", arrayed ? bname : "", arrayed ? "." : "", cn);
+                        add_io(arr, narr, m, stage, nm, mt, -1, -1, 0, mpatch, -1);
+                    }
+                }
+                continue;
+            }
+            /* user blocks list "Block.member" */
             uint32_t loc = 0; get_dec(m, v, -1, SpvDecorationLocation, &loc);
             for (uint32_t i = 0; i < m->t[st].nmem; i++) {
                 char nm[512]; snprintf(nm, sizeof nm, "%s.%s", id_name(m, st), member_name(m, st, i));
@@ -1719,6 +1868,7 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
     SMod *r = s->r;
     s->active = zalloc(r->bound + 1);
     s->dub_active = zalloc(s->ndub + 1);
+    s->bused = zalloc((r->bound + 1) * sizeof(uint64_t));
     spvc_context c = NULL; spvc_parsed_ir ir = NULL; spvc_compiler comp = NULL;
     bool ok = false;
     if (spvc_context_create(&c) == SPVC_SUCCESS &&
@@ -1735,16 +1885,24 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
                 }
                 ok = true;
             }
-            /* built-in inputs/outputs are not in resource lists: mark used ones from the set */
+            /* built-in inputs/outputs are not in SPIRV-Cross resource lists: mark used ones
+             * from the function bodies (Load's pointer is w[2], Store's pointer w[1],
+             * an AccessChain's base w[2]; earlier code compared w[3] and missed reads).
+             * Built-in BLOCK variables (gl_PerVertex / gl_in[]) have no BuiltIn decoration
+             * at all — they are detected structurally. */
             for (uint32_t v = 1; v <= r->bound; v++)
                 if (r->isvar[v] && r->vglobal[v] && (r->vsc[v] == SpvStorageClassInput || r->vsc[v] == SpvStorageClassOutput) &&
-                    get_dec(r, v, -1, SpvDecorationBuiltIn, NULL)) {
-                    /* conservative: referenced anywhere in function bodies */
+                    (get_dec(r, v, -1, SpvDecorationBuiltIn, NULL) || builtin_block_var(r, v, NULL))) {
+                    /* conservative: referenced anywhere in function bodies
+                     * (OpLoad's pointer is w[3], OpStore's pointer w[1], an
+                     * AccessChain's base w[3] — both have a Result Type word) */
                     for (size_t k = r->first_func; k < r->n && !s->active[v]; k++) {
                         uint32_t op = r->in[k].w[0] & 0xffff;
-                        if (op == SpvOpLoad && r->in[k].w[3] == v) s->active[v] = 1;
-                        if (op == SpvOpStore && r->in[k].w[1] == v) s->active[v] = 1;
-                        if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && r->in[k].w[3] == v) s->active[v] = 1;
+                        uint32_t len = r->in[k].len;
+                        if (op == SpvOpLoad && len >= 4 && r->in[k].w[3] == v) s->active[v] = 1;
+                        if (op == SpvOpStore && len >= 3 && r->in[k].w[1] == v) s->active[v] = 1;
+                        if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && len >= 5 && r->in[k].w[3] == v) s->active[v] = 1;
+                        if (op == SpvOpCopyMemory && len >= 4 && (r->in[k].w[1] == v || r->in[k].w[2] == v)) s->active[v] = 1;
                     }
                 }
         }
@@ -1753,10 +1911,28 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
             if (spvc_compiler_get_active_buffer_ranges(comp, s->dub_var, &ranges, &nr) == SPVC_SUCCESS)
                 for (size_t i = 0; i < nr; i++) if (ranges[i].index < s->ndub) s->dub_active[ranges[i].index] = 1;
         }
+        /* per UBO/SSBO variable: which top-level members this stage's module actually
+         * accesses (REFERENCED_BY_*_SHADER is usage-based, GL 4.6 §9.2 — a declared but
+         * untouched block must report 0 for the stage).  SPIRV-Cross reports the
+         * top-level member containing each access. */
+        for (uint32_t v = 1; v <= r->bound; v++) {
+            if (!r->isvar[v] || !r->vglobal[v]) continue;
+            if (r->vsc[v] != SpvStorageClassUniform && r->vsc[v] != SpvStorageClassStorageBuffer) continue;
+            const spvc_buffer_range *ranges; size_t nr;
+            if (spvc_compiler_get_active_buffer_ranges(comp, v, &ranges, &nr) != SPVC_SUCCESS) {
+                s->bused[v] = MGL_BUSED_UNKNOWN;
+                continue;
+            }
+            for (size_t i = 0; i < nr; i++) {
+                if (ranges[i].index >= 64) { s->bused[v] = MGL_BUSED_UNKNOWN; break; }  /* beyond the mask: conservative */
+                s->bused[v] |= 1ull << ranges[i].index;
+            }
+        }
     }
     if (!ok) {
         for (uint32_t v = 1; v <= r->bound; v++) if (r->isvar[v] && r->vglobal[v]) s->active[v] = 1;
         for (uint32_t k = 0; k < s->ndub; k++) s->dub_active[k] = 1;
+        for (uint32_t v = 1; v <= r->bound; v++) if (r->isvar[v] && r->vglobal[v]) s->bused[v] = MGL_BUSED_UNKNOWN;
     }
     /* Uniform blocks stay ACTIVE when they are declared but none of their members is
      * referenced: GL 4.6 §7.6.2 ("resources may still be consumed ... implementations
@@ -1775,6 +1951,32 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
 }
 
 static bool name_is_hidden(const char *n) { return !strncmp(n, "_mgl_sr_", 8); }
+
+/* for an array-of-blocks variable: bitmask of ELEMENT indices referenced in
+ * function bodies (~0ull when an element index is dynamic or the whole array is
+ * copied).  GL 4.6 §9.2 makes REFERENCED_BY_*_SHADER per RESOURCE: each element
+ * of a uniform-block array is its own resource (CTS uniform-block-types:
+ * "TrickyBlock[1]" must report 0 when only e[0] is used). */
+static uint64_t block_elem_use(const SMod *m, uint32_t v)
+{
+    uint64_t used = 0;
+    if (m->first_func == (size_t)-1) return 0;
+    for (size_t k = m->first_func; k < m->n; k++) {
+        const uint32_t *w = m->in[k].w;
+        uint32_t op = w[0] & 0xffff;
+        if (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain) {
+            if (m->in[k].len < 5 || w[3] != v) continue;
+            uint32_t e = w[4];
+            if (e <= m->bound && m->isconst[e]) {
+                uint32_t c = m->cval[e];
+                used |= (c < 64) ? (1ull << c) : ~(uint64_t)0;
+            } else used = ~(uint64_t)0;
+        } else if (op == SpvOpLoad && m->in[k].len >= 4 && w[3] == v) used = ~(uint64_t)0;
+        else if (op == SpvOpStore && m->in[k].len >= 3 && w[1] == v) used = ~(uint64_t)0;
+        else if (op == SpvOpCopyMemory && m->in[k].len >= 4 && (w[1] == v || w[2] == v)) used = ~(uint64_t)0;
+    }
+    return used;
+}
 
 static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *src)
 {
@@ -1865,6 +2067,11 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         /* glslang auto-mapped bindings are not explicit: GL defaults un-bound blocks to binding point 0 */
         if (binding && !src_explicit_qual(src, bname, ubo ? "uniform" : "buffer", "binding")) binding = 0;
         uint32_t nel = m->t[t].kind == T_ARRAY ? m->t[t].count : 0;
+        uint64_t eused = ~(uint64_t)0;
+        if (nel) {
+            eused = block_elem_use(m, v);
+            if (eused == ~(uint64_t)0) { /* dynamic element index: every element counts */ }
+        }
         for (uint32_t e = 0; e < (nel ? nel : 1); e++) {
             char nm[512];
             if (nel) snprintf(nm, sizeof nm, "%s[%u]", bname, e); else snprintf(nm, sizeof nm, "%s", bname);
@@ -1877,10 +2084,27 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
                 uint32_t sz = block_type_size(m, st, 0, 0);
                 b->data_size = (GLint)(ubo ? align_up(sz, 16) : sz);
             }
-            b->stages |= 1u << stage;
+            /* usage-based stage bits (GL 4.6 §9.2: REFERENCED_BY_X_SHADER is 1 only if
+             * the block "contains at least one variable referenced by" X).  The block
+             * itself stays listed for declared-but-unused UBOs (see compute_active). */
+            uint64_t bused = (s->bused && v <= m->bound) ? s->bused[v] : MGL_BUSED_UNKNOWN;
+            if (bused == 0) {
+                /* belt and braces for accesses the member-range analysis cannot see
+                 * (whole-block load/store): any function-body reference to the variable */
+                for (size_t k = m->first_func; k < m->n && bused == 0; k++) {
+                    uint32_t op = m->in[k].w[0] & 0xffff;
+                    if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain ||
+                         op == SpvOpLoad) && m->in[k].w[3] == v) bused = MGL_BUSED_UNKNOWN;
+                    else if (op == SpvOpStore && m->in[k].w[1] == v) bused = MGL_BUSED_UNKNOWN;
+                    else if (op == SpvOpCopyMemory && (m->in[k].w[1] == v || m->in[k].w[2] == v)) bused = MGL_BUSED_UNKNOWN;
+                }
+            }
+            if (bused && (eused == ~(uint64_t)0 || ((eused >> e) & 1))) b->stages |= 1u << stage;
             b->spv_id[stage] = v;
-            BlockWalk bw = { ip, m, stage, bi, ssbo, 0, 1, 0, bools };
-            {
+            bool e_used = !nel || eused == ~(uint64_t)0 || ((eused >> e) & 1);
+            BlockWalk bw = { ip, m, stage, bi, ssbo, 0, 1, 0, bools,
+                             (bused == MGL_BUSED_UNKNOWN || !e_used) ? 0 : bused,
+                             bused == MGL_BUSED_UNKNOWN && e_used, false, st };            {
                 char prefix[512];
                 /* GL names block members "<block type name>.<member>" only when the block
                  * has an instance name; anonymous block members keep their plain names

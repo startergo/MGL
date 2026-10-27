@@ -1207,8 +1207,17 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
 
         if (route)
         {
+            /* give the geometry emulation the command when it is already in hand (the
+             * query read it) or cheaply readable from the buffer's CPU copy: it sizes
+             * the emulation buffers EXACTLY (the GPU-only fallback sizes by the mode's
+             * worst case with a single assumed instance) */
+            uint32_t cmd5[5] = { 0, 0, 0, 0, 0 };
+            const uint32_t *gcmd = counted ? cmd : NULL;
+
+            if (!gcmd && read_indirect(ctx, ibuf, offset, cmd5, words, false))
+                gcmd = cmd5;
             batch_end(ctx, batch);
-            if (mgl_geom_route_indirect(ctx, mode, type, ibuf, offset))
+            if (mgl_geom_route_indirect(ctx, mode, type, ibuf, offset, gcmd))
                 return;
         }
     }

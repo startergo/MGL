@@ -134,6 +134,7 @@ typedef struct MGLIProgram {
     struct { char *name; GLuint color, index; } *frag_binds; int nfrag_binds;
 
     int      linked;
+    int      link_failed;  /* geom r58: a relink failed after a successful link: queries/locations error (GL_INVALID_OPERATION), but the previous executable stays active with its uniform state (GL 4.6 7.3.1) */
     GLbitfield stage_mask;
     int      first_stage, last_stage;
 
@@ -228,6 +229,13 @@ MGLIProgram *mgli_find(GLMContext ctx, GLuint program);
 MGLIProgram *mgli_get(GLMContext ctx, GLuint program);
 /* program lookup with GL error semantics; returns NULL (error set) on failure */
 MGLIProgram *mgli_program_checked(GLMContext ctx, GLuint program, bool need_linked);
+void mgli_invalidate_program(GLMContext ctx, GLuint program);
+void mgli_mark_relink_failed(GLMContext ctx, GLuint program); /* geom r58 */
+bool mgli_link_failed(GLMContext ctx, GLuint program);       /* geom r58 */
+
+/* free the program's introspection record when the GL program object dies
+ * (keeps mgli_find's list bounded by live programs) */
+void mgl_ext_delete_program_introspect(GLMContext ctx, Program *p);
 void mgli_set_error(GLMContext ctx, const char *func, GLenum err);
 
 /* uniform value API shared by glUniform* and glProgramUniform* (uniforms.c) */

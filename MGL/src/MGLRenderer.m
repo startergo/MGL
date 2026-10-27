@@ -2086,41 +2086,58 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
     NSLog(@"MGL AGX: Creating emergency fallback texture (size: %dx%dx%d)", tex->width, tex->height, tex->depth);
 
     @try {
+        /* the fallback must match the dimensional type of the GL target: sampler slots
+         * whose GL texture is incomplete (no storage) sample this texture, and a 2D
+         * texture bound to a texture1d / 3D / cube slot does not work (sampler1D came
+         * back (0,0,0,0) instead of the required (0,0,0,1)) */
         MTLTextureDescriptor *fallbackDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                                     width:MAX(tex->width, 1)
                                                                                                    height:MAX(tex->height, 1)
                                                                                                 mipmapped:NO];
+        switch (tex->target)
+        {
+            case GL_TEXTURE_3D:
+                fallbackDesc.textureType = MTLTextureType3D;
+                fallbackDesc.depth = MAX(tex->depth, 1);
+                break;
+            case GL_TEXTURE_CUBE_MAP:
+                fallbackDesc.textureType = MTLTextureTypeCube;
+                break;
+            case GL_TEXTURE_2D_ARRAY:
+                fallbackDesc.textureType = MTLTextureType2DArray;
+                fallbackDesc.arrayLength = 1;
+                break;
+            default:
+                break;   /* 1D/2D/RECT are realized as 2D (see createMTLTextureFromGLTexture) */
+        }
         fallbackDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
         fallbackDesc.storageMode = MTLStorageModeShared;
 
         id<MTLTexture> fallbackTexture = [_device newTextureWithDescriptor:fallbackDesc];
 
         if (fallbackTexture) {
-            // Fill with simple gradient pattern using a simple approach
+            /* opaque black: this texture also backs sampler slots whose GL texture is
+             * incomplete (no storage / inconsistent), which the spec requires to sample
+             * as (0,0,0,1) — a visible pattern here fails those cases */
             NSUInteger width = fallbackTexture.width;
             NSUInteger height = fallbackTexture.height;
 
             if (width <= 512 && height <= 512) {
                 uint32_t *gradientData = calloc(width * height, sizeof(uint32_t));
                 if (gradientData) {
-                    // Create simple red-blue gradient
-                    for (NSUInteger y = 0; y < height; y++) {
-                        for (NSUInteger x = 0; x < width; x++) {
-                            NSUInteger index = y * width + x;
-                            uint8_t r = (uint8_t)((x * 255) / width);
-                            uint8_t g = 128;
-                            uint8_t b = (uint8_t)((y * 255) / height);
-                            uint8_t a = 255;
-                            gradientData[index] = (a << 24) | (b << 16) | (g << 8) | r;
-                        }
+                    for (NSUInteger i = 0; i < width * height; i++)
+                        gradientData[i] = 0xffu << 24;
+
+                    NSUInteger slices = (fallbackDesc.textureType == MTLTextureTypeCube) ? 6 : 1;
+                    if (fallbackDesc.textureType == MTLTextureType3D) slices = MAX(tex->depth, 1);
+                    for (NSUInteger s = 0; s < slices; s++)
+                    {
+                        MTLRegion region = MTLRegionMake3D(0, 0, 0, width, height, 1);
+                        [fallbackTexture replaceRegion:region mipmapLevel:0 slice:s withBytes:gradientData
+                                   bytesPerRow:width * sizeof(uint32_t) bytesPerImage:width * height * sizeof(uint32_t)];
                     }
 
-                    MTLRegion region = MTLRegionMake2D(0, 0, width, height);
-                    [fallbackTexture replaceRegion:region mipmapLevel:0 withBytes:gradientData
-                               bytesPerRow:width * sizeof(uint32_t)];
-
                     free(gradientData);
-                    NSLog(@"MGL AGX: Fallback texture created with gradient pattern");
                 }
             }
         }
@@ -3874,7 +3891,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         }
 
         // new pipeline / vertex / renderbuffer and pipelinestate descriptor, should probably make this a single dirty bit
-        if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE))
+        GLuint pipe_bits = ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE);
+        if (pipe_bits)
         {
             uint64_t t20tmp = mgl_prof_begin(20);
             /* compat domain fast path: the trigger is only VAO / render-state
@@ -3897,10 +3915,6 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             else
             {
             uint64_t p2 = mgl_prof_begin(2);
-            if (mgl_prof_on && (mgl_prof_cnt[2] % 200) == 0)
-                fprintf(stderr, "MGL PROFILE pipeline-block dirty=0x%llx sel=0x%llx\n",
-                        (unsigned long long)ctx->state.dirty_bits,
-                        (unsigned long long)(ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE)));
             // create pipeline descriptor
             MTLRenderPipelineDescriptor *pipelineStateDescriptor;
 

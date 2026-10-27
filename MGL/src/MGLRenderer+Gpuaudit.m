@@ -45,8 +45,9 @@ static inline MGLRenderer *GAR(GLMContext c) { return (__bridge MGLRenderer *)c-
 typedef struct {
     __unsafe_unretained id<MTLTexture> tex;
     NSUInteger level, slice, plane, layers;
+    GLuint name;    /* mirrors FBTarget.name (fbSourceFor writes a whole FBTarget) */
 } MGLGAFBTarget;
-static_assert(sizeof(MGLGAFBTarget) == 40, "MGLRenderer+Framebuffer.m FBTarget layout changed");
+static_assert(sizeof(MGLGAFBTarget) == 48, "MGLRenderer+Framebuffer.m FBTarget layout changed");
 
 /* gpuaudit renderer state, kept as an associated object (nothing is stored in ivars) */
 /* A cache entry retains the functions the pipeline was built from. The key hashes

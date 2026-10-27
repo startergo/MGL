@@ -60,6 +60,64 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
     return e;
 }
 
+/* function-pointer -> (MSL text + entry) content id: the compat pipeline cache uses
+ * stage-function POINTERS as MSL content identity ("equal pointers mean equal code"),
+ * which holds while this cache keeps every function alive forever.  This registry
+ * makes that assumption checkable: a released-and-recycled address gets a new id,
+ * and the audit in MGLRenderer+Compat.m drops any pipeline-cache entry whose stored
+ * id no longer matches (a wrong-PSO hit would render with foreign shader code). */
+#define MGL_FNID_CAP 8192   /* power of two; ids are never removed */
+static void      *fnid_key[MGL_FNID_CAP];
+static uint64_t   fnid_val[MGL_FNID_CAP];
+static int        fnid_used;
+
+static uint64_t fnidHash(void *fn)
+{
+    uintptr_t v = (uintptr_t)fn;
+    v ^= v >> 33;
+    v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33;
+    return (uint64_t)v;
+}
+
+/* caller holds mslLibCacheLock() */
+static void fnidRegister(void *fn, uint64_t id)
+{
+    if (!fn) return;
+    if (fnid_used * 4 > MGL_FNID_CAP * 3) return;   /* full: audit degrades to no-op */
+    uint64_t mask = MGL_FNID_CAP - 1;
+    uint64_t i = fnidHash(fn) & mask;
+    while (fnid_key[i] && fnid_key[i] != fn) i = (i + 1) & mask;
+    if (!fnid_key[i]) { fnid_key[i] = fn; fnid_used++; }
+    fnid_val[i] = id;
+}
+
+uint64_t mglProgramFunctionId(void *fn)
+{
+    if (!fn) return 0;
+    NSLock *lock = mslLibCacheLock();
+    [lock lock];
+    uint64_t mask = MGL_FNID_CAP - 1;
+    uint64_t i = fnidHash(fn) & mask;
+    uint64_t id = 0;
+    while (fnid_key[i])
+    {
+        if (fnid_key[i] == fn) { id = fnid_val[i]; break; }
+        i = (i + 1) & mask;
+    }
+    [lock unlock];
+    return id;
+}
+
+static uint64_t fnidOf(const char *msl, const char *entry)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = entry; *p; p++) { h = (h ^ (uint8_t)*p) * 1099511628211ULL; }
+    h = (h ^ 0x2f) * 1099511628211ULL;
+    for (const char *p = msl; *p; p++) { h = (h ^ (uint8_t)*p) * 1099511628211ULL; }
+    return h ? h : 1;
+}
+
 - (bool) extProgramCompileMSL:(const char *)msl entry:(const char *)entry
                       library:(void **)library function:(void **)function error:(char **)error_log
 {
@@ -95,6 +153,7 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
         if (cached_fn)
         {
             id<MTLLibrary> cached_lib = entry_cache[@"__lib"];
+            fnidRegister((void *)(__bridge void *)cached_fn, fnidOf(msl, entry));
             [lock unlock];
             *library = (void *)CFBridgingRetain(cached_lib);
             *function = (void *)CFBridgingRetain(cached_fn);
@@ -112,10 +171,14 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
         }
 
         /* specialized with no values, like -bindMTLProgram: functions carrying function
-         * constants (rstate fixups) take their GL-default branches.  constantValues must
-         * be non-nil (Metal API validation asserts on nil); an empty set keeps the
-         * function constants' default specializations. */
-        fn = [lib newFunctionWithName:name constantValues:[[MTLFunctionConstantValues alloc] init] error:nil];
+        /* specialized with no values, like -bindMTLProgram: functions carrying function
+         * constants (rstate fixups) take their GL-default branches.  constantValues
+         * must be non-nil: Metal validation asserts on nil (test_atomic_counters
+         * SIGTRAPped in the full suite; 'failure -[MGLRenderer processGLState:]' logs
+         * otherwise) — an empty values object selects the same default branches. */
+        fn = [lib newFunctionWithName:name
+                        constantValues:[[MTLFunctionConstantValues alloc] init]
+                                  error:nil];
         if (!fn)
         {
             if (getenv("MGL_MSL_DEBUG"))
@@ -127,6 +190,13 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
 
         *library = (void *)CFBridgingRetain(lib);
         *function = (void *)CFBridgingRetain(fn);
+
+        {
+            NSLock *lock2 = mslLibCacheLock();
+            [lock2 lock];
+            fnidRegister(*function, fnidOf(msl, entry));
+            [lock2 unlock];
+        }
 
         [lock lock];
         entry_cache[@"__lib"] = lib;

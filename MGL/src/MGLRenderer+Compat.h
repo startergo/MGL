@@ -24,6 +24,13 @@
 /* C bridge (GL-side buffer write paths etc.) — no-op unless the env flag is on */
 void mgl_compat_cs_drain(GLMContext glm_ctx);
 
+/* MGL_NO_PIPE_FAST=1 disables the compat pipeline fast path (debug switch; the
+ * getenv happens once, this is the draw path) */
+int mglNoPipeFast(void);
+/* function-pointer -> MSL content id (MGLRenderer+Program.m): the content
+ * identity the pipeline-cache key hashes instead of raw function addresses */
+uint64_t mglProgramFunctionId(void *fn);
+
 @interface MGLRenderer (Compat)
 /* IOSurface present path (CGL-like async swap): enabled per renderer with
  * MGL_SURFACE_PRESENT=1 and only while a windowed Metal layer exists; see

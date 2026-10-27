@@ -222,6 +222,16 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     hooks->releaseObj = texparamReleaseObj;
 }
 
+#ifndef GL_DEPTH_TEXTURE_MODE
+#define GL_DEPTH_TEXTURE_MODE 0x884B
+#endif
+#ifndef GL_LUMINANCE
+#define GL_LUMINANCE 0x1909
+#endif
+#ifndef GL_INTENSITY
+#define GL_INTENSITY 0x8049
+#endif
+
 #pragma mark samplers
 
 - (id<MTLSamplerState>) texparamCreateSampler:(TextureParameter *)p target:(GLenum)target
@@ -429,6 +439,70 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
 
     bool swizzled = swz.red != MTLTextureSwizzleRed || swz.green != MTLTextureSwizzleGreen ||
                     swz.blue != MTLTextureSwizzleBlue || swz.alpha != MTLTextureSwizzleAlpha;
+
+    /* GL_DEPTH_TEXTURE_MODE (GL 4.6 8.26): a non-comparison depth texture
+     * splats its depth as (d,0,0,1)/(d,d,d,1)/(d,d,d,d)/(0,0,0,d); Metal's
+     * depth2d splat is (d,d,d,d), so the mode becomes a view swizzle. The
+     * TEXTURE_SWIZZLE selectors are then applied to that splatted vector
+     * (geom r58: texture_swizzle.functional composes swizzle [A,B,G,R] with
+     * mode RED and requires green <- (d,0,0,1).b == 0), so compose the user
+     * selectors through the mode selector instead of overriding it. */
+    {
+        bool is_depth_fmt = false;
+        switch (base.pixelFormat)
+        {
+            case MTLPixelFormatDepth16Unorm:
+            case MTLPixelFormatDepth32Float:
+            case MTLPixelFormatDepth24Unorm_Stencil8:
+            case MTLPixelFormatDepth32Float_Stencil8:
+                is_depth_fmt = true;
+                break;
+            default: break;
+        }
+        if (is_depth_fmt)
+        {
+            /* mode selector: how each of (r,g,b,a) of the splatted vector maps
+             * to Metal's raw (d,d,d,d) or a constant */
+            MTLTextureSwizzle msel[4];
+            switch (p->depth_texture_mode)
+            {
+                case GL_RED:
+                    msel[0] = MTLTextureSwizzleRed;  msel[1] = MTLTextureSwizzleZero; msel[2] = MTLTextureSwizzleZero; msel[3] = MTLTextureSwizzleOne;
+                    break;
+                case GL_INTENSITY:
+                    msel[0] = MTLTextureSwizzleRed;  msel[1] = MTLTextureSwizzleRed;  msel[2] = MTLTextureSwizzleRed;  msel[3] = MTLTextureSwizzleRed;
+                    break;
+                case GL_ALPHA:
+                    msel[0] = MTLTextureSwizzleZero; msel[1] = MTLTextureSwizzleZero; msel[2] = MTLTextureSwizzleZero; msel[3] = MTLTextureSwizzleRed;
+                    break;
+                default: /* LUMINANCE */
+                    msel[0] = MTLTextureSwizzleRed;  msel[1] = MTLTextureSwizzleRed;  msel[2] = MTLTextureSwizzleRed;  msel[3] = MTLTextureSwizzleOne;
+                    break;
+            }
+            /* map a selector (MTLTextureSwizzleZero..Alpha) through the mode
+             * splat; Zero/One constants pass through unchanged */
+            MTLTextureSwizzle mode_vec[6];
+            mode_vec[MTLTextureSwizzleRed]   = msel[0];
+            mode_vec[MTLTextureSwizzleGreen] = msel[1];
+            mode_vec[MTLTextureSwizzleBlue]  = msel[2];
+            mode_vec[MTLTextureSwizzleAlpha] = msel[3];
+            mode_vec[MTLTextureSwizzleZero]  = MTLTextureSwizzleZero;
+            mode_vec[MTLTextureSwizzleOne]   = MTLTextureSwizzleOne;
+            if (swizzled)
+            {
+                const MTLTextureSwizzle user[4] = { swz.red, swz.green, swz.blue, swz.alpha };
+                MTLTextureSwizzle net[4];
+                for (int c = 0; c < 4; c++)
+                    net[c] = mode_vec[user[c]];
+                swz = MTLTextureSwizzleChannelsMake(net[0], net[1], net[2], net[3]);
+            }
+            else
+            {
+                swz = MTLTextureSwizzleChannelsMake(msel[0], msel[1], msel[2], msel[3]);
+                swizzled = true;
+            }
+        }
+    }
 
     if (base_level == 0 && max_level == levels - 1 && format == base.pixelFormat && !swizzled)
         return base;

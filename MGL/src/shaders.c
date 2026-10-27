@@ -494,6 +494,8 @@ static void mgl_glslang_cache_ref(glslang_shader_t *sh, int delta);
 bool mgl_glslang_unshared_release(glslang_shader_t *sh);
 static int  mgl_glslang_unshared_find(glslang_shader_t *sh);
 int  mgl_glslang_cache_unshare(glslang_shader_t *sh);
+uint64_t mgl_glslang_cache_group(glslang_shader_t *sh);
+void mgl_glslang_cache_set_group(glslang_shader_t *sh, uint64_t group);
 
 static void release_glslang_shader(GLMContext ctx, Shader *ptr)
 {
@@ -725,6 +727,13 @@ typedef struct {
     char               *log;        /* info-log snapshot at compile time */
     GLboolean           status;
     int                 refs;       /* GL shader objects holding `shader` */
+    /* r53: the link-group this entry's handle last linked in (0 = never).  A link
+     * writes program-wide uniform locations into the shared intermediate, so a
+     * handle may only be REUSED by the IDENTICAL stage set — every attached entry
+     * carrying the same group id (program.c).  Repeated identical links (the CTS
+     * relinks the same stage sets tens of thousands of times) then stay cache-hot;
+     * any other combination still falls back to the unshare+reparse path. */
+    uint64_t            linked_group;
 } MGLGlslangCacheEnt;
 
 static MGLGlslangCacheEnt mgl_glslang_cache[MGL_GLSLANG_CACHE_MAX];
@@ -881,6 +890,26 @@ static void mgl_glslang_cache_add(GLenum type, const char *src, glslang_shader_t
     e->log = log ? strdup(log) : NULL;
     e->status = status;
     e->refs = sh ? 1 : 0;   /* the object that just compiled it */
+    e->linked_group = 0;
+}
+
+/* r53: link-group bookkeeping for same-set handle reuse (see MGLGlslangCacheEnt) */
+uint64_t mgl_glslang_cache_group(glslang_shader_t *sh)
+{
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].shader == sh)
+            return mgl_glslang_cache[i].linked_group;
+    return 0;       /* not a cache-owned handle (private / unshared) */
+}
+
+void mgl_glslang_cache_set_group(glslang_shader_t *sh, uint64_t group)
+{
+    for (int i = 0; i < mgl_glslang_cache_count; i++)
+        if (mgl_glslang_cache[i].shader == sh)
+        {
+            mgl_glslang_cache[i].linked_group = group;
+            return;
+        }
 }
 
 void mglCompileShader(GLMContext ctx, GLuint shader)

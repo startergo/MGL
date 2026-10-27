@@ -658,9 +658,11 @@ void mglTexParamGetLevel(GLMContext ctx, Texture *tex, GLenum target, GLint leve
                 Buffer *b = (Buffer *)searchHashTable(&STATE(buffer_table), rec->buffer);
                 if (b)
                 {
-                    /* a resize after the binding is visible in the query (the CTS
-                     * re-uploads the store and re-queries without rebinding) */
-                    if (size < 0 || (GLsizeiptr)b->size != rec->buffer_offset + size)
+                    /* -1 = whole-buffer binding: always the live store size; an explicit
+                     * range keeps its size while the store still covers it and is clamped
+                     * when the store was re-defined smaller (the texext info path in
+                     * textures_ext.c GL_TEXTURE_BUFFER_SIZE does the same) */
+                    if (size < 0 || (GLsizeiptr)b->size < rec->buffer_offset + size)
                         size = b->size > rec->buffer_offset ? b->size - rec->buffer_offset : 0;
                 }
                 else if (size < 0)

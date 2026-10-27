@@ -259,12 +259,18 @@ static void begin_query(GLMContext ctx, GLenum target, GLuint index, GLuint id)
     /* a geometry stage counts these on the GPU (per-stream counters folded into a
      * persistent accumulator after every draw): the word restarts at the next draw,
      * which opens this query's counting period.  The clipping counters ride on the
-     * stream-0 generated word: what the geometry stage emits is what reaches clipping */
+     * stream-0 generated word: what the geometry stage emits is what reaches clipping.
+     * GEOMETRY_SHADER_INVOCATIONS is accumulator word 8: the geometry kernel bumps
+     * ctl[21] once per (input primitive, invocation) thread — the exact count for
+     * indirect draws too, where the CPU-side vertex/instance estimate sees zeros
+     * (KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries). */
     if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
-        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES)
+        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES ||
+        target == GL_GEOMETRY_SHADER_INVOCATIONS)
     {
         unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
-                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index : 0u;
+                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index :
+                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u : 0u;
         if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_begin)
             ctx->mtl_funcs.ext_geom->query_begin(ctx, 1u << word);
     }
@@ -303,10 +309,12 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
     /* the geometry stage's exact per-stream counters accumulated since the begin fold
      * into the CPU-tracked part here; queries without a geometry-stage draw read 0 */
     if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
-        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES)
+        target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES ||
+        target == GL_GEOMETRY_SHADER_INVOCATIONS)
     {
         unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
-                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index : 0u;
+                        (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index :
+                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u : 0u;
         if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_read)
         {
             uint64_t v = 0;
@@ -681,8 +689,10 @@ static bool queries_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count, 
     {
         /* GEOMETRY_SHADER_PRIMITIVES_EMITTED and PRIMITIVES_GENERATED come from the
          * geometry kernel's per-stream counters, read through the ext_geom query hooks
-         * (begin/end query); the invocation count is the input primitive count */
-        count_active(S, MGL_QB_GEOMETRY_SHADER_INVOCATIONS, prims);
+         * (begin/end query); so does GEOMETRY_SHADER_INVOCATIONS (accumulator word 8,
+         * ctl[21]: one bump per (input primitive, invocation) thread).  The CPU-side
+         * estimate would double-count — and is zero for indirect draws whose
+         * vertex/instance counts never reach the CPU (mgl_geom_route_indirect). */
     }
 
     mgl_prof_end(26, t26);

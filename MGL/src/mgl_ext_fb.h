@@ -85,6 +85,10 @@ struct MGLExtState_fb {
 struct MGLExtMetal_fb {
     void *default_color;            /* retained id<MTLTexture> */
     void *default_depth_stencil;    /* retained id<MTLTexture> */
+    /* bumped whenever the default framebuffer's backing textures are (re)created:
+     * part of the render-pass-descriptor cache key (FBTarget.name), so a recycled
+     * Metal texture address can never alias two generations of the default fb */
+    uint64_t default_fb_gen;
     void *pipeline_cache;           /* retained NSMutableDictionary */
     GLuint default_width, default_height;
     GLint  max_samples;
@@ -127,5 +131,6 @@ typedef struct MGLFBFormatInfo {
     GLboolean color_renderable, depth_renderable, stencil_renderable;
 } MGLFBFormatInfo;
 const MGLFBFormatInfo *mgl_fb_format_info(GLenum internalformat);
+bool mgl_fb_slot_lacks_alpha(GLMContext ctx, Framebuffer *fbo, GLuint slot); /* geom r58 */
 
 #endif

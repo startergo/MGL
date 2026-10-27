@@ -451,6 +451,222 @@ char *mgl_msl_fix_cull_distance(const char *msl)
     return o;
 }
 
+/* ===== uint-in-MSL / int-in-GL integer builtins =============================================
+ *
+ * SPIRV-Cross emits Metal's `gl_VertexID' / `gl_InstanceID' / `gl_BaseVertex' /
+ * `gl_BaseInstance' / `gl_PrimitiveID' builtins for the SPIR-V BuiltIn of the same GL
+ * name.  The MSL builtins are `uint' while GL(SL) declares them `int', and SPIRV-Cross
+ * does not insert the narrowing cast: any std-lib call mixing the builtin with int
+ * operands then fails to compile with an ambiguous overload —
+ *
+ *     out.dataOut = b.m[min(4, gl_VertexID)];   // error: call to 'min' is ambiguous
+ *                                              // candidate min(int,int) / min(uint,uint)
+ *                                              // (KHR-GL46.draw_indirect.advanced-twoPass-
+ *                                              //  transformFeedback-*)
+ *
+ * mgl_msl_fix_int_builtins() wraps every *use* of these builtins in an explicit
+ * `int(...)' cast, restoring GL's signed semantics (also for `/', `%', comparisons).
+ * Declaration sites of same-named locals — MGL's own emulation kernels declare
+ * `uint gl_VertexID = ...;' — and member accesses (`in.gl_VertexID') are left alone;
+ * uses already inside a cast (`uint(gl_VertexID)') are skipped for the same reason.
+ * SPIRV-Cross also hoists entry-point bodies into a static helper that receives the
+ * builtin through a `thread uint& gl_VertexID' parameter; a wrapped use could not bind
+ * to that reference, so such parameters are first rewritten in place (length-preserving)
+ * to a by-value `int' parameter — the builtin is read-only, so passing a copy is exact.
+ * Returns a malloc'd corrected copy, or NULL when nothing needed fixing. */
+static const char *const msl_int_builtins[] = {
+    "gl_VertexID", "gl_InstanceID", "gl_BaseVertex", "gl_BaseInstance", "gl_PrimitiveID",
+};
+
+static int msl_is_decl_type_token(const char *p, size_t len)
+{
+    static const char *const types[] = {
+        "uint", "int", "ushort", "short", "ulong", "long", "uchar", "char", "bool",
+        "float", "half", "size_t", "ptrdiff_t", "const", "static", "auto",
+    };
+    for (size_t i = 0; i < sizeof types / sizeof types[0]; i++)
+        if (strlen(types[i]) == len && !memcmp(p, types[i], len))
+            return 1;
+    return 0;
+}
+
+/* match a builtin name at `p' (whole identifier) */
+static size_t msl_builtin_at(const char *p, size_t avail)
+{
+    for (size_t k = 0; k < sizeof msl_int_builtins / sizeof msl_int_builtins[0]; k++)
+    {
+        size_t l = strlen(msl_int_builtins[k]);
+        if (avail >= l && !memcmp(p, msl_int_builtins[k], l))
+        {
+            char next = p[l];
+            if (!isalnum((unsigned char)next) && next != '_')
+                return l;
+        }
+    }
+    return 0;
+}
+
+/* rewrite `uint& NAME' function-parameter declarations to `int  NAME' (in place,
+ * length-preserving: "uint" -> "int ", '&' -> ' '), so wrapped call arguments
+ * (`int(gl_VertexID)') can bind.  Returns the number of rewrites. */
+static int msl_fix_ref_params(char *buf)
+{
+    int n = 0;
+    size_t len = strlen(buf);
+    for (size_t i = 0; i < len; )
+    {
+        size_t l = msl_builtin_at(buf + i, len - i);
+        if (!l)
+        {
+            i++;
+            continue;
+        }
+        /* back over whitespace and '&' sigils */
+        size_t j = i, amp = 0;
+        while (j > 0 && (isspace((unsigned char)buf[j - 1]) || buf[j - 1] == '&'))
+        {
+            if (buf[j - 1] == '&')
+                amp++;
+            j--;
+        }
+        if (!amp || j == 0)
+        {
+            i += l;
+            continue;
+        }
+        size_t e = j;
+        while (e > 0 && (isalnum((unsigned char)buf[e - 1]) || buf[e - 1] == '_'))
+            e--;
+        /* forward: parameter end must be reached (',' or ')') */
+        size_t k = i + l;
+        while (k < len && isspace((unsigned char)buf[k]))
+            k++;
+        if (j - e == 4 && !memcmp(buf + e, "uint", 4) && k < len && (buf[k] == ',' || buf[k] == ')'))
+        {
+            memcpy(buf + e, "int ", 4);
+            for (size_t a = e + 4; a < i; a++)
+                if (buf[a] == '&')
+                    buf[a] = ' ';
+            n++;
+        }
+        i += l;
+    }
+    return n;
+}
+
+char *mgl_msl_fix_int_builtins(const char *msl)
+{
+    if (!msl)
+        return NULL;
+
+    bool any = false;
+    for (size_t i = 0; i < sizeof msl_int_builtins / sizeof msl_int_builtins[0]; i++)
+        if (strstr(msl, msl_int_builtins[i]))
+        {
+            any = true;
+            break;
+        }
+    if (!any)
+        return NULL;
+
+    char *work = strdup(msl);
+    if (!work)
+        return NULL;
+    int ref_fixed = msl_fix_ref_params(work);
+
+    const size_t len = strlen(work);
+    size_t cap = len + 1024;
+    char *o = malloc(cap);
+    if (!o)
+    {
+        free(work);
+        return NULL;
+    }
+    size_t n = 0, i = 0;
+    int changed = ref_fixed;
+
+    while (i < len)
+    {
+        if (isalpha((unsigned char)work[i]) || work[i] == '_')
+        {
+            size_t s = i;
+            while (i < len && (isalnum((unsigned char)work[i]) || work[i] == '_'))
+                i++;
+            size_t w = i - s;
+            if (!msl_builtin_at(work + s, w))
+            {
+                if (n + w + 1 > cap)
+                {
+                    free(o);
+                    free(work);
+                    return NULL;
+                }
+                memcpy(o + n, work + s, w);
+                n += w;
+                continue;
+            }
+            /* previous token: a declaration (`uint gl_VertexID = ...', after the
+             * ref-rewrite above also `int  gl_VertexID,'), an existing cast
+             * (`uint(gl_VertexID)') or a member (`in.gl_VertexID') must not be wrapped */
+            size_t j = s;
+            while (j > 0 && (isspace((unsigned char)work[j - 1]) || work[j - 1] == '&' || work[j - 1] == '*'))
+                j--;
+            bool skip = (j > 0 && (work[j - 1] == '.' || work[j - 1] == '>'));
+            if (!skip && j > 0 && (work[j - 1] == '&' || work[j - 1] == '*'))
+                skip = true;    /* declaration sigil: `uint& name' / `int* name' */
+            if (!skip && j > 0)
+            {
+                size_t e = j;
+                while (e > 0 && (isalnum((unsigned char)work[e - 1]) || work[e - 1] == '_'))
+                    e--;
+                if (e < j && msl_is_decl_type_token(work + e, j - e))
+                    skip = true;
+            }
+            if (skip)
+            {
+                if (n + w + 1 > cap)
+                {
+                    free(o);
+                    free(work);
+                    return NULL;
+                }
+                memcpy(o + n, work + s, w);
+                n += w;
+                continue;
+            }
+            if (n + w + 8 > cap)
+            {
+                free(o);
+                free(work);
+                return NULL;
+            }
+            o[n++] = 'i'; o[n++] = 'n'; o[n++] = 't'; o[n++] = '(';
+            memcpy(o + n, work + s, w);
+            n += w;
+            o[n++] = ')';
+            changed++;
+        }
+        else
+        {
+            if (n + 2 > cap)
+            {
+                free(o);
+                free(work);
+                return NULL;
+            }
+            o[n++] = work[i++];
+        }
+    }
+    o[n] = 0;
+    free(work);
+
+    if (!changed)
+    {
+        free(o);
+        return NULL;
+    }
+    return o;
+}
 
 /* See the header.  GLSL's interpolateAtOffset(x, o) takes the offset from the
  * pixel CENTER; Metal's interpolate_at_offset takes it from the pixel's

@@ -441,6 +441,29 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!_currentRenderEncoder || !_pipelineState)
         return false;
 
+    {
+        static int audit_on = -1;
+        if (audit_on < 0)
+        {
+            const char *e = getenv("MGL_DRAW_AUDIT");
+            audit_on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (audit_on)
+        {
+            static uint64_t seq = 0;
+            Shader *sv = ctx->state.program ? ctx->state.program->shader_slots[_VERTEX_SHADER] : NULL;
+            Shader *sf = ctx->state.program ? ctx->state.program->shader_slots[_FRAGMENT_SHADER] : NULL;
+            fprintf(stderr, "MGL DRAWAUDIT #%llu prog=%u(%p) pso=%p vs=%p/%p fs=%p/%p dirty=0x%llx enc=%p\n",
+                    (unsigned long long)++seq,
+                    ctx->state.program ? ctx->state.program->name : 0, (void *)ctx->state.program,
+                    (void *)(__bridge void *)_pipelineState,
+                    (void *)sv, sv ? (void *)sv->mtl_data.function : NULL,
+                    (void *)sf, sf ? (void *)sf->mtl_data.function : NULL,
+                    (unsigned long long)ctx->state.dirty_bits,
+                    (void *)(__bridge void *)_currentRenderEncoder);
+        }
+    }
+
     uint64_t t13 = mgl_prof_begin(13);
     if (![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true])
     {

@@ -1653,6 +1653,7 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
     spvc_compiler_options opts = NULL;
     const char *result = NULL;
     char *ret = NULL;
+    char *owns_result = NULL;
     uint32_t *lowered = NULL;
     uint32_t *patched = NULL;
     size_t lower_words = 0;
@@ -1728,6 +1729,16 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
     mgl_msl_mangle_reserved(comp, ir, words);
 
     if (spvc_compiler_compile(comp, &result) == SPVC_SUCCESS && result) {
+        /* uint-in-MSL / int-in-GL index builtins (msl_reserved.c): the capture
+         * variant recompiles the vertex shader, so `min(4, gl_VertexID)' hits the
+         * same ambiguous Metal overload here */
+        {
+            char *fixed_vid = mgl_msl_fix_int_builtins(result);
+            if (fixed_vid) {
+                result = fixed_vid;
+                owns_result = fixed_vid;
+            }
+        }
         /* fp64: the capture kernel carries the soft-float library; a
          * `thread const T&` parameter cannot bind the `constant`-space
          * uniform members at the call sites (Metal: "no matching function"),
@@ -1757,6 +1768,7 @@ done:
     spvc_context_destroy(sctx);
     free(lowered);
     free(patched);
+    free(owns_result);
     return ret;
 }
 

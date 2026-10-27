@@ -358,8 +358,11 @@ static void texBufferCommon(GLMContext ctx, const char *func, Texture *tex, GLen
         return;
     tex->complete = buf != NULL;
 
+    /* a whole-buffer binding tracks the live store size (the record's -1 sentinel
+     * makes the query recompute it after a glBufferData re-definition), an explicit
+     * range keeps its requested size (KHR-GL46.texture_buffer texture_buffer_parameters) */
     mgl_texparam_record_buffer(ctx, tex, buffer, info->buffer_offset,
-                               buf ? (ranged ? size : buf->size) : 0);
+                               buf ? (ranged ? size : (GLsizeiptr)-1) : 0);
 
     texext_mark_dirty(ctx, tex);
 }
@@ -436,10 +439,26 @@ static void texMultisampleCommon(GLMContext ctx, const char *func, Texture *tex,
         return;
     }
 
-    if (!texext_is_renderable_format(internalformat) || !checkInternalFormatForMetal(ctx, internalformat))
+    /* GL 4.6 8.8.1: internalformat for multisample textures must be a SIZED internal
+     * format (INVALID_ENUM otherwise); there is no renderability requirement at
+     * creation time — KHR-GL46.texture_swizzle.functional allocates R3_G3_B2 and
+     * RGB9_E5 multisample textures.  checkInternalFormatForMetal covers the sized
+     * set with a Metal storage mapping.  Compressed formats are the exception:
+     * they are never legal for multisample textures (no block-compressed MSAA),
+     * and accepting one would hand the texture immutable storage the caller can
+     * never respecify (test_texext multisample_errors). */
+    if (!checkInternalFormatForMetal(ctx, internalformat))
     {
         ctx->error_func(ctx, func, GL_INVALID_ENUM);
         return;
+    }
+    {
+        const TDFormat *tdf = tdFormatInfo(internalformat);
+        if (tdf && (tdf->flags & TDF_COMPRESSED))
+        {
+            ctx->error_func(ctx, func, GL_INVALID_ENUM);
+            return;
+        }
     }
 
     if ((GLuint)samples > texext_max_samples_for(ctx, internalformat))

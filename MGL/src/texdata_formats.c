@@ -705,23 +705,6 @@ static inline double clampd(double v, double lo, double hi) { return v < lo ? lo
 
 static inline double un_to_f(double v, int bits) { return v / (double)((1ull << bits) - 1); }
 static inline double sn_to_f(double v, int bits) { double r = v / (double)((1ull << (bits - 1)) - 1); return r < -1.0 ? -1.0 : r; }
-/* IEC 61966-2-1 sRGB transfer functions, used when a *linear* client value meets an
- * sRGB8-family storage (GL 4.6 8.5.4: conversions go through floats; the sRGB
- * storage keeps the gamma-encoded 8-bit values the GPU texture format expects) */
-static inline double td_srgb_encode(double v)
-{
-    v = clampd(v, 0.0, 1.0);
-    if (v <= 0.0031308) return v * 12.92;
-    return 1.055 * pow(v, 1.0 / 2.4) - 0.055;
-}
-
-static inline double td_srgb_decode(double v)
-{
-    v = clampd(v, 0.0, 1.0);
-    if (v <= 0.04045) return v / 12.92;
-    return pow((v + 0.055) / 1.055, 2.4);
-}
-
 static inline uint64_t f_to_un(double f, int bits){
     if (isnan(f)) f = 0;
     return (uint64_t)llround(clampd(f, 0.0, 1.0) * (double)((1ull << bits) - 1));
@@ -938,10 +921,6 @@ static void storage_read_row(const TDFormat *f, const uint8_t *src, const uint8_
         TDPix *p = &out[x];
         pix_default(p);
         const uint8_t *s = src + (size_t)x * f->bpp;
-        /* an sRGB8-family storage converts to linear floats when it leaves the
-         * storage (GL 4.6 8.5.4: conversion goes through floats) */
-        bool srgb = (f->flags & TDF_SRGB) != 0;
-
         switch (f->kind)
         {
             case TDK_RGB10A2UN: case TDK_RGB10A2UI:
@@ -1109,14 +1088,7 @@ static bool td_direct(const TDFormat *f, GLenum format, GLenum type)
     }
 }
 
-/* client types whose values are linear floats (see tdUnpack / tdPack sRGB handling) */
-static bool td_client_type_is_float(GLenum type)
-{
-    return type == GL_FLOAT || type == GL_HALF_FLOAT ||
-           type == GL_UNSIGNED_INT_10F_11F_11F_REV ||
-           type == GL_UNSIGNED_INT_5_9_9_9_REV ||
-           type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
-}
+
 
 void tdUnpack(const TDFormat *f, const void *src, size_t src_row, size_t src_img,
               GLenum format, GLenum type, bool swap_bytes,

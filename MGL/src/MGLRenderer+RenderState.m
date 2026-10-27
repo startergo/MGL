@@ -19,6 +19,7 @@
 #import "mgl_ext_geom.h"
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
+#include "mgl_ext_fb.h"     /* geom r58: mgl_fb_slot_lacks_alpha */
 
 /* per-renderer rstate bookkeeping kept outside the shared ivar block */
 @interface MGLRSCache : NSObject
@@ -474,7 +475,8 @@ static bool rs_mode_is_polygon(GLenum m)
                      program->shader_slots[stage] &&
                      shader->mtl_data.function != program->shader_slots[stage]->mtl_data.function;
     if (!mgl_rstate_msl_is_patched(msl) &&
-        !(msl && strstr(msl, "mgl_shadow_op_") != NULL) && !standinFn)
+        !(msl && strstr(msl, "mgl_shadow_op_") != NULL) &&
+        !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn)
         return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
@@ -672,6 +674,13 @@ static bool rs_mode_is_polygon(GLenum m)
         if (rs->color_mask[i][1]) m |= MTLColorWriteMaskGreen;
         if (rs->color_mask[i][2]) m |= MTLColorWriteMaskBlue;
         if (rs->color_mask[i][3]) m |= MTLColorWriteMaskAlpha;
+        /* geom r58: GL formats with no alpha channel (R3_G3_B2, RGB*, RG*, R*)
+         * live on an RGBA Metal backing; GL discards writes to the missing
+         * channel and reads return 1.0 — mask the alpha write or a fill leaks
+         * its alpha into the backing, which a GL_TEXTURE_SWIZZLE sourcing A
+         * then reads back (texture_swizzle.functional). */
+        if ((m & MTLColorWriteMaskAlpha) && mgl_fb_slot_lacks_alpha(ctx, ctx->state.framebuffer, (GLuint)i))
+            m &= ~MTLColorWriteMaskAlpha;
         a.writeMask = m;
     }
 

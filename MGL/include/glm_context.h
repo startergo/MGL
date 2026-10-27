@@ -212,13 +212,20 @@ typedef struct BufferBaseTarget_t {
     Buffer      *buf;
 } BufferBaseTarget;
 
-#define MAX_BINDABLE_BUFFERS    16
+/* GL 4.6 minimum for GL_MAX_UNIFORM_BUFFER_BINDINGS is 84; the CTS multi_bind
+ * functional cases bind a buffer on every reported point and read them back, so the
+ * indexed binding array must really hold that many rows (the overflow table in
+ * buffers.c only covered 8 of them). */
+#define MAX_BINDABLE_BUFFERS    84
 typedef struct BufferBase_t {
     BufferBaseTarget    buffers[MAX_BINDABLE_BUFFERS];
 } BufferBase;
 
 typedef struct TextureParameter_t {
     GLenum  depth_stencil_mode;
+    /* GL_DEPTH_TEXTURE_MODE: how a non-comparison depth texture splats its
+     * depth into the sampled vec4 (RED/LUMINANCE/INTENSITY/ALPHA) */
+    GLenum  depth_texture_mode;
     GLuint  base_level;
     GLfloat border_color[4];
     GLint   border_color_i[4];
