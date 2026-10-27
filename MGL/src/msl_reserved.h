@@ -36,6 +36,10 @@ int mgl_msl_is_reserved_name(const char *name);
  * no fixup.
  */
 char *mgl_msl_fix_vertex_id_builtins(const char *msl);
+/* GLSL interpolateAtOffset is center-relative; Metal's is corner-relative.
+ * Rewrites SPIRV-Cross's `+ 0.4375' bias to the exact `+ 0.5'.  NULL = nothing
+ * to rewrite (the caller keeps the original). */
+char *mgl_msl_fix_interpolate_at_offset(const char *msl);
 
 /* Rename every reserved OpName / OpMemberName of `words` (the same module `compiler` was
  * created from) to `<name>_mgl<N>` in the compiler.  Renames never touch `gl_`-prefixed

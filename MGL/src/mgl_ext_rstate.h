@@ -139,6 +139,8 @@ void *mgl_rstate_rewrite_indices(GLMContext ctx, GLenum mode, GLenum type, const
  * gl_Position). */
 char *mgl_rstate_patch_vertex_msl(const char *msl, const char *entry_point);
 char *mgl_rstate_patch_fragment_msl(const char *msl, const char *entry_point);
+/* per-sample-shading MSL variant (sample-qualified interpolants); NULL = nothing to patch */
+char *mgl_rstate_pss_fragment_msl(const char *msl, const char *entry_point);
 
 /* For glDrawArrays-style draws when mgl_rstate_arrays_rewrite_needed(): returns a malloc'ed
  * index list (GL_UNSIGNED_INT) for vertices first..first+count-1 in the order Metal must draw them. */

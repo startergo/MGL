@@ -88,6 +88,28 @@ static inline GLuint mgl_make_program(const char *vs_src, const char *fs_src)
     return p;
 }
 
+static inline GLuint mgl_make_program3(const char *vs_src, const char *gs_src, const char *fs_src)
+{
+    GLuint p = glCreateProgram();
+    const char *srcs[3] = { vs_src, gs_src, fs_src };
+    GLenum types[3] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    for (int i = 0; i < 3; i++) {
+        if (!srcs[i]) continue;
+        GLuint s = glCreateShader(types[i]);
+        glShaderSource(s, 1, &srcs[i], NULL);
+        glCompileShader(s);
+        GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) { char log[2048] = ""; glGetShaderInfoLog(s, sizeof log, NULL, log);
+                   MGL_FAIL("shader compile failed: %s", log); return 0; }
+        glAttachShader(p, s);
+    }
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[2048] = ""; glGetProgramInfoLog(p, sizeof log, NULL, log);
+               MGL_FAIL("program link failed: %s", log); return 0; }
+    return p;
+}
+
 static inline int mgl_test_summary(void)
 {
     printf("== %d checks, %d failures\n", mgl_test_checks, mgl_test_failures);

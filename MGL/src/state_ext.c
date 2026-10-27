@@ -567,14 +567,150 @@ char *mgl_rstate_patch_vertex_msl(const char *msl, const char *entry)
     return b.s;
 }
 
+/* PSS (GL_SAMPLE_SHADING) variant of a patched fragment MSL: re-qualifies the
+ * fragment stage-in struct's interpolated members to sample interpolation.
+ * Metal evaluates center-qualified interpolants once per pixel even when the
+ * function reads [[sample_id]], so per-sample shading without this gives every
+ * sample of a pixel the same color (KHR-GL46.sample_shading.render).
+ * Members that must not move: flat/integer inputs, inputs already qualified
+ * (sample_*), centroid inputs (different semantics), and the built-in
+ * attributes (position, point_coord, ...).  Returns a malloc'd copy, or NULL
+ * when the entry / stage-in struct is not found or nothing is interpolatable
+ * (the caller then keeps the base function). */
+char *mgl_rstate_pss_fragment_msl(const char *msl, const char *entry)
+{
+    rs_entry e;
+    if (!msl || !entry || !rs_find_entry(msl, entry, &e))
+        return NULL;
+
+    /* the stage_in parameter's type names the stage-in struct */
+    const char *p = strstr(msl + e.params_open, "[[stage_in]]");
+    if (!p || p > msl + e.params_close)
+        return NULL;
+    /* the stage_in parameter: "<type> <name> [[stage_in]]" — back up over the
+     * name, then the type identifier */
+    const char *q = p;
+    while (q > msl + e.params_open && (unsigned char)*(q - 1) == ' ') q--;
+    long nend = (long)(q - msl);
+    long nstart = nend;
+    while (nstart > e.params_open && rs_ident_char(msl[nstart - 1])) nstart--;
+    long tstart = nstart;
+    while (tstart > e.params_open && (msl[tstart - 1] == ' ')) tstart--;
+    long tend = tstart;
+    while (tend > e.params_open && rs_ident_char(msl[tend - 1])) tend--;
+    if (tend == tstart || tstart - tend > 250 || nstart == nend)
+        return NULL;
+    char type[256];
+    memcpy(type, msl + tend, (size_t)(tstart - tend));
+    type[tstart - tend] = 0;
+
+    long struct_open;
+    if (!rs_struct_member_with_attr(msl, type, NULL, NULL, 0, &struct_open))
+        return NULL;
+    const char *body = msl + struct_open;
+    const char *open = strchr(body, '{');
+    long close = rs_match(msl, (long)(open - msl), '{', '}');
+    if (!open || close < 0)
+        return NULL;
+
+    rs_str b;
+    rs_str_init(&b, msl);
+    long delta = 0;
+    bool any = false;
+
+    /* walk the member declarations inside the struct */
+    long pos = (long)(open - msl) + 1;
+    while (pos < close)
+    {
+        long semi = pos;
+        while (semi < close && msl[semi] != ';' && msl[semi] != '{') semi++;
+        if (semi >= close || msl[semi] == '{')
+            break;                          /* not a plain member list: give up */
+
+        /* leading type identifier */
+        long t = pos;
+        while (t < semi && (msl[t] == ' ' || msl[t] == '\t' || msl[t] == '\n' || msl[t] == '\r')) t++;
+        long tstart = t;
+        while (t < semi && rs_ident_char(msl[t])) t++;
+        long tend = t;
+        char mtype[64];
+        if (tend - tstart > 0 && (size_t)(tend - tstart) < sizeof mtype)
+        {
+            memcpy(mtype, msl + tstart, (size_t)(tend - tstart));
+            mtype[tend - tstart] = 0;
+        }
+        else
+            mtype[0] = 0;
+
+        bool is_float = !strncmp(mtype, "float", 5) || !strncmp(mtype, "half", 4);
+        if (is_float)
+        {
+            const char *attr = strstr(msl + t, "[[");
+            const char *attr_end = attr && attr < msl + semi ? strstr(attr, "]]") : NULL;
+            if (attr && attr_end)
+            {
+                char attrs[512];
+                size_t alen = (size_t)(attr_end - attr);
+                bool flat = false, qualified = false, centroid = false, nopersp = false;
+                snprintf(attrs, sizeof attrs, "%.*s", (int)alen, attr);
+                for (char *w = strtok(attrs, "[[ ,\n\t]"); w; w = strtok(NULL, "[[ ,\n\t]( "))
+                {
+                    if (!strcmp(w, "flat")) flat = true;
+                    if (!strncmp(w, "sample_", 7) || !strncmp(w, "interpolate", 11)) qualified = true;
+                    if (!strncmp(w, "centroid", 8)) centroid = true;
+                    if (!strcmp(w, "center_no_perspective") || !strcmp(w, "sample_no_perspective")) nopersp = true;
+                }
+                if (!flat && !qualified && !centroid)
+                {
+                    if (nopersp)
+                    {
+                        /* same length: overwrite the center qualifier in place */
+                        const char *cnp = strnstr(attr, "center_no_perspective", (size_t)(attr_end - attr));
+                        if (cnp)
+                        {
+                            memcpy(b.s + (cnp - msl) + delta, "sample_no_perspective", 21);
+                            any = true;
+                        }
+                    }
+                    else
+                    {
+                        const char *qual = ", sample_perspective";
+                        size_t qlen = strlen(qual);
+                        /* append inside the attribute list, before ]] */
+                        long insp = (long)(attr_end - msl);
+                        rs_str_insert(&b, (size_t)(insp + delta), qual);
+                        delta += (long)qlen;
+                        any = true;
+                    }
+                }
+            }
+            else
+            {
+                const char *qual = " [[sample_perspective]]";
+                size_t qlen = strlen(qual);
+                rs_str_insert(&b, semi + delta, qual);
+                delta += (long)qlen;
+                any = true;
+            }
+        }
+        pos = semi + 1;
+    }
+
+    if (!any)
+    {
+        free(b.s);
+        return NULL;
+    }
+    return b.s;
+}
+
 char *mgl_rstate_patch_fragment_msl(const char *msl, const char *entry)
 {
     rs_entry e;
     char pc[128], sm[128];
     long struct_open = -1;
 
-    if (!msl || !entry || mgl_rstate_msl_is_patched(msl)) return NULL;
-    if (!rs_find_entry(msl, entry, &e)) return NULL;
+    if (!msl || !entry || mgl_rstate_msl_is_patched(msl)) return NULL;    if (!rs_find_entry(msl, entry, &e)) return NULL;
 
     bool returns_struct = e.ret_type[0] && strcmp(e.ret_type, "void") &&
                           rs_struct_member_with_attr(msl, e.ret_type, NULL, NULL, 0, &struct_open) &&
@@ -753,7 +889,14 @@ static bool rs_program_has_flat(GLMContext ctx)
     static int next;
     for (int i = 0; i < 64; i++)
         if (cache[i].msl == msl && memcmp(cache[i].head, msl, 32) == 0) return cache[i].has;
-    bool has = strstr(msl, "[[flat]]") != NULL;
+    /* SPIRV-Cross writes the qualifiers comma-separated inside one attribute
+     * bracket: a located flat input is `[[user(locn0), flat]]`, an unlocated one
+     * `[[flat]]` (and `[[flat, user(locnN)]]` for the other order).  Probing only
+     * for `[[flat]]` missed every located varying, so the provoking-vertex index
+     * rotation never ran and flat inputs took Metal's first vertex instead of
+     * GL's last (glDrawElementsBaseVertex + flat colour showed vertex 0's id). */
+    bool has = strstr(msl, "[[flat") != NULL || strstr(msl, " flat]]") != NULL ||
+               strstr(msl, "flat, ") != NULL;
     cache[next].msl = msl;
     memset(cache[next].head, 0, 32);
     memcpy(cache[next].head, msl, 32);

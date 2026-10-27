@@ -20,6 +20,12 @@
 # with the old order 50000 us makes the flash near-constant and the check
 # fails immediately; with the fixed order the same probe must still pass).
 set -u
+# one glmark2 on the machine at a time: the whole check (launch -> capture ->
+# kill) is one glmark2 session, so re-exec under the shared lock (supervisor
+# note 01:18 EDT: overlapping glmark2 runs skew every luminance/FPS number).
+if [ -z "${MGL_FLASH_LOCK:-}" ]; then
+    MGL_FLASH_LOCK=1 exec /usr/bin/lockf -k /tmp/mgl_glmark2.lock /bin/bash "$0" "$@"
+fi
 WT="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="${1:-$WT/build/nsgl/libmgl_nsgl.dylib}"
 TAG="${2:-FLCHK}"
@@ -63,15 +69,15 @@ python3 - "$n" "$D/frames" <<'EOF'
 import sys, glob
 n, d = int(sys.argv[1]), sys.argv[2]
 W, H = 80, 63
-vals = []
-for f in sorted(glob.glob(d + '/*.raw')):
+frames = []                            # (mean, data) — keep the pixels: a flash must
+for f in sorted(glob.glob(d + '/*.raw')):   # correlate with the scene it flashes OVER
     data = open(f, 'rb').read()
-    vals.append(sum(data) / (W * H))
-if len(vals) < 50:
-    print(f"FAIL: only {len(vals)} usable captures (window not frontmost?)"); sys.exit(1)
-head = vals[:120]                     # skip any end-of-run score page
-vs = sorted(head); med = vs[len(vs) // 2]
-covered = sum(1 for v in head if v > 230)
+    frames.append((sum(data) / (W * H), data))
+if len(frames) < 50:
+    print(f"FAIL: only {len(frames)} usable captures (window not frontmost?)"); sys.exit(1)
+head = frames[:120]                     # skip any end-of-run score page
+vals = [v[0] for v in head]; vs = sorted(vals); med = vs[len(vs) // 2]
+covered = sum(1 for v in vals if v > 230)
 if covered > len(head) * 0.25:
     print(f"INVALID: {covered}/{len(head)} covered frames (>230) — the window was "
           "occluded during the run (another agent's window / score page); retry"); sys.exit(2)
@@ -81,9 +87,37 @@ if covered > len(head) * 0.25:
 if med > 170 or med < 40:
     print(f"INVALID: scene not visible (median {med:.1f}; window covered or "
           "info/score page) — bring glmark2 to front and retry"); sys.exit(2)
-flash = [round(v, 1) for v in head if v > med + 15]
+
+# A bright frame is only the present-path flash when it still shows the scene:
+# the translucent frame composited over the white backdrop correlates with the
+# neighbouring scene frame.  A flat bright frame that does NOT correlate is a
+# foreign window that covered glmark2 for a moment (parallel agents; below the
+# 25% INVALID threshold) — not a flash of ours.  Compare 255-x so the white
+# backdrop subtracts out.
+def corr(a, b):
+    ma = sum(a) / len(a); mb = sum(b) / len(b)
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = sum((x - ma) ** 2 for x in a); db = sum((y - mb) ** 2 for y in b)
+    return num / ((da * db) ** 0.5) if da > 0 and db > 0 else 0.0
+
+flash, foreign = [], []
+last_scene = None
+for i, (m, data) in enumerate(head):
+    # i<12: the scene's fade-in still brightens the first captures (the mean
+    # crosses 131..115 on the way down) — not a present-path artifact
+    if m > med + 15 and i >= 12:
+        inv = [255 - x for x in data]
+        if last_scene is not None and corr(inv, last_scene) > 0.35:
+            flash.append(round(m, 1))
+        elif m > 230:
+            foreign.append(round(m, 1))   # covered by a foreign window: not our flash
+        else:
+            flash.append(round(m, 1))     # bright, structured, no reference: count it
+    if m < 170:
+        last_scene = [255 - x for x in data]
 print(f"flash_check: n={len(head)} median={med:.1f} min={vs[0]:.1f} max={vs[-1]:.1f} "
-      f"frames>med+15: {len(flash)}")
+      f"frames>med+15: {len(flash) + len(foreign)}"
+      + (f" ({len(foreign)} foreign-window)" if foreign else ""))
 if flash:
     print(f"FAIL: {len(flash)} flash frames: {flash[:10]}")
     sys.exit(1)

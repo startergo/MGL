@@ -531,6 +531,28 @@ static bool rs_mode_is_polygon(GLenum m)
         [cv setConstantValue:&per_sample type:MTLDataTypeBool atIndex:MGL_RS_FC_PER_SAMPLE];
         uint32_t psamples = (uint32_t)MAX(samples, 1);
         [cv setConstantValue:&psamples type:MTLDataTypeUInt atIndex:MGL_RS_FC_PIPELINE_SAMPLES];
+        /* per-sample shading needs sample-qualified interpolants: Metal evaluates
+         * center-qualified stage inputs once per pixel even when the function
+         * reads [[sample_id]], so every sample of a pixel would shade to the same
+         * color (GL_SAMPLE_SHADING, KHR-GL46.sample_shading).  Swap in the
+         * sample-qualified variant of this MSL, compiled lazily and cached by
+         * text — only programs actually drawn with sample shading pay for it. */
+        char *pss_msl = NULL;
+        if (per_sample)
+        {
+            pss_msl = mgl_rstate_pss_fragment_msl(msl, [base.name UTF8String]);
+            if (pss_msl)
+            {
+                id<MTLLibrary> plib = [self extProgramLibraryForMSL: pss_msl key: nil error: nil];
+                id<MTLFunction> pfn = plib ? [plib newFunctionWithName: base.name] : nil;
+                if (pfn)
+                {
+                    lib = plib;
+                    base = pfn;
+                    msl = pss_msl;
+                }
+            }
+        }
         /* same as above: function pointer + MSL checksum, so a reused library address
          * cannot resurrect a deleted program's fragment function */
         {
@@ -538,6 +560,7 @@ static bool rs_mode_is_polygon(GLenum m)
             if (msl) { for (const char *q = msl; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; } }
             key = [NSString stringWithFormat:@"%p:%p:%llx:f:%d:%x:%d:%u", lib, base, (unsigned long long)h, lower, mask, per_sample, psamples];
         }
+        free(pss_msl);
     }
 
     MGLRSCache *c = [self rstateCache];

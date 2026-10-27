@@ -1587,19 +1587,25 @@ static char *rewrite_vs_kernel(const char *msl)
         len += plen;
     }
 
-    /* GL id semantics (replaces the uses of the removed locals) */
+    /* GL id semantics (replaces the uses of the removed locals).  The
+     * replacements must stay valid MSL: `as_uint' is an OpenCL/HLSL builtin
+     * (Metal spells it as_type<uint>()), and no cast is needed anyway —
+     * gl_GlobalInvocationID and mgl_vs_params are already uint, so a plain
+     * expression is type-correct (KHR-GL46.draw_elements_base_vertex_tests.
+     * AEP_shader_stages links a tess VS that reads gl_InstanceID and failed
+     * with "use of undeclared identifier 'as_uint'"). */
     buf_replace(&out, &len, &cap,
                 "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + spvDispatchBase.x);",
-                "uint gl_VertexID = as_uint(gl_GlobalInvocationID.x + mgl_vs_params[0]);");
+                "uint gl_VertexID = gl_GlobalInvocationID.x + mgl_vs_params[0];");
     buf_replace(&out, &len, &cap,
                 "uint gl_VertexID = gl_GlobalInvocationID.x + spvDispatchBase.x;",
                 "uint gl_VertexID = gl_GlobalInvocationID.x + mgl_vs_params[0];");
     buf_replace(&out, &len, &cap,
                 "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y + spvDispatchBase.y);",
-                "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y);");
+                "uint gl_InstanceID = gl_GlobalInvocationID.y;");
     buf_replace(&out, &len, &cap,
                 "uint gl_InstanceID = gl_GlobalInvocationID.y + spvDispatchBase.y;",
-                "uint gl_InstanceID = as_uint(gl_GlobalInvocationID.y);");
+                "uint gl_InstanceID = gl_GlobalInvocationID.y;");
 
     /* append the params parameter to the kernel signature */
     {

@@ -200,6 +200,22 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
             target == _currentCommandBuffer)
             return;                     /* cannot commit our own encoding buffer: nothing to wait on */
 
+        /* an abandoned buffer — error recovery (resetMetalState) dropped the
+         * current command buffer uncommitted and nil'd it out — will never run,
+         * and waitUntilCompleted on it blocks forever (seen as a 0%-CPU wedge
+         * after a pipeline-creation failure).  Commit what is recorded in it so
+         * it can complete; if even that fails, give up on its serial instead of
+         * hanging the context. */
+        if (target.status < MTLCommandBufferStatusCommitted)
+        {
+            @try { [target commit]; } @catch (NSException *) { }
+            if (target.status < MTLCommandBufferStatusCommitted)
+            {
+                atomic_max_u64(&p->completed, target_serial);
+                return;
+            }
+        }
+
         // one in-order queue: completion of this buffer implies earlier ones completed
         [target waitUntilCompleted];
         atomic_max_u64(&p->completed, target_serial);

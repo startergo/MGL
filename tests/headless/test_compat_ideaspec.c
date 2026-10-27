@@ -192,10 +192,8 @@ TEST(ideas_respec_shape_cpu)
             glUniformMatrix4fv(loc_nm, 1, GL_FALSE, mvp);
             glUniform4f(loc_c, 0.4f, 0.5f, 0.6f, 1.0f);
             glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
-#ifdef IDEASPEC_ARRAYS
             for (int d = 1; d < MGL_IDEASPEC_EXTRA; d++)
-                glDrawArrays(GL_TRIANGLES, d * 6, 12);
-#endif
+                glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, (void *)(long)(d * 8));
         }
     }
     uint64_t wall1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);

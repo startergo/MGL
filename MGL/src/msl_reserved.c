@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdbool.h>
 #include "spirv.h"
 #include "msl_reserved.h"
 
@@ -450,6 +451,84 @@ char *mgl_msl_fix_cull_distance(const char *msl)
     return o;
 }
 
+
+/* See the header.  GLSL's interpolateAtOffset(x, o) takes the offset from the
+ * pixel CENTER; Metal's interpolate_at_offset takes it from the pixel's
+ * upper-left corner (verified on this GPU: the SPIRV-Cross bias below maps GL
+ * (0,0) to 7/16 from the corner = 1/16 px short of the center), quantized to
+ * the 1/16 pixel grid.  SPIRV-Cross emits `.interpolate_at_offset(o + 0.4375)'
+ * (0.5 - 1/16, its closest stand-in for the center), which leaves a systematic
+ * 1/16-pixel error — KHR-GL46.shader_multisample_interpolation.render.
+ * interpolate_at_offset_check (offset = gl_SamplePosition - 0.5, tolerance
+ * 1/255) rejects it.  GL offsets live in (-0.5, 0.5) and sample positions sit
+ * on the 1/16 grid, so `+ 0.5' is the exact translation; the hardware accepts
+ * the full [0, 1) corner range (measured up to 13/16).  Rewrite the bias in
+ * every interpolate_at_offset call tail. */
+char *mgl_msl_fix_interpolate_at_offset(const char *msl)
+{
+    static const char kCall[] = ".interpolate_at_offset(";
+    static const char kBias[] = " + 0.4375)";
+    static const char kFix[]  = " + 0.5)";
+
+    if (!msl) return NULL;
+    const char *p = msl;
+    bool any = false;
+    while ((p = strstr(p, kCall)) != NULL)
+    {
+        const char *open = p + strlen(kCall) - 1;      /* the argument '(' */
+        int depth = 1;
+        const char *q = open + 1;
+        while (*q && depth > 0)
+        {
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            q++;
+        }
+        if (depth == 0)
+        {
+            size_t blen = strlen(kBias);
+            if ((size_t)(q - p) > blen && strncmp(q - blen, kBias, blen) == 0)
+                any = true;
+        }
+        p = q;
+    }
+    if (!any)
+        return NULL;
+
+    /* one replacement pass */
+    char *out = malloc(strlen(msl) + 1);
+    if (!out) return NULL;
+    const char *s = msl;
+    char *d = out;
+    p = msl;
+    while ((p = strstr(p, kCall)) != NULL)
+    {
+        const char *open = p + strlen(kCall) - 1;
+        int depth = 1;
+        const char *q = open + 1;
+        while (*q && depth > 0)
+        {
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            q++;
+        }
+        size_t blen = strlen(kBias);
+        if (depth == 0 && (size_t)(q - p) > blen && strncmp(q - blen, kBias, blen) == 0)
+        {
+            size_t head = (size_t)(q - s) - blen;
+            memcpy(d, s, head);
+            d += head;
+            memcpy(d, kFix, strlen(kFix));
+            d += strlen(kFix);
+            s = q;
+            p = q;
+        }
+        else
+            p = q;
+    }
+    strcpy(d, s);
+    return out;
+}
 
 /* See the header.  KHR-GL46.draw_indirect.advanced-twoPass-transformFeedback-*
  * compiles `min(4, gl_VertexID)' — the mixed int/uint overload is ambiguous. */

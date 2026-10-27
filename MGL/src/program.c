@@ -2169,6 +2169,18 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     {
         ptr->spirv[stage].msl_str = strdup(result);
     }
+    /* interpolateAtOffset is fragment-only and center-relative in GLSL while
+     * Metal's is corner-relative; SPIRV-Cross's `+ 0.4375' bias is 1/16 px
+     * short of the pixel center (see msl_reserved.c). */
+    if (stage == _FRAGMENT_SHADER)
+    {
+        char *fixed = mgl_msl_fix_interpolate_at_offset(ptr->spirv[stage].msl_str);
+        if (fixed)
+        {
+            free(ptr->spirv[stage].msl_str);
+            ptr->spirv[stage].msl_str = fixed;
+        }
+    }
     /* glslang types gl_VertexID / gl_InstanceID as SIGNED int (the GL builtins),
      * but SPIRV-Cross hardcodes `uint` for the [[vertex_id]]/[[instance_id]]
      * parameters (Metal requires uint for those attributes) while the

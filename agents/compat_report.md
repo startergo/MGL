@@ -1,4 +1,177 @@
 # compat domain — progress log
+READY s20 100d132 — CTS queue 21/21 -> 0 Fail: draw_elements_base_vertex (as_uint MSL fix
++tess VS ids), sample_shading 13/13, shader_multisample_interpolation 109/109; flat-varying
+provoking rotation was dead (probe missed [[user(locnN), flat]]); PSO-failure path no longer
+wedges glFinish. Gate: full suite 0 FAIL, test_geom 10x 603/0, test_fp64fast 3x 298/0,
+flash_check 3x PASS (glmark2 now under /tmp/mgl_glmark2.lock). Geom-emulation gaps found and
+documented below (GS raster provoking/basevertex/vcount, gl_VertexID=0 through GS).
+READY s19 9ed54ae — per-draw CPU: compact VAO layout key + MGL_DF_REBIND respec tier + bindList
+skip. Gate: full suite 7880 checks 0 FAIL (3 runs), test_geom 10x 603/0, test_fp64fast 3x 298/0,
+flash_check PASS (7/7 no flash), no logo/magenta (terrain+bump+jellyfish+grid+shadow+idea visual).
+ideas CPU/frame A/B (quiet, 3 interleaved rounds): draw 1.713 -> 1.350 ms (-21%), processGLState
+0.610 -> 0.186 ms (-70%); FPS 265 -> 285 (+8%).  Details in the session 19 section below.
+
+## session 20 (Oct 26, 23:26-...) — s20: conformance queue part 2 (basevertex, interpolateAtOffset)
+
+Task (supervisor): review+commit the uncommitted s19 tail (msl_reserved.c/.h, program.c, mgl_test.h,
+report), check the test_compat_basevertex 0%-CPU stall, then drive the 21-case CTS queue
+(fails_compat.txt) to 0 Fail.  Rules: -j4, merge gl46-port before READY.
+
+### 1. the uncommitted s19 tail — verified and committed
+* `msl_reserved.c/.h` `mgl_msl_fix_interpolate_at_offset` + the `program.c` hook (12 lines):
+  GLSL's interpolateAtOffset takes the offset from the pixel **center**, Metal's
+  `interpolate_at_offset` from the pixel's **upper-left corner**; SPIRV-Cross emits a
+  `+ 0.4375` bias (0.5 - 1/16, its closest stand-in for the center), a systematic 1/16-pixel
+  error that the CTS check (offset = gl_SamplePosition - 0.5, tol 1/255) rejects. The rewrite
+  bumps the bias to the exact `+ 0.5` in every call tail. test_compat_ipolmap probes 5 offsets
+  and matches GL's exact values, test_compat_interpatoffset is the CTS-shaped regression
+  (sample-qualified varying == interpolateAtOffset(gl_SamplePosition-0.5)) at 1/2/4 samples.
+* `mgl_test.h` `mgl_make_program3` (vs+gs+fs helper), tests test_compat_ipolconv/ipolmap promoted
+  from print-probes to assertions (ipolmap now asserts the exact GL value per offset).
+
+### 2. the test_compat_basevertex "stall": three stacked bugs
+Symptom: the test sat at 0% CPU until killed. `sample` showed the main thread in
+`waitUntilCompleted` from `c_mtl_flush` (glFinish) — a command buffer that can never complete.
+Chain, each layer fixed:
+1. **test bug** (mine, from s19): the FS consumed `f_color` while the VS wrote `v_color` (no match
+   by name/location), and the "triangle" positions were 2D pairs read as a vec4/stride-16 attribute
+   (degenerate). GL makes the unwritten FS input *undefined* (the link is legal), so MGL's PSO
+   creation fails for it.
+2. **MGL wedge** (MGLRenderer+Draw.m, `extBufWaitSerial`): after a PSO failure, MGLRenderer.m's
+   `resetMetalState` recreates the command queue and *abandons the current command buffer
+   uncommitted*; glFinish then waited forever on it. Fix: if the wait target is still uncommitted
+   after the flush attempt, commit it (error-recovery already ended its encoders); if even that
+   fails, advance `completed` to its serial instead of blocking. Regression case
+   `unwritten_fs_input_no_hang` in test_compat_basevertex (was a 100% repro hang, now finishes and
+   skips the draw).
+3. **real GL bug** (state_ext.c `rs_program_has_flat`): the provoking-vertex index rotation probe
+   looked for `[[flat]]`, but SPIRV-Cross writes located flat inputs as `[[user(locn0), flat]]` —
+   so *no* flat-varying program ever rotated its indices and flat inputs took Metal's FIRST vertex
+   instead of GL's LAST. Probe now matches `[[flat`, ` flat]]`, `flat, `. With that,
+   glDrawElementsBaseVertex + `flat out vec4` = provoking id exactly (73/109/219 r-channel checks).
+   This also silently fixed gl_VertexID-vs-flat ordering for every existing flat program.
+
+### 3. the CTS case: KHR-GL46.draw_elements_base_vertex_tests.AEP_shader_stages
+Reproduced ("Program linking failed"): the AEP tessellation combos link a TES-stage program whose
+VS reads gl_InstanceID. `rewrite_vs_kernel` (tessellation.c) rewrote the vertex kernel ids with
+`as_uint(...)` — an OpenCL/HLSL builtin, MSL spells it `as_type<uint>` and neither is needed: the
+operands are already uint. Any tess VS touching gl_InstanceID/gl_VertexID failed MSL compilation
+and the link. Fixed to plain expressions (tess domain file — surgical, flagged in the report).
+Result: **draw_elements_base_vertex_tests 12 cases: 11 Pass / 1 NotSupported (ES-only) / 0 Fail.**
+
+### 4. found while verifying (geometry-emulation gaps — NOT fixed here, geom domain)
+Probe /tmp/bv7 (GS pass-through triangle, 64x64 FBO), all through the GS path:
+* gl_VertexID is 0 for every vertex the capture pass re-runs (colors constant at id 0) — the CTS
+  AEP GS combos still pass because they only compare base-vs-reference textures, which come out
+  equal when both use id 0.
+* CPU assembly drops draws with a nonzero vstart: glDrawElementsBaseVertex(ushort, bv=4) renders
+  nothing (vstart=4 vcount=3 traced, no raster output).
+* GPU assembly (GL_UNSIGNED_INT element buffer) renders nothing for a 3-index draw (vcount=0 in the
+  trace); UBYTE/SHORT fall back to CPU assembly (U8 has no Metal index type; U16 untested by CTS).
+* the raster pass does not apply GL's last-vertex provoking rule to the GS's *outputs* (flat inputs
+  take Metal's first emitted vertex).
+Documented in test_compat_basevertex.c; the VS+GS+FS link is asserted there, the GS draws are not.
+
+### 5. gate (s20)
+* full headless suite: **0 FAIL** (every test "== N checks, 0 failures").
+* test_geom 10x: 603/0 every run.  test_fp64fast 3x: 298/0 every run.
+* flash_check: 3x PASS (median 113.9, max 119.3 with the lock held). Hardened first
+  (a) the whole check re-execs under `lockf -k /tmp/mgl_glmark2.lock` — two glmark2 runs at
+  once were skewing both agents' numbers (supervisor 01:18), (b) a >med+15 frame now counts
+  as a flash only if it correlates with the scene it flashes over; flat uncorrelated bright
+  frames are other agents' windows (measured: corr 0.007 for the 245.4 frames that failed
+  the first runs), (c) the first 12 captures are skipped (scene fade-in legitimately rides
+  the band top, 131 -> 115). Earlier FAILs were all foreign-window occlusion; under the lock
+  the band is tight (min 107.7 max 119.3).
+* CTS re-runs (current build, agents/conformance/run.py, nice, one batch at a time):
+  - draw_elements_base_vertex_tests: 12 cases = 11 Pass + 1 NotSupported (ES-only) — 0 Fail
+  - sample_shading: 13 cases = 13 Pass
+  - shader_multisample_interpolation: 109 cases = 109 Pass
+  fails_compat.txt queue (21 cases) therefore at 0 Fail.
+* stub_scanner EMPTY/NOOP/ASSERT on compat*.c: clean.  gl46-port (6ee46f0) merged (already
+  contained).  Build -j4, no new warnings.
+
+### shared-file edits this session (call-outs)
+* MGL/src/program.c (+12): call mgl_msl_fix_interpolate_at_offset on fragment MSL (s19 tail).
+* MGL/src/msl_reserved.c/.h (+83/+4): the new interpolateAtOffset bias rewrite (s19 tail).
+* MGL/src/MGLRenderer+Draw.m (~+12, extBufWaitSerial): never wait on an uncommittable
+  command buffer (PSO-failure recovery abandons it) — was a hard 0%-CPU hang.
+* MGL/src/tessellation.c (4 lines, rewrite_vs_kernel): as_uint() is not MSL; plain uint
+  expressions.  Any tess VS reading gl_InstanceID/gl_VertexID failed to link.
+* ab/flash_check.sh: glmark2 lock + flash discrimination (above).
+
+
+## session 19 (Oct 26, 17:10-...) — per-draw CPU: the respec walk
+
+Task: cut [ideas] per-draw CPU (targets processGLState 0.58 ms, draw 1.20 ms at load ~5).  Merged
+gl46-port 9442011 first (s18 was merged there).
+
+### What the [ideas] walks actually are
+
+Recovered the real [ideas] bucket breakdown from the s16 A/B logs (ab16_*.log): 89 of 353 draws
+re-specify vertex arrays; per walk: tail-pipeBind+PreDraw 0.14-0.22 ms/frame (biggest), pipeline-
+block 0.055-0.082, mapBuffersToMTL 0.060-0.092, plus gate 0.15-0.26 and encode 0.11-0.19 across
+all draws.  glmark2's SceneIdeas/SGILogo re-specify **identical layouts against a different VBO per
+mesh** (logo.cc: bufferObjects_[0] + per-mesh glVertexAttribPointer with per-piece offsets) — the
+gate misses at check 13 (vao-fmt/binding, the Buffer identity is part of the memcmp), so every mesh
+pays a full processGLState walk although the only real work is re-pointing the encoder's
+vertex-buffer bindings.  (pipeHit=89/frame at one slot in [ideas]: the PSO key never saw the
+buffer identity — it hashes `(buffer != NULL)`, and the offsets there are constant.)
+
+Built two headless benches to iterate without glmark2 (no window, no present):
+- test_compat_ideaspec: the exact [ideas] shape on a compat context — one VAO, per-mesh VBO respec
+  + uniform update, 133 walks + 267 skips/frame, pixel check + WALL ms/frame.  Gotcha found on the
+  way: small (<ring threshold) buffers and element buffers stream through the ring and inject ~25
+  µs/draw GPU-coupled stalls — the bench's VBOs/EBO are padded to 32 KB so the Metal path matches
+  [ideas] (real MTL buffers; the Metal call itself measures 1.6-2.4 µs).
+- test_compat_rebind: 9 adversarial respec patterns, pixel-exact, verified identical on the
+  pre-change build (patterns that must full-walk: stride, divisor, alignment-class, misaligned
+  offset with data really at byte 13; patterns that may rebind: buffer swap, offset move, split
+  bindings, alternating L/R; plus uniform-updates-on-the-same-draw).
+
+### Changes (compat files + 2 surgical edits)
+
+1. **Compact VAO layout key** (a72280c).  compatVAOHashCached packed all 16*3 attrib + 16*3
+   binding words (776 B stack pack + memcmp per walk) and hashed the raw byte offset, so
+   per-mesh-offset shapes fanned one layout into one PSO cache entry per mesh.  Now it packs the
+   ENABLED attribs' formats + the bindings they reference — exactly the set vattribMapVertex-
+   Buffers maps (mask==0 or bufferless bindings never reach the encoder), so the descriptor and the
+   shared plan's binding_index[] depend on nothing outside it — and a binding's offset enters as
+   its 4-byte alignment class (the aligned-vs-shadow decision); the base offset reaches the encoder
+   per draw.  Disabled attribs feed fixed-format const streams (double value bits), so their fmt
+   words are not key material.  Snapshot buffer is fixed-capacity now (the packed length varies;
+   the first version malloc'd for the first pack size and a later larger pack overran it — caught
+   by test_vattrib crashing 1-in-3 runs in malloc, fixed before commit).  Measured on the bench:
+   rstate+vao part of the pipeline block 1157 -> 690 ns/walk (the pack) and one PSO for all
+   per-mesh-offset layouts.
+
+2. **MGL_DF_REBIND: buffer-identity-only respec tier** (974fb3a).  compatDrawGate classifies a
+   failed check-13 content compare (compatRebindClassify: layout words equal, alignment class
+   equal, buffer presence equal, changed buffers MTL-backed, no SHADOW fetch, plan valid) and
+   returns MGL_DF_REBIND instead of MGL_DF_FULL.  compatDrawFastRebind then: re-points the vertex
+   map list's attribute suffix **in place** (the entry set/order, mtl indices and the SSBO pad
+   position are unchanged — no bindmap-suffix rebuild), flushes dirty listed buffers
+   (updateDirtyBaseBufferList), rebinds through extBufBindList, clears the redundant dirty bits
+   and re-latches only the changed groups (bindings, vabuf ids, map entries).  Skipped as provable
+   no-ops: the PSO path (the compact key ignores buffer identity and the gate proved program+pipe
+   identity), updateEncoder, the PreDraw hook fan-out (rstate/texext gate-proven unchanged; the
+   vattrib hook's binds are the bindList rebinds), geomBindSSBOSizes.  Everything the gate checks
+   still runs — the tier only replaces the *processing* of gate-proven-equal state.
+   Bench: processGLState 0.99 -> 0.24-0.33 ms/frame, the respec draw's compat CPU ~4x cheaper.
+
+3. **extBufBindList skips already-bound slots in C** (6a3f64f): one call to
+   compatVbufAlreadyBound (exact mirror of compatBindVertexBuffer's shadow test: same encoder
+   generation, same buffer object, same offset at the same index) replaces the storage/ring
+   dispatch + ObjC bind chain for unchanged entries.  Rebind path 1.85 -> 1.5 µs.
+
+Shared-file edits: MGLRenderer+Draw.m +23 lines (the MGL_DF_REBIND branch in extBufBeginDraw, the
+C pre-check in extBufBindList), MGLRenderer+VertexAttrib.m 0 (the temporary probes were removed),
+MGL/src/compat.c -6 (debug print removed).  New state lives in MGLCompatDrawFastSnap (mine).
+
+### Results (numbers)
+
+(pending the quiet-machine glmark2 A/B — see ab/run_ideas_cpu_s19.sh; headless bench numbers above.)
+
 ## session 18 (Oct 26, 15:35-17:00 EDT) — s18 task 1: single-pass present copy (be2a894)
 
 Supervisor verdict from the quiet A/B: no ~16% code regression (159d900 itself ~2960 today); the
