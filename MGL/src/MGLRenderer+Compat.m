@@ -291,40 +291,65 @@ static uint64_t compatVAOHash(GLMContext ctx)
  * inputs, so two VAOs with identical layouts validate each other's entry. */
 #define MGLC_VAO_LAYOUT_WORDS  (1 + MAX_ATTRIBS * 3 + MGL_VA_MAX_BINDINGS * 3)
 
+/* VAO layout hash for the pipeline key.  Session 19 compaction: only the
+ * layout-relevant words are packed — the ENABLED attribs' formats plus the
+ * bindings those attribs reference (exactly the set vattribMapVertexBuffers
+ * maps, so the PSO descriptor and the shared plan's binding_index[] depend on
+ * nothing outside it: a disabled attrib feeds a fixed-format const stream
+ * (double value bits, current-value content is not pipeline state), and a
+ * binding no enabled attrib references never reaches the encoder).  A vertex
+ * buffer's base byte offset reaches the encoder per draw (setVertexBuffer, read
+ * live from va->binding[]), so only its 4-byte alignment class — the
+ * aligned-vs-shadow fetch decision — is hashed.  glmark2-style per-mesh offsets
+ * used to fan 89 same-layout meshes out into 89 distinct PSO keys; they now
+ * share one.  Word order is deterministic (attrib index order, binding index
+ * order), so equal byte sequences mean equal relevant layouts. */
 static uint64_t compatVAOHashCached(struct MGLExtMetal_compat *m, GLMContext ctx)
 {
     VertexArray *vao = ctx->state.vao;
     MGLVertexArrayFull *va = mgl_va_full(vao);
     uint64_t w[MGLC_VAO_LAYOUT_WORDS];
-    w[0] = vao->enabled_attribs;
+    unsigned nw = 0;
+    GLuint used = 0;
+    w[nw++] = (uint64_t)vao->enabled_attribs;
     for (GLuint i = 0; i < MAX_ATTRIBS; i++)
     {
+        if (!(vao->enabled_attribs & (1u << i)))
+            continue;
         MGLVertexAttribFormat *f = &va->fmt[i];
-        uint64_t *a = &w[1 + 3 * i];
+        if (f->binding < MGL_VA_MAX_BINDINGS)
+            used |= 1u << f->binding;
+        uint64_t *a = &w[nw];
         a[0] = (uint64_t)f->size | ((uint64_t)f->type << 32);
         a[1] = (uint64_t)f->normalized | ((uint64_t)f->integer << 8) |
                ((uint64_t)f->is_long << 16) | ((uint64_t)f->binding << 32);
         a[2] = (uint64_t)f->relativeoffset;
+        nw += 3;
     }
     for (GLuint i = 0; i < MGL_VA_MAX_BINDINGS; i++)
     {
+        if (!(used & (1u << i)))
+            continue;
         MGLVertexBinding *b = &va->binding[i];
-        uint64_t *a = &w[1 + 3 * MAX_ATTRIBS + 3 * i];
+        uint64_t *a = &w[nw];
         a[0] = (uint64_t)(b->buffer != NULL);         /* bufferless -> constant stream */
-        a[1] = (uint64_t)b->offset;                   /* %4 feeds the aligned-fetch decision */
+        a[1] = (uint64_t)(b->offset & 3);             /* alignment class: aligned-fetch decision */
         a[2] = (uint64_t)b->stride | ((uint64_t)b->divisor << 32);
+        nw += 3;
     }
-    const size_t bytes = sizeof w;
+    const size_t bytes = nw * sizeof w[0];
     uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < MGLC_VAO_LAYOUT_WORDS; i++)
+    for (unsigned i = 0; i < nw; i++)
         h = (h ^ w[i]) * 1099511628211ULL;
     if (!m)
         return h;
     if (m->vaokey.len == bytes && m->vaokey.snap &&
         memcmp(m->vaokey.snap, w, bytes) == 0)
         return m->vaokey.hash;
+    /* fixed-capacity snapshot: the packed word count varies with the enabled
+     * set, so a shrink followed by a grow must not outgrow the allocation */
     if (!m->vaokey.snap)
-        m->vaokey.snap = (uint8_t *)malloc(bytes);
+        m->vaokey.snap = (uint8_t *)malloc(MGLC_VAO_LAYOUT_WORDS * sizeof w[0]);
     if (m->vaokey.snap)
     {
         memcpy(m->vaokey.snap, w, bytes);
@@ -658,7 +683,7 @@ static const void *kCompatPipeBindKey = &kCompatPipeBindKey;
 /* per-draw counters for the profiler: skipped vs issued Metal argument binds */
 uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 /* compat perf session 12: per-draw state-walk fast-path hit/miss counters */
-uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss;
+uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
 
 /* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
  * mapBuffersToMTL (MGLRenderer.m) re-enumerates the program's SPIR-V buffer
@@ -1117,6 +1142,49 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
  * listed buffer, so a real change shows up as a listed-buffer dirty bit) */
 #define MGL_DF_REDUNDANT (DIRTY_VAO | DIRTY_TEX_BINDING | DIRTY_BUFFER_BASE_STATE | DIRTY_IMAGE_UNIT_STATE)
 
+/* session 19: does a failed fmt/binding content check differ from the snapshot
+ * ONLY by which buffer object each binding owns (and its base offset)?  Such a
+ * respec (glmark2 Mesh::draw: every mesh re-specifies identical layouts against
+ * its own VBO) needs no pipeline work: the PSO key (compacted: enabled formats
+ * + referenced bindings + alignment class), the plan, the map enumeration and
+ * every other gate group are unchanged — only the encoder's vertex-buffer
+ * bindings and the map-suffix entries move. */
+static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct MGLCompatDrawSnap *s)
+{
+    const struct MGLExtState_vattrib *vs =
+        (const struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+
+    /* shadow (converted) streams are re-encoded from the bound buffer's bytes
+     * by the vattrib PreDraw hook on every walk: a respec that moves the
+     * buffer needs that rebuild, so only direct/const fetches may rebind */
+    if (vs)
+        for (int a = 0; a < MAX_ATTRIBS; a++)
+            if (vs->plan.fetch[a] == MGL_VA_FETCH_SHADOW)
+                return false;
+
+    for (GLuint a = 0; a < MAX_ATTRIBS; a++)
+    {
+        const MGLVertexAttribFormat *f = &va->fmt[a], *g = &s->fmt[a];
+        if (f->binding != g->binding || f->size != g->size || f->type != g->type ||
+            f->normalized != g->normalized || f->integer != g->integer || f->is_long != g->is_long ||
+            f->relativeoffset != g->relativeoffset || f->pointer_stride != g->pointer_stride)
+            return false;
+    }
+    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+    {
+        const MGLVertexBinding *B = &va->binding[b], *G = &s->binding[b];
+        if ((B->buffer != NULL) != (G->buffer != NULL))
+            return false;                   /* bufferless <-> buffered: fetch mode change */
+        if (B->stride != G->stride || B->divisor != G->divisor)
+            return false;                   /* layout word change: new PSO key */
+        if ((B->offset & 3) != (G->offset & 3))
+            return false;                   /* alignment class change: new PSO key */
+        if (B->buffer && B->buffer != G->buffer && !B->buffer->data.mtl_data)
+            return false;                   /* ring-backed stream: the full walk re-streams */
+    }
+    return true;
+}
+
 - (int) compatDrawGate: (bool) allowDirtyListBuffers
 {
     struct MGLExtMetal_compat *m = compatMetal(ctx);
@@ -1132,6 +1200,7 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
 
 #define MGL_DF_MISS(_why_) do { if (df) df->misswhy[_why_]++; mgl_compat_fast_miss++; return MGL_DF_FULL; } while (0)
 
+    bool rebind = false;                    /* session 19: buffer-identity-only respec */
     if (!df || !(s = &df->snap)->valid || !m->enabled)
         MGL_DF_MISS(0);
 
@@ -1275,7 +1344,17 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
                 MGL_DF_MISS(12);
             if (memcmp(va->fmt, s->fmt, sizeof(s->fmt)) != 0 ||
                 memcmp(va->binding, s->binding, sizeof(s->binding)) != 0)
-                MGL_DF_MISS(13);
+            {
+                /* session 19: a respec that only moves a used binding to a
+                 * different buffer object (same layout words, same alignment
+                 * class, buffer-backed) needs nothing but the encoder
+                 * rebind + a map-suffix rebuild: classify it and let the rest
+                 * of the gate run — if nothing else fails we return
+                 * MGL_DF_REBIND instead of a full walk */
+                if (!vs->plan.valid || !compatRebindClassify(ctx, va, s))
+                    MGL_DF_MISS(13);
+                rebind = true;
+            }
         }
         /* session 17: glVertexAttrib* arms no dirty bit, so the gate must
          * detect generic-attrib writes; every writer bumps current_serial
@@ -1306,8 +1385,8 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
             if (buf->data.dirty_bits)
                 MGL_DF_MISS(17);
             if ((buf->data.mtl_data != NULL) != (s->vabuf[b].mtl != NULL) ||
-                buf->size != s->vabuf[b].size ||
-                (buf->data.mtl_data && buf->data.mtl_data != s->vabuf[b].mtl))
+                (!rebind && (buf->size != s->vabuf[b].size ||
+                 (buf->data.mtl_data && buf->data.mtl_data != s->vabuf[b].mtl))))
                 MGL_DF_MISS(18);
         }
     }
@@ -1319,6 +1398,15 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
      * identity), so a clean same-identity draw reads the cached boolean. */
     if (s->tess_active || [self extTessActive])
         MGL_DF_MISS(25);
+
+    /* session 19: a respec that only re-points a used binding at a different
+     * buffer object: rebuild the map suffix + rebind, skip the rest of the
+     * walk (everything else about this draw was gate-proven unchanged) */
+    if (rebind)
+    {
+        mgl_compat_fast_rebind++;
+        return MGL_DF_REBIND;
+    }
 
     /* everything matched: the walk is a no-op except for listed-buffer content
      * (a listed buffer with dirty data needs the ring re-stream) */
@@ -1451,6 +1539,92 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
 
     /* the end-of-draw snapshot stays valid: it records "what was last stamped";
      * if this walk changed the stamped set, the end gate's own compares fail */
+}
+
+/* partial fast path (perf session 19): the vertex-array respec only re-pointed
+ * used bindings at different buffer objects (gate-classified by
+ * compatRebindClassify).  Everything a full walk would do is provably a no-op
+ * except: rebuilding the vertex map list's attribute suffix (the entries must
+ * carry the new buffer objects) and re-binding the changed entries to the
+ * encoder.  The PSO key ignores buffer identity (compacted layout key), the
+ * rstate/texext/vattrib-hook groups were gate-proven unchanged, and the
+ * bindList rebinds below are exactly the vattrib PreDraw hook's own binds. */
+- (bool) compatDrawFastRebind
+{
+    uint64_t t13 = mgl_prof_begin(13);
+
+    struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+    MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+    struct MGLCompatDrawSnap *s = df ? &df->snap : NULL;
+    BufferMapList *list = &ctx->state.vertex_buffer_map_list;
+
+    if (!vs || !va || !s || !ctx->state.vao)
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+
+    /* 1. re-point the vertex map list's attribute suffix at the new buffers.
+     * The entry set and order (hence every mtl index and the SSBO pad
+     * position) are unchanged — the gate proved the used-binding set equal —
+     * so only the buffer-object-derived fields of the mapped entries move. */
+    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+    {
+        int slot = vs->plan.binding_index[b];
+        if (slot < 0 || (GLuint)slot >= list->count)
+            continue;
+        Buffer *nb = va->binding[b].buffer;
+        if (!nb)
+            continue;
+        BufferMap *e = &list->buffers[slot];
+        e->buf = nb;
+        e->offset = va->binding[b].offset;
+        e->size = nb->size;
+    }
+
+    /* 2. flush listed-buffer content and re-bind the changed entries: the
+     * attribute entries carry the new buffers, the bindList shadow setters
+     * issue one setVertexBuffer per changed slot (the exact binds the vattrib
+     * PreDraw hook would make after a full walk) and the ring entries
+     * memcmp-skip unchanged bytes */
+    if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
+        ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list] ||
+        ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
+        ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+
+    compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
+    compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
+
+    /* 3. consume the redundant dirty bits the full walk would clear: the gate
+     * proved every one of their content checks passes for this draw */
+    ctx->state.dirty_bits &= ~MGL_DF_REDUNDANT;
+
+    /* 4. partial re-latch: only the binding records, the map entries and the
+     * per-binding buffer identities changed (fmt, plan, current values,
+     * textures, image units and the rstate generations were all gate-proven
+     * equal, so re-copying them would just memcmp-copy unchanged bytes) */
+    memcpy(s->binding, va->binding, sizeof s->binding);
+    memcpy(s->fmt, va->fmt, sizeof s->fmt);     /* the client pointers moved with the respec */
+    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+    {
+        Buffer *buf = va->binding[b].buffer;
+        if (vs->plan.binding_index[b] < 0 || !buf)
+            continue;
+        s->vabuf[b].buf = buf;
+        s->vabuf[b].mtl = buf->data.mtl_data;
+        s->vabuf[b].size = buf->size;
+    }
+    compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
+    compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
+
+    mgl_prof_end(13, t13);
+    return true;
 }
 
 /* partial fast path (perf session 12): every group except listed-buffer
@@ -1638,6 +1812,22 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
 }
 
 /* -------- real-buffer binds (identity + offset filtered) ------------ */
+
+/* session 19: C-level pre-check for extBufBindList — skips the whole
+ * storage/ring dispatch + ObjC bind call when the compat shadow already has
+ * this (buffer, offset) bound at this index on this encoder.  Mirrors
+ * compatBindVertexBuffer's own shadow test exactly. */
+bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_t offset, void *enc_ptr)
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)enc_ptr;
+    if (!m || !enc || idx >= MGLC_BIND_SLOTS || !mtl || !enc_ptr)
+        return false;
+    struct MGLCompatBindShadow *sh = &m->vbuf[idx];
+    uint64_t gen = compatEncGen(m, enc_ptr);
+    return sh->obj == mtl && sh->offset == offset &&
+           sh->gen == gen && sh->encoder == enc_ptr;
+}
 
 - (void) compatBindVertexBuffer: (id<MTLBuffer>)buf offset: (NSUInteger)offset atIndex: (NSUInteger)idx
 {

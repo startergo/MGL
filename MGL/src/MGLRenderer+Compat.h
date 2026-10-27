@@ -43,7 +43,7 @@ void mgl_compat_cs_drain(GLMContext glm_ctx);
 - (bool) compatBindmapFast: (int) vertex_stage;
 - (void) compatBindmapStore: (int) vertex_stage;
 /* perf session 12 verdicts of compatDrawGate: */
-enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE };
+enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE, MGL_DF_REBIND };
 
 /* perf session 12: per-draw state-walk fast path.  extBufBeginDraw calls
  * compatDrawGate first: when every state group the walk reads still matches
@@ -53,6 +53,12 @@ enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE };
  * extBufEndDraw does the same for the GPU-serial stamps. */
 - (int)  compatDrawGate: (bool) allowDirtyListBuffers;
 - (bool) compatDrawFastBuffers;
+- (bool) compatDrawFastRebind;
+
+/* compat perf (session 19): true when the compat shadow already has this
+ * (buffer, offset) bound at this index on this encoder — used by
+ * extBufBindList to skip the whole storage/ring dispatch for unchanged slots */
+bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_t offset, void *enc_ptr);
 - (bool) compatDrawFastRState;
 - (void) compatDrawLatch;
 - (bool) compatEndDrawFast;

@@ -307,12 +307,20 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
  * for storage / large buffers, setBytes snapshots for small read-only buffers */
 - (bool) extBufBindList: (BufferMapList *) list vertex: (bool) vertex
 {
+    GLMContext ctx_bc = ctx;
     for (GLuint i = 0; i < list->count; i++)
     {
         BufferMap *map = &list->buffers[i];
         Buffer *buf = map->buf;
 
         if (!buf || !buf->data.buffer_data)
+            continue;
+
+        /* compat perf (session 19): already bound at this slot on this
+         * encoder -> the dispatch below would only shadow-skip */
+        if (buf->data.mtl_data && compatVbufAlreadyBound(ctx_bc, map->buffer_base_index,
+                                                         buf->data.mtl_data, (size_t)map->offset,
+                                                         (__bridge void *)_currentRenderEncoder))
             continue;
 
         size_t offset = map->offset > 0 ? (size_t)map->offset : 0;
@@ -377,6 +385,13 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         bool ok = [self compatDrawFastBuffers];
         mgl_prof_end(22, t22);
         return ok;
+    }
+    if (gate == MGL_DF_REBIND)
+    {
+        /* session 19: buffer-identity-only vertex-array respec (see
+         * compatRebindClassify): map suffix + encoder rebind, no walk */
+        mgl_prof_end(22, t22);
+        return [self compatDrawFastRebind];
     }
     if (gate == MGL_DF_RSTATE)
     {
