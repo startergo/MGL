@@ -948,15 +948,23 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         fn = (__bridge id<MTLFunction>)vs_tp->vs_function;
     if ((!fn || fn.functionType != MTLFunctionTypeKernel))
     {
-        /* a SEPARABLE vs-only program (pipeline draw) keeps the plain vertex function:
-         * the tessellation kernel variant was compiled at its link time */
-        if (MGL_PROGRAM_OBJ(program)->separable == GL_TRUE)
-        {
-            id<MTLFunction> kfn = tessPipelineVsKernel(ctx, device, program);
+        /* a vs-only program (pipeline draw, or a program bound with glUseProgram
+         * next to a pipeline's TCS/TES — GL 4.6 §7.3 stage resolution) keeps the
+         * plain vertex function: the tessellation kernel variant comes from the
+         * tess domain's cache.  SEPARABLE programs compiled it at link time; a
+         * non-separable program's module was cached prepared and the kernel MSL
+         * is generated on demand (mgl_tess_vs_kernel_msl inside the pair build —
+         * the same lookup mgl_tess_vs_kernel_fn resolves there) */
+        id<MTLFunction> kfn = tessPipelineVsKernel(ctx, device, program);
 
-            if (kfn && kfn.functionType == MTLFunctionTypeKernel)
-                fn = kfn;
+        if (!kfn && MGL_PROGRAM_OBJ(program)->separable != GL_TRUE)
+        {
+            /* lazy build: force the kernel MSL generation for this program */
+            mgl_tess_vs_kernel_msl(ctx, program->name, NULL);
+            kfn = tessPipelineVsKernel(ctx, device, program);
         }
+        if (kfn && kfn.functionType == MTLFunctionTypeKernel)
+            fn = kfn;
     }
     if (!fn || fn.functionType != MTLFunctionTypeKernel)
     {

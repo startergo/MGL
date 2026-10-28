@@ -1287,6 +1287,8 @@ struct CanonRec {
  * "name_i" elements of that varying: the two merge into the wider (array) entry */
 static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, int nin)
 {
+    size_t dummy_align = 0, dummy_size = 0;
+
     memset(out, 0, sizeof *out);
     for (int s = 0; s < nin; s++)
     {
@@ -1333,6 +1335,11 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                 }
                 if (o_arr && !m_arr && m->array_idx != 0)
                     absorbed = true;   /* element of an array slot already present */
+                if (!o_arr && !m_arr && m->array_idx != 0 &&
+                    msl_matrix_type(out->m[j].type, &dummy_align, &dummy_size))
+                    absorbed = true;   /* flattened MATRIX COLUMN of a matrix slot already
+                                         * present (the TES side sees one [[attribute]] per
+                                         * column; the producer's whole matrix covers it) */
             }
             if (absorbed)
                 continue;
@@ -1347,10 +1354,27 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
             else if (m->size > out->m[found].size)
             {
                 /* keep the wider type, remember the member that provides it */
+                int whole_matrix = msl_matrix_type(m->type, &dummy_align, &dummy_size) != 0;
+
                 snprintf(out->m[found].type, sizeof out->m[found].type, "%s", m->type);
                 snprintf(out->m[found].name, sizeof out->m[found].name, "%s", m->name);
                 out->m[found].size = m->size;
                 out->m[found].array_idx = m->array_idx;
+                if (whole_matrix)
+                {
+                    /* a WHOLE matrix replaces its column slots: drop the other
+                     * flattened columns of the same member */
+                    for (int d = 0; d < out->n; d++)
+                        if (d != found && out->m[d].key == m->key)
+                        {
+                            memmove(&out->m[d], &out->m[d + 1],
+                                    (out->n - d - 1) * sizeof out->m[d]);
+                            out->n--;
+                            if (d < found)
+                                found--;
+                            d--;
+                        }
+                }
             }
         }
     }
@@ -1598,10 +1622,55 @@ static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own, 
     char *buf = NULL;
     size_t len = 0, bc = 0;
     bool first = true;
+    char base0[112];
 
     out[0] = 0;
     for (int i = 0; i < canon->n; i++)
     {
+        /* flattened MATRIX columns merge back into one matrix member: the stages
+         * whose MSL keeps the interface whole write `m = float2x2(...)' — a body
+         * of loose float2 columns would leave those stores nameless.  (Layout is
+         * unchanged: a float<C>x<R> occupies the same C*R*4 bytes as the C
+         * columns it replaces.) */
+        if (!strncmp(canon->m[i].type, "float", 5) && strlen(canon->m[i].type) == 6 &&
+            strstr(canon->m[i].name, "_0"))
+        {
+            int run = 1;
+            size_t bl = strlen(canon->m[i].name);
+
+            while (i + run < canon->n && canon->m[i + run].key == canon->m[i].key &&
+                   !strcmp(canon->m[i + run].type, canon->m[i].type))
+            {
+                char suf[8];
+
+                snprintf(suf, sizeof suf, "_%d", run);
+                if (!strstr(canon->m[i + run].name, suf))
+                    break;
+                run++;
+            }
+            if (run >= 2 && run <= 4 && bl > 2 && bl - 2 < sizeof base0)
+            {
+                MGLTessPatchMember whole = canon->m[i];
+
+
+                memcpy(base0, canon->m[i].name, bl - 2);
+                base0[bl - 2] = 0;                  /* strip the "_0" column suffix */
+                snprintf(whole.type, sizeof whole.type, "float%dx%d", run,
+                         canon->m[i].type[5] - '0');
+                whole.size = canon->m[i].size * run;
+                whole.array_idx = 0;
+                /* emit directly (the ORIGINAL column-stripped name): the member table
+                 * lookup in tess_canon_member_lines would rename it back to the
+                 * stage's split "_0" column */
+                str_append(&buf, &len, &bc, "%s    %s %s;\n",
+                           first ? "\n" : "", whole.type, base0);
+                if (!buf)
+                    return;
+                first = false;
+                i += run - 1;                       /* the whole run is emitted */
+                continue;
+            }
+        }
         /* not renamed here: msl_rewrite_struct_body renames (and injects the template)
          * only when the original MSL does not define spvUnsafeArray before the struct */
         tess_canon_member_lines(&buf, &len, &bc, &canon->m[i],
@@ -3757,13 +3826,16 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
     free(tp);
 }
 
-void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
+/* drop a program's tess RECORD (and records derived from it): used both on
+ * program deletion and on a successful relink that no longer carries a TES
+ * (the record's layouts must not survive the new executable).  Deliberately
+ * leaves the vs_kernel cache alone: a relink of the SAME program refreshes the
+ * kernel there (mgl_tess_cache_vs_kernel replaces a changed MSL) */
+static void tess_drop_program_record(GLMContext ctx, Program *program)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     MGLTessProgram *tp;
 
-    if (!S)
-        return;
     while ((tp = mgl_tess_program(ctx, program)) != NULL)
         tess_free_program(ctx, tp);
     /* pairs DERIVED from this program (it played the tc-only side of a pipeline
@@ -3777,10 +3849,22 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
                 tp->pair_program = NULL;
                 tp->pair_key = NULL;
             }
+}
+
+void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    if (!S)
+        return;
+    tess_drop_program_record(ctx, program);
     /* drop the program's cached separable vertex kernel (name reuse must not find it) */
     for (unsigned slot = 0; slot < S->vs_kernel_n; )
         if (S->vs_kernel[slot].name == program->name)
         {
+            if (tess_trace())
+                fprintf(stderr, "MGL tess: sep-vs cache entry dropped (program %u deleted)\n",
+                        program->name);
             if (S->vs_kernel[slot].library && ctx->mtl_funcs.ext_program &&
                 ctx->mtl_funcs.ext_program->release_obj)
                 ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].library);
@@ -3788,6 +3872,7 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
                 ctx->mtl_funcs.ext_program->release_obj)
                 ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].function);
             free(S->vs_kernel[slot].msl);
+            free(S->vs_kernel[slot].words);
             /* compact: deleted programs must not waste cache capacity (a CTS case
              * links hundreds of short-lived single-stage programs) */
             if (slot + 1 < S->vs_kernel_n)
@@ -3816,8 +3901,10 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
         /* a successful relink that dropped the TES must not leave this program's
          * old record installed: mgl_tess_active_program keys on the Program
          * pointer and would keep routing draws through the stale layout (the
-         * O(1) mgl_tess_stage_bound gate and the record then disagree). */
-        mgl_ext_delete_program_tess(ctx, program);
+         * O(1) mgl_tess_stage_bound gate and the record then disagree).  The
+         * vs_kernel cache is NOT dropped — a relink of the same program refreshes
+         * its kernel (a changed MSL replaces the cached one). */
+        tess_drop_program_record(ctx, program);
         return;                         /* not (a usable) tessellation program */
     }
 
@@ -4834,8 +4921,19 @@ bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, cons
     for (slot = 0; slot < S->vs_kernel_n; slot++)
         if (S->vs_kernel[slot].name == name)
         {
-            if (S->vs_kernel[slot].function)
-                return true;      /* already cached (a relink recompiles below) */
+            /* a relink regenerates the stage: only a cached kernel with the SAME
+             * MSL is reusable — a different MSL is a stale relink leftover and
+             * must be recompiled (the old function is released below) */
+            if (S->vs_kernel[slot].function &&
+                S->vs_kernel[slot].msl && strcmp(S->vs_kernel[slot].msl, msl) == 0)
+                return true;
+            if (S->vs_kernel[slot].function && ctx->mtl_funcs.ext_program->release_obj)
+            {
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].library);
+                ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[slot].function);
+                S->vs_kernel[slot].library = NULL;
+                S->vs_kernel[slot].function = NULL;
+            }
             break;
         }
     if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, msl, entry ? entry : "main", &lib, &fn, &err))
@@ -4863,6 +4961,7 @@ bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, cons
                 ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[0].function);
             }
             free(S->vs_kernel[0].msl);
+            free(S->vs_kernel[0].words);
             memmove(&S->vs_kernel[0], &S->vs_kernel[1],
                     (S->vs_kernel_n - 1) * sizeof S->vs_kernel[0]);
             memset(&S->vs_kernel[--S->vs_kernel_n], 0, sizeof S->vs_kernel[0]);
@@ -4878,10 +4977,94 @@ bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, cons
     S->vs_kernel[slot].msl = strdup(msl);  /* pair rewrites re-compile from it */
     snprintf(S->vs_kernel[slot].entry, sizeof S->vs_kernel[slot].entry, "%s",
              entry ? entry : "main0");
+    free(S->vs_kernel[slot].words);
+    S->vs_kernel[slot].words = NULL;
+    S->vs_kernel[slot].words_n = 0;
     if (tess_trace())
         fprintf(stderr, "MGL tess: sep-vs kernel cached for program %u (slot %u fn=%p)\n",
                 name, slot, fn);
     return true;
+}
+
+/* Cache a PREPARED SPIR-V module of a vs-only program for lazy kernel
+ * compilation: a NON-separable vs-only program can still be paired with a
+ * pipeline's TCS/TES at draw time (GL 4.6 §7.3 stage resolution — the bound
+ * program wins for the stages it defines, the pipeline supplies the rest).
+ * Compiling the kernel variant at link time for every program would double
+ * link cost, so program.c stores the prepared module here and the kernel MSL
+ * is generated on the first tessellation draw that actually needs it. */
+bool mgl_tess_cache_vs_words(GLMContext ctx, GLuint name, const uint32_t *words, size_t nwords,
+                             const char *spirv_entry)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    uint32_t *copy;
+    unsigned slot;
+
+    if (!S || !words || !nwords)
+        return false;
+    copy = (uint32_t *)malloc(nwords * sizeof(uint32_t));
+    if (!copy)
+        return false;
+    memcpy(copy, words, nwords * sizeof(uint32_t));
+    for (slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == name)
+        {
+            free(S->vs_kernel[slot].words);
+            S->vs_kernel[slot].words = copy;
+            S->vs_kernel[slot].words_n = nwords;
+            snprintf(S->vs_kernel[slot].spirv_entry, sizeof S->vs_kernel[slot].spirv_entry,
+                     "%s", spirv_entry ? spirv_entry : "main");
+            return true;                    /* relink refresh of the module */
+        }
+    if (S->vs_kernel_n >= MGL_TESS_VS_KERNEL_CACHE)
+    {
+        /* same eviction policy as the compiled cache above */
+        if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
+        {
+            ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[0].library);
+            ctx->mtl_funcs.ext_program->release_obj(ctx, S->vs_kernel[0].function);
+        }
+        free(S->vs_kernel[0].msl);
+        free(S->vs_kernel[0].words);
+        memmove(&S->vs_kernel[0], &S->vs_kernel[1],
+                (S->vs_kernel_n - 1) * sizeof S->vs_kernel[0]);
+        memset(&S->vs_kernel[--S->vs_kernel_n], 0, sizeof S->vs_kernel[0]);
+    }
+    slot = S->vs_kernel_n++;
+    memset(&S->vs_kernel[slot], 0, sizeof S->vs_kernel[slot]);
+    S->vs_kernel[slot].name = name;
+    S->vs_kernel[slot].words = copy;
+    S->vs_kernel[slot].words_n = nwords;
+    snprintf(S->vs_kernel[slot].spirv_entry, sizeof S->vs_kernel[slot].spirv_entry,
+             "%s", spirv_entry ? spirv_entry : "main");
+    if (tess_trace())
+        fprintf(stderr, "MGL tess: sep-vs module cached (lazy) for program %u (slot %u)\n",
+                name, slot);
+    return true;
+}
+
+/* read a program's cached prepared module back (program.c's link cache keeps it
+ * across program deletion so a cache-hit relink can re-prime this cache —
+ * names are reused, the by-name entries are dropped on program free) */
+bool mgl_tess_vs_words_get(GLMContext ctx, GLuint name, const uint32_t **words, size_t *nwords,
+                           const char **entry)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    if (!S)
+        return false;
+    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == name && S->vs_kernel[slot].words)
+        {
+            if (words)
+                *words = S->vs_kernel[slot].words;
+            if (nwords)
+                *nwords = S->vs_kernel[slot].words_n;
+            if (entry)
+                *entry = S->vs_kernel[slot].spirv_entry;
+            return true;
+        }
+    return false;
 }
 
 const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry)
@@ -4891,12 +5074,43 @@ const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **ent
     if (!S)
         return NULL;
     for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
-        if (S->vs_kernel[slot].name == name && S->vs_kernel[slot].msl)
+    {
+        if (S->vs_kernel[slot].name != name)
+            continue;
+        if (S->vs_kernel[slot].msl)
         {
             if (entry)
                 *entry = S->vs_kernel[slot].entry;
             return S->vs_kernel[slot].msl;
         }
+        if (S->vs_kernel[slot].words)
+        {
+            /* lazily build the kernel MSL of a NON-separable vs-only program on
+             * its first tessellation draw (program.c cached the prepared module
+             * at link — see mgl_tess_cache_vs_words) */
+            char kentry[128];
+            char *msl = mgl_program_tess_kernel_msl(ctx, S->vs_kernel[slot].words,
+                                                    S->vs_kernel[slot].words_n,
+                                                    S->vs_kernel[slot].spirv_entry, kentry);
+            if (msl)
+            {
+                mgl_tess_cache_vs_kernel(ctx, name, msl, kentry);  /* takes over the slot */
+                free(msl);
+                /* the cache may have compacted (eviction) — re-resolve by name */
+                for (unsigned s2 = 0; s2 < S->vs_kernel_n; s2++)
+                    if (S->vs_kernel[s2].name == name && S->vs_kernel[s2].msl)
+                    {
+                        if (entry)
+                            *entry = S->vs_kernel[s2].entry;
+                        return S->vs_kernel[s2].msl;
+                    }
+            }
+            else if (tess_trace())
+                fprintf(stderr, "MGL tess: lazy sep-vs kernel MSL generation failed "
+                                "(program %u)\n", name);
+        }
+        return NULL;
+    }
     return NULL;
 }
 
@@ -5200,6 +5414,7 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
      * kernel's output record when no TCS runs */
     {
         const struct CanonRec *rec = tp->has_tcs ? &canon_tcs : &canon;
+        size_t malign = 0, msize = 0;
 
         tp->num_cp_record = rec->n;
         tp->cp_record_full_size = rec->size;
@@ -5209,11 +5424,16 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
 
         /* TES control point members read at the canonical offsets (attribute indices
          * unchanged: they belong to the TES's own struct). Flattened elements of an
-         * arrayed varying point into the array member's element slots */
+         * arrayed varying point into the array member's element slots; a flattened
+         * MATRIX COLUMN has its own canonical slot (the parse split the columns) */
         for (int i = 0; i < tp->num_tes_cp; i++)
         {
             for (int j = 0; j < tp->num_cp_record; j++)
-                if (tp->tes_cp[i].key == rec->m[j].key)
+                if (tp->tes_cp[i].key == rec->m[j].key &&
+                    /* the record splits matrix columns into "_0"/"_1" entries with the
+                     * same key: take THIS member's own slot, not the first match */
+                    (tp->tes_cp[i].array_idx == 0 || rec->m[j].array_idx == tp->tes_cp[i].array_idx ||
+                     !strcmp(rec->m[j].name, tp->tes_cp[i].name)))
                 {
                     tp->tes_cp[i].offset = rec->m[j].offset;
                     if (tp->tes_cp[i].array_idx && strstr(rec->m[j].type, "spvUnsafeArray"))
@@ -5223,6 +5443,23 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                         if (msl_element_type(rec->m[j].type, &align, &size))
                             tp->tes_cp[i].offset = rec->m[j].offset +
                                 tp->tes_cp[i].array_idx * (size / msl_array_len(rec->m[j].type));
+                    }
+                    else if (tp->tes_cp[i].array_idx &&
+                             msl_matrix_type(rec->m[j].type, &malign, &msize))
+                    {
+                        /* a flattened column of a matrix member: float<C>x<R> has C
+                         * columns, each msize/C bytes (tes_cp[i].size is the column) */
+                        int cols = rec->m[j].type[5] - '0';
+
+                        if (cols >= 2 && cols <= 4)
+                            tp->tes_cp[i].offset = rec->m[j].offset +
+                                tp->tes_cp[i].array_idx * (msize / (size_t)cols);
+                    }
+                    else if (tp->tes_cp[i].array_idx == rec->m[j].array_idx)
+                    {
+                        /* an exact (key, column) slot: the canonical record itself is
+                         * split into columns (msl_parse_struct) */
+                        tp->tes_cp[i].offset = rec->m[j].offset;
                     }
                     break;
                 }
@@ -5508,9 +5745,28 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
     if (!tcs_msl || !tes_msl)
         return NULL;
 
-    /* the vertex stage of the same pipeline (the draw's own resolution) */
-    if (ctx->state.program_pipeline)
-        vs_prog = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER];
+    /* the vertex stage of the same draw (GL 4.6 §7.3 stage resolution, exactly
+     * like extTessDrawPatches does it): a program bound with glUseProgram wins
+     * for the stages it defines, the pipeline supplies the rest.  KHR-GL46
+     * tessellation utilities draw with useProgram() while an earlier run's
+     * pipeline is still bound — the pipeline's stale VS slot must not win. */
+    {
+        Program *cur = (ctx->state.program && ctx->state.program->name != 0)
+                           ? ctx->state.program : NULL;
+
+        if (cur && cur->spirv[_VERTEX_SHADER].ir)
+            vs_prog = cur;                    /* the bound program defines the VS */
+        else if (ctx->state.program_pipeline)
+            vs_prog = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER];
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: pair: vs_prog %u from %s (obj=%p table=%p sep=%d msl=%d)\n",
+                    vs_prog ? vs_prog->name : 0,
+                    (cur && cur->spirv[_VERTEX_SHADER].ir && vs_prog == cur) ? "cur" : "pipeline",
+                    (const void *)vs_prog,
+                    vs_prog ? (const void *)findProgram(ctx, vs_prog->name) : NULL,
+                    vs_prog ? (int)MGL_PROGRAM_OBJ(vs_prog)->separable : -1,
+                    vs_prog ? (int)(vs_prog->spirv[_VERTEX_SHADER].msl_str != NULL) : -1);
+    }
     if (!vs_prog)
         vs_prog = tes;                   /* a vs+tes program in the TES slot */
     if (vs_prog == tes)
@@ -5522,6 +5778,10 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
         const char *entry = NULL;
         const char *kmsl = mgl_tess_vs_kernel_msl(ctx, vs_prog->name, &entry);
 
+        if (!kmsl && tess_trace())
+            fprintf(stderr, "MGL tess: pair: vs-only program %u has no cached kernel "
+                            "(separable=%d msl=%d)\n", vs_prog->name,
+                    (int)MGL_PROGRAM_OBJ(vs_prog)->separable, vs_prog->spirv[_VERTEX_SHADER].msl_str != NULL);
         vs_msl = kmsl;                   /* owned by the cache (never freed here) */
     }
 

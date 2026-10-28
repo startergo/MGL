@@ -289,18 +289,27 @@ struct MGLExtState_tess {
     GLsizei patch_count;    /* patches in the current draw (all instances) */
     GLuint  mtl_flags;      /* (unused) */
 
-    /* draw-time vertex-kernel variants for SEPARABLE pipeline vertex programs: a
-     * vs-only program linked alone keeps the plain vertex function (rstate fixup
-     * baked in), and the tess draw path needs the compute-kernel rewrite of it.
+    /* draw-time vertex-kernel variants for pipeline vertex programs: a vs-only
+     * program linked alone keeps the plain vertex function (rstate fixup baked in),
+     * and the tess draw path needs the compute-kernel rewrite of it.
      * Compiled on first use, released when the program's tess record goes away.
      * The kernel MSL is kept too: a pipeline pair (MGLTessProgram.pair) re-compiles
-     * canonical-record variants of it against the pair's interface layouts. */
+     * canonical-record variants of it against the pair's interface layouts.
+     * SEPARABLE programs get the eager link-time compile (program.c); a
+     * NON-separable vs-only program can still feed a pipeline's TCS/TES at draw
+     * time (GL 4.6 §7.3 stage resolution — glUseProgram's program wins for the
+     * stages it defines; KHR-GL46.tessellation_shader.*.gl_MaxPatchVertices_*
+     * draws exactly that), so its PREPARED SPIR-V module is cached here at link
+     * and the kernel MSL is compiled lazily on first tess draw. */
     struct {
         GLuint name;           /* program name the kernel belongs to */
         void  *library;        /* id<MTLLibrary>  (bridged-retain) */
         void  *function;       /* id<MTLFunction> (bridged-retain) */
         char  *msl;            /* kernel MSL (owned by the cache) */
         char   entry[128];     /* its entry point name */
+        uint32_t *words;       /* prepared SPIR-V module for LAZY compilation */
+        size_t   words_n;      /* (in words) — released once msl exists */
+        char     spirv_entry[128]; /* SPIR-V entry point of `words' */
     } vs_kernel[MGL_TESS_VS_KERNEL_CACHE];
     unsigned vs_kernel_n;
 };
@@ -321,6 +330,19 @@ MGLTessProgram *mgl_tess_program(GLMContext ctx, Program *program);
 MGLTessProgram *mgl_tess_active_program(GLMContext ctx);
 bool mgl_tess_plain_render(GLMContext ctx);
 bool mgl_tess_cache_vs_kernel(GLMContext ctx, GLuint name, const char *msl, const char *entry);
+/* cache a prepared SPIR-V module for LAZY kernel compilation (non-separable
+ * vs-only program — see the vs_kernel[] comment); the kernel MSL/Metal objects
+ * are built by mgl_tess_vs_kernel_msl() on the first tessellation draw */
+bool mgl_tess_cache_vs_words(GLMContext ctx, GLuint name, const uint32_t *words, size_t nwords,
+                             const char *spirv_entry);
+/* read the cached prepared module back (program.c's link cache priming) */
+bool mgl_tess_vs_words_get(GLMContext ctx, GLuint name, const uint32_t **words, size_t *nwords,
+                           const char **entry);
+/* program.c: the SPIRV-Cross vertex-for-tessellation MSL generation for a
+ * PREPARED module (the same option/fixup sequence the separable link path
+ * applies) — returns a malloc'd MSL string, NULL on failure */
+char *mgl_program_tess_kernel_msl(GLMContext ctx, const uint32_t *words, size_t nwords,
+                                  const char *spirv_entry, char entry_out[128]);
 /* GL_TESS_CONTROL_OUTPUT_VERTICES of a linked program: the tess link record when it has
  * one (a program with a TES), otherwise the TCS's own declaration — a separable tc-only
  * program links without a tess record (the TES comes from the pipeline at draw time) */

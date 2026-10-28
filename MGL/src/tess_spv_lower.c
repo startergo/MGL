@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#define SPV_OP_TYPE_VECTOR      23
 #define SPV_OP_TYPE_MATRIX      24
 #define SPV_OP_TYPE_ARRAY       28
 #define SPV_OP_TYPE_STRUCT      30
@@ -155,7 +156,7 @@ static int64_t spv_lower_const(const struct SpvLowerCtx *c, uint32_t id)
     return (int32_t)c->w[c->off[k] + 3];
 }
 
-enum { SPV_T_OTHER = 0, SPV_T_ARRAY, SPV_T_MATRIX, SPV_T_STRUCT };
+enum { SPV_T_OTHER = 0, SPV_T_ARRAY, SPV_T_MATRIX, SPV_T_STRUCT, SPV_T_VECTOR };
 
 static int spv_lower_type_kind(const struct SpvLowerCtx *c, uint32_t type)
 {
@@ -166,6 +167,7 @@ static int spv_lower_type_kind(const struct SpvLowerCtx *c, uint32_t type)
         case SPV_OP_TYPE_ARRAY:  return SPV_T_ARRAY;
         case SPV_OP_TYPE_MATRIX: return SPV_T_MATRIX;
         case SPV_OP_TYPE_STRUCT: return SPV_T_STRUCT;
+        case SPV_OP_TYPE_VECTOR: return SPV_T_VECTOR;
         default:                 return SPV_T_OTHER;
     }
 }
@@ -179,6 +181,8 @@ static uint32_t spv_lower_elem_type(const struct SpvLowerCtx *c, uint32_t type, 
         return (member + 2 < c->wc[k]) ? c->w[off + 2 + member] : 0;
     if (c->op[k] == SPV_OP_TYPE_ARRAY || c->op[k] == SPV_OP_TYPE_MATRIX)
         return c->w[off + 2];      /* [hdr, result, element, length] */
+    if (c->op[k] == SPV_OP_TYPE_VECTOR)
+        return c->w[off + 2];      /* [hdr, result, component type, count] */
     return 0;
 }
 
@@ -206,17 +210,50 @@ struct SpvLowerSite
     uint32_t arr_type;  /* composite the dynamic index walks into */
     uint32_t elem_type; /* pointee of the chain's result (element type) */
     uint32_t func;      /* enclosing OpFunction instruction index */
+    uint32_t root;      /* split chains: the root Input VARIABLE id (0 = own base) */
+    uint32_t prefix[8]; /* split chains: the inner chains' CONSTANT indices, in
+                         * application order (walked before this chain's own) */
+    uint32_t prefix_n;
 };
 
 /* Does this access chain dynamically index an array/matrix MEMBER of an Input
- * block?  (The first index — the control-point array — may be dynamic.) */
+ * block?  (The first index — the control-point array — may be dynamic.)
+ * glslang SPLITS long chains: OpAccessChain(%mid, block, 0, member) followed by
+ * OpAccessChain(%res, %mid, i) — the dynamic index then sits in a chain whose
+ * base is another chain, not the variable.  Resolve through up to four
+ * intermediate chains; their indices must be constant (the rewrite re-roots the
+ * element copy at the variable and concatenates them). */
 static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLowerSite *site)
 {
     uint32_t off = c->off[inst], wc = c->wc[inst];
     uint32_t base = c->w[off + 3];
     int var = spv_lower_find(c, base);
     uint32_t cur, j;
+    uint32_t prefix[8], prefix_n = 0;
 
+    site->root = 0;
+    site->prefix_n = 0;
+    for (int depth = 0; var >= 0 && c->op[var] != SPV_OP_VARIABLE && depth < 4; depth++)
+    {
+        uint32_t voff, vwc, q, rev[8], rn = 0;
+
+        if (c->op[var] != SPV_OP_ACCESSCHAIN && c->op[var] != SPV_OP_INBOUNDSAC)
+            return false;                       /* a load or something else: give up */
+        voff = c->off[var];
+        vwc = c->wc[var];
+        for (q = 4; q < vwc; q++)
+        {
+            if (rn >= 8 || prefix_n + rn >= 8)
+                return false;
+            if (spv_lower_const(c, c->w[voff + q]) < 0)
+                return false;                   /* dynamic in the inner chain: unsupported */
+            rev[rn++] = c->w[voff + q];
+        }
+        while (rn)
+            prefix[prefix_n++] = rev[--rn];     /* un-reverse into application order */
+        base = c->w[voff + 3];
+        var = spv_lower_find(c, base);
+    }
     if (var < 0 || c->op[var] != SPV_OP_VARIABLE)
         return false;
     if (c->wc[var] < 4 || c->w[c->off[var] + 3] != SPV_SC_INPUT)
@@ -227,8 +264,24 @@ static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLo
     if (!cur)
         return false;
 
+    /* apply the inner chains' constant indices first */
+    for (uint32_t q = 0; q < prefix_n && cur; q++)
+    {
+        int64_t lit = spv_lower_const(c, prefix[q]);
+        int kind = spv_lower_type_kind(c, cur);
+
+        if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
+            cur = spv_lower_elem_type(c, cur, 0);
+        else if (kind == SPV_T_STRUCT)
+            cur = spv_lower_elem_type(c, cur, (uint32_t)lit);
+        else
+            return false;
+    }
+    if (!cur)
+        return false;
+
     j = off + 4;                                    /* first index operand */
-    if (spv_lower_type_kind(c, cur) == SPV_T_ARRAY)
+    if (prefix_n == 0 && spv_lower_type_kind(c, cur) == SPV_T_ARRAY)
     {
         /* the control-point array: its index may be dynamic (gl_in[i]) */
         cur = spv_lower_elem_type(c, cur, 0);
@@ -243,7 +296,14 @@ static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLo
         int64_t lit = spv_lower_const(c, idx);
         int kind = spv_lower_type_kind(c, cur);
 
-        if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
+        if (kind == SPV_T_VECTOR)
+        {
+            /* a component index behind the dynamic one (m[i].x): walks to the
+             * component type; a dynamic VECTOR index past the offending one
+             * still lowers (the copy covers it) */
+            cur = spv_lower_elem_type(c, cur, 0);
+        }
+        else if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
         {
             if (lit < 0)
             {
@@ -251,6 +311,12 @@ static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLo
                 site->k = (uint32_t)(j - off);
                 site->arr_type = cur;
                 site->elem_type = 0;                /* filled by the caller (walks the rest) */
+                if (prefix_n)
+                {
+                    site->root = c->def[var];
+                    memcpy(site->prefix, prefix, prefix_n * sizeof(uint32_t));
+                    site->prefix_n = prefix_n;
+                }
                 return true;
             }
             cur = spv_lower_elem_type(c, cur, 0);
@@ -281,7 +347,9 @@ static uint32_t spv_lower_chain_elem_type(struct SpvLowerCtx *c, const struct Sp
         uint32_t idx = c->w[off + j];
         int64_t lit = spv_lower_const(c, idx);
         int kind = spv_lower_type_kind(c, cur);
-        if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
+        if (kind == SPV_T_VECTOR)
+            cur = spv_lower_elem_type(c, cur, 0);
+        else if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
         {
             if (lit < 0)
                 cur = spv_lower_elem_type(c, cur, 0);
@@ -363,7 +431,11 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
     uint32_t arrptr[64], loaded[64], fvar[64], elemc[64], idx_type = 0;
 
     if (!spv_lower_setup(&c, words, n))
+    {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess lower: setup failed (%zu words)\n", n);
         return NULL;
+    }
     next_id = words[3];
 
     for (uint32_t k = 0; k < c.ninst; k++)
@@ -381,6 +453,8 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
     }
     if (!n_sites)
     {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess lower: no dynamic-IO sites (%zu words)\n", n);
     }
 
     /* validate the sites: need a chain-elem type, an index type (from a
@@ -388,14 +462,21 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
     for (uint32_t s = 0; s < n_sites; s++)
     {
         uint32_t off = c.off[sites[s].inst];
-        if (!sites[s].elem_type || sites[s].k < 5 ||
+        int ck = -1;
+
+        if (!sites[s].elem_type || sites[s].k < 4 ||
             !spv_lower_composite_len(&c, sites[s].arr_type))
         {
             sites[s].inst = 0xffffffff;
             continue;
         }
-        /* the index type: any constant used as an index in the prefix */
-        int ck = spv_lower_find(&c, c.w[off + 4]);
+        /* the index type: a constant used as an index in the prefix — this
+         * chain's own (k > 4) or, for split chains whose first operand already
+         * IS the dynamic index, an inner chain's constant */
+        if (sites[s].k > 4)
+            ck = spv_lower_find(&c, c.w[off + 4]);
+        else if (sites[s].prefix_n)
+            ck = spv_lower_find(&c, sites[s].prefix[0]);
         if (ck < 0 || c.op[ck] != SPV_OP_CONSTANT)
         {
             sites[s].inst = 0xffffffff;
@@ -560,11 +641,19 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
                 if (!ce) { ok = false; break; }
 
                 /* %eptr = AccessChain ptrIn_elem %base <prefix> %e
-                 * words: hdr, rtype, result, base, [4, k) indices, e -> k+1 */
-                LOW_PUSH(((st->k + 1) << 16) | SPV_OP_ACCESSCHAIN);
+                 * words: hdr, rtype, result, base, [4, k) indices (+ split-chain
+                 * inner-prefix indices before those), e */
+                LOW_PUSH(((st->k + 1 + st->prefix_n) << 16) | SPV_OP_ACCESSCHAIN);
                 LOW_PUSH(ptr_in);
                 LOW_PUSH(arrptr[s]);
-                LOW_PUSH(c.w[off + 3]);
+                if (st->root)
+                {
+                    LOW_PUSH(st->root);
+                    for (uint32_t q = 0; q < st->prefix_n; q++)
+                        LOW_PUSH(st->prefix[q]);
+                }
+                else
+                    LOW_PUSH(c.w[off + 3]);
                 for (uint32_t q = 4; q < st->k; q++)
                     LOW_PUSH(c.w[off + q]);
                 LOW_PUSH(ce);
@@ -634,8 +723,7 @@ uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t 
     size_t first_function = 0, i;
 
     *out_n = 0;
-    if (!words || n < 5)
-        return NULL;
+    if (!words || n < 5) return NULL;
 
     for (i = 5; i < n; )
     {
@@ -658,8 +746,7 @@ uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t 
             votes++;
         i += wc;
     }
-    if (!votes)
-        return NULL;
+    if (!votes) return NULL;
 
     uint32_t next_id = words[3];
     uint32_t new_type = 0, new_const = 0;
@@ -674,8 +761,7 @@ uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t 
 
     size_t need = n + votes + (new_type ? 4 : 0) + (new_const ? 4 : 0) + (have_cap ? 0 : 2);
     uint32_t *out = (uint32_t *)malloc(need * sizeof(uint32_t));
-    if (!out)
-        return NULL;
+    if (!out) return NULL;
     size_t o = 0;
     const3 = const3 ? const3 : new_const;
 
@@ -690,8 +776,7 @@ uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t 
 
     for (i = 5; i < n; )
     {
-        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
-        if (wc == 0 || i + wc > n) { free(out); return NULL; }
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff; if (wc == 0 || i + wc > n) { free(out); return NULL; }
 
         /* declarations for the scope constant: right before the functions */
         if (first_function && i == first_function)
@@ -756,8 +841,7 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
     size_t i;
 
     *out_n = 0;
-    if (!words || n < 5)
-        return NULL;
+    if (!words || n < 5) return NULL;
 
     for (i = 5; i < n; )
     {
@@ -771,8 +855,7 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
         }
         i += wc;
     }
-    if (!hit)
-        return NULL;
+    if (!hit) return NULL;
 
     next_id = words[3];
     for (i = 5; i < n; )
@@ -782,13 +865,11 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
         if (op == SPV_OP_VARIABLE && wc >= 4 && words[i + 2] == var)
         {
             old_ptr = words[i + 1];
-            if (words[i + 3] != SPV_SC_INPUT)
-                return NULL;            /* not an input builtin: leave it */
+            if (words[i + 3] != SPV_SC_INPUT) return NULL;            /* not an input builtin: leave it */
         }
         i += wc;
     }
-    if (!old_ptr)
-        return NULL;
+    if (!old_ptr) return NULL;
 
     /* the pointee of the variable's pointer type, and any reusable Private
      * pointer of the same pointee (separate scans: the type is declared
@@ -806,15 +887,13 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
         }
         i += wc;
     }
-    if (!pointee)
-        return NULL;
+    if (!pointee) return NULL;
     if (!new_ptr)
         new_ptr = next_id++;
 
     size_t need = n + 8 + (new_ptr >= words[3] ? 4 : 0);
     uint32_t *out = (uint32_t *)malloc(need * sizeof(uint32_t));
-    if (!out)
-        return NULL;
+    if (!out) return NULL;
     size_t o = 0;
 
     for (int q = 0; q < 5; q++)
@@ -822,8 +901,7 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
 
     for (i = 5; i < n; )
     {
-        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
-        if (wc == 0 || i + wc > n) { free(out); return NULL; }
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff; if (wc == 0 || i + wc > n) { free(out); return NULL; }
 
         if (op == SPV_OP_DECORATE && wc >= 4 && words[i + 1] == var &&
             words[i + 2] == SPV_DEC_BUILTIN && words[i + 3] == SPV_BUILTIN_DRAW_INDEX)

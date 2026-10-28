@@ -1,9 +1,10 @@
 # tess domain — round 29 report (perf: O(1) per-draw gates)
 
-READY ddd8f68
+READY ddd8f68 — ab_bench m0 8.22->6.66 ms (-19.0%), m1 46.50->46.53 ms (+0.06%); glmark2 ideas median 511.5->518.5 (+1.4%), jellyfish 4551->4814 (+5.8%, noise-dominated)
 
-(tip ddd8f68 on c1bb530; gl46-port still 6f9b359 — nothing to merge. gate and
-every number below measured on exactly this tree.)
+(r29 numbers measured on tip ddd8f68 = c1bb530 + bbffefa + ddd8f68, against
+baseline-6f9b359.  r30 continues on a merge of gl46-port b7821df [which took
+r28+r29 upstream] — see the r30 section below.)
 
 ## r29: the r28 SPEED rejection
 
@@ -65,6 +66,13 @@ Link-time flags, nothing per draw touches ext_tess unless the program needs it:
 
 ## r29 gate
 
+* **Per-draw CPU gate (merge rule of 21:30, final tip, min of 7 interleaved vs
+  ~/MGL-cts/baseline-6f9b359): `ab_bench m0 8.22->6.66 ms (-19.0%)`,
+  `m1 46.50->46.53 ms (+0.06%)` — both far inside the +3% limit.**  An earlier
+  measurement on the same tree under heavier load read m0 11.85->10.72
+  (-9.6%), m1 68.06->67.35 (-1.0%).  The m0 win is real: the inline stage
+  gate also removes the tess-record hash walk the BASELINE itself pays per
+  draw.
 * Full headless gate `tests/headless/run.sh`: **140 tests, 0 FAIL, 135x
   "0 failures"** (the remaining stderr lines are a passing test's deliberate
   failed-relink trace).  `test_tess` **504/0**; `test_geom` 10x
