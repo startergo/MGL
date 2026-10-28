@@ -190,9 +190,13 @@ TEST(map_flag_combinations)
     glGetBufferParameteri64v(GL_COPY_WRITE_BUFFER, GL_BUFFER_MAP_OFFSET, &v64); EXPECT_EQ_INT(v64, 16);
     glGetBufferParameteri64v(GL_COPY_WRITE_BUFFER, GL_BUFFER_MAP_LENGTH, &v64); EXPECT_EQ_INT(v64, 32);
     glGetBufferPointerv(GL_COPY_WRITE_BUFFER, GL_BUFFER_MAP_POINTER, &ptr);     EXPECT_TRUE(ptr == r);
-    /* mapped: second map, SubData, GetSubData and FlushMapped (no FLUSH_EXPLICIT) fail */
+    /* mapped: second map, GetSubData and FlushMapped (no FLUSH_EXPLICIT) fail;
+     * BufferSubData on a *disjoint* range is legal (ARB_buffer_storage), only
+     * ranges overlapping the mapping get GL_INVALID_OPERATION */
     EXPECT_TRUE(glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, 4, GL_MAP_READ_BIT) == NULL); EXPECT_GL_ERROR(GL_INVALID_OPERATION);
-    glBufferSubData(GL_COPY_WRITE_BUFFER, 0, 4, data);                  EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glBufferSubData(GL_COPY_WRITE_BUFFER, 0, 4, data);                  EXPECT_GL_ERROR(GL_NO_ERROR);
+    glBufferSubData(GL_COPY_WRITE_BUFFER, 16, 4, data);                 EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+    glBufferSubData(GL_COPY_WRITE_BUFFER, 100, 4, data);                EXPECT_GL_ERROR(GL_NO_ERROR);
     glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, 4, out);                EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glFlushMappedBufferRange(GL_COPY_WRITE_BUFFER, 0, 4);               EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     EXPECT_TRUE(glUnmapBuffer(GL_COPY_WRITE_BUFFER));

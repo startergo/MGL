@@ -73,11 +73,13 @@ static bool check(GLint *tcs_out, GLint *tes_out)
 
 TEST(tess_image_uniforms)
 {
+    /* follows GL_MAX_IMAGE_UNITS (16): KHR-GL46.gl_spirv.spirv_validation_capabilities
+     * links a compute shader with 10 active image uniforms and expects success */
     GLint v = -1;
     glGetIntegerv(GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS, &v);
-    EXPECT_EQ_INT(v, 8);
+    EXPECT_EQ_INT(v, 16);
     glGetIntegerv(GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS, &v);
-    EXPECT_EQ_INT(v, 8);
+    EXPECT_EQ_INT(v, 16);
 }
 
 static void setup(GLuint *res_tcs, GLuint *res_tes, GLuint *src2d, GLuint *srccube)

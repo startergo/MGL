@@ -2095,7 +2095,7 @@ static uint32_t widen_int(F64 *f, uint32_t x, uint32_t ety)
 
 static uint32_t rw_extinst_val(F64 *f, const uint32_t *iw, uint32_t wc)
 {
-    uint32_t rt = iw[1], rid = iw[2];
+    uint32_t rt = iw[1];
     uint32_t num = iw[4];
     uint32_t a = (wc >= 6) ? iw[5] : 0;
     uint32_t b = (wc >= 7) ? iw[6] : 0;
@@ -2192,18 +2192,25 @@ static uint32_t rw_extinst_val(F64 *f, const uint32_t *iw, uint32_t wc)
         /* struct { frac = x - trunc(x), integral = trunc(x) }:  BOTH members
          * have x's type (SPIR-V GLSL.std.450 spec; the old code narrowed
          * member 1 to int and Metal rejected the construct).  glslang emits
-         * this for modf(x, out ip); the out param is stored from member 1. */
-        uint32_t n = vlen_of(f, xt);
+         * this for modf(x, out ip); the out param is stored from member 1.
+         * The construct is emitted into a FRESH id and returned — emitting it
+         * with rid and returning 0 duplicated the definition (0 means "copy
+         * the original instruction unchanged", so the module kept the raw
+         * OpExtInst next to the lowered construct: MSL "redefinition of _NN"
+         * plus an ambiguous frexp/modf on the native double, and the link
+         * failed; tests/headless/test_fp64c.c fp64_out_param_fns). */
         uint32_t tr = cw1(f, xt, a, "mgl_ftrunc64");
         uint32_t fr = cw2(f, xt, a, tr, "mgl_fsub64");
         uint32_t comps[2] = { fr, tr };
-        uint32_t o[5] = {rt, rid, comps[0], comps[1], 0};
+        uint32_t v = nid(f);
+        uint32_t o[5] = {rt, v, comps[0], comps[1], 0};
         binst(&f->body, SpvOpCompositeConstruct, o, 4);
-        return 0;
+        return v;
     }
     case GLSLstd450FrexpStruct: {
         /* struct { mantissa in [0.5, 1.0) (x's type), exponent (int/ivecN) }:
-         * glslang emits this for frexp(x, out e); op 52 was rejected before. */
+         * glslang emits this for frexp(x, out e); op 52 was rejected before.
+         * Fresh-id construct + return, like ModfStruct above. */
         uint32_t n = vlen_of(f, xt);
         uint32_t comps[2];
         comps[0] = cw1(f, xt, a, "mgl_frexp64_sig");
@@ -2219,9 +2226,10 @@ static uint32_t rw_extinst_val(F64 *f, const uint32_t *iw, uint32_t wc)
         } else {
             comps[1] = fcall(f, f->i32ty, "mgl_frexp64_exp", &a, 1);
         }
-        uint32_t o[5] = {rt, rid, comps[0], comps[1], 0};
+        uint32_t v = nid(f);
+        uint32_t o[5] = {rt, v, comps[0], comps[1], 0};
         binst(&f->body, SpvOpCompositeConstruct, o, 4);
-        return 0;
+        return v;
     }
     case GLSLstd450Frexp: {
         uint32_t n = vlen_of(f, xt);
@@ -3724,7 +3732,15 @@ static bool rw_body_inst(F64 *f, size_t j)
     case SpvOpExtInst: {
         uint32_t rt = iw[1], rid = iw[2];
         uint32_t res = rw_extinst_val(f, iw, wc);
-        if (res) emit_result(f, rt, rid, res);
+        /* rw_extinst_val returns 0 when neither result nor first operand is
+         * double ("fp32 GLSL.std.450 math stays native") — those instructions
+         * must be copied, not dropped: returning true without emitting deleted
+         * every fp32 builtin call (sin, packUnorm2x16, ...) in a module that
+         * also lowered doubles, leaving stores of undefined ids
+         * (KHR-GL46.gl_spirv.spirv_glsl_to_spirv_builtin_functions_test).
+         * res == 0 after fail() is harmless: fail() aborts the whole lowering. */
+        if (!res) return false;
+        emit_result(f, rt, rid, res);
         return true;
     }
     default:

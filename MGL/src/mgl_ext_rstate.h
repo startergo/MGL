@@ -73,7 +73,27 @@ struct MGLExtState_rstate {
     GLuint    generation_pipeline;      /* bumped only on pipeline-baked state (blend, masks,
                                            function constants) — not viewport/scissor/raster, which
                                            never change MTLRenderPipelineState */
+
+    /* compat: GL_CLAMP_TO_BORDER border-colour emulation (compat_border.c).
+     * The per-draw signature of the emulated-slot table (0 = none) rides the
+     * pipeline fast-path key, and the rewritten MSL variant is cached against
+     * the source MSL pointer it was built from. */
+    uint64_t  border_sig;
+    const void *border_msl_src;
+    char      *border_msl;
+    uint64_t  border_msl_sig;
 };
+
+/* one MSL texture slot needing GL_CLAMP_TO_BORDER colour emulation */
+#define MGL_BORDER_MAX 16
+typedef struct MGLBorderEmu {
+    GLuint  msl_slot;    /* Metal [[texture(N)]] argument index */
+    uint8_t axes;        /* bit0 = S, bit1 = T, bit2 = R clamp-to-border */
+    uint8_t linear;      /* within-level LINEAR weights (else NEAREST) */
+    uint8_t kind;        /* 0 = float4, 1 = half4, 2 = int4, 3 = uint4 colour */
+    char    bc[128];     /* MSL literal of the exact border colour */
+    char    bh[128];     /* MSL literal of the colour the Metal sampler returns */
+} MGLBorderEmu;
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_rstate; filled by MGLRenderer (RenderState). */
 struct MGLExtMetal_rstate {
@@ -112,6 +132,12 @@ extern "C" {
 bool mgl_rstate_arrays_rewrite_needed(GLMContext ctx, GLenum mode);
 
 /* ---- helpers exported for other domains ---------------------------------------------------- */
+
+/* GL_CLAMP_TO_BORDER border-colour emulation (compat_border.c, fragment stage) */
+bool mgl_border_wanted(GLMContext ctx);                      /* cheap per-draw gate */
+int  mgl_border_scan(GLMContext ctx, int stage, MGLBorderEmu out[MGL_BORDER_MAX]);
+uint64_t mgl_border_sig(const MGLBorderEmu *e, int n);
+char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n);   /* malloc'd MSL or NULL */
 
 /* GL_CLAMP_READ_COLOR for glReadPixels (owner of ReadPixels: 'fb').
  * Returns true if colors read back must be clamped to [0,1].  read_fixed_point is true when the

@@ -30,6 +30,9 @@ int mglNoPipeFast(void);
 /* function-pointer -> MSL content id (MGLRenderer+Program.m): the content
  * identity the pipeline-cache key hashes instead of raw function addresses */
 uint64_t mglProgramFunctionId(void *fn);
+/* register a program stage function's MSL content identity (call wherever a
+ * compiled function is installed on a program — see MGLRenderer+Program.m) */
+void mglProgramRegisterMSLIdentity(const void *function, const char *msl, const char *entry);
 
 @interface MGLRenderer (Compat)
 /* IOSurface present path (CGL-like async swap): enabled per renderer with

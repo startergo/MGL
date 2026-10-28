@@ -931,7 +931,11 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
 
     if (obj->spirv_binary)
     {
+        /* ARB_gl_spirv: CompileShader on a shader whose SPIR_V_BINARY_ARB state is TRUE
+         * is an error — the module is finalized by glSpecializeShader instead
+         * (KHR-GL46.gl_spirv.spirv_modules_error_verification_test) */
         mgl_set_info_log(&ptr->log, "ERROR: shader %u holds a SPIR-V binary; use glSpecializeShader instead of glCompileShader\n", shader);
+        ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
 

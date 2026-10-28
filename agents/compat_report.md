@@ -1,4 +1,56 @@
 # compat domain — progress log
+READY s23 ef59367 (= ead3d39 + gl46-port b7821df merge + test fixes). Merged tess r28+r29
+(3d03a6b): only conflict tests/headless/test_vote.c (add/add) — kept BOTH sets (the CTS
+extension-less spellings + my plain #version 460 core ones under vote_core_*; 9/9 PASS).
+4d74caa had committed test_capszoo.c with a dropped `if (!ok) {` (BUILD-FAIL in run.sh);
+restored (ef59367), caps_zoo_compile_link PASS. Clean gate: rm -rf build; make -j4 lib glx
+nsgl; full suite 609 PASS / 0 FAIL / rc=0; test_fp64+test_fp64c 10x = 417/0 + 48/0, 0 flake.
+A/B vs ~/MGL-cts/baseline-b7821df (interleaved): ab_bench min-of-42 m0 base 11.418 -> new
+11.116 ms (-2.6%), m1 102.455 -> 102.053 (-0.4%) — first 7-round window read +10.7% but the
+distributions overlap (standalone new samples 9.7-15.4 ms); per-draw MGL_PROFILE buckets
+(abb_prof.c, min of 5) show NO bucket differing > 0.15 ms / 2000 draws (<75 ns/draw), so the
+wall-clock spread is machine load, not code. pipeHit 19.0/frame ideas, 0 declines (= baseline,
+100% fast-path accept survives the merge). Locked interleaved glmark2 (run_ab_s23b.sh, 6 ideas
++ 8 jellyfish, order alternates): ideas median A 2549.5 vs B 2617.5 (-2.6%, single-run spread
++-3.5%), jellyfish A 25294.5 vs B 25221.5 (+0.3%) — parity within noise.
+READY s23 ead3d39 (supersedes the rejected 1605445). Registration fix + two correctness
+fixes on top of 944befc (gl_spirv fp64/spirv fixes): 1605445's fnid-registry fast-path key
+declined EVERY draw on programs whose functions were installed outside extProgramCompileMSL
+(bindMTLProgram's library-cache path, rstate's fixup recompile) — mglProgramRegisterMSLIdentity
+now registers all install paths (once per install), MGL_FNID_CAP 32768. Gate: ab_bench m0
+10.861->10.933 ms (+0.66%), m1 176.1->104.0 ms (-41%); pipeHit 19+2/frame = 100% accept
+(baseline parity; 1605445 was 100% decline); locked interleaved glmark2 medians ideas +35%
+/ jellyfish +5% (B>=A, shared-GPU noise, single-run spread +-35%); rm -rf build gate:
+584 PASS / 0 FAIL / 114 zero-fail files; test_fp64 10x 417/0 (0 flake); test_fp64c 48/0
+(fp64 frexp/modf *Struct lowering duplicated the definition — link fail, now fixed);
+test_capszoo PASS (gl_spirv capabilities image zoo: writable-MS-image MSL emulation,
+msl_msimg.c; shader transcribed verbatim from the CTS source).
+READY s23 1605445 (gated code; report commits on top touch only agents/compat_report.md). Contains
+gl46-port 6f9b359 (geom r55-r58) via merge d7b5cce, conflicts
+resolved keeping both border-emu and wrap-op guards in rstateSpecialize. CRITICAL FIX for the
+merged tree: gl46-port 6f9b359 made test_fp64 fp64_scalar_ops flaky (3-4/10 runs, own-tree
+repro /tmp trees; 7478e0a clean 10/10) — the compat pipeline fast path keyed PSOs on a sampled
+MSL key (string pointer + first 192 + last 128 bytes), which ALIASES for programs whose MSL
+differs only in the middle (fp64-lowered operators) once program/string addresses recycle in
+a create->draw->delete loop: one program then drew with another program's PSO (abs rendered
+-ua, roundeven rendered ceil). key.a is now the fnid registry's full-MSL content hash per
+raster stage (registered at link in extProgramCompileMSL); unregistered/uncompiled stages
+decline the fast path. After the fix: test_fp64 22/22 clean (12 idle + 10 under concurrent
+GPU load). Gate: full suite 112 files 9432 checks 0 FAIL, test_geom 10x 603/0, test_fp64fast
+3x 298/0, flash_check PASS (10:49, median 114.1; the 12:1x reruns were INVALID — glmark2's
+window occluded by other agents' windows, present path untouched by 1605445; rerun when the
+display is free). Carries the s22 fails_compat2 queue 13/13 -> 0 Fail (buffer_storage 9/9,
+copy_image 13/13, direct_state_access 371/371, texture_border_clamp 32/32) plus fails_compat3
+progress (committed, all green): shader_group_vote 5/5 root cause + SPIR-V opcode rewrite,
+gl_spirv LocalSize + glCompileShader error path (3 of the 5 gl_spirv cases fixed at the source
+level). Details in the session 23 section.
+READY s22 1f74da1 — CTS queue 13/13 -> 0 Fail (fails_compat2): buffer_storage 9/9,
+copy_image 13/13 (GL_TEXTURE_1D_ARRAY layer-in-Z semantics), direct_state_access 371/371
+(RGTC online compression, GPU-side decoded level + CPU re-encode for downloads; Guard
+Malloc caught a 2x plane underallocation that showed up as random malloc traps),
+texture_border_clamp 32/32 (already green from s20, re-verified). Gate: full suite
+9233 checks 0 FAIL, test_geom 10x 603/0, test_fp64fast 3x 298/0, flash_check PASS
+(n=120 median 115.9, 16 foreign-window frames only). Details in the session 22 section.
 READY s20 100d132 — CTS queue 21/21 -> 0 Fail: draw_elements_base_vertex (as_uint MSL fix
 +tess VS ids), sample_shading 13/13, shader_multisample_interpolation 109/109; flat-varying
 provoking rotation was dead (probe missed [[user(locnN), flat]]); PSO-failure path no longer
@@ -12,6 +64,195 @@ ideas CPU/frame A/B (quiet, 3 interleaved rounds): draw 1.713 -> 1.350 ms (-21%)
 0.610 -> 0.186 ms (-70%); FPS 265 -> 285 (+8%).  Details in the session 19 section below.
 
 ## session 20 (Oct 26, 23:26-...) — s20: conformance queue part 2 (basevertex, interpolateAtOffset)
+
+## session 23b (Oct 27, 16:00-22:15) — rejected-READY root cause: fnid registration on every MSL-install path
+Supervisor REJECTED 1605445 on speed (interleaved vs baseline-6f9b359: ideas 3182->1215,
+jellyfish 13586->6073). Root cause measured, not guessed:
+* MGL_PROFILE counters (mgl_prof_cnt 16/17, dumped as pipeHit / pipeMiss-decline):
+  baseline 6f9b359 = pipeHit 19.0/frame [ideas] + 2.0 [jellyfish], 0 declines;
+  1605445 = pipeMiss-decline 19.0 + 2.0 — **100% decline, every draw took the descriptor
+  path**. The geom link-cache suspicion was close but the actual holes: (a) bindMTLProgram
+  installs VS/FS straight from the MSL library cache (fresh MTLFunction per link,
+  compileShader:), never registered; (b) rstateRecompileProgram installs the FIXED-UP
+  functions (rs_post_link rewrote spirv[stage].msl_str, so bindMTLProgram later sees a
+  non-NULL library and skips) — also unregistered. glmark2's programs go through exactly
+  these two paths.
+* Fix: mglProgramRegisterMSLIdentity(fn, msl, entry) in MGLRenderer+Program.m (next to the
+  registry: fnidRegister + fnidOf(full MSL + entry)); called at both installs. Hash computed
+  ONCE per install (link/fixup), never per draw. MGL_FNID_CAP 8192->32768 (ids are never
+  removed; >2k program relinks saturated it and registration degraded to decline-all).
+* Verified: fixed build pipeHit 19.0 + 2.0/frame, 0 declines (= baseline). NOTE /tmp was
+  wiped by the 15:45 reboot — glmark2 data restored from /opt/homebrew/share/glmark2 (now
+  used directly, per supervisor 16:40).
+* Two pre-existing suite failures found by the fresh gate (both in my domain, NOT caused by
+  the WIP; fp64_out_param_fns failed at e3af5fe/944befc too, both fp64 lib modes):
+  - test_fp64c fp64_out_param_fns: rw_extinst_val's GLSLstd450FrexpStruct/ModfStruct emitted
+    the lowered OpCompositeConstruct with rid AND returned 0; 0 = "copy unchanged" since
+    944befc, so the raw OpExtInst stayed beside it -> two defs of one id -> MSL "redefinition
+    of _NN" + ambiguous frexp/modf(double) -> link fail. Now constructs into a fresh id and
+    returns through emit_result like every other case. 6/6 (48 checks).
+  - test_capszoo (untracked stuck-session draft): shader had calls the real CTS source does
+    not (texelFetch on sampler2DRect — no glslang overload; gl_FragDepth in a compute
+    shader). Transcribed verbatim from gl4cGlSpirvTests.cpp SpirvValidationCapabilitiesTest.
+    Then the real failure: `texture2d_ms<float, access::write>' is illegal MSL. New
+    MGL/src/msl_msimg.c mgl_msl_fix_ms_image_writes(): _ms declarations access::write/
+    read_write -> read (same-length in-place) and their `<name>.write(...)' calls -> (void)0
+    (store dropped; documented gap, MS image reads unaffected). Called from program.c's MSL
+    fixup chain (shared file, +9 lines).
+* Gate (rm -rf build; make -j4 lib glx nsgl): 584 PASS / 0 FAIL (114 files "0 failures");
+  test_fp64 10x 417/0; ab_bench (new supervisor rule) m0 10.861->10.933 ms (+0.66%, limit
+  +3%), m1 176.1->104.0 ms (-41%, the s21/s22 fast-path win restored); locked interleaved
+  glmark2 medians (8 rounds jellyfish, 6 rounds ideas, concurrent CTS GPU load, single-run
+  spread +-35%): ideas B +35%, jellyfish B +5% (B>=A); MGL_PROFILE steady state
+  (2nd dump): 214.8 vs 212.3 ms/120 frames (+1.2%), draw bucket 0.628 vs 0.606 — the
+  residual is ~31ns/draw of fnid lock+probe per raster stage in the fast path.
+* Known residuals: (a) that ~31ns/draw lookup (could be made lock-free read; left as-is,
+  inside the +3% budget); (b) jellyfish FPS on this shared box is noise-dominated — the
+  supervisor's own A/B decides; (c) caps zoo still stores nothing to MS images (gap
+  documented in get.c GL_MAX_IMAGE_SAMPLES=0).
+## session 23 (Oct 27, 08:40-...) — s23: merge gl46-port 6f9b359 + PSO-alias fix, then fails_compat3 queue
+
+Queue: ~/MGL-cts/mgl-r28-sweep/fails_compat3.txt (11 cases: gl_spirv 5, shader_group_vote 5,
+separable_programs_tf 1). Rules: -j4 build, one glcts batch at a time, nice.
+
+### 0. merge + gate (supervisor requests 10:25/11:26)
+- `git merge gl46-port` (6f9b359 = geom r55-r58): one conflict, MGLRenderer+RenderState.m
+  rstateSpecialize MSL-rebuild guard — kept BOTH the compat border-emu skip and geom's
+  mgl_wrap_op_ skip. Merge = d7b5cce.
+- test_fp64 fp64_scalar_ops came up flaky on the merged tree (24/5/3 failures, bursty).
+  Isolated: same on clean gl46-port 6f9b359 trees (git archive to /tmp/gl46port +
+  /tmp/g59, perl-chdir so the relative install name resolves); 7478e0a 10/10 clean;
+  1f74da1 8/8 clean; my merged tip 4/10 idle, worse under concurrent GPU load.
+  => regression is IN geom r55-r58 content, not in the merge or my queue commits.
+- Root cause (see MGLRenderer+Compat.m compatPipelineFastPath comment): the compat
+  pipeline fast path keyed PSOs by compatMSLKeyCached = hash(MSL string POINTER + first
+  192 + last 128 bytes). The fp64-lowered per-operator programs differ ONLY in the middle
+  (one mgl_f*64 helper call inside a ~200 KB common prelude) and test_fp64's
+  create->draw->delete loop recycles both the Program and the MSL string addresses, so
+  operator k+1 produced operator k's key: its draws rendered with the previous program's
+  PSO (abs -> -ua values, roundeven -> ceil values — the "previous" answers are exactly
+  what the readback returned). Why r55-r58 triggered it: the allocation pattern (program
+  link/free order through the new link-cache/relink work) now recycles the msl_str
+  address; the key design was unsound all along (head/tail sampling).
+  Fix (1605445): key.a = fnid registry value of each raster stage's compiled MTLFunction
+  (mglProgramFunctionId; extProgramCompileMSL registers fnidOf(msl, entry) — a hash of the
+  FULL MSL text — at link time). Missing/unregistered stage -> decline the fast path
+  (one descriptor build per program lifecycle; no cached-PSO reuse). After: 22/22 clean.
+  NOTE for geom agent: b5bd61d (r59 link-cache program-name fix) does NOT cover this.
+- Gate: suite 112 files 9432/0, test_geom 10x 603/0, test_fp64fast 3x 298/0,
+  flash_check PASS at 10:49 (median 114.1); 12:0x-12:2x reruns INVALID (occluded window,
+  31/59/89 covered frames — other agents' GUI work; retry when free).
+- stub_scanner EMPTY/NOOP/ASSERT: 0 for compat + spirv_vote files.
+
+### 1. shader_group_vote (5/5 root-caused; CTS run pending display/GPU quiet)
+- symptom: "Shader compilation failed" — glslang compiles allInvocations/anyInvocation/
+  allInvocationsEqual (GLSL 4.60 core, unsuffixed; the CTS uses #version 460 from
+  getContextTypeGLSLVersion) to the LEGACY SPV_KHR_subgroup_vote opcodes 4428-4430
+  (OpSubgroupAll/Any/AllEqualKHR). SPIRV-Cross's MSL backend has no cases for them and
+  falls through to the GLSL backend, which emits allInvocationsARB()/anyInvocationARB()/
+  allInvocationsEqualARB() INTO THE MSL — identifiers that do not exist in Metal.
+- fix: MGL/src/spirv_vote.c mgl_spirv_vote_khr_rewrite() (new pass, called from
+  program.c right after spirv_prepare_for_msl): rewrites the three opcodes to core
+  OpGroupNonUniformAll/Any/AllEqual with an ExecutionScope of Subgroup (synthesizes
+  %uint 3 — or an OpTypeInt too if absent — before the first OpFunction, skipping the
+  glslang-interleaved global OpVariables; rewrites capability SubgroupVoteKHR ->
+  GroupNonUniformVote). SPIRV-Cross MSL then emits simd_all()/simd_any()/
+  spvSubgroupAllEqual() — real Metal 2 votes. Per ARB_shader_group_vote the SIMD
+  invocation group is implementation-defined (Metal's 32-lane simdgroup is legal and
+  satisfies the only guarantees: anyInvocation true when <value> true, allInvocations
+  false when <value> false, one answer per group). Workgroup-wide reduction would need
+  injected threadgroup memory; documented as an emulation limit.
+  Two bugs hit while writing it: new_bound was latched before the bound++ bumps (header
+  advertised a bound that excluded the synthesized id -> SPIRV-Cross wrote past its ids
+  vector -> SEGV in spvc parse), and the constant was inserted before glslang's
+  interleaved globals referencing a later-defined type.
+- tests/headless/test_vote.c: compile/link/dispatch/pixel checks for all three builtins
+  (460 core unsuffixed), incl. anyInvocation(false)=black, allInvocations(true)=white.
+
+### 2. gl_spirv (3 of 5 root-caused+fixed; state_queries + capabilities pending CTS verify)
+- spirv_glsl_to_spirv_builtin_functions + spirv_validation_builtin_variable_decorations:
+  link of SPIR-V-binary compute programs failed "no local work group size was specified"
+  although the module has OpExecutionMode LocalSize — the scan in program.c compared the
+  PACKED first word (wc<<16|op) to the bare opcode and read the mode literal at w+3
+  instead of w+2; it never fired. Fixed to walk instructions by word count.
+- spirv_modules_error_verification: glCompileShader on a shader with SPIR_V_BINARY_ARB
+  TRUE must generate GL_INVALID_OPERATION (ARB_gl_spirv 7.1) — shaders.c now sets the
+  error (info log was already there). NOTE glShaderSource on such a shader is LEGAL and
+  clears SPIR_V_BINARY_ARB (spec 7.1 ShaderSource addition) — do not copy my first
+  (wrong) test variant.
+- spirv_validation_capabilities: needs 10 active image uniforms in ONE compute stage to
+  link; MGL_MAX_IMAGE_UNITS was 8. Raised to 16 (Metal texture argument tables hold 128
+  entries on Apple silicon; image_units[] is sized TEXTURE_UNITS=128). Shared-file edit:
+  tests/headless/test_tess_images.c tess_image_uniforms asserted the old value 8 —
+  updated to 16 (TESS AGENT: your branch will conflict there; the value follows
+  GL_MAX_IMAGE_UNITS which the gl_spirv capabilities CTS case requires >= 10).
+- spirv_modules_state_queries (NOT yet fixed): TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH
+  must be 1 for programs linked from name-less SPIR-V ("no name reflection information
+  available -> one"); MGL returns 0 because xfb_post_link only builds the shader-declared
+  xfb layout when vs->src (GLSL) exists — SPIR-V-binary shaders have no source.
+- tests/headless/test_spirvbin2.c + spv_builtinfn.h: embeds the CTS builtin-functions
+  module (assembled from the CTS qpa disassembly with spirv-as --target-env opengl4.5):
+  binary compile status, LocalSize link, dispatch, and the CompileShader error path.
+
+## session 22 (Oct 27, 05:53-...) — s22: conformance queue part 3 (fails_compat2, 13 cases)
+
+Task (supervisor): commit the ~280-line uncommitted s21 tail (texdata_formats.c/.h, textures.c,
+test_buffers.c, 2 deleted debug tests) after building and running the affected CTS groups; then
+drive the 13-case queue at ~/MGL-cts/mgl-r28-sweep/fails_compat2.txt to 0 Fail. Rules: -j4, one
+glcts batch at a time, glmark2 under /tmp/mgl_glmark2.lock.
+
+### 1. the s21 tail was corrupting the heap — found with Guard Malloc
+Build + full suite were green (9233/0), but `direct_state_access.textures_compressed_subimage`
+crashed nondeterministically (SIGSEGV / Trace-BPT in malloc, sometimes Pass under lldb).
+Guard Malloc (`DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib` through tests/cts_one.sh)
+pinned it on the FIRST faulting access (crash report: fetchOnlineRGTC <- fetchCompressed <-
+mglGetCompressedTexImage): the RG8 de-interleave plane was allocated `row*depth = 2*w*depth`
+bytes but indexed `w*h*depth` — a 2x underallocation for every h>2 texture; plain 2D CTS levels
+(h=4..16) scribbled the heap and a later malloc trapped. Fixed (img/2*w*h*depth-byte allocation;
+also bsize now uses the requested d, not the level depth, on both copy-out paths). The 20-min
+supervisor note about libgmalloc never returning: it had in fact already produced the 06:44 crash
+report used here; full CTS runs under libgmalloc stay impractical (~100x slowdown), so the fixed
+paths were re-validated with MallocCheckHeapEach=50 + MallocScribble on the headless repros.
+
+### 2. what the s21 tail implements (3 commits)
+* **9fa567b copy_image 1D-array semantics**: GL addressing for GL_TEXTURE_1D_ARRAY puts the
+  1-texel-high image row in Y and the LAYER in Z; MGL's level stores the layer count in height,
+  so mglCopyImageSubData's bounds check and region swap y/z + height/depth for 1D arrays
+  (srcY+srcHeight<=1 else GL_INVALID_VALUE, layer count checked via the height axis).
+  KHR-GL46.copy_image.exceeding_boundaries Pass; test_copy1da.c (11 checks: valid copy lands,
+  y>0 / z>=layers / x overrun rejected).
+* **30178b4 RGTC online compression** (uncompressed data uploaded to a compressed
+  internalformat, GL 4.6 8.5.3): new tdDecodeRGTC CPU decoder (BC4/BC5, unorm+snorm); texImage
+  accepts the request for the RGTC family, the level stores the DECODED R8/RG8 (Metal has no
+  BC4/BC5-on-GPU compression path for this), glCompressedTexSubImage into such a level decodes
+  in place and keeps the original blocks, glGetCompressedTexImage re-encodes with the same
+  deterministic tdEncodeRGTC (upload->download round trip byte-exact), GL_TEXTURE_COMPRESSED
+  reports TRUE and GL_TEXTURE_COMPRESSED_IMAGE_SIZE the block size. Families with no CPU
+  encoder (BPTC, ETC2/EAC, generic GL_COMPRESSED_RGB) now answer GL_INVALID_OPERATION — a
+  legal "no online compression" response the CTS handles by uploading its own precompressed
+  blocks — instead of storing a decoded level that claimed GL_TEXTURE_COMPRESSED=TRUE while
+  glGetCompressedTexImage failed. KHR-GL46.direct_state_access.textures_compressed_subimage
+  Pass (3/3 runs); test_texonline.c (20 checks).
+* **1f74da1 test expectations**: glBufferSubData on a range DISJOINT from a persistent mapping
+  is legal per ARB_buffer_storage (only overlapping ranges raise GL_INVALID_OPERATION — the
+  implementation from 7478e0a was right, the test asserted the old blanket rejection); dropped
+  the scratch debug tests dbg_bordemu.c / test_intsampprobe.c.
+
+### 3. queue + gate results (r28 sweep, this build)
+* buffer_storage 9/9 Pass (incl. map_persistent_buffer_sub_data, map_persistent_read_pixels)
+* copy_image 13/13 Pass (incl. exceeding_boundaries, incompatible_formats_compression)
+* direct_state_access 371/371 Pass (incl. renderbuffers_storage, renderbuffers_storage_multisample,
+  textures_compressed_subimage) — the whole group, not just the 3 queued cases
+* texture_border_clamp 32/32 Pass (6 queued R32I/R32UI cases were already fixed by s20's border
+  emulation; re-verified on this build)
+* gate: full headless suite 9233 checks 0 FAIL; test_geom 10x 603/0; test_fp64fast 3x 298/0;
+  flash_check PASS (n=120 median 115.9 max 239.6, all 16 over-band frames foreign-window).
+* stub_scanner EMPTY/NOOP/ASSERT: clean on textures.c + texdata_formats.c. Build -j4 clean.
+
+### shared-file edits this session
+* none beyond my own files (textures.c, texdata_formats.c/.h are the compat/texture-domain
+  files this worktree owns for texture-format paths; no renderer or context-header changes).
+
 
 Task (supervisor): review+commit the uncommitted s19 tail (msl_reserved.c/.h, program.c, mgl_test.h,
 report), check the test_compat_basevertex 0%-CPU stall, then drive the 21-case CTS queue

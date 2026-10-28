@@ -72,4 +72,16 @@ char *mgl_msl_fix_cull_distance(const char *msl);
  */
 char *mgl_msl_fix_int_builtins(const char *msl);
 
+/*
+ * Writable multisample images: Metal's texture2d_ms / texture2d_ms_array are
+ * read-only (`access::write' fails the compile) and have no .write() member.
+ * Shaders that declare image2DMS / image2DMSArray with stores (e.g. the
+ * gl_spirv spirv_validation_capabilities type zoo) get their declarations'
+ * access rewritten to read and their <name>.write(...) calls replaced by
+ * (void)0 — the store is dropped (MGL reports GL_MAX_IMAGE_SAMPLES 0; MS
+ * image READS are unaffected).  Returns a malloc'd fixed copy, or NULL when
+ * nothing needed changing.  (implementation: msl_msimg.c)
+ */
+char *mgl_msl_fix_ms_image_writes(const char *msl);
+
 #endif

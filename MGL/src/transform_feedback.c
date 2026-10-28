@@ -1772,7 +1772,8 @@ done:
     return ret;
 }
 
-static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool api)
+static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool api,
+                     const unsigned *spirv_module, size_t spirv_words)
 {
     uint32_t *ir = NULL;
     size_t words = 0;
@@ -1785,6 +1786,19 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     bool *whole = NULL;
     char *glsl = NULL;
 
+    /* ARB_gl_spirv: a SPIR-V-binary vertex stage has no GLSL source — reflect its
+     * module directly (the layout is in the Offset/XfbBuffer decorations; names
+     * come from OpName, so a name-less module yields empty names and the
+     * MAX_LENGTH queries report 1 per ARB_gl_spirv).  The capture variant below
+     * is generated from GLSL source and cannot be built for a binary stage. */
+    if (!vs_src && spirv_module && spirv_words)
+    {
+        ir = (uint32_t *)malloc(spirv_words * 4);
+        if (!ir) goto done;
+        memcpy(ir, spirv_module, spirv_words * 4);
+        words = spirv_words;
+    }
+    else
     /* reflect the ORIGINAL vertex shader (independent of the program's SPIR-V, which other
      * domains may rewrite after linking) */
     if (!xfb_glsl_to_spirv(ctx, vs_src, 0, &ir, &words, &log)) {
@@ -1819,6 +1833,9 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     if (xp->record_words == 0) goto done;   /* only skips: nothing to run on the GPU */
 
     /* capture variant: original source + a wrapping main() that stores the outputs */
+    if (!vs_src)
+        goto done;   /* SPIR-V-binary stage: layout + queries only (no capture variant) */
+
     glsl = xfb_capture_glsl(vs_src, xp, whole);
     if (!glsl) { xfb_fail(xp, "vertex shader has no main()", NULL, NULL); goto done; }
     if (xfb_debug()) fprintf(stderr, "MGL xfb: capture GLSL for program %u:\n%s\n", xp->name, glsl);
@@ -1937,12 +1954,49 @@ done:
     free(log);
 }
 
+/* ARB_gl_spirv: a SPIR-V-binary stage has no GLSL source — its transform feedback
+ * layout is declared by Offset / XfbBuffer decorations in the module (GLSL's
+ * xfb_offset / xfb_buffer lower to exactly those).  Cheap instruction walk. */
+static bool xfb_spirv_has_xfb_deco(const Program *p, const Shader *sh)
+{
+    const unsigned *ir;
+    size_t n;
+
+    if (!sh || sh->src || !p)
+        return false;
+    if (!(ir = p->spirv[_VERTEX_SHADER].ir))
+        return false;
+    n = p->spirv[_VERTEX_SHADER].size;    if (n < 5)
+        return false;
+    for (size_t w = 5; w < n; )
+    {
+        uint32_t op = ir[w] & 0xFFFFu, wc = ir[w] >> 16;
+        if (wc == 0 || w + wc > n)
+            return false;
+        if (op == 71)   /* OpDecorate: [target] [Decoration] ... */
+        {
+            if (wc >= 3 && (ir[w + 2] == SpvDecorationOffset ||
+                            ir[w + 2] == SpvDecorationXfbBuffer))
+                return true;
+        }
+        if (op == 72)   /* OpMemberDecorate: [struct] [member] [Decoration] ... */
+        {
+            if (wc >= 4 && (ir[w + 3] == SpvDecorationOffset ||
+                            ir[w + 3] == SpvDecorationXfbBuffer))
+                return true;
+        }
+        w += wc;
+    }
+    return false;
+}
+
 static void xfb_post_link(GLMContext ctx, Program *p)
 {
     if (!XFB() || !p) return;
     Shader *vs = p->shader_slots[_VERTEX_SHADER];
     MGLXfbProgram *xp = xfb_prog(ctx, p, false);
-    bool shader_xfb = vs && vs->src && strstr(vs->src, "xfb_");
+    bool shader_xfb = (vs && vs->src && strstr(vs->src, "xfb_")) ||
+                      xfb_spirv_has_xfb_deco(p, vs);   /* ARB_gl_spirv binary vertex stage */
     /* the in-shader xfb qualifiers sit on the OUTPUTS of the last pre-rasterization stage:
      * a geometry or tessellation-evaluation shader declaring them (possibly an interface
      * block member with xfb_buffer / xfb_offset) is captured through that stage's resolver */
@@ -1970,7 +2024,8 @@ static void xfb_post_link(GLMContext ctx, Program *p)
             mgl_geom_tess_xfb_link(ctx, p);
             return;
         }
-        xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false);
+        xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false,
+                 p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
         if (xp->from_shader || xp->link_failed) return;
         xfb_clear_linked(ctx, xp);
         xp->linked = true;
@@ -2011,7 +2066,8 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     /* introspect: the source must run through the subroutine rewrite (glslang cannot
      * compile GLSL subroutines; mgl_introspect_shader_source also strips the
      * #extension GL_ARB_shader_subroutine directive) */
-    xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), true);
+    xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), true,
+             p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
 }
 
 #pragma mark - capture: primitive assembly

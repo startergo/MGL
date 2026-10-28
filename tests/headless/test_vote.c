@@ -7,7 +7,11 @@
  * the SPIR-V 1.3 OpGroupNonUniform* that SPIRV-Cross lowers to
  * simd_all/simd_any/spvSubgroupAllEqual.  End-to-end: dispatch + image
  * readback of every CTS predicate shape (uniform true/false, mixed parity,
- * workgroup-uniform). */
+ * workgroup-uniform).
+ *
+ * (merge note) gl46/compat added the same file testing the plain
+ * "#version 460 core" spellings end-to-end; both sets are kept below under
+ * the vote_core_* names. */
 #include "mgl_test.h"
 
 static const char *cs_avail = R"(#version 450
@@ -124,12 +128,50 @@ static int run_vote(const char *cs, int r, int g, int b)
     return bad == 0;
 }
 
+/* --- gl46/compat: same predicates spelled plainly under #version 460 core --- */
+static const char *core_cs_all =
+    "#version 460 core\n"
+    "layout(rgba8, binding = 2) writeonly uniform highp image2D destImage;\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "void main (void)\n"
+    "{\n"
+    "    bool result = allInvocations(true);\n"
+    "    vec4 outColor = vec4(vec3(result ? 1.0 : 0.0), 1.0);\n"
+    "    imageStore(destImage, ivec2(gl_GlobalInvocationID.xy), outColor);\n"
+    "}\n";
+
+static const char *core_cs_any =
+    "#version 460 core\n"
+    "layout(rgba8, binding = 2) writeonly uniform highp image2D destImage;\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "void main (void)\n"
+    "{\n"
+    "    bool result = anyInvocation(false);\n"
+    "    vec4 outColor = vec4(vec3(result ? 1.0 : 0.0), 1.0);\n"
+    "    imageStore(destImage, ivec2(gl_GlobalInvocationID.xy), outColor);\n"
+    "}\n";
+
+static const char *core_cs_equal =
+    "#version 460 core\n"
+    "layout(rgba8, binding = 2) writeonly uniform highp image2D destImage;\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "void main (void)\n"
+    "{\n"
+    "    bool result = allInvocationsEqual(true);\n"
+    "    vec4 outColor = vec4(vec3(result ? 1.0 : 0.0), 1.0);\n"
+    "    imageStore(destImage, ivec2(gl_GlobalInvocationID.xy), outColor);\n"
+    "}\n";
+
 TEST(availability)      { EXPECT_TRUE(run_vote(cs_avail, 255, 255, 255)); }
 TEST(all_invocations)   { EXPECT_TRUE(run_vote(cs_all, 255, 255, 255)); }
 TEST(any_invocation)    { EXPECT_TRUE(run_vote(cs_any, 0, 0, 0)); }
 TEST(vars_expr1_black)  { EXPECT_TRUE(run_vote(cs_v1, 0, 0, 0)); }
 TEST(vars_expr2_white)  { EXPECT_TRUE(run_vote(cs_v2, 255, 255, 255)); }
 TEST(vars_expr3_white)  { EXPECT_TRUE(run_vote(cs_v3, 255, 255, 255)); }
+
+TEST(vote_core_result_all)      { EXPECT_TRUE(run_vote(core_cs_all, 255, 255, 255)); }
+TEST(vote_core_result_any_false){ EXPECT_TRUE(run_vote(core_cs_any, 0, 0, 0)); }
+TEST(vote_core_result_equal)    { EXPECT_TRUE(run_vote(core_cs_equal, 255, 255, 255)); }
 
 int main(void)
 {
@@ -139,5 +181,8 @@ int main(void)
     RUN(vars_expr1_black);
     RUN(vars_expr2_white);
     RUN(vars_expr3_white);
-    return 0;
+    RUN(vote_core_result_all);
+    RUN(vote_core_result_any_false);
+    RUN(vote_core_result_equal);
+    return mgl_test_summary();
 }

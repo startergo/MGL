@@ -149,7 +149,11 @@ static GLuint max_uniform_buffer_bindings(GLMContext ctx)
 #define MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS  8
 #define MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  8
 #define MGL_MAX_TRANSFORM_FEEDBACK_BUFFERS      4
-#define MGL_MAX_IMAGE_UNITS                     8
+/* 16 image units (>= the GL 4.6 floor of 8): Metal's per-function texture argument
+ * tables hold 128 entries on Apple silicon, so a stage can address 16 storage
+ * images alongside its samplers — KHR-GL46.gl_spirv.spirv_validation_capabilities
+ * links a compute shader with 10 active image uniforms and expects success. */
+#define MGL_MAX_IMAGE_UNITS                     16
 
 /* the binding-point limits as reported by glGet*, for the GLSL layout(binding=N)
  * compile-time range check (GLSL 4.60 4.4.5: a binding at or beyond the limit is a

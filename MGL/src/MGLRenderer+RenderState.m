@@ -15,6 +15,7 @@
 #import <objc/runtime.h>
 #import "MGLRenderer+RenderState.h"
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+Compat.h"   /* compat perf: mglProgramRegisterMSLIdentity (pipeline fast-path key) */
 #import "mgl_ext_tess.h"
 #import "mgl_ext_geom.h"
 #define MGL_RSTATE_INTERNAL 1
@@ -461,6 +462,13 @@ static bool rs_mode_is_polygon(GLenum m)
     bool is_vertex_like = (stage == _VERTEX_SHADER) ||
                           (stage != _FRAGMENT_SHADER && stage_msl && strstr(stage_msl, "mgl_rs_vertex_fixup"));
     const char *msl = program ? program->spirv[stage].msl_str : NULL;
+    /* compat: a CLAMP_TO_BORDER border colour Metal cannot express is emulated by
+     * an MSL rewrite of the fragment stage (compat_border.c) — even an otherwise
+     * unpatched stage must reach the specialization below for it */
+    bool border_emu = (stage == _FRAGMENT_SHADER) && mgl_border_wanted(ctx);
+    if (getenv("MGL_BORDER_DEBUG") && stage == _FRAGMENT_SHADER)
+        fprintf(stderr, "MGL border: rstateSpecialize frag, wanted=%d patched=%d\n",
+                (int)border_emu, msl ? mgl_rstate_msl_is_patched(msl) : -1);
     /* geom: the vertex stage's shadow-sampling emulation carries its own function
      * constants (32010+slot) that must be specialized even when the rstate fixups
      * did not patch this MSL (e.g. a vertex function without a [[position]] output) */
@@ -476,7 +484,7 @@ static bool rs_mode_is_polygon(GLenum m)
                      shader->mtl_data.function != program->shader_slots[stage]->mtl_data.function;
     if (!mgl_rstate_msl_is_patched(msl) &&
         !(msl && strstr(msl, "mgl_shadow_op_") != NULL) &&
-        !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn)
+        !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn && !border_emu)
         return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
@@ -552,6 +560,72 @@ static bool rs_mode_is_polygon(GLenum m)
                     lib = plib;
                     base = pfn;
                     msl = pss_msl;
+                }
+            }
+        }
+        /* compat: GL_CLAMP_TO_BORDER with a border colour Metal's samplers cannot
+         * express (they have three fixed colours only) — swap in the lazily
+         * rewritten MSL variant whose plain sample calls return the exact border
+         * colour (compat_border.c).  Cached by source MSL pointer + table
+         * signature; the compiled library is cached by text like the PSS one. */
+        MGLBorderEmu bemu[MGL_BORDER_MAX];
+        int nbemu = mgl_border_scan(ctx, _FRAGMENT_SHADER, bemu);
+        if (getenv("MGL_BORDER_DEBUG"))
+            fprintf(stderr, "MGL border: stage %d scan -> %d slots%s\n", stage, nbemu,
+                    nbemu ? " (emulated)" : "");
+        if (nbemu > 0)
+        {
+            uint64_t bsig = mgl_border_sig(bemu, nbemu);
+            if (getenv("MGL_BORDER_DEBUG"))
+                fprintf(stderr, "MGL border: sig %llx slot %u axes %u lin %u kind %u bc %s\n",
+                        (unsigned long long)bsig, bemu[0].msl_slot, bemu[0].axes, bemu[0].linear,
+                        bemu[0].kind, bemu[0].bc);
+            if (!rs->border_msl || rs->border_msl_src != (const void *)msl || rs->border_msl_sig != bsig)
+            {
+                char *v = mgl_border_rewrite(msl, bemu, nbemu);
+                if (getenv("MGL_BORDER_DEBUG"))
+                {
+                    fprintf(stderr, "MGL border: rewrite %s\n", v ? "OK" : "no match");
+                    if (v) for (const char *q = v; *q; ) { const char *e = strchr(q, '\n'); size_t l = e ? (size_t)(e - q) + 1 : strlen(q); if (strstr(q, "mgl_bsamp") || strstr(q, "mgl_border:") || strstr(q, "sample")) fwrite(q, 1, l, stderr); q += l; }
+                }
+                if (v)
+                {
+                    free(rs->border_msl);
+                    rs->border_msl = v;
+                    rs->border_msl_src = (const void *)msl;
+                    rs->border_msl_sig = bsig;
+                }
+                else if (rs->border_msl_src == (const void *)msl)
+                {
+                    /* this source has no rewritable call: remember so we do not
+                     * re-walk the text on every pipeline build */
+                    free(rs->border_msl);
+                    rs->border_msl = NULL;
+                    rs->border_msl_src = (const void *)msl;
+                    rs->border_msl_sig = bsig;
+                }
+            }
+            if (rs->border_msl && rs->border_msl_src == (const void *)msl)
+            {
+                char berr[2048] = "";
+                if (getenv("MGL_BORDER_DUMP"))
+                {
+                    char p_[256];
+                    snprintf(p_, sizeof p_, "%s/variant_stage%d.msl", getenv("MGL_BORDER_DUMP"), stage);
+                    FILE *f = fopen(p_, "wb");
+                    if (f) { fwrite(rs->border_msl, 1, strlen(rs->border_msl), f); fclose(f); }
+                }
+                id<MTLLibrary> blib = [self extProgramLibraryForMSL: rs->border_msl key: nil error: berr];
+                if (getenv("MGL_BORDER_DEBUG") && berr[0])
+                    fprintf(stderr, "MGL border: variant compile: %.400s\n", berr);
+                id<MTLFunction> bfn = blib ? [blib newFunctionWithName: base.name] : nil;
+                if (getenv("MGL_BORDER_DEBUG"))
+                    fprintf(stderr, "MGL border: variant fn=%s\n", bfn ? "OK" : "MISSING");
+                if (bfn)
+                {
+                    lib = blib;
+                    base = bfn;
+                    msl = rs->border_msl;
                 }
             }
         }
@@ -787,6 +861,13 @@ static bool rs_mode_is_polygon(GLenum m)
         if (shader->mtl_data.function) CFBridgingRelease(shader->mtl_data.function);
         shader->mtl_data.library = (void *)CFBridgingRetain(lib);
         shader->mtl_data.function = (void *)CFBridgingRetain(fn);
+        /* compat perf (surgical, one call): record the fixed-up function's MSL
+         * content identity — the compat pipeline fast path keys on it, and this
+         * install path bypasses extProgramCompileMSL (bindMTLProgram then sees
+         * a non-NULL library and skips, leaving the function unregistered, so
+         * every draw of the program would decline the fast path) */
+        mglProgramRegisterMSLIdentity(shader->mtl_data.function,
+                                      program->spirv[stage].msl_str, entry);
     }
 }
 
@@ -815,6 +896,23 @@ static bool rs_pre_draw(GLMContext glm_ctx, GLenum mode, GLsizei vertex_count, G
     if (ctx->state.caps.cull_face && ctx->state.var.cull_face_mode == GL_FRONT_AND_BACK &&
         rs_mode_is_polygon(mode) && (!ctx->state.ext_rstate || ctx->state.ext_rstate->polygon_mode != GL_POINT))
         return false;
+
+    /* compat: CLAMP_TO_BORDER border-colour emulation — the fragment MSL variant
+     * with the exact border colour is baked into the pipeline state, so a change
+     * of the per-slot table must rebuild it.  Runs before the state walk (this
+     * hook precedes processGLState) and stays off unless an active unit actually
+     * clamps to border, so the per-draw cost is one scan of the active units. */
+    if (ctx->state.program && ctx->state.ext_rstate && mgl_border_wanted(ctx))
+    {
+        MGLBorderEmu be[MGL_BORDER_MAX];
+        int nb = mgl_border_scan(ctx, _FRAGMENT_SHADER, be);
+        uint64_t sig = mgl_border_sig(be, nb);
+        if (ctx->state.ext_rstate->border_sig != sig)
+        {
+            ctx->state.ext_rstate->border_sig = sig;
+            ctx->state.dirty_bits |= DIRTY_PROGRAM;
+        }
+    }
 
     return true;
 }

@@ -149,6 +149,10 @@ void tdConvertStorage(const TDFormat *sf, const TDStorage *src, const TDFormat *
  * decoded storage of f (RGBA8 / R16 / RG16, snorm for signed EAC). */
 void tdDecodeETC(const TDFormat *f, const void *blocks, int w, int h, void *dst, size_t dst_row);
 
+/* CPU decoder for the RGTC family (BC4 single / BC5 dual channel, unorm+snorm):
+ * blocks -> decoded R8 / R8_SNORM / RG8 / RG8_SNORM pixels. */
+void tdDecodeRGTC(const TDFormat *f, const void *blocks, int w, int h, void *dst, size_t dst_row);
+
 /* compress w x h x d 8-bit samples (row pitch rw, image pitch iw) into the image's BC4 /
  * BC5 (RGTC1 / RGTC2, signedness per snorm) blocks; NULL on allocation failure. */
 uint8_t *tdEncodeRGTC(const uint8_t *chan0, const uint8_t *chan1, int w, int h, int d,

@@ -1428,6 +1428,60 @@ static void eac11_block(const uint8_t *blk, bool sgn, int32_t out[4][4])
         }
 }
 
+void tdDecodeRGTC(const TDFormat *f, const void *blocks, int w, int h, void *dst, size_t dst_row)
+{
+    const uint8_t *b = (const uint8_t *)blocks;
+    uint8_t *out = (uint8_t *)dst;
+    bool two = (f->base == GL_RG);
+    bool snorm = (f->comp_type == GL_SIGNED_NORMALIZED);
+    int ncomp = two ? 2 : 1;
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++)
+        {
+            const uint8_t *blk = b + ((size_t)by * bw + bx) * 8 * ncomp;
+            for (int c = 0; c < ncomp; c++)
+            {
+                const uint8_t *p = blk + 8 * c;
+                int e0 = snorm ? (int)(int8_t)p[0] : (int)p[0];
+                int e1 = snorm ? (int)(int8_t)p[1] : (int)p[1];
+                /* 48 bits of 3-bit codes, little endian */
+                uint64_t bits = 0;
+                for (int k = 0; k < 6; k++) bits |= (uint64_t)p[2 + k] << (8 * k);
+
+                for (int yy = 0; yy < 4; yy++)
+                {
+                    int py = by * 4 + yy;
+                    if (py >= h) continue;
+                    for (int xx = 0; xx < 4; xx++)
+                    {
+                        int px = bx * 4 + xx;
+                        if (px >= w) continue;
+                        int code = (int)((bits >> (3 * (yy * 4 + xx))) & 7ull);
+                        int v;
+                        if (e0 > e1)
+                        {
+                            static const int w8[8][2] = { {6,1},{5,2},{4,3},{3,4},{2,5},{1,6} };
+                            if (code == 0) v = e0;
+                            else if (code == 1) v = e1;
+                            else v = (w8[code - 2][0] * e0 + w8[code - 2][1] * e1) / 7;
+                        }
+                        else
+                        {
+                            static const int w6[4][2] = { {4,1},{3,2},{2,3},{1,4} };
+                            if (code == 0) v = e0;
+                            else if (code == 1) v = e1;
+                            else if (code < 6) v = (w6[code - 2][0] * e0 + w6[code - 2][1] * e1) / 5;
+                            else v = (code == 6) ? (snorm ? -128 : 0) : (snorm ? 127 : 255);
+                        }
+                        out[(size_t)py * dst_row + (size_t)px * ncomp + c] = (uint8_t)v;
+                    }
+                }
+            }
+        }
+}
+
 void tdDecodeETC(const TDFormat *f, const void *blocks, int w, int h, void *dst, size_t dst_row)
 {
     const uint8_t *b = (const uint8_t *)blocks;

@@ -52,6 +52,7 @@ static uint64_t mgl_link_group_seq;
 #include "fp64.h"
 #include "buffers.h"
 #include "msl_reserved.h"
+#include "spirv_vote.h"
 
 void mgl_program_ref(Program *ptr);
 void mgl_program_unref(GLMContext ctx, Program *ptr);
@@ -2216,6 +2217,18 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         return false;
     }
 
+    /* SPV_KHR_subgroup_vote opcodes (what glslang emits for the GLSL group-vote
+     * builtins) have no MSL backend in SPIRV-Cross: rewrite them to the core
+     * OpGroupNonUniform* instructions, which lower to Metal simd votes. */
+    {
+        uint32_t *vote_fixed = mgl_spirv_vote_khr_rewrite(prepared, prepared_words, &prepared_words);
+        if (vote_fixed)
+        {
+            free(prepared);
+            prepared = vote_fixed;
+        }
+    }
+
     if (stage == _VERTEX_SHADER)
     {
         /* a vertex input location overlap is a link error (GL 4.6, 11.1.1); the
@@ -2367,6 +2380,11 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         return false;
     }
     spvc_context_set_error_callback(context, spvc_log_cb, log);
+    if (getenv("MGL_PREPARED_DUMP")) {   /* diagnosis: module as fed to SPIRV-Cross */
+        char p_[256]; snprintf(p_, sizeof p_, "%s/stage%d.spv", getenv("MGL_PREPARED_DUMP"), stage);
+        FILE *f_ = fopen(p_, "wb");
+        if (f_) { fwrite(prepared, 4, prepared_words, f_); fclose(f_); }
+    }
 
     if (spvc_context_parse_spirv(context, prepared, prepared_words, &ir) != SPVC_SUCCESS ||
         spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler) != SPVC_SUCCESS)
@@ -2922,6 +2940,19 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             if (tess_owned != result) free(tess_owned);
             tess_owned = copied;
             result = copied;
+        }
+    }
+
+    /* writable multisample images are emulated (Metal's texture2d_ms is
+     * read-only): access::write -> read and the .write() stores dropped —
+     * msl_msimg.c, gl_spirv spirv_validation_capabilities image zoo */
+    {
+        char *fixed = mgl_msl_fix_ms_image_writes(result);
+        if (fixed)
+        {
+            if (tess_owned != result) free(tess_owned);
+            tess_owned = fixed;
+            result = fixed;
         }
     }
 
@@ -3818,10 +3849,16 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
              * linked compute SPIR-V's execution modes are authoritative */
             unsigned *ir = scratch->base.spirv[_COMPUTE_SHADER].ir;
             size_t n = scratch->base.spirv[_COMPUTE_SHADER].size;
-            for (size_t w = 5; w + 3 < n; w++)
-                if ((ir[w] == 16 && ir[w + 3] == 17) ||   /* OpExecutionMode LocalSize */
-                    (ir[w] == 17 && ir[w + 3] == 18))     /* OpExecutionModeId LocalSizeId */
+            for (size_t w = 5; w + 2 < n; )
+            {
+                uint32_t op = ir[w] & 0xFFFFu, wc = ir[w] >> 16;
+                if (wc == 0 || w + wc > n)
+                    break;                          /* malformed: nothing more to read */
+                /* OpExecutionMode [entry] <mode> ...: LocalSize=17, LocalSizeId=18 */
+                if (op == 16 && wc >= 3 && (ir[w + 2] == 17 || ir[w + 2] == 18))
                     declared = true;
+                w += wc;
+            }
         }
         if (!declared)
         {

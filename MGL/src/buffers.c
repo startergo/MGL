@@ -239,6 +239,19 @@ static bool mappedNonPersistent(Buffer *ptr)
     return ptr->mapped && !(ptr->access_flags & GL_MAP_PERSISTENT_BIT);
 }
 
+/* GL_ARB_buffer_storage sub-data rule (Mesa buffer_object_subdata_range_good):
+ * a persistent mapping never blocks client writes — the address is stable and
+ * GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT orders it; a non-persistent mapping blocks
+ * only the ranges it covers.  A whole-store range degenerates to the pre-4.4
+ * "buffer is mapped" error. */
+static bool mappedRangeBlocked(Buffer *ptr, GLintptr offset, GLsizeiptr size)
+{
+    if (!mappedNonPersistent(ptr))
+        return false;
+    return offset < ptr->mapped_offset + ptr->mapped_length &&
+           ptr->mapped_offset < offset + size;
+}
+
 /* CPU wrote [offset, offset+size) of the buffer contents */
 static void bufferDidModify(GLMContext ctx, Buffer *ptr, size_t offset, size_t size)
 {
@@ -446,7 +459,7 @@ static void bufferSubData(GLMContext ctx, Buffer *ptr, GLintptr offset, GLsizeip
 {
     ERROR_CHECK_RETURN(offset >= 0 && size >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(mgl_range_ok(offset, size, ptr->size), GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(mappedNonPersistent(ptr) == false, GL_INVALID_OPERATION);
+    ERROR_CHECK_RETURN(!mappedRangeBlocked(ptr, offset, size), GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(!(ptr->immutable_storage && !(ptr->storage_flags & GL_DYNAMIC_STORAGE_BIT)), GL_INVALID_OPERATION);
 
     if (size == 0 || data == NULL)
@@ -1327,7 +1340,9 @@ bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintpt
     ERROR_CHECK_RETURN_VALUE(src_integer == dst_integer, GL_INVALID_OPERATION, false);
     ERROR_CHECK_RETURN_VALUE(!(src_integer && (type == GL_FLOAT || type == GL_HALF_FLOAT)), GL_INVALID_OPERATION, false);
 
-    ERROR_CHECK_RETURN_VALUE(mappedNonPersistent(ptr) == false, GL_INVALID_OPERATION, false);
+    /* ClearBufferSubData uses the sub-data rule (range overlap); the whole-store
+     * ClearBufferData callers pass [0, size) so they keep the blanket error */
+    ERROR_CHECK_RETURN_VALUE(!mappedRangeBlocked(ptr, offset, size), GL_INVALID_OPERATION, false);
 
     if (size == 0)
         return true;

@@ -1641,6 +1641,13 @@ static void setProxy(GLMContext ctx, Texture *proxy, GLint level, GLenum ifmt, G
             proxy->num_levels = l + 1;
 }
 
+/* the RGTC family (BC4/BC5): the only compressed formats with a CPU encoder
+ * (tdEncodeRGTC), so the only ones MGL can online-compress round-trip */
+static bool isRgtcFormat(const TDFormat *f)
+{
+    return f && (f->flags & TDF_BC) && (f->base == GL_RED || f->base == GL_RG);
+}
+
 static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint internalformat,
                      GLsizei width, GLsizei height, GLsizei depth, GLint border,
                      GLenum format, GLenum type, const void *pixels)
@@ -1694,13 +1701,16 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     if (req->flags & TDF_COMPRESSED)
     {
         /* uncompressed client data given to a compressed internal format has to be
-         * compressed by the GL ("online compression", GL 4.6 8.5.3).  MGL stores the
-         * DECODED equivalent instead (R8/RG8/RGB8/RGBA8/sRGB...): a legal
-         * representation — GL_TEXTURE_COMPRESSED then reports GL_FALSE and
-         * glGetCompressedTexImage is not available for it.  This keeps uploads and
-         * downloads byte-exact (a CPU RGTC encoder is lossy and the CTS
-         * packed_pixels rectangle.compressed_* compares gradients byte-exactly;
-         * tdEncodeRGTC remains for explicit glCompressedTex* block uploads). */
+         * compressed by the GL ("online compression", GL 4.6 8.5.3).  MGL has a CPU
+         * encoder only for the RGTC family (BC4/BC5), whose downloads re-encode from
+         * the decoded storage; the other families report the "no online compression"
+         * error instead of storing a decoded level that would report
+         * GL_TEXTURE_COMPRESSED=TRUE while glGetCompressedTexImage fails.  Levels
+         * created this way store the DECODED equivalent (R8/RG8), keeping uploads
+         * and downloads byte-exact; tdEncodeRGTC remains for explicit
+         * glCompressedTex* block uploads. */
+        if (pixels && !isRgtcFormat(req))
+            TD_CHECK(0, GL_INVALID_OPERATION);
         if (f->flags & TDF_COMPRESSED)
         {
             /* no decoded equivalent in the table (should not happen): reject */
@@ -2336,6 +2346,10 @@ void mglCompressedTexImage1D(GLMContext ctx, GLenum target, GLint level, GLenum 
     compressedTexImage(ctx, target, 1, level, internalformat, width, 1, 1, border, imageSize, data);
 }
 
+static bool storeOnlineRGTC(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                            GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                            const TDFormat *f, const uint8_t *blocks);
+
 static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLint level,
                                   GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
                                   GLenum format, GLsizei imageSize, const void *data)
@@ -2350,7 +2364,12 @@ static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int
 
     TextureLevel *l = texLevel(tex, face, level);
     TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
-    TD_CHECK(l->mtl_format == format, GL_INVALID_OPERATION);
+    /* exception: an online-compressed RGTC level stores the decoded format, so
+     * the sub-image's compressed format matches the *texture's* internalformat
+     * (storeOnlineRGTC decodes into the level and keeps the original blocks) */
+    bool online_rgtc = l->mtl_format != format && isRgtcFormat(f) && f->decoded &&
+                       tex->internalformat == format && l->mtl_format == f->decoded;
+    TD_CHECK(l->mtl_format == format || online_rgtc, GL_INVALID_OPERATION);
     TD_CHECK(dims != 1, GL_INVALID_OPERATION);
 
     err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
@@ -2376,9 +2395,61 @@ static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int
 
     uint8_t *blocks = gatherCompressed(f, src, off, rs, is, w, h, d);
     TD_CHECK(blocks, GL_OUT_OF_MEMORY);
-    bool ok = storeCompressed(ctx, tex, face, level, x, y, z, w, h, d, blocks);
+    bool ok = online_rgtc ? storeOnlineRGTC(ctx, tex, face, level, x, y, z, w, h, d, f, blocks)
+                          : storeCompressed(ctx, tex, face, level, x, y, z, w, h, d, blocks);
     free(blocks);
     TD_CHECK(ok, GL_OUT_OF_MEMORY);
+}
+
+/*
+ * Compressed sub-image into an ONLINE-compressed RGTC level (its storage is the
+ * decoded R8/RG8 format, see texImage): decode the blocks into the level and keep
+ * the original blocks in the texdata info, so a later glGetCompressedTexImage
+ * returns exactly the bytes the client uploaded (the level behaves, from the
+ * outside, like the hardware-compressed texture its queries report).
+ */
+static bool storeOnlineRGTC(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                            GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                            const TDFormat *f, const uint8_t *blocks)
+{
+    const TDFormat *sf = tdFormatInfo(levelFormat(tex, face, level));
+    TDTexInfo *info = mgl_texdata_info(ctx, tex);
+    TextureLevel *l = texLevel(tex, face, level);
+    size_t lrow, limg, row, img;
+
+    if (!info || !l || !sf || sf->internalformat != f->decoded)
+        return false;
+
+    lrow = tdStorageRowBytes(f, l->width);
+    limg = tdStorageImageBytes(f, l->width, l->height);
+    row = tdStorageRowBytes(f, w);
+    img = tdStorageImageBytes(f, w, h);
+
+    /* keep the whole-level original blocks for byte-exact downloads */
+    if (!info->orig[face][level])
+    {
+        size_t lsize = limg * l->depth;
+        info->orig[face][level] = calloc(1, lsize ? lsize : 1);
+        if (!info->orig[face][level])
+            return false;
+        info->orig_size[face][level] = lsize;
+    }
+    uint8_t *o = (uint8_t *)info->orig[face][level];
+    size_t bx = (size_t)x / f->block_w * f->block_bytes, by = (size_t)y / f->block_h;
+    size_t brows = ((size_t)h + f->block_h - 1) / f->block_h;
+    for (GLsizei zz = 0; zz < d; zz++)
+        for (size_t yy = 0; yy < brows; yy++)
+            memcpy(o + (size_t)(z + zz) * limg + (by + yy) * lrow + bx, blocks + (size_t)zz * img + yy * row, row);
+
+    TDRegion r = glRegion(tex, face, level, x, y, z, w, h, d);
+    TDStorage st;
+    if (!allocStorage(sf, w, h, d, &st))
+        return false;
+    for (GLsizei zz = 0; zz < d; zz++)
+        tdDecodeRGTC(f, blocks + (size_t)zz * img, w, h, (uint8_t *)st.data + (size_t)zz * st.image_pitch, st.row_pitch);
+    bool ok = writeRegion(ctx, tex, &r, &st, true, true);
+    free(st.data);
+    return ok;
 }
 
 void mglCompressedTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data)
@@ -2446,12 +2517,103 @@ void mglCompressedTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level,
 }
 
 /* read tight compressed blocks of a GL region */
+/*
+ * Download of an online-compressed RGTC level: read the decoded storage back and
+ * re-encode it with the same deterministic CPU encoder the upload path uses.
+ * Only whole-level reads are handled (sub-region reads fall back to the error).
+ */
+static bool fetchOnlineRGTC(GLMContext ctx, Texture *tex, GLuint face, GLint level,
+                            GLsizei w, GLsizei h, GLsizei d, uint8_t *out)
+{
+    const TDFormat *req = tdFormatInfo(tex->internalformat);
+    if (!req || !(req->flags & TDF_COMPRESSED) || !req->decoded || !isRgtcFormat(req))
+        return false;
+
+    const TDFormat *sf = tdFormatInfo(levelFormat(tex, face, level));
+    if (!sf || sf->internalformat != req->decoded)
+        return false;   /* not the decoded equivalent of the requested format */
+
+    TextureLevel *l = texLevel(tex, face, level);
+    if (!l || !l->complete)
+        return false;
+
+    /* whole level only */
+    if (w != (GLsizei)l->width || h != (GLsizei)l->height || d != (GLsizei)l->depth)
+        return false;
+
+    /* an explicit glCompressedTexSubImage upload kept its exact bytes */
+    TDTexInfo *info = mgl_texdata_find_info(ctx, tex);
+    const uint8_t *o = info ? (const uint8_t *)info->orig[face][level] : NULL;
+    if (o)
+    {
+        size_t brows = ((size_t)w + req->block_w - 1) / req->block_w;
+        size_t bsize = brows * (((size_t)h + req->block_h - 1) / req->block_h) * (size_t)d *
+                       req->block_bytes;
+        memcpy(out, o, bsize);
+        return true;
+    }
+
+    size_t row = (size_t)l->width * sf->bpp, img = row * (size_t)l->height;
+    uint8_t *buf = (uint8_t *)malloc(img * (size_t)l->depth);
+    if (!buf)
+        return false;
+    TDRegion r = glRegion(tex, face, level, 0, 0, 0, l->width, l->height, l->depth);
+    TDStorage st = { buf, row, img, NULL, 0, 0 };
+    if (!readRegion(ctx, tex, &r, &st))
+    {
+        free(buf);
+        return false;
+    }
+
+    bool two = (req->base == GL_RG);
+    bool snorm = (req->comp_type == GL_SIGNED_NORMALIZED);
+    uint8_t *p0 = buf, *p1 = NULL, *plane1 = NULL;
+    if (two)
+    {
+        /* RG8 storage is interleaved; the encoder wants separate planes.
+         * one byte per texel per plane => img/2 (= w*h) bytes per image */
+        plane1 = (uint8_t *)malloc((img / 2) * (size_t)l->depth);
+        if (!plane1) { free(buf); return false; }
+        for (GLsizei zz = 0; zz < (GLsizei)l->depth; zz++)
+            for (size_t y = 0; y < (size_t)l->height; y++)
+                for (size_t x = 0; x < (size_t)l->width; x++)
+                {
+                    size_t i = zz * img + y * row + 2 * x;
+                    plane1[zz * img / 2 + y * (size_t)l->width + x] = buf[i + 1];
+                    p0[zz * img / 2 + y * (size_t)l->width + x] = buf[i];
+                }
+        p1 = plane1;
+    }
+
+    uint8_t *blocks = tdEncodeRGTC(p0, p1, l->width, l->height, l->depth,
+                                    l->width, (int)(l->width * l->height), two, snorm);
+    bool ok = blocks != NULL;
+    if (ok)
+    {
+        size_t brows = ((size_t)w + req->block_w - 1) / req->block_w;
+        size_t bsize = brows * (((size_t)h + req->block_h - 1) / req->block_h) * (size_t)d *
+                       req->block_bytes;
+        memcpy(out, blocks, bsize);
+        free(blocks);
+    }
+    free(plane1);
+    free(buf);
+    return ok;
+}
+
 static bool fetchCompressed(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLint x, GLint y, GLint z,
                             GLsizei w, GLsizei h, GLsizei d, uint8_t *out)
 {
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
     if (!f)
         return false;
+
+    /* an online-compressed level (uncompressed data uploaded to a compressed
+     * internalformat) stores the DECODED format; re-encode it here so the client
+     * sees the blocks a hardware-compressed texture would return.  Deterministic
+     * encoder => a download->upload->download round trip is byte-exact. */
+    if (!(f->flags & TDF_COMPRESSED) && fetchOnlineRGTC(ctx, tex, face, level, w, h, d, out))
+        return true;
     size_t row = tdStorageRowBytes(f, w), img = tdStorageImageBytes(f, w, h);
 
     if (etcFallback(f))
@@ -2486,7 +2648,17 @@ static void getCompressed(GLMContext ctx, Texture *tex, GLuint face, GLint level
     TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
 
     const TDFormat *f = tdFormatInfo(l->mtl_format);
-    TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+    if (!f || !(f->flags & TDF_COMPRESSED))
+    {
+        /* exception: an online-compressed RGTC level (decoded storage, see
+         * fetchOnlineRGTC) reads back re-encoded blocks */
+        const TDFormat *oreq = tdFormatInfo(tex->internalformat);
+        bool online_rgtc = oreq && isRgtcFormat(oreq) && oreq->decoded &&
+                           f && f->internalformat == oreq->decoded;
+        if (!online_rgtc)
+            TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+        f = online_rgtc ? oreq : f;   /* block layout of the requested format */
+    }
 
     if (whole)
     {
@@ -3345,12 +3517,32 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
     if (vsc && !vdc) { dw = (srcWidth + vsf->block_w - 1) / vsf->block_w; dh = (srcHeight + vsf->block_h - 1) / vsf->block_h; }
     if (!vsc && vdc) { dw = srcWidth * vdf->block_w; dh = srcHeight * vdf->block_h; }
 
-    /* regions in range and block aligned */
-    GLint sz = scube ? 0 : srcZ, dz = dcube ? 0 : dstZ;
-    err = checkSubRegion(st, sface0, srcLevel, srcX, srcY, sz, srcWidth, srcHeight, scube ? 1 : srcDepth);
-    TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
-    err = checkSubRegion(dt, dface0, dstLevel, dstX, dstY, dz, dw, dh, dcube ? 1 : srcDepth);
-    TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    /* regions in range and block aligned.  GL_TEXTURE_1D_ARRAY: Y addresses the
+     * single row of a 1-high image and Z selects the layer (GL 4.6 CopyImageSubData,
+     * same as Mesa prepare_target_err); MGL keeps the layer count in the level
+     * height, so for 1D arrays the y/z and height/depth axes swap for this check */
+    if (srcTarget == GL_TEXTURE_1D_ARRAY)
+    {
+        TD_CHECK(srcY + srcHeight <= 1, GL_INVALID_VALUE);   /* single-row image */
+        err = checkSubRegion(st, sface0, srcLevel, srcX, srcZ, 0, srcWidth, srcDepth, srcHeight);
+        TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    }
+    else
+    {
+        err = checkSubRegion(st, sface0, srcLevel, srcX, srcY, scube ? 0 : srcZ, srcWidth, srcHeight, scube ? 1 : srcDepth);
+        TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    }
+    if (dstTarget == GL_TEXTURE_1D_ARRAY)
+    {
+        TD_CHECK(dstY + dh <= 1, GL_INVALID_VALUE);          /* single-row image */
+        err = checkSubRegion(dt, dface0, dstLevel, dstX, dstZ, 0, dw, srcDepth, dh);
+        TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    }
+    else
+    {
+        err = checkSubRegion(dt, dface0, dstLevel, dstX, dstY, dcube ? 0 : dstZ, dw, dh, dcube ? 1 : srcDepth);
+        TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
+    }
 
     if (vsc)
     {
@@ -3379,8 +3571,15 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
         GLint dzz = dcube ? 0 : (per_face ? dstZ + i : dstZ);
         GLsizei n = per_face ? 1 : layers;
 
-        TDRegion sr = glRegion(st, sface, srcLevel, srcX, srcY, szz, srcWidth, srcHeight, n);
-        TDRegion dr = glRegion(dt, dface, dstLevel, dstX, dstY, dzz, dw, dh, n);
+        /* GL_TEXTURE_1D_ARRAY: the GL API puts the layer in Z and keeps the
+         * 1-texel-high image in Y; MGL's level stores the layers in height, so
+         * the copy region is (x, z, 0, w, layers, 1) — see the bounds checks */
+        GLint sry = srcY, srz = szz, dr_y = dstY, drz = dzz;
+        GLsizei srh = srcHeight, srd = n, drh = dh, drd = n;
+        if (srcTarget == GL_TEXTURE_1D_ARRAY) { sry = srcZ; srz = 0; srh = n; srd = srcHeight; }
+        if (dstTarget == GL_TEXTURE_1D_ARRAY) { dr_y = dstZ; drz = 0; drh = n; drd = dh; }
+        TDRegion sr = glRegion(st, sface, srcLevel, srcX, sry, srz, srcWidth, srh, srd);
+        TDRegion dr = glRegion(dt, dface, dstLevel, dstX, dr_y, drz, dw, drh, drd);
 
         if (!cpu && TDM(ctx)->copy_image(ctx, st, &sr, dt, &dr))
             continue;
@@ -3392,7 +3591,7 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
             size_t bytes = tdCompressedSize(sf, srcWidth, srcHeight, n);
             raw = (uint8_t *)malloc(bytes + 1);
             TD_CHECK(raw, GL_OUT_OF_MEMORY);
-            fetchCompressed(ctx, st, sface, srcLevel, srcX, srcY, szz, srcWidth, srcHeight, n, raw);
+            fetchCompressed(ctx, st, sface, srcLevel, srcX, sry, srz, srcWidth, srh, srd, raw);
         }
         else
         {
@@ -3418,7 +3617,7 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
 
         if (dc)
         {
-            storeCompressed(ctx, dt, dface, dstLevel, dstX, dstY, dzz, dw, dh, n, raw);
+            storeCompressed(ctx, dt, dface, dstLevel, dstX, dr_y, drz, dw, drh, drd, raw);
         }
         else
         {

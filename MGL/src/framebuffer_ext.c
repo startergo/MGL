@@ -688,7 +688,10 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
 
     if (pbo)
     {
-        if (pbo->mapped) FB_ERROR(GL_INVALID_OPERATION);
+        /* a persistent mapping keeps a stable address: GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT
+         * orders it; only a non-persistent mapping blocks the read (Mesa readpix.c) */
+        if (pbo->mapped && !(pbo->access_flags & GL_MAP_PERSISTENT_BIT))
+            FB_ERROR(GL_INVALID_OPERATION);
         pbo_offset = (size_t)(uintptr_t)pixels;
         GLuint ts = typeSize(type);
         if (ts && (pbo_offset % ts) != 0) FB_ERROR(GL_INVALID_OPERATION);

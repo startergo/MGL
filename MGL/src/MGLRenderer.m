@@ -2797,6 +2797,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 }
                 shader->mtl_data.library = (void *)CFBridgingRetain(library);
                 shader->mtl_data.function = (void *)CFBridgingRetain(function);
+                /* compat perf: record this function's MSL content identity once
+                 * per link — the pipeline fast path keys on it (a fresh function
+                 * object is created here for every link of the same MSL) */
+                mglProgramRegisterMSLIdentity(shader->mtl_data.function,
+                                              ptr->spirv[i].msl_str, shader->entry_point);
             }
         }
     }

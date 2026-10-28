@@ -462,11 +462,47 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
     struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
     CompatPipelineKey key;
-    /* content-identity (see compatMSLKey): the three raster stages' generated
-     * MSL identifies the pipeline functions exactly */
-    key.a = compatMSLKeyCached(m, ctx->state.program->spirv[_VERTEX_SHADER].msl_str)
-          ^ compatMSLKeyCached(m, ctx->state.program->spirv[_FRAGMENT_SHADER].msl_str) * 0x100000001B3ULL
-          ^ compatMSLKeyCached(m, ctx->state.program->spirv[_GEOMETRY_SHADER].msl_str);
+    /* content identity of the three raster stages: the fnid registry value of
+     * each stage's compiled MTLFunction (registered in extProgramCompileMSL at
+     * link time as a hash of the FULL MSL text + entry point).  Keying on the
+     * registry value instead of sampling the MSL string (compatMSLKey: pointer
+     * + first 192 + last 128 bytes) closes an alias hole: two programs whose
+     * generated MSL differs only in the MIDDLE — e.g. the fp64-lowered
+     * operators, one helper call inside a ~200 KB common prelude — plus a
+     * recycled program/string address (create -> draw -> delete -> create in a
+     * loop) produced identical sampled keys, and the second program drew with
+     * the first program's PSO ("abs" rendered "-ua", roundeven rendered ceil:
+     * tests/headless/test_fp64.c fp64_scalar_ops, 3-4 of 10 runs).
+     * A stage with no compiled function yet (first draw, bindMTLProgram has
+     * not run) or a function the registry does not know (registry degraded)
+     * declines the fast path; the descriptor path then compiles and caches. */
+    {
+        Shader *ss[3];
+        ss[0] = ctx->state.program->shader_slots[_VERTEX_SHADER];
+        ss[1] = ctx->state.program->shader_slots[_FRAGMENT_SHADER];
+        ss[2] = ctx->state.program->shader_slots[_GEOMETRY_SHADER];
+        uint64_t id[3] = {1, 1, 1};
+        for (int i = 0; i < 3; i++)
+        {
+            if (!ss[i])
+                continue;                 /* stage not attached: contributes the neutral 1 */
+            if (!ss[i]->mtl_data.function)
+            {
+                mgl_prof_cnt[17]++;       /* declined: stage not compiled yet */
+                return false;
+            }
+            uint64_t fid = mglProgramFunctionId(ss[i]->mtl_data.function);
+            if (!fid)
+            {
+                mgl_prof_cnt[17]++;       /* declined: no registered content identity */
+                return false;
+            }
+            id[i] = fid;
+        }
+        key.a = id[0]
+              ^ id[1] * 0x100000001B3ULL
+              ^ id[2] * 0xC2B2AE3D27D4EB4FULL;
+    }
     /* pipeline-baked rstate by CONTENT hash, not by the monotonic generation
      * counter: alternating blend / mask states must produce the same two keys
      * forever (rstatePipelineContentHash is cached against the generation, so
@@ -514,6 +550,13 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
         }
     }
     key.b ^= (m ? m->fmt_hash : 0) * 0xD6E8FEB86659FD93ULL;
+
+    /* compat: a CLAMP_TO_BORDER border colour Metal cannot express is emulated by
+     * a per-table fragment MSL variant baked into the pipeline — the signature
+     * must move this key as well, or a border-colour change would reuse the
+     * pipeline built with the previous variant */
+    if (rs && rs->border_sig)
+        key.b ^= rs->border_sig * 0xC2B2AE3D27D4EB4FULL;
 
     MGLCompatPipelineCache *cache = objc_getAssociatedObject(self, kCompatPipeKey);
     if (!cache)

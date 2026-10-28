@@ -66,7 +66,9 @@ static NSMutableDictionary *mglEntryCacheForKey(NSMutableDictionary *cache, cons
  * makes that assumption checkable: a released-and-recycled address gets a new id,
  * and the audit in MGLRenderer+Compat.m drops any pipeline-cache entry whose stored
  * id no longer matches (a wrong-PSO hit would render with foreign shader code). */
-#define MGL_FNID_CAP 8192   /* power of two; ids are never removed */
+#define MGL_FNID_CAP 32768  /* power of two; ids are never removed (was 8192: CTS
+                             * suites that relink >2k programs saturated it and the
+                             * fast path silently degraded to decline-everything) */
 static void      *fnid_key[MGL_FNID_CAP];
 static uint64_t   fnid_val[MGL_FNID_CAP];
 static int        fnid_used;
@@ -90,6 +92,18 @@ static void fnidRegister(void *fn, uint64_t id)
     while (fnid_key[i] && fnid_key[i] != fn) i = (i + 1) & mask;
     if (!fnid_key[i]) { fnid_key[i] = fn; fnid_used++; }
     fnid_val[i] = id;
+}
+
+/* Register <function>'s MSL content identity (the FULL MSL text hash) so the
+ * compat pipeline fast path can key on it.  extProgramCompileMSL registers its
+ * functions itself; bindMTLProgram installs functions that came from the
+ * library cache directly (compileShader:), and those must be registered too or
+ * every draw of such a program declines the fast path (glmark2 ideas -63%). */
+void mglProgramRegisterMSLIdentity(const void *function, const char *msl, const char *entry)
+{
+    if (!function || !msl)
+        return;
+    fnidRegister((void *)function, fnidOf(msl, entry ? entry : "main"));
 }
 
 uint64_t mglProgramFunctionId(void *fn)
