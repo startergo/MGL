@@ -214,11 +214,15 @@ int mgli_uniform_index(MGLIProgram *ip, const char *name)
         /* "arr" matches "arr[0]" */
         if (!strncmp(u->name, name, ln) && !strcmp(u->name + ln, "[0]")) return i;
     }
-    /* hoisted sampler/image struct members (see mgli_uniform_location) */
+    /* hoisted sampler/image struct members (see mgli_uniform_location);
+     * a miss here must NOT stop the search: dotted NON-sampler paths
+     * ("u1.m1[1]" of a struct array member) still resolve below */
     if (strchr(name, '.')) {
         char hoisted[256];
-        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted))
-            return mgli_uniform_index(ip, hoisted);
+        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted)) {
+            int hi = mgli_uniform_index(ip, hoisted);
+            if (hi >= 0) return hi;
+        }
     }
     return -1;
 }
@@ -261,11 +265,15 @@ GLint mgli_uniform_location(MGLIProgram *ip, const char *name)
     if (i >= 0) return ip->uniforms[i].location;
     /* sampler/image members hoisted out of default-block structs
      * (mgl_hoist_struct_samplers) live under the joined name: "s.c" ->
-     * "s_mglhoist_c", "s[0].c" -> "s_mglhoist_c[0]" */
+     * "s_mglhoist_c", "s[0].c" -> "s_mglhoist_c[0]".  Only a hit short-circuits:
+     * dotted struct-array element lookups ("u1.m1[1]") continue to the
+     * array-index fallback below. */
     if (strchr(name, '.')) {
         char hoisted[256];
-        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted))
-            return mgli_uniform_location(ip, hoisted);
+        if (mgl_hoist_lookup_name(name, hoisted, sizeof hoisted)) {
+            GLint hl = mgli_uniform_location(ip, hoisted);
+            if (hl >= 0) return hl;
+        }
     }
     /* "arr[N]" (also "a[i][N]") -> base + N.  The index must be a canonical decimal
      * integer: no whitespace, no sign, no leading zeros (CTS program_interface_query

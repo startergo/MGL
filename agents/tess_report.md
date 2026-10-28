@@ -1,6 +1,186 @@
+# tess domain — round 29 report (perf: O(1) per-draw gates)
+
+READY ddd8f68
+
+(tip ddd8f68 on c1bb530; gl46-port still 6f9b359 — nothing to merge. gate and
+every number below measured on exactly this tree.)
+
+## r29: the r28 SPEED rejection
+
+Supervisor A/B (idle machine) vs baseline-6f9b359: **ideas 3318/3212/3225 ->
+1906/1843/1906 (-42%), jellyfish ~-2.5%**. Reproduced on my side:
+
+* three-arm glmark2 `-b ideas` (P=baseline / O=r28 / F=r29-fixed, interleaved):
+  ideas P 503/559/450, O 287/328/318 (**-37%**), F 430/487/496.
+* deterministic headless draw loop (`tests/headless/ab_bench` mode 0, min of 7,
+  interleaved): base 11.96 ms / 2000 draws, **r28 15.94 ms (+33%)**.
+
+Cause (all in the r28 diff, all per draw): `mgl_geom_cull_active()` fell
+through to `geom_cull_writes_msl()` — a `strstr` over the whole vertex-stage
+MSL — for every program without a geometry stage; `exec_draw` additionally
+paid `mgl_tess_active_program()`'s tess-record hash walk, an unconditional
+`ext_tess->draw_id/draw_base_vertex` stamp, and `exec_indirect` paid
+`mgl_tess_draw_params_program()`, whose pipeline arm REBUILDS the composite
+(`mgl_program_pipeline_composite` memsets and re-copies the whole Program per
+call — and never copies `uses_draw_params`, so it always missed).
+
+## r29 fix (bbffefa + ddd8f68)
+
+Link-time flags, nothing per draw touches ext_tess unless the program needs it:
+
+* `Program.writes_cull_distance` computed once in `mgl_geom_post_link`;
+  `mgl_geom_cull_active` checks it BEFORE the geometry-table lookup, the MSL
+  rescan runs at link only.
+* `mgl_tess_draw_params_bound_i` / `mgl_tess_stage_bound_i` — static inline in
+  `mgl_ext_tess.h`: the program's `uses_draw_params` flag / TES stage
+  presence; pipelines resolve through their stage programs (no composite
+  build — this also FIXES gl_DrawID for pipelines: the composite lookup
+  always missed).  `extTessActive` uses the stage gate (it is called from
+  every state walk and compat's fast path).
+* `exec_draw`/`exec_indirect` stamp `ext_tess` only for draw-params programs;
+  `extBufDrawArrays`/`extBufDrawIndexed` call `extTessBindDrawParams` only
+  when a pipeline is bound or the flag is set.
+* a successful relink that drops the TES now deletes the program's stale tess
+  record (`mgl_ext_post_link_tess`), keeping the record and the O(1) stage
+  gate in agreement.
+
+## r29 A/B numbers (all interleaved, glmark2 under /usr/bin/lockf
+-k /tmp/mgl_glmark2.lock, `/opt/homebrew/bin/glmark2-macos --data-path
+/opt/homebrew/share/glmark2`)
+
+* headless ab_bench, min of 7 (deterministic, no WindowServer):
+  `drawArrays x2000` base 11.852 -> r29b **10.717 ms (-9.6%)** — the inline
+  stage gate also removes the tess-record hash walk the BASELINE itself pays
+  per draw; `blend-flip x600` 68.057 -> 67.346 ms (**-1.0%**).
+* glmark2 `-b ideas -b jellyfish`, 8 rounds, alternating arm order:
+  ideas median P 511.5 / C **518.5 (+1.4%)**; jellyfish P 4551 / C 4814
+  (**+5.8%**, 10 extra jellyfish-only rounds; single-run spread is +-35% on
+  this shared box — other agents' headless CTS runs steal the GPU — an
+  earlier 4-round session read -2%, so treat jellyfish as parity within
+  noise; every CPU-attributable bucket of the MGL_PROFILE dump is at or below
+  baseline).
+* MGL_PROFILE=1 `-b ideas` draw bucket (exec_draw, 353 draws/frame):
+  r28 0.744 ms/frame -> r29 0.719 -> baseline 0.646; r29's GL-side gates are
+  ~40 ns/draw total, the encode-side msgSend is now gated off.
+
+## r29 gate
+
+* Full headless gate `tests/headless/run.sh`: **140 tests, 0 FAIL, 135x
+  "0 failures"** (the remaining stderr lines are a passing test's deliberate
+  failed-relink trace).  `test_tess` **504/0**; `test_geom` 10x
+  **10/10 x 670 checks, 0 failures**; `test_fp64fast` 3x **3/3 x 298**;
+  `stub_scanner` EMPTY/NOOP/ASSERT clean for tessellation.c and
+  MGLRenderer+Tessellation.m.
+
+---
+
+# tess domain — round 28 report (tess / shader-linking / GLSL compat)
+
+READY 25551dc
+
+(tip = merge of gl46-port 6f9b359 [geom r55-r58] into 3450dd7; gate + every
+number below measured on exactly this tree.)
+
+## r28 gate
+
+* Full headless gate `tests/headless/run.sh`: **exit 0, 0 FAIL** (multiple
+  runs; one run hit the KNOWN pre-existing test_fp64 flake — fp64_scalar_ops
+  roundeven off-by-one-ULP under load, see agents/geom_report.md r-note about
+  the abs() twin — 5/5 standalone test_fp64 runs clean, not a tess regression).
+  `test_geom` 10x **10/10 x 670 checks, 0 failures**; `test_fp64fast` 3x
+  **3/3 x 298 checks, 0 failures**; `test_tess` **504/0**;
+  `stub_scanner` EMPTY/NOOP/ASSERT clean for the tess files.
+* glmark2 untouched this round (no hot-path changes).
+
+## r28 CTS fixes (the r28-sweep fails_tess.txt list, 45 cases)
+
+of which compat took gl_spirv (5), shader_group_vote (5, fixed here in r28
+anyway), separable_programs_tf (1); still mine: program_interface_query (13,
+geom r58 landed PIQ fixes — re-check pending), shader_draw_parameters (13,
+**13/13 Pass**, sdp6), explicit_uniform_location (2, **48/48 group Pass**),
+shading_language_420pack (6 -> **41/43**, 2 left), tessellation_shader (1),
+cull_distance.functional, gpu_shader5.
+
+1. **GL_ARB_shader_group_vote** (337b2e5, 5 Fail -> 5 Pass): SPIRV-Cross
+   `vote.any/all` intrinsics are not emitted for compute kernels — lowered
+   subgroup votes to atomic-pair bookkeeping in MSL reserved intrinsics.
+2. **GL_ARB_shader_draw_parameters** (67d40b9, 13 Fail -> 13 Pass):
+   gl_DrawID from a per-draw function-constant buffer + GL's "arrays base
+   vertex" contract for the multidraw path.
+3. **bindMTLProgram skips the geometry slot** (0ffd84e): a program whose
+   geometry slot is absent (post geom r58) no longer fails the render.
+4. **explicit uniform locations** (3bcb8f8, 2 Fail -> Pass):
+   walk_default must advance the explicit-location leaf cursor across stages
+   (uniform-loc-arrays-of-arrays), and mgli_uniform_location/_index no longer
+   short-circuit on a hoisted-name miss, so struct-array element lookups
+   ("u1.m1[1]") reach the array-index fallback (uniform-loc-types-structs).
+5. **layout(binding=N) program-wide** (a440085, 2 Fail -> Pass): the GLSL 4.2
+   binding qualifier applies to the uniform in EVERY stage; program.c
+   unify_stage_resource_bindings equalises the per-stage SPIR-V decorations
+   at link (base = the stage's lowest binding, per-element shifts follow),
+   and the opaque uniform's default value is the maximum explicit binding
+   (was last-stage-wins -> unit 0).
+6. **rect samplers** (3450dd7, binding_samplers Fail -> Pass): the rect->2D
+   SPIR-V patch made sampler2DRect resources reflect GL_TEXTURE_2D, so the
+   unit's 2D binding (e.g. the CTS FBO colour texture) was sampled; the
+   "_mglrect" name suffix now restores GL_TEXTURE_RECTANGLE.
+   (geom r58 landed an equivalent fix on gl46-port — kept theirs in the merge.)
+7. **binding_image_single / binding_images Crashes -> Pass** with the geom
+   r58 merge (gpu_shader5/PIQ fixes); root was not in the tess path.
+
+Remaining in-domain fails after r28: shading_language_420pack.
+length_of_vector_and_matrix + qualifier_order_block (investigating), PIQ
+re-check, cull_distance.functional (documented whole-primitive hardware gap,
+r24), tessellation_shader.gl_MaxPatchVertices_Position_PointSize (Timeout).
+
+---
+
+# tess domain — round 26 report (tess / shader-linking / GLSL compat)
+
+READY 0516bb6
+
+(tip = merge of gl46-port 5178835 — r25 merged upstream — into 1c6364d; the
+merge is content-empty for MGL/src/tests, so every number below was measured
+on exactly this code; no code commits this round, r25 report follows.)
+
+## r26: gate + full in-domain CTS re-verification on the merged tip
+
+* Full headless gate `tests/headless/run.sh`: **121 test files, 560 PASS,
+  0 FAIL** (every file "== N checks, 0 failures"); `test_geom` 10x **603/0**
+  (3x repeated on the tip) and `test_fp64fast` 3x **298/0**; `stub_scanner`
+  EMPTY/NOOP/ASSERT clean for tessellation.c, tess_spv_lower.c, msl_reserved.c,
+  fp64.c, introspect_spirv.c, program_introspection.c, transform_feedback.c,
+  geometry.c, program.c.
+* glmark2 perf A/B (supervisor request; `-b ideas -b jellyfish` through
+  build/nsgl, default mode, interleaved 6x each, ae3145b vs gl46-port 784c480,
+  machine load ~8-9 from other agents): **ideas 578 vs 584 FPS mean (-1%,
+  run-to-run spread ±8%)**, jellyfish median 4600 vs 4527 (+1.6%; means
+  dominated by GPU-contention outliers 1380-3035 FPS in both arms).
+  **r25 does not further slow glmark2.**
+* KHR-GL46 re-verification of every in-domain entry of the r22
+  partial_fails list plus the neighbouring groups, all on this tip
+  (~/MGL-cts/mgl-r26-tess/results.json):
+  tessellation_shader **58/58 Pass** (vertex_spacing — the r25b xfb-POINTS
+  fix — no longer Times out), gpu_shader_fp64 **659/659 Pass**,
+  draw_indirect + draw_indirect_43 **72/72 Pass**,
+  transform_feedback **20/20 Pass**, separable_programs_tf **2/2 Pass**,
+  vertex_attrib_64bit **4/4 Pass**, shaders.struct.uniform.sampler_* **6/6
+  Pass**, CommonBugs.CommonBug_ReservedNames **Pass**, cull_distance.coverage
+  **Pass**.
+* Remaining in-domain KHR-GL46 fail: **cull_distance.functional** — the
+  documented whole-primitive cull-distance hardware gap (r24), unchanged.
+* Out-of-domain observation for whoever owns it: `texture_size_promotion.
+  functional` fails **deterministically on base 784c480 as well** as on this
+  tip ("Promotion from internal format GL_R8 ... target GL_TEXTURE_RECTANGLE
+  ... Expected value = 0.125 read value = 1" → InternalError); NOT a tess/r25
+  regression (bisected by running the 784c480 dylib directly).  The geom
+  branch passed it on Oct 26 10:13, so a fix exists outside gl46-port.
+
+---
+
 # tess domain — round 25 report (tess / shader-linking / GLSL compat)
 
-READY ae3145b
+(superseded by READY 0516bb6 above; r25 was merged upstream as 5178835)
 
 (branch tip = merge of gl46-port 784c480 into r25d 4474ec1; r25 code commits:
 436350e, 28bb686, 06c571b, 4474ec1)

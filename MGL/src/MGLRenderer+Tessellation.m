@@ -94,6 +94,24 @@ static bool tNoFixup(void)
 
 @implementation MGLRenderer (Tessellation)
 
+/* gl_DrawID / gl_BaseVertex (GL_ARB_shader_draw_parameters): the raster vertex
+ * function reads them from MGL_DRAW_PARAMS (draw_buffers.c stamps
+ * ctx->state.ext_tess per exec_draw — GL's base vertex is 0 for arrays draws,
+ * Metal's [[base_vertex]] would be `first').  Inline bytes: no CPU stall.
+ * O(1) gate (glmark2 perf r29): the link-time uses_draw_params flag. */
+- (void) extTessBindDrawParams: (id<MTLRenderCommandEncoder>) enc
+{
+    if (!mgl_tess_draw_params_bound(ctx))
+        return;
+    uint32_t dp[2] = { 0, 0 };
+    if (ctx->state.ext_tess)
+    {
+        dp[0] = ctx->state.ext_tess->draw_id;
+        dp[1] = (uint32_t)ctx->state.ext_tess->draw_base_vertex;
+    }
+    [enc setVertexBytes: dp length: sizeof dp atIndex: MGL_DRAW_PARAMS];
+}
+
 /* ------------------------------------------------------------------ scratch state
  * Categories cannot add ivars; the scratch buffers are file-static and grow on demand.
  * They hold no GL objects, so lifetime is "until program exit".
@@ -1635,7 +1653,13 @@ static void tessRetireCapture(GLMContext ctx)
 
 - (bool) extTessActive
 {
-    return mgl_tess_active_program(ctx) != NULL;
+    /* O(1) (glmark2 perf r29): the stage gate — a tess record exists exactly for
+     * programs whose successful link carried a TES (mgl_ext_post_link_tess; a
+     * relink that drops the TES deletes it).  Called from every state walk
+     * (mapBuffersToMTL, bindTexturesToCurrentRenderEncoder, the pipeline
+     * descriptor build, compat's fast path), so the per-program record hash
+     * walk of mgl_tess_active_program is not paid by non-tessellation programs. */
+    return mgl_tess_stage_bound(ctx);
 }
 
 - (bool) extTessDrawPatches: (bool) indexed type: (GLenum) type offset: (size_t) offset
@@ -2249,6 +2273,19 @@ static void tessRetireCapture(GLMContext ctx)
         [cenc setComputePipelineState: vs_pso];
         tessBindStageUniforms(ctx, cenc, prog_vs, _VERTEX_SHADER);
         tessBindStageTextures(ctx, cenc, prog_vs, _VERTEX_SHADER);
+        if (prog_vs->uses_draw_params)
+        {
+            /* gl_DrawID / gl_BaseVertex in a tessellation pipeline: the vertex
+             * kernel's own draw-parameters buffer (the raster index is taken
+             * by the VS output buffer here) */
+            uint32_t dp[2] = { 0, 0 };
+            if (ctx->state.ext_tess)
+            {
+                dp[0] = ctx->state.ext_tess->draw_id;
+                dp[1] = (uint32_t)ctx->state.ext_tess->draw_base_vertex;
+            }
+            [cenc setBytes: dp length: sizeof dp atIndex: MGL_DRAW_PARAMS_KERNEL];
+        }
         if (!tessBindVSAttributes(ctx, cenc, &plan, (GLuint)vcount))
         {
             [cenc endEncoding];

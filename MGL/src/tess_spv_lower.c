@@ -610,3 +610,269 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
     *out_n = out_len;
     return out;
 }
+
+/* ===== legacy subgroup-vote opcodes -> SPIR-V 1.3 group-nonuniform =====
+ *
+ * OpSubgroupAllKHR / OpSubgroupAnyKHR / OpSubgroupAllEqualKHR
+ * (SPV_KHR_shader_ballot) -> OpGroupNonUniformAll / Any / AllEqual with a
+ * Subgroup-scope operand (see mgl_ext_tess.h).  Id-local, one word inserted
+ * per rewritten instruction plus at most one OpTypeInt/OpConstant pair and
+ * one OpCapability GroupNonUniformVote. */
+#define SPV_OP_CAPABILITY       17
+#define SPV_OP_TYPE_INT         21
+#define SPV_CAP_GROUP_NONUNIFORM_VOTE 62
+#define SPV_OP_SUBGROUP_ALL_KHR     4428
+#define SPV_OP_SUBGROUP_ANY_KHR     4429
+#define SPV_OP_SUBGROUP_ALL_EQ_KHR  4430
+#define SPV_OP_GNU_ALL          334
+#define SPV_OP_GNU_ANY          335
+#define SPV_OP_GNU_ALL_EQUAL    336
+
+uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t *out_n)
+{
+    uint32_t votes = 0, type_u32 = 0, const3 = 0, have_cap = 0;
+    size_t first_function = 0, i;
+
+    *out_n = 0;
+    if (!words || n < 5)
+        return NULL;
+
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        if (op == SPV_OP_CAPABILITY)
+        {
+            if (wc >= 2 && words[i + 1] == SPV_CAP_GROUP_NONUNIFORM_VOTE)
+                have_cap = 1;
+        }
+        else if (op == SPV_OP_TYPE_INT && wc == 4 && words[i + 2] == 32 && words[i + 3] == 0)
+            type_u32 = words[i + 1];
+        else if (op == SPV_OP_CONSTANT && wc == 4 && type_u32 && words[i + 1] == type_u32 &&
+                 words[i + 3] == 3)
+            const3 = words[i + 2];
+        else if (op == SPV_OP_FUNCTION && !first_function)
+            first_function = i;
+        else if (op == SPV_OP_SUBGROUP_ALL_KHR || op == SPV_OP_SUBGROUP_ANY_KHR ||
+                 op == SPV_OP_SUBGROUP_ALL_EQ_KHR)
+            votes++;
+        i += wc;
+    }
+    if (!votes)
+        return NULL;
+
+    uint32_t next_id = words[3];
+    uint32_t new_type = 0, new_const = 0;
+    if (!type_u32)
+    {
+        new_type = next_id++;
+        if (!const3)
+            new_const = next_id++;
+    }
+    else if (!const3)
+        new_const = next_id++;
+
+    size_t need = n + votes + (new_type ? 4 : 0) + (new_const ? 4 : 0) + (have_cap ? 0 : 2);
+    uint32_t *out = (uint32_t *)malloc(need * sizeof(uint32_t));
+    if (!out)
+        return NULL;
+    size_t o = 0;
+    const3 = const3 ? const3 : new_const;
+
+    /* header, with the raised bound */
+    for (int q = 0; q < 5; q++)
+        out[o++] = (q == 3) ? next_id : words[q];
+    if (!have_cap)
+    {
+        out[o++] = (2u << 16) | SPV_OP_CAPABILITY;
+        out[o++] = SPV_CAP_GROUP_NONUNIFORM_VOTE;
+    }
+
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) { free(out); return NULL; }
+
+        /* declarations for the scope constant: right before the functions */
+        if (first_function && i == first_function)
+        {
+            if (new_type)
+            {
+                out[o++] = (4u << 16) | SPV_OP_TYPE_INT;
+                out[o++] = new_type;
+                out[o++] = 32;
+                out[o++] = 0;
+            }
+            if (new_const)
+            {
+                out[o++] = (4u << 16) | SPV_OP_CONSTANT;
+                out[o++] = new_type ? new_type : type_u32;
+                out[o++] = new_const;
+                out[o++] = 3;      /* ExecutionScopeSubgroup */
+            }
+        }
+
+        if (op == SPV_OP_SUBGROUP_ALL_KHR || op == SPV_OP_SUBGROUP_ANY_KHR ||
+            op == SPV_OP_SUBGROUP_ALL_EQ_KHR)
+        {
+            uint32_t core = (op == SPV_OP_SUBGROUP_ALL_KHR) ? SPV_OP_GNU_ALL :
+                            (op == SPV_OP_SUBGROUP_ANY_KHR) ? SPV_OP_GNU_ANY :
+                                                              SPV_OP_GNU_ALL_EQUAL;
+            out[o++] = (5u << 16) | core;
+            out[o++] = words[i + 1];   /* result type */
+            out[o++] = words[i + 2];   /* result id */
+            out[o++] = const3;         /* scope = Subgroup */
+            out[o++] = words[i + 3];   /* predicate */
+        }
+        else
+        {
+            for (uint32_t q = 0; q < wc; q++)
+                out[o++] = words[i + q];
+        }
+        i += wc;
+    }
+
+    *out_n = o;
+    return out;
+}
+
+/* ===== BuiltIn DrawIndex (gl_DrawID) demoted to a Private variable =====
+ *
+ * SPIRV-Cross's MSL backend refuses BuiltInDrawIndex outright ("DrawIndex is
+ * not supported in MSL") — Metal has no draw-id argument.  Demote the
+ * variable to Private storage in the MSL-facing module; the stage MSL then
+ * carries a plain `gl_DrawID` global whose value mgl_draw_params_rewrite_msl()
+ * (tessellation.c) takes from MGL's draw-parameters buffer.  GL sees the
+ * untouched module, so introspection still reports the built-in. */
+#define SPV_OP_DECORATE         71
+#define SPV_DEC_BUILTIN         11
+#define SPV_BUILTIN_DRAW_INDEX  4426
+#define SPV_SC_OUTPUT           3
+#define SPV_SC_PRIVATE          6
+
+uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *out_n)
+{
+    uint32_t var = 0, hit = 0, old_ptr = 0, pointee = 0, new_ptr = 0, next_id;
+    size_t i;
+
+    *out_n = 0;
+    if (!words || n < 5)
+        return NULL;
+
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        if (op == SPV_OP_DECORATE && wc >= 4 && words[i + 2] == SPV_DEC_BUILTIN &&
+            words[i + 3] == SPV_BUILTIN_DRAW_INDEX)
+        {
+            var = words[i + 1];
+            hit = 1;
+        }
+        i += wc;
+    }
+    if (!hit)
+        return NULL;
+
+    next_id = words[3];
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        if (op == SPV_OP_VARIABLE && wc >= 4 && words[i + 2] == var)
+        {
+            old_ptr = words[i + 1];
+            if (words[i + 3] != SPV_SC_INPUT)
+                return NULL;            /* not an input builtin: leave it */
+        }
+        i += wc;
+    }
+    if (!old_ptr)
+        return NULL;
+
+    /* the pointee of the variable's pointer type, and any reusable Private
+     * pointer of the same pointee (separate scans: the type is declared
+     * before the variable) */
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
+        if (op == SPV_OP_TYPE_POINTER && wc == 4)
+        {
+            if (words[i + 1] == old_ptr)
+                pointee = words[i + 3];
+            else if (pointee && words[i + 2] == SPV_SC_PRIVATE && words[i + 3] == pointee)
+                new_ptr = words[i + 1];
+        }
+        i += wc;
+    }
+    if (!pointee)
+        return NULL;
+    if (!new_ptr)
+        new_ptr = next_id++;
+
+    size_t need = n + 8 + (new_ptr >= words[3] ? 4 : 0);
+    uint32_t *out = (uint32_t *)malloc(need * sizeof(uint32_t));
+    if (!out)
+        return NULL;
+    size_t o = 0;
+
+    for (int q = 0; q < 5; q++)
+        out[o++] = (q == 3) ? next_id : words[q];
+
+    for (i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        if (wc == 0 || i + wc > n) { free(out); return NULL; }
+
+        if (op == SPV_OP_DECORATE && wc >= 4 && words[i + 1] == var &&
+            words[i + 2] == SPV_DEC_BUILTIN && words[i + 3] == SPV_BUILTIN_DRAW_INDEX)
+        {
+            i += wc;                    /* drop the BuiltIn decoration */
+            continue;
+        }
+        if (op == SPV_OP_VARIABLE && wc >= 4 && words[i + 2] == var)
+        {
+            if (new_ptr >= words[3])
+            {
+                /* the Private pointer type must precede its first use */
+                out[o++] = (4u << 16) | SPV_OP_TYPE_POINTER;
+                out[o++] = new_ptr;
+                out[o++] = SPV_SC_PRIVATE;
+                out[o++] = pointee;
+            }
+            out[o++] = words[i];
+            out[o++] = new_ptr;
+            out[o++] = var;
+            out[o++] = SPV_SC_PRIVATE;
+            for (uint32_t q = 4; q < wc; q++)
+                out[o++] = words[i + q];
+            i += wc;
+            continue;
+        }
+        for (uint32_t q = 0; q < wc; q++)
+            out[o++] = words[i + q];
+        i += wc;
+    }
+
+    *out_n = o;
+    return out;
+}
+
+/* the shared MSL preparation: every module handed to SPIRV-Cross's MSL
+ * backend (program.c compile_stage, introspect_spirv.c msl_accepts) runs
+ * through this so the acceptance gate and the real compile agree.  Returns a
+ * fresh malloc'd module with both lowerings applied, or NULL when neither
+ * fired (the caller's module is unchanged). */
+uint32_t *mgl_spirv_prepare_for_msl(const uint32_t *words, size_t n, size_t *n_out)
+{
+    uint32_t *mid = mgl_spirv_lower_subgroup_vote(words, n, n_out);
+    const uint32_t *cur = mid ? mid : words;
+    size_t cn = mid ? *n_out : n;
+    uint32_t *out = mgl_spirv_lower_draw_index(cur, cn, n_out);
+    if (!out)
+        *n_out = cn;                    /* the pass clears n_out on a miss */
+    else if (mid)
+        free(mid);
+    return out ? out : mid;
+}

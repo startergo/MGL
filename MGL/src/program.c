@@ -302,6 +302,7 @@ static void exec_move(MGLProgramObj *dst, MGLProgramObj *src)
     dst->base.local_workgroup_size.y = src->base.local_workgroup_size.y;
     dst->base.local_workgroup_size.z = src->base.local_workgroup_size.z;
     dst->base.linked_glsl_program = src->base.linked_glsl_program;
+    dst->base.uses_draw_params = src->base.uses_draw_params;   /* tess: gl_DrawID */
     dst->linked_mask = src->linked_mask;
     dst->samplers = src->samplers;
     dst->num_samplers = src->num_samplers;
@@ -2291,6 +2292,20 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* MSL normalizations every module needs (tess_spv_lower.c):
+     *  - subgroup-vote opcodes (glslang's GL target emits the legacy KHR forms)
+     *  - BuiltIn DrawIndex demoted to Private (SPIRV-Cross refuses it in MSL) */
+    {
+        size_t norm_words = 0;
+        uint32_t *norm_ir = mgl_spirv_prepare_for_msl(prepared, prepared_words, &norm_words);
+        if (norm_ir)
+        {
+            free(prepared);
+            prepared = norm_ir;
+            prepared_words = norm_words;
+        }
+    }
+
     /* GL rectangle textures: SPIRV-Cross's MSL backend has no DimRect mapping
      * (it emits `unknown_texture_type`, which never compiles), so the MSL-facing
      * module rewrites the image Dim of every OpTypeImage from Rect to 2D.  The
@@ -2702,6 +2717,24 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         {
             result = tess_msl;     /* the spvc context owns the original string */
             tess_owned = tess_msl;
+        }
+    }
+
+    /* gl_DrawID / gl_BaseVertex: the demoted DrawIndex declaration and the
+     * arrays-draw base-vertex correction read the draw-parameters buffer
+     * (tessellation.c; bound by MGLRenderer+Draw.m) */
+    if (stage == _VERTEX_SHADER &&
+        (strstr(result, "gl_DrawID;") || strstr(result, "gl_BaseVertex [[base_vertex]]")))
+    {
+        char *dp_msl = mgl_draw_params_rewrite_vertex_msl(
+            result, tess_pipeline ? MGL_DRAW_PARAMS_KERNEL : MGL_DRAW_PARAMS);
+        if (dp_msl)
+        {
+            if (tess_owned && tess_owned != result)
+                free(tess_owned);
+            tess_owned = dp_msl;
+            result = dp_msl;
+            dst->base.uses_draw_params = 1;
         }
     }
 
@@ -3595,6 +3628,71 @@ static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramOb
     return ok;
 }
 
+/* GLSL 4.2 "binding" layout qualifier (§4.3.2/4.4.5): it applies to the uniform
+ * (or block) in EVERY stage of the program — a stage that declares the same
+ * uniform without the qualifier inherits the binding.  The per-stage SPIR-V
+ * decorations keep each stage's own value (no qualifier decorates binding 0),
+ * and every draw-time binder picks the texture/buffer unit from its stage's
+ * resource entry, so unify the entries by name here: the maximum binding wins.
+ * KHR-GL46.shading_language_420pack.binding_sampler_single declares goku with
+ * binding=2 only in the stage under test (the other stages' binding=0 would
+ * sample unit 0 and read the framebuffer texture). */
+static void unify_stage_resource_bindings(MGLProgramObj *prog)
+{
+    static const int types[] = {
+        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
+        SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
+    };
+    if (!prog)
+        return;
+    for (size_t t = 0; t < sizeof types / sizeof types[0]; t++)
+        for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+        {
+            SpirvResourceList *l = &prog->base.spirv_resources_list[s][types[t]];
+            for (GLuint i = 0; i < l->count; i++)
+            {
+                SpirvResource *r = &l->list[i];
+                if (!r->name)
+                    continue;
+                /* a name reflected more than once in one stage is a block ARRAY
+                 * (per-element entries "GOKU" x14 with positional bindings
+                 * base..base+n-1, binding_uniform_block_array): unify the BASE
+                 * (this stage's lowest binding) across stages, then shift every
+                 * element.  A single entry just takes the maximum binding. */
+                GLuint b = r->binding;
+                {
+                    /* this stage's base: its lowest binding for the name (for a
+                     * per-element reflection that is the first array element;
+                     * for a single whole-array entry it is the entry itself) */
+                    GLuint oldbase = r->binding;
+                    for (GLuint j = 0; j < l->count; j++)
+                        if (l->list[j].name && !strcmp(l->list[j].name, r->name) && l->list[j].binding < oldbase)
+                            oldbase = l->list[j].binding;
+                    GLuint newbase = oldbase;
+                    for (int s2 = 0; s2 < _MAX_SHADER_TYPES; s2++)
+                    {
+                        SpirvResourceList *l2 = &prog->base.spirv_resources_list[s2][types[t]];
+                        for (GLuint j = 0; j < l2->count; j++)
+                            if (l2->list[j].name && !strcmp(l2->list[j].name, r->name))
+                            {
+                                GLuint b2 = l2->list[j].binding;
+                                for (GLuint k = 0; k < l2->count; k++)
+                                    if (l2->list[k].name && !strcmp(l2->list[k].name, r->name) && l2->list[k].binding < b2)
+                                        b2 = l2->list[k].binding;
+                                if (b2 > newbase)
+                                    newbase = b2;
+                            }
+                    }
+                    b = newbase + (r->binding - oldbase);
+                }
+                if (b != r->binding && getenv("MGL_UNIFY_DEBUG"))
+                    fprintf(stderr, "MGL unify: type=%d name=%s stage=%d %u -> %u\n", (int)types[t], r->name, s, r->binding, b);
+                r->binding = b;
+            }
+        }
+}
+
 enum { LINK_FROM_ATTACHED = 0, LINK_FROM_EXECUTABLES = 1 };
 
 /*
@@ -3734,6 +3832,7 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
 
     if (ok)
     {
+        unify_stage_resource_bindings(scratch);
         finish_reflection(scratch, &acc);
 
         exec_free(ctx, obj);

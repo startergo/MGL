@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include "spirv.h"
 #include "msl_reserved.h"
@@ -288,12 +289,9 @@ void mgl_msl_mangle_reserved(spvc_compiler compiler, const uint32_t *words, size
 #define CULL_FIXUP_PREFIX "._RESERVED_IDENTIFIER_FIXUP_gl_CullDistance["
 #define CULL_FIXUP_LEN (sizeof CULL_FIXUP_PREFIX - 1)
 
-char *mgl_msl_fix_cull_distance(const char *msl)
+/* the flattened-member table: element i -> "gl_CullDistance_i" style member name */
+static int cull_parse_table(const char *msl, char elemname[][40])
 {
-    if (!msl || !strstr(msl, "[[user(cull"))
-        return NULL;
-    /* 1. element i -> flattened member name (from the struct declarations) */
-    char elemname[64][40];          /* gl_CullDistance has at most 8 elements in GL 4.6 */
     int nelem = 0;
     for (const char *p = strstr(msl, "[[user(cull"); p; p = strstr(p + 1, "[[user(cull"))
     {
@@ -306,17 +304,177 @@ char *mgl_msl_fix_cull_distance(const char *msl)
         const char *n = a;
         while (n > msl && (isalnum((unsigned char)n[-1]) || n[-1] == '_')) n--;
         size_t nl = (size_t)(a - n);
-        if (nl == 0 || nl >= sizeof elemname[0])
+        if (nl == 0 || nl >= 40)
             continue;
         if (idx + 1 > nelem) nelem = idx + 1;
         memcpy(elemname[idx], n, nl);
         elemname[idx][nl] = 0;
     }
-    if (nelem == 0)
-        return NULL;
     for (int i = 0; i < nelem; i++)
         if (!elemname[i][0])
-            return NULL;           /* incomplete table: do not touch the MSL */
+            return 0;                /* incomplete table: caller must not touch the MSL */
+    return nelem;
+}
+
+/* tiny formatted append for the rewriters below (no SB dependency here) */
+static void cull_append(char **buf, size_t *len, size_t *cap, const char *fmt, ...)
+{
+    va_list ap, ap2;
+    int need;
+    char *nb;
+
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need <= 0) { va_end(ap2); return; }
+    if (*len + (size_t)need + 1 > *cap)
+    {
+        *cap = (*len + (size_t)need + 1) * 2;
+        nb = realloc(*buf, *cap);
+        if (!nb) { va_end(ap2); return; }
+        *buf = nb;
+    }
+    vsnprintf(*buf + *len, *cap - *len, fmt, ap2);
+    va_end(ap2);
+    *len += (size_t)need;
+}
+
+/* BARE array arguments: when the stage main was renamed (geometry capture variant) and
+ * its builtin gl_CullDistance global hoisted into a reference parameter, the generated
+ * entry passes `out.gl_CullDistance' — an array the flattened output struct no longer
+ * has.  Route the argument through a local array and copy back to the flattened members
+ * after the call statement.  Returns a new string, or NULL when the shape is absent. */
+static char *cull_fix_bare_arg(const char *msl, char elemname[][40], int nelem)
+{
+    const char *needle = "out.gl_CullDistance";
+    const size_t nl = strlen(needle);
+    const char *p;
+    char *out = NULL;
+    size_t done = 0;      /* bytes of the original consumed into the output */
+    size_t scan = 0;      /* independent scan cursor (skips must not move `done') */
+
+    while ((p = strstr(msl + scan, needle)) != NULL)
+    {
+        size_t k = (size_t)(p - msl);
+        if (p[nl] == '[' || isalnum((unsigned char)p[nl]) || p[nl] == '_')
+        {
+            /* indexed store or a longer identifier: handled by the caller's main pass */
+            scan = k + 1;
+            continue;
+        }
+
+        /* the statement boundaries around the call */
+        size_t stmt_s = k;
+        while (stmt_s > done && msl[stmt_s-1] != ';' && msl[stmt_s-1] != '{' &&
+               msl[stmt_s-1] != '}') stmt_s--;
+        size_t stmt_e = k + nl, depth = 0;
+        while (stmt_e < strlen(msl))
+        {
+            char c = msl[stmt_e];
+            if (c == '(') depth++;
+            else if (c == ')')
+            {
+                if (depth == 0) { stmt_e++; break; }     /* the call's own close */
+                depth--;
+            }
+            else if (c == ';' && depth == 0) break;
+            stmt_e++;
+        }
+        if (stmt_e >= strlen(msl)) { free(out); return NULL; }
+
+        {
+            char *b = NULL;
+            size_t bl = 0, bc = 0;
+            char *stmt, *q;
+            cull_append(&b, &bl, &bc, "%.*s", (int)(stmt_s - done), msl + done);
+            /* the statement with the argument swapped for the local */
+            stmt = malloc(stmt_e - stmt_s + 64);
+            if (!stmt) { free(out); free(b); return NULL; }
+            memcpy(stmt, msl + stmt_s, stmt_e - stmt_s);
+            stmt[stmt_e - stmt_s] = 0;
+            q = strstr(stmt, needle);
+            if (!q) { free(stmt); free(b); free(out); return NULL; }
+            {
+                size_t off = (size_t)(q - stmt);
+                memmove(stmt + off + strlen("mgl_cull_arg_fix"), stmt + off + nl,
+                        strlen(stmt) - off - nl + 1);
+                memcpy(stmt + off, "mgl_cull_arg_fix", strlen("mgl_cull_arg_fix"));
+            }
+            {
+                char zeros[8*4] = "0";
+                for (int z = 1; z < (nelem > 8 ? 8 : nelem); z++)
+                    strcpy(zeros + strlen(zeros), ",0");
+                cull_append(&b, &bl, &bc, "    float mgl_cull_arg_fix[%d] = {%s};\n    ",
+                            nelem > 8 ? 8 : nelem, zeros);
+            }
+            cull_append(&b, &bl, &bc, "%s", stmt);
+            free(stmt);
+            if (msl[stmt_e] == ';')
+            {
+                cull_append(&b, &bl, &bc, ";");
+                stmt_e++;
+            }
+            for (int e = 0; e < nelem && e < 8; e++)
+                cull_append(&b, &bl, &bc, "\n    out.%s = mgl_cull_arg_fix[%d];", elemname[e], e);
+            cull_append(&b, &bl, &bc, "\n");
+
+            free(out);
+            out = b;                       /* keep the pieces written so far */
+            done = stmt_e;
+            scan = stmt_e;
+        }
+    }
+    if (!out) return NULL;
+    {
+        /* the remainder after the last fixed statement */
+        size_t ol = strlen(out);
+        char *fin = malloc(ol + strlen(msl) - done + 1);
+        if (!fin) { free(out); return NULL; }
+        memcpy(fin, out, ol);
+        strcpy(fin + ol, msl + done);
+        free(out);
+        return fin;
+    }
+}
+
+/* the main pass: rewrite indexed accesses of the flattened members (constant indices
+ * become member writes, dynamic indices copy through a local array) */
+static char *mgl_msl_fix_cull_distance_indexed(const char *msl);
+
+char *mgl_msl_fix_cull_distance(const char *msl)
+{
+    char elemname[64][40];          /* gl_CullDistance has at most 8 elements in GL 4.6 */
+    int nelem;
+    char *bare;
+
+    if (!msl || !strstr(msl, "[[user(cull"))
+        return NULL;
+    /* 1. element i -> flattened member name (from the struct declarations) */
+    nelem = cull_parse_table(msl, elemname);
+    if (nelem == 0)
+        return NULL;
+
+    /* 1b. repair the hoisted-array call arguments first */
+    bare = cull_fix_bare_arg(msl, elemname, nelem);
+    if (bare)
+    {
+        char *indexed = mgl_msl_fix_cull_distance_indexed(bare);
+        if (indexed) { free(bare); return indexed; }
+        return bare;         /* the bare repair alone fixed the source */
+    }
+    return mgl_msl_fix_cull_distance_indexed(msl);
+}
+
+/* the main pass: rewrite indexed accesses of the flattened members (constant indices
+ * become member writes, dynamic indices copy through a local array) */
+static char *mgl_msl_fix_cull_distance_indexed(const char *msl)
+{
+    char elemname[64][40];
+    int nelem = cull_parse_table(msl, elemname);
+
+    if (nelem == 0)
+        return NULL;
 
     const size_t len = strlen(msl);
     size_t cap = len + 4096;

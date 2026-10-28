@@ -1363,7 +1363,11 @@ static void merge_explicit_loc(MGLIProgram *ip, int ui, int explicit_loc, int cu
     if (el + u->size > ip->uniform_loc_max) ip->uniform_loc_overflow = 1;
     if (u->location >= 0)
     {
-        if (u->location != el) ip->uniform_loc_conflict = 1;
+        if (u->location != el)
+        {
+            if (getenv("MGL_LOC_TRACE")) fprintf(stderr, "MGL loc: conflict %s: stored %d vs stage el=%d (explicit %d cursor %d)\n", u->name, u->location, el, explicit_loc, cursor);
+            ip->uniform_loc_conflict = 1;
+        }
     }
     else if (u->location < -1)
         u->location = el;            /* implicit so far: adopt the explicit location */
@@ -1415,7 +1419,13 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
                     ip->uniform_loc_overflow = 1;   /* GL 4.6 11.1.1: beyond GL_MAX_UNIFORM_LOCATIONS */
                 *loc_cursor += u->size;
             }
-            else merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
+            else
+            {
+                merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
+                *loc_cursor += u->size;   /* the merge path must advance too: a
+                                           * second stage's leaves would otherwise
+                                           * all see cursor 0 (false conflict) */
+            }
             u->stages |= 1u << stage;
             u->st[stage].present = 1;
             u->st[stage].offset = offset; u->st[stage].array_stride = stride;
@@ -1455,7 +1465,11 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             ip->uniform_loc_overflow = 1;           /* GL 4.6 11.1.1: beyond GL_MAX_UNIFORM_LOCATIONS */
         *loc_cursor += 1;
     }
-    else merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
+    else
+    {
+        merge_explicit_loc(ip, ui, explicit_loc, *loc_cursor);
+        *loc_cursor += 1;                /* keep the leaf cursor in step across stages */
+    }
     u->stages |= 1u << stage;
     u->st[stage].present = 1;
     if (getenv("MGL_FP64_DUMP")) { FILE*d_ = fopen("/tmp/fp64wd.txt","a"); if (d_) { fprintf(d_, "walk %s stage=%d off=%u\n", name, stage, offset); fclose(d_); } }
@@ -2210,6 +2224,18 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
         words = swapped;
         n = swapped_n;
     }
+    {
+        /* the same MSL normalizations program.c installs (vote opcodes,
+         * gl_DrawID) — the gate must accept what the real compile accepts */
+        uint32_t *norm = mgl_spirv_prepare_for_msl(words, n, &swapped_n);
+        if (norm)
+        {
+            if (swapped) free(swapped);
+            swapped = norm;          /* freed below with `swapped` */
+            words = swapped;
+            n = swapped_n;
+        }
+    }
 
     spvc_context c = NULL; spvc_parsed_ir ir = NULL; spvc_compiler comp = NULL; spvc_compiler_options opt = NULL;
     const char *res = NULL;
@@ -2492,11 +2518,23 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
         for (int s = 0; s < MGLI_STAGES; s++) {
             if (!u->st[s].present || !sc[s].r) continue;
             if (u->opaque_class) {
-                uint32_t b = 0; /* default unit: layout(binding), else texture unit 0 */
-                const char *src = stage_source(ctx, ptr, s);
-                if (get_dec(sc[s].r, u->st[s].spv_id, -1, SpvDecorationBinding, &b) &&
-                    src && !src_explicit_qual(src, u->name, "uniform", "binding")) b = 0;
-                for (int e = 0; e < u->size; e++) ((uint32_t *)u->shadow)[e] = b + (uint32_t)(u->st[s].elem_base + e);
+                /* default unit: layout(binding) of ANY stage that declares the uniform —
+                 * the qualifier applies program-wide (GLSL 4.2 §4.3.2), so a stage
+                 * without it must not overwrite the value (last-stage-wins sampled
+                 * unit 0 for KHR-GL46.shading_language_420pack.binding_sampler_single).
+                 * The maximum explicit binding wins; >= keeps the last stage's
+                 * elem_base for the uniform all-stages-declare-it case. */
+                uint32_t bmax = 0;
+                int base = 0;
+                for (int s2 = 0; s2 < MGLI_STAGES; s2++) {
+                    if (!u->st[s2].present || !sc[s2].r) continue;
+                    uint32_t b = 0;
+                    const char *src = stage_source(ctx, ptr, s2);
+                    if (get_dec(sc[s2].r, u->st[s2].spv_id, -1, SpvDecorationBinding, &b) &&
+                        src && !src_explicit_qual(src, u->name, "uniform", "binding")) b = 0;
+                    if (b >= bmax) { bmax = b; base = u->st[s2].elem_base; }
+                }
+                for (int e = 0; e < u->size; e++) ((uint32_t *)u->shadow)[e] = bmax + (uint32_t)(base + e);
                 continue;
             }
             for (int k = 0; k < ip->ninits[s]; k++) {

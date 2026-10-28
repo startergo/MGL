@@ -453,6 +453,10 @@ typedef struct Program_t {
     struct {
         unsigned x, y, z;
     } local_workgroup_size;
+    int uses_draw_params;   /* tess: gl_DrawID read from the draw-params buffer (mgl_ext_tess.h) */
+    int writes_cull_distance; /* tess: VS writes gl_CullDistance (mgl_geom_post_link computes;
+                               * the per-draw mgl_geom_cull_active must not rescan the MSL —
+                               * glmark2 ideas lost 42% to that strstr per draw) */
     void *mtl_data;
 } Program;
 

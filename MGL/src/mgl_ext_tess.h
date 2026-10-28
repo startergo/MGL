@@ -50,6 +50,14 @@
 #define MGL_TESS_VD_PATCH        9      /* per-patch data (PerPatch) */
 #define MGL_TESS_VD_FACTORS     10      /* half tessellation factors (PerPatch, stride 12) */
 #define MGL_TESS_TES_COORDS     27      /* render stage: (u,v,w,patch id) per vertex */
+
+/* gl_DrawID (GL_ARB_shader_draw_parameters / core 4.60): the draw-parameters
+ * buffer of the vertex function.  Raster VS: automatic app buffer bindings
+ * are sequential, so 30 is free (the tess VS-as-kernel output lives there
+ * only in tessellation pipelines).  Tess VS kernel: 24 (TCS-only reservation,
+ * free in the vertex kernel). */
+#define MGL_DRAW_PARAMS         30
+#define MGL_DRAW_PARAMS_KERNEL  24
 #define MGL_TESS_TES_CP         28      /* render stage: control point records */
 #define MGL_TESS_TES_PATCH      29      /* render stage: per-patch data blob */
 
@@ -245,6 +253,16 @@ typedef struct MGLTessProgram_t {
 struct MGLExtState_tess {
     MGLTessProgram *programs[MGL_TESS_PROGRAM_HASH];
 
+    /* gl_DrawID of the single draw currently executing (GL_ARB_shader_draw_parameters):
+     * draw_buffers.c stamps it per exec_draw from the DrawBatch counter — 0 for every
+     * single-draw command, 0..n-1 inside a multi-draw — and the renderer binds it to
+     * the draw-parameters buffer of the raster vertex function (MGLRenderer+Draw.m) */
+    uint32_t draw_id;
+    /* GL's gl_BaseVertex for the same draw: 0 for arrays draws (GL: `first' is not a
+     * base vertex, unlike Metal's [[base_vertex]] == vertexStart), the basevertex
+     * argument for indexed draws */
+    int32_t draw_base_vertex;
+
     /* published TES-output capture of the last GL_PATCHES draw (valid until the
      * next one) — see the MGLTessCapture contract above */
     MGLTessCapture capture;
@@ -312,9 +330,72 @@ GLint mgl_tess_program_out_vertices(GLMContext ctx, Program *program);
  * returns a malloc'd replacement for msl (caller frees the original), or NULL to keep it */
 char *mgl_tess_rewrite_stage_msl(GLMContext ctx, int stage, bool tess_pipeline, const char *msl);
 
+/* gl_DrawID: give the vertex function / tess vertex kernel a draw-parameters
+ * buffer parameter and initialize the demoted DrawIndex declaration from it.
+ * Returns a malloc'd replacement, or NULL when msl carries no gl_DrawID. */
+char *mgl_draw_params_rewrite_vertex_msl(const char *msl, int buffer_index);
+
+/* O(1) per-draw gates (glmark2 perf r29) — link-time flags, no state walks:
+ * does the bound program / pipeline's vertex stage read gl_DrawID /
+ * gl_BaseVertex from the draw-parameters buffer (program.c sets
+ * uses_draw_params at link), and is a tessellation evaluation stage bound?
+ * STATIC INLINE: these run on every draw (exec_draw, extBufDrawArrays) — a
+ * cross-translation-unit call is ~5 ns each, 353 ideas draws pay it per frame.
+ * The pipeline arm resolves through the pipeline's stage programs; the
+ * composite (state.program with name 0, installed during processGLState)
+ * never carries the flag, so it falls to the pipeline arm as well. */
+static inline bool mgl_tess_draw_params_bound_i(GLMContext ctx)
+{
+    Program *p = ctx->state.program;
+
+    if (p && p->name != 0)
+        return p->uses_draw_params != 0;
+    if (ctx->state.program_pipeline)
+    {
+        Program *vs = ctx->state.program_pipeline->stage_programs[_VERTEX_SHADER];
+        return vs != NULL && vs->uses_draw_params != 0;
+    }
+    return false;
+}
+
+/* a tess record exists exactly for programs whose successful link carried a
+ * TES (mgl_ext_post_link_tess; a relink that drops the TES deletes it), so
+ * the stage presence IS mgl_tess_active_program() != NULL without the
+ * per-program record hash walk */
+static inline bool mgl_tess_stage_bound_i(GLMContext ctx)
+{
+    Program *p = ctx->state.program;
+
+    if (p && p->name != 0)
+        return p->spirv[_TESS_EVALUATION_SHADER].ir != NULL;
+    if (ctx->state.program_pipeline)
+        return ctx->state.program_pipeline->stage_programs[_TESS_EVALUATION_SHADER] != NULL;
+    return false;
+}
+
+/* out-of-line forms for callers outside the hot path (renderer state walks) */
+bool mgl_tess_draw_params_bound(GLMContext ctx);
+bool mgl_tess_stage_bound(GLMContext ctx);
+
 /* SPIR-V preparation: isolines are emulated on the quad domain (rewrites the execution mode) */
 uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n);
 uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n);
+
+/* glslang's OpenGL target emits the legacy OpSubgroupAll/Any/AllEqualKHR
+ * opcodes for the GL_ARB_shader_group_vote built-ins; SPIRV-Cross's MSL
+ * backend implements only the SPIR-V 1.3 core forms.  See the function. */
+uint32_t *mgl_spirv_lower_subgroup_vote(const uint32_t *words, size_t n, size_t *out_n);
+
+/* BuiltIn DrawIndex (gl_DrawID): SPIRV-Cross's MSL backend refuses it; the
+ * MSL-facing module demotes the variable to Private storage and the stage
+ * MSL rewrite (tessellation.c) fills it from MGL's draw-parameters buffer. */
+uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *out_n);
+
+/* every MSL-facing module goes through these (program.c compile_stage and the
+ * introspect_spirv.c acceptance gate must agree): subgroup-vote opcode
+ * normalization + the gl_DrawID demotion.  Returns a malloc'd replacement, or
+ * NULL when neither fired. */
+uint32_t *mgl_spirv_prepare_for_msl(const uint32_t *words, size_t n, size_t *n_out);
 
 /* True when a raw (attribute-based) TES MSL needs more Metal attribute slots
  * than the device has.  MGL never rasterizes from the raw form — the canonical

@@ -72,6 +72,32 @@ static size_t skip_ws_comments(const char *src, size_t len, size_t i)
     }
 }
 
+/* whitespace / comments WITHIN the directive's own line only: a whole-expression
+ * macro test (`#ifndef GL_ARB_cull_distance') must have nothing else on the line,
+ * and the general helper above crosses newlines (isspace eats '\n'), which made
+ * the very next line's `#error' look like part of the directive and refused the
+ * fold (KHR-GL46.cull_distance.functional's `#ifndef ... #error' guard). */
+static size_t skip_ws_line(const char *src, size_t len, size_t i)
+{
+    for (;;)
+    {
+        while (i < len && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r')) i++;
+        if (i + 1 < len && src[i] == '/' && src[i + 1] == '/')
+        {
+            while (i < len && src[i] != '\n') i++;
+            return i;
+        }
+        if (i + 1 < len && src[i] == '/' && src[i + 1] == '*')
+        {
+            size_t j = i + 2;
+            while (j + 1 < len && !(src[j] == '*' && src[j + 1] == '/') && src[j] != '\n') j++;
+            if (j + 1 < len && src[j] == '*' && src[j + 1] == '/') { i = j + 2; continue; }
+            return j;      /* unterminated / newline-terminated: stop there */
+        }
+        return i;
+    }
+}
+
 /* index of the ')' closing the '(' at `open` (len if unbalanced) */
 static size_t match_paren(const char *src, size_t len, size_t open)
 {
@@ -791,9 +817,50 @@ static char *strip_invariant_on_input(const char *src)
         }
         if (c == '{') { depth++; i++; continue; }
         if (c == '}') { depth--; i++; continue; }
+        if (depth >= 1 && at_word(out, len, i, "invariant"))
+        {
+            /* interface-block MEMBER: GLSL 4.2 (ARB_shading_language_420pack)
+             * allows invariant on members of an INPUT block (ignored); glslang
+             * rejects it there ("can only apply to an output").  The block
+             * header decides: strip only inside `in' blocks — output members
+             * keep the qualifier (KHR-GL46.shading_language_420pack.
+             * qualifier_order_block) */
+            size_t b = i;
+            int d = depth;
+            while (b > 0)
+            {
+                if (out[b] == '}') d++;
+                else if (out[b] == '{')
+                {
+                    d--;
+                    if (d == 0) break;
+                }
+                b--;
+            }
+            size_t hs = b;
+            while (hs > 0 && out[hs - 1] != ';' && out[hs - 1] != '{' && out[hs - 1] != '}') hs--;
+            bool is_in = false, is_out = false;
+            for (size_t k = hs; k < b; k++)
+            {
+                if (at_word(out, len, k, "in")) is_in = true;
+                else if (at_word(out, len, k, "out")) is_out = true;
+                else if (at_word(out, len, k, "uniform") || at_word(out, len, k, "buffer")) is_out = true;
+            }
+            if (is_in && !is_out)
+            {
+                /* splice the token out */
+                size_t e = i + strlen("invariant");
+                while (e < len && (out[e] == ' ' || out[e] == '\t')) e++;
+                memmove(out + i, out + e, len - e + 1);
+                len -= e - i;
+                changed = true;
+                continue;
+            }
+            i += strlen("invariant");
+            continue;
+        }
         if (depth == 0 && at_word(out, len, i, "invariant"))
         {
-            /* declaration span: from the previous ; { } to the next ; */
             size_t ds = i;
             while (ds > 0 && out[ds - 1] != ';' && out[ds - 1] != '{' && out[ds - 1] != '}') ds--;
             size_t de = i;
@@ -1357,12 +1424,142 @@ static int cull_conditional_fold(const char *src, size_t len, size_t j)
         else
             k = k2;
         /* nothing but whitespace/comment may follow the whole-expression test */
-        size_t r = skip_ws_comments(src, len, k);
+        size_t r = skip_ws_line(src, len, k);
         if (r < len && src[r] != '\n') return 0;
         int is_cull = !strcmp(t2, "GL_ARB_cull_distance");
         return is_cull ? (negate ? -1 : 1) : 0;
     }
     return 0;
+}
+
+/* ===== GL_ARB_shader_group_vote / bare subgroup-vote spellings =====
+ *
+ * KHR-GL46.shader_group_vote specialises its compute shaders for a 4.6 core
+ * context to the extension-less spellings of the vote built-ins
+ * (allInvocations / anyInvocation / allInvocationsEqual) and adds no
+ * #extension directive; glslang only knows them under
+ * GL_ARB_shader_group_vote as the ARB-suffixed names (the KHR subgroup
+ * extensions are Vulkan-only there, even when the #extension line is
+ * accepted).  Rename the bare (and EXT-suffixed) calls to the ARB spellings
+ * and enable the extension; MGL lowers OpGroupNonUniformAll/Any/AllEqual to
+ * Metal simd_all/simd_any/spvSubgroupAllEqual (SPIRV-Cross). */
+static char *rewrite_subgroup_vote_ext(const char *src)
+{
+    static const char *const names[3] = { "allInvocations", "anyInvocation", "allInvocationsEqual" };
+    if (!src) return NULL;
+    /* all three names carry "nvocation" */
+    if (!strstr(src, "nvocation")) return NULL;
+
+    /* does a call site exist (identifier-boundary name followed by '(')? */
+    int calls = 0;
+    for (int n = 0; n < 3 && !calls; n++)
+    {
+        const char *p = src;
+        size_t nl = strlen(names[n]);
+        while ((p = strstr(p, names[n])) != NULL)
+        {
+            size_t i = (size_t)(p - src);
+            size_t after = i + nl;
+            int pre_ok = (i == 0) || !is_ident_char((unsigned char)src[i - 1]);
+            /* skip spaces/tabs between the name and the '(' */
+            size_t j = after;
+            while (src[j] == ' ' || src[j] == '\t') j++;
+            if (pre_ok && (src[j] == '('))
+            {
+                /* already suffixed (allInvocationsARB / ...EXT)? */
+                if (!(after + 3 <= strlen(src) &&
+                      (strncmp(src + after, "ARB", 3) == 0 || strncmp(src + after, "EXT", 3) == 0)))
+                    calls = 1;
+            }
+            p += nl;
+        }
+    }
+    if (!calls) return NULL;
+
+    /* is the ARB extension already enabled (or explicitly disabled)? */
+    int have_arb = 0, arb_disabled = 0;
+    {
+        const char *p = src;
+        while ((p = strstr(p, "#extension")) != NULL)
+        {
+            const char *e = p + 10;
+            while (*e == ' ' || *e == '\t') e++;
+            if (!strncmp(e, "GL_ARB_shader_group_vote", 24))
+            {
+                const char *b = e + 24;
+                while (*b == ' ' || *b == '\t') b++;
+                if (*b == ':')
+                {
+                    b++;
+                    while (*b == ' ' || *b == '\t') b++;
+                    if (!strncmp(b, "disable", 7)) arb_disabled = 1;
+                    else have_arb = 1;   /* enable / require / warn */
+                }
+                else
+                    have_arb = 1;
+            }
+            p += 10;
+        }
+    }
+
+    if (arb_disabled) return NULL;      /* app turned it off: leave the (now
+                                         * illegal) bare spellings alone */
+
+    /* emit: rename the calls, inject the #extension after #version */
+    size_t len = strlen(src);
+    Str out = {0};
+    size_t i = 0;
+    size_t version_end = 0;              /* insert the directive after this */
+    if (!have_arb && !arb_disabled)
+    {
+        const char *v = strstr(src, "#version");
+        if (v)
+        {
+            const char *nl = strchr(v, '\n');
+            version_end = nl ? (size_t)(nl - src) + 1 : len;
+        }
+    }
+    while (i < len)
+    {
+        int replaced = 0;
+        if (version_end && i == version_end && !have_arb)
+        {
+            static const char dir[] = "#extension GL_ARB_shader_group_vote : enable\n";
+            str_append(&out, dir, sizeof dir - 1);
+            version_end = 0;             /* once */
+        }
+        for (int n = 0; n < 3 && !replaced; n++)
+        {
+            const char *name = names[n];
+            size_t nl = strlen(name);
+            if (!strncmp(src + i, name, nl))
+            {
+                size_t after = i + nl;
+                int pre_ok = (i == 0) || !is_ident_char((unsigned char)src[i - 1]);
+                if (!pre_ok) break;
+                if (after + 3 <= len &&
+                    (strncmp(src + after, "ARB", 3) == 0 || strncmp(src + after, "EXT", 3) == 0))
+                    break;               /* already suffixed */
+                size_t j = after;
+                while (j < len && (src[j] == ' ' || src[j] == '\t')) j++;
+                if (j < len && src[j] == '(')
+                {
+                    str_append(&out, src + i, nl);
+                    str_append(&out, "ARB", 3);
+                    i = after;
+                    replaced = 1;
+                }
+            }
+        }
+        if (!replaced)
+        {
+            str_push(&out, src[i]);
+            i++;
+        }
+    }
+    if (!out.buf) return NULL;
+    str_push(&out, '\0');
+    return out.buf;
 }
 
 static char *rewrite_cull_distance_ext(const char *src)
@@ -1457,11 +1654,13 @@ static char *rewrite_cull_distance_ext(const char *src)
             {
                 char nm[64];
                 size_t k = mglc_token(src, len, j, nm, sizeof nm);
-                size_t r = skip_ws_comments(src, len, k);
+                size_t r = skip_ws_line(src, len, k);
                 if (!strcmp(nm, "GL_ARB_cull_distance") && (r >= len || src[r] == '\n'))
                 {
                     str_append(&out, src + ls, i - ls);
-                    str_append(&out, dir[1] == 'n' ? "#if 0" : "#if 1", 6);
+                    /* "#if 0"/"#if 1" are FIVE bytes: six would copy the literal's
+                     * NUL into the buffer and truncate everything after it */
+                    str_append(&out, !strcmp(dir, "ifndef") ? "#if 0" : "#if 1", 5);
                     i = e;
                     continue;
                 }
@@ -1472,12 +1671,11 @@ static char *rewrite_cull_distance_ext(const char *src)
                 if (fold)
                 {
                     str_append(&out, src + ls, i - ls);
-                    str_append(&out, dir[0] == 'e' ? "#elif " : "#if ", dir[0] == 'e' ? 7 : 4);
+                    str_append(&out, dir[0] == 'e' ? "#elif " : "#if ", dir[0] == 'e' ? 6 : 4);
                     str_append(&out, fold > 0 ? "1" : "0", 1);
                     i = e;
                     continue;
-                }
-            }
+                }            }
             str_append(&out, src + ls, e - ls);
             i = e;
             continue;
@@ -2499,6 +2697,14 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
          * macro the CTS's #ifdef guards expect (see the pass above) */
         char *culled = rewrite_cull_distance_ext(src);
         if (culled) { owned = culled; src = owned; }
+    }
+    {
+        /* the extension-less spellings of the GL_ARB_shader_group_vote
+         * built-ins (allInvocations/anyInvocation/allInvocationsEqual) are
+         * not in glslang's desktop-GL tables: rename to the ARB names and
+         * enable the extension (see rewrite_subgroup_vote_ext) */
+        char *voted = rewrite_subgroup_vote_ext(src);
+        if (voted) { free(owned); owned = voted; src = owned; }
     }
     {
         /* samplers inside default-block structs cannot be lowered to MSL

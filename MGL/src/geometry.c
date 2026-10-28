@@ -1353,6 +1353,11 @@ static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_function);
     if (gp->capture_library && ctx->mtl_funcs.ext_program)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_library);
+    /* the synthetic cull kernel has no gs Shader to live in (tess domain cull emulation) */
+    if (gp->kernel_function && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->kernel_function);
+    if (gp->kernel_library && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->kernel_library);
     if (gp->draw_function && ctx->mtl_funcs.ext_program)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_function);
     if (gp->draw_library && ctx->mtl_funcs.ext_program)
@@ -2231,6 +2236,68 @@ static char *strip_member_quals(const char *s, size_t n)
     return strip_member_quals2(s, n, false);
 }
 
+/* rename the reserved builtins of a hoisted global declaration: the source's
+ * `out float gl_CullDistance[8];' must become `float mgl_gs_cull[8];' — glslang
+ * reserves gl_* identifiers outside an interface redeclaration, and the
+ * emulation's own globals (mgl_gs_cull etc.) are what the kernel reads/writes
+ * (KHR-GL46.cull_distance.functional's pass-through GS declares cull outputs). */
+/* Is this hoisted global a redeclaration of a gl_PerVertex member
+ * (`out float gl_CullDistance[8];')?  The kernel's own mgl_gs_clip/mgl_gs_cull
+ * globals replace those members, so the declaration itself must be dropped —
+ * renaming it would redeclare the kernel's arrays (and keeping gl_* would trip
+ * glslang's reserved-identifier rule). */
+static bool geom_is_member_redecl(const char *body)
+{
+    static const char *names[2] = { "gl_ClipDistance", "gl_CullDistance" };
+    const char *p = body;
+
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    /* interpolation qualifiers */
+    for (;;)
+    {
+        const char *q = p;
+        size_t n = 0;
+        while (is_ident_char((unsigned char)q[n])) n++;
+        if ((n == 4 && !strncmp(q, "flat", 4)) ||
+            (n == 13 && !strncmp(q, "noperspective", 13)) ||
+            (n == 8 && !strncmp(q, "centroid", 8)) ||
+            (n == 6 && !strncmp(q, "sample", 6)))
+        { p = q + n; while (*p == ' ' || *p == '\t') p++; continue; }
+        break;
+    }
+    /* the type */
+    {
+        size_t n = 0;
+        while (is_ident_char((unsigned char)p[n])) n++;
+        if (!n) return false;
+        p += n;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    for (int k = 0; k < 2; k++)
+    {
+        size_t n = strlen(names[k]);
+        if (!strncmp(p, names[k], n) &&
+            !is_ident_char((unsigned char)p[n]))
+        {
+            const char *r = p + n;
+            while (*r == ' ' || *r == '\t') r++;
+            return *r == '[' || *r == ';';
+        }
+    }
+    return false;
+}
+
+static char *geom_rename_decl_body(const char *body)
+{
+    SB o;
+    size_t p = 0;
+    int bd = 0;
+    bool gi = false;
+    memset(&o, 0, sizeof(o));
+    copy_renamed(&o, body, &p, strlen(body), NULL, &bd, &gi);
+    return o.s;
+}
+
 static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtInfo *info,
                            unsigned in_verts, char *gl_in_name, size_t gl_in_cap, bool *input_iface)
 {
@@ -2371,6 +2438,14 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
                 body = close + 1;
             }
         }
+        char *rb = geom_rename_decl_body(body);
+        if (rb) body = rb;
+        if (geom_is_member_redecl(body))
+        {
+            free(rb);
+            free(raw);
+            return;             /* the kernel's own globals replace the member */
+        }
         for (const char *p = body; *p; )
         {
             if (p[0] == '[' && p[1] == ']')
@@ -2384,6 +2459,7 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
         }
         sb_put(out, "%s", decl.s ? decl.s : body);
         free(decl.s);
+        free(rb);
     }
     else
     {
@@ -2425,9 +2501,14 @@ static void emit_interface(SB *out, const char *s, size_t pos, size_t end, StmtI
          * references an undeclared identifier (texture_cube_map_array texture_size_*_sh) */
         if (!brace || decl.s == NULL)
         {
-            char *stripped = strip_member_quals(body, strlen(body));
-            sb_put(out, "%s", stripped ? stripped : body);
-            free(stripped);
+            if (!geom_is_member_redecl(body))
+            {
+                char *rb = geom_rename_decl_body(body);
+                char *stripped = strip_member_quals(rb ? rb : body, strlen(rb ? rb : body));
+                sb_put(out, "%s", stripped ? stripped : (rb ? rb : body));
+                free(stripped);
+                free(rb);
+            }
             free(raw);
             return;
         }
@@ -4850,6 +4931,282 @@ pin:
     return total;
 }
 
+/* Vertex-stage input location of a program module variable, by name.  The link
+ * pass rewrites the SPIR-V Location decorations to the program's internal
+ * attribute slots (introspect_spirv.c), so this is the index the renderer's
+ * vertex descriptor binds at — the regenerated capture source must use exactly
+ * these, not glslang's declaration-order assignment. */
+static uint32_t geom_input_slot(const SpvModule *m, const char *name)
+{
+    for (int i = 0; i < m->n_vars; i++)
+    {
+        uint32_t loc;
+        SpvVar *v = &m->vars[i];
+        const char *nm;
+        if (v->storage != SpvStorageClassInput) continue;   /* module scope: function locals use the Function class */
+        nm = spv_name((SpvModule *)m, v->id);
+        if (!nm || strcmp(nm, name)) continue;
+        if (spv_deco((SpvModule *)m, v->id, SpvDecorationLocation, &loc)) return loc;
+    }
+    return 0xffffffffu;
+}
+
+/* Pin every top-level input declaration of the regenerated capture source to
+ * the program module's slot: `layout(location = N) ...'.  Without this an
+ * UNUSED input declared before a used one shifts glslang's automatic
+ * numbering (KHR-GL46.cull_distance.functional declares
+ * `in float clipdistance_data[1]' it never reads: culldistance_data moved to
+ * attributes 1..8 and position to 9, so the capture kernel read every vertex
+ * attribute one buffer off).  A declaration that already carries
+ * layout(location=) is rewritten to the program slot for the same reason. */
+static char *geom_pin_capture_inputs(const char *glsl, const SpvModule *vs_m)
+{
+    SB b;
+    size_t i = 0, len = strlen(glsl);
+    int depth = 0, changed = 0;
+
+    memset(&b, 0, sizeof(b));
+    while (i < len)
+    {
+        /* one source line (declarations may span lines; the storage keyword is
+         * on the first) */
+        size_t ls = i, e = i;
+        while (e < len && glsl[e] != '\n') e++;
+        i = e + (e < len);
+
+        /* brace depth at line start (function bodies are skipped entirely) */
+        {
+            size_t k = ls;
+            while (k < e)
+            {
+                if (glsl[k] == '{') depth++;
+                else if (glsl[k] == '}') depth--;
+                k++;
+            }
+        }
+        if (depth > 0)
+        {
+            sb_put(&b, "%.*s", (int)(e - ls), glsl + ls);
+            sb_put(&b, "\n");
+            continue;
+        }
+
+        /* find an input declaration on this line: `in ...' / `attribute ...'
+         * possibly behind layout(...) / interpolation qualifiers */
+        size_t p = ls;
+        while (p < e && (glsl[p] == ' ' || glsl[p] == '\t')) p++;
+        size_t kw = (size_t)-1;
+        int kwlen = 0;
+        /* scan qualifier words until the storage keyword */
+        for (;;)
+        {
+            size_t q = p;
+            while (q < e && (is_ident_char((unsigned char)glsl[q]))) q++;
+            if (q == p) break;
+            if ((q - p == 2 && !strncmp(glsl + p, "in", 2)) ||
+                (q - p == 9 && !strncmp(glsl + p, "attribute", 9)))
+            {
+                kw = p;
+                kwlen = (int)(q - p);
+                break;
+            }
+            p = q;
+            while (p < e && (glsl[p] == ' ' || glsl[p] == '\t' ||
+                             glsl[p] == ',' || glsl[p] == '(' || glsl[p] == ')')) p++;
+            /* layout(...) qualifier contents are skipped as non-ident chars above */
+            if (p < e && glsl[p] == '(')
+            {
+                int d2 = 1;
+                p++;
+                while (p < e && d2)
+                {
+                    if (glsl[p] == '(') d2++;
+                    else if (glsl[p] == ')') d2--;
+                    p++;
+                }
+                while (p < e && (glsl[p] == ' ' || glsl[p] == '\t')) p++;
+            }
+        }
+
+        if (kw == (size_t)-1)
+        {
+            sb_put(&b, "%.*s", (int)(e - ls), glsl + ls);
+            sb_put(&b, "\n");
+            continue;
+        }
+
+        /* declared name: the identifier immediately before the first '[' (array
+         * size), '=' or ';' of the declaration (which may continue past this
+         * line) */
+        char name[160];
+        name[0] = 0;
+        {
+            size_t d = kw + kwlen;
+            size_t dend = d;
+            while (dend < len && glsl[dend] != '[' && glsl[dend] != '=' && glsl[dend] != ';')
+            {
+                if (glsl[dend] == '{') break;   /* not a simple declaration */
+                dend++;
+            }
+            size_t q = dend;
+            while (q > d && !is_ident_char((unsigned char)glsl[q - 1])) q--;
+            size_t nend = q;
+            while (q > d && is_ident_char((unsigned char)glsl[q - 1])) q--;
+            if (nend > q && nend - q < sizeof name)
+            {
+                memcpy(name, glsl + q, nend - q);
+                name[nend - q] = 0;
+            }
+        }
+
+        uint32_t slot = name[0] ? geom_input_slot(vs_m, name) : 0xffffffffu;
+        if (slot == 0xffffffffu || !name[0])
+        {
+            /* not a program input (or no slot): keep verbatim */
+            sb_put(&b, "%.*s", (int)(e - ls), glsl + ls);
+            sb_put(&b, "\n");
+            continue;
+        }
+
+        /* replace an existing location= qualifier in the preserved prefix (a
+         * second layout(location) would be a syntax error): keep any other
+         * qualifier of the same layout(), then emit ours before the keyword */
+        {
+            char prefix[512], fixed[600];
+            size_t pl = kw - ls;
+            if (pl >= sizeof prefix) pl = sizeof prefix - 1;
+            memcpy(prefix, glsl + ls, pl);
+            prefix[pl] = 0;
+            /* find the layout qualifier closest to the storage keyword */
+            char *lay = NULL;
+            for (char *q = prefix; (q = strstr(q, "layout")); q += 6) lay = q;
+            fixed[0] = 0;
+            if (lay)
+            {
+                char *op = strchr(lay, '(');
+                char *cp = op ? strchr(op, ')') : NULL;
+                if (op && cp)
+                {
+                    /* qualifiers minus location */
+                    char keep[256];
+                    size_t kl = 0;
+                    char *s2 = op + 1;
+                    *cp = 0;
+                    while (s2 < cp && kl + 1 < sizeof keep)
+                    {
+                        char *c2 = strchr(s2, ',');
+                        char *e2 = c2 ? c2 : cp;
+                        while (s2 < e2 && (*s2 == ' ' || *s2 == '\t')) s2++;
+                        while (e2 > s2 && (e2[-1] == ' ' || e2[-1] == '\t')) e2--;
+                        if (e2 > s2 && strncmp(s2, "location", 8))
+                        {
+                            if (kl) keep[kl++] = ',';
+                            if (kl + (size_t)(e2 - s2) >= sizeof keep) break;
+                            memcpy(keep + kl, s2, (size_t)(e2 - s2));
+                            kl += (size_t)(e2 - s2);
+                        }
+                        s2 = c2 ? c2 + 1 : cp;
+                    }
+                    keep[kl] = 0;
+                    *cp = ')';
+                    /* rebuild the line with the kept qualifiers (or the whole
+                     * layout() dropped when none remain) */
+                    size_t head = (size_t)(lay - prefix);
+                    if (kl)
+                        snprintf(fixed, sizeof fixed, "%.*slayout(%.*s)%s",
+                                 (int)head, prefix, (int)kl, keep, cp + 1);
+                    else
+                        snprintf(fixed, sizeof fixed, "%.*s%s",
+                                 (int)head, prefix, cp + 1);
+                }
+            }
+            if (!fixed[0]) snprintf(fixed, sizeof fixed, "%s", prefix);
+            sb_put(&b, "%s", fixed);
+        }
+        sb_put(&b, "layout(location = %u) ", slot);
+        sb_put(&b, "%.*s", kwlen, glsl + kw);
+        sb_put(&b, "%.*s", (int)(e - (kw + kwlen)), glsl + kw + kwlen);
+        sb_put(&b, "\n");
+        changed = 1;
+    }
+    if (!changed) { free(b.s); return NULL; }
+    return b.s;
+}
+
+/* Rewrite the declared sizes of gl_ClipDistance / gl_CullDistance in the
+ * regenerated capture source to the capture RECORD's word count: the record
+ * copies gp->in_clip_size entries of each (the cull/clip evaluation reads a
+ * fixed layout), but the shader may declare smaller arrays — glslang rejects
+ * `gl_ClipDistance[1]' indexing beyond its declared size, which used to fail
+ * the whole synthetic build whenever clip and cull sizes differed
+ * (KHR-GL46.cull_distance.functional iteration 1: clip=1 + cull=7).  Only
+ * declarations are rewritten (the statement up to the name mentions `out');
+ * reads inside the function bodies are left alone. */
+static char *geom_pin_builtins(const char *glsl, GLuint clip_words)
+{
+    static const char *names[2] = { "gl_ClipDistance", "gl_CullDistance" };
+    SB b;
+    size_t i = 0, len = strlen(glsl);
+    int changed = 0;
+
+    if (!clip_words) return NULL;
+    memset(&b, 0, sizeof(b));
+    while (i < len)
+    {
+        /* copy through to the next occurrence of either name */
+        size_t hit = (size_t)-1;
+        int which = 0;
+        for (int k = 0; k < 2; k++)
+        {
+            const char *f = strstr(glsl + i, names[k]);
+            if (f)
+            {
+                size_t off = (size_t)(f - glsl);
+                if (!is_ident_char((unsigned char)f[-1]) &&
+                    !is_ident_char((unsigned char)f[strlen(names[k])]) &&
+                    off < hit) { hit = off; which = k; }
+            }
+        }
+        if (hit == (size_t)-1)
+        {
+            sb_put(&b, "%s", glsl + i);
+            break;
+        }
+        /* statement start: previous ';' or '{' or '}' */
+        size_t st = hit;
+        while (st > 0 && glsl[st - 1] != ';' && glsl[st - 1] != '{' && glsl[st - 1] != '}') st--;
+        int is_out = 0;
+        for (size_t q = st; q + 3 < hit; q++)
+            if (!strncmp(glsl + q, "out", 3) &&
+                !is_ident_char((unsigned char)glsl[q - 1]) &&
+                !is_ident_char((unsigned char)glsl[q + 3]))
+            { is_out = 1; break; }
+        /* the declaration's size bracket follows the name */
+        size_t nb = hit + strlen(names[which]);
+        while (nb < len && (glsl[nb] == ' ' || glsl[nb] == '\t')) nb++;
+        if (!is_out || nb >= len || glsl[nb] != '[')
+        {
+            /* not a declaration: copy this occurrence and continue after it */
+            sb_put(&b, "%.*s", (int)(nb - i), glsl + i);
+            i = nb;
+            continue;
+        }
+        size_t ne = nb + 1;
+        while (ne < len && glsl[ne] != ']' && glsl[ne] != ';') ne++;
+        if (ne >= len || glsl[ne] != ']')
+        {
+            sb_put(&b, "%.*s", (int)(nb - i), glsl + i);
+            i = nb;
+            continue;
+        }
+        sb_put(&b, "%.*s[%u]", (int)(nb - i), glsl + i, clip_words);
+        i = ne + 1;
+        changed = 1;
+    }
+    if (!changed) { free(b.s); return NULL; }
+    return b.s;
+}
+
 static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
                                    const SpvModule *vs_m, char **log)
 {
@@ -4884,6 +5241,19 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     noblk = geom_plain_outputs(nover);
     free(nover);
     nover = noblk;
+    /* pin the input locations to the program's attribute slots (see
+     * geom_pin_capture_inputs) — the raster pipeline binds at those, and a
+     * recompile through glslang would renumber them in declaration order */
+    {
+        char *pinned = geom_pin_capture_inputs(nover, vs_m);
+        if (pinned) { free(nover); nover = pinned; }
+    }
+    /* and widen the clip/cull builtin arrays to the record's word count (see
+     * geom_pin_builtins) */
+    {
+        char *widened = geom_pin_builtins(nover, gp->in_clip_size);
+        if (widened) { free(nover); nover = widened; }
+    }
 
     memset(&b, 0, sizeof(b));
     sb_put(&b, "#version 460 core\n");
@@ -5351,6 +5721,21 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
         sb_put(&b, "    atomicAdd(mgl_ctl[17u + s], 1u);\n");
     }
     sb_put(&b, "}\n\n");
+    if (gp->out_has_cull)
+    {
+        /* the whole-primitive cull-distance test on emitted records (see the caller):
+         * a, b, c are record slots; b == a / c == a mark unused corners so the same
+         * helper serves points, lines and triangles */
+        sb_put(&b, "bool mgl_prim_culled(uint a, uint b, uint c)\n{\n");
+        sb_put(&b, "    for (uint p = 0u; p < %uu; p++) {\n", gp->out_clip_size);
+        sb_put(&b, "        if (uintBitsToFloat(mgl_out[a * %uu + %uu + p]) < 0.0 &&\n",
+               gp->out_words, gp->out_cull_off);
+        sb_put(&b, "            (b == a || uintBitsToFloat(mgl_out[b * %uu + %uu + p]) < 0.0) &&\n",
+               gp->out_words, gp->out_cull_off);
+        sb_put(&b, "            (c == a || uintBitsToFloat(mgl_out[c * %uu + %uu + p]) < 0.0)) return true;\n",
+               gp->out_words, gp->out_cull_off);
+        sb_put(&b, "    }\n    return false;\n}\n\n");
+    }
     sb_put(&b, "void mgl_gs_end_stream_primitive(uint s)\n{\n");
     sb_put(&b, "    if (mgl_strip_n == 0u) return;\n");
     sb_put(&b, "    uint n = mgl_strip_n;\n");
@@ -5371,7 +5756,43 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     sb_put(&b, "        uint base = mgl_t * lc + mgl_lcnt;\n");
     sb_put(&b, "        if (base + cnt > mgl_t * lc + lc || base + cnt > mgl_hdr[4]) { mgl_ctl[3] = 1u; }\n");
     sb_put(&b, "        else {\n");
-    if (out_type_code == 0)
+    if (gp->out_has_cull && !getenv("MGL_NO_KCULL"))
+    {
+        /* whole-primitive cull distance (GL 4.6 13.5.2): an emitted primitive is
+         * dropped when EVERY vertex has gl_CullDistance[p] < 0 for the same p.  The
+         * test runs per output primitive (a strip decomposes), on the records the
+         * kernel itself wrote; unwritten entries are 0.0 (reset at every
+         * mgl_gs_emit_stream_vertex) and never cull.  Only the raster index list is
+         * affected - the records (and so transform feedback) keep every vertex. */
+        sb_put(&b, "            uint w = 0u;\n");
+        if (out_type_code == 0)
+        {
+            sb_put(&b, "            for (uint i = 0u; i < n; i++)\n");
+            sb_put(&b, "                if (!mgl_prim_culled(mgl_strip_v[i], mgl_strip_v[i], mgl_strip_v[i]))\n"
+                       "                    mgl_lscr[base + w++] = mgl_strip_v[i];\n");
+        }
+        else if (out_type_code == 1)
+        {
+            sb_put(&b, "            for (uint i = 0u; i + 1u < n; i++)\n");
+            sb_put(&b, "                if (!mgl_prim_culled(mgl_strip_v[i], mgl_strip_v[i + 1u], mgl_strip_v[i])) {\n"
+                       "                    mgl_lscr[base + w] = mgl_strip_v[i];"
+                       " mgl_lscr[base + w + 1u] = mgl_strip_v[i + 1u]; w += 2u;\n");
+            sb_put(&b, "                }\n");
+        }
+        else
+        {
+            sb_put(&b, "            for (uint i = 0u; i + 2u < n; i++) {\n");
+            sb_put(&b, "                uint a = mgl_strip_v[i], b2 = mgl_strip_v[i + 1u], c = mgl_strip_v[i + 2u];\n");
+            sb_put(&b, "                if ((i & 1u) != 0u) { uint t = a; a = b2; b2 = t; }\n");
+            sb_put(&b, "                if (!mgl_prim_culled(a, b2, c)) {\n");
+            sb_put(&b, "                    mgl_lscr[base + w] = a; mgl_lscr[base + w + 1u] = b2;"
+                       " mgl_lscr[base + w + 2u] = c; w += 3u;\n");
+            sb_put(&b, "                }\n");
+            sb_put(&b, "            }\n");
+        }
+        sb_put(&b, "            cnt = w;\n");
+    }
+    else if (out_type_code == 0)
     {
         sb_put(&b, "            for (uint i = 0u; i < n; i++) mgl_lscr[base + i] = mgl_strip_v[i];\n");
     }
@@ -5542,6 +5963,18 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         sb_put(&b, "layout(location = %u) flat out uint mgl_out_prim;\n", gp->prim_loc);
     }
 
+    /* re-declare gl_PerVertex with the distance arrays the main() below assigns
+     * (glslang rejects assigning them without a redeclaration that carries them) */
+    if ((gp->out_has_clip && gp->out_clip_size) || gp->out_has_cull)
+    {
+        sb_put(&b, "out gl_PerVertex\n{\n    vec4 gl_Position;\n");
+        if (gp->out_has_psize) sb_put(&b, "    float gl_PointSize;\n");
+        if (gp->out_has_clip && gp->out_clip_size)
+            sb_put(&b, "    float gl_ClipDistance[%u];\n", gp->out_clip_size);
+        if (gp->out_has_cull)
+            sb_put(&b, "    float gl_CullDistance[%u];\n", gp->out_clip_size);
+        sb_put(&b, "};\n");
+    }
     sb_put(&b, "\nvoid main()\n{\n");
     sb_put(&b, "    uint r = uint(gl_VertexID) * %uu;\n", gp->out_words);
     sb_put(&b, "    gl_Position = vec4(uintBitsToFloat(mgl_draw[r + %u]), uintBitsToFloat(mgl_draw[r + %u]),"
@@ -5549,6 +5982,18 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
            gp->out_pos_off + 0, gp->out_pos_off + 1, gp->out_pos_off + 2, gp->out_pos_off + 3);
     if (gp->out_has_psize)
         sb_put(&b, "    gl_PointSize = uintBitsToFloat(mgl_draw[r + %u]);\n", gp->out_psize_off);
+    /* gl_ClipDistance re-exports the distances the stage produced: SPIRV-Cross turns the
+     * builtin into [[clip_distance]] members (hardware clipping, exactly GL 13.5.1) and
+     * flattened [[user(clipN)]] copies that a fragment stage reading the builtin matches
+     * by attribute name; gl_CullDistance has no hardware form and only feeds the
+     * fragment stage the same way (whole-primitive culling happened in the kernel) */
+    if (gp->out_has_clip && gp->out_clip_size)
+        for (GLuint i = 0; i < gp->out_clip_size; i++)
+            sb_put(&b, "    gl_ClipDistance[%u] = %s ? uintBitsToFloat(mgl_draw[r + %u]) : 1.0e30;\n",
+                   i, (gp->clip_planes >> i) & 1u ? "true" : "false", gp->out_clip_off + i);
+    if (gp->out_has_cull)
+        for (GLuint i = 0; i < gp->out_clip_size; i++)
+            sb_put(&b, "    gl_CullDistance[%u] = uintBitsToFloat(mgl_draw[r + %u]);\n", i, gp->out_cull_off + i);
     if (gp->out_has_layer)
         sb_put(&b, "    mgl_out_layer = mgl_draw[r + %u];\n", gp->out_layer_off);
     if (gp->out_has_vp)
@@ -5846,6 +6291,14 @@ static int geom_module_ac_vars(SpvModule *m, MGLAtomicCounterVar *vars, GLuint *
     return nvars;
 }
 
+/* forward: the cull-distance emulation's generated pass-through (tess domain, tail of
+ * this file) — used by the link/draw machinery above */
+static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp);
+static int geom_cull_family(GLenum mode);
+static bool geom_cull_prepare(GLMContext ctx, MGLGeomProgram *gp, Program *program, GLenum mode);
+static bool geom_cull_writes_msl(Program *p);
+static uint32_t geom_cull_store_mask(const uint32_t *ir, size_t nwords, uint32_t builtin, bool *writes);
+
 bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int stage,                            const uint32_t *words, size_t nwords, const char *entry, char **log)
 {
     MGLProgramObj *obj = (MGLProgramObj *)obj_p;
@@ -6055,8 +6508,12 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
                 n = geom_declared_clip_words(vs_src, "gl_CullDistance");
                 if (gp->in_has_cull)
                 {
+                    /* the record carries the clip AND the cull array at one shared
+                     * width (geom_layout), so the wider of the two declared sizes
+                     * wins - a smaller cull array must not shrink the clip words
+                     * (clip=1 + cull=7 kept 1 word and dropped cull[1..6]) */
                     GLuint nc2 = n ? n : MGL_GEOM_MAX_CLIP;
-                    if (nc2 < gp->in_clip_size) gp->in_clip_size = nc2;
+                    if (nc2 > gp->in_clip_size) gp->in_clip_size = nc2;
                 }
                 gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
                                     (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
@@ -6066,6 +6523,15 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         geom_layout(gp);
         }
         free(decompiled);
+    }
+
+    /* which clip planes this geometry stage writes (tess-domain store scan, geometry.c
+     * tail): the raster pass-through neutralizes the unwritten ones, whose values are
+     * undefined in GL and would otherwise clip spuriously */
+    if (gp->out_has_clip)
+    {
+        bool w = false;
+        gp->clip_planes = geom_cull_store_mask(words, nwords, (uint32_t)SpvBuiltInClipDistance, &w);
     }
 
     if (gp->deferred)
@@ -6315,7 +6781,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                              if (!gp->deferred) obj->link_status = false; goto done; } while (0)
 
     if (!gp || !obj) return;
-    if (!program->shader_slots[_GEOMETRY_SHADER]) return;
+    if (!program->shader_slots[_GEOMETRY_SHADER] && !gp->synthetic) return;
 
     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
 
@@ -6334,6 +6800,15 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 
     {
         const char *src = geom_gs_source(ctx, obj);
+        if (gp->synthetic)
+        {
+            /* the cull-distance emulation (tess domain, see the tail of this file): the
+             * "geometry" stage is a generated pass-through that drops culled primitives */
+            gs_src = geom_gen_cull_gs_glsl(gp);
+            if (!gs_src) GEOM_FAIL("cull pass-through generation failed");
+        }
+        else
+        {
         gs_src = xstrdup(src ? src : "");
         if (!gs_src[0])
         {
@@ -6348,6 +6823,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
              * kernel re-emits the block with explicit std430 offsets anyway, so the
              * member locations are meaningless: strip them. */
             geom_strip_block_member_locations(gs_src);
+        }
         }
     }
 
@@ -6456,6 +6932,13 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                             gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
+    /* a vertex stage writing gl_CullDistance leaves BuiltInCullDistance stores pointing
+     * at a non-existent array member in the capture MSL too (program.c applies the same
+     * repair to the plain vertex MSL) */
+    {
+        char *fixed_cull = mgl_msl_fix_cull_distance(msl);
+        if (fixed_cull) { free(msl); msl = fixed_cull; }
+    }
     /* the renamed vertex main is called from the generated entry point */
     msl_value_parameters(msl, "mgl_geom_vs_main(");
 
@@ -6509,8 +6992,12 @@ build:
     int gs_span = 0;                /* the user pins' slot span: atomics sit above it */
     {
         const char *e2 = NULL;
-        SpvModule *p_gs = spv_parse(program->spirv[_GEOMETRY_SHADER].ir,
-                                    program->spirv[_GEOMETRY_SHADER].size, &e2);
+        /* the synthetic cull pass-through (tess domain) has no geometry stage of its
+         * own and no user resources: the kernel's arguments are the eight emulation
+         * buffers alone, so there is nothing to reflect or pin */
+        SpvModule *p_gs = gp->synthetic ? NULL :
+            spv_parse(program->spirv[_GEOMETRY_SHADER].ir,
+                      program->spirv[_GEOMETRY_SHADER].size, &e2);
         SpvModule *k_gs = NULL;
         glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, p_gs, &log);
         if (!glsl) GEOM_FAIL("kernel generation failed");
@@ -6523,6 +7010,8 @@ build:
         {
             /* the kernel's own buffers live at fixed Metal slots (MGL_GEOM_MSL_*): the
              * stage's program resources must fit in the slots below them */
+            if (!gp->synthetic)
+            {
             int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
                                        gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
             bool array_len = spv_uses_array_length(ir, words) != 0;
@@ -6538,6 +7027,7 @@ build:
                           array_len ?
                           ", and MGL_GEOM_KERNEL_SIZE_BUFFER is reserved for SSBO "
                           ".length() sizes" : "");
+            }
         }
         spv_free(k_gs);
         spv_free(p_gs);
@@ -6625,13 +7115,17 @@ build:
     gp->kernel_msl = msl;
     geom_dump("kernel.msl", msl);
 
-    /* the geometry stage executable is the kernel */
-    free(program->spirv[_GEOMETRY_SHADER].msl_str);
-    program->spirv[_GEOMETRY_SHADER].msl_str = xstrdup(gp->kernel_msl);
-    free(program->spirv[_GEOMETRY_SHADER].entry_point);
-    program->spirv[_GEOMETRY_SHADER].entry_point = xstrdup(gp->kernel_entry);
-    if (program->shader_slots[_GEOMETRY_SHADER])
-        program->shader_slots[_GEOMETRY_SHADER]->entry_point = xstrdup(gp->kernel_entry);
+    /* the geometry stage executable is the kernel; the synthetic cull pass-through has
+     * no geometry stage slot to publish it in (it rides in gp->kernel_msl) */
+    if (!gp->synthetic)
+    {
+        free(program->spirv[_GEOMETRY_SHADER].msl_str);
+        program->spirv[_GEOMETRY_SHADER].msl_str = xstrdup(gp->kernel_msl);
+        free(program->spirv[_GEOMETRY_SHADER].entry_point);
+        program->spirv[_GEOMETRY_SHADER].entry_point = xstrdup(gp->kernel_entry);
+        if (program->shader_slots[_GEOMETRY_SHADER])
+            program->shader_slots[_GEOMETRY_SHADER]->entry_point = xstrdup(gp->kernel_entry);
+    }
 
     /* ---- 3. pass-through raster vertex function ---- */
     glsl = geom_gen_draw_glsl(ctx, gp, &log);
@@ -6670,6 +7164,13 @@ build:
             free(msl);
             msl = patched;
         }
+    }
+
+    /* the pass-through re-exports gl_CullDistance for a fragment stage reading it: the
+     * flattened members need the same repair as the plain vertex MSL (msl_reserved.c) */
+    {
+        char *fixed_cull = mgl_msl_fix_cull_distance(msl);
+        if (fixed_cull) { free(msl); msl = fixed_cull; }
     }
 
     /* a point size is only meaningful for point output; some Metal implementations reject a
@@ -6951,14 +7452,53 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
 {
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
 
+    /* link-time fact for the per-draw mgl_geom_cull_active: scanning the VS MSL
+     * for "[[user(cull" on every draw cost glmark2 ideas 42%. */
+    program->writes_cull_distance =
+        (!program->shader_slots[_GEOMETRY_SHADER] &&
+         !program->shader_slots[_TESS_EVALUATION_SHADER] &&
+         geom_cull_writes_msl(program)) ? 1 : 0;
+
     /* no geometry stage: the program has no geometry emulation, and creating a slot for
      * it (the old behaviour) made EVERY link walk/grow the program table — a VS+FS
      * program per sub-case decayed quadratically (texture_swizzle smoke) */
-    if (!program->shader_slots[_GEOMETRY_SHADER]) return;
+    if (!program->shader_slots[_GEOMETRY_SHADER])
+    {
+        /* cull-distance emulation (tess domain, tail of this file): without a geometry
+         * or tess-evaluation stage, a vertex stage that writes gl_CullDistance needs the
+         * synthetic kernel slot; the kernel itself is built at the first draw (its input
+         * layout depends on the primitive mode) */
+        if (program->shader_slots[_TESS_EVALUATION_SHADER])
+        {
+            MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+            if (gp && gp->synthetic)
+                geom_free_prog(ctx, gp);   /* a tess stage supersedes the emulation */
+            return;
+        }
+        if (program->writes_cull_distance)
+        {
+            MGLGeomProgram *gp = geom_prog_slot(ctx, program, true);
+            if (gp && !gp->linked && !gp->synthetic)
+            {
+                memset(gp, 0, sizeof *gp);
+                gp->program = program;
+                gp->name = program->name;
+                gp->synthetic = true;    /* linked stays false: built at first draw */
+            }
+        }
+        else
+        {
+            MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
+            if (gp && gp->synthetic && (gp->linked || gp->cull_family == -1 || gp->cull_family != 0))
+                geom_free_prog(ctx, gp);  /* stale: rebuild lazily after this relink */
+        }
+        return;
+    }
 
     MGLGeomProgram *gp = geom_prog_slot(ctx, program, true);
-
     if (!gp || !obj) return;
+    if (gp->synthetic)
+        geom_free_prog(ctx, gp);          /* a real geometry stage supersedes the cull emulation */
 
     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
     gp->deferred = !program->shader_slots[_VERTEX_SHADER];
@@ -7017,8 +7557,12 @@ static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                 n = geom_declared_clip_words(vs_src, "gl_CullDistance");
                 if (gp->in_has_cull)
                 {
+                    /* the record carries the clip AND the cull array at one shared
+                     * width (geom_layout), so the wider of the two declared sizes
+                     * wins - a smaller cull array must not shrink the clip words
+                     * (clip=1 + cull=7 kept 1 word and dropped cull[1..6]) */
                     GLuint nc2 = n ? n : MGL_GEOM_MAX_CLIP;
-                    if (nc2 < gp->in_clip_size) gp->in_clip_size = nc2;
+                    if (nc2 > gp->in_clip_size) gp->in_clip_size = nc2;
                 }
                 gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
                                     (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
@@ -7106,6 +7650,14 @@ MGLGeomProgram *mgl_geom_current(GLMContext ctx)
     {
         gp = geom_for_program(ctx, ctx->state.program);
         if (gp) return gp;
+        /* the cull-distance emulation (tess domain, tail of this file): a program whose
+         * vertex stage writes gl_CullDistance draws through a synthetic pass-through */
+        if (!ctx->state.program->shader_slots[_GEOMETRY_SHADER] &&
+            !ctx->state.program->shader_slots[_TESS_EVALUATION_SHADER])
+        {
+            gp = geom_prog_slot(ctx, ctx->state.program, false);
+            if (gp && gp->synthetic) return gp;
+        }
     }
     if (ctx->state.program_pipeline)
     {
@@ -7116,6 +7668,17 @@ MGLGeomProgram *mgl_geom_current(GLMContext ctx)
         {
             gp = geom_for_program(ctx, gs);
             if (gp) return gp;
+        }
+        else
+        {
+            /* cull-distance emulation: the vertex stage program owns the slot; a
+             * pipeline tessellation stage routes through the tess path instead */
+            Program *vs = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_VERTEX_SHADER];
+            if (vs && !MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_TESS_EVALUATION_SHADER])
+            {
+                gp = geom_prog_slot(ctx, vs, false);
+                if (gp && gp->synthetic) return gp;
+            }
         }
     }
     return NULL;
@@ -7609,11 +8172,18 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     MGLGeomDraw d; memset(&d, 0, sizeof d);   /* route fields read by the renderer must never hold stack garbage */
     GLenum gs_in;
 
-    if (!mgl_geom_present(ctx)) return;
+    if (!mgl_geom_present(ctx) && !mgl_geom_cull_active(ctx)) return;
 
     gTraceCtx = ctx;
     gp = mgl_geom_current(ctx);
     if (!gp) return;
+
+    /* the cull-distance emulation's kernel is generated per input-primitive family (a
+     * draw-time property): (re)build it before the mode check below applies */
+    if (gp->synthetic && (!gp->linked || gp->cull_family != geom_cull_family(mode)))
+    {
+        if (!geom_cull_prepare(ctx, gp, gp->program, mode)) return;  /* draws unculled */
+    }
 
     if (geom_env(0))
         fprintf(stderr, "geom: trace route mode=%u indexed=%d first=%u count=%u inst=%u gp=%p linked=%d\n",
@@ -9053,4 +9623,609 @@ char *mgl_msl_add_unsafearray_copies(const char *msl)
     memcpy(out + at, overloads, sizeof overloads);
     strcpy(out + at + sizeof overloads - 1, msl + at);
     return out;
+}
+
+/* ==========================================================================
+ * cull-distance whole-primitive emulation (tess domain)
+ * ==========================================================================
+ *
+ * Metal raster stages have no whole-primitive rejection: SPIRV-Cross exports
+ * gl_CullDistance as [[user(cullN)]] attributes, which reach only the fragment stage.
+ * GL 4.6 13.5.2 requires a primitive to be dropped ENTIRELY when the cull distance of
+ * all its vertices is negative for the same cull plane — a fragment-stage discard
+ * cannot express that (an interpolated negative distance also occurs inside primitives
+ * that must stay visible, and sibling vertices are invisible to a fragment).
+ *
+ * A draw whose last pre-rasterization stage writes gl_CullDistance therefore runs
+ * through the geometry-emulation path with a SYNTHETIC pass-through "geometry" stage:
+ * the vertex capture variant records the real vertex stage's outputs (position, cull
+ * and clip distances, varyings), a generated kernel evaluates the cull rule over each
+ * input primitive's vertices and emits the primitive only when it survives, and the
+ * existing pass-through raster function draws the survivor list.  Everything stays on
+ * the GPU (no readback, no CPU stall): the same capture -> kernel -> raster pipeline a
+ * user geometry shader takes, with the cull check standing in for the GS body.
+ *
+ * The kernel is generated per input-primitive family (points / lines / triangles /
+ * line-adjacency / triangle-adjacency) because the input layout qualifier must match
+ * the GL draw mode; the family is a draw-time property, so the route (re)builds the
+ * kernel lazily whenever it changes.
+ * ========================================================================== */
+
+/* the input-primitive family a GL draw mode maps to (-1: cannot run here).  NOTE:
+ * GL_POINTS == 0 is a valid family, so 0 must not double as the failure value */
+static int geom_cull_family(GLenum mode)
+{
+    switch (mode)
+    {
+        case GL_POINTS:                   return GL_POINTS;
+        case GL_LINES:
+        case GL_LINE_STRIP:
+        case GL_LINE_LOOP:                return GL_LINES;
+        case GL_LINES_ADJACENCY:
+        case GL_LINE_STRIP_ADJACENCY:     return GL_LINES_ADJACENCY;
+        case GL_TRIANGLES:
+        case GL_TRIANGLE_STRIP:
+        case GL_TRIANGLE_FAN:            return GL_TRIANGLES;
+        case GL_TRIANGLES_ADJACENCY:
+        case GL_TRIANGLE_STRIP_ADJACENCY: return GL_TRIANGLES_ADJACENCY;
+        default:                          return -1;
+    }
+}
+
+/* the vertices that form the primitive (adjacency vertices never do — GL 4.6 13.5
+ * keeps them out of clipping and culling) and the order they are emitted in: the
+ * primitive's winding is preserved (a cyclic rotation) while the GL provoking vertex
+ * ends up emitted last, which is the geometry stage's provoking rule. */
+static void geom_cull_emit_list(GLenum in_type, bool provoking_first,
+                                int emit[8], int *n_emit, int check[8], int *n_check)
+{
+    switch (in_type)
+    {
+        case GL_POINTS:
+            emit[0] = check[0] = 0; *n_emit = *n_check = 1;
+            return;
+        case GL_LINES:
+            /* line winding is irrelevant to rasterization */
+            if (provoking_first) { emit[0] = 1; emit[1] = 0; }
+            else                 { emit[0] = 0; emit[1] = 1; }
+            *n_emit = 2;
+            check[0] = 0; check[1] = 1; *n_check = 2;
+            return;
+        case GL_LINES_ADJACENCY:
+            emit[0] = check[0] = 1; emit[1] = check[1] = 2;
+            *n_emit = *n_check = 2;
+            return;
+        case GL_TRIANGLES_ADJACENCY:
+            check[0] = 0; check[1] = 2; check[2] = 4; *n_check = 3;
+            if (provoking_first) { emit[0] = 2; emit[1] = 4; emit[2] = 0; }
+            else                 { emit[0] = 0; emit[1] = 2; emit[2] = 4; }
+            *n_emit = 3;
+            return;
+        default:    /* GL_TRIANGLES: strips/fans arrive pre-assembled as windows */
+            check[0] = 0; check[1] = 1; check[2] = 2; *n_check = 3;
+            if (provoking_first) { emit[0] = 1; emit[1] = 2; emit[2] = 0; }
+            else                 { emit[0] = 0; emit[1] = 1; emit[2] = 2; }
+            *n_emit = 3;
+            return;
+    }
+}
+
+/* SPIR-V word scan: which gl_CullDistance entries does the stage actually STORE?
+ *
+ * glslang exports gl_CullDistance as the BuiltIn CullDistance(4) member of the
+ * gl_PerVertex struct.  Entries the shader never writes are undefined in GL and must
+ * not cull (Mesa leaves them zero), so the generated kernel only evaluates the stored
+ * entries: a constant-index store names its plane, any store through an index the scan
+ * cannot resolve turns every plane on.  Returns the plane bitmask and sets *writes when
+ * a store reaches the array at all. */
+static uint32_t geom_cull_store_mask(const uint32_t *ir, size_t nwords, uint32_t builtin, bool *writes)
+{
+    uint32_t max_id = 0;
+    uint32_t *const_val = NULL, *ptr_pointee = NULL, *arr_elem = NULL;
+    uint32_t *chain_idx_val = NULL, *cull_member = NULL, *chain_base = NULL;
+    uint8_t  *var_storage = NULL, *chain_idx_const = NULL, *chain_cull = NULL;
+    uint8_t  *chain_kind = NULL;      /* 1: base is the builtin variable, 2: base is another cull chain */
+    uint32_t cull_vars[8];
+    int n_cull_vars = 0;
+    uint32_t member = 0xffffffff, mask = 0;
+    bool all = false, any = false;
+    size_t i = 5;
+
+    *writes = false;
+    if (!ir || nwords < 5) return 0;
+    /* the header's Bound bounds every result id */
+    max_id = ir[3];
+    if (max_id < 2 || max_id > (1u << 22)) return 0;
+
+    const_val      = malloc((max_id + 1) * sizeof *const_val);
+    ptr_pointee    = calloc(max_id + 1, sizeof *ptr_pointee);
+    arr_elem       = calloc(max_id + 1, sizeof *arr_elem);
+    var_storage    = calloc(max_id + 1, 1);
+    chain_base     = calloc(max_id + 1, sizeof *chain_base);
+    chain_idx_const = calloc(max_id + 1, 1);
+    chain_idx_val  = calloc(max_id + 1, sizeof *chain_idx_val);
+    chain_cull     = calloc(max_id + 1, 1);
+    chain_kind     = calloc(max_id + 1, 1);
+    cull_member    = calloc(max_id + 1, sizeof *cull_member);
+    if (!const_val || !ptr_pointee || !arr_elem || !var_storage || !chain_base ||
+        !chain_idx_const || !chain_idx_val || !chain_cull || !cull_member || !chain_kind)
+        goto done;
+    for (i = 0; i <= max_id; i++) const_val[i] = 0xffffffff;
+
+    /* pass 1: pointer/array types, int constants, output variables, the gl_PerVertex
+     * member carrying the CullDistance builtin */
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+        if (!wc) break;
+
+        switch (op)
+        {
+            case SpvOpTypePointer:
+                if (i + 4 <= nwords) ptr_pointee[ir[i+1]] = ir[i+3];
+                break;
+            case SpvOpTypeArray:
+                if (i + 3 <= nwords) arr_elem[ir[i+1]] = ir[i+2];
+                break;
+            case SpvOpConstant:
+                if (i + 4 <= nwords && ir[i+2] <= max_id) const_val[ir[i+2]] = ir[i+3];
+                break;
+            case SpvOpVariable:
+                /* [op, result type, result, storage class] */
+                if (i + 4 <= nwords && ir[i+2] <= max_id) var_storage[ir[i+2]] = (uint8_t)ir[i+3];
+                break;
+            case SpvOpMemberDecorate:
+                /* [op, struct type, member index, decoration, literal...] */
+                if (i + 5 <= nwords && ir[i+1] <= max_id &&
+                    ir[i+3] == (uint32_t)SpvDecorationBuiltIn &&
+                    ir[i+4] == builtin)
+                    cull_member[ir[i+1]] = ir[i+2] + 1;   /* member index + 1 (0 = none) */
+                break;
+            default:
+                break;
+        }
+        i += wc;
+    }
+
+    /* the output variables that address that struct (possibly through arrays) */
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+        if (!wc) break;
+        if (op == SpvOpVariable && i + 4 <= nwords)
+        {
+            uint32_t rid = ir[i+2], ty = ir[i+1], sc = ir[i+3];   /* [op, type, result, storage] */
+            if (sc == SpvStorageClassOutput && ty <= max_id)
+            {
+                uint32_t pt = ptr_pointee[ty];
+                int guard = 0;
+                while (pt && pt <= max_id && arr_elem[pt] && ++guard < 4) pt = arr_elem[pt];
+                if (pt && pt <= max_id && cull_member[pt] && n_cull_vars < 8)
+                {
+                    cull_vars[n_cull_vars++] = rid;
+                    member = cull_member[pt] - 1;
+                }
+            }
+        }
+        i += wc;
+    }
+    if (!n_cull_vars) goto done;
+
+    /* pass 2: the access chains into the array and the stores through them.  SPIR-V is
+     * dominated, so a chain's base is always defined earlier in the stream. */
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+        if (!wc) break;
+
+        if (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain)
+        {
+            uint32_t rid = ir[i+2], base = ir[i+3];   /* [op, type, result, base, idx...] */
+            int nidx = (int)wc - 4;
+            uint8_t into = 0;
+
+            for (int k = 0; k < n_cull_vars; k++) if (base == cull_vars[k]) into = 1;
+            if (!into && base <= max_id && chain_cull[base]) into = 2;    /* chain of a chain */
+            if (rid <= max_id) chain_base[rid] = base;
+            if (into && rid <= max_id)
+            {
+                chain_kind[rid] = into;
+                for (int k = 0; k < nidx && k < 2; k++)
+                {
+                    uint32_t ix = ir[i+4+k];
+                    if (ix <= max_id && const_val[ix] != 0xffffffff)
+                    {
+                        chain_idx_const[rid] |= (uint8_t)(1u << k);
+                        if (k == 0) chain_idx_val[rid] = (chain_idx_val[rid] & 0xffff0000u) | (const_val[ix] & 0xffffu);
+                        else        chain_idx_val[rid] = (chain_idx_val[rid] & 0x0000ffffu) | (const_val[ix] << 16);
+                    }
+                }
+                /* gl_Position and the varyings live in the same gl_PerVertex variable:
+                 * only a chain that selects the cull-distance member addresses the array */
+                if (into == 1)
+                    chain_cull[rid] = ((chain_idx_const[rid] & 1u) &&
+                                       (chain_idx_val[rid] & 0xffffu) == member) ? 1 : 0;
+                else
+                    chain_cull[rid] = 1;
+            }
+        }
+        else if (op == SpvOpStore && i + 3 <= nwords)
+        {
+            uint32_t ptr = ir[i+1];
+            if (ptr > max_id) { i += wc; continue; }
+
+            bool direct = false;
+            for (int k = 0; k < n_cull_vars; k++) if (ptr == cull_vars[k]) direct = true;
+
+            if (direct) all = any = true;             /* whole-array store */
+            else if (chain_cull[ptr])
+            {
+                uint32_t plane;
+                bool plane_known = false;
+
+                any = true;
+                if (member == 0xffffffff)
+                {
+                    /* a bare BuiltIn variable: the first index is the plane */
+                    if (chain_idx_const[ptr] & 1u)
+                    {
+                        plane = chain_idx_val[ptr] & 0xffffu;
+                        plane_known = true;
+                    }
+                }
+                else if (chain_kind[ptr] == 1)
+                {
+                    /* [member, plane]: this chain selects the gl_PerVertex member first */
+                    if ((chain_idx_const[ptr] & 1u) && (chain_idx_val[ptr] & 0xffffu) == member &&
+                        (chain_idx_const[ptr] & 2u))
+                    {
+                        plane = (chain_idx_val[ptr] >> 16) & 0xffffu;
+                        plane_known = true;
+                    }
+                }
+                else
+                {
+                    /* chain of a chain: the inner chain selected the member (its only
+                     * index), this chain's first index is the plane */
+                    uint32_t inner = chain_base[ptr];
+                    if (inner <= max_id && chain_cull[inner] && chain_kind[inner] == 1 &&
+                        (chain_idx_const[inner] & 1u) && !(chain_idx_const[inner] & 2u) &&
+                        (chain_idx_val[inner] & 0xffffu) == member && (chain_idx_const[ptr] & 1u))
+                    {
+                        plane = chain_idx_val[ptr] & 0xffffu;
+                        plane_known = true;
+                    }
+                }
+                if (plane_known)
+                {
+                    if (plane < MGL_GEOM_MAX_CLIP) mask |= 1u << plane;
+                    else all = true;                 /* out of range: be conservative */
+                }
+                else all = true;                     /* not statically known */
+            }
+        }
+        i += wc;
+    }
+
+done:
+    free(const_val); free(ptr_pointee); free(arr_elem); free(var_storage);
+    free(chain_base); free(chain_idx_const); free(chain_idx_val); free(chain_cull); free(cull_member);
+    free(chain_kind);
+    if (all) mask = (1u << MGL_GEOM_MAX_CLIP) - 1u;
+    *writes = any;
+    return mask;
+}
+
+/* the program the synthetic cull slot keys on (mirrors mgl_geom_current's resolution):
+ * the last pre-rasterization stage is the vertex stage and no geometry stage may be
+ * present (a geometry stage owns the path and evaluates cull itself) */
+static Program *geom_cull_program(GLMContext ctx)
+{
+    if (!ctx->state.ext_geom) return NULL;
+    if (ctx->state.program)
+    {
+        Program *p = ctx->state.program;
+        if (p->shader_slots[_GEOMETRY_SHADER] || p->shader_slots[_TESS_EVALUATION_SHADER]) return NULL;
+        return p;
+    }
+    if (ctx->state.program_pipeline)
+    {
+        /* a pipeline resolves through the program owning the stage (mgl_geom_current):
+         * the vertex stage program here; a pipeline geometry stage wins instead, and a
+         * pipeline tessellation stage routes through the tess path */
+        MGLPipelineObj *pl = MGL_PIPELINE_OBJ(STATE(program_pipeline));
+        if (pl->base.stage_programs[_GEOMETRY_SHADER] || pl->base.stage_programs[_TESS_EVALUATION_SHADER])
+            return NULL;
+        return pl->base.stage_programs[_VERTEX_SHADER];
+    }
+    return NULL;
+}
+
+/* fast presence check: the MSL substring hit is only paid until the link-time slot
+ * exists (mgl_geom_post_link creates it) */
+static bool geom_cull_writes_msl(Program *p)
+{
+    const char *msl = p ? p->spirv[_VERTEX_SHADER].msl_str : NULL;
+    return msl && strstr(msl, "[[user(cull") != NULL;
+}
+
+bool mgl_geom_cull_active(GLMContext ctx)
+{
+    Program *p = geom_cull_program(ctx);
+    MGLGeomProgram *gp;
+
+    if (!p) return false;
+    /* link-time flag first (mgl_geom_post_link, glmark2 perf r29): the geometry
+     * program-table lookup is only paid by programs that actually write
+     * gl_CullDistance — rescanning the VS MSL here cost glmark2 ideas 42% */
+    if (!p->writes_cull_distance) return false;
+    gp = geom_prog_slot(ctx, p, false);
+    if (gp) return gp->synthetic;
+    return true;
+}
+
+/* the synthetic pass-through "geometry" stage source: cull evaluation + emit */
+static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp)
+{
+    SB b;
+    const char *in_kw, *out_kw;
+    int emit[8], check[8], n_emit, n_check;
+
+    memset(&b, 0, sizeof b);
+    switch (gp->in_type)
+    {
+        case GL_POINTS:              in_kw = "points";              out_kw = "points, max_vertices = 1"; break;
+        case GL_LINES:               in_kw = "lines";               out_kw = "line_strip, max_vertices = 2"; break;
+        case GL_LINES_ADJACENCY:     in_kw = "lines_adjacency";     out_kw = "line_strip, max_vertices = 2"; break;
+        case GL_TRIANGLES_ADJACENCY: in_kw = "triangles_adjacency"; out_kw = "triangle_strip, max_vertices = 3"; break;
+        default:                     in_kw = "triangles";           out_kw = "triangle_strip, max_vertices = 3"; break;
+    }
+
+    sb_put(&b, "#version 460 core\n");
+    sb_put(&b, "layout(%s) in;\n", in_kw);
+    sb_put(&b, "layout(%s) out;\n\n", out_kw);
+
+    /* only the members the capture records exist on gl_in */
+    sb_put(&b, "in gl_PerVertex\n{\n    vec4 gl_Position;\n");
+    if (gp->in_has_psize) sb_put(&b, "    float gl_PointSize;\n");
+    if (gp->in_has_clip && gp->in_clip_size) sb_put(&b, "    float gl_ClipDistance[%u];\n", gp->in_clip_size);
+    if (gp->in_clip_size) sb_put(&b, "    float gl_CullDistance[%u];\n", gp->in_clip_size);
+    sb_put(&b, "} gl_in[];\n\n");
+
+    for (int i = 0; i < gp->n_in; i++)
+    {
+        MGLGeomVar *v = &gp->in_v[i];
+        const char *ty = glsl_type_name(v->base, v->rows, v->cols);
+        char arr[24];
+        if (!ty) { free(b.s); return NULL; }
+        if (v->elems > 1) snprintf(arr, sizeof arr, "[%u]", v->elems); else arr[0] = 0;
+        sb_put(&b, "%s%s%sin %s mgl_ci%d%s[];\n", v->flat ? "flat " : "",
+               v->noperspective ? "noperspective " : "", v->centroid ? "centroid " : "",
+               ty, i, arr);
+    }
+    sb_put(&b, "\n");
+    for (int i = 0; i < gp->n_out; i++)
+    {
+        MGLGeomVar *v = &gp->out_v[i];
+        const char *ty = glsl_type_name(v->base, v->rows, v->cols);
+        char arr[24];
+        if (!ty) { free(b.s); return NULL; }
+        if (v->elems > 1) snprintf(arr, sizeof arr, "[%u]", v->elems); else arr[0] = 0;
+        sb_put(&b, "%s%s%sout %s mgl_co%d%s;\n", v->flat ? "flat " : "",
+               v->noperspective ? "noperspective " : "", v->centroid ? "centroid " : "",
+               ty, i, arr);
+    }
+
+    sb_put(&b, "\nvoid main()\n{\n");
+    sb_put(&b, "    bool mgl_culled = false;\n");
+    geom_cull_emit_list(gp->in_type, false, emit, &n_emit, check, &n_check);
+    for (int i = 0; i < (int)gp->in_clip_size; i++)
+    {
+        if (!(gp->cull_planes & (1u << i))) continue;
+        sb_put(&b, "    {\n        bool mgl_neg = true;\n");
+        for (int v = 0; v < n_check; v++)
+            sb_put(&b, "        if (gl_in[%d].gl_CullDistance[%d] >= 0.0) mgl_neg = false;\n",
+                   check[v], i);
+        sb_put(&b, "        if (mgl_neg) mgl_culled = true;\n    }\n");
+    }
+    sb_put(&b, "    if (mgl_culled) return;\n");
+    geom_cull_emit_list(gp->in_type, gp->provoking_first_emit, emit, &n_emit, check, &n_check);
+    for (int e_i = 0; e_i < n_emit; e_i++)
+    {
+        int e = emit[e_i];
+        sb_put(&b, "    gl_Position = gl_in[%d].gl_Position;\n", e);
+        if (gp->in_has_psize) sb_put(&b, "    gl_PointSize = gl_in[%d].gl_PointSize;\n", e);
+        if (gp->in_has_clip && gp->in_clip_size)
+            for (int i = 0; i < (int)gp->in_clip_size; i++)
+                sb_put(&b, "    gl_ClipDistance[%d] = gl_in[%d].gl_ClipDistance[%d];\n", i, e, i);
+        if (gp->in_clip_size)
+            for (int i = 0; i < (int)gp->in_clip_size; i++)
+                sb_put(&b, "    gl_CullDistance[%d] = gl_in[%d].gl_CullDistance[%d];\n", i, e, i);
+        for (int i = 0; i < gp->n_out; i++)
+            sb_put(&b, "    mgl_co%d = mgl_ci%d[%d];\n", i, i, e);
+        sb_put(&b, "    EmitVertex();\n");
+    }
+    sb_put(&b, "    EndPrimitive();\n}\n");
+    return b.s;
+}
+
+/* fill the emulation state for a cull program: everything mgl_geom_compile_stage derives
+ * from a real geometry stage's interface comes from the vertex stage here (the synthetic
+ * stage is a pass-through, so its inputs and outputs are the vertex stage's outputs) */
+static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *program)
+{
+    MGLGeomVar vs_out[MGL_GEOM_MAX_VARYINGS];
+    int n_vs_out = 0;
+    SpvModule *vm = NULL;
+    const char *e2 = NULL, *src;
+    char *vs_src = NULL;
+    GLuint n;
+    bool ok = false;
+
+    if (!program->shader_slots[_VERTEX_SHADER] || !program->spirv[_VERTEX_SHADER].ir)
+        return false;
+
+    vm = spv_parse(program->spirv[_VERTEX_SHADER].ir, program->spirv[_VERTEX_SHADER].size, &e2);
+    if (!vm) goto done;
+    if (!geom_reflect_stage(vm, false, vs_out, &n_vs_out, NULL)) goto done;
+    if (n_vs_out > MGL_GEOM_MAX_VARYINGS) n_vs_out = MGL_GEOM_MAX_VARYINGS;
+
+    gp->cull_planes = geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
+                                           program->spirv[_VERTEX_SHADER].size,
+                                           (uint32_t)SpvBuiltInCullDistance, &gp->writes_cull);
+    if (!gp->writes_cull) goto done;    /* nothing is stored: nothing can cull */
+
+    /* which clip planes the vertex stage really writes: the rest are undefined in GL
+     * and must not clip (the raster pass-through neutralizes them) */
+    {
+        bool w = false;
+        gp->clip_planes = geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
+                                               program->spirv[_VERTEX_SHADER].size,
+                                               (uint32_t)SpvBuiltInClipDistance, &w);
+    }
+
+    src = geom_vs_source(ctx, MGL_PROGRAM_OBJ(program));
+    vs_src = xstrdup(src ? src : "");
+
+    /* clip/cull word count: the capture wrapper must not read past either declaration.
+     * A declaration carries its own size; without one the largest STORED entry decides
+     * (the source's highest gl_CullDistance[7] literal is an INDEX, not a size — the
+     * store scan above knows the real extent). */
+    gp->in_has_clip = strstr(vs_src, "gl_ClipDistance") != NULL;
+    n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
+    gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+    n = geom_declared_clip_words(vs_src, "gl_CullDistance");
+    if (n && n > gp->in_clip_size) gp->in_clip_size = n;   /* shared record width: the wider array wins */
+    if (!gp->in_clip_size) gp->in_clip_size = n;
+    /* the record must carry every entry a store reaches */
+    {
+        uint32_t both = gp->cull_planes | gp->clip_planes;
+        GLuint hb = 0;
+        for (GLuint b = 0; b < MGL_GEOM_MAX_CLIP; b++)
+            if (both & (1u << b)) hb = b + 1;
+        if (hb > gp->in_clip_size) gp->in_clip_size = hb;
+        if (gp->in_clip_size > MGL_GEOM_MAX_CLIP) gp->in_clip_size = MGL_GEOM_MAX_CLIP;
+    }
+    /* only planes the declaration carries can cull */
+    gp->cull_planes &= (gp->in_clip_size >= 32) ? 0xffffffffu : ((1u << gp->in_clip_size) - 1u);
+    if (!gp->cull_planes) goto done;
+    gp->in_has_cull = true;
+
+    gp->in_has_pos = true;
+    gp->in_has_psize = strstr(vs_src, "gl_PointSize") != NULL;
+    gp->out_has_pos = true;
+    gp->out_has_psize = gp->in_has_psize;
+    gp->out_has_clip = gp->in_has_clip;
+    gp->out_has_cull = true;
+    gp->out_has_layer = false;
+    gp->out_has_vp = false;
+    gp->out_has_prim = false;
+    gp->out_clip_size = gp->in_clip_size;
+    gp->streams = 1;
+    gp->invocations = 1;
+
+    gp->n_in = gp->n_out = n_vs_out;
+    for (int i = 0; i < n_vs_out; i++)
+    {
+        MGLGeomVar *iv = &gp->in_v[i], *ov = &gp->out_v[i];
+
+        snprintf(iv->name, sizeof iv->name, "mgl_ci%d", i);
+        snprintf(ov->name, sizeof ov->name, "mgl_co%d", i);
+        snprintf(iv->expr, sizeof iv->expr, "%s%s%s", vs_out[i].name,
+                 vs_out[i].member[0] ? "." : "", vs_out[i].member);
+        snprintf(iv->block, sizeof iv->block, "%s", vs_out[i].block);
+        snprintf(ov->block, sizeof ov->block, "%s", vs_out[i].block);
+        iv->member[0] = ov->member[0] = 0;
+        iv->location = ov->location = vs_out[i].location;
+        iv->base = ov->base = vs_out[i].base;
+        iv->rows = ov->rows = vs_out[i].rows;
+        iv->cols = ov->cols = vs_out[i].cols;
+        iv->elems = ov->elems = vs_out[i].elems;
+        iv->words = ov->words = vs_out[i].words;
+        iv->flat = ov->flat = vs_out[i].flat;
+        iv->noperspective = ov->noperspective = vs_out[i].noperspective;
+        iv->centroid = ov->centroid = vs_out[i].centroid;
+        iv->sample = ov->sample = vs_out[i].sample;
+        iv->stream = ov->stream = 0;
+        iv->xfb_buffer = ov->xfb_buffer = -1;
+        iv->xfb_offset = ov->xfb_offset = 0;
+    }
+    geom_layout(gp);
+    ok = true;
+
+done:
+    spv_free(vm);
+    free(vs_src);
+    return ok;
+}
+
+/* (re)build the synthetic emulation for a GL draw mode.  Returns false when the program
+ * turns out not to cull (the caller falls back to the normal draw path). */
+static bool geom_cull_prepare(GLMContext ctx, MGLGeomProgram *gp, Program *program, GLenum mode)
+{
+    int fam = geom_cull_family(mode);
+
+    if (getenv("MGL_CULL_TRACE"))
+        fprintf(stderr, "cull prepare: mode=%u fam=%d gp=%p linked=%d family=%d\n",
+                mode, fam, (void *)gp, gp ? gp->linked : -1, gp ? gp->cull_family : -1);
+    if (fam < 0) return false;
+    if (gp->linked && gp->synthetic && gp->cull_family == fam) return true;
+    if (gp->synthetic && gp->cull_family == -1) return false;   /* build failed once */
+
+    geom_free_prog(ctx, gp);
+    memset(gp, 0, sizeof *gp);
+    gp->program = program;
+    gp->name = program->name;
+    gp->synthetic = true;
+    gp->cull_family = fam;
+    /* a failed build must not poison the program's own link status (GEOM_FAIL) */
+    gp->deferred = true;
+    gp->in_type = fam;
+    gp->out_type = (fam == GL_POINTS) ? GL_POINTS :
+                   ((fam == GL_LINES || fam == GL_LINES_ADJACENCY) ? GL_LINE_STRIP : GL_TRIANGLE_STRIP);
+    gp->in_verts = (fam == GL_POINTS) ? 1 : (fam == GL_LINES) ? 2 :
+                   (fam == GL_LINES_ADJACENCY) ? 4 : (fam == GL_TRIANGLES_ADJACENCY) ? 6 : 3;
+    gp->max_vertices = (fam == GL_POINTS) ? 1 : (fam == GL_LINES_ADJACENCY) ? 2 :
+                       (fam == GL_TRIANGLES_ADJACENCY) ? 3 : gp->in_verts;
+    gp->provoking_first_emit = (ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION);
+    gp->kernel_entry = xstrdup("mgl_geom_gs");
+    gp->capture_entry = xstrdup("main0");
+    gp->draw_entry = xstrdup("main0");
+
+    if (!geom_cull_reflect(ctx, gp, program))
+    {
+        geom_free_prog(ctx, gp);        /* release anything reflect left behind */
+        memset(gp, 0, sizeof *gp);
+        gp->program = program;
+        gp->name = program->name;
+        gp->synthetic = true;           /* stays inert (linked false): draws pass through */
+        gp->cull_family = -1;
+        return false;
+    }
+    geom_build(ctx, gp, program);
+    if (!gp->linked)
+    {
+        geom_free_prog(ctx, gp);
+        memset(gp, 0, sizeof *gp);
+        gp->program = program;
+        gp->name = program->name;
+        gp->synthetic = true;
+        gp->cull_family = -1;           /* do not retry: draws pass through unculled */
+        return false;
+    }
+    return true;
+}
+
+/* ensure the synthetic kernel exists for this draw's primitive family; false leaves the
+ * caller to draw through the normal (unculled) path */
+bool mgl_geom_cull_ready(GLMContext ctx, GLenum mode)
+{
+    MGLGeomProgram *gp = mgl_geom_current(ctx);
+
+    if (!gp || !gp->synthetic) return false;
+    if (gp->linked && gp->cull_family == geom_cull_family(mode)) return true;
+    return geom_cull_prepare(ctx, gp, gp->program, mode);
 }

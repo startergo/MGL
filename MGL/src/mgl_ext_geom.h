@@ -257,6 +257,22 @@ typedef struct MGLGeomProgram {
     char   *draw_msl, *draw_entry;
     void   *capture_function, *capture_library;     /* retained MTLFunction / MTLLibrary */
     void   *draw_function, *draw_library;           /* pass-through raster vertex function */
+    /* ---- cull-distance emulation (tess domain) --------------------------------
+     * A program whose last pre-rasterization stage writes gl_CullDistance culls whole
+     * primitives, which no Metal raster stage can express: the draw then runs through
+     * the geometry-emulation path with a SYNTHETIC pass-through "geometry" stage whose
+     * kernel evaluates the cull rule over each input primitive and emits nothing for a
+     * culled one (geometry.c: mgl_geom_cull_* below). */
+    bool     synthetic;         /* this gp is the cull pass-through, not a user GS */
+    int      cull_family;       /* the in_type the kernel was generated for (rebuild on change) */
+    uint32_t cull_planes;       /* bitmask of gl_CullDistance entries that participate */
+    uint32_t clip_planes;       /* bitmask of gl_ClipDistance entries the stage writes:
+                                 * unwritten entries are undefined and must not clip the
+                                 * primitive (the raster pass-through neutralizes them) */
+    bool     writes_cull;       /* the stage stores gl_CullDistance at all */
+    bool     provoking_first_emit;  /* emit order puts the GL provoking vertex last */
+    void    *kernel_function, *kernel_library;   /* the synthetic kernel (no gs Shader
+                                                  * exists to cache it in) */
     /* capture-pass pipeline cache: the capture PSO depends only on (capture function,
      * vertex layout), but geomDraw rebuilt it on EVERY draw (newRenderPipelineState ~
      * 50-100 us even on the driver's internal cache — 4-6% of a gl41-geometry frame).
@@ -462,6 +478,14 @@ bool mgl_geom_get_programiv(GLMContext ctx, struct Program_t *program, GLenum pn
 bool mgl_geom_present(GLMContext ctx);
 void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size_t offset,
                     GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance);
+
+/* ---- cull-distance emulation (tess domain): Metal has no whole-primitive cull, so a
+ * program whose last pre-rasterization stage writes gl_CullDistance is routed through the
+ * geometry-emulation path with a synthetic pass-through stage that drops culled
+ * primitives (see the MGLGeomProgram.synthetic fields above) */
+bool mgl_geom_cull_active(GLMContext ctx);
+bool mgl_geom_cull_ready(GLMContext ctx, GLenum mode);   /* true: route through the
+                                                          * synthetic kernel for this mode */
 /* an indirect draw: the prep kernel reads the command from `ibuf`; false when the CPU has
  * to read it after all (no bound on the counts) */
 bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, struct Buffer_t *ibuf, size_t offset,

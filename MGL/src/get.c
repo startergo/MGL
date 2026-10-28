@@ -308,6 +308,8 @@ static const char *mgl_extensions[] = {
     "GL_ARB_shader_image_size",
     "GL_ARB_shader_texture_image_samples",  /* textureSamples()/imageSamples(); MSL get_num_samples() */
     "GL_ARB_shader_storage_buffer_object",
+    "GL_ARB_shader_draw_parameters",  /* gl_DrawID/gl_BaseVertex/gl_BaseInstance from the draw-params buffer (tessellation.c) */
+    "GL_ARB_shader_group_vote",       /* OpGroupNonUniformAll/Any/AllEqual -> simd_vote (cts_glsl_compat.c) */
     "GL_ARB_shader_subroutine",       /* GLSL rewrite to switch + int selector (introspect_subroutine.c) */
     "GL_ARB_shader_texture_lod",
     "GL_ARB_shading_language_420pack",

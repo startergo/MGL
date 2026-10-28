@@ -2064,15 +2064,19 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     NSError *error = nil;
     Shader *gs = program->shader_slots[_GEOMETRY_SHADER];
     const char *kernel_msl = gp->kernel_msl ? gp->kernel_msl : program->spirv[_GEOMETRY_SHADER].msl_str;
+    /* the cull-distance pass-through (tess domain) has no geometry Shader object to keep
+     * the kernel in: the MGLGeomProgram owns it instead */
+    void **fn_slot = &gp->kernel_function, **lib_slot = &gp->kernel_library;
+    if (gs) { fn_slot = &gs->mtl_data.function; lib_slot = &gs->mtl_data.library; }
 
-    if (!gs || !kernel_msl)
+    if ((!gs && !gp->synthetic) || !kernel_msl)
     {
         NSLog(@"MGL geom: the geometry kernel was not generated (program %u)", program->name);
         return false;
     }
 
     /* the program may not have been through bindMTLProgram yet: compile the kernel here */
-    if (!gs->mtl_data.function || !gs->mtl_data.library)
+    if (!*fn_slot || !*lib_slot)
     {
         if (!ctx->mtl_funcs.ext_program || !ctx->mtl_funcs.ext_program->compile_msl) return false;
 
@@ -2087,15 +2091,15 @@ void geom_xfb_gpu_reset(GLMContext ctx)
             free(err);
             return false;
         }
-        if (gs->mtl_data.function) ctx->mtl_funcs.ext_program->release_obj(ctx, gs->mtl_data.function);
-        if (gs->mtl_data.library) ctx->mtl_funcs.ext_program->release_obj(ctx, gs->mtl_data.library);
-        gs->mtl_data.function = fn;
-        gs->mtl_data.library = lib;
+        if (*fn_slot) ctx->mtl_funcs.ext_program->release_obj(ctx, *fn_slot);
+        if (*lib_slot) ctx->mtl_funcs.ext_program->release_obj(ctx, *lib_slot);
+        *fn_slot = fn;
+        *lib_slot = lib;
     }
 
-    if (gGsPso && gPsoKey == gs->mtl_data.function) return geomCtlPipelines(_device);
+    if (gGsPso && gPsoKey == *fn_slot) return geomCtlPipelines(_device);
 
-    id<MTLFunction> gsfn = (__bridge id<MTLFunction>)gs->mtl_data.function;
+    id<MTLFunction> gsfn = (__bridge id<MTLFunction>)*fn_slot;
 
     id<MTLComputePipelineState> pso = [_device newComputePipelineStateWithFunction: gsfn error: &error];
     if (!pso)
@@ -4900,6 +4904,18 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             fprintf(stderr, "geom: trace raster prim=%d args=%u %u %u %u %u idx=%u %u %u\n",
                     (int)prim, cp[8], cp[9], cp[10], cp[11], cp[12],
                     ((uint32_t *)gIdx.contents)[0], ((uint32_t *)gIdx.contents)[1], ((uint32_t *)gIdx.contents)[2]);
+            if (getenv("MGL_CULL_TRACE"))
+            {
+                uint32_t *ix = (uint32_t *)gIdx.contents;
+                float *ov = (float *)gOutv.contents;
+                fprintf(stderr, "cull: idx[0..7] = %u %u %u %u %u %u %u %u  out_words=%u\n",
+                        ix[0], ix[1], ix[2], ix[3], ix[4], ix[5], ix[6], ix[7], gp->out_words);
+                for (int r = 0; r < 9; r++)
+                {
+                    int o = r * (int)gp->out_words;
+                    fprintf(stderr, "cull: out rec %d: pos %5.2f %5.2f\n", r, ov[o + 2], ov[o + 3]);
+                }
+            }
         }
         [_currentRenderEncoder drawIndexedPrimitives: prim
                                                indexType: MTLIndexTypeUInt32
@@ -4907,6 +4923,35 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                                        indexBufferOffset: 0
                                           indirectBuffer: gCtl
                                     indirectBufferOffset: MGL_GEOM_ARG_OFFSET * sizeof(uint32_t)];
+
+        /* cull diagnostics: dump the compacted index list and the emitted records once
+         * the GPU has finished (a completed handler sees the final contents; an inline
+         * read would race the compute that produces them) */
+        if (getenv("MGL_CULL_DUMP") && _currentCommandBuffer &&
+            _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+        {
+            id<MTLBuffer> idx = gIdx, outv = gOutv, ctl = gCtl;
+            size_t idx_off = 0, out_off = gOutvOff / 4;
+            uint32_t ow = gp->out_words, nrec = (uint32_t)((outv.length - gOutvOff) / 4 / (ow ? ow : 1));
+            [_currentCommandBuffer addCompletedHandler: ^(id<MTLCommandBuffer> b) {
+                uint32_t *ix = (uint32_t *)idx.contents;
+                uint32_t *cp = (uint32_t *)ctl.contents;
+                uint32_t n = cp ? cp[MGL_GEOM_ARG_OFFSET] : 0;
+                if (n > 64) n = 64;
+                fprintf(stderr, "culldump: %u indices:", n);
+                for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %u", ix[idx_off + i]);
+                fprintf(stderr, "\n");
+                float *ov = (float *)outv.contents;
+                uint32_t r = nrec < 16 ? nrec : 16;
+                for (uint32_t k = 0; k < r; k++)
+                {
+                    float *rec = ov + out_off + (size_t)k * ow;
+                    fprintf(stderr, "culldump: rec %2u: pos %6.3f %6.3f %6.3f %6.3f tag %u %u\n",
+                            k, rec[2], rec[3], rec[4], rec[5],
+                            *(uint32_t *)&rec[0], *(uint32_t *)&rec[1]);
+                }
+            }];
+        }
 
         BUF()->end_draw(ctx);
     }

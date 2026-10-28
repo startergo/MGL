@@ -87,7 +87,11 @@ static size_t tess_skip_ws_comments(const char *s, size_t i)
     for (;;)
     {
         while (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') i++;
-        if (s[i] == '/' && s[i + 1] == '/') { while (s[i] && s[i] != '\n') i++; continue; }
+        if (s[i] == '/' && s[i + 1] == '/')
+        {
+            while (s[i] && s[i] != '\n') i++;
+            continue;
+        }
         if (s[i] == '/' && s[i + 1] == '*')
         {
             i += 2;
@@ -99,14 +103,259 @@ static size_t tess_skip_ws_comments(const char *s, size_t i)
     }
 }
 
+static int tess_ident_char(int c)
+{
+    return isalnum(c) || c == '_';
+}
+#define is_ident_char tess_ident_char
+
+/* the size bracket of the FIRST `name[N]' occurrence in the source ("8" for an
+ * empty `[]'), written into out ("" when the name is not declared with a
+ * bracket at all) */
+static void tess_declared_size(const char *src, const char *name, char *out, size_t outn)
+{
+    const char *p = src;
+    size_t nl = strlen(name);
+    out[0] = 0;
+    while ((p = strstr(p, name)))
+    {
+        if ((p == src || !tess_ident_char((unsigned char)p[-1])) &&
+            !tess_ident_char((unsigned char)p[nl]))
+        {
+            const char *b = p + nl;
+            while (*b == ' ' || *b == '\t') b++;
+            if (*b == '[')
+            {
+                size_t n = 0;
+                b++;
+                while (*b == ' ' || *b == '\t') b++;
+                if (*b == ']') { out[0] = 0; return; }   /* `[]' - unsized: the link sizes it */
+                while (*b >= '0' && *b <= '9' && n + 1 < outn) out[n++] = *b++;
+                if (n && (*b == ']' || *b == ' '))
+                {
+                    out[n] = 0;
+                    return;
+                }
+                out[0] = 0;   /* non-numeric bracket (a macro parameter): keep looking */
+            }
+        }
+        p += nl;
+    }
+}
+
+/* A VERTEX stage may redeclare the distance members loose (`out float
+ * gl_CullDistance[8];') — legal GLSL and what the CTS writes — while the
+ * tessellation stages' gl_PerVertex BLOCK redeclarations (expanded to the full
+ * member set by the pass below) stay blocks.  glslang's cross-stage machinery
+ * cannot pair a loose-member interface with a block one: the link fails
+ * ("vertex block member has no corresponding member in tessellation control
+ * block") or its io mapper aborts ("Invalid In/Out variable type :
+ * gl_PerVertex").  Rewrite the loose members of a VERTEX source into one
+ * gl_PerVertex block carrying the full built-in member set (arrays sized as
+ * declared, 8 = the implementation maximum when loose/unsized) — the SPIR-V
+ * interface is identical. */
+static char *tess_vs_member_to_block(const char *src)
+{
+    size_t i = 0, len = strlen(src);
+    int depth = 0, clip_sz = -1, cull_sz = -1, changed = 0;
+    char *out = NULL;
+    size_t out_len = 0;
+    FILE *mem;
+    long insert_at = -1;      /* output offset right after the last #version line */
+
+    if (!strstr(src, "gl_ClipDistance") && !strstr(src, "gl_CullDistance")) return NULL;
+    /* gl_CullDistance in a block needs GLSL 4.50 (or the ARB extension) */
+    {
+        int version = 0;
+        const char *v = strstr(src, "#version");
+        if (v) version = atoi(v + strlen("#version"));
+        if (version && version < 450 && strstr(src, "gl_CullDistance")) return NULL;
+    }
+
+    mem = open_memstream(&out, &out_len);
+    if (!mem) return NULL;
+
+    while (i < len)
+    {
+        size_t ls = i, e = i;
+        while (e < len && src[e] != '\n') e++;
+
+        /* brace depth (function bodies are not interface declarations) */
+        for (size_t k = ls; k < e; k++)
+        {
+            if (src[k] == '{') depth++;
+            else if (src[k] == '}') depth--;
+        }
+
+        if (depth == 0)
+        {
+            /* a loose member redeclaration: `out float gl_(Clip|Cull)Distance[N];' */
+            size_t p = ls;
+            int is_decl = 0, which = 0;
+            long sz = -1;
+            while (p < e && (src[p] == ' ' || src[p] == '\t')) p++;
+            if (p + 3 < e && !strncmp(src + p, "out", 3) &&
+                !is_ident_char((unsigned char)src[p + 3]))
+            {
+                size_t q = tess_skip_ws_comments(src, p + 3);
+                if (q + 5 < e && !strncmp(src + q, "float", 5) &&
+                    !is_ident_char((unsigned char)src[q + 5]))
+                {
+                    size_t r = tess_skip_ws_comments(src, q + 5);
+                    for (int w = 0; w < 2; w++)
+                    {
+                        const char *nm = w ? "gl_CullDistance" : "gl_ClipDistance";
+                        size_t nl = strlen(nm);
+                        if (r + nl <= e && !strncmp(src + r, nm, nl) &&
+                            !is_ident_char((unsigned char)src[r + nl]))
+                        {
+                            size_t s = tess_skip_ws_comments(src, r + nl);
+                            if (s < e && src[s] == '[')
+                            {
+                                size_t t = s + 1;
+                                sz = 0;
+                                while (t < e && src[t] != ']' && src[t] != ';')
+                                {
+                                    if (src[t] >= '0' && src[t] <= '9')
+                                        sz = sz * 10 + (src[t] - '0');
+                                    t++;
+                                }
+                                if (t >= e || src[t] != ']') { sz = -2; break; }
+                                if (sz == 0) sz = 8;      /* `[]' - implicit maximum */
+                                if (sz > 8) sz = 8;
+                            }
+                            else sz = 8;                 /* unsized member */
+                            is_decl = 1;
+                            which = w;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (is_decl && sz >= 0)
+            {
+                if (which == 0) { if (clip_sz < 0) clip_sz = (int)sz; }
+                else { if (cull_sz < 0) cull_sz = (int)sz; }
+                changed = 1;
+                i = e + (e < len);
+                continue;               /* drop the loose declaration */
+            }
+        }
+
+        fwrite(src + ls, 1, e - ls, mem);
+        if (e < len) fputc('\n', mem);
+        i = e + (e < len);
+        if (insert_at < 0 && src[ls] == '#' && !strncmp(src + ls, "#version", 8))
+            insert_at = ftell(mem);    /* right after the version line's newline */
+    }
+
+    if (!changed)
+    {
+        fclose(mem);
+        free(out);
+        return NULL;
+    }
+
+    /* splice the block in after #version (or at the head) */
+    {
+        char block[256], cszs[16] = "", uszs[16] = "";
+        int n;
+        char *fin;
+        size_t fin_len, at = insert_at > 0 ? (size_t)insert_at : 0;
+        fclose(mem);
+        if (clip_sz > 0) snprintf(cszs, sizeof cszs, "%d", clip_sz);
+        if (cull_sz > 0) snprintf(uszs, sizeof uszs, "%d", cull_sz);
+        n = snprintf(block, sizeof block,
+                     "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;"
+                     " float gl_ClipDistance[%s]; float gl_CullDistance[%s]; };\n",
+                     cszs, uszs);
+        if (n < 0 || (size_t)n >= sizeof block) { free(out); return NULL; }
+        fin = malloc(out_len + (size_t)n + 1);
+        if (!fin) { free(out); return NULL; }
+        memcpy(fin, out, at);
+        memcpy(fin + at, block, (size_t)n);
+        memcpy(fin + at + n, out + at, out_len - at);
+        fin[out_len + n] = 0;
+        free(out);
+        return fin;
+    }
+}
+
 char *mgl_tess_glsl_compat(GLenum type, const char *src)
 {
     if (!src ||
         (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
          type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
         return NULL;
+
+    /* vertex AND geometry stages: fold loose `out float gl_*Distance[N];' members
+     * into one gl_PerVertex block.  A block interface in one stage and a loose
+     * member in the other is exactly the mix glslang's link / io-mapper cannot
+     * pair ("vertex block member has no corresponding member..." / "Invalid
+     * In/Out variable type : gl_PerVertex"): a program with a tessellation stage
+     * (block form, expanded below) and a loose-member VS or GS hits it, and the
+     * CTS writes the same members loose in every stage - make them uniform. */
+    if (type == GL_VERTEX_SHADER || type == GL_GEOMETRY_SHADER)
+    {
+        char *blocked = tess_vs_member_to_block(src);
+        if (blocked)
+        {
+            /* the blocked source has no loose members left: the recursive call
+             * goes straight to the injection/expansion below */
+            char *next = mgl_tess_glsl_compat(type, blocked);
+            if (next) { free(blocked); return next; }
+            return blocked;
+        }
+    }
+
     if (!strstr(src, "gl_PerVertex"))
         return NULL;
+
+    /* a stage that INDEXES gl_in[..].gl_ClipDistance / gl_CullDistance with a
+     * variable must redeclare its input block with a size first ("array must be
+     * redeclared with a size before being indexed with a variable"); inject the
+     * full-member block when the source reads the distance members through gl_in */
+    if ((type == GL_TESS_CONTROL_SHADER || type == GL_TESS_EVALUATION_SHADER ||
+         type == GL_GEOMETRY_SHADER) &&
+        strstr(src, "gl_in") && !strstr(src, "in gl_PerVertex") &&
+        (strstr(src, "gl_ClipDistance") || strstr(src, "gl_CullDistance")))
+    {
+        int version = 0;
+        const char *v = strstr(src, "#version");
+        if (v) version = atoi(v + strlen("#version"));
+        if (version < 450 && strstr(src, "gl_CullDistance")) version = 0;
+        if (version)
+        {
+            char *with_in = NULL;
+            size_t wl = 0;
+            /* the injected members must not pin sizes the producer contradicts
+             * (clip=1 + cull=7 programs): take the stage's OWN declared size for
+             * each array - programs declare the same size in every stage - and
+             * leave it unsized when this stage does not mention it */
+            char cs[32], us[32];
+            tess_declared_size(src, "gl_ClipDistance", cs, sizeof cs);
+            tess_declared_size(src, "gl_CullDistance", us, sizeof us);
+            FILE *m2 = open_memstream(&with_in, &wl);
+            if (m2)
+            {
+                const char *nl = v ? strchr(v, '\n') : src;
+                size_t head = nl ? (size_t)(nl - src) + 1 : 0;
+                fwrite(src, 1, head, m2);
+                fprintf(m2, "in gl_PerVertex { vec4 gl_Position; float gl_PointSize;"
+                            " float gl_ClipDistance[%s]; float gl_CullDistance[%s]; } gl_in[];\n",
+                        cs[0] ? cs : "", us[0] ? us : "");
+                fputs(src + head, m2);
+                fclose(m2);
+                if (with_in)
+                {
+                    char *next = mgl_tess_glsl_compat(type, with_in);
+                    if (next) { free(with_in); return next; }
+                    return with_in;   /* the expansion declined: the injection stands */
+                }
+            }
+        }
+    }
 
     /* gl_CullDistance is an ARB extension before GLSL 4.50: expanding a subset
      * redeclaration with it would fail ("block redeclaration has extra members") */
@@ -119,7 +368,7 @@ char *mgl_tess_glsl_compat(GLenum type, const char *src)
     const char *pervtx_member[4] = {
         "vec4 gl_Position",
         "float gl_PointSize",
-        "float gl_ClipDistance[]",
+        "float gl_ClipDistance[]",            /* unsized: takes the producer's size at link */
         version >= 450 ? "float gl_CullDistance[]" : NULL,
     };
 
@@ -852,6 +1101,28 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
         key = tess_builtin_key(m->name);
         if (key) { m->key = key; continue; }
 
+        /* a FLATTENED builtin array member ("gl_CullDistance_3"): key it to the
+         * builtin slot with the suffix as the element index, so the consumer's
+         * flattened struct aliases the producer's whole-array member at the same
+         * canonical offsets (the generic path below resolves names through the
+         * stage's reflected variables, which never list the builtins) */
+        {
+            char b2[128];
+            size_t n = strlen(m->name);
+            while (n > 1 && m->name[n - 1] >= '0' && m->name[n - 1] <= '9') n--;
+            if (n > 1 && m->name[n - 1] == '_')
+            {
+                snprintf(b2, sizeof b2, "%.*s", (int)(n - 1), m->name);
+                key = tess_builtin_key(b2);
+                if (key)
+                {
+                    m->key = key;
+                    m->array_idx = (uint32_t)atoi(m->name + n);
+                    continue;
+                }
+            }
+        }
+
         base[0] = 0;
         if (rl)
             for (GLuint j = 0; j < rl->count; j++)
@@ -1547,6 +1818,166 @@ static void buf_replace(char **buf, size_t *len, size_t *cap, const char *old, c
  *    the params buffer: fetching stage-in attributes silently returns zeros when a kernel
  *    also takes [[grid_size]] (AGX driver bug, verified with a bisected probe)
  */
+/* gl_DrawID (GL_ARB_shader_draw_parameters / GLSL 4.60): BuiltIn DrawIndex is
+ * demoted to a Private variable by mgl_spirv_lower_draw_index(), so
+ * SPIRV-Cross emits a plain function-local declaration
+ * ("int _RESERVED_IDENTIFIER_FIXUP_gl_DrawID;").  Give the function a
+ * draw-parameters buffer parameter and initialize the variable from it; the
+ * renderer stamps the buffer with the single draw's id at draw time
+ * (draw_buffers.c exec_draw -> MGLRenderer+Draw.m / +Tessellation.m). */
+/* locate the vertex function (or the tess vertex kernel) in stage MSL: its
+ * keyword, '(' and the matching ')'.  Returns nonzero when none is found. */
+static int stage_function(const char *msl, const char **kind, const char **open, const char **close)
+{
+    const char *k = strstr(msl, "\nvertex ");
+    if (!k && strncmp(msl, "vertex ", 7) == 0)
+        k = msl;
+    if (!k)
+    {
+        k = strstr(msl, "\nkernel ");
+        if (!k && strncmp(msl, "kernel ", 7) == 0)
+            k = msl;
+    }
+    if (!k)
+        return 1;
+    const char *o = strchr(k, '(');
+    if (!o)
+        return 1;
+    const char *c = o + 1;
+    while (*c && *c != ')')
+    {
+        if (*c == '(')
+        {
+            c++;
+            int depth = 1;                  /* nested parens in a parameter type */
+            while (*c && depth)
+            {
+                depth += (*c == '(') - (*c == ')');
+                c++;
+            }
+            continue;
+        }
+        c++;
+    }
+    if (!*c)
+        return 1;
+    *kind = k; *open = o; *close = c;
+    return 0;
+}
+
+char *mgl_draw_params_rewrite_vertex_msl(const char *msl, int buffer_index)
+{
+    if (!msl)
+        return NULL;
+    bool draw_id = strstr(msl, "gl_DrawID;") != NULL;
+    bool base_vertex = strstr(msl, "gl_BaseVertex [[base_vertex]]") != NULL;
+    if (!draw_id && !base_vertex)
+        return NULL;                       /* neither built-in in this stage */
+
+    char *out = NULL;
+    size_t len = 0, cap = 0;
+    str_append(&out, &len, &cap, "%s", msl);
+
+    /* 1. the parameter, appended to the vertex function / kernel signature */
+    {
+        const char *kind = NULL, *open = NULL, *close = NULL;
+        if (stage_function(out, &kind, &open, &close))
+        {
+            free(out);
+            return NULL;
+        }
+        while (close && *close && *close != ')')
+        {
+            if (*close == '(')
+            {
+                close++;                   /* nested parens in a parameter type */
+                int depth = 1;
+                while (*close && depth)
+                {
+                    depth += (*close == '(') - (*close == ')');
+                    close++;
+                }
+                continue;
+            }
+            close++;
+        }
+        if (!close || !*close)
+        {
+            free(out);
+            return NULL;
+        }
+        char add[96];
+        snprintf(add, sizeof add, "%sconstant uint2* mgl_dp [[buffer(%d)]]",
+                 (close[-1] == '(') ? "" : ", ", buffer_index);
+        size_t addlen = strlen(add), off = (size_t)(close - out);
+        char *grown = (char *)realloc(out, len + addlen + 1);
+        if (!grown) { free(out); return NULL; }
+        out = grown; cap = len + addlen + 1;
+        memmove(out + off + addlen, out + off, len - off + 1);
+        memcpy(out + off, add, addlen);
+        len += addlen;
+    }
+
+    /* 2a. gl_DrawID declaration initializes from the buffer:
+     *     "TYPE IDENT;" -> "TYPE IDENT = TYPE(mgl_dp[0]);" */
+    if (draw_id)
+    {
+        const char *d = strstr(out, "_RESERVED_IDENTIFIER_FIXUP_gl_DrawID;");
+        const char *d2 = !d ? strstr(out, "gl_DrawID;") : NULL;
+        d = d ? d : d2;
+        if (!d)
+        {
+            free(out);
+            return NULL;
+        }
+        const char *istart = d;            /* identifier start (back over the fixup) */
+        while (istart > out && !isspace((unsigned char)istart[-1])) istart--;
+        const char *iend = istart;
+        while (*iend && !isspace((unsigned char)*iend) && *iend != ';') iend++;
+        const char *te = istart;           /* type token end */
+        while (te > out && isspace((unsigned char)te[-1])) te--;
+        const char *ts = te;
+        while (ts > out && !isspace((unsigned char)ts[-1]) && ts[-1] != ';') ts--;
+        char target[96], init[128];
+        snprintf(target, sizeof target, "%.*s;", (int)(iend - istart), istart);
+        snprintf(init, sizeof init, "%.*s = %.*s(mgl_dp[0].x);",
+                 (int)(iend - istart), istart, (int)(te - ts), ts);
+        buf_replace(&out, &len, &cap, target, init);
+    }
+
+    /* 2b. gl_BaseVertex: Metal fills [[base_vertex]] with vertexStart, which for
+     *     arrays draws is GL's `first', not GL's base vertex (0).  Rename the
+     *     attribute parameter and define gl_BaseVertex from the buffer. */
+    if (base_vertex)
+    {
+        static const char param[] = "gl_BaseVertex [[base_vertex]]";
+        buf_replace(&out, &len, &cap, param, "mgl_base_vertex_mtl [[base_vertex]]");
+        /* first statement of the function body */
+        const char *kind = NULL, *open = NULL, *close = NULL;
+        const char *brace = NULL;
+        if (!stage_function(out, &kind, &open, &close))
+            brace = close ? strchr(close, '{') : NULL;
+        if (brace)
+        {
+            static const char decl[] = "\n    int gl_BaseVertex = int(mgl_dp[0].y);";
+            size_t dl = sizeof decl - 1, off = (size_t)(brace - out) + 1;
+            char *grown = (char *)realloc(out, len + dl + 1);
+            if (!grown) { free(out); return NULL; }
+            out = grown; cap = len + dl + 1;
+            memmove(out + off + dl, out + off, len - off + 1);
+            memcpy(out + off, decl, dl);
+            len += dl;
+        }
+        else
+        {
+            free(out);
+            return NULL;
+        }
+    }
+
+    return out;
+}
+
 static char *rewrite_vs_kernel(const char *msl)
 {
     char *out = NULL;
@@ -3381,7 +3812,14 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
     has_tcs = program->spirv[_TESS_CONTROL_SHADER].ir != NULL;
     has_tes = program->spirv[_TESS_EVALUATION_SHADER].ir != NULL;
     if (!has_tes)
-        return;                             /* not (a usable) tessellation program */
+    {
+        /* a successful relink that dropped the TES must not leave this program's
+         * old record installed: mgl_tess_active_program keys on the Program
+         * pointer and would keep routing draws through the stale layout (the
+         * O(1) mgl_tess_stage_bound gate and the record then disagree). */
+        mgl_ext_delete_program_tess(ctx, program);
+        return;                         /* not (a usable) tessellation program */
+    }
 
     domain = spv_tess_domain(program->spirv[_TESS_EVALUATION_SHADER].ir,
                              program->spirv[_TESS_EVALUATION_SHADER].size,
@@ -6269,4 +6707,41 @@ out:
     free(mesh.coords);
     free(mesh.indices);
     return r;
+}
+
+/* gl_DrawID: the program whose vertex stage was rewritten to read the draw id
+ * from the draw-parameters buffer (program.c sets uses_draw_params).
+ *
+ * The two gates below are the O(1) per-draw form (glmark2 perf r29): the flags
+ * are computed once at link, so a plain VS+FS program pays two loads instead of
+ * a pipeline-composite rebuild (mgl_program_pipeline_composite memsets and
+ * re-copies the whole Program on EVERY call — and never copied uses_draw_params,
+ * so the pipeline arm of this lookup always missed). */
+bool mgl_tess_draw_params_bound(GLMContext ctx)
+{
+    Program *p = ctx->state.program;
+
+    if (p && p->name != 0)
+        return p->uses_draw_params != 0;
+    if (ctx->state.program_pipeline)
+    {
+        Program *vs = MGL_PIPELINE_OBJ(ctx->state.program_pipeline)->base.stage_programs[_VERTEX_SHADER];
+        return vs != NULL && vs->uses_draw_params != 0;
+    }
+    return false;
+}
+
+/* O(1): a tessellation evaluation stage is bound (program object or separable
+ * pipeline) — mirrors mgl_tess_active_program's stage resolution without the
+ * per-program tess-record hash walk (a record exists exactly for programs whose
+ * link had spirv[_TESS_EVALUATION_SHADER].ir, see mgl_ext_post_link_tess). */
+bool mgl_tess_stage_bound(GLMContext ctx)
+{
+    Program *p = ctx->state.program;
+
+    if (p && p->name != 0)
+        return p->spirv[_TESS_EVALUATION_SHADER].ir != NULL;
+    if (ctx->state.program_pipeline)
+        return MGL_PIPELINE_OBJ(ctx->state.program_pipeline)->base.stage_programs[_TESS_EVALUATION_SHADER] != NULL;
+    return false;
 }

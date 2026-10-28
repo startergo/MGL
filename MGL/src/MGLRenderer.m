@@ -2769,9 +2769,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                     mgl_tess_tes_msl_exceeds_attributes(ptr->spirv[i].msl_str))
                     continue;
 
+                /* A geometry shader is never bound from its program slot either:
+                 * the geometry domain rasterizes through its own pass-through
+                 * function reading the geometry kernel's output from a buffer.
+                 * A separable geometry-only program (and the name-0 pipeline
+                 * composite built from it) legitimately carries no MSL in the
+                 * slot — skip it here instead of failing the render. */
+                if (i == _GEOMETRY_SHADER && ptr->spirv[i].msl_str == NULL)
+                    continue;
+
                 library = [self compileShader: ptr->spirv[i].msl_str];
                 if (!library) {
-                    NSLog(@"MGL ERROR: Failed to compile %s shader, skipping render", i == _VERTEX_SHADER ? "vertex" : "fragment");
+                    NSLog(@"MGL ERROR: Failed to compile %s shader (ptr=%p name=%u stage=%d), skipping render", i == _VERTEX_SHADER ? "vertex" : "fragment", (void*)ptr, ptr->name, i);
                     shader->mtl_data.library = NULL;
                     shader->mtl_data.function = NULL;
                     return false;  // Signal shader compilation failure

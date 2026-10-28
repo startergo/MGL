@@ -290,6 +290,7 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * a tessellation evaluation shader — the render pipeline's vertex function is then the
  * (rewritten) TES and the vertex stage runs as a compute kernel before the render pass */
 - (bool) extTessActive;
+- (void) extTessBindDrawParams: (id<MTLRenderCommandEncoder>) enc;   /* gl_DrawID (r28) */
 - (MTLVertexDescriptor *) extTessVertexDescriptor;
 - (void) extTessConfigurePipeline: (MTLRenderPipelineDescriptor *) desc;
 - (bool) bindBuffersToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;

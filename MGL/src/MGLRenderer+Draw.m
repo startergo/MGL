@@ -552,6 +552,8 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
 - (void) extBufDrawArrays: (int) prim first: (GLint) first count: (GLsizei) count instances: (GLsizei) instances baseInstance: (GLuint) base_instance
 {
+    if (ctx->state.program_pipeline || (ctx->state.program && ctx->state.program->uses_draw_params))
+        [self extTessBindDrawParams: _currentRenderEncoder];      /* gl_DrawID */
     if (base_instance)
         [_currentRenderEncoder drawPrimitives: (MTLPrimitiveType)prim vertexStart: first vertexCount: count
                                 instanceCount: instances baseInstance: base_instance];
@@ -610,6 +612,8 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         }
     }
 
+    if (ctx->state.program_pipeline || (ctx->state.program && ctx->state.program->uses_draw_params))
+        [self extTessBindDrawParams: _currentRenderEncoder];      /* gl_DrawID */
     [_currentRenderEncoder drawIndexedPrimitives: (MTLPrimitiveType)prim indexCount: count indexType: itype
                                      indexBuffer: index_buffer indexBufferOffset: index_offset
                                    instanceCount: instances baseVertex: base_vertex baseInstance: base_instance];

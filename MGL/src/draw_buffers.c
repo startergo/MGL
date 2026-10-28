@@ -280,6 +280,7 @@ static GLenum validate_draw_state(GLMContext ctx, GLenum mode, bool uses_element
 typedef struct {
     bool begun;
     bool failed;
+    GLuint next_draw_id;    /* tess: gl_DrawID source — 0..n-1 within one GL draw command */
 } DrawBatch;
 
 static bool batch_begin(GLMContext ctx, DrawBatch *b)
@@ -869,8 +870,22 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
         return;
     }
 
-    /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active */
-    if (mode != GL_PATCHES && mgl_tess_active_program(ctx))
+    /* tess: gl_DrawID / gl_BaseVertex — the i-th single draw of this GL command
+     * (every entry point starts from a fresh zeroed DrawBatch).  GL's
+     * gl_BaseVertex is 0 for arrays draws: `first' is not a base vertex, while
+     * Metal's [[base_vertex]] == vertexStart == first there.
+     * O(1) gate (glmark2 perf r29): the link-time uses_draw_params flag — the
+     * stamp only touches ext_tess for programs that read the draw parameters. */
+    if (ctx->state.ext_tess && mgl_tess_draw_params_bound_i(ctx))
+    {
+        ctx->state.ext_tess->draw_id = batch->next_draw_id++;
+        ctx->state.ext_tess->draw_base_vertex = indexed ? basevertex : 0;
+    }
+
+    /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active
+     * (O(1) stage gate — mgl_tess_active_program's record walk is not paid by
+     * non-tessellation programs) */
+    if (mode != GL_PATCHES && mgl_tess_stage_bound_i(ctx) && mgl_tess_active_program(ctx))
     {
         ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return;
@@ -889,8 +904,11 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     }
 
     /* a geometry stage runs through its own path: capture pass + kernel + pass-through
-     * raster (it also performs the transform feedback capture of the geometry output) */
-    if (mgl_geom_present(ctx))
+     * raster (it also performs the transform feedback capture of the geometry output).
+     * A program whose vertex stage writes gl_CullDistance takes the same route with a
+     * generated pass-through kernel that drops culled primitives (geometry.c) */
+    if (mgl_geom_present(ctx) ||
+        (mgl_geom_cull_active(ctx) && mgl_geom_cull_ready(ctx, mode)))
     {
         batch_end(ctx, batch);
         mgl_geom_route(ctx, mode, indexed, type, offset, first, count, instances, basevertex, baseinstance);
@@ -1169,6 +1187,8 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
 
     // the GPU can consume the command directly unless the draw needs CPU-side work
     bool geom = mgl_geom_present(ctx);
+    if (!geom && mgl_geom_cull_active(ctx) && mgl_geom_cull_ready(ctx, mode))
+        geom = true;   /* the cull pass-through kernel (tess domain) routes like a GS */
 
     bool gpu_ok = prim >= 0 && type != GL_UNSIGNED_BYTE && !capturing && !geom && mode != GL_PATCHES &&
                   !(type ? mgl_rstate_index_rewrite_needed(ctx, mode, type, NULL, 0)
@@ -1224,6 +1244,12 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
 
     // read the command when CPU-visible; when nothing needs the counts and Metal can
     // take the command buffer directly, skip the read entirely (gpuaudit)
+    // draw-params programs (gl_DrawID / gl_BaseVertex) need every command on the CPU:
+    // the per-draw stamp below and GL's base vertex do not survive Metal's indirect
+    // path, so take the decoded route (O(1) link-time flag, glmark2 perf r29)
+    bool dp_program = mgl_tess_draw_params_bound_i(ctx);
+    if (dp_program)
+        gpu_ok = false;
     bool known = counted ? true
                          : ((gpu_ok && !need_counts) ? false
                                                      : read_indirect(ctx, ibuf, offset, cmd, words, !gpu_ok || need_counts));
@@ -1248,6 +1274,15 @@ static void exec_indirect(GLMContext ctx, DrawBatch *batch, GLenum mode, GLenum 
 
     if (gpu_ok && !known && ctx->state.ext_gpuaudit)
         ctx->state.ext_gpuaudit->indirect_noread++;
+
+    /* tess: the i-th single draw of this multi-draw-indirect (draw_buffers.c
+     * exec_draw stamps the direct-draw path).  O(1) gate: only programs that
+     * read the draw parameters touch ext_tess (glmark2 perf r29). */
+    if (ctx->state.ext_tess && mgl_tess_draw_params_bound_i(ctx))
+    {
+        ctx->state.ext_tess->draw_id = batch->next_draw_id++;
+        ctx->state.ext_tess->draw_base_vertex = type ? (GLint)cmd[3] : 0;
+    }
 
     if (gpu_ok)
     {
