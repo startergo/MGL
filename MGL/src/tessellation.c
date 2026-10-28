@@ -4620,6 +4620,33 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             snprintf(types[tp->cap_members_n], 48, "float4");
             tp->cap_members[tp->cap_members_n].offset = 0;
         }
+        else if (!strncmp(m, "gl_ClipDistance_", 16) || !strncmp(m, "gl_CullDistance_", 16))
+        {
+            /* flattened gl_PerVertex builtin array element: the tess lowering copies the
+             * evaluation stage's gl_ClipDistance/gl_CullDistance outputs into per-element
+             * user attributes ("gl_ClipDistance_0", ...).  Capture them — a following
+             * geometry stage reads gl_in[].gl_ClipDistance/gl_CullDistance from the
+             * record, and the GLSL/gl_spirv validation programs (KHR-GL46.gl_spirv
+             * spirv_validation_builtin_variable_decorations tessGeom) thread them through
+             * every stage.  One float word per element; the geometry import maps the
+             * element members onto its input record's clip/cull words by name. */
+            const char *e = m + 16;    /* both prefixes are 16 bytes */
+            int digits = 0;
+
+            for (const char *q = e; *q; q++)
+                if (*q < '0' || *q > '9') { digits = 0; break; }
+                else digits++;
+            if (!digits || strcmp(rec.members[i].type, "float"))
+            {
+                if (tess_trace())
+                    fprintf(stderr, "MGL tess: capture: unsupported builtin element %s of type %s\n",
+                            m, rec.members[i].type);
+                { if (tess_trace()) fprintf(stderr, "MGL tess: capture_msl: fail point 4b\n"); goto done; }
+            }
+            w = 1;
+            snprintf(types[tp->cap_members_n], 48, "float");
+            tp->cap_members[tp->cap_members_n].offset = off;
+        }
         else if (!strncmp(m, "gl_", 3))
             continue;               /* other builtins are not captured */
         else if (!tess_msl_type_words(rec.members[i].type, &w))

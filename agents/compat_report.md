@@ -1,4 +1,84 @@
 # compat domain — progress log
+## session 24 (Oct 28, 01:57-02:4x) — merge gl46-port aafc7c2 (tess r30), conflict resolved, gate re-run
+
+### after READY: fails_compat3 finished (47d7336, on top of the READY)
+
+tessGeom sub-case of KHR-GL46.gl_spirv.spirv_validation_builtin_variable_
+decorations_test Fail->Pass, and with it the whole fails_compat3 queue
+(gl_spirv 9/9, separable_programs_tf 2/2, shader_group_vote 5/5).
+
+A geometry stage fed by tessellation could not read gl_in[].gl_ClipDistance /
+gl_CullDistance AT ALL: the link refused (honest gap error — the TES-output
+capture skipped every non-Position builtin), so the tessGeom validation failed
+on BOTH iterations (GLSL and glShaderBinary; reproduced standalone in
+tests/headless/test_svv_tessgeom.c before fixing). Fix, three pieces:
+1. tessellation.c `mgl_tess_capture_msl`: the tess lowering already copies the
+   evaluation stage's gl_ClipDistance/gl_CullDistance outputs into per-element
+   user attributes (gl_ClipDistance_0, ...) — capture those members (one float
+   word each, offsets after the varyings) instead of skipping them.
+   mgl_ext_tess.h capture contract updated.
+2. geometry.c `geom_out_decl_size()`: reads a stage module's declared OUTPUT
+   gl_PerVertex builtin sizes (prefers the Output interface — an evaluation
+   module declares gl_in[] too and the sizes may differ); `geom_tess_clip_check()`
+   replaces the blanket link error with "legal iff the evaluation stage declares
+   the outputs"; the from_tess link path now sizes in_clip_size/out_clip_size
+   from the TES (mirroring the vertex-stage rule) instead of zeroing them, so
+   geom_layout gives the input record real clip/cull words.
+3. geom_route_tess: the import kernel table gains (capture element word ->
+   in_clip_off/in_cull_off) pairs, found by the flattened member names.
+Post-fix verification: CTS gl_spirv 9/9, geometry_shader 135/136 (the 1 fail =
+api.max_image_uniforms, fails identically on pristine aafc7c2 AND the
+pre-merge tip — the documented MS-image caps gap), tessellation_shader 57/58
+(unchanged), separable_programs_tf 2/2, full headless suite 617 PASS / 0 FAIL,
+stub scanner clean; short locked glmark2 sanity (3 pairs, alternating):
+ideas median 2803 vs 2740 (+2.3%, one load dip each side), jellyfish 25352 vs
+25947 (-2.3%, B dip 21376) — parity within noise, and the change is off the
+glmark2 path entirely (no tess+GS program there).
+
+READY s24 08b19dc (report commits on top touch only agents/compat_report.md) —
+merge gl46-port aafc7c2 into 52dcd0d, conflict resolved, gate re-run. The
+merge-tree was NOT clean (supervisor correction): MGL/src/tessellation.c conflicted
+because BOTH sides had independently landed the records-only post-link cleanup —
+upstream r29 named it `tess_drop_program_record`, mine `tess_forget_records`
+(identical bodies modulo my defensive `!S` guard). Resolution keeps BOTH behaviours:
+* upstream's name/structure + r30's content (gl_MaxPatchVertices handling, lazy
+  sep-vs `words` caching, the `free(vs_kernel.words)` fix, the drop trace);
+* my `!S` guard, and — the behaviour that must survive — RECORDS-ONLY cleanup on
+  the TES-carrying relink path (`mgl_ext_post_link_tess`), where upstream r29 had
+  gone back to the full `mgl_ext_delete_program_tess` (purging the sep-vs kernel).
+  Safe because `sep_vs_kernel_cache` runs on BOTH link paths (compile_stage and the
+  whole-link cache hit, program.c 3355/4175) and `mgl_tess_cache_vs_kernel` replaces
+  a changed MSL in place; a purge would drop the fresh entry
+  (KHR-GL46.separable_programs_tf.geometry_active).
+
+Gate (clean `rm -rf build; make -j4 lib glx nsgl`, rc=0, no new warnings — the one
+`-Wincomplete-implementation` for extProgramLibraryForMSL in MGLRenderer.m is
+pre-existing upstream: none of MGLRenderer{,_Private.h,+Program.m} changed in the
+merge, the method lives in the +Program category):
+* test_tess{,_dynio,_images,_buf,_cap,_emu}: all PASS (test_tessemu 117 checks).
+* KHR-GL46.separable_programs_tf: **2/2 Pass** (the conflict-resolution group).
+* KHR-GL46.tessellation_shader: **57/58** — the 1 Fail
+  (`single.primitive_coverage`, pixel mismatch idx 8188) reproduces IDENTICALLY on
+  pristine gl46-port aafc7c2 (/tmp/gp30b build) AND on my pre-merge tip c66f3dc
+  (/tmp/premerge build), so it is a pre-existing upstream regression in the r27-r29
+  window (r26 reported 58/58), NOT from this merge — for the tess agent. My
+  resolution cannot affect it (no relink in that case).
+* Full headless suite: **615 PASS / 0 FAIL**, 119 files "== N checks, 0 failures",
+  9507 checks, rc=0 (up from 614/609: r30's new tests).
+* test_fp64 + test_fp64c 10x: 417/0 + 48/0 every run, 0 flakes.
+* ab_bench vs ~/MGL-cts/baseline-aafc7c2 (min of 7, interleaved, order alternating):
+  **m0 13.026 -> 12.506 ms (-4.0%), m1 164.618 -> 133.719 ms (-18.8%)** (medians
+  15.0/15.2 and 182.0/157.1; r5 old-m0 142.9 ms is a load spike, min discards it).
+* glmark2 locked (`/usr/bin/lockf -k /tmp/mgl_glmark2.lock`), interleaved 6 pairs,
+  order alternating: ideas median 2502.5 vs 2558.5 (**-2.2%**, single-run spread
+  +-3%, B max 2645 > A max 2583 — parity within noise), jellyfish 24970 vs 24935.5
+  (**+0.1%**, parity).
+
+Remaining (supervisor queue): none of fails_compat3 left open — see the
+"after READY" section above for the tessGeom fix that closed it.
+
+---
+
 READY s23 52dcd0d (bf253e9 + merge gl46-port c6ded7d). fails_compat3 remainder done:
 - KHR-GL46.separable_programs_tf.geometry_active Fail->Pass (group 2/2). Four bugs found
   with a single headless repro (tests/headless/test_sptf_geom.c, VS+TCS+TES+GS+FS

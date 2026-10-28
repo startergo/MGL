@@ -105,6 +105,10 @@ typedef struct MGLTessPatchMember_t {
  *               words = elems * cols * rows * base_words   (base_words = 2 for
  *               double, else 1) — the same rule geometry.c uses for its captured
  *               VS-output records, so the geometry kernel can consume the records
+ *   then, when the evaluation stage declares the builtins, one word per element of
+ *               gl_ClipDistance / gl_CullDistance (flattened "gl_ClipDistance_<i>"
+ *               members, in element order) — the tess*geom import maps them onto the
+ *               geometry stage's gl_in[].gl_ClipDistance/gl_CullDistance words
  *   stride      tp->cap.stride words per record
  *
  * The consumer matches varyings by NAME from capture.members (geometry.c matches

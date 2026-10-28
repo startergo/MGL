@@ -6569,6 +6569,8 @@ static int geom_cull_family(GLenum mode);
 static bool geom_cull_prepare(GLMContext ctx, MGLGeomProgram *gp, Program *program, GLenum mode);
 static bool geom_cull_writes_msl(Program *p);
 static uint32_t geom_cull_store_mask(const uint32_t *ir, size_t nwords, uint32_t builtin, bool *writes);
+static GLuint geom_out_decl_size(const uint32_t *ir, size_t nwords, uint32_t builtin);
+static const char *geom_tess_clip_check(const Program *program, const MGLGeomProgram *gp);
 
 bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int stage,                            const uint32_t *words, size_t nwords, const char *entry, char **log)
 {
@@ -6835,11 +6837,15 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
      * capture supplies the records, so there is no vertex stage to derive the inputs'
      * producing expressions from (the draw-time import repacks the capture instead) */
     gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
-    if (gp->from_tess && gp->in_has_clip)
+    if (gp->from_tess)
     {
-        mgl_append_log(log, "ERROR: geometry: gl_ClipDistance of a tessellation stage is not captured, "
-                            "so the geometry stage cannot read gl_in[].gl_ClipDistance\n");
-        goto done;
+        const char *cc = geom_tess_clip_check(program, gp);
+
+        if (cc)
+        {
+            mgl_append_log(log, "ERROR: %s\n", cc);
+            goto done;
+        }
     }
 
     /* writer side: the vertex outputs feeding each input location.  A separable
@@ -7061,9 +7067,13 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
      * variant — the records are repacked into this program's input record at draw time
      * (mgl_geom_route / the import kernel in MGLRenderer+Geometry.m) */
     gp->from_tess = (program->shader_slots[_TESS_EVALUATION_SHADER] != NULL);
-    if (gp->from_tess && gp->in_has_clip)
-        GEOM_FAIL("gl_ClipDistance of a tessellation stage is not captured: "
-                  "the geometry stage cannot read gl_in[].gl_ClipDistance");
+    if (gp->from_tess)
+    {
+        const char *cc = geom_tess_clip_check(program, gp);
+
+        if (cc)
+            GEOM_FAIL("%s", cc);
+    }
     if (!gp->from_tess &&
         (program->shader_slots[_TESS_CONTROL_SHADER] || program->shader_slots[_TESS_EVALUATION_SHADER]))
         GEOM_FAIL("a tessellation control shader without an evaluation shader cannot feed "
@@ -7128,7 +7138,22 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
          * member layout) and the import kernel repacks them into gp's input record */
         gp->vid_absolute = false;
         gp->iid_absolute = false;
-        gp->in_clip_size = 0;
+        /* the record's clip/cull words are sized by the evaluation stage's declared
+         * OUTPUT sizes (the capture carries its gl_ClipDistance/gl_CullDistance as
+         * flattened per-element members; the import maps them onto in_clip_off /
+         * in_cull_off) — not by the vertex stage the reflection used, the TES is
+         * the producer.  Mirrors the vertex-stage rule one-to-one (see above). */
+        {
+            const Spirv *tes = &program->spirv[_TESS_EVALUATION_SHADER];
+            GLuint n  = geom_out_decl_size(tes->ir, tes->size, (uint32_t)SpvBuiltInClipDistance);
+            GLuint nc = geom_out_decl_size(tes->ir, tes->size, (uint32_t)SpvBuiltInCullDistance);
+
+            gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+            if (gp->in_has_cull && (nc ? nc : MGL_GEOM_MAX_CLIP) > gp->in_clip_size)
+                gp->in_clip_size = nc ? nc : MGL_GEOM_MAX_CLIP;
+            gp->out_clip_size = (gp->out_has_clip || gp->out_has_cull) ?
+                                (gp->in_clip_size ? gp->in_clip_size : MGL_GEOM_MAX_CLIP) : 0;
+        }
         gp->capture_entry = xstrdup("main0");
         geom_layout(gp);
         goto build;          /* skip the capture variant, the draw variant is built below */
@@ -8413,6 +8438,43 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
             {
                 d.tess_pairs[d.tess_npairs++] = c->member[j].offset + w;   /* word offset */
                 d.tess_pairs[d.tess_npairs++] = gp->in_v[i].offset + w;
+            }
+        }
+    }
+
+    /* gl_in[].gl_ClipDistance / gl_CullDistance: the capture record carries the
+     * evaluation stage's outputs as flattened per-element members
+     * ("gl_ClipDistance_<i>", "gl_CullDistance_<i>" — see mgl_tess_capture_msl);
+     * map every element word onto the input record's clip/cull words, which
+     * geom_layout placed at in_clip_off / in_cull_off */
+    if (gp->in_has_clip || gp->in_has_cull)
+    {
+        static const char kPref[2][20] = { "gl_ClipDistance_", "gl_CullDistance_" };
+
+        for (int b = 0; b < 2; b++)
+        {
+            if (b == 0 && !gp->in_has_clip)
+                continue;
+            if (b == 1 && !gp->in_has_cull)
+                continue;
+            for (GLuint i = 0; i < gp->in_clip_size; i++)
+            {
+                char nm[64];
+                int j = -1;
+
+                snprintf(nm, sizeof nm, "%s%u", kPref[b], i);
+                for (int m2 = 0; m2 < (int)c->members; m2++)
+                    if (!strcmp(c->member[m2].name, nm)) { j = m2; break; }
+                if (j < 0)
+                {
+                    if (geom_env(0))
+                        fprintf(stderr, "geom: tess import: no capture member %s\n", nm);
+                    return false;   /* internal: the link validated the declared sizes */
+                }
+                if (d.tess_npairs + 2 > MGL_GEOM_TESS_MAX_WORDS)
+                    return false;   /* internal: import table exhausted */
+                d.tess_pairs[d.tess_npairs++] = c->member[j].offset;
+                d.tess_pairs[d.tess_npairs++] = (b ? gp->in_cull_off : gp->in_clip_off) + i;
             }
         }
     }
@@ -10425,6 +10487,157 @@ done:
     free(arr_len);
     free(struct_mbr);
     return words;
+}
+
+/* The declared OUTPUT size of a gl_PerVertex builtin (gl_ClipDistance /
+ * gl_CullDistance) of a stage module, preferring the OUTPUT interface: an
+ * evaluation-stage module declares gl_in[] as well, and the input and output
+ * sizes may differ.  Resolves the member of the gl_PerVertex block that an
+ * Output variable points at (unwrapping a TCS-style array of blocks), or a bare
+ * Output builtin variable.  Returns 0 when the stage does not declare it. */
+static GLuint geom_out_decl_size(const uint32_t *ir, size_t nwords, uint32_t builtin)
+{
+    uint32_t max_id;
+    uint32_t *const_val = NULL, *ptr_pointee = NULL, *arr_elem = NULL, *arr_len = NULL;
+    uint32_t *struct_mbr = NULL, *member_of = NULL, *member_idx = NULL, *bare_var = NULL;
+    GLuint words = 0;
+    size_t i;
+
+    if (!ir || nwords < 5) return 0;
+    max_id = ir[3];
+    if (max_id < 2 || max_id > (1u << 22)) return 0;
+    const_val   = malloc((max_id + 1) * sizeof *const_val);
+    ptr_pointee = calloc(max_id + 1, sizeof *ptr_pointee);
+    arr_elem    = calloc(max_id + 1, sizeof *arr_elem);
+    arr_len     = calloc(max_id + 1, sizeof *arr_len);
+    struct_mbr  = calloc(max_id + 1, sizeof *struct_mbr);
+    member_of   = calloc(max_id + 1, sizeof *member_of);   /* per builtin-decorated member */
+    member_idx  = calloc(max_id + 1, sizeof *member_idx);
+    bare_var    = calloc(max_id + 1, sizeof *bare_var);
+    if (!const_val || !ptr_pointee || !arr_elem || !arr_len || !struct_mbr ||
+        !member_of || !member_idx || !bare_var)
+        goto done;
+    for (i = 0; i <= max_id; i++) const_val[i] = 0xffffffff;
+
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+
+        if (!wc) break;
+        switch (op)
+        {
+            case SpvOpConstant:
+                if (i + 4 <= nwords && ir[i+2] <= max_id) const_val[ir[i+2]] = ir[i+3];
+                break;
+            case SpvOpTypePointer:
+                if (i + 4 <= nwords && ir[i+1] <= max_id) ptr_pointee[ir[i+1]] = ir[i+3];
+                break;
+            case SpvOpTypeArray:
+                if (i + 4 <= nwords && ir[i+1] <= max_id)
+                {
+                    arr_elem[ir[i+1]] = ir[i+2];
+                    arr_len[ir[i+1]] = (ir[i+3] <= max_id && const_val[ir[i+3]] != 0xffffffff)
+                                       ? const_val[ir[i+3]] : 0xffffffff;
+                }
+                break;
+            case SpvOpTypeStruct:
+                if (ir[i+1] <= max_id) struct_mbr[ir[i+1]] = (uint32_t)(i + 2);
+                break;
+            case SpvOpMemberDecorate:
+                if (i + 5 <= nwords && ir[i+1] <= max_id &&
+                    ir[i+3] == (uint32_t)SpvDecorationBuiltIn && ir[i+4] == builtin)
+                {
+                    member_of[ir[i+1]] = 1;
+                    member_idx[ir[i+1]] = ir[i+2];
+                }
+                break;
+            case SpvOpDecorate:
+                if (i + 4 <= nwords && ir[i+1] <= max_id &&
+                    ir[i+3] == (uint32_t)SpvDecorationBuiltIn && ir[i+4] == builtin)
+                    bare_var[ir[i+1]] = 1;
+                break;
+            default:
+                break;
+        }
+        i += wc;
+    }
+
+    /* an Output variable whose pointee (through one array level) is a decorated
+     * gl_PerVertex block, or a bare decorated Output builtin variable */
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+        uint32_t ty = 0;
+
+        if (!wc) break;
+        if (op == SpvOpVariable && i + 4 <= nwords && ir[i+3] == (uint32_t)SpvStorageClassOutput)
+        {
+            uint32_t vid = ir[i+2];      /* the variable's result id */
+            uint32_t pty;                /* the pointee before any array unwrap */
+
+            if (ir[i+1] <= max_id) pty = ty = ptr_pointee[ir[i+1]];
+            else pty = ty = 0;
+            if (ty && ty <= max_id && arr_len[ty] && arr_elem[ty] <= max_id)
+                ty = arr_elem[ty];                       /* array of blocks -> block */
+            if (ty && ty <= max_id && member_of[ty] && struct_mbr[ty])
+            {
+                size_t base = struct_mbr[ty];
+
+                if (base + member_idx[ty] < nwords)
+                {
+                    uint32_t mt = ir[base + member_idx[ty]];
+
+                    if (mt <= max_id && arr_len[mt] && arr_len[mt] != 0xffffffff)
+                        words = arr_len[mt];
+                }
+            }
+            else if (vid <= max_id && bare_var[vid] && pty && pty <= max_id &&
+                     arr_len[pty] && arr_len[pty] != 0xffffffff)
+                words = arr_len[pty];
+            if (words)
+                break;
+        }
+        i += wc;
+    }
+
+done:
+    free(const_val);
+    free(ptr_pointee);
+    free(arr_elem);
+    free(arr_len);
+    free(struct_mbr);
+    free(member_of);
+    free(member_idx);
+    free(bare_var);
+    return words;
+}
+
+/* Validate a tess-fed geometry stage's gl_in[].gl_ClipDistance / gl_CullDistance reads
+ * against the evaluation stage's declared outputs: the TES-output capture carries the
+ * builtins as flattened per-element members (mgl_tess_capture_msl), so the reads are
+ * legal exactly when the evaluation stage declares the outputs.  Returns a static
+ * message to fail the link with, or NULL when the capture can supply the words. */
+static const char *geom_tess_clip_check(const Program *program, const MGLGeomProgram *gp)
+{
+    const Spirv *tes;
+    GLuint tc, tcu;
+
+    if (!gp->in_has_clip && !gp->in_has_cull)
+        return NULL;
+    if (!program || !program->shader_slots[_TESS_EVALUATION_SHADER])
+        return NULL;
+    tes = &program->spirv[_TESS_EVALUATION_SHADER];
+    tc  = geom_out_decl_size(tes->ir, tes->size, (uint32_t)SpvBuiltInClipDistance);
+    tcu = geom_out_decl_size(tes->ir, tes->size, (uint32_t)SpvBuiltInCullDistance);
+    if (gp->in_has_clip && !tc)
+        return "geometry: the geometry stage reads gl_in[].gl_ClipDistance but the "
+               "evaluation stage does not declare the gl_ClipDistance output";
+    if (gp->in_has_cull && !tcu)
+        return "geometry: the geometry stage reads gl_in[].gl_CullDistance but the "
+               "evaluation stage does not declare the gl_CullDistance output";
+    return NULL;
 }
 
 /* fill the emulation state for a cull program: everything mgl_geom_compile_stage derives
