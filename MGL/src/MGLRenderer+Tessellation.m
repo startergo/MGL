@@ -968,8 +968,8 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     }
     if (!fn || fn.functionType != MTLFunctionTypeKernel)
     {
-        NSLog(@"MGL ERROR: tess VS stage function is not a kernel (fn=%@ type=%ld)",
-              fn, (long)(fn ? fn.functionType : -1));
+        NSLog(@"MGL ERROR: tess VS stage function is not a kernel (prog %u fn=%@ type=%ld)",
+              program->name, fn, (long)(fn ? fn.functionType : -1));
         return nil;
     }
 

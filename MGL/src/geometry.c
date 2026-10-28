@@ -7510,9 +7510,9 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
 /* make sure the emulation exists for the program that is about to draw */
 static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
 {
-    if (!gp || !program) return false;
+    if (!gp || !program) { if (getenv("MGL_GEOM_TRACE_DRAW")) fprintf(stderr, "geom_ensure: null gp/program\n"); return false; }
     if (gp->linked) return true;
-    if (!program->shader_slots[_VERTEX_SHADER]) return false;
+    if (!program->shader_slots[_VERTEX_SHADER]) { if (getenv("MGL_GEOM_TRACE_DRAW")) fprintf(stderr, "geom_ensure: prog %u no VS\n", program->name); return false; }
 
     /* a relink of the geometry program (glUseProgramStages relinks its stage programs)
      * leaves the slot reflected-empty: redo it from the program's own geometry stage */
@@ -10052,6 +10052,110 @@ static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp)
     return b.s;
 }
 
+/* module-side gl_ClipDistance / gl_CullDistance declaration: the word width the
+ * vertex stage's gl_PerVertex block carries for `builtin` (the member's array
+ * length, or a bare BuiltIn variable's array length; 0 when not declared).
+ * GLSL-linked programs answer this from the source text (geom_declared_clip_
+ * words), but a program linked from SPIR-V binaries has no source — its clip
+ * distances must survive the synthetic cull pass-through too, or every plane is
+ * dropped and nothing clips (KHR-GL46.gl_spirv.spirv_validation_builtin_
+ * variable_decorations, clipNegative on the SPIR-V iteration). */
+static GLuint geom_builtin_decl_size(const uint32_t *ir, size_t nwords, uint32_t builtin)
+{
+    uint32_t max_id, member_of = 0, member_idx = 0, bare_var = 0;
+    uint32_t *const_val = NULL, *ptr_pointee = NULL, *arr_len = NULL, *struct_mbr = NULL;
+    GLuint words = 0;
+    size_t i;
+
+    if (!ir || nwords < 5) return 0;
+    max_id = ir[3];
+    if (max_id < 2 || max_id > (1u << 22)) return 0;
+
+    const_val   = malloc((max_id + 1) * sizeof *const_val);
+    ptr_pointee = calloc(max_id + 1, sizeof *ptr_pointee);
+    arr_len     = calloc(max_id + 1, sizeof *arr_len);
+    struct_mbr  = calloc(max_id + 1, sizeof *struct_mbr);
+    if (!const_val || !ptr_pointee || !arr_len || !struct_mbr) goto done;
+    for (i = 0; i <= max_id; i++) const_val[i] = 0xffffffff;
+
+    i = 5;
+    while (i < nwords)
+    {
+        uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+        if (!wc) break;
+
+        switch (op)
+        {
+            case SpvOpConstant:      /* [op, type, result, value] */
+                if (i + 4 <= nwords && ir[i+2] <= max_id) const_val[ir[i+2]] = ir[i+3];
+                break;
+            case SpvOpTypePointer:
+                if (i + 4 <= nwords && ir[i+1] <= max_id) ptr_pointee[ir[i+1]] = ir[i+3];
+                break;
+            case SpvOpTypeArray:     /* [op, result, elem, len] */
+                if (i + 4 <= nwords && ir[i+1] <= max_id)
+                    arr_len[ir[i+1]] = (ir[i+3] <= max_id && const_val[ir[i+3]] != 0xffffffff)
+                                       ? const_val[ir[i+3]] : 0xffffffff;
+                break;
+            case SpvOpTypeStruct:    /* [op, result, member types...] */
+                if (ir[i+1] <= max_id) struct_mbr[ir[i+1]] = (uint32_t)(i + 2); /* stream index of member 0's type */
+                break;
+            case SpvOpMemberDecorate:/* [op, struct, member, decoration, literal...] */
+                if (i + 5 <= nwords && ir[i+1] <= max_id &&
+                    ir[i+3] == (uint32_t)SpvDecorationBuiltIn && ir[i+4] == builtin)
+                {
+                    member_of = ir[i+1];
+                    member_idx = ir[i+2];
+                }
+                break;
+            case SpvOpDecorate:      /* a bare BuiltIn variable (no gl_PerVertex block) */
+                if (i + 4 <= nwords && ir[i+3] == (uint32_t)SpvDecorationBuiltIn &&
+                    ir[i+4] == builtin)
+                    bare_var = ir[i+1];
+                break;
+            default:
+                break;
+        }
+        i += wc;
+    }
+
+    {
+        uint32_t ty = 0;
+        if (member_of && member_of <= max_id && struct_mbr[member_of])
+        {
+            /* member m's type is the (m+1)-th operand after the struct id */
+            size_t base = struct_mbr[member_of];
+            if (base + member_idx < nwords) ty = ir[base + member_idx];
+        }
+        else if (bare_var && bare_var <= max_id)
+        {
+            /* OpVariable [op, ptr type, result, storage] -> pointee */
+            /* the variable's own instruction is needed for its pointer type; scan again */
+            i = 5;
+            while (i < nwords)
+            {
+                uint32_t inst = ir[i], wc = inst >> 16, op = inst & 0xffff;
+                if (!wc) break;
+                if (op == SpvOpVariable && i + 4 <= nwords && ir[i+2] == bare_var)
+                {
+                    if (ir[i+1] <= max_id) ty = ptr_pointee[ir[i+1]];
+                    break;
+                }
+                i += wc;
+            }
+        }
+        if (ty && ty <= max_id && arr_len[ty] && arr_len[ty] != 0xffffffff)
+            words = arr_len[ty];
+    }
+
+done:
+    free(const_val);
+    free(ptr_pointee);
+    free(arr_len);
+    free(struct_mbr);
+    return words;
+}
+
 /* fill the emulation state for a cull program: everything mgl_geom_compile_stage derives
  * from a real geometry stage's interface comes from the vertex stage here (the synthetic
  * stage is a pass-through, so its inputs and outputs are the vertex stage's outputs) */
@@ -10093,10 +10197,25 @@ static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *progr
     /* clip/cull word count: the capture wrapper must not read past either declaration.
      * A declaration carries its own size; without one the largest STORED entry decides
      * (the source's highest gl_CullDistance[7] literal is an INDEX, not a size — the
-     * store scan above knows the real extent). */
-    gp->in_has_clip = strstr(vs_src, "gl_ClipDistance") != NULL;
-    n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
-    gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+     * store scan above knows the real extent).  Presence on the module side comes from
+     * the STORE scan as well — glslang always emits the whole gl_PerVertex block, so a
+     * bare OpMemberDecorate BuiltIn says nothing; a SPIR-V-binary program (no source)
+     * that stores gl_ClipDistance must still clip, and one that does not store it must
+     * not grow a clip region (the record offsets would shift and cull would break:
+     * test_cull lines_dynamic_index_writes). */
+    {
+        GLuint mod_clip = geom_builtin_decl_size(program->spirv[_VERTEX_SHADER].ir,
+                                                 program->spirv[_VERTEX_SHADER].size,
+                                                 (uint32_t)SpvBuiltInClipDistance);
+        bool writes_clip = false;
+        geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
+                             program->spirv[_VERTEX_SHADER].size,
+                             (uint32_t)SpvBuiltInClipDistance, &writes_clip);
+        gp->in_has_clip = strstr(vs_src, "gl_ClipDistance") != NULL || writes_clip;
+        n = geom_declared_clip_words(vs_src, "gl_ClipDistance");
+        if (gp->in_has_clip && mod_clip > n) n = mod_clip;
+        gp->in_clip_size = gp->in_has_clip ? (n ? n : MGL_GEOM_MAX_CLIP) : 0;
+    }
     n = geom_declared_clip_words(vs_src, "gl_CullDistance");
     if (n && n > gp->in_clip_size) gp->in_clip_size = n;   /* shared record width: the wider array wins */
     if (!gp->in_clip_size) gp->in_clip_size = n;
@@ -10115,7 +10234,17 @@ static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *progr
     gp->in_has_cull = true;
 
     gp->in_has_pos = true;
-    gp->in_has_psize = strstr(vs_src, "gl_PointSize") != NULL;
+    /* the source scan covers GLSL-linked programs; a program linked from SPIR-V
+     * binaries has no source, so also detect the store in the module (same rule as
+     * the source text: only a stage that really writes gl_PointSize re-exports it —
+     * glslang leaves unwritten builtin members out of the emitted gl_PerVertex). */
+    {
+        bool writes_psize = false;
+        geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
+                             program->spirv[_VERTEX_SHADER].size,
+                             (uint32_t)SpvBuiltInPointSize, &writes_psize);
+        gp->in_has_psize = strstr(vs_src, "gl_PointSize") != NULL || writes_psize;
+    }
     gp->out_has_pos = true;
     gp->out_has_psize = gp->in_has_psize;
     gp->out_has_clip = gp->in_has_clip;

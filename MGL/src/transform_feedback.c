@@ -190,12 +190,14 @@ static void xfb_clear_linked(GLMContext ctx, MGLXfbProgram *xp)
 static Program *xfb_active_program(GLMContext ctx)
 {
     if (STATE(program)) return STATE(program);
-    /* a pipeline: the varyings were recorded on one of the stage programs — the CTS puts
-     * them on the tessellation evaluation program.  Resolve to the LAST pre-rasterization
-     * stage program that has a transform feedback table (TES -> GS -> VS), so the capture
-     * picks the program the varyings actually live on. */
+    /* a pipeline: the varyings were recorded on one of the stage programs.  Resolve to
+     * the LAST pre-rasterization stage program that has a transform feedback table
+     * (GL 4.6 §13.4.1: a geometry stage's varyings win, else the evaluation stage's,
+     * else the vertex stage's — KHR-GL46.separable_programs_tf.geometry_active puts
+     * varyings on all three and expects o_geom), so the capture picks the program the
+     * varyings actually live on. */
     if (STATE(program_pipeline)) {
-        static const int order[] = { _TESS_EVALUATION_SHADER, _GEOMETRY_SHADER, _VERTEX_SHADER };
+        static const int order[] = { _GEOMETRY_SHADER, _TESS_EVALUATION_SHADER, _VERTEX_SHADER };
         for (int i = 0; i < 3; i++) {
             Program *p = STATE(program_pipeline)->stage_programs[order[i]];
             if (p && xfb_prog(ctx, p, false)) return p;

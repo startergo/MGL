@@ -1,4 +1,38 @@
 # compat domain — progress log
+READY s23 52dcd0d (bf253e9 + merge gl46-port c6ded7d). fails_compat3 remainder done:
+- KHR-GL46.separable_programs_tf.geometry_active Fail->Pass (group 2/2). Four bugs found
+  with a single headless repro (tests/headless/test_sptf_geom.c, VS+TCS+TES+GS+FS
+  separable programs in one pipeline, TF PRIMITIVES_WRITTEN + captured data):
+  1) transform_feedback xfb_active_program preferred the TES program over the GS (GL 4.6
+     13.4.1: geometry > evaluation > vertex) so TF captured o_tess instead of o_geom;
+  2) the tess post-link hook ran the full mgl_ext_delete_program_tess for LIVE programs,
+     purging the separable-vertex KERNEL the link itself had just cached -> every pipeline
+     draw failed with "tess VS stage function is not a kernel"; records-only cleanup is now
+     split out (tess_forget_records), real deletes keep the purge;
+  3) the whole-link cache hit clones the executable without compile_stage, so a second
+     program with identical sources never cached the kernel under its own name (the CTS
+     runs tessellation_active then geometry_active with the same sources) — sep-vs caching
+     extracted to sep_vs_kernel_cache() and called on both paths;
+  4) geometry VS-cull clip presence from the module must use the STORE scan, not the
+     declaration: glslang always emits the full gl_PerVertex block, so every program
+     "declared" clip, the record grew a clip region, cull offsets shifted and culling broke
+     (test_cull lines_dynamic_index_writes caught this; fixed in the same commit).
+- KHR-GL46.gl_spirv.spirv_validation_builtin_variable_decorations: validations 1
+  (clipNegative) and 3 (point) Fail->Pass on the SPIR-V iteration — geom_cull_reflect
+  derived in_has_clip/in_has_psize from the GLSL SOURCE only, and a program linked from
+  SPIR-V binaries has none: the synthetic cull pass-through dropped every gl_ClipDistance
+  (nothing clipped) and gl_PointSize (1px points). geom_builtin_decl_size() reads the
+  declared member width from the module; presence uses the store scan (see 4).
+  gl_spirv group 8/9 Pass. Remaining: the tessGeom sub-case needs the tess capture record
+  to carry gl_ClipDistance/gl_CullDistance words for a following geometry stage (today the
+  capture skips other gl_* builtins: tessellation.c "other builtins are not captured") —
+  that is a tess*geom interface change, left for the next session.
+Gate (after the c6ded7d merge, clean -j4 build): full headless suite 614 PASS / 0 FAIL
+rc=0; test_fp64+test_fp64c 10x = 0 fails; gl_spirv 8/9, separable_programs_tf 2/2. A/B vs
+~/MGL-cts/baseline-c6ded7d: ab_bench m0 11.829->11.661 ms (-1.4%), m1 100.687->101.977 ms
+(+1.3%) (min of 7, two interleaved runs); locked glmark2 medians ideas 2436->2510 (+3.0%
+faster), jellyfish 25345->24998 (-1.4%) — r7 jellyfish A was killed by the supervisor's
+01:35 glmark2 restart; medians computed from 7 clean pairs.
 READY s23 ef59367 (= ead3d39 + gl46-port b7821df merge + test fixes). Merged tess r28+r29
 (3d03a6b): only conflict tests/headless/test_vote.c (add/add) — kept BOTH sets (the CTS
 extension-less spellings + my plain #version 460 core ones under vote_core_*; 9/9 PASS).

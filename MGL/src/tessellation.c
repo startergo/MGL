@@ -3829,13 +3829,21 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
 /* drop a program's tess RECORD (and records derived from it): used both on
  * program deletion and on a successful relink that no longer carries a TES
  * (the record's layouts must not survive the new executable).  Deliberately
- * leaves the vs_kernel cache alone: a relink of the SAME program refreshes the
- * kernel there (mgl_tess_cache_vs_kernel replaces a changed MSL) */
+ * leaves the vs_kernel cache alone: the program is very much alive at the
+ * post-link call site and its cached separable vertex kernel must SURVIVE a
+ * relink — the kernel is compiled during the link itself (compile_stage), so
+ * purging it here deleted the entry the link just made and every later
+ * pipeline draw of a separable vertex stage failed with "tess VS stage
+ * function is not a kernel" (KHR-GL46.separable_programs_tf.geometry_active);
+ * a relink of the SAME program refreshes the kernel there (mgl_tess_cache_vs_kernel
+ * replaces a changed MSL). */
 static void tess_drop_program_record(GLMContext ctx, Program *program)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
     MGLTessProgram *tp;
 
+    if (!S)
+        return;
     while ((tp = mgl_tess_program(ctx, program)) != NULL)
         tess_free_program(ctx, tp);
     /* pairs DERIVED from this program (it played the tc-only side of a pipeline
@@ -3902,8 +3910,9 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
          * old record installed: mgl_tess_active_program keys on the Program
          * pointer and would keep routing draws through the stale layout (the
          * O(1) mgl_tess_stage_bound gate and the record then disagree).  The
-         * vs_kernel cache is NOT dropped — a relink of the same program refreshes
-         * its kernel (a changed MSL replaces the cached one). */
+         * vs_kernel cache is NOT dropped — the program is alive and a relink
+         * of the same program refreshes its kernel (a changed MSL replaces the
+         * cached one). */
         tess_drop_program_record(ctx, program);
         return;                         /* not (a usable) tessellation program */
     }
@@ -3924,8 +3933,11 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
             out_vertices = 3;
     }
 
-    /* replace any stale entry (relink) */
-    mgl_ext_delete_program_tess(ctx, program);
+    /* replace any stale entry (relink) — records only, keep the separable vs
+     * kernel: the program is live and both link paths (compile_stage and the
+     * whole-link cache hit) re-cache the kernel, whose replace-on-changed-MSL
+     * rule makes a purge unnecessary and would drop the fresh entry */
+    tess_drop_program_record(ctx, program);
 
     tp = (MGLTessProgram *)calloc(1, sizeof(MGLTessProgram));
     if (!tp)

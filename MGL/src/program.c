@@ -2229,6 +2229,97 @@ static char *mgl_msl_fix_texelfetch_srgb(const char *msl, const char *const *nam
     return fin;
 }
 
+/* Compile and cache the tess domain's compute-kernel variant of a SEPARABLE vertex
+ * stage (SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION + CAPTURE_OUTPUT_TO_BUFFER;
+ * the plain vertex function stays the program's own for normal draws).  Runs for every
+ * fresh link (compile_stage below) AND for a whole-link CACHE HIT — the hit clones the
+ * executable without compile_stage, so without this call the kernel would never be
+ * cached under the new program's name and pipeline draws fail with "tess VS stage
+ * function is not a kernel" (KHR-GL46.separable_programs_tf, any case after the first
+ * reuses the same shader sources). */
+static void sep_vs_kernel_cache(GLMContext ctx, GLuint name, const uint32_t *prepared,
+                                size_t prepared_words, const char *entry)
+{
+    /* a FRESH compiler: re-installing options on the used one mixes the plain and
+     * captured entry-point lowerings (redefinition of the out local) */
+    spvc_context context = NULL;
+    spvc_compiler c2 = NULL;
+    spvc_compiler_options o2 = NULL;
+    spvc_parsed_ir ir2 = NULL;
+    const char *cleansed = NULL;
+
+    if (spvc_context_create(&context) != SPVC_SUCCESS)
+    {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess: sep-vs kernel: no spvc context\n");
+        return;
+    }
+
+    /* re-parse: the first compiler owns (and lowers) the parsed IR, so a second
+     * compiler must start from the module again */
+    if (spvc_context_parse_spirv(context, prepared, prepared_words, &ir2) == SPVC_SUCCESS &&
+        spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir2, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c2) == SPVC_SUCCESS &&
+        spvc_compiler_set_entry_point(c2, entry, SpvExecutionModelVertex) == SPVC_SUCCESS &&
+        (cleansed = spvc_compiler_get_cleansed_entry_point_name(c2, entry, SpvExecutionModelVertex)) != NULL &&
+        spvc_compiler_create_compiler_options(c2, &o2) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE) == SPVC_SUCCESS &&
+        spvc_compiler_msl_add_discrete_descriptor_set(c2, 3) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION, SPVC_TRUE) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) == SPVC_SUCCESS &&
+        spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_VS_OUT_BUF) == SPVC_SUCCESS &&
+        spvc_compiler_install_compiler_options(c2, o2) == SPVC_SUCCESS)
+    {
+        const char *tmsl = NULL;
+
+        if (spvc_compiler_compile(c2, &tmsl) == SPVC_SUCCESS && tmsl)
+        {
+            /* uint-in-MSL / int-in-GL index builtins (msl_reserved.c); before the
+             * tess rewrite, which declares its own `uint gl_VertexID' local */
+            char *tmsl_fixed = mgl_msl_fix_int_builtins(tmsl);
+            char *k;
+            if (tmsl_fixed)
+                tmsl = tmsl_fixed;
+            k = mgl_tess_rewrite_stage_msl(ctx, _VERTEX_SHADER, true, tmsl);
+
+            if (k)
+            {
+                /* SPIRV-Cross names the kernel after the entry (e.g. "main0") when
+                 * it is not renamed: take the actual function name from the MSL */
+                char kentry[128] = "main";
+                const char *kd = strstr(k, "kernel void ");
+
+                if (kd)
+                {
+                    const char *ks = kd + strlen("kernel void ");
+                    size_t kl = 0;
+
+                    while (ks[kl] && (isalnum((unsigned char)ks[kl]) || ks[kl] == '_'))
+                        kl++;
+                    if (kl && kl < sizeof kentry)
+                    {
+                        memcpy(kentry, ks, kl);
+                        kentry[kl] = 0;
+                    }
+                }
+                mgl_tess_cache_vs_kernel(ctx, name, k, kentry);
+                free(k);
+            }
+            else if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL tess: sep-vs kernel: rewrite failed (head: %.100s)\n", tmsl);
+            free(tmsl_fixed);
+        }
+        else if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess: sep-vs kernel: second SPIRV-Cross compile failed\n");
+    }
+    else if (getenv("MGL_TESS_DEBUG"))
+        fprintf(stderr, "MGL tess: sep-vs kernel: fresh compiler/options rejected\n");
+
+    spvc_context_destroy(context);
+}
+
 static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const uint32_t *words,
                           size_t nwords, const char *entry, ReflectAcc *acc, char **log,
                           bool tess_pipeline)
@@ -3261,76 +3352,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                 (int)(ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl));
     if (stage == _VERTEX_SHADER && !tess_pipeline && dst->separable == GL_TRUE &&
         ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
-    {
-        /* a FRESH compiler: re-installing options on the used one mixes the plain and
-         * captured entry-point lowerings (redefinition of the out local) */
-        spvc_compiler c2 = NULL;
-        spvc_compiler_options o2 = NULL;
-        spvc_parsed_ir ir2 = NULL;
-        const char *cleansed = NULL;
-
-        /* re-parse: the first compiler owns (and lowers) the parsed IR, so a second
-         * compiler must start from the module again */
-        if (spvc_context_parse_spirv(context, prepared, prepared_words, &ir2) == SPVC_SUCCESS &&
-            spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir2, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c2) == SPVC_SUCCESS &&
-            spvc_compiler_set_entry_point(c2, entry, model) == SPVC_SUCCESS &&
-            (cleansed = spvc_compiler_get_cleansed_entry_point_name(c2, entry, model)) != NULL &&
-            spvc_compiler_create_compiler_options(c2, &o2) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_VERSION, SPVC_MAKE_MSL_VERSION(3, 1, 0)) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D, SPVC_TRUE) == SPVC_SUCCESS &&
-            spvc_compiler_msl_add_discrete_descriptor_set(c2, 3) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_VERTEX_FOR_TESSELLATION, SPVC_TRUE) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_bool(o2, SPVC_COMPILER_OPTION_MSL_CAPTURE_OUTPUT_TO_BUFFER, SPVC_TRUE) == SPVC_SUCCESS &&
-            spvc_compiler_options_set_uint(o2, SPVC_COMPILER_OPTION_MSL_SHADER_OUTPUT_BUFFER_INDEX, MGL_TESS_VS_OUT_BUF) == SPVC_SUCCESS &&
-            spvc_compiler_install_compiler_options(c2, o2) == SPVC_SUCCESS)
-        {
-            const char *tmsl = NULL;
-
-            if (spvc_compiler_compile(c2, &tmsl) == SPVC_SUCCESS && tmsl)
-            {
-                /* uint-in-MSL / int-in-GL index builtins (msl_reserved.c); before the
-                 * tess rewrite, which declares its own `uint gl_VertexID' local */
-                char *tmsl_fixed = mgl_msl_fix_int_builtins(tmsl);
-                char *k;
-                if (tmsl_fixed)
-                    tmsl = tmsl_fixed;
-                k = mgl_tess_rewrite_stage_msl(ctx, _VERTEX_SHADER, true, tmsl);
-
-                if (k)
-                {
-                    /* SPIRV-Cross names the kernel after the entry (e.g. "main0") when
-                     * it is not renamed: take the actual function name from the MSL */
-                    char kentry[128] = "main";
-                    const char *kd = strstr(k, "kernel void ");
-
-                    if (kd)
-                    {
-                        const char *ks = kd + strlen("kernel void ");
-                        size_t kl = 0;
-
-                        while (ks[kl] && (isalnum((unsigned char)ks[kl]) || ks[kl] == '_'))
-                            kl++;
-                        if (kl && kl < sizeof kentry)
-                        {
-                            memcpy(kentry, ks, kl);
-                            kentry[kl] = 0;
-                        }
-                    }
-                    mgl_tess_cache_vs_kernel(ctx, ptr->name, k, kentry);
-                    free(k);
-                }
-                else if (getenv("MGL_TESS_DEBUG"))
-                    fprintf(stderr, "MGL tess: sep-vs kernel: rewrite failed (head: %.100s)\n", tmsl);
-                free(tmsl_fixed);
-            }
-            else if (getenv("MGL_TESS_DEBUG"))
-                fprintf(stderr, "MGL tess: sep-vs kernel: second SPIRV-Cross compile failed\n");
-        }
-        else if (getenv("MGL_TESS_DEBUG"))
-            fprintf(stderr, "MGL tess: sep-vs kernel: fresh compiler/options rejected\n");
-    }
+        sep_vs_kernel_cache(ctx, ptr->name, prepared, prepared_words, entry);
 
     else if (stage == _VERTEX_SHADER && !tess_pipeline && dst->separable != GL_TRUE)
     {
@@ -4141,6 +4163,19 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
             linked = link_cache_get(ctx, MGL_PROGRAM_OBJ(pptr), lkey);
         pthread_mutex_unlock(&link_cache_lock);
         linked_by_cache = linked;
+
+        if (linked_by_cache &&
+            MGL_PROGRAM_OBJ(pptr)->separable == GL_TRUE &&
+            pptr->spirv[_VERTEX_SHADER].ir && pptr->spirv[_VERTEX_SHADER].size &&
+            MGL_PROGRAM_OBJ(pptr)->stage_entry[_VERTEX_SHADER])
+        {
+            /* the cache hit cloned the executable without compile_stage: cache the
+             * tess vertex-kernel variant under THIS program's name too, or pipeline
+             * draws fail with "tess VS stage function is not a kernel" */
+            sep_vs_kernel_cache(ctx, pptr->name,
+                                pptr->spirv[_VERTEX_SHADER].ir, pptr->spirv[_VERTEX_SHADER].size,
+                                MGL_PROGRAM_OBJ(pptr)->stage_entry[_VERTEX_SHADER]);
+        }
 
         if (!linked &&
             run_link(ctx, MGL_PROGRAM_OBJ(pptr), LINK_FROM_ATTACHED, NULL, NULL, NULL, 0))
