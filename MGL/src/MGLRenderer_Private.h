@@ -360,6 +360,12 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * is a type-confusion crash */
 - (id<MTLSamplerState>) texparamCachedSampler:(TextureParameter *)p;
 - (id<MTLTexture>) texparamTextureForTex:(Texture *)tex base:(id<MTLTexture>)base;
+/* geom r60: the geometry-emulation bind paths (MGLRenderer+Geometry.m) share the
+ * renderer's 1x1 black fallback for GL 8.17 incomplete-texture sampling */
+- (id<MTLTexture>) computeFallbackTexture;
+/* geom r60: the compute bind path binds samplers at their own MSL index */
+- (NSUInteger) geomComputeSamplerSlotForImage: (const char *)img_name textureSlot: (NSUInteger)tslot;
+- (id<MTLSamplerState>) computeFallbackSampler;
 - (void) texparamPrepareTextureDescriptor:(MTLTextureDescriptor *)desc forTex:(Texture *)tex;
 - (MTLTextureSwizzleChannels) texparamSwizzleForParams:(TextureParameter *)p;
 @end

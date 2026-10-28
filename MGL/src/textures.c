@@ -2850,7 +2850,9 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
     TD_CHECK(f, GL_INVALID_OPERATION);
 
-    err = tdCheckFormatCompat(f, format, type, TD_PIX_GETTEXIMAGE);
+    err = tdCheckGetFormatCompat(f, format, type,
+                                 tex && tex->params.depth_stencil_mode ? tex->params.depth_stencil_mode
+                                                                       : GL_DEPTH_COMPONENT);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     if (whole)

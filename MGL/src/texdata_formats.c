@@ -555,6 +555,28 @@ GLenum tdValidateFormatType(GLenum format, GLenum type)
     }
 }
 
+/* Readback-time compatibility (GetTexImage / GetTextureSubImage): honours the
+ * depth-stencil texture mode.  GL 4.6 8.11.4 — with DEPTH_STENCIL_TEXTURE_MODE =
+ * STENCIL_INDEX a combined depth-stencil texture behaves as STENCIL_INDEX8 for
+ * all reads (GL_RED_INTEGER / GL_STENCIL_INTEGER answers); with DEPTH_COMPONENT
+ * (the default) the depth channel additionally answers GL_RED/GL_FLOAT reads
+ * (KHR-GL46.stencil_texturing.functional reads the D channel that way). */
+GLenum tdCheckGetFormatCompat(const TDFormat *f, GLenum format, GLenum type, GLenum ds_mode)
+{
+    if (f->base == GL_DEPTH_STENCIL)
+    {
+        if (ds_mode == GL_STENCIL_INDEX)
+        {
+            if (format == GL_STENCIL_INDEX || format == GL_RED_INTEGER)
+                return tdCheckFormatCompat(tdFormatInfo(GL_STENCIL_INDEX8), format, type, TD_PIX_GETTEXIMAGE);
+            return GL_INVALID_OPERATION;
+        }
+        if (format == GL_RED)
+            return (type == GL_FLOAT) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+    }
+    return tdCheckFormatCompat(f, format, type, TD_PIX_GETTEXIMAGE);
+}
+
 GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op)
 {
     TDClientFormat cf;
@@ -585,9 +607,14 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
             if (op == TD_PIX_TEXIMAGE) return GL_INVALID_OPERATION;
             break;
         default:
-            if (tex_ds) return GL_INVALID_OPERATION;
-            /* integer formats need *_INTEGER client data and vice versa */
-            if (((f->flags & TDF_INTEGER) != 0) != cf.integer) return GL_INVALID_OPERATION;
+            /* stencil-indexed textures also answer GL_RED_INTEGER reads (the
+             * stencil-texturing readback form, KHR-GL46.stencil_texturing) */
+            if (tex_ds && !(tex_stencil && format == GL_RED_INTEGER)) return GL_INVALID_OPERATION;
+            /* integer formats need *_INTEGER client data and vice versa; the
+             * stencil-index internal formats predate that flag, so accept the
+             * GL_RED_INTEGER stencil-texturing read regardless */
+            if (((f->flags & TDF_INTEGER) != 0) != cf.integer &&
+                !(tex_stencil && format == GL_RED_INTEGER)) return GL_INVALID_OPERATION;
             break;
     }
     if (op == TD_PIX_TEXIMAGE && f->base == GL_STENCIL_INDEX)
@@ -1173,6 +1200,19 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
             if (direct) { memcpy(o, s, rowbytes); continue; }
 
             storage_read_row(f, s, ss, w, tmp);
+            /* a depth-stencil storage read through GL_RED carries the DEPTH channel
+             * and, in stencil-texturing mode, GL_RED_INTEGER the STENCIL plane
+             * (GL_RED/GL_RED_INTEGER otherwise address the (empty) colour channel) */
+            if (format == GL_RED &&
+                (f->kind == TDK_D16 || f->kind == TDK_D32F || f->kind == TDK_D32FS8))
+            {
+                for (int x = 0; x < w; x++) tmp[x].c[0] = tmp[x].d;
+            }
+            else if (format == GL_RED_INTEGER &&
+                     (f->kind == TDK_S8 || f->kind == TDK_D32FS8))
+            {
+                for (int x = 0; x < w; x++) tmp[x].c[0] = (double)tmp[x].s;
+            }
             /* No sRGB decode on readback either (GL 4.6 8.5.1/8.5.4: the gamma
              * conversion is a sampling-time operation only; GetTexImage moves raw
              * storage values — FLOAT clients get storage/255, not decode(storage)) */

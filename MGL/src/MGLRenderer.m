@@ -482,13 +482,21 @@ static char kComputeFallbackKey;
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
                                                             width: 1 height: 1 mipmapped: NO];
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    desc.storageMode = MTLStorageModePrivate;
+    /* geom r60: the (0,0,0,1) texel must actually LAND in the texture — with
+     * Private storage the replaceRegion below is CPU access to a private texture
+     * (rejected by Metal validation, silently dropped by the driver), leaving a
+     * zero-filled fallback whose ALPHA read 0 instead of 1 (GL 8.17 incomplete
+     * sampling is (0,0,0,1); KHR-GL46.texture_gather.incomplete-texture-last-comp) */
+    desc.storageMode = MTLStorageModeShared;
 
     tex = [_device newTextureWithDescriptor: desc];
     if (tex)
     {
-        const uint32_t black[4] = { 0, 0, 0, 0xffffffff };
-        [tex replaceRegion: MTLRegionMake2D(0, 0, 1, 1) mipmapLevel: 0 withBytes: black bytesPerRow: 16];
+        /* one RGBA8Unorm texel is 4 bytes; the previous 4x uint32 fill put the
+         * alpha byte outside the texture, so the texel read (0,0,0,0) and GL 8.17
+         * incomplete sampling returned alpha 0 instead of 1 */
+        const uint32_t black = 0xff000000u;
+        [tex replaceRegion: MTLRegionMake2D(0, 0, 1, 1) mipmapLevel: 0 withBytes: &black bytesPerRow: 4];
 
         MTLSamplerDescriptor *sdesc = [[MTLSamplerDescriptor alloc] init];
         sdesc.minFilter = MTLSamplerMinMagFilterNearest;
@@ -1099,6 +1107,37 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                 // incomplete texture
                 if (tex->faces[face].levels[i].complete == false)
                     return NULL;
+            }
+        }
+
+        /* GL 8.17 mipmap completeness: every level base+1..top must halve the
+         * previous level's dimensions.  Only level EXISTENCE was checked above, so a
+         * texture whose level 1 was re-uploaded with the wrong size (e.g. 1x1 under a
+         * 32x32 level 0) sampled its data instead of reporting incomplete
+         * (KHR-GL46.texture_gather.incomplete-texture/-last-comp expect (0,0,0,0)). */
+        {
+            GLint top = (GLint)tex->num_levels - 1;
+
+            if (tex->params.max_level < top)
+                top = tex->params.max_level;
+            for (int i = (int)tex->params.base_level + 1; i <= top; i++)
+            {
+                GLuint w = tex->faces[0].levels[i - 1].width;
+                GLuint h = tex->faces[0].levels[i - 1].height;
+                GLuint d = tex->faces[0].levels[i - 1].depth;
+                GLuint ew, eh, ed;
+
+                ew = MAX(1u, w >> 1); eh = MAX(1u, h >> 1);
+                ed = MAX(1u, d >> 1);
+                if (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY)
+                    eh = h;
+                for (int face = 0; face < num_faces; face++)
+                {
+                    if (tex->faces[face].levels[i].width != ew ||
+                        tex->faces[face].levels[i].height != eh ||
+                        tex->faces[face].levels[i].depth != ed)
+                        return NULL;
+                }
             }
         }
 
@@ -2306,6 +2345,32 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
             // sampler objects bound to the unit override the texture's sampler state;
             // swizzle / base+max level / stencil mode select a texture view (texparam)
+            /* GL 8.17: sampling an INCOMPLETE texture returns (0,0,0,1) — never hand
+             * the GPU a mip chain whose level sizes are inconsistent (only level
+             * EXISTENCE was validated at creation; KHR-GL46.texture_gather.
+             * incomplete-texture/-last-comp replace level 1 with 1x1 under a 32x32
+             * level 0 and expect a black sample). */
+            if (mgl_texture_incomplete_for_sampling(ptr))
+            {
+                id<MTLTexture> ftex = [self computeFallbackTexture];
+                id<MTLSamplerState> fsamp = [self computeFallbackSampler];
+
+                if (ftex)
+                {
+                    if (stage != _FRAGMENT_SHADER)
+                    {
+                        [self compatSetVertexTexture:ftex atIndex:mtl_index + e];
+                        [self compatSetVertexSamplerState:fsamp atIndex:mtl_index + e];
+                    }
+                    else
+                    {
+                        [self compatSetFragmentTexture:ftex atIndex:mtl_index + e];
+                        [self compatSetFragmentSamplerState:fsamp atIndex:mtl_index + e];
+                    }
+                }
+                continue;
+            }
+
             id<MTLSamplerState> sampler = [self texparamSamplerForUnit:unit texture:ptr];
             texture = [self texparamTextureForTex:ptr base:texture];
             assert(sampler);
@@ -4376,6 +4441,21 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                         if (!tex_e || !tex_e->mtl_data) continue;
 
                         RETURN_FALSE_ON_FAILURE([self bindMTLTexture: tex_e]);
+                        if (gl_texture_type == _TEXTURE &&
+                            mgl_texture_incomplete_for_sampling(tex_e))
+                        {
+                            /* GL 8.17 (geom r60): incomplete texture samples (0,0,0,1)
+                             * in compute too (the gather emulation reads the bound
+                             * texture directly) — bind the shared 1x1 fallback */
+                            id<MTLTexture> ftex = [self computeFallbackTexture];
+                            id<MTLSamplerState> fsamp = [self computeFallbackSampler];
+                            if (ftex && fsamp)
+                            {
+                                [computeCommandEncoder setTexture: ftex atIndex: mtl_index + e];
+                                [computeCommandEncoder setSamplerState: fsamp atIndex: mtl_index + e];
+                                continue;
+                            }
+                        }
                         texture = (__bridge id<MTLTexture>)(tex_e->mtl_data);
                         sampler = [self texparamSamplerForUnit: spirv_binding + e texture: tex_e];
                         if (gl_texture_type == _TEXTURE)
@@ -4389,10 +4469,21 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                                             base: texture
                                                        elemClass: (sres ? sres->elem_class : 0xffffffffu)];
                         }
+                        if (getenv("MGL_GEOM_DEBUG") && gl_texture_type == _IMAGE_TEXTURE)
+                            fprintf(stderr, "MGL geom: compute img bind unit=%u view=%s type=%lu fmt=%lu slot=%u\\n",
+                                    spirv_binding + e,
+                                    texture ? "ok" : "NIL",
+                                    texture ? (unsigned long)texture.textureType : 0ul,
+                                    texture ? (unsigned long)texture.pixelFormat : 0ul,
+                                    mtl_index + e);
                         if (!sampler) continue;   /* no sampler state: skip, MSL default applies */
 
                         [computeCommandEncoder setTexture:texture atIndex:mtl_index + e];
-                        [computeCommandEncoder setSamplerState: sampler atIndex:mtl_index + e];
+                        /* geom r60: the sampler rides at ITS OWN MSL index (see
+                         * geomComputeSamplerSlotForImage) */
+                        [computeCommandEncoder setSamplerState: sampler
+                                                        atIndex: [self geomComputeSamplerSlotForImage: (sres && sres->name) ? sres->name : ""
+                                                                                               textureSlot: mtl_index + e]];
                     }
 
                     /* geom: the image-atomic sidecar buffers of the compute stage —

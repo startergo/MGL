@@ -108,6 +108,10 @@ enum {
  * REPEAT / 2 CLAMP_TO_EDGE / ...; default 0 = REPEAT) rides in as function
  * constant MGL_GEOM_FC_WRAP_BASE+N per gather slot. */
 #define MGL_GEOM_FC_WRAP_BASE 32200
+
+/* geom r60: per-slot CLAMP_TO_BORDER gather tap colour (float4, 32300+4*slot+c;
+ * Metal samplers only offer three preset border colours, GL allows any float4). */
+#define MGL_GEOM_FC_BORDER_BASE 32300
 #define MGL_GEOM_SHADOW_OP_LEQUAL   0
 #define MGL_GEOM_SHADOW_OP_GEQUAL   1
 #define MGL_GEOM_SHADOW_OP_LESS     2
@@ -380,7 +384,8 @@ struct MGLExtState_geom {
      * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer).
      * dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
      * geomResolveImageAtomics copies it back into the texture at barrier time. */
-    struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty, needs_seed; } img_atom[TEXTURE_UNITS];
+    struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty, needs_seed;
+            GLuint elems; uint64_t sig; } img_atom[TEXTURE_UNITS];
 
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
@@ -519,5 +524,8 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
 #ifdef __cplusplus
 }
 #endif
+
+/* GL 8.17 sampling completeness (geometry.c; used by bindTextures) */
+bool mgl_texture_incomplete_for_sampling(const Texture *tex);
 
 #endif

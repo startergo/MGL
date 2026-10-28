@@ -98,6 +98,8 @@ size_t tdStorageImageBytes(const TDFormat *f, int w, int h);
 GLenum tdValidateFormatType(GLenum format, GLenum type);
 /* GL_NO_ERROR or GL_INVALID_OPERATION: can client format be used with a texture of this format? */
 GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op);
+/* geom r60: readback variant honouring DEPTH_STENCIL_TEXTURE_MODE (textures.c) */
+GLenum tdCheckGetFormatCompat(const TDFormat *f, GLenum format, GLenum type, GLenum ds_mode);
 /* pixel-operation selector for tdCheckFormatCompat (see its comment) */
 enum { TD_PIX_TEXIMAGE = 0, TD_PIX_SUBIMAGE = 1, TD_PIX_GETTEXIMAGE = 2 };
 

@@ -14,6 +14,7 @@
 #include "hash_table.h"
 #include "mgl_ext_texext.h"
 #include "mgl_compat_perf.h"           /* texext PreDraw skip epoch (perf session 12) */
+#include "mgl_ext_geom.h"               /* mgl_texture_incomplete_for_sampling (geom r60) */
 
 /* pixel_utils.c returns its own 32-bit MTLPixelFormat enum */
 extern uint32_t mtlFormatForGLInternalFormat(GLenum internal_format);
@@ -727,6 +728,30 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
             continue;
 
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
+        /* GL 8.17 (geom r60): an INCOMPLETE texture samples (0,0,0,1) — the core
+         * binder (bindTexturesToCurrentRenderEncoder) swaps in the shared 1x1
+         * fallback for those units; this vertex-stage refresh must not overwrite
+         * it with the real mip chain again (KHR-GL46.texture_gather.
+         * incomplete-texture / -last-comp read level-0 data otherwise) */
+        if (mgl_texture_incomplete_for_sampling(ptr))
+        {
+            id<MTLTexture> ftex = [self computeFallbackTexture];
+            id<MTLSamplerState> fsamp = [self computeFallbackSampler];
+            if (ftex && fsamp)
+            {
+                if (stage == _FRAGMENT_SHADER)
+                {
+                    [self compatSetFragmentTexture:ftex atIndex:(GLuint)binding];
+                    [self compatSetFragmentSamplerState:fsamp atIndex:(GLuint)binding];
+                }
+                else
+                {
+                    [self compatSetVertexTexture:ftex atIndex:(GLuint)binding];
+                    [self compatSetVertexSamplerState:fsamp atIndex:(GLuint)binding];
+                }
+                continue;
+            }
+        }
         /* texparam: swizzle / base+max level / stencil mode select a view of the base
          * texture — this refresh must bind the same view the core binder
          * (bindTexturesToCurrentRenderEncoder) binds, or a vertex-stage swizzle is

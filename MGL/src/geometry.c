@@ -3222,16 +3222,86 @@ char *mgl_msl_insert_image_fences(const char *msl)
  */
 enum { MGL_AI_2D = 0, MGL_AI_3D, MGL_AI_ARR2, MGL_AI_CUBE, MGL_AI_CUBEARR };
 
+/* GL 8.17 texture completeness for SAMPLING: with a mipmap min filter, every level
+ * base+1..top must halve the previous level's dimensions; with NEAREST/LINEAR only
+ * the base level must exist.  MGL validated level EXISTENCE when the texture was
+ * created (createMTLTextureFromGLTexture:), but a level can be REPLACED with the
+ * wrong size afterwards (glTexImage2D on level 1 with 1x1 under a 32x32 level 0),
+ * which makes the texture incomplete — sampling must then return (0,0,0,1) instead
+ * of the data (KHR-GL46.texture_gather.incomplete-texture / -last-comp).
+ * Used from bindTexturesToCurrentRenderEncoder (MGLRenderer.m); declared in
+ * mgl_ext_geom.h. */
+bool mgl_texture_incomplete_for_sampling(const Texture *tex)
+{
+    GLint base, top, i, faces = 1;
+
+    if (!tex || !tex->faces || tex->num_levels < 1)
+        return true;
+
+    /* CUBE_MAP (only!) stores one face entry per cube face; a CUBE_MAP_ARRAY
+     * keeps the whole array in faces[0] (mgl_texdata_num_faces) — iterating
+     * faces[1..5] there read zeroed entries and rejected every complete cube
+     * ARRAY chain (plain-gather-*-cube-array / texture_cube_map_array.sampling
+     * sampled the 1x1 black fallback). */
+    if (tex->target == GL_TEXTURE_CUBE_MAP)
+        faces = 6;
+
+    base = (GLint)tex->params.base_level;
+    if (base < 0 || (GLuint)base >= tex->num_levels)
+        return true;                      /* base level has no storage */
+    top = (GLint)tex->num_levels - 1;
+    if ((GLint)tex->params.max_level < top)
+        top = (GLint)tex->params.max_level;
+    if (tex->params.min_filter == GL_NEAREST || tex->params.min_filter == GL_LINEAR)
+        top = base;                       /* no mipmaps are consulted */
+
+    for (int f = 0; f < faces; f++)
+        if (!tex->faces[f].levels[base].complete)
+            return true;
+
+    for (i = base + 1; i <= top; i++)
+    {
+        GLuint w = tex->faces[0].levels[i - 1].width;
+        GLuint h = tex->faces[0].levels[i - 1].height;
+        GLuint d = tex->faces[0].levels[i - 1].depth;
+        GLuint ew = (w > 1) ? (w >> 1) : 1;
+        GLuint eh = (h > 1) ? (h >> 1) : 1;
+        GLuint ed = (d > 1) ? (d >> 1) : 1;
+
+        if (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY)
+            eh = h;
+        /* GL 8.17.1: only GL_TEXTURE_3D halves the DEPTH of each level — for
+         * 2D_ARRAY / CUBE_MAP_ARRAY the layer count stays CONSTANT across the
+         * chain (halving it here rejected every complete array mip chain when
+         * the min filter consults mipmaps, so the shared 1x1 black fallback
+         * was bound: KHR-GL46.texture_gather *-2darray / *-cube-array read
+         * back zeros). */
+        if (tex->target != GL_TEXTURE_3D)
+            ed = d;
+        for (int f = 0; f < faces; f++)
+        {
+            if (tex->faces[f].levels[i].width != ew ||
+                tex->faces[f].levels[i].height != eh ||
+                tex->faces[f].levels[i].depth != ed)
+                return true;              /* inconsistent chain: incomplete */
+        }
+    }
+    return false;
+}
+
 char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                                 MGLGeomTexSlot *slots_out, int *nslots_out, int max_slots,
                                 int *dub_out)
 {
     struct { char name[128]; int auto_idx, index, kind; } imgs[32];
+    struct { char elem[96]; unsigned count; char hname[152]; } arrs[32]; /* name-indexed */
     int nimgs = 0;
     struct { size_t at, len; char *text; } edits[256];
     int nedits = 0;
+    int msl_has_lta;
 
     if (!msl) return NULL;
+    msl_has_lta = (strstr(msl, "spvLinearTextureAlignment") != NULL);
     if (nslots_out) *nslots_out = 0;
     if (dub_out) *dub_out = -1;
     if (dub_out)
@@ -3318,6 +3388,41 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             else if (tlen >= 18 && !strncmp(t, "texturecube_array<", 18)) kind = MGL_AI_CUBEARR;
             else if (tlen >= 12 && !strncmp(t, "texturecube<", 12)) kind = MGL_AI_CUBE;
             imgs[i].kind = kind;
+            /* an ARRAY of images: `array<texture2d<int>, 8> u_image [[texture(0)]]`.
+             * SPIRV-Cross keeps ONE _atomic side buffer for the whole array but emits
+             * every access as `<name>[<i>]_atomic[...]` — an identifier that does not
+             * exist.  Record the element type and length: the rewrite below flattens
+             * the access into the single buffer with a per-element padded stride, the
+             * same layout geomImageAtomicBufferArray builds. */
+            if (tlen > 7 && !strncmp(t, "array<", 6))
+            {
+                /* `array<texture2d<int>, 8>`: split at the TOP-LEVEL comma (the
+                 * element type itself contains <>), count runs to the final `>` */
+                const char *inner = t + 6, *split = NULL, *cnt, *e;
+                int ang = 1;
+                for (e = inner; e < t + tlen; e++)
+                {
+                    if (*e == '<') ang++;
+                    else if (*e == '>') ang--;
+                    else if (*e == ',' && ang == 1) { split = e; break; }
+                }
+                if (split)
+                {
+                    const char *cend = t + tlen - 1;   /* at the array's closing '>' */
+                    for (cnt = split + 1; cnt < cend && (*cnt == ' ' || *cnt == '\t'); cnt++) {}
+                    unsigned cv = 0;
+                    while (cnt < cend && *cnt >= '0' && *cnt <= '9')
+                        cv = cv * 10u + (unsigned)(*cnt++ - '0');
+                    if (cv > 0 && cv < 256 && (size_t)(split - inner) < sizeof arrs[i].elem)
+                    {
+                        snprintf(arrs[i].elem, sizeof arrs[i].elem, "%.*s",
+                                 (int)(split - inner), inner);
+                        arrs[i].count = cv;
+                        snprintf(arrs[i].hname, sizeof arrs[i].hname,
+                                 "spvMglAIArr_%s", imgs[i].name);
+                    }
+                }
+            }
         }
         p = attr + 10;
     }
@@ -3364,6 +3469,91 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     {
         char sub[160];
         const char *helper = NULL;
+
+        /* 5a. an ARRAY image: every access is `<name>[<i>]_atomic[<sub>]` (the element
+         * index ends up INSIDE the identifier SPIRV-Cross builds).  Flatten into the
+         * single side buffer: `<name>_atomic[spvMglAIArr_<name>(<name>, <i>, <coord>)]`
+         * where <coord> is SPIRV-Cross's macro's first argument (a plain 2D coord). */
+        if (arrs[i].count && imgs[i].kind == MGL_AI_2D &&
+            !strncmp(arrs[i].elem, "texture2d<", 10) && arrs[i].hname[0])
+        {
+            snprintf(sub, sizeof sub, "%s[", imgs[i].name);
+            for (const char *p = msl; (p = strstr(p, sub)) != NULL; )
+            {
+                if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+                { p += strlen(sub); continue; }
+                if (arrs[i].hname[0] && p - msl >= 1 &&
+                    !strncmp(p - 1, arrs[i].hname, strlen(arrs[i].hname)))
+                { p += strlen(sub); continue; }         /* our own helper's parameter use */
+
+                const char *is = p + strlen(sub);       /* index start */
+                const char *ie = is;                    /* ... and end (']') */
+                int d = 1;
+                while (*ie)
+                {
+                    if (*ie == '[' || *ie == '(') d++;
+                    else if (*ie == ']' || *ie == ')') { if (--d == 0) { ie++; break; } }
+                    ie++;
+                }
+                if (d || ie[-1] != ']' || strncmp(ie, "_atomic[", 8))
+                { p += strlen(sub); continue; }
+
+                size_t ilen = (size_t)(ie - 1 - is);    /* the element index expression */
+                const char *cs = ie + 8;                /* coordinate start */
+                const char *ce = cs;
+                d = 1;
+                while (*ce)
+                {
+                    if (*ce == '[' || *ce == '(') d++;
+                    else if (*ce == ']' || *ce == ')') { if (--d == 0) { ce++; break; } }
+                    ce++;
+                }
+                if (d) { p = cs; continue; }
+                size_t clen = (size_t)(ce - cs - 1);    /* inside [ ... ] */
+
+                /* strip spvImage2DAtomicCoord(<coord>, <tex>): keep <coord> (the last
+                 * top-level comma inside the macro splits the two arguments) */
+                const char *w = NULL;
+                if (clen > 24 && !strncmp(cs, "spvImage2DAtomicCoord(", 22))
+                {
+                    const char *r = cs + 21, *c2 = NULL;
+                    int dd = 0, depth = 0;
+                    while (r < cs + clen)
+                    {
+                        if (*r == '(' || *r == '[') depth++;
+                        else if (*r == ')' || *r == ']') depth--;
+                        else if (*r == ',' && depth == 1) c2 = r;
+                        r++;
+                    }
+                    (void)dd;
+                    if (c2) { w = cs + 22; clen = (size_t)(c2 - cs - 22); }
+                }
+                if (!w)
+                {
+                    /* a plain coordinate (no macro): accept int2(...) shaped text */
+                    w = cs;
+                }
+
+                char *rep = malloc(strlen(arrs[i].hname) + 2 * strlen(imgs[i].name) + ilen + clen + 24);
+                if (rep)
+                {
+                    snprintf(rep, strlen(arrs[i].hname) + 2 * strlen(imgs[i].name) + ilen + clen + 24,
+                             "%s_atomic[%s(%s, %.*s, %.*s)]", imgs[i].name, arrs[i].hname,
+                             imgs[i].name, (int)ilen, is, (int)clen, w);
+                    if (nedits < 256)
+                    {
+                        edits[nedits].at = (size_t)(p - msl);
+                        edits[nedits].len = (size_t)(ce - p);
+                        edits[nedits].text = rep;
+                        nedits++;
+                    }
+                    else free(rep);
+                }
+                p = ce;
+            }
+            continue;                                   /* arrays use no other rewrite */
+        }
+
         snprintf(sub, sizeof sub, "%s_atomic[", imgs[i].name);
 
         for (const char *p = msl; (p = strstr(p, sub)) != NULL; )
@@ -3446,9 +3636,20 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
         }
     }
 
-    /* the helper definitions this MSL actually uses */
-    char helpers[2400];
+    /* the helper definitions this MSL actually uses (plus one per ARRAY image —
+     * each specialized to the exact `array<texture2d<T,access>, N>` type declared) */
+    size_t helpers_cap = 2400 + 720 * (size_t)nimgs;
+    char *helpers = malloc(helpers_cap);
+    char *arrhelpers = malloc(helpers_cap);
+    if (!helpers || !arrhelpers)
+    {
+        for (int a = 0; a < nedits; a++) free(edits[a].text);
+        free(helpers);
+        free(arrhelpers);
+        return NULL;
+    }
     helpers[0] = 0;
+    arrhelpers[0] = 0;
     {
         static const struct { const char *name; const char *body; } h[4] = {
             { "spvMglAI3D(",
@@ -3474,12 +3675,44 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             int used = 0;
             for (int a = 0; a < nedits && !used; a++)
                 used = !strncmp(edits[a].text, h[k].name, strlen(h[k].name));
-            if (used && strlen(helpers) + strlen(h[k].body) + 1 < sizeof helpers)
+            if (used && strlen(helpers) + strlen(h[k].body) + 1 < helpers_cap)
                 strcat(helpers, h[k].body);
         }
+        /* one helper per ARRAY image: the element offset uses the same 16-texel row
+         * pitch the sidecar layout (geomImageAtomicBufferArray) and SPIRV-Cross's
+         * spvImage2DAtomicCoord macro use */
+        for (int i = 0; i < nimgs; i++)
+        {
+            char probe[160];
+            int used = 0;
+
+            if (!arrs[i].count || !arrs[i].hname[0]) continue;
+            snprintf(probe, sizeof probe, "%s(", arrs[i].hname);
+            for (int a = 0; a < nedits && !used; a++)
+                used = (strstr(edits[a].text, probe) != NULL);
+            if (!used) continue;
+
+            const char *al = msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u";
+            char body[640];
+            snprintf(body, sizeof body,
+                "static inline __attribute__((always_inline)) uint %s"
+                "(thread const array<%s, %u>& a, uint i, int2 tc) "
+                "{ uint off = 0; const uint al = (uint)(%s); "
+                "for (uint j = 0; j < i; j++) { uint p = (a[j].get_width() + al - 1) & ~(al - 1); "
+                "off += p * a[j].get_height(); } "
+                "uint p = (a[i].get_width() + al - 1) & ~(al - 1); "
+                "return off + p * uint(tc.y) + uint(tc.x); }\n",
+                arrs[i].hname, arrs[i].elem, arrs[i].count, al);
+            if (strlen(arrhelpers) + strlen(body) + 1 < helpers_cap)
+                strcat(arrhelpers, body);
+        }
     }
-    if (!helpers[0] && !nedits)
+    if (!helpers[0] && !arrhelpers[0] && !nedits)
+    {
+        free(helpers);
+        free(arrhelpers);
         return strdup(msl);
+    }
 
     /* 6. splice: edits at ascending offsets of the ORIGINAL string; the helpers go
      * right after `using namespace metal;` (SPIRV-Cross always emits it) */
@@ -3508,13 +3741,39 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             if (inc > msl) helper_at = (size_t)(inc - msl);
         }
     }
+    /* the ARRAY helpers reference `spvLinearTextureAlignment` (SPIRV-Cross's
+     * function-constant-controlled row pitch), which is declared LATER than the
+     * generic injection point: splice them after its declaration instead */
+    size_t arrhelper_at = helper_at;
+    if (arrhelpers[0])
+    {
+        const char *lta = strstr(msl, "constant uint spvLinearTextureAlignment ");
+        if (!lta)
+            lta = strstr(msl, "constant uint spvLinearTextureAlignment=");
+        if (lta)
+        {
+            const char *semi = strchr(lta, ';');
+            if (semi) arrhelper_at = (size_t)(semi - msl) + 1;
+        }
+        else
+        {
+            const char *def = strstr(msl, "#define spvLinearTextureAlignment");
+            if (def)
+            {
+                const char *e = strchr(def, '\n');
+                if (e) arrhelper_at = (size_t)(e - msl) + 1;
+            }
+        }
+    }
 
-    size_t out_len = strlen(msl) + strlen(helpers) + 32;
+    size_t out_len = strlen(msl) + strlen(helpers) + strlen(arrhelpers) + 32;
     for (int a = 0; a < nedits; a++) out_len += strlen(edits[a].text) + 16;
     char *out = malloc(out_len);
     if (!out)
     {
         for (int a = 0; a < nedits; a++) free(edits[a].text);
+        free(helpers);
+        free(arrhelpers);
         return NULL;
     }
 
@@ -3526,7 +3785,17 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
         {
             memcpy(out + dst, msl + src, helper_at - src); dst += helper_at - src;
             memcpy(out + dst, helpers, strlen(helpers)); dst += strlen(helpers);
+            if (arrhelper_at == helper_at)
+            {
+                memcpy(out + dst, arrhelpers, strlen(arrhelpers)); dst += strlen(arrhelpers);
+            }
             src = helper_at;
+        }
+        if (arrhelper_at > src && arrhelper_at <= upto && arrhelper_at != helper_at)
+        {
+            memcpy(out + dst, msl + src, arrhelper_at - src); dst += arrhelper_at - src;
+            memcpy(out + dst, arrhelpers, strlen(arrhelpers)); dst += strlen(arrhelpers);
+            src = arrhelper_at;
         }
         memcpy(out + dst, msl + src, upto - src); dst += upto - src;
         if (a < nedits)
@@ -3541,6 +3810,8 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     out[dst] = 0;
 
     for (int a = 0; a < nedits; a++) free(edits[a].text);
+    free(helpers);
+    free(arrhelpers);
     return out;
 }
 

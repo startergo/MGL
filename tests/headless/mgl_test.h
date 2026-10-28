@@ -65,6 +65,49 @@ static inline void mgl_read_rgba(int x, int y, GLubyte out[4])
             MGL_FAIL("pixel(%d,%d) = %d,%d,%d,%d expected %d,%d,%d,%d", x, y, _p[0], _p[1], _p[2], _p[3], r, g, b, a); \
     } while (0)
 
+/* Compile + link a 5-stage or compute program; returns 0 and reports on failure. */
+static inline GLuint mgl_make_program5(const char *vs_src, const char *tcs_src, const char *tes_src,
+                                       const char *gs_src, const char *fs_src)
+{
+    GLuint p = glCreateProgram();
+    const char *srcs[5] = { vs_src, tcs_src, tes_src, gs_src, fs_src };
+    GLenum types[5] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER,
+                        GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    for (int i = 0; i < 5; i++) {
+        if (!srcs[i]) continue;
+        GLuint s = glCreateShader(types[i]);
+        glShaderSource(s, 1, &srcs[i], NULL);
+        glCompileShader(s);
+        GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) { char log[2048] = ""; glGetShaderInfoLog(s, sizeof log, NULL, log);
+                   MGL_FAIL("shader compile failed: %s", log); return 0; }
+        glAttachShader(p, s);
+    }
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[2048] = ""; glGetProgramInfoLog(p, sizeof log, NULL, log);
+               MGL_FAIL("program link failed: %s", log); return 0; }
+    return p;
+}
+
+static inline GLuint mgl_make_program_cs(const char *cs_src)
+{
+    GLuint p = glCreateProgram();
+    GLuint s = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(s, 1, &cs_src, NULL);
+    glCompileShader(s);
+    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[2048] = ""; glGetShaderInfoLog(s, sizeof log, NULL, log);
+               MGL_FAIL("shader compile failed: %s", log); return 0; }
+    glAttachShader(p, s);
+    glLinkProgram(p);
+    ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[2048] = ""; glGetProgramInfoLog(p, sizeof log, NULL, log);
+               MGL_FAIL("program link failed: %s", log); return 0; }
+    glDeleteShader(s);
+    return p;
+}
+
 /* Compile + link a VS/FS program; returns 0 and reports on failure. */
 static inline GLuint mgl_make_program(const char *vs_src, const char *fs_src)
 {

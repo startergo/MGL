@@ -2592,11 +2592,90 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     for (int u = 0; u < TEXTURE_UNITS; u++)
     {
         if (g->img_atom[u].buf) { CFBridgingRelease(g->img_atom[u].buf); g->img_atom[u].buf = NULL; }
+        g->img_atom[u].elems = 0;
+        g->img_atom[u].sig = 0;
         g->img_atom[u].view = NULL;
         g->img_atom[u].bytes = 0;
         g->img_atom[u].dirty = false;
         g->img_atom[u].needs_seed = false;
     }
+}
+
+/* The layout of an image-ARRAY's single side buffer, mirroring the MSL helper
+ * mgl_msl_fix_image_atomics emits (spvMglAIArr_*): element e's region starts at
+ * offset_e (in 32-bit words) and spans raw_width*height words — the same raw row
+ * pitch SPIRV-Cross's spvImage2DAtomicCoord uses with the default function
+ * constant (spvLinearTextureAlignment = 4 -> one-texel alignment).  Returns the
+ * total word count and a cheap signature of the bound views. */
+- (NSUInteger) geomImageAtomicArrayLayout: (GLuint) unit elems: (GLuint) elems
+                                     offs: (NSUInteger *) offs maxe: (NSUInteger) maxe
+                                      sig: (uint64_t *) sig
+{
+    NSUInteger total = 0;
+    uint64_t s = 0;
+
+    if (!offs || elems > maxe || unit + elems > TEXTURE_UNITS)
+        return 0;
+    for (GLuint e = 0; e < elems; e++)
+    {
+        ImageUnit *iu = &STATE(image_units[unit + e]);
+        Texture *tex = iu->tex;
+        id<MTLTexture> view;
+
+        if (!tex || !tex->mtl_data)
+            return 0;
+        view = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(tex->mtl_data)];
+        if (!view)
+            return 0;
+        offs[e] = total;
+        total += view.width * view.height;
+        s ^= (uint64_t)(uintptr_t)(__bridge void *)view * 0x9E3779B97F4A7C15ULL
+             ^ ((uint64_t)view.width * 0x85EBCA6BULL) ^ ((uint64_t)view.height * 0xC2B2AE35ULL)
+             ^ ((uint64_t)e * 0x27D4EB2FULL);
+    }
+    if (sig)
+        *sig = s;
+    return total;
+}
+
+/* The ONE side buffer of an image ARRAY uniform (SPIRV-Cross declares a single
+ * `<name>_atomic [[buffer(N)]]` for the whole array; its size covers every
+ * element's region back to back — see geomImageAtomicArrayLayout). */
+- (id<MTLBuffer>) geomImageAtomicBufferArray: (GLuint) unit elems: (GLuint) elems
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    NSUInteger offs[TEXTURE_UNITS];
+    uint64_t sig = 0;
+    NSUInteger words = [self geomImageAtomicArrayLayout: unit elems: elems offs: offs
+                                                   maxe: TEXTURE_UNITS sig: &sig];
+    id<MTLBuffer> buf;
+
+    if (!g || !words)
+        return nil;
+    buf = (__bridge id<MTLBuffer>)g->img_atom[unit].buf;
+    if (buf && g->img_atom[unit].elems == elems && g->img_atom[unit].sig == sig &&
+        g->img_atom[unit].bytes == words * 4)
+    {
+        g->img_atom[unit].dirty = true;      /* a dispatch/encoder saw it */
+        return buf;
+    }
+    buf = [_device newBufferWithLength: words * 4 options: MTLResourceStorageModeShared];
+    if (!buf)
+        return nil;
+    if (g->img_atom[unit].buf)
+        CFBridgingRelease(g->img_atom[unit].buf);
+    memset(buf.contents, 0, words * 4);
+    g->img_atom[unit].buf = CFBridgingRetain(buf);
+    if (g->img_atom[unit].view)
+        CFBridgingRelease(g->img_atom[unit].view);
+    g->img_atom[unit].view = NULL;
+    g->img_atom[unit].fmt = 0;
+    g->img_atom[unit].bytes = words * 4;
+    g->img_atom[unit].elems = elems;
+    g->img_atom[unit].sig = sig;
+    g->img_atom[unit].dirty = true;
+    g->img_atom[unit].needs_seed = true;     /* seed every element region before use */
+    return buf;
 }
 
 /* ---- atomic sidecar -> texture resolve -------------------------------------------
@@ -2814,6 +2893,58 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     if (!g->img_atom[unit].buf || !g->img_atom[unit].needs_seed) return false;
 
     buf = (__bridge id<MTLBuffer>)(g->img_atom[unit].buf);
+
+    /* an image ARRAY's single side buffer: seed each element region from its own
+     * texture, through a 1-slice 2D-array view (the raw layout the MSL helper
+     * spvMglAIArr_* indexes — NOT the scalar 16-texel-padded one) */
+    if (g->img_atom[unit].elems > 1)
+    {
+        NSUInteger offs[TEXTURE_UNITS];
+        NSUInteger words = [self geomImageAtomicArrayLayout: (GLuint)unit
+                                                       elems: g->img_atom[unit].elems
+                                                        offs: offs
+                                                        maxe: TEXTURE_UNITS
+                                                         sig: NULL];
+        bool any = false;
+
+        if (!words || words * 4 != g->img_atom[unit].bytes)
+        { g->img_atom[unit].needs_seed = false; return false; }
+        for (GLuint e = 0; e < g->img_atom[unit].elems; e++)
+        {
+            ImageUnit *iu2 = &STATE(image_units[unit + e]);
+            id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
+                ? [self geomImageUnitView: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)]
+                : nil;
+            id<MTLTexture> av;
+            NSUInteger total_e;
+            uint32_t d2[4];
+            id<MTLComputePipelineState> pso2;
+
+            if (!ev) continue;
+            av = [ev newTextureViewWithPixelFormat: ev.pixelFormat
+                                    textureType: MTLTextureType2DArray
+                                         levels: NSMakeRange(0, 1)
+                                         slices: NSMakeRange(0, 1)];
+            if (!av) continue;
+            total_e = ev.width * ev.height;
+            pso2 = [self geomAtomSeedPso: MTLTextureType2DArray format: av.pixelFormat];
+            if (!pso2 || !total_e) continue;
+            d2[0] = (uint32_t)ev.width;
+            d2[1] = (uint32_t)ev.height;
+            d2[2] = 1;
+            d2[3] = (uint32_t)total_e;
+            [encoder setComputePipelineState: pso2];
+            [encoder setBuffer: buf offset: offs[e] * 4 atIndex: 0];
+            [encoder setTexture: av atIndex: 0];
+            [encoder setBytes: &d2 length: sizeof(d2) atIndex: 1];
+            [encoder dispatchThreads: MTLSizeMake(total_e, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+            any = true;
+        }
+        g->img_atom[unit].needs_seed = false;
+        return any;
+    }
+
     view = (__bridge id<MTLTexture>)(g->img_atom[unit].view);
     if (!buf || !view) { g->img_atom[unit].needs_seed = false; return false; }
 
@@ -2876,7 +3007,55 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         buf = (__bridge id<MTLBuffer>)(g->img_atom[u].buf);
         view = (__bridge id<MTLTexture>)(g->img_atom[u].view);
         g->img_atom[u].dirty = false;
-        if (!buf || !view) continue;
+        if (!buf) continue;
+
+        /* an image ARRAY's single side buffer: resolve every element region into
+         * its own texture (the layout mirrors geomImageAtomicArrayLayout) */
+        if (g->img_atom[u].elems > 1)
+        {
+            NSUInteger offs[TEXTURE_UNITS];
+            NSUInteger words = [self geomImageAtomicArrayLayout: (GLuint)u
+                                                           elems: g->img_atom[u].elems
+                                                            offs: offs
+                                                            maxe: TEXTURE_UNITS
+                                                             sig: NULL];
+            if (!words || words * 4 != g->img_atom[u].bytes)
+                continue;                     /* the binding changed since the dispatch */
+            for (GLuint e = 0; e < g->img_atom[u].elems; e++)
+            {
+                ImageUnit *iu2 = &STATE(image_units[u + e]);
+                id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
+                    ? [self geomImageUnitView: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)]
+                    : nil;
+                id<MTLTexture> av;              /* a 1-slice 2D-array view: the raw (unpadded)
+                                                  * sidecar layout, exactly what the MSL
+                                                  * spvMglAIArr_* helper indexes */
+                NSUInteger total_e;
+
+                if (!ev) continue;
+                av = [ev newTextureViewWithPixelFormat: ev.pixelFormat
+                                        textureType: MTLTextureType2DArray
+                                             levels: NSMakeRange(0, 1)
+                                             slices: NSMakeRange(0, 1)];
+                if (!av) continue;
+                total_e = ev.width * ev.height;
+                pso = [self geomAtomResolvePso: MTLTextureType2DArray format: av.pixelFormat];
+                if (!pso || !total_e) continue;
+                dims[0] = (uint32_t)ev.width;
+                dims[1] = (uint32_t)ev.height;
+                dims[2] = 1;
+                dims[3] = (uint32_t)total_e;
+                [enc setComputePipelineState: pso];
+                [enc setBuffer: buf offset: offs[e] * 4 atIndex: 0];
+                [enc setTexture: av atIndex: 0];
+                [enc setBytes: &dims length: sizeof(dims) atIndex: 1];
+                [enc dispatchThreads: MTLSizeMake(total_e, 1, 1)
+                          threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
+                                                             pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
+            }
+            continue;
+        }
+        if (!view) continue;
 
         tt = view.textureType;
         pf = view.pixelFormat;
@@ -2979,6 +3158,18 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         GLuint elems = sres->array_size ? sres->array_size : 1;
 
         if (mtl_index == 0xffffffffu) continue;
+
+        /* an ARRAY image: ONE side buffer covers every element (SPIRV-Cross declares a
+         * single `<name>_atomic [[buffer(N)]]` for the whole array) */
+        if (elems > 1)
+        {
+            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems];
+
+            if (buf)
+                [encoder setBuffer: buf offset: 0 atIndex: mtl_index];
+            continue;
+        }
+
         for (GLuint e = 0; e < elems; e++)
         {
             ImageUnit *iu;
@@ -3022,6 +3213,16 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         GLuint mtl = sres->msl_atomic;
 
         if (mtl == 0xffffffffu) continue;
+
+        /* an ARRAY image: one combined side buffer; the seed path walks the elements
+         * (geomSeedImageAtomic's elems>1 branch) */
+        if (elems > 1 && b >= 0 && (GLuint)b < TEXTURE_UNITS)
+        {
+            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems] &&
+                g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
+                pending[n_pending++] = b;
+            continue;
+        }
 
         for (GLuint e = 0; e < elems && b >= 0; e++)
         {
@@ -3100,6 +3301,46 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
  * pass has no fragment function).  Consecutive units feed array elements (GL sampler
  * convention: base..base+N-1 at consecutive Metal argument slots).  The capture variant's
  * argument indices come from its own pinning (gp->tex_slots_vs). */
+/* geom r60: SPIRV-Cross gives a combined image sampler's SAMPLER its own Metal
+ * argument index.  In a compute kernel that also has image textures the two
+ * drift apart (e.g. `dst [[texture(0)]]` pushes `s` to [[texture(1)]] while its
+ * `sSmplr` stays [[sampler(0)]]) — the compute bind path used the TEXTURE index
+ * for the sampler, so every sample() hit an unbound sampler slot and read 0
+ * (KHR-GL46.stencil_texturing.functional's compute pass, texture_buffer cases).
+ * Parse the sampler's own [[sampler(N)]] from the kernel MSL (cached per
+ * program); fall back to the texture index when it cannot be found. */
+- (NSUInteger) geomComputeSamplerSlotForImage: (const char *)img_name textureSlot: (NSUInteger)tslot
+{
+    static struct { const void *program; char name[96]; NSUInteger slot; } cache[8];
+    if (!ctx || !ctx->state.program) return tslot;
+    const char *msl = ctx->state.program->spirv[_COMPUTE_SHADER].msl_str;
+    if (!msl || !img_name || !*img_name) return tslot;
+
+    int ci = -1;
+    for (int i = 0; i < 8; i++)
+        if (cache[i].program == (const void *)ctx->state.program &&
+            strncmp(cache[i].name, img_name, sizeof cache[i].name) == 0)
+            return cache[i].slot;
+    for (int i = 0; i < 8; i++) if (!cache[i].program) { ci = i; break; }
+    if (ci < 0) { ci = 0; memset(cache, 0, sizeof cache); }
+
+    /* the pair is emitted adjacently: ... texture2d<float> s [[texture(1)]],
+     * sampler sSmplr [[sampler(0)]] ... */
+    char pat[128];
+    snprintf(pat, sizeof pat, "%sSmplr [[sampler(", img_name);
+    const char *hit = strstr(msl, pat);
+    NSUInteger slot = tslot;
+    if (hit)
+    {
+        int v = atoi(hit + strlen(pat));
+        if (v >= 0) slot = (NSUInteger)v;
+    }
+    cache[ci].program = (const void *)ctx->state.program;
+    snprintf(cache[ci].name, sizeof cache[ci].name, "%s", img_name);
+    cache[ci].slot = slot;
+    return slot;
+}
+
 - (void) geomBindRenderStageTextures: (id<MTLRenderCommandEncoder>) enc stage: (int) stage
                                 geomProgram: (MGLGeomProgram *) gp
 {
@@ -3135,6 +3376,22 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                 id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
                 if (!types[t].image)
                 {
+                    /* GL 8.17: an INCOMPLETE texture samples (0,0,0,1) — the emulation
+                     * kernels read() the bound texture directly, so they must see the
+                     * shared 1x1 fallback, not the real mip chain (bindTextures'
+                     * normal path does this for the non-emulated stages;
+                     * KHR-GL46.texture_gather.incomplete-texture[-last-comp]) */
+                    if (mgl_texture_incomplete_for_sampling(tex))
+                    {
+                        id<MTLTexture> ftex = [self computeFallbackTexture];
+                        id<MTLSamplerState> fsamp = [self computeFallbackSampler];
+                        if (ftex && fsamp)
+                        {
+                            [enc setVertexSamplerState: fsamp atIndex: mtl_index + e];
+                            [enc setVertexTexture: ftex atIndex: mtl_index + e];
+                            continue;
+                        }
+                    }
                     id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
                     texture = [self texparamTextureForTex: tex base: texture];
                     if (sampler) [enc setVertexSamplerState: sampler atIndex: mtl_index + e];
@@ -3346,6 +3603,19 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     if (!texture) continue;
                     if (!types[t].image)
                     {
+                        /* GL 8.17: incomplete texture -> shared 1x1 fallback (see
+                         * geomBindRenderStageTextures) */
+                        if (mgl_texture_incomplete_for_sampling(tex))
+                        {
+                            id<MTLTexture> ftex = [self computeFallbackTexture];
+                            id<MTLSamplerState> fsamp = [self computeFallbackSampler];
+                            if (ftex && fsamp)
+                            {
+                                [enc setSamplerState: fsamp atIndex: mtl_index + e];
+                                [enc setTexture: ftex atIndex: mtl_index + e];
+                                continue;
+                            }
+                        }
                         id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
                         texture = [self texparamTextureForTex: tex base: texture];
                         if (sampler) [enc setSamplerState: sampler atIndex: mtl_index + e];
@@ -5123,7 +5393,7 @@ bool mgl_msl_has_size_constants(const char *msl)
 
 /* the compare ops the last specialization baked in, for the per-draw staleness
  * check (a GL_TEXTURE_COMPARE_FUNC change alone does not dirty the pipeline) */
-static struct { void *program; bool valid; int ops[32]; int wraps[32]; } gShadowSpec;
+static struct { void *program; bool valid; int ops[32]; int wraps[32]; float borders[32][4]; int has_border[32]; } gShadowSpec;
 
 /* mgl_wco encodings (program.c read()-based gather taps) */
 static inline int mgl_geom_wrap_code(GLenum w)
@@ -5177,6 +5447,24 @@ static inline int mgl_geom_wrap_code(GLenum w)
         int32_t wv = wrap;
         [cv setConstantValue:&wv type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + slot];
         if (hash) { *hash ^= (uint64_t)(wrap + 1) << ((slot + 3) & 7); *hash *= 1099511628211ULL; }
+
+        /* CLAMP_TO_BORDER gathers: the border colour rides in as four float
+         * function constants (default 0,0,0,1 — Metal only has three presets) */
+        {
+            float bcol[4];
+            bcol[0] = pp->border_color[0]; bcol[1] = pp->border_color[1];
+            bcol[2] = pp->border_color[2]; bcol[3] = pp->border_color[3];
+            for (int c = 0; c < 4; c++)
+                [cv setConstantValue:&bcol[c] type:MTLDataTypeFloat atIndex:MGL_GEOM_FC_BORDER_BASE + 4 * (int)slot + c];
+            memcpy(gShadowSpec.borders[slot], bcol, sizeof bcol);
+            gShadowSpec.has_border[slot] = 1;
+            if (hash) {
+                uint32_t bh = 2166136261u;
+                for (int c = 0; c < 4; c++) { bh ^= (uint32_t)(bcol[c] * 1024.0f) + 1u; bh *= 16777619u; }
+                *hash ^= (uint64_t)bh << ((slot + 5) & 7);
+                *hash *= 1099511628211ULL;
+            }
+        }
     }
 
     gShadowSpec.program = (void *)p;
@@ -5198,9 +5486,12 @@ static inline int mgl_geom_wrap_code(GLenum w)
     Sampler *gs = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
     TextureParameter *pp = gs ? &gs->params : &tex->params;
     int wrap = mgl_geom_wrap_code(pp->wrap_s) + 16 * mgl_geom_wrap_code(pp->wrap_t);
+    bool border_changed = gShadowSpec.has_border[slot] &&
+        memcmp(pp->border_color, gShadowSpec.borders[slot], sizeof pp->border_color) != 0;
     if ((mgl_geom_shadow_op_of(pp->compare_func) != gShadowSpec.ops[slot] &&
          (ctx->state.program->spirv[_VERTEX_SHADER].shadow_slots & (1u << slot))) ||
-        (gShadowSpec.wraps[slot] >= 0 && wrap != gShadowSpec.wraps[slot]))
+        (gShadowSpec.wraps[slot] >= 0 && wrap != gShadowSpec.wraps[slot]) ||
+        border_changed)
     {
         gShadowSpec.valid = false;   /* the rebuild that follows re-records it */
         ctx->state.dirty_bits |= DIRTY_PROGRAM;

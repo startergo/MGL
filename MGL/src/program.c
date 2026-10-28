@@ -1218,13 +1218,28 @@ static GLuint sampler_type_key(spvc_compiler c, spvc_type_id type_id)
 static const char *k_gath_helpers =
 /* geom: read()-based gather taps must honour the sampler's address mode themselves
  * (read() cannot); the wrap mode rides in as a function constant (32200+slot),
- * packed ws | wt<<4 (default 0 = REPEAT, the GL default).  CLAMP_TO_BORDER and
- * GL_CLAMP fall back to edge texels - the border colour is not plumbed through. */
+ * packed ws | wt<<4 (default 0 = REPEAT, the GL default).  Code 3 = CLAMP_TO_BORDER:
+ * those taps return the texture's border colour, which arrives as four float
+ * function constants per slot (MGL_GEOM_FC_BORDER_BASE, geom r60 — Metal samplers
+ * only offer three preset border colours but GL allows any float4).  GL_CLAMP still
+ * falls back to edge texels (it differs only for LINEAR filtering, which a gather
+ * tap never does). */
 "static inline int mgl_wco(int v, int n, int m)\n"
 "{\n"
 "    if (m == 0) { int r = v % n; if (r < 0) r += n; return r; }\n"                     /* GL_REPEAT */
 "    if (m == 1) { int a = v % (2 * n); if (a < 0) a += 2 * n; if (a >= n) a = 2 * n - 1 - a; return a; }\n"  /* MIRRORED_REPEAT */
 "    return clamp(v, 0, n - 1);\n"                                                       /* CLAMP_TO_EDGE (+CLAMP/BORDER/MIRROR approximated) */
+"}\n"
+"static inline bool mgl_wcb(int v, int n, int m)\n"
+"{\n"
+"    return m == 3 && (v < 0 || v >= n);\n"                                              /* CLAMP_TO_BORDER: outside tap */
+"}\n"
+"static inline float mgl_gselb(vec<float,4> v, component c)\n"
+"{\n"
+"    if (c == component::x) return v.x;\n"
+"    if (c == component::y) return v.y;\n"
+"    if (c == component::z) return v.z;\n"
+"    return v.w;\n"
 "}\n"
 "template <typename T>\n"
 "static inline __attribute__((always_inline)) T mgl_gsel(vec<T,4> v, component c)\n"
@@ -1265,31 +1280,37 @@ static const char *k_gath_helpers =
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm, int wrap = 0)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d<T> t, sampler s, float2 uv, int2 off, component c, bool unorm, int wrap = 0, vec<float,4> bcol = vec<float,4>(0.0, 0.0, 0.0, 1.0))\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
+"    float2 tc = (unorm ? uv : uv * sz);\n"
+"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
+"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
+"    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
-"    r[1] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
-"    r[2] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
-"    r[3] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
+"    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
+"    r[1] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
+"    r[2] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
+"    r[3] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), c);\n"
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d_array<T> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm, int wrap = 0)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gath_vs(texture2d_array<T> t, sampler s, float2 uv, uint layer, int2 off, component c, bool unorm, int wrap = 0, vec<float,4> bcol = vec<float,4>(0.0, 0.0, 0.0, 1.0))\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
+"    float2 tc = (unorm ? uv : uv * sz);\n"
+"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
+"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
+"    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
-"    r[1] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
-"    r[2] = mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
-"    r[3] = mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
+"    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
+"    r[1] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
+"    r[2] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
+"    r[3] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), c);\n"
 "    return r;\n"
 "}\n";
 
@@ -1307,31 +1328,37 @@ static const char *k_gcmp_read_helpers =
 "    return ref <= d;\n"                 /* 0 = GL_LEQUAL (the GL default) */
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, int op, bool unorm, int wrap = 0)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d<T> t, sampler s, float2 uv, T ref, int2 off, int op, bool unorm, int wrap = 0, vec<float,4> bcol = vec<float,4>(0.0, 0.0, 0.0, 1.0))\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
+"    float2 tc = (unorm ? uv : uv * sz);\n"
+"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
+"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
+"    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
-"    r[1] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
-"    r[2] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
-"    r[3] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
+"    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
+"    r[1] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
+"    r[2] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
+"    r[3] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), 0), op);\n"
 "    return r;\n"
 "}\n"
 "template <typename T>\n"
-"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, int op, bool unorm, int wrap = 0)\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_gcmp_vs(depth2d_array<T> t, sampler s, float2 uv, uint layer, T ref, int2 off, int op, bool unorm, int wrap = 0, vec<float,4> bcol = vec<float,4>(0.0, 0.0, 0.0, 1.0))\n"
 "{\n"
 "    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
-"    int2 b = int2(floor((unorm ? uv : uv * sz) - float2(0.5)) + float2(off));\n"
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
+"    float2 tc = (unorm ? uv : uv * sz);\n"
+"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
+"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
+"    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
-"    r[0] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
-"    r[1] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
-"    r[2] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
-"    r[3] = mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
+"    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
+"    r[1] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
+"    r[2] = (mgl_wcb(b.x + 1, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x + 1, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
+"    r[3] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y, h, wt)), layer, 0), op);\n"
 "    return r;\n"
 "}\n";
 
@@ -1577,6 +1604,44 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
                 char buf[2048];
                 size_t at = (size_t)snprintf(buf, sizeof buf, "%s(%s",
                                              shadow ? "mgl_gcmp_vs" : "mgl_gath_vs", name);
+
+                /* SPIRV-Cross cannot emit a non-constant gather offset, so it folds
+                 * it into the coordinate:  ((floor((C * sz) - 0.5) + float2(O)) + 0.5) / sz
+                 * — which bakes the UNclamped base (and the offset itself) into the
+                 * coordinate before the address-mode handling below can see either.
+                 * Pull the folded (coord, offset) back apart (gpu_shader5
+                 * texture_gather_offset_*: the offset is a per-vertex attribute). */
+                char foldo[512];
+                bool folded = false;
+                {
+                    const char *c = args[1];
+                    static const char p1[] = " * float2(int2(";
+                    static const char p2[] = "- float2(0.5)) + float2(";
+                    static const char p3[] = ")) + float2(0.5)) / float2(int2(";
+                    const char *fl = strstr(c, "floor((");
+                    if (fl && fl - c <= 4)
+                    {
+                        const char *m1 = strstr(c, p1);
+                        const char *m2 = m1 ? strstr(m1, p2) : NULL;
+                        const char *m3 = m2 ? strstr(m2, p3) : NULL;
+                        if (m1 && m2 && m3)
+                        {
+                            size_t cl = (size_t)(m1 - (fl + 7));
+                            size_t ol = (size_t)(m3 - (m2 + strlen(p2)));
+                            if (cl > 0 && cl < 256 && ol > 0 && ol < sizeof foldo - 16)
+                            {
+                                char foldc[256];
+                                memcpy(foldc, fl + 7, cl);
+                                foldc[cl] = 0;
+                                memcpy(foldo, m2 + strlen(p2), ol);
+                                foldo[ol] = 0;
+                                folded = true;
+                                snprintf(args[1], 256, "%s", foldc);
+                            }
+                        }
+                    }
+                }
+
                 for (int a = 0; a < base; a++)
                 {
                     at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s", args[a]);
@@ -1585,26 +1650,42 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
 
                 const char *off = "int2(0)";
                 const char *comp = "component::x";
-                for (int a = base; a < nargs; a++)
+                /* shadow: args[base] is the compare REFERENCE, not an offset — a
+                 * folded (variable) offset leaves no offset argument in the call at
+                 * all, and scanning the ref into `off' emitted a float where the
+                 * helper's int2 goes (depth_repeat_y link failure) */
+                for (int a = base + (shadow && !compute ? 1 : 0); a < nargs; a++)
                 {
                     if (strncmp(args[a], "component::", 11) == 0) comp = args[a];
                     else off = args[a];
+                }
+                char offbuf[768];
+                const char *use_off = off;
+                if (folded)
+                {
+                    /* the call's own offset arg is int2(0) after the fold; add any
+                     * constant one back on top of the folded (variable) offset */
+                    if (strcmp(off, "int2(0)") == 0)
+                        snprintf(offbuf, sizeof offbuf, "int2(%s)", foldo);
+                    else
+                        snprintf(offbuf, sizeof offbuf, "(int2(%s) + (%s))", foldo, off);
+                    use_off = offbuf;
                 }
                 size_t rl = strlen(o->name);
                 const char *rect = (rl > 8 && strcmp(o->name + rl - 8, "_mglrect") == 0) ? "true" : "false";
                 if (shadow && !compute)
                 {
-                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, mgl_shadow_op_%d, %s, mgl_wrap_op_%d)",
-                                           args[base], off, o->slot, rect, o->slot);
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, mgl_shadow_op_%d, %s, mgl_wrap_op_%d, mgl_border_%d)",
+                                           args[base], use_off, o->slot, rect, o->slot, o->slot);
                     if (slots_out) *slots_out |= 1u << o->slot;
                 }
                 else if (shadow)
                     at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)",
-                                           args[base], off, rect);
+                                           args[base], use_off, rect);
                 else if (compute)
-                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)", off, comp, rect);
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s)", use_off, comp, rect);
                 else
-                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s, mgl_wrap_op_%d)", off, comp, rect, o->slot);
+                    at += (size_t)snprintf(buf + at, sizeof buf - at, ", %s, %s, %s, mgl_wrap_op_%d, mgl_border_%d)", use_off, comp, rect, o->slot, o->slot);
                 if (at >= sizeof buf) at = sizeof buf - 1;
                 (void)at;
                 strcat(out, buf);
@@ -1626,7 +1707,7 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
         for (int i = 0; i < nobjs && !compute; i++)
         {
             if (!objs[i].depth) continue;
-            char line[256];
+            char line[1024];
             int dup = 0;
             for (int j = 0; j < i; j++) if (objs[j].slot == objs[i].slot) dup = 1;
             if (dup) continue;
@@ -1642,15 +1723,31 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
          * function constant too (default 0 = REPEAT, the GL default). */
         for (int i = 0; i < nobjs && !compute; i++)
         {
-            char line[256];
+            char line[1024];
             int dup = 0;
             for (int j = 0; j < i; j++) if (objs[j].slot == objs[i].slot) dup = 1;
             if (dup) continue;
             snprintf(line, sizeof line,
                      "constant int mgl_wrap_op_%d_ [[function_constant(%d)]];\n"
-                     "constant int mgl_wrap_op_%d = is_function_constant_defined(mgl_wrap_op_%d_) ? mgl_wrap_op_%d_ : 0;\n",
+                     "constant int mgl_wrap_op_%d = is_function_constant_defined(mgl_wrap_op_%d_) ? mgl_wrap_op_%d_ : 0;\n"
+                     "constant float mgl_border_%d_0 [[function_constant(%d)]];\n"
+                     "constant float mgl_border_%d_1 [[function_constant(%d)]];\n"
+                     "constant float mgl_border_%d_2 [[function_constant(%d)]];\n"
+                     "constant float mgl_border_%d_3 [[function_constant(%d)]];\n"
+                     "constant vec<float,4> mgl_border_%d = vec<float,4>(is_function_constant_defined(mgl_border_%d_0) ? mgl_border_%d_0 : 0.0,\n"
+                     "    is_function_constant_defined(mgl_border_%d_1) ? mgl_border_%d_1 : 0.0,\n"
+                     "    is_function_constant_defined(mgl_border_%d_2) ? mgl_border_%d_2 : 0.0,\n"
+                     "    is_function_constant_defined(mgl_border_%d_3) ? mgl_border_%d_3 : 1.0);\n",
                      objs[i].slot, MGL_GEOM_FC_WRAP_BASE + objs[i].slot,
-                     objs[i].slot, objs[i].slot, objs[i].slot);
+                     objs[i].slot, objs[i].slot, objs[i].slot,
+                     objs[i].slot, MGL_GEOM_FC_BORDER_BASE + 4 * objs[i].slot + 0,
+                     objs[i].slot, MGL_GEOM_FC_BORDER_BASE + 4 * objs[i].slot + 1,
+                     objs[i].slot, MGL_GEOM_FC_BORDER_BASE + 4 * objs[i].slot + 2,
+                     objs[i].slot, MGL_GEOM_FC_BORDER_BASE + 4 * objs[i].slot + 3,
+                     objs[i].slot, objs[i].slot, objs[i].slot,
+                     objs[i].slot, objs[i].slot, objs[i].slot,
+                     objs[i].slot, objs[i].slot, objs[i].slot,
+                     objs[i].slot, objs[i].slot);
             strcat(pre, line);
         }
         strcat(pre, k_gath_helpers);
@@ -3353,7 +3450,6 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
     if (stage == _VERTEX_SHADER && !tess_pipeline && dst->separable == GL_TRUE &&
         ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
         sep_vs_kernel_cache(ctx, ptr->name, prepared, prepared_words, entry);
-
     else if (stage == _VERTEX_SHADER && !tess_pipeline && dst->separable != GL_TRUE)
     {
         /* A NON-separable vs-only program can still be bound (glUseProgram) next
@@ -4171,10 +4267,19 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         {
             /* the cache hit cloned the executable without compile_stage: cache the
              * tess vertex-kernel variant under THIS program's name too, or pipeline
-             * draws fail with "tess VS stage function is not a kernel" */
-            sep_vs_kernel_cache(ctx, pptr->name,
-                                pptr->spirv[_VERTEX_SHADER].ir, pptr->spirv[_VERTEX_SHADER].size,
-                                MGL_PROGRAM_OBJ(pptr)->stage_entry[_VERTEX_SHADER]);
+             * draws fail with "tess VS stage function is not a kernel".  The stored
+             * module is RAW: prepare it first — compile_stage's fresh path caches a
+             * PREPARED module and sep_vs_kernel_cache parses it as-is. */
+            size_t pn = 0;
+            uint32_t *prep = spirv_prepare_for_msl(
+                (const uint32_t *)pptr->spirv[_VERTEX_SHADER].ir,
+                pptr->spirv[_VERTEX_SHADER].size, _VERTEX_SHADER, &pn);
+            if (prep)
+            {
+                sep_vs_kernel_cache(ctx, pptr->name, prep, pn,
+                                    MGL_PROGRAM_OBJ(pptr)->stage_entry[_VERTEX_SHADER]);
+                free(prep);
+            }
         }
 
         if (!linked &&

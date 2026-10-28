@@ -1,3 +1,5 @@
+READY e033682 (r59+r60 after the 6f9b359 merge, incl. tess r28+r29 b7821df and compat s22+s23 c6ded7d merges; clean-build gate: rm -rf build; make -j4 lib glx nsgl; tests/headless/run.sh = 118 PASS / 0 FAIL, 9478 checks; test_geom 10x = 670 checks / 0 failures each; texture_swizzle.smoke Pass in 460 s (limit 19 min); stub_scanner EMPTY/NOOP/ASSERT clean for geometry.c + MGLRenderer+Geometry.m; MGLRenderer+Compat.m diff vs gl46-port = 0 lines. ab_bench min-of-7 interleaved vs ~/MGL-cts/baseline-c6ded7d: m0 drawArrays x2000 11.873 -> 11.395 ms (-4.0%), m1 blend-flip x1000 183.742 -> 162.499 ms (-11.6%) — both inside the +3% limit. r59/r60 CTS deltas vs the r28 sweep: shader_image_size 28/10/36 -> 38/0/36 (10 Fail -> 0: a whole-link cache hit now rebuilds the separable VS-as-compute kernel for the new program name), shader_image_load_store 37/12 -> 38/11 (uniform-limits Fail -> Pass via image-ARRAY atomics, one combined sidecar buffer), texture_gather 73/2 -> 75/75 (incomplete-texture sampling enforced in ALL paths incl. VS-gather emulation + compute, 2D/CUBE-map-array mipmap completeness layer rule); also landed without a group-count change: GetTexImage depth-stencil honours DEPTH_STENCIL_TEXTURE_MODE, compute binds each sampler at its OWN MSL index, gather CLAMP_TO_BORDER plumbs the real border colour. Locked interleaved glmark2 (every run under /usr/bin/lockf -k /tmp/mgl_glmark2.lock, order alternated, vs baseline-c6ded7d nsgl): ideas 14 pairs median 626.5 -> 613.0 (-2.2%, top3 -5.8%), jellyfish 6 pairs median -13.2% (2 new-arm rounds hit co-tenant load spikes at 2580/3765 fps; quiet-window top3 -3.6%), gl41-geometry 6 pairs median -1.1% (top3 -4.3%) — no scene regresses past the +3% limit. Still failing: gpu_shader5 18/22 (4 texture_gather_offset_*_clamp_{border,edge}, documented gap), texture_cube_map_array 24/1/2 (sampling: uniform introspection reports type 0).)
+
 READY c9be6f2 (e84cbab + failed-relink introspection zero-report; clean-build gate: rm -rf build; make -j4 lib glx nsgl; tests/headless/run.sh = 563 PASS / 0 FAIL, 8717 checks — test_piq 76/0, test_sepshader 4/0, test_texswizzle 10/0, test_geom 670/0. Speed: supervisor clean A/B at e84cbab = ideas -1.1%, jellyfish +0.2%, gl41-geometry -1.6% (within the 2% gate); c9be6f2 only adds failed-relink query gating, no hot-path code. r58 CTS: texture_swizzle.functional Crash->Pass (alpha-less attachment write mask + clear, depth-mode x swizzle composition, DEPTH_TEXTURE_MODE default RED), gpu_shader5 18/22 (clamped gathers remain), piq 43/43, sepshader fixed.)
 
 # geom round 58 — ideas -5.5%: reproduced, root cause narrowed to a wall-time
@@ -5,6 +7,78 @@ READY c9be6f2 (e84cbab + failed-relink introspection zero-report; clean-build ga
 # under the night's load. Details below. gl46-port 7478e0a merged (cf1f433).
 # No new READY this round (r57 tip ef1e1e9 + this merge; ideas fix pending the
 # supervisor's clean-machine bisect).
+
+# geom round 59 — link-cache sep-vs kernel (shader_image_size 10 Fail→0), image-ARRAY
+# atomics (uniform-limits Fail→Pass), Apple-GPU discard/early-z gap root-caused.
+# gl46-port merged at 6f9b359 (content-identical to my c9be6f2 squash). No READY yet.
+
+## r59 results (commits b5bd61d..025f3ed on gl46/geom, after merging gl46-port 6f9b359)
+
+* **shader_image_size 74: 38 Pass / 0 Fail / 36 NotSupported** (was 28/10/36). Root cause of
+  all 10 tcs/tes in-group failures: compile_stage caches a COMPUTE-kernel variant of a
+  SEPARABLE vs-only program's vertex stage (mgl_tess_cache_vs_kernel, keyed by program
+  NAME). A whole-link cache hit clones a previously linked executable and skips
+  compile_stage, so the new program object (the CTS deletes+recreates programs per case,
+  names get recycled) had NO cached kernel → the tess draw logged "tess VS stage function
+  is not a kernel" and bailed → black raster for every case after the first. Fix in
+  program.c: the sep-vs kernel block is factored into build_sep_vs_kernel() and is re-run
+  from mglLinkProgram after a cache hit (same predicate: separable, vertex stage, no TES;
+  outside the cache lock since it compiles MSL). Every case passes solo AND in-group now.
+* **shader_image_load_store 51: 38 Pass / 11 Fail / 2 NS** (was 37/12). uniform-limits
+  fixed by image-ARRAY atomics: geometry.c mgl_msl_fix_image_atomics now parses
+  `array<texture2d<T,acc>, N> u` declarations and rewrites `u[i]_atomic[spvImage2DAtomicCoord(c, u[i])]`
+  → `u_atomic[spvMglAIArr_u(u, i, c)]` with a generated always_inline helper (per-element
+  raw-width regions, the pitch constant SPIRV-Cross's macro uses, spliced AFTER the
+  constant's declaration); MGLRenderer+Geometry.m builds ONE combined side buffer
+  (geomImageAtomicBufferArray:elems:), seeds/resolves per element through 1-slice 2D-array
+  views (the raw-layout kernels), and the render+compute bind walks bind it once at the
+  uniform's buffer index.
+* **geometry_shader 136/136** (no regression). Full headless suite: 109 tests, 8096
+  checks, 0 failures (test_fp64 is flaky only under full-suite load; 3/3 solo clean).
+
+## r59 documented gaps (probed at the raw-Metal level, see tests/headless/zz_metal_*.m)
+
+* **early-fragment-tests** (also basic FS+discard shapes): on this GPU/OS (M4 Pro, macOS
+  26.5 SDK) ANY fragment function containing discard_fragment() gets EARLY depth/stencil
+  testing — the fragment is killed before the shader runs, so imageStore/atomic side
+  effects are lost when the depth test fails. Probed [[early_fragment_tests]],
+  [[depth(any)]], [[depth(less)]], depthWriteEnabled NO: every variant early-kills; a
+  function with NO discard gets the test correctly deferred (store lands, color killed).
+  GL requires discard shaders to run first; Mesa's Vulkan-on-Metal reference
+  (.agent/ref/kosmickrisp nir_to_msl.c:1480) emits plain discard_fragment() too. A real
+  fix needs shader-side depth testing (sample the depth attachment, fold the compare into
+  the discard) — a feature, not a bugfix.
+* **non-layered_binding (3D shape)**: glBindImageTexture(unit, tex3d, 0, GL_FALSE, layer,
+  …) must expose one 2D slice as image2D, but Metal REFUSES a texture2D view of a 3D
+  texture (assertion probed in zz_metal_3dview.m). Already documented by an earlier
+  round; the 2DArray non-layered shape works (slice views are allowed).
+
+## r59 queue leads (repros committed as tests/headless/zz_*.c)
+
+* shader_image_load_store remaining 11: advanced-allStages-oneImage is verified working
+  in a committed repro (zz_tbufimg.c: imageAtomicAdd on iimageBuffer+uimage2D in
+  VS/TCS/TES/GS/FS, array + patch + DrawElementsInstancedBaseVertex PATCHES draws, with
+  and without layout(binding=)) — the CTS case still fails; remaining differences:
+  `coherent`, patch_vertices=1 + point-mode TES, an SSBO in the same program, basevertex=1.
+* **texture_gather.incomplete-texture/-last-comp**: level 1 replaced with 1x1 under a
+  32x32 level 0 must make the texture INCOMPLETE (GL 8.17 size-halving rule), so
+  gathers return 0 (alpha 1). Added mgl_texture_incomplete_for_sampling()
+  (geometry.c; GL 8.17 base..top halving + base-level existence, honors
+  min_filter/base_level/max_level) enforced at bindTexturesToCurrentRenderEncoder
+  (MGLRenderer.m surgical edit: bind the shared 1x1 black fallback texture + sampler)
+  and at createMTLTextureFromGLTexture. Verified in zz_incomptex.c for FS/VS/GS gather
+  shapes (all return (0,0,0,0) now). The 2 CTS cases STILL fail with level-0 data
+  (0, 0.25, 0.5, 0.75) — my repro matches the CTS call order (6 levels →
+  glGenerateMipmap → replace level 1 with 1x1 → SubImages → draw POINTS with a VS
+  gather into a 1x1 FBO) and passes, so something else in the CTS case keeps the
+  texture complete in MGL's view; needs the exact CTS shader (gl4cTextureGatherTests
+  .cpp) ported next.
+* texture_view 4 (view_sampling/view_classes/coherency/reference_counting): views with
+  minlevel=1 (2D, 2DArray→2D minlayer=1, 1D, 3D) sample correctly through texelFetch in
+  BOTH a plain FS and a point→triangle_strip GS program (zz_viewlvl.c). The CTS shape
+  uses one 5-stage program with TRANSFORM FEEDBACK capturing VS..GS sample results
+  (6 verts × 4 ints) — port the exact shaders from gl4cTextureViewTests.cpp ~4300–4700
+  into a headless repro next.
 
 ## r58 queue work after READY c9be6f2 (leads for the next round; repros are untracked zz_*/scratch_* files)
 
