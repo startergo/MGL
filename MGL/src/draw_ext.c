@@ -15,6 +15,7 @@
 #include "glm_context.h"
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
+#include "mgl_ext_texext.h"     /* mgl_texext_info: buffer-texture aliases in foreign-write tracking */
 #include "mgl_buffers_err.h"
 
 /* compat CS (MGLRenderer+CompatCS.m): drains the encoder worker before a CPU
@@ -180,6 +181,33 @@ static bool bound_for_foreign_gpu_write(GLMContext ctx, Buffer *buf)
     for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++)
         if (STATE(buffer_base[_TRANSFORM_FEEDBACK_BUFFER]).buffers[i].buf == buf)
             return true;
+
+    /* a dispatch can also write the buffer through the texture that aliases it: a
+     * buffer texture's Metal storage IS the buffer's own bytes, and imageStore /
+     * imageAtomic* (or the image-atomic sidecar resolve) write it without the buffer
+     * ever appearing in the dispatch's buffer map — so no write_serial is stamped
+     * for it.  Any live binding of a buffer texture backed by this buffer counts
+     * (image unit or texture unit; the shadow-copy path snapshots instead of
+     * aliasing, but the extra wait is harmless there).  KHR-GL46.texture_buffer
+     * texture_buffer_atomic_functions / texture_buffer_operations_image_store. */
+    for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+    {
+        Texture *bt[2];
+        int n = 0;
+
+        bt[n++] = STATE(texture_units[u].textures[_TEXTURE_BUFFER_TARGET]);
+        bt[n++] = STATE(image_units[u].tex);
+        for (int k = 0; k < n; k++)
+        {
+            MGLTexExtInfo *info;
+
+            if (!bt[k] || bt[k]->target != GL_TEXTURE_BUFFER)
+                continue;
+            info = mgl_texext_info(ctx, bt[k]);
+            if (info && info->kind == MGL_TEXEXT_BUFFER && info->buffer_name == buf->name)
+                return true;
+        }
+    }
 
     return false;
 }

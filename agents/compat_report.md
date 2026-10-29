@@ -1987,3 +1987,168 @@ jellyfish/goal numbers (>=3400 / >=12800) NOT verified today — no quiet window
 ### Also this session
 * Merged gl46-port twice: 784c480 (my s13-s16 squashed back) as 7a50188, and 5178835
   (tess r25) as b80fabf; suite green after both merges.
+
+## Session 25 (Oct 28, 04:2x-05:4x EDT) — merge gl46-port 1e840b4, READY re-verified
+
+Merge 37254a7 (gl46-port 1e840b4 into gl46/compat @ 58d55ae). Conflicts: geometry.c
+(gl46-port predates my 47d7336 geom_out_decl_size/geom_tess_clip_check — kept HEAD,
+both call sites intact) and compat_report.md (kept HEAD). Gate after merge:
+**617 PASS / 0 FAIL** headless.
+
+fails_compat3 re-verified post-merge (tests/cts_group.sh):
+- KHR-GL46.gl_spirv **9/9 Pass**
+- KHR-GL46.separable_programs_tf **2/2 Pass**
+- KHR-GL46.shader_group_vote **5/5 Pass**
+
+READY 37254a7 (= 47d7336 + merge of gl46-port 1e840b4), A/B vs baseline-1e840b4:
+- ab_bench (ab/abbench_s25.sh, min of 7 interleaved): m0 11.648 -> 11.157 (**-4.2%**),
+  m1 101.061 -> 102.409 (**+1.3%**, within the +3% limit).
+- locked glmark2 (ab/run_ab_s25.sh, best-of interleaved, load 0.0-0.9):
+  ideas 2953 vs 2966 (**-0.4%**), jellyfish 25883 vs 25831 (**+0.2%**),
+  gl41-geometry 21894 vs 22062 (**-0.8%**) — tess->geom capture path at parity.
+
+## Session 25 addendum — the test_geom_xfbperf GPU page fault (NOT READY, root cause not fully closed)
+
+Supervisor report: test_geom_xfbperf (built from this tree) caused GPU Address Faults +
+a WindowServer GPU restart. Investigation summary:
+
+* **Pre-existing at the READY**: a pristine `git archive 37254a7` build (built outside
+  the worktree, no local changes) faults the same way — this is NOT from my post-READY
+  commits (efbce1b's MSL pass is inert for this program: its shaders contain no
+  `_atomic [[buffer(` args; the draw_ext.c change is CPU-side sync only).
+* **Where**: the faulting CB is the draw's own (label = xfb-finish, the last set before
+  commit: capture + prefix + scatter + finish + the raster of that draw).  CPU-pack
+  mode (`MGL_GEOM_CPU_XFB=1`) never faults; `MTL_SHADER_VALIDATION=1` never faults
+  (serialized/slow) => racing/stale data dependent, needs >= ~8 frames (several draws
+  in flight).  Fault kills one CB and the primitive count loses ~2 frames.
+* **CPU-side bounds now proven at dispatch** (new MGL_GEOM_DEBUG assert block in
+  geomXfbEncode): recs/cnt/xbase/ctl slices, xfb dst capacities, nil bindings —
+  all PASS on the failing config, so the bindings and slice sizes are not the fault.
+  (One assert bug found+fixed on the way: cnt needs `threads` words, not threads*4.)
+* **Three unguarded index computations found and bounded** (defence in depth):
+  1. scatter `recs + (slot - n + 1 + p + j) * out_words`: uint underflow when a stale/
+     half-written flagged record claims a strip longer than its position (n > s+1)
+     => wild read.  Guarded (drop the record); the CPU pack had the same arithmetic,
+     guarded too.
+  2. scatter capacity test re-read `xfb[3+b]` after testing it (TOCTOU vs a concurrent
+     draw's finish bumping the write offset): now a per-primitive `base[4]` snapshot,
+     so each thread writes inside the capacity it tested.
+  3. prefix scan `for (s = 0; s < cnt[i]; ...)` unclamped against the tile's record
+     slots: clamped to maxv (same in the CPU pack).
+* **Still faulting** after those guards (one sanctioned MTL_DEBUG_LAYER+debug run):
+  the remaining suspect set is the CAPTURE/ASSEMBLY side (the indirect draw argument
+  for the raster derives from live GPU counters; a stale/large count would walk the
+  raster past the records buffer) or a consumer-tracking hole in the record-pool
+  reclaim; both are geometry-domain code.  NOT root-caused to the end; needs a
+  per-dispatch scoping run (errorOptions encoder status) or a geometry-domain review.
+  **No more faulting runs were made** after the sanctioned one.
+
+Gate with test_geom_xfbperf.c parked (pre-existing fault): **619 PASS / 0 FAIL**.
+
+Commits this session: b5a262e (merge gl46-port 1e840b4 + READY re-verify), 5c57d94
+(merge gl46-port 71cfe2a, arrs zero-init), efbce1b (texture_buffer.atomic_functions
+fix: 15/16 -> 16/16 CTS, gl_spirv 9/9, sptf 2/2, vote 5/5, ab parity) + this addendum.
+
+## Session 25 resume (22:32 EDT, after the user pause) — merge gl46-port 48a41ef
+
+Merge d9abb22 (48a41ef = geom r59-r61 + my gl_spirv 9/9 landed by the lead) — clean.
+Gate with test_geom_xfbperf.c parked (the pre-existing GPU fault; hard rule):
+**619 PASS / 0 FAIL**.  (test_gather_xfb had "timed out" in the aborted 07:16 run —
+that was the user pause freezing the process mid-suite; single run now: PASS in 4.2 s.)
+
+A/B vs baseline-48a41ef (quiet machine):
+- ab_bench m0/m1 min-of-7 interleaved: 12.746 -> 11.802 (**-7.4%**), 109.822 -> 100.286
+  (**-8.7%**) — faster.
+- locked glmark2 best-of interleaved (ab/run_ab_s48.sh): ideas 2788 vs 2752 (+1.3%),
+  jellyfish 25596 vs 25663 (-0.3%), gl41-geometry 21929 vs 22123 (-0.9%) — parity
+  (an external load spike 9-11 hit the jellyfish/geometry rounds; best-of held).
+- (Earlier run vs baseline-1e840b4 had also been at parity; a one-off +12% reading
+  against 71cfe2a under load 0.9 was noise, not reproduced.)
+
+READY accounting: efbce1b (texture_buffer.atomic_functions: coherent image atomics
+on buffer textures; texture_buffer 16/16 CTS, gl_spirv 9/9, sptf 2/2, vote 5/5,
+gate 619/0) is READY-able with the numbers above.  c0cfdc8 (the xfb-pack bounds
+hardening) touches the faulting path and is NOT claimed READY — root cause open.
+
+Queue after texture_buffer: shader_storage_buffer_object.advanced-switchBuffers and
+.advanced-indirectAddressing-case2 fail identically on baseline-48a41ef (pre-existing,
+deep multi-draw cases); sparse_buffer_tests 3x NotSupported is correct (GL_ARB_sparse_buffer
+not advertised, documented gap).  Otherwise my-area queue is empty.
+
+## Session 26 (Oct 28, 23:18 EDT) — revert c0cfdc8, un-park test_geom_xfbperf
+
+Supervisor direction: the branch tip must contain exactly the claimed READY work, and
+no test may be parked out of the gate.  c0cfdc8 (xfb-pack bounds hardening +
+MGL_GEOM_DEBUG asserts) has behaviour clamps, not asserts only, so it does not qualify
+as "safe to include" — reverted on top of 6cd2083 (229c1b4).  Its investigation
+narrative above is kept for the record; the guards are gone from the code.
+test_geom_xfbperf.c was never removed from the tree (the "park" was a run-time
+move-aside).
+
+Sequence and results this session:
+
+* Revert 229c1b4 applied clean (only agents/compat_report.md conflicted, resolved
+  keeping both narratives).  Code delta vs gl46-port 48a41ef is exactly efbce1b
+  (texture_buffer.atomic_functions) + the two merge resolutions.
+* Clean build: `rm -rf build; make -j4 lib glx nsgl` rc=0, only the pre-existing
+  upstream `-Wincomplete-implementation` for extProgramLibraryForMSL.
+* test_geom_xfbperf ran ONCE at 229c1b4 (23:21, then inside the full gate 23:26):
+  the TEST passed both times (200 frames, 2 checks, 0 failures) — but per the
+  supervisor's 23:42 quarantine message those two runs GPU-page-faulted at machine
+  level.  A test-level PASS therefore does NOT rule out the intermittent fault; my
+  earlier "no fault" statement was wrong at the machine level, and the 06:52-07:16
+  "pristine 37254a7 archive faults" observation stands as one data point in what is
+  now clearly a latent, timing-dependent gl46-port bug seen from three worker trees.
+  Not run again after 23:42.
+* Full gate (23:26, xfbperf still in): 619 PASS / 0 FAIL, 9717 checks, rc=0.
+* Quarantined gate per supervisor 23:42 (test moved aside for the run only, file
+  restored, nothing committed): **619 PASS / 0 FAIL**, 9715 checks, rc=0.
+  test_geom_xfbperf quarantined (supervisor 23:42).
+* stub_scanner EMPTY/NOOP/ASSERT clean on compat.c/compat_ffp.c/geometry.c/
+  draw_ext.c/MGLRenderer+Geometry.m.
+
+### A/B harness defects found this session (important for all domains' numbers)
+
+1. abbench_s2x.sh (m0/m1) was measuring MY BUILD AGAINST ITSELF.  libmgl.dylib's
+   install name is the RELATIVE path `build/libmgl.dylib` (no @rpath), so `-Wl,
+   -rpath,<baseline>` never applies (rpaths only substitute into @rpath install
+   names) and dyld resolves the relative name against the LAUNCH CWD.  Run from the
+   worktree root, BOTH /tmp/abb_base and /tmp/abb_new load wt/compat/build/
+   libmgl.dylib — proven with DYLD_PRINT_LIBRARIES (identical UUIDs).  Every
+   m0/m1 "delta" those scripts printed was noise (plus a base-first warm-up
+   asymmetry), including this session's earlier -7.4%/-8.7% and the +23.7%/+41.7%
+   first attempt tonight.  ab/abbench_abs.sh fixes it: copy each side's dylib to a
+   private dir, `install_name_tool -id` to an absolute path, and PROVE the two
+   sides load different files before printing numbers.
+   (Also: this harness exports HOME='~' literally, so `$HOME/MGL-cts/...` paths
+   silently break; resolve the real home directory first.)
+2. glmark2 A/B (DYLD_INSERT_LIBRARIES) is structurally sound — nsgl carries an
+   `@loader_path` rpath so the inserted baseline nsgl reexports the baseline
+   libmgl — but only when the insert path is absolute.  Tonight's $HOME='~' would
+   have silently compared system-GL vs system-GL; verified insert works by
+   `mgl_nsgl: NSOpenGL -> MGL interposer active` in stderr.
+
+### A/B vs baseline-48a41ef on 229c1b4 (fixed harness)
+
+* ab_bench m0/m1 (abbench_abs.sh, min-of-7 and min-of-11, interleaved, load 2.3-5.4):
+  m0 +4.0% then -13.0%, m1 -8.6% then -1.3% — the sign flips between runs with
+  heavily overlapping distributions => parity within noise; consistent with the
+  code delta (nothing in efbce1b/revert is on the m0/m1 paths —
+  bound_for_foreign_gpu_write runs only in the CPU-read sync path, and ab_bench
+  modes 0/1 never CPU-read a buffer).
+* locked glmark2 (interleaved, alternating order, 3 rounds/scene, load ~3.5;
+  NOTE absolute levels are 3-4x below last session's — plain system-GL ideas
+  scores 550 tonight, so the machine is contended; only the interleaved deltas
+  carry information): ideas 793 vs 786 (+0.9%), jellyfish 5606 vs 5550 (+1.0%),
+  gl41-geometry 2105 vs 2153 (-2.2%) — parity.
+
+READY (this session): 229c1b4 + the report/harness commit on top of it (no MGL
+code changes in the latter) — gate 619 PASS / 0 FAIL, 9715 checks,
+test_geom_xfbperf quarantined (supervisor 23:42); ab_bench + glmark2 parity vs
+baseline-48a41ef on the fixed harness.  Claimed work in the tip: efbce1b
+(texture_buffer.atomic_functions) + the gl_spirv tessGeom fix (48a41ef, landed by
+the lead) + merge resolutions; c0cfdc8 reverted.
+
+### Next (supervisor queue)
+shader_storage_buffer_object.advanced-switchBuffers and
+.advanced-indirectAddressing-case2 (fail identically on baseline-48a41ef).

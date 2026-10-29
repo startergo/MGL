@@ -3293,7 +3293,7 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                                 MGLGeomTexSlot *slots_out, int *nslots_out, int max_slots,
                                 int *dub_out)
 {
-    struct { char name[128]; int auto_idx, index, kind; } imgs[32];
+    struct { char name[128]; int auto_idx, index, kind; int scalar; int is2d; char elem[12]; } imgs[32];
     struct { char elem[96]; unsigned count; char hname[152]; } arrs[32]; /* name-indexed */
     int nimgs = 0;
     struct { size_t at, len; char *text; } edits[256];
@@ -3345,6 +3345,23 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                 imgs[nimgs].name[nm_end - nm] = 0;
                 imgs[nimgs].auto_idx = idx;
                 imgs[nimgs].kind = MGL_AI_2D;
+                imgs[nimgs].scalar = 0;
+                imgs[nimgs].is2d = 0;
+                imgs[nimgs].elem[0] = 0;
+                arrs[nimgs].count = 0;              /* set when an array<> type is found */
+                arrs[nimgs].hname[0] = 0;
+                /* the element type of the side argument (`device atomic_uint*` etc.) —
+                 * the imageLoad/imageStore redirect rebuilds the GLSL gvec4 from it */
+                {
+                    const char *a = nm;
+                    const char *e = NULL;
+
+                    while (a > msl && (a[-1] == ' ' || a[-1] == '*')) a--;
+                    e = a;
+                    while (e > msl && (isalnum((unsigned char)e[-1]) || e[-1] == '_')) e--;
+                    if (!strncmp(e, "atomic_", 7) && (size_t)(a - e - 7) < sizeof imgs[0].elem)
+                        memcpy(imgs[nimgs].elem, e + 7, (size_t)(a - e - 7)), imgs[nimgs].elem[a - e - 7] = 0;
+                }
                 nimgs++;
             }
         }
@@ -3388,6 +3405,13 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             else if (tlen >= 18 && !strncmp(t, "texturecube_array<", 18)) kind = MGL_AI_CUBEARR;
             else if (tlen >= 12 && !strncmp(t, "texturecube<", 12)) kind = MGL_AI_CUBE;
             imgs[i].kind = kind;
+            /* imageLoad/imageStore redirect support: the scalar-subscript targets
+             * (imageBuffer / image1D) and plain image2D (through SPIRV-Cross's own
+             * spvImage2DAtomicCoord macro, always defined when a 2D atomic exists) */
+            imgs[i].scalar = (kind == MGL_AI_2D) &&
+                             ((tlen >= 15 && !strncmp(t, "texture_buffer<", 15)) ||
+                              (tlen >= 10 && !strncmp(t, "texture1d<", 10)));
+            imgs[i].is2d = (kind == MGL_AI_2D) && (tlen >= 10 && !strncmp(t, "texture2d<", 10));
             /* an ARRAY of images: `array<texture2d<int>, 8> u_image [[texture(0)]]`.
              * SPIRV-Cross keeps ONE _atomic side buffer for the whole array but emits
              * every access as `<name>[<i>]_atomic[...]` — an identifier that does not
@@ -3636,6 +3660,127 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
         }
     }
 
+    /* 5b. coherent loads/stores of an atomics-carrying image must go through the side
+     * buffer too: the sidecar is the ONLY storage imageAtomic* sees, so an imageLoad
+     * of the same texel through the texture argument would read the pre-dispatch value
+     * (KHR-GL46.texture_buffer texture_buffer_atomic_functions: add into [0], read [0]
+     * back, CompSwap it into every lane's slot — all within one kernel).  Redirect
+     * `<name>.read(c)` / `<name>.write(v, c)` of the scalar targets (imageBuffer /
+     * image1D) and plain image2D to the sidecar; the 3D / array / cube targets keep
+     * their texture accesses (coherence gap, none of the CTS mixes them). */
+    int used_load_helper = 0;
+    for (int i = 0; i < nimgs; i++)
+    {
+        const char *reads[2] = { ".read(", ".write(" };
+
+        if (!imgs[i].elem[0] || (!imgs[i].scalar && !imgs[i].is2d))
+            continue;
+
+        for (int which = 0; which < 2; which++)
+        {
+            char pat[160];
+            snprintf(pat, sizeof pat, "%s%s", imgs[i].name, reads[which]);
+
+            for (const char *p = msl; (p = strstr(p, pat)) != NULL; )
+            {
+                const char *arg;                       /* first argument */
+                const char *ae;                        /* its end (matching ')') */
+                const char *cs = NULL;                 /* top-level comma (write) */
+                int d;
+
+                if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+                { p += strlen(pat); continue; }
+                arg = p + strlen(pat);
+                d = 1; ae = arg;
+                while (*ae)
+                {
+                    if (*ae == '(' || *ae == '[') d++;
+                    else if (*ae == ')' || *ae == ']') { if (--d == 0) break; }
+                    ae++;
+                }
+                if (d) { p = arg; continue; }
+                if (which == 1)
+                {
+                    /* .write(<value>, <coord>): find the top-level comma, then the coord */
+                    d = 1; cs = arg;
+                    while (*cs)
+                    {
+                        if (*cs == '(' || *cs == '[') d++;
+                        else if (*cs == ')' || *cs == ']') { if (--d == 0) break; }
+                        else if (*cs == ',' && d == 1) break;
+                        cs++;
+                    }
+                    if (*cs != ',') { p = ae; continue; }
+                    arg = cs + 1;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    d = 1; ae = arg;
+                    while (*ae)
+                    {
+                        if (*ae == '(' || *ae == '[') d++;
+                        else if (*ae == ')' || *ae == ']') { if (--d == 0) break; }
+                        ae++;
+                    }
+                    if (d) { p = arg; continue; }
+                }
+
+                /* the linear sidecar subscript: scalar targets use the coordinate as
+                 * written; image2D strips SPIRV-Cross's uint2(...) cast and reuses its
+                 * own spvImage2DAtomicCoord macro (same pitch the atomics use) */
+                {
+                    const char *c0 = arg, *c1 = ae;
+                    char texpr[512];
+                    char *rep;
+
+                    if (imgs[i].is2d)
+                    {
+                        size_t cl = (size_t)(c1 - c0);
+                        if (cl > 7 && !strncmp(c0, "uint2(", 6) && c1[-1] == ')')
+                        { c0 += 6; c1 -= 1; cl = (size_t)(c1 - c0); }
+                        if (cl + 64 >= sizeof texpr) { p = ae; continue; }
+                        snprintf(texpr, sizeof texpr, "spvImage2DAtomicCoord(%.*s, %s)",
+                                 (int)cl, c0, imgs[i].name);
+                    }
+                    else
+                    {
+                        size_t cl = (size_t)(c1 - c0);
+                        if (cl + 1 >= sizeof texpr) { p = ae; continue; }
+                        snprintf(texpr, sizeof texpr, "%.*s", (int)cl, c0);
+                    }
+
+                    if (which == 0)
+                    {
+                        rep = malloc(strlen(texpr) + strlen(imgs[i].name) + strlen(imgs[i].elem) + 64);
+                        if (!rep) { p = ae; continue; }
+                        snprintf(rep, strlen(texpr) + strlen(imgs[i].name) + strlen(imgs[i].elem) + 64,
+                                 "spvMglAILoad<%s>(%s_atomic, %s)", imgs[i].elem, imgs[i].name, texpr);
+                        used_load_helper = 1;
+                    }
+                    else
+                    {
+                        /* the value argument spans from just after ".write(" to the comma */
+                        const char *v0 = p + strlen(pat);
+                        const char *v1 = cs;
+
+                        rep = malloc((size_t)(v1 - v0) + strlen(texpr) + strlen(imgs[i].name) + 80);
+                        if (!rep) { p = ae; continue; }
+                        snprintf(rep, (size_t)(v1 - v0) + strlen(texpr) + strlen(imgs[i].name) + 80,
+                                 "atomic_store_explicit(&%s_atomic[%s], (%.*s).x, memory_order_relaxed)",
+                                 imgs[i].name, texpr, (int)(v1 - v0), v0);
+                    }
+                    if (nedits < 256)
+                    {
+                        edits[nedits].at = (size_t)(p - msl);
+                        edits[nedits].len = (size_t)(ae + 1 - p);   /* through the ')' */
+                        edits[nedits].text = rep;
+                        nedits++;
+                    }
+                    else free(rep);
+                }
+                p = ae;
+            }
+        }
+    }
+
     /* the helper definitions this MSL actually uses (plus one per ARRAY image —
      * each specialized to the exact `array<texture2d<T,access>, N>` type declared) */
     size_t helpers_cap = 2400 + 720 * (size_t)nimgs;
@@ -3651,7 +3796,7 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     helpers[0] = 0;
     arrhelpers[0] = 0;
     {
-        static const struct { const char *name; const char *body; } h[4] = {
+        static const struct { const char *name; const char *body; } h[5] = {
             { "spvMglAI3D(",
               "template <typename T> static inline __attribute__((always_inline)) "
               "uint spvMglAI3D(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
@@ -3668,11 +3813,17 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             { "spvMglAICB(",
               "template <typename T> static inline __attribute__((always_inline)) "
               "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); "
-              "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" }
+              "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" },
+            /* imageLoad of an atomics-carrying image, through its side buffer: the GLSL
+             * gvec4 of a single-channel format is (v, 0, 0, 1) */
+            { "spvMglAILoad<",
+              "template <typename E, typename A> static inline __attribute__((always_inline)) "
+              "vec<E,4> spvMglAILoad(device A* side, uint t) "
+              "{ return vec<E,4>(E(atomic_load_explicit(&side[t], memory_order_relaxed)), E(0), E(0), E(1)); }\n" }
         };
-        for (int k = 0; k < 3; k++)
+        for (int k = 0; k < 4; k++)
         {
-            int used = 0;
+            int used = (k == 3) ? used_load_helper : 0;
             for (int a = 0; a < nedits && !used; a++)
                 used = !strncmp(edits[a].text, h[k].name, strlen(h[k].name));
             if (used && strlen(helpers) + strlen(h[k].body) + 1 < helpers_cap)

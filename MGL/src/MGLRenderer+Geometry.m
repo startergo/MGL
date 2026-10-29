@@ -3078,6 +3078,13 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                         u, (unsigned long)tt, (unsigned)pf);
             continue;
         }
+        if (getenv("MGL_GEOM_DEBUG"))
+        {
+            const uint32_t *sv = (const uint32_t *)buf.contents;
+            fprintf(stderr, "MGL geom: img-atom resolve dump unit=%d side[%llu]=%u %u %u %u\n",
+                    u, (unsigned long long)total, sv ? sv[0] : 0, sv && total > 1 ? sv[1] : 0,
+                    sv && total > 2 ? sv[2] : 0, sv && total > 3 ? sv[3] : 0);
+        }
         dims[3] = (uint32_t)total;
 
         dims[0] = (uint32_t)view.width;
