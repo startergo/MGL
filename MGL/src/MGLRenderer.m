@@ -2308,10 +2308,14 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
              * element, which need not be base+e (base+e is only the default when
              * the element was never set; KHR-GL46.shaders.struct.uniform.
              * sampler_array_* sets s[0].c=1, s[1].c=0).  Element 0's value is
-             * latched into sres->binding at upload (mgli_upload_uniform). */
+             * latched into sres->binding at upload (mgli_upload_uniform); the rest
+             * read the same latched table (SpirvResource.unit_vals — shared with a
+             * bound pipeline's composite), falling back to the introspection
+             * domain's uniform-table lookup. */
             GLuint unit = (e == 0) ? spirv_binding
-                                   : mgli_sampler_elem_unit(ctx, prog, stage, sres->_id, e,
-                                                            spirv_binding + e);
+                                   : (sres->unit_vals ? mgl_res_elem_unit(sres, e)
+                                                      : mgli_sampler_elem_unit(ctx, prog, stage, sres->_id, e,
+                                                                               spirv_binding + e));
             if (unit >= TEXTURE_UNITS)
                 continue;
             /* GL sampler semantics: the sampler's dimension selects the unit's
@@ -2443,8 +2447,16 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
             for (GLuint e = 0; e < elems; e++)
             {
-            if (unit + e >= TEXTURE_UNITS) continue;
-            iu = &STATE(image_units[unit + e]);
+            /* geom/GL semantics: image-ARRAY elements are independent uniforms —
+             * element e's unit is the value the app stored with glProgramUniform1i on
+             * THAT element, which need not be base+e (shader_image_load_store.
+             * advanced-sso-simple binds g_image[0..3] to units 0,2,4,6 of one 2D
+             * array texture, one layer each).  Element 0's value is latched into
+             * sres->binding at upload (mgli_upload_uniform); the rest read the
+             * program's uniform table. */
+            GLuint unit_e = mgl_res_elem_unit(sres, e);
+            if (unit_e >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit_e]);
             ptr = iu->tex;
             if (!ptr) continue;                       /* unbound unit: legal GL, undefined results */
 
@@ -4432,12 +4444,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                         Texture *tex_e = ptr;
                         id<MTLTexture> texture;
                         id<MTLSamplerState> sampler;
+                        /* geom/GL semantics: image-ARRAY elements are independent
+                         * uniforms (glProgramUniform1i per element; see the render
+                         * binder's identical comment) — element e's unit is not
+                         * necessarily base+e */
+                        GLuint ue = (sres && gl_texture_type == _IMAGE_TEXTURE)
+                                        ? mgl_res_elem_unit(sres, e) : spirv_binding + e;
 
                         if (e && gl_texture_type == _IMAGE_TEXTURE)
-                            tex_e = (spirv_binding + e < TEXTURE_UNITS)
-                                        ? STATE(image_units[spirv_binding + e].tex) : NULL;
+                            tex_e = (ue < TEXTURE_UNITS)
+                                        ? STATE(image_units[ue].tex) : NULL;
                         else if (e)
-                            tex_e = mgl_texture_for_sampler(ctx, spirv_binding + e, 0);
+                            tex_e = mgl_texture_for_sampler(ctx, ue, 0);
                         if (!tex_e || !tex_e->mtl_data) continue;
 
                         RETURN_FALSE_ON_FAILURE([self bindMTLTexture: tex_e]);
@@ -4457,21 +4475,21 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                             }
                         }
                         texture = (__bridge id<MTLTexture>)(tex_e->mtl_data);
-                        sampler = [self texparamSamplerForUnit: spirv_binding + e texture: tex_e];
+                        sampler = [self texparamSamplerForUnit: ue texture: tex_e];
                         if (gl_texture_type == _TEXTURE)
                             texture = [self texparamTextureForTex: tex_e base: texture];
-                        else if (spirv_binding + e < TEXTURE_UNITS)
+                        else if (ue < TEXTURE_UNITS)
                         {
                             /* an image unit binds one mip level / layer: view of that
                              * level, reinterpreted as the unit's format when it differs
                              * from the texture's internal format (geomImageUnitViewRes) */
-                            texture = [self geomImageUnitViewRes: &STATE(image_units[spirv_binding + e])
+                            texture = [self geomImageUnitViewRes: &STATE(image_units[ue])
                                                             base: texture
                                                        elemClass: (sres ? sres->elem_class : 0xffffffffu)];
                         }
                         if (getenv("MGL_GEOM_DEBUG") && gl_texture_type == _IMAGE_TEXTURE)
                             fprintf(stderr, "MGL geom: compute img bind unit=%u view=%s type=%lu fmt=%lu slot=%u\\n",
-                                    spirv_binding + e,
+                                    ue,
                                     texture ? "ok" : "NIL",
                                     texture ? (unsigned long)texture.textureType : 0ul,
                                     texture ? (unsigned long)texture.pixelFormat : 0ul,

@@ -14,6 +14,7 @@
 
 #include "tcuPlatform.hpp"
 #include "gluPlatform.hpp"
+#include "vkPlatform.hpp"
 
 namespace tcu
 {
@@ -28,6 +29,12 @@ public:
 
     virtual bool processEvents(void);
     virtual const glu::Platform &getGLPlatform(void) const;
+    /* The CTS's GL tests only touch the "Vulkan platform" for memory limits
+     * (ShaderImageLoadStoreBase::scaleDimensionsToMemory asks how big a test
+     * surface may be).  MGL is GL-only, so createLibrary() throws, but the
+     * limits are reported from the host (Apple GPUs use unified memory, so
+     * totalDeviceLocalMemory stays 0 = "counts against system memory"). */
+    virtual const vk::Platform &getVulkanPlatform(void) const;
 };
 
 } // namespace mgl

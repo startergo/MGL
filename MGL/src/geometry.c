@@ -3667,8 +3667,13 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             switch (imgs[i].kind)
             {
                 case MGL_AI_3D:     helper = "spvMglAI3D"; break;
-                case MGL_AI_CUBE:
-                case MGL_AI_CUBEARR: helper = "spvMglAICB"; break;
+                /* cube and cube ARRAY get distinct helpers (not an overload): MSL has
+                 * no texture_type query (get_texture_type does not exist — probed), so
+                 * the face count is a compile-time constant per kind: 6 faces, or
+                 * array_length*6, exactly what geomImageAtomicTexels sized the sidecar
+                 * to on the CPU side */
+                case MGL_AI_CUBE:    helper = "spvMglAICB"; break;
+                case MGL_AI_CUBEARR: helper = "spvMglAICBA"; break;
                 case MGL_AI_ARR2:
                     /* overloads pick the layout: int2 is a 1D array (the layer in y),
                      * int3 a 2D array (the layer in z) */
@@ -3858,18 +3863,25 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             { "spvMglAIA(",
               "template <typename T> static inline __attribute__((always_inline)) "
               "uint spvMglAIA(T tex, int2 tc) { uint w = tex.get_width(), h = tex.get_height(); "
-              "uint n = h; if (any(tc < int2(0)) || uint(tc.x) >= w || uint(tc.y) >= n) return w * h * tex.get_array_length(); "
+              "uint n = h; if (any(tc < int2(0)) || uint(tc.x) >= w || uint(tc.y) >= n) return w * h * tex.get_array_size(); "
               "return uint(tc.x) + w * uint(tc.y); }\n"
               "template <typename T> static inline __attribute__((always_inline)) "
               "uint spvMglAIA(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
-              "uint n = tex.get_array_length(); if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= h || "
+              "uint n = tex.get_array_size(); if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= h || "
               "uint(tc.z) >= n) return w * h * n; "
               "return uint(tc.x) + w * (uint(tc.y) + h * uint(tc.z)); }\n" },
             /* a cube face — and a cube-array slice: glslang packs layer*6+face into z */
             { "spvMglAICB(",
               "template <typename T> static inline __attribute__((always_inline)) "
-              "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); uint n = "
-              "tex.get_texture_type() == texture_type::texture_cube_array ? (uint)tex.get_array_length() * 6u : 6u; "
+              "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); uint n = 6u; "
+              "if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= w || uint(tc.z) >= n) "
+              "return w * w * n; "
+              "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" },
+            /* a cube ARRAY: glslang packs layer*6+face into z */
+            { "spvMglAICBA(",
+              "template <typename T> static inline __attribute__((always_inline)) "
+              "uint spvMglAICBA(T tex, int3 tc) { uint w = tex.get_width(); uint n = "
+              "(uint)tex.get_array_size() * 6u; "
               "if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= w || uint(tc.z) >= n) "
               "return w * w * n; "
               "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" },
@@ -3880,7 +3892,7 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
               "vec<E,4> spvMglAILoad(device A* side, uint t) "
               "{ return vec<E,4>(E(atomic_load_explicit(&side[t], memory_order_relaxed)), E(0), E(0), E(1)); }\n" }
         };
-        for (int k = 0; k < 4; k++)   /* 4 helpers: 3D / array / cube + the load shim */
+        for (int k = 0; k < 5; k++)   /* 5 helpers: 3D / array / cube / cube-array + the load shim */
         {
             int used = (k == 3) ? used_load_helper : 0;
             for (int a = 0; a < nedits && !used; a++)

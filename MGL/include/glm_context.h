@@ -413,7 +413,19 @@ typedef struct SpirvResource_t {
                           * no atomics / was stripped); the renderer binds a sidecar buffer */
     GLuint  elem_class;  /* geom: storage images only — element kind of the SPIR-V image's
                           * sampled type: 0 float, 1 int, 2 uint (the unit-format view) */
+    GLuint  *unit_vals;  /* geom: sampler/image ARRAY elements are independent GL uniforms
+                          * (glUniform1i per element): element e's unit lives here when the app
+                          * set it away from the default base+e (mgli_upload_uniform latches it;
+                          * the pipeline composite's resource copy shares this array). NULL =
+                          * all elements at the default binding+e */
 } SpirvResource;
+
+/* geom: element e's GL unit for an arrayed opaque resource (sampler/image array),
+ * honouring the per-element uniforms the app set; see SpirvResource.unit_vals */
+static inline GLuint mgl_res_elem_unit(const SpirvResource *r, GLuint e)
+{
+    return (r->unit_vals && e < r->array_size) ? r->unit_vals[e] : r->binding + e;
+}
 
 typedef struct SpirvResourceList_t {
     GLuint  count;

@@ -214,6 +214,12 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 /* geom: create + seed the image-atomic sidecars of the pending compute dispatch
  * (own compute pass, before the dispatch's encoder is opened) */
 - (void) geomPrepareImageAtomicsCompute;
+/* geom: the (program, stage) twins for the tessellation emulation's VS / TCS / TES
+ * kernels, which run as compute with their own stage's resource list */
+- (bool) geomBindStageImageAtomicsCompute: (Program *) program
+                                   encoder: (id <MTLComputeCommandEncoder>) encoder
+                                     stage: (int) stage;
+- (void) geomPrepareStageImageAtomicsCompute: (Program *) program stage: (int) stage;
 - (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view;
 - (void) geomReleaseImageAtomics;
 - (id<MTLComputePipelineState>) geomAtomResolvePso: (MTLTextureType) tt format: (MTLPixelFormat) pf;

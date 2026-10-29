@@ -1169,6 +1169,16 @@ static bool read_indirect(GLMContext ctx, Buffer *buf, size_t offset, uint32_t *
 
         mgl_buffers_prepare_cpu_read(ctx, buf);
     }
+    else if (must)
+    {
+        /* geom: the command may have been written GPU-side without the buffer's own
+         * tracking stamping it — a VS under RASTERIZER_DISCARD imageStores the command
+         * into a buffer-texture image that zero-copy ALIASES this buffer
+         * (shader_image_load_store.advanced-sync-drawIndirect).  prepare_cpu_read waits
+         * conservatively for such foreign writers (bound_for_foreign_gpu_write) and is a
+         * no-op for a buffer that carries no GPU writes. */
+        mgl_buffers_prepare_cpu_read(ctx, buf);
+    }
 
     memcpy(out, (const uint8_t *)buf->data.buffer_data + offset, words * sizeof(uint32_t));
     return true;

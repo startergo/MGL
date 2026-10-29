@@ -571,8 +571,12 @@ GLenum tdCheckGetFormatCompat(const TDFormat *f, GLenum format, GLenum type, GLe
                 return tdCheckFormatCompat(tdFormatInfo(GL_STENCIL_INDEX8), format, type, TD_PIX_GETTEXIMAGE);
             return GL_INVALID_OPERATION;
         }
-        if (format == GL_RED)
-            return (type == GL_FLOAT) ? GL_NO_ERROR : GL_INVALID_OPERATION;
+        /* GL_RED / GL_FLOAT readback of a combined depth-stencil texture is NOT
+         * legal (GL 4.6 table 8.2: only DEPTH_COMPONENT / DEPTH_STENCIL client
+         * formats) — KHR-GL46.packed_pixels.varied_rectangle.depth24_stencil8
+         * expects an error for every non-depth/stencil format, GL_RED included.
+         * (stencil_texturing reads its R32F RESULT texture with RED/FLOAT, not the
+         * depth-stencil texture.) */
     }
     return tdCheckFormatCompat(f, format, type, TD_PIX_GETTEXIMAGE);
 }
@@ -607,14 +611,23 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
             if (op == TD_PIX_TEXIMAGE) return GL_INVALID_OPERATION;
             break;
         default:
-            /* stencil-indexed textures also answer GL_RED_INTEGER reads (the
-             * stencil-texturing readback form, KHR-GL46.stencil_texturing) */
-            if (tex_ds && !(tex_stencil && format == GL_RED_INTEGER)) return GL_INVALID_OPERATION;
-            /* integer formats need *_INTEGER client data and vice versa; the
-             * stencil-index internal formats predate that flag, so accept the
-             * GL_RED_INTEGER stencil-texturing read regardless */
-            if (((f->flags & TDF_INTEGER) != 0) != cf.integer &&
-                !(tex_stencil && format == GL_RED_INTEGER)) return GL_INVALID_OPERATION;
+            /* stencil-indexed textures also answer GL_RED_INTEGER READS (the
+             * stencil-texturing readback form, KHR-GL46.stencil_texturing).  The
+             * exception is readback-only and STENCIL-ONLY textures: GL_RED_INTEGER
+             * stays INVALID for uploads and for combined depth-stencil formats
+             * (KHR-GL46.packed_pixels.varied_rectangle.depth24_stencil8 /
+             * depth32f_stencil8 reject RED_INTEGER TexImage: table 8.11), whose
+             * stencil read goes through tdCheckGetFormatCompat's ds_mode branch */
+            {
+                bool stencil_read = (op == TD_PIX_GETTEXIMAGE && f->base == GL_STENCIL_INDEX &&
+                                     format == GL_RED_INTEGER);
+                if (tex_ds && !stencil_read) return GL_INVALID_OPERATION;
+                /* integer formats need *_INTEGER client data and vice versa; the
+                 * stencil-index internal formats predate that flag, so accept the
+                 * stencil-texturing read regardless */
+                if (((f->flags & TDF_INTEGER) != 0) != cf.integer && !stencil_read)
+                    return GL_INVALID_OPERATION;
+            }
             break;
     }
     if (op == TD_PIX_TEXIMAGE && f->base == GL_STENCIL_INDEX)

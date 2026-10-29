@@ -32,6 +32,8 @@
 #include "glwInitFunctions.hpp"
 
 #include <cstdlib>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 
 namespace tcu
 {
@@ -227,6 +229,51 @@ glu::RenderContext *MglContextFactory::createContext(const glu::RenderConfig &co
 }
 
 } // namespace
+
+/*--------------------------------------------------------------------
+ *  vk::Platform stub: the GL CTS asks the platform for the Vulkan
+ *  memory limits (scaleDimensionsToMemory) even in pure-GL tests; the
+ *  base-class default throws NotSupportedError, which those cases then
+ *  report as failures.  Only the limits are answered; a real Vulkan
+ *  library is not available (createLibrary throws, like the null
+ *  platform's other paths).
+ *------------------------------------------------------------------*/
+namespace
+{
+
+class MglVulkanPlatform : public vk::Platform
+{
+public:
+    virtual vk::Library *createLibrary(void) const
+    {
+        throw tcu::NotSupportedError("MGL is a GL-only platform (no Vulkan driver)", DE_NULL, __FILE__, __LINE__);
+    }
+
+    virtual void getMemoryLimits(vk::PlatformMemoryLimits &limits) const
+    {
+        int64_t memSize = 8ll * 1024 * 1024 * 1024; // fallback: 8 GB
+        size_t sz       = sizeof(memSize);
+        if (sysctlbyname("hw.memsize", &memSize, &sz, DE_NULL, 0) != 0 || memSize <= 0)
+            memSize = 8ll * 1024 * 1024 * 1024;
+
+        // Apple Silicon has unified memory: DEVICE_LOCAL counts against system
+        // memory, which the CTS expresses as totalDeviceLocalMemory = 0.
+        limits.totalSystemMemory                 = (size_t)(memSize / 2); // leave room for everything else
+        limits.totalDeviceLocalMemory            = 0;
+        limits.deviceMemoryAllocationGranularity = 256;
+        limits.devicePageSize                    = 16384;
+        limits.devicePageTableEntrySize          = 8;
+        limits.devicePageTableHierarchyLevels    = 3;
+    }
+};
+
+} // namespace
+
+const vk::Platform &Platform::getVulkanPlatform(void) const
+{
+    static MglVulkanPlatform platform;
+    return platform;
+}
 
 Platform::Platform(void)
 {

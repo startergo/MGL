@@ -60,7 +60,30 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
             if (!p) continue;
             SpirvResourceList *l = &p->spirv_resources_list[s][u->st[s].res_type];
             for (GLuint k = 0; k < l->count; k++)
-                if (l->list[k]._id == u->st[s].spv_id && u->st[s].elem_base == 0) l->list[k].binding = ((uint32_t *)u->shadow)[0];
+                if (l->list[k]._id == u->st[s].spv_id)
+                {
+                    if (u->st[s].elem_base == 0)
+                        l->list[k].binding = ((uint32_t *)u->shadow)[0];
+
+                    /* geom: image/sampler ARRAY elements are independent uniforms —
+                     * remember every element's unit (base+e is only the default) so the
+                     * renderers' array walks can honour strided units
+                     * (shader_image_load_store.advanced-sso-simple binds g_image[0..3]
+                     * to units 0,2,4,6).  The pipeline composite shares this array. */
+                    if (u->size > 1)
+                    {
+                        if (!l->list[k].unit_vals || l->list[k].array_size < (GLuint)u->size)
+                        {
+                            free(l->list[k].unit_vals);
+                            l->list[k].unit_vals = (GLuint *)calloc((size_t)u->size, sizeof(GLuint));
+                            if (l->list[k].unit_vals)
+                                l->list[k].array_size = (GLuint)u->size;
+                        }
+                        if (l->list[k].unit_vals)
+                            for (int e = 0; e < u->size; e++)
+                                l->list[k].unit_vals[e] = ((uint32_t *)u->shadow)[e];
+                    }
+                }
             ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_IMAGE_UNIT_STATE;
             continue;
         }
@@ -255,7 +278,7 @@ GLuint mgli_sampler_elem_unit(GLMContext ctx, Program *p, int stage, uint32_t sp
         }
         return def;
     }
-    return def;
+        return def;
 }
 
 GLint mgli_uniform_location(MGLIProgram *ip, const char *name)

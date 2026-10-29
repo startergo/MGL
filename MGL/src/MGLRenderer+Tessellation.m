@@ -1405,8 +1405,12 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
         for (GLuint e = 0; e < elems; e++)
         {
-            if (unit < 0 || (GLuint)(unit + e) >= TEXTURE_UNITS) continue;
-            ImageUnit *iu = &STATE(image_units[unit + e]);
+            /* geom/GL semantics: image-ARRAY elements are independent uniforms
+             * (glProgramUniform1i per element; see the render binder in MGLRenderer.m
+             * for the same rule) — element e's unit need not be base+e */
+            GLuint ue = mgl_res_elem_unit(sres, e);
+            if (ue >= TEXTURE_UNITS) continue;
+            ImageUnit *iu = &STATE(image_units[ue]);
             Texture *tex = iu->tex;
 
             if (!tex) continue;             /* unbound unit: legal GL, undefined results */
@@ -1418,6 +1422,12 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
                 [enc setTexture: texture atIndex: (NSUInteger)(sres->msl_binding + e)];
         }
     }
+
+    /* geom: those kernels' image ATOMICS run through the sidecar buffers SPIRV-Cross's
+     * emulation declared (`<name>_atomic [[buffer(N)]]`, SpirvResource.msl_atomic) —
+     * bind + seed them like the compute stage does, or the atomics write an unbound
+     * slot and are lost (shader_image_load_store.advanced-allStages-oneImage) */
+    [self2 geomBindStageImageAtomicsCompute: program encoder: enc stage: stage];
 }
 
 /* ---- index-scan cache ------------------------------------------------------------
@@ -2253,6 +2263,12 @@ static void tessRetireCapture(GLMContext ctx)
     [self geomRealizeStageTextures: prog_vs stage: _VERTEX_SHADER];
     if (prog_tcs) [self geomRealizeStageTextures: prog_tcs stage: _TESS_CONTROL_SHADER];
     if (prog_tes) [self geomRealizeStageTextures: prog_tes stage: _TESS_EVALUATION_SHADER];
+    /* geom: create + seed the stages' image-atomic sidecars while no encoder is open
+     * (the seed is its own compute pass, so it must precede the kernels' encoder;
+     * geomBindStageImageAtomicsCompute binds them inside tessBindStageTextures) */
+    [self geomPrepareStageImageAtomicsCompute: prog_vs stage: _VERTEX_SHADER];
+    if (prog_tcs) [self geomPrepareStageImageAtomicsCompute: prog_tcs stage: _TESS_CONTROL_SHADER];
+    if (prog_tes) [self geomPrepareStageImageAtomicsCompute: prog_tes stage: _TESS_EVALUATION_SHADER];
 
     if ((need_readback && !use_hardware) || debug_wait)
     {
@@ -2970,6 +2986,25 @@ static void tessRetireCapture(GLMContext ctx)
             free(err);
         }
         free(msl);
+    }
+
+    /* geom: when a geometry stage consumes the TES capture, geom_route_tess forced
+     * GL_RASTERIZER_DISCARD — the plain-TES draw below would re-run the TES body a
+     * SECOND time (its image atomics / SSBO stores would double:
+     * shader_image_load_store.advanced-allStages-oneImage) for output nobody reads;
+     * the capture kernel already executed the TES once per tessellated vertex.  Skip
+     * it and just retire the ring block. */
+    if (gpu_emulated && tp->capture && ctx->state.caps.rasterizer_discard == GL_TRUE)
+    {
+        int rslot = ring_slot;
+        id<MTLCommandBuffer> rcb = _currentCommandBuffer;
+
+        if (tRingTrace())
+            fprintf(stderr, "MGL ring: retire(capture-only; plain-TES draw skipped) slot=%d cb=%d\n",
+                    rslot, rcb ? (int)rcb.status : -1);
+        tessRingRetireOn(rcb, rslot);
+        ctx->state.dirty_bits = DIRTY_ALL;
+        return true;
     }
 
     /* GPU emulated path: render with an indirect draw; the patch-data blob was

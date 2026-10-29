@@ -21,6 +21,7 @@
 #include "mgl_ext_texext.h"   /* MGLTexExtInfo: buffer-texture writeback (r63) */
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_introspect.h"   /* mgli_sampler_elem_unit: image-array element -> its uniform's unit */
 #include "mgl_ext_tess.h"   /* MGLTessCapture debug dump in geom_xfb_dump */
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
@@ -2459,7 +2460,11 @@ void geom_xfb_gpu_reset(GLMContext ctx)
 
             for (GLuint e = 0; e < elems; e++)
             {
-                GLuint unit = sres->binding + e;
+                /* GL semantics: image/sampler ARRAY elements are independent uniforms
+                 * (mgli_sampler_elem_unit; see MGLRenderer.m) — element e's unit need
+                 * not be base+e */
+                GLuint unit = (types[t].image) ? mgl_res_elem_unit(sres, e)
+                                               : sres->binding + e;
 
                 if (unit >= TEXTURE_UNITS) continue;
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
@@ -3361,6 +3366,120 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     [enc endEncoding];
 }
 
+/* geom: the tessellation emulation's VS / TCS (and the TES-capture) kernels run as
+ * COMPUTE carrying their OWN stage's resource list (tessBindStageTextures,
+ * MGLRenderer+Tessellation.m) — the two helpers above only walk the current
+ * program's _COMPUTE_SHADER stage.  These (program, stage)-parameterized twins give
+ * those kernels the same sidecar binding and seeding; without them the kernels'
+ * imageAtomic* write an unbound `<name>_atomic` buffer argument and never land
+ * (shader_image_load_store.advanced-allStages-oneImage: every VS/TCS add lost). */
+- (bool) geomBindStageImageAtomicsCompute: (Program *) program
+                                   encoder: (id <MTLComputeCommandEncoder>) encoder
+                                     stage: (int) stage
+{
+    if (!encoder || !program) return false;
+    GLuint count = program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count;
+    for (GLuint i = 0; i < count; i++)
+    {
+        SpirvResource *sres = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+        GLuint unit = sres->binding, mtl_index = sres->msl_atomic;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+
+        if (mtl_index == 0xffffffffu) continue;    /* no atomic argument in the MSL */
+
+        if (elems > 1)
+        {
+            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems];
+            if (buf) [encoder setBuffer: buf offset: 0 atIndex: mtl_index];
+            continue;
+        }
+
+        for (GLuint e = 0; e < elems; e++)
+        {
+            ImageUnit *iu;
+            Texture *ptr;
+            id<MTLTexture> texture;
+            id<MTLBuffer> buf;
+
+            if (unit + e >= TEXTURE_UNITS) continue;
+            iu = &STATE(image_units[unit + e]);
+            ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            {   /* buffer-texture atomics mark the GL buffer GPU-written (as above) */
+                MGLTexExtInfo *bi = mgl_texext_info(ctx, ptr);
+                Buffer *gb = (bi && bi->kind == MGL_TEXEXT_BUFFER && bi->buffer_name)
+                             ? (Buffer *)searchHashTable(&ctx->state.buffer_table, bi->buffer_name) : NULL;
+
+                if (gb) mgl_buffers_mark_gpu_use(ctx, gb, true);
+            }
+            texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                      elemClass: sres->elem_class];
+            buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) continue;
+            [encoder setBuffer: buf offset: 0 atIndex: mtl_index + e];
+        }
+    }
+    return true;
+}
+
+/* create (and seed) those sidecars before the tess kernels' compute encoder opens —
+ * same shape as geomPrepareImageAtomicsCompute, but for an explicit (program, stage) */
+- (void) geomPrepareStageImageAtomicsCompute: (Program *) program stage: (int) stage
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    int pending[TEXTURE_UNITS];
+    int n_pending = 0;
+    id<MTLComputeCommandEncoder> enc = NULL;
+    GLuint count;
+
+    if (!g || !program) return;
+    count = program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count;
+
+    for (GLuint i = 0; i < count; i++)
+    {
+        SpirvResource *sres = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+        int b = (int)sres->binding;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+        GLuint mtl = sres->msl_atomic;
+
+        if (mtl == 0xffffffffu) continue;
+
+        if (elems > 1 && b >= 0 && (GLuint)b < TEXTURE_UNITS)
+        {
+            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems] &&
+                g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
+                pending[n_pending++] = b;
+            continue;
+        }
+
+        for (GLuint e = 0; e < elems && b >= 0; e++)
+        {
+            GLuint unit = (GLuint)(b + e);
+            ImageUnit *iu;
+            Texture *ptr;
+            id<MTLTexture> view;
+
+            if (unit >= TEXTURE_UNITS) break;
+            iu = &STATE(image_units[unit]);
+            ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            view = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                    elemClass: sres->elem_class];
+            if (![self geomImageAtomicBuffer: unit view: view]) continue;   /* creates + flags */
+            if (g->img_atom[unit].needs_seed && n_pending < TEXTURE_UNITS)
+                pending[n_pending++] = (int)unit;
+        }
+    }
+
+    if (!n_pending) return;
+
+    enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc) return;
+    for (int i = 0; i < n_pending; i++)
+        [self geomSeedImageAtomic: pending[i] encoder: enc];
+    [enc endEncoding];
+}
+
 /* the generated variants number their texture arguments themselves (geom_build_pins):
  * the walks look up the Metal slot by resource name; msl_binding is only the fallback */
 static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
@@ -3476,7 +3595,10 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
             if (spirv_binding < 0) continue;
             for (int e = 0; e < cnt; e++)
             {
-                int unit = spirv_binding + e;
+                /* GL semantics: image-ARRAY elements are independent uniforms
+                 * (mgli_sampler_elem_unit; see MGLRenderer.m) */
+                int unit = (types[t].image) ? (int)mgl_res_elem_unit(sres, (GLuint)e)
+                                            : spirv_binding + e;
 
                 if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
@@ -3710,7 +3832,10 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
 
                 for (int e = 0; e < n; e++)
                 {
-                    int unit = spirv_binding + e;
+                    /* GL semantics: image-ARRAY elements are independent uniforms
+                     * (mgli_sampler_elem_unit; see MGLRenderer.m) */
+                    int unit = (types[t].image) ? (int)mgl_res_elem_unit(sres, (GLuint)e)
+                                                : spirv_binding + e;
                     if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
 
                     Texture *tex = types[t].image ? STATE(image_units[unit].tex)
