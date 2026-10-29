@@ -2146,9 +2146,111 @@ READY (this session): 229c1b4 + the report/harness commit on top of it (no MGL
 code changes in the latter) — gate 619 PASS / 0 FAIL, 9715 checks,
 test_geom_xfbperf quarantined (supervisor 23:42); ab_bench + glmark2 parity vs
 baseline-48a41ef on the fixed harness.  Claimed work in the tip: efbce1b
-(texture_buffer.atomic_functions) + the gl_spirv tessGeom fix (48a41ef, landed by
+(texture_buffer.atomic.functions) + the gl_spirv tessGeom fix (48a41ef, landed by
 the lead) + merge resolutions; c0cfdc8 reverted.
 
 ### Next (supervisor queue)
 shader_storage_buffer_object.advanced-switchBuffers and
+[HEAD
 .advanced-indirectAddressing-case2 (fail identically on baseline-48a41ef).
+
+## Session 26 addendum (00:05-00:35 EDT) — primitive_coverage root cause: PSO key
+ignored the tessellation stages; FIXED (tessellation_shader 58/58)
+
+Supervisor forward (tess's r30 report): KHR-GL46.tessellation_shader.single.
+primitive_coverage "renders channel-reversed pixels".  Investigation:
+
+* The two colours are exact RGBA reverses BY DESIGN: the test stencil-marks the
+  tessellated patch's coverage (GL_NEVER+REPLACE), then draws reference triangles
+  with GL_NOTEQUAL — any pixel left at stencil_pass_color (32,64,128,255) is a
+  HOLE in tessellated coverage vs the reference rasterization.  One pixel
+  (index 8188 of 2048x2048), 4 sub-iterations.  Not a swizzle bug.
+* Reproduced on baselines: b7821df Pass, c6ded7d Fail (both via MGL_LIBRARY).
+  c6ded7d is a single commit on b7821df, so bisected by content in a detached
+  worktree build: reverting only the two mglProgramRegisterMSLIdentity call
+  sites (MGLRenderer.m bindMTLProgram, MGLRenderer+RenderState.m specialize
+  install) to no-ops makes c6ded7d PASS — the fnid registration is the trigger.
+* Root cause (my s23 change): the registration made these programs ELIGIBLE for
+  the compat pipeline fast path, whose key.a hashes ONLY the VS/FS/GEOM stage
+  function identities.  For a tessellated draw the PSO's vertex function IS the
+  TES (MGLRenderer.m swaps the kernel-typed vertex function for
+  shader_slots[_TESS_EVALUATION_SHADER]->mtl_data.function) — the quad-tess and
+  triangle-tess programs in this test share IDENTICAL VS+FS MSL, so their keys
+  collided and the second program drew with the first program's PSO; its
+  coverage differed from the reference draw by one pixel.  (b7821df passed only
+  because the unregistered functions made the fast path decline.)
+* Fix (MGLRenderer+Compat.m): key.a now mixes the TCS and TES function
+  identities as well (id[5], two more odd multipliers; attached-but-unregistered
+  tess stages still decline the fast path).  Non-tess programs: unchanged key,
+  cost = two NULL slot tests.
+
+Verification on the fixed tip:
+* primitive_coverage: Pass x3 (c6ded7d+fix detached, branch tip x2).
+* KHR-GL46 tessellation_shader **58/58 Pass** (was 57/58; 4m35s).
+* separable_programs_tf 2/2, shader_group_vote 5/5, gl_spirv 9/9,
+  texture_buffer 16/16 — no regressions.
+* Full headless gate (test_geom_xfbperf quarantined (supervisor 23:42)):
+  **619 PASS / 0 FAIL**, 9715 checks, rc=0.
+* Perf: no new measurement — machine load 5.9-9.9 (other worker trees active;
+  a locked glmark2 sanity under that load swung 4x and is meaningless).  The
+  fix adds two NULL tests for non-tess programs, so the 23:44 parity numbers
+  (fixed harness) still describe this tip for everything glmark2/ab_bench run.
+---- (below: compat-worker session 26 continues)
+.advanced-indirectAddressing-case2 (fail identically on baseline-48a41ef).
+
+
+## Session 26 final (01:00-01:20 EDT) — SSBO advanced-switchBuffers / indirectAddressing FIXED; merge gl46-port 3cd6208
+
+Both queued pre-existing fails were ONE bug, in my drawfast gate (MGLRenderer+Compat.m):
+
+* DIRTY_BUFFER_BASE_STATE was listed in MGL_DF_REDUNDANT ("processing proven
+  redundant by the content gates below") — but no content gate covered the four
+  INDEXED binding tables (UBO / uniform-constant / SSBO / ACB).  A
+  glBindBufferBase / glBindBufferRange between draws of one program therefore
+  skipped mapGLBuffersToMTLBufferMap, the fast path re-bound the LATCHED map
+  lists, and every following draw kept reading the first draw's buffer object.
+  Repro (tests/headless/test_ssbo_switch.c): 4 quads from 4 SSBOs — only the
+  first drew; with glFinish between draws the stale binding lagged visibly.
+* Fix: gate 26 — when DIRTY_BUFFER_BASE_STATE stands, memcmp the four tables
+  against the snapshot and MISS(26) to the full walk when any content moved;
+  the latch snapshots them (compare-first).  Same-buffer rebinds compare equal
+  and still skip; steady-state draws have the bit clear and pay nothing.
+  MGL_BINDMAP=0 and MGL_BIND_SHADOW=0 both still failed, which is how the gate
+  (not the bindmap prefix cache / bind shadow) was isolated.
+* CTS: shader_storage_buffer_object.advanced-switchBuffers,
+  .advanced-indirectAddressing-case1 and -case2 all Pass;
+  shader_storage_buffer_object.* 124/124.
+* tests/headless/test_ssbo_switch.c: bindBase / bindRange / finish loops, 12
+  checks.  (Data layout note: std430 puts vec3 color at +16 of the 32-byte
+  VertexData record — a probe writing it at +8 makes every quad render its
+  red channel only, which cost one debug round.)
+
+### merge gl46-port 3cd6208 (supervisor 01:03)
+
+Merged as 4f136c3 (report conflict only, both narratives kept).  On the merged
+tip, clean build rc=0 and re-verified: primitive_coverage 1/1, SSBO switch /
+indirectAddressing-case1/-case2 Pass, separable_programs_tf 2/2,
+shader_group_vote 5/5, gl_spirv 9/9, texture_buffer 16/16, tessellation_shader
+58/58 (from the PSO-key fix below).  Full headless gate:
+**620 PASS / 0 FAIL**, 9727 checks, rc=0
+(test_geom_xfbperf quarantined (supervisor 23:42) — file moved aside for the run
+only, restored after, nothing committed).
+
+### A/B vs baseline-3cd6208 (fixed harness; machine load 4-6 from parallel trees)
+
+* ab_bench (min-of-9, two runs): m0 +3.1% then +16.9%, m1 +2.2% then -10.4% —
+  the noise floor between runs (base m0 min 9.4 vs 11.7) is larger than any
+  delta; nothing in the delta (revert, PSO-key fix, gate-26) executes on the
+  m0/m1 paths (no indexed respec between draws).  Parity within noise.
+* locked glmark2 (interleaved, alternating order, load ~6): ideas 760/837 vs
+  707/807, jellyfish 5523/5291 vs 5407/5271, gl41-geometry 1872/1851 vs
+  1951/1871 — parity (mine >= base on ideas/jellyfish, -1..-4% on
+  gl41-geometry).
+
+READY (session 26 final): 4f136c3 + report commit on top (no code change) —
+merge of gl46-port 3cd6208; PSO fast-path key includes TCS/TES
+(tessellation_shader 57/58 -> 58/58); drawfast gate re-enumerates on indexed
+respec (SSBO group 124/124); c0cfdc8 reverted; A/B harness defect found and
+fixed (abbench had been loading the same dylib on both sides).  Gate 620 PASS /
+0 FAIL (9717 checks + test_ssbo_switch 12 = 9727), test_geom_xfbperf
+quarantined (supervisor 23:42).  ab_bench + glmark2 parity vs baseline-3cd6208.

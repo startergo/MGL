@@ -477,12 +477,25 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
      * not run) or a function the registry does not know (registry degraded)
      * declines the fast path; the descriptor path then compiles and caches. */
     {
-        Shader *ss[3];
+        Shader *ss[5];
         ss[0] = ctx->state.program->shader_slots[_VERTEX_SHADER];
         ss[1] = ctx->state.program->shader_slots[_FRAGMENT_SHADER];
         ss[2] = ctx->state.program->shader_slots[_GEOMETRY_SHADER];
-        uint64_t id[3] = {1, 1, 1};
-        for (int i = 0; i < 3; i++)
+        /* tess: the evaluation shader IS the pipeline's vertex function for a
+         * tessellated draw (MGLRenderer.m: the kernel-typed vertex function is
+         * swapped for shader_slots[_TESS_EVALUATION_SHADER]->mtl_data.function,
+         * or the TES-derived plain_function for emulated domains), and the
+         * control shader feeds the tess kernel — two programs that share VS+FS
+         * MSL but differ in TCS/TES therefore get DIFFERENT pipelines from the
+         * same source stages. KHR-GL46.tessellation_shader.single.primitive_
+         * coverage draws exactly that (a quad-tess and a triangle-tess program
+         * with identical VS/FS): without the tess stages in the key the second
+         * program reused the first program's PSO and its coverage differed
+         * from the reference draw by one pixel (a stencil-flagged hole). */
+        ss[3] = ctx->state.program->shader_slots[_TESS_CONTROL_SHADER];
+        ss[4] = ctx->state.program->shader_slots[_TESS_EVALUATION_SHADER];
+        uint64_t id[5] = {1, 1, 1, 1, 1};
+        for (int i = 0; i < 5; i++)
         {
             if (!ss[i])
                 continue;                 /* stage not attached: contributes the neutral 1 */
@@ -501,7 +514,9 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
         }
         key.a = id[0]
               ^ id[1] * 0x100000001B3ULL
-              ^ id[2] * 0xC2B2AE3D27D4EB4FULL;
+              ^ id[2] * 0xC2B2AE3D27D4EB4FULL
+              ^ id[3] * 0xD6E8FEB86659FD93ULL
+              ^ id[4] * 0x9E3779B97F4A7C15ULL;
     }
     /* pipeline-baked rstate by CONTENT hash, not by the monotonic generation
      * counter: alternating blend / mask states must produce the same two keys
@@ -1010,6 +1025,15 @@ struct MGLCompatDrawSnap {
     MGLCurrentAttrib current[MAX_ATTRIBS];      /* generic vertex attribs (const streams) */
     const void *tex[TEXTURE_UNITS], *samp[TEXTURE_UNITS];
     void *tex_mtl[TEXTURE_UNITS], *tex_par[TEXTURE_UNITS], *samp_par[TEXTURE_UNITS];
+    /* indexed binding tables (gate 26): DIRTY_BUFFER_BASE_STATE stands between
+     * draws that re-point an indexed binding (glBindBufferBase/Range on UBO /
+     * SSBO / ACB), and the skip path never re-runs mapGLBuffersToMTLBufferMap,
+     * so the map lists — and with them the encoder's buffer bindings — would
+     * keep the buffer object from the latched draw (KHR-GL46.shader_storage_
+     * buffer_object.advanced-switchBuffers: 4 draws of one program through 4
+     * SSBOs all read the first buffer).  The gate compares the tables' content
+     * and only takes the full walk when it actually moved. */
+    BufferBase   bb_ub, bb_uc, bb_ssbo, bb_atom;
 };
 
 struct MGLCompatDrawFast {
@@ -1026,7 +1050,7 @@ struct MGLCompatDrawFast {
     GLuint      end_vn, end_fn;
 
     /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
-    uint64_t    misswhy[26];
+    uint64_t    misswhy[27];
     uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
     uint64_t    dirtymask_val[8];
 
@@ -1264,6 +1288,18 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
             }
         }
         MGL_DF_MISS(1);
+    }
+    /* gate 26: an indexed respec is NOT redundant unless the tables' content is
+     * unchanged — a re-pointed UBO/SSBO/ACB binding must reach a fresh
+     * mapBuffersToMTL enumeration, not the latched map lists (see the snap
+     * struct's bb_* comment).  Same-buffer rebinds compare equal and skip on. */
+    if (ctx->state.dirty_bits & DIRTY_BUFFER_BASE_STATE)
+    {
+        if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0 ||
+            memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
+            memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
+            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0)
+            MGL_DF_MISS(26);
     }
     /* ...and only for the three PreDraw hooks this gate reasons about */
     /* session 17: the hook table is filled during context setup; re-count at
@@ -1519,6 +1555,17 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
      * memcmp instead of a copy; only changed groups are written back. */
     if (memcmp(s->image_units, ctx->state.image_units, sizeof(s->image_units)) != 0)
         memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
+
+    /* gate 26 inputs: the four indexed binding tables (compare-first like the
+     * groups above; only a table that actually moved is written back) */
+    if (memcmp(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase)) != 0)
+        memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
+    if (memcmp(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase)) != 0)
+        memcpy(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase));
+    if (memcmp(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase)) != 0)
+        memcpy(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
+    if (memcmp(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase)) != 0)
+        memcpy(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
 
     compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
     compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
