@@ -729,6 +729,20 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS:
         case GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS:
         case GL_MAX_FRAGMENT_IMAGE_UNIFORMS:
+            /* Metal caps textures with access::read_write at 8 per function
+             * (probed on fragment AND compute functions: 'number of textures
+             * with read_write access exceeds maximum supported (8)'; read-only
+             * and write-only bindings are plentiful, but a load+store image
+             * needs read_write).  These stages must compile as one Metal
+             * function holding both loads and stores (fragment/vertex are real
+             * functions; tcs/tes/gs are compute kernels —
+             * KHR-GL46.shader_image_load_store.multiple-uniforms links a
+             * program using gl_Max<Stage>ImageUniforms load+store images per
+             * stage), so report the ARB_shader_image_load_store floor of 8 for
+             * them.  The compute stage keeps the full unit count: its images
+             * are typically access-decorated (KHR-GL46.gl_spirv links a
+             * compute shader with 10 active image uniforms). */
+            PUT1(8);
         case GL_MAX_COMPUTE_IMAGE_UNIFORMS:
             /* every per-stage limit is capped by GL_MAX_IMAGE_UNITS (an active image
              * variable consumes one unit in its stage — ARB_shader_image_load_store);

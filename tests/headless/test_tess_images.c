@@ -73,13 +73,17 @@ static bool check(GLint *tcs_out, GLint *tes_out)
 
 TEST(tess_image_uniforms)
 {
-    /* follows GL_MAX_IMAGE_UNITS (16): KHR-GL46.gl_spirv.spirv_validation_capabilities
-     * links a compute shader with 10 active image uniforms and expects success */
+    /* the tess stages are Metal compute kernels, and Metal caps access::
+     * read_write textures at 8 per function (probed); KHR-GL46.shader_image_
+     * load_store.multiple-uniforms links tcs/tes programs with
+     * gl_MaxTess*ImageUniforms load+store images, so the stages report the
+     * ARB_shader_image_load_store floor of 8 (compute keeps 16 for the
+     * access-decorated image sets of KHR-GL46.gl_spirv) */
     GLint v = -1;
     glGetIntegerv(GL_MAX_TESS_CONTROL_IMAGE_UNIFORMS, &v);
-    EXPECT_EQ_INT(v, 16);
+    EXPECT_EQ_INT(v, 8);
     glGetIntegerv(GL_MAX_TESS_EVALUATION_IMAGE_UNIFORMS, &v);
-    EXPECT_EQ_INT(v, 16);
+    EXPECT_EQ_INT(v, 8);
 }
 
 static void setup(GLuint *res_tcs, GLuint *res_tes, GLuint *src2d, GLuint *srccube)

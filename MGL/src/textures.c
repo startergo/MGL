@@ -1926,6 +1926,112 @@ static bool uploadRGTC(GLMContext ctx, Texture *tex, GLuint face, GLuint level, 
     return ok;
 }
 
+/*
+ * Online compression for sub-images: uncompressed client data written into a
+ * REAL compressed level (texStorage'd RGTC / BPTC).  The client data is
+ * converted to the encoder's input layout and encoded to blocks, which are
+ * then stored block-aligned exactly like an explicit glCompressedTexSubImage —
+ * so the level keeps its hardware blocks and glGetCompressedTexImage reads
+ * them back byte-exact (GL 4.6 8.5.3: "the GL will compress").
+ * The caller has already validated the region and its block alignment.
+ */
+static bool uploadOnlineCompressed(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
+                                   GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                                   GLenum format, GLenum type, const void *pixels)
+{
+    const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
+    TDStorage st;
+    const uint8_t *src = (const uint8_t *)pixels;
+    TDPixelStore ps;
+    uint8_t *heap = NULL, *blocks = NULL;
+    size_t need = (size_t)w * h * (size_t)(d > 0 ? d : 1);
+    bool ok = false;
+
+    if (!f || !need || need > SIZE_MAX / 16)
+        return false;
+
+    ps = pixelStore(ctx, true);
+    if (isRgtcFormat(f) || (isBptcFormat(f) && !(f->flags & TDF_BPTC_FLOAT)))
+    {
+        /* byte path: RGTC wants one or two 8-bit planes, BC7 wants RGBA8 */
+        size_t row = (size_t)w * 4;
+        st.row_pitch = row;
+        st.image_pitch = row * h;
+        st.s_row_pitch = st.s_image_pitch = 0;
+        st.data = st.stencil = NULL;
+        heap = (uint8_t *)malloc(need * 4);
+        if (!heap)
+            return false;
+        st.data = heap;
+    }
+    else
+    {
+        /* float path: BC6H takes RGBA32F */
+        size_t row = (size_t)w * 16;
+        st.row_pitch = row;
+        st.image_pitch = row * h;
+        st.s_row_pitch = st.s_image_pitch = 0;
+        st.data = st.stencil = NULL;
+        heap = (uint8_t *)malloc(need * 16);
+        if (!heap)
+            return false;
+        st.data = heap;
+    }
+
+    {
+        size_t c_off, c_row, c_img;
+        bool wd = true, ws = true;
+        GLenum dst_ifmt = (isBptcFormat(f) && (f->flags & TDF_BPTC_FLOAT)) ? GL_RGBA32F : GL_RGBA8;
+        tdClientLayout(&ps, format, type, w, h, d, d > 1, &c_off, &c_row, &c_img);
+        tdUnpack(tdFormatInfo(dst_ifmt), src + c_off, c_row, c_img, format, type, ps.swap_bytes,
+                 w, h, d, &st, &wd, &ws);
+    }
+
+    if (isRgtcFormat(f))
+    {
+        int nch = (f->base == GL_RG) ? 2 : 1;
+        bool snorm = (f->comp_type == GL_SIGNED_NORMALIZED);
+        uint8_t *planes[2] = { NULL, NULL };
+        planes[0] = (uint8_t *)malloc(need);
+        if (nch == 2) planes[1] = (uint8_t *)malloc(need);
+        if (planes[0] && (nch == 1 || planes[1]))
+        {
+            size_t pr = (size_t)w;
+            for (GLsizei zz = 0; zz < (d > 0 ? d : 1); zz++)
+                for (GLsizei yy = 0; yy < h; yy++)
+                {
+                    const uint8_t *r = heap + (size_t)zz * st.image_pitch + (size_t)yy * st.row_pitch;
+                    uint8_t *q0 = planes[0] + (size_t)zz * pr * h + (size_t)yy * pr;
+                    uint8_t *q1 = planes[1] ? planes[1] + (size_t)zz * pr * h + (size_t)yy * pr : NULL;
+                    for (GLsizei xx = 0; xx < w; xx++)
+                    {
+                        q0[xx] = r[xx * 4];
+                        if (q1) q1[xx] = r[xx * 4 + 1];
+                    }
+                }
+            blocks = tdEncodeRGTC(planes[0], planes[1], w, h, d, (size_t)w, (size_t)w * h, nch == 2, snorm);
+        }
+        free(planes[0]);
+        free(planes[1]);
+    }
+    else if (f->flags & TDF_BPTC_FLOAT)
+    {
+        blocks = tdEncodeBPTCFloat((const float *)heap, w, h, d, (size_t)w * 16, (size_t)w * h * 16,
+                                   (f->flags & TDF_SIGNED) ? 1 : 0);
+    }
+    else if (isBptcFormat(f))
+    {
+        blocks = tdEncodeBPTCUnorm(heap, w, h, d, (size_t)w * 4, (size_t)w * h * 4);
+    }
+
+    if (blocks)
+        ok = storeCompressed(ctx, tex, face, level, x, y, z, w, h, d, blocks);
+    free(blocks);
+    free(heap);
+    return ok;
+}
+
+
 void mglTexImage1D(GLMContext ctx, GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const void *pixels)
 {
     texImage(ctx, target, 1, level, internalformat, width, 1, 1, border, format, type, pixels);
@@ -1983,8 +2089,39 @@ static void texSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLi
     err = tdCheckFormatCompat(f, format, type, TD_PIX_SUBIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
 
-    /* uncompressed data into a compressed texture would need an encoder */
-    TD_CHECK(!(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+    /* uncompressed data into a compressed texture: online compression.  The GL
+     * compresses the data on the fly (GL 4.6 8.5.3); MGL has CPU block encoders
+     * for the RGTC and BPTC families (every core view class with a compressed
+     * member), so a texStorage'd level keeps real hardware blocks.  Families
+     * without an encoder (ETC2/EAC) stay rejected. */
+    if (f->flags & TDF_COMPRESSED)
+    {
+        bool online = isRgtcFormat(f) || isBptcFormat(f);
+        TextureLevel *lvl = texLevel(tex, face, level);
+
+        TD_CHECK(online, GL_INVALID_OPERATION);
+        TD_CHECK(lvl, GL_INVALID_OPERATION);
+        /* same block-alignment rules as CompressedTexSubImage */
+        TD_CHECK((x % f->block_w) == 0 && (y % f->block_h) == 0, GL_INVALID_OPERATION);
+        TD_CHECK((w % f->block_w) == 0 || (GLuint)(x + w) == lvl->width, GL_INVALID_OPERATION);
+        TD_CHECK((h % f->block_h) == 0 || (GLuint)(y + h) == lvl->height, GL_INVALID_OPERATION);
+
+        if (w == 0 || h == 0 || d == 0)
+            return;
+
+        TDPixelStore ps = pixelStore(ctx, true);
+        size_t extent = tdClientLayout(&ps, format, type, w, h, d, dims == 3, NULL, NULL, NULL);
+        uint8_t *src = NULL;
+
+        err = resolveClientPtr(ctx, true, pixels, extent, typeAlign(type), &src, NULL);
+        TD_CHECK(err == GL_NO_ERROR, err);
+        if (!src)
+            return;
+
+        if (!uploadOnlineCompressed(ctx, tex, face, level, x, y, z, w, h, d, format, type, src))
+            TD_ERR(GL_OUT_OF_MEMORY);
+        return;
+    }
 
     if (w == 0 || h == 0 || d == 0)
         return;
@@ -2931,6 +3068,7 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
                         bool whole, bool is3d, size_t dst_skip)
 {
     GLenum err;
+    Texture *qview = tex;
 
     tex = view_redirect(ctx, tex, &face, &level, &z);
 
@@ -2988,11 +3126,22 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
 
     if (sf->flags & TDF_COMPRESSED)
     {
-        /* decompress on the GPU into RGBA32F, then pack */
+        /* decompress on the GPU into RGBA32F, then pack.  A view whose own
+         * internalformat differs from the root's decodes with the VIEW's
+         * decoder (BC6H float <-> ufloat, sRGB <-> linear): pass the view
+         * record through; the download builds its format-cast view over the
+         * root's storage with root-relative region coordinates. */
+        Texture *dtex = tex;
+        if (qview != tex)
+        {
+            const TDFormat *vf = tdFormatInfo(qview->internalformat);
+            if (vf && (vf->flags & TDF_COMPRESSED))
+                dtex = qview;
+        }
         size_t texels = (size_t)w * h * d;
         float *rgba = (float *)malloc(texels * 16 + 16);
         TD_CHECK(rgba, GL_OUT_OF_MEMORY);
-        if (!TDM(ctx) || !TDM(ctx)->download_decoded || !TDM(ctx)->download_decoded(ctx, tex, &r, rgba))
+        if (!TDM(ctx) || !TDM(ctx)->download_decoded || !TDM(ctx)->download_decoded(ctx, dtex, &r, rgba))
         {
             free(rgba);
             TD_ERR(GL_INVALID_OPERATION);

@@ -109,6 +109,10 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     /* compat CS: every recorded packet must be encoded before this commit */
     [self compatCSDrain];
 
+    /* geom: 3D image-unit shadow planes must land in their 3D texture before
+     * the buffer commits (geom3DImageShadowSync refreshes them per draw) */
+    [self geom3DImageShadowFlush];
+
     if ((__bridge void *)cmdbuf == (__bridge void *)_currentCommandBuffer)
         [self extBufSerial];
 
@@ -419,6 +423,11 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
     uint64_t prof_t0 = mgl_prof_begin(0);
     [self extBufEnsureCommandBuffer];
+
+    /* geom: non-layered image2D bindings of 3D textures run through 2D shadow
+     * planes; refresh them (and write back stale ones) BEFORE the state walk
+     * creates this draw's render encoder.  No-op unless a unit binds 3D. */
+    [self geom3DImageShadowSync];
 
     uint64_t t12 = mgl_prof_begin(12);
     if (![self processGLState: true])

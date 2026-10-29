@@ -159,6 +159,13 @@ void tdDecodeRGTC(const TDFormat *f, const void *blocks, int w, int h, void *dst
  * BC5 (RGTC1 / RGTC2, signedness per snorm) blocks; NULL on allocation failure. */
 uint8_t *tdEncodeRGTC(const uint8_t *chan0, const uint8_t *chan1, int w, int h, int d,
                       size_t rw, size_t iw, bool two_channel, bool snorm);
+/* BPTC encoders (BC6H mode 10 / BC7 mode 6, one subset): online compression of
+ * uncompressed client data into compressed BPTC storage.  Input is interleaved
+ * RGBA (floats for BC6H, bytes for BC7) with byte row/image pitches; the
+ * return is a malloc'd block buffer (free() it). */
+uint8_t *tdEncodeBPTCFloat(const float *rgba, int w, int h, int d, size_t row, size_t img, int isign);
+uint8_t *tdEncodeBPTCUnorm(const uint8_t *rgba, int w, int h, int d, size_t row, size_t img);
+
 
 /* half <-> float */
 float    tdHalfToFloat(uint16_t h);

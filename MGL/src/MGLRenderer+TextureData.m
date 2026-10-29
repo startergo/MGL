@@ -17,6 +17,8 @@
 #include "mgl_ext_texparam.h"
 #include "mgl_ext_fb.h"
 #import "MGLRenderer+TextureExt.h"
+#import "mgl_ext_texext.h"
+extern uint32_t mtlFormatForGLInternalFormat(GLenum internal_format);
 #include "texdata_formats.h"
 
 static char kTDDecodePipeline;
@@ -240,6 +242,9 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
 - (bool) texdataDownload:(id<MTLTexture>)texture tex:(Texture *)tex format:(const TDFormat *)sf
                   region:(const TDRegion *)r dst:(const TDStorage *)dst
 {
+    /* flush a pending 3D image-unit shadow plane before reading the storage */
+    [self geom3DImageShadowFlushTexture:tex];
+
     bool compressed = (sf->flags & TDF_COMPRESSED) != 0;
     bool is3d = texture.textureType == MTLTextureType3D;
     NSUInteger slices = is3d ? 1 : (NSUInteger)r->d;
@@ -485,10 +490,31 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
 
 - (bool) texdataDownloadDecoded:(Texture *)tex region:(const TDRegion *)r dst:(float *)dst
 {
-    if (![self texdataRealize:tex] || !tex->mtl_data)
+    /* a 3D texture with a pending image-unit shadow plane must be written back
+     * before its storage is decoded (geom domain) */
+    [self geom3DImageShadowFlushTexture:tex];
+
+    /* A GL view (texext) whose internalformat differs from the root's (BC6H
+     * float <-> ufloat, sRGB <-> linear, view classes) must decode with the
+     * VIEW's decoder: build the decode view over the ROOT's storage so the
+     * region stays root-relative, and take the pixel format from the view. */
+    Texture *owner = tex;
+
+    {
+        MGLTexExtInfo *xinfo = mgl_texext_info(ctx, tex);
+        if (xinfo && xinfo->kind == MGL_TEXEXT_VIEW && xinfo->view_root)
+        {
+            Texture *root = xinfo->view_root;
+            if (![self texdataRealize:root] || !root->mtl_data)
+                return false;
+            owner = root;
+        }
+    }
+
+    if (![self texdataRealize:owner] || !owner->mtl_data)
         return false;
 
-    id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)owner->mtl_data;
     if (texture.textureType == MTLTextureType3D)
         return false;
 
@@ -498,6 +524,8 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
 
     /* GetTexImage returns stored values: read sRGB formats through their linear variant */
     MTLPixelFormat pf = texture.pixelFormat;
+    if (owner != tex)
+        pf = (MTLPixelFormat)mtlFormatForGLInternalFormat(tex->internalformat);
     switch (pf)
     {
         case MTLPixelFormatBC1_RGBA_sRGB: case MTLPixelFormatBC2_RGBA_sRGB: case MTLPixelFormatBC3_RGBA_sRGB:
@@ -523,7 +551,7 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
     {
         id<MTLTexture> view = [texture newTextureViewWithPixelFormat:pf textureType:MTLTextureType2D
                                                               levels:NSMakeRange(r->level, 1)
-                                                              slices:NSMakeRange(td_slice(tex, r->face, r->z + z), 1)];
+                                                              slices:NSMakeRange(td_slice(owner, r->face, r->z + z), 1)];
         if (!view)
         {
             [enc endEncoding];

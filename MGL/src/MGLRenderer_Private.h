@@ -187,6 +187,12 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
  * returns `base` unchanged when no slicing is needed.  Shared by the render, compute,
  * geometry and tessellation image-binding paths. */
 - (id<MTLTexture>) geomImageUnitView: (const ImageUnit *) iu base: (id<MTLTexture>) base;
+/* geom: non-layered image2D bindings of 3D textures alias one z-slice through
+ * a 2D shadow plane (Metal has no 3D<->2D view/blit).  Sync at draw start,
+ * flush pending stores at commit and before reads of the 3D texture. */
+- (void) geom3DImageShadowSync;
+- (void) geom3DImageShadowFlush;
+- (void) geom3DImageShadowFlushTexture: (Texture *) tex;
 /* geom: like geomImageUnitView, then reinterpret the texels as the image unit's `format`
  * argument (glBindImageTexture) through a Metal pixel-format view when it differs from
  * the texture's internal format — GL 4.6 §8.26 lets a unit read, say, an R32I texture as

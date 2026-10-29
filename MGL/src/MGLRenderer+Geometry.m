@@ -1335,6 +1335,12 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
     return [r geomCanAssembleGPU];
 }
 
+/* (defined in MGLRenderer+Draw.m; declared here so this category can create a
+ * command buffer for shadow copies at readback time) */
+@interface MGLRenderer (Geom3DShadowPriv)
+- (void) extBufEnsureCommandBuffer;
+@end
+
 @implementation MGLRenderer (Geometry)
 
 /* ---------------- the transform feedback pack, Metal side ---------------- */
@@ -2142,6 +2148,289 @@ void geom_xfb_gpu_reset(GLMContext ctx)
  * texturecube_array, texture3d ...); a non-layered binding of an arrayed target becomes
  * a single-slice 2D/1D view for the shader's non-arrayed image type.  Returns `base`
  * unchanged when no slicing is needed (level-0, whole texture, buffer textures). */
+#pragma mark - 3D image units: 2D shadow planes
+
+/* A non-layered image2D binding of a GL_TEXTURE_3D must alias one z-slice as a
+ * 2D image.  Metal offers no path for that (probes in zz_*): no 3D->2D texture
+ * view (validation aborts), no 3D<->2D blit (silently no-ops), and a 3D texture
+ * bound into a texture2d argument silently kills the whole dispatch.  The slice
+ * therefore runs through a 2D SHADOW texture: geom3DImageShadowSync (start of
+ * every draw) copies the bound slice 3D->2D with a typed compute kernel, the
+ * image unit binds the shadow, and pending stores are written 2D->3D when the
+ * unit rebinds elsewhere, at buffer commit, and before any read of the 3D
+ * texture (downloads).  Copy kernels are generated per MSL texel type from the
+ * texture's GL format; unorm/snorm/float/integer formats round-trip exactly,
+ * sRGB storage is copied through its linear variant (GL image access bypasses
+ * sRGB decode).  Limitation: sampling the 3D texture in the SAME draw that
+ * writes its shadowed image unit cannot see the pending stores (GL itself
+ * leaves that race undefined). */
+
+static NSMutableDictionary *gPlanePsoCache = nil;
+static id<MTLTexture> g3DShadowTex[TEXTURE_UNITS];
+static id<MTLTexture> g3DShadowBase[TEXTURE_UNITS];   /* retained 3D base of the shadow */
+static void *g3DShadowOwner[TEXTURE_UNITS];
+static GLuint g3DShadowLevel[TEXTURE_UNITS], g3DShadowLayer[TEXTURE_UNITS];
+static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
+
+- (const char *) geom3DPlaneMslType: (GLenum) internalformat
+{
+    const TDFormat *f = tdFormatInfo(internalformat);
+
+    if (!f || (f->flags & TDF_COMPRESSED))
+        return NULL;
+    if (f->base != GL_RED && f->base != GL_RG && f->base != GL_RGB && f->base != GL_RGBA)
+        return NULL;
+    /* Metal texture templates take the SCALAR channel type; the vector width
+     * follows the pixel format automatically (read/write use vec<T,4>) */
+    if (f->comp_type == GL_INT)
+        return "int";
+    if (f->comp_type == GL_UNSIGNED_INT)
+        return "uint";
+    return "float";
+}
+
+- (id<MTLComputePipelineState>) geom3DPlanePso: (int) dir mslType: (const char *) T
+{
+    NSString *key = [NSString stringWithFormat:@"p%d_%s", dir, T];
+    id<MTLComputePipelineState> p = gPlanePsoCache[key];
+
+    if (p)
+        return p;
+
+    NSString *src = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\n"
+        @"using namespace metal;\n"
+        @"kernel void mgl_geom_p3to2(texture3d<%s> s [[texture(0)]],\n"
+        @"                            texture2d<%s, access::write> d [[texture(1)]],\n"
+        @"                            constant uint2 &zl [[buffer(0)]],\n"
+        @"                            ushort2 gid [[thread_position_in_grid]])\n"
+        @"{\n"
+        @"    if (gid.x >= d.get_width() || gid.y >= d.get_height()) return;\n"
+        @"    d.write(s.read(uint3(uint2(gid), zl.x), zl.y), uint2(gid));\n"
+        @"}\n"
+        @"kernel void mgl_geom_p2to3(texture2d<%s> s [[texture(0)]],\n"
+        @"                            texture3d<%s, access::write> d [[texture(1)]],\n"
+        @"                            constant uint2 &zl [[buffer(0)]],\n"
+        @"                            ushort2 gid [[thread_position_in_grid]])\n"
+        @"{\n"
+        @"    if (gid.x >= s.get_width() || gid.y >= s.get_height()) return;\n"
+        @"    d.write(s.read(uint2(gid)), uint3(uint2(gid), zl.x), zl.y);\n"
+        @"}\n", T, T, T, T];
+    NSError *err = nil;
+    id<MTLLibrary> lib = [_device newLibraryWithSource:src options:nil error:&err];
+
+    if (!lib)
+    {
+        NSLog(@"MGL WARNING: 3D image-plane library (%@): %@", key, err);
+        return nil;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:dir ? @"mgl_geom_p2to3" : @"mgl_geom_p3to2"];
+    p = [_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!p)
+    {
+        NSLog(@"MGL WARNING: 3D image-plane pso (%@): %@", key, err);
+        return nil;
+    }
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gPlanePsoCache = [NSMutableDictionary new]; });
+    gPlanePsoCache[key] = p;
+    return p;
+}
+
+/* encode one plane copy (dir 0: 3D->2D, 1: 2D->3D) */
+- (BOOL) geom3DPlaneCopy: (int) dir enc: (id<MTLComputeCommandEncoder>) enc
+                     pso: (id<MTLComputePipelineState>) pso
+                   tex3d: (id<MTLTexture>) t3 tex2d: (id<MTLTexture>) t2
+                  layer: (NSUInteger) z level: (NSUInteger) level
+{
+    uint32_t zl[2] = {(uint32_t)z, (uint32_t)level};
+    NSUInteger w = dir ? [t2 width] : [t3 width] >> level, h = dir ? [t2 height] : [t3 height] >> level;
+
+    if (!dir)
+    {
+        w = [t2 width];
+        h = [t2 height];
+    }
+    w = MAX(w, 1);
+    h = MAX(h, 1);
+
+    [enc setComputePipelineState:pso];
+    [enc setTexture:dir ? t2 : t3 atIndex:0];
+    [enc setTexture:dir ? t3 : t2 atIndex:1];
+    [enc setBytes:zl length:8 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((w + 15) / 16, (h + 15) / 16, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    return YES;
+}
+
+/* refresh shadows before a draw; write back stale ones.  Must run before the
+ * draw's render encoder is created (it ends the current one itself). */
+- (void) geom3DImageShadowSync
+{
+    GLMContext glm = ctx;
+    struct
+    {
+        int dir, unit;
+        void *tex;
+        NSUInteger layer, level;
+    } todo[TEXTURE_UNITS];
+    int ncopy = 0;
+
+    if (!ctx || !ctx->mtl_funcs.ext_texdata)
+        return;
+
+    /* write back shadows that stopped matching their unit's binding (or whose
+     * unit no longer wants one) */
+    for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+    {
+        ImageUnit *iu = &STATE(image_units[u]);
+        BOOL wants = iu->tex && !iu->layered && iu->tex->target == GL_TEXTURE_3D;
+
+        if (g3DShadowTex[u] && g3DShadowPending[u] &&
+            (!wants || g3DShadowOwner[u] != iu->tex || g3DShadowLevel[u] != iu->level ||
+             g3DShadowLayer[u] != (GLuint)MAX(iu->layer, 0)))
+        {
+            /* capture the OLD slice here: the refresh loop below updates the
+             * per-unit state before these copies are encoded */
+            todo[ncopy].dir = 1;
+            todo[ncopy].unit = u;
+            todo[ncopy].tex = g3DShadowOwner[u];
+            todo[ncopy].layer = g3DShadowLayer[u];
+            todo[ncopy++].level = g3DShadowLevel[u];
+        }
+        else if (g3DShadowTex[u] && !wants)
+            g3DShadowValid[u] = NO;   /* parked */
+    }
+
+    /* copy in slices whose shadow is new or was invalidated */
+    for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+    {
+        ImageUnit *iu = &STATE(image_units[u]);
+
+        if (!(iu->tex && !iu->layered && iu->tex->target == GL_TEXTURE_3D))
+            continue;
+        if (!ctx->mtl_funcs.ext_texdata->realize || !ctx->mtl_funcs.ext_texdata->realize(ctx, iu->tex) || !iu->tex->mtl_data)
+            continue;
+
+        id<MTLTexture> base = (__bridge id<MTLTexture>)iu->tex->mtl_data;
+        NSUInteger level = iu->level < [base mipmapLevelCount] ? iu->level : 0;
+        NSUInteger layer = (NSUInteger)MAX(iu->layer, 0);
+        NSUInteger w = MAX([base width] >> level, 1), h = MAX([base height] >> level, 1);
+
+        if (layer >= [base depth])
+            continue;
+
+        if (!g3DShadowTex[u] || [g3DShadowTex[u] pixelFormat] != [base pixelFormat] ||
+            [g3DShadowTex[u] width] != w || [g3DShadowTex[u] height] != h)
+        {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[base pixelFormat]
+                                                                                          width:w height:h mipmapped:NO];
+            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            d.storageMode = MTLStorageModePrivate;
+            g3DShadowTex[u] = [_device newTextureWithDescriptor:d];
+            g3DShadowValid[u] = NO;
+            g3DShadowPending[u] = NO;
+        }
+        if (!g3DShadowValid[u] || g3DShadowOwner[u] != iu->tex ||
+            g3DShadowLevel[u] != level || g3DShadowLayer[u] != layer)
+        {
+            todo[ncopy].dir = 0;
+            todo[ncopy].unit = u;
+            todo[ncopy].tex = iu->tex;
+            todo[ncopy].layer = layer;
+            todo[ncopy++].level = level;
+        }
+        g3DShadowOwner[u] = iu->tex;
+        g3DShadowBase[u] = base;
+        g3DShadowLevel[u] = level;
+        g3DShadowLayer[u] = layer;
+    }
+
+    if (!ncopy)
+        return;
+
+    /* encode the copies (write-backs first, so a slice that moved between two
+     * units of the same texture lands in order) */
+    [self endRenderEncoding];
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+
+    if (!enc)
+        return;
+    for (int i = 0; i < ncopy; i++)
+    {
+        int u = todo[i].unit;
+        const char *T = todo[i].tex ? [self geom3DPlaneMslType: ((Texture *)todo[i].tex)->internalformat] : NULL;
+
+        if (!T || !g3DShadowTex[u])
+            continue;
+        id<MTLComputePipelineState> pso = [self geom3DPlanePso:todo[i].dir mslType:T];
+
+        if (!pso)
+            continue;
+        [self geom3DPlaneCopy:todo[i].dir enc:enc pso:pso
+                       tex3d:g3DShadowBase[u] tex2d:g3DShadowTex[u]
+                      layer:todo[i].layer level:todo[i].level];
+        if (todo[i].dir)
+            g3DShadowPending[u] = NO;
+        else
+            g3DShadowValid[u] = YES;
+    }
+    [enc endEncoding];
+    STATE(dirty_bits) = DIRTY_ALL;
+}
+
+/* write back every pending shadow (buffer commit) */
+- (void) geom3DImageShadowFlush
+{
+    GLMContext glm = ctx;
+    int ncopy = 0;
+    int units[TEXTURE_UNITS];
+
+    if (!ctx)
+        return;
+
+    for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+        if (g3DShadowTex[u] && g3DShadowPending[u] && g3DShadowBase[u])
+            units[ncopy++] = u;
+    if (!ncopy)
+        return;
+
+    [self extBufEnsureCommandBuffer];
+    [self endRenderEncoding];
+    id<MTLComputeCommandEncoder> enc = _currentCommandBuffer ? [_currentCommandBuffer computeCommandEncoder] : nil;
+
+    if (!enc)
+        return;
+    for (int i = 0; i < ncopy; i++)
+    {
+        int u = units[i];
+        const char *T = [self geom3DPlaneMslType: ((Texture *)g3DShadowOwner[u])->internalformat];
+
+        if (!T)
+            continue;
+        id<MTLComputePipelineState> pso = [self geom3DPlanePso:1 mslType:T];
+
+        if (!pso)
+            continue;
+        [self geom3DPlaneCopy:1 enc:enc pso:pso
+                       tex3d:g3DShadowBase[u] tex2d:g3DShadowTex[u]
+                      layer:g3DShadowLayer[u] level:g3DShadowLevel[u]];
+        g3DShadowPending[u] = NO;
+    }
+    [enc endEncoding];
+}
+
+/* read of a 3D texture outside the image path: flush its shadow first */
+- (void) geom3DImageShadowFlushTexture: (Texture *) tex
+{
+    for (GLuint u = 0; u < TEXTURE_UNITS; u++)
+        if (g3DShadowPending[u] && g3DShadowOwner[u] == (void *)tex)
+        {
+            [self geom3DImageShadowFlush];
+            return;
+        }
+}
+
 - (id<MTLTexture>) geomImageUnitView: (const ImageUnit *) iu base: (id<MTLTexture>) base
 {
     MTLTextureType type, view_type;
@@ -2244,14 +2533,14 @@ void geom_xfb_gpu_reset(GLMContext ctx)
             }
             else
             {
-                /* GL wants an image2D view of one 3D slice.  Metal texture-view rules
-                 * REFUSE aliasing a 3D texture as 2D (tried: newTextureViewWithType 2D
-                 * with a one-slice range → Metal validation aborts the process), so hand
-                 * the whole texture and let the MSL's texture2d argument read the
-                 * slice-0 plane.  Documented emulation gap: non-layered 3D image
-                 * bindings read/write the wrong plane
-                 * (KHR-GL46.shader_image_load_store.non-layered_binding). */
-                return base;
+                /* GL wants an image2D view of one 3D slice (see the shadow-plane
+                 * block above geomImageUnitView).  The shadow was refreshed by
+                 * geom3DImageShadowSync at the start of this draw. */
+                id<MTLTexture> shadow = g3DShadowTex[iu->unit % TEXTURE_UNITS];
+
+                if (shadow && iu->access != GL_READ_ONLY)
+                    g3DShadowPending[iu->unit % TEXTURE_UNITS] = YES;
+                return shadow ? shadow : base;
             }
             break;
         case MTLTextureTypeCube:

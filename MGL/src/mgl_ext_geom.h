@@ -534,4 +534,5 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
 /* GL 8.17 sampling completeness (geometry.c; used by bindTextures) */
 bool mgl_texture_incomplete_for_sampling(const Texture *tex);
 
+
 #endif

@@ -3002,6 +3002,17 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         mgl_append_info_log(log, "ERROR: %s stage: SPIR-V → MSL translation failed\n", stage_label(stage));
         goto done;
     }
+    if (getenv("MGL_DUMP_STAGE_MSL"))
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/mgl_stage_%d.msl", stage);
+        FILE *df = fopen(path, "w");
+        if (df)
+        {
+            fputs(result, df);
+            fclose(df);
+        }
+    }
 
     /* MSL's gl_VertexID &c are uint while GL declares them int; SPIRV-Cross emits them
      * uncast, so `min(4, gl_VertexID)' is an ambiguous Metal overload

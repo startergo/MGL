@@ -1620,8 +1620,12 @@ static void rgtc_bc4_block(const uint8_t *p, size_t pitch, bool snorm, uint8_t o
 
     out[0] = (uint8_t)mn;                   /* endpoints: raw (sign-extended) bytes */
     out[1] = (uint8_t)mx;
-    for (int k = 0; k < 6; k++)
-        shade[k] = mn + (int)(((long long)(mx - mn) * k + 2) / 5);
+    /* BC4/5 palette (code0 <= code1 branch): idx0 = code0, idx1 = code1,
+     * idx2..5 interpolate in 1/5 steps, idx6/7 are the clamp values */
+    shade[0] = mn;
+    shade[1] = mx;
+    for (int k = 0; k < 4; k++)
+        shade[2 + k] = (mn * (4 - k) + mx * (1 + k)) / 5;   /* exact decoder math */
     shade[6] = snorm ? -127 : 0;
     shade[7] = snorm ? 127 : 255;
 
@@ -1683,3 +1687,461 @@ uint8_t *tdEncodeRGTC(const uint8_t *chan0, const uint8_t *chan1, int w, int h, 
     }
     return dst;
 }
+
+/* ------------------------------------------------------------------------ */
+/* BPTC (BC6H / BC7) CPU encoders                                           */
+/* ------------------------------------------------------------------------ */
+/* Used for online compression: uncompressed client data uploaded to a
+ * compressed BPTC internalformat (GL 4.6 8.5.3 lets the GL compress), and for
+ * re-encoding decoded storage on glGetCompressedTexImage of such a level.
+ *
+ * Bit layouts follow the D3D / Khronos data-format specs, cross-checked field
+ * by field against VK-GL-CTS's reference decoders decompressBc6H() /
+ * decompressBc7() (framework/common/tcuCompressedTexture.cpp), which are the
+ * conformance ground truth.  The decoders' exact arithmetic is replicated here
+ * (unquantize / interpolate / finishUnquantize for BC6H; endpoint expansion +
+ * interpolate for BC7), so encode -> decode round-trips reproduce the chosen
+ * palette values on any conformant decoder, including the Metal hardware one.
+ *
+ * Only the simplest adequate single-subset modes are emitted:
+ *   BC6H mode 10  - absolute (non-delta) 10-bit endpoints, 4-bit indices
+ *   BC7  mode 6   - 7-bit + P RGB endpoints, 8-bit A endpoints, 4-bit indices
+ * Both use per-channel range-fit endpoint selection and exact palette
+ * reconstruction (nearest of the 16 interpolation weights). */
+
+/* BC6H / BC7 4-bit interpolation weights (2.6 fixed point, /64) */
+static const uint8_t bptc_w4[16] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+
+static void bptc_put(uint8_t *dst, int bit, int nbits, uint32_t v)
+{
+    for (int i = 0; i < nbits; i++)
+        if ((v >> i) & 1)
+            dst[(bit + i) >> 3] |= (uint8_t)(1u << ((bit + i) & 7));
+}
+
+/* BC6H mode-10 unquantize of a 10-bit endpoint code -> the 16/17-bit value the
+ * interpolator works on (decoder math; epBits[10] = 10) */
+static int32_t bc6h_unquant(int32_t code, int isign)
+{
+    int32_t s = isign ? (code < 0 ? -1 : 1) : 1;
+    int32_t m = isign ? (code < 0 ? -code : code) : code;
+
+    if (m == 0)
+        return 0;
+    if (isign)
+    {
+        if (m >= 511)
+            return s * 0x7fff;
+    }
+    else if (m >= 1023)
+        return 0xffff;
+    /* ((m << 15) + 0x4000) >> 9 == 64*m + 32 for 0 < m < the clamp above */
+    return s * (64 * m + 32);
+}
+
+/* BC6H mode-10 finishUnquantize: interpolated value -> half bit pattern */
+static uint32_t bc6h_finish(int32_t x, int isign)
+{
+    if (isign)
+    {
+        int32_t s = x < 0;
+        int32_t m = s ? -x : x;
+        m = (m * 31) >> 5;
+        return (uint32_t)((s ? 0x8000u : 0u) | (uint32_t)m);
+    }
+    return (uint32_t)((x * 31) / 64);
+}
+
+/* decoded (interpolated, finished) half bits of palette entry idx */
+static uint32_t bc6h_palette(int32_t u0, int32_t u1, int idx, int isign)
+{
+    int32_t w = bptc_w4[idx];
+    int32_t v = ((64 - w) * u0 + w * u1 + 32) >> 6;
+    return bc6h_finish(v, isign);
+}
+
+/* endpoint code whose unquantized value is nearest the desired unquantized
+ * value (unquant(c) = 64*c + 32 on the interior, 0 for c = 0, and the clamp
+ * code maps to the max) */
+static int32_t bc6h_code_from_u(int32_t u, int isign)
+{
+    int32_t s = u < 0 ? -1 : 1;
+    int32_t m = u < 0 ? -u : u;
+    int32_t c, limit = isign ? 511 : 1023;
+
+    if (m == 0)
+        return 0;
+    if (isign)
+    {
+        if (m >= 0x7fff)
+            return s * limit;
+    }
+    else if (m >= 0xffff)
+        return limit;
+    /* interior lattice: u = 64*c + 32 => c = (u - 32) / 64 (rounded) */
+    c = (m - 32 + 32) / 64;
+    if (c < 1)
+        c = 1;
+    if (c > limit - 1)
+        c = limit - 1;
+    return s * c;
+}
+
+uint8_t *tdEncodeBPTCFloat(const float *rgba, int w, int h, int d, size_t row, size_t img, int isign)
+{
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    size_t bytes = (size_t)bw * bh * (size_t)(d > 0 ? d : 1) * 16;
+    uint8_t *dst = (uint8_t *)calloc(bytes ? bytes : 1, 1);
+
+    if (!dst)
+        return NULL;
+
+    uint8_t *out = dst;
+    for (int z = 0; z < (d > 0 ? d : 1); z++)
+    {
+        for (int by = 0; by < bh; by++)
+            for (int bx = 0; bx < bw; bx++)
+            {
+                float tile[3][16];
+                uint16_t src_bits[3][16];
+                int32_t udes[3][16];
+                int32_t ucm[3][2];
+                int32_t ep[2][3];
+                int32_t ep_ls[2][3];
+                int idx[16];
+                int x0 = bx * 4, y0 = by * 4;
+
+                memset(tile, 0, sizeof(tile));
+                for (int y = 0; y < 4 && y0 + y < h; y++)
+                {
+                    /* row/img are BYTE pitches (tdEncodeRGTC convention) */
+                    const float *r = rgba + (size_t)z * (img / 4) + (size_t)(y0 + y) * (row / 4) +
+                                     (size_t)x0 * 4;
+                    for (int x = 0; x < 4 && x0 + x < w; x++)
+                    {
+                        int t = y * 4 + x;
+                        tile[0][t] = r[x * 4];
+                        tile[1][t] = r[x * 4 + 1];
+                        tile[2][t] = r[x * 4 + 2];
+                    }
+                }
+
+                /* BC6H interpolates in the unquantized domain, whose
+                 * finishUnquantize output is the half BIT pattern - so range-fit
+                 * there: convert each texel to half bits, invert the finish map
+                 * back to the unquantized scale, and pick endpoint codes for the
+                 * extremes (NaN / Inf are not representable: clamp to 0). */
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    int32_t umin = 0x7fffffff, umax = -0x7fffffff;
+                    for (int t = 0; t < 16; t++)
+                    {
+                        float v = tile[ch][t];
+                        uint16_t bits;
+                        int32_t u;
+
+                        if (!(v == v) || v > 65504.0f || v < -65504.0f)
+                            v = 0.0f;
+                        bits = tdFloatToHalf(v);
+
+                        if (isign)
+                        {
+                            int s = (bits >> 15) & 1;
+                            int32_t m = bits & 0x7fff;
+                            /* finish: m' = (|u| * 31) >> 5 => |u| ~ m*32/31 */
+                            u = (int32_t)(((int64_t)m * 32 + 15) / 31);
+                            if (s)
+                                u = -u;
+                        }
+                        else
+                        {
+                            /* finish: bits = (u * 31) / 64 => u ~ bits*64/31 */
+                            u = (int32_t)(((int64_t)bits * 64 + 15) / 31);
+                        }
+                        udes[ch][t] = u;
+                        if (u < umin)
+                            umin = u;
+                        if (u > umax)
+                            umax = u;
+                        src_bits[ch][t] = bits;
+                    }
+                    if (umax < umin)
+                        umin = umax = 0;
+                    ucm[ch][0] = umin;
+                    ucm[ch][1] = umax;
+                }
+
+                /* Shared-index alignment: BC6H interpolates linearly in the
+                 * unquantized domain with ONE index for all channels, so
+                 * channels with different [umin,umax] spans want different
+                 * weights for the same texel.  Express each texel as a fraction
+                 * of its channel span, average over channels, then least-squares
+                 * refit each channel (u = a + b*f) and snap a / a+b to endpoint
+                 * codes.  First-order fix: the single shared index still caps
+                 * quality (fine for online compression, which GL does not
+                 * accuracy-guarantee). */
+                {
+                    double ff[16];
+                    for (int t = 0; t < 16; t++)
+                    {
+                        double f = 0;
+                        for (int ch = 0; ch < 3; ch++)
+                        {
+                            double span = (double)(ucm[ch][1] - ucm[ch][0]);
+                            double fc = span > 0 ? (udes[ch][t] - ucm[ch][0]) / span : 0.0;
+                            if (fc < 0) fc = 0;
+                            if (fc > 1) fc = 1;
+                            f += fc;
+                        }
+                        ff[t] = f / 3.0;
+                    }
+                    for (int ch = 0; ch < 3; ch++)
+                    {
+                        double sf = 0, sf2 = 0, su = 0, sfu = 0;
+                        for (int t = 0; t < 16; t++)
+                        {
+                            sf += ff[t];
+                            sf2 += ff[t] * ff[t];
+                            su += udes[ch][t];
+                            sfu += ff[t] * udes[ch][t];
+                        }
+                        double var = sf2 - sf * sf / 16.0;
+                        double a, b;
+                        if (var > 1e-9)
+                        {
+                            b = (sfu - sf * su / 16.0) / var;
+                            a = (su - b * sf) / 16.0;
+                        }
+                        else
+                        {
+                            a = ucm[ch][0];
+                            b = (double)(ucm[ch][1] - ucm[ch][0]);
+                        }
+                        if (b < 0)
+                        {
+                            a = ucm[ch][0];
+                            b = ucm[ch][1] - ucm[ch][0];
+                        }
+                        ep_ls[0][ch] = bc6h_code_from_u((int32_t)(a + 0.5), isign);
+                        ep_ls[1][ch] = bc6h_code_from_u((int32_t)(a + b + 0.5), isign);
+                    }
+                }
+
+                /* choose per channel between range-fit (exact extremes) and the
+                 * LS-aligned pair: a 2x2x2 search, scoring each combination by
+                 * its optimal shared index per texel in bit space */
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    ep[0][ch] = bc6h_code_from_u(ucm[ch][0], isign);
+                    ep[1][ch] = bc6h_code_from_u(ucm[ch][1], isign);
+                }
+                {
+                    uint64_t best_err = ~0ull;
+                    for (int mask = 0; mask < 8; mask++)
+                    {
+                        int32_t cand[2][3], uc[2][3];
+                        uint32_t pal[3][16];
+                        uint64_t terr = 0;
+
+                        for (int ch = 0; ch < 3; ch++)
+                            for (int e = 0; e < 2; e++)
+                            {
+                                int use_ls = (mask >> (ch + (e ? 3 : 0))) & 1;
+                                cand[e][ch] = use_ls ? ep_ls[e][ch] : (e ? bc6h_code_from_u(ucm[ch][1], isign)
+                                                                          : bc6h_code_from_u(ucm[ch][0], isign));
+                                uc[e][ch] = bc6h_unquant(cand[e][ch], isign);
+                            }
+                        for (int ch = 0; ch < 3; ch++)
+                            for (int t = 0; t < 16; t++)
+                                pal[ch][t] = bc6h_palette(uc[0][ch], uc[1][ch], t, isign);
+                        for (int t = 0; t < 16; t++)
+                        {
+                            uint32_t be = 0xffffffffu;
+                            int lim = (t == 0) ? 8 : 16;
+                            for (int i = 0; i < lim; i++)
+                            {
+                                uint32_t err = 0;
+                                for (int ch = 0; ch < 3; ch++)
+                                {
+                                    uint32_t a = pal[ch][i], b = src_bits[ch][t];
+                                    err += a > b ? a - b : b - a;
+                                }
+                                if (err < be)
+                                    be = err;
+                            }
+                            terr += be;
+                        }
+                        if (terr < best_err)
+                        {
+                            best_err = terr;
+                            for (int ch = 0; ch < 3; ch++)
+                                for (int e = 0; e < 2; e++)
+                                    ep[e][ch] = cand[e][ch];
+                        }
+                    }
+                }
+
+                /* exact palette (decoder arithmetic) + nearest shared index in
+                 * bit space; texel 0 is the anchor: only 3 index bits stored */
+                {
+                    int32_t u[2][3];
+                    uint32_t pal[3][16];
+                    for (int e = 0; e < 2; e++)
+                        for (int ch = 0; ch < 3; ch++)
+                            u[e][ch] = bc6h_unquant(ep[e][ch], isign);
+                    for (int ch = 0; ch < 3; ch++)
+                        for (int t = 0; t < 16; t++)
+                            pal[ch][t] = bc6h_palette(u[0][ch], u[1][ch], t, isign);
+                    for (int t = 0; t < 16; t++)
+                    {
+                        uint32_t be = 0xffffffffu;
+                        int bi = 0;
+                        int lim = (t == 0) ? 8 : 16;
+                        for (int i = 0; i < lim; i++)
+                        {
+                            uint32_t err = 0;
+                            for (int ch = 0; ch < 3; ch++)
+                            {
+                                uint32_t a = pal[ch][i], b = src_bits[ch][t];
+                                err += a > b ? a - b : b - a;
+                            }
+                            if (err < be)
+                            {
+                                be = err;
+                                bi = i;
+                            }
+                        }
+                        idx[t] = bi;
+                    }
+                }
+
+                /* mode 10 (mode field 0x03), absolute endpoints at bits 5..64 */
+                bptc_put(out, 0, 5, 0x03);
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    bptc_put(out, 5 + 10 * ch, 10, (uint32_t)(ep[0][ch] & 0x3ff));
+                    bptc_put(out, 35 + 10 * ch, 10, (uint32_t)(ep[1][ch] & 0x3ff));
+                }
+                {
+                    int bit = 65;
+                    bptc_put(out, bit, 3, (uint32_t)idx[0]);
+                    bit += 3;
+                    for (int t = 1; t < 16; t++)
+                    {
+                        bptc_put(out, bit, 4, (uint32_t)idx[t]);
+                        bit += 4;
+                    }
+                }
+                out += 16;
+            }
+    }
+    return dst;
+}
+
+uint8_t *tdEncodeBPTCUnorm(const uint8_t *rgba, int w, int h, int d, size_t row, size_t img)
+{
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    size_t bytes = (size_t)bw * bh * (size_t)(d > 0 ? d : 1) * 16;
+    uint8_t *dst = (uint8_t *)calloc(bytes ? bytes : 1, 1);
+
+    if (!dst)
+        return NULL;
+
+    uint8_t *out = dst;
+    for (int z = 0; z < (d > 0 ? d : 1); z++)
+    {
+        for (int by = 0; by < bh; by++)
+            for (int bx = 0; bx < bw; bx++)
+            {
+                uint8_t tile[4][16];
+                uint8_t ep[2][4];
+                int pbit[2];
+                int idx[16];
+                int x0 = bx * 4, y0 = by * 4;
+
+                memset(tile, 0, sizeof(tile));
+                for (int y = 0; y < 4 && y0 + y < h; y++)
+                {
+                    const uint8_t *r = rgba + (size_t)z * img + (size_t)(y0 + y) * row + (size_t)x0 * 4;
+                    for (int x = 0; x < 4 && x0 + x < w; x++)
+                        for (int ch = 0; ch < 4; ch++)
+                            tile[ch][y * 4 + x] = r[x * 4 + ch];
+                }
+
+                for (int ch = 0; ch < 4; ch++)
+                {
+                    int mn = tile[ch][0], mx = tile[ch][0];
+                    for (int t = 1; t < 16; t++)
+                    {
+                        if (tile[ch][t] < mn) mn = tile[ch][t];
+                        if (tile[ch][t] > mx) mx = tile[ch][t];
+                    }
+                    ep[0][ch] = (uint8_t)mn;
+                    ep[1][ch] = (uint8_t)mx;
+                }
+
+                /* mode-6 endpoints are 7-bit + one P bit per ENDPOINT shared by
+                 * all four channels: decoded = (v7 << 1) | p, so quantize each
+                 * endpoint to the majority parity (worst case -1 on a channel) */
+                for (int e = 0; e < 2; e++)
+                {
+                    int odd = 0;
+                    for (int ch = 0; ch < 4; ch++)
+                        if (ep[e][ch] & 1)
+                            odd++;
+                    pbit[e] = odd >= 2 ? 1 : 0;
+                    for (int ch = 0; ch < 4; ch++)
+                        if ((ep[e][ch] & 1) != pbit[e])
+                            ep[e][ch] = (uint8_t)(ep[e][ch] ? ep[e][ch] - 1 : 1);
+                }
+
+                /* exact palette (decoder interpolation on the 8-bit endpoints)
+                 * + nearest shared index; texel 0 is the anchor (3 bits) */
+                for (int t = 0; t < 16; t++)
+                {
+                    int be = 1 << 30;
+                    int bi = 0;
+                    int lim = (t == 0) ? 8 : 16;
+                    for (int i = 0; i < lim; i++)
+                    {
+                        int err = 0;
+                        for (int ch = 0; ch < 4; ch++)
+                        {
+                            int p = ((64 - bptc_w4[i]) * ep[0][ch] + bptc_w4[i] * ep[1][ch] + 32) >> 6;
+                            int e = p - tile[ch][t];
+                            err += e * e;
+                        }
+                        if (err < be)
+                        {
+                            be = err;
+                            bi = i;
+                        }
+                    }
+                    idx[t] = bi;
+                }
+
+                /* mode 6: bit 6 set, bits 0..5 clear; endpoints 7-bit + P */
+                bptc_put(out, 6, 1, 1);
+                for (int ch = 0; ch < 4; ch++)
+                {
+                    bptc_put(out, 7 + 14 * ch, 7, (uint32_t)(ep[0][ch] >> 1));
+                    bptc_put(out, 14 + 14 * ch, 7, (uint32_t)(ep[1][ch] >> 1));
+                }
+                bptc_put(out, 63, 1, (uint32_t)pbit[0]);
+                bptc_put(out, 64, 1, (uint32_t)pbit[1]);
+                {
+                    int bit = 65;
+                    bptc_put(out, bit, 3, (uint32_t)idx[0]);
+                    bit += 3;
+                    for (int t = 1; t < 16; t++)
+                    {
+                        bptc_put(out, bit, 4, (uint32_t)idx[t]);
+                        bit += 4;
+                    }
+                }
+                out += 16;
+            }
+    }
+    return dst;
+}
+
