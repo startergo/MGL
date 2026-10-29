@@ -778,6 +778,7 @@ struct GLMDispatchTable {
         void  (*get_program_stageiv)(GLMContext ctx, GLuint program, GLenum shadertype, GLenum pname, GLint *values);
         void  (*patch_parameteri)(GLMContext ctx, GLenum pname, GLint value);
         void  (*patch_parameterfv)(GLMContext ctx, GLenum pname, const GLfloat *values);
+        void  (*max_shader_compiler_threads)(GLMContext ctx, GLuint count);   /* ARB/KHR_parallel_shader_compile */
         void  (*bind_transform_feedback)(GLMContext ctx, GLenum target, GLuint id);
         void  (*delete_transform_feedbacks)(GLMContext ctx, GLsizei n, const GLuint *ids);
         void  (*gen_transform_feedbacks)(GLMContext ctx, GLsizei n, GLuint *ids);

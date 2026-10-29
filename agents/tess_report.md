@@ -1,7 +1,57 @@
+# tess domain — round 33 report (gate + READY on the 3cd6208 merge)
+
+READY 1dddf05 (merge of gl46-port 3cd6208 [compat s26] into e6a2333 [tess
+r31+r32]; every number below on exactly this tree)
+* suite `tests/headless/run.sh`: **153 tests, 0 FAIL / 0 BUILD-FAIL, 149x
+  "0 failures" summaries** (the 5 without a summary line — drawparams, orphan,
+  v64limits, zz_gather, zz_gmsl — end in PASS lines by design);
+  **test_geom_xfbperf quarantined (supervisor 23:42)** and skipped.
+* test_geom 10x = **10/10 x 670 checks, 0 failures**; test_fp64 5x = **5/5 x
+  417**; test_fp64fast 3x = **3/3 x 298**.
+* ab_bench m0/m1 **min-of-7 interleaved vs ~/MGL-cts/baseline-3cd6208**:
+  quiet window m0 4.314 -> 3.895 ms (**-9.7%**) / m1 81.599 -> 78.971
+  (**-3.2%**); under co-tenant GPU load a second min-of-7 read m0 +21.0% /
+  m1 -8.2% — the wall-clock min flips sign with box load in BOTH directions
+  (same-window A/A control, baseline vs baseline-copy: min-of-7 +2.2%/-5.1%,
+  median +2.6%/+3.9%; 20-rep interleaved m1 floor run: tip 102.75 vs base
+  107.52 = **-4.4%**).  Direct CPU attribution, MGL_PROFILE per-draw buckets
+  (ab_bench mode 11, interleaved, median of 6): draw 0.320 -> 0.267,
+  pipeline-descriptor 0.161 -> 0.155, dirtyState-block 0.307 -> 0.254,
+  processGLState 0.300 -> 0.248, newRenderEncoder 0.058 -> 0.053 ms/frame —
+  **tip <= baseline in every bucket**.
+* locked glmark2 (every run under `/usr/bin/lockf -k /tmp/mgl_glmark2.lock`,
+  order alternated, vs baseline-3cd6208 nsgl): **ideas 5 pairs median 2732 vs
+  2665 (+2.5%), jellyfish quiet-window top-3 25403 vs 25100 (+1.2%),
+  gl41-geometry 5 pairs median 21440 vs 21481 (-0.2%)** — no scene past the
+  +3% limit (r31 touched geomRasterPass/MGLRenderer.m/draw_buffers.c;
+  gl41-geometry is exactly that path: parity holds with r31b's export-PSO
+  cache fix).
+* CTS deltas (the r28-sweep queue, on this tree): **cull_distance 3/3**
+  (functional fixed r31, negative r31b), **tessellation_shader 57/58,
+  program_interface_query 43/43, explicit_uniform_location 48/48,
+  gpu_shader5 18/22** (4 `texture_gather_offset_*_clamp_{border,edge}` =
+  the documented texdata border-clamp gap; every non-gather gpu_shader5 case
+  passes), shader_draw_parameters 13/13 + shader_group_vote 5/5 (r28),
+  shading_language_420pack length_of_vector_and_matrix + gl_MaxPatchVertices
+  (r30), gl_spirv + separable_programs_tf.geometry_active (compat s23-s25).
+  **The r28 fails_tess.txt queue is now 0 open tess-side cases.**
+* `tessellation_shader.single.primitive_coverage` re-checked on **pristine
+  baseline-3cd6208: still Fail with channel-REVERSED pixels** (rendered
+  0x20,0x40,0x80,0xff vs expected 0xff,0x80,0x40,0x20 at index 8188) — the
+  c6ded7d copy_image / MS-image-write regression forwarded to compat, not a
+  tess bug (see Known gaps 1 below for the residual tess-side question).
+* stub_scanner EMPTY/NOOP/ASSERT clean for tessellation.c,
+  MGLRenderer+Tessellation.m, tess_spv_lower.c, mgl_ext_tess.h.
+
+r33 changed no library code: this round is the gl46-port 3cd6208 merge plus
+the full gate above (the r31/r32 work was already on the branch; see the r31
+and r32 sections below for what those changed).
+
+---
+
 # tess domain — round 30 report (dynamic matrix-member indices; c6ded7d merge)
 
-READY ddc2099 (merge of gl46-port c6ded7d into 5988b5d; gate below on exactly
-this tree)
+READY ddc2099 (superseded by READY 1dddf05 above; gate of 5988b5d + c6ded7d)
 
 ## r30 fixes (from fails_tess.txt)
 
@@ -615,16 +665,18 @@ record size + "leave the word alone" for the synthetic cull variant.
 * tessellation_shader 47/48 (only single.primitive_coverage, below).
 
 ### Known gaps
-1. **tessellation_shader.single.primitive_coverage**: the CTS requires the
-   tessellated primitive to stamp a pixel whose centre lies *exactly* on the
-   patch's hypotenuse (index 8188 = (2047,0): 2047.5/1024-1 + 0.5/1024-1 = 0).
-   MGL's tessellated coverage is bit-identical to a plain GL_TRIANGLES draw of
-   the same vertices (missing=0 extra=0 at every level, see test_edgeprobe.c),
-   and Metal's fill rule decides that pixel from the geometry alone — flipping
-   `tessellationOutputWindingOrder` changes culling (TessOrientationCulling
-   fails) but not this pixel.  A conforming implementation appears to rely on
-   the tessellator emitting a corner 1 ulp outside so the pixel centre becomes
-   strictly inside; Metal's hardware tessellator emits exact domain
-   coordinates.  Also fails on the pristine baseline.
+1. **tessellation_shader.single.primitive_coverage**: FAILS on the pristine
+   gl46-port baselines too (verified on baseline-48a41ef and baseline-3cd6208
+   with the identical log) — rendered pixels are channel-REVERSED (rendered
+   0x20,0x40,0x80,0xff vs expected 0xff,0x80,0x40,0x20), the c6ded7d
+   copy_image / MS-image-write regression, forwarded to compat (s26 did not
+   change it).  The pixel the CTS complains about (index 8188 = (2047,0):
+   2047.5/1024-1 + 0.5/1024-1 = 0, a centre lying *exactly* on the patch's
+   hypotenuse) IS stamped — the complaint is its colour, not its coverage —
+   and MGL's tessellated coverage is bit-identical to a plain GL_TRIANGLES
+   draw of the same vertices (missing=0 extra=0 at every level,
+   test_edgeprobe.c).  When compat fixes the channel reversal, the residual
+   tess-side question is whether Metal's exact domain coordinates need a
+   1-ulp-outside corner like the D3D11 reference tessellator; re-check then.
 2. gpu_shader5 texture_gather_offset clamp/edge (4): border clamp emulation —
    texdata domain.

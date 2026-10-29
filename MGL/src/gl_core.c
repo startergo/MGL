@@ -5342,6 +5342,22 @@ void glPatchParameteri(GLenum pname, GLint value)
     ctx->dispatch.patch_parameteri(ctx, pname, value);
 }
 
+/* ARB/KHR_parallel_shader_compile: a hint; MGL compiles synchronously, so the
+ * count is only stored for glGet (and COMPLETION_STATUS is always TRUE) */
+void glMaxShaderCompilerThreadsARB(GLuint count)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    ctx->dispatch.max_shader_compiler_threads(ctx, count);
+}
+
+void glMaxShaderCompilerThreadsKHR(GLuint count)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    ctx->dispatch.max_shader_compiler_threads(ctx, count);
+}
+
 void glPatchParameterfv(GLenum pname, const GLfloat *values)
 {
     GLMContext ctx = GET_CONTEXT();

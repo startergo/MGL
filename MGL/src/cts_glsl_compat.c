@@ -1562,6 +1562,129 @@ static char *rewrite_subgroup_vote_ext(const char *src)
     return out.buf;
 }
 
+/* GL_ARB_shader_ballot's desktop-GL surface needs two adjustments through
+ * glslang -> SPIR-V -> SPIRV-Cross/MSL:
+ *  - gl_SubGroupSizeARB stays a default-uniform (not the SubgroupSize builtin),
+ *    which would read 0: replace the uses with an injected helper returning the
+ *    Metal simdgroup width (32 on every Apple GPU; the TES pass folds it to 1).
+ *  - the gl_SubGroup*MaskARB builtins are lowered by SPIRV-Cross to
+ *    simd_ballot(true), which only sets the bits of ACTIVE lanes; a partially
+ *    active wave (e.g. the 4 vertices of a quad in the vertex-stage compute
+ *    kernel) then disagrees with the spec/CTS formula "all subgroup indices i
+ *    with i OP gl_SubGroupInvocationARB".  The masks are pure functions of the
+ *    invocation index, so replace them with helpers computing that formula
+ *    (uint64_t flavor for the bare use, uvec4 flavor when a swizzle follows,
+ *    since the desktop profile declares the masks uint64_t while SPIR-V/MSL
+ *    expose them as uvec4 — glslang accepts both spellings of the builtin).
+ * The TES pass (tessellation.c) rewrites gl_SubGroupInvocationARB to 0 inside
+ * these helper bodies, giving the size-1 subgroup it must emulate. */
+static char *rewrite_ballot_subgroup_size(const char *src)
+{
+    static const char name[] = "gl_SubGroupSizeARB";
+    static const char *const masks[5] = { "gl_SubGroupEqMaskARB", "gl_SubGroupGeMaskARB",
+                                          "gl_SubGroupGtMaskARB", "gl_SubGroupLeMaskARB",
+                                          "gl_SubGroupLtMaskARB" };
+    const size_t len = strlen(src);
+
+    int uses = 0, mask_uses = 0;
+    for (size_t i = 0; i + sizeof name - 1 <= len; i++)
+        if (at_word(src, len, i, name)) { uses++; i += sizeof name - 2; }
+    for (int k = 0; k < 5; k++)
+    {
+        size_t ml = strlen(masks[k]);
+        for (size_t i = 0; i + ml <= len; i++)
+            if (at_word(src, len, i, masks[k])) { mask_uses++; i += ml - 1; }
+    }
+    if (!uses && !mask_uses) return NULL;
+
+    /* inject the helper after the last #extension directive (and after
+     * #version), so it never precedes the preprocessor preamble */
+    size_t insert = 0;
+    {
+        const char *v = strstr(src, "#version");
+        if (v)
+        {
+            const char *nl = strchr(v, '\n');
+            insert = nl ? (size_t)(nl - src) + 1 : len;
+        }
+        const char *p = src;
+        while ((p = strstr(p, "#extension")) != NULL)
+        {
+            const char *nl = strchr(p, '\n');
+            if (!nl) break;
+            size_t at = (size_t)(nl - src) + 1;
+            if (at > insert) insert = at;
+            p = nl;
+        }
+    }
+
+    static const char pre[] =
+        "#extension GL_ARB_gpu_shader_int64 : enable\n"
+        "uint mgl_ballot_subgroup_size() { return 32u; }"
+        " /* MGL: simdgroup width, see rewrite_ballot_subgroup_size */\n"
+        /* lanes(): bits [0, size) — the TES/VS pass folds the size call to 1u,
+         * which clamps every mask to the emulated size-1 subgroup */
+        "uint64_t mgl_ballot_lanes() { return (1ul << mgl_ballot_subgroup_size()) - 1ul; }\n"
+        "uint64_t mgl_ballot_eq() { return mgl_ballot_lanes() & (1ul << gl_SubGroupInvocationARB); }\n"
+        "uint64_t mgl_ballot_ge() { return mgl_ballot_lanes() & (~0ul << gl_SubGroupInvocationARB); }\n"
+        "uint64_t mgl_ballot_gt() { return mgl_ballot_lanes() & (~0ul << (gl_SubGroupInvocationARB + 1u)); }\n"
+        "uint64_t mgl_ballot_le() { return mgl_ballot_lanes() & ((2ul << gl_SubGroupInvocationARB) - 1ul); }\n"
+        "uint64_t mgl_ballot_lt() { return mgl_ballot_lanes() & ((1ul << gl_SubGroupInvocationARB) - 1ul); }\n"
+        "uvec4 mgl_ballot_v4(uint64_t m) { return uvec4(uint(m), uint(m >> 32ul), 0u, 0u); }\n"
+        "uvec4 mgl_ballot_eq4() { return mgl_ballot_v4(mgl_ballot_eq()); }\n"
+        "uvec4 mgl_ballot_ge4() { return mgl_ballot_v4(mgl_ballot_ge()); }\n"
+        "uvec4 mgl_ballot_gt4() { return mgl_ballot_v4(mgl_ballot_gt()); }\n"
+        "uvec4 mgl_ballot_le4() { return mgl_ballot_v4(mgl_ballot_le()); }\n"
+        "uvec4 mgl_ballot_lt4() { return mgl_ballot_v4(mgl_ballot_lt()); }\n";
+    static const char repl[] = "mgl_ballot_subgroup_size()";
+    static const char *const maskrepl[5] = { "mgl_ballot_eq", "mgl_ballot_ge", "mgl_ballot_gt",
+                                             "mgl_ballot_le", "mgl_ballot_lt" };
+
+    Str out = {0};
+    for (size_t i = 0; i <= len; i++)
+    {
+        if (insert && i == insert)
+        {
+            str_append(&out, pre, sizeof pre - 1);
+            insert = 0;                     /* once */
+        }
+        int took = 0;
+        if (i < len && at_word(src, len, i, name))
+        {
+            str_append(&out, repl, sizeof repl - 1);
+            i += sizeof name - 2;
+            took = 1;
+        }
+        else if (i < len)
+        {
+            for (int k = 0; k < 5 && !took; k++)
+            {
+                size_t ml = strlen(masks[k]);
+                if (at_word(src, len, i, masks[k]))
+                {
+                    /* swizzled use (uvec4 flavor) or bare use (uint64_t flavor) */
+                    size_t j = i + ml;
+                    while (j < len && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n')) j++;
+                    int v4 = (j < len && src[j] == '.');
+                    const char *r = v4 ? maskrepl[k] : maskrepl[k];   /* base name */
+                    size_t rl = strlen(r);
+                    str_append(&out, r, rl);
+                    if (v4) { str_push(&out, '4'); }
+                    str_push(&out, '(');
+                    str_push(&out, ')');
+                    i += ml - 1;
+                    took = 1;
+                }
+            }
+        }
+        if (!took && i < len)
+            str_push(&out, src[i]);
+    }
+    if (out.buf) str_push(&out, '\0');
+    if (getenv("MGL_BALLOT_DUMP") && out.buf) fprintf(stderr, "[cts ballot source]\n%s\n[/cts ballot]\n", out.buf);
+    return out.buf;
+}
+
 static char *rewrite_cull_distance_ext(const char *src)
 {
     if (!src || !strstr(src, "GL_ARB_cull_distance"))
@@ -2705,6 +2828,14 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
          * enable the extension (see rewrite_subgroup_vote_ext) */
         char *voted = rewrite_subgroup_vote_ext(src);
         if (voted) { free(owned); owned = voted; src = owned; }
+    }
+    {
+        /* glslang's OpenGL profile keeps GL_ARB_shader_ballot's
+         * gl_SubGroupSizeARB a default-uniform (not the SubgroupSize builtin),
+         * which would read 0 through mgl_DefaultUniforms: give the uses an
+         * injected helper returning the simdgroup width */
+        char *ballot = rewrite_ballot_subgroup_size(src);
+        if (ballot) { free(owned); owned = ballot; src = owned; }
     }
     {
         /* samplers inside default-block structs cannot be lowered to MSL

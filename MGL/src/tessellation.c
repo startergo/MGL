@@ -23,6 +23,7 @@
 #include "glm_context.h"
 #include "mgl.h"
 #include "mgl_ext.h"
+#include "mgl_ext_program.h"      /* mgl_program_register_programiv_hook */
 #include "mgl_ext_tess.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_queries.h"
@@ -141,6 +142,170 @@ static void tess_declared_size(const char *src, const char *name, char *out, siz
         }
         p += nl;
     }
+}
+
+/* GL_ARB_shader_ballot in a TES: the post-tessellation vertex function has no
+ * simdgroup attributes on Metal (see mgl_tess_glsl_compat), so this rewrites
+ * the ARB subgroup builtins/functions of a TES source to a size-1 subgroup —
+ * invocation 0, the lane-0 masks, a one-lane ballot, identity reads.  The
+ * subgroup size is implementation-defined per stage, and every other MGL stage
+ * keeps the real 32-wide simdgroup, so this is conformant.  Returns NULL when
+ * the source does not mention any of the names. */
+static char *tess_ballot_one_lane(const char *src)
+{
+    static const struct { const char *name, *repl; } map[] = {
+        /* the cts_glsl_compat pass may already have rewritten the size */
+        { "mgl_ballot_subgroup_size()", "1u" },
+        { "gl_SubGroupSizeARB",         "1u" },
+        { "gl_SubGroupInvocationARB",   "0u" },
+        { "gl_SubGroupEqMaskARB",       "mgl_tess_mask_eq()" },
+        { "gl_SubGroupGeMaskARB",       "mgl_tess_mask_ge()" },
+        { "gl_SubGroupGtMaskARB",       "mgl_tess_mask_gt()" },
+        { "gl_SubGroupLeMaskARB",       "mgl_tess_mask_le()" },
+        { "gl_SubGroupLtMaskARB",       "mgl_tess_mask_lt()" },
+        { "ballotARB",           "mgl_tess_ballot1" },
+        { "readInvocationARB",   "mgl_tess_read1" },
+        { "readFirstInvocationARB", "mgl_tess_readfirst1" },
+    };
+    static const char pre[] =
+        /* the helpers use uint64_t (ballotARB's type); enable it in case the
+         * source declared ballotARB's extension but not int64's */
+        "#extension GL_ARB_gpu_shader_int64 : enable\n"
+        /* the ARB masks are uint64_t on the desktop profile (glslang declares
+         * them so at >= 450), so the emulated lane-0 values are too; a size-1
+         * subgroup has only lane 0, so Eq/Ge/Le = {0} = 1 and Gt/Lt = {} = 0 */
+        "uint64_t mgl_tess_ballot1(bool p) { return uint64_t(p); }\n"
+        "uint64_t mgl_tess_mask_eq() { return uint64_t(1); }\n"
+        "uint64_t mgl_tess_mask_ge() { return uint64_t(1); }\n"
+        "uint64_t mgl_tess_mask_gt() { return 0ul; }\n"
+        "uint64_t mgl_tess_mask_le() { return uint64_t(1); }\n"
+        "uint64_t mgl_tess_mask_lt() { return 0ul; }\n"
+        "float  mgl_tess_read1(float v, uint i)  { return v; }\n"
+        "vec2   mgl_tess_read1(vec2 v, uint i)   { return v; }\n"
+        "vec3   mgl_tess_read1(vec3 v, uint i)   { return v; }\n"
+        "vec4   mgl_tess_read1(vec4 v, uint i)   { return v; }\n"
+        "int    mgl_tess_read1(int v, uint i)    { return v; }\n"
+        "ivec2  mgl_tess_read1(ivec2 v, uint i)  { return v; }\n"
+        "ivec3  mgl_tess_read1(ivec3 v, uint i)  { return v; }\n"
+        "ivec4  mgl_tess_read1(ivec4 v, uint i)  { return v; }\n"
+        "uint   mgl_tess_read1(uint v, uint i)   { return v; }\n"
+        "uvec2  mgl_tess_read1(uvec2 v, uint i)  { return v; }\n"
+        "uvec3  mgl_tess_read1(uvec3 v, uint i)  { return v; }\n"
+        "uvec4  mgl_tess_read1(uvec4 v, uint i)  { return v; }\n"
+        "bool   mgl_tess_read1(bool v, uint i)   { return v; }\n"
+        "bvec2  mgl_tess_read1(bvec2 v, uint i)  { return v; }\n"
+        "bvec3  mgl_tess_read1(bvec3 v, uint i)  { return v; }\n"
+        "bvec4  mgl_tess_read1(bvec4 v, uint i)  { return v; }\n"
+        "double mgl_tess_read1(double v, uint i) { return v; }\n"
+        /* readFirstInvocationARB takes no index: it degenerates to the value */
+        "float  mgl_tess_readfirst1(float v)  { return v; }\n"
+        "vec2   mgl_tess_readfirst1(vec2 v)   { return v; }\n"
+        "vec3   mgl_tess_readfirst1(vec3 v)   { return v; }\n"
+        "vec4   mgl_tess_readfirst1(vec4 v)   { return v; }\n"
+        "int    mgl_tess_readfirst1(int v)    { return v; }\n"
+        "ivec2  mgl_tess_readfirst1(ivec2 v)  { return v; }\n"
+        "ivec3  mgl_tess_readfirst1(ivec3 v)  { return v; }\n"
+        "ivec4  mgl_tess_readfirst1(ivec4 v)  { return v; }\n"
+        "uint   mgl_tess_readfirst1(uint v)   { return v; }\n"
+        "uvec2  mgl_tess_readfirst1(uvec2 v)  { return v; }\n"
+        "uvec3  mgl_tess_readfirst1(uvec3 v)  { return v; }\n"
+        "uvec4  mgl_tess_readfirst1(uvec4 v)  { return v; }\n"
+        "bool   mgl_tess_readfirst1(bool v)   { return v; }\n"
+        "bvec2  mgl_tess_readfirst1(bvec2 v)  { return v; }\n"
+        "bvec3  mgl_tess_readfirst1(bvec3 v)  { return v; }\n"
+        "bvec4  mgl_tess_readfirst1(bvec4 v)  { return v; }\n"
+        "double mgl_tess_readfirst1(double v) { return v; }\n";
+
+    if (!src) return NULL;
+    int any = 0;
+    for (size_t k = 0; k < sizeof map / sizeof map[0]; k++)
+        if (strstr(src, map[k].name)) { any = 1; break; }
+    if (!any) return NULL;
+    /* idempotence: on a re-entry (the recursion from mgl_tess_glsl_compat) the
+     * prelude is already there and only the token renames must continue — in
+     * particular gl_SubGroupInvocationARB inside the cts pass's mask helpers */
+    int have_prelude = strstr(src, "mgl_tess_ballot1") != NULL;
+
+    size_t len = strlen(src);
+    /* inject the helpers after the last #extension (and #version) line */
+    size_t insert = 0;
+    {
+        const char *v = strstr(src, "#version");
+        if (v)
+        {
+            const char *nl = strchr(v, '\n');
+            insert = nl ? (size_t)(nl - src) + 1 : len;
+        }
+        const char *p = src;
+        while ((p = strstr(p, "#extension")) != NULL)
+        {
+            const char *nl = strchr(p, '\n');
+            if (!nl) break;
+            size_t at = (size_t)(nl - src) + 1;
+            if (at > insert) insert = at;
+            p = nl;
+        }
+    }
+
+    char *out = malloc(len * 3 + sizeof pre + 64);
+    if (!out) return NULL;
+    size_t o = 0;
+    int changed = 0;
+    for (size_t i = 0; i <= len; i++)
+    {
+        if (insert && i == insert)
+        {
+            if (!have_prelude)
+            {
+                memcpy(out + o, pre, sizeof pre - 1);
+                o += sizeof pre - 1;
+            }
+            insert = 0;
+        }
+        size_t took = 0;
+        if (i < len)
+        {
+            for (size_t k = 0; k < sizeof map / sizeof map[0]; k++)
+            {
+                size_t nl = strlen(map[k].name);
+                if (i + nl <= len && !strncmp(src + i, map[k].name, nl) &&
+                    (i == 0 || !is_ident_char((unsigned char)src[i - 1])) &&
+                    (i + nl == len || !is_ident_char((unsigned char)src[i + nl])))
+                {
+                    /* the cts pass's helper DEFINITION ("uint
+                     * mgl_ballot_subgroup_size() { ... }") must survive even
+                     * though call sites become 1u: skip a match that is a
+                     * function head (followed by '{') or a declaration */
+                    size_t j = i + nl;
+                    while (j < len && (src[j] == ' ' || src[j] == '\t')) j++;
+                    int is_head = (j < len && src[j] == '{') ||
+                                  (i >= 5 && !strncmp(src + i - 5, "uint ", 5));
+                    if (!is_head)
+                    {
+                        size_t rl = strlen(map[k].repl);
+                        memcpy(out + o, map[k].repl, rl);
+                        o += rl;
+                        took = nl;
+                        changed = 1;
+                    }
+                    else
+                    {
+                        memcpy(out + o, src + i, nl);
+                        o += nl;
+                        took = nl;
+                    }
+                    break;
+                }
+            }
+        }
+        if (!took && i < len)
+            out[o++] = src[i];
+        i += took ? took - 1 : 0;
+    }
+    out[o] = 0;
+    if (!changed) { free(out); return NULL; }   /* only the definition matched: nothing to rewrite */
+    if (getenv("MGL_TESS_BALLOT_DUMP")) fprintf(stderr, "[tess ballot1 source]\n%s\n[/tess ballot1]\n", out);
+    return out;
 }
 
 /* A VERTEX stage may redeclare the distance members loose (`out float
@@ -575,6 +740,32 @@ char *mgl_tess_glsl_compat(GLenum type, const char *src)
         (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
          type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
         return NULL;
+    /* GL_ARB_shader_ballot where Metal has no simdgroup attributes: the TES
+     * (post-tessellation vertex function — verified: "invalid
+     * 'thread_index_in_simdgroup' attribute ... in a post-tessellation vertex
+     * function") and the VERTEX stage (a plain vertex function whenever the
+     * pipeline has no tessellation; Metal rejects the attribute there the same
+     * way, and MGL cannot know at compile time whether the link will turn the
+     * VS into a compute kernel).  SPIRV-Cross refuses both ("Subgroup builtins
+     * are not available in this type of function").  The subgroup size is
+     * implementation-defined per stage, so emulate a size-1 subgroup in those
+     * two stages only — every other MGL stage runs compute/fragment kernels
+     * with real 32-wide simdgroups: invocation 0, the lane-0 masks, a one-lane
+     * ballot, and the reads degenerate to the value itself. */
+    if (type == GL_TESS_EVALUATION_SHADER || type == GL_VERTEX_SHADER)
+    {
+        char *emulated = tess_ballot_one_lane(src);
+        if (emulated)
+        {
+            /* run the rest of the stage's passes on the rewritten source (the
+             * recursion re-enters here; tess_ballot_one_lane is idempotent).
+             * The body below returns NULL when it has nothing to rewrite —
+             * then the emulated copy is the final result. */
+            char *rest = mgl_tess_glsl_compat(type, emulated);
+            if (rest) { free(emulated); return rest; }
+            return emulated;
+        }
+    }
     /* vertex AND geometry stages: fold loose `out float gl_*Distance[N];' members
      * into one gl_PerVertex block.  A block interface in one stage and a loose
      * member in the other is exactly the mix glslang's link / io-mapper cannot
@@ -4308,6 +4499,8 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
 /* ------------------------------------------------------------------ GL hooks */
 
+static bool mgl_tess_program_completion_status(GLMContext ctx, Program *program, GLenum pname, GLint *params);
+
 void mgl_ext_init_tess(GLMContext ctx)
 {
     struct MGLExtState_tess *S;
@@ -4319,13 +4512,53 @@ void mgl_ext_init_tess(GLMContext ctx)
         return;
     ctx->state.ext_tess = S;
 
+    /* ARB/KHR_parallel_shader_compile: the spec's initial "no limit" state */
+    S->max_shader_compiler_threads = (GLint)0xFFFFFFFFu;
+
     mgl_ext_register_post_link(mgl_ext_post_link_tess);
+    mgl_program_register_programiv_hook(mgl_tess_program_completion_status);
 }
 
 bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data)
 {
     /* limits are served by get.c; GL_PATCH_VERTICES / default levels by rstate */
+    if (pname == GL_MAX_SHADER_COMPILER_THREADS_ARB /* == ..._KHR, 0x91B0 */)
+    {
+        /* the glMaxShaderCompilerThreads hint (always answered in every glGet
+         * type; the ARB/KHR enum values are identical) */
+        GLint v = ctx->state.ext_tess ? ctx->state.ext_tess->max_shader_compiler_threads
+                                      : (GLint)0xFFFFFFFFu;
+        mgl_get_store(type, data, 0, (double)v);
+        return true;
+    }
     return false;
+}
+
+/* glGetProgramiv(GL_COMPLETION_STATUS_ARB/KHR): MGL links synchronously, which
+ * ARB_parallel_shader_compile explicitly permits, so a program's compile/link
+ * is always complete by the time glGetProgramiv observes it. */
+static bool mgl_tess_program_completion_status(GLMContext ctx, Program *program, GLenum pname, GLint *params)
+{
+    (void)ctx;
+    (void)program;
+    if (pname == GL_COMPLETION_STATUS_ARB)      /* == GL_COMPLETION_STATUS_KHR */
+    {
+        *params = GL_TRUE;
+        return true;
+    }
+    return false;
+}
+
+/* glMaxShaderCompilerThreads[ARB|KHR]: a *hint* only.  MGL compiles and links
+ * synchronously, which the ARB_parallel_shader_compile spec explicitly allows
+ * ("the implementation may ignore the limit entirely"), so this just stores
+ * the value glGet(GL_MAX_SHADER_COMPILER_THREADS_ARB) reports back. */
+void mglMaxShaderCompilerThreads(GLMContext ctx, GLuint count)
+{
+    if (!ctx->state.ext_tess)
+        mgl_ext_init_tess(ctx);
+    if (ctx->state.ext_tess)
+        ctx->state.ext_tess->max_shader_compiler_threads = (GLint)count;
 }
 
 /* GL 4.6 §11.1.3.1/§7.3 link validation: the tessellation control shader's

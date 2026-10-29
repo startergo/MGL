@@ -317,6 +317,14 @@ static const char *mgl_extensions[] = {
     "GL_ARB_shader_group_vote",       /* OpGroupNonUniformAll/Any/AllEqual -> simd_vote (cts_glsl_compat.c) */
     "GL_ARB_shader_subroutine",       /* GLSL rewrite to switch + int selector (introspect_subroutine.c) */
     "GL_ARB_shader_texture_lod",
+    "GL_ARB_parallel_shader_compile",  /* glMaxShaderCompilerThreadsARB: a hint MGL
+                                        * stores for glGet (compiles are synchronous,
+                                        * which the ARB allows; COMPLETION_STATUS=TRUE) */
+    "GL_KHR_parallel_shader_compile",
+    "GL_ARB_shader_ballot",           /* ballotARB/read{First,}InvocationARB + gl_SubGroup*ARB: glslang ->
+                                       * SPV_KHR_shader_ballot opcodes, spirv_vote.c rewrites them to the
+                                       * OpGroupNonUniform* core forms SPIRV-Cross lowers to Metal simd ops */
+    "GL_ARB_gpu_shader_int64",        /* Metal 3 64-bit integer emulation (fp64.c also lowers int64<->fp64) */
     "GL_ARB_shading_language_420pack",
     "GL_ARB_shading_language_packing",
     "GL_ARB_stencil_texturing",

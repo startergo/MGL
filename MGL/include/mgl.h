@@ -781,6 +781,7 @@ void mglUniformSubroutinesuiv(GLMContext ctx, GLenum shadertype, GLsizei count, 
 void mglGetUniformSubroutineuiv(GLMContext ctx, GLenum shadertype, GLint location, GLuint *params);
 void mglGetProgramStageiv(GLMContext ctx, GLuint program, GLenum shadertype, GLenum pname, GLint *values);
 void mglPatchParameteri(GLMContext ctx, GLenum pname, GLint value);
+void mglMaxShaderCompilerThreads(GLMContext ctx, GLuint count);   /* ARB/KHR_parallel_shader_compile (tessellation.c) */
 void mglPatchParameterfv(GLMContext ctx, GLenum pname, const GLfloat *values);
 void mglBindTransformFeedback(GLMContext ctx, GLenum target, GLuint id);
 void mglDeleteTransformFeedbacks(GLMContext ctx, GLsizei n, const GLuint *ids);

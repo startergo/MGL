@@ -275,6 +275,11 @@ struct MGLExtState_tess {
      * next one) — see the MGLTessCapture contract above */
     MGLTessCapture capture;
 
+    /* gl_MaxShaderCompilerThreads (ARB/KHR_parallel_shader_compile): a hint
+     * MGL stores for glGet only (compiles are synchronous, so completion is
+     * immediate); 0xFFFFFFFF = "no limit", the spec's initial state */
+    GLint max_shader_compiler_threads;
+
     /* draw-time CPU tessellation scratch (grown on demand) */
     float  *coord_buf;      /* 4 floats per tessellated vertex: u, v, w, patch id */
     size_t  coord_cap;      /* in floats */

@@ -1118,6 +1118,12 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
         case GL_SHADER_TYPE:
             *params = (GLint)ptr->type;
             break;
+        case GL_COMPLETION_STATUS_ARB:   /* == GL_COMPLETION_STATUS_KHR; MGL
+                                          * compiles synchronously (ARB_parallel_
+                                          * shader_compile allows that), so
+                                          * completion is immediate */
+            *params = GL_TRUE;
+            break;
 
         case GL_DELETE_STATUS:
             *params = ptr->delete_status ? GL_TRUE : GL_FALSE;

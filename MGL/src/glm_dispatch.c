@@ -774,6 +774,7 @@ void init_dispatch(GLMContext ctx)
     ctx->dispatch.get_program_stageiv = mglGetProgramStageiv;
     ctx->dispatch.patch_parameteri = mglPatchParameteri;
     ctx->dispatch.patch_parameterfv = mglPatchParameterfv;
+    ctx->dispatch.max_shader_compiler_threads = mglMaxShaderCompilerThreads;
     ctx->dispatch.bind_transform_feedback = mglBindTransformFeedback;
     ctx->dispatch.delete_transform_feedbacks = mglDeleteTransformFeedbacks;
     ctx->dispatch.gen_transform_feedbacks = mglGenTransformFeedbacks;
