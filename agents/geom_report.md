@@ -1,3 +1,47 @@
+READY bb5ba10 (= e033682 + gl46-port merges aafc7c2 [tess r30] and 1e840b4 [compat s23+s24]; clean-build gate: rm -rf build; make -j4 lib glx nsgl; tests/headless/run.sh = 122 PASS / 0 FAIL, 9507 checks; test_geom 10x = 670 checks / 0 failures each; ab_bench min-of-7 interleaved vs ~/MGL-cts/baseline-1e840b4: m0 drawArrays 11.190 -> 10.826 ms (-3.3%), m1 blend-flip 150.98 -> 151.82 ms (+0.6%) — inside the +3% limit; texture_swizzle.smoke Pass in 373 s. SMOKE 73 s -> 460 s ANSWER: ambient load, not a code regression — the 73 s reference was a quiet machine; same-load A/B tonight: r58 lib (baseline-6f9b359) 379 s vs this tip 373 s = parity; microbenchmarks: whole-link cache hit 0.37-0.47 ms/link on BOTH libs, and the smoke shape (link + texStorage/texSubImage + draw + readback) identical to 3% on both. One flaky smoke FAIL seen exactly once in 5 tip runs (wrong pixel at gl3cTextureSwizzleTests.cpp:3709, never reproduced — follow-up). Merge notes: compat's sep_vs_kernel_cache replaces my build_sep_vs_kernel (I kept my r59 prepare-before-rebuild on the whole-link cache-hit path: compile_stage caches a PREPARED module, so the raw stored SPIR-V must go through spirv_prepare_for_msl first); my first merge-resolution dropped compile_stage's done:-tail frees/return (suite 201/364 geom fails) — caught and fixed before commit; the r59 MISS debug log is REMOVED entirely (was env-gated).)
+
+## r61 session (after READY bb5ba10): texture_view.coherency FIXED; merges aafc7c2/1e840b4/71cfe2a; smoke-6x explained
+* merges: aafc7c2 (tess r30; my program.c resolution initially dropped compile_stage's
+  done:-tail frees/return — suite showed test_geom 201/364, fixed before the commit landed;
+  MGLRenderer+Tessellation.m now matches gl46-port exactly, the r59 MISS debug log deleted),
+  1e840b4 (compat s23+s24: their sep_vs_kernel_cache replaces my build_sep_vs_kernel; on the
+  whole-link cache-hit path I kept my r59 prepare-first call — compile_stage caches a
+  PREPARED module so the raw stored SPIR-V must run through spirv_prepare_for_msl),
+  71cfe2a (my r59-r61 back-merged by gl46-port; report conflict only).
+* FIX (textures.c, surgical): texture VIEW images live in the ROOT's storage —
+  getTexImage/texSubImage/copyTexSubImage now redirect (level += view_min_level, cube face
+  or z layer += view_min_layer).  KHR-GL46.texture_view.coherency: Fail -> Pass (was
+  "glGetTexImage() call failed"; also fixed copyTexSubImage into a view returning
+  GL_OUT_OF_MEMORY).  Suite after: 122 tests / 9507 checks / 0 fail; test_texext 122/0,
+  test_geom 670/0.
+* FIX (MGLRenderer+Geometry.m, my file): the VS-capture kernel bind now calls
+  bindMTLTexture for textures with no mtl_data (a VIEW materializes its Metal texture
+  lazily; the kernel otherwise bound nothing at that slot).
+* INVESTIGATED + NOT A BUG: "geometry stage samples the render target" — my zz_view_gs
+  repro left the FBO's rt bound on the sampled unit.  After fixing the repro, GS-kernel
+  sampling is CORRECT for parent + view, 1D, and minlevel=1 shapes (MGL_GEOM_DUMP shows
+  the kernel MSL text/texture(0) args are right and the bind lands at the same index).
+* REMAINING (documented): KHR-GL46.texture_view.view_sampling still Fails — failures now
+  appear in different stages per iteration (vertex/geometry/fragment(0,0)); my isolated
+  5-stage and 1-stage repros pass, so it needs a per-iteration bisect of the CTS's
+  target/format matrix (next step: port the exact iteration that first fails).
+  texture_view.view_classes needs CPU BPTC encoders (BC7 unorm + BC6H float) to accept
+  uncompressed uploads into texStorage2D'd BPTC storage (RGTC already encodes online).
+* stencil_texturing.functional root-caused to the COMPUTE path only: the DRAW path
+  (5-stage VS/TCS/TES/GS/FS with DEPTH_STENCIL_TEXTURE_MODE=DEPTH_COMPONENT) samples
+  D24S8 and D32FS8 EXACTLY (my repro zz_stencil_tex.c passes; the earlier "D24S8 upload
+  scramble" was my own repro packing 24_8 into an 8-byte-stride buffer — GL layout is
+  depth<<8|stencil, tight 4B/texel, which MGL handles correctly).  The compute half
+  samples texel(x-1,y-1) at EXACT texel boundaries: Metal NEAREST = floor(u*n - 0.5),
+  GL = floor(u*n).  Exact-equivalence fix: add 0.5/n to the coordinate for NEAREST
+  samplers — needs a per-sampler-slot mechanism (function constants like the r60 gather
+  border set, or an MSL sample() rewrite); not implemented tonight.
+* gates on the final tip (71b07d7 = bb5ba10 + view fix + back-merges): full suite
+  122 PASS / 9507 checks / 0 FAIL, test_geom 670/0, test_tess 504/0, test_texext 122/0,
+  test_sepshader 4/0.  (ab_bench/smoke numbers above were measured on bb5ba10; the only
+  code change since is the view redirect — a mgl_texext_info lookup in the GetTexImage/
+  SubImage entry points, not a per-draw path.)
+
 READY e033682 (r59+r60 after the 6f9b359 merge, incl. tess r28+r29 b7821df and compat s22+s23 c6ded7d merges; clean-build gate: rm -rf build; make -j4 lib glx nsgl; tests/headless/run.sh = 118 PASS / 0 FAIL, 9478 checks; test_geom 10x = 670 checks / 0 failures each; texture_swizzle.smoke Pass in 460 s (limit 19 min); stub_scanner EMPTY/NOOP/ASSERT clean for geometry.c + MGLRenderer+Geometry.m; MGLRenderer+Compat.m diff vs gl46-port = 0 lines. ab_bench min-of-7 interleaved vs ~/MGL-cts/baseline-c6ded7d: m0 drawArrays x2000 11.873 -> 11.395 ms (-4.0%), m1 blend-flip x1000 183.742 -> 162.499 ms (-11.6%) — both inside the +3% limit. r59/r60 CTS deltas vs the r28 sweep: shader_image_size 28/10/36 -> 38/0/36 (10 Fail -> 0: a whole-link cache hit now rebuilds the separable VS-as-compute kernel for the new program name), shader_image_load_store 37/12 -> 38/11 (uniform-limits Fail -> Pass via image-ARRAY atomics, one combined sidecar buffer), texture_gather 73/2 -> 75/75 (incomplete-texture sampling enforced in ALL paths incl. VS-gather emulation + compute, 2D/CUBE-map-array mipmap completeness layer rule); also landed without a group-count change: GetTexImage depth-stencil honours DEPTH_STENCIL_TEXTURE_MODE, compute binds each sampler at its OWN MSL index, gather CLAMP_TO_BORDER plumbs the real border colour. Locked interleaved glmark2 (every run under /usr/bin/lockf -k /tmp/mgl_glmark2.lock, order alternated, vs baseline-c6ded7d nsgl): ideas 14 pairs median 626.5 -> 613.0 (-2.2%, top3 -5.8%), jellyfish 6 pairs median -13.2% (2 new-arm rounds hit co-tenant load spikes at 2580/3765 fps; quiet-window top3 -3.6%), gl41-geometry 6 pairs median -1.1% (top3 -4.3%) — no scene regresses past the +3% limit. Still failing: gpu_shader5 18/22 (4 texture_gather_offset_*_clamp_{border,edge}, documented gap), texture_cube_map_array 24/1/2 (sampling: uniform introspection reports type 0).)
 
 READY c9be6f2 (e84cbab + failed-relink introspection zero-report; clean-build gate: rm -rf build; make -j4 lib glx nsgl; tests/headless/run.sh = 563 PASS / 0 FAIL, 8717 checks — test_piq 76/0, test_sepshader 4/0, test_texswizzle 10/0, test_geom 670/0. Speed: supervisor clean A/B at e84cbab = ideas -1.1%, jellyfish +0.2%, gl41-geometry -1.6% (within the 2% gate); c9be6f2 only adds failed-relink query gating, no hot-path code. r58 CTS: texture_swizzle.functional Crash->Pass (alpha-less attachment write mask + clear, depth-mode x swizzle composition, DEPTH_TEXTURE_MODE default RED), gpu_shader5 18/22 (clamped gathers remain), piq 43/43, sepshader fixed.)

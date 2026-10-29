@@ -31,6 +31,9 @@
 #include "glm_context.h"
 #include "mgl_ext_texdata.h"
 #include "mgl_ext_texext.h"
+
+/* forward: defined with the pixel read/write helpers below */
+static Texture *view_redirect(GLMContext ctx, Texture *tex, GLuint *face, GLint *level, GLint *z);
 #include "mgl_ext_texparam.h"
 #include "mgl_ext_fb.h"
 
@@ -1893,6 +1896,7 @@ static void texSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLi
                         GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
                         GLenum format, GLenum type, const void *pixels)
 {
+    tex = view_redirect(ctx, tex, &face, &level, &z);
     GLenum err;
 
     TD_CHECK(tex, GL_INVALID_OPERATION);
@@ -2828,11 +2832,38 @@ void mglGetCompressedTextureSubImage(GLMContext ctx, GLuint texture, GLint level
 /* GetTexImage                                                              */
 /* ------------------------------------------------------------------------ */
 
+/* A texture VIEW's images live in the ROOT texture's storage (textures_ext.c
+ * keeps the mapping).  GL-level pixel paths (GetTexImage / SubImage / CopyTex*)
+ * must follow the view to the root's level/face/layer, or they look at the
+ * view's own empty level bookkeeping and fail with INVALID_OPERATION
+ * (KHR-GL46.texture_view.coherency: glGetTexImage of a view's LOD). */
+static Texture *view_redirect(GLMContext ctx, Texture *tex, GLuint *face, GLint *level, GLint *z)
+{
+    MGLTexExtInfo *info = mgl_texext_info(ctx, tex);
+
+    if (!info || info->kind != MGL_TEXEXT_VIEW || !info->view_root || !info->view_root->faces)
+        return tex;
+
+    if (level)
+        *level += (GLint)info->view_min_level;
+
+    if (info->view_min_layer)
+    {
+        if (face && info->view_root->target == GL_TEXTURE_CUBE_MAP)
+            *face += info->view_min_layer;              /* a cube face view: face index in the root */
+        else if (z)
+            *z += (GLint)info->view_min_layer;          /* array / 3D layer view */
+    }
+    return info->view_root;
+}
+
 static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z,
                         GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type, GLsizei bufSize, void *pixels,
                         bool whole, bool is3d, size_t dst_skip)
 {
     GLenum err;
+
+    tex = view_redirect(ctx, tex, &face, &level, &z);
 
     TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, tex->target), GL_INVALID_VALUE);
 
@@ -3097,6 +3128,7 @@ static GLenum copyCompat(GLMContext ctx, const TDFormat *df, bool *depth, bool *
 static void copyTexSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
                             GLint x, GLint y, GLsizei width, GLsizei height)
 {
+    tex = view_redirect(ctx, tex, &face, &level, &zoffset);
     GLenum err;
 
     TD_CHECK(tex, GL_INVALID_OPERATION);

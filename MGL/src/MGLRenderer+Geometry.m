@@ -18,6 +18,7 @@
 #include "glm_context.h"
 #include "mgl_ext.h"
 #include "mgl_ext_geom.h"
+#include "mgl_ext_texext.h"   /* MGLTexExtInfo: buffer-texture writeback (r63) */
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_tess.h"   /* MGLTessCapture debug dump in geom_xfb_dump */
@@ -2306,17 +2307,38 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         if (kind != elem_class)
             return view;                     /* the shader's image type says otherwise */
     }
-    @try {
-        id<MTLTexture> rv = [view newTextureViewWithPixelFormat: (MTLPixelFormat)fi->mtl];
-        if (gEnv.debug)
-            NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
-                  iu->unit, (int)view.pixelFormat, fi->mtl, elem_class,
-                  (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
-                  rv ? "" : " FAILED");
-        if (rv) return rv;
-    } @catch (NSException *e) {
-        NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
-              (int)view.pixelFormat, fi->mtl, e);
+    /* the SAME cast view object must come back every draw: the image-atomic sidecar
+     * keys its "binding unchanged, contents persist" check on the view's address
+     * (geomImageAtomicBuffer) and the array layout signs it into its signature
+     * (geomImageAtomicArrayLayout), so a fresh view per call would discard the
+     * sidecar (and its accumulated atomics) on every draw.  A view keeps its parent
+     * texture alive, so keying on the parent's address cannot alias a new texture. */
+    {
+        static NSMutableDictionary<NSString *, id<MTLTexture>> *castCache = nil;
+        static dispatch_once_t once;
+        NSString *key;
+        id<MTLTexture> cached;
+
+        dispatch_once(&once, ^{ castCache = [NSMutableDictionary dictionary]; });
+        key = [NSString stringWithFormat: @"%p:%u", (void *)view, (unsigned)fi->mtl];
+        @synchronized (castCache) { cached = castCache[key]; }
+        if (cached && cached.pixelFormat == (MTLPixelFormat)fi->mtl)
+            return cached;
+        @try {
+            id<MTLTexture> rv = [view newTextureViewWithPixelFormat: (MTLPixelFormat)fi->mtl];
+            if (gEnv.debug)
+                NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
+                      iu->unit, (int)view.pixelFormat, fi->mtl, elem_class,
+                      (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
+                      rv ? "" : " FAILED");
+            if (rv) {
+                @synchronized (castCache) { castCache[key] = rv; }
+                return rv;
+            }
+        } @catch (NSException *e) {
+            NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
+                  (int)view.pixelFormat, fi->mtl, e);
+        }
     }
     return view;
 }
@@ -2571,7 +2593,9 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     }
 
     if (buf) { buf = nil; }                     /* ARC release before overwriting */
-    buf = [_device newBufferWithLength:texels * 4 options:MTLResourceStorageModeShared];
+    /* +1 DUMP word: the MSL index helpers (mgl_msl_fix_image_atomics) point
+     * out-of-range image accesses at it instead of past the buffer */
+    buf = [_device newBufferWithLength:texels * 4 + 4 options:MTLResourceStorageModeShared];
     if (!buf) return nil;
     memset(buf.contents, 0, buf.length);        /* atomics start from a cleared image */
 
@@ -2659,7 +2683,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         g->img_atom[unit].dirty = true;      /* a dispatch/encoder saw it */
         return buf;
     }
-    buf = [_device newBufferWithLength: words * 4 options: MTLResourceStorageModeShared];
+    buf = [_device newBufferWithLength: words * 4 + 4 options: MTLResourceStorageModeShared];  /* +1 DUMP word (OOB image accesses) */
     if (!buf)
         return nil;
     if (g->img_atom[unit].buf)
@@ -2913,7 +2937,8 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         {
             ImageUnit *iu2 = &STATE(image_units[unit + e]);
             id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
-                ? [self geomImageUnitView: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)]
+                ? [self geomImageUnitViewRes: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)
+                                   elemClass: 0xffffffffu]
                 : nil;
             id<MTLTexture> av;
             NSUInteger total_e;
@@ -3025,7 +3050,8 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             {
                 ImageUnit *iu2 = &STATE(image_units[u + e]);
                 id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
-                    ? [self geomImageUnitView: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)]
+                    ? [self geomImageUnitViewRes: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)
+                                     elemClass: 0xffffffffu]
                     : nil;
                 id<MTLTexture> av;              /* a 1-slice 2D-array view: the raw (unpadded)
                                                   * sidecar layout, exactly what the MSL
@@ -3106,6 +3132,48 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         [enc dispatchThreads: MTLSizeMake(total, 1, 1)
         threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
                                            pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
+
+        /* r63: a TEXTURE BUFFER's atomics resolve into its SHADOW texture (buffer
+         * textures are converted copies, mgl_uses_shadow): the GL buffer itself would
+         * still read the pre-draw bytes through glMapBufferRange / glGetBufferSubData.
+         * Blit the resolved shadow back into the GL buffer's storage (the compute
+         * encoder above and this blit encoder are ordered within the command buffer).
+         * KHR-GL46 shader_image_load_store.advanced-allStages-oneImage,
+         * texture_buffer.texture_buffer_atomic_functions ("Buffer value is 0"). */
+        if (tt == MTLTextureTypeTextureBuffer)
+        {
+            ImageUnit *iu2 = &STATE(image_units[u]);
+            MGLTexExtInfo *info = (iu2->tex) ? mgl_texext_info(ctx, iu2->tex) : NULL;
+            Buffer *gb = (info && info->buffer_name)
+                         ? (Buffer *)searchHashTable(&ctx->state.buffer_table, info->buffer_name)
+                         : NULL;
+            id<MTLBuffer> shadow = [(__bridge id<MTLTexture>)iu2->tex->mtl_data buffer];
+
+            if (info && info->kind == MGL_TEXEXT_BUFFER && info->mtl_uses_shadow &&
+                gb && gb->data.mtl_data && shadow && iu2->tex->mtl_data)
+            {
+                size_t bytes = (size_t)total * 4;
+                GLintptr dst = info->buffer_ranged ? info->buffer_offset : 0;
+
+                if ((size_t)dst + bytes > (size_t)gb->size) bytes = ((size_t)gb->size > (size_t)dst)
+                                                                 ? (size_t)gb->size - (size_t)dst : 0;
+                if (bytes)
+                {
+                    id<MTLBlitCommandEncoder> bl = [_currentCommandBuffer blitCommandEncoder];
+
+                    if (bl)
+                    {
+                        [bl copyFromBuffer: shadow sourceOffset: (NSUInteger)view.bufferOffset
+                                    toBuffer: (__bridge id<MTLBuffer>)gb->data.mtl_data
+                           destinationOffset: (NSUInteger)dst size: bytes];
+                        [bl endEncoding];
+                        if (gEnv.debug)
+                            fprintf(stderr, "MGL geom: img-atom buffer writeback unit=%d %zu bytes @%ld\n",
+                                    u, bytes, (long)dst);
+                    }
+                }
+            }
+        }
     }
     [enc endEncoding];
     ctx->state.dirty_bits |= DIRTY_ALL;      /* the encoder state must be rebuilt */
@@ -3141,7 +3209,22 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             iu = &STATE(image_units[unit + e]);
             ptr = iu->tex;
             if (!ptr || !ptr->mtl_data) continue;
-            texture = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            /* r63: the atomics resolve straight into a buffer texture's storage (the
+             * texture aliases the GL buffer) or through the writeback blit — either way
+             * the GL buffer carries pending GPU writes the buffer domain cannot see
+             * (its tracking only knows buffer bindings).  Mark it, or glMapBufferRange /
+             * glGetBufferSubData read the stale pre-draw bytes
+             * (shader_image_load_store.advanced-allStages-oneImage,
+             * texture_buffer.texture_buffer_atomic_functions: "Buffer value is 0"). */
+            {
+                MGLTexExtInfo *bi = mgl_texext_info(ctx, ptr);
+                Buffer *gb = (bi && bi->kind == MGL_TEXEXT_BUFFER && bi->buffer_name)
+                             ? (Buffer *)searchHashTable(&ctx->state.buffer_table, bi->buffer_name) : NULL;
+
+                if (gb) mgl_buffers_mark_gpu_use(ctx, gb, true);
+            }
+            texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                      elemClass: sres->elem_class];
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
             if (!buf) continue;
             if (stage != _FRAGMENT_SHADER)
@@ -3188,7 +3271,16 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             iu = &STATE(image_units[unit + e]);
             ptr = iu->tex;
             if (!ptr || !ptr->mtl_data) continue;
-            texture = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            {   /* buffer-texture atomics: pending GPU writes to the GL buffer (see the
+                 * render-stage note above) */
+                MGLTexExtInfo *bi = mgl_texext_info(ctx, ptr);
+                Buffer *gb = (bi && bi->kind == MGL_TEXEXT_BUFFER && bi->buffer_name)
+                             ? (Buffer *)searchHashTable(&ctx->state.buffer_table, bi->buffer_name) : NULL;
+
+                if (gb) mgl_buffers_mark_gpu_use(ctx, gb, true);
+            }
+            texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                      elemClass: sres->elem_class];
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
             if (!buf) continue;
             [encoder setBuffer: buf offset: 0 atIndex: mtl_index + e];
@@ -3242,7 +3334,8 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             iu = &STATE(image_units[unit]);
             ptr = iu->tex;
             if (!ptr || !ptr->mtl_data) continue;
-            view = [self geomImageUnitView: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)];
+            view = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                    elemClass: sres->elem_class];
             if (![self geomImageAtomicBuffer: unit view: view]) continue;   /* creates + flags */
             if (g->img_atom[unit].needs_seed && n_pending < TEXTURE_UNITS)
                 pending[n_pending++] = (int)unit;
@@ -3379,6 +3472,15 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                 if (unit < 0 || (GLuint)unit >= TEXTURE_UNITS) continue;
                 Texture *tex = types[t].image ? STATE(image_units[unit].tex)
                                               : mgl_texture_for_sampler(ctx, unit, sres->target);
+                if (tex && !tex->mtl_data)
+                {
+                    /* a texture VIEW (texext-owned: view / buffer / MS) materializes
+                     * its Metal texture lazily; the render-encoder bind path realizes
+                     * it on first bind, this emulation-kernel path must do the same
+                     * or the kernel samples an unbound slot
+                     * (KHR-GL46.texture_view.view_sampling: geometry stage) */
+                    [self bindMTLTexture: tex];
+                }
                 if (!tex || !tex->mtl_data) continue;
                 id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
                 if (!types[t].image)
@@ -4173,15 +4275,37 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
     else
     {
-        /* the capture pass draws `out_idx' indices per instance; the record pool must
-         * cover the same range in the worst case.  Known counts (read command) size it
-         * exactly, and can only shrink it below the whole-buffer bound */
+        /* GPU (prep-kernel) assembly.  The prep kernel derives vmin/vmax and the
+         * capture header on the GPU; until r63 this sized the pool by the INDEX
+         * count ("the capture pass draws out_idx indices per instance") — but the
+         * capture pass draws the prep's capture list as an INDEX BUFFER, so the
+         * capture variant's gl_VertexID is the fetched index VALUE and its record
+         * lands at (index - vmin)*in_words: the slice must cover the drawn VERTEX
+         * RANGE, not the index count.  A sparse indexed draw — test_geom_xfbperf's
+         * 30k indices over a 100k-vertex buffer — wrote 3x past the slice: silently
+         * into the rest of the pool most of the time, into unmapped pages whenever
+         * the slice landed at the pool buffer's end (the intermittent GPU page
+         * fault; it needed several draws in flight for the pool to reach that
+         * state).  geom_route_gpu scans the element range for direct draws and
+         * supplies d->vstart/d->vcount; indirect draws leave vcount 0 and fall back
+         * to the index-count bound, with the capture variant's capacity clamp
+         * (mgl_hdr[4], written below) keeping it inside the slice. */
         uint64_t vb = bound;
         uint64_t ib = d->instances > 0 ? (uint64_t)d->instances : 1;
 
+        if (d->indexed && d->vcount && (uint64_t)d->vcount > vb) vb = d->vcount;
         if (d->known_vcount && (uint64_t)d->known_vcount < vb) vb = d->known_vcount;
         if (d->known_instances) ib = d->known_instances;
         vsout_bytes = (8 + (size_t)vb * (size_t)ib * gp->in_words) * sizeof(uint32_t);
+        if (getenv("MGL_GEOM_ASSERT") && d->indexed && d->vcount)
+        {
+            /* CPU-side proof every capture write stays in the slice: the largest
+             * record word offset is (vcount-1 + (instances-1)*vcount)*in_words plus
+             * in_words words, all under the 8-word header. */
+            uint64_t need = (8 + (size_t)vb * (size_t)ib * (uint64_t)gp->in_words) * 4;
+            assert(need <= vsout_bytes);
+            assert((size_t)d->vcount <= vb);   /* the range fits the per-instance bound */
+        }
     }
 
     /* every draw gets its own range of the record buffer: a later draw's geometry kernel
@@ -4215,6 +4339,12 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     gPrim = geomSubAlloc(self, _device, &gPrimPool, prim_bytes, &gPrimOff, _currentCommandBuffer);
     if (!gPrim) { geomReleaseStatics(); return false; }
     gVsout = geomSubAlloc(self, _device, &gVsoutPool, vsout_bytes, &gVsoutOff, _currentCommandBuffer);
+    /* r63: the capture variant's record-capacity clamp reads VSOUT header word 4
+     * (mgl_hdr[4], in words, after the 8-word header).  Nothing else writes word 4
+     * (the prep/tess kernels fill 0..3), so writing it here — after this draw's
+     * sizing, before any dispatch — keeps it exact for every draw. */
+    if (gVsout && gVsout.contents)
+        ((uint32_t *)gVsout.contents)[gVsoutOff / 4 + 4] = (uint32_t)(vsout_bytes / 4 - 8);
     if (!gVsout) { geomReleaseStatics(); return false; }
 
     if (![self geomPipelines: gp program: program]) return false;
@@ -5408,7 +5538,8 @@ static inline int mgl_geom_wrap_code(GLenum w)
     switch (w) {
         case GL_REPEAT: return 0;
         case GL_MIRRORED_REPEAT: return 1;
-        default: return 2;   /* CLAMP_TO_EDGE; CLAMP / CLAMP_TO_BORDER / MIRROR_CLAMP_TO_EDGE approximated */
+        case GL_CLAMP_TO_BORDER: return 3;  /* taps outside -> the unit's border colour (mgl_border_fc) */
+        default: return 2;   /* CLAMP_TO_EDGE; CLAMP / MIRROR_CLAMP_TO_EDGE approximate to edge texels */
     }
 }
 

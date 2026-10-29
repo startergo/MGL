@@ -1223,7 +1223,18 @@ static const char *k_gath_helpers =
  * function constants per slot (MGL_GEOM_FC_BORDER_BASE, geom r60 — Metal samplers
  * only offer three preset border colours but GL allows any float4).  GL_CLAMP still
  * falls back to edge texels (it differs only for LINEAR filtering, which a gather
- * tap never does). */
+ * tap never does).
+ *
+ * The tap block base is floor(uv * size - 0.5) in UNWRAPPED texel space and the
+ * address mode runs PER TAP after the gather offset was added (GL 4.6 8.14.2 /
+ * ARB_texture_gather: the offset shifts the tap's texel indices before the wrap
+ * mode wraps them) — so a CLAMP_TO_EDGE tap pushed past the edge by the offset
+ * clamps to the edge texel, instead of the offset dragging the whole footprint in
+ * after the coordinate was clamped.  That coordinate pre-clamp (LINEAR texel-centre
+ * clamping, GL 8.13.1) was r60's model and is wrong for gather+offset:
+ * KHR-GL46.gpu_shader5.texture_gather_offset_{color,depth}_clamp_to_{edge,border}
+ * decode the unclamped base from a CLAMP_TO_BORDER reference gather and expect
+ * clamp(base + offset) per tap (geom r62). */
 "static inline int mgl_wco(int v, int n, int m)\n"
 "{\n"
 "    if (m == 0) { int r = v % n; if (r < 0) r += n; return r; }\n"                     /* GL_REPEAT */
@@ -1286,8 +1297,6 @@ static const char *k_gath_helpers =
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    float2 tc = (unorm ? uv : uv * sz);\n"
-"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
-"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
 "    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
 "    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), c);\n"
@@ -1303,8 +1312,6 @@ static const char *k_gath_helpers =
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    float2 tc = (unorm ? uv : uv * sz);\n"
-"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
-"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
 "    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
 "    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_gselb(bcol, c)) : mgl_gsel(t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), c);\n"
@@ -1334,8 +1341,6 @@ static const char *k_gcmp_read_helpers =
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    float2 tc = (unorm ? uv : uv * sz);\n"
-"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
-"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
 "    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
 "    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), 0), op);\n"
@@ -1351,8 +1356,6 @@ static const char *k_gcmp_read_helpers =
 "    int ws = wrap & 7, wt = (wrap >> 4) & 7;\n"
 "    int w = (int)t.get_width(), h = (int)t.get_height();\n"
 "    float2 tc = (unorm ? uv : uv * sz);\n"
-"    if (ws == 2) tc.x = clamp(tc.x, 0.5, float(w) - 0.5);\n"
-"    if (wt == 2) tc.y = clamp(tc.y, 0.5, float(h) - 0.5);\n"
 "    int2 b = int2(floor(tc - float2(0.5)) + float2(off));\n"
 "    vec<T,4> r;\n"
 "    r[0] = (mgl_wcb(b.x, w, ws) || mgl_wcb(b.y + 1, h, wt)) ? T(mgl_cmp_do(ref, bcol.x, op)) : mgl_cmp_do(ref, t.read(uint2(mgl_wco(b.x, w, ws), mgl_wco(b.y + 1, h, wt)), layer, 0), op);\n"
@@ -1650,11 +1653,14 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
 
                 const char *off = "int2(0)";
                 const char *comp = "component::x";
-                /* shadow: args[base] is the compare REFERENCE, not an offset — a
-                 * folded (variable) offset leaves no offset argument in the call at
-                 * all, and scanning the ref into `off' emitted a float where the
-                 * helper's int2 goes (depth_repeat_y link failure) */
-                for (int a = base + (shadow && !compute ? 1 : 0); a < nargs; a++)
+                /* shadow: args[base] is the compare REFERENCE, not an offset — in
+                 * BOTH stages (a folded (variable) offset leaves no offset argument
+                 * in the call at all, and scanning the ref into `off' emitted a
+                 * float where the helper's int2 goes — depth_repeat_y link failure,
+                 * and the same mis-scan broke the COMPUTE form: KHR-GL46
+                 * texture_gather.offset-gather-depth-2d's compute variant compiled
+                 * "int2(fold) + (p.w)" and failed the Metal build) */
+                for (int a = base + (shadow ? 1 : 0); a < nargs; a++)
                 {
                     if (strncmp(args[a], "component::", 11) == 0) comp = args[a];
                     else off = args[a];

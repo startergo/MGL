@@ -3294,7 +3294,13 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                                 int *dub_out)
 {
     struct { char name[128]; int auto_idx, index, kind; int scalar; int is2d; char elem[12]; } imgs[32];
+    memset(imgs, 0, sizeof imgs);   /* r63: same latent-uninitialized risk as arrs[] below */
     struct { char elem[96]; unsigned count; char hname[152]; } arrs[32]; /* name-indexed */
+    memset(arrs, 0, sizeof arrs);   /* r63: an UNinitialized entry with garbage count and
+                                     * an empty hname made the emit probe "(" match any
+                                     * parenthesised edit text and splice a garbage helper
+                                     * into the MSL (broke the Metal build as soon as the
+                                     * stack layout shifted) */
     int nimgs = 0;
     struct { size_t at, len; char *text; } edits[256];
     int nedits = 0;
@@ -3304,6 +3310,41 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     msl_has_lta = (strstr(msl, "spvLinearTextureAlignment") != NULL);
     if (nslots_out) *nslots_out = 0;
     if (dub_out) *dub_out = -1;
+
+    /* 0. SPIRV-Cross's spvImage2DAtomicCoord linearizes with NO bounds check, so an
+     * imageAtomic* at a coordinate outside the image (GL discards those; the CTS does
+     * them from full-window quads into 64x64 images — advanced-cast, allStages-oneImage)
+     * indexes past the sidecar buffer and undefined-writes GPU memory.  Re-point the
+     * macro's out-of-range branch at the DUMP word the allocation carries (pitch*h,
+     * geomImageAtomicBuffer's +1 word): in-range indices are byte-identical. */
+    {
+        static const char def[] = "#define spvImage2DAtomicCoord(tc, tex)";
+        const char *d = strstr(msl, def);
+        if (d)
+        {
+            const char *body = d + sizeof def - 1;
+            while (*body == ' ' || *body == '\t') body++;
+            const char *e = strchr(body, '\n');       /* a #define ends at the newline */
+            if (e && nedits < 256)
+            {
+                char nb[768];
+                snprintf(nb, sizeof nb,
+                    "((((tc).x >= 0 && (tc).y >= 0 && (tc).x < (int)(tex).get_width() && "
+                    "(tc).y < (int)(tex).get_height()) ? "
+                    "((((((tex).get_width() + %s - 1) & ~(%s - 1))) * (uint)(tc).y) + (uint)(tc).x) : "
+                    "(((((tex).get_width() + %s - 1) & ~(%s - 1))) * (uint)(tex).get_height())))",
+                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
+                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
+                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
+                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u");
+                edits[nedits].at = (size_t)(body - msl);
+                edits[nedits].len = (size_t)(e - body);
+                edits[nedits].text = strdup(nb);
+                if (edits[nedits].text) nedits++;
+            }
+        }
+    }
+
     if (dub_out)
     {
         /* the packed default-uniform block argument: `mgl_DefaultUniforms_1 [[buffer(N)]]`
@@ -3797,22 +3838,40 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     arrhelpers[0] = 0;
     {
         static const struct { const char *name; const char *body; } h[5] = {
+            /* The index helpers BOUNDS-CHECK the coordinate: GL discards image accesses
+             * outside the image ("If the texel coordinates ... are outside the range of
+             * the image, the result is undefined" — but a GPU-side write must not land
+             * anywhere visible), and SPIRV-Cross's raw linearization would otherwise
+             * address past the sidecar buffer (KHR-GL46.shader_image_load_store.
+             * advanced-cast atomics at ivec2(gl_FragCoord.xy) of a window-sized quad
+             * into a 64x64 image faulted/undefined-wrote).  An OOB access indexes the
+             * one extra DUMP word the allocation carries (geomImageAtomicBuffer):
+             * in-range results are unaffected, OOB ones all pile up on that word. */
             { "spvMglAI3D(",
               "template <typename T> static inline __attribute__((always_inline)) "
-              "uint spvMglAI3D(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
+              "uint spvMglAI3D(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(), "
+              "d = tex.get_depth(); if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= h || "
+              "uint(tc.z) >= d) return w * h * d; "
               "return uint(tc.x) + w * (uint(tc.y) + h * uint(tc.z)); }\n" },
             /* texture2d_array carries both image1DArray (an int2 coordinate: the layer in
              * y) and image2DArray (int3: the layer in z) — the overloads pick the layout */
             { "spvMglAIA(",
               "template <typename T> static inline __attribute__((always_inline)) "
-              "uint spvMglAIA(T tex, int2 tc) { return uint(tc.x) + tex.get_width() * uint(tc.y); }\n"
+              "uint spvMglAIA(T tex, int2 tc) { uint w = tex.get_width(), h = tex.get_height(); "
+              "uint n = h; if (any(tc < int2(0)) || uint(tc.x) >= w || uint(tc.y) >= n) return w * h * tex.get_array_length(); "
+              "return uint(tc.x) + w * uint(tc.y); }\n"
               "template <typename T> static inline __attribute__((always_inline)) "
               "uint spvMglAIA(T tex, int3 tc) { uint w = tex.get_width(), h = tex.get_height(); "
+              "uint n = tex.get_array_length(); if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= h || "
+              "uint(tc.z) >= n) return w * h * n; "
               "return uint(tc.x) + w * (uint(tc.y) + h * uint(tc.z)); }\n" },
             /* a cube face — and a cube-array slice: glslang packs layer*6+face into z */
             { "spvMglAICB(",
               "template <typename T> static inline __attribute__((always_inline)) "
-              "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); "
+              "uint spvMglAICB(T tex, int3 tc) { uint w = tex.get_width(); uint n = "
+              "tex.get_texture_type() == texture_type::texture_cube_array ? (uint)tex.get_array_length() * 6u : 6u; "
+              "if (any(tc < int3(0)) || uint(tc.x) >= w || uint(tc.y) >= w || uint(tc.z) >= n) "
+              "return w * w * n; "
               "return uint(tc.z) * w * w + uint(tc.y) * w + uint(tc.x); }\n" },
             /* imageLoad of an atomics-carrying image, through its side buffer: the GLSL
              * gvec4 of a single-channel format is (v, 0, 0, 1) */
@@ -3821,7 +3880,7 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
               "vec<E,4> spvMglAILoad(device A* side, uint t) "
               "{ return vec<E,4>(E(atomic_load_explicit(&side[t], memory_order_relaxed)), E(0), E(0), E(1)); }\n" }
         };
-        for (int k = 0; k < 4; k++)
+        for (int k = 0; k < 4; k++)   /* 4 helpers: 3D / array / cube + the load shim */
         {
             int used = (k == 3) ? used_load_helper : 0;
             for (int a = 0; a < nedits && !used; a++)
@@ -3848,12 +3907,14 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             snprintf(body, sizeof body,
                 "static inline __attribute__((always_inline)) uint %s"
                 "(thread const array<%s, %u>& a, uint i, int2 tc) "
-                "{ uint off = 0; const uint al = (uint)(%s); "
-                "for (uint j = 0; j < i; j++) { uint p = (a[j].get_width() + al - 1) & ~(al - 1); "
-                "off += p * a[j].get_height(); } "
+                "{ uint off = 0, tot = 0; const uint al = (uint)(%s); "
+                "for (uint j = 0; j < %u; j++) { uint p = (a[j].get_width() + al - 1) & ~(al - 1); "
+                "uint t = p * a[j].get_height(); if (j < i) off += t; tot += t; } "
                 "uint p = (a[i].get_width() + al - 1) & ~(al - 1); "
+                "if (any(tc < int2(0)) || uint(tc.x) >= a[i].get_width() || uint(tc.y) >= a[i].get_height()) "
+                "return tot; "
                 "return off + p * uint(tc.y) + uint(tc.x); }\n",
-                arrs[i].hname, arrs[i].elem, arrs[i].count, al);
+                arrs[i].hname, arrs[i].elem, arrs[i].count, al, arrs[i].count);
             if (strlen(arrhelpers) + strlen(body) + 1 < helpers_cap)
                 strcat(arrhelpers, body);
         }
@@ -5700,6 +5761,15 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
            MGL_GEOM_SSBO_VSOUT);
     sb_put(&b, "void main()\n{\n    mgl_geom_vs_main();\n");
     sb_put(&b, "    uint mgl_o = ((uint(gl_VertexID) - mgl_hdr[0]) + (uint(gl_InstanceID) - mgl_hdr[2]) * mgl_hdr[1]) * mgl_hdr[3];\n");
+    /* r63: mgl_hdr[4] (written fresh per draw CPU-side, after the slice sizing) is the
+     * record capacity in words: for an indexed capture pass gl_VertexID is the fetched
+     * index VALUE, so mgl_o spans the drawn VERTEX RANGE — which a direct draw's pool
+     * now covers exactly (geom_route_gpu scans the element range), but an indirect
+     * draw's CPU-side bound cannot.  Without the clamp the capture wrote past the
+     * slice and paged faulted intermittently (test_geom_xfbperf); with it, records
+     * that cannot fit are dropped instead (documented gap for indirect draws whose
+     * vertex range exceeds the pool bound). */
+    sb_put(&b, "    if (mgl_o + %uu > mgl_hdr[4]) { return; }\n", gp->in_words);
 
     if (gp->in_has_pos)
     {
@@ -8908,6 +8978,47 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d)
     d->cmd_layout = 0;
     d->cmd_buffer = NULL;
     d->cmd_offset = 0;
+
+    /* r63 (test_geom_xfbperf page-fault root cause): the capture pass draws the prep
+     * kernel's capture list as an INDEX BUFFER, so the capture variant's gl_VertexID
+     * is the FETCHED INDEX VALUE and it stores its record at
+     *     mgl_o = (gl_VertexID - vmin + (instanceID - baseInstance) * vcount) * in_words
+     * — the record slot spans the drawn VERTEX RANGE (vmax-vmin+1), NOT the index
+     * count.  Sizing the record pool by the index count ("the vertex range is only
+     * known on the GPU") let a sparse indexed draw — the perf test's 30k indices
+     * over a 100k-vertex buffer — write 3x past the pool slice: mostly silently into
+     * the rest of the pool, and into unmapped pages whenever the slice landed near
+     * the pool buffer's end (an intermittent GPU page fault that needed several
+     * draws in flight for the pool to be in that state).  Read the range on the CPU
+     * (direct draws only — for indirect ones the prep kernel clamps instead) and
+     * hand it to the renderer through d->vstart/d->vcount, the same fields the CPU
+     * route supplies. */
+    if (d->indexed && d->type && d->count > 0)
+    {
+        Buffer *eb = ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL;
+
+        if (eb && eb->data.mtl_data)
+        {
+            uint32_t restart = 0, vmin = 0xffffffffu, vmax = 0;
+            uint32_t *ix = geom_index_list(ctx, d->type, d->offset, d->count, &restart);
+
+            if (ix)
+            {
+                for (GLsizei i = 0; i < d->count; i++)
+                    if (ix[i] != restart)
+                    {
+                        if (ix[i] < vmin) vmin = ix[i];
+                        if (ix[i] > vmax) vmax = ix[i];
+                    }
+                free(ix);
+                if (vmin != 0xffffffffu)
+                {
+                    d->vstart = vmin;
+                    d->vcount = vmax - vmin + 1;
+                }
+            }
+        }
+    }
 
     METAL()->draw(ctx, d);
     return true;
