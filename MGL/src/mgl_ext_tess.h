@@ -152,6 +152,10 @@ void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable);
  * built-in set (added outputs are never written, added inputs never read).
  * Returns a malloc'd rewritten source, or NULL when no rewrite is needed. */
 char *mgl_tess_glsl_compat(GLenum type, const char *src);
+/* GLSL 4.6 §7.1: reject a non-constant index write to an unsized gl_ClipDistance /
+ * gl_CullDistance.  Runs on the RAW source in the compile path (shaders.c): the
+ * introspect pass pins and folds the declarations away.  Returns an #error source. */
+char *mgl_tess_reject_dynamic_distance_index(const char *src);
 const MGLTessCapture *mgl_tess_get_capture(GLMContext ctx);   /* last capture */
 
 typedef struct MGLTessProgram_t {

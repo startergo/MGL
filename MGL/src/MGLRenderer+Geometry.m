@@ -760,6 +760,15 @@ static const char *kGeomTessImportMSL =
     "    uint nidx = cnt[1];\n"
     "    if (nrec > cfg[3]) nrec = cfg[3];                 /* the ring's record capacity */\n"
     "    if (nidx > cfg[4]) nidx = cfg[4];                 /* and its index capacity */\n"
+    "    if (t < nrec)\n"
+    "    {\n"
+    "        /* the tess capture's members only cover what the TES writes: unwritten clip\n"
+    "         * and cull words (and varyings the consumer does not read) must start from\n"
+    "         * a defined value — zero is positive, so an undefined clip/cull plane can\n"
+    "         neither clip nor cull (GL leaves those values undefined) */\n"
+    "        device uint* z = recs + (size_t)t * cfg[5];\n"
+    "        for (uint i = 0u; i < cfg[5]; i++) z[i] = 0u;\n"
+    "    }\n"
     "    if (t == 0u)\n"
     "    {\n"
     "        uint prims = nidx / cfg[1];                   /* k index entries per primitive */\n"
@@ -4768,6 +4777,10 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             _currentRenderEncoder = saved;
             return false;
         }
+        /* this pass owns a private render encoder: no bind-shadow entry may survive
+         * into it (the driver recycles encoder addresses, and a recycled address
+         * would make compatBindVertexBuffer skip the bind) */
+        [self compatBindInvalidate];
         [enc pushDebugGroup: @"MGL geometry vertex capture"];
         [enc setRenderPipelineState: pso];
 
@@ -4910,6 +4923,9 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         if (saved_vs) saved_vs->mtl_data.function = saved_vs_fn;
         _currentRenderEncoder = saved;
         ctx->state.dirty_bits |= DIRTY_VAO | DIRTY_PROGRAM | DIRTY_STATE;
+        /* the GL encoder returns: it must not inherit the capture encoder's bind
+         * shadows (encoder addresses are recycled by the driver) */
+        [self compatBindInvalidate];
     }
 
     if ((geomEnvRead(), gEnv.xfb) && gp->in_words)
@@ -5290,7 +5306,39 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
 - (bool) geomRasterPass: (MGLGeomDraw *) d
 {
     MGLGeomProgram *gp = d->gp;
+    /* the pass installs the vertex-override pipeline (the export vertex function).
+     * The compat pipeline fast path caches PSOs keyed on the PROGRAM's own stage
+     * functions + VAO/rstate/FBO content — it does not know ext_geom->vertex_override,
+     * so two cull/geometry passes whose programs compile to the same MSL but whose
+     * export functions have different record strides (KHR-GL46 cull_distance: the
+     * gl_ClipDistance[1]/gl_CullDistance[7] shape recompiled with an unsized
+     * gl_ClipDistance[]) share a cache slot and the second pass draws with the first
+     * pass's PSO — a stride mismatch that renders the previous draw's records.
+     * Rebuilding the PSO through the descriptor path on EVERY pass is not an option
+     * (glmark2 gl41-geometry: 21174 -> 2863 FPS), so borrow DIRTY_SHADER — nothing
+     * but that fast path's decline test reads it — only when the export function
+     * changed since the last pass: the first pass of a program/family forces the
+     * descriptor build (which fills the slot with the override PSO) and every
+     * following pass with the same function hits the cache, whose slot content is
+     * then correct by construction (a different export function always forces). */
+    {
+        /* the pass's pipeline identity: the owning program, the export function and
+         * its MSL text (all three change on every gp rebuild; address reuse after a
+         * free would have to match all three) */
+        static GLuint last_prog;
+        static void *last_export_fn, *last_export_msl;
+        if (gp->name != last_prog || gp->draw_function != last_export_fn ||
+            (void *)gp->draw_msl != last_export_msl)
+        {
+            ctx->state.dirty_bits |= DIRTY_SHADER;
+            last_prog = gp->name;
+            last_export_fn = gp->draw_function;
+            last_export_msl = gp->draw_msl;
+        }
+    }
+    ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_VAO | DIRTY_STATE;
     if (!BUF()->begin_draw(ctx)) return false;
+    ctx->state.dirty_bits &= ~DIRTY_SHADER;   /* borrowed: no other consumer exists */
     geomMarkPools(_currentCommandBuffer);   /* after begin_draw: covers any command buffer it made */
     geomTimeCommandBuffer(_currentCommandBuffer);
 

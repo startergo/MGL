@@ -6653,6 +6653,20 @@ static const char *geom_vs_source(GLMContext ctx, MGLProgramObj *obj)
     return NULL;
 }
 
+/* the same for any attached stage (the TES source of a tessellation program: the
+ * cull emulation reflects the evaluation stage's declared distance-array sizes) */
+static const char *geom_stage_source(GLMContext ctx, MGLProgramObj *obj, int stage)
+{
+    if (stage == _VERTEX_SHADER) return geom_vs_source(ctx, obj);
+    for (GLuint i = 0; i < obj->num_attached; i++)
+    {
+        Shader *s = obj->attached[i];
+        if (s && s->glm_type == stage && s->src && s->src[0])
+            return mgl_introspect_shader_source(ctx, s);
+    }
+    return NULL;
+}
+
 static GLuint geom_declared_clip_words(const char *src, const char *name)
 {    /* the largest explicitly declared array size of gl_ClipDistance / gl_CullDistance */
     const char *p = src;
@@ -6789,6 +6803,9 @@ static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp);
 static int geom_cull_family(GLenum mode);
 static bool geom_cull_prepare(GLMContext ctx, MGLGeomProgram *gp, Program *program, GLenum mode);
 static bool geom_cull_writes_msl(Program *p);
+static bool geom_cull_writes_msl_tes(Program *p);   /* same, on the tess-eval stage */
+static int  geom_cull_tess_family(GLMContext ctx, Program *program);
+static int  geom_cull_want_family(GLMContext ctx, MGLGeomProgram *gp, GLenum mode);
 static uint32_t geom_cull_store_mask(const uint32_t *ir, size_t nwords, uint32_t builtin, bool *writes);
 static GLuint geom_out_decl_size(const uint32_t *ir, size_t nwords, uint32_t builtin);
 static const char *geom_tess_clip_check(const Program *program, const MGLGeomProgram *gp);
@@ -7363,7 +7380,12 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
          * OUTPUT sizes (the capture carries its gl_ClipDistance/gl_CullDistance as
          * flattened per-element members; the import maps them onto in_clip_off /
          * in_cull_off) — not by the vertex stage the reflection used, the TES is
-         * the producer.  Mirrors the vertex-stage rule one-to-one (see above). */
+         * the producer.  Mirrors the vertex-stage rule one-to-one (see above).
+         * The synthetic cull variant keeps the reflected size: it repacks the tess
+         * capture's own gl_CullDistance_q / gl_ClipDistance_q members instead. */
+        if (gp->synthetic)
+            ;
+        else
         {
             const Spirv *tes = &program->spirv[_TESS_EVALUATION_SHADER];
             GLuint n  = geom_out_decl_size(tes->ir, tes->size, (uint32_t)SpvBuiltInClipDistance);
@@ -7970,11 +7992,14 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
     MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
 
     /* link-time fact for the per-draw mgl_geom_cull_active: scanning the VS MSL
-     * for "[[user(cull" on every draw cost glmark2 ideas 42%. */
+     * for "[[user(cull" on every draw cost glmark2 ideas 42%.  A tessellation
+     * program's evaluation stage owns the writes instead of the vertex stage. */
     program->writes_cull_distance =
         (!program->shader_slots[_GEOMETRY_SHADER] &&
-         !program->shader_slots[_TESS_EVALUATION_SHADER] &&
-         geom_cull_writes_msl(program)) ? 1 : 0;
+         ((program->shader_slots[_TESS_EVALUATION_SHADER] &&
+           geom_cull_writes_msl_tes(program)) ||
+          (!program->shader_slots[_TESS_EVALUATION_SHADER] &&
+           geom_cull_writes_msl(program)))) ? 1 : 0;
 
     /* no geometry stage: the program has no geometry emulation, and creating a slot for
      * it (the old behaviour) made EVERY link walk/grow the program table — a VS+FS
@@ -7982,16 +8007,9 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
     if (!program->shader_slots[_GEOMETRY_SHADER])
     {
         /* cull-distance emulation (tess domain, tail of this file): without a geometry
-         * or tess-evaluation stage, a vertex stage that writes gl_CullDistance needs the
-         * synthetic kernel slot; the kernel itself is built at the first draw (its input
-         * layout depends on the primitive mode) */
-        if (program->shader_slots[_TESS_EVALUATION_SHADER])
-        {
-            MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
-            if (gp && gp->synthetic)
-                geom_free_prog(ctx, gp);   /* a tess stage supersedes the emulation */
-            return;
-        }
+         * stage, a vertex stage — or a tessellation program's evaluation stage — that
+         * writes gl_CullDistance needs the synthetic kernel slot; the kernel itself is
+         * built at the first draw (its input layout depends on the primitive family) */
         if (program->writes_cull_distance)
         {
             MGLGeomProgram *gp = geom_prog_slot(ctx, program, true);
@@ -8168,9 +8186,9 @@ MGLGeomProgram *mgl_geom_current(GLMContext ctx)
         gp = geom_for_program(ctx, ctx->state.program);
         if (gp) return gp;
         /* the cull-distance emulation (tess domain, tail of this file): a program whose
-         * vertex stage writes gl_CullDistance draws through a synthetic pass-through */
-        if (!ctx->state.program->shader_slots[_GEOMETRY_SHADER] &&
-            !ctx->state.program->shader_slots[_TESS_EVALUATION_SHADER])
+         * vertex stage — or, for a tessellation program, its evaluation stage — writes
+         * gl_CullDistance draws through a synthetic pass-through */
+        if (!ctx->state.program->shader_slots[_GEOMETRY_SHADER])
         {
             gp = geom_prog_slot(ctx, ctx->state.program, false);
             if (gp && gp->synthetic) return gp;
@@ -8188,12 +8206,19 @@ MGLGeomProgram *mgl_geom_current(GLMContext ctx)
         }
         else
         {
-            /* cull-distance emulation: the vertex stage program owns the slot; a
-             * pipeline tessellation stage routes through the tess path instead */
+            /* cull-distance emulation: the vertex stage program owns the slot (a
+             * pipeline tessellation stage routes through the same slot: the capture
+             * path keys on the TES program's slot just like a plain program) */
             Program *vs = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_VERTEX_SHADER];
-            if (vs && !MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_TESS_EVALUATION_SHADER])
+            Program *tes = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[_TESS_EVALUATION_SHADER];
+            if (vs && !tes)
             {
                 gp = geom_prog_slot(ctx, vs, false);
+                if (gp && gp->synthetic) return gp;
+            }
+            if (tes)
+            {
+                gp = geom_prog_slot(ctx, tes, false);
                 if (gp && gp->synthetic) return gp;
             }
         }
@@ -8667,7 +8692,9 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
      * evaluation stage's outputs as flattened per-element members
      * ("gl_ClipDistance_<i>", "gl_CullDistance_<i>" — see mgl_tess_capture_msl);
      * map every element word onto the input record's clip/cull words, which
-     * geom_layout placed at in_clip_off / in_cull_off */
+     * geom_layout placed at in_clip_off / in_cull_off.  The synthetic cull kernel's
+     * record consumes the same members (its record carries the builtin word sections
+     * the emulation evaluates) */
     if (gp->in_has_clip || gp->in_has_cull)
     {
         static const char kPref[2][20] = { "gl_ClipDistance_", "gl_CullDistance_" };
@@ -8688,6 +8715,8 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
                     if (!strcmp(c->member[m2].name, nm)) { j = m2; break; }
                 if (j < 0)
                 {
+                    if (gp->synthetic)
+                        break;  /* unwritten plane: the record word stays as the kernel left it */
                     if (geom_env(0))
                         fprintf(stderr, "geom: tess import: no capture member %s\n", nm);
                     return false;   /* internal: the link validated the declared sizes */
@@ -8734,7 +8763,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
 
     /* the cull-distance emulation's kernel is generated per input-primitive family (a
      * draw-time property): (re)build it before the mode check below applies */
-    if (gp->synthetic && (!gp->linked || gp->cull_family != geom_cull_family(mode)))
+    if (gp->synthetic && (!gp->linked || gp->cull_family != geom_cull_want_family(ctx, gp, mode)))
     {
         if (!geom_cull_prepare(ctx, gp, gp->program, mode)) return;  /* draws unculled */
     }
@@ -10267,6 +10296,19 @@ static int geom_cull_family(GLenum mode)
     }
 }
 
+/* the family this draw's cull kernel must cover: for a tessellation program the TES
+ * layout decides (the draw mode is GL_PATCHES and the tessellated output is what the
+ * synthetic kernel receives); otherwise the GL draw mode's family */
+static int geom_cull_want_family(GLMContext ctx, MGLGeomProgram *gp, GLenum mode)
+{
+    if (gp->program && gp->program->shader_slots[_TESS_EVALUATION_SHADER])
+    {
+        int fam = geom_cull_tess_family(ctx, gp->program);
+        if (fam >= 0) return fam;    /* GL_POINTS is 0: any valid family wins */
+    }
+    return geom_cull_family(mode);
+}
+
 /* the vertices that form the primitive (adjacency vertices never do — GL 4.6 13.5
  * keeps them out of clipping and culling) and the order they are emitted in: the
  * primitive's winding is preserved (a cyclic rotation) while the GL provoking vertex
@@ -10523,17 +10565,20 @@ static Program *geom_cull_program(GLMContext ctx)
     if (ctx->state.program)
     {
         Program *p = ctx->state.program;
-        if (p->shader_slots[_GEOMETRY_SHADER] || p->shader_slots[_TESS_EVALUATION_SHADER]) return NULL;
+        /* a geometry stage is the geometry domain's route; a tessellation evaluation
+         * stage routes the cull through the tess capture (geom_route_tess) */
+        if (p->shader_slots[_GEOMETRY_SHADER]) return NULL;
         return p;
     }
     if (ctx->state.program_pipeline)
     {
         /* a pipeline resolves through the program owning the stage (mgl_geom_current):
          * the vertex stage program here; a pipeline geometry stage wins instead, and a
-         * pipeline tessellation stage routes through the tess path */
+         * pipeline tessellation stage keys on the TES program's slot (tess path) */
         MGLPipelineObj *pl = MGL_PIPELINE_OBJ(STATE(program_pipeline));
-        if (pl->base.stage_programs[_GEOMETRY_SHADER] || pl->base.stage_programs[_TESS_EVALUATION_SHADER])
-            return NULL;
+        if (pl->base.stage_programs[_GEOMETRY_SHADER]) return NULL;
+        if (pl->base.stage_programs[_TESS_EVALUATION_SHADER])
+            return pl->base.stage_programs[_TESS_EVALUATION_SHADER];
         return pl->base.stage_programs[_VERTEX_SHADER];
     }
     return NULL;
@@ -10545,6 +10590,27 @@ static bool geom_cull_writes_msl(Program *p)
 {
     const char *msl = p ? p->spirv[_VERTEX_SHADER].msl_str : NULL;
     return msl && strstr(msl, "[[user(cull") != NULL;
+}
+
+/* same test for a tessellation evaluation stage: its output is what must be culled */
+static bool geom_cull_writes_msl_tes(Program *p)
+{
+    const char *msl = p ? p->spirv[_TESS_EVALUATION_SHADER].msl_str : NULL;
+    return msl && strstr(msl, "[[user(cull") != NULL;
+}
+
+/* the primitive family a tessellation program's output takes (TES layout): points for
+ * point_mode, lines for isolines, triangles otherwise. -1 when the program has no TES. */
+static int geom_cull_tess_family(GLMContext ctx, Program *program)
+{
+    MGLTessProgram *tp;
+
+    if (!program->shader_slots[_TESS_EVALUATION_SHADER]) return -1;
+    tp = mgl_tess_program(ctx, program);
+    if (!tp) return -1;
+    if (tp->point_mode) return GL_POINTS;
+    if (tp->domain == MGL_TESS_DOMAIN_ISOLINES) return GL_LINES;
+    return GL_TRIANGLES;
 }
 
 bool mgl_geom_cull_active(GLMContext ctx)
@@ -10914,17 +10980,20 @@ static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *progr
     char *vs_src = NULL;
     GLuint n;
     bool ok = false;
+    /* the interface the synthetic kernel consumes: the TES output for a tessellation
+     * program (the tess capture supplies the records), else the vertex stage output */
+    int stage = program->shader_slots[_TESS_EVALUATION_SHADER] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
 
-    if (!program->shader_slots[_VERTEX_SHADER] || !program->spirv[_VERTEX_SHADER].ir)
+    if (!program->shader_slots[stage] || !program->spirv[stage].ir)
         return false;
 
-    vm = spv_parse(program->spirv[_VERTEX_SHADER].ir, program->spirv[_VERTEX_SHADER].size, &e2);
+    vm = spv_parse(program->spirv[stage].ir, program->spirv[stage].size, &e2);
     if (!vm) goto done;
     if (!geom_reflect_stage(vm, false, vs_out, &n_vs_out, NULL)) goto done;
     if (n_vs_out > MGL_GEOM_MAX_VARYINGS) n_vs_out = MGL_GEOM_MAX_VARYINGS;
 
-    gp->cull_planes = geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
-                                           program->spirv[_VERTEX_SHADER].size,
+    gp->cull_planes = geom_cull_store_mask(program->spirv[stage].ir,
+                                           program->spirv[stage].size,
                                            (uint32_t)SpvBuiltInCullDistance, &gp->writes_cull);
     if (!gp->writes_cull) goto done;    /* nothing is stored: nothing can cull */
 
@@ -10932,12 +11001,21 @@ static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *progr
      * and must not clip (the raster pass-through neutralizes them) */
     {
         bool w = false;
-        gp->clip_planes = geom_cull_store_mask(program->spirv[_VERTEX_SHADER].ir,
-                                               program->spirv[_VERTEX_SHADER].size,
+        gp->clip_planes = geom_cull_store_mask(program->spirv[stage].ir,
+                                               program->spirv[stage].size,
                                                (uint32_t)SpvBuiltInClipDistance, &w);
     }
 
-    src = geom_vs_source(ctx, MGL_PROGRAM_OBJ(program));
+    if (stage == _TESS_EVALUATION_SHADER)
+    {
+        /* the TES's GLSL (the declared gl_ClipDistance/gl_CullDistance sizes drive the
+         * record layout); geom_vs_source resolves only the vertex stage */
+        src = geom_stage_source(ctx, MGL_PROGRAM_OBJ(program), stage);
+    }
+    else
+    {
+        src = geom_vs_source(ctx, MGL_PROGRAM_OBJ(program));
+    }
     vs_src = xstrdup(src ? src : "");
 
     /* clip/cull word count: the capture wrapper must not read past either declaration.
@@ -11041,7 +11119,7 @@ done:
  * turns out not to cull (the caller falls back to the normal draw path). */
 static bool geom_cull_prepare(GLMContext ctx, MGLGeomProgram *gp, Program *program, GLenum mode)
 {
-    int fam = geom_cull_family(mode);
+    int fam = geom_cull_want_family(ctx, gp, mode);
 
     if (getenv("MGL_CULL_TRACE"))
         fprintf(stderr, "cull prepare: mode=%u fam=%d gp=%p linked=%d family=%d\n",
@@ -11101,6 +11179,6 @@ bool mgl_geom_cull_ready(GLMContext ctx, GLenum mode)
     MGLGeomProgram *gp = mgl_geom_current(ctx);
 
     if (!gp || !gp->synthetic) return false;
-    if (gp->linked && gp->cull_family == geom_cull_family(mode)) return true;
+    if (gp->linked && gp->cull_family == geom_cull_want_family(ctx, gp, mode)) return true;
     return geom_cull_prepare(ctx, gp, gp->program, mode);
 }

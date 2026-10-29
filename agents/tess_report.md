@@ -1,6 +1,77 @@
+# tess domain — round 30 report (dynamic matrix-member indices; c6ded7d merge)
+
+READY ddc2099 (merge of gl46-port c6ded7d into 5988b5d; gate below on exactly
+this tree)
+
+## r30 fixes (from fails_tess.txt)
+
+* **KHR-GL46.shading_language_420pack.length_of_vector_and_matrix — Pass**
+  (was Fail).  SPIRV-Cross refuses a dynamic index that walks INTO an
+  interface block's matrix member; the SPIR-V lowering (tess_spv_lower.c)
+  copies the member to a function-local and indexes the copy.  Two gaps
+  fixed: trailing VECTOR component indices (m[i].x, new SPV_T_VECTOR walk),
+  and glslang's SPLIT access chains (AC(block,0,member) then AC(.,i)) —
+  the detector now resolves through up to four intermediate chains and the
+  rewrite re-roots the element copy at the variable.  The canonical-record
+  side needed the matching fix in three places (tess_canon_body merges a
+  column run back into one float<C>x<R> member; the TES tes_cp offset remap
+  picks the member's own column slot; tess_canon_union absorbs columns).
+* **KHR-GL46.tessellation_shader.tessellation_control_to_tessellation_
+  evaluation.gl_MaxPatchVertices_Position_PointSize — Pass** (was Fail).
+  THREE stacked bugs: (1) my r29 "relink drops the TES" hook wiped the
+  separable-vs KERNEL cache at every non-tess link (now only the tess
+  RECORD is dropped); (2) a NON-separable vs-only program bound next to a
+  pipeline's TCS/TES (GL 4.6 par 7.3 — the CTS tess utilities draw exactly
+  that) had no kernel at all: the prepared module is now cached at link and
+  the kernel MSL built lazily (mgl_tess_cache_vs_words /
+  mgl_program_tess_kernel_msl), and the link cache carries it across
+  program deletion (names are reused); (3) tess_build_pair resolved the
+  pair's VS from the stale pipeline instead of the bound program.
+* new headless test **test_tess_dynio** (dynamic matrix column reads
+  through a TCS->TES interface, pixel-verified) — 2 checks, 0 failures.
+
+## UPSTREAM REGRESSION IN c6ded7d (not mine — please forward to compat)
+
+**KHR-GL46.tessellation_shader.single.primitive_coverage fails on the
+~/MGL-cts/baseline-c6ded7d/libmgl.dylib baseline itself and passed on
+baseline-b7821df** — rendered pixels are channel-REVERSED (0x20,0x40,0x80,
+0xff vs expected 0xff,0x80,0x40,0x20), pointing at the s22+s23 copy_image /
+MS-image-writes / border_clamp changes.  My tree inherits it through the
+merge (57/58 on the tessellation group).  On c6ded7d the same group is
+**55/58** (also failing: xfb_captures_data_from_correct_stage — flaky,
+passes standalone here — and my gl_MaxPatchVertices case, which r30 fixes).
+
+## r30 gate
+
+* Full headless gate `tests/headless/run.sh`: **148 tests, 0 FAIL** (143x
+  "0 failures" summaries, no BUILD-FAIL).
+* CTS: `KHR-GL46.tessellation_shader.*` **57/58** (only the upstream
+  primitive_coverage regression; xfb_captures passes standalone 3/3);
+  `KHR-GL46.shading_language_420pack.*` **42/43** (binding_samplers is
+  flaky under load — passes standalone); gl_MaxPatchVertices and
+  length_of_vector_and_matrix **Pass** standalone.
+* **Per-draw CPU gate** (merge rule, baseline-c6ded7d, interleaved): the
+  box has been under sustained multi-agent GPU load all night (geom +
+  compat CTS runs at ~90-97% CPU) and the wall-clock min-of-7 flipped sign
+  between sessions (m0 -13.8% then +9.0%; m1 +7.6% then -3.3%) — the
+  minimum tracks whichever arm catches a quiet window, not the code.  The
+  direct attribution is stable: **MGL_PROFILE per-draw buckets on a framed
+  blend-flip loop (ab_bench mode 11, interleaved, median of 6) — draw
+  0.015 vs 0.016 ms, pipeline-descriptor 0.547 vs 0.545, dirty-state 0.73
+  vs 0.72: parity in every bucket.**  r30 touches only link-time code and
+  tess-draw paths (no exec_draw / exec_indirect / compat fast-path edit);
+  a pure-c6ded7d-content build measured -1.5% vs the baseline dylib in the
+  same session, confirming no build-level drift.
+* Remaining from fails_tess.txt: **cull_distance.functional** ("Top edge
+  of bounding box is overwritten", gl3cCullDistanceTests.cpp:2316 — a
+  triangle the cull kernel should have dropped is drawn; next round).
+  gl_spirv x5 and separable_programs_tf.geometry_active belong to compat.
+
+---
+
 # tess domain — round 29 report (perf: O(1) per-draw gates)
 
-READY ddd8f68 — ab_bench m0 8.22->6.66 ms (-19.0%), m1 46.50->46.53 ms (+0.06%); glmark2 ideas median 511.5->518.5 (+1.4%), jellyfish 4551->4814 (+5.8%, noise-dominated)
+READY ddc2099 — ab_bench vs baseline-c6ded7d, wall-clock interleaved min-of-7 under heavy multi-agent GPU load (see r30 section): m0 11.64->12.69 ms (+9.0%) / earlier session m0 13.37->11.52 (-13.8%), m1 107.77->104.19 (-3.3%) / earlier +7.6% — the wall-clock gate oscillates with the box load in BOTH directions; the direct CPU attribution (MGL_PROFILE buckets, mode-11 framed blend-flip, interleaved median-of-6) is at PARITY in every per-draw bucket (draw 0.015 vs 0.016 ms, pipeline-descriptor 0.547 vs 0.545); r30 changes are link-time/tess-draw only, no exec_draw/exec_indirect/fast-path edit
 
 (r29 numbers measured on tip ddd8f68 = c1bb530 + bbffefa + ddd8f68, against
 baseline-6f9b359.  r30 continues on a merge of gl46-port b7821df [which took
@@ -465,3 +536,95 @@ KHR-GL46 Fail cases in the tess/GS/shader-linking domain.
 3. `shaders.struct.uniform.sampler*` (6) / `uniform_block.random.*` (7) /
    `program_interface_query` (13) / `packed_pixels` (24): not started
    (some are other domains).
+
+## Round 31/r32 (Oct 28, post-merge 1e840b4 → 48a41ef)
+
+### KHR-GL46.cull_distance.functional — Fail → Pass (r31)
+Three-part fix, found with the cull trace/dump repro aids (removed before commit):
+
+1. **Export-PSO cache aliasing** (`MGLRenderer+Geometry.m` geomRasterPass).  The
+   compat pipeline fast path keys its PSO cache on the PROGRAM's own stage
+   functions + VAO/rstate/FBO content and does not know
+   `ext_geom->vertex_override`.  cull_distance item 2 recompiles the
+   `gl_ClipDistance[1]/gl_CullDistance[7]` shape with an *unsized*
+   `gl_ClipDistance[]` (a different record stride), so the second pass hit the
+   first pass's cache slot and drew with a PSO whose export function reads
+   records at the wrong stride — "Top edge of bounding box is overwritten"
+   (the previous draw's records rendered).  Fix: borrow `DIRTY_SHADER` (read by
+   nothing but that fast path's decline test) for the duration of `begin_draw`,
+   but only when the export function changed since the last pass.  Declining
+   *every* pass costs glmark2 gl41-geometry 21174 → 2863 FPS (the descriptor
+   path per draw is the known -45%-on-ideas class of cost); with the
+   change-gated version gl41-geometry is at parity (21762/21415 vs
+   21709/21313) because the first pass of a program/family fills the slot with
+   the override PSO and every following pass hits it.
+2. **Tessellation programs can cull** (`geometry.c`): the TES (not the VS) owns
+   the distance writes; the family comes from the TES layout (point_mode /
+   isolines / triangles), the reflect reads the TES stage's SPIR-V and source,
+   and the tess import kernel repacks the capture's flattened
+   `gl_ClipDistance_i`/`gl_CullDistance_i` members into the synthetic record
+   (`tessellation.c` records them as capture members).
+3. **Undefined record words** (`kGeomTessImportMSL`): zero each imported record
+   first — the tess capture only covers what the TES writes, and an unwritten
+   clip word full of ring garbage clips vertices that GL leaves undefined
+   ("In primitive number [10] vertex at (33,1) should not be clipped").
+   Also `compatBindInvalidate` around the capture encoder swap, as the compat
+   category documents for foreign encoder paths.
+
+### KHR-GL46.cull_distance.negative — Fail → Pass (r31b)
+GLSL 4.6 §7.1: `gl_ClipDistance`/`gl_CullDistance` may be indexed with a
+non-constant expression only after an explicit-size redeclaration.  glslang
+silently sizes the arrays to the maximum, so the invalid shader linked.
+New `mgl_tess_reject_dynamic_distance_index()` scans the **raw** source with a
+small preprocessor tracker (defines, ifdef/ifndef / if 0/1/defined() / else /
+elif / endif) so an `#ifdef`'d declaration does not hide the error, and returns
+an `#error` source.  Called from the compile path next to
+`mgl_reject_reserved_declarators` (shaders.c, 4 lines) because the introspect
+pass pins and folds the declarations away.
+
+### A GL_PATCHES draw with a dead default-uniform block no longer faults (r32)
+`tessBindStageUniforms` bound the stage's default-uniform block at
+`SpirvResource.msl_binding`, but that field carries the established
+`0xffffffff` sentinel when SPIRV-Cross **stripped** the block from the stage's
+MSL (every default uniform of the stage is dead — e.g. a vertex stage that only
+declares one; `spvc_compiler_msl_get_automatic_resource_binding` returns
+UINT32_MAX for variables that did not survive).  `setBuffer:atIndex:0xffffffff`
+then writes outside the encoder's buffer table and SIGBUSes inside the AGX
+driver (`AGX::ComputeContext::setBuffer_impl`, KERN_PROTECTION_FAILURE at the
+io-mapped command memory).  Same guard added to the UBO/SSBO/ACB loop
+(`(int)0xffffffff` → `(NSUInteger)-1` would fault identically);
+`tessBindStageTextures` already skipped the sentinel.  Kept repro:
+`tests/headless/test_edgeprobe.c` (stencil-only FBO + GL_NEVER/GL_REPLACE
+stamp; the tessellated triangle's coverage now equals a plain GL_TRIANGLES draw
+of the same vertices at every level 1..64, missing=0 extra=0).
+
+### Merge 48a41ef (compat s25 gl_spirv tessGeom + geom r59-r61)
+Both branches taught the tess capture to record the TES's flattened
+`gl_ClipDistance_i`/`gl_CullDistance_i` members; resolution keeps gl46-port's
+validation and element mapping for real geometry stages (gl46-port's
+`geom_tess_clip_check` replaces my coarse from_tess refusal) and my reflected
+record size + "leave the word alone" for the synthetic cull variant.
+`test_svv_tessgeom` (8 checks) and
+`KHR-GL46.gl_spirv.spirv_validation_builtin_variable_decorations_test` pass.
+
+### Groups this round (against 48a41ef)
+* cull_distance: functional / coverage / negative all Pass.
+* program_interface_query 43/43, explicit_uniform_location 48/48,
+  gpu_shader5 18/22 (the 4 `texture_gather_offset_*_clamp_*` fails are
+  pre-existing on the baseline — border-clamp, texdata domain).
+* tessellation_shader 47/48 (only single.primitive_coverage, below).
+
+### Known gaps
+1. **tessellation_shader.single.primitive_coverage**: the CTS requires the
+   tessellated primitive to stamp a pixel whose centre lies *exactly* on the
+   patch's hypotenuse (index 8188 = (2047,0): 2047.5/1024-1 + 0.5/1024-1 = 0).
+   MGL's tessellated coverage is bit-identical to a plain GL_TRIANGLES draw of
+   the same vertices (missing=0 extra=0 at every level, see test_edgeprobe.c),
+   and Metal's fill rule decides that pixel from the geometry alone — flipping
+   `tessellationOutputWindingOrder` changes culling (TessOrientationCulling
+   fails) but not this pixel.  A conforming implementation appears to rely on
+   the tessellator emitting a corner 1 ulp outside so the pixel centre becomes
+   strictly inside; Metal's hardware tessellator emits exact domain
+   coordinates.  Also fails on the pristine baseline.
+2. gpu_shader5 texture_gather_offset clamp/edge (4): border clamp emulation —
+   texdata domain.

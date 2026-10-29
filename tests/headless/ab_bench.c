@@ -2,6 +2,7 @@
  * libmgl (rpath build/ab_old, build/ab_new) and compare. Not part of the suite. */
 #include "mgl_test.h"
 #include <stdio.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
@@ -9,7 +10,10 @@
 static double now_s(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (getenv("MGL_AB_CPU"))
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);   /* GPU-contention-immune */
+    else
+        clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
@@ -63,6 +67,20 @@ int main(int argc, char **argv)
             glFinish();
             t = now_s() - t0;
             snprintf(label, sizeof(label), "drawArrays x%d", iters);
+            break;
+        }
+        case 11: {  /* blend flip, ONE draw per frame: MGL_PROFILE dumps per 120 frames */
+            for (int i = 0; i < iters; i++) {
+                if (i & 1) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glFinish();
+            }
+            t = 0; snprintf(label, sizeof(label), "blend-flip framed x%d", iters);
+            {   /* MGL_PROFILE buckets for the whole loop (mgl_prof_frame never
+                 * fires headless: the compat swap path is not taken) */
+                void (*dump)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "mgl_profile_dump");
+                if (dump) dump();
+            }
             break;
         }
         case 1: {  /* blend state flip between draws (pipeline state churn) */

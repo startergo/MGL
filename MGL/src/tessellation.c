@@ -282,13 +282,299 @@ static char *tess_vs_member_to_block(const char *src)
     }
 }
 
+/* ---- GLSL 4.6 §7.1: indexing the unsized distance arrays -------------------
+ *
+ * gl_ClipDistance and gl_CullDistance are predeclared UNSIZED; a shader may
+ * index them with a non-constant expression only after redeclaring the array
+ * with an explicit size.  glslang silently sizes them to the implementation
+ * maximum, so the invalid shader compiles and links (KHR-GL46
+ * cull_distance.negative, "does not redeclare ... uses dynamic index-based
+ * writes").  The check has to run on the RAW source: the introspect pass pins
+ * and folds the declarations, and a #ifdef'd declaration is resolved away in
+ * the compiled text — so the scanner tracks the preprocessor itself.
+ */
+#define TESS_PP_DEFS 512
+
+typedef struct {
+    const char *name;
+    size_t      name_len;
+    const char *val;        /* object-like expansion (points into src) */
+    size_t      val_len;
+} TessPpDefine;
+
+static int tess_pp_define_find(const TessPpDefine *defs, int ndefs, const char *tok, size_t len)
+{
+    for (int i = ndefs - 1; i >= 0; i--)              /* the last definition wins */
+        if (defs[i].name_len == len && !memcmp(defs[i].name, tok, len))
+            return i;
+    return -1;
+}
+
+/* is the bracket text a constant expression?  literals, parenthesised operator
+ * combinations and identifiers the macro table resolves to literals count; any
+ * other identifier (a loop counter, a uniform) does not. */
+static bool tess_pp_index_is_constant(const char *s, size_t n, const TessPpDefine *defs,
+                                      int ndefs, int depth)
+{
+    size_t i = 0;
+    int    tokens = 0, idents = 0;
+    if (!n) return false;
+    while (i < n)
+    {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { i++; continue; }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')
+        {
+            size_t j = i;
+            while (j < n && (is_ident_char((unsigned char)s[j]))) j++;
+            tokens++;
+            int d = tess_pp_define_find(defs, ndefs, s + i, j - i);
+            if (d < 0) return false;                 /* not a known constant */
+            idents++;
+            if (depth < 4 && !tess_pp_index_is_constant(defs[d].val, defs[d].val_len,
+                                                       defs, ndefs, depth + 1))
+                return false;                        /* expands to something dynamic */
+            i = j;
+            continue;
+        }
+        if (c == '-' || c == '+' || c == '*' || c == '/' || c == '%' || c == '(' ||
+            c == ')' || c == '<' || c == '>' || c == '?' || c == ':' || c == '!')
+        {
+            tokens++;
+            i++;
+            continue;
+        }
+        if (c >= '0' && c <= '9')
+        {
+            size_t j = i;
+            while (j < n && !((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z') ||
+                              s[j] == '_' || s[j] == '(')) j++;
+            if (j < n) return false;                 /* `2x': not a plain literal */
+            tokens++;
+            i = j;
+            continue;
+        }
+        return false;                                /* anything else: dynamic */
+    }
+    return tokens > 0 && idents < tokens;            /* a lone macro name is still constant */
+}
+
+/* `#if' with a literal-only condition: 0 / 1 / defined(NAME) */
+static int tess_pp_cond_value(const char *line, size_t len, const TessPpDefine *defs, int ndefs)
+{
+    const char *p = line, *e = line + len;
+    while (p < e && (*p == ' ' || *p == '\t')) p++;
+    if (p + 7 <= e && !strncmp(p, "defined", 7) && !is_ident_char((unsigned char)p[7]))
+    {
+        p += 7;
+        while (p < e && (*p == ' ' || *p == '\t')) p++;
+        int want = 1;
+        if (p < e && *p == '!') { want = 0; p++; while (p < e && (*p==' '||*p=='\t')) p++; }
+        if (p < e && *p == '(') { p++; while (p < e && (*p==' '||*p=='\t')) p++; }
+        size_t n = 0;
+        while (p + n < e && is_ident_char((unsigned char)p[n])) n++;
+        if (!n) return -1;
+        return tess_pp_define_find(defs, ndefs, p, n) >= 0 ? want : !want;
+    }
+    if (p < e && (*p == '0' || *p == '1') && (p + 1 == e || p[1] == ' ' || p[1] == '\t'))
+        return *p - '0';
+    return -1;                                       /* not literal: caller assumes true */
+}
+
+/* walk the raw source: return the #error source when a non-constant index is
+ * written to an unsized gl_ClipDistance / gl_CullDistance, else NULL */
+char *mgl_tess_reject_dynamic_distance_index(const char *src)
+{
+    if (!src) return NULL;
+    if (!strstr(src, "gl_ClipDistance") && !strstr(src, "gl_CullDistance")) return NULL;
+
+    static const char *names[2] = { "gl_ClipDistance", "gl_CullDistance" };
+    TessPpDefine defs[TESS_PP_DEFS];
+    int ndefs = 0;
+    bool sized[2] = { false, false };
+    bool dynamic_write[2] = { false, false };
+    int  cond_active[32], cond_taken[32], cond_depth = 0;   /* -1 = inactive branch */
+    size_t i = 0, len = strlen(src);
+
+    while (i < len)
+    {
+        size_t ls = i, e = i;
+        while (e < len && src[e] != '\n') e++;
+
+        /* --- preprocessor directives decide which lines are live --- */
+        if (src[ls] == '#')
+        {
+            size_t p = ls + 1;
+            while (p < e && (src[p] == ' ' || src[p] == '\t')) p++;
+            struct { const char *w; size_t n; } d;
+            d.w = src + p;
+            d.n = 0;
+            while (p + d.n < e && is_ident_char((unsigned char)src[p + d.n])) d.n++;
+            bool live = true;
+            for (int k = 0; k < cond_depth; k++) if (cond_active[k] == 0) live = false;
+
+            #define TESS_DIR_IS(s) (d.n == strlen(s) && !strncmp(d.w, s, d.n))
+            if (live && TESS_DIR_IS("define"))
+            {
+                size_t q = p + d.n;
+                while (q < e && (src[q] == ' ' || src[q] == '\t')) q++;
+                size_t ns = q;
+                while (q < e && is_ident_char((unsigned char)src[q])) q++;
+                if (q > ns && q < e && src[q] == '(')
+                {
+                    /* function-like macro: its expansion is not a plain literal */
+                    if (ndefs < TESS_PP_DEFS)
+                    {
+                        defs[ndefs].name = src + ns;
+                        defs[ndefs].name_len = q - ns;
+                        defs[ndefs].val = src + e;
+                        defs[ndefs].val_len = 0;
+                        ndefs++;
+                    }
+                }
+                else if (q > ns && ndefs < TESS_PP_DEFS)
+                {
+                    size_t vs = q;
+                    while (vs < e && (src[vs] == ' ' || src[vs] == '\t')) vs++;
+                    defs[ndefs].name = src + ns;
+                    defs[ndefs].name_len = q - ns;
+                    defs[ndefs].val = src + vs;
+                    defs[ndefs].val_len = e - vs;
+                    ndefs++;
+                }
+            }
+            else if (TESS_DIR_IS("ifdef") || TESS_DIR_IS("ifndef"))
+            {
+                size_t q = p + d.n;
+                while (q < e && (src[q] == ' ' || src[q] == '\t')) q++;
+                size_t ns = q;
+                while (q < e && is_ident_char((unsigned char)src[q])) q++;
+                int defined = 0;
+                if (q > ns && live)
+                    defined = tess_pp_define_find(defs, ndefs, src + ns, q - ns) >= 0;
+                else if (q > ns && !live)
+                    defined = -1;                     /* outer level off: stay off */
+                if (cond_depth < 32)
+                {
+                    cond_active[cond_depth] = live ? (TESS_DIR_IS("ifdef") ? (defined == 1)
+                                                                          : (defined == 0)) : 0;
+                    cond_taken[cond_depth] = cond_active[cond_depth];
+                    cond_depth++;
+                }
+            }
+            else if (TESS_DIR_IS("if"))
+            {
+                int v = tess_pp_cond_value(src + p + d.n, e - (p + d.n), defs, ndefs);
+                if (cond_depth < 32)
+                {
+                    cond_active[cond_depth] = live ? (v != 0) : 0;  /* unknown -> true */
+                    cond_taken[cond_depth] = cond_active[cond_depth];
+                    cond_depth++;
+                }
+            }
+            else if (TESS_DIR_IS("elif"))
+            {
+                if (cond_depth)
+                {
+                    int taken = cond_taken[cond_depth - 1];
+                    int v = tess_pp_cond_value(src + p + d.n, e - (p + d.n), defs, ndefs);
+                    bool outer = true;
+                    for (int k = 0; k < cond_depth - 1; k++) if (cond_active[k] == 0) outer = false;
+                    cond_active[cond_depth - 1] = (!taken && outer) ? (v != 0) : 0;
+                    cond_taken[cond_depth - 1] = cond_taken[cond_depth - 1] ||
+                                                  (cond_active[cond_depth - 1] != 0);
+                }
+            }
+            else if (TESS_DIR_IS("else"))
+            {
+                if (cond_depth)
+                {
+                    bool outer = true;
+                    for (int k = 0; k < cond_depth - 1; k++) if (cond_active[k] == 0) outer = false;
+                    cond_active[cond_depth - 1] = (!cond_taken[cond_depth - 1] && outer) ? 1 : 0;
+                    cond_taken[cond_depth - 1] = cond_taken[cond_depth - 1] || 1;
+                }
+            }
+            else if (TESS_DIR_IS("endif"))
+            {
+                if (cond_depth) cond_depth--;
+            }
+            i = e + (e < len);
+            continue;
+        }
+        #undef TESS_DIR_IS
+
+        bool live = true;
+        for (int k = 0; k < cond_depth; k++) if (cond_active[k] == 0) live = false;
+        if (live)
+        {
+            for (int w = 0; w < 2; w++)
+            {
+                const char *nm = names[w];
+                size_t nl = strlen(nm);
+                const char *q = src + ls;
+                while ((q = strstr(q, nm)) && q + nl <= src + e)
+                {
+                    if (is_ident_char((unsigned char)q[nl]) ||
+                        (q > src && is_ident_char((unsigned char)q[-1])) ||
+                        (q > src + 1 && !strncmp(q - 3, "gl_", 3) && q[-3] != '.'))
+                    {
+                        /* gl_in[].gl_ClipDistance / a longer identifier */
+                    }
+                    else if (q[nl] == '[')
+                    {
+                        const char *close = strchr(q + nl, ']');
+                        if (close && close < src + e)
+                        {
+                            size_t in = close - (q + nl + 1);
+                            const char *after = close + 1;
+                            while (after < src + e && (*after == ' ' || *after == '\t')) after++;
+                            if (*after == ';')
+                            {
+                                /* `gl_(Clip|Cull)Distance[N];' — a declaration; an
+                                 * empty bracket (`[]') stays unsized */
+                                if (in > 0) sized[w] = true;
+                            }
+                            else if ((after[0] == '=' && after[1] != '=') ||
+                                     (after + 1 < src + e && after[1] == '=' &&
+                                      (after[0] == '+' || after[0] == '-' ||
+                                       after[0] == '*' || after[0] == '/')))
+                            {
+                                /* a write: only a dynamic index needs the size */
+                                if (!tess_pp_index_is_constant(q + nl + 1, in, defs, ndefs, 0))
+                                    dynamic_write[w] = true;
+                            }
+                        }
+                    }
+                    q += nl;
+                }
+            }
+        }
+        i = e + (e < len);
+    }
+
+    for (int w = 0; w < 2; w++)
+        if (dynamic_write[w] && !sized[w])
+        {
+            const char *msg = w ? "'gl_CullDistance' : array must be redeclared with an "
+                                  "explicit size before indexing with a non-constant expression"
+                                : "'gl_ClipDistance' : array must be redeclared with an "
+                                  "explicit size before indexing with a non-constant expression";
+            size_t n = strlen(src);
+            char *out = (char *)malloc(n + strlen(msg) + 32);
+            if (!out) return NULL;
+            snprintf(out, n + strlen(msg) + 32, "#error %s\n%s", msg, src);
+            return out;
+        }
+    return NULL;
+}
+
 char *mgl_tess_glsl_compat(GLenum type, const char *src)
 {
     if (!src ||
         (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
          type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
         return NULL;
-
     /* vertex AND geometry stages: fold loose `out float gl_*Distance[N];' members
      * into one gl_PerVertex block.  A block interface in one stage and a loose
      * member in the other is exactly the mix glslang's link / io-mapper cannot
@@ -4620,16 +4906,21 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             snprintf(types[tp->cap_members_n], 48, "float4");
             tp->cap_members[tp->cap_members_n].offset = 0;
         }
+        else if (!strcmp(m, "gl_ClipDistance") || !strcmp(m, "gl_CullDistance"))
+            continue;               /* the array-attribute twin of the flattened members */
         else if (!strncmp(m, "gl_ClipDistance_", 16) || !strncmp(m, "gl_CullDistance_", 16))
         {
-            /* flattened gl_PerVertex builtin array element: the tess lowering copies the
-             * evaluation stage's gl_ClipDistance/gl_CullDistance outputs into per-element
-             * user attributes ("gl_ClipDistance_0", ...).  Capture them — a following
-             * geometry stage reads gl_in[].gl_ClipDistance/gl_CullDistance from the
-             * record, and the GLSL/gl_spirv validation programs (KHR-GL46.gl_spirv
+            /* flattened gl_PerVertex builtin array element (SPIRV-Cross [[user(clipN)]] /
+             * [[user(cullN)]]): the tess lowering copies the evaluation stage's
+             * gl_ClipDistance/gl_CullDistance outputs into per-element user attributes
+             * ("gl_ClipDistance_0", ...).  Capture them — a following geometry stage
+             * reads gl_in[].gl_ClipDistance/gl_CullDistance from the record, the GLSL/
+             * gl_spirv validation programs (KHR-GL46.gl_spirv
              * spirv_validation_builtin_variable_decorations tessGeom) thread them through
-             * every stage.  One float word per element; the geometry import maps the
-             * element members onto its input record's clip/cull words by name. */
+             * every stage, and the cull-distance emulation (the synthetic geometry
+             * kernel) evaluates whole-primitive culling on the TES output from them (the
+             * geometry import maps the element members onto its input record's clip/cull
+             * words by name).  One float word per element. */
             const char *e = m + 16;    /* both prefixes are 16 bytes */
             int digits = 0;
 

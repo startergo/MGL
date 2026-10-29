@@ -962,6 +962,11 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
     /* reserved words used as subroutine / declarator names must be rejected on the
      * RAW source: the introspect pass rewrites subroutines away (cts_glsl_compat.c) */
     char *reserved_reject = mgl_reject_reserved_declarators(ptr->src);
+    if (!reserved_reject)
+        /* tess: gl_ClipDistance/gl_CullDistance indexed with a non-constant expression
+         * without an explicit-size redeclaration is a compile error (GLSL 4.6 §7.1) —
+         * the introspect pass pins the arrays, so this also needs the raw source */
+        reserved_reject = mgl_tess_reject_dynamic_distance_index(ptr->src);
     char *compat = mgl_cts_glsl_compat_limited(
         reserved_reject ? reserved_reject : mgl_introspect_shader_source(ctx, ptr), &bl);
     {

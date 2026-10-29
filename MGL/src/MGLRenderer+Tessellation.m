@@ -1282,6 +1282,14 @@ static void tessBindStageUniforms(GLMContext ctx, id<MTLComputeCommandEncoder> e
 
             if (!dub || !dub->data.buffer_data)
                 continue;
+            /* 0xffffffff is the established "no Metal binding" sentinel (the stage
+             * MSL emission left it there when SPIRV-Cross stripped the block - every
+             * default uniform of the stage is dead, e.g. a VERTEX stage that only
+             * declares one).  Passing it to setBuffer:atIndex: faults inside the
+             * driver (KHR repro: a GL_PATCHES draw whose vertex stage declares an
+             * unused uniform); there is no MSL argument to feed, so skip it. */
+            if (list->list[r].msl_binding == 0xffffffffu)
+                continue;
             if (mtlextB(ctx)->ensure_buffer)
                 mtlextB(ctx)->ensure_buffer(ctx, dub);
             if (!dub->data.mtl_data)
@@ -1305,6 +1313,10 @@ static void tessBindStageUniforms(GLMContext ctx, id<MTLComputeCommandEncoder> e
             /* bind at the buffer index the stage's MSL actually uses (msl_binding from
              * SPIRV-Cross, see compile_stage); a running counter made UBOs and SSBOs
              * overwrite each other's slots */
+            /* 0xffffffff = stripped from the MSL (see the dub loop above): there
+             * is no argument to feed */
+            if (list->list[r].msl_binding == 0xffffffffu)
+                continue;
             int index = (int)list->list[r].msl_binding;
             GLuint b = list->list[r].binding;
             if (b >= MAX_BINDABLE_BUFFERS)
@@ -2278,7 +2290,7 @@ static void tessRetireCapture(GLMContext ctx)
         if (tTrace())
             NSLog(@"MGL tess: VS kernel dispatch %u x %d threads%s", vcount, instances,
                   gpu_indexed ? " (indirect, GPU-decided)" : "");
-        [cenc setComputePipelineState: vs_pso];
+[cenc setComputePipelineState: vs_pso];
         tessBindStageUniforms(ctx, cenc, prog_vs, _VERTEX_SHADER);
         tessBindStageTextures(ctx, cenc, prog_vs, _VERTEX_SHADER);
         if (prog_vs->uses_draw_params)
