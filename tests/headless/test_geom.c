@@ -4757,6 +4757,17 @@ TEST(r54_srgb_readback_raw)
  * legal (uncompressed client data takes the decoded-storage path). */
 TEST(r54_compressed_no_3d)
 {
+    /* GL 4.6 spec, TexImage3D errors: RGTC/EAC/ETC2 compressed internalformats
+     * are INVALID_OPERATION unless target is TEXTURE_2D_ARRAY (Mesa
+     * _mesa_target_can_be_compressed); S3TC has no 3D support either, BPTC has
+     * but cannot be online-compressed from GL_RED client data here.  On
+     * TEXTURE_2D_ARRAY the spec-valid combos must SUCCEED —
+     * KHR-GL46.copy_image.incompatible_formats_compression uploads an
+     * uncompressed (online-compressed) RGTC2 to a 2D array (compat s27):
+     *   - RGTC1/SIGNED_RGTC1 + external RED/UNSIGNED_BYTE  -> no error
+     *   - RGTC2/SIGNED_RGTC2 + RED (external is RG)        -> format mismatch
+     *   - S3TC/BPTC + RED (external RGBA / none)           -> no online compression
+     */
     const GLenum bad[] = {
         GL_COMPRESSED_RED_RGTC1, GL_COMPRESSED_SIGNED_RED_RGTC1,
         GL_COMPRESSED_RG_RGTC2, GL_COMPRESSED_SIGNED_RG_RGTC2,
@@ -4772,7 +4783,15 @@ TEST(r54_compressed_no_3d)
         glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
         while (glGetError() != GL_NO_ERROR) {}
         glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, bad[i], 4, 4, 2, 0, GL_RED, GL_UNSIGNED_BYTE, data);
-        EXPECT_EQ_INT(glGetError(), GL_INVALID_OPERATION);
+        /* all four RGTC formats online-compress (decoded storage); the CTS
+         * packed_pixels isFormatValid accepts a client format with fewer
+         * components than the base format (GL_RED into an RG base), so these
+         * all succeed.  S3TC/BPTC have no CPU encoder -> "no online
+         * compression" INVALID_OPERATION. */
+        if (bad[i] == GL_COMPRESSED_RGB_S3TC_DXT1_EXT || bad[i] == GL_COMPRESSED_RGBA_BPTC_UNORM)
+            EXPECT_EQ_INT(glGetError(), GL_INVALID_OPERATION);
+        else
+            EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
         glBindTexture(GL_TEXTURE_3D, tex);
         glTexImage3D(GL_TEXTURE_3D, 0, bad[i], 4, 4, 2, 0, GL_RED, GL_UNSIGNED_BYTE, data);
         EXPECT_EQ_INT(glGetError(), GL_INVALID_OPERATION);

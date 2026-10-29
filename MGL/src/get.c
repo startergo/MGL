@@ -283,6 +283,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_framebuffer_sRGB",
     "GL_ARB_get_texture_sub_image",
     "GL_ARB_gl_spirv",                 /* shader binary format: SPIR-V (get.c) */
+    "GL_ARB_gpu_shader5",              /* core in 4.0; implicit conversions + float bit encoding in #version 150 shaders (gpu_shader5_gl CTS) */
     "GL_ARB_gpu_shader_fp64",          /* software fp64 (fp64.c), GLSL doubles + fp64 lib */
     "GL_ARB_half_float_pixel",
     "GL_ARB_half_float_vertex",
@@ -356,6 +357,11 @@ static const char *mgl_extensions[] = {
     "GL_ARB_depth_texture",
     "GL_ARB_depth_buffer_float",
     "GL_ARB_texture_non_power_of_two",
+    /* GLSL enable extensions: the select-style integer mix() overloads are
+     * implemented by glslang for desktop GLSL 1.50-4.50 and core from 4.50;
+     * the string was the only missing piece (r28: shader_integer_mix 11x
+     * NotSupported).  compat domain — see agents/compat_report.md */
+    "GL_EXT_shader_integer_mix",
     "GL_EXT_texture_shared_exponent",
     "GL_EXT_texture_integer",
     "GL_EXT_texture_sRGB",

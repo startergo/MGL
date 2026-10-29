@@ -1651,6 +1651,25 @@ static bool isRgtcFormat(const TDFormat *f)
     return f && (f->flags & TDF_BC) && (f->base == GL_RED || f->base == GL_RG);
 }
 
+/* BPTC (BC6H/BC7): the one BC family whose 3D support is specified
+ * (table 8.19 "3D Tex." column; Mesa gates on ARB_texture_compression_bptc,
+ * which MGL exposes) */
+static bool isBptcFormat(const TDFormat *f)
+{
+    if (!f || !(f->flags & TDF_BC))
+        return false;
+    switch (f->internalformat)
+    {
+        case GL_COMPRESSED_RGBA_BPTC_UNORM:
+        case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
+        case GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT:
+        case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint internalformat,
                      GLsizei width, GLsizei height, GLsizei depth, GLint border,
                      GLenum format, GLenum type, const void *pixels)
@@ -1692,13 +1711,20 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
     if (f->flags & (TDF_DEPTH | TDF_STENCIL))
         TD_CHECK(depthFormatAllowedOnTarget(t.tex_target), GL_INVALID_OPERATION);
 
-    /* GL 4.6 table 8.5: the block-compressed / ETC formats are not supported for
-     * 3-dimensional textures — glTexImage3D (TEXTURE_3D / TEXTURE_2D_ARRAY) with
-     * such an internalformat is an INVALID_OPERATION
-     * (KHR-GL46.packed_pixels.varied_rectangle.compressed_*_rgtc*, whose
-     * GL_UNPACK_IMAGE_HEIGHT cases upload to GL_TEXTURE_2D_ARRAY). */
-    if ((t.tex_target == GL_TEXTURE_3D || t.tex_target == GL_TEXTURE_2D_ARRAY) &&
-        (req->flags & (TDF_BC | TDF_ETC)))
+    /* GL 4.6 spec, TexImage3D errors: "an INVALID_OPERATION error is generated
+     * ... if internalformat is one of the EAC, ETC2, or RGTC compressed formats
+     * and either border is non-zero, or target is not TEXTURE_2D_ARRAY"
+     * (Mesa _mesa_target_can_be_compressed rejects the same).  S3TC has no 3D
+     * support either (EXT_texture_compression_s3tc defines none; Mesa rejects
+     * it with an error too), while BPTC supports 3D (spec table 8.19, "3D
+     * Tex." column).  TEXTURE_2D_ARRAY is a legal target for every family —
+     * its blocks are per-layer, so the blanket 2D_ARRAY rejection that used to
+     * live here was over-broad and broke the uncompressed (online-compressed)
+     * RGTC2 uploads of KHR-GL46.copy_image.incompatible_formats_compression;
+     * KHR-GL46.packed_pixels.varied_rectangle.compressed_*_rgtc* exercises
+     * the rejected TEXTURE_3D path (it uploads with UNPACK_IMAGE_HEIGHT). */
+    if (t.tex_target == GL_TEXTURE_3D &&
+        (((req->flags & TDF_ETC)) || ((req->flags & TDF_BC) && !isBptcFormat(req))))
         TD_CHECK(0, GL_INVALID_OPERATION);
 
     if (req->flags & TDF_COMPRESSED)

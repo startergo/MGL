@@ -2254,3 +2254,109 @@ respec (SSBO group 124/124); c0cfdc8 reverted; A/B harness defect found and
 fixed (abbench had been loading the same dylib on both sides).  Gate 620 PASS /
 0 FAIL (9717 checks + test_ssbo_switch 12 = 9727), test_geom_xfbperf
 quarantined (supervisor 23:42).  ab_bench + glmark2 parity vs baseline-3cd6208.
+
+## session 27 (supervisor 01:24 EDT) — r28 sweep NotSupported triage
+
+Task: from ~/MGL-cts/mgl-r28-sweep/results.json (239 NotSupported / 116 Fail /
+7 Crash / 1 InternalError), pick the NotSupported groups in my area (buffers,
+DSA, copy/blit, spirv, NSOpenGL/GLX, compat) that a real implementation can
+flip, report top 3, start the biggest.
+
+NotSupported triage by owner (case counts):
+* not mine / other domains: KHR_blend_equation_advanced 88 (renderstate),
+  sample_variables 38 (samples_8 — Metal max 4 samples, hardware limit),
+  shader_image_size 36 ("Required 4 image samples but only 0 available" —
+  image2DMS as image, shaders), ext_texture_shadow_lod 16 (textures),
+  texture_filter_minmax 5, shader_ballot 4, shader_viewport_layer_array 3,
+  post_depth_coverage 2, parallel_shader_compile 3 (program domain),
+  texture_barrier_ARB 4 (renderstate; needs GL_ARB_texture_barrier string),
+  shader_draw_parameters_extension 1 (string IS exposed — needs a look, draw
+  domain), sparse textures 21 (hardware gap).
+* my area, real implementation possible:
+  1. **GL_EXT_shader_integer_mix 11 cases** (shaders.shader_integer_mix 6 +
+     shaders45 5): pure GLSL enable extension; glslang already implements the
+     select-style integer mix() overloads for desktop GLSL 1.50-4.50
+     (Initialize.cpp:3639 builtin gate, ParseHelper:3467 requireExtensions at
+     <450) and they are core GLSL 4.50+ (shaders45.prototypes already Passes).
+     Only the extension string was missing.
+  2. GL_ARB_gpu_shader5 3 cases (gpu_shader5_gl.*): features core since
+     GL 4.0; glslang supports the extension (#version 150 tests get upgraded
+     to 330 core by shaders.c, extension stays).  Only the string missing.
+  3. GL_ARB_sparse_buffer 3 cases: documented gap (sparse buffers) — skipped
+     per supervisor.
+
+### GL_EXT_shader_integer_mix (11 cases)
+
+* tests/headless/test_compat_intmix.c (failing-first): extension in the
+  glGetStringi list; `#ifdef GL_EXT_shader_integer_mix == 1` at #version 330;
+  ivec4/uvec4/int/uint/bool/bvec4 mix() renders select semantics (a ? y : x);
+  same code REJECTED at #version 330 without the extension (glslang hard
+  error, matches CTS prototypes-negative which already passed); works at
+  #version 450 without extension (core).
+* Shared-file edit: MGL/src/get.c — added "GL_EXT_shader_integer_mix" to
+  mgl_extensions[] (one string; mgl_num_extensions/mgl_extension_name pick it
+  up).  No Metal change: glslang lowers integer mix to OpSelect, SPIRV-Cross
+  emits MSL select().
+* Result: test_compat_intmix 5/5 (9 checks).  Neighbours clean
+  (test_compat_profile, test_debug, test_program, test_spirvbin,
+  test_compat_glsl).
+
+### GL_ARB_gpu_shader5 (3 cases) + CTS verification
+
+* tests/headless/test_compat_gpus5.c (failing-first): extension in the
+  glGetStringi list; the three CTS scenarios at #version 150 + `#extension
+  GL_ARB_gpu_shader5 : require` (which shaders.c upgrades to 330 core, keeping
+  the extension line): implicit conversions (int->uint, ivec4->uvec4,
+  uvec4->vec4 with white-iff-exact render check), function overloading
+  (f(vec4,vec4)/f(uvec4,uvec4) resolved through an ivec4->uvec4 implicit
+  conversion), float bit encoding (floatBitsToInt/Uint, int/uintBitsToFloat
+  round-trip); negative: `uint v = 1u - u1` (implicit int->uint) must NOT
+  compile at #version 330 core without the extension.
+* Shared-file edit: MGL/src/get.c — added "GL_ARB_gpu_shader5" to
+  mgl_extensions[] (features are GL 4.0 core, already exercised by the
+  gpu_shader5 group; glslang implements the extension itself).
+* CTS against this worktree's build/libmgl.dylib:
+  - KHR-GL46.*integer_mix* (14 cases): **13 Pass, 1 NotSupported** — the
+    remaining `shaders.shader_integer_mix.prototypes` is a CTS-side gate (the
+    "shaders" package registers the group at GLSL 3.30 and the case returns
+    NotSupported for any version < 4.50; not reachable for us).
+  - KHR-GL46.gpu_shader5_gl (3 cases): **3 Pass**.
+  - KHR-GL46.exposed_extensions: Pass (extension list still consistent).
+* Full headless gate (test_geom_xfbperf moved aside for the run only, restored
+  after — supervisor 23:42 quarantine): **126 test binaries, 630 PASS / 0 FAIL**,
+  0 build failures.  stub_scanner EMPTY/NOOP/ASSERT clean on get.c (only file
+  touched besides tests).
+
+Net effect on the r28 sweep: 16 NotSupported cases flip to Pass (11 integer_mix
+minus the 1 CTS-gated case, plus 3 gpu_shader5_gl, plus both
+prototypes-negative/45-prototypes which now also run — 13 + 3 counted above).
+
+### merge gl46-port 539f74f (supervisor 02:36) + gate
+
+* 1c8d936: merge of gl46-port 539f74f (only agents/compat_report.md conflicted,
+  both narratives kept).  My s27 work re-verified on the merged tip:
+  test_compat_intmix 5/5 (9 checks), test_compat_gpus5 5/5 (16 checks);
+  CTS: integer_mix 13 Pass + 1 CTS-gated NotSupported, gpu_shader5_gl 3/3,
+  copy_image 13/13 (one earlier Timeout was my own concurrent load; clean when
+  run alone), packed_pixels.*rgtc* 12/12.
+* Full gate (xfbperf still quarantined, moved aside for the run only):
+  **126 test binaries, 0 FAIL**.
+* Shared-file edit beyond s27's get.c: tests/headless/test_geom.c
+  r54_compressed_no_3d — its TEXTURE_2D_ARRAY expectations encoded the old
+  over-broad rejection; updated to the spec/CTS matrix (RGTC family succeeds
+  on 2D arrays — online compression, GL_RED client data is legal for an RG
+  base format per packed_pixels isFormatValid; S3TC/BPTC still error with
+  uncompressed data = no CPU encoder; TEXTURE_3D still rejects all six).
+  test_geom 670 checks, 0 failures.
+
+### HANDED-OFF: packed_pixels depth-stencil regression on gl46-port
+
+KHR-GL46.packed_pixels.varied_rectangle.{depth_stencil, depth24_stencil8,
+depth32f_stencil8} fail on **baseline-539f74f** (A/B: 3 Fail with
+~/MGL-cts/baseline-539f74f/libmgl.dylib, 3 Fail on my tip, 0 Fail in the r28
+sweep = geom 3cac39f): "Invalid format used but glTexImage2D/3D succeeded" —
+MGL accepts (format,type) combos for DEPTH24/32F_STENCIL8 internal formats
+that the CTS isFormatValid(INPUT_TEXIMAGE) rejects (depth/stencil client
+formats only with depth base formats).  Regression window 3cac39f..539f74f;
+texdata/textures domain, not compat.  Repro: pattern
+'KHR-GL46.packed_pixels.varied_rectangle.depth*' (8 cases, 3 Fail).
