@@ -41,12 +41,12 @@ def glm_keys():
 
 
 def _timeout() -> float:
-    """Per-request timeout in seconds (MGL_LLM_TIMEOUT, default 420). Without it a
+    """Per-request timeout in seconds (MGL_LLM_TIMEOUT, default 180). Without it a
     half-closed connection (CLOSE_WAIT) can stall a worker for a long time."""
     try:
-        return float(os.environ.get("MGL_LLM_TIMEOUT", "420"))
+        return float(os.environ.get("MGL_LLM_TIMEOUT", "180"))
     except ValueError:
-        return 420.0
+        return 180.0
 
 
 def get_client(key_index: int = 0):
