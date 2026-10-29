@@ -40,6 +40,15 @@ def glm_keys():
     return keys
 
 
+def _timeout() -> float:
+    """Per-request timeout in seconds (MGL_LLM_TIMEOUT, default 420). Without it a
+    half-closed connection (CLOSE_WAIT) can stall a worker for a long time."""
+    try:
+        return float(os.environ.get("MGL_LLM_TIMEOUT", "420"))
+    except ValueError:
+        return 420.0
+
+
 def get_client(key_index: int = 0):
     from anthropic import Anthropic  # imported lazily so --help / --no-llm work without the SDK
     provider = get_provider()
@@ -52,12 +61,14 @@ def get_client(key_index: int = 0):
         if not api_key:
             raise SystemExit("Set ANTHROPIC_AUTH_TOKEN to your Z.AI API key "
                              "(or AGENT_PROVIDER=anthropic with ANTHROPIC_API_KEY).")
-        return Anthropic(api_key=api_key, base_url=base_url)
+        return Anthropic(api_key=api_key, base_url=base_url, timeout=_timeout())
     api_key = key or token
     if not api_key:
         raise SystemExit("Set ANTHROPIC_API_KEY for AGENT_PROVIDER=anthropic.")
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    return Anthropic(api_key=api_key, base_url=base_url) if base_url else Anthropic(api_key=api_key)
+    if base_url:
+        return Anthropic(api_key=api_key, base_url=base_url, timeout=_timeout())
+    return Anthropic(api_key=api_key, timeout=_timeout())
 
 
 def get_model() -> str:
