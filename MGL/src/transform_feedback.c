@@ -34,6 +34,7 @@ char *mgl_program_fix_vertex_gathers(const char *msl);  /* program.c: AGX vertex
 #include "mgl_ext_geom.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
+#include "spirv_vote.h"         /* SPV_KHR subgroup opcodes -> core OpGroupNonUniform* (as program.c) */
 #include "msl_reserved.h"
 #include "hash_table.h"
 
@@ -1702,7 +1703,15 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
     {
         const uint32_t *parse_src = lowered ? lowered : ir;
         size_t parse_n = lowered ? lower_words : words;
-        if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS) goto done;
+        /* glslang's GL target emits the SPV_KHR_subgroup_vote/ballot opcodes for
+         * group-vote/ballot calls; the MSL backend lowers only the OpGroupNonUniform*
+         * core forms (spirv_vote.c — the pass program.c's compile_stage applies; the
+         * captured variant embeds the user's vertex/tessellation source). */
+        uint32_t *vf = mgl_spirv_vote_khr_rewrite(parse_src, parse_n, &parse_n);
+
+        if (vf) parse_src = vf;
+        if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS) { free(vf); goto done; }
+        free(vf);
     }
     if (spvc_context_create_compiler(sctx, SPVC_BACKEND_MSL, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) != SPVC_SUCCESS) goto done;
     spvc_compiler_msl_add_discrete_descriptor_set(comp, 3);

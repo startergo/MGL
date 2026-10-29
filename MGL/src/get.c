@@ -370,6 +370,12 @@ static const char *mgl_extensions[] = {
      * the string was the only missing piece (r28: shader_integer_mix 11x
      * NotSupported).  compat domain — see agents/compat_report.md */
     "GL_EXT_shader_integer_mix",
+    /* shadow samplers with explicit LOD / gradients (textureLod on
+     * sampler{2DArray,Cube,CubeArray}Shadow, implicit in non-fragment stages):
+     * glslang accepts the directive, SPIRV-Cross lowers the Dref sample to MSL
+     * depth-texture sample(level/gradient) — verified pixel-exact in
+     * tests/headless (zz_shadowlod scratch; see test_tess.c) */
+    "GL_EXT_texture_shadow_lod",
     "GL_EXT_texture_shared_exponent",
     "GL_EXT_texture_integer",
     "GL_EXT_texture_sRGB",

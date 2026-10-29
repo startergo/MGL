@@ -1337,6 +1337,93 @@ TEST(TessProgramQueries)
     glDeleteProgram(prog);
 }
 
+/* Multi-patch GL_PATCHES through a geometry shader: the tess domain captures
+ * the TES output in EMISSION order for the geometry kernel (the transform-
+ * feedback order), so the geometry import must use identity primitive slots —
+ * re-indexing through the tessellator's coordinate list permutes twice and the
+ * second patch collapses (KHR-GL46.shader_ballot's 2-patch quad geometry).
+ * Two disjoint triangle patches; both halves must end up white. */
+static const char *kGsPass =
+    "#version 450 core\n"
+    "layout(triangles) in;\n"
+    "layout(triangle_strip, max_vertices=3) out;\n"
+    "layout(location=0) in vec4 f_col[];\n"
+    "layout(location=0) out vec4 g_col;\n"
+    "void main() {\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    gl_Position = gl_in[i].gl_Position;\n"
+    "    g_col = f_col[i];\n"
+    "    EmitVertex();\n"
+    "  }\n"
+    "  EndPrimitive();\n"
+    "}\n";
+static const char *kFsGs =
+    "#version 450 core\n"
+    "layout(location=0) in vec4 g_col;\n"
+    "layout(location=0) out vec4 o_col;\n"
+    "void main() { o_col = g_col; }\n";
+
+TEST(TessGeometryMultiPatch)
+{
+    /* patch 1: left half triangle; patch 2: right half triangle */
+    static const float pos[6][4] = {
+        { -0.9f, -0.8f, 0, 1 }, { -0.9f, 0.8f, 0, 1 }, { -0.1f, 0.0f, 0, 1 },
+        {  0.1f, 0.0f, 0, 1 }, {  0.9f, -0.8f, 0, 1 }, {  0.9f, 0.8f, 0, 1 },
+    };
+    static const float col[6][4] = {
+        { 1, 1, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 },
+        { 1, 1, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 },
+    };
+    static const GLushort idx[6] = { 0, 1, 2, 3, 4, 5 };
+    glViewport(0, 0, 200, 200);
+    GLuint p = glCreateProgram();
+    struct { GLenum t; const char *s; } srcs[5] = {
+        { GL_VERTEX_SHADER, kVs },
+        { GL_TESS_CONTROL_SHADER, kTcsTri },
+        { GL_TESS_EVALUATION_SHADER, kTesTri },
+        { GL_GEOMETRY_SHADER, kGsPass },
+        { GL_FRAGMENT_SHADER, kFsGs },
+    };
+    for (int i = 0; i < 5; i++)
+    {
+        GLuint sh = glCreateShader(srcs[i].t);
+        glShaderSource(sh, 1, &srcs[i].s, NULL);
+        glCompileShader(sh);
+        glAttachShader(p, sh);
+        glDeleteShader(sh);
+    }
+    glLinkProgram(p);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_TRUE(link);
+    if (!link) { glDeleteProgram(p); return; }
+
+    setup_patch_vao(pos, col, 6);
+    /* indexed 2-patch draw: patch 2 uses vertices 3,4,5 */
+    {
+        GLuint ibo;
+        glGenBuffers(1, &ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    }
+    glUseProgram(p);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElements(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL);
+    EXPECT_NO_GL_ERROR();
+
+    float c[4];
+    glFinish();
+    read_px(60, 100, c);   /* inside patch 1 */
+    EXPECT_PIXEL(60, 100, 255, 255, 255, 255, 4);
+    read_px(140, 100, c);  /* inside patch 2 */
+    EXPECT_PIXEL(140, 100, 255, 255, 255, 255, 4);
+    read_px(100, 190, c);  /* between the patches: untouched clear */
+    EXPECT_PIXEL(100, 190, 255, 0, 0, 255, 4);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -1367,6 +1454,7 @@ int main(void)
     }
     RUN(TessFourPatches);
     RUN(TessXfbPoints);
+    RUN(TessGeometryMultiPatch);
     RUN(TessIndexedAndInstanced);
     RUN(TessIndexedRestart);
     RUN(TessIndexedNoRescan);

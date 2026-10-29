@@ -53,6 +53,7 @@
 #include "mgl_ext_introspect.h"   /* subroutine source rewrite for the capture variant */
 #include "fp64.h"             /* software doubles: lower the generated variants like program.c does */
 #include "cts_glsl_compat.h"  /* layout(packed)/layout(shared) block rewrites (as shaders.c does) */
+#include "spirv_vote.h"       /* SPV_KHR subgroup opcodes -> core OpGroupNonUniform* (as program.c does) */
 #include "shaders.h"
 #include "programs.h"
 #include "msl_reserved.h"
@@ -1803,6 +1804,24 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
         {
             parse_ir = fixed;
             parse_words = fixed_words;
+        }
+        /* glslang's GL target emits the SPV_KHR_subgroup_vote/ballot opcodes for the
+         * group-vote/ballot calls (GL_ARB_shader_ballot in a geometry shader —
+         * KHR-GL46.shader_ballot_tests): the MSL backend lowers only the
+         * OpGroupNonUniform* core forms, and an un-rewritten module keeps the bare
+         * call names ("use of undeclared identifier 'ballotARB'").  The same pass
+         * program.c's compile_stage applies (spirv_vote.c). */
+        {
+            size_t vf_words = 0;
+            uint32_t *vf = mgl_spirv_vote_khr_rewrite(parse_ir, parse_words, &vf_words);
+
+            if (vf)
+            {
+                free(fixed);
+                fixed = vf;
+                parse_ir = fixed;
+                parse_words = vf_words;
+            }
         }
         r = spvc_context_parse_spirv(sctx, parse_ir, parse_words, &pir);
         free(fixed);

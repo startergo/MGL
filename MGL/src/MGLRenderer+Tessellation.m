@@ -1657,6 +1657,8 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     c->indices = idx_cap;
     c->prim = tp->point_mode ? GL_POINTS :
               (tp->domain == MGL_TESS_DOMAIN_ISOLINES ? GL_LINES : GL_TRIANGLES);
+    c->emission_order = false;   /* set by the caller: GPU capture = emission order,
+                                  * CPU reference capture = coordinate order */
     c->members = (uint32_t)tp->cap_members_n;
     for (int i = 0; i < tp->cap_members_n && i < MGL_TESS_CAPTURE_MAX; i++)
         c->member[i] = tp->cap_members[i];
@@ -1691,6 +1693,25 @@ static void tessRetireCapture(GLMContext ctx)
      * walk of mgl_tess_active_program is not paid by non-tessellation programs. */
     return mgl_tess_stage_bound(ctx);
 }
+
+/* The per-draw ring-block layout of extTessDrawPatches accumulates block-RELATIVE
+ * sub-offsets (need grows from 0), but tessRingAcquire hands out ABSOLUTE slot
+ * positions — 0 only for a brand-new slot.  Rebase every sub-offset right after the
+ * acquire, before the first bind (setBuffer offsets, ring.contents pointers, the
+ * tessellation-factor buffer): without this a draw landing mid-slot — several tess
+ * draws per frame, or a reused retired slot, both routine for the CTS — bound its
+ * TCS control points / factors / patch data at the slot's START instead, and a
+ * multi-patch GL_PATCHES draw tessellated stale ring bytes (KHR-GL46.shader_ballot_
+ * tests' 2-patch quad collapsed to one patch).  off_vs_out is the block base and the
+ * VS output lives at its start, so it is passed through unchanged. */
+#define TESS_REBASE_RING(off_vs_out_) do { \
+    off_vsparams += (off_vs_out_); off_scanout += (off_vs_out_); \
+    off_tcs_cp += (off_vs_out_); off_tcs_out += (off_vs_out_); \
+    off_tcs_patch += (off_vs_out_); off_factors += (off_vs_out_); \
+    off_levels_f += (off_vs_out_); off_patch_data += (off_vs_out_); \
+    off_gpu_emu += (off_vs_out_); off_capture += (off_vs_out_); \
+    off_capture_perm += (off_vs_out_); off_params += (off_vs_out_); \
+} while (0)
 
 - (bool) extTessDrawPatches: (bool) indexed type: (GLenum) type offset: (size_t) offset
                       first: (GLint) first count: (GLsizei) count instances: (GLsizei) instances
@@ -1728,6 +1749,14 @@ static void tessRetireCapture(GLMContext ctx)
         cp_stride = 16;    /* legal GL: a TCS may write only tess levels (no per-vertex
                               outputs) — the record is then unused, but the gather /
                               tessellator stages still need a stride */
+    /* the VS->TCS record stride (what the vertex kernel writes and the gather copies):
+     * equal to cp_record_full_size when there is no TCS, but canon.size when there is
+     * (one canonical record per interface — tessellation.c).  Sizing the vertex-output
+     * region and the gather with cp_record_full_size made the gather region OVERLAP
+     * the vertex records' tail whenever the two layouts differ, and multi-patch
+     * indexed draws fed the TCS garbage control points (KHR-GL46.shader_ballot_tests'
+     * 2-patch quad rendered one collapsed patch). */
+    size_t vs_rec = tp->vs_record_size ? tp->vs_record_size : cp_stride;
     uint32_t minv = 0, maxv = 0;
     TessVSPlan plan;
     id<MTLCommandBuffer> compute_cb;
@@ -1780,6 +1809,8 @@ static void tessRetireCapture(GLMContext ctx)
     size_t off_tcs_patch = 0, off_factors = 0, off_patch_data = 0, off_gpu_emu = 0;
     size_t off_params = 0;       /* plain-TES parameter words: per-draw, in the ring */
     size_t dbg_coords_off = 0;   /* debug dump only: coordinate stream of the tessellator */
+    size_t dbg_emu_off = 0;      /* debug dump only: the emulated scratch block */
+    size_t coords_cap_dbg = 0;   /* debug dump only: coordinate capacity (index base) */
     size_t dbg_ctl_off = 0;      /* debug dump only: control words (allocs/totals/args) */
     size_t off_coords = 0, off_indices = 0;
     size_t fstride = mgl_tess_factor_stride(ctx, tp);      /* 8 tri / 12 quad */
@@ -1983,8 +2014,8 @@ static void tessRetireCapture(GLMContext ctx)
             total_patches = patches * inst;
 
             {
-                size_t need = (size_t)vcount * (size_t)inst * cp_stride;
-                off_tcs_cp = need; need += tessRingAlign((size_t)tess_idx_used * (size_t)inst * cp_stride);
+                size_t need = (size_t)vcount * (size_t)inst * vs_rec;   /* vertex kernel output */
+                off_tcs_cp = need; need += tessRingAlign((size_t)tess_idx_used * (size_t)inst * vs_rec);
                 if (tp->has_tcs)
                 {
                     off_tcs_out = need;
@@ -2045,6 +2076,7 @@ static void tessRetireCapture(GLMContext ctx)
                     NSLog(@"MGL ERROR: tess: scratch ring exhausted");
                      return false;
                 }
+                TESS_REBASE_RING(off_vs_out);
             }
             /* stash the gather parameters where the compute phase dispatch picks them
              * up: the widened list is minv-normalised already, so base/minv/restart
@@ -2071,16 +2103,18 @@ static void tessRetireCapture(GLMContext ctx)
              * block; nothing is read back and nothing waits. */
             size_t inst = instances > 0 ? (size_t)instances : 1;
             GLuint cap = tessVSCapacity(ctx, &plan, count);
-            size_t need = (size_t)cap * inst * cp_stride;    /* vs out (absolute) */
+            size_t need = (size_t)cap * inst * vs_rec;       /* vs out (absolute) */
 
             gpu_indexed = true;
             vfirst = 0;                          /* absolute vertex indexing */
             vcount = (GLsizei)cap;               /* dispatch/grid bound (the GPU clamps vcount) */
+            /* the GPU-scan path's vertex kernel output (vcount = cap): sized with
+             * the VS->TCS record — NOT cp_stride (see vs_rec above) */
             off_vsparams = need;                 /* the vertex kernel's GPU-written parameter block */
             off_scanout = need + 32;             /* scan atomics (min/max/restarts) */
             need += 64;
 
-            off_tcs_cp = need; need += tessRingAlign((size_t)count * inst * cp_stride);
+            off_tcs_cp = need; need += tessRingAlign((size_t)count * inst * vs_rec);
             if (tp->has_tcs)
             {
                 off_tcs_out = need;
@@ -2135,6 +2169,7 @@ static void tessRetireCapture(GLMContext ctx)
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
                  return false;
             }
+            TESS_REBASE_RING(off_vs_out);
 
             /* scan -> setup: min/max/restart on the GPU, then the vertex kernel's
              * parameter block; committed before the compute buffer (FIFO), never waited on */
@@ -2183,7 +2218,7 @@ static void tessRetireCapture(GLMContext ctx)
         vcount = (GLuint)count;
         {
             size_t inst = instances > 0 ? (size_t)instances : 1;
-            size_t need = (size_t)vcount * inst * cp_stride;                 /* vs out */
+            size_t need = (size_t)vcount * inst * vs_rec;                    /* vs out */
             if (tp->has_tcs)
             {
                 off_tcs_out = need;
@@ -2238,6 +2273,7 @@ static void tessRetireCapture(GLMContext ctx)
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
                  return false;
             }
+            TESS_REBASE_RING(off_vs_out);
         }
     }
     indexed_ring_done: ;   /* the widened-index CPU fallback skips the raw gather */
@@ -2361,7 +2397,11 @@ static void tessRetireCapture(GLMContext ctx)
      * reads the GL element buffer's raw bytes directly (base vertex, no restart) */
     if (indexed && tess_gather_raw && tess_gather_ib)
     {
-        uint32_t gparams[6] = { (uint32_t)(cp_stride / 4), (uint32_t)basevertex, tess_gather_count,
+        /* gather words = the VS->TCS record: the source records are the vertex
+         * kernel's output and the destination stream is what the TCS reads — one
+         * canonical record per interface (vs_rec; NOT cp_stride = the TCS-out
+         * record the TES reads) */
+        uint32_t gparams[6] = { (uint32_t)(vs_rec / 4), (uint32_t)basevertex, tess_gather_count,
                                 tess_gather_itype, tess_gather_minv, tess_gather_restart };
         NSUInteger groups = ((NSUInteger)tess_gather_count + 63) / 64;
 
@@ -2386,7 +2426,7 @@ static void tessRetireCapture(GLMContext ctx)
          *            basevertex, so v = raw_index - min_raw_index)
          *   widened: reads the cached gapless uint32 list (already minv-normalised)
          *            with a per-instance modulo */
-        uint32_t gparams[7] = { (uint32_t)(cp_stride / 4), tess_gather_base, tess_gather_count,
+        uint32_t gparams[7] = { (uint32_t)(vs_rec / 4), tess_gather_base, tess_gather_count,
                                 tess_gather_itype, tess_gather_minv, tess_gather_restart,
                                 tess_gather_modulo };
         NSUInteger groups = ((NSUInteger)tess_gather_count + 63) / 64;
@@ -2722,6 +2762,7 @@ static void tessRetireCapture(GLMContext ctx)
         size_t emu_off = off_gpu_emu;                /* range reserved in the ring block */
         size_t coords_off = emu_off + (((size_t)total_patches * 2 + 2 + 5 + 3) & ~(size_t)3) * 4;
         dbg_coords_off = coords_off;
+        dbg_emu_off = emu_off;
         dbg_ctl_off = emu_off;
         size_t coords_cap = (size_t)total_patches * (tp->domain == MGL_TESS_DOMAIN_QUADS ? 4225 :
                             tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200);
@@ -2732,6 +2773,7 @@ static void tessRetireCapture(GLMContext ctx)
                              tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 4160 : 3200) :
                              tp->domain == MGL_TESS_DOMAIN_QUADS ? 24576 :
                              tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432);
+        coords_cap_dbg = coords_cap;
         size_t need = (coords_off - emu_off) + coords_cap * 16 + indices_cap * 4;
         if (tp->capture)
         {
@@ -2917,6 +2959,58 @@ static void tessRetireCapture(GLMContext ctx)
             id<MTLEvent> ev2 = [_device newEvent];
             [emu_cb encodeSignalEvent: ev2 value: 1];
             [emu_cb commit];
+            if (getenv("MGL_TESS_EMUDBG"))
+            {
+                /* one-off diagnostics: the tessellator's per-patch counts, the TCS's
+                 * control-point records and the half factors, after completion */
+                NSUInteger wcp = (NSUInteger)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in);
+                [emu_cb waitUntilCompleted];
+                const uint32_t *tot = (const uint32_t *)((const uint8_t *)ring.contents + dbg_emu_off);
+                const uint32_t *scanp = (const uint32_t *)((const uint8_t *)ring.contents +
+                                      dbg_emu_off + (size_t)total_patches * 2 * 4);
+                const float *coord = (const float *)((const uint8_t *)ring.contents + dbg_coords_off);
+                const float *tcout = (const float *)((const uint8_t *)ring.contents + off_tcs_out);
+                const uint16_t *hf = (const uint16_t *)((const uint8_t *)ring.contents + off_factors);
+                NSLog(@"emudbg: patches=%u totals coords=%u idx=%u", (unsigned)total_patches, tot[0], tot[1]);
+                for (unsigned p = 0; p < total_patches && p < 4; p++)
+                    NSLog(@"emudbg:  patch %u: cnt c=%u i=%u base c=%u i=%u factors %04x %04x %04x %04x %04x %04x",
+                          p, scanp[p * 4 + 0], scanp[p * 4 + 1], scanp[p * 4 + 2], scanp[p * 4 + 3],
+                          hf[(size_t)p * (fstride / 2) + 0], hf[(size_t)p * (fstride / 2) + 1],
+                          hf[(size_t)p * (fstride / 2) + 2], hf[(size_t)p * (fstride / 2) + 3],
+                          hf[(size_t)p * (fstride / 2) + 4], hf[(size_t)p * (fstride / 2) + 5]);
+                for (NSUInteger k = 0; k < wcp * total_patches && k < 6; k++)
+                {
+                    size_t wds = cp_stride / 4;
+                    NSString *s = @"";
+                    for (size_t q = 0; q < wds && q < 8; q++)
+                        s = [s stringByAppendingFormat: @" %g", tcout[k * wds + q]];
+                    NSLog(@"emudbg:  tcsout[%llu]:%@", (unsigned long long)k, s);
+                }
+                for (unsigned k = 0; k < 8; k++)
+                    NSLog(@"emudbg:  coord[%u] = (%.3f,%.3f,%.3f,%.3f)", k,
+                          coord[k * 4], coord[k * 4 + 1], coord[k * 4 + 2], coord[k * 4 + 3]);
+                if (off_capture)
+                {
+                    const float *crec = (const float *)((const uint8_t *)ring.contents + off_capture);
+                    const uint32_t *cidx = (const uint32_t *)((const uint8_t *)ring.contents +
+                                            dbg_coords_off + coords_cap_dbg * 16);
+                    unsigned n = tot[1];
+                    if (n > 12) n = 12;
+                    if (n == 0) n = 12;   /* the totals word is only written by tArgsPso elsewhere */
+                    for (unsigned k = 0; k < n; k++)
+                        NSLog(@"emudbg:  caprec[%u] = (%.2f,%.2f,%.2f,%.2f) col(%.1f,%.1f,%.1f,%.1f)", k,
+                              crec[(size_t)k * tp->cap_stride],
+                              crec[(size_t)k * tp->cap_stride + 1],
+                              crec[(size_t)k * tp->cap_stride + 2],
+                              crec[(size_t)k * tp->cap_stride + 3],
+                              crec[(size_t)k * tp->cap_stride + 4],
+                              crec[(size_t)k * tp->cap_stride + 5],
+                              crec[(size_t)k * tp->cap_stride + 6],
+                              crec[(size_t)k * tp->cap_stride + 7]);
+                    for (unsigned k = 0; k < n; k++)
+                        NSLog(@"emudbg:  capidx[%u] = %u", k, cidx[k]);
+                }
+            }
             if (getenv("MGL_TESS_DUMP_CAP") && cap_pub_records && tp->capture_pso)
             {
                 /* one-off diagnostics: read the published capture records back and

@@ -2228,12 +2228,29 @@ char *mgl_cts_glsl_compat_generated(const char *src)
      * are never handed to the app — the compile-time binding-range and std430
      * checks do not apply to them. */
     if (!src) return NULL;
+    /* chain-owned copy currently installed in src0 (each pass returns a fresh
+     * malloc'd string or NULL when it changed nothing) */
+    char *owned0 = NULL;
     const char *src0 = src;
-    char *culled0 = rewrite_cull_distance_ext(src);
-    if (culled0) src0 = culled0;   /* GL_ARB_cull_distance: lift to the 4.50
-                                    * core constructs (glslang has no entry) */
+    char *r;
+    r = rewrite_cull_distance_ext(src0);
+    if (r) { owned0 = r; src0 = owned0; }
+    /* the extension-less group-vote spellings must be renamed to the ARB ones in
+     * the generated variants too (the geometry kernel embeds the user's source) */
+    r = rewrite_subgroup_vote_ext(src0);
+    if (r) { free(owned0); owned0 = r; src0 = owned0; }
+    /* GL_ARB_shader_ballot must not reach SPIR-V's SubgroupSize/Subgroup*Mask
+     * builtins in the generated variants: the geometry kernel compiles the user's
+     * source as a compute kernel, and SPIRV-Cross hands `gl_SubgroupSize` to the
+     * renamed main as a plain parameter it never declares in the kernel entry —
+     * "use of undeclared identifier 'gl_SubgroupSize'" (KHR-GL46.shader_ballot_tests'
+     * geometry-stage pipelines rendered nothing).  The injected helpers return the
+     * simdgroup width and the spec's mask formula instead (see
+     * rewrite_ballot_subgroup_size). */
+    r = rewrite_ballot_subgroup_size(src0);
+    if (r) { free(owned0); owned0 = r; src0 = owned0; }
     char *hoisted0 = mgl_hoist_struct_samplers(src0);
-    if (hoisted0) { free(culled0); src0 = hoisted0; }
+    if (hoisted0) { free(owned0); owned0 = hoisted0; src0 = owned0; }
     char *cur = strip_invariant_on_input(src0);
     if (!cur && src0 != src) cur = (char *)src0;
     char *next = strip_gl_block_packings(cur ? cur : src);

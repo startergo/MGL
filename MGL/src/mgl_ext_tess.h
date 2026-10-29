@@ -199,6 +199,13 @@ typedef struct MGLTessProgram_t {
     MGLTessPatchMember cp_record[MGL_TESS_MAX_PATCH_MEMBERS];  /* full record layout (VS/TCS output) */
     int     num_cp_record;
     size_t  cp_record_full_size;   /* stride of one control point record */
+    /* stride of the VS->TCS canonical record (what the vertex kernel WRITES and the
+     * gather / TCS input read): with a TCS the TCS's output (and TES input) record
+     * cp_record_full_size is a DIFFERENT, usually smaller layout — one canonical
+     * record per interface (tessellation.c), and the ring layout and the gather
+     * must size/index the vertex-output region with THIS stride (0 = same as
+     * cp_record_full_size, i.e. no TCS or a pre-canonicalization program) */
+    size_t  vs_record_size;
 
     /* per-patch data: written by the TCS kernel (or defaults) and read by the TES */
     MGLTessPatchMember tcs_patch_out[MGL_TESS_MAX_PATCH_MEMBERS];

@@ -795,6 +795,11 @@ static const char *kGeomTessImportMSL =
     "        device uint* dst = recs + (size_t)t * cfg[5];\n"
     "        for (uint p = 0u; p < cfg[2] * 2u; p += 2u) dst[pairs[p + 1u]] = s[pairs[p]];\n"
     "    }\n"
+    "    /* records in GENERATION order (the emulated path's permuted capture): the emitted\n"
+    "     * sequence already IS the primitive order, so the slots are the identity; only\n"
+    "     * coordinate-ordered records (CPU reference path, point mode) go through the\n"
+    "     * tessellator's index list — applying it in both cases permutes twice and\n"
+    "     * scrambles the geometry kernel's input (KHR-GL46.shader_ballot tess pipelines) */\n"
     "    if (t < nidx) pslot[t] = cfg[8] ? t : idx[t];\n"
     "}\n";
 
@@ -2301,27 +2306,56 @@ void geom_xfb_gpu_reset(GLMContext ctx)
  * arguments — binding the R32Sint texture there is a Metal pixel-format mismatch.
  * A newTextureViewWithPixelFormat: view performs the reinterpretation (allowed between
  * formats of one texel size); elem_class is the SPIR-V image's sampled-type kind
- * (0 float, 1 int, 2 uint — SpirvResource.elem_class) so a format whose kind disagrees
- * with the shader keeps the plain view (GL would reject that draw anyway). */
+ * (0 float, 1 int, 2 uint — SpirvResource.elem_class).  When the unit format's kind
+ * DISAGREES with the shader's image type (a shader format-layout mismatch — undefined
+ * per GL, not an error) the SHADER's interpretation wins: a same-texel-size format of
+ * the shader's element kind is cast instead (mglImageCastFormat), because binding the
+ * plain view hands Apple GPUs a texture2d<T> write against a pixel format of the wrong
+ * element kind, which hangs all GPU work (KHR-GL46.shader_ballot_tests: rgba32f image
+ * over an RGBA32UI texture). */
+static GLenum mglImageCastFormat(uint8_t bpp, GLuint kind)
+{
+    switch (bpp)
+    {
+        case 16: return kind == 1u ? GL_RGBA32I  : kind == 2u ? GL_RGBA32UI  : GL_RGBA32F;
+        case  8: return kind == 1u ? GL_RG32I    : kind == 2u ? GL_RG32UI    : GL_RG32F;
+        case  4: return kind == 1u ? GL_R32I     : kind == 2u ? GL_R32UI     : GL_R32F;
+        case  2: return kind == 1u ? GL_R16I     : kind == 2u ? GL_R16UI     : GL_R16F;
+        case  1: return kind == 1u ? GL_R8I      : kind == 2u ? GL_R8UI      : GL_R8;
+        default: return 0;                 /* no plain format of that texel size */
+    }
+}
 - (id<MTLTexture>) geomImageUnitViewRes: (const ImageUnit *) iu base: (id<MTLTexture>) base
                               elemClass: (GLuint) elem_class
 {
     id<MTLTexture> view = [self geomImageUnitView: iu base: base];
     const TDFormat *fi;
+    MTLPixelFormat want;
 
     geomEnvRead();                             /* MGL_GEOM_DEBUG gates the trace below */
     if (!view || !iu || iu->internalformat == 0 || view.sampleCount > 1)
         return view;
     fi = tdFormatInfo(iu->internalformat);
-    if (!fi || fi->mtl == 0 || (MTLPixelFormat)fi->mtl == view.pixelFormat)
+    if (!fi || fi->mtl == 0)
         return view;
-    if (elem_class != 0xffffffffu)
+    want = (MTLPixelFormat)fi->mtl;         /* the unit <format>'s pixel format */
     {
         GLuint kind = (fi->comp_type == GL_INT) ? 1u :
                       (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u;
-        if (kind != elem_class)
-            return view;                     /* the shader's image type says otherwise */
+        if (elem_class != 0xffffffffu && kind != elem_class)
+        {
+            /* shader format-layout mismatch: reinterpret in the SHADER's element kind
+             * (see the comment above the helper) */
+            GLenum cf = mglImageCastFormat(fi->bpp, elem_class);
+            const TDFormat *cfi = cf ? tdFormatInfo(cf) : NULL;
+
+            if (!cfi || !cfi->mtl)
+                return view;             /* no same-texel-size format of the shader's kind */
+            want = (MTLPixelFormat)cfi->mtl;
+        }
     }
+    if (want == view.pixelFormat)
+        return view;
     /* the SAME cast view object must come back every draw: the image-atomic sidecar
      * keys its "binding unchanged, contents persist" check on the view's address
      * (geomImageAtomicBuffer) and the array layout signs it into its signature
@@ -2335,15 +2369,15 @@ void geom_xfb_gpu_reset(GLMContext ctx)
         id<MTLTexture> cached;
 
         dispatch_once(&once, ^{ castCache = [NSMutableDictionary dictionary]; });
-        key = [NSString stringWithFormat: @"%p:%u", (void *)view, (unsigned)fi->mtl];
+        key = [NSString stringWithFormat: @"%p:%u", (void *)view, (unsigned)want];
         @synchronized (castCache) { cached = castCache[key]; }
-        if (cached && cached.pixelFormat == (MTLPixelFormat)fi->mtl)
+        if (cached && cached.pixelFormat == want)
             return cached;
         @try {
-            id<MTLTexture> rv = [view newTextureViewWithPixelFormat: (MTLPixelFormat)fi->mtl];
+            id<MTLTexture> rv = [view newTextureViewWithPixelFormat: want];
             if (gEnv.debug)
                 NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
-                      iu->unit, (int)view.pixelFormat, fi->mtl, elem_class,
+                      iu->unit, (int)view.pixelFormat, (int)want, elem_class,
                       (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
                       rv ? "" : " FAILED");
             if (rv) {
@@ -2352,7 +2386,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
             }
         } @catch (NSException *e) {
             NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
-                  (int)view.pixelFormat, fi->mtl, e);
+                  (int)view.pixelFormat, (int)want, e);
         }
     }
     return view;

@@ -21,6 +21,9 @@
 #include <stdarg.h>
 
 #include "glm_context.h"
+char *tess_shadow_implicit_lod(const char *src);
+
+
 #include "mgl.h"
 #include "mgl_ext.h"
 #include "mgl_ext_program.h"      /* mgl_program_register_programiv_hook */
@@ -734,12 +737,259 @@ char *mgl_tess_reject_dynamic_distance_index(const char *src)
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* shadow samplers with implicit LOD outside the fragment stage        */
+/* ------------------------------------------------------------------ */
+
+/* Collect the identifiers declared as `uniform <...>sampler...Shadow NAME[, NAME2];`.
+ * Skips comments so a commented-out declaration does not fool the scan. */
+#define TESS_MAX_SHADOW_SAMPLERS 64
+static int tess_shadow_sampler_names(const char *src, size_t len,
+                                     const char *names[TESS_MAX_SHADOW_SAMPLERS])
+{
+    int n = 0;
+    size_t i = 0;
+    while (i < len)
+    {
+        /* skip comments */
+        if (i + 1 < len && src[i] == '/' && src[i + 1] == '/')
+        {
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        if (i + 1 < len && src[i] == '/' && src[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) i++;
+            i = i + 2 < len ? i + 2 : len;
+            continue;
+        }
+        /* the `uniform' keyword at an identifier boundary */
+        if (strncmp(src + i, "uniform", 7) == 0 &&
+            (i == 0 || !isalnum((unsigned char)src[i - 1])) &&
+            !isalnum((unsigned char)src[i + 7]))
+        {
+            /* scan the declaration up to the semicolon: the TYPE is the first
+             * identifier that is not a precision/interp qualifier; every later
+             * identifier before a ',' or '=' is a name of that type */
+            size_t j = i + 7, end = j;
+            while (end < len && src[end] != ';') end++;
+            const char *type = NULL;
+            size_t type_len = 0;
+            while (j < end)
+            {
+                if (isspace((unsigned char)src[j]) || src[j] == ',') { j++; continue; }
+                size_t e = j;
+                while (e < end && (isalnum((unsigned char)src[e]) || src[e] == '_')) e++;
+                if (e == j) { j++; continue; }
+                const char *w = src + j;
+                static const char *skip[] = { "lowp", "mediump", "highp", "precision", NULL };
+                int is_skip = 0;
+                for (int k = 0; skip[k]; k++)
+                    if (strncmp(w, skip[k], e - j) == 0) { is_skip = 1; break; }
+                if (!is_skip)
+                {
+                    if (!type)
+                    {
+                        type = w;
+                        type_len = e - j;
+                    }
+                    else if (type_len > 6 && strncmp(type + type_len - 6, "Shadow", 6) == 0)
+                    {
+                        /* a name of a shadow-sampler type */
+                        if (n < TESS_MAX_SHADOW_SAMPLERS) names[n++] = w;
+                    }
+                }
+                j = e;      /* continue right after this token */
+            }
+            i = end < len ? end + 1 : len;
+            continue;
+        }
+        i++;
+    }
+    return n;
+}
+
+static int tess_name_at(const char *src, size_t len, size_t i,
+                        const char *names[TESS_MAX_SHADOW_SAMPLERS], int n,
+                        size_t *name_len)
+{
+    size_t e = i;
+    while (e < len && (isalnum((unsigned char)src[e]) || src[e] == '_')) e++;
+    if (e == i) return 0;
+    for (int k = 0; k < n; k++)
+    {
+        size_t kl = 0;
+        while (names[k][kl] && isalnum((unsigned char)names[k][kl])) kl++;
+        if (kl == e - i && strncmp(names[k], src + i, kl) == 0)
+        {
+            *name_len = kl;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* skip a balanced (...) group starting at src[i] == '(' */
+static size_t tess_skip_paren(const char *src, size_t len, size_t i)
+{
+    int depth = 0;
+    while (i < len)
+    {
+        if (src[i] == '(') depth++;
+        else if (src[i] == ')')
+        {
+            depth--;
+            if (depth == 0) return i + 1;
+        }
+        i++;
+    }
+    return len;
+}
+
+/* Rewrite implicit-lod shadow samples in a NON-fragment stage to the explicit
+ * base-level form (see the comment at the call site).  Returns a malloc'd copy,
+ * or NULL when the source has no matching call (the caller then keeps `src'). */
+char *tess_shadow_implicit_lod(const char *src)
+{
+    size_t len = strlen(src);
+    const char *names[TESS_MAX_SHADOW_SAMPLERS];
+    int n = tess_shadow_sampler_names(src, len, names);
+    if (getenv("MGL_TESS_SLDBG"))
+        fprintf(stderr, "sl-re: n=%d first400=[%.400s]\n", n, src ? src : "");
+
+    char *out = NULL;
+    size_t out_len = 0, out_cap = 0;
+    size_t i = 0, copied = 0;
+
+#define TESS_OUT_PUSH(p, count)                                                \
+    do {                                                                       \
+        if (out_len + (count) > out_cap)                                       \
+        {                                                                      \
+            out_cap = (out_len + (count)) * 2 + 256;                           \
+            char *t_ = (char *)realloc(out, out_cap);                          \
+            if (!t_) { free(out); return NULL; }                               \
+            out = t_;                                                          \
+        }                                                                      \
+        memcpy(out + out_len, (p), (count));                                   \
+        out_len += (count);                                                    \
+    } while (0)
+
+    while (i < len)
+    {
+        /* texture( / textureOffset( at an identifier boundary */
+        int fn_len = 0;
+        if ((i == 0 || !isalnum((unsigned char)src[i - 1])) && src[i] == 't')
+        {
+            if (strncmp(src + i, "textureOffset(", 14) == 0 &&
+                !isalnum((unsigned char)src[i + 14 - 1]))
+                fn_len = 13;                       /* "textureOffset" */
+            else if (strncmp(src + i, "texture(", 8) == 0)
+                fn_len = 7;                        /* "texture" */
+        }
+        if (fn_len)
+        {
+            size_t a = i + fn_len + 1;             /* first char after '(' */
+            size_t nl;
+            if (tess_name_at(src, len, a, names, n, &nl))
+            {
+                size_t close = tess_skip_paren(src, len, i + fn_len);
+                if (close > a && close <= len && src[close - 1] == ')')
+                {
+                    /* find the first top-level comma of the argument list */
+                    int depth = 0;
+                    size_t c1 = 0;
+                    for (size_t q = a; q < close - 1; q++)
+                    {
+                        if (src[q] == '(') depth++;
+                        else if (src[q] == ')') depth--;
+                        else if (src[q] == ',' && depth == 0) { c1 = q; break; }
+                    }
+                    TESS_OUT_PUSH(src + copied, i - copied);      /* everything before `texture' */
+                    if (fn_len == 13)
+                    {
+                        /* textureOffset(s, P, off) -> textureLodOffset(s, P, 0.0, off):
+                         * the lod goes AFTER P, i.e. after the SECOND top-level comma */
+                        size_t c2 = 0;
+                        depth = 0;
+                        int commas = 0;
+                        for (size_t q = a; q < close - 1; q++)
+                        {
+                            if (src[q] == '(') depth++;
+                            else if (src[q] == ')') depth--;
+                            else if (src[q] == ',' && depth == 0)
+                            {
+                                commas++;
+                                if (commas == 2) { c2 = q; break; }
+                            }
+                        }
+                        if (c2)
+                        {
+                            TESS_OUT_PUSH("textureLodOffset", 16);
+                            TESS_OUT_PUSH(src + i + 13, c2 - (i + 13));            /* "(s, P" */
+                            TESS_OUT_PUSH(", 0.0", 5);
+                            TESS_OUT_PUSH(src + c2, close - c2);                   /* ", off)" */
+                        }
+                        else
+                        {
+                            /* only one argument: leave it untouched */
+                            TESS_OUT_PUSH(src + i, close - i);
+                        }
+                    }
+                    else
+                    {
+                        /* texture(s, P[, compare]) -> textureLod(s, P[, compare], 0.0) */
+                        TESS_OUT_PUSH("textureLod", 10);
+                        TESS_OUT_PUSH(src + i + 7, close - (i + 7) - 1);       /* "(args" */
+                        TESS_OUT_PUSH(", 0.0)", 6);
+                    }
+                    copied = close;
+                    i = close;
+                    continue;
+                }
+            }
+        }
+        i++;
+    }
+    if (!out) return NULL;                        /* nothing rewritten */
+    TESS_OUT_PUSH(src + copied, len - copied);
+#undef TESS_OUT_PUSH
+    /* NUL-terminate */
+    if (out_len + 1 > out_cap)
+    {
+        char *t = (char *)realloc(out, out_len + 1);
+        if (!t) { free(out); return NULL; }
+        out = t;
+    }
+    out[out_len] = 0;
+    return out;
+}
+
 char *mgl_tess_glsl_compat(GLenum type, const char *src)
 {
     if (!src ||
         (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
          type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
         return NULL;
+    /* GL_EXT_texture_shadow_lod / core GLSL 4.6: implicit-lod texture() on a shadow
+     * sampler outside the fragment stage samples the base level (GL 4.6 8.14.1),
+     * but glslang gates the overload behind an extension it only enables for ES
+     * ("The following extension must be enabled to use this feature" — an error
+     * in a vertex shader; KHR-GL46.ext_texture_shadow_lod's *_vertex cases die
+     * on it).  The explicit-lod form is semantically identical here, so rewrite
+     * texture(s, P[, compare]) -> textureLod(s, P[, compare], 0.0) and
+     * textureOffset(s, P, off) -> textureLodOffset(s, P, 0.0, off) for every
+     * sampler*Shadow uniform, in every non-fragment stage. */
+    if (type != GL_FRAGMENT_SHADER)
+    {
+        char *r = tess_shadow_implicit_lod(src);
+        if (r)
+        {
+            char *rest = mgl_tess_glsl_compat(type, r);
+            if (rest) { free(r); return rest; }
+            return r;
+        }
+    }
     /* GL_ARB_shader_ballot where Metal has no simdgroup attributes: the TES
      * (post-tessellation vertex function — verified: "invalid
      * 'thread_index_in_simdgroup' attribute ... in a post-tessellation vertex
@@ -5982,6 +6232,9 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
         tp->num_cp_record = rec->n;
         tp->cp_record_full_size = rec->size;
         tp->cp_record_size = rec->size;
+        /* the vertex kernel's own record (the VS->TCS interface) — see the header:
+         * with a TCS it differs from the TCS-out record the TES reads */
+        tp->vs_record_size = canon.size;
         for (int i = 0; i < rec->n && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
             tp->cp_record[i] = rec->m[i];
 
@@ -6428,6 +6681,7 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
     pair->num_cp_record = canon_tcs.n;
     pair->cp_record_full_size = canon_tcs.size;
     pair->cp_record_size = canon_tcs.size;
+    pair->vs_record_size = canon.size;   /* the VS->TCS interface record (see header) */
     for (int i = 0; i < canon_tcs.n && i < MGL_TESS_MAX_PATCH_MEMBERS; i++)
         pair->cp_record[i] = canon_tcs.m[i];
     /* the pair's TES member keys must be the ones resolved HERE (against the tc

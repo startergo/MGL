@@ -1,3 +1,116 @@
+# tess domain — round 36 report (NotSupported queue: +20 CTS cases; ballot emulation)
+
+READY ec3e01e (merge of gl46-port f600d55 [geom r66-r69] over 70d1f8e; every
+number below on exactly this tree)
+* suite `tests/headless/run.sh`: **128 tests, 0 FAIL / 0 BUILD-FAIL, 126x
+  "0 failures" summaries** (drawparams/orphan/v64limits end in PASS lines by
+  design).  test_geom_xfbperf is IN the gate again (quarantine lifted with
+  geom r64; it ran clean in the suite and in test_geom 10x below).
+* test_geom 10x = **10/10 x 670 checks, 0 failures**; test_fp64 5x = **5/5 x
+  417**; test_fp64fast 3x = **3/3 x 298**.
+* ab_bench m0/m1 min-of-7 interleaved vs ~/MGL-cts/baseline-f600d55: the plain
+  min-of-7 read m0 +11.4% / m1 +6.7% with the baseline catching one quiet
+  window (its 2nd-best was 26%/13% above its min), while the same-window A/A
+  control (baseline vs baseline-copy) read **+14.4% / +21.3%** — the box noise
+  dominates; the decisive 14-rep interleaved floor run gives **m0 min -9.0%,
+  p20 -1.3%, median +2.3%; m1 min +7.1%, p20 -0.5%, median +0.0%** — parity.
+* locked glmark2 (every run under `/usr/bin/lockf -k /tmp/mgl_glmark2.lock`,
+  order alternated, vs baseline-f600d55 nsgl): **ideas 5 pairs median 2483 vs
+  2470 (+0.5%), jellyfish quiet-pair median +0.3%, gl41-geometry 5 pairs
+  median 22365 vs 22294 (+0.3%)** — no scene past +3%.
+* CTS on this tree: **cull_distance 3/3, tessellation_shader 58/58**
+  (primitive_coverage fixed upstream by compat s26), **program_interface_query
+  43/43, shading_language_420pack 43/43** (binding_samplers now passes in the
+  group run too), explicit_uniform_location queue cases Pass (the full
+  48-case group passed 48/48 twice earlier today on the same code paths; it
+  times out at 1200 s under the current box load).
+* **This round's new cases (all previously NotSupported/Fail in my queue):
+  shader_integer_mix 13 (advertising GL_EXT_shader_integer_mix; 1 further case
+  stays NotSupported by CTS design — the gl3 package registers the group at
+  GLSL 330 but `prototypes' gates on >= 450), parallel_shader_compile 3/3
+  (glMaxShaderCompilerThreadsARB/KHR entry + hint query + COMPLETION_STATUS =
+  TRUE, the synchronous-compile path the ARB allows), gpu_shader5_gl 3/3
+  (advertise GL_ARB_gpu_shader5), shader_ballot_tests 1/4** — Availability
+  Pass; the other three fail inside the CTS *compute* validation path, see
+  Known gaps 3.
+* stub_scanner EMPTY/NOOP/ASSERT clean: tessellation.c, spirv_vote.c,
+  cts_glsl_compat.c, MGLRenderer+Tessellation.m, mgl_ext_tess.h.
+* Scratch policy fix from the last review: 88 test_zz_*/zz* scratch files are
+  untracked and moved to .agent/scratch-tests/ (out of the run.sh glob); the
+  old test_zz_gsimplicit 120 s timeout disappears with them (it was a heavy
+  65536-point GS repro, 45.6 s on my tree, not a hang).
+
+## r35/r36 work: the NotSupported queue in my area
+
+Top-3 by case count (from the r28 sweep, re-verified live):
+1. sample_variables 38 (samples_8 rows only) — blocked on GL_MAX_SAMPLES = 4;
+   raising to 8 is a texdata/fb allocation decision, not mine to take.
+2. shader_integer_mix 11 — DONE (13 cases incl. shaders45 now Pass).
+3. shader_ballot_tests 4 — DONE as far as MGL can go (see Known gaps 3).
+
+Also taken because they were pure program/GLSL surface:
+* parallel_shader_compile (3), gpu_shader5_gl (3).
+
+### GL_ARB_shader_ballot design (the interesting one)
+* glslang emits the SPV_KHR_shader_ballot opcodes; SPIRV-Cross's MSL backend
+  only lowers the SPIR-V 1.3 OpGroupNonUniform* core forms, so spirv_vote.c
+  now also rewrites **OpSubgroupBallotKHR -> OpGroupNonUniformBallot,
+  OpSubgroupReadInvocationKHR -> OpGroupNonUniformShuffle,
+  OpSubgroupFirstInvocationKHR -> OpGroupNonUniformBroadcast lane 0** (each
+  inserts the %uint 3 Subgroup scope; broadcast additionally needs a %uint 0,
+  reused when present) and swaps the SubgroupBallotKHR capability for
+  GroupNonUniformBallot(+Shuffle).  Metal lowers those to simd_vote /
+  simd_shuffle, which exist in fragment/compute/tess-control kernels on Apple
+  GPUs (verified end-to-end: readInvocationARB(v,0)+readFirstInvocationARB
+  sum to exactly 1.0 in a fragment).
+* **gl_SubGroupSizeARB is a uniform in glslang's OpenGL profile** (it becomes
+  the SubgroupSize builtin only under Vulkan semantics) and would read 0
+  through mgl_DefaultUniforms: cts_glsl_compat.c replaces its uses with an
+  injected helper returning 32 (the simdgroup width on every Apple GPU).
+* **The mask builtins** are lowered by SPIRV-Cross to simd_ballot(true),
+  which sets only ACTIVE lanes — a partially active wave (4 vertices in the
+  vertex-stage kernel, a 3-vertex patch) then disagrees with the spec/CTS
+  formula "bits i in [0,size) with i OP invocation".  The masks are pure
+  functions of the invocation index, so the same pass injects
+  eq/ge/gt/le/lt helpers computing exactly that formula (uint64_t flavor for
+  the bare use, uvec4 flavor when a swizzle follows — glslang accepts both
+  spellings), clamped by a lanes() mask so they stay correct whatever the
+  reported size.
+* **TES and VERTEX have no simdgroup attributes on Metal** (the compiler
+  rejects `[[thread_index_in_simdgroup]]` in a post-tessellation/ordinary
+  vertex function; SPIRV-Cross refuses the same).  The subgroup size is
+  implementation-defined per stage, so those two stages get a **size-1
+  subgroup emulation** in mgl_tess_glsl_compat: invocation 0, the lane-0
+  masks (via the helpers above composed with the 0u fold), ballotARB(p) =
+  uint64_t(p), and the reads degenerate to the value itself.  Every other
+  stage keeps the real 32-wide simdgroup.
+* GL_ARB_gpu_shader_int64 is advertised too: ballotARB's uint64_t flows
+  through Metal 3's 64-bit integer emulation (verified: shifts/xor/pack of
+  uint64_t compile and run in a fragment shader).
+
+### parallel_shader_compile
+Entry points glMaxShaderCompilerThreadsARB/KHR (gl_core.c + glm_dispatch
+members — shared-file additions, listed below), the implementation stores the
+hint in ext_tess state and mgl_ext_get_tess answers
+GL_MAX_SHADER_COMPILER_THREADS_ARB in every glGet type; a programiv hook
+(registered from tessellation.c) and one case in mglGetShaderiv return
+GL_COMPLETION_STATUS = TRUE, which is exactly what a synchronously compiling
+implementation reports.
+
+### Shared-file edits this round (each surgical)
+* MGL/src/gl_core.c, MGL/include/glm_dispatch.h, MGL/src/glm_dispatch.c,
+  MGL/include/mgl.h: the glMaxShaderCompilerThreads[ARB|KHR] entry point
+  (function + dispatch member + assignment + prototype).
+* MGL/src/shaders.c: GL_COMPLETION_STATUS_ARB case in mglGetShaderiv (3
+  lines); the rest of my shaders.c edits are earlier rounds' (r23/r28).
+* MGL/src/get.c: extension strings (ARB_shader_ballot, ARB_gpu_shader_int64,
+  ARB_parallel_shader_compile, KHR_parallel_shader_compile; ARB_gpu_shader5
+  and GL_EXT_shader_integer_mix deduped after compat landed the same strings
+  upstream).
+* No edits to MGLRenderer+Compat.m, draw_buffers.c, or rendering.c.
+
+---
+
 # tess domain — round 33 report (gate + READY on the 3cd6208 merge)
 
 READY 1dddf05 (merge of gl46-port 3cd6208 [compat s26] into e6a2333 [tess
@@ -665,18 +778,22 @@ record size + "leave the word alone" for the synthetic cull variant.
 * tessellation_shader 47/48 (only single.primitive_coverage, below).
 
 ### Known gaps
-1. **tessellation_shader.single.primitive_coverage**: FAILS on the pristine
-   gl46-port baselines too (verified on baseline-48a41ef and baseline-3cd6208
-   with the identical log) — rendered pixels are channel-REVERSED (rendered
-   0x20,0x40,0x80,0xff vs expected 0xff,0x80,0x40,0x20), the c6ded7d
-   copy_image / MS-image-write regression, forwarded to compat (s26 did not
-   change it).  The pixel the CTS complains about (index 8188 = (2047,0):
-   2047.5/1024-1 + 0.5/1024-1 = 0, a centre lying *exactly* on the patch's
-   hypotenuse) IS stamped — the complaint is its colour, not its coverage —
-   and MGL's tessellated coverage is bit-identical to a plain GL_TRIANGLES
-   draw of the same vertices (missing=0 extra=0 at every level,
-   test_edgeprobe.c).  When compat fixes the channel reversal, the residual
-   tess-side question is whether Metal's exact domain coordinates need a
-   1-ulp-outside corner like the D3D11 reference tessellator; re-check then.
+1. **sample_variables 38 NotSupported** (samples_8 rows): needs 8x MSAA
+   renderbuffers; MGL reports GL_MAX_SAMPLES 4 and
+   glRenderbufferStorageMultisample(8, GL_RGBA8) fails GL_INVALID_OPERATION —
+   the allocation/resolve path belongs to texdata/fb, coordinating there.
 2. gpu_shader5 texture_gather_offset clamp/edge (4): border clamp emulation —
-   texdata domain.
+   texdata domain (pre-existing, documented by geom).
+3. **shader_ballot_tests 3/4**: Bitmasks/FunctionBallot/FunctionRead fail
+   *inside the CTS compute validation*, which binds an RGBA32UI texture to a
+   compute image the shader declares `layout(rgba32f)` and then samples the
+   integer texture with a float sampler expecting the raw float bits
+   (verified: MGL returns 0; a conformant desktop GL returns ~1.0).  Separately,
+   the format-mismatched imageStore path HANGS the GPU work (a dispatch +
+   subsequent readback never completes; reproduced twice, then STOPPED per the
+   GPU-fault rule and reported).  Both behaviors are texdata/compute domain;
+   the ballot implementation itself verifies correct in all six stages
+   (probe replay of the CTS's own shader sources: every rendered pixel white).
+4. shader_integer_mix `shaders.shader_integer_mix.prototypes` stays
+   NotSupported by CTS design (the gl3 package registers the group at GLSL
+   330 while the case itself requires >= 450).
