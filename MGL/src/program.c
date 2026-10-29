@@ -1548,9 +1548,22 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
     }
     if (!nobjs) return NULL;
 
-    /* 2) rewrite the calls into a fresh buffer */
+    /* 2) rewrite the calls into a fresh buffer.
+     *
+     * Sizing (geom r70, fixes the test_vs_gather heap corruption): every rewritten
+     * call appends up to sizeof buf (2048) bytes while the original call text it
+     * replaces is only a few dozen, so the growth budget must be per CALL, not
+     * strlen(msl)*2: a small MSL with many gathers (unrolled loops) outgrew the old
+     * slack and strcat() smashed the neighbouring heap chunk — the corruption was
+     * detected minutes later inside glslang (TStringAtomMap freelist) and only
+     * crashed depending on the neighbour's size class, which is why it looked
+     * layout-dependent.  Count the calls first. */
+    size_t ncalls = 0;
+    for (const char *q = msl; (q = strstr(q, ".gather(")) != NULL; ncalls++, q += 8) {}
+    for (const char *q = msl; (q = strstr(q, ".gather_compare(")) != NULL; ncalls++, q += 16) {}
+
     const char *helpers = compute ? k_gcmp_sc_helpers : k_gcmp_read_helpers;
-    size_t need = strlen(msl) * 2 + strlen(k_gath_helpers) + strlen(helpers) + nobjs * 192 + 4096;
+    size_t need = strlen(msl) + ncalls * (2048 + 64) + 4096;
     char *out = (char *)malloc(need);
     if (!out) return NULL;
     out[0] = 0;
@@ -1705,9 +1718,15 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
     }
 
     /* 3) prepend the helper preamble (+ per-slot compare-op function constants
-     * in the vertex stage) at file scope, right after `using namespace metal;' */
+     * in the vertex stage) at file scope, right after `using namespace metal;'.
+     *
+     * The wrap/border block below is ~830 bytes per slot (the old nobjs*192
+     * allowance only covered the shadow-op line — this overflowed `pre` by
+     * ~640 bytes per gather object and corrupted the neighbouring malloc chunk;
+     * test_vs_gather crashed intermittently in glslang long after).  Each object
+     * emits at most two line[1024] blocks. */
     {
-        char *pre = (char *)malloc(strlen(k_gath_helpers) + strlen(helpers) + nobjs * 192 + 32);
+        char *pre = (char *)malloc(strlen(k_gath_helpers) + strlen(helpers) + (size_t)nobjs * 2048 + 128);
         if (!pre) { free(out); return NULL; }
         pre[0] = 0;
         for (int i = 0; i < nobjs && !compute; i++)
@@ -1923,7 +1942,7 @@ static GLuint sampler_gl_target(spvc_compiler c, spvc_type_id type_id)
 
     switch (spvc_type_get_image_dimension(t))
     {
-        case SpvDim1D:  return GL_TEXTURE_1D;
+        case SpvDim1D:  return arrayed ? GL_TEXTURE_1D_ARRAY : GL_TEXTURE_1D;
         case SpvDim2D:  return ms ? (arrayed ? GL_TEXTURE_2D_MULTISAMPLE_ARRAY : GL_TEXTURE_2D_MULTISAMPLE)
                                    : (arrayed ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D);
         case SpvDim3D:  return GL_TEXTURE_3D;

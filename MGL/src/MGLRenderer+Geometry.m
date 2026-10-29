@@ -736,10 +736,12 @@ static const char *kGeomPrepMSL =
 
 /* the tess producer's import kernel: repacks the TES-output capture records into this
  * program's input record (the layouts differ: the tess record follows the tess capture's
- * member table, this program's record follows geom_layout), copies the tessellator's index
- * list into the primitive slots and publishes the counts the geometry kernel needs
- * (gPrim's header words and the prep block, exactly what the prep kernel writes for a
- * plain draw) */
+ * member table, this program's record follows geom_layout), fills the primitive slots and
+ * publishes the counts the geometry kernel needs (gPrim's header words and the prep block,
+ * exactly what the prep kernel writes for a plain draw).  The primitive slots follow the
+ * capture's record order: when the records are in emission order (cfg[8], the GPU path's
+ * permute — one record per emitted vertex) slot t IS record t; when they are per unique
+ * coordinate (CPU reference path) the tessellator's index list maps them. */
 static const char *kGeomTessImportMSL =
     "#include <metal_stdlib>\n"
     "#include <simd/simd.h>\n"
@@ -754,7 +756,7 @@ static const char *kGeomTessImportMSL =
     "                                 device uint* pslot [[buffer(6)]],          /* primitive slots */\n"
     "                                 device uint* cap_hdr [[buffer(7)]],        /* the capture header */\n"
     "                                 device uint* prep [[buffer(8)]],           /* prep[0] / prep[4] */\n"
-    "                                 constant uint* cfg [[buffer(9)]],          /* stride,k,npairs,reccap,idxcap,in_words,inst,invoc */\n"
+    "                                 constant uint* cfg [[buffer(9)]],          /* stride,k,npairs,reccap,idxcap,in_words,inst,invoc,emission */\n"
     "                                 uint t [[thread_position_in_grid]])\n"
     "{\n"
     "    uint nrec = cnt[0];\n"
@@ -793,7 +795,7 @@ static const char *kGeomTessImportMSL =
     "        device uint* dst = recs + (size_t)t * cfg[5];\n"
     "        for (uint p = 0u; p < cfg[2] * 2u; p += 2u) dst[pairs[p + 1u]] = s[pairs[p]];\n"
     "    }\n"
-    "    if (t < nidx) pslot[t] = idx[t];\n"
+    "    if (t < nidx) pslot[t] = cfg[8] ? t : idx[t];\n"
     "}\n";
 
 #include "mgl_ext_geom_xfb.h"
@@ -2237,10 +2239,13 @@ void geom_xfb_gpu_reset(GLMContext ctx)
             }
             else
             {
-                /* GL wants an image2D view of one 3D slice, but a 3D texture can only
-                 * alias as 3D (Metal texture-view rules) — hand the whole texture and
-                 * let the MSL's texture2d argument read the slice-0 plane.  Documented
-                 * emulation gap (non-layered 3D image bindings read the wrong plane). */
+                /* GL wants an image2D view of one 3D slice.  Metal texture-view rules
+                 * REFUSE aliasing a 3D texture as 2D (tried: newTextureViewWithType 2D
+                 * with a one-slice range → Metal validation aborts the process), so hand
+                 * the whole texture and let the MSL's texture2d argument read the
+                 * slice-0 plane.  Documented emulation gap: non-layered 3D image
+                 * bindings read/write the wrong plane
+                 * (KHR-GL46.shader_image_load_store.non-layered_binding). */
                 return base;
             }
             break;
@@ -3579,9 +3584,12 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
     };
 
     if (!STATE(program)) return;
+    if (getenv("MGL_ZZVCAP")) fprintf(stderr, "ZZVCAP enter stage=%d\n", stage);
     for (int t = 0; types[t].spvc_type; t++)
     {
         GLuint n = [self getProgramBindingCount: stage type: types[t].spvc_type];
+        if (getenv("MGL_ZZVCAP"))
+            fprintf(stderr, "ZZVCAP bind-stage=%d type=%d n=%u\n", stage, types[t].spvc_type, n);
 
         for (GLuint i = 0; i < n; i++)
         {
@@ -3613,6 +3621,10 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     [self bindMTLTexture: tex];
                 }
                 if (!tex || !tex->mtl_data) continue;
+                if (getenv("MGL_ZZVCAP"))
+                    fprintf(stderr, "ZZVCAP vs-capture bind unit=%d tex=%u tgt=%x incomplete=%d mtl=%p\n",
+                            unit, tex->name, tex->target,
+                            (int)mgl_texture_incomplete_for_sampling(tex), (void *)tex->mtl_data);
                 id<MTLTexture> texture = (__bridge id<MTLTexture>)tex->mtl_data;
                 if (!types[t].image)
                 {
@@ -3821,6 +3833,21 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                 int spirv_binding = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
                 NSUInteger mtl_index = (NSUInteger)geomTexSlot(gp->tex_slots_gs, gp->n_tex_slots_gs,
                                                                sres->name ? sres->name : "");
+                if (getenv("MGL_ZZTRACE"))
+                {
+                    FILE *f = fopen("/tmp/geom_zztrace.txt", "a");
+                    if (f)
+                    {
+                        fprintf(f, "gs bind prog=%u name='%s' unit=%d slot=%ld fallback_msl=%d table:",
+                                ctx->state.program ? ctx->state.program->name : 0,
+                                sres->name ? sres->name : "?", spirv_binding,
+                                (long)mtl_index, (int)sres->msl_binding);
+                        for (int q = 0; q < gp->n_tex_slots_gs; q++)
+                            fprintf(f, " ['%s'->%d]", gp->tex_slots_gs[q].name, gp->tex_slots_gs[q].msl);
+                        fprintf(f, "\n");
+                        fclose(f);
+                    }
+                }
                 if (mtl_index == (NSUInteger)-1) mtl_index = (NSUInteger)sres->msl_binding;
                 int n = 1;
 
@@ -4617,7 +4644,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * (prep[4], written here on the GPU) must be visible when that dispatch is issued. */
         id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
         id<MTLBuffer> ring = (__bridge id<MTLBuffer>)d->tess_ring;
-        uint32_t cfg[8];
+        uint32_t cfg[10];
         NSUInteger wg = 64, nt = bound > (NSUInteger)d->count ? bound : (NSUInteger)d->count;
 
         if (!enc) return false;
@@ -4645,6 +4672,9 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         cfg[5] = gp->in_words;                   /* words per input record */
         cfg[6] = (uint32_t)(d->instances > 0 ? d->instances : 1);
         cfg[7] = gp->invocations;
+        cfg[8] = d->tess_emission;               /* records are in emission order:
+                                                 * primitive slot t IS record t */
+        cfg[9] = 0;
         [enc setBytes: cfg length: sizeof cfg atIndex: 9];
         [enc dispatchThreadgroups: MTLSizeMake((nt + wg - 1) / wg, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(wg, 1, 1)];

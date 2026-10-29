@@ -1735,6 +1735,42 @@ static void geom_record_tex_arrays(const uint32_t *ir, size_t words, MGLGeomProg
     spvc_context_destroy(sctx);
 }
 
+/* the original OpName spelling of a SPIR-V id (before mgl_msl_mangle_reserved's
+ * compiler-side renames), for recording slot-table keys under the name the
+ * program's resource list uses */
+static bool geom_spv_opname(const uint32_t *ir, size_t words, uint32_t id,
+                            char *out, size_t outsz)
+{
+    size_t pos;
+
+    if (!ir || words < 5 || ir[0] != SpvMagicNumber)
+        return false;
+    for (pos = 5; pos < words; )
+    {
+        uint32_t wc = ir[pos] >> 16;
+        uint32_t op = ir[pos] & 0xFFFF;
+
+        if (wc == 0 || pos + wc > words)
+            break;
+        if (op == SpvOpName && wc >= 3 && ir[pos + 1] == id)
+        {
+            /* literal string from word 2: 4 bytes little-endian per word, NUL-terminated */
+            const char *bytes = (const char *)(ir + pos + 2);
+            size_t maxb = (size_t)(wc - 2) * 4, k = 0;
+
+            while (k < maxb && k + 1 < outsz && bytes[k])
+            {
+                out[k] = bytes[k];
+                k++;
+            }
+            out[k] = 0;
+            return *out != 0;
+        }
+        pos += wc;
+    }
+    return false;
+}
+
 static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *ir, size_t words,
                                const char *entry, bool disable_rasterization, char **log,
                                int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count,
@@ -1906,10 +1942,48 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
                 for (size_t i = 0; i < n && *nslots < max_slots; i++)
                 {
                     const char *nm = spvc_compiler_get_name(comp, list[i].id);
+                    int msl;
 
                     if (!nm || !*nm) continue;
+                    msl = (int)spvc_compiler_msl_get_automatic_resource_binding(comp, list[i].id);
                     snprintf(slots[*nslots].name, sizeof slots[0].name, "%s", nm);
-                    slots[(*nslots)++].msl = (int)spvc_compiler_msl_get_automatic_resource_binding(comp, list[i].id);
+                    slots[(*nslots)++].msl = msl;
+
+                    /* mgl_msl_mangle_reserved renamed MSL keywords/keyword-colliding
+                     * identifiers ("texture", "sampler", "writeonly", ...) to name_mgl[N]
+                     * IN THE COMPILER, so the recorded name is the mangled one while the
+                     * bind walks (geomTexSlot) key on the program's SPIR-V resource name —
+                     * the ORIGINAL identifier.  Record that spelling too, or every
+                     * sampler the shader happens to name "texture" misses the table and
+                     * falls back to the (wrong) stage-list msl binding
+                     * (KHR-GL46.texture_view.view_sampling: all stages declare
+                     * 'uniform sampler2D texture;'). */
+                    {
+                        char orig[256];
+                        bool have_orig = geom_spv_opname(ir, words, list[i].id, orig, sizeof orig);
+                        const char *canon = have_orig ? orig : nm;
+
+                        if (have_orig && strcmp(orig, nm) && *nslots < max_slots)
+                        {
+                            snprintf(slots[*nslots].name, sizeof slots[0].name, "%s", orig);
+                            slots[(*nslots)++].msl = msl;
+                        }
+                        /* mgl_spirv_rect_to_2d (program.c) renames every RECT sampler to
+                         * name+"_mglrect" in the MSL-facing module — and the stage's
+                         * RESOURCE LIST is introspected from that module, so a rect
+                         * sampler's sres->name carries the suffix while this compile's
+                         * SPIR-V still has the original OpName.  Record the alias or the
+                         * bind misses the table (KHR-GL46.texture_view.view_sampling,
+                         * RECTANGLE iteration: the geometry kernel bound msl 0 instead
+                         * of 1 and sampled the unit's leftover GL_TEXTURE_2D binding). */
+                        if (*canon && *nslots < max_slots &&
+                            strlen(canon) + strlen("_mglrect") < sizeof slots[0].name)
+                        {
+                            snprintf(slots[*nslots].name, sizeof slots[0].name,
+                                     "%s_mglrect", canon);
+                            slots[(*nslots)++].msl = msl;
+                        }
+                    }
                 }
             }
         }
@@ -8755,6 +8829,15 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     d.baseinstance = baseinstance;
     d.tess_rec_cap = c->records ? c->records : 1;
     d.tess_idx_cap = c->indices ? c->indices : 1;
+    /* the GPU tess path permutes the capture records into emission order (one record
+     * per emitted vertex): primitive slot t IS record t; the published index list is
+     * the tessellator's coordinate-index list and must NOT be used as a record map.
+     * The CPU reference path writes one record per unique coordinate — there the list
+     * IS the map.  (Quads/isolines tess domains emit vertices in an order where the
+     * two differ: KHR-GL46.texture_view.view_sampling draws a unit quad — 4 corners,
+     * indices 0 1 3 1 2 3 — and the geometry stage consumed records 0,1,3,1,2,3
+     * instead of the emitted 0..5, collapsing the quad into degenerate triangles.) */
+    d.tess_emission = c->emission_order ? 1u : 0u;
 
     (void)kof;
     return METAL()->draw(ctx, &d);

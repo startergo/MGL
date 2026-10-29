@@ -1873,6 +1873,8 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     char entry[64];
     snprintf(entry, sizeof(entry), "mgl_xfb_vertex_%u", xp->name);
     xp->msl = xfb_spirv_to_msl(ctx, ir, words, entry);
+    if (getenv("MGL_ZZXFB") && xp->msl)
+    { FILE *f = fopen("/tmp/zz_xfb.metal", "w"); if (f) { fputs(xp->msl, f); fclose(f); } }
     /* the capture runs the vertex stage on its own encoder: gathers there must
      * use the read/sample emulation too (AGX vertex functions return zeros for
      * offset gathers) or the captured records are all zero

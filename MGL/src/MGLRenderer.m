@@ -2345,6 +2345,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             if (!ptr->mtl_data)
                 continue;
 
+
             id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
 
             // sampler objects bound to the unit override the texture's sampler state;

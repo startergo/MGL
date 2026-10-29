@@ -718,6 +718,49 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
         detachFromFramebuffer(ctx, STATE(framebuffer), tex);
         detachFromFramebuffer(ctx, STATE(readbuffer), tex);
 
+        /* GL 4.6 9.2: a view shares the parent's images, so deleting the parent (root) is
+         * DEFERRED until no views remain — the view keeps sampling the shared storage
+         * (KHR-GL46.texture_view.reference_counting).  Unbind a dying view's reference
+         * first; the deferred root then dies with its last view. */
+        {
+            MGLTexExtInfo *info = mgl_texext_info(ctx, tex);
+            if (info && info->kind == MGL_TEXEXT_VIEW && info->view_root)
+            {
+                Texture *root = info->view_root;
+                if (mgl_texext_view_unref_root(ctx, root))
+                {
+                    /* the root's hash entry/name were dropped at its own delete; free it now
+                     * (same storage+side-table+struct teardown as below), unless an FBO
+                     * still holds it (that path owns the deferred free then) */
+                    if (!attachedToAnyFramebuffer(ctx, root))
+                    {
+                        freeTextureStorage(ctx, root);
+                        mgl_texext_info_free(ctx, root);
+                        free(root);
+                    }
+                }
+            }
+            /* not a view: a root with live views stays alive for them */
+            if (info && info->view_refs > 0)
+            {
+                info->pending_delete = GL_TRUE;
+                tex->name = TEX_OBJ_RES_NAME;
+                /* deleteHashElement CFReleases the slot object's Metal storage; the
+                 * deferred root's storage must survive for its views, so take it out of
+                 * the slot for the delete and restore it — freeTextureStorage releases
+                 * it when the last view unrefs */
+                {
+                    void *keep_mtl = tex->mtl_data, *keep_pmtl = tex->params.mtl_data;
+                    tex->mtl_data = NULL;
+                    tex->params.mtl_data = NULL;
+                    deleteHashElement(&STATE(texture_table), name);
+                    tex->mtl_data = keep_mtl;
+                    tex->params.mtl_data = keep_pmtl;
+                }
+                continue;
+            }
+        }
+
         deleteHashElement(&STATE(texture_table), name);
 
         // an object still attached to an unbound framebuffer stays alive (GL 4.6 5.1.3)

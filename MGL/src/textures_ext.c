@@ -91,6 +91,23 @@ void mgl_texext_info_free(GLMContext ctx, const Texture *tex)
     }
 }
 
+/* a view of `root` is being destroyed: drop the root's reference.  Returns true when the
+ * caller must now free the root itself — the root was deleted earlier (glDeleteTextures
+ * deferred it because of this reference; its hash entry and name are already gone). */
+bool mgl_texext_view_unref_root(GLMContext ctx, Texture *root)
+{
+    MGLTexExtInfo *info = mgl_texext_info(ctx, root);
+
+    if (!info || info->view_refs <= 0)
+        return false;
+    if (--info->view_refs == 0 && info->pending_delete)
+    {
+        info->pending_delete = GL_FALSE;
+        return true;                       /* the caller frees the root's storage + struct */
+    }
+    return false;
+}
+
 bool mgl_texext_is_view(GLMContext ctx, const Texture *tex)
 {
     MGLTexExtInfo *info = mgl_texext_info(ctx, tex);
@@ -745,8 +762,9 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
 {
     Texture *orig, *tex;
 
-    if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: enter texture=%u orig=%u target=%x fmt=%x %u/%u %u/%u\n",
-                                          texture, origtexture, target, internalformat, minlevel, numlevels, minlayer, numlayers);
+    if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: enter texture=%u orig=%u target=%x fmt=%x %u/%u %u/%u orig_mtl=%p\n",
+                                          texture, origtexture, target, internalformat, minlevel, numlevels, minlayer, numlayers,
+                                          (void *)orig->mtl_data);
     /* texture must be a name returned by GenTextures that has not yet been bound */
     if (texture == 0)
         TEXEXT_ERROR(GL_INVALID_VALUE);
@@ -835,6 +853,9 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
     info->view_num_levels = numlevels;
     info->view_min_layer = base_layer + minlayer;
     info->view_num_layers = numlayers;
+    /* GL 4.6 9.2: the view shares the root's images — the root must outlive it
+     * (mglDeleteTextures defers the root's free while view_refs > 0) */
+    rinfo->view_refs++;
     info->immutable_levels = (oinfo && oinfo->immutable_levels) ?
                                  oinfo->immutable_levels :   /* ARB_texture_view: a view reports
                                                                * the ORIGINAL's TEXTURE_IMMUTABLE_LEVELS */
@@ -896,7 +917,7 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
         mgl_texparam_record_multisample(ctx, tex, info->samples, info->fixed_sample_locations);
 
     texext_mark_dirty(ctx, tex);
-    if (getenv("MGL_VIEW_DEBUG")) { fprintf(stderr, "MGL view: done name=%u levels=%u\n", tex->name, info->view_num_levels); }
+    if (getenv("MGL_VIEW_DEBUG")) { fprintf(stderr, "MGL view: done name=%u levels=%u orig_mtl_after=%p\n", tex->name, info->view_num_levels, (void *)orig->mtl_data); }
 }
 
 #pragma mark - invalidation

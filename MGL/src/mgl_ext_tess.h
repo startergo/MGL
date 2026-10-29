@@ -142,6 +142,17 @@ typedef struct MGLTessCapture {
     MGLTessCaptureMember member[MGL_TESS_CAPTURE_MAX];
     uint64_t serial;         /* bumped on every producing draw */
     bool     valid;
+    bool     emission_order; /* true: records[] holds ONE RECORD PER EMITTED VERTEX in
+                              * emission (generation) order — the GPU path runs the
+                              * capture through the emission-order coordinate permute, so
+                              * record t IS primitive vertex t and the index list is the
+                              * tessellator's coordinate-index list (NOT a record map).
+                              * false: records[] is indexed by the index list (CPU
+                              * reference path: one record per unique coordinate).
+                              * Consumers building per-primitive vertex slots must use
+                              * identity in the first case and the list in the second
+                              * (geometry.c's tess->geometry import; transform feedback
+                              * always wants emission order and reads records in order). */
 } MGLTessCapture;
 
 void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable);

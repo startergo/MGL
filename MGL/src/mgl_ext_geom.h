@@ -354,6 +354,12 @@ typedef struct MGLGeomDraw {
     uint32_t tess_stride;                       /* words per tess record */
     uint32_t tess_prim;                         /* its output primitive type */
     uint32_t tess_rec_cap, tess_idx_cap;        /* record / index-list capacities */
+    uint32_t tess_emission;                     /* MGLTessCapture.emission_order: records
+                                                 * are one per emitted vertex in emission
+                                                 * order — primitive slot t IS record t,
+                                                 * and tess_idx_off's list is the
+                                                 * tessellator's coordinate-index list,
+                                                 * not a record map */
     uint32_t tess_pairs[MGL_GEOM_TESS_MAX_WORDS];
     uint32_t tess_npairs;
 } MGLGeomDraw;

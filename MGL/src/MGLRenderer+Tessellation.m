@@ -2903,8 +2903,16 @@ static void tessRetireCapture(GLMContext ctx)
          * valid until the next GL_PATCHES draw; the ring slot is released by the
          * draw's completion, and consumers copy or consume before then */
         if (cap_pub_records && tp->capture_pso)
+        {
             tessPublishCapture(ctx, ring, tp, cap_pub_records, cap_pub_recs_cap,
                                cap_pub_idx, cap_pub_idx_cap, cap_pub_count);
+            /* GPU path: the capture kernel read the emission-order coordinate permute
+             * (non-point_mode), so records[] are per emitted vertex in emission order
+             * and the published index list is the tessellator's coordinate-index list,
+             * NOT a record map — consumers must not re-index through it
+             * (MGLTessCapture.emission_order, geometry.c's tess->geometry import) */
+            ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.emission_order = true;
+        }
         {
             id<MTLEvent> ev2 = [_device newEvent];
             [emu_cb encodeSignalEvent: ev2 value: 1];
@@ -3329,6 +3337,10 @@ static void tessRetireCapture(GLMContext ctx)
                         [ccenc endEncoding];
                         tessPublishCapture(ctx, ring, tp, recs_off, n, off_indices,
                                            S->tess_index_count, cnt_off);
+                        /* CPU reference path: one record per unique tessellated
+                         * coordinate, so the published index list IS the record map
+                         * (opposite of the GPU path's emission-order permute) */
+                        ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.emission_order = false;
                     }
                 }
             }

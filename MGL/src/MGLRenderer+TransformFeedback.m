@@ -122,25 +122,35 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
      * used to build a pipeline as-is (Metal validation aborts the process), so
      * specialize it with the current shadow-op values and key the pipeline cache on
      * them too — a compare-mode change must rebuild (KHR-GL46.gpu_shader5
-     * texture_gather_offset_depth_* crashed here). */
+     * texture_gather_offset_depth_* crashed here).
+     *
+     * geom r70: ALWAYS specialize, not only when the MSL spells mgl_shadow_op_ /
+     * mgl_wrap_op_.  The capture MSL is assembled from several MSL rewriters (the
+     * gather preamble also declares mgl_border_N_*, and other domains inject their
+     * own function constants — rstate's mgl_rs_fc_*, the image-atomic helpers), so a
+     * name allowlist here is a trap: any constant the list misses leaves an
+     * UNSPECIALIZED function in the render pipeline descriptor and Metal API
+     * validation aborts the whole process ("... cannot be used to build a pipeline
+     * state. Use newFunctionWithName:constantValues:..." — test_vs_gather's full-suite
+     * crash).  Specializing a function that declares no constants is a harmless
+     * rebuild (the rstate domain relies on exactly that). */
     uint64_t shash = 0;
-    id<MTLFunction> fn = nil;
-    if (xp->msl && (strstr(xp->msl, "mgl_shadow_op_") || strstr(xp->msl, "mgl_wrap_op_"))) {
-        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
-        for (int s = 0; s < 32; s++) {           /* defaults for slots the bound
-                                                  * program does not report */
-            int32_t zero = 0;
-            [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + s];
-            [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + s];
-        }
-        [self geomShadowFCValues:cv stage:_VERTEX_SHADER hash:&shash];
-        fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]
-                        constantValues: cv error: &error];
-        if (!fn) {
-            NSLog(@"MGL xfb: capture variant specialization failed: %@", error);
-            return nil;
-        }
-    } else {
+    MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+    for (int s = 0; s < 32; s++) {           /* defaults for slots the bound
+                                              * program does not report */
+        int32_t zero = 0;
+        [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_SHADOW_OP_BASE + s];
+        [cv setConstantValue:&zero type:MTLDataTypeInt atIndex:MGL_GEOM_FC_WRAP_BASE + s];
+    }
+    [self geomShadowFCValues:cv stage:_VERTEX_SHADER hash:&shash];
+    id<MTLFunction> fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]
+                                    constantValues: cv error: &error];
+    if (!fn) {
+        /* constant-free functions must keep working even if specialization is
+         * refused for an unrelated reason: fall back to the unspecialized entry
+         * (it is only invalid when the MSL declares function constants, which the
+         * successful path above covers) */
+        NSLog(@"MGL xfb: capture variant specialization failed (%@); using the unspecialized entry", error);
         fn = [lib newFunctionWithName: [NSString stringWithUTF8String: xp->entry]];
         if (!fn) {
             NSLog(@"MGL xfb: capture entry point %s not found", xp->entry);
@@ -149,8 +159,10 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
     }
 
     /* the pipeline depends on the vertex layout and the shadow-op state; rebuild when
-     * either changes */
-    NSString *key = [NSString stringWithFormat: @"%@:%p:%llx", [vd description], fn,
+     * either changes.  Key on the entry name + the specialization hash (NOT the
+     * MTLFunction pointer: every newFunctionWithName:constantValues: call returns a
+     * fresh object, so a pointer key would never hit) */
+    NSString *key = [NSString stringWithFormat: @"%s:%@:%llx", xp->entry, [vd description],
                                                   (unsigned long long)shash];
     if (xp->mtl_pipeline && xp->mtl_pipeline_key) {
         NSString *old = (__bridge NSString *)xp->mtl_pipeline_key;

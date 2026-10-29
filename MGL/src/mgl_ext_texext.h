@@ -50,6 +50,13 @@ typedef struct MGLTexExtInfo_t {
     void       *view_built_from;    /* root id<MTLTexture> the view was made from (not retained) */
     GLboolean   has_format_views;   /* (root) some view reinterprets the pixel format */
     GLboolean   has_views;          /* (root) has views: keep render-target usage so views can be attached */
+    int         view_refs;          /* (root) live views whose view_root is this texture: GL 4.6
+                                     * 9.2 — a view keeps the parent's images alive, so the
+                                     * root's delete is DEFERRED until the last view is gone
+                                     * (see mglDeleteTextures / mgl_texext_view_unref_root) */
+    GLboolean   pending_delete;     /* (root) glDeleteTextures ran with views still alive: the
+                                     * texture is out of the hash (name = TEX_OBJ_RES_NAME)
+                                     * but its storage stays valid for the views */
 
     /* ---- multisample ---- */
     GLsizei     samples_requested;
@@ -94,6 +101,10 @@ MGLTexExtInfo *mgl_texext_info_create(GLMContext ctx, Texture *tex);          /*
  * Texture pointer: without this, a later Texture allocated at the same address inherits the
  * old one's kind (view / buffer / multisample) and is then refused by the texdata path. */
 void mgl_texext_info_free(GLMContext ctx, const Texture *tex);
+
+/* a view of `root` is being destroyed: drop the root's view reference; returns true when the
+ * caller must free the root NOW (its glDeleteTextures was deferred for this reference) */
+bool mgl_texext_view_unref_root(GLMContext ctx, Texture *root);
 
 /* buffer texture formats (GL 4.6 Table 8.16); returns false if not a legal buffer texture format */
 bool mgl_texext_buffer_format_info(GLenum internalformat, GLuint *texel_size, GLuint *components, bool *expand3);
