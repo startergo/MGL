@@ -307,6 +307,22 @@ struct MGLExtState_tess {
      * immediate); 0xFFFFFFFF = "no limit", the spec's initial state */
     GLint max_shader_compiler_threads;
 
+    /* GL 4.6 §17.3.4 late per-fragment tests: fragment shaders that write to
+     * memory (images / SSBOs / atomic counters) and do not declare
+     * layout(early_fragment_tests) must execute before the depth test — Apple
+     * GPUs cull depth-failed fragments before shading (HSR).  The link hook
+     * (mgl_ext_post_link_tess) generates a patched MSL variant (guarded
+     * discard_fragment() + a [[depth(any)]] output written from [[position]].z,
+     * which makes Metal defer the test); MGLRenderer+RenderState.m swaps it in
+     * when the pipeline has a depth attachment to test against (Metal rejects a
+     * depth output on depthless pipelines).  4-entry cache keyed by Program. */
+#define MGL_TESS_LATE_FRAG_CACHE 4
+    struct {
+        Program *program;
+        const char *msl_src;   /* the fragment msl_str this variant was built from */
+        char *msl;
+    } late_frag[MGL_TESS_LATE_FRAG_CACHE];
+
     /* draw-time CPU tessellation scratch (grown on demand) */
     float  *coord_buf;      /* 4 floats per tessellated vertex: u, v, w, patch id */
     size_t  coord_cap;      /* in floats */

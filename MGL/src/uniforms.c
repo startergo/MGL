@@ -152,7 +152,9 @@ void mgli_set_uniform(GLMContext ctx, const char *func, MGLIProgram *ip, GLint l
     int comps = cols * rows;
     if (u->opaque_class) {
         const GLint *v = data;
-        GLint max_units = u->opaque_class == 2 ? 8 : TEXTURE_UNITS;
+        /* image-unit values are bounded by GL_MAX_IMAGE_UNITS (16 — get.c
+         * MGL_MAX_IMAGE_UNITS / glm_limits.h), not the sampler-unit count */
+        GLint max_units = u->opaque_class == 2 ? MGL_IMAGE_UNITS_MAX : TEXTURE_UNITS;
         if (ctx->state.var.max_combined_texture_image_units > 0 && u->opaque_class == 1) max_units = ctx->state.var.max_combined_texture_image_units;
         for (GLsizei i = 0; i < count; i++) if (v[i] < 0 || v[i] >= max_units) { mgli_set_error(ctx, func, GL_INVALID_VALUE); return; }
     }

@@ -22,6 +22,11 @@
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_fb.h"     /* geom r58: mgl_fb_slot_lacks_alpha */
 
+/* tess r39: GL 4.6 §17.3.4 late-fragment-tests variant for side-effecting
+ * fragment shaders (guarded discard + [[depth(any)]] output); mgl_ext_tess.h
+ * holds the cache, tessellation.c generates it */
+extern char *mgl_tess_late_fragment_variant(GLMContext ctx, struct Program_t *program);
+
 /* per-renderer rstate bookkeeping kept outside the shared ivar block */
 @interface MGLRSCache : NSObject
 @property (nonatomic, strong) NSMutableDictionary<NSString *, id<MTLDepthStencilState>> *dsStates;
@@ -482,9 +487,15 @@ static bool rs_mode_is_polygon(GLenum m)
     bool standinFn = shader && shader->mtl_data.function && program &&
                      program->shader_slots[stage] &&
                      shader->mtl_data.function != program->shader_slots[stage]->mtl_data.function;
+    /* tess r39: the late-fragment-tests variant (GL 4.6 §17.3.4) must reach the
+     * variant swap below even when this stage carries no rstate fixups */
+    bool lateFragVariant = (stage == _FRAGMENT_SHADER && program &&
+                            ctx->state.framebuffer && ctx->state.framebuffer->depth.texture &&
+                            mgl_tess_late_fragment_variant(ctx, program) != NULL);
     if (!mgl_rstate_msl_is_patched(msl) &&
         !(msl && strstr(msl, "mgl_shadow_op_") != NULL) &&
-        !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn && !border_emu)
+        !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn && !border_emu &&
+        !lateFragVariant)
         return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
@@ -626,6 +637,40 @@ static bool rs_mode_is_polygon(GLenum m)
                     lib = blib;
                     base = bfn;
                     msl = rs->border_msl;
+                }
+            }
+        }
+        /* tess r39 (GL 4.6 §17.3.4): a fragment shader that writes to memory
+         * (image/SSBO/atomic counter) and does not declare
+         * layout(early_fragment_tests) must execute before the depth test —
+         * Apple GPUs cull depth-failed fragments before shading (HSR).  When
+         * this pipeline has a depth attachment to test against, swap in the
+         * guarded-discard + [[depth(any)]] variant built at link time; Metal
+         * rejects a depth output on depthless pipelines, and without one no
+         * test can defer.  The GL framebuffer state is the truth here: with a
+         * geometry shader the pipeline descriptor is built before the render
+         * pass descriptor is finalized. */
+        if (stage == _FRAGMENT_SHADER && program &&
+            ctx->state.framebuffer && ctx->state.framebuffer->depth.texture)
+        {
+            char *lft = mgl_tess_late_fragment_variant(ctx, program);
+            if (getenv("MGL_LFT_DEBUG"))
+                fprintf(stderr, "[lft] psoswap: stage=%d prog=%u variant=%s\n",
+                        stage, program->name, lft ? "yes" : "no");
+            if (lft)
+            {
+                char lerr[2048];
+                char *lerrp = &lerr[0];
+                lerr[0] = 0;
+                id<MTLLibrary> llib = [self extProgramLibraryForMSL: lft key: nil error: &lerrp];
+                id<MTLFunction> lfn = llib ? [llib newFunctionWithName: base.name] : nil;
+                if (getenv("MGL_LFT_DEBUG") && lerr[0])
+                    fprintf(stderr, "[lft] variant compile: %.400s\n", lerr);
+                if (lfn)
+                {
+                    lib = llib;
+                    base = lfn;
+                    msl = lft;
                 }
             }
         }

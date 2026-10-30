@@ -153,7 +153,7 @@ static GLuint max_uniform_buffer_bindings(GLMContext ctx)
  * tables hold 128 entries on Apple silicon, so a stage can address 16 storage
  * images alongside its samplers — KHR-GL46.gl_spirv.spirv_validation_capabilities
  * links a compute shader with 10 active image uniforms and expects success. */
-#define MGL_MAX_IMAGE_UNITS                     16
+#define MGL_MAX_IMAGE_UNITS                     MGL_IMAGE_UNITS_MAX
 
 /* the binding-point limits as reported by glGet*, for the GLSL layout(binding=N)
  * compile-time range check (GLSL 4.60 4.4.5: a binding at or beyond the limit is a
@@ -308,6 +308,10 @@ static const char *mgl_extensions[] = {
     "GL_ARB_separate_shader_objects",
     "GL_ARB_shader_atomic_counters",
     "GL_ARB_shader_bit_encoding",
+    "GL_ARB_post_depth_coverage",     /* layout(post_depth_coverage): glslang -> PostDepthCoverage
+                                       * (implies EarlyFragmentTests) -> SPIRV-Cross
+                                       * [[sample_mask, post_depth_coverage]]; the mask reflects the
+                                       * depth test only, not stencil (.agent/gap_post_depth_coverage.md) */
     "GL_ARB_tessellation_shader",      /* core in 4.0; tess domain (geometry.c prep kernel) */
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",

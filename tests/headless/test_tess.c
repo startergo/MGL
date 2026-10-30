@@ -1542,6 +1542,374 @@ TEST(TessLayerFromEvaluationStage)
     glDeleteProgram(p);
 }
 
+/* ------------------------------------------------------------------ post_depth_coverage
+ * KHR-GL46.post_depth_coverage_tests regression guards (GL_ARB_post_depth_coverage).
+ * The Metal path is native: glslang emits EarlyFragmentTests+PostDepthCoverage
+ * execution modes (post_depth_coverage *implies* early fragment tests per the ARB
+ * spec issue 2), SPIRV-Cross lowers gl_SampleMaskIn to a
+ * `[[sample_mask, post_depth_coverage]]` fragment argument (MSL 2.3+; MGL compiles
+ * MSL 3.0) and `[[early_fragment_tests]]` onto the fragment function itself.
+ *
+ * Test 1 — the four compile-only programs of PostDepthShader: plain `require`,
+ * the preprocessor macro check, early+post layouts, and post alone.
+ * Test 2 — the PostDepthSampleMask rendering: a 1x1 4x-MSAA depth/stencil FBO.
+ * A small "near" triangle covers exactly the samples with (sx+sy) < 0.7 in
+ * Apple's default 4x pattern (only sample 0 at (0.375,0.125)); a "far"
+ * full-pixel triangle then fails the early depth/stencil test exactly there.
+ * gl_SampleMaskIn must read {1,1,1,1} without post_depth_coverage and
+ * {0,1,1,1} with it, resolved per-sample into a 1x4 texture. */
+TEST(FragPostDepthShader)
+{
+    const char *vs =
+        "#version 450\n"
+        "in vec3 vertex;\n"
+        "in vec2 inTexCoord;\n"
+        "out vec2 texCoord;\n"
+        "void main() { texCoord = inTexCoord; gl_Position = vec4(vertex, 1); }\n";
+    const char *f1 =
+        "#version 450\n"
+        "#extension GL_ARB_post_depth_coverage : require\n"
+        "out vec4 fragColor;\n"
+        "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    const char *f2 =
+        "#version 450\n"
+        "#extension GL_ARB_post_depth_coverage : enable\n"
+        "#ifndef GL_ARB_post_depth_coverage\n"
+        "  #error GL_ARB_post_depth_coverage not defined\n"
+        "#else\n"
+        "  #if (GL_ARB_post_depth_coverage != 1)\n"
+        "    #error GL_ARB_post_depth_coverage wrong defined\n"
+        "  #endif\n"
+        "#endif\n"
+        "out vec4 fragColor;\n"
+        "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    const char *f3 =
+        "#version 450\n"
+        "#extension GL_ARB_post_depth_coverage : enable\n"
+        "layout(early_fragment_tests) in;\n"
+        "layout(post_depth_coverage) in;\n"
+        "out vec4 fragColor;\n"
+        "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    const char *f4 =
+        "#version 450\n"
+        "#extension GL_ARB_post_depth_coverage : enable\n"
+        "layout(post_depth_coverage) in;\n"
+        "out vec4 fragColor;\n"
+        "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+
+    GLuint p1 = mgl_make_program5(vs, NULL, NULL, NULL, f1);
+    GLuint p2 = mgl_make_program5(vs, NULL, NULL, NULL, f2);
+    GLuint p3 = mgl_make_program5(vs, NULL, NULL, NULL, f3);
+    GLuint p4 = mgl_make_program5(vs, NULL, NULL, NULL, f4);
+    EXPECT_TRUE(p1 != 0); EXPECT_TRUE(p2 != 0);
+    EXPECT_TRUE(p3 != 0); EXPECT_TRUE(p4 != 0);
+    glDeleteProgram(p1); glDeleteProgram(p2); glDeleteProgram(p3); glDeleteProgram(p4);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(FragPostDepthCoverageMask)
+{
+    const char *vs =
+        "#version 450\n"
+        "in vec3 vertex;\n"
+        "in vec2 inTexCoord;\n"
+        "out vec2 texCoord;\n"
+        "void main() { texCoord = inTexCoord; gl_Position = vec4(vertex, 1); }\n";
+    const char *body =
+        "in vec2 texCoord;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    int s1 = (gl_SampleMaskIn[0] & 0x1);\n"
+        "    int s2 = (gl_SampleMaskIn[0] & 0x2) / 2;\n"
+        "    int s3 = (gl_SampleMaskIn[0] & 0x4) / 4;\n"
+        "    int s4 = (gl_SampleMaskIn[0] & 0x8) / 8;\n"
+        "    fragColor = vec4(s1, s2, s3, s4);\n"
+        "}\n";
+    char fPlain[1024], fPdc[1024];
+    snprintf(fPlain, sizeof fPlain,
+             "#version 450\n#extension GL_ARB_post_depth_coverage : enable\n%s", body);
+    snprintf(fPdc, sizeof fPdc,
+             "#version 450\n#extension GL_ARB_post_depth_coverage : enable\n"
+             "layout(post_depth_coverage) in;\n%s", body);
+    const char *fResolve =
+        "#version 450\n"
+        "in vec2 texCoord;\n"
+        "out vec4 fragColor;\n"
+        "uniform sampler2DMS tex;\n"
+        "void main() { fragColor = texelFetch(tex, ivec2(0, 0), int(texCoord.y * 4)); }\n";
+
+    GLuint pA = mgl_make_program5(vs, NULL, NULL, NULL, fPlain);
+    GLuint pB = mgl_make_program5(vs, NULL, NULL, NULL, fPdc);
+    GLuint pR = mgl_make_program5(vs, NULL, NULL, NULL, fResolve);
+    EXPECT_TRUE(pA != 0); EXPECT_TRUE(pB != 0); EXPECT_TRUE(pR != 0);
+    if (!pA || !pB || !pR) return;
+
+    /* 1x1 4x-MSAA target + depth-stencil, and a 1x4 single-sample resolve target */
+    GLuint rb = 0, texMS = 0, fboMS = 0, tex = 0, fbo = 0;
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_DEPTH_STENCIL, 1, 1);
+    EXPECT_NO_GL_ERROR();
+    glGenTextures(1, &texMS);
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, texMS);
+    glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 1, 1, GL_TRUE);
+    EXPECT_NO_GL_ERROR();
+    glGenFramebuffers(1, &fboMS);
+    glBindFramebuffer(GL_FRAMEBUFFER, fboMS);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, texMS, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rb);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 1, 4);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+
+    /* geometry: near covers only the samples with sx+sy < 0.7 (sample 0),
+     * far covers the whole pixel, post is the full-screen resolve quad */
+    static const GLfloat nearV[] = { -1,-1,0.25f,  0.4f,-1,0.25f,  -1,0.25f,0.25f };
+    static const GLfloat farV[]  = { -1,-1,0.75f,  3,-1,0.75f,     -1,3,0.75f };
+    static const GLfloat postV[] = { -1,-1,0,1,  1,-1,0,1,  -1,1,0,1,  1,1,0,1 };
+    static const GLfloat tcs[]   = { 0,0, 1,0, 0,1, 1,1 };
+    GLuint vao = 0, vbo = 0, tbo = 0;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &tbo);
+    glBindBuffer(GL_ARRAY_BUFFER, tbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof tcs, tcs, GL_STATIC_DRAW);
+
+    GLint aVertex = glGetAttribLocation(pA, "vertex");
+    GLint aTexCoord = glGetAttribLocation(pA, "inTexCoord");
+    EXPECT_TRUE(aVertex >= 0 && aTexCoord >= 0);
+
+    for (int stencilCase = 0; stencilCase <= 1; stencilCase++)
+    for (int pdc = 0; pdc <= 1; pdc++)
+    {
+        GLuint prog = pdc ? pB : pA;
+        glBindFramebuffer(GL_FRAMEBUFFER, fboMS);
+        glViewport(0, 0, 1, 1);
+        glEnable(GL_MULTISAMPLE);
+        if (stencilCase) glEnable(GL_STENCIL_TEST); else glEnable(GL_DEPTH_TEST);
+        glClearColor(0, 0, 0, 0);
+        glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        if (stencilCase) {
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_ZERO, GL_REPLACE, GL_REPLACE);
+            glStencilMask(0xFF);
+        }
+
+        GLboolean expected[4];
+        for (int i = 0; i < 4; i++) {
+            GLfloat sp[2];
+            glGetMultisamplefv(GL_SAMPLE_POSITION, i, sp);
+            /* GL_ARB_post_depth_coverage: the mask must reflect the early
+             * depth/stencil tests.  Metal's [[post_depth_coverage]] excludes
+             * DEPTH-failed samples only; stencil-failed samples stay in the
+             * mask (.agent/gap_post_depth_coverage.md) — the stencil variant
+             * below encodes that documented Metal gap, the depth variant the
+             * GL-correct value. */
+            expected[i] = !(pdc && !stencilCase && (sp[0] + sp[1]) < 0.7f);
+        }
+
+        glBindVertexArray(vao);
+        glUseProgram(prog);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof nearV, nearV, GL_STATIC_DRAW);
+        glEnableVertexAttribArray((GLuint)aVertex);
+        glVertexAttribPointer((GLuint)aVertex, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glBindBuffer(GL_ARRAY_BUFFER, tbo);
+        glEnableVertexAttribArray((GLuint)aTexCoord);
+        glVertexAttribPointer((GLuint)aTexCoord, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);            /* near: stamps z/stencil */
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (stencilCase) { glStencilFunc(GL_NOTEQUAL, 1, 0xFF); glStencilMask(0x00); }
+
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof farV, farV, GL_STATIC_DRAW);
+        glVertexAttribPointer((GLuint)aVertex, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);            /* far: fails where near wrote */
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+
+        /* resolve each sample into its own row */
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, 1, 4);
+        glUseProgram(pR);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, texMS);
+        glUniform1i(glGetUniformLocation(pR, "tex"), 0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof postV, postV, GL_STATIC_DRAW);
+        glVertexAttribPointer((GLuint)aVertex, 4, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisable(GL_MULTISAMPLE);
+
+        GLubyte px[16];
+        memset(px, 0, sizeof px);
+        glReadPixels(0, 0, 1, 4, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        printf("    rows (sample0..3): %d%d%d%d %d%d%d%d %d%d%d%d %d%d%d%d\n",
+               px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7],
+               px[8], px[9], px[10], px[11], px[12], px[13], px[14], px[15]);
+        GLboolean got[4] = { GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE };
+        for (int i = 0; i < 4; i++)
+            for (int n = 0; n < 4; n++)
+                got[n] = got[n] || (px[4 * i + n] != 0);
+        int ok = 1;
+        for (int n = 0; n < 4; n++) if (got[n] != expected[n]) ok = 0;
+        mgl_test_checks++;
+        if (!ok)
+            MGL_FAIL("post_depth_coverage (%s, pdc=%d): mask %d%d%d%d expected %d%d%d%d",
+                     stencilCase ? "stencil" : "depth", pdc,
+                     got[0], got[1], got[2], got[3],
+                     expected[0], expected[1], expected[2], expected[3]);
+        else
+            printf("  [pdc %s pdc=%d] mask %d%d%d%d\n",
+                   stencilCase ? "stencil" : "depth", pdc, got[0], got[1], got[2], got[3]);
+        EXPECT_NO_GL_ERROR();
+    }
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo); glDeleteBuffers(1, &tbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fboMS); glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &texMS); glDeleteTextures(1, &tex);
+    glDeleteRenderbuffers(1, &rb);
+    glDeleteProgram(pA); glDeleteProgram(pB); glDeleteProgram(pR);
+}
+
+/* KHR-GL46.shader_image_load_store.early-fragment-tests regression guard
+ * (GL 4.6 §17.3.4): a fragment shader that writes to memory and does NOT
+ * declare layout(early_fragment_tests) must execute before the depth test —
+ * its imageStore side effect happens even when the fragment later fails the
+ * depth test.  Apple GPUs cull depth-failed fragments before shading (HSR);
+ * MGL emulates the late test with a guarded discard_fragment() + [[depth(any)]]
+ * output variant (tessellation.c / MGLRenderer+RenderState.m).  With
+ * early_fragment_tests declared the shader must NOT run for depth-failed
+ * fragments.  Both the plain and the geometry-shader draw path are covered. */
+static void lft_draw(GLuint prog, const float *pos3, int count, GLenum mode)
+{
+    GLuint vao, vbo;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(count * 3 * sizeof(float)), pos3, GL_STATIC_DRAW);
+    GLint aV = glGetAttribLocation(prog, "a_pos");
+    if (aV >= 0) {
+        glEnableVertexAttribArray((GLuint)aV);
+        glVertexAttribPointer((GLuint)aV, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    }
+    glDrawArrays(mode, 0, count);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+}
+
+TEST(FragLateTestsSideEffects)
+{
+    const char *vs =
+        "#version 400 core\n"
+        "in vec3 a_pos;\n"
+        "void main() { gl_Position = vec4(a_pos, 1); }\n";
+    const char *gs =
+        "#version 400 core\n"
+        "layout(points) in;\n"
+        "layout(triangle_strip, max_vertices = 4) out;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(-1,-1,0.5,1); EmitVertex();\n"
+        "    gl_Position = vec4( 3,-1,0.5,1); EmitVertex();\n"
+        "    gl_Position = vec4(-1, 3,0.5,1); EmitVertex();\n"
+        "    gl_Position = vec4( 3, 3,0.5,1); EmitVertex();\n"
+        "    EndPrimitive();\n"
+        "}\n";
+    const char *fs_head =
+        "#version 400 core\n"
+        "#extension GL_ARB_shader_image_load_store : require\n"
+        "layout(r32f) uniform image2D u_image;\n";
+    const char *fs_tail =
+        "void main() {\n"
+        "    imageStore(u_image, ivec2(gl_FragCoord.xy), vec4(1.0, 0, 0, 0));\n"
+        "    discard;\n"
+        "}\n";
+    char fs_late[512], fs_early[512];
+    snprintf(fs_late, sizeof fs_late, "%s%s", fs_head, fs_tail);
+    snprintf(fs_early, sizeof fs_early, "%slayout(early_fragment_tests) in;\n%s", fs_head, fs_tail);
+
+    GLuint pLate = mgl_make_program5(vs, NULL, NULL, NULL, fs_late);
+    GLuint pEarly = mgl_make_program5(vs, NULL, NULL, NULL, fs_early);
+    GLuint pGsLate = mgl_make_program3(vs, gs, fs_late);
+    GLuint pGsEarly = mgl_make_program3(vs, gs, fs_early);
+    EXPECT_TRUE(pLate && pEarly && pGsLate && pGsEarly);
+    if (!pLate || !pEarly || !pGsLate || !pGsEarly) return;
+
+    GLuint tex = 0, rb = 0, rbds = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 1, 1);
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_R32F, 1, 1);
+    glGenRenderbuffers(1, &rbds);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbds);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbds);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 1, 1);
+
+    static const GLfloat tri[] = { -1,-1,0.5f,  3,-1,0.5f,  -1,3,0.5f };  /* z = cleared 0.5 */
+    static const GLfloat pts[] = { 0,0,0 };
+    float zero = 0.0f, one;
+
+    for (int gs = 0; gs <= 1; gs++)
+    for (int early = 0; early <= 1; early++)
+    {
+        GLuint prog = gs ? (early ? pGsEarly : pGsLate) : (early ? pEarly : pLate);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_FLOAT, &zero);
+        glUseProgram(prog);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+        glUniform1i(glGetUniformLocation(prog, "u_image"), 0);
+        glClearDepth(0.5f);
+        glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);               /* z 0.5 < cleared 0.5 fails */
+        if (gs) lft_draw(prog, pts, 1, GL_POINTS);
+        else lft_draw(prog, tri, 3, GL_TRIANGLES);
+        glDisable(GL_DEPTH_TEST);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        one = -1;
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, &one);
+        mgl_test_checks++;
+        int want = early ? 0 : 1;
+        if ((int)one != want) {
+            MGL_FAIL("late fragment tests (%s, early=%d): image red = %g, want %d",
+                     gs ? "GS path" : "direct", early, one, want);
+        } else {
+            printf("  [lft %s early=%d] image red = %g\n", gs ? "GS" : "direct", early, one);
+        }
+        EXPECT_NO_GL_ERROR();
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteRenderbuffers(1, &rb); glDeleteRenderbuffers(1, &rbds);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(pLate); glDeleteProgram(pEarly); glDeleteProgram(pGsLate);
+    glDeleteProgram(pGsEarly);
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -1567,6 +1935,9 @@ int main(void)
         if (!strcmp(one, "tri")) RUN(TessTriangleDomain);
         if (!strcmp(one, "psocache")) RUN(TessPSOCacheStress);
         if (!strcmp(one, "deflvl")) RUN(TessDefaultLevels);
+        if (!strcmp(one, "pdcshader")) RUN(FragPostDepthShader);
+        if (!strcmp(one, "pdcmask")) RUN(FragPostDepthCoverageMask);
+        if (!strcmp(one, "lft")) RUN(FragLateTestsSideEffects);
         printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
         return mgl_test_failures != 0;
     }
@@ -1592,6 +1963,9 @@ int main(void)
     RUN(TessDefaultLevels);
     RUN(TessLayerFromVertexStage);
     RUN(TessLayerFromEvaluationStage);
+    RUN(FragPostDepthShader);
+    RUN(FragPostDepthCoverageMask);
+    RUN(FragLateTestsSideEffects);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

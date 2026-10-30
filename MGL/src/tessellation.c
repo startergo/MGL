@@ -4618,6 +4618,426 @@ void mgl_ext_delete_program_tess(GLMContext ctx, Program *program)
             slot++;
 }
 
+/* ---------------- GL 4.6 §17.3.4: late per-fragment tests ----------------
+ *
+ * "When there is no active program ... or the active program was linked with
+ * early fragment tests disabled, these [depth/stencil per-fragment] operations
+ * are performed only after fragment program execution" (ARB_shader_image_load_
+ * store.txt §"Interactions with early fragment tests").  Apple GPUs always run
+ * the depth test before the fragment shader (HSR), so a GL fragment shader that
+ * writes memory and does NOT declare layout(early_fragment_tests) still gets
+ * culled before its imageStore/SSBO side effects run — verified on M4 Pro
+ * (.agent/probe_latedepth.m):
+ *
+ *   [[depth(any)]] output + guarded discard_fragment()  ->  shader runs, test late   ✓
+ *   [[depth(any)]] output + unconditional discard       ->  culled before the shader ✗
+ *   no depth output (any discard)                       ->  culled before the shader ✗
+ *
+ * The fix (all GPU-side, no readback): when a linked fragment stage writes to
+ * memory and has no EarlyFragmentTests mode, patch its MSL to
+ *  (a) add a `float [[depth(any)]]` output written from [[position]].z unless
+ *      the shader already writes gl_FragDepth — that makes Metal defer the test
+ *      until after the fragment function — and
+ *  (b) guard every `discard_fragment();` with `if (as_type<uint>(pos.z) !=
+ *      0xffffffffu)` (opaque to the compiler, always true at runtime: a valid
+ *      window-space z never has that bit pattern).  An unguarded discard makes
+ *      Metal classify the function as "kill-only late state" and revert to the
+ *      early test.  GL semantics are unchanged: the guard always fires exactly
+ *      where the user's discard was.
+ * Shaders with side effects but no discard are covered by (a) alone (probe:
+ * depth=1 rows above with no discard also ran); gl_FragDepth writers already
+ * carry the output, so they get (b) only. */
+#define MGL_LFT_MARKER "/* mgl-late-fragment-tests */"
+
+/* SPIR-V opcodes the scanner below needs (unified1 grammar) */
+enum {
+    SPV_OP_TYPE_POINTER        = 32,
+    SPV_OP_FUNCTION_PARAMETER  = 55,
+    SPV_OP_VARIABLE            = 59,
+    SPV_OP_IMAGE_TEXEL_POINTER = 60,
+    SPV_OP_STORE               = 62,
+    SPV_OP_COPY_MEMORY         = 63,
+    SPV_OP_COPY_MEMORY_SIZED   = 64,
+    SPV_OP_ACCESS_CHAIN        = 65,
+    SPV_OP_IN_BOUNDS_AC        = 66,
+    SPV_OP_PTR_ACCESS_CHAIN    = 67,
+    SPV_OP_IMAGE_WRITE         = 99,
+};
+
+/* atomics that write (everything except OpAtomicLoad=227); OpAtomicStore=228
+ * has no result id, the rest take their pointer at operand 1 */
+static bool spv_op_is_writing_atomic(unsigned op)
+{
+    return (op >= 228 && op <= 242) ||
+           op == 318 /*FlagTestAndSet*/ || op == 319 /*FlagClear*/ ||
+           op == 5614 || op == 5615 || op == 6035;   /* float atomics */
+}
+
+/* does this module (one entry point's SPIR-V) write to memory through images,
+ * storage buffers or atomic counters?  Walks the flat word stream: pointer ids
+ * rooted in Uniform/StorageBuffer/Image storage are followed through access
+ * chains to a fixpoint; OpStore/OpCopyMemory into them, any OpImageWrite and
+ * every writing atomic count as side effects. */
+static bool spv_module_writes_memory(const unsigned int *ir, size_t size)
+{
+    unsigned int max_id;
+    unsigned char *is_gptr, *is_texel;
+    size_t n_inst;
+    bool changed, writes = false;
+    const unsigned int *p, *end;
+
+    if (!ir || size < 20) return false;
+    max_id = ir[3];
+    if (max_id < 2) return false;
+    is_gptr  = (unsigned char *)calloc(max_id + 1, 1);
+    is_texel = (unsigned char *)calloc(max_id + 1, 1);
+    if (!is_gptr || !is_texel) { free(is_gptr); free(is_texel); return false; }
+
+    p = ir + 5;
+    end = ir + size;                /* size is in 32-bit words */
+
+    /* pass 1: global pointer-typed types, global variables, texel pointers,
+     * global pointer function parameters (helper functions receive them).
+     * Storage classes: Uniform=2, AtomicCounter=10, Image=11, StorageBuffer=12 */
+#define LFT_GLOBAL_SC(sc) ((sc) == 2 || (sc) == 10 || (sc) == 11 || (sc) == 12)
+    for (n_inst = 0; p < end; ) {
+        unsigned int len = *p >> 16, op = *p & 0xffff;
+        if (!len) break;
+        if (op == SPV_OP_TYPE_POINTER) {
+            unsigned int sc = p[3];              /* operand 1: storage class */
+            if (LFT_GLOBAL_SC(sc))
+                is_gptr[p[1]] = 1;               /* result type is such a pointer */
+        } else if (op == SPV_OP_VARIABLE) {
+            unsigned int sc = p[3];              /* operand 1: storage class */
+            if (LFT_GLOBAL_SC(sc))
+                is_gptr[p[2]] = 1;               /* the variable id itself */
+        } else if (op == SPV_OP_FUNCTION_PARAMETER) {
+            if (p[1] <= max_id && is_gptr[p[1]]) /* result type is a global pointer */
+                is_gptr[p[2]] = 1;
+        } else if (op == SPV_OP_IMAGE_TEXEL_POINTER) {
+            is_texel[p[2]] = 1;
+        }
+        p += len;
+        n_inst++;
+    }
+#undef LFT_GLOBAL_SC
+
+    /* pass 2: propagate through access chains (base is operand 3 for the
+     * access-chain family) */
+    do {
+        changed = false;
+        p = ir + 5;
+        for (n_inst = 0; p < end; ) {
+            unsigned int len = *p >> 16, op = *p & 0xffff;
+            if (!len) break;
+            if ((op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_IN_BOUNDS_AC ||
+                 op == SPV_OP_PTR_ACCESS_CHAIN) &&
+                p[3] <= max_id && is_gptr[p[3]] && !is_gptr[p[2]]) {
+                is_gptr[p[2]] = 1;
+                changed = true;
+            }
+            p += len;
+            n_inst++;
+        }
+    } while (changed);
+
+    /* pass 3: the actual stores */
+    p = ir + 5;
+    for (n_inst = 0; p < end && !writes; ) {
+        unsigned int len = *p >> 16, op = *p & 0xffff;
+        if (!len) break;
+        if (op == SPV_OP_IMAGE_WRITE)
+            writes = true;
+        else if (op == SPV_OP_STORE || op == SPV_OP_COPY_MEMORY || op == SPV_OP_COPY_MEMORY_SIZED) {
+            unsigned int ptr = p[1];             /* pointer is operand 1 */
+            if (ptr <= max_id && (is_gptr[ptr] || is_texel[ptr]))
+                writes = true;
+        } else if (spv_op_is_writing_atomic(op)) {
+            unsigned int ptr = (op == 228) ? p[1] : p[3];
+            if (ptr <= max_id && (is_gptr[ptr] || is_texel[ptr]))
+                writes = true;
+        }
+        p += len;
+        n_inst++;
+    }
+
+    free(is_gptr);
+    free(is_texel);
+    return writes;
+}
+
+/* find `fragment <ret> <entry>(` and return the index just past '(' (params
+ * start), filling ret/retlen with the return type token.  The entry can also be
+ * preceded by attributes (SPIRV-Cross puts none there for fragments we patch,
+ * the early-fragment-test form is rejected before). */
+static long mgl_lft_find_entry(const char *msl, const char *entry, const char **ret, size_t *retlen)
+{
+    char pat[256];
+    const char *p;
+
+    snprintf(pat, sizeof pat, "fragment ");
+    p = strstr(msl, pat);
+    while (p) {
+        const char *e = p + strlen(pat);
+        const char *s = e;
+        /* return type token */
+        while (*e && *e != '(' && !isspace((unsigned char)*e)) e++;
+        if (*e == '(' || isspace((unsigned char)*e)) {
+            size_t rl = (size_t)(e - s);
+            const char *n = e;
+            while (*n == ' ' || *n == '\n' || *n == '\t') n++;
+            if (!strncmp(n, entry, strlen(entry)) && n[strlen(entry)] == '(') {
+                if (ret) { *ret = s; *retlen = rl; }
+                return (long)(n + strlen(entry) + 1 - msl);
+            }
+        }
+        p = strstr(e, pat);
+    }
+    return -1;
+}
+
+/* the MSL text patch.  Returns a malloc'ed new MSL or NULL if nothing to do. */
+static char *mgl_late_fragment_tests_msl(const char *msl, const char *entry,
+                                         bool needs_depth_out)
+{
+    const char *ret;
+    size_t retlen;
+    long params_at, close_paren, body_at, guard_to;
+    char posname[64];
+    bool have_pos = false, is_void, have_depth, add_depth;
+    char *out;
+    size_t out_len = 0, cap;
+    const char *body, *p, *seg, *tail;
+    size_t body_len;
+
+    if (!msl || !entry) return NULL;
+    if (strstr(msl, MGL_LFT_MARKER)) return NULL;                    /* idempotent */
+
+    params_at = mgl_lft_find_entry(msl, entry, &ret, &retlen);
+    if (params_at < 0) return NULL;
+
+    {   /* parameter list / body scope: the closing paren of the parameter list
+         * is at paren depth 0 — attributes such as [[texture(0)]] nest parens */
+        const char *cp = NULL;
+        const char *bo;
+        int depth = 0;
+        const char *q;
+        for (q = msl + params_at; *q; q++) {
+            if (*q == '(') depth++;
+            else if (*q == ')') {
+                if (depth == 0) { cp = q; break; }
+                depth--;
+            }
+        }
+        if (!cp) return NULL;
+        close_paren = (long)(cp - msl);
+        bo = strchr(cp, '{');
+        if (!bo) return NULL;
+        body_at = (long)(bo - msl);
+    }
+    {   /* entry end: matching brace */
+        int depth = 0;
+        const char *q;
+        for (q = msl + body_at; *q; q++) {
+            if (*q == '{') depth++;
+            else if (*q == '}') { if (--depth == 0) break; }
+        }
+        if (*q != '}') return NULL;
+        guard_to = (long)(q - msl) + 1;
+    }
+
+    /* an existing [[position]] argument? */
+    {
+        const char *pp = msl + params_at;
+        const char *pl = msl + close_paren;
+        const char *hit;
+        while ((hit = strstr(pp, "[[position]]")) && hit < pl) {
+            const char *b = hit, *n;
+            while (b > pp && (b[-1] == ' ' || b[-1] == '\n' || b[-1] == '\t')) b--;
+            n = b;
+            while (n > pp && (isalnum((unsigned char)n[-1]) || n[-1] == '_')) n--;
+            if (n < b && (size_t)(b - n) < sizeof posname) {
+                memcpy(posname, n, (size_t)(b - n));
+                posname[b - n] = 0;
+                have_pos = true;
+            }
+            pp = hit + 1;
+        }
+    }
+
+    is_void = (retlen == 4 && !strncmp(ret, "void", 4));
+    have_depth = strstr(msl, "[[depth") != NULL;   /* gl_FragDepth writer */
+    add_depth = needs_depth_out && !have_depth;
+
+    if (!add_depth && !strstr(msl + body_at, "discard_fragment")) return NULL;
+
+    cap = strlen(msl) + 8192;
+    out = (char *)malloc(cap);
+    if (!out) return NULL;
+
+#define LFT_APPEND(...) do { out_len += (size_t)snprintf(out + out_len, cap - out_len, __VA_ARGS__); } while (0)
+
+    LFT_APPEND("%s\n", MGL_LFT_MARKER);
+
+    /* helper struct for void-returning functions that gain a depth output */
+    if (is_void && add_depth)
+        LFT_APPEND("struct mgl_lft_out { float mgl_lft_z [[depth(any)]]; };\n");
+
+    /* prefix: everything up to the parameters, with an extra member added to
+     * the return-type struct when the function keeps its struct return.  The
+     * return type token is re-emitted between its two halves. */
+    {
+        long ret_at = (long)(ret - msl);
+        long after_ret = ret_at + (long)retlen;
+        if (!is_void && add_depth) {
+            char structpat[128];
+            snprintf(structpat, sizeof structpat, "struct %.*s\n{", (int)retlen, ret);
+            const char *sdecl = strstr(msl, structpat);
+            bool done = false;
+            if (sdecl) {
+                const char *b = strchr(sdecl, '{');
+                const char *q = b;
+                int depth = 0;
+                for (; *q; q++) {
+                    if (*q == '{') depth++;
+                    else if (*q == '}') { if (--depth == 0) break; }
+                }
+                if (*q == '}' && (long)(q - msl) < ret_at) {
+                    LFT_APPEND("%.*s", (int)(q - msl), msl);
+                    LFT_APPEND("    float mgl_lft_z [[depth(any)]];\n");
+                    LFT_APPEND("%.*s", (int)(ret_at - (q - msl)), q);
+                    done = true;
+                }
+            }
+            if (!done) { free(out); return NULL; }  /* unexpected shape, bail out */
+        } else {
+            LFT_APPEND("%.*s", (int)ret_at, msl);
+        }
+        /* signature: return type, then up to (and including) the '(' */
+        if (is_void && add_depth)
+            LFT_APPEND("mgl_lft_out ");
+        else
+            LFT_APPEND("%.*s ", (int)retlen, ret);
+        LFT_APPEND("%.*s", (int)(params_at - after_ret), msl + after_ret);
+    }
+
+    /* parameters: original list + a position argument when missing */
+    LFT_APPEND("%.*s", (int)(close_paren - params_at), msl + params_at);
+    if (!have_pos) {
+        snprintf(posname, sizeof posname, "mgl_lft_pos");
+        LFT_APPEND(", float4 %s [[position]]", posname);
+    }
+    LFT_APPEND(")%.*s{", (int)(body_at - close_paren - 1), msl + close_paren + 1);
+
+    /* body: guard discards, write the depth member on every return */
+    body = msl + body_at + 1;
+    body_len = (size_t)(guard_to - body_at - 2);   /* drop the closing '}' */
+    p = body;
+    seg = body;
+    while (p < body + body_len) {
+        const char *d = strstr(p, "discard_fragment();");
+        const char *r = strstr(p, "return ");
+        const char *semi;
+        if (d && (!r || d < r) && d + 19 <= body + body_len) {
+            LFT_APPEND("%.*s", (int)(d - seg), seg);
+            LFT_APPEND("{ if (as_type<uint>(%s.z) != 0xffffffffu) discard_fragment(); }", posname);
+            p = d + 19;
+            seg = p;
+        } else if (r && r < body + body_len) {
+            semi = strchr(r, ';');
+            if (!semi || semi > body + body_len) break;
+            LFT_APPEND("%.*s", (int)(r - seg), seg);
+            if (!strncmp(r, "return out;", 11)) {
+                if (add_depth && !is_void)
+                    LFT_APPEND("{ out.mgl_lft_z = %s.z; return out; }", posname);
+                else
+                    LFT_APPEND("return out;");
+            } else if (!strncmp(r, "return;", 7)) {
+                if (add_depth && is_void)
+                    LFT_APPEND("return mgl_lft_out{ %s.z };", posname);
+                else
+                    LFT_APPEND("return;");
+            } else {
+                LFT_APPEND("%.*s", (int)(semi - r + 1), r);
+            }
+            p = semi + 1;
+            seg = p;
+        } else {
+            break;
+        }
+    }
+    LFT_APPEND("%.*s", (int)(body + body_len - seg), seg);
+
+    /* a void body that falls off the end still returns the depth value */
+    if (is_void && add_depth)
+        LFT_APPEND("return mgl_lft_out{ %s.z };\n", posname);
+    LFT_APPEND("}");
+
+    tail = msl + guard_to;
+    LFT_APPEND("%s", tail);
+#undef LFT_APPEND
+
+    /* structural sanity: braces balanced */
+    {
+        int depth = 0;
+        size_t i;
+        for (i = 0; i < out_len; i++) {
+            if (out[i] == '{') depth++;
+            else if (out[i] == '}') depth--;
+            if (depth < 0) { free(out); return NULL; }
+        }
+        if (depth != 0) { free(out); return NULL; }
+    }
+    return out;
+}
+
+/* the variant MSL for `program', or NULL when its fragment stage needs no
+ * late-fragment-tests emulation.  Called from MGLRenderer+RenderState.m at
+ * pipeline build time; the text is generated once at link time (cached). */
+char *mgl_tess_late_fragment_variant(GLMContext ctx, Program *program)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    Spirv *sp;
+    int i, slot = -1;
+    char *v;
+
+    if (!S || !program) return NULL;
+    sp = &program->spirv[_FRAGMENT_SHADER];
+    for (i = 0; i < MGL_TESS_LATE_FRAG_CACHE; i++)
+        /* msl_src must match: relinking (and recycled Program addresses) hand
+         * out a fresh msl_str, so a stale variant can never be selected */
+        if (S->late_frag[i].program == program &&
+            S->late_frag[i].msl_src == sp->msl_str)
+            return S->late_frag[i].msl;          /* may be NULL: known-unneeded */
+
+    if (!sp->msl_str || !sp->ir || strstr(sp->msl_str, "early_fragment_tests"))
+        goto store_none;
+    if (!spv_module_writes_memory(sp->ir, sp->size))
+        goto store_none;
+
+    v = mgl_late_fragment_tests_msl(sp->msl_str, sp->entry_point,
+                                    !strstr(sp->msl_str, "[[depth"));
+    if (!v)
+        goto store_none;
+
+    slot = (int)(program->name % MGL_TESS_LATE_FRAG_CACHE);
+    if (S->late_frag[slot].msl)
+        free(S->late_frag[slot].msl);
+    S->late_frag[slot].program = program;
+    S->late_frag[slot].msl_src = sp->msl_str;
+    S->late_frag[slot].msl = v;
+    return v;
+
+store_none:
+    slot = (int)(program->name % MGL_TESS_LATE_FRAG_CACHE);
+    if (S->late_frag[slot].msl)
+        free(S->late_frag[slot].msl);
+    S->late_frag[slot].program = program;
+    S->late_frag[slot].msl_src = sp->msl_str;
+    S->late_frag[slot].msl = NULL;
+    return NULL;
+}
+
 /* post-link: parse the tessellation modes and the patch data layouts */
 static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 {
@@ -4628,6 +5048,13 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
     if (!S || !program)
         return;
+
+    /* GL 4.6 §17.3.4: late per-fragment tests for side-effecting fragment
+     * shaders.  mgl_tess_late_fragment_variant() generates the patched variant
+     * lazily (at pipeline build time, when a depth attachment is present);
+     * nothing to do here beyond pre-warming the cache.  Runs before the
+     * tessellation early-out below — it applies to non-tessellation programs. */
+    mgl_tess_late_fragment_variant(ctx, program);
 
     has_tcs = program->spirv[_TESS_CONTROL_SHADER].ir != NULL;
     has_tes = program->spirv[_TESS_EVALUATION_SHADER].ir != NULL;

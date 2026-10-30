@@ -791,10 +791,13 @@ GLboolean mglIsTexture(GLMContext ctx, GLuint texture)
 void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
     TD_CHECK(count >= 0, GL_INVALID_VALUE);
-    /* the image-unit count is GL_MAX_IMAGE_UNITS (get.c reports 8), not the texture
-     * unit count — KHR-GL46.multi_bind errors_bind_image_textures expects
-     * GL_INVALID_OPERATION past it */
-    TD_CHECK((GLuint)first + (GLuint)count <= 8, GL_INVALID_OPERATION);
+    /* the image-unit count is GL_MAX_IMAGE_UNITS — get.c reports
+     * MGL_MAX_IMAGE_UNITS (16), so bind against exactly that (an 8 here went
+     * stale when MGL_MAX_IMAGE_UNITS rose and KHR-GL46.multi_bind
+     * dispatch/functional_bind_image_textures began seeing a bogus
+     * GL_INVALID_OPERATION binding all 16 units); state storage is
+     * image_units[TEXTURE_UNITS=128], so 16 is safely addressable */
+    TD_CHECK((GLuint)first + (GLuint)count <= MGL_IMAGE_UNITS_MAX, GL_INVALID_OPERATION);
 
     for (GLsizei i = 0; i < count; i++)
     {

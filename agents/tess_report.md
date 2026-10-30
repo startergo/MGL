@@ -1,3 +1,252 @@
+# tess domain — round 39 report (post_depth_coverage live; GL late fragment tests; r39 WIP settled)
+
+READY fc95a0d (over merge of gl46-port cceed03 [geom r74-r76]; every number below
+is on exactly this tree)
+
+## Task 0 — settle the dead session's uncommitted r39 WIP: committed as designed
+
+The previous session left `GL_MAX_IMAGE_SAMPLES=4` (r39 WIP commit 3ef94c2) reverted
+back to 0 in the working tree, plus the fallout fixes for the image-unit count that
+r38 raised to 16. Verified and committed (a94197c):
+* `GL_MAX_IMAGE_SAMPLES` stays **0**: with 4 reported, shader_image_load_store's
+  `basic-allTargets-store WriteMS/AtomicMS` runs and fails at the Metal compile
+  (MSL has no `texture2d_ms` write path) — geometry domain's documented design.
+  `GL_MAX_SAMPLES` is split from it and reports the framebuffer max (4).
+* stale `8` limits in `mglBindImageTextures` (multi_bind) and the image-unit
+  bound in uniforms.c replaced by the shared `MGL_IMAGE_UNITS_MAX` (16):
+  multi_bind 17/17, gl_spirv 9/9 (the 10-active-image-units link).
+
+## Task 1 — post_depth_coverage_tests: 2x NotSupported → 1 Pass + 1 Fail (Metal gap)
+
+`GL_ARB_post_depth_coverage` is now advertised and **natively implemented**:
+glslang emits `EarlyFragmentTests` + `PostDepthCoverage` execution modes
+(post_depth_coverage *implies* early tests, ARB spec issue 2; glslang also defines
+the `GL_ARB_post_depth_coverage` preprocessor macro = 1), and SPIRV-Cross lowers
+`gl_SampleMaskIn` to a `[[sample_mask, post_depth_coverage]]` fragment argument
+(MSL 2.3+; MGL compiles MSL 3.0). Verified on M4 Pro (`.agent/pdc_probe.c`):
+the mask excludes depth-killed samples; works on MSAA and single-sample pipelines.
+
+The gap (`/.agent/gap_post_depth_coverage.md`): Metal's post-depth mask ignores
+the **stencil** test, so `PostDepthSampleMask`'s two stencil sub-cases Fail
+(log: "Wrong results for BUFFERCASE_DEPTH_STENCIL / PDCCASE_ENABLED") — the
+depth sub-cases all pass, and the write gating is correct (stencil-killed
+samples are not written). Not emulated: re-deriving the mask in-shader needs
+the stencil values (not shader-readable on Metal).
+
+```
+KHR-GL46.post_depth_coverage_tests   2 cases  Pass=1 Fail=1   (was NotSupported=2)
+```
+
+## Task 2 — root-caused shader_image_load_store.early-fragment-tests: Fail → Pass
+
+The CTS log said "Problem with early z test. It is applied when disabled": a
+fragment shader that writes memory and does NOT declare early tests must still
+execute for depth-failing fragments (GL 4.6 §17.3.4 / ARB_shader_image_load_store:
+with early tests disabled "these operations are performed only after fragment
+program execution"). Apple GPUs always run the depth test before the shader
+(HSR), so the imageStore side effect was culled. Probed the whole matrix
+(`.agent/probe_latedepth.m`):
+
+```
+[[depth(any)]] output + guarded discard_fragment()  -> shader runs, test late  ✓
+[[depth(any)]] output + unconditional discard       -> culled before shader    ✗
+no depth output (any discard)                       -> culled before shader    ✗
+```
+
+Fix (all GPU-side, tessellation.c + one block in MGLRenderer+RenderState.m):
+for every linked fragment stage that writes memory (SPIR-V scan: OpImageWrite,
+stores/atomics through Uniform/StorageBuffer/Image/AtomicCounter pointers,
+including access chains and image-texel pointers) and has no EarlyFragmentTests
+mode, a patched MSL variant is generated at link time that
+(a) adds a `float [[depth(any)]]` output written from `[[position]].z` (unless
+the shader already writes gl_FragDepth — SPIRV-Cross emits the attribute then),
+which makes Metal defer the depth test until after the fragment function, and
+(b) guards every `discard_fragment();` with `if (as_type<uint>(pos.z) !=
+0xffffffffu)` (always true at runtime, opaque to the compiler) — an unguarded
+discard makes Metal classify the function as kill-only and revert to the early
+test. The variant is swapped in at pipeline build time (next to rstate's
+pss/border variants) **only when the GL framebuffer has a depth attachment** —
+Metal rejects a depth output on depthless pipelines ("depthAttachmentPixelFormat
+is not valid and shader writes to depth", verified under AGX virtualization) and
+without one no test can defer. The swap also needed one term in rstateSpecialize's
+early-out (a fixup-less fragment stage still must reach the swap) and uses the
+GL framebuffer state instead of the render pass descriptor (the geom path builds
+its pipeline before the pass descriptor is final). The cache is keyed by program
+pointer **and** the fragment `msl_str` pointer, so relinking or recycling a
+Program address can never resurrect a stale variant.
+
+All shapes verified (`.agent/eft_probe.c`, `.agent/eft_gs_probe.c`):
+void-return, struct-return, gl_FragDepth writer, no-discard, atomic counters,
+and through the geometry-shader emulation path; encoded as
+`FragLateTestsSideEffects` (4 combinations, test_tess.c).
+
+```
+KHR-GL46.shader_image_load_store    51 cases  Pass=49 NotSupported=2  (was 48/1 Fail/2)
+```
+
+## Regression state on the final tree
+
+```
+== headless: 128 suites, 0 failures (incl. test_tess.c 550 checks)
+KHR-GL46.shader_atomic_counters     30 cases  Pass=30
+KHR-GL46.shader_storage_buffer_object 124 cases Pass=124
+KHR-GL46.texture_barrier             4 cases  Pass=4
+KHR-GL46.transform_feedback         20 cases  Pass=20
+KHR-GL46.multi_bind                 17 cases  Pass=17
+KHR-GL46.gl_spirv                    9 cases  Pass=9
+KHR-GL46.parallel_shader_compile     3 cases  Pass=3
+KHR-GL46.gpu_shader5_gl              3 cases  Pass=3
+KHR-GL46.shaders45                   7 cases  Pass=7
+KHR-GL46.shader_texture_image_samples_tests 4 cases Pass=3 NotSupported=1 (GL_MAX_IMAGE_SAMPLES=0)
+KHR-GL46.internalformat             52 cases  Pass=51 NotSupported=1 (rgb9_e5 renderbuffer, fb domain)
+KHR-GL46.draw_elements_base_vertex_tests 12 cases Pass=11 NotSupported=1 (ES-only by CTS design)
+KHR-GL46.texture_cube_map_array     27 cases  Pass=25 NotSupported=2 (ES-only by CTS design)
+```
+
+`shader_draw_parameters_tests` 7 Pass / 6 Fail is unchanged (the 6 multi-draw
+gl_DrawID cases; not NotSupported, noted for the draw path owner).
+
+## Remaining NotSupported inventory (from mgl-r28-sweep, after this round)
+
+* `shader_image_size` ms-* (36) + `shader_image_load_store` advanced-sso-perSample,
+  basic-allTargets-load-ms (2) + `shader_texture_image_samples_tests` (1): gated on
+  `GL_MAX_IMAGE_SAMPLES`, geometry domain's documented design (MS image writes are
+  impossible in MSL).
+* `sparse_texture{,2,_clamp}` (15), `sparse_buffer` (3), `texture_filter_minmax` (5):
+  full emulations in the textures/buffers domains (r38 note stands).
+* `internalformat.renderbuffer.rgb9_e5` (1): RGB9_E5 renderbuffer emulation, fb domain.
+* `sample_variables` (38) / `blend_equation_advanced` (88): compat's.
+* ES-only by CTS design (3): texture_cube_map_array.generate_mip_map_non_filterable x2,
+  draw_elements_base_vertex_tests.valid_active_tf.
+* `shaders.shader_integer_mix.prototypes` (1): the KHR-GL46 shaders package registers
+  at 330; `prototypes` without the extension needs GLSL 4.50 (r34 note).
+
+## Shared-file edits this round (each surgical)
+
+* `MGL/src/get.c` — advertise `GL_ARB_post_depth_coverage` (commented); keep
+  `GL_MAX_IMAGE_SAMPLES = 0` (reverting the r39 WIP's 4) and use the shared
+  `MGL_IMAGE_UNITS_MAX` for `GL_MAX_IMAGE_UNITS`.
+* `MGL/include/glm_limits.h` — `MGL_IMAGE_UNITS_MAX 16` shared define.
+* `MGL/src/textures.c`, `MGL/src/uniforms.c` — stale literal 8 → `MGL_IMAGE_UNITS_MAX`.
+* `MGL/src/MGLRenderer+RenderState.m` — late-fragment-tests variant swap after the
+  border-variant block (depth-attachment gated via the GL framebuffer state), one
+  extra term in rstateSpecialize's early-out, and a local extern prototype.
+
+# tess domain — round 38 report (shadow_lod 16/16; +7 NotSupported → Pass)
+
+READY 2b12a12 (over merge of gl46-port eb9eaeb [geom r71-r73]; every number below
+is on exactly this tree)
+
+## Task 1 — the 1 remaining ext_texture_shadow_lod Fail: **16/16 Pass**
+
+`sampler2darrayshadow_vertex` failed on the D16 lattice boundary, not on sampling:
+the CTS grid puts 65 vertices exactly at ref = 0.5 against a layer whose DEPTH_COMPONENT16
+texel is 0x8000 (0.50000763). GL compares in float: 0.5 < 0.50000763 → 1.0. Apple
+GPUs quantize the reference into the 16-bit fixed-point domain when the depth texture is
+Depth16Unorm, so 0.5 vs 0x8000 compares equal → 0. (Verified with a ref sweep: a D16
+texture flips at ref = 0.5 exactly; a D32F texture holding the same value flips at
+0.50000763 — float compare.)  The stored bits were already exact (glGetTexImage
+round-trips 0x8000).
+
+Fix (commit 129594d): **GL_DEPTH_COMPONENT16 textures are stored as Depth32Float,
+quantized to the 16-bit unorm lattice on upload** — exactly the trick the codebase
+already uses for DEPTH_COMPONENT24 (D24S8). texdata_formats.c: format row →
+MTLPixelFormatDepth32Float/TKD_D16F (bpp 4), storage_write_row quantizes
+llround(d*65535)/65535, storage_read_row is a float passthrough, td_direct_client
+never raw-copies (must quantize), GL_RED reads included. Metal then compares in float
+and raw depth sampling matches GL D16 semantics. Readback still returns exact bits.
+
+```
+KHR-GL46.ext_texture_shadow_lod   16 cases  Pass=16   (was 15/16)
+KHR-GL46.pixelstoragemodes       896 cases  Pass=896
+KHR-GL46.packed_pixels           250 cases  Pass=250
+KHR-GL46.packed_depth_stencil     25 cases  Pass=25
+KHR-GL46.copy_image               13 cases  Pass=13
+KHR-GL46.texture_gather           75 cases  Pass=75
+KHR-GL46.texture_border_clamp     32 cases  Pass=32
+KHR-GL46.texture_view              7 cases  Pass=6/Fail=1 → 7/7 after geom r71-r73
+```
+(texture_size_promotion and stencil_texturing fail identically with and without this
+change — pre-existing.)  Permanent guard: `D16LatticeCompare` in test_shadowlod.c.
+
+## Task 2 — NotSupported queue: **+7 cases Pass** (texture_barrier 4, viewport_layer 3)
+
+### texture_barrier_ARB 0 → 4/4 (commit 69b89ee)
+`GL_ARB_texture_barrier` string + a `glTextureBarrierARB()` alias on the core 4.5
+entry point (gl_core.c, next to the glDrawArraysInstancedARB pattern). The barrier
+itself (pass split on Apple GPUs) was already implemented (texextTextureBarrier).
+
+### shader_viewport_layer_array 0 → 3/3 (commits 69b89ee, 2b12a12)
+gl_ViewportIndex already worked (SPIRV-Cross lowers it to `[[viewport_array_index]]`).
+gl_Layer needed two things, found with MTL_DEBUG_LAYER:
+- **Metal rejects the PSO** unless `inputPrimitiveTopology` is set once the final
+  pre-raster function writes `[[render_target_array_index]]`, and **rejects a
+  `[[point_size]]` write under a non-Point topology**. So:
+  `tessConfigureLayeredTopology:` (MGLRenderer+Tessellation.m, called from
+  generatePipelineDescriptor after geomConfigureTopology) derives the class from the
+  draw mode (draw_buffers.c exec_draw stamps ext_tess->draw_mode); GL_PATCHES uses
+  the TES layout (point_mode/isolines). Only render_target_array_index triggers it
+  (viewport-only pipelines stay Unspecified), and the scan runs live — a
+  pointer-keyed cache got poisoned by reallocated MSL strings (that cost an hour).
+- state_ext.c (rstate): the clip-space patcher no longer adds its synthetic
+  `[[point_size]]` member to render_target_array_index writers (a new
+  mgl_rs_vertex_fixup_pos prelude variant without the ps argument); those programs
+  fall back to Metal's default point size. Known degenerate corner: a VS/TES that
+  writes BOTH gl_PointSize and gl_Layer under a non-Point topology cannot exist on
+  Metal (documented; neither CTS nor tests hit it).
+```
+KHR-GL46.texture_barrier_ARB         4 cases Pass=4
+KHR-GL46.shader_viewport_layer_array 3 cases Pass=3   (VS, TCS/TES, TCS/TES/GS pipelines)
+KHR-GL46.geometry_shader           136 cases Pass=136 (point_size/layer interplay OK)
+```
+Permanent guards: `TessLayerFromVertexStage` / `TessLayerFromEvaluationStage` in
+test_tess.c (VS and post-tess TES writing gl_Layer into a 4-layer array FBO).
+
+## Examined and deliberately not taken (this round)
+- shader_image_size ms-* (36) + image_samples (1): gated on GL_MAX_IMAGE_SAMPLES,
+  which is 0 **by the geometry domain's documented design** (ms image stores have no
+  MSL path; reporting 4 flips shader_image_load_store WriteMS to Fail). Not my call.
+- post_depth_coverage (2): Metal has no post-depth sample-mask; advertising would
+  make both Fail. Genuine gap.
+- texture_cube_map_array.generate_mip_map_non_filterable (2),
+  draw_elements_base_vertex_tests.valid_active_tf (1): "test doesn't apply to
+  OpenGL contexts" / ES-only by CTS design — permanently NotSupported on GL46.
+- internalformat.renderbuffer.rgb9_e5 (1): needs an RGB9E5 *renderbuffer* emulation
+  (RGBA16F backing, exact value round-trip); framebuffer-domain work for one case.
+- sparse_texture*/sparse_buffer* (12) + texture_filter_minmax (5): full-feature
+  emulations in the textures/buffers domains (Metal has no sparse residency, no
+  min/max reduction filters). Left for their owners; documented.
+- gl46-port already advertised GL_ARB_shader_texture_image_samples (dropped my
+  duplicate from get.c).
+
+## Shared-file edits (each surgical, called out)
+| file | hunk |
+|---|---|
+| MGL/src/texdata_formats.c (+ .h) | D16 row → Depth32Float/TKD_D16F + the 4 kind-handling hunks (task 1) |
+| MGL/src/gl_core.c | glTextureBarrierARB() alias |
+| MGL/src/get.c | GL_ARB_texture_barrier + GL_ARB_shader_viewport_layer_array strings (commented) |
+| MGL/src/draw_buffers.c | exec_draw stamps ext_tess->draw_mode (1 line + comment) |
+| MGL/src/mgl_ext_tess.h | draw_mode field on my own ext state struct |
+| MGL/src/MGLRenderer.m | 5-line call of tessConfigureLayeredTopology after geomConfigureTopology |
+| MGL/src/MGLRenderer_Private.h | 1-line declaration of tessConfigureLayeredTopology |
+| MGL/src/state_ext.c | rstate patcher: skip synthetic [[point_size]] for RTAI writers + fixup_pos variant |
+
+## Verification (final tree, 2b12a12)
+```
+tests/headless/run.sh:            644 PASS / 0 FAIL (test_tess 519 checks, test_shadowlod 12)
+KHR-GL46.tessellation_shader     58 Pass (100%)     KHR-GL46.shaders 2378 Pass / 3 Fail / 1 NS
+```
+The 3 shaders fails (`indexing.varying_array.*_dynamic_loop_write_dynamic_read`, batch-only
+"Failed to compile shader program") reproduce identically with the supervisor's
+baseline-cff5363 library under the same runner — pre-existing, not from this round.
+
+## Remaining gaps
+- Metal D16 hardware compare quantization is routed around (D32F storage); D24S8/D32FS8
+  depth-compare lattice behavior follows the same D32F storage and is GL-correct.
+- gl_PointSize + gl_Layer from the same vertex/eval stage with non-point topology:
+  Metal-impossible (PSO rejected); the draw errors instead of hanging.
+- post-depth coverage, min/max filters, sparse residency: no Metal equivalent (see above).
+
 # tess domain — round 37 report (shader_ballot compute cases; EXT_texture_shadow_lod)
 
 READY abef1d9 (merge of gl46-port 2898abe [geom r70] over 7b84384; every number
