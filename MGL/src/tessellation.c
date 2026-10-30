@@ -325,20 +325,17 @@ static char *tess_ballot_one_lane(const char *src)
 static char *tess_vs_member_to_block(const char *src)
 {
     size_t i = 0, len = strlen(src);
-    int depth = 0, clip_sz = -1, cull_sz = -1, changed = 0;
+    int depth = 0, clip_sz = -1, cull_sz = -1, changed = 0, decline = 0;
     char *out = NULL;
     size_t out_len = 0;
     FILE *mem;
     long insert_at = -1;      /* output offset right after the last #version line */
 
     if (!strstr(src, "gl_ClipDistance") && !strstr(src, "gl_CullDistance")) return NULL;
-    /* gl_CullDistance in a block needs GLSL 4.50 (or the ARB extension) */
-    {
-        int version = 0;
-        const char *v = strstr(src, "#version");
-        if (v) version = atoi(v + strlen("#version"));
-        if (version && version < 450 && strstr(src, "gl_CullDistance")) return NULL;
-    }
+    /* gl_CullDistance in a block needs GLSL 4.50 or GL_ARB_cull_distance; the
+     * block emitter below adds the extension pragma itself when a sub-4.50
+     * stage redeclared the member loose, and omits the member otherwise
+     * (clip-only #version 130 shaders — KHR-GL46.clip_distance). */
 
     mem = open_memstream(&out, &out_len);
     if (!mem) return NULL;
@@ -381,16 +378,29 @@ static char *tess_vs_member_to_block(const char *src)
                             if (s < e && src[s] == '[')
                             {
                                 size_t t = s + 1;
+                                int ndigits = 0, bad = 0;
                                 sz = 0;
                                 while (t < e && src[t] != ']' && src[t] != ';')
                                 {
                                     if (src[t] >= '0' && src[t] <= '9')
+                                    {
                                         sz = sz * 10 + (src[t] - '0');
+                                        ndigits++;
+                                    }
+                                    else if (src[t] != ' ' && src[t] != '\t')
+                                        bad = 1;
                                     t++;
                                 }
                                 if (t >= e || src[t] != ']') { sz = -2; break; }
-                                if (sz == 0) sz = 8;      /* `[]' - implicit maximum */
-                                if (sz > 8) sz = 8;
+                                /* a size EXPRESSION (`gl_MaxClipDistances + 1') or a
+                                 * literal outside 1..8 cannot be folded into the
+                                 * block without hiding the compile error GL
+                                 * requires (KHR-GL46.clip_distance.negative):
+                                 * leave the declaration loose and decline the
+                                 * rewrite - glslang judges the source itself */
+                                if (bad) { sz = -2; break; }
+                                if (ndigits == 0) sz = 8;   /* `[]' - implicit maximum */
+                                else if (sz < 1 || sz > 8) { sz = -2; break; }
                             }
                             else sz = 8;                 /* unsized member */
                             is_decl = 1;
@@ -409,6 +419,8 @@ static char *tess_vs_member_to_block(const char *src)
                 i = e + (e < len);
                 continue;               /* drop the loose declaration */
             }
+            if (is_decl && sz == -2)
+                decline = 1;            /* unfolded size: keep the source intact */
         }
 
         fwrite(src + ls, 1, e - ls, mem);
@@ -418,7 +430,7 @@ static char *tess_vs_member_to_block(const char *src)
             insert_at = ftell(mem);    /* right after the version line's newline */
     }
 
-    if (!changed)
+    if (!changed || decline)
     {
         fclose(mem);
         free(out);
@@ -427,17 +439,40 @@ static char *tess_vs_member_to_block(const char *src)
 
     /* splice the block in after #version (or at the head) */
     {
-        char block[256], cszs[16] = "", uszs[16] = "";
-        int n;
+        char block[320], cszs[16] = "", uszs[16] = "";
+        int n, cull_member;
+        int version = 0;
         char *fin;
         size_t fin_len, at = insert_at > 0 ? (size_t)insert_at : 0;
+        const char *v = strstr(src, "#version");
         fclose(mem);
+        if (v) version = atoi(v + strlen("#version"));
         if (clip_sz > 0) snprintf(cszs, sizeof cszs, "%d", clip_sz);
         if (cull_sz > 0) snprintf(uszs, sizeof uszs, "%d", cull_sz);
-        n = snprintf(block, sizeof block,
-                     "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;"
-                     " float gl_ClipDistance[%s]; float gl_CullDistance[%s]; };\n",
-                     cszs, uszs);
+        /* gl_CullDistance is not a member of the built-in gl_PerVertex before
+         * GLSL 4.50 (nor does the type exist): a block redeclaration that adds
+         * it fails glslang with "'gl_PerVertex' : block redeclaration has extra
+         * members" — KHR-GL46.clip_distance.functional ships a #version 130
+         * vertex shader.  Include the member below 4.50 only when this stage
+         * itself redeclared it loose, and enable GL_ARB_cull_distance so the
+         * block+member is legal at that version. */
+        cull_member = (version >= 450) || (cull_sz >= 0);
+        if (cull_member)
+        {
+            n = snprintf(block, sizeof block,
+                         "%s"
+                         "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;"
+                         " float gl_ClipDistance[%s]; float gl_CullDistance[%s]; };\n",
+                         (version < 450) ? "#extension GL_ARB_cull_distance : enable\n" : "",
+                         cszs, uszs);
+        }
+        else
+        {
+            n = snprintf(block, sizeof block,
+                         "out gl_PerVertex { vec4 gl_Position; float gl_PointSize;"
+                         " float gl_ClipDistance[%s]; };\n",
+                         cszs);
+        }
         if (n < 0 || (size_t)n >= sizeof block) { free(out); return NULL; }
         fin = malloc(out_len + (size_t)n + 1);
         if (!fin) { free(out); return NULL; }

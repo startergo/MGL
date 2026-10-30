@@ -494,6 +494,10 @@ static MGLProgramObj *exec_clone(GLMContext ctx, const MGLProgramObj *src)
         c->num_samplers = src->num_samplers;
     }
     c->base.local_workgroup_size = src->base.local_workgroup_size;
+    /* tess: gl_DrawID / gl_BaseVertex gate — a cache-hit link must keep reading it
+     * from the draw-parameters buffer, or every draw of the relinked program sees
+     * gl_DrawID == 0 (KHR-GL46.shader_draw_parameters_tests.ShaderMultiDraw*) */
+    c->base.uses_draw_params = src->base.uses_draw_params;
     c->linked_mask = src->linked_mask;
     c->active_attributes = src->active_attributes;
     c->active_attribute_max_length = src->active_attribute_max_length;

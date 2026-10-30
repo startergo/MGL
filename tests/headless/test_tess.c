@@ -1910,6 +1910,161 @@ TEST(FragLateTestsSideEffects)
     glDeleteProgram(pGsEarly);
 }
 
+/* ---- gl_DrawID across the link cache (r40) --------------------------------
+ * A program whose vertex stage reads gl_DrawID / gl_BaseVertex binds the
+ * draw-parameters buffer per draw (execTessBindDrawParams).  The whole-link
+ * executable cache (program.c) clones a linked program for an identical
+ * source set; exec_clone must carry uses_draw_params or the clone never binds
+ * the buffer and every draw sees gl_DrawID == 0 - KHR-GL46
+ * shader_draw_parameters_tests.ShaderMultiDraw* (the single-draw cases pass
+ * because gl_DrawID 0 is their expected value only in draw 0).  Sequence that
+ * fails: link+draw a first program, then relink the same sources and draw a
+ * multi-draw with it. */
+TEST(DrawIdSurvivesLinkCache)
+{
+    static const char *vs =
+        "#version 460\n"
+        "in vec3 vertex;\n"
+        "out vec3 color;\n"
+        "void main()\n"
+        "{\n"
+        "    float hOffset = float(gl_BaseVertex) / 5.0;\n"
+        "    float vOffset = float(gl_BaseInstance) / 5.0;\n"
+        "    color = vec3(0.0);\n"
+        "    if (gl_DrawID % 3 == 0) color.r = 1;\n"
+        "    else if (gl_DrawID % 3 == 1) color.g = 1;\n"
+        "    else if (gl_DrawID % 3 == 2) color.b = 1;\n"
+        "    gl_Position = vec4(vertex + vec3(hOffset, vOffset, 0), 1);\n"
+        "}\n";
+    static const char *fs =
+        "#version 460\n"
+        "in vec3 color;\n"
+        "out vec4 fragColor;\n"
+        "void main() { fragColor = vec4(color, 1.0); }\n";
+    static const GLfloat verts[] = {
+        -1.0f, -1.0f, 0.0f, -1.0f, -0.8f, 0.0f, -0.9f, -1.0f, 0.0f,
+        -0.9f, -0.8f, 0.0f, -0.8f, -1.0f, 0.0f, -0.8f, -0.8f, 0.0f,
+    };
+
+    /* program 1: linked fresh (draw-params flag set on the link path) */
+    GLuint p1 = mgl_make_program(vs, fs);
+    EXPECT_TRUE(p1 != 0);
+    glUseProgram(p1);
+    GLuint vbo; glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+    GLuint vao; glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    GLint loc = glGetAttribLocation(p1, "vertex");
+    glEnableVertexAttribArray((GLuint)loc);
+    glVertexAttribPointer((GLuint)loc, 3, GL_FLOAT, GL_FALSE, 0, 0);
+
+    GLuint tex, fbo;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 256, 256);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glClearColor(0, 0, 0, 1);
+
+    /* the single draw first (gl_DrawID == 0 there) */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 1, 4);
+    EXPECT_NO_GL_ERROR();
+    glDeleteProgram(p1);
+    p1 = 0;
+
+    /* program 2: SAME sources - served from the whole-link cache */
+    GLuint p2 = mgl_make_program(vs, fs);
+    EXPECT_TRUE(p2 != 0);
+    glUseProgram(p2);
+    loc = glGetAttribLocation(p2, "vertex");
+    glEnableVertexAttribArray((GLuint)loc);
+    glVertexAttribPointer((GLuint)loc, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    const GLint dFirst[] = {0, 1};
+    const GLsizei dCount[] = {4, 4};
+    glMultiDrawArrays(GL_TRIANGLE_STRIP, dFirst, dCount, 2);
+    EXPECT_NO_GL_ERROR();
+
+    /* (-0.95,-0.85): covered by both draws -> red+green; (-0.85,-0.95): draw 1 only */
+    GLubyte both[4], green[4], red[4], none[4];
+    mgl_read_rgba(6, 19, both);
+    mgl_read_rgba(19, 6, green);
+    mgl_read_rgba(6, 6, red);
+    mgl_read_rgba(19, 19, none);
+    printf("  [drawid cache-hit] both=%d,%d,%d green=%d,%d,%d red=%d,%d,%d none=%d,%d,%d\n",
+           both[0], both[1], both[2], green[0], green[1], green[2],
+           red[0], red[1], red[2], none[0], none[1], none[2]);
+    EXPECT_EQ_INT(both[0], 255); EXPECT_EQ_INT(both[1], 255); EXPECT_EQ_INT(both[2], 0);
+    EXPECT_EQ_INT(green[0], 0);  EXPECT_EQ_INT(green[1], 255);
+    EXPECT_EQ_INT(red[0], 255);  EXPECT_EQ_INT(red[1], 0);
+    EXPECT_EQ_INT(none[0], 0);   EXPECT_EQ_INT(none[1], 0);
+
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(p2);
+}
+
+/* ---- gl_PerVertex block rewrite below GLSL 4.50 (r40) ----------------------
+ * A #version 130 vertex shader redeclaring gl_ClipDistance loose must link:
+ * the loose member is folded into an out gl_PerVertex block that may not carry
+ * gl_CullDistance below GLSL 4.50 ("block redeclaration has extra members").
+ * The negative form (size gl_MaxClipDistances+1) must fail to compile - the
+ * fold must not clamp an over-range size to 8.  Both from KHR-GL46
+ * clip_distance.functional/coverage/negative. */
+TEST(ClipDistance130Link)
+{
+    static const char *vs_ok =
+        "#version 130\n"
+        "out float gl_ClipDistance[1];\n"
+        "float f(int i) { return 0.0; }\n"
+        "in vec4 position;\n"
+        "void main()\n"
+        "{\n"
+        "    for(int i = 0; i < 1; i++) gl_ClipDistance[i] = f(i);\n"
+        "    gl_Position = position;\n"
+        "}\n";
+    static const char *vs_neg =
+        "#version 130\n"
+        "out float gl_ClipDistance[gl_MaxClipDistances + 1];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_ClipDistance[0] = 0.0;\n"
+        "    gl_Position = vec4(1.0);\n"
+        "}\n";
+    static const char *fs =
+        "#version 130\n"
+        "out vec4 color;\n"
+        "void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+
+    GLuint p = mgl_make_program(vs_ok, fs);
+    EXPECT_TRUE(p != 0);
+    if (p)
+    {
+        glUseProgram(p);
+        EXPECT_NO_GL_ERROR();
+        glDeleteProgram(p);
+    }
+
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vs_neg, NULL);
+    glCompileShader(vs);
+    GLint ok = 0; glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_FALSE);          /* over-maximum redeclaration */
+    glDeleteShader(vs);
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -1966,6 +2121,8 @@ int main(void)
     RUN(FragPostDepthShader);
     RUN(FragPostDepthCoverageMask);
     RUN(FragLateTestsSideEffects);
+    RUN(DrawIdSurvivesLinkCache);
+    RUN(ClipDistance130Link);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }
