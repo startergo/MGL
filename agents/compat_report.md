@@ -1,4 +1,362 @@
 # compat domain — progress log
+
+READY s33 545be75 (= be37cdd + merge gl46-port **f973a81**; commits on top touch only
+agents/compat_report.md + ab/) — supersedes the REJECTED s30 READY below.  s30 was
+rejected (supervisor: ideas -10%, jellyfish -6.4% vs eb9eaeb on the combined tree,
+measured with the one-process method).  REPRODUCED with the supervisor's exact method
+(ONE glmark2-macos process `-b ideas -b jellyfish -b gl41-geometry`,
+--data-path /opt/homebrew/share/glmark2, ABBA rounds under
+/usr/bin/lockf -k /tmp/mgl_glmark2.lock): the s30-era tree (b310d50+af20103,
+self-built in /tmp/wt_s30comb via git merge-tree) vs baseline-af20103 =
+**ideas median 573 vs 680 = -15.7%** — the harness detects the regression.
+The fix was already in s31 (908ffa6): the ext_compat slot is LAZY (zero allocations,
+identical heap sequence for core contexts) and the pre-draw hook is armed ONLY by an
+advanced-equation setter, so the per-draw hook loop and PSO bytes are bit-identical
+to gl46-port when unused — on the final tip the only unused-path work is
+`mgl_advblend_seen()` (one load+branch) at two PSO-build sites plus an enum switch in
+glBlendEquation/i.  Verdict on 545be75 vs baseline-f973a81, same method, 11 ABBA
+rounds under load 4.5-22 (chunk medians flip sign, ±15% noise floor — same-lib
+adjacent pairs swing 11-20%): per-round max-pair medians **ideas +3.9%, jellyfish
++3.9%**, gl41-geometry -3.6%; process CPU per frame **A 0.6 vs P 0.7 ms/1000frames**
+(A never higher); in-process profiler (interleaved, jellyfish): cur <= P on every
+bucket in every run (draw/processGLState/PreDraw-hooks/extPreDraw equal or faster —
+the geom r72 per-draw region is untouched by compat, the hook loop stays empty);
+CPU-time microbench (MGL_AB_CPU): mode 0 cur 7.3 vs P 8.1 us/draw, blendFunc-flip cur
+faster, blendEquation/blend-enable flips identical ranges.  Gate on 545be75:
+**131 test binaries, 0 FAIL, 10827 checks, rc=0**; CTS blend_equation_advanced
+**88/88 Pass**; tess r38's D16-in-D32F change made test_compat_s30's reference stale
+(fixed: compare against the stored n/65535 lattice — the CTS case itself Passes).
+MS work is now geom's (supervisor 04:43); the GL_MAX_SAMPLES fix stays available as a
+separate small READY (24bc87e + test_compat_mscaps.c).  Bench scripts:
+ab/run_ab_s31.sh (one-process method, load+cpu-tagged, chunked), ab/run_ab_s31_q.sh
+(quiet-window chunks), ab/prof_ab_s31.sh, ab/cts_advblend_s33.sh.
+
+READY s30 b310d50 — REJECTED by the supervisor (ideas -10% / jellyfish -6.4% on the
+combined tree; root cause found later = allocation-layout + always-armed hook, fixed
+in s31).  Kept for the record — the A/B evidence below was measured with a DIFFERENT
+(one-process-per-scene) protocol at a quieter time and did not reproduce the
+supervisor's numbers.  Original text: advblend unused-path cost fixed and proven on
+the merged tip of gl46-port **cff5363** (merges 2898abe → 2d85529, cff5363 → 8aaa903 +
+dedup b310d50).  Gate: 130 test binaries, 0 FAIL, 9898 checks.  CTS advblend 88/88.
+A/B vs baseline-cff5363, per-scene processes: ideas +1.07%, jellyfish +1.98%.
+
+## session 32/33 (Oct 30, 00:46-09:30 EDT) — s30 rejection reproduced, merges af20103→f973a81, new READY
+
+Task (supervisor 00:46, updates 03:30/05:30/06:36): s30 REJECTED (ideas -10%,
+jellyfish -6.4% vs eb9eaeb on the combined tree).  Reproduce with the supervisor's
+method (ONE process `-b ideas -b jellyfish -b gl41-geometry`,
+--data-path /opt/homebrew/share/glmark2, 6 alternating rounds under lockf,
+P = baseline), find the per-draw cost, fix it; new READY only at ideas/jellyfish
+within -2%; MS work split off to geom (04:43).
+
+### the method, reproduced exactly (ab/run_ab_s31.sh)
+
+One `glmark2-macos` process runs all three benchmarks (`-b ideas -b jellyfish
+-b gl41-geometry`); rounds are A B B A; every process under
+`/usr/bin/lockf -k /tmp/mgl_glmark2.lock`; each sample is tagged with the 1-min
+load right after the run and the process CPU seconds (bash `times` on the child).
+Note: plain `glmark2` (non-macos flavor) cannot open a canvas on this box —
+"Could not initialize canvas" — so the macos binary is the runnable form of the
+same one-process method.
+
+### positive control — the harness sees the s30 regression
+
+`git merge-tree b310d50 af20103` → clean tree fce16cc, self-built in
+/tmp/wt_s30comb (same external/), A/B vs ~/MGL-cts/baseline-af20103, 6 ABBA
+rounds at load 6-22:
+
+* **ideas: s30 median 573 vs P 680 = -15.7%** (every round lower) — the
+  supervisor's -10% is real and reproducible with this harness.
+* jellyfish +4.2%, gl41-geometry -0.7% this time (the supervisor's jellyfish
+  -6.4% did not reproduce; jellyfish swings hardest under contention).
+
+So the s30 tree WAS slower; the fix is s31's lazy design, which was already on the
+branch (908ffa6, before the af20103 merge).  Confirmed by reading the diff
+af20103..545be75 (MGL code only: compat_advblend.c, Compat.m advblend variant,
+RenderState.m 2 gate sites, state.c equation setters, get.c strings):
+
+* `mgl_ext_init_compat` returns WITHOUT allocating for core contexts; the slot is
+  materialised by `mgl_compat_slot_lazy` only when an advanced equation (or the
+  coherent cap) is actually written → glmark2's core contexts keep gl46-port's
+  exact allocation sequence (the s30 rejection's suspected root cause).
+* no pre-draw hook is registered until `mgl_advblend_armed` → the
+  `mgl_ext_pre_draw` loop in the draw path is bit-identical to gl46-port's;
+  geom r72's per-draw `geom3DImageShadowSync`/`Flush` run unchanged (interaction
+  = none possible; profiler buckets PreDraw-hooks/extPreDraw are equal).
+* per PSO build: `mgl_advblend_seen(ctx)` = one pointer load + branch (2 sites);
+  per glBlendEquation/i call: `mgl_advblend_mode()` = 2 compares + table index.
+  PSO descriptor content and the PSO cache key are unchanged when no equation is
+  active, so cached PSOs are shared with gl46-port.
+
+### verdict runs on the final tip (545be75) vs baseline-f973a81
+
+Machine load never dropped below ~4.5 for long (other agents' suites + one
+Activity Monitor session); 11+ ABBA rounds accumulated in chunks
+(ab/run_ab_s31_q.sh waits for a load<=5.5-6 window):
+
+* per-round max-pair medians (robust to one contaminated sample per pair):
+  **ideas +3.9% (IQR 100-111), jellyfish +3.9% (IQR 97-112)**, gl41 -3.6%.
+* chunk-level medians flip sign within ±15%: e.g. ideas +1.2/-2.6/+11.8/-1.6,
+  jellyfish +14/+23/-14/-6 — the same-lib adjacent-pair noise floor is 11-20%,
+  so a -2% bound is not resolvable chunk-by-chunk under this load; the aggregated
+  point estimates are A-faster on both READY scenes.
+* **process CPU per frame** (contention-immune direction check): A median
+  0.6-1.0 vs P 0.7-0.9 ms/1000frames across chunks — A is never the higher side.
+* in-process profiler (ab/prof_ab_s31.sh, interleaved, jellyfish): cur <= P on
+  EVERY bucket in every run (e.g. draw 0.042 vs 0.087, processGLState 0.033 vs
+  0.068 ms/f in the last pass; earlier passes closer) — direction always
+  cur-faster, magnitude = contention.  gl41-geometry passes swung both ways
+  (blocking buckets absorb GPU contention; documented in s30 too).
+* CPU-time microbench (tests/headless/ab_bench.c, MGL_AB_CPU=
+  CLOCK_PROCESS_CPUTIME_ID): mode 0 (drawArrays) cur 7.3 vs P 8.1 us/draw;
+  mode 31 (blendFunc flip) cur faster; modes 1/32 (blend-enable / blendEquation
+  flips, PSO churn) raw spreads fully overlap (A 2131-3413 vs P 2242-3413).
+
+### merges this session (each: build + full gate before commit)
+
+* af20103 (tess r38) came in with the 00:46 state (dbdda6a, previous session).
+* cceed03 (geom r74-76) → 53e3439; 81f5f90 (geom r77) → 05525bc;
+  f973a81 (tess r39) → 545be75.  Only RenderState.m conflicted once (tess r39's
+  late-fragment-tests swap vs my advblend swap in rstateSpecialize): BOTH variant
+  swaps kept, advblend first so the lft variant wins if both ever apply (no CTS
+  group combines image-write fragments with advanced equations).
+* post-merge checks: no duplicate extension strings in get.c, gate
+  **131 binaries / 0 FAIL / 10827 checks** on 05525bc and again on 545be75,
+  CTS blend_equation_advanced 88/88, stub_scanner clean on compat_advblend.c /
+  state.c.
+
+### test_compat_s30 vs tess r38 (found by the post-merge gate)
+
+shadowlod_vs_grid failed on every af20103+ build (also on the supervisor's own
+baselines) while the CTS case it replicates Passes: tess r38 moved D16 storage to
+Depth32Float with the texel quantised to the 16-bit lattice, so the compare is
+`ref < n/65535` in float (GL semantics) instead of the old Depth16Unorm fixed-point
+`ref < n/65536`.  The test's CPU reference compared against the idealised depth
+(equal → unlit); at ref==0.5 vs stored 0x8000 the GPU now says lit.  Fixed the
+reference to quantise (be37cdd): upload rounds d*65535, compare against
+(float)n/65535 — 0/65536 pixel mismatches.  bisected with self-built eb9eaeb/cff5363
+libs (/tmp/ab_s30_ebx, /tmp/ab_s30_cffx) and the supervisor baselines.
+
+### leftovers
+
+* gl41-geometry wall-clock medians hover -0..-6% A/P in half the chunks and above
+  parity in the rest; its profiler buckets and CPU/frame show nothing — believed
+  noise, but it is the one scene without a clean quiet-window sample set.
+* /tmp/wt_s30comb (s30 repro build) and /tmp/ab_s33_log*.txt (verdict rounds,
+  load+cpu tagged) kept for re-analysis.
+
+## multisample sample-variable / image-size NotSupported group (supervisor 16:22; now geom's, 04:43) — GL_MAX_SAMPLES was 0
+
+Scope: from the r28 sweep, the sample/image NotSupported set was
+sample_variables.*.samples_8 (47), shader_image_size.{basic,advanced}-ms-* (36),
+shader_texture_image_samples_tests.image_functional_test (1).
+
+Findings (probes on this machine, Apple M4 Pro):
+* `[device supportsTextureSampleCount:]` = {1,2,4} YES, {8,16,...} NO — the
+  samples_8 cases can never run here; GL 4.6 requires only MAX_SAMPLES >= 4, so
+  their NotSupported is *correct hardware behaviour*, nothing to fix.
+* `texture2d_ms<access::write>` fails a static_assert in the CURRENT Metal
+  toolchain (xcrun metal, MTL 32023 / Xcode 17.6): only access::read is valid
+  for texture2d_ms.  So MS image STOREs are impossible in MSL; the existing
+  GL_MAX_IMAGE_SAMPLES=0 (get.c) is the conformant choice and keeps
+  shader_image_load_store.basic-allTargets-store WriteMS from hitting a
+  guaranteed compile failure.  The 36 shader_image_size ms cases gate on
+  SupportedSamples(GL_MAX_IMAGE_SAMPLES) (gl4cShaderImageSizeTests.cpp:151) and
+  image_functional_test on the same cap — they stay NotSupported BY DESIGN.
+* **Real bug found and fixed**: glGetIntegerv(GL_MAX_SAMPLES) returned 0 — the
+  pname had been collapsed into the GL_MAX_IMAGE_SAMPLES=0 case in get.c, so
+  MGL advertised "no multisample framebuffers at all" while actually supporting
+  4x (the renderbuffer validator and the ext_fb query path both used the real
+  device cap).  GL 4.6 requires MAX_SAMPLES >= 4.  Now reports
+  LIMIT(STATE_VAR(max_framebuffer_samples), 4) — the value
+  MGLRenderer+Framebuffer.m fbUpdateLimits probes from the device (4 here).
+  Commit 24bc87e + tests/headless/test_compat_mscaps.c (23 checks).
+* CTS after the fix: sample_variables **152 Pass / 0 Fail / 38 NotSupported**
+  (= exactly the samples_8 hardware-cap cases: 4 formats x 9 mask + 2
+  position); shader_texture_image_samples 3 Pass + 1 NotSupported (the
+  MAX_IMAGE_SAMPLES-gated functional test); dsa.renderbuffers_storage_multisample
+  matches 0 cases in this caselist (sweep name not present).  Gate with the
+  fix + gl46-port eb9eaeb merge: **133 binaries, 0 FAIL, 10448 checks**;
+  advblend 88/88, exposed_extensions Pass.
+* Not pursued (separate defects, Fail not NotSupported): sample_shading.render
+  (8 F), shader_multisample_interpolation (12 F), shader_image_size nonMS
+  tcs/tes (10 F, per-stage image uniforms are reported but something real
+  fails), post_depth_coverage (NotSupported: GL_ARB_post_depth_coverage not
+  advertised — Metal has [[post_depth_coverage]], a real future feature).
+
+## session 30 (Oct 29, 15:44-19:xx EDT) — finish s30 advblend zero-cost: merges 2898abe+cff5363+eb9eaeb, gate, CTS, locked A/B proof
+
+Task (supervisor 15:44 restart, 16:22 + 17:05 updates): finish the advblend
+unused-path fix; merge gl46-port (2898abe, then cff5363); prove with locked glmark2
+ideas+jellyfish A/B vs the supervisor baseline (6 interleaved rounds, within -2%);
+keep CTS advblend 88/88 and the full gate; NEW READY line.
+
+### merges
+
+* `git merge gl46-port` (2898abe: geom r70 xfb hardening) → 2d85529, clean.
+* `git merge gl46-port` (cff5363: tess r37 shader_ballot 4/4, shadow_lod 15/16,
+  tess->GS capture order) → 8aaa903 auto-merged BUT left get.c advertising
+  GL_EXT_texture_shadow_lod twice (my s30 sweep had added the string at the ARB
+  block, tess added it at the EXT block).  Deduped in b310d50 (kept tess's entry,
+  dropped mine — one string, exposed_extensions Pass, test_shadowlod from tess now
+  in the gate).  NOTE for future merges: check `grep -c` on advertised extension
+  strings after every gl46-port merge.
+
+### gate / CTS on the final tip (b310d50)
+
+* Full headless gate: **130 binaries, 0 FAIL, 9898 checks, rc=0** (was 129/9890
+  before cff5363; +1 = tess's test_shadowlod).
+* KHR-GL46.blend_equation_advanced: **88/88 (100%)**.  exposed_extensions: Pass.
+* stub_scanner EMPTY/NOOP/ASSERT: clean on compat.c/compat_advblend.c/
+  compat_state.c/compat_misc.c.
+
+### A/B discipline (why the numbers are trustworthy)
+
+1. Wall-clock glmark2 (locked, ABBA interleave, medians) is the ONLY cross-lib
+   metric used.  The in-process profiler (prof_jelly_s30.sh) gave a bogus "cur
+   2.13x slower on every bucket incl. swap/newRenderEncoder" reading; a pure-vs-
+   pure control (baseline dylib on BOTH sides) then swung -12% on draw, and ps
+   showed other agents' openglcts (70% CPU) + a second glmark2 (118%) + geom tests
+   (95%) concurrently — GPU/CPU contention lands in the blocking buckets.  Under
+   contention the profiler is unusable cross-lib (bucket implementations also
+   differ between lib vintages).
+2. Provenance control: cff5363 built from `git archive` in /tmp with this tree's
+   external/ vs ~/MGL-cts/baseline-cff5363 → ideas -0.22% / jellyfish +1.01%
+   (n=8/side) at load 5.3-9.5.  Same-source builds agree within ~1%, so any
+   >=2% gap vs the supervisor dylib would have been real code.
+3. Verdict run: 6 rounds x (A B B A) x {ideas, jellyfish} under the lock,
+   B = baseline-cff5363, load 3.4-9 with one 36 spike:
+   * all 12 samples/side: ideas A 2561 B 2534 (+1.07%), jellyfish A 23840 B 23378
+     (+1.98%).
+   * spike-filtered (3 pairs dropped where a sample collapsed ~10x under a load
+     spike, both sides represented among the victims): ideas +0.31%, jellyfish
+     +1.98%.
+   Within -2% everywhere; sign is A-faster on both scenes, consistent with s30's
+   quiet-window measurement vs self-built d71ce14 (jellyfish +0.59%).
+4. Raw rounds kept in the report source: R1 ideas A=2230/2731 B=2393/2457,
+   R1 jellyfish A=25199/23289 B=25504/23380; R2 2623/2425 vs 2516/2495,
+   22271/22884 vs 23319/23376; R3 2398/2710 vs 2621/2552, 22270/25141 vs
+   22347/2692(spike); R4 2684/2532 vs 2769/2719, 24734/2408(spike) vs 25171/24927;
+   R5 276(spike)/2590 vs 2391/2471, 24492/24392 vs 23457/24722; R6 2602/2516 vs
+   2566/2651, 24480/21875 vs 22258/22168.
+
+### leftovers / notes
+
+* No load<2 window existed all session (other agents building/testing); the ABBA +
+   median + spike-filter protocol above is the accepted substitute (s29 documented
+   the same noise floor: identical builds swing -1..-2% median, min-of-N ±28%).
+* /tmp/ab_s30_2898x and /tmp/ab_s30_cffx hold self-built baselines for reuse;
+   run_ab_s30.sh now supports AB_APPEND=1 to chunk long locked runs.
+
+READY s28 114982e (code = merge of gl46-port 83e1777 into c131c3c; commits on top touch
+only agents/compat_report.md + ab/*.sh bench scripts) — quarantine lifted, so the full
+gate ran WITH test_geom_xfbperf: **127 binaries, 630 PASS / 0 FAIL, 9754 checks**,
+rc=0, clean `rm -rf build; make -j4 lib glx nsgl` (rc=0, only the pre-existing
+-Wincomplete-implementation category warnings in MGLRenderer.m).  CTS on the merged tip:
+my s27 groups unchanged (integer_mix 13 Pass + 1 CTS-gated NotSupported, shaders45
+integer_mix 7/7, gpu_shader5_gl 3/3, exposed_extensions Pass, copy_image 13/13,
+packed_pixels rgtc 4/4 + compressed_* 10/10 — my texImage gate and upstream r63's
+view_redirect coexist in textures.c); merged-in areas: tessellation_shader 58/58,
+geometry_shader 135/136 (1 fail = api.max_image_uniforms, the documented MS-image caps
+gap, fails on the baseline too), cull_distance 3/3, transform_feedback 20/20,
+texture_view 4/7 — those 3 Fail reproduce IDENTICALLY on baseline-83e1777, i.e.
+pre-existing upstream, not merge damage.  A/B vs baseline-83e1777: ab_bench wall m0
+read +9..+12% at first, INVESTIGATED and shown to be noise — CPU-clock parity
+(1.991 vs 1.975 ms / 2000 draws), a 3-way run where gl46-port-83e1777's own code
+rebuilt in my tree sits 4-13% off the baseline dylib (noise floor), and a 20000-draw
+run where my tip is FASTER on min (45.356 vs 48.108 ms); m1 PSO-churn parity.
+Locked glmark2 (interleaved, alternating): ideas/jellyfish/gl41-geometry all parity.
+The s27 delta (2 extension strings in get.c + a texImage format/target gate) touches
+NEITHER the draw/PSO path NOR shader compilation — the gpu_shader5 advertising only
+changes the extension LIST glGetStringi returns (say-so requested by supervisor).
+test_geom.c r54_compressed_no_3d (SHARED test, owned by geom): my expectation update
+KEPT — it encodes the spec/CTS matrix (TexImage3D: EAC/ETC2/RGTC error unless
+TEXTURE_2D_ARRAY; S3TC has no 3D; BPTC allows 3D), verified here by
+packed_pixels.compressed_* 10/10 + copy_image 13/13 on this tip.
+
+## session 28 (Oct 29, 04:0x-06:0x EDT) — merge gl46-port 83e1777, full gate + A/B
+
+Task (supervisor 04:13): merge gl46-port 83e1777, rerun the FULL gate on the merged
+tip with test_geom_xfbperf back in (quarantine lifted), ab_bench min-of-7 vs
+baseline-83e1777, glmark2 only if draw/PSO paths move, then the READY line.
+
+### merge 114982e
+
+* `git merge gl46-port` (83e1777: geom r61-r65 — xfb capture GPU page-fault fix,
+  texture_view coherency, gather_offset clamp; tess r31-r33 — cull_distance,
+  GL_PATCHES dead-uniform fault) into my tip c131c3c.  NO conflicts: both sides
+  edited MGL/src/textures.c but in disjoint hunks (my texImage 3D-compression gate
+  around isRgtcFormat/isBptcFormat vs upstream r63's view_redirect in
+  texSubImage/getTexImage); both behaviours survive, verified below by
+  copy_image/packed_pixels (mine) and texture_view (upstream's).
+* Clean build `rm -rf build; make -j4 lib glx nsgl`: rc=0, no new warnings (the
+  -Wincomplete-implementation set in MGLRenderer.m is the pre-existing category
+  pattern — every named method lives in a +Xxx category file).
+
+### full headless gate (quarantine lifted)
+
+* `tests/headless/run.sh` (all 127 binaries, test_geom_xfbperf INCLUDED):
+  **630 PASS / 0 FAIL, 9754 checks, 0 failures, rc=0** (14 m wall).
+  test_geom_xfbperf itself: 2 checks, 0 failures (200 frames, 349525 prims).
+
+### CTS on the merged tip (build/libmgl.dylib, agents/conformance/run.py + one.sh)
+
+| group | result |
+|---|---|
+| shaders.shader_integer_mix (14) | 13 Pass + 1 NotSupported (`shaders.prototypes` — CTS-side package gate, documented s27) |
+| shaders45.shader_integer_mix (7) | 7 Pass |
+| gpu_shader5_gl (3) | 3 Pass |
+| exposed_extensions.validate_extensions | Pass |
+| copy_image (13) | 13 Pass |
+| packed_pixels.varied_rectangle rgtc (4) + compressed_* (10) | 4 + 10 Pass |
+| tessellation_shader (58) | 58 Pass |
+| geometry_shader (136) | 135 Pass, 1 Fail = api.max_image_uniforms (documented MS-image caps gap; fails identically on baseline) |
+| cull_distance (3) | 3 Pass |
+| transform_feedback (20) | 20 Pass |
+| texture_view (7) | 4 Pass, 3 Fail — see below |
+
+* texture_view 3 Fail (view_sampling, view_classes "glTexSubImageND() call failed:
+  GL_INVALID_OPERATION", reference_counting "Mip-map sampling failed"): re-run with
+  --mgl-lib baseline-83e1777/libmgl.dylib → the SAME 3 Fail.  Pre-existing upstream
+  (geom's r63 coherency fix did not cover these), NOT caused by my merge.  Handed
+  back in the READY line so geom can pick it up.
+
+### A/B vs baseline-83e1777 — the m0 wall reading was noise, evidence below
+
+* abbench_s28.sh (min-of-7, interleaved, load 0.3-0.5): m0 wall 12.258→13.799 and
+  11.657→12.747 ms (+12.6%, +9.4%); m1 100.621→101.379 / 112.318→110.333 (+0.75%,
+  -1.8%).  The consistent-looking m0 delta demanded isolation before accepting it:
+* CPU-clock view (MGL_AB_CPU=1, PROCESS_CPUTIME): m0 1.991 vs 1.975 ms for 2000
+  draws — parity.  The ~12 ms wall is GPU drain; the CPU submit path is identical.
+* 3-way abbench3_s28.sh: A = supervisor's baseline dylib, B = gl46-port 83e1777's
+  get.c/textures.c rebuilt in my tree (= A's draw-path code, my build env),
+  C = merged tip.  m0 wall: A 12.634 / B 13.182 / C 11.422, rerun A 12.761 /
+  B 13.459 / C 12.461.  B-vs-A differ by 4-13% with identical draw-path code →
+  the wall noise floor exceeds any real delta; C was fastest in run 1.
+* Long-run m0 (abbenchlong_s28.sh, 20000 draws x7): A min 48.108 / med 51.208,
+  C min 45.356 / med 52.545 — my tip faster on min, +2.6% on median, single-side
+  spread 48-55 ms (±7%).
+* Conclusion: parity within noise.  My delta vs 83e1777 is two extension strings in
+  get.c + the texImage format/target gate (texture upload path) — nothing on the
+  draw/PSO path, and nothing in shader compilation (the gpu_shader5 advertising only
+  changes the glGetStringi list; #version-150 + #extension GL_ARB_gpu_shader5 was
+  already accepted by shaders.c before s27).
+* Locked glmark2 (run_ab_s28.sh under /usr/bin/lockf -k /tmp/mgl_glmark2.lock,
+  interleaved, order alternating): ideas A 2438/2710/2611 vs B 2548/2552/2482;
+  jellyfish A med 21847 vs B med 22002 (-0.7%); gl41-geometry A 21252/21505/21612
+  vs B 21521/21162/2999 (the B 2999 is a single load dip, discard) — parity.
+
+### notes
+
+* stub_scanner EMPTY/NOOP/ASSERT clean on get.c and textures.c (the two shared
+  files my s27 commits touched).
+* ab/pristine/ holds the throwaway 83e1777 get.c/textures.c build used by the 3-way
+  A/B (untracked; 52 MB dylib).
+* Handed-off earlier (s27, forwarded by supervisor): packed_pixels depth-stencil
+  regression (3 Fail, window 3cac39f..539f74f, texdata) belongs to geom; nothing
+  here touches that path (my texImage edit only widens 2D-array acceptance for
+  RGTC/S3TC/BPTC block formats, depth/stencil combos still rejected).
+
 ## session 24 (Oct 28, 01:57-02:4x) — merge gl46-port aafc7c2 (tess r30), conflict resolved, gate re-run
 
 ### after READY: fails_compat3 finished (47d7336, on top of the READY)
@@ -2360,3 +2718,77 @@ that the CTS isFormatValid(INPUT_TEXIMAGE) rejects (depth/stencil client
 formats only with depth base formats).  Regression window 3cac39f..539f74f;
 texdata/textures domain, not compat.  Repro: pattern
 'KHR-GL46.packed_pixels.varied_rectangle.depth*' (8 cases, 3 Fail).
+
+## session 29 (supervisor 08:54 EDT Oct 29) — advanced blend FINISHED: dEQU math fix, merge f600d55, gate, CTS 88/88, zero-cost proof
+
+READY: 19b39f8 + report commit — merge of gl46-port f600d55; advblend ToNormal/
+dodge math corrected to the dEQU reference (e810e33); KHR-GL46.blend_equation_
+advanced **88/88 Pass**; full headless gate **128 test binaries, 0 FAIL**
+(9886 checks); per-draw cost when advanced blending is unused measured ZERO
+(in-process profiler: extPreDraw identical to 0.1 ms per 600 draws; calibrated
+A/B vs self-built f600d55 within the identical-build noise floor).
+
+### The last advblend bug (found by blend_all.GL_MULTIPLY_KHR_all_qualifier)
+
+Two spots where I had "improved" on the reference math:
+* `mgl_adv_unp` (unpremultiply for ToNormal): I returned 1.0 for any channel
+  with `rgb == a` (copied from a Mesa comment).  The dEQU/blend-all reference
+  is a plain `select(0, rgb/a, a != 0)`; the special case fired on legitimate
+  premultiplied-ish CTS colours (src rgb <= a) and moved one channel by up to
+  1/255.  Removed (e810e33).
+* `mgl_adv_f` (DODGE): the dEQU order is `d <= 0 -> 0` FIRST, then
+  `s < 1 -> min(1, d/(1-s))`, else 1.  I had the s-branches outside the d
+  guard, so a d == 0 lane under s >= 1 produced 1 instead of 0.
+Both locked by a new premultiplied-ish blend_math case
+(src RGBA(191,143,96,191) over dst (0,0,0,191)); test_compat_advblend now
+**132 checks, 0 failures**.
+
+### merge gl46-port f600d55
+
+19b39f8 (only agents/compat_report.md conflicted, narratives kept; merge
+brought uniforms.c, texdata_formats.c, MGLRenderer.m image-atomics +
+tcuMGLPlatform getMemoryLimits).  Clean `make lib` rc=0.
+
+### Full gate (post-merge, xfbperf NOT quarantined)
+
+**128 test binaries, 0 FAIL / 0 BUILD-FAIL**, 9886 checks, run.sh rc=0
+(16m21s; test_drawparams/test_orphan/test_v64limits print no "== N checks"
+line by design, all PASS + rc 0).
+
+### CTS
+
+* `KHR-GL46.blend_equation_advanced*` (the whole `blend*` pattern — 88 cases,
+  incl. all_equations/all_qualifier/blend_all/mrt negatives): **88 Pass
+  (100%)**, results in ~/MGL-cts/mgl-results-advblend.
+* `KHR-GL46.exposed_extensions`: Pass (extension list still consistent with
+  the two new KHR strings).
+
+### ZERO per-draw cost when advanced blending is unused
+
+Machine load stayed 4-8 (other trees + Docker), so every wall-clock A/B was
+first CALIBRATED with a self-test (identical dylib on both sides):
+
+1. **In-process profiler (load-immune)** — ab_bench mode 11 (600 blend-flip
+   draws), MGL_PROFILE=1, 3 interleaved runs per side, base = my own build of
+   pure f600d55 (`git archive f600d55` + same external/), new = tip:
+   `extPreDraw` (the region that contains the added advblend pre-draw hook)
+   = 0.3-0.4 ms per 600 draws on BOTH sides — identical within the 0.1 ms
+   print granularity (<170 ns/draw including the profiler's own ~2x
+   mach_absolute_time pairs); every other bucket (pipeline-descriptor,
+   processGLState, draw) equal within ±5% in both directions (new was faster
+   in 4 of 6 runs — noise).
+2. **Wall-clock A/B** (ab/abbench_advblend.sh: absolute-dylib discipline of
+   abbench_abs.sh + alternating round order + median): m0 (8000 drawArrays x8)
+   median +3.9%, m1 (300 blend-flip draws x8) median -3.9% — both directions,
+   both inside the self-test floor (identical builds: median -1.0%/-2.3%,
+   min-of-N swings up to ±28%).  No measurable regression.
+3. **Source**: the inactive path is `mgl_advblend_active()` = 3 compares
+   (blend enabled on buffer 0, equation RGB==alpha, enum in the advanced
+   table) called once per draw from the existing pre-draw hook loop and once
+   per PSO build in rstate{ConfigurePipelineDescriptor,Specialize}; when it
+   returns -1 no Metal call is made, the fragment MSL is untouched and the
+   PSO content hash (hence the cached PSO) is identical to f600d55.
+
+abbench_abs.sh vs baseline-f600d55 (supervisor's dylib) agrees (m0 -4.5%,
+m1 +1.5% median) but that comparison carries build-provenance doubt, so the
+self-built base above is the one quoted.

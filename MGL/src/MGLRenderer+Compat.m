@@ -23,6 +23,7 @@
 #import "mgl_ext_buffers.h"           /* mgl_buffers_mark_gpu_use (bindmap cache, session 13) */
 #import "mgl_ext_introspect.h"        /* default-uniform buffer revalidation (session 13) */
 #include "mgl_compat_perf.h"
+#include "mgl_ext_compat.h"       /* compat domain state + advblend (GL_KHR_blend_equation_advanced) */
 
 /* MGL_PROFILE counters (MGLRenderer.m) */
 extern uint64_t mgl_prof_ns[18];
@@ -2381,6 +2382,134 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
 - (void) compatBindProfileReset
 {
     mgl_compat_bind_set = mgl_compat_bind_skip = mgl_compat_ring_bytes = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* GL_KHR_blend_equation_advanced (GL 4.6 core §17.3.8) — the fragment  */
+/* variant that composites through a [[color(0)]] framebuffer fetch.   */
+/* See compat_advblend.c; zero work unless an advanced equation is set. */
+
+- (bool) compatAdvancedBlendVariant: (Shader *)shader
+                                msl: (const char **)out_msl
+                            library: (id<MTLLibrary> *)out_lib
+                          function: (id<MTLFunction> *)out_fn
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    int mode = mgl_advblend_active(ctx);
+    Program *program;
+    const char *msl, *entry;
+
+    *out_msl = NULL;
+    *out_lib = nil;
+    *out_fn = nil;
+
+    if (mode < 0 || !m || !shader)
+        return false;
+
+    program = ctx->state.program;
+    if (!program)
+        return false;                       /* pipelines: composite program */
+    msl = program->spirv[_FRAGMENT_SHADER].msl_str;
+    entry = program->spirv[_FRAGMENT_SHADER].entry_point;
+    if (!msl || !entry)
+        return false;
+
+
+    /* the [[color(0)]] fetch needs a color attachment 0 whose format can be
+     * read as float4 (non-integer — GL ignores blending for integer targets
+     * anyway).  Integer formats would make pipeline validation reject the
+     * float4 fetch argument. */
+    {
+        id<MTLTexture> att = _renderPassDescriptor.colorAttachments[0].texture;
+        if (!att || att.pixelFormat == MTLPixelFormatInvalid)
+            return false;
+        switch (att.pixelFormat)
+        {
+            case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint:
+            case MTLPixelFormatR16Sint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+            case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Uint:
+            case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+            case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
+            case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint:
+            case MTLPixelFormatRGBA32Sint:
+                return false;
+            default:
+                break;
+        }
+        /* MSAA: the read is only defined per sample — rstateSpecialize forces
+         * per-sample shading while the advanced variant is in use */
+    }
+
+    /* cache hit on (MSL identity, equation)? */
+    if (m->adv_msl_src == (const void *)msl && m->adv_mode == mode && m->adv_failed)
+        return false;
+    if (m->adv_msl_src == (const void *)msl && m->adv_mode == mode && m->adv_lib)
+    {
+        id<MTLLibrary> lib = (__bridge id<MTLLibrary>)m->adv_lib;
+        id<MTLFunction> fn = [lib newFunctionWithName: [NSString stringWithUTF8String: entry]];
+        if (fn)
+        {
+            *out_msl = m->adv_msl;
+            *out_lib = lib;
+            *out_fn = fn;
+            return true;
+        }
+    }
+
+    char *v = mgl_advblend_rewrite(msl, entry, mode);
+    if (!v)
+    {
+        if (getenv("MGL_ADVBLEND_DEBUG"))
+            fprintf(stderr, "MGL advblend: cannot rewrite fragment MSL %s for %s\n",
+                    entry, mgl_advblend_mode_name(mode));
+        free(m->adv_msl);        m->adv_msl = NULL;
+        m->adv_msl_src = (const void *)msl;
+        m->adv_mode = mode;
+        m->adv_failed = 1;
+        if (m->adv_lib) { CFRelease(m->adv_lib); m->adv_lib = NULL; }
+        return false;
+    }
+
+    char err[256] = "";
+    id<MTLLibrary> lib = [self extProgramLibraryForMSL: v key: nil error: (char **)&err];
+    id<MTLFunction> fn = nil;
+    if (lib)
+        fn = [lib newFunctionWithName: [NSString stringWithUTF8String: entry]];
+    if (!fn)
+    {
+        fprintf(stderr, "MGL advblend: %s library/function failed: %s\n",
+                mgl_advblend_mode_name(mode), err[0] ? err : "no entry");
+        free(v);
+        m->adv_msl_src = (const void *)msl;
+        m->adv_mode = mode;
+        m->adv_failed = 1;
+        if (m->adv_lib) { CFRelease(m->adv_lib); m->adv_lib = NULL; }
+        return false;
+    }
+
+    /* remember the rewrite so repeated pipeline rebuilds (blend toggles,
+     * encoder churn) do not re-walk the MSL */
+    if (m->adv_msl && m->adv_msl != v)
+        free(m->adv_msl);
+    if (m->adv_lib && m->adv_lib != (__bridge void *)lib)
+        CFRelease(m->adv_lib);
+    m->adv_msl_src = (const void *)msl;
+    m->adv_mode = mode;
+    m->adv_failed = 0;
+    m->adv_msl = v;
+    m->adv_lib = (void *)CFBridgingRetain(lib);
+
+    {
+        const char *dbg = getenv("MGL_ADVBLEND_DEBUG");
+        if (dbg && dbg[0] >= '2')
+            fprintf(stderr, "===== MGL advblend MSL (%s) =====\n%s\n=====\n",
+                    mgl_advblend_mode_name(mode), v);
+    }
+
+    *out_msl = v;
+    *out_lib = lib;
+    *out_fn = fn;
+    return true;
 }
 
 /* dispatch the force-opaque kernel on tex (same command buffer, before the

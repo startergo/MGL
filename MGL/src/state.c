@@ -25,6 +25,13 @@
 #include "glm_context.h"
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
+/* compat: GL_KHR_blend_equation_advanced — declared directly because
+ * mgl_ext_compat.h redefines ERROR_RETURN with a `return;' that does not fit
+ * this file's bool helpers (see compat_advblend.c) */
+int mgl_advblend_mode(GLenum eq);
+void mgl_advblend_armed(GLMContext ctx);   /* compat_advblend.c: seen flag + lazy pre-draw hook */
+void mgl_compat_set_blend_advanced_coherent(GLMContext ctx, GLboolean on);   /* compat.c: ext slot */
+GLboolean mgl_compat_get_blend_advanced_coherent(GLMContext ctx);
 
 void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h);
 void mgl_rstate_set_all_scissors(GLMContext ctx, GLint x, GLint y, GLint w, GLint h);
@@ -72,6 +79,13 @@ static bool rs_set_cap(GLMContext ctx, GLenum cap, bool on)
         case GL_DEPTH_TEST: c->depth_test = on; break;
         case GL_STENCIL_TEST: c->stencil_test = on; break;
         case GL_DITHER: c->dither = on; break;
+        case GL_BLEND_ADVANCED_COHERENT_KHR:
+            /* compat (GL_KHR_blend_equation_advanced_coherent): query-only state —
+             * Metal framebuffer-fetch reads are coherent inside a render pass,
+             * so no barrier is ever required (compat_advblend.c).  Lives in the
+             * compat ext slot, NOT GLMCaps (layout stability, perf s30). */
+            mgl_compat_set_blend_advanced_coherent(ctx, on);
+            break;
         case GL_COLOR_LOGIC_OP: c->color_logic_op = on; break;
         case GL_POLYGON_OFFSET_POINT: c->polygon_offset_point = on; break;
         case GL_POLYGON_OFFSET_LINE: c->polygon_offset_line = on; break;
@@ -142,6 +156,10 @@ GLboolean mglIsEnabled(GLMContext ctx, GLenum cap)
         case GL_DEBUG_OUTPUT_SYNCHRONOUS: RET_CAP(debug_output_synchronous);
         case GL_DEPTH_TEST: RET_CAP(depth_test);
         case GL_DITHER: RET_CAP(dither);
+        case GL_BLEND_ADVANCED_COHERENT_KHR:
+            /* ext-slot state (see rs_set_cap): coherent default even if the
+             * slot could not be allocated */
+            return mgl_compat_get_blend_advanced_coherent(ctx);
         case GL_FRAMEBUFFER_SRGB: RET_CAP(framebuffer_srgb);
         case GL_LINE_SMOOTH: RET_CAP(line_smooth);
         case GL_MULTISAMPLE: RET_CAP(multisample);
@@ -617,6 +635,17 @@ void mglBlendEquationSeparate(GLMContext ctx, GLenum modeRGB, GLenum modeAlpha)
 
 void mglBlendEquation(GLMContext ctx, GLenum mode)
 {
+    /* compat (GL_KHR_blend_equation_advanced, GL 4.6 §17.3.8): the 15 advanced
+     * equations are accepted by glBlendEquation (and glBlendEquationi) ONLY —
+     * the Separate variants reject them with GL_INVALID_ENUM.  The pair is
+     * installed as RGB+A together; the compositing itself runs in a rewritten
+     * fragment shader (mgl_advblend.c), draw buffer 0 */
+    if (mgl_advblend_mode(mode) >= 0)
+    {
+        rs_blend_equation(ctx, 0, MAX_COLOR_ATTACHMENTS - 1, mode, mode);
+        mgl_advblend_armed(ctx);      /* lazy pre-draw hook + seen flag */
+        return;
+    }
     mglBlendEquationSeparate(ctx, mode, mode);
 }
 
@@ -629,6 +658,13 @@ void mglBlendEquationSeparatei(GLMContext ctx, GLuint buf, GLenum modeRGB, GLenu
 
 void mglBlendEquationi(GLMContext ctx, GLuint buf, GLenum mode)
 {
+    RS_CHECK(buf < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
+    if (mgl_advblend_mode(mode) >= 0)   /* advanced equations: this path only */
+    {
+        rs_blend_equation(ctx, buf, buf, mode, mode);
+        mgl_advblend_armed(ctx);      /* lazy pre-draw hook + seen flag */
+        return;
+    }
     mglBlendEquationSeparatei(ctx, buf, mode, mode);
 }
 

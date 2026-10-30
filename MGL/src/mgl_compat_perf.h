@@ -162,6 +162,19 @@ struct MGLExtMetal_compat {
     uint64_t texext_epoch_seq, texext_skip_epoch, texext_epoch_applied;
     void    *texext_prog;
     uint64_t texext_encoder_gen;
+
+    /* compat_advblend (GL_KHR_blend_equation_advanced): the framebuffer-fetch
+     * fragment variant of the program's MSL for the current equation — one
+     * entry, keyed on (source MSL pointer, equation mode).  adv_msl is the
+     * malloc'd rewrite (NULL = this combination cannot be rewritten, remember
+     * that), adv_lib the (id<MTLLibrary>) it compiled to (extProgramLibraryForMSL
+     * dedupes by text, this entry just avoids re-walking the MSL per pipeline
+     * rebuild).  Only touched while an advanced equation is active. */
+    const void *adv_msl_src;
+    int         adv_mode;
+    char       *adv_msl;
+    void       *adv_lib;
+    int         adv_failed;
 };
 
 #endif /* mgl_compat_perf_h */

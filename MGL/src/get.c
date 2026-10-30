@@ -397,7 +397,13 @@ static const char *mgl_extensions[] = {
     "GL_EXT_texture_filter_anisotropic",
     "GL_KHR_debug",
     "GL_EXT_texture_compression_s3tc",
-    "GL_KHR_texture_compression_astc_ldr",
+    /* GL 4.6 core §17.3.8 (from GL_KHR_blend_equation_advanced): the 15 advanced
+     * blend equations run in a framebuffer-fetch rewritten fragment shader
+     * (compat domain, mgl_advblend.c).  The tile reads are inherently coherent,
+     * so the coherent variant is advertised too and no barrier is needed. */
+    "GL_KHR_blend_equation_advanced",
+    "GL_KHR_blend_equation_advanced_coherent",
+    "GL_KHR_texture_compression_astc_ldr",   /* must stay LAST (hidden on no-ASTC) */
 };
 #define NUM_MGL_EXTENSIONS ((GLuint)(sizeof(mgl_extensions) / sizeof(mgl_extensions[0])))
 
@@ -702,9 +708,20 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
          * arguments (glBindImageTexture of an MS texture binds the whole texture — one
          * level, all samples), verified by test_geom / the CTS shader_image_size ms cases */
         case GL_MAX_SAMPLES:
+            /* renderbuffer/FBO MSAA cap = what Metal can actually allocate
+             * (MGLRenderer+Framebuffer.m fbUpdateLimits probes
+             * supportsTextureSampleCount: 4 on Apple M4 Pro; the value also backs
+             * glGetFramebufferParameteriv(GL_MAX_SAMPLES) and the renderbuffer
+             * samples validator, both of which already used the device cap —
+             * only this global query was stuck at 0, which falsely told the CTS
+             * "no multisample framebuffers at all" and gated whole groups
+             * (sample_variables samples_8: 'Test sample count greater than
+             * MAX_SAMPLES').  GL 4.6 requires MAX_SAMPLES >= 4. */
+            PUT1(LIMIT(STATE_VAR(max_framebuffer_samples), 4));
         case GL_MAX_IMAGE_SAMPLES:
             /* 0, not 4: MSL has no shader writes to multisample textures
-             * (texture2d_ms<access::write> is illegal MSL), so MS image STOREs
+             * (texture2d_ms<access::write> fails a static_assert in the Metal
+             * toolchain — re-verified 2026-10-29), so MS image STOREs
              * cannot exist.  GL allows 0; with 4 reported, the CTS exercises MS
              * image writes and fails at the Metal compile
              * (KHR-GL46.shader_image_load_store.basic-allTargets-store WriteMS).

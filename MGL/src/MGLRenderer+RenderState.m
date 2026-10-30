@@ -21,6 +21,11 @@
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_fb.h"     /* geom r58: mgl_fb_slot_lacks_alpha */
+/* compat: GL_KHR_blend_equation_advanced — declared instead of including
+ * mgl_ext_compat.h (it redefines ERROR_RETURN with a `return;', which does not
+ * fit this file's bool helpers) */
+int mgl_advblend_active(GLMContext ctx);   /* compat_advblend.c */
+GLboolean mgl_advblend_seen(GLMContext ctx);  /* compat_advblend.c: fast gate (one flag load) */
 
 /* tess r39: GL 4.6 §17.3.4 late-fragment-tests variant for side-effecting
  * fragment shaders (guarded discard + [[depth(any)]] output); mgl_ext_tess.h
@@ -471,6 +476,11 @@ static bool rs_mode_is_polygon(GLenum m)
      * an MSL rewrite of the fragment stage (compat_border.c) — even an otherwise
      * unpatched stage must reach the specialization below for it */
     bool border_emu = (stage == _FRAGMENT_SHADER) && mgl_border_wanted(ctx);
+    /* compat: GL_KHR_blend_equation_advanced — the advanced equations run in a
+     * framebuffer-fetch rewrite of the fragment stage (compat_advblend.c), so an
+     * active equation must reach the variant swap below as well */
+    bool advblend = (stage == _FRAGMENT_SHADER) &&
+                    mgl_advblend_seen(ctx) && mgl_advblend_active(ctx) >= 0;
     if (getenv("MGL_BORDER_DEBUG") && stage == _FRAGMENT_SHADER)
         fprintf(stderr, "MGL border: rstateSpecialize frag, wanted=%d patched=%d\n",
                 (int)border_emu, msl ? mgl_rstate_msl_is_patched(msl) : -1);
@@ -495,7 +505,7 @@ static bool rs_mode_is_polygon(GLenum m)
     if (!mgl_rstate_msl_is_patched(msl) &&
         !(msl && strstr(msl, "mgl_shadow_op_") != NULL) &&
         !(msl && strstr(msl, "mgl_wrap_op_") != NULL) && !standinFn && !border_emu &&
-        !lateFragVariant)
+        !advblend && !lateFragVariant)
         return (__bridge id<MTLFunction>)shader->mtl_data.function;
 
     id<MTLLibrary> lib = (__bridge id<MTLLibrary>)shader->mtl_data.library;
@@ -640,6 +650,28 @@ static bool rs_mode_is_polygon(GLenum m)
                 }
             }
         }
+        /* compat: GL_KHR_blend_equation_advanced — swap in the framebuffer-fetch
+         * variant of THIS fragment MSL (or, with the border variant in, of that
+         * rewrite); Metal fixed-function blending is off for attachment 0 while
+         * this function is in use (rstateConfigurePipelineDescriptor).  A no-op
+         * returning false unless an advanced equation is active. */
+        if (advblend)
+        {
+            id<MTLLibrary> alib = nil;
+            id<MTLFunction> afn = nil;
+            const char *amsl = NULL;
+            if ([self compatAdvancedBlendVariant: shader msl: &amsl library: &alib function: &afn] && afn)
+            {
+                lib = alib;
+                base = afn;
+                if (amsl) msl = amsl;
+                /* MSAA passes only define the [[color(0)]] read per sample, so the
+                 * equation must run per sample there (single-sample passes keep
+                 * the ordinary per-pixel shading) */
+                if (psamples > 1)
+                    per_sample = true;
+            }
+        }
         /* tess r39 (GL 4.6 §17.3.4): a fragment shader that writes to memory
          * (image/SSBO/atomic counter) and does not declare
          * layout(early_fragment_tests) must execute before the depth test —
@@ -781,6 +813,12 @@ static bool rs_mode_is_polygon(GLenum m)
         MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[i];
         if (a.pixelFormat == MTLPixelFormatInvalid) continue;
         bool blend = rs->blend[i] && !rs_format_is_integer(a.pixelFormat);
+        /* compat: GL_KHR_blend_equation_advanced (GL 4.6 §17.3.8) — the advanced
+         * equations composite inside the fragment shader (framebuffer fetch,
+         * compat_advblend.c), so Metal's fixed-function unit must stay off for
+         * attachment 0 while one is selected; plain equations are unchanged */
+        if (i == 0 && blend && mgl_advblend_seen(ctx) && mgl_advblend_active(ctx) >= 0)
+            blend = false;
         a.blendingEnabled = blend;
         a.sourceRGBBlendFactor = rs_blend_factor(ctx->state.var.blend_src_rgb[i]);
         a.destinationRGBBlendFactor = rs_blend_factor(ctx->state.var.blend_dst_rgb[i]);

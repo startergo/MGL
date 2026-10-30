@@ -231,6 +231,23 @@ typedef struct {
 struct MGLExtState_compat {
     GLboolean is_compat;          /* set at context creation */
 
+    /* GL_KHR_blend_equation_advanced fast gate: advblend_seen is set once an
+     * advanced equation is installed for the first time.  Until then the
+     * ordinary blend path must pay *nothing* for this extension: the pre-draw
+     * hook is not registered (the per-draw mgl_ext_pre_draw loop stays empty,
+     * exactly the pre-advblend behaviour) and the pipeline/specialize checks
+     * stop at this single load+branch.  It stays set once an advanced equation
+     * has been used (mgl_advblend_active() then decides per PSO build). */
+    GLboolean advblend_seen;
+
+    /* GL_BLEND_ADVANCED_COHERENT_KHR enable (GL_KHR_blend_equation_advanced_coherent):
+     * query-only state — Metal framebuffer-fetch reads are coherent inside a
+     * render pass, so no barrier is ever needed.  Kept HERE, not in GLMCaps:
+     * this struct is the compat domain's own extension slot, so adding the
+     * field cannot shift the layout of GLMCaps / GLMState (a mid-struct GLMCaps
+     * insertion moved hot per-draw state and cost glmark2 jellyfish ~5%). */
+    GLboolean blend_advanced_coherent;
+
     /* bound-VAO layout hash (per-draw fast path, see MGLC_VAO_HASH_ATTRIBS) */
     void     *vao_hash_vao;
     uint64_t  vao_hash;
@@ -583,5 +600,24 @@ void mgl_compat_point_parameteri(GLMContext ctx, GLenum pname, GLint param);
 void mgl_compat_point_parameteriv(GLMContext ctx, GLenum pname, const GLint *params);
 GLenum mgl_compat_target_index(GLenum target);   /* _TEXTURE_* or -1 */
 int mgl_compat_enabled_texture_target(GLMContext ctx, GLuint unit);
+
+/* compat_advblend.c — GL_KHR_blend_equation_advanced (GL 4.6 core §17.3.8).
+ * The 15 advanced equations run inside a rewritten copy of the fragment MSL
+ * that fetches the destination through a [[color(0)]] argument; Metal
+ * fixed-function blending stays off for attachment 0 for those pipelines.
+ * Nothing runs unless an advanced equation is active (one table lookup). */
+#define MGL_ADVBLEND_MODES 15
+int   mgl_advblend_mode(GLenum eq);              /* 0..14, -1 = not advanced */
+GLenum mgl_advblend_enum(int mode);              /* inverse table */
+const char *mgl_advblend_mode_name(int mode);    /* GLSL qualifier suffix */
+int   mgl_advblend_active(GLMContext ctx);       /* mode if blending now, -1 else */
+void  mgl_advblend_armed(GLMContext ctx);        /* advanced equation just installed: seen flag + lazy pre-draw hook */
+struct MGLExtState_compat *mgl_compat_slot_lazy(GLMContext ctx); /* materialise ext_compat on first compat-family write (NULL-safe, coherent default TRUE; perf s31) */
+GLboolean mgl_advblend_seen(GLMContext ctx);     /* fast gate: an advanced equation was ever installed */
+uint32_t mgl_advblend_scan_src(const char *src); /* blend_support_* bitmask */
+char *mgl_advblend_rewrite(const char *msl, const char *entry, int mode); /* malloc'd or NULL */
+bool  mgl_compat_advblend_pre_draw(GLMContext ctx, GLenum mode, GLsizei vertex_count,
+                                   GLsizei instance_count, bool indexed, GLenum type, size_t offset);
+void  mgl_compat_advblend_post_link(GLMContext ctx, Program *program);
 
 #endif /* MGL_EXT_COMPAT_H */

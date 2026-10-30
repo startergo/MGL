@@ -595,8 +595,17 @@ bool mgl_compat_vao_unchanged(GLMContext ctx, VertexArray *vao)
 }
 
 void mgl_ext_init_compat(GLMContext ctx){
-    if (mglNextContextProfile() != GL_CONTEXT_COMPATIBILITY_PROFILE_BIT)
-        return;     /* core context: compat entry points stay stubs */
+    bool compat = mglNextContextProfile() == GL_CONTEXT_COMPATIBILITY_PROFILE_BIT;
+
+    /* ZERO-FOOTPRINT for core contexts (perf s31): nothing is allocated until
+     * a compat profile is created OR an advanced blend equation / coherent-cap
+     * write actually happens (mgl_compat_slot_lazy).  A core context that
+     * never touches GL_KHR_blend_equation_advanced gets NO ext_compat slot,
+     * NO extra allocation, and an identical heap allocation sequence to a
+     * build without this code — the s29/s30 measurements showed allocation
+     * order/layout alone can cost several percent on draw-heavy scenes. */
+    if (!compat)
+        return;
 
     struct MGLExtState_compat *s = (struct MGLExtState_compat *)calloc(1, sizeof(struct MGLExtState_compat));
 
@@ -604,6 +613,14 @@ void mgl_ext_init_compat(GLMContext ctx){
         return;
 
     ctx->state.ext_compat = s;
+
+    /* NO hook is registered here: the pre-draw hook is armed lazily by the
+     * advanced-equation setters (state.c), and the blend_support_* mask is
+     * scanned from Shader->src on the advanced paths only — so until an
+     * advanced equation is actually selected, GL_KHR_blend_equation_advanced
+     * leaves the link and draw paths completely untouched (perf s30). */
+    s->blend_advanced_coherent = GL_TRUE;  /* Metal tile reads are coherent (ext slot, not GLMCaps) */
+
     s->is_compat = GL_TRUE;
 
     s->version[0] = 0;
@@ -634,11 +651,55 @@ void mgl_ext_init_compat(GLMContext ctx){
     mgl_compat_init_dispatch(ctx);
 }
 
+/* GL_BLEND_ADVANCED_COHERENT_KHR enable lives in THIS domain's ext slot (adding
+ * it to GLMCaps would shift the GLMState layout — perf s30); state.c reaches it
+ * through these two helpers */
+struct MGLExtState_compat *mgl_compat_slot_lazy(GLMContext ctx)
+{
+    struct MGLExtState_compat *s = CS();
+    if (!s)
+    {
+        /* first compat-family state write on a core context (advanced blend
+         * equation, or a coherent-cap enable/disable): materialise the slot
+         * now.  is_compat stays FALSE — this context only gains the advblend
+         * bits, not the compat-profile machinery.  Cold path by design
+         * (perf s31: zero allocations for contexts that never touch it). */
+        s = (struct MGLExtState_compat *)calloc(1, sizeof(struct MGLExtState_compat));
+        if (s)
+        {
+            s->blend_advanced_coherent = GL_TRUE;   /* Metal tile reads are coherent */
+            ctx->state.ext_compat = s;
+        }
+    }
+    return s;
+}
+
+void mgl_compat_set_blend_advanced_coherent(GLMContext ctx, GLboolean on)
+{
+    struct MGLExtState_compat *s = mgl_compat_slot_lazy(ctx);
+    if (s)
+        s->blend_advanced_coherent = on;
+}
+
+GLboolean mgl_compat_get_blend_advanced_coherent(GLMContext ctx)
+{
+    struct MGLExtState_compat *s = CS();
+    return s ? s->blend_advanced_coherent : (GLboolean)GL_TRUE;
+}
+
 #pragma mark - glGet pnames of the compat domain
 
 bool mgl_ext_get_compat(GLMContext ctx, GLenum pname, GLuint type, void *data)
 {
     struct MGLExtState_compat *s = CS();
+
+    /* GL_KHR_blend_equation_advanced_coherent state exists in both profiles
+     * (query-only: Metal tile reads are coherent, no barrier is ever needed) */
+    if (pname == GL_BLEND_ADVANCED_COHERENT_KHR)
+    {
+        mgl_get_store(type, data, 0, s ? s->blend_advanced_coherent : GL_TRUE);
+        return true;
+    }
 
     if (!s || !s->is_compat)
         return false;

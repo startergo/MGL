@@ -396,6 +396,10 @@ typedef struct Spirv_t {
                              * renderer's buffer-map ordinal — mgl_msl_fix_image_atomics
                              * records it and the map binds it here (0xffffffff = none) */
 } Spirv;
+/* compat (GL_KHR_blend_equation_advanced): the per-stage blend_support_* mask is
+ * NOT cached here any more — a field inside Spirv_t grew every Program and
+ * shifted the hot struct layout (perf s30, glmark2 jellyfish -5%).  The mask is
+ * re-scanned from Shader->src on the advanced-blend paths only (cold). */
 
 typedef struct SpirvResource_t {
     GLuint  _id;

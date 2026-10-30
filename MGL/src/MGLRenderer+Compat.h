@@ -98,6 +98,15 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
 - (bool) compatTexResolveHit:(bool)frag unit:(GLuint)unit slot:(GLuint)slot tex:(Texture *)tex;
 - (void) compatTexResolveRecord:(bool)frag unit:(GLuint)unit slot:(GLuint)slot tex:(Texture *)tex
                            view:(id<MTLTexture>)view sampler:(id<MTLSamplerState>)samp;
+
+/* compat: GL_KHR_blend_equation_advanced (GL 4.6 core §17.3.8) — when an
+ * advanced equation is active, the rewritten fragment variant that composites
+ * via a [[color(0)]] framebuffer fetch (compat_advblend.c).  Returns false
+ * when the normal fixed-function path should be kept (no Metal work then). */
+- (bool) compatAdvancedBlendVariant: (Shader *)shader
+                                msl: (const char **)out_msl
+                            library: (id<MTLLibrary> *)out_lib
+                          function: (id<MTLFunction> *)out_fn;
 @end
 
 #endif

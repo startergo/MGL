@@ -99,6 +99,42 @@ int main(int argc, char **argv)
             snprintf(label, sizeof(label), "blend-flip draws x%d", iters);
             break;
         }
+        case 31: {  /* glBlendFunc flip per draw (ideas-like: PSO churn) */
+            for (int i = 0; i < 200; i++) {
+                if (i & 1) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                else       glBlendFunc(GL_ONE, GL_ONE);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++) {
+                if (i & 1) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                else       glBlendFunc(GL_ONE, GL_ONE);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+            glFinish();
+            t = now_s() - t0;
+            snprintf(label, sizeof(label), "blendFunc-flip draws x%d", iters);
+            break;
+        }
+        case 32: {  /* glBlendEquation flip per draw (plain equations only) */
+            for (int i = 0; i < 200; i++) {
+                if (i & 1) glBlendEquation(GL_FUNC_ADD);
+                else       glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++) {
+                if (i & 1) glBlendEquation(GL_FUNC_ADD);
+                else       glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+            glFinish();
+            t = now_s() - t0;
+            snprintf(label, sizeof(label), "blendEquation-flip draws x%d", iters);
+            break;
+        }
         case 2: {  /* triangle fan, per-draw CPU emulation */
             for (int i = 0; i < 100; i++) glDrawArrays(GL_TRIANGLE_FAN, 0, 64);
             glFinish();
