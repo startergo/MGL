@@ -869,10 +869,48 @@ TEST(sample_compressed_and_uploaded)
     glDeleteTextures(2, ts);
 }
 
+/* A D24S8 texel whose depth is the MAXIMUM (0xffffff) must survive every readback
+ * path, not only the byte-identical 24_8 round trip above: reading the same texel
+ * as DEPTH_COMPONENT/FLOAT has to give exactly 1.0 (geom r76: a probe computed the
+ * client word with `(unsigned)(1.0f * 16777215.0f + 0.5f)`, which rounds to
+ * 0x1000000 in FLOAT arithmetic, so its own low 3 bytes were 0 — the "lost depth
+ * 1.0" was in the probe, not in MGL.  This test pins the real behaviour.) */
+TEST(depth24_stencil8_max_depth_reads)
+{
+    GLuint ds[4] = { (0x800000u << 8) | 0x5a, (0xffffffu << 8) | 0x01,
+                     (0x000001u << 8) | 0xff, (0xffffffu << 8) | 0xa5 };
+    GLuint t = new_tex(GL_TEXTURE_2D);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 4, 1, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, ds);
+    EXPECT_NO_GL_ERROR();
+
+    float d[4];
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_NEAR(d[0], 0.5, 1e-7);
+    EXPECT_NEAR(d[1], 1.0, 1e-7);      /* the maximum must not clamp to 0 */
+    EXPECT_NEAR(d[2], 1.0 / 16777215.0, 1e-9);
+    EXPECT_NEAR(d[3], 1.0, 1e-7);
+
+    unsigned char s[4];
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, s);
+    EXPECT_NO_GL_ERROR();
+    EXPECT_EQ_INT(s[0], 0x5a);
+    EXPECT_EQ_INT(s[1], 0x01);
+    EXPECT_EQ_INT(s[2], 0xff);
+    EXPECT_EQ_INT(s[3], 0xa5);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glDeleteTextures(1, &t);
+}
+
 int main(void)
 {
     RUN(rgba8_roundtrip);
     RUN(format_roundtrips);
+    RUN(depth24_stencil8_max_depth_reads);
     RUN(format_conversions);
     RUN(unpack_pack_state);
     RUN(subimage_after_gpu);

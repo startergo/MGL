@@ -783,20 +783,26 @@ uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_
                 memcpy(mod, in, n * sizeof(uint32_t));
             }
             /* patch the OpMemberDecorate Offset word of (type, member): the words are
-             * [0]=opcode/len [1]=type [2]=member [3]=decoration [4]=literal */
-            for (size_t o = 5; o + 5 <= n; o++)
+             * [0]=opcode/len [1]=type [2]=member [3]=decoration [4]=literal.
+             * Walk INSTRUCTION-ALIGNED from the header: a byte-granular scan can
+             * match string/debug words that merely look like a patch target and
+             * then scribble `want` over a real instruction's opcode/length word,
+             * corrupting the module ("SPIR-V instruction goes out of bounds",
+             * KHR-GL46.texture_gather.offset-gather-float-2drect flake). */
+            for (size_t o = 5; o < n; )
             {
                 uint32_t op = mod[o];
-                if ((op & 0xffff) != SpvOpMemberDecorate) continue;
                 uint32_t len = op >> 16;
-                if (o + len > n) break;
-                if (mod[o + 1] == t->id && mod[o + 2] == (uint32_t)mem &&
-                    mod[o + 3] == SpvDecorationOffset && len >= 5)
+                if (len == 0 || o + len > n) break;   /* malformed tail: nothing more to patch */
+                if ((op & 0xffff) == SpvOpMemberDecorate && len >= 5 &&
+                    mod[o + 1] == t->id && mod[o + 2] == (uint32_t)mem &&
+                    mod[o + 3] == SpvDecorationOffset && mod[o + 4] != want)
                 {
                     mod[o + 4] = want;
                     changed = true;
-                    break;
+                    break;   /* one Offset decorate per member */
                 }
+                o += len;
             }
         }
     }

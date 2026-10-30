@@ -4476,7 +4476,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                             if (ftex && fsamp)
                             {
                                 [computeCommandEncoder setTexture: ftex atIndex: mtl_index + e];
-                                [computeCommandEncoder setSamplerState: fsamp atIndex: mtl_index + e];
+                                [computeCommandEncoder setSamplerState: fsamp
+                                                                 atIndex: [self geomComputeSamplerSlotForImage: (sres && sres->name) ? sres->name : ""
+                                                                                                        textureSlot: mtl_index + e]];
                                 continue;
                             }
                         }
@@ -4500,6 +4502,19 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                     texture ? (unsigned long)texture.textureType : 0ul,
                                     texture ? (unsigned long)texture.pixelFormat : 0ul,
                                     mtl_index + e);
+
+                        /* a STORAGE IMAGE is a plain [[texture(n)]] argument of the MSL
+                         * with no sampler (see the render binder's identical rule):
+                         * binding one anyway at the image's texture slot clobbered a
+                         * sampled texture's real sampler(N) with the image unit's own
+                         * sampler state — a kernel sampling with NEAREST then ran with
+                         * Metal's default linear+repeat (KHR-GL46.stencil_texturing.
+                         * functional's compute pass, texture_swizzle cases) */
+                        if (gl_texture_type == _IMAGE_TEXTURE)
+                        {
+                            [computeCommandEncoder setTexture:texture atIndex:mtl_index + e];
+                            continue;
+                        }
                         if (!sampler) continue;   /* no sampler state: skip, MSL default applies */
 
                         [computeCommandEncoder setTexture:texture atIndex:mtl_index + e];

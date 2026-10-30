@@ -2171,6 +2171,42 @@ static id<MTLTexture> g3DShadowBase[TEXTURE_UNITS];   /* retained 3D base of the
 static void *g3DShadowOwner[TEXTURE_UNITS];
 static GLuint g3DShadowLevel[TEXTURE_UNITS], g3DShadowLayer[TEXTURE_UNITS];
 static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
+static BOOL g3DShadowLive = NO;  /* any shadow exists (shadows are never freed before teardown) */
+
+/* per-draw gating (glmark2 ideas/jellyfish): the 3D-shadow sync scan runs only
+ * for programs that actually have storage-image resources, or while any shadow
+ * is alive (write-back duty).  Cached per program pointer + MSL pointer (a
+ * program's address is recycled constantly by CTS-style apps). */
+- (bool) geomProgramUsesImages: (Program *)p
+{
+    static struct { const void *prog, *msl; bool has; } cache[4];
+    if (!p)
+        return false;
+    const void *msl = (const void *)p->spirv[_FRAGMENT_SHADER].msl_str;
+    if (!msl)
+        msl = (const void *)p->spirv[_VERTEX_SHADER].msl_str;
+
+    for (int i = 0; i < 4; i++)
+        if (cache[i].prog == (const void *)p && cache[i].msl == msl)
+            return cache[i].has;
+
+    bool has = false;
+    for (int s = 0; s < _MAX_SHADER_TYPES && !has; s++)
+    {
+        if (!p->shader_slots[s])
+            continue;
+        const SpirvResourceList *l = &p->spirv_resources_list[s][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+        if (l && l->count)
+            has = true;
+    }
+
+    int ci = 0;
+    for (int i = 1; i < 4; i++) if (!cache[i].prog) { ci = i; break; }
+    cache[ci].prog = (const void *)p;
+    cache[ci].msl = msl;
+    cache[ci].has = has;
+    return has;
+}
 
 - (const char *) geom3DPlaneMslType: (GLenum) internalformat
 {
@@ -2279,6 +2315,21 @@ static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
     if (!ctx || !ctx->mtl_funcs.ext_texdata)
         return;
 
+    /* glmark2 ideas/jellyfish gating: nothing to write back and no stage can
+     * consume an image unit — the scan is pure overhead.  With a bound program
+     * PIPELINE and no current program, processGLState substitutes the composite
+     * only later (MGL_PIPELINE_PROGRAM_SCOPE inside it), so consult the
+     * pipeline's stage programs directly here. */
+    bool uses_images = [self geomProgramUsesImages: ctx->state.program];
+    if (!uses_images && !ctx->state.program && STATE(program_pipeline))
+    {
+        MGLPipelineObj *po = MGL_PIPELINE_OBJ(STATE(program_pipeline));
+        for (int s = 0; s < _MAX_SHADER_TYPES && !uses_images; s++)
+            uses_images = [self geomProgramUsesImages: po->base.stage_programs[s]];
+    }
+    if (!g3DShadowLive && !uses_images)
+        return;
+
     /* write back shadows that stopped matching their unit's binding (or whose
      * unit no longer wants one) */
     for (GLuint u = 0; u < TEXTURE_UNITS; u++)
@@ -2328,6 +2379,7 @@ static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
             d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
             d.storageMode = MTLStorageModePrivate;
             g3DShadowTex[u] = [_device newTextureWithDescriptor:d];
+            g3DShadowLive = YES;
             g3DShadowValid[u] = NO;
             g3DShadowPending[u] = NO;
         }
@@ -2389,6 +2441,11 @@ static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
     if (!ctx)
         return;
 
+    /* no shadow ever created (g3DShadowLive, see geom3DImageShadowSync): the
+     * per-commit unit scan below is pure overhead — glmark2 pays it per frame */
+    if (!g3DShadowLive)
+        return;
+
     for (GLuint u = 0; u < TEXTURE_UNITS; u++)
         if (g3DShadowTex[u] && g3DShadowPending[u] && g3DShadowBase[u])
             units[ncopy++] = u;
@@ -2423,6 +2480,11 @@ static BOOL g3DShadowValid[TEXTURE_UNITS], g3DShadowPending[TEXTURE_UNITS];
 /* read of a 3D texture outside the image path: flush its shadow first */
 - (void) geom3DImageShadowFlushTexture: (Texture *) tex
 {
+    /* no shadow ever created (see geom3DImageShadowSync): the unit scan is pure
+     * overhead on every texture download (glmark2 pays it per frame readback) */
+    if (!g3DShadowLive)
+        return;
+
     for (GLuint u = 0; u < TEXTURE_UNITS; u++)
         if (g3DShadowPending[u] && g3DShadowOwner[u] == (void *)tex)
         {
@@ -3867,14 +3929,17 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
  * program); fall back to the texture index when it cannot be found. */
 - (NSUInteger) geomComputeSamplerSlotForImage: (const char *)img_name textureSlot: (NSUInteger)tslot
 {
-    static struct { const void *program; char name[96]; NSUInteger slot; } cache[8];
+    static struct { const void *program; const void *msl; char name[96]; NSUInteger slot; } cache[8];
     if (!ctx || !ctx->state.program) return tslot;
     const char *msl = ctx->state.program->spirv[_COMPUTE_SHADER].msl_str;
     if (!msl || !img_name || !*img_name) return tslot;
 
+    /* the MSL pointer is part of the key: programs are freed and their addresses
+     * recycled constantly (CTS links thousands), and a different program's slot
+     * for the same resource name would silently mis-bind the sampler */
     int ci = -1;
     for (int i = 0; i < 8; i++)
-        if (cache[i].program == (const void *)ctx->state.program &&
+        if (cache[i].program == (const void *)ctx->state.program && cache[i].msl == (const void *)msl &&
             strncmp(cache[i].name, img_name, sizeof cache[i].name) == 0)
             return cache[i].slot;
     for (int i = 0; i < 8; i++) if (!cache[i].program) { ci = i; break; }
@@ -3892,6 +3957,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         if (v >= 0) slot = (NSUInteger)v;
     }
     cache[ci].program = (const void *)ctx->state.program;
+    cache[ci].msl = (const void *)msl;
     snprintf(cache[ci].name, sizeof cache[ci].name, "%s", img_name);
     cache[ci].slot = slot;
     return slot;

@@ -1832,6 +1832,14 @@ static size_t mgl_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_w
     /* ids[id] tags: 1 = rect image type, 2 = rect sampled-image type,
      * 3 = pointer to it, 4 = variable of it */
     size_t i = 5;
+    /* pass A: mark the rect-image chain first.  OpName entries live in the
+     * debug section and routinely PRECEDE the instructions they name, so the id
+     * table must be complete before the budget pass decides which names get
+     * renamed: budgeting while marking (the old single pass) added no "+2" for
+     * names ahead of their definition yet the rebuild pass renamed them anyway
+     * — an 8-byte heap overflow that corrupted neighbouring allocations and
+     * flaked whole links ("SPIR-V instruction goes out of bounds",
+     * KHR-GL46.texture_gather.offset-gather-float-2drect). */
     while (i < n)
     {
         uint32_t wc = w[i] >> 16;
@@ -1858,8 +1866,18 @@ static size_t mgl_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_w
             default:
                 break;
         }
+        i += wc;
+    }
+
+    /* pass B: exact output budget (the id table is complete now) */
+    i = 5;
+    while (i < n)
+    {
+        uint32_t wc = w[i] >> 16;
+        uint32_t op = w[i] & 0xffff;
+        if (wc == 0 || i + wc > n) break;
         if (op == kSpvOpName && wc >= 2 && w[i + 1] < n && ids[w[i + 1]] == 4)
-            need += 2;   /* "_mglrect" = 8 chars = 2 words */
+            need += wc + 2;   /* rename: "name" -> "name_mglrect" = +8 bytes = +2 words */
         else
             need += wc;
         i += wc;

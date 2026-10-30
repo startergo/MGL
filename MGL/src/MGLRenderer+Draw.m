@@ -756,6 +756,13 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
      * encoder (and its pipeline state) exists */
     [self geomPrepareImageAtomicsCompute];
 
+    /* geom: a NON-LAYERED 3D image unit runs through its 2D shadow plane, which is
+     * refreshed at draw start — a compute dispatch can be that plane's FIRST
+     * consumer after glBindImageTexture, so refresh here too, in its own compute
+     * pass before this encoder exists (self-gated: a no-op unless a stage of the
+     * current program/pipeline uses image units) */
+    [self geom3DImageShadowSync];
+
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc)
         return false;

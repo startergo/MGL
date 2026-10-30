@@ -115,8 +115,126 @@ TEST(img3d_nonlayered_copy)
     glDeleteProgram(prog);
 }
 
+/* r75: the same non-layered 3D image unit consumed by glDispatchCompute as its
+ * FIRST user after glBindImageTexture — no draw refreshes the 2D shadow plane in
+ * between (the compute path refreshes it in its own compute pass now).  Also
+ * covers stores INTO a 3D slice from compute (the pending write-back at the next
+ * commit / readback). */
+static const char *kCs3d =
+    "#version 460 core\n"
+    "layout(local_size_x = 4, local_size_y = 4, local_size_z = 1) in;\n"
+    "layout(binding = 0, rgba8) readonly uniform image2D src;\n"
+    "layout(binding = 1, rgba8) writeonly uniform image2D dst;\n"
+    "void main() {\n"
+    "    ivec2 c = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    imageStore(dst, c, imageLoad(src, c) * 2.0 + 0.25);\n"
+    "}\n";
+
+TEST(img3d_compute_nonlayered)
+{
+    GLuint prog = 0, src = 0, mid = 0, dst = 0;
+    GLubyte back[4][4][4][4];
+
+    prog = glCreateProgram();
+    {
+        GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+        glShaderSource(cs, 1, &kCs3d, NULL);
+        glCompileShader(cs);
+        glAttachShader(prog, cs);
+        glDeleteShader(cs);
+    }
+    glLinkProgram(prog);
+    EXPECT_NO_GL_ERROR();
+    {
+        GLint ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        EXPECT_EQ_INT(ok, 1);
+    }
+    glUseProgram(prog);
+
+    glGenTextures(1, &src);
+    glBindTexture(GL_TEXTURE_3D, src);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA8, 4, 4, 4);
+    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 4, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, src_data);
+    EXPECT_NO_GL_ERROR();
+
+    glGenTextures(1, &mid);
+    glBindTexture(GL_TEXTURE_2D, mid);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 4, 4);
+    EXPECT_NO_GL_ERROR();
+
+    glGenTextures(1, &dst);
+    glBindTexture(GL_TEXTURE_3D, dst);
+    glTexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA8, 4, 4, 4);
+    EXPECT_NO_GL_ERROR();
+
+    /* read path: 3D slice -> shadow -> compute -> 2D image (no draw in the loop) */
+    for (int z = 0; z < 4; z++)
+    {
+        glBindImageTexture(0, src, 0, GL_FALSE, z, GL_READ_ONLY, GL_RGBA8);
+        glBindImageTexture(1, mid, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        EXPECT_NO_GL_ERROR();
+        glDispatchCompute(1, 1, 1);
+        EXPECT_NO_GL_ERROR();
+    }
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+
+    memset(back, 0xee, sizeof back);
+    glBindTexture(GL_TEXTURE_2D, mid);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    EXPECT_NO_GL_ERROR();
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            for (int c = 0; c < 4; c++)
+            {
+                /* the LAST dispatch (z=3) must be in mid */
+                int v = src_data[3][y][x][c];
+                int want = v * 2 + 64 > 255 ? 255 : v * 2 + 64;
+                int got = back[0][y][x][c];
+                if (got < want - 2 || got > want + 2)
+                    MGL_FAIL("read: (%d,%d) ch%d: %d, expected %d (src %d)", x, y, c, got, want, v);
+                mgl_test_checks++;
+            }
+
+    /* write path: 2D image -> compute -> 3D slice (shadow write-back) */
+    glBindTexture(GL_TEXTURE_2D, mid);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, src_data[0]);
+    for (int z = 0; z < 4; z++)
+    {
+        glBindImageTexture(0, mid, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+        glBindImageTexture(1, dst, 0, GL_FALSE, z, GL_WRITE_ONLY, GL_RGBA8);
+        EXPECT_NO_GL_ERROR();
+        glDispatchCompute(1, 1, 1);
+        EXPECT_NO_GL_ERROR();
+    }
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+
+    memset(back, 0xee, sizeof back);
+    glBindTexture(GL_TEXTURE_3D, dst);
+    glGetTexImage(GL_TEXTURE_3D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+    EXPECT_NO_GL_ERROR();
+    for (int z = 0; z < 4; z++)
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++)
+                for (int c = 0; c < 4; c++)
+                {
+                    int v = src_data[0][y][x][c];
+                    int want = v * 2 + 64 > 255 ? 255 : v * 2 + 64;
+                    int got = back[z][y][x][c];
+                    if (got < want - 2 || got > want + 2)
+                        MGL_FAIL("write z=%d (%d,%d) ch%d: %d, expected %d (src %d)", z, x, y, c, got, want, v);
+                    mgl_test_checks++;
+                }
+
+    glDeleteTextures(1, &src);
+    glDeleteTextures(1, &mid);
+    glDeleteTextures(1, &dst);
+    glDeleteProgram(prog);
+}
+
 int main(void)
 {
     RUN(img3d_nonlayered_copy);
+    RUN(img3d_compute_nonlayered);
     return mgl_test_summary();
 }
