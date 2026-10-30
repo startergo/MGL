@@ -1424,6 +1424,124 @@ TEST(TessGeometryMultiPatch)
     glDeleteProgram(p);
 }
 
+/* --- gl_Layer from the vertex / evaluation stage (ARB_shader_viewport_layer_array)
+ *
+ * Metal needs MTLRenderPipelineDescriptor.inputPrimitiveTopology once the final
+ * pre-rasterization function writes [[render_target_array_index]] (gl_Layer), and
+ * rejects a [[point_size]] write under a non-Point topology — the rstate patcher
+ * therefore skips the synthetic point-size member for layer writers.  Both guards
+ * (tessConfigureLayeredTopology + state_ext.c) are exercised here: VS-only and
+ * TES (the post-tessellation vertex function is the TES). */
+static GLuint make_layered_fbo(GLuint *tex, int layers)
+{
+    GLuint fbo;
+    glGenTextures(1, tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, *tex);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 64, 64, layers);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, *tex, 0);
+    GLenum db = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1, &db);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 64, 64);
+    return fbo;
+}
+
+static float read_layer(GLuint tex, int layer, int x, int y)
+{
+    GLuint rfbo;
+    float c[4] = { 0, 0, 0, 0 };
+    glGenFramebuffers(1, &rfbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, rfbo);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, layer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, c);
+    glDeleteFramebuffers(1, &rfbo);
+    return c[0];
+}
+
+TEST(TessLayerFromVertexStage)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "#extension GL_ARB_shader_viewport_layer_array: require\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "uniform int u_layer;\n"
+        "void main()\n"
+        "{\n"
+        "  gl_Position = a_pos;\n"
+        "  gl_Layer = u_layer;\n"
+        "  v_col = vec4(1, 0, 0, 1);\n"
+        "}\n";
+    static const float quad[4][4] = {
+        { -1, -1, 0, 1 }, { -1, 1, 0, 1 }, { 1, -1, 0, 1 }, { 1, 1, 0, 1 },
+    };
+    GLuint p = mgl_make_program5(vs, NULL, NULL, NULL, kFs);
+    EXPECT_TRUE(p != 0);
+    if (!p) return;
+
+    GLuint tex, fbo = make_layered_fbo(&tex, 4);
+    setup_patch_vao(quad, quad, 4);
+    glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "u_layer"), 2);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    printf("  [vs layer] layer0=%.2f layer2=%.2f (want 0.0 1.0)\n",
+           read_layer(tex, 0, 32, 32), read_layer(tex, 2, 32, 32));
+    EXPECT_NEAR(read_layer(tex, 2, 32, 32), 1.0f, 1e-4);
+    EXPECT_NEAR(read_layer(tex, 0, 32, 32), 0.0f, 1e-4);
+    EXPECT_NEAR(read_layer(tex, 3, 32, 32), 0.0f, 1e-4);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+}
+
+TEST(TessLayerFromEvaluationStage)
+{
+    const char *tcs = kTcsTri;
+    const char *tes =
+        "#version 450 core\n"
+        "#extension GL_ARB_shader_viewport_layer_array: require\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location=0) in vec4 tc_col[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "uniform int u_layer;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = vec4(1, 0, 0, 1);\n"
+        "  gl_Layer = u_layer;\n"
+        "}\n";
+    GLuint p = mgl_make_program5(kVs, tcs, tes, NULL, kFs);
+    EXPECT_TRUE(p != 0);
+    if (!p) return;
+
+    GLuint tex, fbo = make_layered_fbo(&tex, 4);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "u_layer"), 1);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    printf("  [tes layer] layer0=%.2f layer1=%.2f (want 0.0 1.0)\n",
+           read_layer(tex, 0, 16, 16), read_layer(tex, 1, 16, 16));
+    EXPECT_NEAR(read_layer(tex, 1, 16, 16), 1.0f, 1e-4);
+    EXPECT_NEAR(read_layer(tex, 0, 16, 16), 0.0f, 1e-4);
+    EXPECT_NEAR(read_layer(tex, 3, 16, 16), 0.0f, 1e-4);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -1472,6 +1590,8 @@ int main(void)
     RUN(TessProgramQueries);
     RUN(TessErrors);
     RUN(TessDefaultLevels);
+    RUN(TessLayerFromVertexStage);
+    RUN(TessLayerFromEvaluationStage);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

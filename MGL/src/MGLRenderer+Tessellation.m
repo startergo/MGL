@@ -3953,7 +3953,6 @@ static MTLVertexFormat tessMemberFormat(const char *type)
 - (void) extTessConfigurePipeline: (MTLRenderPipelineDescriptor *) desc
 {
     MGLTessProgram *tp = mgl_tess_active_program(ctx);
-
     if (!tp || !desc)
         return;
 
@@ -3966,6 +3965,65 @@ static MTLVertexFormat tessMemberFormat(const char *type)
     desc.maxTessellationFactor = MGL_TESS_MAX_LEVEL;
     desc.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
     desc.tessellationOutputWindingOrder = tp->vertex_order_ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
+}
+
+/* Metal requires MTLRenderPipelineDescriptor.inputPrimitiveTopology to be set when
+ * the vertex function writes [[render_target_array_index]] / [[viewport_array_index]]
+ * — i.e. gl_Layer / gl_ViewportIndex written directly from the vertex or evaluation
+ * stage (GL_ARB_shader_viewport_layer_array); without it the PSO build is rejected
+ * ("inputPrimitiveTopology is not specified").  The geometry emulation sets its own
+ * (geomConfigureTopology); this covers the GS-less pipelines, whose final
+ * pre-rasterization stage is the plain vertex function or the post-tessellation
+ * vertex function (TES). */
+- (void) tessConfigureLayeredTopology: (MTLRenderPipelineDescriptor *) pd
+{
+    if (!pd || pd.inputPrimitiveTopology != MTLPrimitiveTopologyClassUnspecified)
+        return;
+
+    Program *program = STATE(program);
+    if (!program || program->shader_slots[_GEOMETRY_SHADER])
+        return;                       /* geometry domain owns that path */
+
+    int stage = program->shader_slots[_TESS_EVALUATION_SHADER] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER;
+    const char *msl = program->spirv[stage].msl_str;
+    if (!msl)
+        return;
+
+    /* does this stage write the layer at all?  (no caching: MSL strings are
+     * freed/reallocated at the same addresses across programs, so a
+     * pointer-keyed cache gets poisoned; the scan only runs when the pipeline
+     * descriptor is rebuilt, not per draw) */
+    bool layered_out = strstr(msl, "[[render_target_array_index") != NULL;
+    if (!layered_out)
+        return;
+
+
+    GLenum mode = ctx->state.ext_tess ? ctx->state.ext_tess->draw_mode : GL_NONE;
+    switch (mode)
+    {
+        case GL_POINTS:
+            pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+            break;
+        case GL_LINES: case GL_LINE_STRIP: case GL_LINE_LOOP:
+            pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+            break;
+        case GL_PATCHES:
+        {
+            /* post-tessellation topology: the TES layout (point_mode wins,
+             * isolines rasterize as lines, triangles/quads as triangles) */
+            MGLTessProgram *tp = mgl_tess_active_program(ctx);
+            if (tp && tp->point_mode)
+                pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+            else if (tp && tp->domain == MGL_TESS_DOMAIN_ISOLINES)
+                pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+            else
+                pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+            break;
+        }
+        default:
+            pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+            break;
+    }
 }
 
 /* Compile options for MSL emitted by MGL's shader toolchain.

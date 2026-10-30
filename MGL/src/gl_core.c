@@ -7360,6 +7360,14 @@ void glTextureBarrier()
     ctx->dispatch.texture_barrier(ctx);
 }
 
+/* ARB_texture_barrier alias (see glDrawArraysInstancedARB): same operation as the
+ * core 4.5 entry point; the ARB name exists so the CTS can fetch it when the
+ * extension string is advertised. */
+void glTextureBarrierARB()
+{
+    glTextureBarrier();
+}
+
 /* ARB_gl_spirv alias (see glDrawArraysInstancedARB) */
 void glSpecializeShaderARB(GLuint shader, const GLchar *pEntryPoint, GLuint numSpecializationConstants, const GLuint *pConstantIndex, const GLuint *pConstantValue)
 {

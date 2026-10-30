@@ -524,13 +524,27 @@ char *mgl_rstate_patch_vertex_msl(const char *msl, const char *entry)
 
     bool has_psz = rs_struct_member_with_attr(msl, e.ret_type, "[[point_size", psz, sizeof psz, NULL);
 
+    /* Metal rejects a vertex function that writes [[point_size]] when the pipeline's
+     * inputPrimitiveTopology is a non-Point class.  A function that writes
+     * [[render_target_array_index]] (gl_Layer written from this stage —
+     * ARB_shader_viewport_layer_array) *requires* that topology class to be set
+     * (MGLRenderer+Tessellation.m tessConfigureLayeredTopology), so for those the
+     * synthetic point-size member must not be added: point rendering then uses
+     * Metal's default size and PROGRAM_POINT_SIZE is not emulated — degenerate
+     * combination (a layer-writing vertex stage rasterizing points). */
+    bool rta_out = strstr(msl, "[[render_target_array_index") != NULL;
+    bool add_psz = !has_psz && !rta_out;
+    const char *psz_member = add_psz ? "mgl_rs_PointSize" : NULL;
+
     rs_str b;
     rs_str_init(&b, msl);
 
     /* 1) body: fix up before each return (do this first: later edits are before the body) */
     char pre[512];
-    snprintf(pre, sizeof pre, "mgl_rs_vertex_fixup(out.%s, out.%s);", pos,
-             has_psz ? psz : "mgl_rs_PointSize");
+    if (add_psz)
+        snprintf(pre, sizeof pre, "mgl_rs_vertex_fixup(out.%s, out.%s);", pos, psz_member);
+    else
+        snprintf(pre, sizeof pre, "mgl_rs_vertex_fixup_pos(out.%s);", pos);
     long body_close = e.body_close;
     rs_patch_returns(&b, e.body_open, &body_close, pre);
 
@@ -554,14 +568,21 @@ char *mgl_rstate_patch_vertex_msl(const char *msl, const char *entry)
         "    if (!mgl_rs_ul) p.y = -p.y;\n"
         "    if (!mgl_rs_z01) p.z = (p.z + p.w) * 0.5;\n"
         "    if (!mgl_rs_pps%s) ps = mgl_rs_psz;\n"
+        "}\n\n"
+        "static inline __attribute__((always_inline)) void mgl_rs_vertex_fixup_pos(thread float4 &p)\n"
+        "{\n"
+        "    if (mgl_rs_rd) { p = float4(1.0e6, 1.0e6, 0.5, 1.0); return; }\n"
+        "    if (!mgl_rs_ul) p.y = -p.y;\n"
+        "    if (!mgl_rs_z01) p.z = (p.z + p.w) * 0.5;\n"
         "}\n\n",
         MGL_RS_FC_DEPTH_ZERO_TO_ONE, MGL_RS_FC_ORIGIN_UPPER_LEFT,
         MGL_RS_FC_PROGRAM_POINT_SIZE, MGL_RS_FC_POINT_SIZE, MGL_RS_FC_RASTERIZER_DISCARD,
         has_psz ? "" : " || true");
     rs_str_insert(&b, e.sig_line, prelude);
 
-    /* 3) add a [[point_size]] member when the shader has none (struct precedes the entry) */
-    if (!has_psz && struct_open < e.sig_line)
+    /* 3) add a [[point_size]] member when the shader has none (struct precedes the entry);
+     *    skipped for render_target_array_index writers, see add_psz above */
+    if (add_psz && struct_open < e.sig_line)
         rs_str_insert(&b, struct_open + 1, "\n    float mgl_rs_PointSize [[point_size]];");
 
     return b.s;

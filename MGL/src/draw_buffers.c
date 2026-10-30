@@ -882,6 +882,13 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
         ctx->state.ext_tess->draw_base_vertex = indexed ? basevertex : 0;
     }
 
+    /* the current draw's primitive mode: tessConfigureLayeredTopology needs it when
+     * the final pre-raster stage writes gl_Layer / gl_ViewportIndex
+     * (ARB_shader_viewport_layer_array) — Metal then requires the pipeline's
+     * inputPrimitiveTopology (see MGLRenderer+Tessellation.m) */
+    if (ctx->state.ext_tess)
+        ctx->state.ext_tess->draw_mode = mode;
+
     /* tess domain: only GL_PATCHES can be drawn while a tessellation shader is active
      * (O(1) stage gate — mgl_tess_active_program's record walk is not paid by
      * non-tessellation programs) */

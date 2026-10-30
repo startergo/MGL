@@ -360,6 +360,15 @@ static const char *mgl_extensions[] = {
     "GL_ARB_vertex_type_10f_11f_11f_rev",
     "GL_ARB_vertex_type_2_10_10_10_rev",
     "GL_ARB_viewport_array",
+    /* glTextureBarrierARB alias on the core 4.5 entry point; the barrier itself
+     * (pass split on Apple GPUs) is implemented in MGLRenderer+TextureExt.m */
+    "GL_ARB_texture_barrier",
+    /* gl_ViewportIndex / gl_Layer written from the vertex stage: glslang accepts
+     * the directive, SPIRV-Cross lowers BuiltInViewportIndex/BuiltInLayer to the
+     * MSL [[viewport_array_index]] / [[render_target_array_index]] vertex
+     * outputs; Metal drives layered framebuffers + viewport arrays natively
+     * (KHR-GL46.viewport_array is 17/17). */
+    "GL_ARB_shader_viewport_layer_array",
     /* internalformat test coverage: promoted-to-core extensions the CTS checks
      * explicitly (depth textures, shared exponent, integer textures, packed formats) */
     "GL_ARB_depth_texture",

@@ -143,7 +143,15 @@ static const TDFormat td_formats[] = {
     F(GL_RGBA32I,       GL_RGBA, SI, MTLPixelFormatRGBA32Sint,    TDK_SI32, 4, 16, RI, 32, 32, 32, 32, 0, 0),
     F(GL_RGBA32UI,      GL_RGBA, UI, MTLPixelFormatRGBA32Uint,    TDK_UI32, 4, 16, RI, 32, 32, 32, 32, 0, 0),
     /* depth / stencil (Apple GPUs have no D24S8: DEPTH24_STENCIL8 lives in D32F_S8) */
-    F(GL_DEPTH_COMPONENT16,  GL_DEPTH_COMPONENT, UN, MTLPixelFormatDepth16Unorm, TDK_D16, 1, 2, TDF_RENDERABLE|TDF_FILTERABLE|TDF_DEPTH, 0, 0, 0, 0, 16, 0),
+    /* DEPTH_COMPONENT16 is also kept in D32F storage, quantized to the 16-bit unorm
+     * lattice on upload: Metal's hardware sample_compare against a Depth16Unorm
+     * texel compares the reference in the 16-bit fixed-point domain (or scales the
+     * texel by 1/65536), so ref == texel_value loses ("less" is false) where GL
+     * compares in float against texel*65535/65536 (KHR-GL46.ext_texture_shadow_lod
+     * sampler2darrayshadow_vertex hits exactly this boundary: ref 0.5 vs texel
+     * 0x8000).  Depth32Float compares in float, so D16-in-D32F matches GL.  Same
+     * trick DEPTH_COMPONENT24 already uses below. */
+    F(GL_DEPTH_COMPONENT16,  GL_DEPTH_COMPONENT, UN, MTLPixelFormatDepth32Float, TDK_D16F, 1, 4, TDF_RENDERABLE|TDF_FILTERABLE|TDF_DEPTH, 0, 0, 0, 0, 16, 0),
     F(GL_DEPTH_COMPONENT24,  GL_DEPTH_COMPONENT, UN, MTLPixelFormatDepth32Float, TDK_D32F, 1, 4, TDF_RENDERABLE|TDF_FILTERABLE|TDF_DEPTH, 0, 0, 0, 0, 24, 0),
     F(GL_DEPTH_COMPONENT32,  GL_DEPTH_COMPONENT, UN, MTLPixelFormatDepth32Float, TDK_D32F, 1, 4, TDF_RENDERABLE|TDF_FILTERABLE|TDF_DEPTH, 0, 0, 0, 0, 32, 0),
     F(GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, FL, MTLPixelFormatDepth32Float, TDK_D32F, 1, 4, TDF_RENDERABLE|TDF_FILTERABLE|TDF_DEPTH, 0, 0, 0, 0, 32, 0),
@@ -983,6 +991,7 @@ static void storage_read_row(const TDFormat *f, const uint8_t *src, const uint8_
                 td_decode_rgb9e5(rd32(s, false), p->c);
                 continue;
             case TDK_D16: p->d = un_to_f(rd16(s, false), 16); continue;
+            case TDK_D16F: { float fd; memcpy(&fd, s, 4); p->d = fd; } continue;   /* already on the 16-bit lattice */
             case TDK_D32F: { float fd; memcpy(&fd, s, 4); p->d = fd; } continue;
             case TDK_S8: p->s = s[0]; continue;
             case TDK_D32FS8:
@@ -1048,6 +1057,11 @@ static void storage_write_row(const TDFormat *f, uint8_t *dst, uint8_t *st, int 
             case TDK_D16:
                 if (wd) wr16(s, (uint32_t)f_to_un(p->d, 16), false);
                 continue;
+            case TDK_D16F:
+                /* D16 semantics in D32F storage: quantize to the 16-bit lattice so
+                 * sampling and the shadow compare see exactly the GL D16 value */
+                if (wd) { float fd = (float)((double)f_to_un(p->d, 16) / 65535.0); memcpy(s, &fd, 4); }
+                continue;
             case TDK_D32F:
                 if (wd) { float fd = (float)(clamp_depth ? clampd(p->d, 0.0, 1.0) : p->d); memcpy(s, &fd, 4); }
                 continue;
@@ -1097,6 +1111,7 @@ static bool td_direct(const TDFormat *f, GLenum format, GLenum type)
         case TDK_RG11B10F:  return format == GL_RGB && type == GL_UNSIGNED_INT_10F_11F_11F_REV;
         case TDK_RGB9E5:    return format == GL_RGB && type == GL_UNSIGNED_INT_5_9_9_9_REV;
         case TDK_D16:       return format == GL_DEPTH_COMPONENT && type == GL_UNSIGNED_SHORT;
+        case TDK_D16F:      return false;   /* must quantize to the 16-bit lattice, never copy raw */
         case TDK_D32F:      return format == GL_DEPTH_COMPONENT && type == GL_FLOAT && f->comp_type == GL_FLOAT;
         case TDK_S8:        return format == GL_STENCIL_INDEX && type == GL_UNSIGNED_BYTE;
         case TDK_D32FS8: case TDK_COMPRESSED: case TDK_NONE: return false;
@@ -1217,7 +1232,7 @@ void tdPack(const TDFormat *f, const TDStorage *src, int w, int h, int d,
              * and, in stencil-texturing mode, GL_RED_INTEGER the STENCIL plane
              * (GL_RED/GL_RED_INTEGER otherwise address the (empty) colour channel) */
             if (format == GL_RED &&
-                (f->kind == TDK_D16 || f->kind == TDK_D32F || f->kind == TDK_D32FS8))
+                (f->kind == TDK_D16 || f->kind == TDK_D16F || f->kind == TDK_D32F || f->kind == TDK_D32FS8))
             {
                 for (int x = 0; x < w; x++) tmp[x].c[0] = tmp[x].d;
             }

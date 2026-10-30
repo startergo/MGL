@@ -34,7 +34,10 @@ enum {
     TDK_UI32, TDK_SI32, TDK_F32,
     TDK_RGB10A2UN, TDK_RGB10A2UI, TDK_RG11B10F, TDK_RGB9E5,
     TDK_D16, TDK_D32F, TDK_S8, TDK_D32FS8,
-    TDK_COMPRESSED
+    TDK_COMPRESSED,
+    /* appended (values above are stable): DEPTH_COMPONENT16 stored as Depth32Float
+     * with values quantized to the 16-bit unorm lattice (see texdata_formats.c) */
+    TDK_D16F
 };
 
 /* flags */

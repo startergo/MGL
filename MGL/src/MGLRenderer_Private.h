@@ -305,6 +305,10 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (void) extTessBindDrawParams: (id<MTLRenderCommandEncoder>) enc;   /* gl_DrawID (r28) */
 - (MTLVertexDescriptor *) extTessVertexDescriptor;
 - (void) extTessConfigurePipeline: (MTLRenderPipelineDescriptor *) desc;
+/* inputPrimitiveTopology for GS-less pipelines whose final pre-raster stage writes
+ * gl_Layer / gl_ViewportIndex (ARB_shader_viewport_layer_array): Metal requires it
+ * once the vertex function has [[render_target_array_index]] / [[viewport_array_index]] */
+- (void) tessConfigureLayeredTopology: (MTLRenderPipelineDescriptor *) pd;
 - (bool) bindBuffersToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 - (bool) bindTexturesToComputeEncoder:(id <MTLComputeCommandEncoder>) computeCommandEncoder;
 -(bool)processCompute:(id <MTLComputeCommandEncoder>) computeCommandEncoder;

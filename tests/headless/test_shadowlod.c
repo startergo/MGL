@@ -230,10 +230,90 @@ TEST(ShadowLodVertexImplicit)
     glDeleteProgram(p);
 }
 
+/* DEPTH_COMPONENT16 must behave like a true 16-bit unorm depth format in the
+ * shadow compare: the texel is the GL D16 lattice value b/65535, so ref 0.5
+ * against texel 0x8000 (0.50000763) compares "less" = TRUE and ref 0.50000763
+ * compares FALSE.  Metal's hardware compare on a Depth16Unorm texel quantizes
+ * the reference into the 16-bit domain (both then compare false), which is why
+ * MGL stores D16 textures in Depth32Float quantized to the lattice on upload
+ * (texdata_formats.c TDK_D16F).  This is the boundary
+ * KHR-GL46.ext_texture_shadow_lod.sampler2darrayshadow_vertex fails on. */
+TEST(D16LatticeCompare)
+{
+    const char *fs =
+        "#version 460 core\n"
+        "uniform sampler2DShadow s;\n"
+        "uniform float ref;\n"
+        "in vec2 v_uv;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main()\n"
+        "{\n"
+        "    o = vec4(texture(s, vec3(v_uv, ref)));\n"
+        "}\n";
+    const char *vs =
+        "#version 460 core\n"
+        "in vec4 a_pos;\n"
+        "out vec2 v_uv;\n"
+        "void main()\n"
+        "{\n"
+        "    v_uv = a_pos.xy * 0.5 + 0.5;\n"
+        "    gl_Position = a_pos;\n"
+        "}\n";
+    GLuint p = mgl_make_program5(vs, NULL, NULL, NULL, fs);
+    EXPECT_TRUE(p != 0);
+    if (!p) return;
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT16, 8, 8);
+    GLushort d16[64];
+    for (int i = 0; i < 64; i++) d16[i] = 0x8000;
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 8, 8, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, d16);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LESS);
+    glBindTextureUnit(0, tex);
+
+    glUseProgram(p);
+    glUniform1i(glGetUniformLocation(p, "s"), 0);
+    GLint lref = glGetUniformLocation(p, "ref");
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    /* ref exactly 0.5 must be LESS than the texel 32768/65535 */
+    glUniform1f(lref, 0.5f);
+    draw_full_quad(p);
+    float c[4];
+    glReadPixels(4, 4, 1, 1, GL_RGBA, GL_FLOAT, c);
+    printf("  [d16 lattice] ref=0.5      -> %.3f (want 1.0)\n", c[0]);
+    EXPECT_NEAR(c[0], 1.0f, 1e-4);
+
+    /* ref exactly on the lattice value must NOT be less */
+    glUniform1f(lref, 32768.0f / 65535.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    draw_full_quad(p);
+    glReadPixels(4, 4, 1, 1, GL_RGBA, GL_FLOAT, c);
+    printf("  [d16 lattice] ref=0.5000076 -> %.3f (want 0.0)\n", c[0]);
+    EXPECT_NEAR(c[0], 0.0f, 1e-4);
+
+    /* readback keeps the exact 16-bit bits */
+    GLushort back = 0xffff;
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, &back);
+    EXPECT_EQ_INT(back, 0x8000);
+
+    glBindTextureUnit(0, 0);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     RUN(ShadowLodCompileLink);
     RUN(ShadowLodLevelSelect);
     RUN(ShadowLodVertexImplicit);
+    RUN(D16LatticeCompare);
     return mgl_test_summary();
 }

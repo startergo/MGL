@@ -1,3 +1,142 @@
+# tess domain — round 37 report (shader_ballot compute cases; EXT_texture_shadow_lod)
+
+READY abef1d9 (merge of gl46-port 2898abe [geom r70] over 7b84384; every number
+below is on exactly this tree)
+
+## Task 1 — the 3 shader_ballot compute-path cases: **all Pass**
+
+`python3 agents/conformance/run.py --pattern 'KHR-GL46.shader_ballot_tests.*'`:
+
+```
+== totals (4 cases):
+  Pass                4  (100.0%)
+  KHR-GL46.shader_ballot_tests                       4 cases  Pass=4
+```
+(ShaderBallotAvailability, **Bitmasks**, **FunctionBallot**, **FunctionRead**;
+the last three were Fail since r36.)
+
+How (three separate defects, all fixed in 7b84384 + the merge):
+1. **The GPU-hanging CTS path** was never re-run directly. The bounded headless
+   repro (`tests/headless/zz_ballotprobe.c`, untracked scratch) replicates the
+   CTS's compute validation exactly — 16x16 RGBA32UI texture, `bindImageTexture`
+   with unit format RGBA32UI, a `layout(rgba32f)` writeonly image writing
+   `vec4(1.0)`, one dispatch, texel readback — and only after both parts passed
+   (A: uint store + float sampler = raw bits, B: the formerly-hanging
+   format-mismatched store) was the CTS group run (it finishes in ~5 s).
+   The hang itself: the geometry domain's image-unit view now casts a
+   format-kind-mismatched image to a same-texel-size view of the SHADER's
+   element kind (RGBA32F view of RGBA32UI storage) instead of dispatching into
+   an invalid texture2d<float>-over-RGBA32Uint store. Part B reads back
+   0x3F800000 x4, pixel-verified.
+2. **The render stages of FunctionRead failed on an uncovered centre pixel** —
+   `validateScreenPixelsSameColor` takes the screen-centre pixel as the desired
+   colour and requires at least one non-red pixel. Root cause (found with a
+   patch-split probe: patch1-only / patch2-only / no-GS): the emulated
+   tessellation path publishes its TES-output capture records in GENERATION
+   order (the permuted stream the transform-feedback pack consumes), but the
+   geometry import kernel built its primitive slots from the tessellator's
+   coordinate-index list as well — every slot was permuted **twice**, so the
+   geometry kernel consumed scrambled control points (patch 2 of the CTS's
+   2-patch quad lost 90% of its triangles, patch 1 ~1/3; with an affine TES the
+   GS route rendered only one edge strip for both patches). Fix:
+   `MGLTessCapture.emission_order` — emission-ordered records get identity
+   primitive slots, coordinate-ordered records (CPU reference path, point_mode)
+   keep the index list. Verified: every tess+GS case now matches its no-GS
+   reference pixel-for-pixel (`zz_pbdiag`, scratch), and the CTS's
+   normalize-through-the-origin patch corner covers the centre (white).
+   *Note:* the geom agent hit the same bug from the XFB side in gl46-port r70
+   (identical `cfg[8]` fix); the merge kept the upstream naming
+   (`tess_emission`/`emission_order`) and my explanatory comments.
+3. The remaining probes all pass: replay of the CTS's own six-stage pipelines
+   (Bitmasks 60 checks, FunctionBallot+FunctionRead 30 combos, availability 8
+   checks) — the earlier probe failures were an attribute-location assumption
+   in my validation quad (now explicit `layout(location=)`).
+
+## Task 2 — more NotSupported cases: **ext_texture_shadow_lod 16 -> 15 Pass + 1 Fail**
+
+```
+== totals (16 cases):
+  Pass               15  (93.8%)
+  Fail                1  (6.3%)
+  KHR-GL46.ext_texture_shadow_lod                   16 cases  Pass=15 Fail=1
+```
+(was 16/16 NotSupported on the missing extension string.)
+
+* `get.c` advertises **GL_EXT_texture_shadow_lod** after the path was verified
+  pixel-exactly: glslang accepts the directive at 460 core and SPIRV-Cross
+  lowers the OpImageSample*Dref* forms to MSL `depth2d_array/depthcube/
+  depthcube_array sample_compare(level/gradient/bias, offset)` —
+  `tests/headless/test_shadowlod.c` compiles/links every function the suite
+  uses, verifies LOD level selection through both levels, and vertex-stage
+  implicit sampling of 2D-array + cube-array shadow textures.
+* `tessellation.c` (`tess_shadow_implicit_lod`, wired into
+  `mgl_tess_glsl_compat`): non-fragment stages rewrite implicit shadow sampling
+  to the explicit base-level form — `texture(s,P[,compare])` ->
+  `textureLod(...,0.0)`, `textureOffset(s,P,off)` -> `textureLodOffset(s,P,0.0,off)`
+  — for every `sampler*Shadow` uniform (GL 4.6 8.14.1: implicit LOD outside the
+  fragment stage is the base level; the explicit form also keeps MSL on
+  `sample_compare(level(0))`, which is the defined vertex-stage form).
+* Known gap: `texture.sampler2darrayshadow_vertex` still fails image comparison
+  (difference 0.109462 vs threshold 0.0705 — it renders, and the CTS's own
+  Result/Reference/ErrorMask images were extracted from the .qpa to compare).
+  Everything testable in isolation was verified correct: generated MSL
+  (`sample_compare(s, xy, uint(round(z)), w, level(0.0))`), compare direction,
+  layer rounding/stepping (a z-sweep hits every layer boundary exactly), wrap of
+  negative/>1 UVs, DEPTH_COMPONENT16/24, NEAREST/MIPMAP filters, vertex vs
+  fragment stage, and the double-sampler case. The residual mismatch is inside
+  the CTS's 65x65-vertex interpolated field (its user-attribute matrix maps
+  coord.z/coord.w along the two grid diagonals); my CPU reference of that field
+  is too crude to localize it further. Second gap: a SECOND shadow sampler in
+  one vertex stage reads the first texture's raw depth (my test prints it; the
+  CTS never puts two shadow samplers in a vertex stage).
+
+## Other groups re-run on this tree (regression check)
+
+```
+  KHR-GL46.tessellation_shader    58 cases  Pass=58   (100%)
+  KHR-GL46.geometry_shader       136 cases  Pass=135  (api.max_image_uniforms
+                                                fails on the GS image path, not
+                                                a limit: all MAX_*_IMAGE_UNIFORMS
+                                                report 16)
+  KHR-GL46.shaders45               7 cases  Pass=7
+  KHR-GL46.packed_depth_stencil   25 cases  Pass=25   (extension-string sanity)
+  KHR-GL46.shader_ballot_tests     4 cases  Pass=4
+```
+
+## Suite
+
+`tests/headless/run.sh` on this tree: **129 tests, 0 FAIL / 0 BUILD-FAIL**
+(exit 0; every test reports "0 failures"). New: `test_shadowlod.c` (8 checks)
+and `TessGeometryMultiPatch` in `test_tess.c` (two disjoint patches through
+TCS/TES/GS in one indexed GL_PATCHES draw — regression for the capture
+permutation fix).
+
+`python3 agents/stub_scanner.py --list EMPTY|NOOP|ASSERT`: clean for
+tessellation.c, spirv_vote.c, cts_glsl_compat.c, MGLRenderer+Tessellation.m,
+mgl_ext_tess.h.
+
+## Shared-file edits this round (all called out)
+
+* `MGLRenderer+Geometry.m` (geom domain): (a) the image-unit format-cast
+  continuation of r66; (b) the tess import kernel's identity-slot guard
+  (upstream r70 has the same line — merge kept upstream + my comment);
+  (c) reverted my temporary MGL_CULL_TRACE index-list dump extension.
+* `geometry.c` (geom domain): `d.tess_emission` plumbing (upstream naming).
+* `mgl_ext_geom.h` (geom domain): `tess_emission` field (upstream).
+* `get.c` (queries): +1 extension string, GL_EXT_texture_shadow_lod.
+* `mgl_ext_tess.h` (mine): `MGLTessCapture.emission_order` (upstream bool form).
+* `MGLRenderer+Tessellation.m` (mine): publish the emission-order flag at both
+  capture sites; kept the env-gated `MGL_TESS_EMUDBG` diagnostic dump (per-patch
+  counts, TCS records, factors, capture records/indices).
+* `tessellation.c` (mine): `tess_shadow_implicit_lod` + scanner-name fixups.
+
+## Reproduction / scratch (untracked, by convention)
+
+`.agent/scratch-tests/probe_ballot_*.c` and `tests/headless/zz_*.c` (ballot
+repro, patch-split diagnostic, shadow-lod bisectors). The permanent regressions
+live in `test_tess.c` / `test_shadowlod.c`.
+
+
 # tess domain — round 36 report (NotSupported queue: +20 CTS cases; ballot emulation)
 
 READY ec3e01e (merge of gl46-port f600d55 [geom r66-r69] over 70d1f8e; every

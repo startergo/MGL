@@ -289,6 +289,15 @@ struct MGLExtState_tess {
      * argument for indexed draws */
     int32_t draw_base_vertex;
 
+    /* mode of the draw currently executing (draw_buffers.c exec_draw stamps it):
+     * Metal requires MTLRenderPipelineDescriptor.inputPrimitiveTopology when the
+     * final pre-rasterization function writes [[render_target_array_index]] /
+     * [[viewport_array_index]] — gl_Layer / gl_ViewportIndex written from the
+     * vertex or evaluation stage (ARB_shader_viewport_layer_array).  The geometry
+     * stage sets its own topology; the tess category derives it from this mode for
+     * the GS-less pipelines (tessConfigureLayeredTopology) */
+    GLenum draw_mode;
+
     /* published TES-output capture of the last GL_PATCHES draw (valid until the
      * next one) — see the MGLTessCapture contract above */
     MGLTessCapture capture;

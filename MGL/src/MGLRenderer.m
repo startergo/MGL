@@ -3575,6 +3575,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // function writes render_target_array_index / viewport_array_index (gl_Layer /
     // gl_ViewportIndex), which Metal requires
     [self geomConfigureTopology: pipelineStateDescriptor];
+    // same requirement when a GS-less pipeline's final pre-raster stage (plain
+    // vertex, or the post-tessellation TES) writes those attributes directly
+    // (ARB_shader_viewport_layer_array); the tess category derives the class
+    if (pipelineStateDescriptor.inputPrimitiveTopology == MTLPrimitiveTopologyClassUnspecified)
+        [self tessConfigureLayeredTopology: pipelineStateDescriptor];
 
     // geom: a void vertex function (stage writes only images/buffers) cannot rasterize;
     // last — rstateConfigurePipelineDescriptor runs again through
