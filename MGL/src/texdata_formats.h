@@ -72,6 +72,10 @@ typedef struct TDFormat {
 
 const TDFormat *tdFormatInfo(GLenum internalformat);
 
+/* geom r77: GL_RGB-based format stored on a 4-component Metal backing (no
+ * alpha channel) — sampling must read alpha 1 (texparam builds an A->One view) */
+bool tdFormatLacksAlphaBacking(GLenum internalformat);
+
 /* Resolve unsized base formats (GL_RGBA, ...) and generic compressed formats
  * (GL_COMPRESSED_RGBA, ...) to a concrete sized format, using format/type as a
  * hint. Returns 0 if internalformat is not a valid texture internal format. */

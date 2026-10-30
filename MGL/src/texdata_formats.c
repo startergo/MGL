@@ -233,6 +233,21 @@ static const TDFormat td_formats[] = {
 
 #define TD_NUM_FORMATS (sizeof(td_formats) / sizeof(td_formats[0]))
 
+/* geom r77 (texture_size_promotion.functional): true for GL formats that have
+ * no alpha channel but whose storage is a 4-component Metal format (R3_G3_B2,
+ * RGB4/5/565/8/10/12/16 and _SNORM, SRGB8, RGB16F, RGB32F on RGBA*). GL 4.6
+ * 8.26: reads of a missing alpha channel return one and writes are discarded —
+ * but the RGBA Metal backing would hand back whatever byte sits there (uploads
+ * force 255 via apply_base; a texture only rendered into has 0). Sampling is
+ * fixed at bind time with a texture-view swizzle A->One
+ * (MGLRenderer+TextureParams texparamTextureForTex). */
+bool tdFormatLacksAlphaBacking(GLenum internalformat)
+{
+    const TDFormat *f = tdFormatInfo(internalformat);
+    return f && !(f->flags & TDF_COMPRESSED) && f->base == GL_RGB &&
+           f->ncomp == 4 && f->bits[3] == 0;
+}
+
 const TDFormat *tdFormatInfo(GLenum internalformat)
 {
     for (size_t i = 0; i < TD_NUM_FORMATS; i++)

@@ -1,3 +1,177 @@
+READY 8f-line (r77 on top of the cceed03 merge 8bacd8e; r77 = c9afeb6 + r77b = 2b96406). SUPERVISOR QUEUE: (1) KHR-GL46.texture_size_promotion.functional Fail->Pass (fixed for real — see below). (2) geometry_shader.api.max_image_uniforms: ALREADY GREEN, no fake caps — 16/16 geometry_shader.api Pass x4 runs (3 single + full api group) with GL_MAX_GEOMETRY_IMAGE_UNIFORMS reporting the honest r73 value 8 (Metal caps access::read_write textures at 8/function; the test builds a GS with that many image uniforms + xfb of gl_Position and verifies); it had failed only in r18/r28-era sweeps (compat-s28-merged-geom, mgl-results-r18-ac) and was closed by the r72/r73 image work. (3) FRESH DOMAIN SWEEP ~/MGL-cts/geom-r77-dom (r77 lib, 9 patterns, done 04:24): textures+images+geometry+xfb = 599 Pass / 45 NotSupported / 1 Fail / 1 Crash — the ONLY non-Pass in the whole domain are shader_image_load_store.early-fragment-tests (Fail, the documented probed Apple-GPU early-z platform limit, unchanged) and texture_swizzle.smoke (Crash rc=-24 = SIGXCPU batch-kill artifact: the same runner marked it Crash in the r28 sweep; standalone it PASSES 1/1 in 7m49s on this exact lib, 8th consecutive pass counting tonight's earlier runs). Everything the r28 sweep listed for this domain is now green: texture_buffer 16/16 (atomic_functions incl.), copy_image 13/13, texture_view 7/7, texture_border_clamp 32/32, SSBO 124/124, shader_image_size 38P/36NS (the 10 tcs/tes fails gone), transform_feedback 20/20 + overflow queries 13/13, separable_programs_tf 2/2, sepshaderobjs 8/8, geometry_shader 136/136, texture_gather 75/75, texture_cube_map_array 25P/2NS, texture_repeat_mode 162/162, texture_size_promotion 1/1, texture_barrier 4/4(+ARB 4/4), texture_filter_minmax 5NS (no hw). GATES: full tests/headless/run.sh = 131 binaries / 10668 checks / 0 FAILED; test_geom 3x 670/0; test_img3d 613/0; test_texparam 716/0; test_texext 122/0; test_texdata 251/0; test_texswizzle 10/0; stub_scanner EMPTY/NOOP/ASSERT clean for geometry.c, MGLRenderer+Geometry.m, texdata_formats.c, MGLRenderer+TextureParams.m. Shared-file edits: texdata_formats.c/.h (tdFormatLacksAlphaBacking — my file on this branch), MGLRenderer+TextureParams.m (texparamTextureForTex alpha-less view swizzle + a static pixel-format pre-check — texparam domain file, one surgical insertion), new tests/headless/test_alphaless.c (3 cases).
+
+# geom round 77 — texture_size_promotion (missing-alpha reads), queue item 2 already
+# green, fresh domain sweep
+
+## 1. texture_size_promotion.functional — root cause and fix
+
+Failure: "Promotion from internal format GL_R3_G3_B2 have failed during
+functional test of alpha channel with target GL_TEXTURE_2D_MULTISAMPLE.
+Expected value = 1 read value = 0."
+
+The test renders its RGBA source data into a 1x1, (MAX_SAMPLES-1)-sample
+R3_G3_B2 multisample texture, then reads every channel through
+texelFetch(sampler2DMS, ivec2(0), MAX_SAMPLES-1) and expects .a == 1.
+
+MGL stores R3_G3_B2 on an RGBA8Unorm Metal backing (no 3-channel 8-bit
+format). GL 4.6 8.26: a format without an alpha channel DISCARDS writes to
+it and READS ONE. Three writers must cooperate:
+* CPU uploads already force it (apply_base -> alpha byte 255),
+* glClear already forces it (r58: clear color A=1 for alpha-less slots),
+* shader rendering already masks the alpha write (r58 mgl_fb_slot_lacks_alpha),
+but the backing of a texture that was only ever RENDERED INTO (or never
+written) holds Metal's zero-init 0 -> texelFetch read 0. (r58 fixed exactly
+this for the WRITE side; the READ side was still open.)
+
+Fix (sampling side, general): texparamTextureForTex composes the missing
+channel into the bind-time texture-view swizzle — when the bound texture's GL
+format is RGB-based on an RGBA Metal backing (tdFormatLacksAlphaBacking:
+R3_G3_B2, RGB4/5/565/8/8_SNORM/10/12/16/16_SNORM, SRGB8, RGB16F, RGB32F),
+every swizzle selector that sources Metal's A is remapped to One, so the
+user's TEXTURE_SWIZZLE_* applies on the logical (r,g,b,1) vector exactly as
+GL specifies. Metal's newTextureViewWithPixelFormat swizzle applies to ALL
+shader reads of the view — verified for texture.read() (texelFetch/sampler2DMS)
+on the GPU, not just sample()/gather(). This also fixes the non-multisample
+render-into-RGB8-then-sample-.a hole and makes any stale backing byte
+(including a hypothetical direct RGBA upload into an RGB format) invisible.
+Cost: one switch on the Metal pixel format per texture bind
+(texparamPixelFormatHasAlphaBacking); the format-table scan only runs for
+RGBA-backed storages; the view itself is cached in the existing
+MGLTexParamCache and only ever created for the rare alpha-less formats.
+
+tests/headless/test_alphaless.c pins all three paths:
+ms_r3g3b2_texelfetch_alpha_one (the exact CTS shape incl. 1x1 size and
+sample index MAX_SAMPLES-1), render_into_rgb8_sample_alpha_one, and
+r3g3b2_upload_swizzle_a (SWIZZLE_A=ALPHA composes to 1).
+
+Verified no regressions: texture_swizzle 4/4 (api_errors, intial_state,
+smoke 7m49s standalone, functional), texparam/texext/texdata/texswizzle
+headless suites green.
+
+## 2. geometry_shader.api.max_image_uniforms
+Already passing on this tip (4 verification runs; 136/136 geometry_shader in
+the r28 sweep and 136/136 in tonight's fresh sweep). No caps were invented:
+GL_MAX_GEOMETRY_IMAGE_UNIFORMS reports 8, the r73-probed Metal limit
+(access::read_write textures cap at 8 per function on this GPU), and the
+test builds a GS with exactly that many iimage2D uniforms, runs it through
+the geometry compute emulation with transform feedback of gl_Position and
+verifies the result. The r18/r28-era failures predate r72/r73.
+
+## 3. Fresh domain sweep (~/MGL-cts/geom-r77-dom, r77 lib, finished 04:24)
+Patterns: texture*, shader_image*, geometry_shader*, transform_feedback*,
+copy_image*, shader_storage_buffer_object*, texture_buffer*,
+separable_programs_tf*, sepshaderobjs* (599 Pass / 45 NS / 1 Fail / 1 Crash):
+
+  copy_image 13P | geometry_shader 136P | shader_image_load_store 48P/2NS/1F
+  shader_image_size 38P/36NS | texture_barrier 4P (+ARB 4P) | texture_border_clamp 32P
+  texture_buffer 16P | texture_cube_map_array 25P/2NS | texture_filter_anisotropic 2P
+  texture_filter_minmax 5NS | texture_gather 75P | texture_repeat_mode 162P
+  texture_size_promotion 1P | texture_swizzle 3P/1Crash* | texture_view 7P
+  transform_feedback 20P | transform_feedback_overflow_query_ARB 13P
+  SSBO 124P | separable_programs_tf 2P | sepshaderobjs 8P
+
+  * texture_swizzle.smoke Crash = runner batch-kill artifact (SIGXCPU after
+    ~26 min wall under a co-tenant full-headless-suite run; the r28 sweep
+    recorded the same Crash with the same runner). Standalone on the same
+    library: Pass 1/1 in 7m49s. 8 consecutive passes across r76/r77 code.
+  * shader_image_load_store.early-fragment-tests = the documented probed
+    Apple-GPU early-z limit (see 545ebb6 GAPS).
+  * The 36 shader_image_size NotSupported are the CTS's own multisample-image
+    filter, not an MGL gap; texture_cube_map_array's 2 NS likewise ("can be
+    run only in ES context"); texture_filter_minmax 5 NS = no hardware
+    EXT_texture_filter_minmax.
+
+Gates on this tip (8bacd8e + c9afeb6 + 2b96406):
+* make lib clean; full tests/headless/run.sh = 131 binaries, 10668 checks,
+  0 FAILED (no new warnings in my files).
+* test_geom 3x = 670/0 each; test_img3d 613/0; test_texparam 716/0;
+  test_texext 122/0; test_texdata 251/0; test_texswizzle 10/0.
+* stub_scanner EMPTY/NOOP/ASSERT clean: geometry.c, MGLRenderer+Geometry.m,
+  texdata_formats.c, MGLRenderer+TextureParams.m.
+* gl46-port merged at cceed03 (merge 8bacd8e; only geom_report.md conflicted,
+  both READY lines kept).
+
+
+READY 2d302c0 (r76, on top of the af20103 merge 05c5159 — the session that died at 22:37 had already landed r74/r75/r75b (the 3D-shadow per-draw/per-commit gating) and the stencil_texturing compute sampler-slot fix as WIP commit 3dfaf1c; this round re-based nothing, closed its queue and verified it. SUPERVISOR GOALS ALL GREEN ON THIS TIP: texture_gather 75/75 Pass (2 runs), texture_cube_map_array 25 Pass + 2 NotSupported (generate_mip_map_non_filterable_{mutable,immutable}_storage, "can be run only in ES context" — the CTS's own ES filter, not an MGL gap; 2 runs), stencil_texturing.functional 1/1 Pass (2 runs — the WIP 3dfaf1c compute image-unit sampler-slot fix holds), texture_swizzle 4/4 Pass in 4 consecutive full-group runs tonight (932/967/1180/1146 s) + the previous session's 18:11 run = 5 consecutive passes with the FLAKY smoke case green in every one, no failure reproduced since the single observation at bb5ba10 (r59 era). BONUS: gpu_shader5 22/22 Pass — the 4 texture_gather_offset_*_clamp_{border,edge} cases that were the r59 documented gap are green too. r76 = (1) geom3DImageShadowFlushTexture now returns on !g3DShadowLive before its TEXTURE_UNITS scan: every glGetTexImage/download paid that walk (glmark2 pays it per frame readback); same gate the r75b per-commit flush already had. (2) tests/headless/test_texdata.c +depth24_stencil8_max_depth_reads (240 -> 251 checks): the dead session's last open thread, "D24S8 depth 1.0 uploads read back 0" (zz_stxt10), was its OWN PROBE's arithmetic — (unsigned)(1.0f * 16777215.0f + 0.5f) == 0x1000000 in float (16777215.5 is not representable, rounds up to 2^24), so the probe memcpy'd the LOW 3 bytes of 0x01000000 = depth 0 into its own source data; MGL's f_to_un clamps at (1<<24)-1 and is exact — the new test pins depth 1.0 through DEPTH_COMPONENT/FLOAT plus the stencil plane. r72 3D-SHADOW PER-DRAW COST VERIFIED ZERO (the supervisor's 5th item): direct A/B, interleaved, 12 reps, min — drawArrays x2000 WITH the geom3DImageShadowSync call 10.386 ms vs the SAME LIBRARY with both call sites compiled out 11.644 ms (not slower; a first 8-rep pass measured +2.8% = the load noise band, load avg 4-5 with a co-tenant tess run and Docker); the code path returns after 2 ObjC sends + a 4-entry (program,msl) cache probe when the program has no storage-image resource and no shadow was ever created (r75/r75b), and the per-commit + per-download scans are now gated the same way. GATES on 2d302c0: full tests/headless/run.sh = 130 test binaries, 10636 checks, 0 FAILED (rc=0, ~29 min alongside a CTS group run); test_geom 10x = 670 checks / 0 failures each; test_img3d 5x = 613/0 (the changed path); test_texdata 251/0; stub_scanner EMPTY/NOOP/ASSERT clean for MGL/src/geometry.c and MGL/src/MGLRenderer+Geometry.m; no source file of another domain touched (test_texdata.c is the texdata domain's test file — one added TEST only, justified above). REMAINING GAPS: unchanged from the 545ebb6 list (early-fragment-tests = probed Apple-GPU early-z limit; layout_binding.image2D_layout_binding_* 3x = pre-existing, another domain; BC6H adversarial-ramp quality = format limit, bit-exact consistency verified; same-draw 3D-shadow sampling race = GL leaves it undefined).)
+
+# geom round 76 — supervisor queue closed: 4 CTS groups green, smoke flake not
+# reproduced (5 passes), r72 per-draw cost measured zero, "D24S8 1.0" root-caused
+# as a probe bug (pinned by a new test), one more 3D-shadow gate (per-download).
+
+## 0. Session recovery
+* gl46-port was already merged at 05c5159 (af20103 = tess r38); `git merge gl46-port`
+  is a no-op.  Nothing was uncommitted in the tree except zz_* probe files
+* (zz_stxt10.c was the dead session's last probe — see §3).  The WIP commit
+* 3dfaf1c (compute image-unit sampler-slot fix) was complete and is verified green
+* by stencil_texturing below.
+
+## 1. The four supervisor CTS items (all green, twice each)
+| group | result | notes |
+|---|---|---|
+| KHR-GL46.texture_gather.* | **75/75 Pass** x2 | r59's 2 incomplete-texture cases and r60's border/gather work hold |
+| KHR-GL46.texture_cube_map_array.* | **25 Pass / 2 NotSupported** x2 | the 2 NS are the CTS's own "ES context only" filter; the old "sampling: uniform introspection reports type 0" failure is gone |
+| KHR-GL46.stencil_texturing.* | **1/1 Pass** x2 | draw path + compute path; 3dfaf1c's [[sampler(N)]] slot parse + _IMAGE_TEXTURE no-sampler rule hold |
+| KHR-GL46.texture_swizzle.* | **4/4 Pass x4 tonight** (+1 at 18:11) | api_errors, intial_state, smoke, functional |
+Also re-run for the record: **KHR-GL46.gpu_shader5.* = 22/22 Pass** (the r59 gap
+list's 4 texture_gather_offset_*_clamp_{border,edge} cases included).
+
+## 2. The flaky texture_swizzle.smoke
+Not reproduced.  5 consecutive full-group passes since the single observation at
+bb5ba10 (r59 era, "wrong pixel at gl3cTextureSwizzleTests.cpp:3709").  Audit of the
+path that observation would have hit (RGBA32UI output texture read by
+glGetTexImage right after a 4-point draw): texdataDownload allocates a FRESH
+MTLBuffer (Shared) per readback, ends the render encoder, blits, then
+texdataSubmitAndWait (commit + waitUntilCompleted) — there is no recycled-buffer
+race to lose a texel through, and the draw/fill share the same serial command
+buffer.  Nothing actionable found; leaving it as a watch item (any future
+occurrence should be saved with --deqp-log-filename and the qpa kept).
+
+## 3. "D24S8 depth 1.0 uploads read back 0" — probe bug, closed
+zz_stxt10/11/12/13 (untracked) all showed every 0xffffff-depth texel reading 0.0
+while 0x800000 etc. were exact, and test_texdata's own 24_8 round trip (which
+contains 0xffffff) PASSED in the same build — the store was fine.  Root cause:
+the probes packed the client word with
+`(unsigned)(1.0f * 16777215.0f + 0.5f)` — in FLOAT arithmetic that is 16777215.5
+-> 16777216 = 0x1000000, and `memcpy(&src[i*4+1], &di, 3)` then copied the LOW
+three bytes 00 00 00, i.e. the probe uploaded depth 0.  (double arithmetic gives
+0xffffff.)  MGL's conversions are exact: client_read_row un_to_f(v>>8,24),
+f_to_un clamps at (1<<24)-1.  Pinned by the new test_texdata case
+depth24_stencil8_max_depth_reads (depth 1.0 through DEPTH_COMPONENT/FLOAT, the
+1-lsb floor value, and the stencil plane).
+
+## 4. r72 3D-shadow refresh: per-draw cost measured
+* Code path (r75/r75b): geom3DImageShadowSync returns before any unit scan unless
+  (a) the bound program / a pipeline stage program has a STORAGE_IMAGE resource
+  (cached per (program, msl-pointer), 4 entries) or (b) a shadow ever existed
+  (g3DShadowLive — write-back duty).  Two ObjC sends + a 4-entry probe per draw.
+* Measured: ab_bench m0 (drawArrays x2000, plain VS/FS, no image units), two
+  builds of the same tip differing ONLY in the two `[self geom3DImageShadowSync]`
+  call sites being compiled out (build/ab_old) vs present (build/ab_new):
+  12 interleaved reps, min 11.644 ms (call removed) vs 10.386 ms (call present);
+  medians 15.07 vs 15.03.  Not slower — the cost is below the noise floor
+  (< 1% of 5.8 us/draw).  (Machine load 4-5 from a co-tenant tess run + Docker.)
+* r76 closes the last ungated walk: geom3DImageShadowFlushTexture (every 3D
+  texture download) now returns on !g3DShadowLive before scanning TEXTURE_UNITS.
+
+## 5. Gates on 2d302c0
+* tests/headless/run.sh: **130 test binaries, 10636 checks, 0 FAILED** (rc=0;
+  ran alongside a CTS group run, ~29 min wall).
+* test_geom 10x: 670 checks / 0 failures each.  test_img3d 5x: 613/0.
+  test_texdata: 251/0 (was 240).  test_bptc in the suite: 257/0.
+* python3 agents/stub_scanner.py --list EMPTY|NOOP|ASSERT: clean for
+  MGL/src/geometry.c and MGL/src/MGLRenderer+Geometry.m.
+* MGL/src/MGLRenderer+Compat.m: untouched this round.
+
+## Shared-file edits this round
+* tests/headless/test_texdata.c — ONE added TEST (depth24_stencil8_max_depth_reads)
+  in the texdata domain's test file; no MGL source of another domain touched.
+  Reason: it pins the exact behaviour that the dead session's open thread was
+  about, and texdata has no max-depth readback case.
+
+## Scratch (untracked, not committed)
+zz_stxt10..14.c (the D24S8 1.0 bisect + the float-arithmetic proof), scratch_cts.sh,
+scratch_cts2.sh, scratch_qpa.py, /tmp/run_swz2.sh + /tmp/ab3d*.sh harnesses,
+build/ab_old + build/ab_new (A/B pair for §4).
 READY 545ebb6 (r71+r72+r73, on top of gl46-port cff5363 merge d1f251e. SUPERVISOR GOALS DONE: texture_view 7/7 Pass (was 6/7, view_classes failed on uncompressed uploads into BPTC storage); shader_image_load_store 48 Pass / 2 NotSupported / 1 Fail (was 46/3/2 — non-layered_binding and multiple-uniforms FIXED; the remaining early-fragment-tests Fail is a probed Metal platform limit, see GAPS). r71 = BPTC/RGTC online compression: CPU encoders BC7 mode 6 (unorm+srgb) and BC6H mode 10 (signed/unsigned float) in texdata_formats.c with bit layouts cross-checked field-by-field against VK-GL-CTS's reference decoders (framework/common/tcuCompressedTexture.cpp decompressBc6H/decompressBc7 — hardware decode verified BIT-EXACT against a CTS-port in tests/headless/test_bptc.c), plus a latent BC4/5 palette off-by-one fix in tdEncodeRGTC (the old code's shade[] table skipped the a1 endpoint slot — blocks decoded to the wrong staircase; exposed by the first-ever real hardware decode of its output); texSubImage into texStorage'd RGTC/BPTC levels now encodes blocks and stores them block-aligned like CompressedTexSubImage (ETC2 stays rejected: no encoder); getTexImage of a compressed VIEW now decodes with the VIEW's decoder (format-cast Metal view over the root storage — fixes the BC6H signed<->unsigned cross-pair). r72 = non-layered 3D image units: Metal has NO path to alias one 3D slice as 2D (probes committed as knowledge: 3D->2D newTextureView ABORTS the process, 3D<->2D blits silently no-op, a 3D texture bound into a texture2d argument silently kills the whole dispatch) — the slice now runs through a 2D SHADOW texture with typed compute copy kernels (per MSL scalar channel type; sRGB through its linear view), refreshed per draw and written back on rebinding/commit/readback (tests/headless/test_img3d.c covers layer-by-layer copy + readback). r73 = per-stage image-uniform limits: Metal caps access::read_write textures at 8 per function (probed on fragment AND compute; read/write-only are plentiful but a load+store image needs read_write, and 16 ro+wo pairs = 32 > the 31-entry texture table), so fragment/vertex/tcs/tes/geometry report the ARB floor 8 while compute keeps 16 (KHR-GL46.gl_spirv links 10 access-decorated compute images); test_tess_images.c updated to expect 8 (shared-file edit, justified above). GATES on 545ebb6: full tests/headless/run.sh = 124 test binaries, 10289 checks, 0 FAIL (13m42s); test_geom 670/0, test_bptc 257/0, test_img3d 270/0; ab_bench vs baseline-cff5363 (5 draw modes x5): no regression (dmin +1.8%..-18.9%, medians overlap = the usual load noise band; no draw-path hunks in r71-r73). REMAINING GAPS (documented in code comments too): (1) shader_image_load_store.early-fragment-tests Fail — GL 4.6 requires a discard-using fragment shader to get the depth test AFTER it runs (side effects before discard persist); probed on raw Metal (zzab58/metaldepth_probe.m pattern): even a [[depth(any)]]-writing fragment function is early-rejected by Apple GPUs with the interpolated z, so GL's late-z-for-discard would need Always+shader-side depth sampling of the depth attachment (feedback-loop hazard + per-draw depth snapshot) — rejected as too risky for the gain; stencil-with-discard same. (2) layout_binding.image2D_layout_binding_imageLoad_{Compute,Fragment,Vertex}Shader 3x Fail = PRE-EXISTING (verified against baseline-2898abe before my changes; binding-default issue, another domain). (3) BC6H encoder quality on adversarial per-channel-offset ramps is coarse (endpoints exact; one shared 4-bit index per RGB texel is a format limit — GL does not guarantee online-compression quality; consistency verified bit-exact instead). (4) 3D shadow planes: sampling the 3D texture in the SAME draw that writes its shadowed image unit cannot see the pending stores (GL leaves that race undefined); the shadow copies run at draw start, so image->image layer ping-pong across draws is correct.)
 
 READY bba736a (r69: packed_pixels depth-stencil regression FIX — 2 holes my r59-r61 opened + one spec-correct rejection; on top of gl46-port 83e1777 + r66/r67/r68. GATES on this tip: full tests/headless/run.sh = 123 tests PASS / 9729 checks / 0 FAIL (test_geom_xfbperf in, quarantine lifted); test_geom 10x = 670 checks / 0 failures each; KHR-GL46.packed_pixels.varied_rectangle.* = 83/83 Pass (was 81/83: depth24_stencil8, depth32f_stencil8, depth_stencil failing); packed_pixels full group 250/250 Pass; packed_depth_stencil 25/25, texture headless suites (texdata 240, texparam 716, texext 122, texswizzle 10, texonline 20) all 0 fail. ab_bench interleaved vs ~/MGL-cts/baseline-83e1777, 3 runs of 5: m0 drawArrays min 11.52 new vs 12.32 base (equal-or-faster; per-run deltas flip sign +11/-10/+9% = machine load noise 3.7-6.5, no r66-r69 code path touches the plain draw path), m1 min 96.9/97.0/107.9 new vs 96.3/113.6/112.0 base (equal-or-faster in every run). r69c is a PURE TEST-PROBE commit (zz_* files; your merge strips zz_*). DETAIL: (1) the r59-r61 GL_RED_INTEGER stencil-texturing exception keyed on ANY depth/stencil base, accepting glTexImage2D(DEPTH24_STENCIL8/DEPTH32F_STENCIL8/GL_DEPTH_STENCIL, GL_RED_INTEGER, ...) — now readback-only + STENCIL_INDEX base only; (2) tdCheckGetFormatCompat answered (GL_RED, GL_FLOAT) reads of combined depth-stencil textures (stencil_texturing reads its R32F RESULT texture that way, never the DS texture) — rejected like every non-DS client format per GL 4.6 table 8.2. Also in this tip since 83e1777: r66 image-atomic MSL helpers (get_array_size / per-kind cube helpers) shader_image_load_store 5 atomic cases Fail->Pass; r67 tess-kernel image atomics + no double TES execution (advanced-allStages-oneImage Fail->Pass); r68 image/sampler ARRAY elements at strided units (advanced-sso-simple/-subroutine Fail->Pass); CTS glue vk::Platform::getMemoryLimits (3 more shader_image_load_store cases). shader_image_load_store is now 46 Pass / 3 Fail / 2 NS on this tip.)

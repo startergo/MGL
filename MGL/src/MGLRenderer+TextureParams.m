@@ -17,6 +17,7 @@
 #import "MGLRenderer_Private.h"
 #include "mgl_ext_texparam.h"
 #include "tex_param_internal.h"
+#include "texdata_formats.h"    /* geom r77: tdFormatLacksAlphaBacking */
 
 @interface MGLTexParamCache : NSObject
 @property (nonatomic, strong) id<MTLSamplerState> sampler;
@@ -400,6 +401,29 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     return cache.sampler;
 }
 
+/* texparamTextureForTex helper: Metal pixel formats whose storage has a real
+ * alpha component (so a GL format without one can leak the stale backing byte
+ * into reads). 1/2/3-component Metal formats return alpha 1 in hardware. */
+static bool texparamPixelFormatHasAlphaBacking(MTLPixelFormat pf)
+{
+    switch (pf)
+    {
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Snorm:
+        case MTLPixelFormatRGB10A2Unorm:
+        case MTLPixelFormatRGBA16Unorm:
+        case MTLPixelFormatRGBA16Snorm:
+        case MTLPixelFormatRGBA16Float:
+        case MTLPixelFormatRGBA32Float:
+        case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatBGRA8Unorm_sRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* texture to bind for sampling: a view when swizzle / level range / stencil texturing apply */
 - (id<MTLTexture>) texparamTextureForTex:(Texture *)tex base:(id<MTLTexture>)base
 {
@@ -439,6 +463,30 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
 
     bool swizzled = swz.red != MTLTextureSwizzleRed || swz.green != MTLTextureSwizzleGreen ||
                     swz.blue != MTLTextureSwizzleBlue || swz.alpha != MTLTextureSwizzleAlpha;
+
+    /* geom r77 (texture_size_promotion.functional): a GL_RGB-based format on an
+     * RGBA Metal backing (R3_G3_B2, RGB*, SRGB8, RGB16F/32F) has NO alpha
+     * channel — GL reads of a missing channel return one (8.26). The backing
+     * byte is only 255 right after an upload (apply_base); a texture that was
+     * rendered into (alpha writes masked, see mgl_fb_slot_lacks_alpha) or never
+     * written hands back 0. Compose the missing channel into the view swizzle:
+     * every selector that sources A reads One instead — the user's TEXTURE_SWIZZLE
+     * selectors then apply on top of the (r,g,b,1) vector, matching GL.
+     * The pixel-format pre-check keeps the common path (RGBA/RGB-with-alpha
+     * textures bind per draw) at one switch before the format-table scan. */
+    if (texparamPixelFormatHasAlphaBacking(base.pixelFormat) &&
+        tdFormatLacksAlphaBacking(tex->internalformat))
+    {
+        MTLTextureSwizzle net[4] = { swz.red, swz.green, swz.blue, swz.alpha };
+        bool remapped = false;
+        for (int c = 0; c < 4; c++)
+            if (net[c] == MTLTextureSwizzleAlpha) { net[c] = MTLTextureSwizzleOne; remapped = true; }
+        if (remapped)
+        {
+            swz = MTLTextureSwizzleChannelsMake(net[0], net[1], net[2], net[3]);
+            swizzled = true;
+        }
+    }
 
     /* GL_DEPTH_TEXTURE_MODE (GL 4.6 8.26): a non-comparison depth texture
      * splats its depth as (d,0,0,1)/(d,d,d,1)/(d,d,d,d)/(0,0,0,d); Metal's
