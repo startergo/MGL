@@ -34,6 +34,9 @@
 
 #include "mgl_ext_fb.h"
 
+/* compat domain: EXT_texture_integer integer clear colour (glClearColorIiEXT) */
+#include "mgl_ext_compat.h"
+
 #define FB_ERROR(_e_)   do { ERROR_RETURN(_e_); return; } while (0)
 
 extern GLenum mgl_fb_status(GLMContext ctx, Framebuffer *fbo);
@@ -77,12 +80,23 @@ void mglClear(GLMContext ctx, GLbitfield mask)
 
             req.color_slots |= 1u << i;
             req.color_kind[i] = kind;
+            /* compat domain (EXT_texture_integer): once glClearColorIiEXT/
+             * glClearColorIuiEXT has been called, integer attachments clear
+             * with that exact bit pattern instead of the converted float
+             * value; float attachments are unaffected. */
+            struct MGLExtState_compat *cm = ctx->state.ext_compat;
+            GLint icc[4] = { 0, 0, 0, 0 };
+            if (cm && cm->clear_color_i_set && kind != MGL_FB_KIND_FLOAT)
+                memcpy(icc, cm->clear_color_i, sizeof icc);
             for (int c = 0; c < 4; c++)
             {
                 GLfloat v = STATE(color_clear_value[c]);
                 if (kind == MGL_FB_KIND_FLOAT) req.color[i].f[c] = v;
-                else if (kind == MGL_FB_KIND_INT) req.color[i].i[c] = (GLint)v;
-                else req.color[i].u[c] = v < 0 ? 0 : (GLuint)v;
+                else if (kind == MGL_FB_KIND_INT)
+                    req.color[i].i[c] = cm && cm->clear_color_i_set ? icc[c] : (GLint)v;
+                else
+                    req.color[i].u[c] = cm && cm->clear_color_i_set ? (GLuint)icc[c] :
+                                        (v < 0 ? 0 : (GLuint)v);
             }
         }
     }

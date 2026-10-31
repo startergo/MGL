@@ -119,18 +119,36 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
      */
     int glsl_version = 330; /* Default to GLSL 3.30 - minimum for SPIR-V */
     int original_version = 330;
+    bool es_shader = false;   /* "#version N es" — ARB_ES3_1_compatibility */
     const char *version_str = strstr(src, "#version");
     if (version_str) {
         int scanned_version;
-        if (sscanf(version_str, "#version %d", &scanned_version) == 1) {
+        char prof_token[32] = "";
+        if (sscanf(version_str, "#version %d %31s", &scanned_version, prof_token) >= 1) {
             original_version = scanned_version;
             glsl_version = scanned_version;
+            if (strcmp(prof_token, "es") == 0)
+                es_shader = true;
             /* Upgrade legacy GLSL versions to 330 minimum for SPIR-V */
             if (glsl_version < 330) {
                 glsl_version = 330;
             }
         }
     }
+
+    /* GL 4.5 core (ARB_ES3_1_compatibility; ES 3.2 via ES3_2_compatibility)
+     * accepts "#version 310 es" / "#version 320 es" shaders with full ES
+     * semantics: arrays of arrays, samplerCubeArray, gl_HelperInvocation,
+     * layout(binding=..), gl_SampleMask — none of which exist in the desktop
+     * GLSL the old code forced onto them (glslang reported ~3700 of the first
+     * 12k dEQP-GL45-ES31 cases as "compute shaders require es profile ..." /
+     * "arrays of arrays not supported" / "Reserved word" — 2026-10-31).
+     * glslang compiles the ES profile with an OpenGL SPIR-V client from
+     * version 310 up, so those keep their exact version AND the ES profile.
+     * ES 100/300 cannot target SPIR-V as ES ("ES shaders for SPIR-V require
+     * version 310 or higher"), so they keep the legacy desktop mapping below
+     * (330 core), which every ES-3.0 feature the CTS uses is a subset of. */
+    const bool es_profile = es_shader && original_version >= 310;
 
     /* Set client_version to match GLSL version for SPIR-V targeting
      * This prevents "forced to be (450, core)" error when using GLSL 330 shaders
@@ -139,7 +157,12 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
      * Note: glslang only exposes GLSLANG_TARGET_OPENGL_450, so we use that
      * as the SPIR-V target for all modern GLSL versions
      */
-    if (glsl_version < 330) {
+    if (es_profile) {
+        /* ES 3.1/3.2 shader: the ES profile carries its own semantics, the
+         * OpenGL client dialect version is irrelevant to it (only used to
+         * pick the desktop SPIR-V flavour) — 450 matches GL 4.6 */
+        input->client_version = GLSLANG_TARGET_OPENGL_450;
+    } else if (glsl_version < 330) {
         /* Legacy GLSL - still target 450 for SPIR-V but shader will be upgraded */
         input->client_version = GLSLANG_TARGET_OPENGL_450;
     } else if (glsl_version == 330) {
@@ -151,7 +174,7 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     }
 
 
-    if (original_version < 330) {
+    if (original_version < 330 && !es_profile) {
         if (mgl_dbg_env()) fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
                 original_version, glsl_version);
 
@@ -205,12 +228,18 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
             input->code = src;
         }
     } else {
-        /* glslang does not declare gl_NumSamples for desktop GLSL (it is an
-         * OES_sample_variables builtin there): declare it here as the constant GL says it
+        /* glslang does not declare gl_NumSamples for desktop GLSL >= 400 nor
+         * for the ES profile when targeting SPIR-V (it is an OES_sample_
+         * variables builtin that glslang only adds to the ES preamble when
+         * spvVersion.spv == 0): declare it here as the constant GL says it
          * is, baked from the CURRENT draw framebuffer's sample count - the shader is
          * compiled for that framebuffer, exactly how the CTS uses it (the mask loop over
-         * gl_SampleMask / gl_SampleMaskIn needs the count; nothing else reads it) */
-        if (type == GL_FRAGMENT_SHADER && glsl_version >= 400 && strstr(src, "gl_NumSamples"))
+         * gl_SampleMask / gl_SampleMaskIn needs the count; nothing else reads it).
+         * ES < 3.20 keeps the name free (not reserved under ES+SPIR-V), so a
+         * shader that declares gl_NumSamples itself is left untouched. */
+        if (type == GL_FRAGMENT_SHADER && strstr(src, "gl_NumSamples") &&
+            !strstr(src, "int gl_NumSamples") &&
+            ((glsl_version >= 400 && !es_shader) || es_profile))
         {
             extern GLint mgl_fb_samples(GLMContext ctx, Framebuffer *fbo);
             GLint n = ctx->state.framebuffer ? mgl_fb_samples(ctx, ctx->state.framebuffer) : 1;
@@ -244,6 +273,14 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 
     input->default_version = glsl_version;
     input->default_profile = GLSLANG_CORE_PROFILE;
+    if (es_profile)
+    {
+        /* keep the shader's own ES version: 310/320 with GLSLANG_ES_PROFILE
+         * (the source line stays untouched, so force_default_version_and_
+         * profile just re-states what the shader already declares) */
+        input->default_version = original_version;
+        input->default_profile = GLSLANG_ES_PROFILE;
+    }
     //input->messages = 0xFFFF & ~GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
     {
@@ -255,7 +292,7 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
          * compiler and leave the shader source otherwise untouched.
          * (Shared-file edit, shaders.c — see agents/compat_report.md.) */
         const char *code = input->code;
-        if (glsl_version < 410 && strstr(code, "gl_PerVertex") &&
+        if (!es_profile && glsl_version < 410 && strstr(code, "gl_PerVertex") &&
             !strstr(code, "GL_ARB_separate_shader_objects"))
         {
             const char *p = strstr(code, "#version");

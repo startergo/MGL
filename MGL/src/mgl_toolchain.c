@@ -93,17 +93,26 @@ static void mgl_init_input(glslang_input_t *input,
      */
     int glsl_version = 330; /* Default to GLSL 3.30 */
     int original_version = 330;
+    bool es_shader = false;   /* "#version N es" — ARB_ES3_1_compatibility */
     const char *version_str = strstr(src, "#version");
     if (version_str) {
         int scanned_version;
-        if (sscanf(version_str, "#version %d", &scanned_version) == 1) {
+        char prof_token[32] = "";
+        if (sscanf(version_str, "#version %d %31s", &scanned_version, prof_token) >= 1) {
             original_version = scanned_version;
             glsl_version = scanned_version;
+            if (strcmp(prof_token, "es") == 0)
+                es_shader = true;
             if (glsl_version < 330) {
                 glsl_version = 330;
             }
         }
     }
+
+    /* ES 3.1/3.2 shaders keep ES semantics (see shaders.c initGLSLInput):
+     * glslang accepts the ES profile with an OpenGL SPIR-V client from 310
+     * up; ES 100/300 keep the legacy desktop upgrade. */
+    const bool es_profile = es_shader && original_version >= 310;
 
     /* Log version upgrade for debugging */
     if (original_version < 330) {
@@ -129,7 +138,7 @@ static void mgl_init_input(glslang_input_t *input,
 
         /* Find and replace #version line */
         char *version_line = strstr(modified_src, "#version");
-        if (version_line) {
+        if (version_line && !es_profile) {
             char *newline = strchr(version_line, '\n');
             if (newline) {
                 /* Replace with new version, keeping the rest of the line intact
@@ -159,6 +168,11 @@ static void mgl_init_input(glslang_input_t *input,
 
     input->default_version = glsl_version;
     input->default_profile = GLSLANG_CORE_PROFILE;
+    if (es_profile)
+    {
+        input->default_version = original_version;   /* 310 / 320 */
+        input->default_profile = GLSLANG_ES_PROFILE;
+    }
     input->force_default_version_and_profile = 1;
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->resource = glslang_default_resource();

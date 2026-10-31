@@ -291,6 +291,18 @@ struct MGLExtState_compat {
      * insertion moved hot per-draw state and cost glmark2 jellyfish ~5%). */
     GLboolean blend_advanced_coherent;
 
+    /* glBlendBarrier* call counter (mglBlendBarrier): the barrier itself is a
+     * no-op because the equations run with raster-ordered framebuffer fetch,
+     * the count makes that observable to tests / the debug layer. */
+    unsigned  advblend_barriers;
+
+    /* EXT_texture_integer integer clear colour (glClearColorIiEXT/UiEXT via
+     * entry_ext_compat.c; consumed by the clear path in rendering.c).  Used
+     * for integer attachments only, and only once set — before that the
+     * legacy float->int conversion of GL_COLOR_CLEAR_VALUE applies. */
+    GLint     clear_color_i[4];
+    GLboolean clear_color_i_set;
+
     /* bound-VAO layout hash (per-draw fast path, see MGLC_VAO_HASH_ATTRIBS) */
     void     *vao_hash_vao;
     uint64_t  vao_hash;

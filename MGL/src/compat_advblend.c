@@ -133,6 +133,29 @@ void mgl_advblend_armed(GLMContext ctx)
     }
 }
 
+/* glBlendBarrierKHR / glBlendBarrierNV / glBlendBarrier (entry_ext_compat.c).
+ *
+ * KHR_blend_equation_advanced §2.3.5: the barrier guarantees that subsequent
+ * geometry blending with an advanced equation sees the results of all
+ * previously drawn geometry.  MGL evaluates the equations with framebuffer
+ * fetch (the `mglAdvDst [[color(0)]]` argument added by mgl_advblend_rewrite),
+ * which Metal executes in raster-ordered-group 0 *inside* the fragment
+ * shader: the destination read is ordered with every earlier draw of the
+ * same render pass, and render passes complete in submission order, so the
+ * guarantee already holds — this is also why the _coherent variant is
+ * advertised.  The call is therefore state-only: it counts (queryable by the
+ * debug layer / tests so the no-op is observable) and must not generate a
+ * GL error or stall the GPU. */
+void mglBlendBarrier(GLMContext ctx)
+{
+    struct MGLExtState_compat *cm = ctx->state.ext_compat;
+
+    if (cm)
+        cm->advblend_barriers++;
+    else
+        mgl_advblend_armed(ctx);   /* materialise the slot (core context) so the counter exists */
+}
+
 /* Fast gate for the per-PSO-build checks (MGLRenderer+RenderState.m): one
  * flag load, no equation read, no table.  False for every context that never
  * selected an advanced blend equation. */

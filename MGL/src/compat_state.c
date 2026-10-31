@@ -27,6 +27,39 @@
 
 #define CS() (ctx->state.ext_compat)
 
+/* glClearColorIiEXT / glClearColorIuiEXT (EXT_texture_integer §2.6, exported
+ * by entry_ext_compat.c).  The integer clear colour is separate state from
+ * GL_COLOR_CLEAR_VALUE: integer attachments are cleared with these exact
+ * bit patterns (no float rounding), float attachments keep using the float
+ * value.  mgl_compat_slot_lazy materialises the compat slot on first use —
+ * core contexts never pay for it until the app actually calls the EXT. */
+void mglClearColorIi(GLMContext ctx, GLint r, GLint g, GLint b, GLint a)
+{
+    struct MGLExtState_compat *cm = mgl_compat_slot_lazy(ctx);
+
+    if (!cm)
+        return;
+
+    /* keep both interpretations: INT reads .i, UINT reads .u below — the
+     * same bits, so one store serves both attachment kinds */
+    memcpy(cm->clear_color_i, (GLint[4]){ r, g, b, a }, sizeof cm->clear_color_i);
+    cm->clear_color_i_set = GL_TRUE;
+    /* no dirty bit needed: mglClear re-packs MGLFBClearRequest from state
+     * on every call, so the next clear picks the integer colour up */
+}
+
+void mglClearColorIui(GLMContext ctx, GLuint r, GLuint g, GLuint b, GLuint a)
+{
+    struct MGLExtState_compat *cm = mgl_compat_slot_lazy(ctx);
+
+    if (!cm)
+        return;
+
+    memcpy(cm->clear_color_i, (const GLint[4]){ (GLint)r, (GLint)g, (GLint)b, (GLint)a },
+           sizeof cm->clear_color_i);
+    cm->clear_color_i_set = GL_TRUE;
+}
+
 void mgl_compat_fog_recompute(GLMContext ctx)
 {
     struct MGLExtState_compat *s = CS();

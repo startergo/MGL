@@ -1,3 +1,46 @@
+## READY (2026-10-31 ~17:20 EDT) — supervisor items 1 + 1b, commits a7fa149 + c1346cb + gl_NumSamples follow-up
+
+Items ready for verification/merge. Base 965d88f, branch gl46/compat.
+
+### 1. glBlendBarrierKHR CTS SEGFAULT (commit a7fa149)
+New MGL/src/entry_ext_compat.c exports EVERY gl.xml-required entry point of every
+advertised extension (audit: ab/ext_entry_audit.py). glBlendBarrier{KHR,NV,} ->
+mglBlendBarrier: documented no-op (equations run with raster-ordered framebuffer
+fetch; _coherent advertised for the same reason). glClearColorIiEXT/UiEXT got real
+integer-clear-colour state (ext_compat slot; rendering.c clear loop).
+* CTS dEQP-GL45-ES3.functional.draw_buffers_indexed.overwrite_common.* : 18/18 Pass
+  overwrite_indexed.* : 18/18 Pass     (965d88f: process SEGFAULT, 10 advanced cases killed)
+* Loader audit: only GL_ARB_gpu_shader_int64's glUniform*64ARB missing (glslang maps
+  64-bit int uniforms to 4-byte MGLI_K_INT so a forwarding entry point would corrupt
+  values; glcts does not load the ARB names — only NV_gpu_shader5's, not advertised).
+
+### 1b. '#version 310/320 es' forced to desktop GLSL (commit c1346cb + gl_NumSamples)
+shaders.c (and mgl_toolchain.c) now honour the 'es' profile token: ES 310/320 keep
+their version with GLSLANG_ES_PROFILE; desktop rewrite/gl_PerVertex/gl_NumSamples
+injection paths skipped for ES. ES 100/300 keep the legacy 330-core mapping
+(glslang refuses ES+SPIR-V < 310). gl_NumSamples: this glslang omits it for the ES
+profile under SPIR-V (only declared when spvVersion.spv==0) -> now injected as the
+baked framebuffer sample count for ES fragment shaders too (same mechanism the
+desktop path already used).
+
+CTS (same filters, MGL_LIBRARY baseline-965d88f vs this branch):
+  dEQP-GL45-ES31.functional.compute.*   79/195 (40.5%)  -> 191/195 (97.9%)
+  dEQP-GL45-ES31.functional.ssbo.*      42/2061 (2.0%)  -> 2028/2061 (98.4%)
+  dEQP-GL45-ES31.functional.ubo.*       110/837 (13.1%) -> 837/837 (100%)
+  KHR-GL46.es_31_compatibility          59/355 (296 Fail) -> 309/355, 8 Fail (144 were
+                                        sample_variables 'gl_NumSamples undeclared')
+  KHR-GL46.gpu_shader_fp64 (desktop control) 659/659 Pass
+Remaining known: es_31_compatibility 8 Fail (sample_variables semantics + 2
+image_load_store), compute.* 4 Fail = image atomics / multi-dispatch barrier
+(both fail identically at 965d88f — separate bugs, not ES-profile related).
+tests/headless: full suite green; tests/headless/test_es_profile.c 27 checks;
+tests/headless/test_entry_ext.c 75 checks.
+
+Unrelated pre-existing bug found (report, not fixed; textures/get-tex-image domain):
+glDispatchCompute followed by glGetTexImage in the same process SIGSEGVs at process
+exit. Minimal: CS link+dispatch, then create any 2D texture and glGetTexImage it.
+
+---
 # compat domain — progress log
 
 READY e4cb8df (branch gl46/compat tip = merge gl46-port **f8be669** (geom r82+r83
@@ -3222,3 +3265,50 @@ agents/cts_qpa_summary.py (case-insensitive qpa summary - the shared
 tests/cts_group.sh parser misses this builds lowercase #beginTestCaseResult
 markers and reports 0 cases), agents/cts_audit.sh (batch group runner),
 agents/cts_caselist.sh (package caselist export), ab/abbench_s35.sh.
+
+---
+
+## Session 2026-10-31 (supervisor tasks 1, 1b, 2) — base 965d88f
+
+### 1. CTS crash: glBlendBarrierKHR missing (commit a7fa149)
+GL_KHR_blend_equation_advanced was advertised without glBlendBarrierKHR, so the
+glcts loader stored NULL and dEQP-GL45-ES3 draw_buffers_indexed.overwrite_* SEGFAULTed.
+* New MGL/src/entry_ext_compat.c: every gl.xml-required entry point of every
+  advertised extension is exported (audit script ab/ext_entry_audit.py, regenerates
+  the list from get.c + gl.xml). glBlendBarrier{KHR,NV,} -> mglBlendBarrier
+  (compat_advblend.c): documented no-op — the equations run with raster-ordered
+  framebuffer fetch, which is also why _coherent is advertised; counted for
+  observability. Forwarders: ARB_draw_buffers_blend, ARB_occlusion_query,
+  ARB_texture_buffer_object, ARB_robustness (incl. getnMap/PixelMap/PolygonStipple
+  + the ARB_imaging stubs), ARB_viewport_array's NV depth-range aliases, KHR_debug
+  KHR suffixes.
+* glClearColorIiEXT/UiEXT implemented for real: integer clear colour state in
+  ext_compat, consumed by the clear loop in rendering.c (surgical edit).
+* Documented gap: GL_ARB_gpu_shader_int64 glUniform*{i,ui}64*ARB not exported —
+  needs width-64 uniform introspection (introspect_spirv.c maps 64-bit int
+  uniforms to 4-byte MGLI_K_INT; the MSL member is `long` = 8 bytes, so uploads
+  corrupt). glcts only loads the NV_gpu_shader5 names (not advertised) so it does
+  not crash there today.
+* CTS: overwrite_common 18/18, overwrite_indexed 18/18 Pass (was segfault).
+
+### 1b. '#version 310/320 es' compiled as desktop GLSL (commit c1346cb)
+shaders.c initGLSLInput forced CORE profile on every compile. Now: 'es' token on
+the #version line -> GLSLANG_ES_PROFILE with the shader's own version for 310/320;
+the <330 desktop rewrite / gl_PerVertex injection / gl_NumSamples injection are
+skipped for ES. ES 100/300 keep the legacy 330-core mapping (glslang refuses
+ES+SPIR-V below 310). Same fix in mgl_toolchain.c (exported helper, no in-tree
+callers). fp64.c's internal source is desktop-only, untouched.
+* CTS: compute.shared_var 136/136 (was all-Fail); compute.* 191/195 (4 Fails
+  identical at baseline); texture.cube_array 516/570; KHR-GL46.gpu_shader_fp64
+  659/659 (desktop unregressed). tests/headless/test_es_profile.c 27 checks.
+
+### Unrelated pre-existing bug found (NOT fixed — textures/get-tex-image domain)
+glDispatchCompute followed by glGetTexImage in the same process SIGSEGVs at
+process exit (tail-call to pc=0/lr=0 before exit() is reached; _ctx and
+dispatch.get_error are intact). Minimal repro (also at clean 965d88f, desktop
+'#version 450 core' ES-free shaders):
+  compile+link CS; glDispatchCompute(1,1,1); create an unrelated texture;
+  glGetTexImage(GL_TEXTURE_2D,...) -> exits with SIGSEGV.
+Without the dispatch, or without the glGetTexImage, the process exits cleanly.
+Second variant: FBO + glReadPixels after the dispatch exits cleanly (used in
+test_es_profile.c to keep the suite green).
