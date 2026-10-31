@@ -3632,8 +3632,21 @@ static bool copyTexComplete(Texture *tex, GLuint face)
         return false;
 
     bool mips = !(tex->params.min_filter == GL_NEAREST || tex->params.min_filter == GL_LINEAR);
-    GLint top = mips ? max : base;
-    if ((GLuint)top >= tex->mipmap_levels)
+    GLint top = base;
+    if (mips)
+    {
+        /* GL 4.6 8.17: the chain a mip min filter needs ends at p = min(max_level, q)
+         * with q = base + floor(log2(max mip dims of the level-base image)).  A default
+         * TEXTURE_MAX_LEVEL of 1000 must NOT make a texture incomplete when the
+         * levels it actually needs are all defined (dEQP-GL45-ES31 copy_image leaves a
+         * mip min filter set on its images before copying). */
+        TextureLevel *bl = texLevel(tex, face, base);
+        if (!bl || !bl->complete)
+            return false;
+        top = base + (GLint)log2u(fullChainLevels(tex, bl->width, bl->height, bl->depth) - 1);
+        if (top > max) top = max;
+    }
+    if (top < base || (GLuint)top >= tex->mipmap_levels)
         return false;
 
     for (GLint l = base; l <= top; l++)

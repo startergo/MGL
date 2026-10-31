@@ -688,6 +688,54 @@ TEST(copy_image_sub_data)
     glDeleteTextures(6, ts);
 }
 
+TEST(copy_image_sub_data_mip_complete)
+{
+    /* GL 4.6 18.3.3 + 8.17: a texture whose mipmap chain covers
+     * base..min(MAX_LEVEL, q) is complete for CopyImageSubData even with the
+     * default MAX_LEVEL 1000 and a mip min filter — dEQP-GL45-ES31
+     * functional.copy_image leaves NEAREST_MIPMAP_NEAREST set before copying */
+    GLubyte src[65 * 63 * 4];
+    for (int i = 0; i < (int)sizeof src; i++) src[i] = (GLubyte)(i * 7);
+    GLuint a = new_tex(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 65, 63, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+    for (int l = 1; l < 7; l++)
+        glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, 65 >> l, 63 >> l, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    /* MAX_LEVEL stays 1000 (default) */
+
+    GLuint b = new_tex(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 65, 63, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    for (int l = 1; l < 7; l++)
+        glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, 65 >> l, 63 >> l, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+
+    glBindTexture(GL_TEXTURE_2D, a);
+    glCopyImageSubData(a, GL_TEXTURE_2D, 0, 0, 0, 0, b, GL_TEXTURE_2D, 0, 3, 5, 0, 16, 8, 1);
+    EXPECT_NO_GL_ERROR();
+    glCopyImageSubData(a, GL_TEXTURE_2D, 1, 0, 0, 0, b, GL_TEXTURE_2D, 2, 1, 1, 0, 4, 4, 1);
+    EXPECT_NO_GL_ERROR();
+    glBindTexture(GL_TEXTURE_2D, b);
+    GLubyte o[65 * 63 * 4];
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, o);
+    EXPECT_EQ_INT(o[(5 * 65 + 3) * 4], src[0]);
+    EXPECT_EQ_INT(o[(5 * 65 + 3) * 4 + 3], src[3]);
+    EXPECT_EQ_INT(o[((5 + 7) * 65 + (3 + 15)) * 4], src[(7 * 65 + 15) * 4]);
+
+    /* but a texture missing the levels the chain needs is incomplete
+     * (KHR-GL46 copy_image.incomplete_tex): 4x4 needs levels 0..2 */
+    GLuint c = new_tex(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    GLuint d = new_tex(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glCopyImageSubData(c, GL_TEXTURE_2D, 0, 0, 0, 0, d, GL_TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
+
+    glDeleteTextures(4, (GLuint[4]){ a, b, c, d });
+}
+
 TEST(clear_tex_image)
 {
     GLuint t = new_tex(GL_TEXTURE_2D);
@@ -924,6 +972,7 @@ int main(void)
     RUN(copy_tex_sub_image_from_fbo);
     RUN(copy_into_array_layer);
     RUN(copy_image_sub_data);
+    RUN(copy_image_sub_data_mip_complete);
     RUN(clear_tex_image);
     RUN(object_errors);
     RUN(sample_compressed_and_uploaded);

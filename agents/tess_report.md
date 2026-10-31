@@ -1,5 +1,78 @@
-READY 74a0749 (all r44 code; the report commit on top is the branch tip)
+READY 26ab48f (all r45 code; the report commit on top is the branch tip)
 
+# tess domain — round 45 report (supervisor-assigned: glCopyImageSubData completeness fix, dEQP-GL45-ES31 copy_image 7680->0 fails)
+
+Task from the 14:35 note: the official-equivalent CTS (opengl-cts-4.6.8.1, gl45-es31-main)
+failed ALL of dEQP-GL45-ES31.functional.copy_image.non_compressed.* with
+"glCopyImageSubData failed.: glGetError() returned GL_INVALID_OPERATION" on every
+valid copy involving a texture, while KHR-GL46.copy_image passed.  This round finds
+the bug, fixes it, and finishes the verification runs the previous run left undone.
+
+## Root cause and fix (381b73e)
+`copyTexComplete()` in MGL/src/textures.c (the texdata domain's file — surgical edit,
+see "Shared-file edits") computed the top of the mipmap chain a copy source/dest must
+have as `TEXTURE_MAX_LEVEL` (default 1000).  A texture that defines fewer than 1000
+levels was therefore treated as incomplete whenever its MIN_FILTER was a mip filter,
+and glCopyImageSubData returned GL_INVALID_OPERATION.  dEQP's copy_image tests render
+their source images through a sampler with a mip min filter and never restore
+GL_NEAREST, so every texture case failed; renderbuffer-only pairs (155 cases) passed.
+
+Per GL 4.6 8.17 ("Sampler Completeness") the chain a mip min filter needs ends at
+`p = min(max_level, q)` with `q = base + floor(log2(max(w,h,d) of the level-base
+image))`.  The fix computes exactly that (`fullChainLevels` already existed for
+texture completeness elsewhere in the file) and additionally requires the level-base
+image itself to be defined.  A texture whose base..p levels all exist is now
+copyable even with the default MAX_LEVEL 1000; a texture actually missing a level in
+base..p stays incomplete (KHR-GL46 copy_image.incomplete_tex: 4x4, level 0 only,
+needs 0..2, still fails with GL_INVALID_OPERATION).
+
+## Verification (this round's runs)
+* **dEQP-GL45-ES31.functional.copy_image.\* (full group, new glcts at
+  ~/MGL-cts-new, -j4, nice'd, 256x256, seed -1): 7835 Pass / 0 Fail / 0 NotSupported.**
+  Baseline r965d88f (same case set): **7680 Fail / 155 Pass** — every previously
+  failing case now passes.  Per viewclass: 8-bit 361/361, 16-bit 1089/1089,
+  24-bit 441/441, 32-bit 4708/4708, 48-bit 144/144, 64-bit 752/752, 96-bit 144/144,
+  128-bit 196/196.  Repro: .agent/cts45_ci.sh (log .agent/cts45_ci.log, per-run
+  qpa in .agent/cts45_ci/).
+* **KHR-GL46.copy_image.\*: 324/324 Pass, 0 Fail, 0 NotSupported** (same glcts,
+  .agent/cts45_khr.log) — no regression, including the incomplete_tex cases.
+* Full headless suite: **144 test files, 0 failures** (139 check-summaries, all
+  "0 failures"; no BUILD-FAIL/crash), including the new regression test
+  `copy_image_sub_data_mip_complete` in test_texdata.c (26ab48f): 65x63 texture,
+  levels 0..6, NEAREST_MIPMAP_NEAREST, MAX_LEVEL default -> both copies succeed and
+  read back pixel-exact; 4x4 texture with only level 0 -> still GL_INVALID_OPERATION.
+* stub_scanner EMPTY/NOOP/ASSERT: clean for MGL/src/tessellation.c and
+  MGL/src/textures.c.  `make lib` clean (the one -Wpointer-bool-conversion warning at
+  textures.c:3053 is pre-existing on the 965d88f base, untouched by this round).
+
+## Pre-READY ab_bench (.agent/abbench_r45.sh, ab_patches, MGL_AB_CPU=1, min-of-7,
+alternating, background CTS load 5-8)
+| bench (ms/1000)      | A = 965d88f | C = r45 |
+|----------------------|-------------|---------|
+| drawArrays-tris      | 0.433       | 0.372   |
+| patches-noTCS        | 89.7        | 85.4    |
+| patches-TCS-TES      | 131.7       | 94.1    |
+| patches-TCS-TES-64   | 89.4        | 92.3    |
+CPU-time parity within the run's load noise (as expected: the change only touches a
+texture-completeness predicate on the copy path, no draw-path code).
+
+## Shared-file edits
+* **MGL/src/textures.c** (+15/-2, commit 381b73e): `copyTexComplete()` only — the
+  mip-chain top is now min(MAX_LEVEL, 8.17 q) instead of MAX_LEVEL, plus the
+  level-base-defined check.  Nothing else in the file changed; the texdata domain's
+  own tests all still pass (test_texdata 257 checks, 0 failures in the suite run).
+* **tests/headless/test_texdata.c** (+49, commit 26ab48f): one new TEST, no edits to
+  existing tests.
+
+## Notes
+* GL_KHR_shader_subgroup left unexposed, per the user's 15:44 decision — no work
+  started, no API/state touched.
+* Tess code itself is untouched this round (r44 ring work is merged and unchanged);
+  the round was entirely the supervisor-assigned copy_image fix plus verification.
+
+---
+
+# (round 44 history below)
 # tess domain — round 44 report (ring retire latency + draw-size robustness)
 
 Builds clean (`make -j8 lib`, no new warnings in my files), full headless suite
