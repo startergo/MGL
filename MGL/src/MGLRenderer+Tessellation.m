@@ -138,6 +138,12 @@ static int tRingTrace(void)
 
 /* acquire a block of `bytes` from the ring; returns the buffer and sets *offset.
  * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched). */
+/* tess draws encoded on the current shared command buffer (AGX keep-alive,
+ * see the flush at the end of the hardware path) */
+static unsigned tHwDrawsOnCb = 0;
+/* >0: the ring went dry recently - flush every draw for the next 64 draws
+ * (see the keep-alive comment at the end of the hardware path) */
+static unsigned tRingExhaust = 0;
 static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t *offset,
                                      int *slot, MGLRenderer *self)
 {
@@ -193,13 +199,24 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
             for (int i = 0; i < MGL_TESS_RING && !any; i++)
                 any = !tRingBusy[i];
             if (any)
-                return tessRingAcquire(device, bytes, offset, slot, self);
-            if (spin == 50 && self && !self->_currentRenderEncoder &&
-                self->_currentCommandBuffer &&
+            {
+                    return tessRingAcquire(device, bytes, offset, slot, self);
+            }
+            if (spin == 50 && self && self->_currentCommandBuffer &&
                 self->_currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
             {
+                /* shared-buffer draws (r42): ring blocks retire with the command
+                 * buffer the draw encoded into, which stays open across a burst of
+                 * draws — the eight slots can all be busy on it.  End the render
+                 * encoding and commit it so the completion handlers can retire the
+                 * slots; the next draw's extBufEnsureCommandBuffer (or this draw's
+                 * compute phase, which picks a fresh buffer when the current one is
+                 * committed) reopens one. */
+                [self endRenderEncoding];
                 [self->_currentCommandBuffer commit];
                 self->_currentCommandBuffer = nil;
+                tHwDrawsOnCb = 0;
+                tRingExhaust = 64;   /* go per-draw for a while (keep-alive) */
             }
             if (spin == 19999 && !self->_currentCommandBuffer && !self->_currentRenderEncoder)
             {
@@ -2629,6 +2646,23 @@ static void tessRetireCapture(GLMContext ctx)
         _currentCommandBuffer = [_commandQueue commandBuffer];
         ctx->state.dirty_bits = DIRTY_ALL;
     }
+    else if (use_hardware && compute_cb == _currentCommandBuffer &&
+             _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+    {
+        /* tess perf (r42): the compute encoders above were appended to the SAME
+         * command buffer the render pass will use — Metal executes the encoders of
+         * one command buffer strictly in encoding order, so the VS/TCS/blob kernels
+         * are complete before the render pass reads their output.  No event, no
+         * commit, no fresh command buffer: the old per-draw signal/wait pair also
+         * committed every earlier draw on the shared buffer and forced a full
+         * pipeline rebuild (measured ~230 us of CPU per GL_PATCHES draw with
+         * .agent/ab_patches.c; a plain drawArrays is ~5 us).  The render encoder was
+         * ended before the compute phase; DIRTY_RENDER_STATE makes the next
+         * processGLState open a new render pass on this same buffer, after the
+         * kernels.  Ring blocks now retire only when the shared buffer completes
+         * (glFinish / readback / the ring's own forced commit in tessRingAcquire). */
+        ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    }
     else
     {
         id<MTLEvent> ev = [_device newEvent];
@@ -2714,9 +2748,19 @@ static void tessRetireCapture(GLMContext ctx)
 
 
             
-            ctx->state.dirty_bits = DIRTY_ALL;
-            
-            /* the ring block retires when this command buffer completes */
+            /* tess perf (r42): a full DIRTY_ALL here forced the NEXT draw through
+             * the whole descriptor rebuild (~126 us of NSString-keyed pipeline
+             * descriptor per draw, measured with .agent/ab_patches.c) even though
+             * the encoder binds of this draw are the only thing that changed.
+             * DIRTY_VAO re-runs the vertex-buffer map list (this draw bound the
+             * tess rings at MGL_TESS_VD_CP/PATCH/FACTORS, so GL attribute binds
+             * must be re-issued) and keeps the compat pipeline fast path
+             * admissible (it declines on DIRTY_FBO); DIRTY_RENDER_STATE rebuilds
+             * the render pass, which every following tess draw needs anyway (its
+             * compute encoders must be ordered before its own drawPatches).  The
+             * bind-shadow generation bump in extCompatRenderEncoderCreated keeps
+             * per-index encoder binds from leaking into the new encoder. */
+            ctx->state.dirty_bits = DIRTY_VAO | DIRTY_RENDER_STATE;
             {
                 int slot = ring_slot;
                 id<MTLCommandBuffer> cb = _currentCommandBuffer;
@@ -2724,6 +2768,34 @@ static void tessRetireCapture(GLMContext ctx)
                     fprintf(stderr, "MGL ring: register(hw) slot=%d cb=%d\n", slot,
                             cb ? (int)cb.status : -1);
                 tessRingRetireOn(cb, slot);   /* handles committed/completed buffers */
+            }
+
+            /* AGX keep-alive (r42): a command buffer that carries several tess
+             * draws and is then left uncommitted lets the driver's submission
+             * and completion path go idle.  Metal batches command-buffer
+             * submissions on a timer, so a burst that out-runs the 8 ring slots
+             * (2 draws per flushed buffer) ends up sleeping one whole batch
+             * window inside tessRingAcquire (~6.7 ms here, ~250 ms under heavy
+             * load; measured with .agent/ab_patches.c).  Committing the shared
+             * buffer every 2nd tess draw keeps completions flowing — per-draw
+             * CPU cost drops from ~270 us (the old commit-and-signal-every-draw
+             * design) to ~85 us — and when the ring does go dry anyway, the
+             * flush tightens to every draw for the next 64 draws: that is
+             * exactly the tight-loop shape where submission latency dominates
+             * and per-draw commits keep Metal's batcher hot. */
+            if (tRingExhaust > 0)
+                tRingExhaust--;
+            unsigned ka_every = tRingExhaust ? 1u : 2u;
+            if (++tHwDrawsOnCb >= ka_every)
+            {
+                tHwDrawsOnCb = 0;
+                if (_currentCommandBuffer &&
+                    _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+                {
+                    [self endRenderEncoding];
+                    [_currentCommandBuffer commit];
+                    _currentCommandBuffer = nil;
+                }
             }
         }
         return true;
