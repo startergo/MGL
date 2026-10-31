@@ -747,13 +747,65 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
     return nt;
 }
 
+/* plain-UNORM view of an _sRGB texture: rendering and clearing through it skips
+ * Metal's automatic sRGB encode.  GL 4.6: fragment output converts linear->sRGB
+ * only while GL_FRAMEBUFFER_SRGB is enabled (off by default), and glClear applies
+ * NO transfer at all (the clear color is stored raw — Mesa parity, and what the
+ * CTS readback model assumes: reads return the stored bytes raw). */
+static bool fbPixelIsSRGB(MTLPixelFormat f)
+{
+    switch (f)
+    {
+        case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatR8Unorm_sRGB:    case MTLPixelFormatRG8Unorm_sRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
+- (id<MTLTexture>) fbPlainUnormView:(id<MTLTexture>)t
+{
+    MTLPixelFormat plain = MTLPixelFormatInvalid;
+    switch (t.pixelFormat)
+    {
+        case MTLPixelFormatRGBA8Unorm_sRGB: plain = MTLPixelFormatRGBA8Unorm; break;
+        case MTLPixelFormatBGRA8Unorm_sRGB: plain = MTLPixelFormatBGRA8Unorm; break;
+        case MTLPixelFormatR8Unorm_sRGB:    plain = MTLPixelFormatR8Unorm; break;
+        case MTLPixelFormatRG8Unorm_sRGB:   plain = MTLPixelFormatRG8Unorm; break;
+        default: break;
+    }
+    if (plain == MTLPixelFormatInvalid) return t;
+    NSNumber *key = [NSNumber numberWithUnsignedLongLong:(uintptr_t)(__bridge void *)t];
+    NSMutableDictionary *cache = [self fbCache];
+    NSString *vkey = [NSString stringWithFormat:@"srgbview:%@", key];
+    id<MTLTexture> v = cache[vkey];
+    if (!v)
+    {
+        v = [t newTextureViewWithPixelFormat:plain];
+        if (v) cache[vkey] = v;
+    }
+    return v ? v : t;
+}
+
 - (id<MTLTexture>) fbTextureForAttachment:(FBOAttachment *)att renderTarget:(bool)rt
 {
     Texture *tex = mgl_fb_attachment_texture(ctx, att);
     if (!tex) return nil;
 
     if (att->textarget == GL_RENDERBUFFER)
+    {
+        /* compat s34: renderbuffers used to be returned in their _sRGB Metal
+         * format, so clears (always) and fragment writes (while
+         * GL_FRAMEBUFFER_SRGB is off) picked up Metal's automatic sRGB encode —
+         * unlike texture attachments, which the r52 code below routed through
+         * the plain-UNORM view.  Same swap for renderbuffers now
+         * (KHR-GL46.direct_state_access.renderbuffers_storage{,_multisample}
+         * cleared 0.25 into SRGB8_ALPHA8 and read back 0.537255 = sRGB(0.25)). */
+        if (rt && !ctx->state.caps.framebuffer_srgb)
+            return [self fbPlainUnormView:(__bridge id<MTLTexture>)tex->mtl_data];
         return (__bridge id<MTLTexture>)tex->mtl_data;
+    }
 
     if (rt && !tex->mtl_data)
         tex->is_render_target = GL_TRUE;
@@ -770,30 +822,7 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
      * default).  Metal would encode automatically for an _sRGB render target,
      * so render through a plain-UNORM view until the cap is turned on. */
     if (rt && !ctx->state.caps.framebuffer_srgb)
-    {
-        MTLPixelFormat plain = MTLPixelFormatInvalid;
-        switch (t.pixelFormat)
-        {
-            case MTLPixelFormatRGBA8Unorm_sRGB: plain = MTLPixelFormatRGBA8Unorm; break;
-            case MTLPixelFormatBGRA8Unorm_sRGB: plain = MTLPixelFormatBGRA8Unorm; break;
-            case MTLPixelFormatR8Unorm_sRGB:    plain = MTLPixelFormatR8Unorm; break;
-            case MTLPixelFormatRG8Unorm_sRGB:   plain = MTLPixelFormatRG8Unorm; break;
-            default: break;
-        }
-        if (plain != MTLPixelFormatInvalid)
-        {
-            NSNumber *key = [NSNumber numberWithUnsignedLongLong:(uintptr_t)(__bridge void *)t];
-            NSMutableDictionary *cache = [self fbCache];
-            NSString *vkey = [NSString stringWithFormat:@"srgbview:%@", key];
-            id<MTLTexture> v = cache[vkey];
-            if (!v)
-            {
-                v = [t newTextureViewWithPixelFormat:plain];
-                if (v) cache[vkey] = v;
-            }
-            if (v) t = v;
-        }
-    }
+        t = [self fbPlainUnormView:t];
     return t;
 }
 
@@ -908,6 +937,22 @@ static void fbSetAttachment(MTLRenderPassAttachmentDescriptor *a, const FBTarget
             int k = fbKindForPixelFormat(T->color[i].tex.pixelFormat);
             if (k == MGL_FB_KIND_UINT) for (int c = 0; c < 4; c++) v[c] = v[c] < 0 ? 0 : floor(v[c]);
             if (k == MGL_FB_KIND_INT) for (int c = 0; c < 4; c++) v[c] = trunc(v[c]);
+            /* compat s34: with GL_FRAMEBUFFER_SRGB on the clear still targets the
+             * _sRGB texture, and Metal ENCODES its clear color.  GL applies no
+             * transfer on clear (the color is stored raw, like Mesa and like the
+             * plain-UNORM path above), so pre-decode to cancel the encode. */
+            switch (T->color[i].tex.pixelFormat)
+            {
+                case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm_sRGB:
+                case MTLPixelFormatR8Unorm_sRGB:    case MTLPixelFormatRG8Unorm_sRGB:
+                    for (int c = 0; c < 3; c++)
+                    {
+                        double x = v[c] < 0.0 ? 0.0 : (v[c] > 1.0 ? 1.0 : v[c]);
+                        v[c] = x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+                    }
+                    break;
+                default: break;
+            }
             /* geom r58: an alpha-less GL format clears A to 1.0 (GL 4.6: reads of a
              * missing alpha channel return one); the RGBA Metal backing would
              * otherwise store the clear color's alpha (texture_swizzle.functional). */
@@ -1468,6 +1513,27 @@ typedef struct FBBlitParams {
     bool same = src->tex == dst->tex;
     id<MTLTexture> stex = [self fbSampleable:src forceCopy:same];
     if (!stex) return;
+
+    /* compat s34: sRGB-encoding neutrality.  MSL read() on an _sRGB source
+     * DECODES, and while GL_FRAMEBUFFER_SRGB is off the dst renders through its
+     * plain-UNORM view, so the decoded value would be stored raw
+     * (KHR-GL46.direct_state_access.renderbuffers_storage_multisample: clear
+     * 0.25 -> resolve blit -> read back decode(0.25)=0.051).  A GL blit between
+     * color buffers of the same encoding passes the bytes through unchanged, so
+     * blit through plain-UNORM views of BOTH sides whenever the source is _sRGB
+     * (a blit whose sides differ in encoding is INVALID_OPERATION, so the dst
+     * is then _sRGB too and fbPlainUnormView is a no-op for the already-plain
+     * framebuffer_srgb-off dst).  Raw bytes in, raw bytes out — the linear-
+     * filter path therefore filters the encoded values, which is exact for the
+     * uniform sources the CTS blits and lossless for nearest. */
+    FBTarget dstv;
+    if (fbPixelIsSRGB(stex.pixelFormat))
+    {
+        stex = [self fbPlainUnormView:stex];
+        dstv = *dst;
+        dstv.tex = [self fbPlainUnormView:dst->tex];
+        dst = &dstv;
+    }
 
     int sk = fbKindForPixelFormat(stex.pixelFormat);
     bool ms = stex.sampleCount > 1;

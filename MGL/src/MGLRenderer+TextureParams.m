@@ -403,7 +403,12 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
 
 /* texparamTextureForTex helper: Metal pixel formats whose storage has a real
  * alpha component (so a GL format without one can leak the stale backing byte
- * into reads). 1/2/3-component Metal formats return alpha 1 in hardware. */
+ * into reads). 1/2/3-component Metal formats return alpha 1 in hardware.
+ * compat s34: the integer RGBA backings (RGB8I/RGB8UI/RGB16*UI/I on
+ * RGBA{8,16,32}{S,U}int) count too — texture_size_promotion.functional renders
+ * RGB8I into a 2D_MULTISAMPLE texture (no upload ever writes the backing alpha
+ * byte) and texelFetch(...).a must read 1; swizzled views do apply to
+ * texture2d_ms read() (verified natively on M4 Pro). */
 static bool texparamPixelFormatHasAlphaBacking(MTLPixelFormat pf)
 {
     switch (pf)
@@ -418,6 +423,12 @@ static bool texparamPixelFormatHasAlphaBacking(MTLPixelFormat pf)
         case MTLPixelFormatRGBA32Float:
         case MTLPixelFormatBGRA8Unorm:
         case MTLPixelFormatBGRA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Sint:
+        case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatRGBA16Sint:
+        case MTLPixelFormatRGBA16Uint:
+        case MTLPixelFormatRGBA32Sint:
+        case MTLPixelFormatRGBA32Uint:
             return true;
         default:
             return false;

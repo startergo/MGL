@@ -1,8 +1,62 @@
 # compat domain — progress log
 
-READY s33 545be75 (= be37cdd + merge gl46-port **f973a81**; commits on top touch only
-agents/compat_report.md + ab/) — supersedes the REJECTED s30 READY below.  s30 was
-rejected (supervisor: ideas -10%, jellyfish -6.4% vs eb9eaeb on the combined tree,
+READY s34 a99f674 (= merge gl46-port **52e6276** (tess r40) + 7dadf9a + 5a003da;
+both commits are CTS Fail->Pass fixes, no new state, no shared-behaviour change
+for passing paths).  Supersedes the gl46/compat-ms2 standalone READY below
+(supervisor 17:31: fb8915e already contains the GL_MAX_SAMPLES fix AND its test
+— the squash carried them; compat-ms2 is redundant now, do not merge it).
+Contents:
+1) **7dadf9a sRGB renderbuffer attachments + sRGB-neutral blits**
+   (KHR-GL46.direct_state_access.renderbuffers_storage{,_multisample} Fail->Pass;
+   both were the only remaining Fails in the whole r28 sweep fail list).
+   Root cause: fbTextureForAttachment returned renderbuffers in their _sRGB
+   Metal format, so glClear (always) and fragment writes (while
+   GL_FRAMEBUFFER_SRGB is off, the default) got Metal's automatic sRGB encode;
+   texture attachments were already routed through a plain-UNORM view (r52).
+   Fixes (all in MGLRenderer+Framebuffer.m, 3 surgical edits, no code moved):
+   - fbPlainUnormView helper (the r52 inline switch factored out, same
+     srgbview:%@ cache key) applied to RENDERBUFFER targets when rt && !
+     framebuffer_srgb — clears and writes now store the RAW bytes.
+   - while GL_FRAMEBUFFER_SRGB is on the clear still targets the _sRGB texture,
+     so the clear color is PRE-DECODED there: glClear applies no transfer (Mesa
+     parity: Mesa's readpix.c linearizes the rb format and applies no decode on
+     read; the CTS packed_pixels.srgb8* cases assert byte-verbatim float reads,
+     which pinned the read side raw — the DSA test pins clear->read identity).
+   - the 4x->1x resolve leaked the other way: MSL read() on an _sRGB source
+     DECODES and the plain dst stored the decoded value (storage_multisample
+     fetched decode(0.25)=0.051).  fbShaderBlitFrom now blits through plain-UNORM
+     views of BOTH sides whenever the source is _sRGB: raw bytes in, raw bytes
+     out (a blit whose sides differ in encoding is INVALID_OPERATION).
+   Tests: new tests/headless/test_compat_srgbclear.c (5 TESTs / 29 checks:
+   rbo clear roundtrip, texture control, fragment-write linear when srgb off,
+   srgb-on roundtrip, 4x resolve blit roundtrip).  CTS on the tip:
+   renderbuffers_storage{,_multisample} Pass, all 11 direct_state_access
+   renderbuffer cases Pass, all 14 srgb-named packed_pixels/texture_gather
+   cases Pass (incl. the two that pin raw readback).
+2) **5a003da alpha-less INTEGER formats** (KHR-GL46.texture_size_promotion.
+   functional Fail->Pass).  Pre-existing at fb8915e (verified by stashing the
+   sRGB fix: still fails), NOT a regression from my merge.  r77's
+   texparamPixelFormatHasAlphaBacking listed only unorm/float RGBA backings, so
+   RGB8I/RGB8UI/RGB16* never composed the alpha->One view swizzle and the
+   backing alpha byte (255 after uploads, 0 for render-only textures) leaked
+   into reads: the CTS renders RGB8I into a GL_TEXTURE_2D_MULTISAMPLE target
+   and read texelFetch(..).a == 0 instead of 1.  Added the 6 integer RGBA Metal
+   formats to the predicate (MGLRenderer+TextureParams.m, one predicate, no
+   other change — texparam/geom domain file, called out).  Swizzle views DO
+   apply to texture2d_ms read() — native probe probes/ms_swizzle_probe.m,
+   committed): plain MS tex reads 10 20 30 0, swizzled view reads 10 20 30 1.
+   Tests: new tests/headless/test_compat_alphams.c (2D -> render -> 2DMS ->
+   texelFetch .a == 1 chain, 9 checks); geom's test_alphaless still 21/21.
+   CTS: texture_size_promotion.functional Pass, texture_swizzle 4/4,
+   copy_image 13/13.
+GATES on a99f674: full tests/headless/run.sh = **136 test binaries, 0 FAILED /
+0 BUILD-FAIL, 10865 checks, rc=0**; the ENTIRE r28-sweep fail list (124 cases:
+116 Fail + 7 Crash + 1 InternalError) re-run on this tip = **124/124 Pass**
+(texture_swizzle.functional needs >300 s; Pass at 900 s timeout).  stub_scanner
+EMPTY/NOOP/ASSERT clean for the compat files.
+
+## session 33 (Oct 30, morning-08:31) — s30 rejection reproduced; s33 READY (545be75)
+(s30 was rejected: ideas -10% / jellyfish -6.4% vs eb9eaeb on the combined tree,
 measured with the one-process method).  REPRODUCED with the supervisor's exact method
 (ONE glmark2-macos process `-b ideas -b jellyfish -b gl41-geometry`,
 --data-path /opt/homebrew/share/glmark2, ABBA rounds under
