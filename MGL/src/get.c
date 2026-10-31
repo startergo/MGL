@@ -308,10 +308,14 @@ static const char *mgl_extensions[] = {
     "GL_ARB_separate_shader_objects",
     "GL_ARB_shader_atomic_counters",
     "GL_ARB_shader_bit_encoding",
-    "GL_ARB_post_depth_coverage",     /* layout(post_depth_coverage): glslang -> PostDepthCoverage
-                                       * (implies EarlyFragmentTests) -> SPIRV-Cross
-                                       * [[sample_mask, post_depth_coverage]]; the mask reflects the
-                                       * depth test only, not stencil (.agent/gap_post_depth_coverage.md) */
+    /* GL_ARB_post_depth_coverage is deliberately NOT advertised (r41): Metal's
+     * [[sample_mask, post_depth_coverage]] reflects the depth test only —
+     * stencil-failed samples stay covered (.agent/gap_post_depth_coverage.md),
+     * so KHR-GL46.post_depth_coverage_tests PostDepthSampleMask could not
+     * pass honestly.  Mesa/Asahi do not advertise the extension either, and
+     * layout(post_depth_coverage) is rejected at link (tessellation.c
+     * spv_uses_post_depth_coverage) so no shader can depend on the broken
+     * behaviour.  layout(early_fragment_tests) is GL 4.2 core and unaffected. */
     "GL_ARB_tessellation_shader",      /* core in 4.0; tess domain (geometry.c prep kernel) */
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",

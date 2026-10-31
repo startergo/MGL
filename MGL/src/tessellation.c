@@ -1256,6 +1256,8 @@ char *mgl_tess_glsl_compat(GLenum type, const char *src)
 #define SPV_EM_QUADS                        24
 #define SPV_EM_ISOLINES                     25
 #define SPV_EM_OUTPUT_VERTICES              26
+#define SPV_EM_POST_DEPTH_COVERAGE        4426
+#define SPV_EXECUTION_MODEL_FRAGMENT        4
 
 /* collect execution modes of the tessellation entry point (model-filtered) */
 static bool spv_tess_modes(const uint32_t *ir, size_t n, unsigned model_wanted,
@@ -5074,6 +5076,81 @@ store_none:
 }
 
 /* post-link: parse the tessellation modes and the patch data layouts */
+/* True if the GLSL source uses the post_depth_coverage layout qualifier — as
+ * opposed to merely naming the extension in a #extension line, which glslang
+ * accepts with no behavioural effect.  Comments are skipped, preprocessor
+ * lines (#extension/#ifdef/#define) are ignored (the extension NAME lives
+ * there), and the token is matched with identifier boundaries so
+ * my_post_depth_coverage / post_depth_coverage2 do not match. */
+static bool mgl_src_uses_post_depth_coverage(const char *src)
+{
+    static const char tok[] = "post_depth_coverage";
+    const size_t tlen = sizeof tok - 1;
+    const char *p = src;
+    bool in_line_comment = false, in_block_comment = false, line_is_pp = false;
+
+    if (!src) return false;
+    while (*p)
+    {
+        if (*p == '\n')
+        {
+            in_line_comment = false;
+            line_is_pp = false;
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#') line_is_pp = true;
+            continue;
+        }
+        if (in_line_comment) { p++; continue; }
+        if (in_block_comment)
+        {
+            if (p[0] == '*' && p[1] == '/') { in_block_comment = false; p += 2; }
+            else p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '/') { in_line_comment = true; p += 2; continue; }
+        if (p[0] == '/' && p[1] == '*') { in_block_comment = true; p += 2; continue; }
+        if (!line_is_pp && strncmp(p, tok, tlen) == 0)
+        {
+            bool before_ok = (p == src) ||
+                             !(isalnum((unsigned char)p[-1]) || p[-1] == '_');
+            bool after_ok = !(isalnum((unsigned char)p[tlen]) || p[tlen] == '_');
+            if (before_ok && after_ok)
+                return true;
+            p += tlen;
+            continue;
+        }
+        p++;
+    }
+    return false;
+}
+
+/* True if a linked program uses layout(post_depth_coverage).  Two layers:
+ * the GLSL qualifier (glslang's OpenGL client compiles it away — SPIR-V's
+ * PostDepthCoverage execution mode is Vulkan-only, the ARB spelling only
+ * emits EarlyFragmentTests, probed with external glslang -G) and, for
+ * completeness, the SPIR-V mode itself (were it ever to appear, SPIRV-Cross
+ * would emit Metal's [[post_depth_coverage]], whose stencil semantics MGL
+ * cannot honor). */
+static bool mgl_program_uses_post_depth_coverage(GLMContext ctx, Program *program)
+{
+    (void)ctx;
+    Shader *fs = program->shader_slots[_FRAGMENT_SHADER];
+    if (fs && mgl_src_uses_post_depth_coverage(fs->src))
+        return true;
+
+    {
+        int modes[16], nmodes = 0;
+        if (spv_tess_modes(program->spirv[_FRAGMENT_SHADER].ir,
+                           program->spirv[_FRAGMENT_SHADER].size,
+                           SPV_EXECUTION_MODEL_FRAGMENT, modes, &nmodes, NULL))
+            for (int m = 0; m < nmodes; m++)
+                if (modes[m] == SPV_EM_POST_DEPTH_COVERAGE)
+                    return true;
+    }
+    return false;
+}
+
 static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
@@ -5083,6 +5160,26 @@ static void mgl_ext_post_link_tess(GLMContext ctx, Program *program)
 
     if (!S || !program)
         return;
+
+    /* GL_ARB_post_depth_coverage is not advertised (get.c, r41): Metal's
+     * [[sample_mask, post_depth_coverage]] misses stencil-failed samples
+     * (.agent/gap_post_depth_coverage.md), so no shader may depend on it.
+     * glslang still accepts the GLSL extension name, so the feature use is
+     * rejected here, at link: a fragment shader carrying the
+     * post_depth_coverage layout qualifier fails the link (the CTS
+     * post_depth_coverage_tests group is extension-gated and stays
+     * NotSupported).  layout(early_fragment_tests) — GL 4.2 core — is a
+     * different qualifier and unaffected. */
+    if (mgl_program_uses_post_depth_coverage(ctx, program))
+    {
+        MGLProgramObj *obj = MGL_PROGRAM_OBJ(program);
+        obj->link_status = false;
+        mgl_set_info_log(&obj->info_log,
+                         "ERROR: GL_ARB_post_depth_coverage is not supported "
+                         "(layout(post_depth_coverage) is not available)\n");
+        tess_drop_program_record(ctx, program);
+        return;
+    }
 
     /* GL 4.6 §17.3.4: late per-fragment tests for side-effecting fragment
      * shaders.  mgl_tess_late_fragment_variant() generates the patched variant

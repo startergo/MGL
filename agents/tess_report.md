@@ -1,3 +1,255 @@
+# tess domain — round 41 report (priority: de-advertise GL_ARB_post_depth_coverage; tasks 2+3 Metal infeasibility documented; merge 8c97af2; scratch cleanup)
+
+READY 059d475 (gl46-port 8c97af2 [compat s34] merged as 04cce70; every
+number below is on exactly this tree).
+
+## Priority task — stop advertising GL_ARB_post_depth_coverage (user-approved)
+
+Metal cannot do the stencil sub-case (PostDepthSampleMask was our only known
+Fail) and Mesa/Asahi do not advertise the extension either.  Implemented:
+
+* **get.c**: `GL_ARB_post_depth_coverage` removed from the extension list
+  (GL_EXTENSIONS / glGetStringi / GL_NUM_EXTENSIONS derive from that array;
+  the entry-count query needs no separate fix).  The comment documents why.
+* **GLSL acceptance removed**: `#extension GL_ARB_post_depth_coverage :
+  require/enable` alone still compiles (glslang knows the name; nothing
+  depends on it), but every *feature use* now **fails the link** —
+  `mgl_program_uses_post_depth_coverage()` (tessellation.c, called from my
+  `mgl_ext_post_link_tess` hook on every link) rejects the program with
+  "ERROR: GL_ARB_post_depth_coverage is not supported".  Two layers:
+  1. a GLSL-source scan for the `post_depth_coverage` qualifier
+     (comment-stripping, `#`-lines ignored, identifier boundaries; the
+     extension NAME in a #extension line does not match) — needed because
+     glslang's OpenGL client compiles `layout(post_depth_coverage)` away:
+     SPIR-V's PostDepthCoverage execution mode is Vulkan-only, the ARB
+     spelling only emits EarlyFragmentTests (probed with the tree's glslang
+     `-G`: modes {OriginLowerLeft, DepthReplacing, EarlyFragmentTests}), so
+     nothing is detectable in the linked SPIR-V;
+  2. the SPIR-V PostDepthCoverage mode (4426) scan, should it ever appear —
+     SPIRV-Cross would then emit Metal's `[[post_depth_coverage]]`, whose
+     stencil semantics MGL cannot honor (.agent/gap_post_depth_coverage.md).
+* **layout(early_fragment_tests) untouched**: different qualifier (GL 4.2
+  core), no rejection, late-fragment-tests PSO variant path unchanged.
+* CTS on this tip: `KHR-GL46.post_depth_coverage_tests` = **2 NotSupported**
+  (both cases now extension-gated), `KHR-GL46.shader_image_load_store` =
+  **49 Pass / 0 Fail / 2 NotSupported — unchanged**.
+* Regression guards updated in test_tess.c: `FragPostDepthShader` asserts the
+  extension is absent from glGetStringi and that all layout(post_depth_
+  coverage) programs (with/without early_fragment_tests) fail the link with a
+  clear log, while the `require`/macro-check programs still link;
+  `FragPostDepthCoverageMask` now asserts the pdc program fails to link and
+  keeps the GL 4.0 core coverage semantics check (plain gl_SampleMaskIn =
+  {1,1,1,1} in both the depth and the stencil case).
+
+## Task 1 — direct_state_access.renderbuffers_storage{,_multisample}: DROPPED (compat s34 = a99f674, verified)
+
+Per the 19:07 change of plan I kept no MGLRenderer+Framebuffer.m edit; compat
+s34 (now merged into this branch as 8c97af2) implements the same design I had
+prototyped before the drop.  **Verified on this tip: both
+`renderbuffers_storage` and `renderbuffers_storage_multisample` Pass, and
+`packed_pixels` full group 250/250 Pass** (readback stays raw byte-wise for
+sRGB attachments; only the write side stops encoding while FRAMEBUFFER_SRGB
+is off).  One detail from my (reverted) prototype worth keeping on record:
+the MSAA resolve blit must fetch the sRGB source through a plain-UNORM view
+too, because Metal's `read()` *does* sRGB-decode `texture2d<float>` /
+`texture2d_ms` sources (probed, `.agent/probe_srgb_read.m`: byte 64 ->
+0.0513); GL blits do no conversion (18.3.1).  compat s34 evidently covers it
+(the multisample case passes).
+
+## Task 2 — texture_filter_minmax (5 NS): NOT implementable honestly on this Metal
+
+Feasibility answer: **no exact implementation exists**; the 5
+`KHR-GL46.texture_filter_minmax_tests.*` cases stay NotSupported (verified on
+this tip: 5 NS), because `GL_ARB_texture_filter_minmax` must stay unadvertised.
+
+Evidence (all probed on this machine; probe kept in `.agent/probe_reduction.m`):
+
+* The macOS 26.5 SDK finally exposes `MTLSamplerReductionMode{WeightedAverage,
+  Minimum,Maximum}` and `MTLSamplerDescriptor.reductionMode`
+  (API_AVAILABLE(macos(26.0))) — the first Metal-native hook for this feature.
+* Header-documented gate: the sampler *ignores* reductionMode unless mipFilter
+  is Linear and min/magFilter are Linear.  The CTS uses GL_LINEAR min+mag
+  (base level, no mips), i.e. the NotMipmapped shape — already a mismatch.
+* Runtime probe, M4 Pro (Apple GPU family): sampler states with Minimum /
+  Maximum reduction are accepted, but results are **bit-identical to
+  WeightedAverage** in every configuration probed:
+    - fragment `sample()`: minification (4 texels/pixel) and magnification
+      (0.5 texels/pixel), mipFilter Linear and NotMipmapped;
+    - trilinear two-level texture at LOD ~0.5 (the one path the header allows):
+      AVG 0.7519, MIN 0.7519, MAX 0.7519;
+    - compute-shader `sample()`; anisotropy 16; R8Unorm, R32Float,
+      Depth32Float sources.
+  => the hardware does not implement min/max reduction on this GPU; the
+  property is a no-op (Metal's own doc gate makes even the intent trilinear-
+  only, which the CTS never exercises).
+* Shader-side emulation cannot be "exact" (supervisor's bar): the reduction
+  mode is sampler-object / texture state bound per draw, while `sample()` is
+  compiled into the program MSL — emulating means per-(program, mode) shader
+  variants replacing sample() with a manual footprint min/max, and the GL
+  footprint for mip/anisotropic filtering is not reproducible from MSL
+  texture reads.  MoltenVK likewise does not expose samplerFilterMinmax on
+  Apple GPUs.  GL enums (GL_TEXTURE_REDUCTION_MODE_ARB 0x9366,
+  GL_WEIGHTED_AVERAGE_ARB 0x9367) already exist in glcorearb.h, so if a future
+  macOS/GPU honors reductionMode, the plumbing is trivial.
+
+## Task 3 — internalformat.renderbuffer.rgb9_e5 (1 NS): NS is the spec-correct verdict
+
+`KHR-GL46.internalformat.renderbuffer.rgb9_e5` reports **"Framebuffer not
+complete" -> NotSupported**, and that is the honest ceiling:
+
+* GL 4.6 table 8.28 marks RGB9_E5 **color-renderable = NO**; completeness
+  (9.4.2) then requires GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT, which the CTS
+  maps to NotSupported.  Conformant desktop drivers land on the same verdict.
+* Metal side (probed, `.agent/probe_rgb9e5_rt.m`): an `RGB9E5Float` texture
+  with RenderTarget usage *can be created* on the M4 Pro, but the first
+  command buffer touching it as a color attachment errors (status 4).  So no
+  render pass can back a "renderable" RGB9_E5.
+* MGL's existing behaviour is the correct emulation and was kept as-is:
+  `glRenderbufferStorage(GL_RGB9_E5)` succeeds (any sized format is accepted),
+  the backing texture is created ShaderRead-only (RenderTarget usage stripped
+  so Metal does not kill the command buffer), and completeness reports
+  INCOMPLETE_ATTACHMENT.
+* "Emulating" renderability (e.g. an RGBA16F shadow backing + complete
+  attachment) would claim color-renderability the GL spec table denies and the
+  hardware cannot honor — rejected as dishonest per the round rules.
+* Verified on this tip: `internalformat.renderbuffer.*` = 6 Pass + rgb9_e5 NS;
+  the rgb9_e5 *texture*-side cases pass
+  (`internalformat.texture2d.rgba_unsigned_byte_rgb9_e5` Pass,
+  `internalformat.copy_tex_image.rgb9_e5` Pass).
+
+## Gates on this tree
+
+* `tests/headless/run.sh` (full): **136 test binaries, 0 FAIL / 0 BUILD-FAIL**
+  (two consecutive full runs after the priority change; test_tess.c
+  **684 checks, 0 failures**).
+* `python3 agents/stub_scanner.py --list EMPTY|NOOP|ASSERT` clean for my files.
+* ab_bench min-of-7 interleaved vs `~/MGL-cts/baseline-8c97af2`
+  (build/ab_old = baseline, build/ab_new = this tip):
+  m0 12.160->9.341, m1 126.076->101.652, m4 6.469->10.647, m6 9.252->8.230,
+  m9 9.147->10.542 ms — the m4 outlier does not reproduce (three further
+  min-of-7 passes on m4: 11.776->11.364, 11.112->10.536, 10.479->11.258,
+  i.e. parity within +-7% with the *floor itself* moving 6.5..11.8 ms between
+  passes), and the earlier **A/A control** (identical dylib raced against its
+  own copy) read min-of-7 **4.014 vs 7.107 ms (+77%)** — the box's co-tenant
+  load dominates single-digit deltas.  What my change actually does at
+  runtime: one array entry removed from the extension list (queried once per
+  context) and one source scan per *link* — no draw-path change exists, so
+  the draw numbers cannot move by construction; locked glmark2 therefore not
+  run (required only for draw-path changes).
+* CTS on this tip: post_depth_coverage_tests **2 NotSupported**,
+  shader_image_load_store **49 Pass / 0 Fail / 2 NotSupported** (unchanged),
+  direct_state_access.renderbuffers_storage{,_multisample} Pass/Pass,
+  packed_pixels **250/250 Pass**, texture_filter_minmax_tests 5 NotSupported,
+  internalformat.renderbuffer 6 Pass + 1 NS (rgb9_e5).
+
+## Branch hygiene
+
+Removed 67 `tests/headless/scratch_*.c|sh` and `zz_*.c` probe files committed
+by earlier tess rounds (r28 et al.) — "no scratch files in commits"; run.sh
+only builds `test_*.c`, nothing referenced them.  Knowledge probes live in the worktree's (git-ignored) `.agent/` dir, which
+survives between rounds: `probe_reduction.m` (sampler reduction no-op),
+`probe_srgb_read.m` (Metal read() decodes sRGB), `probe_rgb9e5_rt.m`
+(RGB9E5Float render target errors the command buffer).
+# tess domain — round 40 report (NotSupported hunt: clip_distance + draw-parameters regressions fixed; stale clusters refreshed)
+
+READY at 5fa51a1 (over merge of gl46-port f973a81 [tess r39]; every number below
+is on exactly this tree).
+
+## Task 0 — merge gl46-port
+
+f973a81 merged into gl46/tess (a3ed674), no conflicts, full headless suite green
+(129 files 0-failure), test_tess 550->567 checks.
+
+## Task 1 — KHR-GL46.clip_distance: my own r28 regression, 3/3 Pass again
+
+clip_distance.functional/coverage failed on the combined tree and the failure
+reproduced on my branch. Root cause is mine, from r28 (45880bc, tess_vs_member_to_block):
+
+* the loose-`out float gl_ClipDistance[N]`-to-`gl_PerVertex` block rewrite emitted
+  `float gl_CullDistance[];` **unconditionally**; below GLSL 4.50 gl_CullDistance
+  is not a member of the built-in block, so glslang rejects the whole program
+  ("'gl_PerVertex' : block redeclaration has extra members") — the CTS ships a
+  `#version 130` vertex shader there. Broken since r28; the last passing run
+  (mgl-r28-sweep) predates the commit by 2.5 h.
+* fixing that exposed a second bug in the same rewrite: a size *expression*
+  (`gl_ClipDistance[gl_MaxClipDistances + 1]`) or an out-of-1..8 literal was folded
+  to 8, hiding the compile error GL requires -> clip_distance.negative failed.
+
+Fix (tessellation.c): the member list is now version-aware — gl_CullDistance is
+included at >= 4.50 or when the stage itself redeclared it loose (then an
+`#extension GL_ARB_cull_distance : enable` pragma is injected); non-integer or
+out-of-range sizes are left loose and the whole rewrite declines, letting glslang
+produce the spec-required error. Regression tests: ClipDistance130Link
+(functional + negative form) in test_tess.c.
+
+```
+KHR-GL46.clip_distance  3 cases  Pass=3   (was Fail=2 Pass=1)
+KHR-GL46.cull_distance  3 cases  Pass=3   (unchanged, >=450 path byte-identical)
+```
+
+## Task 2 — KHR-GL46.shader_draw_parameters_tests: 6 Fail -> 13/13 Pass (one-line fix)
+
+All six failing cases (ShaderMultiDraw*, MultiDraw*IndirectCount) shared one root
+cause in MY code path: the gl_DrawID/gl_BaseVertex gate flag `uses_draw_params`
+(program.c) was not carried by `exec_clone`, the function that snapshots a linked
+program into the **whole-link executable cache**. The first link of a source set
+set the flag; every cache-hit relink (the CTS relinks identical sources per case)
+got uses_draw_params=0, so `extTessBindDrawParams` never bound the draw-parameters
+buffer and the MSL read an unbound buffer -> gl_DrawID always 0 (verified with a
+pixel repro: the second draw of a glMultiDrawArrays renders with the first draw's
+id; single-draw cases pass because 0 is their expected value). Fix: exec_clone
+copies the flag (+4 lines, program.c). Regression test: DrawIdSurvivesLinkCache
+in test_tess.c (link+draw, delete, relink same sources, multi-draw, pixel check).
+
+```
+KHR-GL46.shader_draw_parameters_tests  13 cases  Pass=13   (was Pass=8 Fail=5)
+```
+
+## Task 3 — NotSupported hunt: remaining NS audited; stale clusters refreshed
+
+Every remaining NotSupported in the merged CTS picture was triaged against the
+CTS source; the honest ones are (no code change warranted):
+
+* `sample_variables` samples_8 rows (38): Apple-silicon Metal has no 8x-MSAA
+  render targets (GL_MAX_SAMPLES=4).
+* `shader_image_size` ms rows (36) + `image_load_store` load-ms/perSample (2) +
+  `texture_image_samples` (1): GL_MAX_IMAGE_SAMPLES=0 is the honest answer —
+  MSL has no write path for texture2d_ms (r39 decision, re-verified).
+* `internalformat.renderbuffer.rgb9_e5`: MTLRGB9E5Float is not renderable on
+  Apple GPUs -> incomplete FBO -> CTS NS.
+* `texture_cube_map_array.generate_mip_map_non_filterable_*` (2): CTS throws
+  NotSupportedError for desktop contexts by design.
+* `draw_elements_base_vertex_tests.valid_active_tf`: "doesn't apply to OpenGL
+  contexts" by CTS design.
+* `shaders.shader_integer_mix.prototypes`: CTS NS for GLSL<450 without the
+  extension enable (the extension form passes).
+* `sparse_*` (18) and `texture_filter_minmax` (5): no sparse residency, no
+  reduction samplers in Metal.
+
+Clusters whose results predated the fixing commit (10-26 sweeps) were re-run on
+this tree and now Pass: ext_texture_shadow_lod 16/16, shader_viewport_layer_array
+3/3, shader_ballot_tests 4/4, shader_group_vote 5/5, buffer_storage 9/9,
+shading_language_420pack 43/43, explicit_uniform_location 48/48, sample_shading
+13/13, shader_multisample_interpolation 109/109, gpu_shader5 22/22,
+texture_swizzle 4/4 (incl. the earlier Crash), stencil_texturing.functional,
+direct_state_access.textures_compressed_subimage, and
+tessellation_shader.single.primitive_coverage (the r26->r29 regression noted in
+the compat report is gone) -> **tessellation_shader 58/58**.
+
+Remaining Fails in the merged picture (both other domains, both documented):
+direct_state_access.renderbuffers_storage{,_multisample} (sRGB-decode-on-readback
+trade-off vs packed_pixels.srgb8, framebuffer domain) and
+post_depth_coverage_tests.PostDepthSampleMask (Metal post-depth mask ignores the
+stencil test, r39 gap doc).
+
+## Perf
+
+No draw-path file changed vs gl46-port f973a81 (git diff: program.c +4,
+tessellation.c preprocessing only), so the locked glmark2 A/B is not the gate
+here; run anyway: jellyfish min-of-7 interleaved 2591 (baseline-f973a81) vs 2618
+(+1.0%, parity). An ideas re-run was polluted by the concurrent supervisor A/B
+(both sides collapsed to <20 FPS identically under load; first rounds ~parity).
+
 # tess domain — round 39 report (post_depth_coverage live; GL late fragment tests; r39 WIP settled)
 
 READY fc95a0d (over merge of gl46-port cceed03 [geom r74-r76]; every number below

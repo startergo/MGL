@@ -1543,21 +1543,23 @@ TEST(TessLayerFromEvaluationStage)
 }
 
 /* ------------------------------------------------------------------ post_depth_coverage
- * KHR-GL46.post_depth_coverage_tests regression guards (GL_ARB_post_depth_coverage).
- * The Metal path is native: glslang emits EarlyFragmentTests+PostDepthCoverage
- * execution modes (post_depth_coverage *implies* early fragment tests per the ARB
- * spec issue 2), SPIRV-Cross lowers gl_SampleMaskIn to a
- * `[[sample_mask, post_depth_coverage]]` fragment argument (MSL 2.3+; MGL compiles
- * MSL 3.0) and `[[early_fragment_tests]]` onto the fragment function itself.
+ * KHR-GL46.post_depth_coverage_tests guards.  GL_ARB_post_depth_coverage is
+ * deliberately NOT advertised (r41): Metal's [[sample_mask,
+ * post_depth_coverage]] misses stencil-failed samples, so no shader may use
+ * the feature — the CTS group is extension-gated (2 NotSupported) and
+ * layout(post_depth_coverage) fails the link (tessellation.c rejects the
+ * PostDepthCoverage execution mode).
  *
- * Test 1 — the four compile-only programs of PostDepthShader: plain `require`,
- * the preprocessor macro check, early+post layouts, and post alone.
- * Test 2 — the PostDepthSampleMask rendering: a 1x1 4x-MSAA depth/stencil FBO.
- * A small "near" triangle covers exactly the samples with (sx+sy) < 0.7 in
- * Apple's default 4x pattern (only sample 0 at (0.375,0.125)); a "far"
- * full-pixel triangle then fails the early depth/stencil test exactly there.
- * gl_SampleMaskIn must read {1,1,1,1} without post_depth_coverage and
- * {0,1,1,1} with it, resolved per-sample into a 1x4 texture. */
+ * Test 1 — the extension string is gone, and the PostDepthShader programs:
+ * `require`/`enable` without the layout still compile (glslang knows the
+ * extension name; nothing depends on it), while every
+ * layout(post_depth_coverage) program must FAIL the link with a clear log.
+ * Test 2 — the plain gl_SampleMaskIn rendering (GL 4.0 core, no extension):
+ * a 1x1 4x-MSAA depth/stencil FBO; a "near" triangle stamps depth/stencil,
+ * a "far" triangle fails both tests everywhere, and — without
+ * post_depth_coverage — the mask reflects COVERAGE, so it must read
+ * {1,1,1,1} for every sample in both the depth and the stencil case,
+ * resolved per-sample into a 1x4 texture. */
 TEST(FragPostDepthShader)
 {
     const char *vs =
@@ -1597,13 +1599,55 @@ TEST(FragPostDepthShader)
         "out vec4 fragColor;\n"
         "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
 
+    /* the extension must NOT be in GL_EXTENSIONS / glGetStringi */
+    {
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        EXPECT_TRUE(n > 0);
+        for (GLint i = 0; i < n; i++)
+        {
+            const GLubyte *e = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+            EXPECT_TRUE(e != NULL);
+            if (e && strcmp((const char *)e, "GL_ARB_post_depth_coverage") == 0)
+                MGL_FAIL("GL_ARB_post_depth_coverage is still advertised");
+        }
+    }
+
+    /* require/enable without the feature use: glslang accepts the name, and
+     * nothing in the program depends on the unsupported behaviour */
     GLuint p1 = mgl_make_program5(vs, NULL, NULL, NULL, f1);
     GLuint p2 = mgl_make_program5(vs, NULL, NULL, NULL, f2);
-    GLuint p3 = mgl_make_program5(vs, NULL, NULL, NULL, f3);
-    GLuint p4 = mgl_make_program5(vs, NULL, NULL, NULL, f4);
     EXPECT_TRUE(p1 != 0); EXPECT_TRUE(p2 != 0);
-    EXPECT_TRUE(p3 != 0); EXPECT_TRUE(p4 != 0);
-    glDeleteProgram(p1); glDeleteProgram(p2); glDeleteProgram(p3); glDeleteProgram(p4);
+    glDeleteProgram(p1); glDeleteProgram(p2);
+
+    /* every layout(post_depth_coverage) program must fail the link */
+    for (int i = 0; i < 2; i++)
+    {
+        GLuint vs2 = glCreateShader(GL_VERTEX_SHADER);
+        GLuint fs2 = glCreateShader(GL_FRAGMENT_SHADER);
+        GLuint p = glCreateProgram();
+        const char *fs_src = i ? f4 : f3;
+        GLint ok = 0;
+        char log[512] = "";
+
+        glShaderSource(vs2, 1, &vs, NULL);
+        glCompileShader(vs2);
+        glShaderSource(fs2, 1, &fs_src, NULL);
+        glCompileShader(fs2);
+        glAttachShader(p, vs2);
+        glAttachShader(p, fs2);
+        glLinkProgram(p);
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        if (!ok) glGetProgramInfoLog(p, sizeof log, NULL, log);
+        if (ok)
+            MGL_FAIL("layout(post_depth_coverage) program %d linked although "
+                     "GL_ARB_post_depth_coverage is not supported", i);
+        if (!strstr(log, "post_depth_coverage"))
+            MGL_FAIL("post_depth_coverage link rejection lacks a clear log: %s", log);
+        glDeleteProgram(p);
+        glDeleteShader(vs2);
+        glDeleteShader(fs2);
+    }
     EXPECT_NO_GL_ERROR();
 }
 
@@ -1626,8 +1670,7 @@ TEST(FragPostDepthCoverageMask)
         "    fragColor = vec4(s1, s2, s3, s4);\n"
         "}\n";
     char fPlain[1024], fPdc[1024];
-    snprintf(fPlain, sizeof fPlain,
-             "#version 450\n#extension GL_ARB_post_depth_coverage : enable\n%s", body);
+    snprintf(fPlain, sizeof fPlain, "#version 450\n%s", body);
     snprintf(fPdc, sizeof fPdc,
              "#version 450\n#extension GL_ARB_post_depth_coverage : enable\n"
              "layout(post_depth_coverage) in;\n%s", body);
@@ -1639,10 +1682,32 @@ TEST(FragPostDepthCoverageMask)
         "void main() { fragColor = texelFetch(tex, ivec2(0, 0), int(texCoord.y * 4)); }\n";
 
     GLuint pA = mgl_make_program5(vs, NULL, NULL, NULL, fPlain);
-    GLuint pB = mgl_make_program5(vs, NULL, NULL, NULL, fPdc);
     GLuint pR = mgl_make_program5(vs, NULL, NULL, NULL, fResolve);
-    EXPECT_TRUE(pA != 0); EXPECT_TRUE(pB != 0); EXPECT_TRUE(pR != 0);
-    if (!pA || !pB || !pR) return;
+    EXPECT_TRUE(pA != 0); EXPECT_TRUE(pR != 0);
+    if (!pA || !pR) return;
+
+    /* the post_depth_coverage program must fail the link (r41: the extension
+     * is not supported and is not advertised) */
+    {
+        GLuint s = glCreateShader(GL_FRAGMENT_SHADER);
+        GLuint pB = glCreateProgram();
+        GLint ok = 0;
+        char log[512] = "";
+        const char *fsrc = fPdc;
+        glShaderSource(s, 1, &fsrc, NULL);
+        glCompileShader(s);
+        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        EXPECT_TRUE(ok);
+        glAttachShader(pB, s);
+        glLinkProgram(pB);
+        glGetProgramiv(pB, GL_LINK_STATUS, &ok);
+        if (ok) glGetProgramInfoLog(pB, sizeof log, NULL, log);
+        EXPECT_TRUE(!ok);
+        if (ok) MGL_FAIL("layout(post_depth_coverage) linked although the extension is not supported (%s)", log);
+        glDeleteProgram(pB);
+        glDeleteShader(s);
+    }
+    EXPECT_NO_GL_ERROR();
 
     /* 1x1 4x-MSAA target + depth-stencil, and a 1x4 single-sample resolve target */
     GLuint rb = 0, texMS = 0, fboMS = 0, tex = 0, fbo = 0;
@@ -1687,9 +1752,8 @@ TEST(FragPostDepthCoverageMask)
     EXPECT_TRUE(aVertex >= 0 && aTexCoord >= 0);
 
     for (int stencilCase = 0; stencilCase <= 1; stencilCase++)
-    for (int pdc = 0; pdc <= 1; pdc++)
     {
-        GLuint prog = pdc ? pB : pA;
+        GLuint prog = pA;
         glBindFramebuffer(GL_FRAMEBUFFER, fboMS);
         glViewport(0, 0, 1, 1);
         glEnable(GL_MULTISAMPLE);
@@ -1703,18 +1767,10 @@ TEST(FragPostDepthCoverageMask)
             glStencilMask(0xFF);
         }
 
-        GLboolean expected[4];
-        for (int i = 0; i < 4; i++) {
-            GLfloat sp[2];
-            glGetMultisamplefv(GL_SAMPLE_POSITION, i, sp);
-            /* GL_ARB_post_depth_coverage: the mask must reflect the early
-             * depth/stencil tests.  Metal's [[post_depth_coverage]] excludes
-             * DEPTH-failed samples only; stencil-failed samples stay in the
-             * mask (.agent/gap_post_depth_coverage.md) — the stencil variant
-             * below encodes that documented Metal gap, the depth variant the
-             * GL-correct value. */
-            expected[i] = !(pdc && !stencilCase && (sp[0] + sp[1]) < 0.7f);
-        }
+        /* without post_depth_coverage the sample mask is plain coverage
+         * (GL 4.0 core): every sample of the covered pixel reads 1,
+         * no matter what the depth/stencil tests did to the fragments */
+        GLboolean expected[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
 
         glBindVertexArray(vao);
         glUseProgram(prog);
@@ -1766,13 +1822,13 @@ TEST(FragPostDepthCoverageMask)
         for (int n = 0; n < 4; n++) if (got[n] != expected[n]) ok = 0;
         mgl_test_checks++;
         if (!ok)
-            MGL_FAIL("post_depth_coverage (%s, pdc=%d): mask %d%d%d%d expected %d%d%d%d",
-                     stencilCase ? "stencil" : "depth", pdc,
+            MGL_FAIL("sample mask coverage (%s): mask %d%d%d%d expected %d%d%d%d",
+                     stencilCase ? "stencil" : "depth",
                      got[0], got[1], got[2], got[3],
                      expected[0], expected[1], expected[2], expected[3]);
         else
-            printf("  [pdc %s pdc=%d] mask %d%d%d%d\n",
-                   stencilCase ? "stencil" : "depth", pdc, got[0], got[1], got[2], got[3]);
+            printf("  [coverage %s] mask %d%d%d%d\n",
+                   stencilCase ? "stencil" : "depth", got[0], got[1], got[2], got[3]);
         EXPECT_NO_GL_ERROR();
     }
 
@@ -1783,7 +1839,7 @@ TEST(FragPostDepthCoverageMask)
     glDeleteFramebuffers(1, &fboMS); glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &texMS); glDeleteTextures(1, &tex);
     glDeleteRenderbuffers(1, &rb);
-    glDeleteProgram(pA); glDeleteProgram(pB); glDeleteProgram(pR);
+    glDeleteProgram(pA); glDeleteProgram(pR);
 }
 
 /* KHR-GL46.shader_image_load_store.early-fragment-tests regression guard
