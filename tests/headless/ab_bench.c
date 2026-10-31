@@ -1,6 +1,8 @@
 /* ab_bench.c — A/B benchmark for the gpuaudit domain: run against two builds of
  * libmgl (rpath build/ab_old, build/ab_new) and compare. Not part of the suite. */
 #include "mgl_test.h"
+#include "mgl_compat.h"
+#include "gl_compat.h"
 #include <stdio.h>
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -38,6 +40,52 @@ static GLuint mkquad(void)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
     return vao;
+}
+
+/* fixed-function client-array draw bench on a compatibility context:
+ *   churn  — glRotatef every draw (compat state serial bump: uniform sync runs)
+ *   lights — GL_LIGHTING + LIGHT0 + normals (full lighting uniform block)
+ * the per-draw CPU path is mgl_compat_draw: client-array upload, FFP program
+ * cache lookup, current-attrib re-issue, builtin-uniform sync */
+static void compat_ffp_bench(double *t, char *label, int iters, int churn, int lights)
+{
+    static const float verts[6 * 3] = {
+        -1, -1, 0,   1, -1, 0,   1, 1, 0,
+        -1, -1, 0,   1,  1, 0,  -1, 1, 0
+    };
+    static const float colors[6 * 4] = {
+        1, 0, 0, 1,  0, 1, 0, 1,  0, 0, 1, 1,
+        1, 0, 0, 1,  0, 1, 0, 1,  0, 0, 1, 1
+    };
+    static const float norms[6 * 3] = { 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+
+    void *cc = mglCompatCreateContext();
+    if (!cc) { MGL_FAIL("compat ctx"); *t = -1; return; }
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(3, GL_FLOAT, 0, verts);
+    glEnableClientState(GL_COLOR_ARRAY);
+    glColorPointer(4, GL_FLOAT, 0, colors);
+    if (lights) {
+        glEnableClientState(GL_NORMAL_ARRAY);
+        glNormalPointer(GL_FLOAT, 0, norms);
+        glEnable(GL_LIGHTING);
+        glEnable(GL_LIGHT0);
+        glLightModelf(GL_LIGHT_MODEL_LOCAL_VIEWER, 1.0f);
+    }
+    glViewport(0, 0, 64, 64);
+    glMatrixMode(GL_MODELVIEW);
+    glFinish();
+
+    double t0 = now_s();
+    for (int i = 0; i < iters; i++) {
+        if (churn)
+            glRotatef(1.0f, 0.0f, 0.0f, 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glFinish();
+    *t = now_s() - t0;
+    snprintf(label, sizeof(label), "compat ffp drawArrays%s%s x%d",
+             lights ? "+lights" : "", churn ? "+rotate" : " static", iters);
 }
 
 int main(int argc, char **argv)
@@ -300,6 +348,64 @@ int main(int argc, char **argv)
             glFinish();
             snprintf(label, sizeof(label), "big texSubImage 512x512 x%d", iters);
             glDeleteTextures(1, &tex);
+            break;
+        }
+        /* ---- compat-profile per-draw CPU work (compat domain, s37) ---- */
+        case 40:   /* FFP client-array drawArrays, matrix churn every draw */ compat_ffp_bench(&t, label, iters, 1, 0); break;
+        case 41:   /* FFP client-array drawArrays, static state (per-draw floor) */ compat_ffp_bench(&t, label, iters, 0, 0); break;
+        case 42:   /* FFP drawArrays + lighting (full builtin-uniform sync) */ compat_ffp_bench(&t, label, iters, 1, 1); break;
+        case 43: { /* immediate mode: glBegin/glEnd batching per draw */
+            void *cc = mglCompatCreateContext();
+            if (!cc) { MGL_FAIL("compat ctx"); return 1; }
+            glViewport(0, 0, 64, 64);
+            glMatrixMode(GL_MODELVIEW);
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++) {
+                glRotatef(1.0f, 0.0f, 0.0f, 1.0f);
+                glBegin(GL_QUADS);
+                glColor3f(1.0f, 0.5f, 0.25f);
+                glVertex3f(-0.5f, -0.5f, 0.0f);
+                glVertex3f(0.5f, -0.5f, 0.0f);
+                glVertex3f(0.5f, 0.5f, 0.0f);
+                glVertex3f(-0.5f, 0.5f, 0.0f);
+                glEnd();
+            }
+            glFinish();
+            t = now_s() - t0;
+            snprintf(label, sizeof(label), "compat imm quad+rotate x%d", iters);
+            break;
+        }
+        case 44: { /* compat user program using gl_ModelViewMatrix: builtin uniform sync */
+            void *cc = mglCompatCreateContext();
+            if (!cc) { MGL_FAIL("compat ctx"); return 1; }
+            static const char *vs =
+                "#version 110\n"
+                "void main() { gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex; }\n";
+            static const char *fs =
+                "#version 110\n"
+                "void main() { gl_FragColor = vec4(0.2, 0.6, 1.0, 1.0); }\n";
+            GLuint prog = mgl_make_program(vs, fs);
+            if (!prog) { MGL_FAIL("program"); return 1; }
+            glUseProgram(prog);
+            static const float quad[] = { -1,-1,  1,-1,  1,1,   -1,-1,  1,1,  -1,1 };
+            GLuint vbo;
+            glGenBuffers(1, &vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glVertexPointer(2, GL_FLOAT, 0, quad);
+            glViewport(0, 0, 64, 64);
+            glMatrixMode(GL_MODELVIEW);
+            glFinish();
+            double t0 = now_s();
+            for (int i = 0; i < iters; i++) {
+                glRotatef(1.0f, 0.0f, 0.0f, 1.0f);   /* serial bump: builtin sync must re-upload */
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+            }
+            glFinish();
+            t = now_s() - t0;
+            snprintf(label, sizeof(label), "compat userprog MVP sync x%d", iters);
             break;
         }
         default: return 1;

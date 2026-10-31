@@ -1,5 +1,14 @@
 # compat domain — progress log
 
+READY s37 985b341 (branch gl46/compat tip = merge gl46-port **288e724** (tess r42) + s37
+commits 6a4722c/60ae3b2/9904987/c371ad3/0904e04/985b341 + report commit 6599e15;
+buildable, full gates below).
+Work this session (supervisor 03:36): (1) NotSupported triage — see "session 37" section
+below, no code change justified, all 24 remaining NotSupported are honest; (2) compat
+per-draw CPU work — streaming rings + uniform-location caches, parity within noise, no
+per-draw kernel allocations left; suite green (136 binaries, 0 failures); locked glmark2
+gate clean.  Prior session below.
+
 READY s36 83caf6d (branch gl46/compat tip = merge gl46-port **1121e66** + c86346e + f05a00a + 83caf6d;
 buildable, full gates below).  Work this session:
 1. **internalformat.renderbuffer.rgb9_e5 NotSupported -> Pass (exact)** — RGBA16F-backed
@@ -31,6 +40,138 @@ Shared-file edits (surgical, called out): framebuffers.c (rgb9e5 renderbuffer
 completeness), texture_query.c (per-target caps), MGLRenderer+Framebuffer.{h,m}
 (format map + usage + quantize method + read hook), MGLRenderer+TextureData.m
 (copy-out hook), MGLRenderer+Compat.m (gate), ab/abbench_s36.sh (new).
+
+## session 37 (Oct 31, cont.) — compat per-draw CPU work (task 2)
+
+Profiled the compat draw path with ab_bench modes 40-44 (new: FFP client-array draws with
+and without per-draw state churn + lighting, glBegin/glEnd quads, compat user program with
+gl_ModelViewMatrix) + macOS `sample`.  Findings and fixes (all committed):
+
+1. **mgl_compat_draw read positions of every draw** for the CPU/feedback paths even in
+   GL_RENDER mode -> made lazy (only rmode != GL_RENDER / line-stipple paths).
+2. **set_current_attribs re-issued 16 mglVertexAttrib\* per draw** -> byte-shadow gate
+   (MGLCCurAttribs; no setter can be forgotten, compares current values + destination
+   identity).  Also: user-program draws now get the constants too (needed by 3).
+3. **Immediate-mode flush uploaded 16 attribute streams per glEnd** (13 of them constant
+   copies of the current state) -> per-batch varying scan: only streams that actually vary
+   are uploaded; stale arrays from a previous batch are disabled.  Bit-identical semantics
+   (constant streams read the generic current attribs); pixel-exact coverage in the new
+   tests/headless/test_compat_immconst.c (13 checks: varying vs constant color/texcoord/normal
+   with lighting + stale-disable + single-vertex batches).
+4. **upload_stream/draw_index_list reallocated storage per draw**: first measured as
+   mach_vm_allocate/deallocate churn, then (after switching to subdata) as the buffers-domain
+   rename-on-write allocating a fresh MTLBuffer + kernel IOGPUResourceCreate per draw (70% of
+   per-draw CPU in the sample).  Replaced with **persistent bump-allocated scratch rings**
+   (compat_vb.c compat_ring_write): fresh range per draw, published exactly like
+   buffers.c bufferDidModify (dirty bit + gpuaudit invalidation + didModifyRange) minus the
+   rename; rings recycle only after completed_serial >= the draw serial stamped in
+   unbind_ffp (grow-first to 8 MB, wait at the cap).  **Ring floor is 1 MB** — 4 KB rings
+   stalled a GPU completion round-trip every ~28 draws (mode40 +46% under supervisor load;
+   1 MB floor restores parity).  glPopAttrib now re-keeps the live ring/caches from the
+   snapshot (compat_list.c) — a popped snapshot replayed stale offsets/Buffer\*.
+5. **Per-program uniform-location caches** (MGLCUniEnt open-addressed table, 128 slots) for
+   both the FFP sync and translated-user-program builtin sync: ~40 glGetUniformLocation
+   string lookups per state bump -> table hits.  **Invalidation is the hard part**: Program\*
+   and glslang-program heap addresses get recycled, so pointer identity is not enough — the
+   compat dispatch now bumps s->prog_epoch on every glLinkProgram/glDeleteProgram and both
+   caches clear on epoch change (two sentinel uniforms are re-resolved per sync as belt and
+   braces).  Without this the caches served stale locations intermittently (black draws in
+   test_compat_glsl, ~50% of runs; 15/15 clean after the fix; found by a temporary per-hit
+   verification build).
+
+Measurements (interleaved CPU-time min-of-8, A = baseline-288e724, C = tip; load ~5.5,
+documented harness noise floor ±10% here — mode1 (core blend flip, no compat code touched)
+swung +11.2%):
+```
+mode40 ffp+rotate A=1086.8 C=1158.9  +6.6%   mode43 imm quad   A=1266.2 C=1251.7  -1.1%
+mode41 ffp static A=1135.3 C=1208.1  +6.4%   mode44 userprog   A=1516.5 C=1509.3  -0.5%
+mode42 ffp lights A=1333.3 C=1329.6  -0.3%   mode0/1/31/32/6 (core) within noise
+```
+=> parity within noise on wall-clock CPU; the structural win is that a compat draw no longer
+performs ANY kernel allocation (no vm_allocate, no MTLBuffer/IOGPUResourceCreate) — under
+GPU load this is what keeps the tail flat (the +46% stall case is gone).  Locked glmark2
+(ABBA n=6 medians, ideas/jellyfish/gl41-geometry): -2.8% / -1.6% / +10.9%, per-run swings
+±10-16% on BOTH sides (gl41-geometry documented noisy) -> no regression attributable to the
+compat changes.
+
+Gates: full tests/headless/run.sh = 136 binaries, 0 failures (re-run after the ring-floor
+commit); stub_scanner clean for all compat files; no shared-file edits this session
+(mtl_funcs.ext_buffers hook table + mtl_va_element_size are read-only cross-domain calls,
+noted here).
+
+## session 37 (supervisor 03:36 EDT Oct 31) — NotSupported triage: integer_mix.prototypes, sparse (18), texture_filter_minmax (5)
+
+Task: for each remaining NotSupported that is NOT a plain hardware limit, say why it is
+NotSupported; make it Pass ONLY if an honest, exact implementation exists; advertise nothing
+Metal can't do.  Per-group CTS runs on tip 08091dd (fresh, /tmp/cts-s37-*), CTS sources read,
+Metal capabilities probed on-device (Apple M4 Pro, macOS 26.5, Xcode 26.5 SDK; property
+queries + tiny sampling probes only).  **Result: no code change is justified — all 24 cases
+are honest NotSupported; evidence below.**
+
+| group (cases) | status on 08091dd | verdict |
+|---|---|---|
+| shaders.shader_integer_mix (7) | 6 Pass + 1 NotSupported | `prototypes` = CTS-side gate, can never Pass |
+| sparse_texture_tests (6) | 6 NotSupported | hardware: Metal sparse textures non-functional on M4 Pro |
+| sparse_texture2_tests (6) | 6 NotSupported | hardware + shader pipeline: see below |
+| sparse_texture_clamp_tests (3) | 3 NotSupported | shader pipeline: SPIRV-Cross has no sparse image ops |
+| sparse_buffer_tests (3) | 3 NotSupported | API: Metal has no usable sparse buffers on this OS path |
+| texture_filter_minmax_tests (5) | 5 NotSupported | hardware: sampler min/max reduction ignored on Apple GPUs |
+
+### 1. KHR-GL46.shaders.shader_integer_mix.prototypes — CTS-side version gate (not fixable)
+Source: `glcShaderIntegerMixTests.cpp` — the old `shaders` package instantiates the group at
+GLSL **3.30** (`gl3cTestPackages.cpp:262`), and `ShaderIntegerMixPrototypesCase::test()` with
+use_extension=false returns QP_TEST_RESULT_NOT_SUPPORTED *unconditionally* when
+`m_glslVersion < GLSL_VERSION_450` (lines 217-220) — before touching the GL.  No driver
+behaviour can flip it; the identical case at GLSL 4.50 in `shaders45` PASSES (7/7 group).
+Every other integer_mix case in this group passes through the GL_EXT_shader_integer_mix
+string we added in s27.  Honest NotSupported forever.
+
+### 2. texture_filter_minmax (5) — sampler min/max reduction is ignored by Apple GPUs
+GL_ARB_texture_filter_minmax's entire function is GL_TEXTURE_REDUCTION_MODE_ARB
+(WEIGHTED_AVERAGE/MIN/MAX).  Metal's sampler reduction API on this OS/SDK is
+`MTLSamplerDescriptor.reductionMode` (renamed from reductionFilter; macOS 26.0).  Probed
+on-device (2x2/4x4 R8, RGBA8, R32F, Depth32Float; compute + render; mag bilinear at a texel
+corner, minification, and true trilinear with LOD 1.5 between two populated mip levels):
+**Minimum and Maximum produce bit-identical results to WeightedAverage in every
+configuration** (e.g. trilinear case returns 0.5985 for all three modes; MIN should be 0.2,
+MAX 0.8).  The enum is accepted, the property is silently ignored — matches the Metal
+feature tables (min/max reduction filter is a discrete-GPU/Mac-family feature).  The only
+alternative would be rewriting every `texture()` call in SPIRV-Cross-generated MSL into a
+4-texel footprint min/max — NOT exact (trilinear/cube-seam/shadow/gather footprints and
+weights are implementation-defined) and cannot reproduce hardware behaviour, so advertising
+the extension would be advertising something Metal can't do.  Stays unadvertised;
+NotSupported is correct.
+
+### 3. sparse_texture_tests / sparse_texture2_tests / sparse_texture_clamp_tests (15)
+All exit at `isExtensionSupported("GL_ARB_sparse_texture(2)")` (qpa: "Not Supported").
+Probed on-device (this is the interesting part — the M4 Pro *nearly* has the machinery):
+* `MTLHeapTypeSparse` heap creation SUCCEEDS, `sparseTileSizeInBytes`=16384,
+  2D RGBA8 tile = 64x64 — but `[heap newTextureWithDescriptor:offset:]` returns **nil**,
+  every usage/size variant tried.
+* macOS 26 placement-sparse path (`MTLHeapTypePlacement` heap +
+  `maxCompatiblePlacementSparsePageSize` + `textureDescriptor.placementSparsePageSize`):
+  heap AND texture allocate, but the texture reports **isSparse=0 / sparseTextureTier=0
+  (MTLTextureSparseTierNone)** and behaves as a normal texture —
+  `updateTextureMapping:mode:region:mipLevel:slice:` is a no-op, "unmapped" regions contain
+  written data.  So sparse textures are NOT functional on Apple M4 Pro / macOS 26.5.
+* Even if a working path appeared, two exactness blockers remain for sparse_texture2:
+  StandardPageSizesTestCase mandates EXACT standard virtual page sizes (R8 256x256, RGBA8
+  128x128, RGBA32F 64x64, ...) vs Metal's single fixed 16KB tile (RGBA8 64x64, R8 128x128);
+  and sparse_texture2's shader guarantees (zero reads of uncommitted regions ARE documented
+  by Metal tier 1 as opaque black = GL's (0,0,0,1), so that part would have matched).
+* sparse_texture_clamp (3) + SparseTexture2Lookup need GL_ARB_sparse_texture2 GLSL builtins
+  (textureClampARB/sparseTexelsResidentARB) -> SPIR-V OpImageSparse* -> and SPIRV-Cross's
+  MSL backend has **no OpImageSparse handling at all** (grep: only spirv_glsl.cpp touches
+  sparse ops), so those cases cannot compile through MGL's pipeline without writing a
+  custom SPIRV-Cross pass.  Nothing to advertise.  Honest NotSupported.
+
+### 4. sparse_buffer_tests (3) — GL_ARB_sparse_buffer
+qpa reason: "GL_ARB_sparse_buffer is not supported".  Classic Metal has no virtual-memory
+buffers; macOS 26 adds an `MTLBufferSparseTier1` *per-resource* query (documented zero
+reads / no-op writes for unbacked ranges) but MGL's buffers are plain MTLBuffers and the
+new placement-sparse resource API is outside what this session can integrate + verify.
+A future session could revisit on macOS 26+ hardware that reports tier 1; today the
+extension stays unadvertised.  Honest NotSupported.
 
 READY s34 a99f674 (= merge gl46-port **52e6276** (tess r40) + 7dadf9a + 5a003da;
 both commits are CTS Fail->Pass fixes, no new state, no shared-behaviour change

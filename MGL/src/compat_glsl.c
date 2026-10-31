@@ -702,25 +702,34 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
 
 #pragma mark built-in uniform sync for translated user shaders
 
-/* look up the location of "name" or "name[0]"; -1 when absent */
+/* look up the location of "name" or "name[0]"; -1 when absent.
+ * compat perf session 37: through the per-program MGLCUniEnt cache of the
+ * active builtin_prog slot (see mgl_ext_compat.h) — the sync path re-runs on
+ * every compat state change and used to issue dozens of
+ * glGetUniformLocation string lookups per draw.  sync_builtin_uniforms()
+ * publishes the slot cache; when NULL (uncached program) we fall back. */
 static GLint uloc(GLMContext ctx, GLuint prog, const char *name)
 {
-    return mglGetUniformLocation(ctx, prog, name);
+    struct MGLExtState_compat *s = CS();
+
+    if (!s->uni_sync_cache)
+        return mglGetUniformLocation(ctx, prog, name);
+
+    return mgl_compat_uni_cached(ctx, prog, s->uni_sync_cache, name);
 }
 
 static GLint uloc_arr(GLMContext ctx, GLuint prog, const char *name, int idx)
 {
     char buf[96];
     snprintf(buf, sizeof buf, "%s[%d]", name, idx);
-    return mglGetUniformLocation(ctx, prog, buf);
+    return uloc(ctx, prog, buf);
 }
 
 static GLint uloc_mem(GLMContext ctx, GLuint prog, const char *name, int idx, const char *member)
 {
     char buf[96];
     snprintf(buf, sizeof buf, "%s[%d].%s", name, idx, member);
-    GLint l = mglGetUniformLocation(ctx, prog, buf);
-    return l;
+    return uloc(ctx, prog, buf);
 }
 
 /* glGetUniformLocation that also accepts the built-in compat names
@@ -777,13 +786,24 @@ void mgl_compat_sync_builtin_uniforms(GLMContext ctx, Program *program)
         bp->prog = program;
         bp->link_id = NULL;
         bp->sync_serial = 0;
+        bp->epoch = s->prog_epoch;
+        mgl_compat_uni_clear(bp->uni);
     }
 
-    if (bp->link_id == program->linked_glsl_program && bp->sync_serial == s->state_serial)
+    if (bp->link_id == program->linked_glsl_program && bp->sync_serial == s->state_serial &&
+        bp->epoch == s->prog_epoch)
         return;
+
+    if (bp->link_id != program->linked_glsl_program || bp->epoch != s->prog_epoch)
+    {
+        mgl_compat_uni_clear(bp->uni);      /* relink/reuse: locations may move */
+        bp->epoch = s->prog_epoch;
+    }
 
     bp->link_id = program->linked_glsl_program;
     bp->sync_serial = s->state_serial;
+    s->uni_sync_cache = bp->uni;            /* per-program locations (s37) */
+    mgl_compat_uni_validate(ctx, prog, bp->uni);
 
     /* matrices */
     l = uloc(ctx, prog, "mglModelViewMatrix");

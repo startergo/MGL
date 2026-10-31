@@ -19,6 +19,8 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_compat.h"
+#include "mgl_ext_buffers.h"   /* streaming-ring publish hooks (did_modify, serials) */
+#include "mgl_ext_gpuaudit.h"  /* mgl_gpuaudit_invalidate (see bufferDidModify) */
 #include "vertex_arrays.h"
 
 #define CS() (ctx->state.ext_compat)
@@ -39,6 +41,12 @@ typedef struct MGLCImm_t {
     float *edge;                    /* 1 */
     float *index;                   /* 1 */
     float *texcoord[MGLC_MAX_COORDS];   /* 4 */
+
+    /* compat perf session 37: which imm_vao attribute arrays are currently
+     * enabled (mirror; only streams whose recorded values actually vary
+     * across the batch are uploaded — constant streams read the generic
+     * current attribs, which is bit-identical GL behaviour) */
+    uint32_t enabled;
 } MGLCImm;
 
 static MGLCImm *imm(GLMContext ctx)
@@ -190,7 +198,130 @@ static GLuint scratch_buffer(GLMContext ctx, int index)
     return s->scratch_ibo;
 }
 
-/* upload |count| elements of a client array stream into its scratch buffer and
+/* compat perf session 37 — streaming ring write.
+ *
+ * The old path did mglBufferData/mglBufferSubData per draw, which either
+ * reallocated VM storage or triggered the buffers-domain rename-on-write
+ * (a fresh MTLBuffer allocation per draw: ~70% of the per-draw CPU in the
+ * s37 profile).  The ring instead writes a fresh range of the persistent
+ * backing store directly:
+ *   - never touches a range an in-flight command buffer can still read
+ *     (rings recycle only after completed_serial >= their draw serial,
+ *      growing first and blocking only at the capacity cap);
+ *   - publishes the write exactly like buffers.c bufferDidModify
+ *     (dirty bit, gpuaudit invalidation, managed-storage didModifyRange),
+ *     minus mgl_buffers_prepare_cpu_write's rename, which is what we avoid.
+ *
+ * si is the scratch slot: attribute index, or MAX_ATTRIBS for elements. */
+#define MGLC_RING_CAP_MAX (8u << 20)
+#define MGLC_RING_CAP_MIN (1u << 20)   /* small rings stall on the GPU at
+                                        * every wrap (a completion round-trip);
+                                        * ~7k small draws per MB */
+
+/* buffers-domain metal hooks (see buffers.c mtlext) */
+static inline struct MGLExtMetal_buffers *cmr(GLMContext ctx)
+{
+    return ctx->mtl_funcs.ext_buffers;
+}
+
+static void compat_ring_write(GLMContext ctx, int si, size_t need, const void *src)
+{
+    struct MGLExtState_compat *s = CS();
+    Buffer *buf = s->scratch_obj[si];
+    size_t rounded = (need + 4095) & ~(size_t)4095;
+
+    if (rounded < MGLC_RING_CAP_MIN)
+        rounded = MGLC_RING_CAP_MIN;
+
+    if (!buf || s->scratch_ring[si].cap < rounded)
+    {
+        /* first use or a stream larger than the ring: (re)allocate */
+        size_t cap = rounded;
+
+        scratch_buffer(ctx, si);      /* create the internal name on demand */
+
+        if (buf && cap < s->scratch_ring[si].cap * 2 && s->scratch_ring[si].cap < MGLC_RING_CAP_MAX)
+            cap = s->scratch_ring[si].cap * 2;
+
+        mglBindBuffer(ctx, si == MAX_ATTRIBS ? GL_ELEMENT_ARRAY_BUFFER : GL_ARRAY_BUFFER,
+                      si == MAX_ATTRIBS ? s->scratch_ibo : s->scratch_vbo[si]);
+        mglBufferData(ctx, si == MAX_ATTRIBS ? GL_ELEMENT_ARRAY_BUFFER : GL_ARRAY_BUFFER,
+                      (GLsizeiptr)cap, NULL, GL_STREAM_DRAW);
+        buf = STATE(buffers[si == MAX_ATTRIBS ? _ELEMENT_ARRAY_BUFFER : _ARRAY_BUFFER]);
+        s->scratch_obj[si] = buf;
+        s->scratch_ring[si].cap = buf ? cap : 0;
+        s->scratch_ring[si].off = 0;
+        if (!buf)
+            return;
+    }
+    else if (s->scratch_ring[si].off + need > s->scratch_ring[si].cap)
+    {
+        /* wrap: only into ranges the GPU has finished reading; prefer growing
+         * while below the cap (a wrap under load waits for a completion) */
+        uint64_t done = cmr(ctx) && cmr(ctx)->completed_serial ?
+                            cmr(ctx)->completed_serial(ctx) : ~0ull;
+
+        if (s->scratch_ring[si].cap < MGLC_RING_CAP_MAX)
+        {
+            size_t cap = s->scratch_ring[si].cap * 2;
+
+            if (cap < MGLC_RING_CAP_MIN)
+                cap = MGLC_RING_CAP_MIN;
+
+            mglBindBuffer(ctx, si == MAX_ATTRIBS ? GL_ELEMENT_ARRAY_BUFFER : GL_ARRAY_BUFFER,
+                          si == MAX_ATTRIBS ? s->scratch_ibo : s->scratch_vbo[si]);
+            mglBufferData(ctx, si == MAX_ATTRIBS ? GL_ELEMENT_ARRAY_BUFFER : GL_ARRAY_BUFFER,
+                          (GLsizeiptr)cap, NULL, GL_STREAM_DRAW);
+            buf = STATE(buffers[si == MAX_ATTRIBS ? _ELEMENT_ARRAY_BUFFER : _ARRAY_BUFFER]);
+            s->scratch_obj[si] = buf;
+            s->scratch_ring[si].cap = buf ? cap : 0;
+            s->scratch_ring[si].off = 0;
+            if (!buf)
+                return;
+        }
+        else if (done >= s->scratch_ring[si].serial)
+        {
+            s->scratch_ring[si].off = 0;
+        }
+        else if (cmr(ctx) && cmr(ctx)->wait_serial)
+        {
+            cmr(ctx)->wait_serial(ctx, s->scratch_ring[si].serial);
+            s->scratch_ring[si].off = 0;
+        }
+        else
+        {
+            s->scratch_ring[si].off = 0;
+        }
+    }
+
+    if (!buf->data.buffer_data)
+        return;
+
+    memcpy((char *)buf->data.buffer_data + s->scratch_ring[si].off, src, need);
+
+    /* publish (see buffers.c bufferDidModify; the rename in
+     * mgl_buffers_prepare_cpu_write is deliberately skipped: the written
+     * range is beyond every in-flight read of this buffer) */
+    buf->data.dirty_bits |= DIRTY_BUFFER_DATA;
+    mgl_gpuaudit_invalidate(ctx, buf);
+
+    if (cmr(ctx) && cmr(ctx)->did_modify)
+        cmr(ctx)->did_modify(ctx, buf, s->scratch_ring[si].off, need);
+
+    s->scratch_ring[si].off += need;
+}
+
+/* stamp the ring with the serial of the draw that just consumed it so the
+ * wrap check above knows when its contents are retired */
+static void compat_ring_stamp(GLMContext ctx, int si)
+{
+    struct MGLExtState_compat *s = CS();
+
+    if (cmr(ctx) && cmr(ctx)->current_serial)
+        s->scratch_ring[si].serial = cmr(ctx)->current_serial(ctx);
+}
+
+/* upload |count| elements of a client array stream into its scratch ring and
  * attach it to |vao| at |attrib|; returns the buffer name (0 on failure) */
 static void upload_stream(GLMContext ctx, VertexArray *vao, GLuint attrib,
                           GLint size, GLenum type, GLboolean normalized,
@@ -204,11 +335,16 @@ static void upload_stream(GLMContext ctx, VertexArray *vao, GLuint attrib,
     if (!count || !src)
         return;
 
-    GLuint buf = scratch_buffer(ctx, (int)attrib);
+    size_t need = st * (size_t)count;
+    size_t off;
 
-    mglBindBuffer(ctx, GL_ARRAY_BUFFER, buf);
-    mglBufferData(ctx, GL_ARRAY_BUFFER, (GLsizeiptr)(st * count), src, GL_STREAM_DRAW);
-    mglVertexAttribPointer(ctx, attrib, size, type, normalized, stride, NULL);
+    compat_ring_write(ctx, (int)attrib, need, src);
+    off = CS()->scratch_ring[attrib].off - need;   /* range just written */
+    CS()->scratch_used |= 1u << attrib;
+
+    /* bind the ring as the attribute source at the written offset */
+    mglBindBuffer(ctx, GL_ARRAY_BUFFER, CS()->scratch_vbo[attrib]);
+    mglVertexAttribPointer(ctx, attrib, size, type, normalized, stride, (void *)(uintptr_t)off);
 
     if (saved)
         mglBindBuffer(ctx, GL_ARRAY_BUFFER, saved->name);
@@ -216,8 +352,6 @@ static void upload_stream(GLMContext ctx, VertexArray *vao, GLuint attrib,
         mglBindBuffer(ctx, GL_ARRAY_BUFFER, 0);
 
     mglEnableVertexAttribArray(ctx, attrib);
-
-    (void)vao;
 }
 
 /* save / restore of the vertex array binding around internal draws */
@@ -330,23 +464,36 @@ static GLuint convert_prim(GLMContext ctx, GLenum mode, GLuint n, uint32_t **out
     return count;
 }
 
-/* draws an index list through the scratch element buffer */
+/* draws an index list through the streaming element ring (compat perf session
+ * 37: no per-draw allocation — indices are bump-allocated into the persistent
+ * scratch element buffer and referenced by offset) */
 static void draw_index_list(GLMContext ctx, GLenum mode, const uint32_t *idx, GLuint count,
                             GLsizei instances, GLint basevertex)
 {
-    GLuint buf = scratch_buffer(ctx, -1);
+    struct MGLExtState_compat *s = CS();
     VertexArray *vao = STATE(vao);
     Buffer *saved = vao ? vao->element_array.buffer : NULL;
+    Buffer *cur = STATE(buffers[_ELEMENT_ARRAY_BUFFER]);
+    size_t need = (size_t)count * sizeof(uint32_t);
+    size_t off;
 
-    mglBindBuffer(ctx, GL_ELEMENT_ARRAY_BUFFER, buf);
-    mglBufferData(ctx, GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(count * sizeof(uint32_t)), idx, GL_STREAM_DRAW);
+    if (!count || !idx)
+        return;
+
+    compat_ring_write(ctx, MAX_ATTRIBS, need, idx);
+    off = s->scratch_ring[MAX_ATTRIBS].off - need;
+
+    if (!cur || cur != s->scratch_obj[MAX_ATTRIBS])
+        mglBindBuffer(ctx, GL_ELEMENT_ARRAY_BUFFER, s->scratch_ibo);
 
     if (instances > 1)
-        mglDrawElementsInstancedBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL, instances, basevertex);
+        mglDrawElementsInstancedBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, (void *)(uintptr_t)off, instances, basevertex);
     else if (basevertex)
-        mglDrawElementsBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL, basevertex);
+        mglDrawElementsBaseVertex(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, (void *)(uintptr_t)off, basevertex);
     else
-        mglDrawElements(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, NULL);
+        mglDrawElements(ctx, mode, (GLsizei)count, GL_UNSIGNED_INT, (void *)(uintptr_t)off);
+
+    compat_ring_stamp(ctx, MAX_ATTRIBS);
 
     /* restore the caller's element binding */
     if (saved)
@@ -416,6 +563,30 @@ static void set_current_attribs(GLMContext ctx)
 {
     struct MGLExtState_compat *s = CS();
 
+    /* per-draw cost gate (compat perf session 37): the 16 mglVertexAttrib4f
+     * re-issues are pure VAO state — only needed when a current value changed
+     * or a different VAO receives them.  A byte-shadow compare is used so no
+     * setter can be forgotten (a missed bump would freeze stale constants). */
+    {
+        MGLCCurAttribs cur;
+
+        memset(&cur, 0, sizeof cur);
+        memcpy(cur.normal, s->cur_normal, sizeof cur.normal);
+        memcpy(cur.color, s->cur_color, sizeof cur.color);
+        memcpy(cur.secondary, s->cur_secondary, sizeof cur.secondary);
+        cur.fogcoord = s->cur_fogcoord;
+        cur.edgeflag = s->cur_edgeflag ? 1.0f : 0.0f;
+        cur.index = s->cur_index;
+        for (int u = 0; u < MGLC_MAX_COORDS; u++)
+            memcpy(cur.texcoord[u], s->cur_texcoord[u], sizeof cur.texcoord[u]);
+        cur.vao = VAO();
+
+        if (s->attr_shadow_set && !memcmp(&s->attr_shadow, &cur, sizeof cur))
+            return;
+        s->attr_shadow = cur;
+        s->attr_shadow_set = 1;
+    }
+
     mglVertexAttrib4f(ctx, MGLC_ATTR_VERTEX, 0.0f, 0.0f, 0.0f, 1.0f);
     mglVertexAttrib3f(ctx, MGLC_ATTR_NORMAL, s->cur_normal[0], s->cur_normal[1], s->cur_normal[2]);
     mglVertexAttrib4f(ctx, MGLC_ATTR_COLOR, s->cur_color[0], s->cur_color[1], s->cur_color[2], s->cur_color[3]);
@@ -439,6 +610,11 @@ static Program *bind_ffp(GLMContext ctx)
     if (user)
     {
         mgl_compat_sync_builtin_uniforms(ctx, user);
+        /* constant vertex state for the user program too: immediate-mode
+         * batches only upload the streams that vary, so every other
+         * attribute reads the generic current value (compat perf session 37;
+         * byte-shadow gated in set_current_attribs) */
+        set_current_attribs(ctx);
         /* keep returning the user program: unbind_ffp re-selects it after the
          * draw (a no-op) — returning NULL here made unbind_ffp issue
          * glUseProgram(0), silently unbinding the application's program after
@@ -464,6 +640,24 @@ static Program *bind_ffp(GLMContext ctx)
 
 static void unbind_ffp(GLMContext ctx, Program *user)
 {
+    /* stamp the streaming rings with the serial of the draw that just read
+     * them (conservative: the command buffer the draw went into may already
+     * be retired) so ring wrap never overtakes an in-flight read */
+    if (CS()->scratch_used)
+    {
+        struct MGLExtState_compat *s = CS();
+        uint32_t used = s->scratch_used;
+
+        while (used)
+        {
+            int si = __builtin_ctz(used);
+
+            compat_ring_stamp(ctx, si);
+            used &= used - 1;
+        }
+        s->scratch_used = 0;
+    }
+
     if (!user && !STATE(program))
         return;
 
@@ -539,15 +733,75 @@ void mgl_compat_flush_imm(GLMContext ctx)
 
     GLuint n = im->count;
 
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_VERTEX, 4, GL_FLOAT, GL_FALSE, 0, im->pos, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_NORMAL, 3, GL_FLOAT, GL_FALSE, 0, im->normal, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_COLOR, 4, GL_FLOAT, GL_FALSE, 0, im->color, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_SECONDARY, 4, GL_FLOAT, GL_FALSE, 0, im->secondary, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_FOG, 1, GL_FLOAT, GL_FALSE, 0, im->fog, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_EDGEFLAG, 1, GL_FLOAT, GL_FALSE, 0, im->edge, n);
-    upload_stream(ctx, s->imm_vao, MGLC_ATTR_INDEX, 1, GL_FLOAT, GL_FALSE, 0, im->index, n);
-    for (int u = 0; u < MGLC_MAX_COORDS; u++)
-        upload_stream(ctx, s->imm_vao, MGLC_ATTR_TEXCOORD(u), 4, GL_FLOAT, GL_FALSE, 0, im->texcoord[u], n);
+    /* compat perf session 37: upload only the streams that actually vary
+     * across the batch.  imm_emit() records a copy of the current vertex
+     * state for every vertex, so a stream whose values are identical in all
+     * recorded vertices carries exactly the generic current value — which
+     * set_current_attribs() has in the VAO.  Skipping the upload is
+     * bit-identical and saves 13+ glBufferData + ~65 dispatch calls per
+     * glEnd for the common "position (+ color) only" batch. */
+    {
+        uint32_t want = (n >= 1) ? (1u << MGLC_ATTR_VERTEX) : 0;
+
+        if (n >= 2)
+        {
+            GLuint i;
+            for (i = 1; i < n; i++)
+            {
+                if (memcmp(&im->normal[i * 3], im->normal, 3 * sizeof(float))) { want |= 1u << MGLC_ATTR_NORMAL; }
+                if (memcmp(&im->color[i * 4], im->color, 4 * sizeof(float))) { want |= 1u << MGLC_ATTR_COLOR; }
+                if (memcmp(&im->secondary[i * 4], im->secondary, 4 * sizeof(float))) { want |= 1u << MGLC_ATTR_SECONDARY; }
+                if (im->fog[i] != im->fog[0]) { want |= 1u << MGLC_ATTR_FOG; }
+                if (im->edge[i] != im->edge[0]) { want |= 1u << MGLC_ATTR_EDGEFLAG; }
+                if (im->index[i] != im->index[0]) { want |= 1u << MGLC_ATTR_INDEX; }
+                for (int u = 0; u < MGLC_MAX_COORDS; u++)
+                    if (memcmp(&im->texcoord[u][i * 4], im->texcoord[u], 4 * sizeof(float)))
+                        want |= 1u << MGLC_ATTR_TEXCOORD(u);
+                /* all streams already flagged: stop scanning */
+                if (want == ((1u << MGLC_ATTR_VERTEX) | (1u << MGLC_ATTR_NORMAL) |
+                             (1u << MGLC_ATTR_COLOR) | (1u << MGLC_ATTR_SECONDARY) |
+                             (1u << MGLC_ATTR_FOG) | (1u << MGLC_ATTR_EDGEFLAG) |
+                             (1u << MGLC_ATTR_INDEX) | (0xFFu << MGLC_ATTR_TEXCOORD(0))))
+                    break;
+            }
+        }
+
+        if (want & (1u << MGLC_ATTR_VERTEX))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_VERTEX, 4, GL_FLOAT, GL_FALSE, 0, im->pos, n);
+        if (want & (1u << MGLC_ATTR_NORMAL))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_NORMAL, 3, GL_FLOAT, GL_FALSE, 0, im->normal, n);
+        if (want & (1u << MGLC_ATTR_COLOR))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_COLOR, 4, GL_FLOAT, GL_FALSE, 0, im->color, n);
+        if (want & (1u << MGLC_ATTR_SECONDARY))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_SECONDARY, 4, GL_FLOAT, GL_FALSE, 0, im->secondary, n);
+        if (want & (1u << MGLC_ATTR_FOG))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_FOG, 1, GL_FLOAT, GL_FALSE, 0, im->fog, n);
+        if (want & (1u << MGLC_ATTR_EDGEFLAG))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_EDGEFLAG, 1, GL_FLOAT, GL_FALSE, 0, im->edge, n);
+        if (want & (1u << MGLC_ATTR_INDEX))
+            upload_stream(ctx, s->imm_vao, MGLC_ATTR_INDEX, 1, GL_FLOAT, GL_FALSE, 0, im->index, n);
+        for (int u = 0; u < MGLC_MAX_COORDS; u++)
+            if (want & (1u << MGLC_ATTR_TEXCOORD(u)))
+                upload_stream(ctx, s->imm_vao, MGLC_ATTR_TEXCOORD(u), 4, GL_FLOAT, GL_FALSE, 0, im->texcoord[u], n);
+
+        /* attribute arrays enabled by a previous batch that this batch does
+         * not feed must be disabled again (their data would still be bound) */
+        uint32_t stale = im->enabled & ~want;
+
+        if (stale)
+        {
+            GLuint attrib = 0;
+
+            while (stale)
+            {
+                if (stale & 1u)
+                    mglDisableVertexAttribArray(ctx, attrib);
+                stale >>= 1;
+                attrib++;
+            }
+        }
+        im->enabled = want;
+    }
 
     upload_line_stipple(ctx, im->mode, im->pos, n);
 
@@ -1540,10 +1794,10 @@ void mgl_compat_draw(GLMContext ctx, GLenum mode, GLint first, GLsizei count)
 
     mgl_compat_upload_client_arrays(ctx, first, first + count - 1);
 
-    const float *pos = mgl_compat_read_positions(ctx, 0, count);
-
     if (s->rmode.mode != GL_RENDER)
     {
+        const float *pos = mgl_compat_read_positions(ctx, 0, count);
+
         if (pos)
         {
             float *col = NULL, *tex = NULL;

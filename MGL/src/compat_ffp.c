@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 
@@ -81,7 +82,9 @@ typedef struct {
     int failed;
     GLuint prog;
     uint64_t sync;
+    uint64_t epoch;                     /* program epoch at table build */
     MGLFFPKey key;
+    MGLCUniEnt uni[MGLC_UNI_CACHE];   /* name->location (compat perf session 37) */
 } MGLFFPCacheEnt;
 
 /* NEAREST within a mip level? (chooses the border weight function when the
@@ -1217,6 +1220,7 @@ static GLuint ffp_program(GLMContext ctx, const MGLFFPConfig *c, const MGLFFPKey
     cache[slot].prog = prog;
     cache[slot].sync = 0;
     cache[slot].key = *key;
+    mgl_compat_uni_clear(cache[slot].uni);      /* new program: fresh locs */
 
     return prog;
 }
@@ -1267,9 +1271,116 @@ static void sync_stipple_texture(GLMContext ctx)
 #pragma mark uniform sync
 
 /* location lookup that tolerates missing uniforms (returns -1, no GL error) */
+/* uni(): uniform location of a fixed-function shader uniform, through the
+ * per-program cache.  ffp_sync() publishes the active cache entry in
+ * s->ffp_sync_cache before the first call. */
 static GLint uni(GLMContext ctx, GLuint prog, const char *name)
 {
-    return mglGetUniformLocation(ctx, prog, name);
+    struct MGLExtState_compat *s = CS();
+
+    if (!s->ffp_sync_cache)
+        return mglGetUniformLocation(ctx, prog, name);
+
+    return mgl_compat_uni_cached(ctx, prog, s->ffp_sync_cache, name);
+}
+
+/* per-program name -> location cache (compat perf session 37); see
+ * MGLCUniEnt in mgl_ext_compat.h.  cache belongs to the cache slot of
+ * |prog| and is cleared when the slot changes program. */
+/* pure table lookup; INT_MIN when absent */
+GLint mgl_compat_uni_lookup(MGLCUniEnt *cache, const char *name)
+{
+    uint32_t h = 2166136261u;
+    const char *p;
+
+    for (p = name; *p; p++)
+        h = (h ^ (uint8_t)*p) * 16777619u;
+
+    uint32_t i = h & (MGLC_UNI_CACHE - 1);
+
+    for (uint32_t probe = 0; probe < 16; probe++)
+    {
+        if (!cache[i].name[0])
+            return INT_MIN;                    /* empty: miss */
+
+        if (strcmp(cache[i].name, name) == 0)
+            return cache[i].loc;
+
+        i = (i + 1) & (MGLC_UNI_CACHE - 1);
+    }
+
+    return INT_MIN;                            /* probe chain exhausted */
+}
+
+GLint mgl_compat_uni_cached(GLMContext ctx, GLuint prog, MGLCUniEnt *cache, const char *name)
+{
+    GLint hit = mgl_compat_uni_lookup(cache, name);
+
+    if (hit != INT_MIN)
+        return hit;
+
+    GLint loc = mglGetUniformLocation(ctx, prog, name);
+
+    if (strlen(name) < MGLC_UNI_NAME)
+    {
+        uint32_t h = 2166136261u;
+        const char *p;
+        uint32_t j;
+
+        for (p = name; *p; p++)
+            h = (h ^ (uint8_t)*p) * 16777619u;
+
+        j = h & (MGLC_UNI_CACHE - 1);
+
+        for (uint32_t probe = 0; probe < 16; probe++)
+        {
+            if (!cache[j].name[0])
+            {
+                strcpy(cache[j].name, name);
+                cache[j].loc = loc;
+                break;
+            }
+
+            if (strcmp(cache[j].name, name) == 0)
+                break;                          /* already present */
+
+            j = (j + 1) & (MGLC_UNI_CACHE - 1);
+        }
+    }
+
+    return loc;
+}
+
+void mgl_compat_uni_clear(MGLCUniEnt *cache)
+{
+    memset(cache, 0, MGLC_UNI_CACHE * sizeof(MGLCUniEnt));
+}
+
+/* per-sync validation (compat perf session 37): cache slots are keyed by
+ * program identity (Program* / GL name), and a deleted program's identity
+ * can be recycled (heap address / name reuse), which would serve stale
+ * locations.  Two sentinel uniforms — present in every fixed-function and
+ * translated compat shader — are re-resolved through the real API each sync
+ * (two string lookups instead of ~40); any mismatch wipes the table. */
+void mgl_compat_uni_validate(GLMContext ctx, GLuint prog, MGLCUniEnt *cache)
+{
+    static const char *const sentinels[2] = { "mglModelViewMatrix", "mglProjectionMatrix" };
+
+    for (int i = 0; i < 2; i++)
+    {
+        GLint cached = mgl_compat_uni_lookup(cache, sentinels[i]);
+
+        if (cached == INT_MIN)           /* never cached: nothing to validate */
+            continue;
+
+        GLint fresh = mglGetUniformLocation(ctx, prog, sentinels[i]);
+
+        if (fresh != cached)
+        {
+            mgl_compat_uni_clear(cache);
+            return;
+        }
+    }
 }
 
 void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
@@ -1282,14 +1393,21 @@ void mgl_compat_ffp_sync(GLMContext ctx, GLuint prog)
     if (!prog)
         return;
 
+    s->ffp_sync_cache = NULL;      /* stale only if prog is not cached */
+
     ffp_build_config(ctx, &c);
 
     for (int i = 0; i < MGLC_FFP_CACHE; i++)
         if (cache && cache[i].used && cache[i].prog == prog)
         {
-            if (cache[i].sync == s->state_serial)
+            if (cache[i].sync == s->state_serial && cache[i].epoch == s->prog_epoch)
                 return;
             cache[i].sync = s->state_serial;
+            cache[i].epoch = s->prog_epoch;
+            if (cache[i].uni[0].name[0])
+                mgl_compat_uni_clear(cache[i].uni);  /* epoch changed: stale */
+            s->ffp_sync_cache = cache[i].uni;   /* per-program locations */
+            mgl_compat_uni_validate(ctx, prog, cache[i].uni);
             break;
         }
 

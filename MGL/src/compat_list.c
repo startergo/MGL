@@ -812,6 +812,16 @@ void mglPopAttrib(GLMContext ctx)
         s->scratch_ibo = keep.scratch_ibo;
         for (int i = 0; i < MAX_ATTRIBS; i++)
             s->scratch_vbo[i] = keep.scratch_vbo[i];
+        /* compat perf session 37: the streaming rings / caches describe the
+         * LIVE scratch buffers above — a popped snapshot would replay stale
+         * offsets (overwriting in-flight draws) and stale Buffer* identities */
+        memcpy(s->scratch_ring, keep.scratch_ring, sizeof keep.scratch_ring);
+        memcpy(s->scratch_obj, keep.scratch_obj, sizeof keep.scratch_obj);
+        s->scratch_used = keep.scratch_used;
+        s->attr_shadow = keep.attr_shadow;
+        s->attr_shadow_set = keep.attr_shadow_set;
+        s->uni_sync_cache = keep.uni_sync_cache;
+        s->ffp_sync_cache = keep.ffp_sync_cache;
         s->stipple_tex = keep.stipple_tex;
         s->stipple_serial = keep.stipple_serial;
         s->blit_program = keep.blit_program;

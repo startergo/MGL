@@ -151,6 +151,23 @@ static void compat_get_pointerv(GLMContext ctx, GLenum pname, void **params)
     *params = (void *)s->arrays[index].pointer;
 }
 
+/* compat perf session 37 — program-epoch guard for the per-program uniform
+ * location caches: any (re)link or delete of any program invalidates every
+ * cached table wholesale (locations are only stable for a linked, live
+ * program; heap-address reuse of Program objects made pointer-identity checks
+ * insufficient — caught as intermittent black draws in test_compat_glsl). */
+static void compat_link_program(GLMContext ctx, GLuint program)
+{
+    ctx->state.ext_compat->prog_epoch++;
+    mglLinkProgram(ctx, program);
+}
+
+static void compat_delete_program(GLMContext ctx, GLuint program)
+{
+    ctx->state.ext_compat->prog_epoch++;
+    mglDeleteProgram(ctx, program);
+}
+
 /* wrappers that record into a display list before executing */
 #define REC0V(OP, CALL) \
     static void rec_##OP(GLMContext ctx) { \
@@ -749,6 +766,8 @@ void mgl_compat_init_dispatch(GLMContext ctx)
     ctx->dispatch.get_stringi = compat_get_stringi;
     ctx->dispatch.bind_vertex_array = compat_bind_vertex_array;
     ctx->dispatch.get_pointerv = compat_get_pointerv;
+    ctx->dispatch.link_program = compat_link_program;
+    ctx->dispatch.delete_program = compat_delete_program;
     ctx->dispatch.polygon_mode = compat_polygon_mode;
     ctx->dispatch.point_size = compat_point_size;
     ctx->dispatch.point_parameterf = mgl_compat_point_parameterf;

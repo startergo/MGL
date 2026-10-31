@@ -144,6 +144,47 @@ typedef struct {
     const void *pointer;          /* client memory */
 } MGLCClientArray;
 
+#pragma mark constant-attrib shadow (compat perf session 37)
+
+/* byte shadow of the current vertex values + the VAO that last received them:
+ * set_current_attribs() re-issues its 16 mglVertexAttrib* calls only when a
+ * current value or the destination VAO changed.  A byte compare is used so no
+ * setter can be forgotten (a missed serial bump would freeze stale values). */
+typedef struct {
+    float normal[3];
+    float color[4];
+    float secondary[4];
+    float fogcoord;
+    float edgeflag;               /* 0.0 / 1.0 */
+    float index;
+    float texcoord[MGLC_MAX_COORDS][4];
+    void *vao;
+} MGLCCurAttribs;
+
+#pragma mark uniform-location mini cache (compat perf session 37)
+
+/* Fixed-function and translated-compat shaders reference a fixed pool of
+ * mgl* uniform names; the sync paths used to call glGetUniformLocation for
+ * every one of them on every state-serial bump (string parse + program
+ * uniform hash per call, ~50% of a compat draw after the ring work).  Each
+ * program cache entry holds an open-addressed name->location table; misses
+ * (including -1, so absent uniforms are looked up once) insert.  Locations
+ * are stable for the lifetime of a program object; the owner clears the
+ * table when a slot is re-used for a different program or relink. */
+#define MGLC_UNI_CACHE 128          /* power of two */
+#define MGLC_UNI_NAME 40
+
+typedef struct {
+    char  name[MGLC_UNI_NAME];
+    GLint loc;
+} MGLCUniEnt;
+
+/* compat_ffp.c */
+GLint mgl_compat_uni_cached(GLMContext ctx, GLuint prog, MGLCUniEnt *cache, const char *name);
+GLint mgl_compat_uni_lookup(MGLCUniEnt *cache, const char *name);
+void mgl_compat_uni_clear(MGLCUniEnt *cache);
+void mgl_compat_uni_validate(GLMContext ctx, GLuint prog, MGLCUniEnt *cache);
+
 #pragma mark display lists
 
 typedef enum {
@@ -412,11 +453,27 @@ struct MGLExtState_compat {
     VertexArray *vao0;            /* VAO 0 backing store */
     VertexArray *imm_vao;         /* internal VAO for glBegin/glEnd */
     GLuint    scratch_vbo[MAX_ATTRIBS];   /* streaming vertex buffers */
-    GLuint    scratch_ibo;
+    GLuint    scratch_ibo;               /* streaming element buffer */
+
+    /* compat perf session 37: the scratch buffers are bump-allocated rings —
+     * every draw writes a fresh range of the persistent backing store (no
+     * glBufferSubData, so the buffers-domain rename-on-write never fires and
+     * no MTLBuffer is allocated per draw).  A ring only recycles once the GPU
+     * completed the serial of the last draw that read it (grow-first, wait at
+     * the cap).  scratch_obj caches the Buffer* of each internal name. */
+    struct {
+        size_t    off, cap;              /* bump offset / capacity in bytes */
+        uint64_t  serial;                /* serial of the last draw fed */
+    } scratch_ring[MAX_ATTRIBS + 1];     /* [MAX_ATTRIBS] = element ring */
+    Buffer   *scratch_obj[MAX_ATTRIBS + 1];
+    uint32_t  scratch_used;              /* rings fed since the last draw */
     GLuint    ffp_program;        /* generated fixed-function program */
     uint64_t  ffp_key;            /* key of the generated program */
     uint64_t  ffp_sync_serial;
+    MGLCUniEnt *uni_sync_cache;   /* active builtin_prog slot (compat_glsl.c) */
+    uint64_t  prog_epoch;         /* bumped on any program link/delete (dispatch hooks) */
     void     *ffp_cache;          /* MGLFFPCacheEnt[] (compat_ffp.c) */
+    MGLCUniEnt *ffp_sync_cache;   /* active slot's uniform cache (compat_ffp.c) */
     GLuint    stipple_tex;        /* 32x32 R8 pattern, unit MGLC_STIPPLE_UNIT */
     uint64_t  stipple_serial;
     GLuint    blit_program;       /* drawpixels / bitmap / copypixels */
@@ -431,6 +488,10 @@ struct MGLExtState_compat {
     struct MGLCImm_t *imm;
     float   *pos_scratch;         /* last positions read for CPU paths */
 
+    /* constant-attrib issue gate (MGLCCurAttribs above) */
+    MGLCCurAttribs attr_shadow;
+    uint64_t attr_shadow_set;
+
     /* display-list / draw temporaries */
     uint32_t *index_scratch;
     GLuint    index_scratch_cap;
@@ -439,7 +500,8 @@ struct MGLExtState_compat {
     struct MGLCBuiltinProg_t {
         Program *prog;
         void    *link_id;         /* program->linked_glsl_program (link identity) */
-        GLint    loc[96];         /* MGLC_BUILTIN_* (compat_glsl.c) */
+        uint64_t epoch;           /* program epoch at table build (s37) */
+        MGLCUniEnt uni[MGLC_UNI_CACHE];  /* name -> location (compat perf session 37) */
         uint64_t sync_serial;
     } builtin_prog[8];
     int       builtin_prog_count;
