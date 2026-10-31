@@ -291,6 +291,13 @@ typedef struct MGLGeomProgram {
      * Keyed on the vertex-descriptor layout hash + the capture function pointer. */
     void   *capture_pso;
     uint64_t capture_pso_key;
+    /* r84: the "does this variant declare spvBufferSizeConstants" probe scanned the
+     * whole MSL text on EVERY draw (strstr over tens of KB in geomBindStageBuffers and
+     * the capture bind).  Memoized on the text pointer: a gp rebuild installs a NEW
+     * string (geometry.c assigns kernel_msl/capture_msl fresh), so the memo cannot go
+     * stale — probe!=msl re-probes.  has=0 unknown, 1 no, 2 yes. */
+    const char *kernel_msl_sizes_at, *capture_msl_sizes_at;
+    uint8_t kernel_msl_sizes, capture_msl_sizes;
 } MGLGeomProgram;
 
 /* per-draw input of the routing helper: either the assembled lists (CPU assembly, the

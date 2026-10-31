@@ -148,7 +148,9 @@ static void geomEnvRead(void)
 {
     if (gEnv.read) return;    gEnv.read = 1;
     gEnv.draw = getenv("MGL_GEOM_TRACE_DRAW") != NULL;
-    gEnv.debug = gEnv.debug != NULL;
+    /* r83 regression: this read gEnv.debug (still zero) instead of the environment,
+     * so MGL_GEOM_DEBUG never latched and every gEnv.debug site was dead */
+    gEnv.debug = getenv("MGL_GEOM_DEBUG") != NULL;
     gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
     gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
@@ -242,6 +244,22 @@ static uint32_t gQaccReset;                       /* words that restart at the n
 static bool gQaccRan;                             /* an update was encoded since the last begin */
 static id<MTLCommandBuffer> gQaccCb;              /* last command buffer holding an update */
 static void *gPsoKey;               /* the kernel function the PSOs were built from */
+
+/* r84: "does this variant declare spvBufferSizeConstants" decided the per-draw size-constant
+ * bind by scanning the whole MSL text (strstr over tens of KB, twice per draw).  Memoized on
+ * the text pointer: every rebuild path memsets the gp (geom_free_prog) and installs a fresh
+ * string, so probe != msl re-probes and the memo cannot go stale. */
+static bool geomMslHasSizeConstants(const char *msl, const char **probe, uint8_t *memo)
+{
+    if (!msl) return false;
+    if (*probe != msl)
+    {
+        /* memo layout: 0 unknown, 1 no, 2 yes (the probe caches the answer's key) */
+        *memo = strstr(msl, "spvBufferSizeConstants") != NULL ? 2 : 1;
+        *probe = msl;
+    }
+    return *memo == 2;
+}
 
 /* stringise a macro value for the embedded MSL */
 #define MGL_GEOM_STR2(x) #x
@@ -5145,7 +5163,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
      * this walk itself binds at the map index — so the sizes array is indexed by the map
      * index too (geomFillSSBOSizes indexes by the RASTER msl_binding, which the pins
      * renumber) */
-    if (gp->kernel_msl && strstr(gp->kernel_msl, "spvBufferSizeConstants"))
+    if (geomMslHasSizeConstants(gp->kernel_msl, &gp->kernel_msl_sizes_at, &gp->kernel_msl_sizes))
     {
         uint32_t sizes[MAX_MAPPED_BUFFERS];
         GLuint n = 0;
@@ -6057,7 +6075,19 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         {
             if (!eb->data.mtl_data) [self bindMTLBuffer: eb];
             have_eb = eb->data.mtl_data != NULL;
-            if (have_eb) mgl_buffers_mark_gpu_use(ctx, eb, true);
+            /* READ tracking only: the prep kernel loads the indices (buffer(2) is
+             * `const device uchar*`), it never writes them.  Stamping the element
+             * buffer gpu-WRITTEN here made the next draw's geom_index_list ->
+             * mgl_buffers_prepare_cpu_read see write_serial == the current serial
+             * and wait for the CURRENT (uncommitted) command buffer:
+             * extBufWaitSerial -> extBufFlush committed it mid-frame and set
+             * DIRTY_ALL, so EVERY indexed geometry draw paid a full GPU round-trip
+             * wait plus the complete pipeline-descriptor rebuild (compatPipelineFastPath
+             * declines under DIRTY_SHADER, ~150 us) instead of hitting the pipeline
+             * cache.  A buffer the GPU actually writes (xfb into an index buffer,
+             * a compute pass) still gets its write_serial stamped by the writer,
+             * so the CPU read keeps its protection. */
+            if (have_eb) mgl_buffers_mark_gpu_use(ctx, eb, false);
         }
 
         [enc pushDebugGroup: @"MGL geometry prep"];
@@ -6300,15 +6330,17 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         [enc pushDebugGroup: @"MGL geometry vertex capture"];
         [enc setRenderPipelineState: pso];
 
-        /* vertex stage resources of the program + the capture buffer */
+        /* vertex stage resources of the program + the capture buffer.
+         * r84: the map walk was run a second time here, but nothing between the
+         * descriptor build above and this bind loop can change the answer — the
+         * program, the buffer_base rows and the VAO are all untouched in between
+         * (geomPrepareStageTextures only realizes texture uploads, and the PSO /
+         * encoder creation touches no GL state), and map #1 already folded in
+         * updateDirtyBaseBufferList.  The list from map #1 is reused as-is; the
+         * bind loop re-reads b->data.mtl_data per entry, so a buffer materialised
+         * between the two points is still picked up. */
         ctx->state.program = program;
-        if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage: _VERTEX_SHADER])
         {
-            if (ctx->state.dirty_bits & DIRTY_BUFFER)
-            {
-                [self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list];
-                ctx->state.dirty_bits &= ~DIRTY_BUFFER;
-            }
             for (int i = 0; i < (int)ctx->state.vertex_buffer_map_list.count; i++)
             {
                 Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
@@ -6392,7 +6424,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * VSOUT slot), and geomBindSSBOSizes skips the vertex table for a geometry
          * program (the RASTER pass's vertex function is the pass-through, which reads no
          * SSBO) — bind them for the capture pass itself */
-        if (gp->capture_msl && strstr(gp->capture_msl, "spvBufferSizeConstants"))
+        if (geomMslHasSizeConstants(gp->capture_msl, &gp->capture_msl_sizes_at, &gp->capture_msl_sizes))
         {
             uint32_t sizes[MAX_MAPPED_BUFFERS];
             GLuint n = 0;
