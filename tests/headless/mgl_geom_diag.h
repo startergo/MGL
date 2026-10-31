@@ -12,6 +12,12 @@ extern "C" {
 void *mgl_geom_ctx(void);
 void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
 
+/* r82: monotonic image-atomic sidecar counters of the current context.
+ * which: 0 seeds, 1 flushes (MS raster), 2 compute resolves, 3 sidecar
+ * allocations.  Used to prove the sidecar's zero cost when a program declares
+ * no image atomics (and that each pass runs exactly once when one does). */
+uint64_t mgl_geom_ms_stat(int which);
+
 #ifdef __cplusplus
 }
 #endif

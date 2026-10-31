@@ -132,19 +132,23 @@ static uint32_t gTiledMin = 4096u;/* the scratch is capped so absurdly large ind
 static struct {
     int  read;
     bool draw, debug, xfb, worst_case, dump, serial_prep;
+    /* r83: the remaining per-draw probes share the one-shot latch — raw getenv()
+     * on the draw path (several of them per geometry draw) is a libc call with a
+     * lock, ~0.1-0.5us each, pure overhead when the probe is off */
+    bool trace, qdebug, dump_runs, cull_trace, cull_dump, asserts, zzvcap, ssbo_dbg, zztrace;
     /* stage-skip diagnostics (MGL_GEOM_SKIP_*): GPU-time attribution of the emulation's
      * stages — the skipped stage's consumers keep reading the same VOLUME of data (a
      * previous draw's records / counters), so the difference of two runs is the stage's
      * own cost.  Development diagnostics only; never set by the library itself. */
     bool skip_capture, skip_kernel, skip_order, skip_raster, gputime, skip_gs, no_barrier, skip_scan, skip_copy, no_implicit;
     int scan_reps;
-} gEnv = { 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, 0 };
+} gEnv = { 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, 0 };
 
 static void geomEnvRead(void)
 {
     if (gEnv.read) return;    gEnv.read = 1;
     gEnv.draw = getenv("MGL_GEOM_TRACE_DRAW") != NULL;
-    gEnv.debug = getenv("MGL_GEOM_DEBUG") != NULL;
+    gEnv.debug = gEnv.debug != NULL;
     gEnv.xfb = getenv("MGL_GEOM_XFB_TRACE") != NULL;
     gEnv.worst_case = getenv("MGL_GEOM_WORST_CASE_DISPATCH") != NULL;
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
@@ -159,6 +163,15 @@ static void geomEnvRead(void)
     gEnv.skip_scan = getenv("MGL_GEOM_SKIP_SCAN") != NULL;
     gEnv.skip_copy = getenv("MGL_GEOM_SKIP_COPY") != NULL;
     gEnv.no_implicit = getenv("MGL_GEOM_NO_IMPLICIT") != NULL;   /* A/B: force assembly */
+    gEnv.trace = getenv("MGL_GEOM_TRACE") != NULL;
+    gEnv.qdebug = getenv("MGL_GEOM_QDEBUG") != NULL;
+    gEnv.dump_runs = getenv("MGL_GEOM_DUMP_RUNS") != NULL;
+    gEnv.cull_trace = getenv("MGL_CULL_TRACE") != NULL;
+    gEnv.cull_dump = getenv("MGL_CULL_DUMP") != NULL;
+    gEnv.asserts = getenv("MGL_GEOM_ASSERT") != NULL;
+    gEnv.zzvcap = getenv("MGL_ZZVCAP") != NULL;
+    gEnv.ssbo_dbg = getenv("MGL_SSBO_DEBUG") != NULL;
+    gEnv.zztrace = getenv("MGL_ZZTRACE") != NULL;
     {
         const char *r = getenv("MGL_GEOM_SCAN_REPS");
         if (r) { int v = atoi(r); if (v >= 1 && v <= 32) gEnv.scan_reps = v; }
@@ -1386,6 +1399,7 @@ bool geom_xfb_gpu_pending(void)
 
 - (void) geomQueryRead: (unsigned) word out: (uint64_t *) out
 {
+    (void)geomEnvRead();
     if (!out) return;
     if (!gQacc || !gQaccRan || word >= 16) { *out = 0; return; }
 
@@ -1425,7 +1439,7 @@ bool geom_xfb_gpu_pending(void)
         for (int i = 0; i < 6; i++) fprintf(stderr, " %u", h[MGL_GEOM_HDR_WORDS + 8 + i]);
         fprintf(stderr, "\n");
     }
-    if (getenv("MGL_GEOM_QDEBUG"))
+    if (gEnv.qdebug)
         fprintf(stderr, "geom: qacc read w%u -> %u  [%u %u %u %u | %u %u %u %u] ran=%d\n",
                 word, (unsigned)*out,
                 ((volatile uint32_t *)gQacc.contents)[0], ((volatile uint32_t *)gQacc.contents)[1],
@@ -2304,6 +2318,7 @@ static BOOL g3DShadowLive = NO;  /* any shadow exists (shadows are never freed b
 - (void) geom3DImageShadowSync
 {
     GLMContext glm = ctx;
+    (void)geomEnvRead();
     struct
     {
         int dir, unit;
@@ -2516,7 +2531,7 @@ static BOOL g3DShadowLive = NO;  /* any shadow exists (shadows are never freed b
 
         if (!no_image)
             mgl_texdata_level_geometry((Texture *)iu->tex, 0, iu->level, &lw, &lh, &ld);
-        if (getenv("MGL_GEOM_DEBUG") && (iu->tex->target == GL_TEXTURE_2D_MULTISAMPLE ||
+        if (gEnv.debug && (iu->tex->target == GL_TEXTURE_2D_MULTISAMPLE ||
                                          iu->tex->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY))
             fprintf(stderr, "MGL geom: iuv MS unit %d texw=%u lvl=%u lw=%u lh=%u base=%p %ux%lu\n",
                     iu->unit, iu->tex->width, iu->level, lw, lh, (__bridge void *)base,
@@ -3043,6 +3058,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         g->img_atom[unit].bytes == (size_t)(texels * 4))
     {
         g->img_atom[unit].dirty = true;         /* bound to a dispatch: contents may change */
+        g->img_atom_any = true;
         return buf;                             /* same binding: the contents persist */
     }
 
@@ -3072,6 +3088,11 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     g->img_atom[unit].bytes = (size_t)(texels * 4);
     g->img_atom[unit].dirty = true;
     g->img_atom[unit].needs_seed = true;        /* seed from the texture before the next dispatch */
+    g->img_atom[unit].elems = 0;                /* a SINGLE image replaces an ARRAY record (r82:
+                                                 * a stale elems>0 sent the seed and the resolve
+                                                 * down the array paths against one sidecar) */
+    g->img_atom_any = true;
+    g->stat_sidecar_allocs++;
     g->img_atom[unit].ms = (view.textureType == MTLTextureType2DMultisample ||
                             view.textureType == MTLTextureType2DMultisampleArray);
     g->img_atom[unit].samples = g->img_atom[unit].ms ? (GLuint)view.sampleCount : 0;
@@ -3096,6 +3117,22 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     }
 }
 
+/* r82: the view of image unit `u` used for ARRAY sidecar element regions (the
+ * raw-layout element view the seed/resolve/MS-flush paths index).  nil when the
+ * unit is not bound to a real texture. */
+- (id<MTLTexture>) geomImageAtomicArrayElemView: (GLuint) u
+{
+    ImageUnit *iu;
+    Texture *ptr;
+
+    if (u >= TEXTURE_UNITS) return nil;
+    iu = &STATE(image_units[u]);
+    ptr = iu->tex;
+    if (!ptr || !ptr->mtl_data) return nil;
+    return [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                            elemClass: 0xffffffffu];
+}
+
 /* The layout of an image-ARRAY's single side buffer, mirroring the MSL helper
  * mgl_msl_fix_image_atomics emits (spvMglAIArr_*): element e's region starts at
  * offset_e (in 32-bit words) and spans raw_width*height words — the same raw row
@@ -3106,14 +3143,21 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                                      offs: (NSUInteger *) offs maxe: (NSUInteger) maxe
                                       sig: (uint64_t *) sig
 {
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
     NSUInteger total = 0;
     uint64_t s = 0;
 
-    if (!offs || elems > maxe || unit + elems > TEXTURE_UNITS)
+    if (!offs || !g || elems > maxe || unit + elems > TEXTURE_UNITS)
         return 0;
     for (GLuint e = 0; e < elems; e++)
     {
-        ImageUnit *iu = &STATE(image_units[unit + e]);
+        /* the element's REAL image unit (a remapped array element is not at
+         * unit+e — see MGLExtState_geom.img_atom[].eunits, r82; 0xffffffff marks
+         * an unset slot (record not yet created / element past the 8-deep list)
+         * and falls back to the consecutive default) */
+        GLuint ue = (e < 8 && g->img_atom[unit].eunits[e] != 0xffffffffu)
+                        ? g->img_atom[unit].eunits[e] : unit + e;
+        ImageUnit *iu = &STATE(image_units[ue]);
         Texture *tex = iu->tex;
         id<MTLTexture> view;
 
@@ -3141,23 +3185,58 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
 
 /* The ONE side buffer of an image ARRAY uniform (SPIRV-Cross declares a single
  * `<name>_atomic [[buffer(N)]]` for the whole array; its size covers every
- * element's region back to back — see geomImageAtomicArrayLayout). */
+ * element's region back to back — see geomImageAtomicArrayLayout).
+ * `res` (may be NULL) supplies the element->image-unit mapping: image-array
+ * elements are independent uniforms, so g[1] may live far from g[0]'s unit
+ * (advanced-sso-simple binds 0,2,4,6) — the record's eunits[] then agrees with
+ * the MSL helper's runtime offsets (r82). */
 - (id<MTLBuffer>) geomImageAtomicBufferArray: (GLuint) unit elems: (GLuint) elems
+                                         res: (SpirvResource *) res
 {
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
     NSUInteger offs[TEXTURE_UNITS];
     uint64_t sig = 0;
-    NSUInteger words = [self geomImageAtomicArrayLayout: unit elems: elems offs: offs
-                                                   maxe: TEXTURE_UNITS sig: &sig];
+    NSUInteger words;
+
+    if (!g) return nil;
+    /* fill the element-unit map FIRST: the layout reads it */
+    for (GLuint e = 0; e < 8; e++)
+        g->img_atom[unit].eunits[e] = (res && e < elems) ? mgl_res_elem_unit(res, e)
+                                 : (e < elems ? unit + e : 0xffffffffu);
+    words = [self geomImageAtomicArrayLayout: unit elems: elems offs: offs
+                                        maxe: TEXTURE_UNITS sig: &sig];
     id<MTLBuffer> buf;
 
-    if (!g || !words)
+    if (!words)
         return nil;
+    /* r82: record whether the ELEMENTS are multisample — the seed and the barrier
+     * resolve must take the MS paths for their regions (a 2D-array compute resolve
+     * cannot write texture2d_ms, and the MS seed reads per sample) */
+    {
+        bool ms_elems = false;
+        GLuint samples = 0;
+        for (GLuint e = 0; e < elems; e++)
+        {
+            GLuint ue = (e < 8 && g->img_atom[unit].eunits[e] != 0xffffffffu)
+                            ? g->img_atom[unit].eunits[e] : unit + e;
+            id<MTLTexture> tv = [self geomImageAtomicArrayElemView: ue];
+            if (tv && (tv.textureType == MTLTextureType2DMultisample ||
+                       tv.textureType == MTLTextureType2DMultisampleArray))
+            {
+                ms_elems = true;
+                samples = (GLuint)tv.sampleCount;
+                break;
+            }
+        }
+        g->img_atom[unit].ms = ms_elems;
+        g->img_atom[unit].samples = samples;
+    }
     buf = (__bridge id<MTLBuffer>)g->img_atom[unit].buf;
     if (buf && g->img_atom[unit].elems == elems && g->img_atom[unit].sig == sig &&
         g->img_atom[unit].bytes == words * 4)
     {
         g->img_atom[unit].dirty = true;      /* a dispatch/encoder saw it */
+        g->img_atom_any = true;
         return buf;
     }
     buf = [_device newBufferWithLength: words * 4 + 4 options: MTLResourceStorageModeShared];  /* +1 DUMP word (OOB image accesses) */
@@ -3176,6 +3255,12 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     g->img_atom[unit].sig = sig;
     g->img_atom[unit].dirty = true;
     g->img_atom[unit].needs_seed = true;     /* seed every element region before use */
+    g->img_atom_any = true;
+    g->stat_sidecar_allocs++;
+    if (gEnv.debug)
+        fprintf(stderr, "MGL geom: ARRAY sidecar CREATED unit=%u elems=%u words=%lu e0=%u e1=%u\\n",
+                unit, elems, (unsigned long)words,
+                g->img_atom[unit].eunits[0], g->img_atom[unit].eunits[1]);
     return buf;
 }
 
@@ -3382,6 +3467,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
 - (bool) geomSeedImageAtomic: (int) unit
                     encoder: (id <MTLComputeCommandEncoder>) encoder
 {
+    (void)geomEnvRead();
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
     id<MTLTexture> view;
     id<MTLBuffer> buf;
@@ -3412,7 +3498,10 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         { g->img_atom[unit].needs_seed = false; return false; }
         for (GLuint e = 0; e < g->img_atom[unit].elems; e++)
         {
-            ImageUnit *iu2 = &STATE(image_units[unit + e]);
+            /* the element's real unit (remapped array elements, r82) */
+            GLuint ue = (e < 8 && g->img_atom[unit].eunits[e] != 0xffffffffu)
+                            ? g->img_atom[unit].eunits[e] : unit + e;
+            ImageUnit *iu2 = &STATE(image_units[ue]);
             id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
                 ? [self geomImageUnitViewRes: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)
                                    elemClass: 0xffffffffu]
@@ -3423,6 +3512,33 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             id<MTLComputePipelineState> pso2;
 
             if (!ev) continue;
+
+            /* a MULTISAMPLE element (image2DMS g[N], r82): its region uses the
+             * per-sample 4-words-per-texel-sample layout — the MS seed kernel at
+             * the element's offset (a 2D-array compute write cannot read
+             * texture2d_ms per sample the way mgl_ms_seed does). */
+            if (ev.textureType == MTLTextureType2DMultisample ||
+                ev.textureType == MTLTextureType2DMultisampleArray)
+            {
+                NSUInteger L = (ev.textureType == MTLTextureType2DMultisampleArray)
+                               ? ev.arrayLength : 1;
+                id<MTLComputePipelineState> mpso = [self geomMsSeedPso: ev.textureType
+                                                                format: ev.pixelFormat];
+                if (!mpso || !ev.sampleCount) continue;
+                d2[0] = (uint32_t)ev.width;
+                d2[1] = (uint32_t)ev.height;
+                d2[2] = (uint32_t)L;
+                d2[3] = (uint32_t)(ev.width * ev.height * L);
+                [encoder setComputePipelineState: mpso];
+                [encoder setBuffer: buf offset: offs[e] * 4 atIndex: 0];
+                [encoder setTexture: ev atIndex: 0];
+                [encoder setBytes: &d2 length: sizeof(d2) atIndex: 1];
+                [encoder dispatchThreads: MTLSizeMake(d2[3], 1, 1)
+                          threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+                any = true;
+                continue;
+            }
+
             av = [ev newTextureViewWithPixelFormat: ev.pixelFormat
                                     textureType: MTLTextureType2DArray
                                          levels: NSMakeRange(0, 1)
@@ -3444,6 +3560,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             any = true;
         }
         g->img_atom[unit].needs_seed = false;
+        if (any) g->stat_seeds++;
         return any;
     }
 
@@ -3470,6 +3587,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         [encoder dispatchThreads: MTLSizeMake(md[3], 1, 1)
                   threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
         g->img_atom[unit].needs_seed = false;
+        g->stat_seeds++;
         return true;
     }
 
@@ -3492,6 +3610,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     [encoder dispatchThreads: MTLSizeMake(total, 1, 1)
               threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
     g->img_atom[unit].needs_seed = false;
+    g->stat_seeds++;
     return true;
 }
 
@@ -3669,15 +3788,27 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
 - (bool) geomMsFlushUnit: (int) unit
 {
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
-    id<MTLBuffer> buf;
-    id<MTLTexture> view;
+
+    if (!g || unit < 0 || unit >= TEXTURE_UNITS || !g->img_atom[unit].buf) return false;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)(g->img_atom[unit].buf);
+    id<MTLTexture> view = (__bridge id<MTLTexture>)(g->img_atom[unit].view);
+    if (!buf || !view) return false;
+    return [self geomMsFlushView: buf offset: 0 view: view unit: unit];
+}
+
+/* r82: the flush core, parameterized by (side buffer, BYTE offset, view) so an MS
+ * image ARRAY element's region rasterizes back through the same path — its words
+ * live at offs[e]*4 inside the array's single sidecar.  `unit` is a debug label
+ * (-1 for array elements). */
+- (bool) geomMsFlushView: (id<MTLBuffer>)buf
+                  offset: (NSUInteger)off
+                    view: (id<MTLTexture>)view
+                    unit: (int)unit
+{
     bool arrayed;
     uint32_t dims[4];
     NSUInteger total, L;
 
-    if (!g || unit < 0 || unit >= TEXTURE_UNITS || !g->img_atom[unit].buf) return false;
-    buf = (__bridge id<MTLBuffer>)(g->img_atom[unit].buf);
-    view = (__bridge id<MTLTexture>)(g->img_atom[unit].view);
     if (!buf || !view) return false;
 
     arrayed = (view.textureType == MTLTextureType2DMultisampleArray);
@@ -3685,16 +3816,16 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     total = view.width * view.height * L;
     if (!total || !view.sampleCount) return false;
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    if (gEnv.debug)
     {
         /* the store path must have left its words in the sidecar BEFORE the flush:
          * word 0..3 = texel(0,0) sample0, and texel(1,0) sample3 */
-        volatile uint32_t *w32 = (volatile uint32_t *)buf.contents;
-        fprintf(stderr, "MGL geom: ms flush PRE buf=%p len=%zu words=%lu NONZERO at:",
-                (__bridge void *)buf, buf.length, (unsigned long)(buf.length / 4));
+        volatile uint32_t *w32 = (volatile uint32_t *)((uint8_t *)buf.contents + off);
+        fprintf(stderr, "MGL geom: ms flush PRE (unit %d) buf=%p off=%lu words=%lu NONZERO at:",
+                unit, (__bridge void *)buf, (unsigned long)off, (unsigned long)(buf.length / 4));
         {
             int shown = 0;
-            for (NSUInteger i = 0; i < buf.length / 4 && shown < 24; i++)
+            for (NSUInteger i = 0; i < (buf.length - off) / 4 && shown < 24; i++)
                 if (w32[i]) { fprintf(stderr, " [%lu]=%08x", (unsigned long)i, w32[i]); shown++; }
         }
         fprintf(stderr, "\n");
@@ -3705,7 +3836,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                                                   arrayed: arrayed];
     if (!pso)
     {
-        if (getenv("MGL_GEOM_DEBUG"))
+        if (gEnv.debug)
             fprintf(stderr, "MGL geom: ms flush unit %d PSO FAILED (pf %u sc %lu arr %d)\n",
                     unit, (unsigned)view.pixelFormat, (unsigned long)view.sampleCount, arrayed);
         return false;
@@ -3735,7 +3866,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     if (arrayed) rp.renderTargetArrayLength = L;
 
     id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor: rp];
-    if (getenv("MGL_GEOM_DEBUG") && !renc)
+    if (gEnv.debug && !renc)
         fprintf(stderr, "MGL geom: ms flush ENCODER NIL (pf %u sc %lu arr %d tex %p %lux%lu s=%lu)\n",
                 (unsigned)view.pixelFormat, (unsigned long)view.sampleCount, arrayed,
                 (__bridge void *)view, (unsigned long)view.width, (unsigned long)view.height,
@@ -3744,7 +3875,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     [renc setRenderPipelineState: pso];
     [renc setViewport: (MTLViewport){ 0, 0, (double)view.width, (double)view.height, 0.0, 1.0 }];
     [renc setVertexBytes: &dims length: sizeof(dims) atIndex: 0];
-    [renc setFragmentBuffer: buf offset: 0 atIndex: 1];
+    [renc setFragmentBuffer: buf offset: off atIndex: 1];
     [renc setFragmentBytes: &dims length: sizeof(dims) atIndex: 0];
     /* chunked: a single multi-million-point draw of a huge multisample image
      * pushed the render pass over the GPU's transient allocation and died with
@@ -3757,7 +3888,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         if (n > 8u * 1024u * 1024u) n = 8u * 1024u * 1024u;
         [renc drawPrimitives: MTLPrimitiveTypePoint vertexStart: base vertexCount: n];
     }
-    if (getenv("MGL_GEOM_DEBUG"))
+    if (gEnv.debug)
         fprintf(stderr, "MGL geom: ms flush DRAW pf=%u total=%lu dims=%u,%u,%u,%u sc=%lu enc=%s\n",
                 (unsigned)view.pixelFormat, (unsigned long)total, dims[0], dims[1], dims[2], dims[3],
                 (unsigned long)view.sampleCount, renc ? "ok" : "NIL");
@@ -3801,7 +3932,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                     [venc endEncoding];
                 }
             }
-            else if (getenv("MGL_GEOM_DEBUG"))
+            else if (gEnv.debug)
                 fprintf(stderr, "MGL geom: ms flush VERIFY compile failed: %s\n",
                         verr ? verr.localizedDescription.UTF8String : "?");
             /* print after commit+wait below */
@@ -3812,9 +3943,9 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     /* no waitUntilCompleted: the flush is ordered against everything before it
      * (own buffer, same queue) and everything after it (later buffers on the
      * queue); only the DEBUG paths below read GPU results from the CPU */
-    if (getenv("MGL_GEOM_DEBUG")) [cb waitUntilCompleted];
+    if (gEnv.debug) [cb waitUntilCompleted];
 
-    if (getenv("MGL_FLUSH_VERIFY") && getenv("MGL_GEOM_DEBUG") && vbVerify)
+    if (getenv("MGL_FLUSH_VERIFY") && gEnv.debug && vbVerify)
     {
         volatile uint32_t *o = (volatile uint32_t *)[vbVerify contents];
         fprintf(stderr, "MGL geom: ms flush VERIFY cbstatus=%ld tex(0,0) s0=%g %g %g %g "
@@ -3923,10 +4054,20 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
     bool any = false;
 
+    (void)geomEnvRead();
     if (!g) return;
+    /* r82: the O(1) early-out — img_atom_any is maintained where .dirty is set
+     * (geomImageAtomicBuffer / geomImageAtomicBufferArray / the array re-see)
+     * and recomputed at the end of this pass, so a barrier with no sidecar in
+     * flight costs ONE load instead of a 128-slot scan. */
+    if (!g->img_atom_any) return;
     for (int u = 0; u < TEXTURE_UNITS && !any; u++)
         if (g->img_atom[u].buf && g->img_atom[u].dirty) any = true;
-    if (!any) return;
+    if (!any)
+    {
+        g->img_atom_any = false;
+        return;
+    }
 
     [self endRenderEncoding];
 
@@ -3943,7 +4084,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
      * the plain-image path. */
     bool any_ms = false;
     for (int u = 0; u < TEXTURE_UNITS; u++)
-        if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms && !g->img_atom[u].elems)
+        if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms)
             any_ms = true;
     if (any_ms)
     {
@@ -3953,11 +4094,15 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     }
 
     /* multisample sidecars rasterize back into their textures first (render passes,
-     * one per unit); the compute resolve below then handles the rest */
+     * one per unit — an MS image ARRAY does one per element, from its region inside
+     * the shared array side buffer); the compute resolve below then handles the rest */
     for (int u = 0; u < TEXTURE_UNITS; u++)
-        if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms && !g->img_atom[u].elems)
+    {
+        if (!g->img_atom[u].buf || !g->img_atom[u].dirty || !g->img_atom[u].ms) continue;
+
+        if (!g->img_atom[u].elems)
         {
-            if (getenv("MGL_GEOM_DEBUG"))
+            if (gEnv.debug)
             {
                 Texture *tptr = STATE(image_units[u]).tex;
                 id<MTLTexture> live = (tptr && tptr->mtl_data)
@@ -3966,10 +4111,41 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                 NSLog(@"MGL geom: ms flush unit %d sideview=%p livetex=%p SAME=%d",
                       u, (__bridge void *)sv, (__bridge void *)live, (live == sv) ? 1 : 0);
             }
-            if ([self geomMsFlushUnit: u]) g->img_atom[u].dirty = false;
+            if ([self geomMsFlushUnit: u]) { g->img_atom[u].dirty = false; g->stat_flushes++; }
             else if (gEnv.debug)
                 fprintf(stderr, "geom: MS sidecar flush skipped (unit %d, no PSO?)\n", u);
+            continue;
         }
+
+        /* an MS image ARRAY: rasterize each element's region back into its own
+         * texture (r82).  A compute resolve cannot write texture2d_ms — only the
+         * per-sample [[sample_mask]] render pass can. */
+        {
+            NSUInteger offs[TEXTURE_UNITS];
+            NSUInteger words = [self geomImageAtomicArrayLayout: (GLuint)u
+                                                          elems: g->img_atom[u].elems
+                                                           offs: offs
+                                                           maxe: TEXTURE_UNITS
+                                                            sig: NULL];
+            id<MTLBuffer> buf = (__bridge id<MTLBuffer>)(g->img_atom[u].buf);
+            bool all = (words && words * 4 == g->img_atom[u].bytes);
+
+            for (GLuint e = 0; all && e < g->img_atom[u].elems; e++)
+            {
+                /* the element's real unit (remapped array elements, r82) */
+                GLuint ue = (e < 8 && g->img_atom[u].eunits[e] != 0xffffffffu)
+                                ? g->img_atom[u].eunits[e] : u + e;
+                if (ue >= TEXTURE_UNITS) continue;
+                id<MTLTexture> ev = [self geomImageAtomicArrayElemView: ue];
+
+                if (ev && (ev.textureType == MTLTextureType2DMultisample ||
+                           ev.textureType == MTLTextureType2DMultisampleArray))
+                    if ([self geomMsFlushView: buf offset: offs[e] * 4 view: ev unit: -1])
+                        g->stat_flushes++;
+            }
+            g->img_atom[u].dirty = false;
+        }
+    }
 
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
 
@@ -4001,9 +4177,18 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                                                              sig: NULL];
             if (!words || words * 4 != g->img_atom[u].bytes)
                 continue;                     /* the binding changed since the dispatch */
+            if (gEnv.debug)
+            {
+                fprintf(stderr, "MGL geom: img-atom ARRAY resolve unit=%d elems=%u words=%lu eunits=%u,%u\\n",
+                        u, g->img_atom[u].elems, (unsigned long)words,
+                        g->img_atom[u].eunits[0], g->img_atom[u].eunits[1]);
+            }
             for (GLuint e = 0; e < g->img_atom[u].elems; e++)
             {
-                ImageUnit *iu2 = &STATE(image_units[u + e]);
+                GLuint ue = (e < 8 && g->img_atom[u].eunits[e] != 0xffffffffu)
+                                ? g->img_atom[u].eunits[e] : u + e;
+                if (ue >= TEXTURE_UNITS) continue;
+                ImageUnit *iu2 = &STATE(image_units[ue]);
                 id<MTLTexture> ev = (iu2->tex && iu2->tex->mtl_data)
                     ? [self geomImageUnitViewRes: iu2 base: (__bridge id<MTLTexture>)(iu2->tex->mtl_data)
                                      elemClass: 0xffffffffu]
@@ -4059,7 +4244,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                         u, (unsigned long)tt, (unsigned)pf);
             continue;
         }
-        if (getenv("MGL_GEOM_DEBUG"))
+        if (gEnv.debug)
         {
             const uint32_t *sv = (const uint32_t *)buf.contents;
             fprintf(stderr, "MGL geom: img-atom resolve dump unit=%d side[%llu]=%u %u %u %u\n",
@@ -4081,12 +4266,13 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         [enc setBuffer: buf offset: 0 atIndex: 0];
         [enc setTexture: view atIndex: 0];
         [enc setBytes: &dims length: sizeof(dims) atIndex: 1];
-        if (getenv("MGL_GEOM_DEBUG"))
+        if (gEnv.debug)
             fprintf(stderr, "MGL geom: img-atom resolve unit=%d type=%lu w=%u total=%u\n", u,
                     (unsigned long)tt, dims[0], dims[3]);
         [enc dispatchThreads: MTLSizeMake(total, 1, 1)
         threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
                                            pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
+        g->stat_resolves++;
 
         /* r63: a TEXTURE BUFFER's atomics resolve into its SHADOW texture (buffer
          * textures are converted copies, mgl_uses_shadow): the GL buffer itself would
@@ -4132,6 +4318,75 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     }
     [enc endEncoding];
     ctx->state.dirty_bits |= DIRTY_ALL;      /* the encoder state must be rebuilt */
+
+    /* r82: recompute the O(1) early-out flag — every unit this pass visited had
+     * its .dirty cleared, but a binding that changed mid-resolve (or a skipped
+     * element) may have left one set. */
+    g->img_atom_any = false;
+    for (int u = 0; u < TEXTURE_UNITS; u++)
+        if (g->img_atom[u].buf && g->img_atom[u].dirty) { g->img_atom_any = true; break; }
+}
+
+/* r83: the draw-time sidecar GATE, memoized — "does ANY stage of the bound program
+ * (or program pipeline) declare a storage image with an atomic sidecar slot
+ * (SpirvResource.msl_atomic != 0xffffffff)?"  Every sidecar entry point on the draw
+ * path (geomPrepareImageAtomicsRender, geomBindImageAtomicBuffersRender) asks this
+ * first, so a program without image atomics — the common case — pays ONE cache probe
+ * (a 7-word identity compare) instead of the six-stage resource walk, and none of
+ * the downstream work.
+ *
+ * Identity: the program object (or the pipeline object) plus every stage's MSL text
+ * pointer.  A relink regenerates all MSL of the relinked stages, so the key changes
+ * with the resource lists it guards; an address-reuse false hit would additionally
+ * need every freed MSL string to be reallocated at its old address.  A stale answer
+ * is also self-correcting in the wrong direction only (TRUE costs the walk, never a
+ * lost sidecar: FALSE requires the key to match a program whose lists GAINED an
+ * atomic slot between two draws without a relink). */
+static bool geomAnyAtomicSlot(GLMContext ctx)
+{
+    struct gate_cache {
+        const void *id;
+        const void *msl[_MAX_SHADER_TYPES];
+        bool any, valid;
+    };
+    static struct gate_cache cache[4];
+    static unsigned rr;
+    Program *p = STATE(program);
+    MGLPipelineObj *po = (!p && STATE(program_pipeline)) ? MGL_PIPELINE_OBJ(STATE(program_pipeline)) : NULL;
+    const void *id, *msl[_MAX_SHADER_TYPES];
+    struct gate_cache *e;
+
+    if (!p && !po) return false;
+    id = p ? (const void *)p : (const void *)po;
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+    {
+        Program *ps = p ? p : po->base.stage_programs[s];
+        msl[s] = ps ? (const void *)ps->spirv[s].msl_str : NULL;
+    }
+    for (int i = 0; i < 4; i++)
+        if (cache[i].valid && cache[i].id == id && memcmp(cache[i].msl, msl, sizeof msl) == 0)
+            return cache[i].any;
+
+    {
+        struct MGLExtState_geom *g = (struct MGLExtState_geom *)ctx->state.ext_geom;
+        bool any = false;
+
+        if (g) g->stat_gate_misses++;
+        for (int s = 0; s < _MAX_SHADER_TYPES && !any; s++)
+        {
+            Program *ps = p ? p : po->base.stage_programs[s];
+            if (!ps) continue;
+            const SpirvResourceList *l = &ps->spirv_resources_list[s][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+            for (GLuint i = 0; i < l->count && !any; i++)
+                any = l->list[i].msl_atomic != 0xffffffffu;
+        }
+        e = &cache[rr++ & 3];
+        e->valid = true;
+        e->id = id;
+        memcpy(e->msl, msl, sizeof msl);
+        e->any = any;
+        return any;
+    }
 }
 
 /* bind the sidecars of a raster stage's storage images (vertex or fragment slots of
@@ -4140,8 +4395,20 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 - (bool) geomBindImageAtomicBuffersRender: (int) stage
 {
     if (!_currentRenderEncoder) return false;
-    GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
-    if (getenv("MGL_GEOM_DEBUG"))
+    /* r82: the count straight off the Program struct — bindTextures calls this on
+     * every encoder build, and the message send per stage showed up in the
+     * per-draw CPU profile; STATE(program) is the pipeline composite under
+     * MGL_PIPELINE_PROGRAM_SCOPE, so the value is identical.  The count check
+     * comes first: one load, and a program without storage images never reaches
+     * the memo (baseline parity on the no-image path). */
+    Program *pb = STATE(program);
+    GLuint count = pb ? pb->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count : 0;
+    if (!count) return false;
+    /* r83: the memoized gate — a program with storage images but no atomic sidecar
+     * slot has nothing to bind and must not pay the resource walk */
+    if (!geomAnyAtomicSlot(ctx)) return false;
+    (void)geomEnvRead();
+    if (gEnv.debug)
         fprintf(stderr, "MGL geom: img-atom bind render stage %d: %u storage images\n", stage, count);
     for (GLuint i = 0; i < count; i++)
     {
@@ -4153,9 +4420,32 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         if (sres->msl_atomic == 0xffffffffu) continue;  /* no atomic argument in the MSL */
         mtl_index = (sres->msl_atomic & ~MGL_GEOM_MS_SLOT);
         ms_slot = (sres->msl_atomic & MGL_GEOM_MS_SLOT) != 0;
+
+        /* an ARRAY image: ONE side buffer covers every element (SPIRV-Cross declares
+         * a single `<name>_atomic [[buffer(N)]]` for the whole array — after the
+         * msl pass every access reads `<name>_atomic[spvMglAIArr*_<name>(...)]`),
+         * exactly like the compute binder.  The per-element loop below used to bind
+         * N single-image sidecars at mtl_index+e — buffers the MSL never reads —
+         * so a fragment-stage array atomic wrote into unit `binding`'s sidecar at
+         * ARRAY offsets (out of its bounds) and the result never reached any
+         * texture (r82 fix). */
+        if (elems > 1)
+        {
+            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems res: sres];
+
+            if (buf)
+            {
+                if (stage != _FRAGMENT_SHADER)
+                    [_currentRenderEncoder setVertexBuffer: buf offset: 0 atIndex: mtl_index];
+                else
+                    [self compatBindFragmentBuffer: buf offset: 0 atIndex: mtl_index];
+            }
+            continue;
+        }
+
         for (GLuint e = 0; e < elems; e++)
         {
-            if (getenv("MGL_GEOM_DEBUG"))
+            if (gEnv.debug)
                 fprintf(stderr, "MGL geom: img-atom bind stage %d unit %u slot %u (tex %s)\n",
                         stage, unit + e, mtl_index + e, sres->name ? sres->name : "?");
             ImageUnit *iu;
@@ -4186,7 +4476,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
             if (!buf) buf = [self geomImageAtomicDummy];     /* refused (oversized): sink */
             if (!buf) continue;
-            if (getenv("MGL_GEOM_DEBUG") && stage == _FRAGMENT_SHADER)
+            if (gEnv.debug && stage == _FRAGMENT_SHADER)
                 fprintf(stderr, "MGL geom: img-atom BIND stage %d unit %u slot %u buf=%p len=%zu "
                         "(view %lux%lux%lu s=%lu t=%lu)\n", stage, unit + e, mtl_index + e,
                         (__bridge void *)buf, buf.length,
@@ -4211,7 +4501,8 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 - (bool) geomBindImageAtomicBuffersCompute: (id <MTLComputeCommandEncoder>) encoder
 {
     if (!encoder) return false;
-    GLuint count = [self getProgramBindingCount: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+    Program *pb = STATE(program);
+    GLuint count = pb ? pb->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count : 0;
     for (GLuint i = 0; i < count; i++)
     {
         SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
@@ -4225,7 +4516,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
          * single `<name>_atomic [[buffer(N)]]` for the whole array) */
         if (elems > 1)
         {
-            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems];
+            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems res: sres];
 
             if (buf)
                 [encoder setBuffer: buf offset: 0 atIndex: mtl_index];
@@ -4269,18 +4560,24 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 - (void) geomPrepareImageAtomicsCompute
 {
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
-    GLuint count = [self getProgramBindingCount: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+    Program *pb = STATE(program);
+    GLuint count = pb ? pb->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count : 0;
     int pending[TEXTURE_UNITS];
     int n_pending = 0;
     id<MTLComputeCommandEncoder> enc = NULL;
 
     if (!g || !count) return;
+    /* deferred texture uploads: an image unit's Texture may not have its MTLTexture
+     * yet when this dispatch is the first to touch it — realize BEFORE building the
+     * sidecar layout (no encoder is open this early in the dispatch path; element
+     * units come from mgl_res_elem_unit, honouring remapped array elements) */
+    [self geomRealizeStageTextures: pb stage: _COMPUTE_SHADER];
 
     for (GLuint i = 0; i < count; i++)
     {
-        SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER]
+        SpirvResource *sres = &pb->spirv_resources_list[_COMPUTE_SHADER]
                                                     [SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
-        int b = [self getProgramBinding: _COMPUTE_SHADER type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE index: i];
+        int b = (int)sres->binding;      /* r82: no message send per dispatch */
         GLuint elems = sres->array_size ? sres->array_size : 1;
         GLuint mtl = sres->msl_atomic;
 
@@ -4290,7 +4587,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
          * (geomSeedImageAtomic's elems>1 branch) */
         if (elems > 1 && b >= 0 && (GLuint)b < TEXTURE_UNITS)
         {
-            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems] &&
+            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems res: sres] &&
                 g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
                 pending[n_pending++] = b;
             continue;
@@ -4338,24 +4635,19 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     id<MTLComputeCommandEncoder> enc;
 
     if (!g || !ctx || !ctx->mtl_funcs.ext_texdata) return;
+    (void)geomEnvRead();
 
-    /* cheap gate: only programs with an MS-flagged atomic slot can have work */
-    bool any_ms = false;
-    for (int s = 0; s < _MAX_SHADER_TYPES && !any_ms; s++)
-    {
-        Program *p = STATE(program);
-        if (!p && STATE(program_pipeline))
-        {
-            MGLPipelineObj *po = MGL_PIPELINE_OBJ(STATE(program_pipeline));
-            p = po->base.stage_programs[s];
-        }
-        if (!p) continue;
-        GLuint count = [self getProgramBindingCount: s type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
-        for (GLuint i = 0; i < count && !any_ms; i++)
-            any_ms = (p->spirv_resources_list[s][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i].msl_atomic &
-                      MGL_GEOM_MS_SLOT) != 0;
-    }
-    if (!any_ms) return;
+    /* r83: the O(1) memoized gate (see geomAnyAtomicSlot).  A first-draw SEED is
+     * needed whenever the program declares ANY storage image with an atomic sidecar
+     * slot — MS images (their loads lower to sidecar reads) and plain r32ui atomics
+     * alike (the atomic's returned value must see the texture's contents) — but a
+     * program that declares none must pay nothing here, not even the six-stage
+     * walk: the r82 gate walked the lists and read three env probes on every draw
+     * of every program, which the locked glmark2 A/B measured on the plain draw
+     * path (ideas -2.2%, no image in sight). */
+    if (!geomAnyAtomicSlot(ctx)) return;
+    if (gEnv.debug)
+        fprintf(stderr, "MGL geom: img-atom prep render: gate open\n");
 
     int stages[2] = { _VERTEX_SHADER, _FRAGMENT_SHADER };
     for (int si = 0; si < 2; si++)
@@ -4365,29 +4657,64 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         if (!p && STATE(program_pipeline))
             p = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[stage];
         if (!p) continue;
-        GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+        GLuint count = p->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].count;
+        /* r83: the stage's own atomic slots — the realize pass below runs only for
+         * stages that actually have one */
+        bool stage_slot = false;
+        for (GLuint i = 0; i < count && !stage_slot; i++)
+            stage_slot = p->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i].msl_atomic
+                         != 0xffffffffu;
+        if (!stage_slot) continue;
+        /* deferred texture uploads: an image unit's Texture may have no MTLTexture
+         * yet at draw time (bindTextures materializes it later — too late for the
+         * seed).  geomRealizeStageTextures runs with no encoder open, exactly like
+         * the tess kernel path.  r83: AFTER the stage-slot check — this walk (and
+         * its per-texture work) is sidecar bookkeeping, so a program without an
+         * atomic slot never pays it. */
+        [self geomRealizeStageTextures: p stage: stage];
         for (GLuint i = 0; i < count; i++)
         {
             SpirvResource *sres = &p->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
-            if (sres->msl_atomic == 0xffffffffu || !(sres->msl_atomic & MGL_GEOM_MS_SLOT)) continue;
+            if (sres->msl_atomic == 0xffffffffu) continue;
             GLuint mtl_index = (sres->msl_atomic & ~MGL_GEOM_MS_SLOT);
-            if (sres->array_size) continue;                        /* arrays: sidecar path */
+            (void)mtl_index;
 
-            int b = [self getProgramBinding: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE index: i];
-            if (b < 0 || (GLuint)b >= TEXTURE_UNITS) continue;
+            /* an ARRAY image: one side buffer per array; its base unit carries the
+             * seed record (img_atom[binding].elems > 1) */
+            if (sres->array_size)
+            {
+                GLuint b = sres->binding;
+                if (b < TEXTURE_UNITS && [self geomImageAtomicBufferArray: b elems: sres->array_size res: sres] &&
+                    g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
+                    pending[n_pending++] = (int)b;
+                continue;
+            }
+
+            /* sres->binding IS the image-unit index (the render/compute binders use it
+             * directly) — no per-draw getProgramBinding: message send (r82) */
+            GLuint b = sres->binding;
+            if (gEnv.debug)
+                fprintf(stderr, "MGL geom: prep render stage %d img %u binding %u msl_atomic %u arr %u\n",
+                        stage, i, b, sres->msl_atomic, sres->array_size);
             ImageUnit *iu = &STATE(image_units[b]);
             Texture *ptr = iu->tex;
+            if (gEnv.debug)
+                fprintf(stderr, "MGL geom: prep render unit %u: tex=%p mtl=%p needs_seed=%d dirty=%d\n",
+                        b, (void *)ptr, ptr ? ptr->mtl_data : NULL,
+                        g->img_atom[b].needs_seed, g->img_atom[b].dirty);
             if (!ptr || !ptr->mtl_data) continue;
             id<MTLTexture> view = [self geomImageUnitViewRes: iu
                                                         base: (__bridge id<MTLTexture>)(ptr->mtl_data)
                                                    elemClass: sres->elem_class];
-            if (![self geomImageAtomicBuffer: (GLuint)b view: view]) continue;
+            if (![self geomImageAtomicBuffer: b view: view]) continue;
             if (g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
-                pending[n_pending++] = b;
+                pending[n_pending++] = (int)b;
         }
     }
     if (!n_pending) return;
 
+    if (gEnv.debug)
+        fprintf(stderr, "MGL geom: prep render seeding %d unit(s)\n", n_pending);
     [self endRenderEncoding];
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
         [self newCommandBuffer];
@@ -4422,7 +4749,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 
         if (elems > 1)
         {
-            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems];
+            id<MTLBuffer> buf = [self geomImageAtomicBufferArray: unit elems: elems res: sres];
             if (buf) [encoder setBuffer: buf offset: 0 atIndex: mtl_index];
             continue;
         }
@@ -4480,7 +4807,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 
         if (elems > 1 && b >= 0 && (GLuint)b < TEXTURE_UNITS)
         {
-            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems] &&
+            if ([self geomImageAtomicBufferArray: (GLuint)b elems: elems res: sres] &&
                 g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
                 pending[n_pending++] = b;
             continue;
@@ -4617,11 +4944,12 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
     };
 
     if (!STATE(program)) return;
-    if (getenv("MGL_ZZVCAP")) fprintf(stderr, "ZZVCAP enter stage=%d\n", stage);
+    (void)geomEnvRead();
+    if (gEnv.zzvcap) fprintf(stderr, "ZZVCAP enter stage=%d\n", stage);
     for (int t = 0; types[t].spvc_type; t++)
     {
         GLuint n = [self getProgramBindingCount: stage type: types[t].spvc_type];
-        if (getenv("MGL_ZZVCAP"))
+        if (gEnv.zzvcap)
             fprintf(stderr, "ZZVCAP bind-stage=%d type=%d n=%u\n", stage, types[t].spvc_type, n);
 
         for (GLuint i = 0; i < n; i++)
@@ -4654,7 +4982,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     [self bindMTLTexture: tex];
                 }
                 if (!tex || !tex->mtl_data) continue;
-                if (getenv("MGL_ZZVCAP"))
+                if (gEnv.zzvcap)
                     fprintf(stderr, "ZZVCAP vs-capture bind unit=%d tex=%u tgt=%x incomplete=%d mtl=%p\n",
                             unit, tex->name, tex->target,
                             (int)mgl_texture_incomplete_for_sampling(tex), (void *)tex->mtl_data);
@@ -4709,7 +5037,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
      * instance arrays (one entry per element at consecutive slots), matching the flat
      * layout geom_build_pins assigns to the generated kernels */
     if (![self mapGLBuffersToMTLBufferMap: &list stage: _GEOMETRY_SHADER]) return false;
-    if (getenv("MGL_SSBO_DEBUG"))
+    if (gEnv.ssbo_dbg)
     {
         NSLog(@"MGL geom: gs kernel resource list: count=%u", list.count);
         for (int i = 0; i < (int)list.count; i++)
@@ -4766,7 +5094,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
                 offset: (NSUInteger)off
                atIndex: (NSUInteger)i];
-        if (getenv("MGL_SSBO_DEBUG"))
+        if (gEnv.ssbo_dbg)
             NSLog(@"MGL geom: gs kernel bind i=%d off=%ld len=%lu base=%u", i, (long)off,
                   (unsigned long)((__bridge id<MTLBuffer>)b->data.mtl_data).length,
                   list.buffers[i].buffer_base_index);
@@ -4804,7 +5132,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
         [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
                 offset: (NSUInteger)off
                atIndex: (NSUInteger)gp->ac_msl[i]];
-        if (getenv("MGL_SSBO_DEBUG"))
+        if (gEnv.ssbo_dbg)
             NSLog(@"MGL geom: gs kernel atomic counter %s: unit=%u at msl %d (off=%ld)",
                   gp->ac_vars[i].name ? gp->ac_vars[i].name : "?", unit, gp->ac_msl[i],
                   (long)off);
@@ -4866,7 +5194,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                 int spirv_binding = [self getProgramBinding: _GEOMETRY_SHADER type: types[t].spvc_type index: i];
                 NSUInteger mtl_index = (NSUInteger)geomTexSlot(gp->tex_slots_gs, gp->n_tex_slots_gs,
                                                                sres->name ? sres->name : "");
-                if (getenv("MGL_ZZTRACE"))
+                if (gEnv.zztrace)
                 {
                     FILE *f = fopen("/tmp/geom_zztrace.txt", "a");
                     if (f)
@@ -5491,7 +5819,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         if (d->known_vcount && (uint64_t)d->known_vcount < vb) vb = d->known_vcount;
         if (d->known_instances) ib = d->known_instances;
         vsout_bytes = (8 + (size_t)vb * (size_t)ib * gp->in_words) * sizeof(uint32_t);
-        if (getenv("MGL_GEOM_ASSERT") && d->indexed && d->vcount)
+        if (gEnv.asserts && d->indexed && d->vcount)
         {
             /* CPU-side proof every capture write stays in the slice: the largest
              * record word offset is (vcount-1 + (instances-1)*vcount)*in_words plus
@@ -5768,7 +6096,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             uint64_t cnt = d->count_bound ? (uint64_t)d->count_bound : (uint64_t)(d->count > 0 ? d->count : 0);
             uint64_t tiles = (cnt + MGL_GEOM_WG - 1) / MGL_GEOM_WG;
             uint64_t words = 5ull * tiles + 4ull * ((uint64_t)cnt + 2ull);
-            if (getenv("MGL_GEOM_DEBUG")) NSLog(@"MGL geom tiled: cnt=%llu words=%llu scr=%zu", (unsigned long long)cnt, (unsigned long long)words, gPrepScrWords);
+            if (gEnv.debug) NSLog(@"MGL geom tiled: cnt=%llu words=%llu scr=%zu", (unsigned long long)cnt, (unsigned long long)words, gPrepScrWords);
             uint32_t *in = (uint32_t *)gPrep.contents + gPrepOff / 4;
 
             if (!gPrepScr || gPrepScrWords < words)
@@ -5985,7 +6313,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             {
                 Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
                 GLintptr off = ctx->state.vertex_buffer_map_list.buffers[i].offset;
-                if (getenv("MGL_GEOM_TRACE"))
+                if (gEnv.trace)
                     NSLog(@"MGL geom trace: capture bind i=%d buf=%p mtl=%p size=%d data=%p dirty=%llx w0=%08x w1=%08x",
                           i, b, b ? b->data.mtl_data : NULL, b ? (int)b->size : -1,
                           b ? b->data.buffer_data : NULL, b ? (unsigned long long)b->data.dirty_bits : 0ull,
@@ -6290,7 +6618,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             if (gQacc && gQaccPso)
             {
                 uint32_t mask = gQaccReset;
-                if (getenv("MGL_GEOM_QDEBUG"))
+                if (gEnv.qdebug)
                     fprintf(stderr, "geom: qacc dispatch mask=%x\n", mask);
                 gQaccReset = 0;
                 gQaccRan = true;
@@ -6389,7 +6717,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         fprintf(stderr, "\ngeom: trace prep @%zu:", gPrepOff / 4);
         for (int i = 0; i < 44; i++)
             fprintf(stderr, " %u", ((uint32_t *)gPrep.contents)[gPrepOff / 4 + i]);
-        if (getenv("MGL_GEOM_DUMP_RUNS"))
+        if (gEnv.dump_runs)
         {
             /* tiled-chain state: T tiles, total restarts, the GS/emit grids, then the
              * first run records at sc[5T] (start, subcount, prim prefix, cap prefix) */
@@ -6547,7 +6875,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             fprintf(stderr, "geom: trace raster prim=%d args=%u %u %u %u %u idx=%u %u %u\n",
                     (int)prim, cp[8], cp[9], cp[10], cp[11], cp[12],
                     ((uint32_t *)gIdx.contents)[0], ((uint32_t *)gIdx.contents)[1], ((uint32_t *)gIdx.contents)[2]);
-            if (getenv("MGL_CULL_TRACE"))
+            if (gEnv.cull_trace)
             {
                 uint32_t *ix = (uint32_t *)gIdx.contents;
                 float *ov = (float *)gOutv.contents;
@@ -6570,7 +6898,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         /* cull diagnostics: dump the compacted index list and the emitted records once
          * the GPU has finished (a completed handler sees the final contents; an inline
          * read would race the compute that produces them) */
-        if (getenv("MGL_CULL_DUMP") && _currentCommandBuffer &&
+        if (gEnv.cull_dump && _currentCommandBuffer &&
             _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
         {
             id<MTLBuffer> idx = gIdx, outv = gOutv, ctl = gCtl;
@@ -6713,6 +7041,7 @@ bool mgl_msl_has_size_constants(const char *msl)
 
 - (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex
 {    Program *p = ctx->state.program;
+    (void)geomEnvRead();
 
     if (!p || stage < 0 || !p->spirv[stage].msl_str) return;
     if (!geomSSBOSizesNeeded(p, stage)) return;
@@ -6743,7 +7072,7 @@ bool mgl_msl_has_size_constants(const char *msl)
     uint32_t sizes[MAX_MAPPED_BUFFERS];
     GLuint n = 0;
     [self geomFillSSBOSizes: sizes list: &ctx->state.compute_buffer_map_list count: &n];
-    if (getenv("MGL_SSBO_DEBUG"))
+    if (gEnv.ssbo_dbg)
     {
         NSLog(@"MGL geom: ssbo sizes (compute): n=%u list->count=%u [0]=%u [1]=%u msl=%p",
               n, ctx->state.compute_buffer_map_list.count, sizes[0], sizes[1],

@@ -1135,6 +1135,9 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
             case SpvOpTypeVector:  /* [1]=id [2]=component [3]=count */
                 defop[in[o + 1]] = op; defa[in[o + 1]] = in[o + 2]; defb[in[o + 1]] = in[o + 3];
                 break;
+            case SpvOpTypeArray:   /* [1]=id [2]=element [3]=length — image2DMS g[N] */
+                defop[in[o + 1]] = op; defa[in[o + 1]] = in[o + 2]; defb[in[o + 1]] = in[o + 3];
+                break;
             case SpvOpTypeInt:     /* [1]=id [2]=width [3]=signedness */
                 defop[in[o + 1]] = op; defa[in[o + 1]] = in[o + 2]; defb[in[o + 1]] = in[o + 3];
                 break;
@@ -1169,7 +1172,7 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
     /* sweep 2: classify the image accesses */
     uint32_t ms_vars[64]; int nms = 0;              /* variables written / atomiced */
     struct { size_t off; int kind; uint32_t imgt, image, coord, texel, sample, restype, resid;
-             bool arrayed; int ncomp; uint32_t var; } todo[512];
+             bool arrayed; int ncomp; uint32_t var; uint32_t base_ptr; } todo[512];
     int ntodo = 0;
 
     for (size_t o = 5; o < n; )
@@ -1214,7 +1217,23 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                 {
                     uint32_t pt = defa[var];
                     if (defop[defb[pt]] == SpvOpTypeImage) imgt = defb[pt];
+                    /* an ARRAY of images (image2DMS g[N]): the variable's pointee is an
+                     * OpTypeArray whose ELEMENT is the OpTypeImage itself (glslang:
+                     * %arr = OpTypeArray %imgt %len; the access chain yields a pointer
+                     * to ONE image) — resolve through it, so array elements lower
+                     * exactly like the scalar uniform.  Without this the write keeps
+                     * its texture2d_ms access::write and Metal rejects the whole stage
+                     * at compile. */
+                    else if (defop[defb[pt]] == SpvOpTypeArray &&
+                             defop[defa[defb[pt]]] == SpvOpTypeImage)
+                        imgt = defa[defb[pt]];
                 }
+                /* the pointer the image VALUE was loaded from: the uniform variable for
+                 * a scalar image, the OpAccessChain ELEMENT for an array — the rebuilt
+                 * OpImageTexelPointer / OpLoad must name it (SPIRV-Cross builds the
+                 * `<name>[i]_atomic[...]` subscript from that chain) */
+                uint32_t base_ptr = var;
+                if (defop[image] == SpvOpLoad && defa[image]) base_ptr = defa[image];
                 if (getenv("MGL_MS_DEBUG"))
                     fprintf(stderr, "MGL ms-pass: op %u image %u -> var %u (defop %u), imgt %u (defop %u flags 0x%x)\n",
                             op, image, var, var ? defop[var] : 0, imgt, imgt ? defop[imgt] : 0,
@@ -1239,6 +1258,7 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                     todo[ntodo].texel = texel; todo[ntodo].sample = sample;
                     todo[ntodo].restype = restype; todo[ntodo].resid = resid;
                     todo[ntodo].var = var;
+                    todo[ntodo].base_ptr = base_ptr;
                     todo[ntodo].arrayed = (defb[imgt] & 2u) != 0;
                     todo[ntodo].ncomp = ms_format_components(defb[imgt] >> 16);
                     ntodo++;
@@ -1419,12 +1439,13 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                 uint32_t w_[7];
 
                 /* the query instructions need the LOADED image; an OpImageTexelPointer
-                 * references the pointer, so load it once here */
+                 * references the pointer, so load it once here (base_ptr: the uniform
+                 * variable, or the array ELEMENT the access chain selected) */
                 uint32_t img_val = todo[t].image;
                 if (todo[t].kind == 3)
                 {
                     img_val = next_id++;
-                    uint32_t t5[3] = { todo[t].imgt, img_val, todo[t].var };
+                    uint32_t t5[3] = { todo[t].imgt, img_val, todo[t].base_ptr };
                     ms_inst(&b, SpvOpLoad, 4, t5);
                 }
 
@@ -1581,7 +1602,7 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                     {
                         uint32_t idx, cc, pt = next_id++, vc = next_id++;
                         MS_IDX_FOR(c, idx, cc);
-                        w_[0] = bases[bi].ptr; w_[1] = pt; w_[2] = todo[t].var; w_[3] = cc; w_[4] = kint[0];
+                        w_[0] = bases[bi].ptr; w_[1] = pt; w_[2] = todo[t].base_ptr; w_[3] = cc; w_[4] = kint[0];
                         ms_inst(&b, SpvOpImageTexelPointer, 6, w_);
                         w_[0] = base; w_[1] = vc; w_[2] = todo[t].texel; w_[3] = (uint32_t)c;
                         ms_inst(&b, SpvOpCompositeExtract, 5, w_);
@@ -1602,7 +1623,7 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                         {
                             uint32_t idx, cc, pt = next_id++, lv = next_id++;
                             MS_IDX_FOR(c, idx, cc);
-                            w_[0] = bases[bi].ptr; w_[1] = pt; w_[2] = todo[t].var; w_[3] = cc; w_[4] = kint[0];
+                            w_[0] = bases[bi].ptr; w_[1] = pt; w_[2] = todo[t].base_ptr; w_[3] = cc; w_[4] = kint[0];
                             ms_inst(&b, SpvOpImageTexelPointer, 6, w_);
                             w_[0] = base; w_[1] = lv; w_[2] = pt; w_[3] = kuint[1]; w_[4] = kuint[0];
                             ms_inst(&b, SpvOpAtomicLoad, 6, w_);
@@ -4232,11 +4253,21 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                         cv = cv * 10u + (unsigned)(*cnt++ - '0');
                     if (cv > 0 && cv < 256 && (size_t)(split - inner) < sizeof arrs[i].elem)
                     {
+                        bool ms_elem = !strncmp(inner, "texture2d_ms_array<", 19);
+                        bool ms2_elem = !strncmp(inner, "texture2d_ms<", 13);
                         snprintf(arrs[i].elem, sizeof arrs[i].elem, "%.*s",
                                  (int)(split - inner), inner);
                         arrs[i].count = cv;
-                        snprintf(arrs[i].hname, sizeof arrs[i].hname,
-                                 "spvMglAIArr_%s", imgs[i].name);
+                        /* an ARRAY of multisample images (image2DMS g[N]): the ELEMENT
+                         * type names the target, and the flattened sidecar offsets need
+                         * the MS word layout (4 words per texel-sample, no row padding),
+                         * so the image kind follows the element and the helper gets its
+                         * own name (r82) */
+                        if (ms_elem) imgs[i].kind = MGL_AI_MSARR;
+                        else if (ms2_elem) imgs[i].kind = MGL_AI_MS2D;
+                        snprintf(arrs[i].hname, sizeof arrs[i].hname, "%s_%s",
+                                 (ms_elem || ms2_elem) ? "spvMglAIArrMS" : "spvMglAIArr",
+                                 imgs[i].name);
                     }
                 }
             }
@@ -4336,6 +4367,126 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     {
         char sub[160];
         const char *helper = NULL;
+
+        /* 5a-MS: an ARRAY of MULTISAMPLE images (image2DMS g[N]): the access is
+         * `<name>[<i>]_atomic[spvImage2DAtomicCoord(int2(<idx>, 0), <name>[<i>])]`
+         * where <idx> is the FOLDED within-element word index the SPIR-V pass
+         * computed (4*sample + S*(layer + L*(x+W*y)) + comp).  Flatten into the
+         * single array side buffer with the MS element layout:
+         * `<name>_atomic[spvMglAIArrMS_<name>(<name>, <i>, <idx>)]` — the helper
+         * adds element i's region offset (w*h*S*4 words per element, exactly what
+         * geomImageAtomicArrayLayout sized, no row padding: the MS layout is
+         * folded) and clamps OOB indices onto the +1 dump word. */
+        if (arrs[i].count && (imgs[i].kind == MGL_AI_MS2D || imgs[i].kind == MGL_AI_MSARR) &&
+            arrs[i].hname[0])
+        {
+            snprintf(sub, sizeof sub, "%s[", imgs[i].name);
+            for (const char *p = msl; (p = strstr(p, sub)) != NULL; )
+            {
+                if (p > msl && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+                { p += strlen(sub); continue; }
+                if (p - msl >= 1 && !strncmp(p - 1, arrs[i].hname, strlen(arrs[i].hname)))
+                { p += strlen(sub); continue; }         /* our own helper's parameter use */
+
+                const char *is = p + strlen(sub);       /* element index start */
+                const char *ie = is;                    /* ... end (']') */
+                int d = 1;
+                while (*ie)
+                {
+                    if (*ie == '[' || *ie == '(') d++;
+                    else if (*ie == ']' || *ie == ')') { if (--d == 0) { ie++; break; } }
+                    ie++;
+                }
+                if (d || ie[-1] != ']' || strncmp(ie, "_atomic[", 8))
+                { p += strlen(sub); continue; }
+                /* the element index expression must be a plain literal or identifier:
+                 * digits, letters, '_' (a run-time array index of a helper call is
+                 * legal MSL here; nested brackets are not) */
+                {
+                    bool plain = (ie - 1 > is);
+                    for (const char *q = is; q < ie - 1 && plain; q++)
+                        if (!isalnum((unsigned char)*q) && *q != '_') plain = false;
+                    if (!plain) { p += strlen(sub); continue; }
+                }
+
+                const char *cs = ie + 8;                /* subscript start */
+                const char *ce = cs;
+                d = 1;
+                while (*ce)
+                {
+                    if (*ce == '[' || *ce == '(') d++;
+                    else if (*ce == ']' || *ce == ')') { if (--d == 0) { ce++; break; } }
+                    ce++;
+                }
+                if (d) { p = cs; continue; }
+                size_t clen = (size_t)(ce - cs - 1);    /* inside [ ... ] */
+
+                /* `spvImage2DAtomicCoord(int2(<idx>, 0), <name>[<i>])`: strip the
+                 * wrapper, then the int2/int3(...) to the folded <idx> */
+                const char *w = NULL;
+                size_t wlen = 0;
+                if (clen > 22 && !strncmp(cs, "spvImage2DAtomicCoord(", 22))
+                {
+                    const char *seg0 = cs + 22;
+                    const char *c1 = NULL;
+                    int depth = 1;                      /* inside the macro '(' */
+                    const char *r = seg0;
+                    while (r < cs + clen)
+                    {
+                        if (*r == '(' || *r == '[') depth++;
+                        else if (*r == ')' || *r == ']') depth--;
+                        else if (*r == ',' && depth == 1 && !c1) c1 = r;
+                        r++;
+                    }
+                    if (c1 && (!strncmp(seg0, "int2(", 5) || !strncmp(seg0, "int3(", 5)))
+                    {
+                        r = seg0 + 5;                   /* inside intN( */
+                        const char *ci = NULL;
+                        depth = 1;
+                        while (r < c1 - 1)
+                        {
+                            if (*r == '(' || *r == '[') depth++;
+                            else if (*r == ')' || *r == ']') depth--;
+                            else if (*r == ',' && depth == 1 && !ci) ci = r;
+                            r++;
+                        }
+                        if (ci)
+                        {
+                            const char *z = ci + 1;
+                            while (z < c1 - 1 && (*z == ' ' || *z == '\t')) z++;
+                            size_t rest = (size_t)(c1 - 1 - z);
+                            if ((rest == 1 && z[0] == '0') ||
+                                (rest == 4 && z[0] == '0' && z[1] == ',' &&
+                                 (z[2] == ' ' || z[2] == '\t') && z[3] == '0'))
+                            { w = seg0 + 5; wlen = (size_t)(ci - w); }
+                        }
+                    }
+                }
+                if (w && wlen)
+                {
+                    size_t ilen = (size_t)(ie - 1 - is);
+                    char *rep = malloc(strlen(imgs[i].name) * 2 + strlen(arrs[i].hname) +
+                                       ilen + wlen + 32);
+                    if (rep)
+                    {
+                        snprintf(rep, strlen(imgs[i].name) * 2 + strlen(arrs[i].hname) +
+                                 ilen + wlen + 32,
+                                 "%s_atomic[%s(%s, %.*s, %.*s)]", imgs[i].name, arrs[i].hname,
+                                 imgs[i].name, (int)ilen, is, (int)wlen, w);
+                        if (nedits < 256)
+                        {
+                            edits[nedits].at = (size_t)(p - msl);
+                            edits[nedits].len = (size_t)(ce - p);
+                            edits[nedits].text = rep;
+                            nedits++;
+                        }
+                        else free(rep);
+                    }
+                }
+                p = ce;
+            }
+            continue;                                   /* MS arrays: no other rewrite */
+        }
 
         /* 5a. an ARRAY image: every access is `<name>[<i>]_atomic[<sub>]` (the element
          * index ends up INSIDE the identifier SPIRV-Cross builds).  Flatten into the
@@ -4814,6 +4965,49 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
             for (int a = 0; a < nedits && !used; a++)
                 used = (strstr(edits[a].text, probe) != NULL);
             if (!used) continue;
+
+            /* a MULTISAMPLE element array: each element's region is its folded MS
+             * layout (w*h*S*4 words; *layers for image2DMSArray elements) with NO row
+             * padding — the same footprint geomImageAtomicArrayLayout sizes on the
+             * CPU side.  The helper adds element i's offset to the folded index and
+             * sends out-of-range accesses (also the pass's own bounds-select) to the
+             * total-words DUMP word. */
+            if (imgs[i].kind == MGL_AI_MS2D || imgs[i].kind == MGL_AI_MSARR)
+            {
+                bool arrayed_elem = (imgs[i].kind == MGL_AI_MSARR);
+                char body[640], elemt[128];
+                /* the parameter type must be a READABLE texture (get_num_samples is
+                 * query-access-only): sanitize the element type's access qualifier —
+                 * msl_msimg flips the ARGUMENT's write to read only later, and
+                 * instantiating metal::array<texture2d_ms<..., access::write>, N>
+                 * alone trips texture2d_ms's access static_assert */
+                snprintf(elemt, sizeof elemt, "%s", arrs[i].elem);
+                for (char *r = elemt; (r = strstr(r, "access::read_write")) != NULL; )
+                {
+                    memcpy(r, "access::read     ", 17);
+                    r += 17;
+                }
+                for (char *r = elemt; (r = strstr(r, "access::write")) != NULL; )
+                {
+                    memcpy(r, "access::read ", 13);
+                    r += 13;
+                }
+                snprintf(body, sizeof body,
+                    "static inline __attribute__((always_inline)) uint %s"
+                    "(thread const array<%s, %u>& a, uint i, int idx) "
+                    "{ uint off = 0, tot = 0; "
+                    "for (uint j = 0; j < %u; j++) { uint t = a[j].get_width() * a[j].get_height() "
+                    "* a[j].get_num_samples() * 4u%s; if (j < i) off += t; tot += t; } "
+                    "uint ti = a[i].get_width() * a[i].get_height() * a[i].get_num_samples() * 4u%s; "
+                    "if (idx < 0 || (uint)idx >= ti) return tot; "
+                    "return off + (uint)idx; }\n",
+                    arrs[i].hname, elemt, arrs[i].count, arrs[i].count,
+                    arrayed_elem ? " * a[j].get_array_size()" : "",
+                    arrayed_elem ? " * a[i].get_array_size()" : "");
+                if (strlen(arrhelpers) + strlen(body) + 1 < helpers_cap)
+                    strcat(arrhelpers, body);
+                continue;
+            }
 
             const char *al = msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u";
             char body[640];
@@ -9145,8 +9339,15 @@ bool mgl_geom_present(GLMContext ctx)
     if (ctx->state.program && ctx->state.program->shader_slots[_GEOMETRY_SHADER]) return true;
     if (ctx->state.program_pipeline)
     {
-        Program *c = mgl_program_pipeline_composite(ctx);
-        if (c && c->shader_slots[_GEOMETRY_SHADER]) return true;
+        /* r83: no composite build — mgl_geom_route asks this on EVERY draw, and the
+         * pipeline composite (a fresh Program: memset + per-stage resource-list
+         * copies) was built and thrown away once per draw for this one boolean.
+         * The composite's slot is stage_programs[GS]->shader_slots[GS] by
+         * construction (mgl_program_pipeline_composite copies it only when the
+         * stage program has the stage attached), so reading the stage program
+         * directly answers the identical question. */
+        Program *p = MGL_PIPELINE_OBJ(ctx->state.program_pipeline)->base.stage_programs[_GEOMETRY_SHADER];
+        return p && p->shader_slots[_GEOMETRY_SHADER] != NULL;
     }
     return false;
 }
@@ -9381,6 +9582,30 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d);
 /* the last context that ran a geometry draw (the trace is a debugging aid) */
 static GLMContext gTraceCtx;
 void *mgl_geom_ctx(void) { return gTraceCtx; }
+
+/* ---- r82 diagnostics: monotonic sidecar counters (tests/headless/mgl_geom_diag.h).
+ * The headless suite asserts on these to prove the MS/atomic sidecar costs NOTHING
+ * when a program declares no image atomics (seeds 0, flushes 0, resolves 0) and
+ * that the passes run exactly once when one does — structural, no timing.
+ * which: 0 seeds, 1 flushes, 2 compute resolves, 3 sidecar allocations. */
+uint64_t mgl_geom_ms_stat(int which)
+{
+    GLMContext c = (GLMContext)gTraceCtx;
+    struct MGLExtState_geom *g;
+
+    if (!c) return 0;
+    g = (struct MGLExtState_geom *)c->state.ext_geom;
+    if (!g) return 0;
+    switch (which)
+    {
+        case 0: return g->stat_seeds;
+        case 1: return g->stat_flushes;
+        case 2: return g->stat_resolves;
+        case 3: return g->stat_sidecar_allocs;
+        case 4: return g->stat_gate_misses;   /* r83: sidecar-gate memo misses (once per program link) */
+        default: return 0;
+    }
+}
 
 /* ---- tessellation in front of the geometry stage ---- */
 
@@ -9907,6 +10132,7 @@ void mgl_ext_init_geom(GLMContext ctx)
     /* calloc zeroes free_head; the free list is empty at -1 */
     if (ctx->state.ext_geom)
         ((struct MGLExtState_geom *)ctx->state.ext_geom)->free_head = -1;
+    gTraceCtx = ctx;                    /* the diag accessors need a context */
     mgl_ext_register_post_link(mgl_geom_post_link);
 }
 

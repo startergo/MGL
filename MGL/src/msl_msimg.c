@@ -75,9 +75,33 @@ char *mgl_msl_fix_ms_image_writes(const char *msl)
         }
         if (acc)
         {
-            /* variable name after '>' */
+            /* variable name after '>' (or after the ARRAY's ', 2>' tail — an array
+             * element declaration is `array<texture2d_ms<...>, 2> g`: the name follows
+             * the array's own closing '>', r82) */
             const char *n = close + 1;
-            while (*n == ' ' || *n == '\t') n++;
+            for (;;)
+            {
+                while (*n == ' ' || *n == '\t') n++;
+                if (*n == ',')
+                {
+                    /* skip the array's length / template tail up to its '>' */
+                    int ad = 0;
+                    const char *q2 = n + 1;
+                    while (*q2)
+                    {
+                        if (*q2 == '<') ad++;
+                        else if (*q2 == '>')
+                        {
+                            if (ad == 0) { n = q2 + 1; break; }
+                            ad--;
+                        }
+                        q2++;
+                    }
+                    if (*q2) continue;           /* found the array '>' — re-check */
+                    n = q2;                     /* ran off the end: no name here */
+                }
+                break;
+            }
             const char *n0 = n;
             while (*n && (isalnum((unsigned char)*n) || *n == '_')) n++;
             if (n > n0 && nn < 64)
@@ -118,11 +142,27 @@ char *mgl_msl_fix_ms_image_writes(const char *msl)
         {
             size_t nb = strlen(names[i]);
             if (strncmp(s, names[i], nb) != 0) continue;
-            if (strncmp(s + nb, ".write(", 7) != 0) continue;
+            const char *after = s + nb;
+            /* an ARRAY element write: <name>[<i>].write(...) — the element index
+             * sits between the name and the member call (r82) */
+            if (*after == '[')
+            {
+                int d2 = 1;
+                const char *q2 = after + 1;
+                while (*q2 && d2 > 0)
+                {
+                    if (*q2 == '[' || *q2 == '(') d2++;
+                    else if (*q2 == ']' || *q2 == ')') d2--;
+                    q2++;
+                }
+                if (d2 != 0 || q2[-1] != ']') continue;
+                after = q2;
+            }
+            if (strncmp(after, ".write(", 7) != 0) continue;
             /* word boundary: not a member of another object / longer identifier */
             if (s > work && (isalnum((unsigned char)s[-1]) || s[-1] == '_' || s[-1] == '.')) continue;
             /* balanced-paren scan over the call */
-            const char *open = s + nb + 6;   /* the '(' of ".write(" */
+            const char *open = after + 6;   /* the '(' of ".write(" */
             int depth = 1;
             const char *q = open + 1;
             while (*q && depth > 0)

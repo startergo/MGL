@@ -406,8 +406,33 @@ struct MGLExtState_geom {
      * the texture (one 1-pixel point per texel, per-sample [[sample_mask]] output).
      * samples: the view's sample count, part of the binding identity. */
     struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty, needs_seed;
-            GLuint elems; uint64_t sig; bool ms; GLuint samples; } img_atom[TEXTURE_UNITS];
+            GLuint elems; uint64_t sig; bool ms; GLuint samples;
+            /* r82: the image unit of each ARRAY element (image-array elements are
+             * independent uniforms — glUniform1i may place g[1] on a unit far from
+             * g[0]'s).  Filled by geomImageAtomicBufferArray through
+             * mgl_res_elem_unit; the seed / flush / resolve element walks and the
+             * CPU layout must use THESE units, not binding+e, to agree with the
+             * MSL helper's runtime offsets (it reads the bound element textures).
+             * Elements past 8 fall back to binding+e (arrays that long with a
+             * remap are pathological; consecutive default). */
+            GLuint eunits[8]; } img_atom[TEXTURE_UNITS];
     void *atom_dummy;      /* the 4-byte sink for oversized (refused) sidecars */
+    /* r82: "any sidecar dirty" — the O(1) early-out of geomResolveImageAtomics
+     * (glMemoryBarrier pays one load instead of a 128-slot scan when no image
+     * atomic is in flight).  Maintained where .dirty is set; recomputed by the
+     * resolve pass itself. */
+    bool img_atom_any;
+    /* r83: draw-time sidecar GATE memo misses — how often the "any stage declares
+     * a storage image with an atomic sidecar slot" flag had to be recomputed from
+     * the resource lists (every program pays ONE miss; a hit costs a 7-word
+     * compare).  The zero-cost proof: a program without image atomics walks the
+     * lists exactly once per link, never again (mgl_geom_ms_stat(4)). */
+    uint64_t stat_gate_misses;
+    /* r82 diagnostics: monotonic counters the headless tests assert on — the
+     * structural proof that the sidecar costs NOTHING when no image atomic runs
+     * (seed passes 0, flush passes 0) and that they run exactly once when one
+     * does.  Which: 0 seeds, 1 flushes, 2 compute resolves, 3 sidecar allocations. */
+    uint64_t stat_seeds, stat_flushes, stat_resolves, stat_sidecar_allocs;
 
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
