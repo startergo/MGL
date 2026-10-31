@@ -17,6 +17,7 @@
 #include "mgl_ext_texparam.h"
 #include "mgl_ext_fb.h"
 #import "MGLRenderer+TextureExt.h"
+#import "MGLRenderer+Framebuffer.h"   /* compat s36: fbQuantizeRGB9E5 (RGB9_E5 rb read-out) */
 #import "mgl_ext_texext.h"
 extern uint32_t mtlFormatForGLInternalFormat(GLenum internal_format);
 #include "texdata_formats.h"
@@ -606,6 +607,11 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
         mgl_fb_attachment_slice(ctx, fbo, att, &l, &s, &p, &n);
         *level = l; *slice = s; *plane = p;
         *ifmt = tex->internalformat;
+        /* compat s36: RGB9_E5 renderbuffers are RGBA16F-backed; snap the backing
+         * onto the 5-9-9-9 lattice before glCopyTex* consumes it as a source
+         * (see fbQuantizeRGB9E5 in MGLRenderer+Framebuffer.m) */
+        if (!ds && att->textarget == GL_RENDERBUFFER && tex->internalformat == GL_RGB9_E5)
+            [self fbQuantizeRGB9E5:(__bridge id<MTLTexture>)tex->mtl_data];
         return (__bridge id<MTLTexture>)tex->mtl_data;
     }
 

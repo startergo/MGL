@@ -479,9 +479,20 @@ static GLenum attachmentCompleteness(GLMContext ctx, Framebuffer *fbo, FBOAttach
     if (!fi)
         return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
 
-    if ((kind == 0 && !fi->color_renderable) ||
-        (kind == 1 && !fi->depth_renderable) ||
-        (kind == 2 && !fi->stencil_renderable))
+    /* compat s36: GL_RGB9_E5 RENDERBUFFER attachments are emulated on an
+     * RGBA16Float backing with the 5-9-9-9 lattice applied on every read /
+     * copy-out (MGLRenderer+Framebuffer.m fbQuantizeRGB9E5), so they are
+     * complete colour attachments (KHR-GL46.internalformat.renderbuffer.rgb9_e5).
+     * GL_RGB9_E5 *texture* attachments stay incomplete: Metal's RGB9E5Float is
+     * not a render target, and the GL 4.6 table 8.13 marks the format
+     * color-renderable = N for texture images. */
+    bool rgb9e5_rbo = (kind == 0 && att->textarget == GL_RENDERBUFFER &&
+                       fi->internalformat == GL_RGB9_E5);
+
+    if (!rgb9e5_rbo &&
+        ((kind == 0 && !fi->color_renderable) ||
+         (kind == 1 && !fi->depth_renderable) ||
+         (kind == 2 && !fi->stencil_renderable)))
         return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
 
     if (att->textarget != GL_RENDERBUFFER)

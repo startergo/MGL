@@ -26,6 +26,10 @@
 #include "mgl_ext_fb.h"
 #include "mgl_ext_rstate.h"    /* RS(): indexed viewports (default-fb sizing) */
 
+/* framebuffers.c keeps this cast private; mirror it for the renderbuffer
+ * attachment lookups below (struct is public in mgl_ext_fb.h) */
+#define FB_RBEX(_rb_)   ((MGLRenderbufferEx *)(_rb_))
+
 // render-state per-index setters (state_ext.c)
 void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h);
 void mgl_rstate_set_all_scissors(GLMContext ctx, GLint x, GLint y, GLint w, GLint h);
@@ -113,7 +117,16 @@ static MTLPixelFormat fbMTLFormatForInternalFormat(GLenum ifmt)
         case GL_RG32F:                      return MTLPixelFormatRG32Float;
         case GL_RGB32F: case GL_RGBA32F:    return MTLPixelFormatRGBA32Float;
         case GL_R11F_G11F_B10F:             return MTLPixelFormatRG11B10Float;
-        case GL_RGB9_E5:                    return MTLPixelFormatRGB9E5Float;
+        /* compat s36: RGB9_E5 renderbuffers are emulated on an RGBA16Float
+         * backing (Apple Metal has no renderable RGB9E5Float target).  The
+         * GL_RGB9_E5 (5-bit shared exponent / 9-bit mantissa, bias 15) lattice
+         * is re-applied to the backing by fbQuantizeRGB9E5 before ANY read /
+         * copy-out consumes the attachment, so write/clear-then-read and
+         * readPixels(GL_UNSIGNED_INT_5_9_9_9_REV) are bit-exact (every lattice
+         * value is exactly representable in half float, so the quantised
+         * backing IS the 5-9-9-9 image).  See fbQuantizeRGB9E5 for the two
+         * documented caveats (blending, multisample). */
+        case GL_RGB9_E5:                    return MTLPixelFormatRGBA16Float;
         case GL_R8I:                        return MTLPixelFormatR8Sint;
         case GL_R8UI:                       return MTLPixelFormatR8Uint;
         case GL_R16I:                       return MTLPixelFormatR16Sint;
@@ -1329,6 +1342,79 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
 
 #pragma mark readback
 
+#pragma mark RGB9_E5 renderbuffer emulation (compat s36)
+
+/* Re-apply the GL_RGB9_E5 (5-bit shared exponent, bias 15 / 9-bit mantissa)
+ * lattice to an RGBA16F renderbuffer backing IN PLACE, right before the
+ * attachment is consumed as a read / copy-out source (glReadPixels,
+ * glBlitFramebuffer, glCopyTex*: both acquisition points fbSourceFor and
+ * texdataReadSource call this).  GL 4.6 2.3.5.2 encode + decode in one pass.
+ * Every 5-9-9-9 value is exactly representable as half float (min 2^-24,
+ * max sharedExpMax 65504 == half max), and the pass is idempotent, so after it
+ * the backing IS the exact 5-9-9-9 image and every consumer — including
+ * readPixels(GL_RGB, GL_UNSIGNED_INT_5_9_9_9_REV) — returns spec-exact values.
+ * Documented caveats of the emulation:
+ *  - blending runs in half precision BEFORE the lattice is applied; GL does
+ *    not require blending for RGB9_E5 (not a mandated renderable format), and
+ *    blended results stay within one lattice step (2^-9 relative) of a
+ *    hypothetical true 5-9-9-9 surface.
+ *  - multisample RGB9_E5 renderbuffers are stored per-sample in half and are
+ *    NOT per-sample quantised (the MSAA resolve filter is implementation
+ *    defined for float formats anyway); single-sample attachments are exact.
+ *  - the fragment store rounds to half, then this pass rounds to the lattice:
+ *    a fragment value that lands within a quarter lattice step BELOW a tie can
+ *    end up one mantissa step above what a true 5-9-9-9 target would store. */
+- (void) fbQuantizeRGB9E5:(id<MTLTexture>)tex
+{
+    if (!tex || tex.sampleCount > 1 || tex.textureType != MTLTextureType2D ||
+        tex.width == 0 || tex.height == 0)
+        return;
+
+    [self endRenderEncoding];
+    [self fbEnsureCommandBuffer];
+    if (!_currentCommandBuffer) return;
+
+    id<MTLComputePipelineState> ps = [self fbCache][@"ps:rgb9e5"];
+    if (!ps)
+    {
+        NSString *src = @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "/* GL 4.6 2.3.5.2: float -> shared exponent (N=9, B=15, E_max=31) and back */\n"
+        "kernel void mgl_rgb9e5_quantize(texture2d<float, access::read_write> t [[texture(0)]],\n"
+        "                                uint2 gid [[thread_position_in_grid]])\n"
+        "{\n"
+        "    if (gid.x >= t.get_width() || gid.y >= t.get_height()) return;\n"
+        "    float4 c = t.read(gid);\n"
+        "    float3 v = clamp(c.rgb, 0.0f, 65504.0f);   /* sharedExpMax = 511/512 * 2^16 */\n"
+        "    float mx = max(v.x, max(v.y, v.z));\n"
+        "    float e = max(-16.0f, floor(log2(mx))) + 16.0f;  /* max(-B-1, floor(log2(max))) + 1 + B */\n"
+        "    float scale = exp2(e - 24.0f);             /* 2^(E - B - N) */\n"
+        "    float max_s = floor(mx / scale + 0.5f);\n"
+        "    if (!(max_s >= 0.0f && max_s < 512.0f)) scale *= 2.0f;   /* E = E_p + 1 */\n"
+        "    float3 q = float3(floor(v / scale + 0.5f)) * scale;      /* F * 2^(E-B-N) */\n"
+        "    t.write(float4(q, c.a), gid);\n"
+        "}\n";
+        id<MTLLibrary> lib = [self fbLibrary:src key:@"rgb9e5"];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"mgl_rgb9e5_quantize"] : nil;
+        NSError *err = nil;
+        ps = fn ? [_device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!ps)
+        {
+            NSLog(@"MGL fb: rgb9e5 quantize pipeline failed (%@)", err);
+            return;
+        }
+        [self fbCache][@"ps:rgb9e5"] = ps;
+    }
+
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    enc.label = @"MGL rgb9e5 quantize";
+    [enc setComputePipelineState:ps];
+    [enc setTexture:tex atIndex:0];
+    MTLSize groups = MTLSizeMake((tex.width + 15) / 16, (tex.height + 15) / 16, 1);
+    [enc dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [enc endEncoding];
+}
+
 - (bool) fbSourceFor:(Framebuffer *)fbo aspect:(int)aspect attachment:(GLenum)attachment out:(FBTarget *)t
 {
     memset(t, 0, sizeof(*t));
@@ -1350,6 +1436,11 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     if (!att || !mgl_fb_attachment_size(ctx, att, NULL, NULL, NULL)) return false;
     id<MTLTexture> tex = [self fbTextureForAttachment:att renderTarget:false];
     if (!tex) return false;
+    /* RGB9_E5 renderbuffer: snap the RGBA16F backing onto the 5-9-9-9 lattice
+     * before it is used as a read/copy-out source (see fbQuantizeRGB9E5) */
+    if (aspect == MGL_FB_ASPECT_COLOR && att->textarget == GL_RENDERBUFFER &&
+        FB_RBEX(att->buf.rbo)->internalformat == GL_RGB9_E5)
+        [self fbQuantizeRGB9E5:tex];
     [self fbFillTarget:t fbo:fbo att:att tex:tex];
     if (t->layers > 1) t->layers = 1;   /* layered attachments read layer 0 */
     return true;
@@ -2113,12 +2204,21 @@ typedef struct DSBlitParams {
     }
     d.storageMode = MTLStorageModePrivate;
     d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    /* compat s36: the RGB9_E5 emulation quantises the backing IN PLACE with a
+     * read_write compute kernel (fbQuantizeRGB9E5), so it needs ShaderWrite too */
+    if (rb->internalformat == GL_RGB9_E5)
+        d.usage |= MTLTextureUsageShaderWrite;
 
-    /* non-renderable sized formats (RGB9_E5) are legal renderbuffer storage but can
-     * never be attached to a live render pass: keep them sample-only so Metal does not
-     * reject the descriptor; framebuffer completeness reports the GL-level failure */
+    /* non-renderable sized formats would be legal renderbuffer storage but could
+     * never be attached to a live render pass: keep them sample-only so Metal does
+     * not reject the descriptor; framebuffer completeness reports the GL-level failure.
+     * (compat s36: GL_RGB9_E5 no longer takes this branch — it is RGBA16F-backed
+     * and complete as a colour attachment — so no sized format is left that is
+     * accepted by storage yet not renderable; the branch stays as a guard.) */
     const MGLFBFormatInfo *rfi = mgl_fb_format_info(rb->internalformat);
     bool renderable = rfi && (rfi->color_renderable || rfi->depth_renderable || rfi->stencil_renderable);
+    if (rb->internalformat == GL_RGB9_E5)
+        renderable = true;   /* emulated: RGBA16Float backing, quantised on read-out */
     if (!renderable)
         d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [_device newTextureWithDescriptor:d];

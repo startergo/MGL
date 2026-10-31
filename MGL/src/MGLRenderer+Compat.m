@@ -446,15 +446,22 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
      * texture with an identical pixel format leaves the key unchanged — and
      * it is the descriptor path that binds the new attachment to the render
      * pass (KHR-GL46.texture_swizzle.smoke drew with the previous texture
-     * bound).  DIRTY_ALPHA_STATE / DIRTY_RENDER_STATE stay admissible: their
-     * PSO-relevant CONTENT is hashed fresh inside this function
-     * (rstatePipelineContentHash: blend/color-mask/clip/sample/alpha-to-
-     * coverage/multisample, cached against generation_pipeline) — measured
-     * full-geom-rule cost: 4 descriptor builds per [ideas] frame, -45% FPS.
-     * To re-adopt the full geom rule, add the two bits back to the mask. */
+     * bound).
+     * compat s36: DIRTY_ALPHA_STATE (the pipeline-baked rstate dirt marker,
+     * set by mgl_rs_dirty_pipeline: blend enable/func/equation, colour masks,
+     * clip origin/depth mode, point size, sample coverage/mask/shading) is now
+     * an admissible trigger too — its PSO-relevant CONTENT is hashed fresh
+     * inside this function (rstatePipelineContentHash, cached against
+     * generation_pipeline, so the per-draw cost stays two integer compares),
+     * and every rstateSpecialize function-constant input is part of that hash.
+     * Before s36 a blend-only flip declined here and rebuilt the FULL descriptor
+     * + newRenderPipelineStateWithDescriptor on EVERY flip (glmark2 [shading]/
+     * CTS blend churn: ~100+ us per draw); alternating states now hit the two
+     * content-keyed cache slots.  DIRTY_RENDER_STATE alone (encoder-only state)
+     * still declines — it never reaches the pipeline block anyway. */
     {
         GLuint d = ctx->state.dirty_bits;
-        if ((d & DIRTY_FBO) || !(d & (DIRTY_VAO | DIRTY_PROGRAM)))
+        if ((d & DIRTY_FBO) || !(d & (DIRTY_VAO | DIRTY_PROGRAM | DIRTY_ALPHA_STATE)))
             return false;
     }
     if (!ctx->state.program)

@@ -842,7 +842,14 @@ static int tq_internalformat(GLMContext ctx, GLenum target, GLenum internalforma
     bool color = supported && tq_has_color(d);
     bool depth = supported && d->d;
     bool stencil = supported && d->s;
-    bool color_r = color && caps.color_renderable && !d->compressed && d->fmt != GL_RGB9_E5;
+    /* compat s36: GL_RGB9_E5 is color-renderable for RENDERBUFFER objects only
+     * (RGBA16F-backed emulation, 5-9-9-9 lattice applied on every read/copy-out
+     * — MGLRenderer+Framebuffer.m fbQuantizeRGB9E5); Metal has no renderable
+     * RGB9E5Float target, so texture images of the format stay non-renderable.
+     * This keeps the caps honest for the emulated attachment
+     * (KHR-GL46.internalformat.renderbuffer.rgb9_e5). */
+    bool color_r = color && caps.color_renderable && !d->compressed &&
+                   (d->fmt != GL_RGB9_E5 || target == GL_RENDERBUFFER);
     bool depth_r = depth && caps.depth_renderable;
     bool stencil_r = stencil && caps.stencil_renderable;
     bool renderable = (color_r || depth_r || stencil_r) && target != GL_TEXTURE_BUFFER;

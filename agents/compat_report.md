@@ -1,5 +1,37 @@
 # compat domain — progress log
 
+READY s36 83caf6d (branch gl46/compat tip = merge gl46-port **1121e66** + c86346e + f05a00a + 83caf6d;
+buildable, full gates below).  Work this session:
+1. **internalformat.renderbuffer.rgb9_e5 NotSupported -> Pass (exact)** — RGBA16F-backed
+   RGB9_E5 renderbuffer, fbQuantizeRGB9E5 snaps the backing onto the 5-9-9-9 lattice
+   (GL 4.6 2.3.5.2 encode+decode, idempotent read_write compute kernel) at BOTH
+   read/copy-out acquisition points (fbSourceFor: glReadPixels/glBlitFramebuffer,
+   texdataReadSource: glCopyTex*); every lattice value is half-exact (min 2^-24,
+   max 65504 == sharedExpMax) so readPixels(5_9_9_9_REV) is bit-exact.  Caveats
+   documented in the kernel comment: blending pre-lattice (half precision), MS
+   renderbuffers not per-sample quantised, store rounds half-then-lattice
+   (<=1 mantissa step for values within a quarter step below a tie).  Caps honest:
+   COLOR_RENDERABLE/FB_RENDERABLE TRUE only for the GL_RENDERBUFFER target; RGB9_E5
+   TEXTURE attachments stay INCOMPLETE_ATTACHMENT.  CTS: internalformat 52/52,
+   direct_state_access.renderbuffers 8/8, packed_pixels 250/250, packed_depth_stencil
+   25/25, copy_image 13/13, blend_equation_advanced 88/88, clip/cull_distance +
+   texture_swizzle + aggressive_optimizations all Pass.
+2. **Perf: pipeline fast-path gate takes DIRTY_ALPHA_STATE** (blend enable/func/
+   equation, colour masks, point size, sample coverage churn) — no longer rebuilds
+   the full MTLRenderPipelineDescriptor + newRenderPipelineStateWithDescriptor per
+   flip; the content key already covers every rstateSpecialize function-constant
+   input.  Draw-path change => LOCKED glmark2 A/B vs baseline-1121e66 (ABBA x4 under
+   lockf, load 4-8): ideas 98%, jellyfish 96%, gl41-geometry 103% (inside the
+   documented +-15% jellyfish noise floor), process CPU/frame identical (0.6/0.6).
+   ab_bench CPU-time min-of-7 (load-immune; wall was order-biased at load>4, see
+   abbench_s36.sh comment): blend-flip draws 12.47 -> 10.22 ms/1200 (**-18%**),
+   drawArrays 3.44 -> 3.33, blendFunc/blendEquation flip parity, readPixels PBO
+   10.69 -> 10.64 (rgb9e5 hook free).  Headless suite: 686 PASS / 0 FAIL.
+Shared-file edits (surgical, called out): framebuffers.c (rgb9e5 renderbuffer
+completeness), texture_query.c (per-target caps), MGLRenderer+Framebuffer.{h,m}
+(format map + usage + quantize method + read hook), MGLRenderer+TextureData.m
+(copy-out hook), MGLRenderer+Compat.m (gate), ab/abbench_s36.sh (new).
+
 READY s34 a99f674 (= merge gl46-port **52e6276** (tess r40) + 7dadf9a + 5a003da;
 both commits are CTS Fail->Pass fixes, no new state, no shared-behaviour change
 for passing paths).  Supersedes the gl46/compat-ms2 standalone READY below

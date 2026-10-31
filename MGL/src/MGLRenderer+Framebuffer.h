@@ -23,6 +23,10 @@
 - (bool) fbRenderbufferStorage: (MGLRenderbufferEx *) rb;
 - (bool) fbSamplePosition: (GLuint) samples index: (GLuint) index out: (GLfloat *) xy;
 - (GLuint) fbRoundSamples: (GLuint) samples;
+/* compat s36: snap an RGBA16F RGB9_E5 renderbuffer backing onto the 5-9-9-9
+ * lattice before it is used as a read/copy-out source (MGLRenderer+TextureData.m
+ * texdataReadSource calls this too) */
+- (void) fbQuantizeRGB9E5: (id<MTLTexture>) tex;
 @end
 
 #endif
