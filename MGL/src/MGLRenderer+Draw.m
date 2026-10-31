@@ -429,6 +429,11 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
      * creates this draw's render encoder.  No-op unless a unit binds 3D. */
     [self geom3DImageShadowSync];
 
+    /* geom: a multisample image's sidecar must be seeded (a compute dispatch)
+     * before this draw's render encoder opens — no-op unless the program
+     * declares an image2DMS write/atomic (geomPrepareImageAtomicsRender gates). */
+    [self geomPrepareImageAtomicsRender];
+
     uint64_t t12 = mgl_prof_begin(12);
     if (![self processGLState: true])
     {

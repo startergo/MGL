@@ -2516,6 +2516,11 @@ static BOOL g3DShadowLive = NO;  /* any shadow exists (shadows are never freed b
 
         if (!no_image)
             mgl_texdata_level_geometry((Texture *)iu->tex, 0, iu->level, &lw, &lh, &ld);
+        if (getenv("MGL_GEOM_DEBUG") && (iu->tex->target == GL_TEXTURE_2D_MULTISAMPLE ||
+                                         iu->tex->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY))
+            fprintf(stderr, "MGL geom: iuv MS unit %d texw=%u lvl=%u lw=%u lh=%u base=%p %ux%lu\n",
+                    iu->unit, iu->tex->width, iu->level, lw, lh, (__bridge void *)base,
+                    (unsigned)base.width, (unsigned long)base.sampleCount);
         if (no_image || !lw)
         {
             id<MTLTexture> empty = [self geomImageEmptyTexture: iu->internalformat];
@@ -2952,8 +2957,16 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     NSUInteger w = view.width, h = view.height;
     switch (view.textureType)
     {
-        case MTLTextureType2D:
         case MTLTextureType2DMultisample:
+            /* image2DMS — the layout of mgl_spirv_lower_ms_images /
+             * mgl_msl_fix_image_atomics (spvMglAIMS): 4 words per (texel, layer,
+             * sample).  A texture2d_ms cannot be written by a shader, so every MS
+             * image access goes through this buffer and the barrier-time flush
+             * (geomResolveImageAtomics) rasterizes it back into the texture. */
+            return w * h * view.sampleCount * 4u;
+        case MTLTextureType2DMultisampleArray:
+            return w * h * view.arrayLength * view.sampleCount * 4u;
+        case MTLTextureType2D:
         {
             /* image2D / image2DRect — and image1D, which the MSL realizes as a
              * single-row 2D texture (spvImage2DAtomicCoord aligns the row to 16) */
@@ -2975,17 +2988,54 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     }
 }
 
+/* the "too big to sidecar" sink: a 4-byte buffer bound at the sidecar's slot
+ * when geomImageAtomicBuffer refuses an oversized image, so the lowered
+ * stores/atomics write somewhere legal instead of an unbound (NULL) buffer
+ * argument — the values are lost, but nothing faults or OOMs */
+- (id<MTLBuffer>) geomImageAtomicDummy
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+
+    if (!g) return nil;
+    if (!g->atom_dummy)
+    {
+        id<MTLBuffer> d = [_device newBufferWithLength:4 options:MTLResourceStorageModeShared];
+
+        if (!d) return nil;
+        memset(d.contents, 0, d.length);
+        g->atom_dummy = (void *)CFBridgingRetain(d);
+    }
+    return (__bridge id<MTLBuffer>)g->atom_dummy;
+}
+
 - (id<MTLBuffer>) geomImageAtomicBuffer: (GLuint) unit view: (id<MTLTexture>) view
 {
     struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
     ImageUnit *iu;
-    id<MTLBuffer> buf;
-    NSUInteger texels;
+    id<MTLBuffer> buf;    NSUInteger texels;
 
     if (!g || !view || unit >= TEXTURE_UNITS) return nil;
     iu = &STATE(image_units[unit]);
     texels = geomImageAtomicTexels(view);
     if (!texels) return nil;
+
+    /* the MS sidecar costs as many WORDS as the texture has BYTES × its sample
+     * count (one word per component per sample) — a huge multisample image
+     * would double GPU memory and OOM the device (KHR advanced-sso-perSample
+     * allocates a 10.3 GB MS texture; its sidecar killed the command buffer
+     * with kIOGPUCommandBufferCallbackErrorOutOfMemory).  Refuse MS sidecars
+     * past 1 GiB: the caller binds the tiny dump-only buffer instead, so the
+     * lowered stores write harmlessly into it (the values are wrong — no
+     * silent OOM, and the draw cannot fault on an unbound buffer argument).
+     * Single-sample sidecars stay uncapped: a 16384² non-MS sidecar is 1 GiB
+     * and KHR advanced-cast legitimately uses one. */
+    if (view.sampleCount > 1 && (uint64_t)texels * 4 + 4 > (1ull << 30))
+    {
+        if (geomEnvRead(), gEnv.debug)
+            fprintf(stderr, "geom: MS sidecar refused: %llu texels exceed the 1 GiB cap\n",
+                    (unsigned long long)texels);
+        return nil;
+    }
 
     buf = (g->img_atom[unit].buf) ? (__bridge id<MTLBuffer>)(g->img_atom[unit].buf) : nil;
     if (buf && g->img_atom[unit].view == (__bridge void *)view &&
@@ -2996,7 +3046,20 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         return buf;                             /* same binding: the contents persist */
     }
 
-    if (buf) { buf = nil; }                     /* ARC release before overwriting */
+    /* drop the OLD record's retain (+1 from CFBridgingRetain) — leaking it per
+     * rebind showed up in the CTS all-targets sweep, and the borrowed VIEW
+     * pointer crashed geomMsFlushUnit once the GL texture was deleted */
+    if (g->img_atom[unit].buf)
+    {
+        CFRelease((CFTypeRef)g->img_atom[unit].buf);
+        g->img_atom[unit].buf = NULL;
+    }
+    if (g->img_atom[unit].view)
+    {
+        CFRelease((CFTypeRef)g->img_atom[unit].view);
+        g->img_atom[unit].view = NULL;
+    }
+    buf = nil;                                  /* ARC release before overwriting */
     /* +1 DUMP word: the MSL index helpers (mgl_msl_fix_image_atomics) point
      * out-of-range image accesses at it instead of past the buffer */
     buf = [_device newBufferWithLength:texels * 4 + 4 options:MTLResourceStorageModeShared];
@@ -3004,11 +3067,14 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     memset(buf.contents, 0, buf.length);        /* atomics start from a cleared image */
 
     g->img_atom[unit].buf = (void *)CFBridgingRetain(buf);
-    g->img_atom[unit].view = (__bridge void *)view;
+    g->img_atom[unit].view = (void *)CFBridgingRetain(view);   /* OWNED: survives its GL texture */
     g->img_atom[unit].fmt = iu->internalformat;
     g->img_atom[unit].bytes = (size_t)(texels * 4);
     g->img_atom[unit].dirty = true;
     g->img_atom[unit].needs_seed = true;        /* seed from the texture before the next dispatch */
+    g->img_atom[unit].ms = (view.textureType == MTLTextureType2DMultisample ||
+                            view.textureType == MTLTextureType2DMultisampleArray);
+    g->img_atom[unit].samples = g->img_atom[unit].ms ? (GLuint)view.sampleCount : 0;
     return buf;
 }
 
@@ -3020,9 +3086,10 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     for (int u = 0; u < TEXTURE_UNITS; u++)
     {
         if (g->img_atom[u].buf) { CFBridgingRelease(g->img_atom[u].buf); g->img_atom[u].buf = NULL; }
+        if (g->img_atom[u].view) { CFBridgingRelease(g->img_atom[u].view); g->img_atom[u].view = NULL; }
+        if (g->atom_dummy) { CFBridgingRelease(g->atom_dummy); g->atom_dummy = NULL; }
         g->img_atom[u].elems = 0;
         g->img_atom[u].sig = 0;
-        g->img_atom[u].view = NULL;
         g->img_atom[u].bytes = 0;
         g->img_atom[u].dirty = false;
         g->img_atom[u].needs_seed = false;
@@ -3056,7 +3123,13 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         if (!view)
             return 0;
         offs[e] = total;
-        total += view.width * view.height;
+        /* a multisample element is addressed by the (sample-folded) spvImage2DAtomic
+         * coordinate, not the padded 2D row pitch — give it the full MS layout
+         * (4 words per texel-sample) so an unlowered array access stays in bounds */
+        total += (view.textureType == MTLTextureType2DMultisample ||
+                  view.textureType == MTLTextureType2DMultisampleArray)
+                     ? geomImageAtomicTexels(view)
+                     : view.width * view.height;
         s ^= (uint64_t)(uintptr_t)(__bridge void *)view * 0x9E3779B97F4A7C15ULL
              ^ ((uint64_t)view.width * 0x85EBCA6BULL) ^ ((uint64_t)view.height * 0xC2B2AE35ULL)
              ^ ((uint64_t)e * 0x27D4EB2FULL);
@@ -3382,6 +3455,24 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     total = geomImageAtomicTexels(view);
     if (!total) { g->img_atom[unit].needs_seed = false; return false; }
 
+    /* multisample images: per-sample reads into the 4-words-per-texel-sample layout */
+    if (tt == MTLTextureType2DMultisample || tt == MTLTextureType2DMultisampleArray)
+    {
+        NSUInteger L = (tt == MTLTextureType2DMultisampleArray) ? view.arrayLength : 1;
+        id<MTLComputePipelineState> mpso = [self geomMsSeedPso: tt format: pf];
+        if (!mpso || !view.sampleCount) { g->img_atom[unit].needs_seed = false; return false; }
+        uint32_t md[4] = { (uint32_t)view.width, (uint32_t)view.height, (uint32_t)L,
+                           (uint32_t)(view.width * view.height * L) };
+        [encoder setComputePipelineState: mpso];
+        [encoder setBuffer: buf offset: 0 atIndex: 0];
+        [encoder setTexture: view atIndex: 0];
+        [encoder setBytes: &md length: sizeof(md) atIndex: 1];
+        [encoder dispatchThreads: MTLSizeMake(md[3], 1, 1)
+                  threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+        g->img_atom[unit].needs_seed = false;
+        return true;
+    }
+
     id<MTLComputePipelineState> pso = [self geomAtomSeedPso: tt format: pf];
     if (!pso) { g->img_atom[unit].needs_seed = false; return false; }
 
@@ -3404,6 +3495,426 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     return true;
 }
 
+/* ---- multisample sidecar flush ----
+ * A multisample image's sidecar cannot be copied back with a compute write (Metal's
+ * texture2d_ms is read-only), so it is rasterized back instead: one 1-pixel POINT per
+ * texel, a render pipeline whose rasterSampleCount matches the texture, and a fragment
+ * that runs PER SAMPLE ([[sample_id]] forces per-sample shading), reads the sample's
+ * 4 sidecar words and outputs them with [[sample_mask]] = 1<<sample so exactly that
+ * sample of the texel is replaced.  Metal rasterizes primitives in order, so the
+ * sidecar's order is preserved.  LoadAction Load keeps samples that were never
+ * written (r32* images only use word 0 of each texel-sample quad). */
+- (id<MTLRenderPipelineState>) geomMsFlushPso: (MTLPixelFormat) pf
+                                  sampleCount: (NSUInteger) sc
+                                      arrayed: (bool) arrayed
+{
+    static NSMutableDictionary<NSString *, id> *cache;
+    NSString *key = [NSString stringWithFormat: @"msflush:%u:%lu:%d", (unsigned)pf,
+                                                         (unsigned long)sc, arrayed ? 1 : 0];
+    id<MTLRenderPipelineState> pso;
+
+    if (cache && (pso = cache[key])) return pso;
+
+    /* channel type / count of the 32-bit image formats the MS lowering supports */
+    const char *T = "float", *T4 = "float4", *FT = "as_type<float>", *W = "as_type<uint>";
+    const char *V0 = "0.0", *V1 = "0.0";
+    int C = 4;
+    switch (pf)
+    {
+        case MTLPixelFormatR32Float:    case MTLPixelFormatRG32Float:    case MTLPixelFormatRGBA32Float:
+            T = "float"; T4 = "float4"; FT = "as_type<float>"; W = "as_type<uint>";
+            V0 = "0.0"; V1 = "1.0"; break;
+        case MTLPixelFormatR32Sint:     case MTLPixelFormatRG32Sint:     case MTLPixelFormatRGBA32Sint:
+            T = "int"; T4 = "int4"; FT = "static_cast<int>"; W = "as_type<uint>";
+            V0 = "0"; V1 = "1"; break;
+        case MTLPixelFormatR32Uint:     case MTLPixelFormatRG32Uint:     case MTLPixelFormatRGBA32Uint:
+            T = "uint"; T4 = "uint4"; FT = "static_cast<uint>"; W = "";
+            V0 = "0u"; V1 = "1u"; break;
+        default:
+            return nil;
+    }
+    switch (pf)
+    {
+        case MTLPixelFormatR32Float:  case MTLPixelFormatR32Sint:  case MTLPixelFormatR32Uint:   C = 1; break;
+        case MTLPixelFormatRG32Float: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Uint:  C = 2; break;
+        default:                                                                                   C = 4; break;
+    }
+
+    char vs[1400], fs[2200];
+    snprintf(vs, sizeof vs,
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct MGLMsFV { float4 pos [[position]]; float psize [[point_size]]; %s };\n"
+        "vertex MGLMsFV mgl_ms_flush_v(uint vid [[vertex_id]], constant uint4& dims [[buffer(0)]])\n"
+        "{\n"
+        "    uint wh = dims.x * dims.y;\n"
+        "    uint layer = %s ? vid / wh : 0u;\n"
+        "    uint r = %s ? vid %% wh : vid;\n"
+        "    MGLMsFV o;\n"
+        "    o.psize = 1.0;\n"      /* AGX rasterizes NOTHING for points without an
+                                      * explicit [[point_size]] (verified against a
+                                      * standalone render: nan before, per-sample
+                                      * writes after) */
+        "    o.pos = float4((float(r %% dims.x) + 0.5) / float(dims.x) * 2.0 - 1.0,\n"
+        "                   (float(r / dims.x) + 0.5) / float(dims.y) * 2.0 - 1.0, 0.0, 1.0);\n"
+        "    %s\n"
+        "    return o;\n"
+        "}\n",
+        arrayed ? "uint rti [[render_target_array_index]];" : "",
+        arrayed ? "1u" : "0u", arrayed ? "1u" : "0u",
+        arrayed ? "o.rti = layer;" : "(void)layer;");
+
+    const char *col =
+        C == 1 ? "(FT(side[b + 0]), T(V0), T(V0), T(V0))" :
+        (C == 2 ? "(FT(side[b + 0]), FT(side[b + 1]), T(V0), T(V0))" :
+                  "(FT(side[b + 0]), FT(side[b + 1]), FT(side[b + 2]), FT(side[b + 3]))");
+    char colbuf[320];
+    {
+        /* the template spells FT / T / V0 / V1 as tokens — substitute this format's
+         * spellings (FT first: it contains "T").  The unexpanded tokens made the
+         * whole flush FS fail to compile, so the sidecar NEVER rasterized back. */
+        char tmp[320];
+        size_t n = 0;
+
+        n += (size_t)snprintf(tmp + n, sizeof tmp - n, "%s", T4);
+        for (const char *p = col; *p && n + 1 < sizeof tmp; )
+        {
+            if (p[0] == 'F' && p[1] == 'T' && p[2] == '(')
+            { n += (size_t)snprintf(tmp + n, sizeof tmp - n, "%s(", FT); p += 3; }
+            else if (p[0] == 'T' && p[1] == '(')
+            { n += (size_t)snprintf(tmp + n, sizeof tmp - n, "%s(", T); p += 2; }
+            else if (p[0] == 'V' && p[1] == '0')
+            { n += (size_t)snprintf(tmp + n, sizeof tmp - n, "%s", V0); p += 2; }
+            else if (p[0] == 'V' && p[1] == '1')
+            { n += (size_t)snprintf(tmp + n, sizeof tmp - n, "%s", V1); p += 2; }
+            else tmp[n++] = *p++;
+        }
+        tmp[n] = 0;
+        snprintf(colbuf, sizeof colbuf, "%s", tmp);
+    }
+
+    snprintf(fs, sizeof fs,
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct MGLMsFF { %s col [[color(0)]]; uint mask [[sample_mask]]; };\n"
+        "fragment MGLMsFF mgl_ms_flush_f(float4 pos [[position]], uint sid [[sample_id]],\n"
+        "                                %s device const uint* side [[buffer(1)]],\n"
+        "                                constant uint4& dims [[buffer(0)]])\n"
+        "{\n"
+        "    uint2 c((uint)pos.x, (uint)pos.y);\n"
+        "    uint S = dims.w;\n"
+        "    uint layer = %s;\n"
+        "    uint b = 4u * (sid + S * (layer + dims.z * (c.x + dims.x * c.y)));\n"
+        "    MGLMsFF o;\n"
+        "    o.col = %s;\n"
+        "    o.mask = 1u << sid;\n"
+        "    return o;\n"
+        "}\n",
+        T4, arrayed ? "uint layer_id [[render_target_array_index]]," : "", arrayed ? "layer_id" : "0u", colbuf);
+    (void)T; (void)W; (void)V1;
+
+    NSError *err = nil;
+    /* options nil, like every other runtime kernel this renderer builds: the AGX
+     * driver's newLibraryWithSource rejects a non-nil options object here */
+    id<MTLLibrary> lib = [_device newLibraryWithSource: [NSString stringWithUTF8String: vs]
+                                               options: nil error: &err];
+    if (!lib)
+    {
+        if (gEnv.debug) fprintf(stderr, "geom: MS flush VS compile failed: %s\n",
+                                err.localizedDescription.UTF8String);
+        return nil;
+    }
+    id<MTLLibrary> flib = nil;
+    for (int attempt = 0; attempt < 3 && !flib; attempt++)
+    {
+        err = nil;
+        flib = [_device newLibraryWithSource: [NSString stringWithUTF8String: fs]
+                                     options: nil error: &err];
+        if (!flib && !err)
+            usleep(50000);   /* macOS quirk: a concurrently-running compile can
+                              * fail with no error — retry */
+    }
+    if (!flib)
+    {
+        if (geomEnvRead(), gEnv.debug) fprintf(stderr, "geom: MS flush FS compile failed: dom=%s code=%ld src=%s\n",
+                                err.domain.UTF8String ?: "(null)", (long)err.code, fs);
+        return nil;
+    }
+
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+    d.label = @"mgl-ms-image-flush";
+    d.vertexFunction = [lib newFunctionWithName: @"mgl_ms_flush_v"];
+    d.fragmentFunction = [flib newFunctionWithName: @"mgl_ms_flush_f"];
+    d.rasterSampleCount = sc;
+    if (arrayed)
+    {
+        d.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;   /* required when the
+                                                                      * VS writes rti */
+    }
+    d.colorAttachments[0].pixelFormat = pf;
+    pso = [_device newRenderPipelineStateWithDescriptor: d error: &err];
+    if (!pso)
+    {
+        if (getenv("MGL_FLUSH_DUMP") || (geomEnvRead(), gEnv.debug))
+            fprintf(stderr, "geom: MS flush PSO failed: %s\nfs=%s\nvs=%s\n",
+                    err.localizedDescription.UTF8String, fs, vs);
+        return nil;
+    }
+    if (getenv("MGL_FLUSH_DUMP"))
+        fprintf(stderr, "geom: MS flush FS (pf %u C %d):\n%s\nVS:\n%s\n", (unsigned)pf, C, fs, vs);
+    if (!cache) cache = [NSMutableDictionary new];
+    cache[key] = pso;
+    return pso;
+}
+
+/* rasterize one unit's multisample sidecar back into its texture */
+- (bool) geomMsFlushUnit: (int) unit
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    id<MTLBuffer> buf;
+    id<MTLTexture> view;
+    bool arrayed;
+    uint32_t dims[4];
+    NSUInteger total, L;
+
+    if (!g || unit < 0 || unit >= TEXTURE_UNITS || !g->img_atom[unit].buf) return false;
+    buf = (__bridge id<MTLBuffer>)(g->img_atom[unit].buf);
+    view = (__bridge id<MTLTexture>)(g->img_atom[unit].view);
+    if (!buf || !view) return false;
+
+    arrayed = (view.textureType == MTLTextureType2DMultisampleArray);
+    L = arrayed ? view.arrayLength : 1;
+    total = view.width * view.height * L;
+    if (!total || !view.sampleCount) return false;
+
+    if (getenv("MGL_GEOM_DEBUG"))
+    {
+        /* the store path must have left its words in the sidecar BEFORE the flush:
+         * word 0..3 = texel(0,0) sample0, and texel(1,0) sample3 */
+        volatile uint32_t *w32 = (volatile uint32_t *)buf.contents;
+        fprintf(stderr, "MGL geom: ms flush PRE buf=%p len=%zu words=%lu NONZERO at:",
+                (__bridge void *)buf, buf.length, (unsigned long)(buf.length / 4));
+        {
+            int shown = 0;
+            for (NSUInteger i = 0; i < buf.length / 4 && shown < 24; i++)
+                if (w32[i]) { fprintf(stderr, " [%lu]=%08x", (unsigned long)i, w32[i]); shown++; }
+        }
+        fprintf(stderr, "\n");
+    }
+
+    id<MTLRenderPipelineState> pso = [self geomMsFlushPso: view.pixelFormat
+                                              sampleCount: view.sampleCount
+                                                  arrayed: arrayed];
+    if (!pso)
+    {
+        if (getenv("MGL_GEOM_DEBUG"))
+            fprintf(stderr, "MGL geom: ms flush unit %d PSO FAILED (pf %u sc %lu arr %d)\n",
+                    unit, (unsigned)view.pixelFormat, (unsigned long)view.sampleCount, arrayed);
+        return false;
+    }
+
+    dims[0] = (uint32_t)view.width;
+    dims[1] = (uint32_t)view.height;
+    dims[2] = (uint32_t)L;
+    dims[3] = (uint32_t)view.sampleCount;
+
+    /* an OWN command buffer, committed and waited synchronously: the flush must
+     * not interleave with the shared one (a second render encoder on a buffer
+     * whose encoder the draw path still appends to proved not to execute) */
+    id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
+    if (!cb) return false;
+    cb.label = @"mgl-ms-image-flush";
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = view;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (getenv("MGL_FLUSH_CLEAR"))       /* debug: prove the pass itself runs */
+    {
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(7.75, 5.5, 3.25, 1.0);
+    }
+    if (arrayed) rp.renderTargetArrayLength = L;
+
+    id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor: rp];
+    if (getenv("MGL_GEOM_DEBUG") && !renc)
+        fprintf(stderr, "MGL geom: ms flush ENCODER NIL (pf %u sc %lu arr %d tex %p %lux%lu s=%lu)\n",
+                (unsigned)view.pixelFormat, (unsigned long)view.sampleCount, arrayed,
+                (__bridge void *)view, (unsigned long)view.width, (unsigned long)view.height,
+                (unsigned long)view.sampleCount);
+    renc.label = @"mgl-ms-image-flush";
+    [renc setRenderPipelineState: pso];
+    [renc setViewport: (MTLViewport){ 0, 0, (double)view.width, (double)view.height, 0.0, 1.0 }];
+    [renc setVertexBytes: &dims length: sizeof(dims) atIndex: 0];
+    [renc setFragmentBuffer: buf offset: 0 atIndex: 1];
+    [renc setFragmentBytes: &dims length: sizeof(dims) atIndex: 0];
+    /* chunked: a single multi-million-point draw of a huge multisample image
+     * pushed the render pass over the GPU's transient allocation and died with
+     * kIOGPUCommandBufferCallbackErrorOutOfMemory — 8M points per call is well
+     * under any tile/vertex working set and costs nothing when total is small */
+    for (NSUInteger base = 0; base < total; base += 8u * 1024u * 1024u)
+    {
+        NSUInteger n = total - base;
+
+        if (n > 8u * 1024u * 1024u) n = 8u * 1024u * 1024u;
+        [renc drawPrimitives: MTLPrimitiveTypePoint vertexStart: base vertexCount: n];
+    }
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: ms flush DRAW pf=%u total=%lu dims=%u,%u,%u,%u sc=%lu enc=%s\n",
+                (unsigned)view.pixelFormat, (unsigned long)total, dims[0], dims[1], dims[2], dims[3],
+                (unsigned long)view.sampleCount, renc ? "ok" : "NIL");
+    [renc endEncoding];
+    id<MTLBuffer> vbVerify = nil;
+    if (getenv("MGL_FLUSH_VERIFY"))
+    {
+        /* DEBUG: read the flushed texture's texel (0,0), samples 0..S-1, back into a
+         * shared buffer through a compute kernel and print — proves whether the
+         * render pass above actually rasterized the sidecar into the texture */
+        vbVerify = [_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vb = vbVerify;
+        if (vb)
+        {
+            memset(vb.contents, 0, vb.length);
+            NSString *vsrc = @"#include <metal_stdlib>\nusing namespace metal;\n\
+kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::read> t [[texture(0)]], constant uint4& dims [[buffer(1)]], uint3 g [[thread_position_in_grid]]) {\n\
+    if (g.x != 0u || g.y != 0u) return;\n\
+    for (uint s = 0u; s < 4u; s++) { uint4 v = t.read(uint2(0u, 0u), s); \
+        out[s * 4u + 0u] = v.x; out[s * 4u + 1u] = v.y; \
+        out[s * 4u + 2u] = v.z; out[s * 4u + 3u] = v.w; } \
+    uint2 pc[5] = { uint2(1u,0u), uint2(0u,1u), uint2(2u,2u), uint2(3u,3u), uint2(7u,7u) }; \
+    for (uint k = 0u; k < 5u; k++) for (uint s = 0u; s < 4u; s++) { uint4 v = t.read(pc[k], s); \
+        out[16u + k * 4u + 0u] = v.x; out[16u + k * 4u + 1u] = v.y; \
+        out[16u + k * 4u + 2u] = v.z; out[16u + k * 4u + 3u] = v.w; }\n}\n";
+            NSError *verr = nil;
+            id<MTLLibrary> vlib = [_device newLibraryWithSource:vsrc options:nil error:&verr];
+            if (vlib)
+            {
+                id<MTLComputePipelineState> vpso = [_device newComputePipelineStateWithFunction:
+                                                    [vlib newFunctionWithName:@"vkernel"] error:&verr];
+                if (vpso)
+                {
+                    id<MTLComputeCommandEncoder> venc = [cb computeCommandEncoder];
+                    [venc setComputePipelineState:vpso];
+                    [venc setBuffer:vb offset:0 atIndex:0];
+                    [venc setTexture:view atIndex:0];
+                    [venc setBytes:&dims length:sizeof(dims) atIndex:1];
+                    [venc dispatchThreads:MTLSizeMake(1, 1, 1)
+                          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    [venc endEncoding];
+                }
+            }
+            else if (getenv("MGL_GEOM_DEBUG"))
+                fprintf(stderr, "MGL geom: ms flush VERIFY compile failed: %s\n",
+                        verr ? verr.localizedDescription.UTF8String : "?");
+            /* print after commit+wait below */
+            (void)vb;
+        }
+    }
+    [cb commit];
+    /* no waitUntilCompleted: the flush is ordered against everything before it
+     * (own buffer, same queue) and everything after it (later buffers on the
+     * queue); only the DEBUG paths below read GPU results from the CPU */
+    if (getenv("MGL_GEOM_DEBUG")) [cb waitUntilCompleted];
+
+    if (getenv("MGL_FLUSH_VERIFY") && getenv("MGL_GEOM_DEBUG") && vbVerify)
+    {
+        volatile uint32_t *o = (volatile uint32_t *)[vbVerify contents];
+        fprintf(stderr, "MGL geom: ms flush VERIFY cbstatus=%ld tex(0,0) s0=%g %g %g %g "
+                "s1=%g %g %g %g s2=%g %g %g %g s3=%g %g %g %g "
+                "(3,3)s0-3=%u %u %u %u (err=%s)\n",
+                (long)cb.status,
+                *(volatile float *)&o[0], *(volatile float *)&o[1],
+                *(volatile float *)&o[2], *(volatile float *)&o[3],
+                *(volatile float *)&o[4], *(volatile float *)&o[5],
+                *(volatile float *)&o[6], *(volatile float *)&o[7],
+                *(volatile float *)&o[8], *(volatile float *)&o[9],
+                *(volatile float *)&o[10], *(volatile float *)&o[11],
+                *(volatile float *)&o[12], *(volatile float *)&o[13],
+                *(volatile float *)&o[14], *(volatile float *)&o[15],
+                *(volatile float *)&o[16], *(volatile float *)&o[17],
+                *(volatile float *)&o[18], *(volatile float *)&o[19],
+                o[28], o[29], o[30], o[31],                cb.error ? cb.error.localizedDescription.UTF8String : "nil");
+    }
+    return true;
+}
+
+/* the MS seed kernel: one thread per (texel, layer) copies every sample's words out of
+ * the texture2d_ms (a READ — the one thing Metal lets us do with it) */
+- (id<MTLComputePipelineState>) geomMsSeedPso: (MTLTextureType) tt format: (MTLPixelFormat) pf
+{
+    static NSMutableDictionary<NSString *, id> *cache;
+    NSString *key = [NSString stringWithFormat: @"msseed:%lu:%u", (unsigned long)tt, (unsigned)pf];
+    id<MTLComputePipelineState> pso;
+
+    if (cache && (pso = cache[key])) return pso;
+
+    const char *T = "float", *W = "as_type<uint>";
+    int C = 4;
+    switch (pf)
+    {
+        case MTLPixelFormatR32Float:   T = "float"; W = "as_type<uint>"; C = 1; break;
+        case MTLPixelFormatRG32Float:  T = "float"; W = "as_type<uint>"; C = 2; break;
+        case MTLPixelFormatRGBA32Float:T = "float"; W = "as_type<uint>"; C = 4; break;
+        case MTLPixelFormatR32Sint:    T = "int";   W = "as_type<uint>"; C = 1; break;
+        case MTLPixelFormatRG32Sint:   T = "int";   W = "as_type<uint>"; C = 2; break;
+        case MTLPixelFormatRGBA32Sint: T = "int";   W = "as_type<uint>"; C = 4; break;
+        case MTLPixelFormatR32Uint:    T = "uint";  W = "";              C = 1; break;
+        case MTLPixelFormatRG32Uint:   T = "uint";  W = "";              C = 2; break;
+        case MTLPixelFormatRGBA32Uint: T = "uint";  W = "";              C = 4; break;
+        default: return nil;
+    }
+    bool arr = (tt == MTLTextureType2DMultisampleArray);
+    char src[2600];
+    snprintf(src, sizeof src,
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void mgl_ms_seed(device uint* side [[buffer(0)]],\n"
+        "                        %s<%s, access::read> tex [[texture(0)]],\n"
+        "                        constant uint4& dims [[buffer(1)]],\n"
+        "                        uint t [[thread_position_in_grid]])\n"
+        "{\n"
+        "    if (t >= dims.w) return;\n"
+        "    uint wh = dims.x * dims.y;\n"
+        "    uint layer = %s ? t / wh : 0u;\n"
+        "    uint r = %s ? t %% wh : t;\n"
+        "    uint2 c(r %% dims.x, r / dims.x);\n"
+        "    uint S = tex.get_num_samples();\n"
+        "    for (uint s = 0; s < S; s++)\n"
+        "    {\n"
+        "        vec<%s, %d> v = %s;\n"
+        "        uint b = 4u * (s + S * (%s));\n"
+        "        %s\n"
+        "    }\n"
+        "}\n",
+        arr ? "texture2d_ms_array" : "texture2d_ms", T,
+        arr ? "1u" : "0u", arr ? "1u" : "0u",
+        T, C,
+        arr ? "tex.read(c, layer, s)" : "tex.read(c, s)",
+        arr ? "layer + dims.z * (c.x + dims.x * c.y)" : "c.y * dims.x + c.x",
+        C == 4 ? "side[b+0] = W1(v.x); side[b+1] = W1(v.y); side[b+2] = W1(v.z); side[b+3] = W1(v.w);"
+               : (C == 2 ? "side[b+0] = W1(v.x); side[b+1] = W1(v.y);"
+                         : "side[b+0] = W1(v.x);"));
+
+    char wmac[80];
+    snprintf(wmac, sizeof wmac, "#define W1(x) %s(x)\n", W ? W : "");
+    NSString *full = [NSString stringWithFormat: @"%s%s", wmac, src];
+
+    NSError *err = nil;
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.preserveInvariance = false;
+    id<MTLLibrary> lib = [_device newLibraryWithSource: full options: opts error: &err];
+    if (!lib)
+    {
+        if (gEnv.debug) fprintf(stderr, "geom: MS seed compile failed (fmt %u): %s\n",
+                                (unsigned)pf, err.localizedDescription.UTF8String);
+        return nil;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName: @"mgl_ms_seed"];
+    if (!fn) return nil;
+    pso = [_device newComputePipelineStateWithFunction: fn error: &err];
+    if (!pso) return nil;
+    if (!cache) cache = [NSMutableDictionary new];
+    cache[key] = pso;
+    return pso;
+}
+
 /* copy every dirty sidecar back into its texture: called at glMemoryBarrier time (the
  * CTS's texture-readback tests barrier before glGetTexImage) — cheap when nothing is
  * dirty, and it ends the render encoder only when a resolve is actually needed */
@@ -3418,8 +3929,48 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     if (!any) return;
 
     [self endRenderEncoding];
-    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
-        [self newCommandBuffer];
+
+    /* the draws that filled a multisample sidecar may still sit UNCOMMITTED in the
+     * shared command buffer (the store path is a fragment/compute write to the
+     * sidecar, recorded like any other draw): commit it, or the flush below
+     * rasterizes a stale, all-zero sidecar into the texture and then drops the
+     * dirty flag — the words would never reach the texture.  Commit WITHOUT
+     * waiting: the flush runs on its own command buffer from the same queue, and
+     * Metal orders buffers on a queue, so the flush still sees the finished
+     * sidecar — and the CPU never stalls (a wait here cost two synchronous
+     * round-trips per barrier and made the CTS store case crawl).  Only paid when
+     * an MS sidecar is actually dirty (geomImageAtomicBuffer sets it), never on
+     * the plain-image path. */
+    bool any_ms = false;
+    for (int u = 0; u < TEXTURE_UNITS; u++)
+        if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms && !g->img_atom[u].elems)
+            any_ms = true;
+    if (any_ms)
+    {
+        [self flushCommandBuffer: false];
+        if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+            [self newCommandBuffer];
+    }
+
+    /* multisample sidecars rasterize back into their textures first (render passes,
+     * one per unit); the compute resolve below then handles the rest */
+    for (int u = 0; u < TEXTURE_UNITS; u++)
+        if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms && !g->img_atom[u].elems)
+        {
+            if (getenv("MGL_GEOM_DEBUG"))
+            {
+                Texture *tptr = STATE(image_units[u]).tex;
+                id<MTLTexture> live = (tptr && tptr->mtl_data)
+                                          ? (__bridge id<MTLTexture>)tptr->mtl_data : nil;
+                id<MTLTexture> sv = (__bridge id<MTLTexture>)g->img_atom[u].view;
+                NSLog(@"MGL geom: ms flush unit %d sideview=%p livetex=%p SAME=%d",
+                      u, (__bridge void *)sv, (__bridge void *)live, (live == sv) ? 1 : 0);
+            }
+            if ([self geomMsFlushUnit: u]) g->img_atom[u].dirty = false;
+            else if (gEnv.debug)
+                fprintf(stderr, "geom: MS sidecar flush skipped (unit %d, no PSO?)\n", u);
+        }
+
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
 
     for (int u = 0; u < TEXTURE_UNITS; u++)
@@ -3595,10 +4146,13 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     for (GLuint i = 0; i < count; i++)
     {
         SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
-        GLuint unit = sres->binding, mtl_index = sres->msl_atomic;
+        GLuint unit = sres->binding, mtl_index;
         GLuint elems = sres->array_size ? sres->array_size : 1;
+        bool ms_slot;
 
-        if (mtl_index == 0xffffffffu) continue;         /* no atomic argument in the MSL */
+        if (sres->msl_atomic == 0xffffffffu) continue;  /* no atomic argument in the MSL */
+        mtl_index = (sres->msl_atomic & ~MGL_GEOM_MS_SLOT);
+        ms_slot = (sres->msl_atomic & MGL_GEOM_MS_SLOT) != 0;
         for (GLuint e = 0; e < elems; e++)
         {
             if (getenv("MGL_GEOM_DEBUG"))
@@ -3630,11 +4184,24 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
                                       elemClass: sres->elem_class];
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) buf = [self geomImageAtomicDummy];     /* refused (oversized): sink */
             if (!buf) continue;
+            if (getenv("MGL_GEOM_DEBUG") && stage == _FRAGMENT_SHADER)
+                fprintf(stderr, "MGL geom: img-atom BIND stage %d unit %u slot %u buf=%p len=%zu "
+                        "(view %lux%lux%lu s=%lu t=%lu)\n", stage, unit + e, mtl_index + e,
+                        (__bridge void *)buf, buf.length,
+                        (unsigned long)texture.width, (unsigned long)texture.height,
+                        (unsigned long)texture.arrayLength, (unsigned long)texture.sampleCount,
+                        (unsigned long)texture.textureType);
             if (stage != _FRAGMENT_SHADER)
                 [_currentRenderEncoder setVertexBuffer: buf offset: 0 atIndex: mtl_index + e];
             else
-                [_currentRenderEncoder setFragmentBuffer: buf offset: 0 atIndex: mtl_index + e];
+                /* through the compat shadow, NOT a raw setFragmentBuffer: the render
+                 * encoder is recreated around draws (state re-application) and a raw
+                 * bind is then LOST (the shadow replays only what it knows) — a
+                 * program with a default uniform block recreated the encoder after
+                 * this bind and the MS atomic silently wrote nowhere. */
+                [self compatBindFragmentBuffer: buf offset: 0 atIndex: mtl_index + e];
         }
     }
     return true;
@@ -3648,10 +4215,11 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     for (GLuint i = 0; i < count; i++)
     {
         SpirvResource *sres = &STATE(program)->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
-        GLuint unit = sres->binding, mtl_index = sres->msl_atomic;
+        GLuint unit = sres->binding, mtl_index;
         GLuint elems = sres->array_size ? sres->array_size : 1;
 
-        if (mtl_index == 0xffffffffu) continue;
+        if (sres->msl_atomic == 0xffffffffu) continue;
+        mtl_index = (sres->msl_atomic & ~MGL_GEOM_MS_SLOT);
 
         /* an ARRAY image: ONE side buffer covers every element (SPIRV-Cross declares a
          * single `<name>_atomic [[buffer(N)]]` for the whole array) */
@@ -3686,6 +4254,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
                                       elemClass: sres->elem_class];
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) buf = [self geomImageAtomicDummy];     /* refused (oversized): sink */
             if (!buf) continue;
             [encoder setBuffer: buf offset: 0 atIndex: mtl_index + e];
         }
@@ -3756,7 +4325,81 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     [enc endEncoding];
 }
 
-/* geom: the tessellation emulation's VS / TCS (and the TES-capture) kernels run as
+/* geom: render stages (vertex / fragment) with MULTISAMPLE image writes or atomics
+ * need their sidecar seeded before the draw's render encoder opens — the seed is a
+ * compute dispatch, which cannot run mid-encoder.  Called next to
+ * geom3DImageShadowSync at draw time; the program-level gate keeps it free for
+ * every program without a multisample image (the common case). */
+- (void) geomPrepareImageAtomicsRender
+{
+    struct MGLExtState_geom *g = (struct MGLExtState_geom *)(ctx ? ctx->state.ext_geom : NULL);
+    int pending[TEXTURE_UNITS];
+    int n_pending = 0;
+    id<MTLComputeCommandEncoder> enc;
+
+    if (!g || !ctx || !ctx->mtl_funcs.ext_texdata) return;
+
+    /* cheap gate: only programs with an MS-flagged atomic slot can have work */
+    bool any_ms = false;
+    for (int s = 0; s < _MAX_SHADER_TYPES && !any_ms; s++)
+    {
+        Program *p = STATE(program);
+        if (!p && STATE(program_pipeline))
+        {
+            MGLPipelineObj *po = MGL_PIPELINE_OBJ(STATE(program_pipeline));
+            p = po->base.stage_programs[s];
+        }
+        if (!p) continue;
+        GLuint count = [self getProgramBindingCount: s type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+        for (GLuint i = 0; i < count && !any_ms; i++)
+            any_ms = (p->spirv_resources_list[s][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i].msl_atomic &
+                      MGL_GEOM_MS_SLOT) != 0;
+    }
+    if (!any_ms) return;
+
+    int stages[2] = { _VERTEX_SHADER, _FRAGMENT_SHADER };
+    for (int si = 0; si < 2; si++)
+    {
+        int stage = stages[si];
+        Program *p = STATE(program);
+        if (!p && STATE(program_pipeline))
+            p = MGL_PIPELINE_OBJ(STATE(program_pipeline))->base.stage_programs[stage];
+        if (!p) continue;
+        GLuint count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
+        for (GLuint i = 0; i < count; i++)
+        {
+            SpirvResource *sres = &p->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_STORAGE_IMAGE].list[i];
+            if (sres->msl_atomic == 0xffffffffu || !(sres->msl_atomic & MGL_GEOM_MS_SLOT)) continue;
+            GLuint mtl_index = (sres->msl_atomic & ~MGL_GEOM_MS_SLOT);
+            if (sres->array_size) continue;                        /* arrays: sidecar path */
+
+            int b = [self getProgramBinding: stage type: SPVC_RESOURCE_TYPE_STORAGE_IMAGE index: i];
+            if (b < 0 || (GLuint)b >= TEXTURE_UNITS) continue;
+            ImageUnit *iu = &STATE(image_units[b]);
+            Texture *ptr = iu->tex;
+            if (!ptr || !ptr->mtl_data) continue;
+            id<MTLTexture> view = [self geomImageUnitViewRes: iu
+                                                        base: (__bridge id<MTLTexture>)(ptr->mtl_data)
+                                                   elemClass: sres->elem_class];
+            if (![self geomImageAtomicBuffer: (GLuint)b view: view]) continue;
+            if (g->img_atom[b].needs_seed && n_pending < TEXTURE_UNITS)
+                pending[n_pending++] = b;
+        }
+    }
+    if (!n_pending) return;
+
+    [self endRenderEncoding];
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        [self newCommandBuffer];
+    enc = [_currentCommandBuffer computeCommandEncoder];
+    if (!enc) return;
+    enc.label = @"mgl-ms-image-seed";
+    for (int i = 0; i < n_pending; i++)
+        [self geomSeedImageAtomic: pending[i] encoder: enc];
+    [enc endEncoding];
+}
+
+/* geom: the tessellation emulation's VS / TCS (and TES-capture) kernels run as
  * COMPUTE carrying their OWN stage's resource list (tessBindStageTextures,
  * MGLRenderer+Tessellation.m) — the two helpers above only walk the current
  * program's _COMPUTE_SHADER stage.  These (program, stage)-parameterized twins give
@@ -3805,6 +4448,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
             texture = [self geomImageUnitViewRes: iu base: (__bridge id<MTLTexture>)(ptr->mtl_data)
                                       elemClass: sres->elem_class];
             buf = [self geomImageAtomicBuffer: unit + e view: texture];
+            if (!buf) buf = [self geomImageAtomicDummy];     /* refused (oversized): sink */
             if (!buf) continue;
             [encoder setBuffer: buf offset: 0 atIndex: mtl_index + e];
         }

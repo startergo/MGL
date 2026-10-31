@@ -162,6 +162,14 @@ typedef struct MGLGeomVar {
 
 typedef struct { char name[64]; int msl; } MGLGeomTexSlot;
 
+/* set on a MGLGeomTexSlot.msl (and thus on the storage-image resource's
+ * msl_atomic) when the image is a MULTISAMPLE one: its sidecar uses the
+ * 4-words-per-(texel, layer, sample) layout of mgl_spirv_lower_ms_images, is
+ * seeded per sample (geomMsSeedPso) and rasterizes back into the texture at the
+ * image-atomics barrier (geomMsFlushUnit — a texture2d_ms cannot be written by
+ * a compute kernel).  Mask it off to get the plain Metal buffer index. */
+#define MGL_GEOM_MS_SLOT 0x40000000
+
 /* GL atomic-counter (atomic_uint) declaration of a stage, for the MSL argument
  * injection below — program.c collects them from the stage's SPIR-V; geometry.c
  * from the geometry stage's module for the emulation kernel */
@@ -388,10 +396,18 @@ struct MGLExtState_geom {
      * unit format changes.  Only atomic operations see this storage — an imageStore
      * before an imageAtomic on the same texel is an emulation gap (the texture and the
      * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer).
-     * dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
-     * geomResolveImageAtomics copies it back into the texture at barrier time. */
+    /* dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
+     * geomResolveImageAtomics copies it back into the texture at barrier time.
+     * ms: the unit's image is a MULTISAMPLE one (image2DMS / image2DMSArray).  Its
+     * sidecar layout is 4 words per (texel, layer, sample) — every load/store/atomic
+     * on a multisample image is lowered to a sidecar word access (mgl_spirv_lower_ms
+     * _images, geometry.c), because Metal's texture2d_ms cannot be written from a
+     * shader.  At a barrier geomResolveImageAtomics rasterizes the sidecar back into
+     * the texture (one 1-pixel point per texel, per-sample [[sample_mask]] output).
+     * samples: the view's sample count, part of the binding identity. */
     struct { void *buf, *view; GLuint fmt; size_t bytes; bool dirty, needs_seed;
-            GLuint elems; uint64_t sig; } img_atom[TEXTURE_UNITS];
+            GLuint elems; uint64_t sig; bool ms; GLuint samples; } img_atom[TEXTURE_UNITS];
+    void *atom_dummy;      /* the 4-byte sink for oversized (refused) sidecars */
 
     /* the pass-through vertex function that reads the geometry kernel's output.  The PSO builder consults this so the pass-through wins even when a bound program pipeline's composite is rebuilt from the stage programs inside processGLState (mgl_program_scope_enter copies the stage programs' MSL by value, discarding a substitution on the composite). */
     void *vertex_override;
@@ -439,6 +455,12 @@ size_t mgl_program_spirv_rect_to_2d(const uint32_t *w, size_t n, uint32_t **out_
 /* geometry.c: repair interface-block member offsets after glslang's implicit
  * array growth (see mgl_spirv_fix_block_offsets); returns NULL when unchanged */
 uint32_t *mgl_spirv_fix_block_offsets(const uint32_t *in, size_t n, size_t *out_n);
+
+/* geometry.c: reroute multisample-image loads / stores / atomics through the
+ * image-atomic sidecar (Metal's texture2d_ms is read-only; SPIRV-Cross drops
+ * the sample of MS OpImageTexelPointer coordinates).  Returns NULL when the
+ * module has nothing to lower (pure multisample reads keep the fast path). */
+uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n);
 
 /* arrays-of-matrices stage inputs (e.g. `in mat2x3 d[2]`): lowers the variable to
  * N element-typed inputs + a private shadow so SPIRV-Cross can emit MSL; returns

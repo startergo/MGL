@@ -708,30 +708,26 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_FRAMEBUFFER_HEIGHT: PUT1(LIMIT(STATE_VAR(max_framebuffer_height), 16384));
         case GL_MAX_FRAMEBUFFER_LAYERS: PUT1(LIMIT(STATE_VAR(max_framebuffer_layers), 2048));
         case GL_MAX_FRAMEBUFFER_SAMPLES: PUT1(LIMIT(STATE_VAR(max_framebuffer_samples), 4));
-        /* multisample image units work through Metal texture2d_ms / texture2d_ms_array
-         * arguments (glBindImageTexture of an MS texture binds the whole texture — one
-         * level, all samples), verified by test_geom / the CTS shader_image_size ms cases */
+        /* GL_MAX_SAMPLES: the device cap (4 on Apple GPUs; framebuffer_ext's
+         * ext-slot handler answers it first — this is the get_limit fallback,
+         * mirroring it so both paths agree; MGLRenderer+Framebuffer.m
+         * fbUpdateLimits probes supportsTextureSampleCount). */
         case GL_MAX_SAMPLES:
-            /* renderbuffer/FBO MSAA cap = what Metal can actually allocate
-             * (MGLRenderer+Framebuffer.m fbUpdateLimits probes
-             * supportsTextureSampleCount: 4 on Apple M4 Pro; the value also backs
-             * glGetFramebufferParameteriv(GL_MAX_SAMPLES) and the renderbuffer
-             * samples validator, both of which already used the device cap —
-             * only this global query was stuck at 0, which falsely told the CTS
-             * "no multisample framebuffers at all" and gated whole groups
-             * (sample_variables samples_8: 'Test sample count greater than
-             * MAX_SAMPLES').  GL 4.6 requires MAX_SAMPLES >= 4. */
             PUT1(LIMIT(STATE_VAR(max_framebuffer_samples), 4));
+        /* multisample image units: loads go through Metal's (read-only)
+         * texture2d_ms / texture2d_ms_array; stores and atomics are rerouted
+         * through the image-atomic sidecar (mgl_spirv_lower_ms_images) and
+         * rasterized back into the texture at the barrier — verified by
+         * test_geom_msimg (per-sample stores, layout collisions, loads,
+         * imageAtomicAdd with uniform updates) and the CTS shader_image_size
+         * ms / load-ms / WriteMS / AtomicMS cases.  Word-addressable formats
+         * only (r32*, rg32*, rgba32*); texture_query reports
+         * GL_SHADER_IMAGE_STORE = NONE for the rest.  Keep glslang's
+         * max_image_samples in sync (geometry.c limits table).  (gl46-port
+         * briefly reported 0 here while MS stores could not work — the sidecar
+         * store path landed in geom r79.) */
         case GL_MAX_IMAGE_SAMPLES:
-            /* 0, not 4: MSL has no shader writes to multisample textures
-             * (texture2d_ms<access::write> fails a static_assert in the Metal
-             * toolchain — re-verified 2026-10-29), so MS image STOREs
-             * cannot exist.  GL allows 0; with 4 reported, the CTS exercises MS
-             * image writes and fails at the Metal compile
-             * (KHR-GL46.shader_image_load_store.basic-allTargets-store WriteMS).
-             * MS image READS do work, but the limit gates both directions.  Keep
-             * glslang's max_image_samples in sync (geometry.c limits table). */
-            PUT1(0);
+            PUT1(LIMIT(STATE_VAR(max_framebuffer_samples), 4));
         case GL_MAX_COLOR_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_color_texture_samples), 4));
         case GL_MAX_DEPTH_TEXTURE_SAMPLES: PUT1(LIMIT(STATE_VAR(max_depth_texture_samples), 4));
         case GL_MAX_INTEGER_SAMPLES: PUT1(LIMIT(STATE_VAR(max_integer_samples), 4));

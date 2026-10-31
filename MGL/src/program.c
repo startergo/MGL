@@ -2688,6 +2688,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* geom: multisample image writes and atomics must go through the image-atomic
+     * sidecar — Metal's texture2d_ms is read-only, and SPIRV-Cross's own atomic
+     * emulation drops the sample / layer of a multisample OpImageTexelPointer.
+     * Multisample reads of images the module does not write keep the direct
+     * texture2d_ms read (nothing to lower → NULL). */
+    {
+        size_t ms_words = 0;
+        if (getenv("MGL_MS_DEBUG")) fprintf(stderr, "MGL ms-hook: stage %d, %zu words\n", stage, prepared_words);
+        uint32_t *ms = mgl_spirv_lower_ms_images(prepared, prepared_words, &ms_words);
+        if (ms)
+        {
+            free(prepared);
+            prepared = ms;
+            prepared_words = ms_words;
+        }
+    }
+
     if (spvc_context_create(&context) != SPVC_SUCCESS)
     {
         mgl_append_info_log(log, "ERROR: SPIRV-Cross context creation failed\n");
@@ -3227,7 +3244,28 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         char *fixed = mgl_msl_fix_image_atomics(result,
                                                 stage == _COMPUTE_SHADER ?
                                                     MGL_CS_SSBO_SIZE_BUFFER_INDEX : 24,
-                                                -1, aslots, &naslots, 32, &dub_msl);
+                                                /* geom: FORCE the FRAGMENT stage's
+                                                 * sidecar slots into the reserved
+                                                 * image-atomic range [16, 24)
+                                                 * (MGL_GEOM_SIDE_BASE in geometry.c).
+                                                 * SPIRV-Cross's auto index gave the
+                                                 * MULTISAMPLE sidecar buffer(0) and
+                                                 * shifted the default uniform block to
+                                                 * buffer(1) (dub_msl), but the legacy
+                                                 * bind-list path still streams the
+                                                 * default uniforms at fragment slot 0 —
+                                                 * clobbering the sidecar (MS image
+                                                 * atomics silently wrote into the
+                                                 * argument ring).  At 16+ the uniforms
+                                                 * keep slot 0 and both paths agree.
+                                                 * FRAGMENT ONLY: tess/GS emulation
+                                                 * stages dispatch as compute kernels
+                                                 * whose buffer tables do not follow the
+                                                 * fragment bind-list convention (the
+                                                 * forced 16 broke
+                                                 * shader_image_load_store.atomicTCS) */
+                                                stage == _FRAGMENT_SHADER ? 16 : -1,
+                                                aslots, &naslots, 32, &dub_msl);
         if (!fixed)
         {
             mgl_append_info_log(log, "ERROR: %s stage: image-atomic buffer argument slots exceed the "

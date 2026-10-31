@@ -78,9 +78,15 @@ char *mgl_msl_fix_int_builtins(const char *msl);
  * Shaders that declare image2DMS / image2DMSArray with stores (e.g. the
  * gl_spirv spirv_validation_capabilities type zoo) get their declarations'
  * access rewritten to read and their <name>.write(...) calls replaced by
- * (void)0 — the store is dropped (MGL reports GL_MAX_IMAGE_SAMPLES 0; MS
- * image READS are unaffected).  Returns a malloc'd fixed copy, or NULL when
- * nothing needed changing.  (implementation: msl_msimg.c)
+ * (void)0 — the store is dropped.  Since geom r79 the word-addressable
+ * 32-bit formats (r32*, rg32*, rgba32*) never reach this pass: their stores
+ * and atomics are rerouted through the image-atomic sidecar at the SPIR-V
+ * level (mgl_spirv_lower_ms_images, geometry.c) and rasterized back into the
+ * texture at the barrier, so GL_MAX_IMAGE_SAMPLES is the device cap again;
+ * texture_query declares GL_SHADER_IMAGE_STORE = NONE for the formats that
+ * stay on this drop path.  MS image READS are unaffected.  Returns a
+ * malloc'd fixed copy, or NULL when nothing needed changing.
+ * (implementation: msl_msimg.c)
  */
 char *mgl_msl_fix_ms_image_writes(const char *msl);
 

@@ -848,6 +848,17 @@ static int tq_internalformat(GLMContext ctx, GLenum target, GLenum internalforma
     bool renderable = (color_r || depth_r || stencil_r) && target != GL_TEXTURE_BUFFER;
     bool mip_target = !(target == GL_TEXTURE_RECTANGLE || target == GL_TEXTURE_BUFFER || tq_is_ms_target(target));
     bool image_fmt = supported && d->img_class != GL_NONE && target != GL_RENDERBUFFER;
+    /* multisample images: loads are a Metal texture2d_ms read (any format), but
+     * stores / atomics go through the image-atomic sidecar of
+     * mgl_spirv_lower_ms_images, which only exists for the word-addressable
+     * 32-bit formats — be honest about the rest (GL_SHADER_IMAGE_STORE = NONE),
+     * so nothing writes through a dropped store */
+    bool ms_word = !tq_is_ms_target(target) ||
+                   (d->fmt == GL_R32F || d->fmt == GL_R32I || d->fmt == GL_R32UI ||
+                    d->fmt == GL_RG32F || d->fmt == GL_RG32I || d->fmt == GL_RG32UI ||
+                    d->fmt == GL_RGBA32F || d->fmt == GL_RGBA32I || d->fmt == GL_RGBA32UI);
+    bool image_store = image_fmt && caps.writable && ms_word;
+    bool image_atomic = image_fmt && caps.atomic && ms_word;
     bool sampleable = supported && target != GL_RENDERBUFFER;
     bool gather_target = (target == GL_TEXTURE_2D || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_CUBE_MAP ||
                           target == GL_TEXTURE_CUBE_MAP_ARRAY || target == GL_TEXTURE_RECTANGLE);
@@ -975,8 +986,8 @@ static int tq_internalformat(GLMContext ctx, GLenum target, GLenum internalforma
         case GL_TEXTURE_GATHER_SHADOW: v = FULL(sampleable && depth && gather_target); break;
 
         case GL_SHADER_IMAGE_LOAD:   v = FULL(image_fmt); break;
-        case GL_SHADER_IMAGE_STORE:  v = FULL(image_fmt && caps.writable); break;
-        case GL_SHADER_IMAGE_ATOMIC: v = FULL(image_fmt && caps.atomic); break;
+        case GL_SHADER_IMAGE_STORE:  v = FULL(image_store); break;
+        case GL_SHADER_IMAGE_ATOMIC: v = FULL(image_atomic); break;
 
         case GL_IMAGE_TEXEL_SIZE: v = image_fmt ? (d->r + d->g + d->b + d->a) : 0; break;
         case GL_IMAGE_COMPATIBILITY_CLASS: v = image_fmt ? d->img_class : GL_NONE; break;

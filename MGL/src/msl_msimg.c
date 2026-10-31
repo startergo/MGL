@@ -2,12 +2,17 @@
  * (the image/sampler type zoo).  Metal's texture2d_ms / texture2d_ms_array are
  * READ-ONLY: `texture2d_ms<float, access::write>' fails the Metal compile
  * ("invalid access value for 'texture2d_ms'"), and there is no .write() member
- * at all.  MGL reports GL_MAX_IMAGE_SAMPLES = 0 (MS image writes do not exist
- * on Metal), but a shader that still declares image2DMS / image2DMSArray with
- * stores must compile and link.  Emulation: the declaration's access is
- * rewritten to read, and every `<name>.write(...)' call on such a texture
- * becomes `(void)0' — the store is dropped (documented gap; MS image READS
- * work through read(coord, sample) and stay untouched).
+ * at all.  Since geom r79 MS image STORES and ATOMICS are real: the SPIR-V
+ * pass mgl_spirv_lower_ms_images (geometry.c) reroutes them through the
+ * image-atomic sidecar for the word-addressable 32-bit formats (r32*, rg32*,
+ * rgba32*), and texture_query reports GL_SHADER_IMAGE_STORE / _ATOMIC = NONE
+ * for every other MS format.  This MSL pass is the fallback for exactly those
+ * remaining formats: a shader that still declares image2DMS /
+ * image2DMSArray with stores must compile and link (gl_spirv's validation
+ * zoo, MS image READS through read(coord, sample) stay untouched).  Emulation:
+ * the declaration's access is rewritten to read, and every `<name>.write(...)'
+ * call on such a texture becomes `(void)0' — the store is dropped, which the
+ * capability query already declared.
  * Returns a malloc'd fixed copy, or NULL when nothing needed changing. */
 
 /*

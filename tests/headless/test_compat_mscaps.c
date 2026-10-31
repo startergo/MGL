@@ -8,11 +8,11 @@
  *     always used the real device cap.  GL 4.6 requires MAX_SAMPLES >= 4; with
  *     0 the CTS gated whole groups with "Test sample count greater than
  *     MAX_SAMPLES" (sample_variables samples_8) / "Not supported".
- *  2. GL_MAX_IMAGE_SAMPLES stays 0 on purpose: texture2d_ms<access::write>
- *     fails a static_assert in the Metal toolchain (re-verified 2026-10-29),
- *     so MS image STOREs cannot exist; GL allows 0 and it keeps
- *     shader_image_load_store.basic-allTargets-store WriteMS from running into
- *     a guaranteed MSL compile failure.
+ *  2. GL_MAX_IMAGE_SAMPLES is the device sample count (4): MS image LOADS are
+ *     Metal texture2d_ms reads and MS image stores/atomics run through the geom
+ *     image-atomic sidecar (r79+, rasterized back at the barrier); the
+ *     word-addressable-only store support is declared honestly through
+ *     texture_query's GL_SHADER_IMAGE_STORE = NONE.
  *
  * samples_8 CTS cases remain NotSupported on this hardware (Apple M4 Pro:
  * supportsTextureSampleCount 8 -> NO, 4 -> YES) which is spec-correct
@@ -48,7 +48,12 @@ TEST(image_samples_zero_and_sync)
     GLint v = -1;
     glGetIntegerv(GL_MAX_IMAGE_SAMPLES, &v);
     EXPECT_NO_GL_ERROR();
-    MS_CHECK(v == 0, "GL_MAX_IMAGE_SAMPLES %d != 0 (MS image stores are impossible in MSL)", v);
+    /* geom r79 (MS image sidecar store path): stores and atomics on MS images
+     * are rerouted through the image-atomic sidecar and rasterized back into
+     * the texture at the barrier (test_geom_msimg verifies stores per sample,
+     * layout collisions, loads and imageAtomicAdd), so the cap is the device
+     * sample count again — no longer 0. */
+    MS_CHECK(v == 4, "GL_MAX_IMAGE_SAMPLES %d != 4 (MS image stores work via the geom sidecar)", v);
 
     /* the related caps that DO describe MSAA support all report >= 4 */
     GLint cts = -1, dts = -1, is = -1;

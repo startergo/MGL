@@ -220,6 +220,7 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 /* geom: create + seed the image-atomic sidecars of the pending compute dispatch
  * (own compute pass, before the dispatch's encoder is opened) */
 - (void) geomPrepareImageAtomicsCompute;
+- (void) geomPrepareImageAtomicsRender;   /* geom: seed MS image sidecars pre-encoder */
 /* geom: the (program, stage) twins for the tessellation emulation's VS / TCS / TES
  * kernels, which run as compute with their own stage's resource list */
 - (bool) geomBindStageImageAtomicsCompute: (Program *) program

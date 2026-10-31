@@ -1,4 +1,118 @@
-READY 8f-line (r77 on top of the cceed03 merge 8bacd8e; r77 = c9afeb6 + r77b = 2b96406). SUPERVISOR QUEUE: (1) KHR-GL46.texture_size_promotion.functional Fail->Pass (fixed for real — see below). (2) geometry_shader.api.max_image_uniforms: ALREADY GREEN, no fake caps — 16/16 geometry_shader.api Pass x4 runs (3 single + full api group) with GL_MAX_GEOMETRY_IMAGE_UNIFORMS reporting the honest r73 value 8 (Metal caps access::read_write textures at 8/function; the test builds a GS with that many image uniforms + xfb of gl_Position and verifies); it had failed only in r18/r28-era sweeps (compat-s28-merged-geom, mgl-results-r18-ac) and was closed by the r72/r73 image work. (3) FRESH DOMAIN SWEEP ~/MGL-cts/geom-r77-dom (r77 lib, 9 patterns, done 04:24): textures+images+geometry+xfb = 599 Pass / 45 NotSupported / 1 Fail / 1 Crash — the ONLY non-Pass in the whole domain are shader_image_load_store.early-fragment-tests (Fail, the documented probed Apple-GPU early-z platform limit, unchanged) and texture_swizzle.smoke (Crash rc=-24 = SIGXCPU batch-kill artifact: the same runner marked it Crash in the r28 sweep; standalone it PASSES 1/1 in 7m49s on this exact lib, 8th consecutive pass counting tonight's earlier runs). Everything the r28 sweep listed for this domain is now green: texture_buffer 16/16 (atomic_functions incl.), copy_image 13/13, texture_view 7/7, texture_border_clamp 32/32, SSBO 124/124, shader_image_size 38P/36NS (the 10 tcs/tes fails gone), transform_feedback 20/20 + overflow queries 13/13, separable_programs_tf 2/2, sepshaderobjs 8/8, geometry_shader 136/136, texture_gather 75/75, texture_cube_map_array 25P/2NS, texture_repeat_mode 162/162, texture_size_promotion 1/1, texture_barrier 4/4(+ARB 4/4), texture_filter_minmax 5NS (no hw). GATES: full tests/headless/run.sh = 131 binaries / 10668 checks / 0 FAILED; test_geom 3x 670/0; test_img3d 613/0; test_texparam 716/0; test_texext 122/0; test_texdata 251/0; test_texswizzle 10/0; stub_scanner EMPTY/NOOP/ASSERT clean for geometry.c, MGLRenderer+Geometry.m, texdata_formats.c, MGLRenderer+TextureParams.m. Shared-file edits: texdata_formats.c/.h (tdFormatLacksAlphaBacking — my file on this branch), MGLRenderer+TextureParams.m (texparamTextureForTex alpha-less view swizzle + a static pixel-format pre-check — texparam domain file, one surgical insertion), new tests/headless/test_alphaless.c (3 cases).
+READY 03520b1 (r81 = 03520b1 on top of the e8ff34b merge 3a800f0; the MS image sidecar itself is r78 b690604 / r79 b0c6f69 / r80 a3858d3, previously unreported). SUPERVISOR TASK DONE HONESTLY: with GL_MAX_IMAGE_SAMPLES = 4 (the device cap, get.c) the three multisample NotSupported groups are LIVE and every one PASSES on this tip — shader_image_size 74/74 Pass (the 36 ms-* rows: basic-ms/advanced-ms x vs/tcs/tes/gs/fs/cs x float/int/uint, all were NotSupported at MAX_IMAGE_SAMPLES=0), shader_image_load_store 51/51 Pass (advanced-sso-perSample and basic-allTargets-load-ms were the 2 NotSupported; early-fragment-tests' old Fail is gone too — that was tess r39's fix, verified green here), shader_texture_image_samples_tests 4/4 Pass. GUARD GROUPS, no Fail/Crash anywhere (~/MGL-cts/geom-r81-guard, 194/194): shader_image_load_store 51/51 (now including the CTS WriteMS sub-case: 4-sample imageStore on 2DMS + 2DMSArray, RGBA32F/I/UI), texture_view 7/7, geometry_shader 136/136. FRESH DOMAIN SWEEP ~/MGL-cts/geom-r81-dom (r81 lib, r77-dom's 9 patterns + the samples group, done 23:49): 784 cases = 776 Pass / 7 NotSupported / 0 Fail / 1 Crash — the 7 NotSupported are texture_filter_minmax 5 (no hw, unchanged) + texture_cube_map_array 2 (the pre-existing introspection gap, unchanged); the 1 Crash is texture_swizzle.smoke rc=-24, the SIGXCPU batch-kill artifact the r77/r28 sweeps also recorded (25-min CPU ulimit under 3-way GPU co-tenancy; standalone verdict in §3). Everything the r77 sweep listed is green and the previously-gated rows are now LIVE: shader_image_size 74/74 (was 38P/36NS), shader_image_load_store 51/51 (was 48P/2NS/1F), shader_texture_image_samples_tests 4/4, geometry_shader 136/136, texture_view 7/7, texture_gather 75/75, texture_repeat_mode 162/162, texture_border_clamp 32/32, SSBO 124/124, transform_feedback 20/20 + overflow 13/13, texture_buffer 16/16, copy_image 13/13, sepshaderobjs 8/8, separable_programs_tf 2/2, texture_barrier 4/4(+ARB 4/4), texture_swizzle 3P(+smoke standalone below), texture_size_promotion 1/1. GATES: full tests/headless/run.sh = 137 binaries / 10986 checks / 0 FAILED; test_geom 3x 670/0; test_geom_msimg 3x 121/0; test_compat_mscaps 23/0; test_alphaless 21/0; test_img3d 613/0; stub_scanner EMPTY/NOOP|ASSERT clean for geometry.c, MGLRenderer+Geometry.m, msl_msimg.c; ab_bench min-of-7 interleaved vs ~/MGL-cts/baseline-e8ff34b: m0 drawArrays x2000 13.777 -> 12.742 ms, m1 blend-flip x2000 414.832 -> 382.161 ms (new faster in both; measured under co-tenant load); locked glmark2 (lockf /tmp/mgl_glmark2.lock, 6 interleaved rounds, order alternating) vs baseline-e8ff34b nsgl, top-3-of-6 per arm (medians unusable — compat gate + tess CTS + my sweep co-ran, spike rounds hit both arms): ideas 561 vs 522 (+7.5%), jellyfish 4260 vs 4356 (-2.2%), gl41-geometry 1050 vs 1063 (-1.2%), score 1956 vs 1979 (-1.2%) — inside the ±3% band, no draw-path regression from the r78 hook.
+
+# geom round 81 — MS image sidecar closeout: the multisample rows go live
+
+## 1. The mechanism (r78-r80, unreported until now)
+
+Metal's `texture2d_ms` / `texture2d_ms_array` are READ-ONLY in MSL
+(`texture2d_ms<T, access::write>` fails the toolchain static_assert), so a GL
+image2DMS/image2DMSArray store, load-after-store or atomic has no direct Metal
+path. r78-r80 route every access of a multisample storage image with a
+32-bit-per-component format (r32*, rg32*, rgba32*) through the EXISTING
+image-atomic sidecar that r63-r68 built for plain images:
+
+* `mgl_spirv_lower_ms_images` (geometry.c, C over the SPIR-V words, runs in
+  program.c's compile_stage on every stage before SPIRV-Cross):
+  - OpImageTexelPointer's coordinate becomes `int4(x, y, layer, sample*4)` so
+    the sidecar index covers layer and sample;
+  - OpImageWrite lowers to one OpAtomicStore per component through a
+    folded-coordinate texel pointer;
+  - OpImageRead of an image THIS module also writes/atomics lowers to
+    per-component OpAtomicLoad (GL 8.26 in-invocation ordering), while reads of
+    images the module does not write stay direct texture2d_ms reads (exact,
+    zero cost);
+  - sidecar word layout `4*(sample + S*(layer + L*(x+W*y))) + component`
+    (MGL_MS_WORDS=4), one layout for r32/rg32/rgba32.
+* `mgl_msl_fix_image_atomics` (geometry.c, MSL text pass) strips the 2D
+  atomic-coord macro wrapper for MS images and adds spvMglAIMS / spvMglAIMSA
+  helpers that clamp through the same layout (the r63 bounds guard alone
+  collapsed every store past the first row).
+* Renderer (MGLRenderer+Geometry.m): `geomImageAtomicBuffer` allocates/seeds
+  the sidecar per unit (seed = geomMsSeedPso compute pass reading the texture),
+  `geomResolveImageAtomics` (the glMemoryBarrier/image-atomics barrier)
+  rasterizes it BACK into the multisample texture — one 1-pixel point per
+  (texel, layer), fragment outputs the sample's word with
+  `[[sample_mask]] = 1<<sample`, chunked at 8M points; the arrayed variant
+  reads `[[render_target_array_index]]` and its PSO sets
+  inputPrimitiveTopology. Ordering: the shared command buffer is committed
+  WITHOUT waiting first (same-queue ordering), so the flush sees the stores —
+  the synchronous wait variant cost two round-trips per barrier and made the
+  CTS store case take >25 min (now 24 s).
+* program.c: the FRAGMENT stage's sidecar buffer slots are forced into the
+  reserved [16,24) range (SPIRV-Cross's auto index handed the MS sidecar
+  buffer(0) and shifted the default-uniform block to buffer(1), which the
+  legacy uniform streaming at fragment slot 0 then clobbered). FRAGMENT ONLY —
+  the tess/GS emulation kernels dispatch as compute and broke with the forced
+  base (shader_image_load_store.atomicTCS).
+* Caps stay honest: texture_query answers GL_SHADER_IMAGE_LOAD = FULL for all
+  MS formats (a texture2d_ms read) but GL_SHADER_IMAGE_STORE / _ATOMIC = NONE
+  for the non-word-addressable ones (rgba8, rgba16f, ...), so no CTS case ever
+  writes through the leftover MSL drop path (mgl_msl_fix_ms_image_writes,
+  which still exists so such shaders LINK).
+* r80 hardening: sidecar views are OWNED (CFBridgingRetain; the borrowed
+  pointer crashed the flush after the GL texture was deleted); sidecars past
+  1 GiB are refused and the lowered stores hit a 4-byte sink buffer, so the
+  CTS 10.3 GB advanced-sso-perSample allocation FAILS ON VALUES instead of
+  killing the command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory);
+  the flush draw is chunked.
+
+test_geom_msimg.c (121 checks) pins per-sample stores, the no-collision layout
+(8x8x4 texels where the naive folded index would collide), loads,
+imageAtomicAdd, and 2DMSArray per-(layer,sample) round-trips.
+
+## 2. This round (r81, 03520b1)
+* verified the three target groups + all three guard groups on the merged tip
+  (numbers in the READY line; per-case statuses in ~/MGL-cts/geom-r81-ms and
+  -geom-r81-guard/results.json).
+* removed the r78 A/B switch `MGL_NO_MSR` from the draw path
+  (MGLRenderer+Draw.m — one line, the geomPrepareImageAtomicsRender call is now
+  unconditional; it early-outs unless the bound program has an MS-flagged
+  image-atomic slot).
+* updated the stale "GL_MAX_IMAGE_SAMPLES = 0" comments (get.c already fixed in
+  r79; geometry.c glslang table, msl_reserved.h, msl_msimg.c, and
+  test_compat_mscaps.c's header now describe the sidecar + honest-cap split).
+* deleted the two r78 debug scratch files that were committed by mistake
+  (tests/headless/scratch_msatom.c, scratch_msprobe.c — their cases live in
+  test_geom_msimg.c; run.sh only builds test_*.c so they were dead weight).
+
+## 3. Gates
+* tests/headless/run.sh (full): 137 test binaries, 10986 checks, 0 FAILED
+  (test_drawparams/test_orphan/test_v64limits print no trailing summary line —
+  pre-existing; all their cases PASS and rc=0).
+* test_geom 3x 670/0, test_geom_msimg 3x 121/0, test_compat_mscaps 23/0,
+  test_alphaless 21/0, test_img3d 613/0.
+* stub_scanner EMPTY/NOOP/ASSERT clean: geometry.c, MGLRenderer+Geometry.m,
+  msl_msimg.c.
+* ab_bench min-of-7 interleaved vs baseline-e8ff34b: m0 13.777->12.742 ms,
+  m1 414.832->382.161 ms.
+* locked glmark2: top-3 per arm (ideas +7.5%, jellyfish -2.2%, gl41-geometry
+  -1.2%, score -1.2%) — no regression.
+* the sweep's one Crash closed standalone: KHR-GL46.texture_swizzle.smoke run
+  ALONE (~/MGL-cts/geom-r81-smoke) = **Pass** in ~6 min — in the sweep batch it
+  was killed by the 25-min CPU ulimit after 29 min of contended batch time
+  (rc=-24/SIGXCPU), the same artifact the r77 and r28 sweeps recorded for this
+  exact case on this exact runner.
+
+## 4. Shared-file edits (this branch vs gl46-port, all of them)
+* MGLRenderer+Draw.m — ONE hook call (geomPrepareImageAtomicsRender) next to
+  the existing geom3DImageShadowSync; cheap gate, no-op without MS images.
+* program.c — the mgl_spirv_lower_ms_images hook in compile_stage + the
+  fragment-stage forced_base 16 for the image-atomic slot rebase.
+* get.c — GL_MAX_SAMPLES fallback mirror + GL_MAX_IMAGE_SAMPLES = device cap.
+* texture_query.c — the ms_word cap split for GL_SHADER_IMAGE_STORE/_ATOMIC.
+* MGLRenderer_Private.h — one method declaration.
+* msl_reserved.h — comment only.
+
+## 5. Known gaps (documented in code comments too)
+* MS image stores/atomics exist only for the word-addressable formats
+  (r32*/rg32*/rgba32*); every other MS format reports
+  GL_SHADER_IMAGE_STORE/_ATOMIC = NONE and its stores are dropped at the MSL
+  level (the shader still links).  CTS honours the caps, so nothing fails.
+* MS sidecars are capped at 1 GiB per unit (sink buffer past that) — a shader
+  writing an MS image that large loses its writes; the only known customer is
+  the CTS's 10.3 GB texture, which fails on values either way.
+* The flush at the image-atomics barrier is one render pass per dirty MS unit
+  (1 point per texel) — O(texels) GPU work per barrier, no CPU readback.
 
 # geom round 77 — texture_size_promotion (missing-alpha reads), queue item 2 already
 # green, fresh domain sweep
