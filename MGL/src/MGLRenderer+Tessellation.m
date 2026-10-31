@@ -35,6 +35,7 @@
 #import "mgl_ext.h"
 #import "mgl_ext_tess.h"
 #include <mach/mach_time.h>   /* the opt-in CPU phase accounting (below) */
+#include <stdatomic.h>        /* the ring's claim/publish protocol (below) */
 #import "mgl_ext_queries.h"  /* tess-count queries force the exact CPU path */
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);
 #import "mgl_ext_rstate.h"
@@ -130,7 +131,6 @@ static bool tNoFixup(void)
 #define MGL_TESS_RING 24
 static id<MTLBuffer> tRing[MGL_TESS_RING];
 static size_t tRingPos[MGL_TESS_RING];
-static bool tRingBusy[MGL_TESS_RING];
 static int tRingScan = 0;
 static size_t tRingCap[MGL_TESS_RING];
 
@@ -165,7 +165,16 @@ static int tRingTrace(void)
 }
 
 /* acquire a block of `bytes` from the ring; returns the buffer and sets *offset.
- * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched). */
+ * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched).
+ *
+ * Concurrency protocol (r43 hardening): only Metal completion-handler threads
+ * (tessRingRelease) and the GL thread touch the ring.  A slot is CLAIMED by
+ * flipping tRingBusy false->true (an atomic exchange — uncontended in practice,
+ * GL contexts serialize, but exact under C11); the releaser finishes every
+ * mutation (pos reset, big-block recycle) BEFORE the release store, so an
+ * acquire that observes busy==false (acquire order) sees the final
+ * tRing/tRingCap/tRingPos — a claim can never race the recycle's tRing=nil. */
+static atomic_bool tRingBusy[MGL_TESS_RING];
 /* tess draws encoded on the current shared command buffer (AGX keep-alive,
  * see the flush at the end of the hardware path) */
 static unsigned tHwDrawsOnCb = 0;
@@ -179,23 +188,29 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
     for (int i = 0; i < MGL_TESS_RING; i++)
     {
         int idx = (tRingScan + i) % MGL_TESS_RING;
-        if (!tRingBusy[idx] && tRingCap[idx] >= tRingPos[idx] + bytes)
+        if (!atomic_load_explicit(&tRingBusy[idx], memory_order_acquire))
         {
-            *offset = tRingPos[idx];
-            tRingPos[idx] += tessRingAlign(bytes);
-            tRingBusy[idx] = true;
-            *slot = idx;
-            tRingScan = (idx + 1) % MGL_TESS_RING;
-            if (tRingTrace())
-                fprintf(stderr, "MGL ring: acquire slot=%d bytes=%zu cap=%zu (fast)\n",
-                        idx, bytes, tRingCap[idx]);
-            return tRing[idx];
+            size_t cap = tRingCap[idx], pos = tRingPos[idx];   /* stable: free slots
+                are only mutated by the releaser BEFORE its busy store */
+            if (cap >= pos + bytes &&
+                !atomic_exchange_explicit(&tRingBusy[idx], true, memory_order_acq_rel))
+            {
+                *offset = pos;
+                tRingPos[idx] = pos + tessRingAlign(bytes);
+                *slot = idx;
+                tRingScan = (idx + 1) % MGL_TESS_RING;
+                if (tRingTrace())
+                    fprintf(stderr, "MGL ring: acquire slot=%d bytes=%zu cap=%zu (fast)\n",
+                            idx, bytes, tRingCap[idx]);
+                return tRing[idx];
+            }
         }
     }
     /* no free slot with room: find a free one and grow it (or take the largest) */
     int best = -1;
     for (int i = 0; i < MGL_TESS_RING; i++)
-        if (!tRingBusy[i] && (best < 0 || tRingCap[i] > tRingCap[best]))
+        if (!atomic_load_explicit(&tRingBusy[i], memory_order_acquire) &&
+            (best < 0 || tRingCap[i] > tRingCap[best]))
             best = i;
     if (best < 0)
     {
@@ -222,9 +237,9 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                 size_t used = 0;
                 for (int i = 0; i < MGL_TESS_RING; i++)
                 {
-                    bm |= tRingBusy[i] << i;
-                    if (!tRingBusy[i]) nfree++;
-                    else used += tRingPos[i];
+                    bool b = atomic_load_explicit(&tRingBusy[i], memory_order_acquire);
+                    bm |= (unsigned)b << i;
+                    if (!b) nfree++;
                 }
                 fprintf(stderr, "MGL ring: SPIN %d free=%u/%d busy-bm-lo=%x used=%zu"
                         " cb=%d enc=%d\n", spin, nfree, MGL_TESS_RING, bm & 0xff, used,
@@ -234,7 +249,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
             }
 
             for (int i = 0; i < MGL_TESS_RING && !any; i++)
-                any = !tRingBusy[i];
+                any = !atomic_load_explicit(&tRingBusy[i], memory_order_acquire);
             if (any)
             {
                     return tessRingAcquire(device, bytes, offset, slot, self);
@@ -297,19 +312,26 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
         }
         return nil;                    /* genuinely stuck: caller must give up */
     }
+    /* claim first, grow after: the mutations then happen only on a slot this
+     * thread owns (the claim is uncontended in practice — GL contexts serialize
+     * — but exact under C11, and the re-entry covers the impossible loss) */
+    if (atomic_exchange_explicit(&tRingBusy[best], true, memory_order_acq_rel))
+        return tessRingAcquire(device, bytes, offset, slot, self);
     {
         size_t cap = tRingCap[best] + tessRingAlign(bytes) + (1u << 20);
         id<MTLBuffer> nb = [device newBufferWithLength: cap
                               options: MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked];
         if (!nb)
+        {
+            atomic_store_explicit(&tRingBusy[best], false, memory_order_release);
             return nil;
+        }
         tRing[best] = nb;
         tRingCap[best] = cap;
         tRingPos[best] = 0;
     }
     *offset = tRingPos[best];
     tRingPos[best] += tessRingAlign(bytes);
-    tRingBusy[best] = true;
     *slot = best;
     tRingScan = (best + 1) % MGL_TESS_RING;
     if (tRingTrace())
@@ -337,22 +359,26 @@ unsigned mgl_tess_ring_big_slots(void)
 
 static void tessRingRelease(int slot)
 {
-    if (slot >= 0 && slot < MGL_TESS_RING && tRingBusy[slot])
+    if (slot >= 0 && slot < MGL_TESS_RING &&
+        atomic_load_explicit(&tRingBusy[slot], memory_order_acquire))
     {
         if (tRingTrace())
             fprintf(stderr, "MGL ring: release slot=%d\n", slot);
-        tRingBusy[slot] = false;
-        tRingPos[slot] = 0;            /* reuse from the start once retired */
         /* big transient blocks are not worth pinning: keep two warm (a repeating
          * big-draw workload then reallocates nothing) and free the rest, so the
-         * deeper ring cannot multiply a capture draw's tens of MB into gigabytes */
+         * deeper ring cannot multiply a capture draw's tens of MB into gigabytes.
+         * Every mutation below happens BEFORE the busy store — a claimed slot is
+         * untouchable, and an acquire that later observes busy==false must see
+         * the FINAL tRing/tRingCap/tRingPos (the r43 hardening: the recycle used
+         * to publish first, so a claim racing it could take a nil'd buffer). */
         if (tRing[slot] && tRingCap[slot] > TESS_RING_BIG)
         {
             int warm = 0;
             for (int i = 0; i < MGL_TESS_RING; i++)
-                if (!tRingBusy[i] && tRing[i] && tRingCap[i] > TESS_RING_BIG)
+                if (i != slot && !atomic_load_explicit(&tRingBusy[i], memory_order_acquire) &&
+                    tRing[i] && tRingCap[i] > TESS_RING_BIG)
                     warm++;
-            if (warm > 2)
+            if (warm >= 2)
             {
                 size_t freed = tRingCap[slot];
                 tRing[slot] = nil;      /* ARC drops the MTLBuffer */
@@ -360,9 +386,11 @@ static void tessRingRelease(int slot)
                 tRingFreedBig++;
                 if (tRingTrace())
                     fprintf(stderr, "MGL ring: freed big slot=%d (%zu bytes, %d warm)\n",
-                            slot, freed, warm - 1);
+                            slot, freed, warm);
             }
         }
+        tRingPos[slot] = 0;            /* reuse from the start once retired */
+        atomic_store_explicit(&tRingBusy[slot], false, memory_order_release);
     }
 }
 
@@ -3033,7 +3061,8 @@ ph_vs = tessPhaseBegin();
             {
                 unsigned free_slots = 0;
                 for (int i = 0; i < MGL_TESS_RING; i++)
-                    free_slots += !tRingBusy[i];
+                    free_slots += !atomic_load_explicit(&tRingBusy[i],
+                                                        memory_order_relaxed);
                 /* hysteresis (min-of-7 ab: a plain low/high threshold oscillated
                  * around the pressure point and cost ~6 us/draw on the noTCS
                  * shape): cadence 2 is the steady state, 4 only with most of the
