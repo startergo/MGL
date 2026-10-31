@@ -54,6 +54,14 @@ GATES on a99f674: full tests/headless/run.sh = **136 test binaries, 0 FAILED /
 116 Fail + 7 Crash + 1 InternalError) re-run on this tip = **124/124 Pass**
 (texture_swizzle.functional needs >300 s; Pass at 900 s timeout).  stub_scanner
 EMPTY/NOOP/ASSERT clean for the compat files.
+DOMAIN SWEEP on the same tip (compat-owned groups): direct_state_access
+**371/371 Pass**, packed_pixels **250/250 Pass**, texture_gather **75/75 Pass**,
+texture_border_clamp + gpu_shader5 + gl_spirv + shader_group_vote **71/71 Pass**,
+sample_variables + sample_shading + multisample groups **336 Pass + 38
+NotSupported** (exactly the samples_8 cases — Apple M4 Pro max 4 samples,
+correct NotSupported), texture_size_promotion + texture_swizzle + copy_image
+**18/18 Pass**.  Net: the r28 sweep's compat-domain surface is now 100% green
+modulo the two documented hardware caps (samples_8, GL_MAX_IMAGE_SAMPLES=0).
 
 ## session 33 (Oct 30, morning-08:31) — s30 rejection reproduced; s33 READY (545be75)
 (s30 was rejected: ideas -10% / jellyfish -6.4% vs eb9eaeb on the combined tree,
@@ -2846,3 +2854,96 @@ first CALIBRATED with a self-test (identical dylib on both sides):
 abbench_abs.sh vs baseline-f600d55 (supervisor's dylib) agrees (m0 -4.5%,
 m1 +1.5% median) but that comparison carries build-provenance doubt, so the
 self-built base above is the one quoted.
+
+## s35 (Oct 30) - compat-domain KHR-GL46 sweep: 0 Fail package-wide; polygon_offset_clamp fixed
+
+Tip 6c4479e = merge of gl46-port 8c97af2 (s34 squash) + this work; later
+45679e1 = merge of gl46-port e8ff34b (tess r41, post_depth_coverage de-advertised).
+
+### The ten ordered groups (all 100% Pass on the merged tip)
+direct_state_access 371/371, buffer_storage 9/9, copy_image 13/13,
+texture_border_clamp 32/32, blend_equation_advanced 88/88, sample_shading 13/13,
+shader_multisample_interpolation 109/109, texture_buffer 16/16, gl_spirv 9/9,
+packed_pixels 250/250.
+
+### Extension/caps audit: every KHR-GL46 group run (9493 cases, 0 Fail)
+Group->extension mapping from the advertised list (121 strings); every group of
+the package was executed (shaders split uniform_block/loops/preprocessor/indexing/
+arrays/struct/fragdepth/declarations/shader_integer_mix/negative; constant_expressions,
+pixelstoragemodes, gpu_shader_fp64, shaders30/42/44/45, shader_bitfield_operation,
+sample_variables, limits, geometry_shader, SSBO, transform_feedback(+43), viewport_array,
+vertex_attrib_binding/64bit, texture_repeat_mode, texture_gather, image_size, draw_indirect(+43),
+tessellation_shader, internalformat, image_load_store, explicit_uniform_location,
+420pack, program_interface_query, compute_shader, layout_location/binding, border_clamp,
+atomic_counters(+ops), subroutine, cube_map_array, packed_depth_stencil, gpu_shader5(+gl),
+multi_bind, texture_buffer, ext_texture_shadow_lod, CommonBugs, aggressive_optimizations,
+clip/clip_control(+ARB)/cull_distance, copy_image, shaders44/45/42, sepshaderobjs,
+sample_shading, gl_spirv/spirv_extensions, parallel_shader_compile, shader_group_vote/
+ballot/draw_parameters/viewport_layer_array/texture_image_samples, stencil_texturing,
+texture_view/swizzle/barrier(+ARB)/filter_anisotropic/size_promotion, sync, info,
+map_buffer_alignment, get_texture_sub_image, multi_bind, nearest_edge, glsl_noperspective,
+conditional_render_inverted, exposed_extensions, incomplete_texture_access,
+separable_programs_tf, post_depth_coverage (after tess r41), and the NOT-advertised
+ARgroups (transform_feedback_overflow 13/13 Pass, pipeline_statistics 10/10 Pass,
+indirect_parameters 3/3 Pass, texture_filter_minmax/sparse_* all NotSupported=consistent).
+
+Non-Pass inventory - every case accounted for, none left unexplained:
+* sample_variables samples_8 x38 NS - Metal cap (GL_MAX_SAMPLES<8 for those formats).
+* shader_image_size x36 + shader_image_load_store basic-allTargets-load-ms x2 +
+  shader_texture_image_samples image_functional_test x1 NS - GL_MAX_IMAGE_SAMPLES=0
+  (documented Metal cap; test gates on it directly).
+* draw_elements_base_vertex valid_active_tf NS - ES-only by test design.
+* texture_cube_map_array generate_mip_map_non_filterable_{mutable,immutable} x2 NS -
+  ES-only by test design.
+* shaders.shader_integer_mix.prototypes NS - version-gated (<GLSL 450) by design;
+  the shaders45 instance (GLSL 450 core integer mix) PASSES.
+* internalformat.renderbuffer.rgb9_e5 NS - GAP, honest caps: GL 4.6 core wants
+  RGB9_E5 color-renderable, Apple Metal has no RGB9E5 render target. MGL answers
+  COLOR_RENDERABLE=0/FB_RENDERABLE=0 and the FBO is INCOMPLETE_ATTACHMENT, so the
+  caps are self-consistent and the CTS degrades to NotSupported. Emulation would
+  need an RGBA16F-backed renderbuffer with 5-9-9-9 lattice quantisation on every
+  read/copy-out (blending then happens in 16F) - not attempted; reported.
+* post_depth_coverage_tests x2 NS after tess r41 (was 1 Fail). Proven this session
+  with a standalone repro: MGLs stencil test rejects the right samples (verified by
+  colour), yet [[sample_mask, post_depth_coverage]] still reports them covered -
+  Apples post_depth_coverage reflects the depth test only, not stencil. De-advertising
+  was the honest-caps call (gl_VertexID-less extension, PostDepthShader was the only
+  Pass).
+
+### FIX: KHR-GL46.polygon_offset_clamp.PolygonOffsetClampMinMax was Fail -> 3/3 Pass
+Root cause (measured on M4 Pro with /tmp probes):
+* Metal scales setDepthBias bias by a FIXED 2^-24 - even for a Depth16Unorm
+  attachment (there it also uses 2^-16... wait, corrected below) - while GLs r is
+  the attachments resolvable difference 1/(2^n-1). For a DEPTH_COMPONENT16
+  attachment GL needs 1000*1/65535 = 0.0153 of offset; Metal applied 1000*2^-24,
+  256x too small, so the clamp never bound and the CTS strict ordering failed
+  (offsetClampDepth == offsetDepth).
+* Metal clamp semantics measured = GLs one-sided rule exactly (clamp>0: min(o,c);
+  clamp<0: max(o,c); 0: unclamped) - matches llvmpipe/llvmpipe-style ARB rule; no
+  change needed there.
+Fix (MGLRenderer+RenderState.m, rstate-owned shared file - surgical edit):
+bias is pre-scaled by r_gl/r_metal, r_metal taken from the actual
+_renderPassDescriptor depth attachment pixelFormat (2^-16 for native Depth16Unorm -
+true for DEPTH_COMPONENT16 renderbuffers - else 2^-24), r_gl from the GL attachment
+internal format (1/65535 for GL_DEPTH_COMPONENT16 - e.g. D16 textures that MGL
+keeps in Depth32Float - else 2^-24). Slope term and clamp pass through unchanged.
+The scale is part of the encoder-side bias cache so state changes still skip the
+Metal call. New tests/headless/test_compat_polygonoffset.c (33 checks, 0 failures)
+covers d16-texture r, d16-renderbuffer r, one-sided clamp both directions,
+clamp=0 unclamped, d24/d32f/d24s8 unchanged.
+
+### Gates
+* Full tests/headless/run.sh on 45679e1: 140 binaries, 0 FAILED / 0 BUILD-FAIL,
+  10898 checks, rc=0.
+* stub_scanner EMPTY/NOOP|ASSERT on legacy_compat.c / non_core_unimplemented.c: clean.
+* ab_bench vs baseline-e8ff34b (ab/abbench_s35.sh, min-of-7, alternating order,
+  3 runs + a 5x4000-iter pass): machine was under outside load (0.35-0.92);
+  C faster in 4 of 6 measurements, worst single run +3.6% m0. The only hot-path
+  change is guarded by `if (offset)` and mode0 draws with polygon offset off,
+  so the deltas are noise: parity.
+
+### Tools added (untracked-adjacent, committed)
+agents/cts_qpa_summary.py (case-insensitive qpa summary - the shared
+tests/cts_group.sh parser misses this builds lowercase #beginTestCaseResult
+markers and reports 0 cases), agents/cts_audit.sh (batch group runner),
+agents/cts_caselist.sh (package caselist export), ab/abbench_s35.sh.

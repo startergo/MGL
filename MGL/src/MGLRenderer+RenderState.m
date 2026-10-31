@@ -58,7 +58,7 @@ extern char *mgl_tess_late_fragment_variant(GLMContext ctx, struct Program_t *pr
 @property (nonatomic) MTLCullMode lastCull;
 @property (nonatomic) MTLWinding lastWinding;
 @property (nonatomic) MTLTriangleFillMode lastFill;
-@property (nonatomic) float lastBiasUnits, lastBiasFactor, lastBiasClamp;
+@property (nonatomic) float lastBiasUnits, lastBiasFactor, lastBiasClamp, lastBiasScale;
 @property (nonatomic) BOOL lastBiasOn, lastClipClamp, lastBiasValid;
 @property (nonatomic) MTLViewport lastViewport;
 @property (nonatomic) MTLScissorRect lastScissor;
@@ -406,9 +406,14 @@ static bool rs_mode_is_polygon(GLenum m)
         c.lastFill = fill;
     }
 
-    /* polygon offset: only polygons, enable selected by the polygon mode.  Metal's depth bias
-     * uses the same units as GL (units * minimum resolvable depth difference r of the depth
-     * format, factor * max depth slope, clamp 0 = unclamped), so values pass through. */
+    /* polygon offset: only polygons, enable selected by the polygon mode.  Metal's depth
+     * bias has factor * max depth slope (no r on the slope term, like GL) and the
+     * ARB_polygon_offset_clamp one-sided clamp (clamp>0: min(o,c), clamp<0: max(o,c),
+     * 0: unclamped — measured on M4 Pro), so factor and clamp pass through unchanged.
+     * The bias term, however, is always scaled by 2^-24 no matter which depth format is
+     * attached, while GL's r is the attachment's resolvable difference (1/(2^n-1) for an
+     * n-bit fixed-point depth buffer).  Pre-scale the bias by r_gl / 2^-24 (256x for a
+     * 16-bit depth attachment) so the effective offset — and the clamp — bind in GL units. */
     bool offset = false;
     if (rs_mode_is_polygon(s_rs_draw_mode)) {
         switch (rs->polygon_mode) {
@@ -417,19 +422,44 @@ static bool rs_mode_is_polygon(GLenum m)
             default:       offset = ctx->state.caps.polygon_offset_fill; break;
         }
     }
+    float biasScale = 1.0f;
+    if (offset) {
+        /* GL's r: 1/(2^n-1) for an n-bit fixed-point depth attachment, 2^-24 otherwise.
+         * Metal's r: 2^-16 for a native Depth16Unorm attachment, 2^-24 for float storage
+         * (MGL keeps GL_DEPTH_COMPONENT16 textures in Depth32Float, quantized to the
+         * 16-bit lattice; renderbuffers use true Depth16Unorm). */
+        GLenum dfmt = GL_NONE;
+        if (ctx->state.framebuffer) {
+            FBOAttachment *da = &ctx->state.framebuffer->depth;
+            if (da->textarget == GL_RENDERBUFFER) {
+                if (da->buf.rbo) dfmt = ((MGLRenderbufferEx *)da->buf.rbo)->internalformat;
+            } else if (da->buf.tex) {
+                dfmt = da->buf.tex->internalformat;
+            }
+        }
+        float rGl = 1.0f / 16777216.0f;
+        if (dfmt == GL_DEPTH_COMPONENT16)
+            rGl = 1.0f / 65535.0f;
+        id<MTLTexture> dt = _renderPassDescriptor.depthAttachment.texture;
+        float rMtl = (dt && dt.pixelFormat == MTLPixelFormatDepth16Unorm) ?
+                        1.0f / 65536.0f : 1.0f / 16777216.0f;
+        biasScale = rGl / rMtl;
+    }
     bool biasSame = !freshEnc && c.lastBiasValid && c.lastBiasOn == offset &&
         (!offset || (rs->polygon_offset_units == c.lastBiasUnits &&
                      rs->polygon_offset_factor == c.lastBiasFactor &&
-                     rs->polygon_offset_clamp == c.lastBiasClamp));
+                     rs->polygon_offset_clamp == c.lastBiasClamp &&
+                     biasScale == c.lastBiasScale));
     if (!biasSame) {
         if (offset)
-            [enc setDepthBias:rs->polygon_offset_units slopeScale:rs->polygon_offset_factor clamp:rs->polygon_offset_clamp];
+            [enc setDepthBias:rs->polygon_offset_units * biasScale slopeScale:rs->polygon_offset_factor clamp:rs->polygon_offset_clamp];
         else
             [enc setDepthBias:0 slopeScale:0 clamp:0];
         c.lastBiasOn = offset;
         c.lastBiasUnits = rs->polygon_offset_units;
         c.lastBiasFactor = rs->polygon_offset_factor;
         c.lastBiasClamp = rs->polygon_offset_clamp;
+        c.lastBiasScale = biasScale;
         c.lastBiasValid = YES;
     }
 
