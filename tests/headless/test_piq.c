@@ -375,6 +375,272 @@ TEST(aom_vertex_input)
     glDeleteProgram(p);
 }
 
+/* --- 9..15: GL 4.6 §7.3.1 struct members of interface blocks (r85) -----
+ * dEQP-GL45-ES31.program_interface_query program_input/program_output
+ * interface_blocks.*.struct crashed the CTS: struct members were reported as
+ * one resource of GL_TYPE GL_NONE and leaf names ("Block.member.field") were
+ * missing. */
+
+static int piq_dump(GLuint prog, GLenum iface, char names[][64], GLenum *types, GLint *sizes, GLint *locs, int cap)
+{
+    GLint n = 0;
+    glGetProgramInterfaceiv(prog, iface, GL_ACTIVE_RESOURCES, &n);
+    for (int i = 0; i < n && i < cap; i++) {
+        GLsizei len = 0;
+        glGetProgramResourceName(prog, iface, i, 64, &len, names[i]);
+        GLenum props[3] = { GL_TYPE, GL_ARRAY_SIZE, GL_LOCATION };
+        GLint vals[3]; GLsizei pl = 0;
+        glGetProgramResourceiv(prog, iface, i, 3, props, 3, &pl, vals);
+        if (types) types[i] = (GLenum)vals[0];
+        if (sizes) sizes[i] = vals[1];
+        if (locs) locs[i] = vals[2];
+    }
+    return n;
+}
+
+static GLuint piq_link(GLuint prog, const char *label)
+{
+    glLinkProgram(prog);
+    GLint st = 0; glGetProgramiv(prog, GL_LINK_STATUS, &st);
+    if (!st) {
+        GLchar log[4096]; glGetProgramInfoLog(prog, sizeof log, NULL, log);
+        printf("  %s link failed: %s\n", label, log);
+    }
+    return prog;
+}
+
+TEST(struct_members_of_named_blocks)
+{
+    /* FS-only program (like the CTS io-block cases): struct member of a named
+     * input block is enumerated per leaf with the leaf type */
+    const char *fs =
+        "#version 450\n"
+        "struct StructType0 { highp float target; };\n"
+        "in TargetInterface { flat StructType0 target; } targetInstance;\n"
+        "void main() { gl_FragDepth = targetInstance.target.target; }\n";
+    const char *vs =
+        "#version 450\n"
+        "struct StructType0 { highp float target; };\n"
+        "out TargetInterface { flat StructType0 target; } targetInstance;\n"
+        "void main() { targetInstance.target.target = 1.0; gl_Position = vec4(0,0,0,1); }\n";
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER), v = glCreateShader(GL_VERTEX_SHADER);
+    GLuint pf = glCreateProgram(), pv = glCreateProgram();
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f); glAttachShader(pf, f);
+    glShaderSource(v, 1, &vs, NULL); glCompileShader(v); glAttachShader(pv, v);
+    piq_link(pf, "fs"); piq_link(pv, "vs");
+    char names[8][64]; GLenum types[8]; GLint sizes[8], locs[8];
+    int n = piq_dump(pf, GL_PROGRAM_INPUT, names, types, sizes, locs, 8);
+    EXPECT_EQ_INT(n, 1);
+    EXPECT_STREQ(names[0], "TargetInterface.target.target");
+    EXPECT_EQ_INT(types[0], GL_FLOAT);
+    EXPECT_EQ_INT(sizes[0], 1);
+    EXPECT_EQ_INT(locs[0], -1);           /* no layout(location): §11.1.1 */
+    EXPECT_TRUE(glGetProgramResourceIndex(pf, GL_PROGRAM_INPUT, "TargetInterface.target.target") == 0);
+    n = piq_dump(pv, GL_PROGRAM_OUTPUT, names, types, sizes, locs, 8);
+    EXPECT_EQ_INT(n, 2);                  /* block member leaf + gl_Position */
+    EXPECT_STREQ(names[0], "TargetInterface.target.target");
+    EXPECT_EQ_INT(types[0], GL_FLOAT);
+    EXPECT_EQ_INT(locs[0], -1);           /* VS output, not fragment output */
+    glDeleteProgram(pf); glDeleteProgram(pv); glDeleteShader(f); glDeleteShader(v);
+}
+
+TEST(anonymous_block_names)
+{
+    /* a block without an instance name does NOT prefix its members */
+    const char *fs =
+        "#version 450\n"
+        "struct S { vec4 a; float b; };\n"
+        "layout(location = 0) in Blk { S s; vec4 v; };\n"
+        "layout(location = 0) out vec4 c;\n"
+        "void main() { c = s.a + v + vec4(s.b); }\n";
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
+    GLuint pf = glCreateProgram(); glAttachShader(pf, f); piq_link(pf, "fs");
+    char names[8][64]; GLint locs[8];
+    int n = piq_dump(pf, GL_PROGRAM_INPUT, names, NULL, NULL, locs, 8);
+    EXPECT_EQ_INT(n, 3);
+    EXPECT_STREQ(names[0], "s.a");  EXPECT_EQ_INT(locs[0], 0);
+    EXPECT_STREQ(names[1], "s.b");  EXPECT_EQ_INT(locs[1], 1);
+    EXPECT_STREQ(names[2], "v");    EXPECT_EQ_INT(locs[2], 2);
+    glDeleteProgram(pf); glDeleteShader(f);
+}
+
+TEST(nested_structs_and_arrays)
+{
+    /* nested structs: dotted leaves; arrays of basic types: one resource
+     * "m[0]" with ARRAY_SIZE = count; arrays of aggregates: per element */
+    const char *fs =
+        "#version 450\n"
+        "struct Inner { vec4 a; vec2 b; };\n"
+        "struct Outer { Inner i; vec4 arr[2]; };\n"
+        "layout(location = 3) in Blk { Outer o; Inner inst[2]; } blk;\n"
+        "layout(location = 0) out vec4 c;\n"
+        "void main() { c = blk.o.i.a + vec4(blk.o.i.b.x) + blk.o.arr[1] + blk.inst[1].b.xxyy; }\n";
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
+    GLuint pf = glCreateProgram(); glAttachShader(pf, f); piq_link(pf, "fs");
+    char names[12][64]; GLenum types[12]; GLint sizes[12], locs[12];
+    int n = piq_dump(pf, GL_PROGRAM_INPUT, names, types, sizes, locs, 12);
+    EXPECT_EQ_INT(n, 7);
+    EXPECT_STREQ(names[0], "Blk.o.i.a");     EXPECT_EQ_INT(types[0], GL_FLOAT_VEC4); EXPECT_EQ_INT(locs[0], 3);
+    EXPECT_STREQ(names[1], "Blk.o.i.b");     EXPECT_EQ_INT(types[1], GL_FLOAT_VEC2); EXPECT_EQ_INT(locs[1], 4);
+    EXPECT_STREQ(names[2], "Blk.o.arr[0]");  EXPECT_EQ_INT(types[2], GL_FLOAT_VEC4); EXPECT_EQ_INT(sizes[2], 2);
+    EXPECT_EQ_INT(locs[2], 5);
+    EXPECT_STREQ(names[3], "Blk.inst[0].a"); EXPECT_EQ_INT(types[3], GL_FLOAT_VEC4); EXPECT_EQ_INT(locs[3], 7);
+    EXPECT_STREQ(names[4], "Blk.inst[0].b"); EXPECT_EQ_INT(types[4], GL_FLOAT_VEC2); EXPECT_EQ_INT(locs[4], 8);
+    EXPECT_STREQ(names[5], "Blk.inst[1].a"); EXPECT_EQ_INT(types[5], GL_FLOAT_VEC4); EXPECT_EQ_INT(locs[5], 9);
+    EXPECT_STREQ(names[6], "Blk.inst[1].b"); EXPECT_EQ_INT(types[6], GL_FLOAT_VEC2); EXPECT_EQ_INT(locs[6], 10);
+    glDeleteProgram(pf); glDeleteShader(f);
+}
+
+TEST(non_vs_inputs_location_minus_one)
+{
+    /* §11.1.1: inputs of stages other than the VS and outputs of stages other
+     * than the FS report -1 unless declared with layout(location) */
+    const char *fs0 =
+        "#version 450\n"
+        "in TargetInterface { flat highp vec4 target; } targetInstance;\n"
+        "in highp vec4 plain;\n"
+        "void main() { gl_FragDepth = targetInstance.target.x + plain.y; }\n";
+    const char *fs1 =
+        "#version 450\n"
+        "layout(location = 5) in TargetInterface { flat highp vec4 target; } targetInstance;\n"
+        "layout(location = 9) in highp vec4 plain;\n"
+        "void main() { gl_FragDepth = targetInstance.target.x + plain.y; }\n";
+    const char *vs0 =
+        "#version 450\n"
+        "out highp vec4 target;\n"
+        "void main() { target = vec4(1); gl_Position = vec4(0,0,0,1); }\n";
+    const struct { const char *src; int expl; int vs; } cases[] = { { fs0, 0, 0 }, { fs1, 1, 0 }, { vs0, 0, 1 } };
+    for (int k = 0; k < 3; k++) {
+        GLenum st = cases[k].vs ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
+        GLuint s = glCreateShader(st);
+        glShaderSource(s, 1, &cases[k].src, NULL); glCompileShader(s);
+        GLuint p = glCreateProgram(); glAttachShader(p, s); piq_link(p, "sep");
+        char names[8][64]; GLint locs[8];
+        GLenum iface = (st == GL_VERTEX_SHADER) ? GL_PROGRAM_OUTPUT : GL_PROGRAM_INPUT;
+        int n = piq_dump(p, iface, names, NULL, NULL, locs, 8);
+        int want = cases[k].expl;
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(names[i], "gl_FragDepth") || !strcmp(names[i], "gl_Position")) continue;
+            printf("  %s loc=%d (explicit=%d)\n", names[i], locs[i], want);
+            EXPECT_EQ_INT(locs[i] >= 0, want ? 1 : 0);
+            if (want) EXPECT_EQ_INT(locs[i], (i == 0) ? 5 : 9);
+        }
+        glDeleteProgram(p); glDeleteShader(s);
+    }
+}
+
+TEST(patch_block_is_per_patch)
+{
+    /* glslang marks `patch` blocks on their members, not the variable */
+    const char *tes =
+        "#version 450\n"
+        "layout(triangles) in;\n"
+        "patch in TargetInterface { highp vec4 target; } targetInstance;\n"
+        "patch in highp vec4 patchPlain;\n"
+        "void main() { gl_Position = targetInstance.target + patchPlain; }\n";
+    GLuint s = glCreateShader(GL_TESS_EVALUATION_SHADER);
+    glShaderSource(s, 1, &tes, NULL); glCompileShader(s);
+    GLuint p = glCreateShaderProgramv(GL_TESS_EVALUATION_SHADER, 1, &tes);
+    glDeleteShader(s);
+    GLint st = 0; glGetProgramiv(p, GL_LINK_STATUS, &st);
+    EXPECT_EQ_INT(st, GL_TRUE);
+    char names[8][64]; GLint locs[8];
+    int n = piq_dump(p, GL_PROGRAM_INPUT, names, NULL, NULL, locs, 8);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(names[i], "TargetInterface.target") && strcmp(names[i], "patchPlain")) continue;
+        GLenum pp = GL_IS_PER_PATCH; GLint v = 0; GLsizei l = 0;
+        glGetProgramResourceiv(p, GL_PROGRAM_INPUT, i, 1, &pp, 1, &l, &v);
+        printf("  %s per_patch=%d loc=%d\n", names[i], v, locs[i]);
+        EXPECT_EQ_INT(v, 1);
+        EXPECT_EQ_INT(locs[i], -1);
+        found++;
+    }
+    EXPECT_EQ_INT(found, 2);
+    glDeleteProgram(p);
+}
+
+TEST(arrayed_tcs_io_name_and_size)
+{
+    /* TCS arrayed io stays "name[0]" with ARRAY_SIZE = max patch vertices */
+    const char *tcs =
+        "#version 450\n"
+        "layout(vertices = 1) out;\n"
+        "in gl_PerVertex { vec4 gl_Position; } gl_in[];\n"
+        "in highp vec4 target[];\n"
+        "void main() {\n"
+        "    gl_out[gl_InvocationID].gl_Position = gl_in[0].gl_Position + target[0];\n"
+        "    gl_TessLevelOuter[0] = 1.0;\n"
+        "}\n";
+    GLuint p = glCreateShaderProgramv(GL_TESS_CONTROL_SHADER, 1, &tcs);
+    GLint st = 0; glGetProgramiv(p, GL_LINK_STATUS, &st);
+    EXPECT_EQ_INT(st, GL_TRUE);
+    GLint mpv = 0; glGetIntegerv(GL_MAX_PATCH_VERTICES, &mpv);
+    char names[8][64]; GLint sizes[8], locs[8];
+    int n = piq_dump(p, GL_PROGRAM_INPUT, names, NULL, sizes, locs, 8);
+    int hit = 0;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(names[i], "target[0]")) {
+            printf("  %s size=%d loc=%d (max patch = %d)\n", names[i], sizes[i], locs[i], mpv);
+            EXPECT_EQ_INT(sizes[i], mpv);
+            EXPECT_EQ_INT(locs[i], -1);
+            hit++;
+        }
+    EXPECT_EQ_INT(hit, 1);
+    EXPECT_TRUE(glGetProgramResourceIndex(p, GL_PROGRAM_INPUT, "target[0]") != GL_INVALID_INDEX);
+    glDeleteProgram(p);
+}
+
+TEST(struct_block_varying_pipeline)
+{
+    /* a struct-typed io block varying links and rasterizes through the pipe */
+    const char *vs =
+        "#version 450\n"
+        "struct S { vec4 a; float b; };\n"
+        "out Blk { S s; vec4 v; } o;\n"
+        "void main() { o.s.a = vec4(float(gl_VertexID)); o.s.b = 1.0; o.v = vec4(1); gl_Position = vec4(0,0,0,1); }\n";
+    const char *fs =
+        "#version 450\n"
+        "struct S { vec4 a; float b; };\n"
+        "in Blk { S s; vec4 v; } i;\n"
+        "layout(location = 0) out vec4 c;\n"
+        "void main() { c = i.s.a + i.v + vec4(i.s.b); }\n";
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(v, 1, &vs, NULL); glCompileShader(v);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
+    GLuint p = glCreateProgram(); glAttachShader(p, v); glAttachShader(p, f); piq_link(p, "pipe");
+    GLint st = 0; glGetProgramiv(p, GL_LINK_STATUS, &st);
+    EXPECT_EQ_INT(st, GL_TRUE);
+    GLuint vao = 0; glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glUseProgram(p);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    glBindVertexArray(0); glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p); glDeleteShader(v); glDeleteShader(f);
+}
+
+TEST(block_member_explicit_location)
+{
+    /* with per-member layout(location) qualifiers (all members must carry one,
+     * ARB_enhanced_layouts) every member reports its explicit location */
+    const char *fs =
+        "#version 450\n"
+        "in Blk { layout(location = 6) highp vec4 a; layout(location = 7) highp vec4 b; } inst;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() { o = inst.a + inst.b; }\n";
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, NULL); glCompileShader(f);
+    GLuint pf = glCreateProgram(); glAttachShader(pf, f); piq_link(pf, "fs");
+    char names[8][64]; GLint locs[8];
+    int n = piq_dump(pf, GL_PROGRAM_INPUT, names, NULL, NULL, locs, 8);
+    EXPECT_EQ_INT(n, 2);
+    EXPECT_STREQ(names[0], "Blk.a"); EXPECT_EQ_INT(locs[0], 6);
+    EXPECT_STREQ(names[1], "Blk.b"); EXPECT_EQ_INT(locs[1], 7);
+    glDeleteProgram(pf); glDeleteShader(f);
+}
+
 int main(void)
 {
     RUN(pervertex_blocks);
@@ -385,5 +651,13 @@ int main(void)
     RUN(ubo_array_element_usage);
     RUN(subroutine_uniform_array);
     RUN(aom_vertex_input);
+    RUN(struct_members_of_named_blocks);
+    RUN(anonymous_block_names);
+    RUN(nested_structs_and_arrays);
+    RUN(non_vs_inputs_location_minus_one);
+    RUN(patch_block_is_per_patch);
+    RUN(arrayed_tcs_io_name_and_size);
+    RUN(struct_block_varying_pipeline);
+    RUN(block_member_explicit_location);
     return mgl_test_summary();
 }

@@ -1681,10 +1681,69 @@ static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *
     v->name = xstrdup(name);
     v->type = gl_type_of(m, t);
     v->size = (m->t[t].kind == T_ARRAY) ? (GLint)m->t[t].count : 1;
+    if (m->t[t].kind == T_RARRAY || (m->t[t].kind == T_ARRAY && m->t[t].count == 0)) {
+        /* unsized arrayed io (tess/geometry per-vertex interfaces): the reported
+         * GL_ARRAY_SIZE is the interface's vertex count (GL_MAX_PATCH_VERTICES
+         * for tessellation; a geometry input primitive is queried per-vertex and
+         * reported as a single element, as the CTS reference does for points) */
+        v->size = (stage == _GEOMETRY_SHADER) ? 1 : MGL_TESS_MAX_PATCH_VERTICES;
+    }
     v->location = loc; v->index = index; v->component = comp; v->is_per_patch = patch;
     v->slot = slot;
     v->stages = 1u << stage;
     (*n)++;
+}
+
+/* GL 4.6 §7.3.1 enumeration of a program input/output (a user interface-block
+ * member or a plain varying) whose type may be nested structs / arrays:
+ *   - every leaf field is its own resource, named by the dotted path from the
+ *     variable down to the field ("Block.member.field");
+ *   - a bottom-level array of basic types contributes ONE resource
+ *     "name[0]" with the leaf type and GL_ARRAY_SIZE = element count;
+ *   - arrays of aggregates (structs / arrays) enumerate EVERY element
+ *     ("name[0].field", "name[1].field", ...), each of size 1.
+ * This mirrors the Khronos CTS reference algorithm
+ * (es31fProgramInterfaceDefinitionUtil.cpp generateVariableTypeResourceNames),
+ * which follows the spec wording; without it a struct member was reported as
+ * one resource of type GL_NONE (unknown to clients -> dEQP crashes).
+ * `expl` tracks whether the location chain is explicit (a layout(location=N)
+ * qualifier); with `need_expl` (inputs of stages other than the vertex shader,
+ * outputs of stages other than the fragment shader, §11.1.1) a non-explicit
+ * leaf reports GL_LOCATION -1 (ARB_enhanced_layouts / CTS LocationValidator).
+ * Returns the location following the walked member. */
+static GLint io_leaf_walk(MGLIVar **arr, int *narr, const SMod *m, int stage,
+                          const char *name, uint32_t t, GLint loc, GLint comp, GLint patch, GLint slot,
+                          bool expl, bool need_expl)
+{
+    const SType *ty = &m->t[t];
+    GLint rep = (need_expl && !expl) ? -1 : loc;
+    if (ty->kind == T_STRUCT) {
+        for (uint32_t i = 0; i < ty->nmem; i++) {
+            char nm[512]; snprintf(nm, sizeof nm, "%s.%s", name, member_name(m, t, i));
+            uint32_t ml;
+            bool mexpl = get_dec(m, t, (int32_t)i, SpvDecorationLocation, &ml) != 0;
+            if (mexpl) { loc = (GLint)ml; expl = true; }
+            loc = io_leaf_walk(arr, narr, m, stage, nm, ty->mem[i], loc, comp, patch, slot, expl, need_expl);
+        }
+        return loc;
+    }
+    if (ty->kind == T_ARRAY) {
+        uint32_t et = ty->elem;
+        bool basic = m->t[et].kind != T_STRUCT && m->t[et].kind != T_ARRAY && m->t[et].kind != T_RARRAY;
+        if (basic) {
+            char nm[512]; snprintf(nm, sizeof nm, "%s[0]", name);
+            add_io(arr, narr, m, stage, nm, t, rep, 0, comp, patch, slot);
+            return loc + (GLint)loc_count(m, t);
+        }
+        uint32_t n = ty->count ? ty->count : 1;
+        for (uint32_t i = 0; i < n; i++) {
+            char nm[512]; snprintf(nm, sizeof nm, "%s[%u]", name, i);
+            loc = io_leaf_walk(arr, narr, m, stage, nm, et, loc, comp, patch, slot, expl, need_expl);
+        }
+        return loc;
+    }
+    add_io(arr, narr, m, stage, name, t, rep, 0, comp, patch, slot);
+    return loc + (GLint)loc_count(m, t);
 }
 
 /* GL-visible name of a SPIR-V BuiltIn id (gl_PerVertex / tess / fragment members) */
@@ -1766,9 +1825,15 @@ static uint32_t builtin_array_active_len(const SMod *m, uint32_t v, uint32_t cou
     return hi + 1;
 }
 
-static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t *active, bool input, MGLIVar **arr, int *narr)
+static bool src_explicit_qual(const char *src, const char *name, const char *dir, const char *qual);
+
+static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t *active, bool input, MGLIVar **arr, int *narr, const char *src)
 {
     uint32_t sc_want = input ? SpvStorageClassInput : SpvStorageClassOutput;
+    /* GL 4.6 §11.1.1 / ARB_enhanced_layouts: only vertex-shader inputs and
+     * fragment-shader outputs report link-assigned locations; every other
+     * interface reports -1 unless declared with layout(location=N). */
+    const bool need_expl = (input && stage != _VERTEX_SHADER) || (!input && stage != _FRAGMENT_SHADER);
     for (uint32_t v = 1; v <= m->bound; v++) {
         if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != sc_want) continue;
         uint32_t bt_probe = 0;
@@ -1776,7 +1841,9 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
         if (!active[v] && !bblock) continue;   /* built-in blocks gate per member below */
         uint32_t t = pointee(m, m->vtype[v]);
         bool patch = get_dec(m, v, -1, SpvDecorationPatch, NULL);
-        if (stage_is_arrayed_io(stage, input) && !patch && (m->t[t].kind == T_ARRAY || m->t[t].kind == T_RARRAY)) t = m->t[t].elem;
+        /* Arrayed interfaces (TCS/TE/GS per-vertex in/out) stay arrays here: the
+         * resource is "<name>[0]" with GL_ARRAY_SIZE = the declared length
+         * (§7.3.1); the link-side slot math uses the same base location. */
         uint32_t st = strip_arrays(m, t);
         bool is_block = m->t[st].kind == T_STRUCT && get_dec(m, st, -1, SpvDecorationBlock, NULL);
         uint32_t bi;
@@ -1835,15 +1902,40 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
                 }
                 continue;
             }
-            /* user blocks list "Block.member" */
+            /* user blocks list "Block.member" and, for struct members, every
+             * leaf field "Block.member.field" (io_leaf_walk, §7.3.1) */
             uint32_t loc = 0; get_dec(m, v, -1, SpvDecorationLocation, &loc);
+            /* the "<interface name>." prefix is used only when the block has an
+             * instance name; an anonymous block's members keep their plain names
+             * (glslang names the variable after the instance name, or after the
+             * block type when there is no instance name) */
+            const char *iname = id_name(m, v);
+            char prefix[512];
+            if (iname[0] && strcmp(iname, id_name(m, st))) snprintf(prefix, sizeof prefix, "%s", id_name(m, st));
+            else prefix[0] = 0;
+            /* a `patch in/out` block carries the Patch decoration on its MEMBERS
+             * (glslang), not on the block variable */
+            bool block_patch = patch;
+            bool expl = false;
             for (uint32_t i = 0; i < m->t[st].nmem; i++) {
-                char nm[512]; snprintf(nm, sizeof nm, "%s.%s", id_name(m, st), member_name(m, st, i));
-                uint32_t ml; if (get_dec(m, st, (int32_t)i, SpvDecorationLocation, &ml)) loc = ml;
-                uint32_t mt = m->t[st].mem[i];
-                if (m->t[mt].kind == T_ARRAY) { char n2[520]; snprintf(n2, sizeof n2, "%s[0]", nm); add_io(arr, narr, m, stage, n2, mt, (GLint)loc, 0, 0, patch, -1); }
-                else add_io(arr, narr, m, stage, nm, mt, (GLint)loc, 0, 0, patch, -1);
-                loc += loc_count(m, mt);
+                if (get_dec(m, st, (int32_t)i, SpvDecorationPatch, NULL)) block_patch = true;
+                if (get_dec(m, st, (int32_t)i, SpvDecorationLocation, NULL)) expl = true;
+            }
+            /* the block-level Location decoration glslang invents is only
+             * meaningful (explicit) when the source has layout(location) */
+            if (get_dec(m, v, -1, SpvDecorationLocation, NULL) &&
+                src_explicit_qual(src, id_name(m, st), input ? "in" : "out", "location")) expl = true;
+            if (getenv("MGL_IO_DEBUG"))
+                fprintf(stderr, "IODBG st%d %s ublock var %u type %u '%s' iname='%s' loc=%u prefix='%s' patch=%d expl=%d\n",
+                        stage, input ? "in" : "out", v, st, id_name(m, st), iname, loc, prefix, block_patch, expl);
+            for (uint32_t i = 0; i < m->t[st].nmem; i++) {
+                char nm[512];
+                uint32_t ml; bool mexpl = get_dec(m, st, (int32_t)i, SpvDecorationLocation, &ml) != 0;
+                if (mexpl) loc = (GLint)ml;
+                if (prefix[0]) snprintf(nm, sizeof nm, "%s.%s", prefix, member_name(m, st, i));
+                else snprintf(nm, sizeof nm, "%s", member_name(m, st, i));
+                loc = io_leaf_walk(arr, narr, m, stage, nm, m->t[st].mem[i], (GLint)loc, 0, block_patch, -1,
+                                   expl || mexpl, need_expl);
             }
             continue;
         }
@@ -1851,13 +1943,20 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
         get_dec(m, v, -1, SpvDecorationLocation, &loc);
         get_dec(m, v, -1, SpvDecorationIndex, &idx);
         get_dec(m, v, -1, SpvDecorationComponent, &comp);
-        if (m->t[t].kind == T_STRUCT) {
-            uint32_t l = loc;
-            for (uint32_t i = 0; i < m->t[t].nmem; i++) {
-                char nm[512]; snprintf(nm, sizeof nm, "%s.%s", id_name(m, v), member_name(m, t, i));
-                add_io(arr, narr, m, stage, nm, m->t[t].mem[i], (GLint)l, 0, 0, patch, -1);
-                l += loc_count(m, m->t[t].mem[i]);
-            }
+        if (m->t[t].kind == T_STRUCT ||
+            (m->t[t].kind == T_ARRAY &&
+             (m->t[m->t[t].elem].kind == T_STRUCT || m->t[m->t[t].elem].kind == T_ARRAY ||
+              m->t[m->t[t].elem].kind == T_RARRAY))) {
+            /* struct / array-of-aggregate varying: enumerate the leaves
+             * ("name.field", "name[0].field", §7.3.1).  Vertex inputs keep their
+             * assigned GL location base (attrib_gl) like the basic-type path. */
+            GLint gl = (GLint)loc;
+            if (stage == _VERTEX_SHADER && input)
+                for (int k = 0; k < ip->nattrib_gl; k++)
+                    if (ip->attrib_gl[k].var == v) { gl = ip->attrib_gl[k].gl; break; }
+            bool expl = get_dec(m, v, -1, SpvDecorationLocation, NULL) &&
+                        src_explicit_qual(src, id_name(m, v), input ? "in" : "out", "location");
+            io_leaf_walk(arr, narr, m, stage, id_name(m, v), t, gl, (GLint)comp, patch, -1, expl, need_expl);
             continue;
         }
         char nm[512];
@@ -1870,6 +1969,8 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
             slot = (GLint)loc;
             for (int k = 0; k < ip->nattrib_gl; k++)
                 if (ip->attrib_gl[k].var == v) { gl = ip->attrib_gl[k].gl; break; }
+        } else if (need_expl && !src_explicit_qual(src, id_name(m, v), input ? "in" : "out", "location")) {
+            gl = -1;   /* §11.1.1: no effective location without layout(location) */
         }
         add_io(arr, narr, m, stage, nm, t,
                gl, (stage == _FRAGMENT_SHADER && !input) ? (GLint)idx : 0, (GLint)comp, patch, slot);
@@ -2499,11 +2600,13 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
     for (int s = 0; s < MGLI_STAGES; s++) if (sc[s].present && sc[s].r) reflect_stage(ip, &sc[s], s, stage_source(ctx, ptr, s));
     if (getenv("MGL_FP64_DUMP")) { for (int s2 = 0; s2 < MGLI_STAGES; s2++) { if (!sc[s2].dub_var || !ptr->spirv[s2].ir) continue; char path[256]; snprintf(path, sizeof path, "/tmp/fp64glview%d.spv", s2); FILE *f_ = fopen(path, "wb"); if (f_) { fwrite(ptr->spirv[s2].ir, 4, ptr->spirv[s2].size, f_); fclose(f_); } } }
     if (ip->first_stage >= 0 && sc[ip->first_stage].r)
-        reflect_io(ip, sc[ip->first_stage].r, ip->first_stage, sc[ip->first_stage].active, true, &ip->inputs, &ip->ninputs);
+        reflect_io(ip, sc[ip->first_stage].r, ip->first_stage, sc[ip->first_stage].active, true, &ip->inputs, &ip->ninputs,
+                   stage_source(ctx, ptr, ip->first_stage));
     if (ip->last_stage >= 0 && ip->last_stage != _COMPUTE_SHADER && sc[ip->last_stage].r)
-        reflect_io(ip, sc[ip->last_stage].r, ip->last_stage, sc[ip->last_stage].active, false, &ip->outputs, &ip->noutputs);
+        reflect_io(ip, sc[ip->last_stage].r, ip->last_stage, sc[ip->last_stage].active, false, &ip->outputs, &ip->noutputs,
+                   stage_source(ctx, ptr, ip->last_stage));
     for (int s = _GEOMETRY_SHADER; s >= _VERTEX_SHADER; s--)
-        if (sc[s].present && sc[s].r) { reflect_io(ip, sc[s].r, s, sc[s].active, false, &ip->vtx_outputs, &ip->nvtx_outputs); break; }
+        if (sc[s].present && sc[s].r) { reflect_io(ip, sc[s].r, s, sc[s].active, false, &ip->vtx_outputs, &ip->nvtx_outputs, stage_source(ctx, ptr, s)); break; }
     if (!assign_uniform_locations(ip)) {
         fprintf(stderr, "MGL introspect: program %u: colliding explicit uniform locations\n", ip->prog ? ip->prog->name : 0);
         return false;
