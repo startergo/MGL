@@ -207,6 +207,10 @@ void mgl_compat_raster_pos(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfl
 
     s->raster_window[0] = (GLint)floor(vp[0] + vp[2] * (clip[0] / clip[3] * 0.5 + 0.5));
     s->raster_window[1] = (GLint)floor(vp[1] + vp[3] * (clip[1] / clip[3] * 0.5 + 0.5));
+    s->raster_window_f[0] = (GLfloat)(vp[0] + vp[2] * (clip[0] / clip[3] * 0.5 + 0.5));
+    s->raster_window_f[1] = (GLfloat)(vp[1] + vp[3] * (clip[1] / clip[3] * 0.5 + 0.5));
+    s->raster_window_f[2] = (GLfloat)((clip[2] / clip[3]) * 0.5 + 0.5);
+    s->raster_window_f[3] = 1.0f;
     s->raster_valid = GL_TRUE;
 }
 
@@ -820,6 +824,14 @@ void mglDrawPixels(GLMContext ctx, GLsizei width, GLsizei height, GLenum format,
     if (!s->raster_valid || !pixels)
         return;
 
+    /* outside GL_RENDER nothing is rasterized: feedback emits one token plus
+     * the raster-position vertex, selection does nothing (spec 5.4) */
+    if (s->rmode.mode != GL_RENDER)
+    {
+        mgl_compat_feedback_pixel(ctx, GL_DRAW_PIXEL_TOKEN);
+        return;
+    }
+
     if (!blit_upload_pixels(ctx, width, height, format, type, pixels))
         return;
 
@@ -858,6 +870,18 @@ void mglBitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLf
             if (o->blob)
                 bitmap = (const GLubyte *)o->blob;
         }
+    }
+
+    /* outside GL_RENDER: feedback token (when the raster position is valid),
+     * selection nothing — the raster position still advances either way */
+    if (s->rmode.mode != GL_RENDER)
+    {
+        mgl_compat_feedback_pixel(ctx, GL_BITMAP_TOKEN);
+        s->raster_window[0] += (GLint)xmove;
+        s->raster_window[1] += (GLint)ymove;
+        s->raster_window_f[0] += xmove;
+        s->raster_window_f[1] += ymove;
+        return;
     }
 
     if (bitmap && s->raster_valid && width > 0 && height > 0)
@@ -927,6 +951,12 @@ void mglCopyPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei heig
 
     if (!s->raster_valid)
         return;
+
+    if (s->rmode.mode != GL_RENDER)
+    {
+        mgl_compat_feedback_pixel(ctx, GL_COPY_PIXEL_TOKEN);
+        return;
+    }
 
     /* read the source rectangle and push it through the drawpixels path */
     GLsizei rw = STATE(viewport)[2], rh = STATE(viewport)[3];

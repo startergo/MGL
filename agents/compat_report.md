@@ -1,5 +1,74 @@
 # compat domain — progress log
 
+READY e4cb8df (branch gl46/compat tip = merge gl46-port **f8be669** (geom r82+r83
+7afedb8, tess r43b f492c47, compat s38 f8be669) + s39 commits c1d1438/5c1b7b5/2417ce1/
+a108342/e4cb8df; full gates below).
+
+## session 39 (Oct 31, supervisor 09:46) — evaluator + select/feedback + attrib-stack + display-list conformance
+
+All Mesa-referenced (MIT, cited per commit). New test files: test_compat_eval.c
+(17 tests / 141 checks), test_compat_select.c (11 tests / 87 checks); test_compat_render2.c
+evaluator calls moved from stride 0 (now a spec error) to tight element strides.
+
+1. **Evaluators** (compat_misc.c, compat.c init):
+   * glMap1/glMap2 stride/ustride/vstride counted in ELEMENTS per spec (was
+     dividing by sizeof — every non-tight stride read garbage control points);
+   * full Mesa error surface (u1==u2/v1==v2, order, points, target, stride<k,
+     and INVALID_OPERATION for Map1/2 on an active texture unit != 0, GL 1.2.1
+     F.2.13);
+   * glMap1/2 no longer sets 'enabled' (glEnable(GL_MAPx_*) is the enable);
+     maps start DEFINED with order 1 + the Mesa default control point, so
+     enabled-but-never-set maps evaluate to the default and glGetMap reports
+     order 1 / domain [0,1];
+   * glEvalCoord1/2 extrapolate outside [u1,u2] (no clamping, Mesa horner);
+   * GL_AUTO_NORMAL implemented (de Casteljau partial derivatives, cross/normalise,
+     homogeneous correction for MAP2_VERTEX_4, overrides the normal map, no
+     effect on glEvalCoord1) — the NURBS/teapot lighting path;
+   * GL_MAP1/2_INDEX evaluation updates GL_CURRENT_INDEX;
+   * glEvalMesh1/2 with no vertex map enabled are complete no-ops (no colour-map
+     evaluation either).
+2. **GL_SELECT/GL_FEEDBACK** (compat_misc.c, compat_pixel.c):
+   * hit records deferred like Mesa HitFlag: primitives with unchanged names
+     merge into ONE record whose zmin/zmax span all of them (was one record per
+     glBegin/End with per-primitive zmins only); z scale fixed to 2^32-1;
+   * records/tokens are written until the buffer is full then counted past the
+     end, so glRenderMode returns -1 on overflow; entering SELECT/FEEDBACK with
+     no buffer reports INVALID_OPERATION while still switching (Mesa exact);
+   * glPushName/glPopName/glLoadName/glInitNames/glPassThrough silent no-ops
+     outside their mode (were INVALID_OPERATION); Pop/Load now compiled into
+     display lists; GL_MAX_NAME_STACK_DEPTH = 64 per spec;
+   * glBitmap/glDrawPixels/glCopyPixels no longer rasterize outside GL_RENDER
+     (they used to paint while selecting!); in feedback they emit
+     BITMAP/DRAW_PIXEL/COPY_PIXEL_TOKEN + the raster-position vertex (float
+     window coords tracked in raster_window_f) when the raster position is
+     valid; glBitmap still advances the raster position.
+3. **glPushAttrib/glPopAttrib** deep-copies evaluator control points: a struct
+   restore used to resurrect freed fpoints (use-after-free on eval, double-free
+   on the next glMap1). Snapshot now carries an eval_map_copy blob; pop frees
+   the live arrays and installs fresh copies.
+4. **Display lists compile evaluator commands**: MGLC_OP_MAP1/MAP2 (control
+   points as tight float blobs), MAPGRID1/2, EVALMESH, EVALPOINT1/2 recorded and
+   replayed; EVALCOORD1F/2F (dead enum values) now record/replay so glCallList
+   re-evaluates with the maps current at call time instead of playing back
+   baked vertices. Map/Grid are state ops (record + execute in
+   COMPILE_AND_EXECUTE); EvalCoord/Mesh/Point are draw ops (record-only, like
+   glRect here).
+
+Gates (branch tip e4cb8df): full tests/headless/run.sh == **11464 checks, 0
+failures**; `make lib` clean (only the pre-existing MSL-cache clang note);
+stub_scanner EMPTY/NOOP/ASSERT clean for compat_misc.c/compat.c; A/B vs
+baseline-f8be669 on ab/abbench_compat.sh (imm quads +0.9%, attrib-lit +1.3%,
+legacy get 0.026us) — within run-to-run noise. CTS: this glcts build has only
+KHR-GL40..46 (core) groups, no compat-profile groups; per-group runs deferred
+to the supervisor's whole-package sweep.
+
+Remaining known gaps: glIndex* still state+query only in RGBA mode (no colour-
+index framebuffer); GL_CLAMP border emulation is opt-in and partial (documented
+in session 33); EvalCoord inside a list evaluates at CALL time (Mesa-like) but
+COMPILE_AND_EXECUTE lists skip the immediate execution of EvalCoord/Mesh/Point
+draw ops (same convention as glRect in this tree); feedback/select are CPU
+paths by design.
+
 READY s38 a7affaf (branch gl46/compat tip = merge gl46-port **d11d184** (tess r43) +
 s38 commits 1fca85d/bfbb061/eb5e59d/a7affaf + merges 5e90d1c/ea54960 + bench 966fb92
 (+ report commit on top); buildable, full gates below).

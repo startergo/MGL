@@ -34,7 +34,7 @@
 #define MGLC_LIST_NESTING      64
 #define MGLC_LIST_OPS          96
 #define MGLC_MAX_EVAL_ORDER    30
-#define MGLC_NAME_STACK_DEPTH  128
+#define MGLC_NAME_STACK_DEPTH  64            /* spec GL_MAX_NAME_STACK_DEPTH */
 #define MGLC_SELECT_HITS       4096
 #define MGLC_FEEDBACK_FLOATS   (256 * 1024)
 
@@ -199,6 +199,8 @@ typedef enum {
     MGLC_OP_TEXCOORD4F, MGLC_OP_MULTITEXCOORD4F, MGLC_OP_FOGCOORDF, MGLC_OP_EDGEFLAG,
     MGLC_OP_INDEXF, MGLC_OP_ARRAY_ELEMENT,
     MGLC_OP_RECTF, MGLC_OP_EVALCOORD2F, MGLC_OP_EVALCOORD1F, MGLC_OP_EVALMESH,
+    MGLC_OP_MAP1, MGLC_OP_MAP2, MGLC_OP_MAPGRID1, MGLC_OP_MAPGRID2,
+    MGLC_OP_EVALPOINT1, MGLC_OP_EVALPOINT2,
     MGLC_OP_RASTERPOS4F, MGLC_OP_WINDOWPOS3F,
     MGLC_OP_LIGHTFV, MGLC_OP_LIGHTMODELFV, MGLC_OP_MATERIALFV, MGLC_OP_COLORMATERIAL,
     MGLC_OP_TEXENVFV, MGLC_OP_TEXGENFV, MGLC_OP_FOGFV,
@@ -371,6 +373,7 @@ struct MGLExtState_compat {
     GLfloat   raster_texcoord[MGLC_MAX_COORDS][4];
     GLfloat   raster_index, raster_distance;
     GLboolean raster_valid;
+    GLfloat   raster_window_f[4];   /* float window x,y,z (+w=1) for feedback */
     GLint     raster_window[2];   /* window space raster position */
     GLfloat   zoom_x, zoom_y;
 
@@ -647,6 +650,8 @@ void mgl_compat_read_feedback_attribs(GLMContext ctx, GLuint first, GLuint count
 
 /* compat_pixel.c */
 void mgl_compat_raster_pos(GLMContext ctx, GLfloat x, GLfloat y, GLfloat z, GLfloat w);
+void mgl_compat_feedback_pixel(GLMContext ctx, GLenum token);   /* bitmap/drawpixels/copypixels token + raster vertex */
+int  mgl_compat_eval_comps(GLenum target);                      /* evaluator component count */
 void mgl_compat_draw_pixels(GLMContext ctx, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels);
 void mgl_compat_bitmap(GLMContext ctx, GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove, GLfloat ymove, const GLubyte *bitmap);
 void mgl_compat_copy_pixels(GLMContext ctx, GLint x, GLint y, GLsizei w, GLsizei h, GLenum type);

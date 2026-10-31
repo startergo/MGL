@@ -365,7 +365,7 @@ TEST(evaluators)
     /* a 1D map: straight line along y at x=16 */
     GLfloat pts[2 * 3] = { 16, 4, 0,  16, 60, 0 };
     glColor4f(0, 1, 0, 1);
-    glMap1f(GL_MAP1_VERTEX_3, 0.0f, 1.0f, 0, 2, pts);   /* stride 0 = tight (bytes) */
+    glMap1f(GL_MAP1_VERTEX_3, 0.0f, 1.0f, 3, 2, pts);     /* tight: 3 floats/point */
     glEnable(GL_MAP1_VERTEX_3);
     glMapGrid1f(16, 0.0f, 1.0f);
     glEvalMesh1(GL_LINE, 0, 16);
@@ -393,7 +393,7 @@ TEST(evaluators)
         4, 60, 0,  60, 60, 0,
     };
     glColor4f(1, 0, 1, 1);
-    glMap2f(GL_MAP2_VERTEX_3, 0, 1, 0, 2, 0, 1, 0, 2, q); /* strides 0 = tight (bytes) */
+    glMap2f(GL_MAP2_VERTEX_3, 0, 1, 6, 2, 0, 1, 3, 2, q); /* tight: vstride 3, ustride 6 floats */
     glEnable(GL_MAP2_VERTEX_3);
     glMapGrid2f(4, 0, 1, 4, 0, 1);
     glEvalMesh2(GL_FILL, 0, 4, 0, 4);

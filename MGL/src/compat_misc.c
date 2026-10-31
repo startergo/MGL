@@ -39,41 +39,46 @@ GLenum mgl_compat_target_index(GLenum target)
 
 #pragma mark selection / feedback
 
-static GLint select_write(GLMContext ctx, GLuint v)
+#pragma mark selection / feedback
+
+static void fb_put(GLMContext ctx, GLfloat v);
+
+/* Mesa-style record write (main/feedback.c write_record): values beyond the
+ * end of the buffer are COUNTED but not stored, so glRenderMode can report
+ * the overflow as -1. */
+static void select_write(GLMContext ctx, GLuint v)
 {
     struct MGLExtState_compat *s = CS();
 
-    if (s->rmode.select_ptr - s->rmode.select_buf >= (GLint)s->rmode.select_size)
-        return 0;
-
-    *s->rmode.select_ptr++ = v;
-    return 1;
+    if (s->rmode.select_count < s->rmode.select_size)
+        s->rmode.select_buf[s->rmode.select_count] = v;
+    s->rmode.select_count++;
 }
 
-static void select_start_hit(GLMContext ctx, float z)
+/* a primitive touched the pick volume: mark the pending hit and widen its
+ * depth range.  The record itself is deferred (Mesa HitFlag): it is written
+ * when the name stack next changes or the render mode is left, so every
+ * primitive drawn with the same names merges into ONE hit record whose
+ * zmin/zmax span all of them. */
+static void select_start_hit(GLMContext ctx, float zmin, float zmax)
 {
     struct MGLExtState_compat *s = CS();
 
     if (!s->rmode.hit_open)
     {
         s->rmode.hit_open = GL_TRUE;
-        s->rmode.hit_zmin_slot = 1;
-        s->rmode.hit_zmax_slot = 2;
-        select_write(ctx, 0);                       /* name count, patched on close */
-        s->rmode.hit_zmin_slot = (GLuint)(s->rmode.select_ptr - s->rmode.select_buf);
-        select_write(ctx, (GLuint)z);               /* zmin placeholder */
-        s->rmode.hit_zmax_slot = (GLuint)(s->rmode.select_ptr - s->rmode.select_buf);
-        select_write(ctx, (GLuint)z);               /* zmax placeholder */
-        s->rmode.zmin = z;
-        s->rmode.zmax = z;
+        s->rmode.zmin = zmin;
+        s->rmode.zmax = zmax;
     }
     else
     {
-        if (z < s->rmode.zmin) s->rmode.zmin = z;
-        if (z > s->rmode.zmax) s->rmode.zmax = z;
+        if (zmin < s->rmode.zmin) s->rmode.zmin = zmin;
+        if (zmax > s->rmode.zmax) s->rmode.zmax = zmax;
     }
 }
 
+/* write the pending hit record: [namelist length, zmin, zmax, names...]
+ * with z scaled by 2^32-1 (spec 5.4 / Mesa update_hit_record) */
 static void select_close_hit(GLMContext ctx)
 {
     struct MGLExtState_compat *s = CS();
@@ -81,10 +86,12 @@ static void select_close_hit(GLMContext ctx)
     if (!s->rmode.hit_open)
         return;
 
-    GLuint ncount = s->rmode.select_ptr - s->rmode.select_buf - s->rmode.hit_zmax_slot - 1;
-    s->rmode.select_buf[s->rmode.hit_zmin_slot - 1] = ncount;
-    s->rmode.select_buf[s->rmode.hit_zmin_slot] = (GLuint)fmin(4294967295.0, (double)s->rmode.zmin * 2147483647.0);
-    s->rmode.select_buf[s->rmode.hit_zmax_slot] = (GLuint)fmin(4294967295.0, (double)s->rmode.zmax * 2147483647.0);
+    select_write(ctx, (GLuint)s->rmode.name_depth);
+    select_write(ctx, (GLuint)fmin(4294967295.0, (double)s->rmode.zmin * 4294967295.0));
+    select_write(ctx, (GLuint)fmin(4294967295.0, (double)s->rmode.zmax * 4294967295.0));
+    for (GLuint i = 0; i < s->rmode.name_depth; i++)
+        select_write(ctx, s->rmode.name_stack[i]);
+
     s->rmode.hit_open = GL_FALSE;
     s->rmode.hit_count++;
 }
@@ -94,18 +101,17 @@ void mglPushName(GLMContext ctx, GLuint name)
 
     struct MGLExtState_compat *s = CS();
 
-    if (s->rmode.mode != GL_SELECT)
-        ERROR_RETURN(GL_INVALID_OPERATION);
-
     if (s->recording && !s->replaying)
     {
-        MGLCListOp *o = NULL;
         extern void mgl_compat_list_record_simple(GLMContext ctx, uint8_t op, int32_t i0);
         mgl_compat_list_record_simple(ctx, MGLC_OP_PUSH_NAME, (int32_t)name);
-        (void)o;
         if (!s->record_exec)
             return;
     }
+
+    /* name-stack commands are silently ignored outside GL_SELECT (Mesa) */
+    if (s->rmode.mode != GL_SELECT)
+        return;
 
     select_close_hit(ctx);
 
@@ -120,8 +126,16 @@ void mglPopName(GLMContext ctx)
 
     struct MGLExtState_compat *s = CS();
 
+    if (s->recording && !s->replaying)
+    {
+        extern void mgl_compat_list_record_simple(GLMContext ctx, uint8_t op, int32_t i0);
+        mgl_compat_list_record_simple(ctx, MGLC_OP_POP_NAME, 0);
+        if (!s->record_exec)
+            return;
+    }
+
     if (s->rmode.mode != GL_SELECT)
-        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
 
     if (s->rmode.name_depth == 0)
         ERROR_RETURN(GL_STACK_UNDERFLOW);
@@ -135,8 +149,16 @@ void mglLoadName(GLMContext ctx, GLuint name)
 
     struct MGLExtState_compat *s = CS();
 
+    if (s->recording && !s->replaying)
+    {
+        extern void mgl_compat_list_record_simple(GLMContext ctx, uint8_t op, int32_t i0);
+        mgl_compat_list_record_simple(ctx, MGLC_OP_LOAD_NAME, (int32_t)name);
+        if (!s->record_exec)
+            return;
+    }
+
     if (s->rmode.mode != GL_SELECT)
-        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
 
     if (s->rmode.name_depth == 0)
         ERROR_RETURN(GL_INVALID_OPERATION);
@@ -158,6 +180,10 @@ void mglInitNames(GLMContext ctx)
             return;
     }
 
+    /* glInitNames is ignored outside GL_SELECT (Mesa) */
+    if (s->rmode.mode != GL_SELECT)
+        return;
+
     select_close_hit(ctx);
     s->rmode.name_depth = 0;
 }
@@ -167,16 +193,15 @@ void mglSelectBuffer(GLMContext ctx, GLsizei size, GLuint *buffer)
 
     struct MGLExtState_compat *s = CS();
 
+    if (size < 0)
+        ERROR_RETURN(GL_INVALID_VALUE);
+
     if (s->rmode.mode == GL_SELECT)
         ERROR_RETURN(GL_INVALID_OPERATION);
-
-    if (!buffer && size > 0)
-        ERROR_RETURN(GL_INVALID_VALUE);
 
     s->rmode.select_buf = buffer;
     s->rmode.select_size = (GLuint)size;
     s->rmode.select_count = 0;
-    s->rmode.select_ptr = buffer;
 }
 
 void mglFeedbackBuffer(GLMContext ctx, GLsizei size, GLenum type, GLfloat *buffer)
@@ -187,11 +212,16 @@ void mglFeedbackBuffer(GLMContext ctx, GLsizei size, GLenum type, GLfloat *buffe
     if (s->rmode.mode == GL_FEEDBACK)
         ERROR_RETURN(GL_INVALID_OPERATION);
 
-    if (type != GL_2D && type != GL_3D && type != GL_3D_COLOR && type != GL_3D_COLOR_TEXTURE && type != GL_4D_COLOR_TEXTURE)
-        ERROR_RETURN(GL_INVALID_ENUM);
+    if (size < 0)
+        ERROR_RETURN(GL_INVALID_VALUE);
 
     if (!buffer && size > 0)
+    {
         ERROR_RETURN(GL_INVALID_VALUE);
+    }
+
+    if (type != GL_2D && type != GL_3D && type != GL_3D_COLOR && type != GL_3D_COLOR_TEXTURE && type != GL_4D_COLOR_TEXTURE)
+        ERROR_RETURN(GL_INVALID_ENUM);
 
     s->rmode.feedback_buf = buffer;
     s->rmode.feedback_size = (GLuint)size;
@@ -204,14 +234,12 @@ void mglPassThrough(GLMContext ctx, GLfloat token)
 
     struct MGLExtState_compat *s = CS();
 
+    /* glPassThrough is a no-op outside feedback mode (no error) */
     if (s->rmode.mode != GL_FEEDBACK)
-        ERROR_RETURN(GL_INVALID_OPERATION);
-
-    if (s->rmode.feedback_count + 2 > s->rmode.feedback_size)
         return;
 
-    s->rmode.feedback_buf[s->rmode.feedback_count++] = (GLfloat)GL_PASS_THROUGH_TOKEN;
-    s->rmode.feedback_buf[s->rmode.feedback_count++] = token;
+    fb_put(ctx, (GLfloat)GL_PASS_THROUGH_TOKEN);
+    fb_put(ctx, token);
 }
 
 GLint mglRenderMode(GLMContext ctx, GLenum mode)
@@ -223,28 +251,37 @@ GLint mglRenderMode(GLMContext ctx, GLenum mode)
     if (mode != GL_RENDER && mode != GL_SELECT && mode != GL_FEEDBACK)
         ERROR_RETURN_VALUE(GL_INVALID_ENUM, 0);
 
-    /* close the previous mode */
+    /* close out the previous mode */
     switch (s->rmode.mode)
     {
         case GL_SELECT:
             select_close_hit(ctx);
-            ret = (GLint)s->rmode.hit_count;
+            ret = (s->rmode.select_count > s->rmode.select_size) ? -1 : (GLint)s->rmode.hit_count;
+            s->rmode.name_depth = 0;        /* Mesa reset_name_stack_to_empty */
             break;
         case GL_FEEDBACK:
-            if (s->rmode.feedback_count < s->rmode.feedback_size)
-                s->rmode.feedback_buf[s->rmode.feedback_count] = (GLfloat)GL_3D_COLOR_TEXTURE + 1;   /* sentinel unused */
-            ret = (GLint)s->rmode.feedback_count;
+            ret = (s->rmode.feedback_count > s->rmode.feedback_size) ? -1 : (GLint)s->rmode.feedback_count;
             break;
         default:
             break;
     }
 
+    /* entering SELECT / FEEDBACK needs a buffer: report the error but still
+     * switch (Mesa _mesa_RenderMode behaviour) */
+    if (mode == GL_SELECT && s->rmode.select_size == 0)
+    {
+        ctx->error_func(ctx, __func__, GL_INVALID_OPERATION);
+    }
+    else if (mode == GL_FEEDBACK && s->rmode.feedback_size == 0)
+    {
+        ctx->error_func(ctx, __func__, GL_INVALID_OPERATION);
+    }
+
     s->rmode.mode = (int)mode;
     s->rmode.hit_count = 0;
     s->rmode.hit_open = GL_FALSE;
-    s->rmode.select_ptr = s->rmode.select_buf;
+    s->rmode.select_count = 0;
     s->rmode.feedback_count = 0;
-    s->rmode.name_depth = 0;
 
     return ret;
 }
@@ -434,20 +471,16 @@ static int fb_vertex_values(GLenum t)
     return v;
 }
 
-static bool fb_room(GLMContext ctx, int extra)
-{
-    struct MGLExtState_compat *s = CS();
-
-    if (s->rmode.feedback_count + (GLuint)extra > s->rmode.feedback_size)
-        return false;
-    return true;
-}
-
+/* Mesa-style token write (main/feedback.c feedback_token): tokens beyond the
+ * end of the buffer are counted but not stored; glRenderMode reports the
+ * overflow as -1. */
 static void fb_put(GLMContext ctx, GLfloat v)
 {
     struct MGLExtState_compat *s = CS();
 
-    s->rmode.feedback_buf[s->rmode.feedback_count++] = v;
+    if (s->rmode.feedback_count < s->rmode.feedback_size)
+        s->rmode.feedback_buf[s->rmode.feedback_count] = v;
+    s->rmode.feedback_count++;
 }
 
 /* one feedback vertex: window coords (+w), color, texture as the type asks.
@@ -484,7 +517,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 0; i < n; i++)
             {
                 if (!clip_visible(ctx, win[i])) continue;
-                if (!fb_room(ctx, 1 + vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POINT_TOKEN);
                 fb_vertex(ctx, win[i], at(col, i), at(tex, i));
             }
@@ -494,7 +526,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 0; i + 1 < n; i += 2)
             {
                 if (!clip_visible(ctx, win[i]) || !clip_visible(ctx, win[i + 1])) continue;
-                if (!fb_room(ctx, 1 + 2 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
                 fb_vertex(ctx, win[i], at(col, i), at(tex, i));
                 fb_vertex(ctx, win[i + 1], at(col, i + 1), at(tex, i + 1));
@@ -512,7 +543,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
                 GLuint b = (si + 1 == n) ? 0 : si + 1;
 
                 if (!clip_visible(ctx, win[a]) || !clip_visible(ctx, win[b])) continue;
-                if (!fb_room(ctx, 1 + 2 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_LINE_TOKEN);
                 fb_vertex(ctx, win[a], at(col, a), at(tex, a));
                 fb_vertex(ctx, win[b], at(col, b), at(tex, b));
@@ -524,7 +554,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 0; i + 2 < n; i += 3)
             {
                 if (!(clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) && clip_visible(ctx, win[i + 2]))) continue;
-                if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
                 fb_vertex(ctx, win[i], at(col, i), at(tex, i));
@@ -537,7 +566,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 0; i + 2 < n; i++)
             {
                 if (!(clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) && clip_visible(ctx, win[i + 2]))) continue;
-                if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
                 fb_vertex(ctx, win[i], at(col, i), at(tex, i));
@@ -550,7 +578,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 1; i + 1 < n; i++)
             {
                 if (!(clip_visible(ctx, win[0]) && clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]))) continue;
-                if (!fb_room(ctx, 2 + 3 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 3.0f);
                 fb_vertex(ctx, win[0], at(col, 0), at(tex, 0));
@@ -565,7 +592,6 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
                 bool vis = clip_visible(ctx, win[i]) && clip_visible(ctx, win[i + 1]) &&
                            clip_visible(ctx, win[i + 2]) && clip_visible(ctx, win[i + 3]);
                 if (!vis) continue;
-                if (!fb_room(ctx, 2 + 4 * vv)) continue;
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, 4.0f);
                 fb_vertex(ctx, win[i], at(col, i), at(tex, i));
@@ -591,7 +617,7 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
                     bool vis = true;
                     for (int k = 0; k < 4; k++)
                         if (!clip_visible(ctx, win[stack[k]])) vis = false;
-                    if (!vis || !fb_room(ctx, 2 + 4 * vv)) continue;
+                    if (!vis) continue;
                     fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                     fb_put(ctx, 4.0f);
                     for (int k = 0; k < 4; k++)
@@ -613,7 +639,7 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             for (GLuint i = 0; i < vn; i++)
                 if (!clip_visible(ctx, win[g[i]])) vis = false;
 
-            if (vis && fb_room(ctx, 2 + (int)vn * vv))
+            if (vis)
             {
                 fb_put(ctx, (GLfloat)GL_POLYGON_TOKEN);
                 fb_put(ctx, (GLfloat)vn);
@@ -624,6 +650,20 @@ static void fb_emit_prims(GLMContext ctx, GLenum mode, const float (*win)[3],
             break;
         }
     }
+}
+
+/* feedback token + raster-position vertex for glBitmap / glDrawPixels /
+ * glCopyPixels (Mesa main/drawpix.c): emitted only when the raster position
+ * is valid; nothing is rasterized outside GL_RENDER. */
+void mgl_compat_feedback_pixel(GLMContext ctx, GLenum token)
+{
+    struct MGLExtState_compat *s = CS();
+
+    if (s->rmode.mode != GL_FEEDBACK || !s->raster_valid)
+        return;
+
+    fb_put(ctx, (GLfloat)(GLint)token);
+    fb_vertex(ctx, s->raster_window_f, s->raster_color, s->raster_texcoord[0]);
 }
 
 /* window-space position of an object-space vertex (for line stipple) */
@@ -685,7 +725,7 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
             case GL_POINTS:
                 for (GLuint i = 0; i < n; i++)
                     if (clip_visible(ctx, win[i]))
-                        select_start_hit(ctx, win[i][2]);
+                        select_start_hit(ctx, win[i][2], win[i][2]);
                 break;
 
             case GL_LINES:
@@ -693,7 +733,7 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 {
                     uint32_t g[2] = { i, i + 1 };
                     if (poly_in_viewport(win, g, 2))
-                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
+                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]), fmaxf(win[i][2], win[i + 1][2]));
                 }
                 break;
 
@@ -703,13 +743,13 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 {
                     uint32_t g[2] = { i, i + 1 };
                     if (poly_in_viewport(win, g, 2))
-                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]));
+                        select_start_hit(ctx, fminf(win[i][2], win[i + 1][2]), fmaxf(win[i][2], win[i + 1][2]));
                 }
                 if (mode == GL_LINE_LOOP && n > 2)
                 {
                     uint32_t g[2] = { n - 1, 0 };
                     if (poly_in_viewport(win, g, 2))
-                        select_start_hit(ctx, fminf(win[n - 1][2], win[0][2]));
+                        select_start_hit(ctx, fminf(win[n - 1][2], win[0][2]), fmaxf(win[n - 1][2], win[0][2]));
                 }
                 break;
 
@@ -718,7 +758,7 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 {
                     uint32_t g[3] = { i, i + 1, i + 2 };
                     if (poly_in_viewport(win, g, 3))
-                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]));
+                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]), fmaxf(fmaxf(win[i][2], win[i + 1][2]), win[i + 2][2]));
                 }
                 break;
 
@@ -727,7 +767,7 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 {
                     uint32_t g[3] = { i, i + 1, i + 2 };
                     if (poly_in_viewport(win, g, 3))
-                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]));
+                        select_start_hit(ctx, fminf(fminf(win[i][2], win[i + 1][2]), win[i + 2][2]), fmaxf(fmaxf(win[i][2], win[i + 1][2]), win[i + 2][2]));
                 }
                 break;
 
@@ -736,7 +776,7 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 {
                     uint32_t g[3] = { 0, i, i + 1 };
                     if (poly_in_viewport(win, g, 3))
-                        select_start_hit(ctx, fminf(fminf(win[0][2], win[i][2]), win[i + 1][2]));
+                        select_start_hit(ctx, fminf(fminf(win[0][2], win[i][2]), win[i + 1][2]), fmaxf(fmaxf(win[0][2], win[i][2]), win[i + 1][2]));
                 }
                 break;
 
@@ -747,7 +787,8 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                     if (poly_in_viewport(win, g, 4))
                     {
                         float z = fminf(fminf(win[i][2], win[i + 1][2]), fminf(win[i + 2][2], win[i + 3][2]));
-                        select_start_hit(ctx, z);
+                        float zm = fmaxf(fmaxf(win[i][2], win[i + 1][2]), fmaxf(win[i + 2][2], win[i + 3][2]));
+                        select_start_hit(ctx, z, zm);
                     }
                 }
                 break;
@@ -759,7 +800,8 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                     if (poly_in_viewport(win, g, 4))
                     {
                         float z = fminf(fminf(win[i][2], win[i + 1][2]), fminf(win[i + 2][2], win[i + 3][2]));
-                        select_start_hit(ctx, z);
+                        float zm = fmaxf(fmaxf(win[i][2], win[i + 1][2]), fmaxf(win[i + 2][2], win[i + 3][2]));
+                        select_start_hit(ctx, z, zm);
                     }
                 }
                 break;
@@ -769,28 +811,24 @@ void mgl_compat_cpu_draw_rgba(GLMContext ctx, GLenum mode, const float *pos, GLu
                 uint32_t *g = (uint32_t *)malloc(n * sizeof(uint32_t));
                 if (g)
                 {
-                    float zmin = 2.0f;
+                    float zmin = 2.0f, zmax = -2.0f;
                     for (GLuint i = 0; i < n; i++)
                     {
                         g[i] = i;
                         if (win[i][2] < zmin) zmin = win[i][2];
+                        if (win[i][2] > zmax) zmax = win[i][2];
                     }
                     if (poly_in_viewport(win, g, n))
-                        select_start_hit(ctx, zmin);
+                        select_start_hit(ctx, zmin, zmax);
                     free(g);
                 }
                 break;
             }
         }
 
-        if (s->rmode.hit_open)
-        {
-            /* append the name stack, then patch the record header */
-            for (GLuint i = 0; i < s->rmode.name_depth; i++)
-                if (!select_write(ctx, s->rmode.name_stack[i]))
-                    break;
-            select_close_hit(ctx);
-        }
+        /* the record stays open: it is written when the name stack next
+         * changes or the render mode is left, so every primitive drawn with
+         * the same names merges into one hit record (Mesa HitFlag) */
     }
 
     free(win);
@@ -842,72 +880,192 @@ static int eval_comps(GLenum target)
     return 0;
 }
 
+/* evaluator component count, shared with the attrib-stack snapshot code */
+int mgl_compat_eval_comps(GLenum target) { return eval_comps(target); }
+
+/* ---- display-list recording for evaluator commands (Mesa dlist.c compiles
+ * Map1/Map2, MapGrid, EvalCoord, EvalMesh and EvalPoint instead of executing
+ * them at compile time) ---- */
+
+static void record_map1(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2,
+                        GLint stride, GLint order, int comps, const void *pts, int dbl)
+{
+    struct MGLExtState_compat *s = CS();
+    MGLCListOp *o;
+    GLfloat *b;
+    size_t n = (size_t)order * comps;
+
+    if (!s->recording || s->replaying)
+        return;
+
+    o = mgl_compat_list_op(ctx, MGLC_OP_MAP1);
+    if (!o) return;
+    o->i0 = (int32_t)target;
+    o->i1 = order;
+    o->f[0] = u1; o->f[1] = u2; o->f[2] = (float)comps;
+    o->blob = malloc(n * sizeof(GLfloat));
+    if (!o->blob) return;
+    o->blob_size = n * sizeof(GLfloat);
+    b = (GLfloat *)o->blob;
+
+    if (dbl)
+    {
+        const GLdouble *p = (const GLdouble *)pts;
+        for (GLint i = 0; i < order; i++)
+            for (int c = 0; c < comps; c++)
+                b[i * comps + c] = (GLfloat)p[(size_t)i * stride + c];
+    }
+    else
+    {
+        const GLfloat *p = (const GLfloat *)pts;
+        for (GLint i = 0; i < order; i++)
+            for (int c = 0; c < comps; c++)
+                b[i * comps + c] = p[(size_t)i * stride + c];
+    }
+}
+
+static void record_map2(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint ustride, GLint uorder,
+                        GLfloat v1, GLfloat v2, GLint vstride, GLint vorder, int comps,
+                        const void *pts, int dbl)
+{
+    struct MGLExtState_compat *s = CS();
+    MGLCListOp *o;
+    GLfloat *b;
+    size_t n = (size_t)uorder * vorder * comps;
+
+    if (!s->recording || s->replaying)
+        return;
+
+    o = mgl_compat_list_op(ctx, MGLC_OP_MAP2);
+    if (!o) return;
+    o->i0 = (int32_t)target;
+    o->i1 = uorder;
+    o->a = (uint8_t)vorder;
+    o->f[0] = u1; o->f[1] = u2; o->f[2] = v1; o->f[3] = v2; o->f[4] = (float)comps;
+    o->blob = malloc(n * sizeof(GLfloat));
+    if (!o->blob) return;
+    o->blob_size = n * sizeof(GLfloat);
+    b = (GLfloat *)o->blob;
+
+    if (dbl)
+    {
+        const GLdouble *p = (const GLdouble *)pts;
+        for (GLint i = 0; i < uorder; i++)
+            for (GLint j = 0; j < vorder; j++)
+                for (int c = 0; c < comps; c++)
+                    b[(i * vorder + j) * comps + c] =
+                        (GLfloat)p[(size_t)i * ustride + (size_t)j * vstride + c];
+    }
+    else
+    {
+        const GLfloat *p = (const GLfloat *)pts;
+        for (GLint i = 0; i < uorder; i++)
+            for (GLint j = 0; j < vorder; j++)
+                for (int c = 0; c < comps; c++)
+                    b[(i * vorder + j) * comps + c] =
+                        p[(size_t)i * ustride + (size_t)j * vstride + c];
+    }
+}
+
+/* the caller pattern is:  if (recording && !replaying) { record; if (!record_exec) return; } */
+
+/* glMap1/glMap2 error surface, in Mesa's check order (main/eval.c): domain,
+ * order, points, target enum, stride, then the "evaluators generate texture
+ * coordinates for unit 0 only" INVALID_OPERATION (GL 1.2.1 spec F.2.13, kept
+ * by every later compat spec).  Returns the map slot or -1 (error set). */
+static int map_validate(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2,
+                        GLdouble v1, GLdouble v2, GLint stride, GLint ustride, GLint vstride,
+                        GLint order, GLint uorder, GLint vorder, const void *points, int *comps)
+{
+    int two_d = (uorder != 0);            /* Map2 passes uorder/vorder */
+
+    if (two_d ? (u1 == u2 || v1 == v2) : (u1 == u2))
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, -1);
+    if (two_d ? (uorder < 1 || uorder > MGLC_MAX_EVAL_ORDER || vorder < 1 || vorder > MGLC_MAX_EVAL_ORDER)
+              : (order < 1 || order > MGLC_MAX_EVAL_ORDER))
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, -1);
+    if (!points)
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, -1);
+
+    int idx = eval_target_index(target);
+    int k = eval_comps(target);
+    if (idx < 0 || k == 0)
+        ERROR_RETURN_VALUE(GL_INVALID_ENUM, -1);
+
+    if (two_d ? (ustride < k || vstride < k) : (stride < k))
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, -1);
+
+    if (STATE(active_texture) != 0)
+        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, -1);
+
+    *comps = k;
+    return idx;
+}
+
+
 void mglMap1d(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2, GLint stride, GLint order, const GLdouble *points)
 {    MGLC_COMPAT_GUARD(ctx);
 
     struct MGLExtState_compat *s = CS();
-    int idx = eval_target_index(target);
-    int comps = eval_comps(target);
+    int comps = 0;
+    int idx = map_validate(ctx, target, u1, u2, 0, 0, stride, 0, 0, order, 0, 0, points, &comps);
 
     if (idx < 0)
-        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
 
-    if (order < 1 || order > MGLC_MAX_EVAL_ORDER)
-        ERROR_RETURN(GL_INVALID_VALUE);
+    if (s->recording && !s->replaying)
+    {
+        record_map1(ctx, target, (GLfloat)u1, (GLfloat)u2, stride, order, comps, points, 1);
+        if (!s->record_exec)
+            return;
+    }
 
-    if (!points)
-        ERROR_RETURN(GL_INVALID_VALUE);
-
+    /* stride counts ELEMENTS (doubles) between control points, not bytes */
     s->map1[idx].target = target;
-    s->map1[idx].stride = stride ? stride : comps;
+    s->map1[idx].stride = stride;
     s->map1[idx].order = order;
     s->map1[idx].u1 = u1;
     s->map1[idx].u2 = u2;
-    s->map1[idx].enabled = GL_TRUE;
+    s->map1[idx].type = GL_DOUBLE;
 
     free(s->map1[idx].fpoints);
     s->map1[idx].fpoints = (GLfloat *)malloc((size_t)order * comps * sizeof(GLfloat));
     if (s->map1[idx].fpoints)
-    {
-        int es = stride ? (stride / (int)sizeof(GLdouble) > 0 ? stride / (int)sizeof(GLdouble) : 1) : comps;
         for (int i = 0; i < order; i++)
             for (int c = 0; c < comps; c++)
-                s->map1[idx].fpoints[i * comps + c] = (GLfloat)points[i * es + c];
-    }
+                s->map1[idx].fpoints[i * comps + c] = (GLfloat)points[i * (size_t)stride + c];
 }
 
 void mglMap1f(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint stride, GLint order, const GLfloat *points)
 {    MGLC_COMPAT_GUARD(ctx);
 
     struct MGLExtState_compat *s = CS();
-    int idx = eval_target_index(target);
-    int comps = eval_comps(target);
+    int comps = 0;
+    int idx = map_validate(ctx, target, u1, u2, 0, 0, stride, 0, 0, order, 0, 0, points, &comps);
 
     if (idx < 0)
-        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
 
-    if (order < 1 || order > MGLC_MAX_EVAL_ORDER)
-        ERROR_RETURN(GL_INVALID_VALUE);
-
-    if (!points)
-        ERROR_RETURN(GL_INVALID_VALUE);
+    if (s->recording && !s->replaying)
+    {
+        record_map1(ctx, target, (GLfloat)u1, (GLfloat)u2, stride, order, comps, points, 0);
+        if (!s->record_exec)
+            return;
+    }
 
     s->map1[idx].target = target;
-    s->map1[idx].stride = stride ? stride : comps;
+    s->map1[idx].stride = stride;
     s->map1[idx].order = order;
     s->map1[idx].u1 = u1;
     s->map1[idx].u2 = u2;
-    s->map1[idx].enabled = GL_TRUE;
+    s->map1[idx].type = GL_FLOAT;
 
     free(s->map1[idx].fpoints);
     s->map1[idx].fpoints = (GLfloat *)malloc((size_t)order * comps * sizeof(GLfloat));
     if (s->map1[idx].fpoints)
-    {
-        int es = stride ? (stride / (int)sizeof(GLfloat) > 0 ? stride / (int)sizeof(GLfloat) : 1) : comps;
         for (int i = 0; i < order; i++)
             for (int c = 0; c < comps; c++)
-                s->map1[idx].fpoints[i * comps + c] = points[i * es + c];
-    }
+                s->map1[idx].fpoints[i * comps + c] = points[i * (size_t)stride + c];
 }
 
 void mglMap2d(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2, GLint ustride, GLint uorder,
@@ -915,42 +1073,39 @@ void mglMap2d(GLMContext ctx, GLenum target, GLdouble u1, GLdouble u2, GLint ust
 {    MGLC_COMPAT_GUARD(ctx);
 
     struct MGLExtState_compat *s = CS();
-    int idx = eval_target_index(target);
-    int comps = eval_comps(target);
+    int comps = 0;
+    int idx = map_validate(ctx, target, u1, u2, v1, v2, 0, ustride, vstride, 0, uorder, vorder, points, &comps);
 
     if (idx < 0)
-        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
 
-    if (uorder < 1 || uorder > MGLC_MAX_EVAL_ORDER || vorder < 1 || vorder > MGLC_MAX_EVAL_ORDER)
-        ERROR_RETURN(GL_INVALID_VALUE);
-
-    if (!points)
-        ERROR_RETURN(GL_INVALID_VALUE);
+    if (s->recording && !s->replaying)
+    {
+        record_map2(ctx, target, (GLfloat)u1, (GLfloat)u2, ustride, uorder,
+                    (GLfloat)v1, (GLfloat)v2, vstride, vorder, comps, points, 1);
+        if (!s->record_exec)
+            return;
+    }
 
     s->map2[idx].target = target;
-    s->map2[idx].ustride = ustride ? ustride : comps * vorder;
-    s->map2[idx].vstride = vstride ? vstride : comps;
+    s->map2[idx].ustride = ustride;
+    s->map2[idx].vstride = vstride;
     s->map2[idx].uorder = uorder;
     s->map2[idx].vorder = vorder;
     s->map2[idx].u1 = u1;
     s->map2[idx].u2 = u2;
     s->map2[idx].v1 = v1;
     s->map2[idx].v2 = v2;
-    s->map2[idx].enabled = GL_TRUE;
     s->map2[idx].type = GL_DOUBLE;
 
     free(s->map2[idx].fpoints);
     s->map2[idx].fpoints = (GLfloat *)malloc((size_t)uorder * vorder * comps * sizeof(GLfloat));
     if (s->map2[idx].fpoints)
-    {
-        int ue = ustride ? (ustride / (int)sizeof(GLdouble) > 0 ? ustride / (int)sizeof(GLdouble) : 1) : comps * vorder;
-        int ve = vstride ? (vstride / (int)sizeof(GLdouble) > 0 ? vstride / (int)sizeof(GLdouble) : 1) : comps;
         for (int i = 0; i < uorder; i++)
             for (int j = 0; j < vorder; j++)
                 for (int c = 0; c < comps; c++)
                     s->map2[idx].fpoints[(i * vorder + j) * comps + c] =
-                        (GLfloat)points[i * ue + j * ve + c];
-    }
+                        (GLfloat)points[i * (size_t)ustride + j * (size_t)vstride + c];
 }
 
 void mglMap2f(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint ustride, GLint uorder,
@@ -958,39 +1113,39 @@ void mglMap2f(GLMContext ctx, GLenum target, GLfloat u1, GLfloat u2, GLint ustri
 {    MGLC_COMPAT_GUARD(ctx);
 
     struct MGLExtState_compat *s = CS();
-    int idx = eval_target_index(target);
-    int comps = eval_comps(target);
+    int comps = 0;
+    int idx = map_validate(ctx, target, u1, u2, v1, v2, 0, ustride, vstride, 0, uorder, vorder, points, &comps);
 
     if (idx < 0)
-        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
 
-    if (uorder < 1 || uorder > MGLC_MAX_EVAL_ORDER || vorder < 1 || vorder > MGLC_MAX_EVAL_ORDER)
-        ERROR_RETURN(GL_INVALID_VALUE);
+    if (s->recording && !s->replaying)
+    {
+        record_map2(ctx, target, (GLfloat)u1, (GLfloat)u2, ustride, uorder,
+                    (GLfloat)v1, (GLfloat)v2, vstride, vorder, comps, points, 0);
+        if (!s->record_exec)
+            return;
+    }
 
     s->map2[idx].target = target;
-    s->map2[idx].ustride = ustride ? ustride : comps * vorder;
-    s->map2[idx].vstride = vstride ? vstride : comps;
+    s->map2[idx].ustride = ustride;
+    s->map2[idx].vstride = vstride;
     s->map2[idx].uorder = uorder;
     s->map2[idx].vorder = vorder;
     s->map2[idx].u1 = u1;
     s->map2[idx].u2 = u2;
     s->map2[idx].v1 = v1;
     s->map2[idx].v2 = v2;
-    s->map2[idx].enabled = GL_TRUE;
     s->map2[idx].type = GL_FLOAT;
 
     free(s->map2[idx].fpoints);
     s->map2[idx].fpoints = (GLfloat *)malloc((size_t)uorder * vorder * comps * sizeof(GLfloat));
     if (s->map2[idx].fpoints)
-    {
-        int ue = ustride ? (ustride / (int)sizeof(GLfloat) > 0 ? ustride / (int)sizeof(GLfloat) : 1) : comps * vorder;
-        int ve = vstride ? (vstride / (int)sizeof(GLfloat) > 0 ? vstride / (int)sizeof(GLfloat) : 1) : comps;
         for (int i = 0; i < uorder; i++)
             for (int j = 0; j < vorder; j++)
                 for (int c = 0; c < comps; c++)
                     s->map2[idx].fpoints[(i * vorder + j) * comps + c] =
-                        points[i * ue + j * ve + c];
-    }
+                        points[i * (size_t)ustride + j * (size_t)vstride + c];
 }
 
 void mglGetMapdv(GLMContext ctx, GLenum target, GLenum query, GLdouble *v)
@@ -1095,7 +1250,26 @@ void mglGetMapiv(GLMContext ctx, GLenum target, GLenum query, GLint *v)
     }
 }
 
-/* Bernstein evaluation of a 1D map */
+/* de Casteljau over one curve of control points (n x comps doubles) */
+static void dc_curve(const double *p, int n, int comps, double t, double *out)
+{
+    double tmp[MGLC_MAX_EVAL_ORDER * 4];
+
+    for (int i = 0; i < n * comps; i++)
+        tmp[i] = p[i];
+
+    for (int k = n - 1; k > 0; k--)
+        for (int i = 0; i < k; i++)
+            for (int c = 0; c < comps; c++)
+                tmp[i * comps + c] = (1.0 - t) * tmp[i * comps + c] + t * tmp[(i + 1) * comps + c];
+
+    for (int c = 0; c < comps; c++)
+        out[c] = tmp[c];
+}
+
+/* Bernstein evaluation of a 1D map.  The parameter is NOT clamped: like
+ * Mesa's horner/de Casteljau, glEvalCoord1/2 extrapolate linearly outside
+ * [u1,u2] (the GL spec defines the maps as polynomials over the reals). */
 static void eval1(GLMContext ctx, int idx, float u, float *out)
 {
     struct MGLExtState_compat *s = CS();
@@ -1104,63 +1278,109 @@ static void eval1(GLMContext ctx, int idx, float u, float *out)
     double du = (s->map1[idx].u2 - s->map1[idx].u1);
     double t = (du != 0.0) ? (u - s->map1[idx].u1) / du : 0.0;
 
-    if (t < 0.0) t = 0.0;
-    if (t > 1.0) t = 1.0;
-
-    /* de Casteljau over the control points (fpoints are floats) */
-    double tmp[MGLC_MAX_EVAL_ORDER * 4];
-    for (int i = 0; i < n * comps; i++)
-        tmp[i] = s->map1[idx].fpoints[i];
-
-    for (int k = n - 1; k > 0; k--)
-        for (int i = 0; i < k; i++)
-            for (int c = 0; c < comps; c++)
-                tmp[i * comps + c] = (1.0 - t) * tmp[i * comps + c] + t * tmp[(i + 1) * comps + c];
-
     for (int c = 0; c < comps; c++)
-        out[c] = (float)tmp[c];
+        out[c] = 0.0f;
+    out[3] = 1.0f;
+
+    if (!s->map1[idx].fpoints || n < 1)
+        return;                            /* defaults already in out */
+
+    {
+        double pts[MGLC_MAX_EVAL_ORDER * 4];
+        double o[4] = { 0, 0, 0, 1 };
+
+        for (int i = 0; i < n * comps; i++)
+            pts[i] = (double)s->map1[idx].fpoints[i];
+
+        dc_curve(pts, n, comps, t, o);
+
+        for (int c = 0; c < comps; c++)
+            out[c] = (float)o[c];
+        if (comps < 4)
+            out[3] = 1.0f;
+    }
 }
 
-static void eval2(GLMContext ctx, int idx, float u, float v, float *out)
+/* 2-D surface point AND exact partial derivatives d/dtu, d/dtv (the GL_AUTO_NORMAL
+ * source).  The derivative control nets are the true Bernstein derivatives
+ * (order * forward differences), which differ from Mesa's _math_de_casteljau_surf
+ * only by the positive scale that normalization removes. */
+static void eval2_deriv(GLMContext ctx, int idx, float u, float v,
+                        double *out, double *du_out, double *dv_out)
 {
     struct MGLExtState_compat *s = CS();
     int un = s->map2[idx].uorder, vn = s->map2[idx].vorder;
     int comps = eval_comps(s->map2[idx].target);
-    double du = (s->map2[idx].u2 - s->map2[idx].u1), dv = (s->map2[idx].v2 - s->map2[idx].v1);
-    double tu = (du != 0.0) ? (u - s->map2[idx].u1) / du : 0.0;
-    double tv = (dv != 0.0) ? (v - s->map2[idx].v1) / dv : 0.0;
+    double du_ = s->map2[idx].u2 - s->map2[idx].u1, dv_ = s->map2[idx].v2 - s->map2[idx].v1;
+    double tu = (du_ != 0.0) ? (u - s->map2[idx].u1) / du_ : 0.0;
+    double tv = (dv_ != 0.0) ? (v - s->map2[idx].v1) / dv_ : 0.0;
 
-    if (tu < 0.0) tu = 0.0; if (tu > 1.0) tu = 1.0;
-    if (tv < 0.0) tv = 0.0; if (tv > 1.0) tv = 1.0;
-
-    double row[MGLC_MAX_EVAL_ORDER * 4];
     double col[MGLC_MAX_EVAL_ORDER * 4];
+    double dcol[MGLC_MAX_EVAL_ORDER * 4];
 
-    /* fpoints layout is [u][v] (see mglMap2d/f): collapse the v direction
-     * first for every u row, then de Casteljau along u */
+    for (int c = 0; c < comps; c++)
+    {
+        out[c] = 0.0;
+        du_out[c] = 0.0;
+        dv_out[c] = 0.0;
+        if (c == 3) out[c] = 1.0;
+    }
+
+    if (!s->map2[idx].fpoints || un < 1 || vn < 1)
+        return;                            /* defaults already in out */
+
     for (int j = 0; j < un; j++)
     {
-        /* the v row of control points for this u */
+        double row[MGLC_MAX_EVAL_ORDER * 4];
+
+        /* value curve of this u row */
         for (int i = 0; i < vn; i++)
             for (int c = 0; c < comps; c++)
                 row[i * comps + c] = s->map2[idx].fpoints[((size_t)j * vn + i) * comps + c];
+        dc_curve(row, vn, comps, tv, &col[j * comps]);
 
-        for (int k = vn - 1; k > 0; k--)
-            for (int i = 0; i < k; i++)
+        /* d/dtv of this u row: vorder * forward differences of the row */
+        if (vn > 1)
+        {
+            for (int i = 0; i < vn - 1; i++)
                 for (int c = 0; c < comps; c++)
-                    row[i * comps + c] = (1.0 - tv) * row[i * comps + c] + tv * row[(i + 1) * comps + c];
-
-        for (int c = 0; c < comps; c++)
-            col[j * comps + c] = row[c];
+                    row[i * comps + c] = (double)vn *
+                        ((double)s->map2[idx].fpoints[((size_t)j * vn + i + 1) * comps + c] -
+                         (double)s->map2[idx].fpoints[((size_t)j * vn + i) * comps + c]);
+            dc_curve(row, vn - 1, comps, tv, &dcol[j * comps]);
+        }
+        else
+            for (int c = 0; c < comps; c++)
+                dcol[j * comps + c] = 0.0;
     }
 
-    for (int k = un - 1; k > 0; k--)
-        for (int i = 0; i < k; i++)
-            for (int c = 0; c < comps; c++)
-                col[i * comps + c] = (1.0 - tu) * col[i * comps + c] + tu * col[(i + 1) * comps + c];
+    dc_curve(col, un, comps, tu, out);
 
+    /* d/dtu: uorder * forward differences of the collapsed rows */
+    if (un > 1)
+    {
+        double dcurve[MGLC_MAX_EVAL_ORDER * 4];
+
+        for (int i = 0; i < un - 1; i++)
+            for (int c = 0; c < comps; c++)
+                dcurve[i * comps + c] = (double)un * (col[(i + 1) * comps + c] - col[i * comps + c]);
+        dc_curve(dcurve, un - 1, comps, tu, du_out);
+    }
+
+    dc_curve(dcol, un, comps, tu, dv_out);
+}
+
+static void eval2(GLMContext ctx, int idx, float u, float v, float *out)
+{
+    double p[4] = { 0, 0, 0, 1 }, dz[4] = { 0, 0, 0, 0 };
+    int comps;
+
+    eval2_deriv(ctx, idx, u, v, p, dz, dz);
+    comps = eval_comps(CS()->map2[idx].target);
     for (int c = 0; c < comps; c++)
-        out[c] = (float)col[c];
+        out[c] = (float)p[c];
+    if (comps < 4)
+        out[3] = 1.0f;
 }
 
 void mglEvalCoord1d(GLMContext ctx, GLdouble u) {    MGLC_COMPAT_GUARD(ctx);
@@ -1176,10 +1396,25 @@ void mglEvalCoord1f(GLMContext ctx, GLfloat u)
     struct MGLExtState_compat *s = CS();
     float v[4];
 
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALCOORD1F);
+
+        if (o) o->f[0] = u;
+        return;                          /* compiled: replayed with the maps
+                                          * current AT CALL TIME (Mesa) */
+    }
+
+    /* only ENABLED maps are evaluated; glMap1f merely defines them */
     if (s->map1[7].enabled && s->map1[7].target == GL_MAP1_COLOR_4)
     {
         eval1(ctx, 7, u, v);
         mglColor4f(ctx, v[0], v[1], v[2], v[3]);
+    }
+    if (s->map1[0].enabled && s->map1[0].target == GL_MAP1_INDEX)
+    {
+        eval1(ctx, 0, u, v);
+        mglIndexf(ctx, v[0]);
     }
     if (s->map1[8].enabled && s->map1[8].target == GL_MAP1_NORMAL)
     {
@@ -1219,6 +1454,41 @@ void mglEvalCoord1f(GLMContext ctx, GLfloat u)
     }
 }
 
+/* GL_AUTO_NORMAL: analytic surface normal = cross(du, dv), normalised, from
+ * the de Casteljau partial derivatives.  For a homogeneous (VERTEX_4) map the
+ * tangents are corrected to the derivative of the projected point (quotient
+ * rule; the 1/w^2 factor is dropped since only the direction matters). */
+static void eval_autonormal(GLMContext ctx, const double *p, double *du, double *dv, int comps)
+{
+    if (comps == 4)
+    {
+        for (int c = 0; c < 3; c++)
+        {
+            du[c] = du[c] * p[3] - du[3] * p[c];
+            dv[c] = dv[c] * p[3] - dv[3] * p[c];
+        }
+    }
+
+    double nx = du[1] * dv[2] - du[2] * dv[1];
+    double ny = du[2] * dv[0] - du[0] * dv[2];
+    double nz = du[0] * dv[1] - du[1] * dv[0];
+    double len = sqrt(nx * nx + ny * ny + nz * nz);
+
+    if (len > 1e-30)
+    {
+        nx /= len;
+        ny /= len;
+        nz /= len;
+    }
+    else
+    {
+        nx = ny = 0.0;                     /* degenerate surface */
+        nz = 1.0;
+    }
+
+    mglNormal3f(ctx, (float)nx, (float)ny, (float)nz);
+}
+
 void mglEvalCoord2d(GLMContext ctx, GLdouble u, GLdouble v) {    MGLC_COMPAT_GUARD(ctx);
  mglEvalCoord2f(ctx, (GLfloat)u, (GLfloat)v); }
 void mglEvalCoord2dv(GLMContext ctx, const GLdouble *u) {    MGLC_COMPAT_GUARD(ctx);
@@ -1232,12 +1502,25 @@ void mglEvalCoord2f(GLMContext ctx, GLfloat u, GLfloat v)
     struct MGLExtState_compat *s = CS();
     float out[4];
 
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALCOORD2F);
+
+        if (o) { o->f[0] = u; o->f[1] = v; }
+        return;                          /* compiled, re-evaluated on call */
+    }
+
     if (s->map2[7].enabled && s->map2[7].target == GL_MAP2_COLOR_4)
     {
         eval2(ctx, 7, u, v, out);
         mglColor4f(ctx, out[0], out[1], out[2], out[3]);
     }
-    if (s->map2[8].enabled && s->map2[8].target == GL_MAP2_NORMAL)
+    if (s->map2[0].enabled && s->map2[0].target == GL_MAP2_INDEX)
+    {
+        eval2(ctx, 0, u, v, out);
+        mglIndexf(ctx, out[0]);
+    }
+    if (!s->auto_normal && s->map2[8].enabled && s->map2[8].target == GL_MAP2_NORMAL)
     {
         eval2(ctx, 8, u, v, out);
         mglNormal3f(ctx, out[0], out[1], out[2]);
@@ -1265,25 +1548,53 @@ void mglEvalCoord2f(GLMContext ctx, GLfloat u, GLfloat v)
 
     if (s->map2[6].enabled && s->map2[6].target == GL_MAP2_VERTEX_4)
     {
-        eval2(ctx, 6, u, v, out);
-        mglVertex4f(ctx, out[0], out[1], out[2], out[3]);
+        double p[4] = { 0, 0, 0, 1 }, du[4] = { 0, 0, 0, 0 }, dv[4] = { 0, 0, 0, 0 };
+
+        eval2_deriv(ctx, 6, u, v, p, du, dv);
+
+        if (s->auto_normal)
+            eval_autonormal(ctx, p, du, dv, 4);
+
+        mglVertex4f(ctx, (float)p[0], (float)p[1], (float)p[2], (float)p[3]);
     }
     else if (s->map2[5].enabled && s->map2[5].target == GL_MAP2_VERTEX_3)
     {
-        eval2(ctx, 5, u, v, out);
-        mglVertex3f(ctx, out[0], out[1], out[2]);
+        if (s->auto_normal)
+        {
+            double p[4] = { 0, 0, 0, 1 }, du[4] = { 0, 0, 0, 0 }, dv[4] = { 0, 0, 0, 0 };
+
+            eval2_deriv(ctx, 5, u, v, p, du, dv);
+            eval_autonormal(ctx, p, du, dv, 3);
+            mglVertex3f(ctx, (float)p[0], (float)p[1], (float)p[2]);
+        }
+        else
+        {
+            eval2(ctx, 5, u, v, out);
+            mglVertex3f(ctx, out[0], out[1], out[2]);
+        }
     }
 }
 
 void mglMapGrid1d(GLMContext ctx, GLint un, GLdouble u1, GLdouble u2)
 {    MGLC_COMPAT_GUARD(ctx);
 
+    struct MGLExtState_compat *s = CS();
+
     if (un < 1)
         ERROR_RETURN(GL_INVALID_VALUE);
 
-    CS()->map_grid1_n = un;
-    CS()->map_grid1_u1 = u1;
-    CS()->map_grid1_u2 = u2;
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_MAPGRID1);
+
+        if (o) { o->i0 = un; o->f[0] = (GLfloat)u1; o->f[1] = (GLfloat)u2; }
+        if (!s->record_exec)
+            return;
+    }
+
+    s->map_grid1_n = un;
+    s->map_grid1_u1 = u1;
+    s->map_grid1_u2 = u2;
 }
 
 void mglMapGrid1f(GLMContext ctx, GLint un, GLfloat u1, GLfloat u2)
@@ -1295,15 +1606,26 @@ void mglMapGrid1f(GLMContext ctx, GLint un, GLfloat u1, GLfloat u2)
 void mglMapGrid2d(GLMContext ctx, GLint un, GLdouble u1, GLdouble u2, GLint vn, GLdouble v1, GLdouble v2)
 {    MGLC_COMPAT_GUARD(ctx);
 
+    struct MGLExtState_compat *s = CS();
+
     if (un < 1 || vn < 1)
         ERROR_RETURN(GL_INVALID_VALUE);
 
-    CS()->map_grid2_nu = un;
-    CS()->map_grid2_u1 = u1;
-    CS()->map_grid2_u2 = u2;
-    CS()->map_grid2_nv = vn;
-    CS()->map_grid2_v1 = v1;
-    CS()->map_grid2_v2 = v2;
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_MAPGRID2);
+
+        if (o) { o->i0 = un; o->i1 = vn; o->f[0] = (GLfloat)u1; o->f[1] = (GLfloat)u2; o->f[2] = (GLfloat)v1; o->f[3] = (GLfloat)v2; }
+        if (!s->record_exec)
+            return;
+    }
+
+    s->map_grid2_nu = un;
+    s->map_grid2_u1 = u1;
+    s->map_grid2_u2 = u2;
+    s->map_grid2_nv = vn;
+    s->map_grid2_v1 = v1;
+    s->map_grid2_v2 = v2;
 }
 
 void mglMapGrid2f(GLMContext ctx, GLint un, GLfloat u1, GLfloat u2, GLint vn, GLfloat v1, GLfloat v2)
@@ -1319,6 +1641,25 @@ void mglEvalMesh1(GLMContext ctx, GLenum mode, GLint i1, GLint i2)
 
     if (mode != GL_POINT && mode != GL_LINE)
         ERROR_RETURN(GL_INVALID_ENUM);
+
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALMESH);
+
+        if (o)
+        {
+            o->a = (uint8_t)(mode == GL_POINT ? 0 : 1);
+            o->b = 1;
+            o->i0 = i1;
+            o->i1 = i2;
+        }
+        return;                          /* compiled: re-meshed on call */
+    }
+
+    /* no vertex map enabled: the whole mesh is a no-op (not even the colour
+     * or normal maps are evaluated) — Mesa main/draw.c _mesa_EvalMesh1 */
+    if (!s->map1[6].enabled && !s->map1[5].enabled)
+        return;
 
     if (s->map_grid1_n < 1)
         return;
@@ -1350,6 +1691,14 @@ void mglEvalPoint1(GLMContext ctx, GLint i)
 
     struct MGLExtState_compat *s = CS();
 
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALPOINT1);
+
+        if (o) o->i0 = i;
+        return;                          /* compiled (Mesa dlist) */
+    }
+
     double u = s->map_grid1_u1 + (double)i * (s->map_grid1_u2 - s->map_grid1_u1) / s->map_grid1_n;
     mglEvalCoord1d(ctx, u);
 }
@@ -1358,6 +1707,14 @@ void mglEvalPoint2(GLMContext ctx, GLint i, GLint j)
 {    MGLC_COMPAT_GUARD(ctx);
 
     struct MGLExtState_compat *s = CS();
+
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALPOINT2);
+
+        if (o) { o->i0 = i; o->i1 = j; }
+        return;                          /* compiled (Mesa dlist) */
+    }
 
     double u = s->map_grid2_u1 + (double)i * (s->map_grid2_u2 - s->map_grid2_u1) / s->map_grid2_nu;
     double v = s->map_grid2_v1 + (double)j * (s->map_grid2_v2 - s->map_grid2_v1) / s->map_grid2_nv;
@@ -1371,6 +1728,26 @@ void mglEvalMesh2(GLMContext ctx, GLenum mode, GLint i1, GLint i2, GLint j1, GLi
 
     if (mode != GL_POINT && mode != GL_LINE && mode != GL_FILL)
         ERROR_RETURN(GL_INVALID_ENUM);
+
+    if (s->recording && !s->replaying)
+    {
+        MGLCListOp *o = mgl_compat_list_op(ctx, MGLC_OP_EVALMESH);
+
+        if (o)
+        {
+            o->a = (uint8_t)(mode == GL_POINT ? 0 : (mode == GL_LINE ? 1 : 2));
+            o->b = 2;
+            o->i0 = i1;
+            o->i1 = i2;
+            o->f[2] = (GLfloat)j1;
+            o->f[3] = (GLfloat)j2;
+        }
+        return;                          /* compiled: re-meshed on call */
+    }
+
+    /* no vertex map enabled: the whole mesh is a no-op (Mesa _mesa_EvalMesh2) */
+    if (!s->map2[6].enabled && !s->map2[5].enabled)
+        return;
 
     if (s->map_grid2_nu < 1 || s->map_grid2_nv < 1)
         return;

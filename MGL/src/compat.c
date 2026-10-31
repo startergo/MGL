@@ -602,6 +602,50 @@ void mgl_compat_init_state(GLMContext ctx)
 
     /* evaluators */
     s->map_grid1_n = 1; s->map_grid2_nu = 1; s->map_grid2_nv = 1;
+    s->map_grid1_u1 = 0; s->map_grid1_u2 = 1;
+    s->map_grid2_u1 = 0; s->map_grid2_u2 = 1;
+    s->map_grid2_v1 = 0; s->map_grid2_v2 = 1;
+    /* every map starts DEFINED with order 1 and a single default control
+     * point (Mesa _mesa_init_eval): evaluating an enabled-but-never-set map
+     * yields the default value and glGetMap reports order 1 / domain [0,1] */
+    {
+        static const GLenum t1[9] = { GL_MAP1_INDEX, GL_MAP1_TEXTURE_COORD_1, GL_MAP1_TEXTURE_COORD_2,
+                                       GL_MAP1_TEXTURE_COORD_3, GL_MAP1_TEXTURE_COORD_4, GL_MAP1_VERTEX_3,
+                                       GL_MAP1_VERTEX_4, GL_MAP1_COLOR_4, GL_MAP1_NORMAL };
+        static const GLenum t2[9] = { GL_MAP2_INDEX, GL_MAP2_TEXTURE_COORD_1, GL_MAP2_TEXTURE_COORD_2,
+                                       GL_MAP2_TEXTURE_COORD_3, GL_MAP2_TEXTURE_COORD_4, GL_MAP2_VERTEX_3,
+                                       GL_MAP2_VERTEX_4, GL_MAP2_COLOR_4, GL_MAP2_NORMAL };
+        static const int    k[9]  = { 1, 1, 2, 3, 4, 3, 4, 4, 3 };
+        static const GLfloat vertex[4]    = { 0, 0, 0, 1 };
+        static const GLfloat normal[3]    = { 0, 0, 1 };
+        static const GLfloat index[1]     = { 1 };
+        static const GLfloat color[4]     = { 1, 1, 1, 1 };
+        static const GLfloat texcoord[4]  = { 0, 0, 0, 1 };
+        static const GLfloat *def[9]      = { index, texcoord, texcoord, texcoord, texcoord,
+                                               vertex, vertex, color, normal };
+
+        for (int i = 0; i < 9; i++)
+        {
+            s->map1[i].target = t1[i];
+            s->map1[i].order = 1;
+            s->map1[i].stride = k[i];
+            s->map1[i].u1 = 0; s->map1[i].u2 = 1;
+            s->map1[i].type = GL_FLOAT;
+            s->map1[i].fpoints = (GLfloat *)malloc((size_t)k[i] * sizeof(GLfloat));
+            if (s->map1[i].fpoints)
+                memcpy(s->map1[i].fpoints, def[i], (size_t)k[i] * sizeof(GLfloat));
+
+            s->map2[i].target = t2[i];
+            s->map2[i].uorder = 1; s->map2[i].vorder = 1;
+            s->map2[i].ustride = k[i]; s->map2[i].vstride = k[i];
+            s->map2[i].u1 = 0; s->map2[i].u2 = 1;
+            s->map2[i].v1 = 0; s->map2[i].v2 = 1;
+            s->map2[i].type = GL_FLOAT;
+            s->map2[i].fpoints = (GLfloat *)malloc((size_t)k[i] * sizeof(GLfloat));
+            if (s->map2[i].fpoints)
+                memcpy(s->map2[i].fpoints, def[i], (size_t)k[i] * sizeof(GLfloat));
+        }
+    }
 
     /* render mode */
     s->rmode.mode = GL_RENDER;

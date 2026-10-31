@@ -582,6 +582,39 @@ void mgl_compat_replay_op(GLMContext ctx, MGLCListOp *o)
             break;
         }
         case MGLC_OP_ARRAY_ELEMENT: mglArrayElement(ctx, o->i0); break;
+        case MGLC_OP_EVALCOORD1F: mglEvalCoord1f(ctx, o->f[0]); break;
+        case MGLC_OP_EVALCOORD2F: mglEvalCoord2f(ctx, o->f[0], o->f[1]); break;
+        case MGLC_OP_EVALPOINT1: mglEvalPoint1(ctx, o->i0); break;
+        case MGLC_OP_EVALPOINT2: mglEvalPoint2(ctx, o->i0, o->i1); break;
+        case MGLC_OP_EVALMESH:
+        {
+            static const GLenum mesh_mode[3] = { GL_POINT, GL_LINE, GL_FILL };
+
+            if (o->b == 2)
+                mglEvalMesh2(ctx, mesh_mode[o->a % 3], o->i0, o->i1, (GLint)o->f[2], (GLint)o->f[3]);
+            else
+                mglEvalMesh1(ctx, mesh_mode[o->a % 3], o->i0, o->i1);
+            break;
+        }
+        case MGLC_OP_MAP1:
+        {
+            int comps = (int)o->f[2];
+
+            mglMap1f(ctx, (GLenum)o->i0, o->f[0], o->f[1], comps, o->i1,
+                     (const GLfloat *)o->blob);
+            break;
+        }
+        case MGLC_OP_MAP2:
+        {
+            int comps = (int)o->f[4];
+            int vorder = o->a;
+
+            mglMap2f(ctx, (GLenum)o->i0, o->f[0], o->f[1], comps * vorder, o->i1,
+                     o->f[2], o->f[3], comps, vorder, (const GLfloat *)o->blob);
+            break;
+        }
+        case MGLC_OP_MAPGRID1: mglMapGrid1f(ctx, o->i0, o->f[0], o->f[1]); break;
+        case MGLC_OP_MAPGRID2: mglMapGrid2f(ctx, o->i0, o->f[0], o->f[1], o->i1, o->f[2], o->f[3]); break;
         case MGLC_OP_RECTF:
         {
             float x1 = o->f[0], y1 = o->f[1], x2 = o->f[2], y2 = o->f[3];
@@ -723,7 +756,24 @@ typedef struct MGLCAttribSnapshotData_t {
     struct MGLExtState_compat compat;
     GLubyte *pixel_map_copy;
     size_t pixel_map_bytes[10];
+    /* evaluator control points are heap arrays: deep-copy them, because a
+     * glMap1/glMap2 between push and pop frees the snapshot pointers (and a
+     * struct restore would resurrect them as dangling pointers) */
+    GLubyte *eval_map_copy;
+    size_t eval_map_bytes[18];      /* map1[0..8], map2[0..8] */
 } MGLCAttribSnapshotData;
+
+/* number of control-point floats in evaluator map slot i (map1 / map2) */
+static int eval_points_count(GLMContext ctx, int two_d, int i)
+{
+    struct MGLExtState_compat *s = CS();
+    int comps = two_d ? mgl_compat_eval_comps(s->map2[i].target)
+                      : mgl_compat_eval_comps(s->map1[i].target);
+
+    if (two_d)
+        return s->map2[i].uorder * s->map2[i].vorder * comps;
+    return s->map1[i].order * comps;
+}
 
 void mglPushAttrib(GLMContext ctx, GLbitfield mask)
 {    MGLC_COMPAT_GUARD(ctx);
@@ -770,6 +820,37 @@ void mglPushAttrib(GLMContext ctx, GLbitfield mask)
         }
     }
 
+    /* evaluator maps: deep-copy the control points (9 x map1 + 9 x map2) */
+    {
+        size_t total = 0;
+        for (int i = 0; i < 9; i++)
+        {
+            int k1 = (int)eval_points_count(ctx, 0, i), k2 = (int)eval_points_count(ctx, 1, i);
+
+            snap->eval_map_bytes[i] = (size_t)(k1 > 0 ? k1 : 0) * sizeof(GLfloat);
+            snap->eval_map_bytes[9 + i] = (size_t)(k2 > 0 ? k2 : 0) * sizeof(GLfloat);
+            total += snap->eval_map_bytes[i] + snap->eval_map_bytes[9 + i];
+        }
+        snap->eval_map_copy = (GLubyte *)malloc(total ? total : 1);
+        if (snap->eval_map_copy)
+        {
+            size_t off = 0;
+            for (int i = 0; i < 9; i++)
+            {
+                if (snap->eval_map_bytes[i])
+                {
+                    memcpy(snap->eval_map_copy + off, s->map1[i].fpoints, snap->eval_map_bytes[i]);
+                    off += snap->eval_map_bytes[i];
+                }
+                if (snap->eval_map_bytes[9 + i])
+                {
+                    memcpy(snap->eval_map_copy + off, s->map2[i].fpoints, snap->eval_map_bytes[9 + i]);
+                    off += snap->eval_map_bytes[9 + i];
+                }
+            }
+        }
+    }
+
     s->attrib_stack[s->attrib_depth].mask = mask;
     s->attrib_stack[s->attrib_depth].deep = (struct MGLExtState_compat *)snap;
     s->attrib_depth++;
@@ -804,6 +885,17 @@ void mglPopAttrib(GLMContext ctx)
         struct MGLExtState_compat keep = *s;
 
         *s = snap->compat;
+
+        /* the struct restore brought back the map control-point pointers
+         * that were live at PUSH time: they may have been freed by a
+         * glMap1/glMap2 in between, so free the CURRENT live arrays (captured
+         * in keep) and install deep copies from the snapshot below — never
+         * freeing the restored values themselves */
+        for (int i = 0; i < 9; i++)
+        {
+            free(keep.map1[i].fpoints);
+            free(keep.map2[i].fpoints);
+        }
 
         s->lists = keep.lists;
         s->list_used = keep.list_used;
@@ -859,6 +951,35 @@ void mglPopAttrib(GLMContext ctx)
                 off += snap->pixel_map_bytes[i];
             }
         }
+
+        /* evaluator control points: fresh copies of the snapshot contents */
+        if (snap->eval_map_copy)
+        {
+            size_t off = 0;
+
+            for (int i = 0; i < 9; i++)
+            {
+                s->map1[i].fpoints = (GLfloat *)malloc(snap->eval_map_bytes[i] ? snap->eval_map_bytes[i] : 1);
+                if (s->map1[i].fpoints && snap->eval_map_bytes[i])
+                    memcpy(s->map1[i].fpoints, snap->eval_map_copy + off, snap->eval_map_bytes[i]);
+                off += snap->eval_map_bytes[i];
+
+                s->map2[i].fpoints = (GLfloat *)malloc(snap->eval_map_bytes[9 + i] ? snap->eval_map_bytes[9 + i] : 1);
+                if (s->map2[i].fpoints && snap->eval_map_bytes[9 + i])
+                    memcpy(s->map2[i].fpoints, snap->eval_map_copy + off, snap->eval_map_bytes[9 + i]);
+                off += snap->eval_map_bytes[9 + i];
+            }
+        }
+        else
+        {
+            /* no snapshot copy (allocation failure at push): NULL them out so
+             * no dangling pointer is left behind */
+            for (int i = 0; i < 9; i++)
+            {
+                s->map1[i].fpoints = NULL;
+                s->map2[i].fpoints = NULL;
+            }
+        }
     }
 
     /* recompute the float matrix caches from the restored stacks */
@@ -883,6 +1004,7 @@ void mglPopAttrib(GLMContext ctx)
     }
 
     free(snap->pixel_map_copy);
+    free(snap->eval_map_copy);
     free(snap);
     slot->deep = NULL;
 
