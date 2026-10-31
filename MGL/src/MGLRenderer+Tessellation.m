@@ -142,6 +142,14 @@ static size_t tRingCap[MGL_TESS_RING];
 
 static size_t tessRingAlign(size_t v) { return (v + 255) & ~(size_t)255; }
 
+/* r44: upper bound on patches per draw (instances included).  The hardware
+ * path's minimum per-patch ring footprint is ~50 B (factor record + float
+ * levels + patch data), so 4M patches is already >200 MB of scratch; anything
+ * bigger belongs to a workload that is far past what a single Metal buffer can
+ * back, and the guard keeps every derived count (uint32 kernel words, size_t
+ * offsets) provably in range. */
+#define MGL_TESS_MAX_TOTAL_PATCHES (1LL << 22)
+
 /* exhaustion diagnostics (mgl_tess_ring_spins): acquires that had to poll for a
  * slot, the worst poll count and the total time slept — the health signal for the
  * keep-alive/depth tuning below (a healthy hot loop stays at or near zero) */
@@ -167,14 +175,115 @@ static int tRingTrace(void)
 /* acquire a block of `bytes` from the ring; returns the buffer and sets *offset.
  * Grows a free slot if needed (creating a NEW buffer; busy ones are never touched).
  *
- * Concurrency protocol (r43 hardening): only Metal completion-handler threads
- * (tessRingRelease) and the GL thread touch the ring.  A slot is CLAIMED by
- * flipping tRingBusy false->true (an atomic exchange — uncontended in practice,
- * GL contexts serialize, but exact under C11); the releaser finishes every
- * mutation (pos reset, big-block recycle) BEFORE the release store, so an
- * acquire that observes busy==false (acquire order) sees the final
- * tRing/tRingCap/tRingPos — a claim can never race the recycle's tRing=nil. */
-static atomic_bool tRingBusy[MGL_TESS_RING];
+ * Concurrency protocol (r43/r44 hardening): only Metal completion-handler threads
+ * and the GL thread touch the ring.  A slot is CLAIMED through the state word
+ * (FREE -> BUSY); a retire CASes BUSY -> BUSY|RETIRING at the generation it was
+ * armed for, mutates exclusively in that state, then publishes FREE with the
+ * generation bumped — an acquire that observes FREE sees the slot's final
+ * tRing/tRingCap/tRingPos by construction, and the twin releases (completion
+ * handler + GL-thread poll) can never both act. */
+static void tessRingPendPoll(void);
+static void tessRingPendPollFull(bool need_slot);
+static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t *offset,
+                                     int *slot, MGLRenderer *self);
+/* r44: a slot's retire can now arrive TWICE — the completion handler (exact but
+ * jumpy: Metal fires it 0.5-2 ms after the GPU finished, worse under load) and
+ * the GL thread's own poll of the in-flight list (every acquire that needs a
+ * slot).  A plain busy flag cannot tell "the poll already released this" from
+ * "the next draw claimed it again", so the late handler would free a slot that
+ * has a new owner — and two releasers racing would both run the release's
+ * mutations (big-block free) on a slot one of them no longer owns.  The state
+ * word packs all of it: bits2.. = generation of the current claim, bit1 =
+ * RETIRING (a release won and is mutating; claims must not take it), bit0 =
+ * BUSY.  A retire CASes BUSY->BUSY|RETIRING at the generation it was armed
+ * for, mutates under that exclusive state, then publishes FREE with the
+ * generation bumped: whichever of the duplicate retires runs second finds the
+ * word already moved and is an exact no-op, and a claim can never observe a
+ * slot mid-mutation. */
+static atomic_uint tRingWord[MGL_TESS_RING];
+
+static inline bool tessSlotBusy(int i)      /* busy or retiring: not claimable */
+{
+    return (atomic_load_explicit(&tRingWord[i], memory_order_acquire) & 3u) != 0;
+}
+static inline uint32_t tessSlotGen(int i)
+{
+    return atomic_load_explicit(&tRingWord[i], memory_order_acquire) >> 2;
+}
+/* claim (GL thread): FREE -> BUSY, keeping the generation the last release
+ * left; the caller then owns every non-atomic field of the slot.  false = not
+ * free. */
+static inline bool tessSlotClaim(int i)
+{
+    unsigned w = atomic_load_explicit(&tRingWord[i], memory_order_acquire);
+    do {
+        if (w & 3u)
+            return false;
+    } while (!atomic_compare_exchange_weak_explicit(&tRingWord[i], &w, (w & ~3u) | 1u,
+                 memory_order_acq_rel, memory_order_acquire));
+    return true;
+}
+/* the one full release: mutations + publish, exclusive through the RETIRING
+ * state.  `gen` must be the generation the retire was armed for; a stale gen
+ * (someone else owns the slot now, or the twin retire won) is a no-op. */
+/* big-block recycle counter (mgl_tess_ring_freed_big): blocks above
+ * TESS_RING_BIG that were freed on retire instead of being pinned in a slot;
+ * mgl_tess_ring_big_slots counts slots currently holding such a block.  A burst
+ * of big draws must keep BOTH small (free draws reuse a warm big slot, at most a
+ * couple grow for in-flight work) — test_tess.c asserts it, the regression
+ * guard for the ring's memory bound. */
+static unsigned long tRingFreedBig;
+static void tessRingRetireGen(int slot, uint32_t gen)
+{
+    unsigned exp = (gen << 2) | 1u;         /* BUSY, not retiring */
+    unsigned win = (gen << 2) | 3u;         /* BUSY + RETIRING */
+    if (slot < 0 || slot >= MGL_TESS_RING)
+        return;
+    if (!atomic_compare_exchange_strong_explicit(&tRingWord[slot], &exp, win,
+            memory_order_acq_rel, memory_order_acquire))
+    {
+        /* the word moved under us: the twin retire (handler or poll) already
+         * acted, or a stale retire found a new owner — exactly what the
+         * generation is for; count it so tests can see the guard work */
+        atomic_fetch_add_explicit(&tRingDupRetires, 1u, memory_order_relaxed);
+        return;
+    }
+    if (tRingTrace())
+        fprintf(stderr, "MGL ring: release slot=%d gen=%u\n", slot, gen);
+    /* big transient blocks are not worth pinning: keep two warm (a repeating
+     * big-draw workload then reallocates nothing) and free the rest, so the
+     * deeper ring cannot multiply a capture draw's tens of MB into gigabytes.
+     * Every mutation below happens while the slot is RETIRING — a state no
+     * claim can take — so an acquire that later observes BUSY==0 sees the
+     * FINAL tRing/tRingCap/tRingPos (the r43 hardening: the recycle used to
+     * publish first, so a claim racing it could take a nil'd buffer). */
+    if (tRing[slot] && tRingCap[slot] > TESS_RING_BIG)
+    {
+        int warm = 0;
+        for (int i = 0; i < MGL_TESS_RING; i++)
+            if (i != slot && !tessSlotBusy(i) && tRing[i] && tRingCap[i] > TESS_RING_BIG)
+                    warm++;
+        if (warm >= 2)
+        {
+            size_t freed = tRingCap[slot];
+            tRing[slot] = nil;      /* ARC drops the MTLBuffer */
+            tRingCap[slot] = 0;
+            tRingFreedBig++;
+            if (tRingTrace())
+                fprintf(stderr, "MGL ring: freed big slot=%d (%zu bytes, %d warm)\n",
+                        slot, freed, warm);
+        }
+    }
+    tRingPos[slot] = 0;            /* reuse from the start once retired */
+    atomic_store_explicit(&tRingWord[slot], (gen + 1u) << 2, memory_order_release);
+}
+/* owner-side release (the draw's own early exit) and the stale-busy recovery:
+ * release whatever generation currently holds the slot */
+static inline void tessRingRetireCurrent(int slot)
+{
+    if (tessSlotBusy(slot))
+        tessRingRetireGen(slot, tessSlotGen(slot));
+}
 /* tess draws encoded on the current shared command buffer (AGX keep-alive,
  * see the flush at the end of the hardware path) */
 static unsigned tHwDrawsOnCb = 0;
@@ -188,12 +297,17 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
     for (int i = 0; i < MGL_TESS_RING; i++)
     {
         int idx = (tRingScan + i) % MGL_TESS_RING;
-        if (!atomic_load_explicit(&tRingBusy[idx], memory_order_acquire))
+        /* claim FIRST, read pos/cap under the claim: a free slot's fields are
+         * only stable until another claim, and between an earlier read and this
+         * one a competing GL thread (a second context: the ring is
+         * process-global) can run a whole claim->retire cycle — including the
+         * big-block recycle that nils tRing[idx].  Fields read while the slot
+         * is owned are untouchable, so a stale-cap handout is impossible. */
+        if (tessSlotClaim(idx))
         {
-            size_t cap = tRingCap[idx], pos = tRingPos[idx];   /* stable: free slots
-                are only mutated by the releaser BEFORE its busy store */
-            if (cap >= pos + bytes &&
-                !atomic_exchange_explicit(&tRingBusy[idx], true, memory_order_acq_rel))
+            size_t cap = tRingCap[idx], pos = tRingPos[idx];
+
+            if (cap >= pos + bytes)
             {
                 *offset = pos;
                 tRingPos[idx] = pos + tessRingAlign(bytes);
@@ -204,13 +318,17 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                             idx, bytes, tRingCap[idx]);
                 return tRing[idx];
             }
+            /* no room: hand the slot straight back.  Nothing was mutated (pos,
+             * cap, buffer untouched), so publishing FREE needs no RETIRING
+             * dance — bump the generation so no stale retire can match. */
+            atomic_store_explicit(&tRingWord[idx], (tessSlotGen(idx) + 1u) << 2,
+                                  memory_order_release);
         }
     }
     /* no free slot with room: find a free one and grow it (or take the largest) */
     int best = -1;
     for (int i = 0; i < MGL_TESS_RING; i++)
-        if (!atomic_load_explicit(&tRingBusy[i], memory_order_acquire) &&
-            (best < 0 || tRingCap[i] > tRingCap[best]))
+        if (!tessSlotBusy(i) && (best < 0 || tRingCap[i] > tRingCap[best]))
             best = i;
     if (best < 0)
     {
@@ -227,7 +345,10 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
         for (int spin = 0; spin < 20000; spin++)
         {
             bool any = false;
-            tessRingPendPoll();
+            /* the pressure path: poll the in-flight handler retires too, so a
+             * slot whose command buffer already completed frees NOW instead of
+             * when Metal's handler thread gets scheduled */
+            tessRingPendPollFull(true);
             if ((unsigned)spin > tRingSpinMax)
                 tRingSpinMax = (unsigned)spin;
             tRingSleptNs += (uint64_t)(spin < 10 ? 100 : 250) * 1000u;  /* the usleep below */
@@ -237,7 +358,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                 size_t used = 0;
                 for (int i = 0; i < MGL_TESS_RING; i++)
                 {
-                    bool b = atomic_load_explicit(&tRingBusy[i], memory_order_acquire);
+                    bool b = tessSlotBusy(i);
                     bm |= (unsigned)b << i;
                     if (!b) nfree++;
                 }
@@ -249,7 +370,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
             }
 
             for (int i = 0; i < MGL_TESS_RING && !any; i++)
-                any = !atomic_load_explicit(&tRingBusy[i], memory_order_acquire);
+                any = !tessSlotBusy(i);
             if (any)
             {
                     return tessRingAcquire(device, bytes, offset, slot, self);
@@ -305,7 +426,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                  * that exited without registering its release).  Retire them rather
                  * than failing every later draw. */
                 for (int i = 0; i < MGL_TESS_RING; i++)
-                    tessRingRelease(i);
+                    tessRingRetireCurrent(i);
                 return tessRingAcquire(device, bytes, offset, slot, self);
             }
             usleep(spin < 10 ? 100 : 250);
@@ -315,15 +436,37 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
     /* claim first, grow after: the mutations then happen only on a slot this
      * thread owns (the claim is uncontended in practice — GL contexts serialize
      * — but exact under C11, and the re-entry covers the impossible loss) */
-    if (atomic_exchange_explicit(&tRingBusy[best], true, memory_order_acq_rel))
+    if (!tessSlotClaim(best))
         return tessRingAcquire(device, bytes, offset, slot, self);
     {
+        /* r44 bound: `bytes` comes from per-draw count arithmetic that has already
+         * been capped (see the draw entry), but the grow must also respect Metal's
+         * own per-buffer limit — newBufferWithLength above it fails (and for absurd
+         * values can abort), so refuse the block here and let the caller drop the
+         * draw instead of the process. */
+        NSUInteger maxbuf = device.maxBufferLength ? device.maxBufferLength : (1u << 30);
         size_t cap = tRingCap[best] + tessRingAlign(bytes) + (1u << 20);
+        if (cap > (size_t)maxbuf)
+        {
+            cap = tessRingAlign(bytes);
+            if (cap > (size_t)maxbuf)
+            {
+                static bool warned = false;
+                if (!warned)
+                {
+                    NSLog(@"MGL tess: draw dropped: scratch block %zu bytes exceeds the Metal buffer limit %llu",
+                          bytes, (unsigned long long)maxbuf);
+                    warned = true;
+                }
+                tessRingRetireGen(best, tessSlotGen(best));
+                return nil;
+            }
+        }
         id<MTLBuffer> nb = [device newBufferWithLength: cap
                               options: MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked];
         if (!nb)
         {
-            atomic_store_explicit(&tRingBusy[best], false, memory_order_release);
+            tessRingRetireGen(best, tessSlotGen(best));
             return nil;
         }
         tRing[best] = nb;
@@ -346,7 +489,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
  * of big draws must keep BOTH small (free draws reuse a warm big slot, at most a
  * couple grow for in-flight work) — test_tess.c asserts it, the regression
  * guard for the ring's memory bound. */
-static unsigned long tRingFreedBig;
+static unsigned long tRingFreedBig;   /* definition: see the r44 state-word block */
 unsigned long mgl_tess_ring_freed_big(void) { return tRingFreedBig; }
 unsigned mgl_tess_ring_big_slots(void)
 {
@@ -357,43 +500,6 @@ unsigned mgl_tess_ring_big_slots(void)
     return n;
 }
 
-static void tessRingRelease(int slot)
-{
-    if (slot >= 0 && slot < MGL_TESS_RING &&
-        atomic_load_explicit(&tRingBusy[slot], memory_order_acquire))
-    {
-        if (tRingTrace())
-            fprintf(stderr, "MGL ring: release slot=%d\n", slot);
-        /* big transient blocks are not worth pinning: keep two warm (a repeating
-         * big-draw workload then reallocates nothing) and free the rest, so the
-         * deeper ring cannot multiply a capture draw's tens of MB into gigabytes.
-         * Every mutation below happens BEFORE the busy store — a claimed slot is
-         * untouchable, and an acquire that later observes busy==false must see
-         * the FINAL tRing/tRingCap/tRingPos (the r43 hardening: the recycle used
-         * to publish first, so a claim racing it could take a nil'd buffer). */
-        if (tRing[slot] && tRingCap[slot] > TESS_RING_BIG)
-        {
-            int warm = 0;
-            for (int i = 0; i < MGL_TESS_RING; i++)
-                if (i != slot && !atomic_load_explicit(&tRingBusy[i], memory_order_acquire) &&
-                    tRing[i] && tRingCap[i] > TESS_RING_BIG)
-                    warm++;
-            if (warm >= 2)
-            {
-                size_t freed = tRingCap[slot];
-                tRing[slot] = nil;      /* ARC drops the MTLBuffer */
-                tRingCap[slot] = 0;
-                tRingFreedBig++;
-                if (tRingTrace())
-                    fprintf(stderr, "MGL ring: freed big slot=%d (%zu bytes, %d warm)\n",
-                            slot, freed, warm);
-            }
-        }
-        tRingPos[slot] = 0;            /* reuse from the start once retired */
-        atomic_store_explicit(&tRingBusy[slot], false, memory_order_release);
-    }
-}
-
 /* deferred ring retires: a completion handler must be added BEFORE the command buffer
  * is committed (Metal asserts otherwise — tessellation_shader_tc_barriers aborts the
  * process through its link-failure path, where the draw bails AFTER a flush), so a
@@ -401,8 +507,38 @@ static void tessRingRelease(int slot)
  * acquire spin) releases its slot once the GPU finished it */
 static id<MTLCommandBuffer> tRingPendCb[MGL_TESS_RING];
 static int tRingPendSlot[MGL_TESS_RING];
+static uint32_t tRingPendGen[MGL_TESS_RING];
 
-static void tessRingPendPoll(void)
+/* r44 in-flight retires: retires armed through a completion handler are ALSO
+ * polled here from the GL thread, so a slot frees as soon as the GPU has
+ * actually finished the command buffer — not when Metal gets around to firing
+ * the handler (0.5-2 ms of jitter after completion, several ms under load;
+ * measured as the dominant per-draw cost of every GPU-contended GL_PATCHES
+ * loop: the ring went dry while 20+ slots sat on finished buffers).  The
+ * handler keeps running (it is still the exact, unpolluted wake for workloads
+ * that stop drawing); whichever of the two arrives second is a no-op through
+ * the generation the retire recorded.  The list is written only by the GL
+ * thread (retire-on / this poll); the handler never touches it. */
+#define MGL_TESS_FLY 32
+static id<MTLCommandBuffer> tRingFlyCb[MGL_TESS_FLY];
+static int tRingFlySlot[MGL_TESS_FLY];
+static uint32_t tRingFlyGen[MGL_TESS_FLY];
+/* retires whose twin had already acted (handler after poll or poll after
+ * handler): the generation guard turning what used to be a double free of a
+ * possibly re-claimed slot into a no-op — mgl_tess_ring_dup_retires() */
+static atomic_uint tRingDupRetires;
+unsigned mgl_tess_ring_dup_retires(void)
+{
+    return atomic_load_explicit(&tRingDupRetires, memory_order_relaxed);
+}
+
+/* poll the parked (committed-before-retire) and in-flight (handler-armed)
+ * retires: release every slot whose command buffer the GPU has finished.
+ * `need_slot` false = the cheap maintenance call at the top of a healthy
+ * acquire (parked list only, a dozen loads); true = an acquire that found no
+ * free slot also polls the in-flight handlers — that is the pressure path the
+ * fly list exists for. */
+static void tessRingPendPollFull(bool need_slot)
 {
     for (int i = 0; i < MGL_TESS_RING; i++)
         if (tRingPendCb[i])
@@ -411,10 +547,23 @@ static void tessRingPendPoll(void)
             if (cb.status >= MTLCommandBufferStatusCompleted || cb.status == MTLCommandBufferStatusError)
             {
                 tRingPendCb[i] = nil;
-                tessRingRelease(tRingPendSlot[i]);
+                tessRingRetireGen(tRingPendSlot[i], tRingPendGen[i]);
+            }
+        }
+    if (!need_slot)
+        return;
+    for (int i = 0; i < MGL_TESS_FLY; i++)
+        if (tRingFlyCb[i])
+        {
+            id<MTLCommandBuffer> cb = tRingFlyCb[i];
+            if (cb.status >= MTLCommandBufferStatusCompleted || cb.status == MTLCommandBufferStatusError)
+            {
+                tRingFlyCb[i] = nil;
+                tessRingRetireGen(tRingFlySlot[i], tRingFlyGen[i]);
             }
         }
 }
+static void tessRingPendPoll(void) { tessRingPendPollFull(false); }
 
 /* Retire a ring block on an early exit (draw bailed after the block was acquired).
  * `cb` is the command buffer that used the block: the CPU reference path has already
@@ -426,15 +575,20 @@ static void tessRingPendPoll(void)
  * and every later draw burned the 2 s acquire timeout. */
 static void tessRingRetireOn(id<MTLCommandBuffer> cb, int slot)
 {
+    uint32_t gen;
+
     if (slot < 0)
         return;
     tessRingPendPoll();
     if (!cb || cb.status >= MTLCommandBufferStatusCompleted ||
         cb.status == MTLCommandBufferStatusError)
     {
-        tessRingRelease(slot);
+        tessRingRetireCurrent(slot);
         return;
     }
+    /* the slot is still claimed by the draw that is retiring it: its generation
+     * is what every deferred release of this retire must present */
+    gen = tessSlotGen(slot);
     if (cb.status >= MTLCommandBufferStatusCommitted)
     {
         /* committed or scheduled: a completion handler would assert (it must be added
@@ -447,6 +601,7 @@ static void tessRingRetireOn(id<MTLCommandBuffer> cb, int slot)
                     fprintf(stderr, "MGL ring: retire deferred slot=%d (cb committed)\n", slot);
                 tRingPendCb[i] = cb;
                 tRingPendSlot[i] = slot;
+                tRingPendGen[i] = gen;
                 return;
             }
         }
@@ -454,11 +609,26 @@ static void tessRingRetireOn(id<MTLCommandBuffer> cb, int slot)
          * busy until one frees up — the acquire spin polls this list */
         return;
     }
-    int s = slot;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-        (void)b;
-        tessRingRelease(s);
-    }];
+    {
+        int s = slot;
+        uint32_t g = gen;
+        /* handler (exact wake, also the only releaser if no further tess draw
+         * ever polls) AND the in-flight list (GL-thread poll, frees the slot as
+         * soon as the GPU finished instead of when the handler thread runs);
+         * the generation makes the second one to arrive a no-op */
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            (void)b;
+            tessRingRetireGen(s, g);
+        }];
+        for (int i = 0; i < MGL_TESS_FLY; i++)
+            if (!tRingFlyCb[i])
+            {
+                tRingFlyCb[i] = cb;
+                tRingFlySlot[i] = slot;
+                tRingFlyGen[i] = g;
+                return;
+            }
+    }
 }
 
 static id<MTLLibrary> tKernelLib;
@@ -2090,6 +2260,31 @@ static void tessRetireCapture(GLMContext ctx)
         NSLog(@"MGL tess: draw patches=%d (count=%d pv=%d)", (int)patches, (int)count, (int)patch_verts_in);
     if (patches <= 0)
         return true;
+    /* r44 size guards: `patches * instances` and `count * instances` are
+     * GLsizei x GLsizei — signed overflow above 2^31 is UB, and even a valid
+     * product then truncates through every uint32 GPU word and the ring sizing
+     * below, sizing the scratch block WRONG (the kernels would write past it:
+     * a silent GPU memory corruption, not a failed draw).  A draw this large
+     * cannot be executed anyway (the block would exceed Metal's per-buffer
+     * limit by orders of magnitude), so drop it; GL generates no error for
+     * running out of drawable resources. */
+    {
+        long long total64 = (long long)patches * (long long)instances;
+        long long gather64 = (long long)count * (long long)(instances > 0 ? instances : 1);
+
+        if (total64 > MGL_TESS_MAX_TOTAL_PATCHES || gather64 > 0x7fffffffLL)
+        {
+            static bool warned = false;
+            if (!warned)
+            {
+                NSLog(@"MGL tess: draw dropped: %lld patches / %lld gathered control points "
+                      "(count=%d inst=%d) exceed the GPU scratch budget", total64, gather64,
+                      (int)count, (int)instances);
+                warned = true;
+            }
+            return true;
+        }
+    }
     total_patches = patches * instances;
 
     if (ctx->state.program_pipeline)
@@ -3061,15 +3256,26 @@ ph_vs = tessPhaseBegin();
             {
                 unsigned free_slots = 0;
                 for (int i = 0; i < MGL_TESS_RING; i++)
-                    free_slots += !atomic_load_explicit(&tRingBusy[i],
-                                                        memory_order_relaxed);
+                    free_slots += !tessSlotBusy(i);
                 /* hysteresis (min-of-7 ab: a plain low/high threshold oscillated
                  * around the pressure point and cost ~6 us/draw on the noTCS
                  * shape): cadence 2 is the steady state, 4 only with most of the
-                 * ring free, 1 when it runs low */
-                unsigned ka_every = tRingExhaust ? 1u :
+                 * ring free, 1 when it runs low.  MGL_TESS_KAMAX caps the cadence
+                 * (A/B knob for the r44 poll-based retirement, where slots free
+                 * at GPU completion instead of handler firing). */
+                static int kaMax = -1;
+                unsigned ka_every;
+
+                if (kaMax < 0)
+                {
+                    const char *e = getenv("MGL_TESS_KAMAX");
+                    kaMax = (e && atoi(e) >= 1 && atoi(e) <= 4) ? atoi(e) : 4;
+                }
+                ka_every = tRingExhaust ? 1u :
                                     (free_slots <= (unsigned)MGL_TESS_RING / 6) ? 1u :
                                     (free_slots <= (unsigned)(MGL_TESS_RING * 2) / 3) ? 2u : 4u;
+                if (ka_every > (unsigned)kaMax)
+                    ka_every = (unsigned)kaMax;
                 if (++tHwDrawsOnCb >= ka_every)
                 {
                     tHwDrawsOnCb = 0;

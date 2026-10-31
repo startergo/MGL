@@ -1418,6 +1418,156 @@ TEST(TessRingBigBlockRecycle)
     glDeleteProgram(p);
 }
 
+/* ------------- r44: ring generation protocol under real timing ------------------
+ * 600 mixed-size patch draws (3-vertex hardware shape and 64-patch hardware draws)
+ * with glFinish on a prime stride: slot reuse across generations while the twin
+ * retires (completion handler + GL-thread poll) race in every possible order.  A
+ * double release would hand one block to two draws and corrupt a frame; every
+ * checked frame must stay pixel-exact, and the ring must never wedge (the
+ * acquire escape hatch only fires after 2 s of no progress — max poll < 50 ms).
+ * mgl_tess_ring_dup_retires() counts the twins the generation guard no-opped. */
+TEST(TessRingGenerationHammer)
+{
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    GLuint pnos;      /* TES-only (no TCS): a second shape, different ring sizes */
+    GLint link = 0;
+    int checked = 0;
+    uint64_t maxns = 0, totns = 0;
+
+    pnos = make_program(NULL, kTesTri);
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    for (int i = 0; i < 600; i++)
+    {
+        GLint vp[4];
+        float w, h, r[4], g[4], b[4];
+
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if ((i % 3) == 0)
+        {
+            glUseProgram(prog);            /* TCS+TES, 1 patch */
+            glDrawArrays(GL_PATCHES, 0, 3);
+        }
+        else if ((i % 3) == 1)
+        {
+            glUseProgram(prog);            /* 64 patches in one draw */
+            glDrawArraysInstanced(GL_PATCHES, 0, 3 * 64, 1);
+        }
+        else
+        {
+            glUseProgram(pnos);            /* no TCS: default levels path */
+            glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL,
+                               (const float[]){ 2, 2, 2, 2 });
+            glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL,
+                               (const float[]){ 2, 2 });
+            glDrawArrays(GL_PATCHES, 0, 3);
+        }
+        if (i % 17 == 0)                   /* prime stride: vary slot lifetimes */
+        {
+            glFinish();
+            glGetIntegerv(GL_VIEWPORT, vp);
+            w = (float)vp[2];
+            h = (float)vp[3];
+            read_px(2, (int)h - 4, r);
+            read_px(2, 2, g);
+            read_px((int)w - 4, 2, b);
+            EXPECT_NEAR(r[0], 1.0f, 0.10f);
+            EXPECT_NEAR(g[1], 1.0f, 0.10f);
+            EXPECT_NEAR(b[2], 1.0f, 0.10f);
+            checked++;
+        }
+    }
+    glFinish();
+    EXPECT_TRUE(checked > 30);
+    mgl_tess_ring_spins(&maxns, &totns);
+    printf("  hammer: %d frames checked, dup retires no-opped by the generation guard: %u\n",
+           checked, mgl_tess_ring_dup_retires());
+    /* the 2 s acquire escape (spin 19999) must never fire: 50 ms of worst-case
+       polling is already 200 acquire rounds under load */
+    EXPECT_TRUE(maxns < 50000ull * 1000ull);
+    glDeleteProgram(prog);
+    glDeleteProgram(pnos);
+}
+
+/* ------------- r44: un-executable patch counts must drop, not corrupt -------------
+ * patches * instances overflows a GLsizei (1024 patches x 2^22 instances = 2^32):
+ * before the r44 guard that was signed-overflow UB whose wrapped value sized the
+ * ring block (a negative/zero total made the kernels dispatch with garbage
+ * grids and Metal validation fail); now the draw is dropped before any GPU work
+ * and the ring stays healthy for everything after it. */
+TEST(TessHugePatchCountDropped)
+{
+    GLuint prog = make_program(kTcsTri, kTesTri);
+    float big[1024 * 3][4];
+    GLint link = 0;
+
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+    for (int i = 0; i < 1024 * 3; i++)
+    {
+        big[i][0] = kTriPos[i % 3][0];
+        big[i][1] = kTriPos[i % 3][1];
+        big[i][2] = kTriPos[i % 3][2];
+        big[i][3] = kTriPos[i % 3][3];
+    }
+    {
+        GLuint bufs[2], vao;
+
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glGenBuffers(2, bufs);
+        glBindBuffer(GL_ARRAY_BUFFER, bufs[0]);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(big), big, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, bufs[1]);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(big), big, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, bufs[0]);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+        glEnableVertexAttribArray(1);
+        glBindBuffer(GL_ARRAY_BUFFER, bufs[1]);
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    }
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstanced(GL_PATCHES, 0, 1024 * 3, 1 << 22);   /* 2^32 total patches */
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    {
+        GLint vp[4];
+        float c[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        read_px(vp[2] / 2, vp[3] / 2, c);
+        EXPECT_NEAR(c[0], 0.0f, 0.02f);     /* dropped: nothing was drawn */
+        EXPECT_NEAR(c[1], 0.0f, 0.02f);
+    }
+    /* and the ring is still healthy: ordinary draws keep rendering exactly */
+    for (int i = 0; i < 40; i++)
+        glDrawArraysInstanced(GL_PATCHES, 0, 9, 1);
+    glFinish();
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glFinish();
+    {
+        GLint vp[4];
+        float r[4], g[4], b[4];
+        glGetIntegerv(GL_VIEWPORT, vp);
+        read_px(2, vp[3] - 4, r);
+        read_px(2, 2, g);
+        read_px(vp[2] - 4, 2, b);
+        EXPECT_NEAR(r[0], 1.0f, 0.10f);
+        EXPECT_NEAR(g[1], 1.0f, 0.10f);
+        EXPECT_NEAR(b[2], 1.0f, 0.10f);
+    }
+    glDeleteProgram(prog);
+}
+
 TEST(TessProgramQueries)
 {
     GLuint prog = make_program(kTcsTri, kTesTri);
@@ -2282,6 +2432,8 @@ int main(void)
     RUN(TessProgramQueries);
     RUN(TessCountQueriesExact);
     RUN(TessRingBigBlockRecycle);
+    RUN(TessRingGenerationHammer);
+    RUN(TessHugePatchCountDropped);
     RUN(TessErrors);
     RUN(TessDefaultLevels);
     RUN(TessLayerFromVertexStage);

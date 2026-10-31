@@ -1,3 +1,102 @@
+READY 74a0749 (all r44 code; the report commit on top is the branch tip)
+
+# tess domain — round 44 report (ring retire latency + draw-size robustness)
+
+Builds clean (`make -j8 lib`, no new warnings in my files), full headless suite
+**139 test files, 0 failures**; stub scanner clean for
+MGLRenderer+Tessellation.m / tessellation.c / tess_spv_lower.c; CTS
+KHR-GL46.tessellation_shader **58/58 Pass** on the merged tree.
+
+## What this round fixed
+
+### 1. Ring slots waited on Metal's completion-handler jitter (per-draw CPU, the dominant cost of every GPU-contended GL_PATCHES loop)
+A slot retired only when Metal fired the command buffer's completion handler —
+0.5-2 ms **after the GPU finished** the buffer, several ms under load.  With
+draws encoding in ~100 us, that latency is worth 5-20 in-flight draws: tight
+GL_PATCHES loops went dry with 20+ slots sitting on *finished* buffers and
+burned 48-150 us/draw sleeping in tessRingAcquire (phase counters, load 5-8).
+
+**Fix (all in my file):** every retire armed through a handler is now ALSO
+recorded on an in-flight list polled from the GL thread (every acquire that
+needs a slot), so a slot frees as soon as the GPU has *actually* finished the
+buffer.  The handler stays armed as the exact wake for workloads that stop
+drawing.  Measured interleaved a/c/a/c (same load, matched 200-draw windows):
+**ring phase 78-150 -> 0.36 us/draw**, draw TOTAL 120-209 -> 40-71 us/draw.
+
+A retire can now arrive twice, so the slot state word packs
+`generation | RETIRING | BUSY`: a retire CASes BUSY->BUSY|RETIRING at the
+generation it was armed for, mutates exclusively in that state (pos reset,
+big-block recycle), then publishes FREE with the generation bumped.  The twin
+(handler after poll, poll after handler — and the pre-existing parked-after-
+escape case) is an exact no-op; `mgl_tess_ring_dup_retires()` counts them.
+The fast path also now claims **before** reading pos/cap (a second GL context
+running a whole claim->retire cycle in between could otherwise hand out a
+nil'd big block through stale capacity — same class as the r43b hole).
+
+### 2. Draw-size overflow guards (robustness)
+`patches * instances` and `count * instances` were GLsizei x GLsizei — signed
+overflow (UB) above 2^31, and the wrapped value sized the ring block: the
+kernels would dispatch garbage grids and Metal validation would abort (a
+silent memory-corruption class bug, worse than a failed draw).  Both products
+are computed in 64 bit now; a draw whose totals exceed 4M patches / 2^31
+gathered control points is dropped before any GPU work (single log, no GL
+error — running out of drawable resources is not a GL error).  The ring's grow
+path also refuses blocks above `device.maxBufferLength`.
+
+### 3. Keep-alive cadence knob
+`MGL_TESS_KAMAX` (1..4) caps the AGX keep-alive commit cadence — an A/B knob
+for the poll-based retirement (measured indistinguishable between 4 and 2 under
+load; the r43 hysteresis stands).
+
+## Tests added (test_tess.c: 689 -> 807 checks, 0 failures)
+* **TessRingGenerationHammer** — 600 mixed-shape draws (TCS+TES / 64-patch /
+  noTCS-default-levels), 36 pixel-exact frames on a prime finish stride, ring
+  must never wedge (worst acquire poll < 50 ms, vs the 2 s escape).
+* **TessHugePatchCountDropped** — 2^32 total patches (int32-overflow product)
+  is dropped cleanly (frame untouched, no GL error, single log) and the ring
+  stays healthy for everything after it.
+
+## Gates (supervisor protocol)
+* Full headless suite after the f8be669 merge: **139 files, 0 failures**.
+* CTS per-group: `KHR-GL46.tessellation_shader*` → **58/58 Pass** (0 Fail, 0
+  NotSupported) on the merged tree.
+* ab_bench (ab_patches, MGL_AB_CPU=1, min-of-7, alternating) vs
+  **baseline-f8be669**: drawArrays 0.71/0.81, noTCS 134.9/137.8,
+  TCS+TES 141.2/152.1, 64-patch 138.0/137.8 ms/1000 — CPU-time parity within
+  the load noise of the run (load 6-8; r43 recorded single-run swings larger
+  than these deltas).  The r44 win is wall-clock latency, which CPU-time
+  accounting deliberately excludes: the interleaved phase windows above show
+  where the sleeping went.
+* Locked glmark2 (lockf, 8 rounds, alternating, same 3 scenes as r43):
+  P(f8be669) median 2951, C(r44) median 2709 — **treat as contaminated**: C's
+  two lowest rounds (1588, 1813) coincide with other agents' GPU bursts
+  (machine load 5-8 through the window), and r44 executes **no code** on these
+  scenes (no GL_PATCHES draws in ideas/jellyfish/gl41-geometry; the ring is
+  entered only from mgl_tess_draw_patches).  The merged-tree deltas that could
+  matter here (geom r82/r83, compat s38) are identical on both sides.
+
+## Shared-file edits
+None this round (all work in MGL/src/MGLRenderer+Tessellation.m,
+tests/headless/test_tess.c, tests/headless/mgl_tess_diag.h).  The f8be669
+merge took gl46-port's side everywhere except MGLRenderer+Tessellation.m,
+where my r44 ring rework supersedes (upstream f492c47 is byte-identical to my
+c83f507, so the resolution loses nothing).
+
+## Gaps / follow-ups
+* The ~20-40 us/draw Metal render-encoder rebuild remains structural for the
+  shared-CB compute/render interleaving; the clean fix is batching the tess
+  compute encoders on a second command buffer chained by events so the render
+  encoder can stay open across draws — noted as future work, not correctness.
+* GPU-bound submit loops still backpressure by design (ring = pipeline depth,
+  24 draws); the poll only removes *handler* latency, not GPU execution time.
+* Still recommended for the queries domain (their file):
+  extQueriesRenderPassDescriptor allocates per render-pass build even with no
+  query targets active; the tess path builds one render pass per draw.
+
+---
+
+# (round 43 history below)
+
 # tess domain — round 43 report (robustness + per-draw CPU in the GL_PATCHES path / shared tess command buffer)
 
 READY c83f507 (gl46-port d11d184 [r43 upstream] merged; r43b on top).  Builds
@@ -14,6 +113,9 @@ TCS input an array-of-arrays; element types `vec2[3]` vs `vec2` genuinely
 mismatch — MGL's link error is correct, verified with `.agent/linktest.c`), so
 the link failed, `glUseProgram` errored, and every "TCS+TES" number r42 quoted
 was actually the TES-only program.  The bench now checks GL_LINK_STATUS (and
+uses conventional `out vec2 vpos;` / `in vec2 vpos[]`).  Consequence: the real
+TCS shape had never been measured before — and it was the one that exhausted
+the ring.
 uses conventional `out vec2 vpos;` / `in vec2 vpos[]`).  Consequence: the real
 TCS shape had never been measured before — and it was the one that exhausted
 the ring.

@@ -18,7 +18,12 @@
  *   cpu_generate_runs  — full CPU tessellations
  *   scan_waits         — GPU index-scan waits (must stay 0: round 14)
  *   cpu_index_reads    — element buffers read on the CPU (restart gapless build)
- *   restart_checks     — restart-presence scans (once per buffer content: round 15) */
+ *   restart_checks     — restart-presence scans (once per buffer content: round 15)
+ * mgl_tess_ring_dup_retires (r44): ring retires that arrived a second time
+ *   (completion handler after the GL-thread poll freed the slot, or vice
+ *   versa) and were turned into no-ops by the slot's generation guard — before
+ *   r44 the second arrival would have freed a slot a newer draw might already
+ *   own.  Purely informational: monotonic, no assertion. */
 unsigned mgl_tess_cpu_blob_builds(void);
 unsigned mgl_tess_cpu_generate_runs(void);
 unsigned mgl_tess_scan_waits(void);
@@ -61,6 +66,7 @@ int mgl_tess_diag_cpu_mesh(int domain, int spacing, int ccw, int point_mode,
  *   hardware draw path (phases setup/index/ring/vsbind/gather/tcs/notcs/blob/
  *   order/render/post/total); zero cost until armed. */
 unsigned mgl_tess_ring_spins(uint64_t *max_ns, uint64_t *total_ns);
+unsigned mgl_tess_ring_dup_retires(void);
 unsigned long mgl_tess_ring_freed_big(void);
 unsigned mgl_tess_ring_big_slots(void);
 void mgl_tess_phase_reset(void);
