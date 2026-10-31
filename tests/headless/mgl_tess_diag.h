@@ -52,4 +52,19 @@ int mgl_tess_diag_cpu_mesh(int domain, int spacing, int ccw, int point_mode,
                            const float levels[6], float *coords, int max_coords,
                            uint32_t *indices, int max_indices, int *out_index_count);
 
+/* ---- r43 ring health / CPU-phase instrumentation --------------------------
+ * mgl_tess_ring_spins: acquires that had to poll for a slot, plus the worst
+ *   poll count and total time slept (a healthy hot loop stays at or near zero).
+ * mgl_tess_ring_freed_big: blocks above 4 MB freed on retire instead of being
+ *   pinned in a slot (the ring's memory bound; see TessRingBigBlockRecycle).
+ * mgl_tess_phase_reset/us/cnt: arms per-phase CPU-time accounting of the
+ *   hardware draw path (phases setup/index/ring/vsbind/gather/tcs/notcs/blob/
+ *   order/render/post/total); zero cost until armed. */
+unsigned mgl_tess_ring_spins(uint64_t *max_ns, uint64_t *total_ns);
+unsigned long mgl_tess_ring_freed_big(void);
+unsigned mgl_tess_ring_big_slots(void);
+void mgl_tess_phase_reset(void);
+double mgl_tess_phase_us(int phase);
+uint64_t mgl_tess_phase_cnt(int phase);
+
 #endif

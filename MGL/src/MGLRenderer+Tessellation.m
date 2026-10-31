@@ -34,6 +34,7 @@
 #import "mgl.h"
 #import "mgl_ext.h"
 #import "mgl_ext_tess.h"
+#include <mach/mach_time.h>   /* the opt-in CPU phase accounting (below) */
 #import "mgl_ext_queries.h"  /* tess-count queries force the exact CPU path */
 size_t mgl_tess_factor_stride(GLMContext ctx, MGLTessProgram *tp);
 #import "mgl_ext_rstate.h"
@@ -117,15 +118,42 @@ static bool tNoFixup(void)
  * They hold no GL objects, so lifetime is "until program exit".
  */
 /* per-draw scratch ring: each draw gets an exclusive block, released when the command
- * buffer(s) that encode it complete. Never resized, never shared between draws. */
-#define MGL_TESS_RING 8
+ * buffer(s) that encode it complete. Never resized, never shared between draws.
+ *
+ * Depth (r43): a slot retires only when its command buffer COMPLETES, and Metal fires
+ * the completion handlers with ~0.5-2 ms of jitter (worse under load).  With draws
+ * encoding in ~100 us, that jitter is worth 5-20 in-flight draws: the old 8-slot ring
+ * went dry in every tight GL_PATCHES loop (measured: 327 spinning acquires in a
+ * 1000-draw bench, ~330 us/draw sleeping in tessRingAcquire).  24 slots absorb the
+ * jitter; the METAL buffers are still allocated lazily and only ever grow to the
+ * largest block handed out, so an idle ring costs eight pointers. */
+#define MGL_TESS_RING 24
 static id<MTLBuffer> tRing[MGL_TESS_RING];
 static size_t tRingPos[MGL_TESS_RING];
 static bool tRingBusy[MGL_TESS_RING];
 static int tRingScan = 0;
 static size_t tRingCap[MGL_TESS_RING];
 
+/* blocks above this size are freed on retire rather than kept (two stay warm): a
+ * capture draw's scratch is tens of MB and would otherwise be pinned per slot —
+ * 24 slots x 10-60 MB is not acceptable, and a workload that repeats such draws is
+ * GPU-bound anyway (the ~100 us mmap is noise there). */
+#define TESS_RING_BIG (4u << 20)
+
 static size_t tessRingAlign(size_t v) { return (v + 255) & ~(size_t)255; }
+
+/* exhaustion diagnostics (mgl_tess_ring_spins): acquires that had to poll for a
+ * slot, the worst poll count and the total time slept — the health signal for the
+ * keep-alive/depth tuning below (a healthy hot loop stays at or near zero) */
+static unsigned tRingSpinCount;
+static unsigned tRingSpinMax;
+static uint64_t tRingSleptNs;
+unsigned mgl_tess_ring_spins(uint64_t *max_ns, uint64_t *total_ns)
+{
+    if (max_ns) *max_ns = (uint64_t)tRingSpinMax * 100u;   /* usleep(100) per poll */
+    if (total_ns) *total_ns = tRingSleptNs;
+    return tRingSpinCount;
+}
 
 /* MGL_TESS_RING_TRACE=1: log every acquire/release/retire so a wedged ring (a draw
  * that never retires its slot) can be found in a CTS log. */
@@ -178,19 +206,28 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
          * slot instead of failing the draw.  If a slot does not free up quickly, the
          * last open command buffer may still be sitting uncommitted (nothing forced a
          * flush): commit it so its completion handlers can retire the slots.  Bounded
-         * to ~2 s, then give up. */
+         * (100 us steps then 250 us, with an exact wait on a parked buffer at ~1 ms),
+         * then give up. */
+        tRingSpinCount++;
         for (int spin = 0; spin < 20000; spin++)
         {
             bool any = false;
             tessRingPendPoll();
+            if ((unsigned)spin > tRingSpinMax)
+                tRingSpinMax = (unsigned)spin;
+            tRingSleptNs += (uint64_t)(spin < 10 ? 100 : 250) * 1000u;  /* the usleep below */
             if (tRingTrace() && (spin % 2000) == 0)
             {
-                unsigned bm = 0;
-                for (int i = 0; i < MGL_TESS_RING; i++) bm |= tRingBusy[i] << i;
-                fprintf(stderr, "MGL ring: SPIN %d busy=%x pos=[%zu %zu %zu %zu %zu %zu %zu %zu]"
-                        " cb=%d enc=%d\n", spin, bm,
-                        tRingPos[0], tRingPos[1], tRingPos[2], tRingPos[3],
-                        tRingPos[4], tRingPos[5], tRingPos[6], tRingPos[7],
+                unsigned bm = 0, nfree = 0;
+                size_t used = 0;
+                for (int i = 0; i < MGL_TESS_RING; i++)
+                {
+                    bm |= tRingBusy[i] << i;
+                    if (!tRingBusy[i]) nfree++;
+                    else used += tRingPos[i];
+                }
+                fprintf(stderr, "MGL ring: SPIN %d free=%u/%d busy-bm-lo=%x used=%zu"
+                        " cb=%d enc=%d\n", spin, nfree, MGL_TESS_RING, bm & 0xff, used,
                         self && self->_currentCommandBuffer ?
                             (int)self->_currentCommandBuffer.status : -1,
                         self && self->_currentRenderEncoder ? 1 : 0);
@@ -218,6 +255,33 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                 tHwDrawsOnCb = 0;
                 tRingExhaust = 64;   /* go per-draw for a while (keep-alive) */
             }
+            if (spin == 10)
+            {
+                /* r43 wait efficiency: after ~1 ms of polling, stop burning CPU.
+                 * Parking holds the not-yet-committed buffers, but committed ones
+                 * pass through here too (a retired draw's shared buffer that got
+                 * committed between park and now): block on the first COMMITTED
+                 * parked buffer's completion — an exact wake instead of more
+                 * syscalls.  The open shared buffer is skipped (it is committed
+                 * at spin 50 below or by the next flush); buffers retired via
+                 * completion handlers are not parked and keep the poll path.
+                 * MGL_TESS_NOWAIT=1 keeps the pure usleep backoff (A/B knob). */
+                static int noWait = -1;
+                if (noWait < 0)
+                    noWait = getenv("MGL_TESS_NOWAIT") != NULL;
+                if (!noWait)
+                for (int i = 0; i < MGL_TESS_RING; i++)
+                {
+                    id<MTLCommandBuffer> pcb = tRingPendCb[i];
+                    if (pcb && pcb != self->_currentCommandBuffer &&
+                        pcb.status >= MTLCommandBufferStatusCommitted &&
+                        pcb.status < MTLCommandBufferStatusCompleted)
+                    {
+                        [pcb waitUntilCompleted];
+                        break;
+                    }
+                }
+            }
             if (spin == 19999 && !self->_currentCommandBuffer && !self->_currentRenderEncoder)
             {
                 /* 2 s with no progress, no open encoder and no uncommitted command
@@ -229,7 +293,7 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
                     tessRingRelease(i);
                 return tessRingAcquire(device, bytes, offset, slot, self);
             }
-            usleep(100);
+            usleep(spin < 10 ? 100 : 250);
         }
         return nil;                    /* genuinely stuck: caller must give up */
     }
@@ -254,6 +318,23 @@ static id<MTLBuffer> tessRingAcquire(id<MTLDevice> device, size_t bytes, size_t 
     return tRing[best];
 }
 
+/* big-block recycle counter (mgl_tess_ring_freed_big): blocks above
+ * TESS_RING_BIG that were freed on retire instead of being pinned in a slot;
+ * mgl_tess_ring_big_slots counts slots currently holding such a block.  A burst
+ * of big draws must keep BOTH small (free draws reuse a warm big slot, at most a
+ * couple grow for in-flight work) — test_tess.c asserts it, the regression
+ * guard for the ring's memory bound. */
+static unsigned long tRingFreedBig;
+unsigned long mgl_tess_ring_freed_big(void) { return tRingFreedBig; }
+unsigned mgl_tess_ring_big_slots(void)
+{
+    unsigned n = 0;
+    for (int i = 0; i < MGL_TESS_RING; i++)
+        if (tRing[i] && tRingCap[i] > TESS_RING_BIG)
+            n++;
+    return n;
+}
+
 static void tessRingRelease(int slot)
 {
     if (slot >= 0 && slot < MGL_TESS_RING && tRingBusy[slot])
@@ -262,6 +343,26 @@ static void tessRingRelease(int slot)
             fprintf(stderr, "MGL ring: release slot=%d\n", slot);
         tRingBusy[slot] = false;
         tRingPos[slot] = 0;            /* reuse from the start once retired */
+        /* big transient blocks are not worth pinning: keep two warm (a repeating
+         * big-draw workload then reallocates nothing) and free the rest, so the
+         * deeper ring cannot multiply a capture draw's tens of MB into gigabytes */
+        if (tRing[slot] && tRingCap[slot] > TESS_RING_BIG)
+        {
+            int warm = 0;
+            for (int i = 0; i < MGL_TESS_RING; i++)
+                if (!tRingBusy[i] && tRing[i] && tRingCap[i] > TESS_RING_BIG)
+                    warm++;
+            if (warm > 2)
+            {
+                size_t freed = tRingCap[slot];
+                tRing[slot] = nil;      /* ARC drops the MTLBuffer */
+                tRingCap[slot] = 0;
+                tRingFreedBig++;
+                if (tRingTrace())
+                    fprintf(stderr, "MGL ring: freed big slot=%d (%zu bytes, %d warm)\n",
+                            slot, freed, warm - 1);
+            }
+        }
     }
 }
 
@@ -926,6 +1027,39 @@ static NSString *tessVSKey(GLMContext ctx, Program *program, TessVSPlan *plan)
     return key;
 }
 
+/* tess perf (r43): the stage-input descriptor a VS-kernel PSO wraps is fully
+ * determined by the freshly built plan (plus the function object); the NSString
+ * key above costs ~5 us of string churn per draw in the dictionary lookup path.
+ * A 64-bit FNV-1a over the plan bytes — binding_offset excluded, it only shifts
+ * the bind, never the PSO — plus the program/function identity hit a direct-
+ * mapped entry and skip the string build AND the dictionary hash entirely.
+ * Never cleared: like tVsPsoCache below, entries live as long as the process
+ * (the PSO is referenced by the PSO cache anyway). */
+static uint64_t tessVsPlanSig(const TessVSPlan *plan)
+{
+    const uint8_t *p = (const uint8_t *)plan;
+    size_t off = offsetof(TessVSPlan, binding_offset);
+    size_t end = off + 16 * sizeof(size_t);
+    uint64_t h = 1469598103934665603ull;
+
+    for (size_t i = 0; i < sizeof *plan; i++)
+    {
+        if (i >= off && i < end)
+            continue;
+        h = (h ^ p[i]) * 1099511628211ull;
+    }
+    return h;
+}
+#define TESS_VS_FAST 4
+static struct {
+    GLMContext ctx;
+    Program *program;
+    void *fn;
+    uint64_t sig;
+    id<MTLComputePipelineState> pso;
+} tVsPsoFast[TESS_VS_FAST];
+static unsigned tVsPsoFastNext;
+
 /* Vertex-kernel variant of a SEPARABLE vs-only pipeline program: compiled at LINK time
  * by compile_stage (the SPIRV-Cross vertex-for-tessellation options cannot be applied to
  * the already-generated plain vertex MSL) and cached in the tess ext state, keyed by the
@@ -990,12 +1124,32 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
         return nil;
     }
 
+    /* direct-mapped fast path (see tessVsPlanSig): same program, same kernel
+     * function, same plan signature -> the PSO of the previous draw */
+    {
+        uint64_t sig = tessVsPlanSig(plan);
+        void *fnp = (__bridge void *)fn;
+        for (unsigned i = 0; i < TESS_VS_FAST; i++)
+            if (tVsPsoFast[i].ctx == ctx && tVsPsoFast[i].program == program &&
+                tVsPsoFast[i].fn == fnp && tVsPsoFast[i].sig == sig && tVsPsoFast[i].pso)
+                return tVsPsoFast[i].pso;
+    }
+
     key = tessVSKey(ctx, program, plan);
     if (tVsPsoCache)
     {
         MGLTessPsoEntry *e = tessPsoLookup(tVsPsoCache, key, program, fn);
         if (e)
+        {
+            uint64_t sig2 = tessVsPlanSig(plan);
+            tVsPsoFast[tVsPsoFastNext].ctx = ctx;
+            tVsPsoFast[tVsPsoFastNext].program = program;
+            tVsPsoFast[tVsPsoFastNext].fn = (__bridge void *)fn;
+            tVsPsoFast[tVsPsoFastNext].sig = sig2;
+            tVsPsoFast[tVsPsoFastNext].pso = e.pso;
+            tVsPsoFastNext = (tVsPsoFastNext + 1) % TESS_VS_FAST;
             return e.pso;
+        }
     }
 
     desc = [[MTLComputePipelineDescriptor alloc] init];
@@ -1122,6 +1276,12 @@ static id<MTLComputePipelineState> tessVsPSO(GLMContext ctx, id<MTLDevice> devic
     if (!tVsPsoCache)
         tVsPsoCache = [[NSMutableDictionary alloc] init];
     tessPsoStore(tVsPsoCache, key, program, fn, pso);
+    tVsPsoFast[tVsPsoFastNext].ctx = ctx;
+    tVsPsoFast[tVsPsoFastNext].program = program;
+    tVsPsoFast[tVsPsoFastNext].fn = (__bridge void *)fn;
+    tVsPsoFast[tVsPsoFastNext].sig = tessVsPlanSig(plan);
+    tVsPsoFast[tVsPsoFastNext].pso = pso;
+    tVsPsoFastNext = (tVsPsoFastNext + 1) % TESS_VS_FAST;
     return pso;
 }
 
@@ -1491,6 +1651,57 @@ static bool tDiagEnabled = false;
 static double tGpuTimeUs;
 static unsigned tCbsCompleted;
 
+/* ---- test-only CPU phase accounting -------------------------------------------
+ * Per-phase CPU time of the hardware draw path (setup / index analysis / ring
+ * acquire / VS bind / gather / TCS / default factors / blob / ordering / render
+ * pass / post-draw commit), read through mgl_tess_phase_us().  Independent of the
+ * GPU-time diag above (whose completed handlers change Metal's completion path
+ * and would contaminate the numbers): mgl_tess_phase_reset() arms it, the next
+ * mgl_tess_diag-based run or process exit leaves it alone. Zero cost when not
+ * armed (the disabled begin returns 0 and the end skips). */
+enum {
+    TESS_PH_SETUP, TESS_PH_INDEX, TESS_PH_RING, TESS_PH_VSBIND, TESS_PH_GATHER,
+    TESS_PH_TCS, TESS_PH_NOTCS, TESS_PH_BLOB, TESS_PH_ORDER, TESS_PH_RENDER,
+    TESS_PH_POST, TESS_PH_TOTAL, TESS_PHASES
+};
+static uint64_t tPhaseNs[TESS_PHASES];
+static uint64_t tPhaseCnt[TESS_PHASES];
+static double tPhaseScale = 0.0;
+static bool tPhaseOn = false;
+
+static inline uint64_t tessPhaseBegin(void)
+{
+    return tPhaseOn ? mach_absolute_time() : 0;
+}
+static inline void tessPhaseEnd(int p, uint64_t t0)
+{
+    if (t0)
+    {
+        if (!tPhaseScale)
+        {
+            mach_timebase_info_data_t tb;
+            mach_timebase_info(&tb);
+            tPhaseScale = (double)tb.numer / (double)tb.denom;
+        }
+        tPhaseNs[p] += mach_absolute_time() - t0;
+        tPhaseCnt[p]++;
+    }
+}
+void mgl_tess_phase_reset(void)      /* also ARMS the accounting */
+{
+    memset(tPhaseNs, 0, sizeof tPhaseNs);
+    memset(tPhaseCnt, 0, sizeof tPhaseCnt);
+    tPhaseOn = true;
+}
+double mgl_tess_phase_us(int p)      /* total us across all draws */
+{
+    return (p >= 0 && p < TESS_PHASES) ? (double)tPhaseNs[p] * tPhaseScale / 1e3 : 0.0;
+}
+uint64_t mgl_tess_phase_cnt(int p)
+{
+    return (p >= 0 && p < TESS_PHASES) ? tPhaseCnt[p] : 0;
+}
+
 void mgl_tess_diag_enable(int enable) { tDiagEnabled = enable != 0; }
 void mgl_tess_gpu_time_reset(void) { tGpuTimeUs = 0.0; tCbsCompleted = 0; }
 double mgl_tess_gpu_time_us(void) { return tGpuTimeUs; }
@@ -1831,6 +2042,10 @@ static void tessRetireCapture(GLMContext ctx)
     size_t dbg_ctl_off = 0;      /* debug dump only: control words (allocs/totals/args) */
     size_t off_coords = 0, off_indices = 0;
     size_t fstride = mgl_tess_factor_stride(ctx, tp);      /* 8 tri / 12 quad */
+    uint64_t ph_total = tessPhaseBegin();
+    uint64_t ph_setup = 0, ph_idx = 0, ph_ring = 0, ph_vs = 0, ph_gather = 0;
+    uint64_t ph_tcs = 0, ph_notcs = 0, ph_blob = 0, ph_order = 0, ph_render = 0, ph_post = 0;
+    ph_setup = ph_total;
 
     if (!tp || !va || cp_stride == 0)
     {
@@ -1893,6 +2108,8 @@ static void tessRetireCapture(GLMContext ctx)
      * (the VS grid dimension must be known at encode time, so the scan needs its own
      * command buffer). The gather kernel then expands the raw element bytes (ubyte/
      * ushort/uint, +base vertex, primitive restart) into the control-point stream. */
+    tessPhaseEnd(TESS_PH_SETUP, ph_setup);
+    ph_idx = tessPhaseBegin();
     if (indexed)
     {
         id<MTLBuffer> ebuf_mtl = nil;
@@ -2087,7 +2304,9 @@ static void tessRetireCapture(GLMContext ctx)
                 off_params = need;
                 need += 16;
 
+                ph_ring = tessPhaseBegin();
                 ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
+                tessPhaseEnd(TESS_PH_RING, ph_ring);
                 if (!ring)
                 {
                     NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -2180,7 +2399,9 @@ static void tessRetireCapture(GLMContext ctx)
             off_params = need;
             need += 16;
 
+            ph_ring = tessPhaseBegin();
             ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
+            tessPhaseEnd(TESS_PH_RING, ph_ring);
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -2284,7 +2505,9 @@ static void tessRetireCapture(GLMContext ctx)
             off_params = need;
             need += 16;
 
+            ph_ring = tessPhaseBegin();
             ring = tessRingAcquire(_device, need + 1024, &off_vs_out, &ring_slot, self);
+            tessPhaseEnd(TESS_PH_RING, ph_ring);
             if (!ring)
             {
                 NSLog(@"MGL ERROR: tess: scratch ring exhausted");
@@ -2296,6 +2519,7 @@ static void tessRetireCapture(GLMContext ctx)
     indexed_ring_done: ;   /* the widened-index CPU fallback skips the raw gather */
 
     /* ---- 2. compute phase (VS kernel, optional gather, optional TCS kernel) ---- */
+    tessPhaseEnd(TESS_PH_INDEX, ph_idx);   /* the non-indexed branch is folded into it */
     [self endRenderEncoding];
 
     /* indexed draws learned their real base vertex (min referenced index) from the
@@ -2359,6 +2583,7 @@ static void tessRetireCapture(GLMContext ctx)
         if (tTrace())
             NSLog(@"MGL tess: VS kernel dispatch %u x %d threads%s", vcount, instances,
                   gpu_indexed ? " (indirect, GPU-decided)" : "");
+ph_vs = tessPhaseBegin();
 [cenc setComputePipelineState: vs_pso];
         tessBindStageUniforms(ctx, cenc, prog_vs, _VERTEX_SHADER);
         tessBindStageTextures(ctx, cenc, prog_vs, _VERTEX_SHADER);
@@ -2407,11 +2632,13 @@ static void tessRetireCapture(GLMContext ctx)
         }
     }
 
+    tessPhaseEnd(TESS_PH_VSBIND, ph_vs);
     cp_source = ring;
     cp_source_off = off_vs_out;
 
     /* gather kernel (indexed): linear control-point stream per index occurrence —
      * reads the GL element buffer's raw bytes directly (base vertex, no restart) */
+    ph_gather = tessPhaseBegin();
     if (indexed && tess_gather_raw && tess_gather_ib)
     {
         /* gather words = the VS->TCS record: the source records are the vertex
@@ -2464,7 +2691,10 @@ static void tessRetireCapture(GLMContext ctx)
         cp_source_off = off_tcs_cp;
     }
 
+    tessPhaseEnd(TESS_PH_GATHER, ph_gather);
+
     /* TCS kernel */
+    ph_tcs = tessPhaseBegin();
     if (tp->has_tcs)
     {
         /* [0] = gl_PatchVerticesIn, [1] = total patches (instances included; the
@@ -2535,46 +2765,51 @@ static void tessRetireCapture(GLMContext ctx)
     }
     else
     {
+        ph_notcs = tessPhaseBegin();
         /* no TCS: the default tessellation levels are CPU-known constants; the control
            points pass through from the vertex kernel output (patch p control point i
            lives at [instance * count + p * patch_verts_in + i] == [p * patch_verts_in + i]) */
         struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
-        float *factors = (float *)calloc((size_t)total_patches, 6 * sizeof(float));
         size_t fhalfs = fstride / 2;                 /* 4 triangles / 6 quads+isolines */
         int ne = (fhalfs == 4) ? 3 : 4;              /* edge levels of the factor record */
         uint16_t *hf = (uint16_t *)((uint8_t *)ring.contents + off_factors);
+        float *lvf = (float *)((uint8_t *)ring.contents + off_levels_f);
+        float f6[6];
 
+        f6[0] = rs->patch_default_outer[0];
+        f6[1] = rs->patch_default_outer[1];
+        f6[2] = rs->patch_default_outer[2];
+        f6[3] = rs->patch_default_outer[3];
+        f6[4] = rs->patch_default_inner[0];
+        f6[5] = rs->patch_default_inner[1];
+
+        /* the ring block is written directly (no per-draw heap array): the half
+         * factor records the GPU tessellator / drawPatches and the blob kernel
+         * read, and the float copy of the same levels (GL's exact-precision
+         * contract) — constants written before dispatch, no GPU dependency */
         for (int p = 0; p < total_patches; p++)
         {
-            factors[p * 6 + 0] = rs->patch_default_outer[0];
-            factors[p * 6 + 1] = rs->patch_default_outer[1];
-            factors[p * 6 + 2] = rs->patch_default_outer[2];
-            factors[p * 6 + 3] = rs->patch_default_outer[3];
-            factors[p * 6 + 4] = rs->patch_default_inner[0];
-            factors[p * 6 + 5] = rs->patch_default_inner[1];
-
-            /* the half factor records the GPU tessellator / drawPatches and the blob
-             * kernel read — constants written before dispatch, no GPU dependency */
             for (int i = 0; i < ne; i++)
-                hf[(size_t)p * fhalfs + i] = tessFloatToHalf(factors[p * 6 + i]);
+                hf[(size_t)p * fhalfs + i] = tessFloatToHalf(f6[i]);
             for (int i = ne; i < (int)fhalfs; i++)
-                hf[(size_t)p * fhalfs + i] = tessFloatToHalf(factors[p * 6 + 4 + (i - ne)]);
+                hf[(size_t)p * fhalfs + i] = tessFloatToHalf(f6[4 + (i - ne)]);
+            memcpy(lvf + (size_t)p * 6, f6, 6 * sizeof(float));
         }
-        /* the float copy of the same levels (GL's exact-precision contract): memcpy the
-         * whole [outer4, inner2] array into the draw's ring block */
-        memcpy((uint8_t *)ring.contents + off_levels_f, factors,
-               (size_t)total_patches * 6 * sizeof(float));
 
         if (use_cpu_reference)
         {
             /* reference path: the CPU blob build and tessellator stay here; the GPU
              * paths take both from the blob kernel / the GPU tessellator below */
+            float *factors = (float *)calloc((size_t)total_patches, 6 * sizeof(float));
+            for (int p = 0; p < total_patches; p++)
+                memcpy(factors + (size_t)p * 6, f6, 6 * sizeof(float));
             mgl_tess_build_patch_blob(ctx, tp, NULL, 0, factors, (unsigned)total_patches);
             mgl_tess_generate(ctx, tp, factors, (unsigned)total_patches);
+            free(factors);
         }
-        else
-            mgl_tess_note_counts(ctx, tp, factors, (unsigned)total_patches);
-        free(factors);
+        /* the GPU paths skip mgl_tess_note_counts (a full CPU tessellator count
+         * pass per patch): its only consumer is a count query, and an active
+         * tess count query forces use_cpu_reference above, which just ran it */
     }
 
     /* patch-data blob on the GPU, replacing the CPU blob build of the emulated and the
@@ -2587,6 +2822,10 @@ static void tessRetireCapture(GLMContext ctx)
      * static kernel set lazily (it is otherwise first needed by the emulated path below,
      * which runs AFTER this dispatch — on a first draw the blob PSO did not exist yet
      * and the TES patch-in blob stayed zero, zeroing every per-patch capture member) */
+    tessPhaseEnd(TESS_PH_TCS, ph_tcs);
+    tessPhaseEnd(TESS_PH_NOTCS, ph_notcs);
+
+    ph_blob = tessPhaseBegin();
     if (!use_cpu_reference && !(use_hardware && tp->has_tcs) && tp->tes_patch_in_size &&
         (tBlobPso || tessKernels(ctx)))
     {
@@ -2620,10 +2859,12 @@ static void tessRetireCapture(GLMContext ctx)
     }
 
     [cenc endEncoding];
+    tessPhaseEnd(TESS_PH_BLOB, ph_blob);
 
     /* GPU-side ordering for EVERY non-reference path (no CPU wait): the compute buffer
      * signals an event the render buffer waits for; the factors and patch data stay on
      * the GPU. Only MGL_TESS_CPU commits and waits on the CPU. */
+    ph_order = tessPhaseBegin();
     bool cpu_reference = use_cpu_reference;
     if (cpu_reference)
     {
@@ -2691,6 +2932,8 @@ static void tessRetireCapture(GLMContext ctx)
            kernel output */
 
         /* ---- 4a. render: drawPatches with the post-tessellation TES ---- */
+        tessPhaseEnd(TESS_PH_ORDER, ph_order);
+        ph_render = tessPhaseBegin();
         {
             id<MTLRenderCommandEncoder> enc;
             GLsizei cp_count = tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in;
@@ -2761,6 +3004,8 @@ static void tessRetireCapture(GLMContext ctx)
              * bind-shadow generation bump in extCompatRenderEncoderCreated keeps
              * per-index encoder binds from leaking into the new encoder. */
             ctx->state.dirty_bits = DIRTY_VAO | DIRTY_RENDER_STATE;
+            tessPhaseEnd(TESS_PH_RENDER, ph_render);
+            ph_post = tessPhaseBegin();
             {
                 int slot = ring_slot;
                 id<MTLCommandBuffer> cb = _currentCommandBuffer;
@@ -2770,34 +3015,47 @@ static void tessRetireCapture(GLMContext ctx)
                 tessRingRetireOn(cb, slot);   /* handles committed/completed buffers */
             }
 
-            /* AGX keep-alive (r42): a command buffer that carries several tess
-             * draws and is then left uncommitted lets the driver's submission
-             * and completion path go idle.  Metal batches command-buffer
-             * submissions on a timer, so a burst that out-runs the 8 ring slots
-             * (2 draws per flushed buffer) ends up sleeping one whole batch
-             * window inside tessRingAcquire (~6.7 ms here, ~250 ms under heavy
-             * load; measured with .agent/ab_patches.c).  Committing the shared
-             * buffer every 2nd tess draw keeps completions flowing — per-draw
-             * CPU cost drops from ~270 us (the old commit-and-signal-every-draw
-             * design) to ~85 us — and when the ring does go dry anyway, the
-             * flush tightens to every draw for the next 64 draws: that is
-             * exactly the tight-loop shape where submission latency dominates
-             * and per-draw commits keep Metal's batcher hot. */
+            /* AGX keep-alive (r42, pressure-driven in r43): a command buffer that
+             * carries several tess draws and is then left uncommitted lets the
+             * driver's submission and completion path go idle — Metal batches
+             * command-buffer submissions on a timer, and a burst that out-runs the
+             * ring slots ends up sleeping a whole batch window inside
+             * tessRingAcquire (~6.7 ms here, ~250 ms under heavy load; measured
+             * with .agent/ab_patches.c).  Committing the shared buffer keeps
+             * completions flowing, and completions are exactly what retires ring
+             * slots, so the cadence is now driven by the ring's own occupancy:
+             * plenty free -> every 4th draw (the batcher amortises the commit),
+             * moderately free -> every 2nd, running low -> every draw, and an
+             * actual exhaustion forces per-draw commits for the next 64 draws
+             * (the tight-loop shape where submission latency dominates). */
             if (tRingExhaust > 0)
                 tRingExhaust--;
-            unsigned ka_every = tRingExhaust ? 1u : 2u;
-            if (++tHwDrawsOnCb >= ka_every)
             {
-                tHwDrawsOnCb = 0;
-                if (_currentCommandBuffer &&
-                    _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+                unsigned free_slots = 0;
+                for (int i = 0; i < MGL_TESS_RING; i++)
+                    free_slots += !tRingBusy[i];
+                /* hysteresis (min-of-7 ab: a plain low/high threshold oscillated
+                 * around the pressure point and cost ~6 us/draw on the noTCS
+                 * shape): cadence 2 is the steady state, 4 only with most of the
+                 * ring free, 1 when it runs low */
+                unsigned ka_every = tRingExhaust ? 1u :
+                                    (free_slots <= (unsigned)MGL_TESS_RING / 6) ? 1u :
+                                    (free_slots <= (unsigned)(MGL_TESS_RING * 2) / 3) ? 2u : 4u;
+                if (++tHwDrawsOnCb >= ka_every)
                 {
-                    [self endRenderEncoding];
-                    [_currentCommandBuffer commit];
-                    _currentCommandBuffer = nil;
+                    tHwDrawsOnCb = 0;
+                    if (_currentCommandBuffer &&
+                        _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+                    {
+                        [self endRenderEncoding];
+                        [_currentCommandBuffer commit];
+                        _currentCommandBuffer = nil;
+                    }
                 }
             }
         }
+        tessPhaseEnd(TESS_PH_POST, ph_post);
+        tessPhaseEnd(TESS_PH_TOTAL, ph_total);
         return true;
     }
 

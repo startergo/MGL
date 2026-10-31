@@ -1308,6 +1308,116 @@ TEST(TessOrientationCulling)
     glDeleteProgram(prog);
 }
 
+/* Counting queries on tessellated output must stay EXACT while active: the draw
+ * then takes the CPU reference path (which notes its own counts), and the GPU
+ * paths skip mgl_tess_note_counts entirely (r43: its only consumer was a count
+ * query).  Lock both: a minimal patch (all levels 1) and a fully culled one. */
+static const char *kTcsLvl1 =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0;\n"
+    "    gl_TessLevelInner[0] = 1.0;\n"
+    "  }\n"
+    "}\n";
+static const char *kTcsCull =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 0.0; gl_TessLevelOuter[1] = 0.0; gl_TessLevelOuter[2] = 0.0;\n"
+    "    gl_TessLevelInner[0] = 0.0;\n"
+    "  }\n"
+    "}\n";
+
+static void query_pair_draw(const char *tcs, GLint *prims, GLint *invocations)
+{
+    GLuint p = make_program(tcs, kTesTri);
+    GLuint q1 = 0, q2 = 0;
+
+    glUseProgram(p);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glGenQueries(1, &q1);
+    glGenQueries(1, &q2);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, q1);
+    glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q2);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+    *prims = *invocations = -1;
+    glGetQueryObjectiv(q1, GL_QUERY_RESULT, prims);
+    glGetQueryObjectiv(q2, GL_QUERY_RESULT, invocations);
+    glDeleteQueries(1, &q1);
+    glDeleteQueries(1, &q2);
+    glDeleteProgram(p);
+}
+
+TEST(TessCountQueriesExact)
+{
+    GLint pg = -1, inv = -1;
+
+    query_pair_draw(kTcsLvl1, &pg, &inv);
+    printf("  [levels 1] PRIMITIVES_GENERATED=%d TES_INVOCATIONS=%d\n", pg, inv);
+    EXPECT_EQ_INT(pg, 1);       /* one triangle, three tessellated vertices */
+    EXPECT_EQ_INT(inv, 3);
+
+    query_pair_draw(kTcsCull, &pg, &inv);
+    printf("  [culled]   PRIMITIVES_GENERATED=%d TES_INVOCATIONS=%d\n", pg, inv);
+    EXPECT_EQ_INT(pg, 0);       /* all outer levels <= 0: the patch is culled */
+    EXPECT_EQ_INT(inv, 0);
+}
+
+/* Ring memory bound: a burst of draws whose emulated scratch exceeds
+ * TESS_RING_BIG (4 MB) must not pin one buffer per slot — a freed draw reuses
+ * a warm big slot (at most a couple grow for in-flight work), and retired big
+ * blocks beyond two are freed (mgl_tess_ring_freed_big).  32 quad patches in
+ * point_mode need ~5.3 MB of tessellator scratch each. */
+TEST(TessRingBigBlockRecycle)
+{
+    const char *tes =
+        "#version 450 core\n"
+        "layout(quads, equal_spacing, ccw, point_mode) in;\n"
+        "layout(location=0) in vec4 tc_col[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = vec4(gl_TessCoord.x * 2.0 - 1.0, gl_TessCoord.y * 2.0 - 1.0, 0.0, 1.0);\n"
+        "  f_col = vec4(1, 0.5, 0.2, 1);\n"
+        "}\n";
+    GLuint p;
+
+    p = make_program(kTcsQuad, tes);
+    glUseProgram(p);
+    {
+        const float pos[4][4] = { { -1, 1, 0, 1 }, { 1, 1, 0, 1 }, { 1, -1, 0, 1 }, { -1, -1, 0, 1 } };
+        const float col[4][4] = { { 1, 1, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 } };
+        setup_patch_vao(pos, col, 4);
+    }
+    glPatchParameteri(GL_PATCH_VERTICES, 4);
+    for (int i = 0; i < 40; i++)
+    {
+        glDrawArrays(GL_PATCHES, 0, 4 * 32);
+        if ((i % 8) == 7)
+            glFinish();      /* let blocks retire so the recycle can run */
+    }
+    glFinish();
+    printf("  freed_big=%lu big_slots=%u after 40 big emulated draws\n",
+           mgl_tess_ring_freed_big(), mgl_tess_ring_big_slots());
+    /* free draws reuse a warm big slot: a couple grow for in-flight work at
+     * most — a slot per draw would pin 40 x 5.3 MB and fail this */
+    EXPECT_TRUE(mgl_tess_ring_big_slots() <= 4);
+    glDeleteProgram(p);
+}
+
 TEST(TessProgramQueries)
 {
     GLuint prog = make_program(kTcsTri, kTesTri);
@@ -2170,6 +2280,8 @@ int main(void)
     RUN(TessPerPatchVaryings);
     RUN(TessArrayedVarying);
     RUN(TessProgramQueries);
+    RUN(TessCountQueriesExact);
+    RUN(TessRingBigBlockRecycle);
     RUN(TessErrors);
     RUN(TessDefaultLevels);
     RUN(TessLayerFromVertexStage);
