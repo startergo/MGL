@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/sysctl.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -113,6 +114,43 @@ static struct {
 /* libmgl's auto-created core context: target for glXMakeCurrent(dpy,None,NULL)
  * so that stray GL calls after unbinding do not dereference NULL */
 static void *s_init_ctx;
+
+/* live-context registry: XID (the MGLXContext pointer) -> context, used by the
+ * GLX_EXT_import_context entry points (glXImportContextEXT has to turn the
+ * XID glXGetContextIDEXT returned back into a GLXContext) */
+#define MGLX_MAX_CONTEXTS 64
+static MGLXContext s_contexts[MGLX_MAX_CONTEXTS];
+static int s_ncontexts;
+
+static void mglx_register_context(MGLXContext c)
+{
+    for (int i = 0; i < MGLX_MAX_CONTEXTS; i++)
+        if (!s_contexts[i])
+        {
+            s_contexts[i] = c;
+            s_ncontexts++;
+            return;
+        }
+}
+
+static void mglx_unregister_context(MGLXContext c)
+{
+    for (int i = 0; i < MGLX_MAX_CONTEXTS; i++)
+        if (s_contexts[i] == c)
+        {
+            s_contexts[i] = NULL;
+            s_ncontexts--;
+            return;
+        }
+}
+
+static MGLXContext mglx_find_context_by_xid(XID xid)
+{
+    for (int i = 0; i < MGLX_MAX_CONTEXTS; i++)
+        if (s_contexts[i] && (XID)(uintptr_t)s_contexts[i] == xid)
+            return s_contexts[i];
+    return NULL;
+}
 
 __attribute__((constructor))
 static void mglx_init(void)
@@ -277,12 +315,16 @@ static MGLXContext mglx_create_context(Display *dpy, MGLXFBConfigRec *cfg,
     }
     CppCreateMGLRendererHeadless(c->glm);
 
-    /* verify the profile took effect (compat contexts advertise it) */
+    /* verify the profile took effect: query the profile mask, NOT the version
+     * string (GL_VERSION is the same "4.6 Metal - 90.5" in both profiles since
+     * the s14 identification-string work, and substring matching it broke every
+     * legacy glXCreateContext/glXCreateNewContext call) */
     void *prev = MGLgetCurrentContext();
     MGLsetCurrentContext(c->glm);
-    const char *ver = (const char *)glGetString(GL_VERSION);
-    int got_compat = ver && strstr(ver, "compat") != NULL;
+    GLint mask = 0;
+    glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &mask);
     while (glGetError() != GL_NO_ERROR) {}
+    int got_compat = (mask & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0;
     MGLsetCurrentContext(prev ? prev : s_init_ctx);
 
     if (compat && !got_compat)
@@ -296,6 +338,7 @@ static MGLXContext mglx_create_context(Display *dpy, MGLXFBConfigRec *cfg,
     c->screen = ds->screen;
     c->cfg = cfg;
     c->dpy_state = ds;
+    mglx_register_context(c);
     return c;
 }
 
@@ -570,6 +613,7 @@ void glXDestroyContext(Display *dpy, GLXContext ctx)
     }
     /* the MGL context itself is intentionally kept alive: MGL has no context
      * teardown path, and apps create a bounded number of contexts */
+    mglx_unregister_context(ctx);
     free(ctx);
 }
 
@@ -973,6 +1017,31 @@ GLXFBConfig glXGetFBConfigFromVisualSGIX(Display *dpy, XVisualInfo *visual)
     return &ds->configs[0];
 }
 
+/*
+ * GLX 1.3: every FBConfig of the screen (no attribute filtering).  The table
+ * is already sorted best-first (mglx_config_compare order), so the array is
+ * returned in table order like glXChooseFBConfig(NULL).
+ */
+GLXFBConfig *glXGetFBConfigs(Display *dpy, int screen, int *nelements)
+{
+    MGLXDisplayRec *ds = mglx_display(dpy);
+    GLXFBConfig *out;
+
+    if (!nelements)
+        return NULL;
+    *nelements = 0;
+    if (!ds || screen != ds->screen)
+        return NULL;
+
+    out = (GLXFBConfig *)malloc(sizeof(GLXFBConfig) * MGLX_NCONFIGS);
+    if (!out)
+        return NULL;
+    for (int i = 0; i < MGLX_NCONFIGS; i++)
+        out[i] = &ds->configs[i];
+    *nelements = MGLX_NCONFIGS;
+    return out;     /* freed with XFree */
+}
+
 GLXWindow glXCreateWindow(Display *dpy, GLXFBConfig config, Window window,
                           const int *attrib_list)
 {
@@ -1261,12 +1330,286 @@ int glXGetSwapIntervalMESA(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* GLX_SGIX_fbconfig / GLX_SGIX_pbuffer / GLX_SGI_make_current_read      */
+/* aliases: X11 apps link these symbol names directly (not through       */
+/* glXGetProcAddress), so they must exist as exported functions; the     */
+/* semantics are the modern GLX 1.3 entry points they were folded into.  */
+
+GLXFBConfig *glXChooseFBConfigSGIX(Display *dpy, int screen,
+                                   const int *attrib_list, int *nelements)
+{
+    return glXChooseFBConfig(dpy, screen, attrib_list, nelements);
+}
+
+int glXGetFBConfigAttribSGIX(Display *dpy, GLXFBConfig config,
+                             int attribute, int *value)
+{
+    return glXGetFBConfigAttrib(dpy, config, attribute, value);
+}
+
+XVisualInfo *glXGetVisualFromFBConfigSGIX(Display *dpy, GLXFBConfig config)
+{
+    return glXGetVisualFromFBConfig(dpy, config);
+}
+
+GLXContext glXCreateContextWithConfigSGIX(Display *dpy, GLXFBConfig config,
+                                          int render_type,
+                                          GLXContext share_list, Bool direct)
+{
+    return glXCreateNewContext(dpy, config, render_type, share_list, direct);
+}
+
+GLXPixmap glXCreateGLXPixmapWithConfigSGIX(Display *dpy, GLXFBConfig config,
+                                           Pixmap pixmap)
+{
+    return glXCreatePixmap(dpy, config, pixmap, NULL);
+}
+
+void glXDestroyGLXPbufferSGIX(Display *dpy, GLXPbuffer pbuffer)
+{
+    glXDestroyPbuffer(dpy, pbuffer);
+}
+
+void glXSelectEventSGIX(Display *dpy, GLXDrawable drawable, unsigned long mask)
+{
+    glXSelectEvent(dpy, drawable, mask);
+}
+
+void glXGetSelectedEventSGIX(Display *dpy, GLXDrawable drawable,
+                             unsigned long *mask)
+{
+    glXGetSelectedEvent(dpy, drawable, mask);
+}
+
+Bool glXMakeCurrentReadSGI(Display *dpy, GLXDrawable draw, GLXDrawable read,
+                           GLXContext ctx)
+{
+    return glXMakeContextCurrent(dpy, draw, read, ctx);
+}
+
+int glXQueryContextInfoEXT(Display *dpy, GLXContext ctx, int attribute,
+                           int *value)
+{
+    return glXQueryContext(dpy, ctx, attribute, value);
+}
+
+/* ------------------------------------------------------------------ */
+/* GLX_EXT_import_context                                              */
+
+XID glXGetContextIDEXT(const GLXContext ctx)
+{
+    /* the context pointer IS the XID in this client-side implementation */
+    return (XID)(uintptr_t)ctx;
+}
+
+GLXContext glXImportContextEXT(Display *dpy, XID context_id)
+{
+    MGLXDisplayRec *ds = mglx_display(dpy);
+    MGLXContext c = mglx_find_context_by_xid(context_id);
+    if (!c || !ds)
+    {
+        mglx_send_error(dpy, GLX_BAD_CONTEXT, context_id, 0);
+        return NULL;
+    }
+    return c;
+}
+
+void glXFreeContextEXT(Display *dpy, GLXContext ctx)
+{
+    glXDestroyContext(dpy, ctx);
+}
+
+Display *glXGetCurrentDisplayEXT(void)
+{
+    return glXGetCurrentDisplay();
+}
+
+/* ------------------------------------------------------------------ */
+/* GLX_MESA_query_renderer                                             */
+
+#define GLX_RENDERER_VENDOR_ID_MESA              0x8183
+#define GLX_RENDERER_DEVICE_ID_MESA              0x8184
+#define GLX_RENDERER_VERSION_MESA                0x8185
+#define GLX_RENDERER_ACCELERATED_MESA            0x8186
+#define GLX_RENDERER_VIDEO_MEMORY_MESA           0x8187
+#define GLX_RENDERER_UNIFIED_MEMORY_ARCHITECTURE_MESA 0x8188
+#define GLX_RENDERER_PREFERRED_PROFILE_MESA      0x8189
+#define GLX_RENDERER_OPENGL_CORE_PROFILE_VERSION_MESA        0x818A
+#define GLX_RENDERER_OPENGL_COMPATIBILITY_PROFILE_VERSION_MESA 0x818B
+#define GLX_RENDERER_OPENGL_ES_PROFILE_VERSION_MESA          0x818C
+#define GLX_RENDERER_OPENGL_ES2_PROFILE_VERSION_MESA         0x818D
+
+/* the GL renderer strings only exist while a context is current; cache copies
+ * so the non-current entry points can answer without one */
+static struct {
+    int   valid;
+    char  vendor[128], renderer[128], version[128];
+} s_renderer_strings;
+
+static void mglx_refresh_renderer_strings(void)
+{
+    if (!s_current.ctx)
+        return;
+    const struct { GLenum e; char *dst; size_t n; } q[3] = {
+        { GL_VENDOR,   s_renderer_strings.vendor,   sizeof s_renderer_strings.vendor },
+        { GL_RENDERER, s_renderer_strings.renderer, sizeof s_renderer_strings.renderer },
+        { GL_VERSION,  s_renderer_strings.version,  sizeof s_renderer_strings.version },
+    };
+    for (int i = 0; i < 3; i++)
+    {
+        const GLubyte *s = glGetString(q[i].e);
+        while (glGetError() != GL_NO_ERROR) {}
+        if (!s)
+            return;
+        snprintf(q[i].dst, q[i].n, "%s", (const char *)s);
+    }
+    s_renderer_strings.valid = 1;
+}
+
+static Bool mglx_query_renderer_integer(int attribute, unsigned int *value)
+{
+    if (!value)
+        return False;
+
+    switch (attribute)
+    {
+        case GLX_RENDERER_VENDOR_ID_MESA:
+        case GLX_RENDERER_DEVICE_ID_MESA:
+            /* no PCI ids behind an MTLDevice on Apple silicon: unknown, and
+             * reported as such rather than guessed */
+            value[0] = 0;
+            return True;
+        case GLX_RENDERER_VERSION_MESA:
+            value[0] = 4; value[1] = 6; value[2] = 0;
+            return True;
+        case GLX_RENDERER_ACCELERATED_MESA:
+            value[0] = 1;      /* Metal: always GPU-rendered */
+            return True;
+        case GLX_RENDERER_VIDEO_MEMORY_MESA:
+            /* on unified memory (Apple silicon) the GPU shares system memory:
+             * report the machine's RAM, the number Metal's working-set limits
+             * are derived from.  Discrete GPUs: not reported (unknown). */
+            mglx_refresh_renderer_strings();
+            if (s_renderer_strings.valid &&
+                strncmp(s_renderer_strings.renderer, "Apple", 5) == 0)
+            {
+                uint64_t ram = 0;
+                size_t sz = sizeof ram;
+                if (sysctlbyname("hw.memsize", &ram, &sz, NULL, 0) == 0 &&
+                    ram >= 1024 * 1024)
+                {
+                    value[0] = (unsigned int)(ram / (1024 * 1024));  /* MiB */
+                    return True;
+                }
+            }
+            return False;
+        case GLX_RENDERER_OPENGL_CORE_PROFILE_VERSION_MESA:
+        case GLX_RENDERER_OPENGL_COMPATIBILITY_PROFILE_VERSION_MESA:
+            value[0] = 4; value[1] = 6; value[2] = 0;
+            return True;
+        case GLX_RENDERER_OPENGL_ES_PROFILE_VERSION_MESA:
+        case GLX_RENDERER_OPENGL_ES2_PROFILE_VERSION_MESA:
+            value[0] = 0; value[1] = 0; value[2] = 0;   /* no GLES contexts */
+            return True;
+        case GLX_RENDERER_UNIFIED_MEMORY_ARCHITECTURE_MESA:
+            /* Apple-silicon GPUs (renderer "Apple ...") share system memory;
+             * discrete GPUs in older Macs do not */
+            mglx_refresh_renderer_strings();
+            value[0] = s_renderer_strings.valid &&
+                       strncmp(s_renderer_strings.renderer, "Apple", 5) == 0;
+            return True;
+        case GLX_RENDERER_PREFERRED_PROFILE_MESA:
+            /* the GLX shim hands X11 (legacy) apps compatibility contexts */
+            value[0] = GLX_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB;
+            return True;
+        default:
+            return False;
+    }
+}
+
+static const char *mglx_query_renderer_string(int attribute)
+{
+    mglx_refresh_renderer_strings();
+    if (!s_renderer_strings.valid)
+        return NULL;
+    switch (attribute)
+    {
+        case GLX_RENDERER_VENDOR_ID_MESA: return s_renderer_strings.vendor;
+        case GLX_RENDERER_DEVICE_ID_MESA: return s_renderer_strings.renderer;
+        case GLX_RENDERER_VERSION_MESA:   return s_renderer_strings.version;
+        default: return NULL;
+    }
+}
+
+Bool glXQueryRendererIntegerMESA(Display *dpy, int screen, int renderer,
+                                 int attribute, unsigned int *value)
+{
+    MGLXDisplayRec *ds = mglx_display(dpy);
+    if (!ds || screen != ds->screen || renderer != 0)
+        return False;
+    return mglx_query_renderer_integer(attribute, value);
+}
+
+Bool glXQueryCurrentRendererIntegerMESA(int attribute, unsigned int *value)
+{
+    if (!s_current.ctx)
+        return False;
+    return mglx_query_renderer_integer(attribute, value);
+}
+
+const char *glXQueryRendererStringMESA(Display *dpy, int screen, int renderer,
+                                       int attribute)
+{
+    MGLXDisplayRec *ds = mglx_display(dpy);
+    if (!ds || screen != ds->screen || renderer != 0)
+        return NULL;
+    return mglx_query_renderer_string(attribute);
+}
+
+const char *glXQueryCurrentRendererStringMESA(int attribute)
+{
+    if (!s_current.ctx)
+        return NULL;
+    return mglx_query_renderer_string(attribute);
+}
+
+/* ------------------------------------------------------------------ */
 /* glXGetProcAddress                                                   */
 
 void (*glXGetProcAddress(const GLubyte *procname))(void);
 void (*glXGetProcAddressARB(const GLubyte *procname))(void);
 void glXCopyContext(Display *dpy, GLXContext src, GLXContext dst,
                     unsigned long mask);
+/* SGIX/EXT/MESA entry points defined further down in this file */
+GLXFBConfig *glXGetFBConfigs(Display *dpy, int screen, int *nelements);
+GLXFBConfig *glXChooseFBConfigSGIX(Display *dpy, int screen,
+                                   const int *attrib_list, int *nelements);
+int glXGetFBConfigAttribSGIX(Display *dpy, GLXFBConfig config,
+                             int attribute, int *value);
+XVisualInfo *glXGetVisualFromFBConfigSGIX(Display *dpy, GLXFBConfig config);
+GLXContext glXCreateContextWithConfigSGIX(Display *dpy, GLXFBConfig config,
+                                          int render_type,
+                                          GLXContext share_list, Bool direct);
+GLXPixmap glXCreateGLXPixmapWithConfigSGIX(Display *dpy, GLXFBConfig config,
+                                           Pixmap pixmap);
+void glXDestroyGLXPbufferSGIX(Display *dpy, GLXPbuffer pbuffer);
+void glXSelectEventSGIX(Display *dpy, GLXDrawable drawable, unsigned long mask);
+void glXGetSelectedEventSGIX(Display *dpy, GLXDrawable drawable,
+                             unsigned long *mask);
+Bool glXMakeCurrentReadSGI(Display *dpy, GLXDrawable draw, GLXDrawable read,
+                           GLXContext ctx);
+int glXQueryContextInfoEXT(Display *dpy, GLXContext ctx, int attribute,
+                           int *value);
+XID glXGetContextIDEXT(const GLXContext ctx);
+GLXContext glXImportContextEXT(Display *dpy, XID context_id);
+void glXFreeContextEXT(Display *dpy, GLXContext ctx);
+Display *glXGetCurrentDisplayEXT(void);
+Bool glXQueryRendererIntegerMESA(Display *dpy, int screen, int renderer,
+                                 int attribute, unsigned int *value);
+Bool glXQueryCurrentRendererIntegerMESA(int attribute, unsigned int *value);
+const char *glXQueryRendererStringMESA(Display *dpy, int screen, int renderer,
+                                       int attribute);
+const char *glXQueryCurrentRendererStringMESA(int attribute);
 
 static const struct { const char *name; void *fn; } mglx_procs[] = {
     { "glXChooseVisual", (void *)glXChooseVisual },
@@ -1298,10 +1641,15 @@ static const struct { const char *name; void *fn; } mglx_procs[] = {
     { "glXGetProcAddressARB", (void *)glXGetProcAddressARB },
     { "glXChooseFBConfig", (void *)glXChooseFBConfig },
     { "glXChooseFBConfigSGIX", (void *)glXChooseFBConfig },
+    { "glXGetFBConfigs", (void *)glXGetFBConfigs },
     { "glXGetFBConfigAttrib", (void *)glXGetFBConfigAttrib },
+    { "glXGetFBConfigAttribSGIX", (void *)glXGetFBConfigAttrib },
     { "glXGetFBConfigFromVisualSGIX", (void *)glXGetFBConfigFromVisualSGIX },
     { "glXGetVisualFromFBConfig", (void *)glXGetVisualFromFBConfig },
     { "glXGetVisualFromFBConfigSGIX", (void *)glXGetVisualFromFBConfig },
+    { "glXCreateContextWithConfigSGIX", (void *)glXCreateContextWithConfigSGIX },
+    { "glXCreateGLXPixmapWithConfigSGIX", (void *)glXCreateGLXPixmapWithConfigSGIX },
+    { "glXDestroyGLXPbufferSGIX", (void *)glXDestroyGLXPbufferSGIX },
     { "glXCreateWindow", (void *)glXCreateWindow },
     { "glXDestroyWindow", (void *)glXDestroyWindow },
     { "glXCreatePixmap", (void *)glXCreatePixmap },
@@ -1312,6 +1660,18 @@ static const struct { const char *name; void *fn; } mglx_procs[] = {
     { "glXDestroyPbuffer", (void *)glXDestroyPbuffer },
     { "glXSelectEvent", (void *)glXSelectEvent },
     { "glXGetSelectedEvent", (void *)glXGetSelectedEvent },
+    { "glXSelectEventSGIX", (void *)glXSelectEventSGIX },
+    { "glXGetSelectedEventSGIX", (void *)glXGetSelectedEventSGIX },
+    { "glXMakeCurrentReadSGI", (void *)glXMakeCurrentReadSGI },
+    { "glXQueryContextInfoEXT", (void *)glXQueryContextInfoEXT },
+    { "glXGetContextIDEXT", (void *)glXGetContextIDEXT },
+    { "glXImportContextEXT", (void *)glXImportContextEXT },
+    { "glXFreeContextEXT", (void *)glXFreeContextEXT },
+    { "glXGetCurrentDisplayEXT", (void *)glXGetCurrentDisplayEXT },
+    { "glXQueryRendererIntegerMESA", (void *)glXQueryRendererIntegerMESA },
+    { "glXQueryCurrentRendererIntegerMESA", (void *)glXQueryCurrentRendererIntegerMESA },
+    { "glXQueryRendererStringMESA", (void *)glXQueryRendererStringMESA },
+    { "glXQueryCurrentRendererStringMESA", (void *)glXQueryCurrentRendererStringMESA },
     { "glXSwapIntervalSGI", (void *)glXSwapIntervalSGI },
     { "glXSwapIntervalEXT", (void *)glXSwapIntervalEXT },
     { "glXSwapIntervalMESA", (void *)glXSwapIntervalMESA },

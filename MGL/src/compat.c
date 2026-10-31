@@ -57,12 +57,17 @@ static int light_index(GLenum cap)
     return -1;
 }
 
+static int client_cap_index(GLMContext ctx, GLenum cap);
+
 bool mgl_compat_valid_cap(GLMContext ctx, GLenum cap)
 {
     if (!mgl_compat_is_compat(ctx))
         return false;
 
     if (light_index(cap) >= 0)
+        return true;
+
+    if (client_cap_index(ctx, cap) >= 0)
         return true;
 
     switch (cap)
@@ -141,6 +146,29 @@ static int eval_cap_slot(GLenum cap, int *is2d)
 }
 
 /* per-unit (active texture) texture target enables */
+
+/* attribute index of a legacy client-array enable cap (-1 = not one).
+ * Mirror of legacy_attrib_index() in compat_vb.c: Mesa lets the server-side
+ * glEnable/glDisable/glIsEnabled toggle and query the client arrays in a
+ * compatibility profile. */
+static int client_cap_index(GLMContext ctx, GLenum cap)
+{
+    switch (cap)
+    {
+        case GL_VERTEX_ARRAY: return MGLC_ATTR_VERTEX;
+        case GL_NORMAL_ARRAY: return MGLC_ATTR_NORMAL;
+        case GL_COLOR_ARRAY: return MGLC_ATTR_COLOR;
+        case GL_SECONDARY_COLOR_ARRAY: return MGLC_ATTR_SECONDARY;
+        case GL_FOG_COORD_ARRAY: return MGLC_ATTR_FOG;
+        case GL_INDEX_ARRAY: return MGLC_ATTR_INDEX;
+        case GL_EDGE_FLAG_ARRAY: return MGLC_ATTR_EDGEFLAG;
+        case GL_TEXTURE_COORD_ARRAY:
+            return MGLC_ATTR_TEXCOORD(CS()->client_active_texture % MGLC_MAX_COORDS);
+    }
+    (void)ctx;
+    return -1;
+}
+
 void mgl_compat_set_cap(GLMContext ctx, GLenum cap, GLboolean on)
 {
     struct MGLExtState_compat *s = CS();
@@ -151,6 +179,20 @@ void mgl_compat_set_cap(GLMContext ctx, GLenum cap, GLboolean on)
         s->lights[light].enabled = on;
         mgl_compat_dirty(ctx);
         return;
+    }
+
+    /* client arrays: same state glEnableClientState touches (Mesa parity) */
+    {
+        int cidx = client_cap_index(ctx, cap);
+        if (cidx >= 0)
+        {
+            s->arrays[cidx].enabled = on;
+            if (s->arrays[cidx].pointer && VAO() && on)
+                mglEnableVertexAttribArray(ctx, (GLuint)cidx);
+            else if (VAO() && !on)
+                mglDisableVertexAttribArray(ctx, (GLuint)cidx);
+            return;
+        }
     }
 
     {
@@ -249,6 +291,12 @@ GLboolean mgl_compat_get_cap(GLMContext ctx, GLenum cap)
 
     if (light >= 0)
         return s->lights[light].enabled;
+
+    {
+        int cidx = client_cap_index(ctx, cap);
+        if (cidx >= 0)
+            return s->arrays[cidx].enabled;
+    }
 
     {
         int is2d = 0;
@@ -722,6 +770,9 @@ bool mgl_ext_get_compat(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case GL_LINE_STIPPLE: case GL_POLYGON_STIPPLE: case GL_POINT_SMOOTH:
         case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D: case GL_TEXTURE_CUBE_MAP:
         case GL_TEXTURE_GEN_S: case GL_TEXTURE_GEN_T: case GL_TEXTURE_GEN_R: case GL_TEXTURE_GEN_Q:
+        case GL_VERTEX_ARRAY: case GL_NORMAL_ARRAY: case GL_COLOR_ARRAY:
+        case GL_INDEX_ARRAY: case GL_TEXTURE_COORD_ARRAY: case GL_EDGE_FLAG_ARRAY:
+        case GL_FOG_COORD_ARRAY: case GL_SECONDARY_COLOR_ARRAY:
             mgl_get_store(type, data, 0, mgl_compat_get_cap(ctx, pname));
             return true;
 
@@ -761,6 +812,72 @@ bool mgl_ext_get_compat(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case GL_MAX_EVAL_ORDER: mgl_get_store(type, data, 0, MGLC_MAX_EVAL_ORDER); return true;
         case GL_MAX_PIXEL_MAP_TABLE: mgl_get_store(type, data, 0, 65536); return true;
 
+        case GL_ATTRIB_STACK_DEPTH: mgl_get_store(type, data, 0, s->attrib_depth); return true;
+        case GL_CLIENT_ATTRIB_STACK_DEPTH: mgl_get_store(type, data, 0, s->client_attrib_depth); return true;
+
+        /* ---- legacy client-array descriptors (glXxxPointer state) ---- */
+        case GL_VERTEX_ARRAY_SIZE: case GL_VERTEX_ARRAY_TYPE: case GL_VERTEX_ARRAY_STRIDE:
+        case GL_NORMAL_ARRAY_TYPE: case GL_NORMAL_ARRAY_STRIDE:
+        case GL_COLOR_ARRAY_SIZE: case GL_COLOR_ARRAY_TYPE: case GL_COLOR_ARRAY_STRIDE:
+        case GL_INDEX_ARRAY_TYPE: case GL_INDEX_ARRAY_STRIDE:
+        case GL_TEXTURE_COORD_ARRAY_SIZE: case GL_TEXTURE_COORD_ARRAY_TYPE: case GL_TEXTURE_COORD_ARRAY_STRIDE:
+        case GL_EDGE_FLAG_ARRAY_STRIDE:
+        case GL_SECONDARY_COLOR_ARRAY_SIZE: case GL_SECONDARY_COLOR_ARRAY_TYPE: case GL_SECONDARY_COLOR_ARRAY_STRIDE:
+        case GL_FOG_COORD_ARRAY_TYPE: case GL_FOG_COORD_ARRAY_STRIDE:
+        {
+            /* defaults per the GL 2.1 spec (never enabled until a pointer is set) */
+            GLint asize = 4, atype = GL_FLOAT, astride = 0;
+            int idx = -1;
+
+            switch (pname)
+            {
+                case GL_VERTEX_ARRAY_SIZE: case GL_VERTEX_ARRAY_TYPE: case GL_VERTEX_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_VERTEX; asize = 4; break;
+                case GL_NORMAL_ARRAY_TYPE: case GL_NORMAL_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_NORMAL; asize = 3; break;
+                case GL_COLOR_ARRAY_SIZE: case GL_COLOR_ARRAY_TYPE: case GL_COLOR_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_COLOR; break;
+                case GL_INDEX_ARRAY_TYPE: case GL_INDEX_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_INDEX; asize = 1; atype = GL_FLOAT; break;
+                case GL_TEXTURE_COORD_ARRAY_SIZE: case GL_TEXTURE_COORD_ARRAY_TYPE: case GL_TEXTURE_COORD_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_TEXCOORD(CS()->client_active_texture % MGLC_MAX_COORDS);
+                    break;
+                case GL_EDGE_FLAG_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_EDGEFLAG; asize = 1; atype = GL_UNSIGNED_BYTE; break;
+                case GL_SECONDARY_COLOR_ARRAY_SIZE: case GL_SECONDARY_COLOR_ARRAY_TYPE: case GL_SECONDARY_COLOR_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_SECONDARY; asize = 3; break;
+                case GL_FOG_COORD_ARRAY_TYPE: case GL_FOG_COORD_ARRAY_STRIDE:
+                    idx = MGLC_ATTR_FOG; asize = 1; break;
+            }
+
+            if (idx >= 0)
+            {
+                const MGLCClientArray *a = &s->arrays[idx];
+                /* an array with no pointer set answers the spec defaults */
+                if (a->pointer || a->size)
+                {
+                    asize = a->size;
+                    atype = (GLint)a->type;
+                    astride = a->stride;
+                }
+            }
+
+            switch (pname)
+            {
+                case GL_VERTEX_ARRAY_SIZE: case GL_COLOR_ARRAY_SIZE:
+                case GL_TEXTURE_COORD_ARRAY_SIZE: case GL_SECONDARY_COLOR_ARRAY_SIZE:
+                    mgl_get_store(type, data, 0, asize); return true;
+                case GL_INDEX_ARRAY_TYPE: mgl_get_store(type, data, 0, atype); return true;
+                default:
+                    if (pname == GL_EDGE_FLAG_ARRAY_STRIDE || pname == GL_NORMAL_ARRAY_STRIDE ||
+                        pname == GL_COLOR_ARRAY_STRIDE || pname == GL_INDEX_ARRAY_STRIDE ||
+                        pname == GL_TEXTURE_COORD_ARRAY_STRIDE || pname == GL_VERTEX_ARRAY_STRIDE ||
+                        pname == GL_SECONDARY_COLOR_ARRAY_STRIDE || pname == GL_FOG_COORD_ARRAY_STRIDE)
+                    { mgl_get_store(type, data, 0, astride); return true; }
+                    mgl_get_store(type, data, 0, atype); return true;   /* the *_TYPE cases */
+            }
+        }
+
         case GL_NAME_STACK_DEPTH: mgl_get_store(type, data, 0, s->rmode.name_depth); return true;
 
         case GL_LIST_MODE:
@@ -785,6 +902,8 @@ bool mgl_ext_get_compat(GLMContext ctx, GLenum pname, GLuint type, void *data)
         }
         case GL_CURRENT_FOG_COORD: mgl_get_store(type, data, 0, s->cur_fogcoord); return true;
         case GL_CURRENT_INDEX: mgl_get_store(type, data, 0, s->cur_index); return true;
+        case GL_INDEX_WRITEMASK: mgl_get_store(type, data, 0, (GLint)STATE_VAR(index_writemask)); return true;
+        case GL_INDEX_CLEAR_VALUE: mgl_get_store(type, data, 0, (GLint)STATE_VAR(index_clear_value)); return true;
         case GL_EDGE_FLAG: mgl_get_store(type, data, 0, s->cur_edgeflag); return true;
 
         case GL_CURRENT_RASTER_POSITION:

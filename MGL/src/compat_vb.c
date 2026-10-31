@@ -941,7 +941,7 @@ void mglEnd(GLMContext ctx)
 #define VXD(n, t, CT) \
 void mglVertex##n##t(GLMContext ctx, CT x, CT y) \
 { MGLC_COMPAT_GUARD(ctx); struct MGLExtState_compat *s = CS(); MGLCImm *im = imm(ctx); \
-  if (!im) return; if (!im->active) ERROR_RETURN(GL_INVALID_OPERATION); \
+  if (!im) return; if (!im->active) return; \
   if (s->recording && !s->replaying) { mgl_compat_list_record_vertex(ctx, n, (float)x, (float)y, 0.0f, 1.0f); return; } \
   s->cur_pos[0] = (float)x; s->cur_pos[1] = (float)y; s->cur_pos[2] = 0.0f; s->cur_pos[3] = 1.0f; \
   imm_emit(ctx); }
@@ -949,7 +949,7 @@ void mglVertex##n##t(GLMContext ctx, CT x, CT y) \
 #define VXD3(n, t, CT) \
 void mglVertex##n##t(GLMContext ctx, CT x, CT y, CT z) \
 { MGLC_COMPAT_GUARD(ctx); struct MGLExtState_compat *s = CS(); MGLCImm *im = imm(ctx); \
-  if (!im) return; if (!im->active) ERROR_RETURN(GL_INVALID_OPERATION); \
+  if (!im) return; if (!im->active) return; \
   if (s->recording && !s->replaying) { mgl_compat_list_record_vertex(ctx, n, (float)x, (float)y, (float)z, 1.0f); return; } \
   s->cur_pos[0] = (float)x; s->cur_pos[1] = (float)y; s->cur_pos[2] = (float)z; s->cur_pos[3] = 1.0f; \
   imm_emit(ctx); }
@@ -957,7 +957,7 @@ void mglVertex##n##t(GLMContext ctx, CT x, CT y, CT z) \
 #define VXD4(n, t, CT) \
 void mglVertex##n##t(GLMContext ctx, CT x, CT y, CT z, CT w) \
 { MGLC_COMPAT_GUARD(ctx); struct MGLExtState_compat *s = CS(); MGLCImm *im = imm(ctx); \
-  if (!im) return; if (!im->active) ERROR_RETURN(GL_INVALID_OPERATION); \
+  if (!im) return; if (!im->active) return; \
   if (s->recording && !s->replaying) { mgl_compat_list_record_vertex(ctx, n, (float)x, (float)y, (float)z, (float)w); return; } \
   s->cur_pos[0] = (float)x; s->cur_pos[1] = (float)y; s->cur_pos[2] = (float)z; s->cur_pos[3] = (float)w; \
   imm_emit(ctx); }

@@ -389,6 +389,9 @@ GLuint mglGenLists(GLMContext ctx, GLsizei range)
         return 0;
     }
 
+    if (range == 0)
+        return 0;   /* spec: no lists generated */
+
     lists = list_storage(ctx);
     if (!lists)
         return 0;

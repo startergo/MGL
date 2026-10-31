@@ -267,6 +267,9 @@ static const char *mglx_ext_string =
     "GLX_MESA_swap_control "
     "GLX_SGIX_fbconfig "
     "GLX_SGIX_pbuffer "
+    "GLX_SGI_make_current_read "
+    "GLX_EXT_import_context "
+    "GLX_MESA_query_renderer "
     "GLX_ARB_multisample "
     "GLX_EXT_visual_info "
     "GLX_EXT_visual_rating";

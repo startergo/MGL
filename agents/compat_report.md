@@ -1,5 +1,38 @@
 # compat domain — progress log
 
+READY s38 a7affaf (branch gl46/compat tip = merge gl46-port **d11d184** (tess r43) +
+s38 commits 1fca85d/bfbb061/eb5e59d/a7affaf + merges 5e90d1c/ea54960 + bench 966fb92
+(+ report commit on top); buildable, full gates below).
+Work this session (supervisor 06:50, "correctness and robustness in the compatibility
+profile"): (1) **GLX shim compat-context regression fixed** — since s14 (852eee2) the
+shim verified a compat context by matching the substring "compat" in GL_VERSION, so
+*every* legacy glXCreateContext/glXCreateNewContext/glXCreateContextAttribsARB(compat)
+returned NULL: glxgears could not create a context at all.  Now queries
+GL_CONTEXT_PROFILE_MASK.  Verified live on XQuartz: tests/glx_probe.c 33/33 OK,
+glxinfo/glxinfo -B clean, glxgears 70-73 FPS (manual tests, need X11).  Also completed
+the XQuartz libGL glX symbol surface (glXGetFBConfigs — GLX 1.3 core, glxinfo dies at
+load without it —, SGIX aliases, GLX_EXT_import_context with a live-context registry,
+GLX_MESA_query_renderer with honest values).  (2) **Registry audit of the compat enums**:
+11 wrong constants in mgl_compat_enums.h/gl_compat.h; four broke real apps
+(GL_GENERATE_MIPMAP 0x8291→0x8191 — generate-mipmap state silently ignored by every
+app, feedback GL_2D..GL_4D_COLOR_TEXTURE 0x1400..→0x600.. — glFeedbackBuffer(GL_2D)
+raised GL_INVALID_ENUM and PASS_THROUGH_TOKEN wrote COPY_PIXEL_TOKEN into the buffer,
+GL_EDGE_FLAG 0x0B44→0x0B43 — collided with GL_CULL_FACE in glGet).  (3) **New legacy
+state surface**: glGet/glIsEnabled/glEnable of the eight client-array caps (was missing
+entirely; glEnable now matches glEnableClientState per Mesa), glGet of
+GL_*_ARRAY_{SIZE,TYPE,STRIDE} with spec defaults, GL_{,CLIENT_}ATTRIB_STACK_DEPTH,
+GL_INDEX_WRITEMASK/GL_INDEX_CLEAR_VALUE.  (4) **Spec edge fixes**: glVertex* outside
+glBegin/glEnd is ignored (was a spurious GL_INVALID_OPERATION), glGenLists(0) returns 0.
+New regression tests: tests/headless/test_compat_edge.c (20 tests / 204 checks: matrix
+stack depths/limits, per-unit texture stacks, transpose matrix entry points,
+immediate-mode error behaviour, glRect, display-list query state + nesting limit +
+list base, attrib and client-attrib stack limits + restore, registry-constant pins for
+every enum fixed above, light snapshot semantics, clip-plane roundtrip, colour-index
+state) and tests/glx_probe.c (manual, X11).  Suite green (142 binaries, 712 PASS, 0
+failures); ab_bench ab/abbench_compat.sh vs baseline-d11d184: no per-draw regression
+(imm-quads 14.6 vs 19.1 us/draw, state loop 0.024 vs 0.035 us/op, thread-CPU min of 9).
+Prior session below.
+
 READY s37 985b341 (branch gl46/compat tip = merge gl46-port **288e724** (tess r42) + s37
 commits 6a4722c/60ae3b2/9904987/c371ad3/0904e04/985b341 + report commit 6599e15;
 buildable, full gates below).
