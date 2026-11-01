@@ -22,6 +22,9 @@
 #import "mgl_ext_texext.h"            /* mgl_texext_info (session 12 texture gate) */
 #import "mgl_ext_buffers.h"           /* mgl_buffers_mark_gpu_use (bindmap cache, session 13) */
 #import "mgl_ext_introspect.h"        /* default-uniform buffer revalidation (session 13) */
+#import "MGLRenderer+Framebuffer.h"    /* fbApplyPipelineFormats (FBO-dirty format key) */
+#import "MGLRenderer+TextureExt.h"     /* texextAdjustPipelineDescriptor (same) */
+#include "mgl_ext_fb.h"                /* MGLRenderbufferEx (attachment GL formats in the key) */
 #include "mgl_compat_perf.h"
 #include "mgl_ext_compat.h"       /* compat domain state + advblend (GL_KHR_blend_equation_advanced) */
 
@@ -440,30 +443,16 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
         mgl_prof_cnt[17]++;   /* declined: a hard bit is set */
         return false;
     }
-    /* geom e767e6a rule (same fix here, narrowed to the found bug class): a
-     * DIRTY_FBO trigger must go through the descriptor path.  The key covers
-     * the framebuffer POINTER and the attachment FORMATS, so re-attaching a
-     * texture with an identical pixel format leaves the key unchanged — and
-     * it is the descriptor path that binds the new attachment to the render
-     * pass (KHR-GL46.texture_swizzle.smoke drew with the previous texture
-     * bound).
-     * compat s36: DIRTY_ALPHA_STATE (the pipeline-baked rstate dirt marker,
-     * set by mgl_rs_dirty_pipeline: blend enable/func/equation, colour masks,
-     * clip origin/depth mode, point size, sample coverage/mask/shading) is now
-     * an admissible trigger too — its PSO-relevant CONTENT is hashed fresh
-     * inside this function (rstatePipelineContentHash, cached against
-     * generation_pipeline, so the per-draw cost stays two integer compares),
-     * and every rstateSpecialize function-constant input is part of that hash.
-     * Before s36 a blend-only flip declined here and rebuilt the FULL descriptor
-     * + newRenderPipelineStateWithDescriptor on EVERY flip (glmark2 [shading]/
-     * CTS blend churn: ~100+ us per draw); alternating states now hit the two
-     * content-keyed cache slots.  DIRTY_RENDER_STATE alone (encoder-only state)
-     * still declines — it never reaches the pipeline block anyway. */
-    {
-        GLuint d = ctx->state.dirty_bits;
-        if ((d & DIRTY_FBO) || !(d & (DIRTY_VAO | DIRTY_PROGRAM | DIRTY_ALPHA_STATE)))
-            return false;
-    }
+    /* No DIRTY_FBO / "VAO or program must be dirty" decline here (784c480 added
+     * one for a KHR-GL46.texture_swizzle.smoke stale-render-target bug that was
+     * later fixed at its source; texture_swizzle is 505 Pass / 0 Fail without
+     * it).  The key below covers the framebuffer pointer and the current
+     * encoder's attachment formats + sample count, which is everything the PSO
+     * depends on; re-attaching a texture ends the encoder (targetsChanged), so
+     * the new attachment is bound by the next render pass, not by the PSO.
+     * The decline sent every draw of FBO-switching scenes through the full
+     * descriptor rebuild: glmark2 desktop blur 4.7k -> 1.4k FPS, desktop shadow
+     * 4.5k -> 0.8k, shadow 12.3k -> 6.9k (~1 ms/frame of pipeline-descriptor). */
     if (!ctx->state.program)
         return false;
 
@@ -549,26 +538,64 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
      * Every attachment change ends the encoder (framebuffers.c targetsChanged
      * -> endRenderEncoding), so hashing once per encoder generation is exact;
      * the per-draw cost is two integer compares. */
-    if (!m || m->fmt_hash_gen == 0 ||
+    /* Attachment formats + sample count, hashed from the inputs the
+     * descriptor path bakes (fbApplyPipelineFormats + the texext multisample
+     * adjust, on a scratch descriptor).  Cached per encoder generation and
+     * framebuffer pointer; recomputed on EVERY draw that carries DIRTY_FBO,
+     * because then the current encoder's render pass may still describe the
+     * PREVIOUS attachments — hashing _renderPassDescriptor there let a
+     * re-attached texture of another format reuse the old format's PSO
+     * (KHR-GL46.texture_size_promotion.functional).  A scratch descriptor is
+     * ~2 orders of magnitude cheaper than the full descriptor path. */
+    bool fbo_dirty = (ctx->state.dirty_bits & DIRTY_FBO) != 0;
+    if (!m || fbo_dirty || m->fmt_hash_gen == 0 ||
         m->fmt_hash_gen != m->encoder_gen || m->fmt_fbo != (uint64_t)(uintptr_t)ctx->state.framebuffer)
     {
-        uint64_t fh = 0;
-        MTLRenderPassDescriptor *rp = _renderPassDescriptor;
-        if (rp)
+        MTLRenderPipelineDescriptor *fd = [[MTLRenderPipelineDescriptor alloc] init];
+        [self fbApplyPipelineFormats: fd];
+        [self texextAdjustPipelineDescriptor: fd];
+        uint64_t fh = 1469598103934665603ULL;
+        for (int i = 0; i < 8; i++)
+            fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)fd.colorAttachments[i].pixelFormat;
+        fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)fd.depthAttachmentPixelFormat;
+        fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)fd.stencilAttachmentPixelFormat;
+        fh = fh * 1099511628211ULL + (uint64_t)fd.rasterSampleCount;
+        fh = fh * 1099511628211ULL + (uint64_t)fd.isRasterizationEnabled;
+        /* the attachments' GL identity too: emulated formats share a Metal
+         * pixel format with their host (GL_RGBA2/RGBA4/RGB* live in RGBA8) but
+         * the rstate variant differs (mgl_fb_slot_lacks_alpha, quantization),
+         * so the Metal formats alone alias them — KHR-GL46.texture_size_
+         * promotion: GL_RGBA2 on a 2D_MULTISAMPLE target read alpha 0 */
+        Framebuffer *kfb = ctx->state.framebuffer;
+        if (kfb)
         {
-            for (int i = 0; i < 4; i++)
+            FBOAttachment *atts[MAX_COLOR_ATTACHMENTS + 2];
+            int na = 0;
+            for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++) atts[na++] = &kfb->color_attachments[i];
+            atts[na++] = &kfb->depth;
+            atts[na++] = &kfb->stencil;
+            for (int i = 0; i < na; i++)
             {
-                id<MTLTexture> t = rp.colorAttachments[i].texture;
-                fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)t.pixelFormat;
-                fh = fh * 1099511628211ULL + (uint64_t)t.sampleCount;
+                FBOAttachment *at = atts[i];
+                GLenum ifmt = 0, tgt = at->textarget;
+                if (at->textarget == GL_RENDERBUFFER)
+                {
+                    if (at->buf.rbo) ifmt = ((MGLRenderbufferEx *)at->buf.rbo)->internalformat;
+                }
+                else if (at->buf.tex)
+                {
+                    ifmt = at->buf.tex->internalformat;
+                    tgt = tgt * 31u + at->buf.tex->target;
+                }
+                fh = fh * 1099511628211ULL + (((uint64_t)tgt << 32) | (uint64_t)ifmt);
             }
-            fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)rp.depthAttachment.texture.pixelFormat;
-            fh = fh * 1099511628211ULL + (uint64_t)(NSUInteger)rp.stencilAttachment.texture.pixelFormat;
         }
         if (m)
         {
             m->fmt_hash = fh ? fh : 1;
-            m->fmt_hash_gen = m->encoder_gen ? m->encoder_gen : 1;
+            /* an FBO-dirty hash is not tied to an encoder: force a re-hash at
+             * the next draw that has no FBO dirt */
+            m->fmt_hash_gen = fbo_dirty ? 0 : (m->encoder_gen ? m->encoder_gen : 1);
             m->fmt_fbo = (uint64_t)(uintptr_t)ctx->state.framebuffer;
         }
     }

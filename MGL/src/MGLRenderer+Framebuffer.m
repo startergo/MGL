@@ -670,9 +670,12 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
 
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[self fbDefaultColorFormat] width:w height:h mipmapped:NO];
     /* compat domain: ShaderRead lets the present pass sample the frame directly
-     * (compatPresentCopyOpaque — one copy+alpha=1 render pass per swap);
-     * ShaderWrite kept for the env-gated direct-present force-opaque kernel */
-    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+     * (compatPresentCopyOpaque — one copy+alpha=1 render pass per swap).
+     * No ShaderWrite: nothing writes this texture from a shader (the
+     * env-gated direct-present path renders into the pool surfaces, which
+     * carry ShaderWrite), and ShaderWrite disables AGX lossless compression
+     * on a render target. */
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     d.storageMode = MTLStorageModePrivate;
     /* compat domain: the color attachment prefers the present surface (render
      * directly into what compatSurfacePresent shows — the swap is then only a

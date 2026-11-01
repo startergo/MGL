@@ -4008,6 +4008,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                  * on a cache hit — the cached PSO already owns functions for
                  * this exact MSL content key. */
                 ctx->state.dirty_bits &= ~(DIRTY_VAO | DIRTY_PROGRAM);
+                /* the hit consumed the FBO change too (the key re-hashed the
+                 * attachment formats for it) — clear it like the descriptor
+                 * path does, or every later draw would re-hash */
+                ctx->state.dirty_bits &= ~DIRTY_FBO;
             }
             else
             {
