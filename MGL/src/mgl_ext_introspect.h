@@ -173,6 +173,16 @@ typedef struct MGLIProgram {
     /* constant initializers of default-block uniforms, captured when the stage is patched */
     struct { char *name; uint32_t *vals; int nvals; int wide; } *inits[MGLI_STAGES];
     int      ninits[MGLI_STAGES];
+
+    /* geom r87: stage-in/out ARRAYS OF MATRICES flattened into N matrix members
+     * at patch time — SPIRV-Cross's MSL backend cannot emit them ("MSL cannot
+     * emit arrays-of-matrices in input and output variables").  `st` is the
+     * (possibly new) struct type, `start`/`count` the flattened member group,
+     * `mtype` the original array-of-matrix type (still in the module, unused),
+     * `var` the plain variable that was re-typed (0 for block-member flattens).
+     * reflect_io reassembles the original single resource from these. */
+    struct { int stage; uint32_t st, start, count, mtype, var; char name[64]; } *flat;
+    int      nflat;
 } MGLIProgram;
 
 /* GL-side state, reachable as ctx->state.ext_introspect; allocate in mgl_ext_init_introspect(). */

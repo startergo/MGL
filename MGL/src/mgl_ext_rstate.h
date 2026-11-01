@@ -82,6 +82,17 @@ struct MGLExtState_rstate {
     const void *border_msl_src;
     char      *border_msl;
     uint64_t  border_msl_sig;
+
+    /* geom r87: "this program's fragment stage declares a flat interpolant",
+     * refreshed at every successful link by the post-link hook
+     * (mgl_rstate_post_link) and read per draw by rs_program_has_flat().
+     * Name-keyed, direct-mapped: a program cannot draw before its first link
+     * refreshes the entry, so a recycled name never serves another program's
+     * answer — the previous pointer-keyed memo did exactly that and flipped
+     * dEQP separate_shader.random.* between identical runs (16 stale hits per
+     * group run: a freed msl_str address recycled by a different program whose
+     * SPIRV-Cross boilerplate header matched the fingerprint). */
+    struct { GLuint name; uint8_t flat; } fs_flat[64];
 };
 
 /* one MSL texture slot needing GL_CLAMP_TO_BORDER colour emulation */

@@ -18,6 +18,7 @@
 #include "glm_context.h"
 #define MGL_RSTATE_INTERNAL 1
 #include "mgl_ext_rstate.h"
+#include "mgl_ext.h"               /* mgl_ext_register_post_link (geom r87 flat record) */
 
 GLboolean mglIsEnabled(GLMContext ctx, GLenum cap);
 void mgl_rstate_sync_viewport0(GLMContext ctx);
@@ -895,6 +896,40 @@ static bool rs_is_strip(GLenum mode)
 }
 
 /* Metal's provoking vertex for flat varyings is the first vertex of each primitive */
+
+/* the flat probe: SPIRV-Cross writes the qualifiers comma-separated inside one
+ * attribute bracket: a located flat input is `[[user(locn0), flat]]`, an
+ * unlocated one `[[flat]]` (and `[[flat, user(locnN)]]` for the other order).
+ * Probing only for `[[flat]]` missed every located varying, so the
+ * provoking-vertex index rotation never ran and flat inputs took Metal's first
+ * vertex instead of GL's last (glDrawElementsBaseVertex + flat colour showed
+ * vertex 0's id). */
+static bool rs_msl_has_flat(const char *msl)
+{
+    return strstr(msl, "[[flat") != NULL || strstr(msl, " flat]]") != NULL ||
+           strstr(msl, "flat, ") != NULL;
+}
+
+/* store (name -> FS-has-flat) in the ext state; the post-link hook calls this
+ * after every successful link, and rs_program_has_flat() calls it defensively
+ * when a draw meets a program the hook never saw (e.g. a glProgramBinary that
+ * skips mglLinkProgram) so the answer is computed once, then exact forever */
+static void rs_store_fs_flat(GLMContext ctx, Program *p)
+{
+    struct MGLExtState_rstate *rs = ctx->state.ext_rstate;
+    if (!rs || !p)
+        return;
+    const char *msl = p->spirv[_FRAGMENT_SHADER].msl_str;
+    rs->fs_flat[p->name & 63].name = p->name;
+    rs->fs_flat[p->name & 63].flat = msl ? rs_msl_has_flat(msl) : 0;
+}
+
+/* post-link hook: refresh the flat record before the program can ever draw */
+static void mgl_rstate_post_link(GLMContext ctx, Program *program)
+{
+    rs_store_fs_flat(ctx, program);
+}
+
 static bool rs_program_has_flat(GLMContext ctx)
 {
     Program *p = ctx->state.program;
@@ -907,32 +942,24 @@ static bool rs_program_has_flat(GLMContext ctx)
      * the monolithic program). */
     if (!p && ctx->state.program_pipeline)
         p = ctx->state.program_pipeline->stage_programs[_FRAGMENT_SHADER];
-    const char *msl = p ? p->spirv[_FRAGMENT_SHADER].msl_str : NULL;
-    if (!msl) return false;
-    /* perf: memoize the substring probe — rs_provoking_rewrite() runs per draw
-     * (provoking=LAST is the default and every LINES/TRIANGLES mode asks), and a
-     * raw strstr scans the whole (tens-of-KB) MSL source each time.  Content-keyed
-     * like mgl_msl_has_size_constants (MGLRenderer+Geometry.m): a freed program's
-     * MSL address can be recycled for different text, so the first 32 bytes
-     * fingerprint the entry. */
-    static struct { const char *msl; char head[32]; bool has; } cache[64];
-    static int next;
-    for (int i = 0; i < 64; i++)
-        if (cache[i].msl == msl && memcmp(cache[i].head, msl, 32) == 0) return cache[i].has;
-    /* SPIRV-Cross writes the qualifiers comma-separated inside one attribute
-     * bracket: a located flat input is `[[user(locn0), flat]]`, an unlocated one
-     * `[[flat]]` (and `[[flat, user(locnN)]]` for the other order).  Probing only
-     * for `[[flat]]` missed every located varying, so the provoking-vertex index
-     * rotation never ran and flat inputs took Metal's first vertex instead of
-     * GL's last (glDrawElementsBaseVertex + flat colour showed vertex 0's id). */
-    bool has = strstr(msl, "[[flat") != NULL || strstr(msl, " flat]]") != NULL ||
-               strstr(msl, "flat, ") != NULL;
-    cache[next].msl = msl;
-    memset(cache[next].head, 0, 32);
-    memcpy(cache[next].head, msl, 32);
-    cache[next].has = has;
-    next = (next + 1) & 63;
-    return has;
+    if (!p)
+        return false;
+    if (!p->spirv[_FRAGMENT_SHADER].msl_str)
+        return false;
+    /* the answer is a per-LINK property of the program: read the record the
+     * post-link hook keeps (a program cannot reach the draw path before its
+     * first link refreshed it), and compute it once if a link path that skips
+     * the hook got here first.  This replaced a memo keyed on the msl_str
+     * POINTER + a 32-byte head fingerprint: CTS links and frees programs in
+     * tight loops, so the freed string's address is recycled by a *different*
+     * program whose SPIRV-Cross boilerplate head matched — 16 stale answers
+     * per dEQP separate_shader group run, each flipping the pipeline-vs-
+     * monolithic comparison of a random.* case between identical runs. */
+    struct MGLExtState_rstate *rs = ctx->state.ext_rstate;
+    if (rs && rs->fs_flat[p->name & 63].name == p->name)
+        return rs->fs_flat[p->name & 63].flat != 0;
+    rs_store_fs_flat(ctx, p);
+    return rs_msl_has_flat(p->spirv[_FRAGMENT_SHADER].msl_str);
 }
 
 static bool rs_provoking_rewrite(GLMContext ctx, GLenum mode)
@@ -1233,6 +1260,8 @@ void mgl_ext_init_rstate(GLMContext ctx)
     struct MGLExtState_rstate *rs = calloc(1, sizeof(*rs));
     assert(rs);
     ctx->state.ext_rstate = rs;
+
+    mgl_ext_register_post_link(mgl_rstate_post_link);
 
     if (ctx->state.var.max_viewports == 0 || ctx->state.var.max_viewports > MGL_RSTATE_MAX_VIEWPORTS)
         ctx->state.var.max_viewports = MGL_RSTATE_MAX_VIEWPORTS;

@@ -3920,9 +3920,21 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             resolver = NULL;
 
             if (mapped) break;
+            /* the mapper is STATEFUL: TGlslIoMapper keeps hadError plus the
+             * in/out/uniform var maps from every addStage it served, and doMap
+             * returns !hadError SILENTLY — reusing one across the retry made
+             * the fresh attempt-1 link fail with an empty glslang log
+             * ("GLSL I/O mapping failed", dEQP separate_shader.pipeline.
+             * different_uniform_separate_programs).  Recreate it per attempt. */
+            glslang_glsl_mapper_delete(mapper);
+            mapper = glslang_glsl_mapper_create();
             {
                 const char *info = glslang_program_get_info_log(glsl_program);
                 overlap_retry = info && strstr(info, "Uniform location overlaps across stages");
+                if (getenv("MGL_MAP_DEBUG"))
+                    fprintf(stderr, "MGL mapio fail attempt=%d natt=%d mapper=%p resolver=%p retry=%d log=[%s]\n",
+                            attempt, obj->num_attached, (void *)mapper, (void *)resolver, (int)overlap_retry,
+                            info ? info : "(null)");
                 if (!overlap_retry || attempt)
                 {
                     mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
