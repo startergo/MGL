@@ -10672,7 +10672,13 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             GLuint n = (GLuint)atoi(name + 17);
             v->type = GL_NONE;
             v->size = (GLint)n;
-            v->words = n;
+            /* words MUST stay 0: a marker is not a capture.  Every consumer (the GPU
+             * scatter's `!vr.words`, the CPU pack's `!var->words`, the VS capture path)
+             * treats words == 0 as "skip / next-buffer marker" and skips the var; leaving
+             * it at n made the marker overwrite the FIRST captured varying of the buffer
+             * (dst_off 0) with record word 0 - zeros, exactly what
+             * KHR-GL46.transform_feedback3.multiple_streams saw. */
+            v->words = 0;
             if (separate)
             {
                 geom_xfb_fail(ctx, xp, "gl_SkipComponents used with GL_SEPARATE_ATTRIBS");
@@ -11094,9 +11100,6 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
 
     if (!o || !o->active || !xp || !xp->count || !count) return;
     if (!records || !cnt) return;
-
-    GLuint per = (gp->out_type == GL_LINE_STRIP) ? 2 :
-                 (gp->out_type == GL_TRIANGLE_STRIP) ? 3 : 1;
     uint32_t close_base = 0;   /* closed stream-0 primitives in the threads before t */
     uint32_t extent[4] = { 0, 0, 0, 0 };
 
@@ -11108,6 +11111,11 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
             uint32_t e = (uint32_t)(xp->vars[v].offset + xp->vars[v].words * 4);
             if (xp->vars[v].buffer < 4 && e > extent[xp->vars[v].buffer]) extent[xp->vars[v].buffer] = e;
         }
+
+    /* vertices per decomposed output primitive (a strip is captured decomposed, with
+     * the odd triangles transposed - see the GPU scatter) */
+    GLuint per = (gp->out_type == GL_LINE_STRIP) ? 2 :
+                 (gp->out_type == GL_TRIANGLE_STRIP) ? 3 : 1;
 
     for (uint32_t t = 0; t < cnt_words; t++)
     {
@@ -11156,7 +11164,11 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
 
                     for (uint32_t j = 0; j < per; j++)
                     {
-                        const uint32_t *rj = records + (size_t)(base_slot + s - n + 1u + p + j) * gp->out_words;
+                        /* mirror the GPU scatter: GL records the strip's triangles with
+                         * the odd ones transposed (the GL strip-decomposition rule), so a 4-vertex strip is
+                         * captured as v0,v1,v2 | v2,v1,v3 (KHR-GL46.transform_feedback.geometry) */
+                        uint32_t sj = (per == 3 && (p & 1u) && j < 2) ? (p + 1u - j) : (p + j);
+                        const uint32_t *rj = records + (size_t)(base_slot + s - n + 1u + sj) * gp->out_words;
 
                         for (GLuint v = 0; v < xp->count; v++)
                         {
@@ -11461,7 +11473,7 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     src.capacity = c->records ? c->records : 1;
     /* GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts PRIMITIVES: k captured
      * vertices each.  k comes from the transform feedback primitive mode the
-     * app selected (GL 4.6 13.4.2: POINTS captures one record per vertex from
+     * app selected (the GL capture rules: POINTS captures one record per vertex from
      * ANY tessellated output — KHR-GL46.tessellation_shader.vertex.vertex_spacing
      * captures POINTS from a triangle domain), not from the TES's domain. */
     {

@@ -1589,7 +1589,9 @@ TEST(xfb_strip_decomposition)
             EXPECT_EQ_INT(gen, cases[c].prim);      /* generated is not buffer-limited */
 
             /* the captured stream repeats the shared strip vertices: primitive p holds
-             * vertices p..p+per-1 of the emitted strip */
+             * vertices p..p+per-1 of the emitted strip, with the ODD triangle-strip
+             * primitives transposed (the GL strip-decomposition rule; KHR-GL46.transform_feedback.geometry
+             * records a 4-vertex strip as v0,v1,v2 | v2,v1,v3) */
             float out[32];
             memset(out, 0, sizeof out);
             glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, buf);
@@ -1598,8 +1600,9 @@ TEST(xfb_strip_decomposition)
             for (int pr = 0; pr < want; pr++)
                 for (int j = 0; j < cases[c].per; j++)
                 {
-                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 0], (float)(pr + j), 1e-5);
-                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 1], (float)(pr + j) + 10.0, 1e-5);
+                    int sj = (cases[c].per == 3 && (pr & 1) && j < 2) ? (pr + 1 - j) : (pr + j);
+                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 0], (float)sj, 1e-5);
+                    EXPECT_NEAR(out[(pr * cases[c].per + j) * 2 + 1], (float)sj + 10.0, 1e-5);
                 }
         }
 

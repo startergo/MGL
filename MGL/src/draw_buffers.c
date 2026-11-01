@@ -394,19 +394,43 @@ static int build_emulated(GLenum mode, const VertexSource *src, GLsizei count, I
     switch(mode)
     {
         case GL_LINES_ADJACENCY:
-            for (GLsizei k = 0; k + 3 < count; k += 4)
+            /* GL 4.6: for fixed-size primitives the restart index ends the current
+             * group and assembly resumes at the NEXT index (a new line needs a full
+             * 4-index group; a restart mid-group discards the partial group).  Walking
+             * with an accumulator keeps the group after a restart aligned to it
+             * (KHR-GL46.primitive_restart.restart_mode: {4,4,3,3,R,4,4,0,0} draws the
+             * line (4,3) AND the line (4,0)); the naive k+=4 walk pushed the restart
+             * index as a vertex when it was not group-aligned. */
             {
-                il_push(out, vs_get(src, k + 1));
-                il_push(out, vs_get(src, k + 2));
+                GLsizei run = 0;
+                for (GLsizei k = 0; k < count; k++)
+                {
+                    if (vs_is_restart(src, k)) { run = 0; continue; }
+                    if (++run == 4)
+                    {
+                        il_push(out, vs_get(src, k - 2));   /* group's i1 */
+                        il_push(out, vs_get(src, k - 1));   /* group's i2 */
+                        run = 0;
+                    }
+                }
             }
             return MGL_PRIM_LINE;
 
         case GL_TRIANGLES_ADJACENCY:
-            for (GLsizei k = 0; k + 5 < count; k += 6)
+            /* same restart rule, 6 indices per group, the triangle is (i1, i3, i5) */
             {
-                il_push(out, vs_get(src, k));
-                il_push(out, vs_get(src, k + 2));
-                il_push(out, vs_get(src, k + 4));
+                GLsizei run = 0;
+                for (GLsizei k = 0; k < count; k++)
+                {
+                    if (vs_is_restart(src, k)) { run = 0; continue; }
+                    if (++run == 6)
+                    {
+                        il_push(out, vs_get(src, k - 4));
+                        il_push(out, vs_get(src, k - 2));
+                        il_push(out, vs_get(src, k));
+                        run = 0;
+                    }
+                }
             }
             return MGL_PRIM_TRIANGLE;
 

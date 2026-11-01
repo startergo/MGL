@@ -957,7 +957,13 @@ static const char *kGeomXfbMSL =
     "        if (!fits) return;\n"
     "\n"
     "        for (uint j = 0u; j < per; j++) {\n"
-    "            const device uint* rj = recs + (size_t)(slot - n + 1u + p + j) * out_words;\n"
+    "            /* GL decomposes a triangle strip into triangles with the odd ones\n"
+    "             * transposed (the GL strip-decomposition rule: the second triangle of (v0,v1,v2,v3)\n"
+    "             * is (v2,v1,v3)), and transform feedback records THAT sequence\n"
+    "             * (KHR-GL46.transform_feedback.geometry captures a 4-vertex strip\n"
+    "             * as v0,v1,v2 | v2,v1,v3).  Lines and points have no flip. */\n"
+    "            uint sj = (per == 3u && (p & 1u) != 0u && j < 2u) ? (p + 1u - j) : (p + j);\n"
+    "            const device uint* rj = recs + (size_t)(slot - n + 1u + sj) * out_words;\n"
     "            for (uint v = 0u; v < nvars; v++) {\n"
     "                constant mgl_geom_xfb_var& vr = vars[v];\n"
     "                device uint* d = dst[vr.buffer];\n"
@@ -965,6 +971,7 @@ static const char *kGeomXfbMSL =
     "                if (!stride || !vr.words) continue; /* skip / next-buffer markers */\n"
     "                if (vr.stream != in[20]) continue; /* another pass packs this stream */\n"
     "                uint pos = xfb[3 + vr.buffer] + (prim * per + j) * stride + vr.dst_off;\n"
+
     "                for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rj[vr.src_word + w];\n"
     "            }\n"
     "        }\n"
@@ -1851,6 +1858,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     [enc setBuffer: gCtl offset: 0 atIndex: 1];
     [enc setBuffer: gXfb offset: 0 atIndex: 2];
     [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
 
     /* the transform feedback buffers were written by this encoder: record it *after* the
      * scatter is encoded, and make sure the serial belongs to this command buffer (the
