@@ -102,6 +102,7 @@ typedef struct MGLBorderEmu {
     uint8_t axes;        /* bit0 = S, bit1 = T, bit2 = R clamp-to-border */
     uint8_t linear;      /* within-level LINEAR weights (else NEAREST) */
     uint8_t kind;        /* 0 = float4, 1 = half4, 2 = int4, 3 = uint4 colour */
+    uint8_t compare_op;  /* shadow gather: GL compare func as 1..7 (0 = none) */
     char    bc[128];     /* MSL literal of the exact border colour */
     char    bh[128];     /* MSL literal of the colour the Metal sampler returns */
 } MGLBorderEmu;

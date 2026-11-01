@@ -2157,6 +2157,7 @@ static void tessRetireCapture(GLMContext ctx)
      * nothing (an early return below: 0 patches, bad vertex setup), which must leave
      * NO capture for consumers to pack */
     tessRetireCapture(ctx);
+    S->cpu_render_now = false;   /* set again by the CPU-reference render phase */
     /* INPUT patch size: GL_PATCH_VERTICES decides how many vertex-shader outputs form
      * one patch.  With a TCS present gl_PatchVerticesOut (what the TES sees as
      * gl_PatchVerticesIn) is a DIFFERENT number — using it here merged patches when
@@ -3628,8 +3629,12 @@ ph_vs = tessPhaseBegin();
 
     /* plain-vertex variant of the TES: needed by every non-hardware path (isolines,
      * point_mode, capture and the CPU reference draw — which renders with a plain
-     * indexed draw, not drawPatches) */
-    if ((gpu_emulated || use_cpu_reference) && !tp->plain_function)
+     * indexed draw, not drawPatches).  The condition is NOT just use_cpu_reference:
+     * a draw can FALL BACK to the CPU reference late, after the GPU tessellator's
+     * scratch budget failed (3495) — gpu_emulated is false then, but the render
+     * below is still the plain indexed draw, so the variant must exist (and
+     * mgl_tess_plain_render must see it) before processGLState builds the pipeline */
+    if ((gpu_emulated || !use_hardware) && !tp->plain_function)
     {
         char *msl = mgl_tess_plain_msl(ctx, tp);
         if (!tNoFixup())
@@ -3946,6 +3951,16 @@ ph_vs = tessPhaseBegin();
         memcpy((uint8_t *)ring.contents + off_indices, S->index_buf, index_bytes);
         memcpy((uint8_t *)ring.contents + off_patch_data, S->patch_data,
                (size_t)S->patch_count * tp->tes_patch_in_size);
+        if (tTrace())
+        {
+            const float *bl = (const float *)((uint8_t *)ring.contents + off_patch_data);
+            const float *src = (const float *)((uint8_t *)ring.contents + off_tcs_patch);
+            fprintf(stderr, "MGL tess: cpu blob@%zu [%.4g %.4g %.4g %.4g] src_tcs_patch@%zu [%.4g %.4g %.4g %.4g] tpio=%u tpso=%u pcnt=%d psz=%u\n",
+                    off_patch_data, bl[0], bl[1], bl[2], bl[3],
+                    off_tcs_patch, src[0], src[1], src[2], src[3],
+                    (unsigned)tp->num_tes_patch_in, (unsigned)tp->num_tcs_patch_out,
+                    (int)S->patch_count, (unsigned)tp->tes_patch_in_size);
+        }
 
         /* TES-output capture on the CPU reference path: the coordinate stream, index
          * list and patch blob were just written into this draw's ring block on the CPU,
@@ -3953,14 +3968,26 @@ ph_vs = tessPhaseBegin();
          * stream — one record per tessellated vertex, the count word CPU-written.  This
          * is what makes transform feedback (and the geometry stage) work when the GPU
          * tessellator's worst-case scratch does not fit its budget and the draw fell back
-         * here (e.g. many patches at once). */
+         * here (e.g. many patches at once).
+         *
+         * GL records one record per TES INVOCATION — triangles and quads emit the same
+         * tessellated coordinate several times through the index list, so the records
+         * must be in EMISSION order (the GPU path re-gathers the coordinates through
+         * the index list with tPermutePso before capturing; dEQP-GL45-ES31
+         * tessellation.primitive_discard expected icount records and got the unique
+         * vertex count).  The permute is done on the CPU here — this path already
+         * tessellated on the CPU, so the coordinate list and the indices are resident. */
         if (tp->capture && tessEnsureCapturePso(ctx, tp, prog_tes) && tp->cap_stride)
         {
+            uint32_t icount = tp->point_mode ? 0 : S->tess_index_count;
+            uint32_t n = tp->point_mode ? S->tess_vertex_count : icount;
             size_t cnt_off = off_patch_data + tessRingAlign((size_t)S->patch_count * tp->tes_patch_in_size);
             size_t recs_off = cnt_off + 16;
-            size_t need = 16 + tessRingAlign((size_t)S->tess_vertex_count * tp->cap_stride * 4);
+            size_t perm_off = recs_off + tessRingAlign((size_t)n * tp->cap_stride * 4);
+            size_t need = 16 + tessRingAlign((size_t)n * tp->cap_stride * 4) +
+                          (icount ? tessRingAlign((size_t)icount * 16) : 0);
 
-            if (tRingCap[ring_slot] < recs_off + need)
+            if (tRingCap[ring_slot] < perm_off + need)
                 NSLog(@"MGL ERROR: tess: CPU reference capture scratch overflow");
             else
             {
@@ -3974,18 +4001,31 @@ ph_vs = tessPhaseBegin();
 
                     if (ccenc)
                     {
-                        uint32_t n = S->tess_vertex_count;
-
                         memcpy((uint8_t *)ring.contents + cnt_off, &n, 4);
+                        if (icount)
+                        {
+                            /* perm[i] = coords[index[i]]: float4 gather in emission order */
+                            const float *c4 = (const float *)S->coord_buf;
+                            const uint32_t *idx = (const uint32_t *)S->index_buf;
+                            float *dst = (float *)((uint8_t *)ring.contents + perm_off);
+
+                            for (uint32_t i = 0; i < icount; i++)
+                            {
+                                dst[i * 4 + 0] = c4[idx[i] * 4 + 0];
+                                dst[i * 4 + 1] = c4[idx[i] * 4 + 1];
+                                dst[i * 4 + 2] = c4[idx[i] * 4 + 2];
+                                dst[i * 4 + 3] = c4[idx[i] * 4 + 3];
+                            }
+                        }
                         [ccenc setComputePipelineState: (__bridge id<MTLComputePipelineState>)tp->capture_pso];
                         tessBindStageUniforms(ctx, ccenc, prog_tes, _TESS_EVALUATION_SHADER);
                         tessBindStageTextures(ctx, ccenc, prog_tes, _TESS_EVALUATION_SHADER);
-                        [ccenc setBuffer: ring offset: off_coords atIndex: MGL_TESS_TES_COORDS];
+                        [ccenc setBuffer: ring offset: (icount ? perm_off : off_coords) atIndex: MGL_TESS_TES_COORDS];
                         [ccenc setBuffer: cp_source offset: cp_source_off atIndex: MGL_TESS_TES_CP];
                         [ccenc setBuffer: ring offset: off_patch_data atIndex: MGL_TESS_TES_PATCH];
                         {
                             /* [1] = patches per instance: gl_PrimitiveID restarts per instance */
-                        uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
+                            uint32_t cparams[4] = { (uint32_t)(tp->has_tcs ? tp->tcs_out_vertices : patch_verts_in), (uint32_t)patches, 0, 0 };
 
                             [ccenc setBytes: cparams length: sizeof cparams atIndex: MGL_TESS_TES_PARAMS];
                         }
@@ -3996,16 +4036,22 @@ ph_vs = tessPhaseBegin();
                         [ccenc endEncoding];
                         tessPublishCapture(ctx, ring, tp, recs_off, n, off_indices,
                                            S->tess_index_count, cnt_off);
-                        /* CPU reference path: one record per unique tessellated
-                         * coordinate, so the published index list IS the record map
-                         * (opposite of the GPU path's emission-order permute) */
-                        ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.emission_order = false;
+                        /* CPU reference path with the CPU permute above: the records
+                         * are already in emission order, exactly like the GPU path */
+                        ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.emission_order = true;
                     }
                 }
             }
         }
 
-        /* processGLState builds the render encoder and the (TES-based) pipeline */
+        /* processGLState builds the render encoder and the (TES-based) pipeline.
+         * This draw renders through the PLAIN TES variant with a plain indexed
+         * draw — flip mgl_tess_plain_render's per-draw signal on and force the
+         * rebuild (a previous hardware-path draw of this program left a
+         * post-tessellation pipeline with a tessellation vertex descriptor in
+         * place, which cannot render an indexed draw). */
+        S->cpu_render_now = true;
+        ctx->state.dirty_bits |= DIRTY_PROGRAM;
         if (![self processGLState: true])
         {
             tessRingRetireOn(_currentCommandBuffer, ring_slot);

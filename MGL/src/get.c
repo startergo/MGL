@@ -881,8 +881,13 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(uniform_buffer_offset_alignment), 256));
         case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_combined_vertex_uniform_components), 233472));
         case GL_MAX_COMBINED_GEOMETRY_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_combined_geometry_uniform_components), 230400));
-        case GL_MAX_COMBINED_TESS_CONTROL_UNIFORM_COMPONENTS: PUT1(230400);
-        case GL_MAX_COMBINED_TESS_EVALUATION_UNIFORM_COMPONENTS: PUT1(230400);
+        /* tess: consistent with the limits reported above — the combined minimum the
+         * CTS derives is MAX_*_UNIFORM_BLOCKS (16) x MAX_UNIFORM_BLOCK_SIZE (65536)
+         * / 4 + MAX_*_UNIFORM_COMPONENTS (1024) = 263168 (dEQP-GL45-ES31
+         * tessellation.state_query.max_combined_tess_[control|evaluation]_
+         * uniform_components); the old constant assumed 14 blocks */
+        case GL_MAX_COMBINED_TESS_CONTROL_UNIFORM_COMPONENTS: PUT1(16 * 65536 / 4 + 1024);
+        case GL_MAX_COMBINED_TESS_EVALUATION_UNIFORM_COMPONENTS: PUT1(16 * 65536 / 4 + 1024);
         case GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_combined_fragment_uniform_components), 233472));
         case GL_MAX_COMBINED_COMPUTE_UNIFORM_COMPONENTS: PUT1(LIMIT(STATE_VAR(max_combined_compute_uniform_components), 230400));
 

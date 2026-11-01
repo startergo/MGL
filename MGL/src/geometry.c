@@ -45,6 +45,7 @@
 #include "glm_context.h"
 #include "mgl_ext.h"
 #include "mgl_ext_geom.h"
+#include "mgl_ext_texdata.h"   /* TD_MAX_LEVELS: clamp of the required mip chain */
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
@@ -4018,7 +4019,34 @@ enum { MGL_AI_2D = 0, MGL_AI_3D, MGL_AI_ARR2, MGL_AI_CUBE, MGL_AI_CUBEARR, MGL_A
  * of the data (KHR-GL46.texture_gather.incomplete-texture / -last-comp).
  * Used from bindTexturesToCurrentRenderEncoder (MGLRenderer.m); declared in
  * mgl_ext_geom.h. */
+/* completeness under one explicit parameter set (texture's own, or a bound
+ * sampler object's — see mgl_texture_incomplete_for_unit) */
+static bool mgl_texture_incomplete_p(const Texture *tex, const TextureParameter *sp);
+
 bool mgl_texture_incomplete_for_sampling(const Texture *tex)
+{
+    return mgl_texture_incomplete_p(tex, &tex->params);
+}
+
+/* GL 4.6 9.2.3: a sampler object bound to the unit OVERRIDES every sampler
+ * state of the texture (filters, base/max level) — completeness must use the
+ * EFFECTIVE state or a sampler with MIN_FILTER=NEAREST over a single-level
+ * texture with the default NEAREST_MIPMAP_LINEAR is wrongly swapped for the
+ * (0,0,0,1) fallback (headless test_compat_bordemu int_border_array_3d). */
+bool mgl_texture_incomplete_for_unit(GLMContext ctx, const Texture *tex, GLuint unit)
+{
+    if (ctx && unit < TEXTURE_UNITS)
+    {
+        Sampler *smp = STATE(texture_samplers[unit]);
+        if (smp)
+            return mgl_texture_incomplete_p(tex, &smp->params);
+    }
+    return mgl_texture_incomplete_p(tex, &tex->params);
+}
+
+/* completeness under one explicit parameter set (texture's own, or a bound
+ * sampler object's — see mgl_texture_incomplete_for_unit) */
+static bool mgl_texture_incomplete_p(const Texture *tex, const TextureParameter *sp)
 {
     GLint base, top, i, faces = 1;
 
@@ -4033,14 +4061,54 @@ bool mgl_texture_incomplete_for_sampling(const Texture *tex)
     if (tex->target == GL_TEXTURE_CUBE_MAP)
         faces = 6;
 
-    base = (GLint)tex->params.base_level;
+    base = (GLint)sp->base_level;
     if (base < 0 || (GLuint)base >= tex->num_levels)
         return true;                      /* base level has no storage */
-    top = (GLint)tex->num_levels - 1;
-    if ((GLint)tex->params.max_level < top)
-        top = (GLint)tex->params.max_level;
-    if (tex->params.min_filter == GL_NEAREST || tex->params.min_filter == GL_LINEAR)
-        top = base;                       /* no mipmaps are consulted */
+    if ((GLint)sp->max_level < base)
+        return true;                      /* GL 8.17: max level below base */
+
+    /* GL 4.6 8.17.2: with a mip min filter the chain must reach
+     * q = min(p, TEXTURE_MAX_LEVEL), p = base + floor(log2(max(w,h,d))) of the
+     * LEVEL BASE image — stopping at the highest DEFINED level (the old rule)
+     * sampled real data from a level-0-only texture under NEAREST_MIPMAP_*,
+     * where GL requires the incomplete color (0,0,0,1)
+     * (dEQP-GL45-ES31 texture.gather.* incomplete.mipmap_incomplete).
+     * Immutable storage cannot define levels beyond its allocation, so the
+     * chain requirement stops there (Mesa caps _MaxLevel at NumLevels-1). */
+    top = base;
+    /* textures that are never mipmap-filtered: MULTISAMPLE / MULTISAMPLE_ARRAY
+     * (GL 3.9.1: min/mag filter state is ignored; only texelFetch reaches them)
+     * and TEXTURE_BUFFER (texel fetch, no filtering, one level) must not take
+     * the mip-chain branch — their default NEAREST_MIPMAP_LINEAR min filter
+     * would mark every single-level image incomplete and swap in the
+     * (0,0,0,1) fallback (headless test_geom_msimg sampler2DMS readback,
+     * test_texswizzle alphaless_attachment, test_texext buffer_texture_*). */
+    bool never_mipmapped = tex->target == GL_TEXTURE_2D_MULTISAMPLE ||
+                           tex->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY ||
+                           tex->target == GL_TEXTURE_BUFFER;
+    if (!never_mipmapped &&
+        sp->min_filter != GL_NEAREST && sp->min_filter != GL_LINEAR)
+    {
+        GLuint w = tex->faces[0].levels[base].width;
+        GLuint h = tex->faces[0].levels[base].height;
+        GLuint d = tex->faces[0].levels[base].depth;
+        /* the mip chain halves w, and h/d for every target but 1D/1D_ARRAY (h)
+         * and non-3D (d); RECTANGLE has no mips at all */
+        GLuint m = w;
+        if (tex->target != GL_TEXTURE_1D && tex->target != GL_TEXTURE_1D_ARRAY && h > m) m = h;
+        if (tex->target == GL_TEXTURE_3D && d > m) m = d;
+        while (m > 1) { m >>= 1; top++; }
+        if ((GLint)sp->max_level < top)
+            top = (GLint)sp->max_level;
+        if (tex->immutable_storage && top > (GLint)tex->num_levels - 1)
+            top = (GLint)tex->num_levels - 1;
+        if (top >= TD_MAX_LEVELS)
+            top = TD_MAX_LEVELS - 1;
+        /* a RECTANGLE texture has a single level: any mipmap min filter makes
+         * it incomplete (GL 8.17.2) */
+        if (tex->target == GL_TEXTURE_RECTANGLE)
+            return true;
+    }
 
     for (int f = 0; f < faces; f++)
         if (!tex->faces[f].levels[base].complete)

@@ -2381,6 +2381,93 @@ static void tess_widen_double_stores(char **msl_p, const struct MslStruct *stage
     }
 }
 
+/* When the canonical record flattens a struct member (SPIRV-Cross must flatten
+ * struct-typed stage-in attributes of the post-tessellation TES, so a member
+ * "S in_te_s" becomes "int in_te_s_x; float4 in_te_s_y;"), a producer stage whose
+ * OWN struct nests the struct still writes "<expr>.in_te_s.x" — rewrite those
+ * accesses to the flattened member names ("<expr>.in_te_s_x") or the rewritten
+ * struct body does not compile ("no member named 'in_te_s'"; dEQP-GL45-ES31
+ * tessellation.user_defined_io.* struct/array varyings). */
+static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, const struct CanonRec *canon)
+{
+    bool changed = false;
+
+    /* the struct body still declares the NESTED members ("S in_te_s;") while the
+     * parsed member list is already flattened (in_te_s_x, in_te_s_y) — take the
+     * nested names from the body */
+    const char *body = own->body;
+    while (body && *body)
+    {
+        const char *semi = strchr(body, ';');
+        if (!semi) break;
+        const char *decl = body;
+        body = semi + 1;
+        /* strip an [[attribute...]] qualifier */
+        const char *attr = memchr(decl, '[', (size_t)(semi - decl));
+        if (attr) semi = attr;
+        /* the member name is the last identifier of the declaration */
+        const char *e = semi;
+        while (e > decl && !isalnum((unsigned char)e[-1]) && e[-1] != '_') e--;
+        const char *s = e;
+        while (s > decl && (isalnum((unsigned char)s[-1]) || s[-1] == '_')) s--;
+        if (s == e) continue;
+
+        char m[128];
+        size_t ml = (size_t)(e - s);
+        if (ml == 0 || ml >= sizeof m) continue;
+        memcpy(m, s, ml); m[ml] = 0;
+
+        bool present = false, expanded = false;
+        for (int k = 0; k < own->count; k++)
+            if (strcmp(own->members[k].name, m) == 0) present = true;
+        for (int k = 0; k < canon->n; k++)
+        {
+            if (strcmp(canon->m[k].name, m) == 0) present = true;
+            if (strncmp(canon->m[k].name, m, ml) == 0 && canon->m[k].name[ml] == '_')
+                expanded = true;         /* canon has m_<field> members */
+        }
+        if (present || !expanded) continue;
+
+        char pat[224];
+        if (ml + 3 >= sizeof pat) continue;
+        snprintf(pat, sizeof pat, ".%s.", m);
+        for (char *w = msl; (w = strstr(w, pat)) != NULL; )
+        {
+            /* longest chain ".f1[.f2...] whose joined name m_f1[_f2...] is a canon
+             * member; the replacement always SHRINKS the text (each '.' consumed) */
+            char joined[256];
+            snprintf(joined, sizeof joined, "%s", m);
+            const char *p = w + ml + 1;               /* first '.' of ".f1" */
+            bool any = false;
+            while (*p == '.')
+            {
+                size_t fl = 0;
+                while (p[1 + fl] && (isalnum((unsigned char)p[1 + fl]) || p[1 + fl] == '_')) fl++;
+                if (!fl) break;
+                char cand[300];
+                if (snprintf(cand, sizeof cand, "%s_%.*s", joined, (int)fl, p + 1) >= (int)sizeof cand)
+                    break;
+                bool hit = false;
+                for (int k = 0; k < canon->n; k++)
+                    if (strcmp(canon->m[k].name, cand) == 0) { hit = true; break; }
+                if (!hit) break;
+                snprintf(joined, sizeof joined, "%s", cand);
+                p += 1 + fl;
+                any = true;
+            }
+            if (!any) { w += ml + 1; continue; }
+            size_t jlen = strlen(joined);
+            size_t consumed = 1 + ml + (size_t)(p - (w + ml + 1));
+            if (jlen >= consumed) { w += consumed; continue; }
+            memmove(w + 1 + jlen, w + consumed, strlen(w + consumed) + 1);
+            memcpy(w + 1, joined, jlen);
+            changed = true;
+            w += 1 + jlen;
+        }
+    }
+    return changed;
+}
+
 static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own,                            const struct CanonRec *canon)
 {
     char *buf = NULL;
@@ -4510,11 +4597,16 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
             }
             else if (src)
             {
-                /* copy from the TCS patch output by varying location (canonical key) */
+                /* copy from the TCS patch output by varying location (canonical key).
+                 * key 0 is a REAL key (GL location 0 — dEQP's primitive_discard
+                 * TCS writes 'patch out vec2 in_te_positionScale' at location 0):
+                 * dropping it left the blob member zero, and the CPU reference
+                 * draw rasterized garbage positions.  The GPU blob map
+                 * (mgl_tess_build_blob_map) matches the same keys without the
+                 * exclusion and was always correct. */
                 for (int j = 0; j < tp->num_tcs_patch_out; j++)
                 {
-                    if (tp->tcs_patch_out[j].key == m->key &&
-                        tp->tcs_patch_out[j].key != 0)
+                    if (tp->tcs_patch_out[j].key == m->key)
                     {
                         size_t so = tp->tcs_patch_out[j].offset;
 
@@ -6253,13 +6345,14 @@ done:
 bool mgl_tess_plain_render(GLMContext ctx)
 {
     MGLTessProgram *tp = mgl_tess_active_program(ctx);
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
 
     if (!tp || !tp->plain_function)
         return false;
     if (ctx->state.program && ctx->state.program->shader_slots[_GEOMETRY_SHADER])
         return false;
     return tp->domain == MGL_TESS_DOMAIN_ISOLINES || tp->point_mode || tp->capture ||
-           mgl_tess_cpu_reference();
+           S->cpu_render_now || mgl_tess_cpu_reference();
 }
 
 void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable){
@@ -6902,7 +6995,13 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
             /* scalar-double outputs: uint2 store in the VS body, uint4 slot in
              * the canonical record — widen the stores before compiling */
             if (nw)
+            {
                 tess_widen_double_stores(&nw, &vs_out, &canon);
+                /* struct members flattened by the canonical record (the TES's
+                 * scalar-only attributes): the kernel body's ".m.f" accesses
+                 * follow the rewritten member names */
+                tess_flatten_body_access(nw, &vs_out, &canon);
+            }
             if (getenv("MGL_DUMP_MSL") && nw)
                 fprintf(stderr, "==== tess VS canonical MSL:\n%s\n==== end\n", nw);
             if (nw && ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
@@ -6954,7 +7053,14 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 nw = msl_rewrite_struct_body(msl, po_name, body);
                 if (nw) { free(msl); msl = nw; changed = true; }
             }
-
+            /* the struct-body rewrite above flattens struct members the canonical
+             * record splits (the TES's scalar-only attributes); the kernel body's
+             * "<expr>.member.field" accesses must follow or the rewrite fails to
+             * compile and the draw falls back with garbage varyings */
+            if (tess_flatten_body_access(msl, &tcs_in, &canon) ||
+                tess_flatten_body_access(msl, &tcs_out, &canon_tcs) ||
+                tess_flatten_body_access(msl, &tcs_po, &canon_patch))
+                changed = true;
             /* triangle domains: write MTLTriangleTessellationFactorsHalf (8-byte factor
              * records) instead of the quad struct (see mgl_tess_factor_stride) */
             if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)

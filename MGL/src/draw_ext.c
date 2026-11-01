@@ -14,6 +14,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_buffers.h"
+#include "mgl_ext_geom.h"     /* img_atom_tb_dirty: imageBuffer atomic sidecar pending */
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: content-generation invalidation */
 #include "mgl_ext_texext.h"     /* mgl_texext_info: buffer-texture aliases in foreign-write tracking */
 #include "mgl_buffers_err.h"
@@ -216,6 +217,17 @@ void mgl_buffers_prepare_cpu_read(GLMContext ctx, Buffer *buf)
 {
     if (!buf || !MTLX() || !MTLX()->completed_serial)
         return;
+
+    /* imageBuffer atomics land in a sidecar MTLBuffer (the Metal texture cannot
+     * take atomics); a CPU read of the backing GL buffer must see them even
+     * without an intervening glMemoryBarrier — dEQP-GL45-ES31
+     * image_load_store.buffer.atomic.* maps the buffer directly after the
+     * dispatch.  The geom domain's resolve copies the sidecar back into the
+     * texture-buffer, which aliases this buffer's storage. */
+    if (ctx->state.ext_geom && ((struct MGLExtState_geom *)(ctx->state.ext_geom))->img_atom_tb_dirty &&
+        MTLX()->barrier)
+        MTLX()->barrier(ctx, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
+                             GL_TEXTURE_FETCH_BARRIER_BIT, false);
 
     uint64_t completed = MTLX()->completed_serial(ctx);
     MGLBufferTrack *t = mgl_buffers_track(ctx, buf, false);

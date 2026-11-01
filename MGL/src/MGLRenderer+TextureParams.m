@@ -11,7 +11,8 @@
  *                  -> texture view of the bound texture (level range, swizzle,
  *                     X32_Stencil8 / X24_Stencil8 pixel format), cached likewise
  *   border color   -> nearest of Metal's transparent black / opaque black / opaque white
- *   LOD bias       -> not representable in MTLSamplerDescriptor (tracked + queryable only)
+ *   LOD bias       -> MTLSamplerDescriptor.lodBias (clamped to +-MAX_LOD_BIAS=16
+ *                     at use, GL 4.6 14.2.2); tracked + queryable in the params
  */
 
 #import "MGLRenderer_Private.h"
@@ -293,6 +294,16 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     if (max_lod < min_lod) max_lod = min_lod;
     desc.lodMinClamp = min_lod;
     desc.lodMaxClamp = max_lod;
+
+    /* GL 4.6 14.2.2: TEXTURE_LOD_BIAS applies to every sampling stage, clamped
+     * to +-GL_MAX_TEXTURE_LOD_BIAS (16) at use.  MTLSamplerDescriptor.lodBias
+     * DOES exist (the header's "not representable" note was wrong) — it was
+     * previously tracked+queryable only, so biased sampling picked the wrong
+     * mip level near the clamp boundaries (KHR-GL46 texture_lod_bias_all). */
+    float lod_bias = p->lod_bias;
+    if (lod_bias < -16.0f) lod_bias = -16.0f;
+    if (lod_bias > 16.0f) lod_bias = 16.0f;
+    desc.lodBias = lod_bias;
 
     float aniso = p->max_anisotropy;
     if (aniso < 1.0f) aniso = 1.0f;

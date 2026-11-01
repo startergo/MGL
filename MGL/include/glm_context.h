@@ -257,6 +257,11 @@ typedef struct TextureLevel_t {
     GLuint depth;
     size_t pitch;
     GLuint mtl_format;
+    GLboolean gen_compressed;   /* created via a GENERIC compressed internal format
+                                 * (GL_COMPRESSED_RGBA etc.): stored uncompressed
+                                 * (GL 4.6 8.5.3 lets the GL choose), but ClearTexImage/
+                                 * ClearTexSubImage must still fail (KHR-GL46
+                                 * clear_tex_image.negative_*_compressed_texture) */
     size_t  data_size;
     vm_address_t data;
 } TextureLevel;

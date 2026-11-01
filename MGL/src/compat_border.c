@@ -169,12 +169,17 @@ int mgl_border_scan(GLMContext ctx, int stage, MGLBorderEmu out[MGL_BORDER_MAX])
 
         bool integer = (f->flags & TDF_INTEGER) != 0 ||
                        f->comp_type == GL_INT || f->comp_type == GL_UNSIGNED_INT;
+        bool shadow = (f->flags & TDF_DEPTH) != 0 &&
+                      p->compare_mode == GL_COMPARE_REF_TO_TEXTURE;
         bool hw;
         if (integer)
         {
             if (f->comp_type == GL_INT) hw = fixed_border_i(p->border_color_i);
             else                        hw = fixed_border_i((const GLint *)p->border_color_ui);
         }
+        else if (shadow)
+            /* only the R component is compared for a shadow sampler */
+            hw = p->border_color[0] == 0.0f || p->border_color[0] == 1.0f;
         else
             hw = fixed_border_f(p->border_color);
 
@@ -185,6 +190,22 @@ int mgl_border_scan(GLMContext ctx, int stage, MGLBorderEmu out[MGL_BORDER_MAX])
         memset(e, 0, sizeof *e);
         e->msl_slot = (r->msl_binding != 0xffffffffu) ? r->msl_binding : unit;
         e->axes = (uint8_t)axes;
+        /* the shadow gather helper re-runs the comparison against the border
+         * depth, so the compare function rides along (GL enum order 0x0200..) */
+        if (shadow)
+        {
+            switch (p->compare_func)
+            {
+                case GL_LESS:    e->compare_op = 1; break;
+                case GL_EQUAL:   e->compare_op = 2; break;
+                case GL_LEQUAL:  e->compare_op = 3; break;
+                case GL_GREATER: e->compare_op = 4; break;
+                case GL_NOTEQUAL:e->compare_op = 5; break;
+                case GL_GEQUAL:  e->compare_op = 6; break;
+                case GL_ALWAYS:  e->compare_op = 7; break;
+                default:         e->compare_op = 0; break;   /* NEVER */
+            }
+        }
 
         /* LINEAR border weights only make sense (and only work — see mgl_badd)
          * for filterable, non-integer textures */
@@ -229,7 +250,7 @@ uint64_t mgl_border_sig(const MGLBorderEmu *e, int n)
     for (int i = 0; i < n; i++)
     {
         h ^= e[i].msl_slot; h *= 1099511628211ULL;
-        h ^= (uint64_t)(e[i].axes << 8 | e[i].linear << 4 | e[i].kind); h *= 1099511628211ULL;
+        h ^= (uint64_t)(e[i].axes << 16 | e[i].linear << 12 | e[i].kind << 8 | e[i].compare_op); h *= 1099511628211ULL;
         h ^= 0x9e3779b97f4a7c15ULL; h *= 1099511628211ULL;
         for (const char *p = e[i].bc; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
         for (const char *p = e[i].bh; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
@@ -245,6 +266,7 @@ static bool idchar(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A'
 struct BTex {
     char name[128];
     char helper[24];    /* mgl_bsamp2 / mgl_bsamp2a / mgl_bsamp3 */
+    char ghelper[24];   /* mgl_bgath2 / mgl_bgath2a / mgl_bgathd ("" = none) */
     const MGLBorderEmu *emu;
 };
 
@@ -288,13 +310,16 @@ static int collect_tex(const char *msl, const MGLBorderEmu *emu, int n, struct B
         memcpy(type, tend, tl); type[tl] = 0;
 
         const char *helper = NULL;
-        if (strncmp(type, "texture2d<", 10) == 0) helper = "mgl_bsamp2";
-        else if (strncmp(type, "texture2d_array<", 16) == 0) helper = "mgl_bsamp2a";
+        const char *ghelper = NULL;
+        if (strncmp(type, "texture2d<", 10) == 0) { helper = "mgl_bsamp2"; ghelper = "mgl_bgath2"; }
+        else if (strncmp(type, "texture2d_array<", 16) == 0) { helper = "mgl_bsamp2a"; ghelper = "mgl_bgath2a"; }
         else if (strncmp(type, "texture3d<", 10) == 0) helper = "mgl_bsamp3";
-        if (!helper) continue;   /* MS / cube / depth: the hardware border stays */
+        else if (strncmp(type, "depth2d<", 8) == 0) ghelper = "mgl_bgathd";
+        if (!helper && !ghelper) continue;   /* MS / cube: the hardware border stays */
 
         memcpy(out[found].name, ns, nl); out[found].name[nl] = 0;
-        snprintf(out[found].helper, sizeof out[found].helper, "%s", helper);
+        snprintf(out[found].helper, sizeof out[found].helper, "%s", helper ? helper : "");
+        snprintf(out[found].ghelper, sizeof out[found].ghelper, "%s", ghelper ? ghelper : "");
         out[found].emu = e;
         found++;
     }
@@ -316,7 +341,8 @@ static size_t arglist_len(const char *open)
     return 0;
 }
 
-/* split the argument list "(a, b, c)" at top-level commas */
+/* split the argument list "(a, b, c)" at top-level commas (each argument
+ * returned with surrounding whitespace stripped) */
 static int split_args(const char *open, size_t len, char args[6][192])
 {
     int n = 0, depth = 0;
@@ -330,7 +356,10 @@ static int split_args(const char *open, size_t len, char args[6][192])
         {
             if (n < 6)
             {
-                size_t l = (size_t)(&open[i] - start);
+                while (start < &open[i] && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) start++;
+                const char *e = &open[i];
+                while (e > start && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+                size_t l = (size_t)(e - start);
                 if (l >= 192) l = 191;
                 memcpy(args[n], start, l); args[n][l] = 0;
                 n++;
@@ -340,7 +369,10 @@ static int split_args(const char *open, size_t len, char args[6][192])
     }
     if (n < 6)
     {
-        size_t l = (size_t)((open + len - 1) - start);
+        const char *e = open + len - 1;
+        while (start < e && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) start++;
+        while (e > start && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+        size_t l = (size_t)(e - start);
         if (l >= 192) l = 191;
         memcpy(args[n], start, l); args[n][l] = 0;
         n++;
@@ -393,6 +425,90 @@ static const char *k_border_helpers =
 "    }\n"
 "    return mgl_badd(t.sample(s, c, rest...), bc - bh, 1.0 - w);\n"
 "}\n"
+"/* gather: the four footprint texels are RAW texel values (no filtering), so\n"
+" * border emulation is exact — overwrite the components whose texel index\n"
+" * falls outside the texture on a CLAMP_TO_BORDER axis (gather corner order\n"
+" * x=(i,j), y=(i+1,j), z=(i+1,j+1), w=(i,j+1), i = floor(c*N - 0.5) + off).\n"
+" * The other axes' wrap modes keep working through the hardware gather. */\n"
+"/* the component argument of gather() must be a compile-time constant\n"
+" * (METAL_CONST_ARG), so it rides as a non-type template parameter */\n"
+"template <metal::component Cmp, typename T, typename... Rest>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_bgath2(texture2d<T> t, sampler s, float2 c, int2 off, uint ax, T bc, Rest... rest)\n"
+"{\n"
+"    vec<T,4> r = t.gather(s, c, off, Cmp, rest...);\n"
+"    if (ax == 0u) return r;\n"
+"    float2 szf = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 sz = int2(szf);\n"
+"    int2 b = int2(floor(c * szf - float2(0.5))) + off;\n"
+"    if ((ax & 1u) != 0u)\n"
+"    {\n"
+"        if (b.x < 0 || b.x > sz.x - 1) { r.x = bc; r.w = bc; }\n"
+"        if (b.x + 1 < 0 || b.x + 1 > sz.x - 1) { r.y = bc; r.z = bc; }\n"
+"    }\n"
+"    if ((ax & 2u) != 0u)\n"
+"    {\n"
+"        if (b.y < 0 || b.y > sz.y - 1) { r.z = bc; r.w = bc; }\n"
+"        if (b.y + 1 < 0 || b.y + 1 > sz.y - 1) { r.x = bc; r.y = bc; }\n"
+"    }\n"
+"    return r;\n"
+"}\n"
+"template <metal::component Cmp, typename T, typename... Rest>\n"
+"static inline __attribute__((always_inline)) vec<T,4> mgl_bgath2a(texture2d_array<T> t, sampler s, float2 c, int2 off, uint ax, T bc, Rest... rest)\n"
+"{\n"
+"    vec<T,4> r = t.gather(s, c, off, Cmp, rest...);\n"
+"    if (ax == 0u) return r;\n"
+"    float2 szf = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 sz = int2(szf);\n"
+"    int2 b = int2(floor(c * szf - float2(0.5))) + off;\n"
+"    if ((ax & 1u) != 0u)\n"
+"    {\n"
+"        if (b.x < 0 || b.x > sz.x - 1) { r.x = bc; r.w = bc; }\n"
+"        if (b.x + 1 < 0 || b.x + 1 > sz.x - 1) { r.y = bc; r.z = bc; }\n"
+"    }\n"
+"    if ((ax & 2u) != 0u)\n"
+"    {\n"
+"        if (b.y < 0 || b.y > sz.y - 1) { r.z = bc; r.w = bc; }\n"
+"        if (b.y + 1 < 0 || b.y + 1 > sz.y - 1) { r.x = bc; r.y = bc; }\n"
+"    }\n"
+"    return r;\n"
+"}\n"
+"/* shadow gather: a border texel compares the reference against the border\n"
+" * DEPTH (the border colour's R), with the sampler's compare function */\n"
+"static inline __attribute__((always_inline)) float mgl_bcmp(float ref, float bcr, int op)\n"
+"{\n"
+"    switch (op)\n"
+"    {\n"
+"        case 1: return ref <  bcr ? 1.0 : 0.0;\n"
+"        case 2: return ref == bcr ? 1.0 : 0.0;\n"
+"        case 3: return ref <= bcr ? 1.0 : 0.0;\n"
+"        case 4: return ref >  bcr ? 1.0 : 0.0;\n"
+"        case 5: return ref != bcr ? 1.0 : 0.0;\n"
+"        case 6: return ref >= bcr ? 1.0 : 0.0;\n"
+"        case 7: return 1.0;\n"
+"        default: return 0.0;\n"
+"    }\n"
+"}\n"
+"template <typename... Rest>\n"
+"static inline __attribute__((always_inline)) float4 mgl_bgathd(depth2d<float> t, sampler s, float2 c, float ref, int2 off, uint ax, float bcr, int op, Rest... rest)\n"
+"{\n"
+"    float4 r = t.gather_compare(s, c, ref, off, rest...);\n"
+"    if (ax == 0u) return r;\n"
+"    float2 szf = float2(float(t.get_width()), float(t.get_height()));\n"
+"    int2 sz = int2(szf);\n"
+"    int2 b = int2(floor(c * szf - float2(0.5))) + off;\n"
+"    float bcv = mgl_bcmp(ref, bcr, op);\n"
+"    if ((ax & 1u) != 0u)\n"
+"    {\n"
+"        if (b.x < 0 || b.x > sz.x - 1) { r.x = bcv; r.w = bcv; }\n"
+"        if (b.x + 1 < 0 || b.x + 1 > sz.x - 1) { r.y = bcv; r.z = bcv; }\n"
+"    }\n"
+"    if ((ax & 2u) != 0u)\n"
+"    {\n"
+"        if (b.y < 0 || b.y > sz.y - 1) { r.z = bcv; r.w = bcv; }\n"
+"        if (b.y + 1 < 0 || b.y + 1 > sz.y - 1) { r.x = bcv; r.y = bcv; }\n"
+"    }\n"
+"    return r;\n"
+"}\n"
 "template <typename T, typename... Rest>\n"
 "static inline __attribute__((always_inline)) vec<T,4> mgl_bsamp3(texture3d<T> t, sampler s, float3 c, uint ax, bool lin, vec<T,4> bc, vec<T,4> bh, Rest... rest)\n"
 "{\n"
@@ -437,7 +553,7 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
         if (f) { fwrite(msl, 1, strlen(msl), f); fclose(f); }
     }
 
-    size_t cap = strlen(msl) + strlen(k_border_helpers) + (size_t)n * 512 + 4096;
+    size_t cap = strlen(msl) + strlen(k_border_helpers) + (size_t)n * 512 + 16384;
     char *out = (char *)malloc(cap);
     if (!out) return NULL;
     size_t at = 0;
@@ -446,10 +562,11 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
 
     while (*src)
     {
-        /* the earliest plain sample call of any emulated texture object */
+        /* the earliest sample / gather call of any emulated texture object */
         const char *hit = NULL;
         struct BTex *hitb = NULL;
         size_t hit_ml = 0;
+        int hit_gather = 0;   /* 1 = .gather(, 2 = .gather_compare( */
         for (int i = 0; i < nbt; i++)
         {
             size_t nl = strlen(bt[i].name);
@@ -459,10 +576,15 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
                 const char *dot = q + nl;
                 if (q > msl && idchar((unsigned char)q[-1])) { q += nl; continue; }
                 size_t ml = 0;
+                int g = 0;
                 if (strncmp(dot, ".sample_level(", 14) == 0) ml = 14;
                 else if (strncmp(dot, ".sample(", 8) == 0) ml = 8;
+                else if (strncmp(dot, ".gather_compare(", 16) == 0 && bt[i].ghelper[0])
+                { ml = 16; g = 2; }
+                else if (strncmp(dot, ".gather(", 8) == 0 && bt[i].ghelper[0])
+                { ml = 8; g = 1; }
                 if (!ml) { q += nl; continue; }
-                if (!hit || q < hit) { hit = q; hitb = &bt[i]; hit_ml = ml; }
+                if (!hit || q < hit) { hit = q; hitb = &bt[i]; hit_ml = ml; hit_gather = g; }
                 break;
             }
         }
@@ -502,6 +624,73 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
         }
 
         const MGLBorderEmu *e = hitb->emu;
+        if (hit_gather)
+        {
+            /* .gather(s, coord[, int2 off][, component::x][, bias...]) or
+             * .gather_compare(s, coord, ref[, int2 off][, bias...]) routed
+             * through the gather helpers: the offset also shifts the border
+             * footprint, and the returned component of the border colour is
+             * selected here (the component is a compile-time enum). */
+            if (nargs < (hit_gather == 2 ? 3 : 2))
+            {
+                if (at + call_len + 1 > cap) { free(out); return NULL; }
+                memcpy(out + at, hit, call_len); at += call_len;
+                src = hit + call_len;
+                out[at] = 0;
+                continue;
+            }
+            int offi = -1;          /* which arg is the int2 offset */
+            for (int a = (hit_gather == 2 ? 3 : 2); a < nargs && a < 5; a++)
+                if (strncmp(args[a], "int2(", 5) == 0) { offi = a; break; }
+            const char *off_expr = offi >= 0 ? args[offi] : "int2(0)";
+            int comp = 0;           /* component::x..w -> 0..3 */
+            for (int a = 2; a < nargs && a < 5; a++)
+            {
+                const char *cp = strstr(args[a], "component::");
+                if (!cp) continue;
+                switch (cp[11])
+                {
+                    case 'y': comp = 1; break;
+                    case 'z': comp = 2; break;
+                    case 'w': comp = 3; break;
+                    default:  comp = 0; break;
+                }
+            }
+            /* gather()'s component argument must be a compile-time constant, so
+             * the helper takes it as a non-type template parameter and the
+             * original component:: argument is dropped from the forwarded tail */
+            char cmp_t[48];
+            if (hit_gather == 1)
+                snprintf(cmp_t, sizeof cmp_t, "<metal::component::%s>",
+                         comp == 1 ? "y" : comp == 2 ? "z" : comp == 3 ? "w" : "x");
+            else
+                cmp_t[0] = 0;
+            /* the border DEPTH / selected border component, as a scalar literal */
+            char bcs[160];
+            if (hit_gather == 2)
+                snprintf(bcs, sizeof bcs, "mgl_bc_%u.x", e->msl_slot);
+            else
+                snprintf(bcs, sizeof bcs, "mgl_bc_%u.%s", e->msl_slot,
+                         comp == 1 ? "y" : comp == 2 ? "z" : comp == 3 ? "w" : "x");
+
+            at += (size_t)snprintf(out + at, cap - at, "%s%s(%s, %s, %s, ",
+                                   hitb->ghelper, cmp_t, hitb->name, args[0], args[1]);
+            if (hit_gather == 2)
+                at += (size_t)snprintf(out + at, cap - at, "%s, ", args[2]);   /* ref */
+            at += (size_t)snprintf(out + at, cap - at, "%s, mgl_ba_%u, %s",
+                                   off_expr, e->msl_slot, bcs);
+            if (hit_gather == 2)
+                at += (size_t)snprintf(out + at, cap - at, ", mgl_bco_%u", e->msl_slot);
+            for (int a = (hit_gather == 2 ? 3 : 2); a < nargs; a++)
+                if (a != offi && !strstr(args[a], "component::"))
+                    at += (size_t)snprintf(out + at, cap - at, ", %s", args[a]);
+            at += (size_t)snprintf(out + at, cap - at, ")");
+            if (at >= cap - 1) { free(out); return NULL; }
+            src = hit + call_len;
+            out[at] = 0;
+            rewrites++;
+            continue;
+        }
         at += (size_t)snprintf(out + at, cap - at, "%s(%s, %s, %s, mgl_ba_%u, mgl_bl_%u, mgl_bc_%u, mgl_bh_%u",
                                hitb->helper, hitb->name, args[0], args[1],
                                e->msl_slot, e->msl_slot, e->msl_slot, e->msl_slot);
@@ -523,7 +712,7 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
 
     /* per-slot constants + helpers, after the using-declaration */
     {
-        char *pre = (char *)malloc(strlen(k_border_helpers) + (size_t)n * 256 + 128);
+        char *pre = (char *)malloc(strlen(k_border_helpers) + (size_t)n * 384 + 128);
         if (!pre) { free(out); return NULL; }
         size_t p = 0;
         p += (size_t)snprintf(pre + p, 128, "// %s GL_CLAMP_TO_BORDER custom border colours\n", MGL_BEMU_MARKER);
@@ -532,14 +721,16 @@ char *mgl_border_rewrite(const char *msl, const MGLBorderEmu *emu, int n)
                                   "constant const uint mgl_ba_%u = %uu;\n"
                                   "constant const bool mgl_bl_%u = %s;\n"
                                   "constant const %s mgl_bc_%u = %s;\n"
-                                  "constant const %s mgl_bh_%u = %s;\n",
+                                  "constant const %s mgl_bh_%u = %s;\n"
+                                  "constant const int mgl_bco_%u = %d;\n",
                                   emu[i].msl_slot, (unsigned)emu[i].axes,
                                   emu[i].msl_slot, emu[i].linear ? "true" : "false",
                                   emu[i].kind == 2 ? "int4" : emu[i].kind == 3 ? "uint4" : emu[i].kind == 1 ? "half4" : "float4",
                                   emu[i].msl_slot, emu[i].bc,
                                   emu[i].kind == 2 ? "int4" : emu[i].kind == 3 ? "uint4" : emu[i].kind == 1 ? "half4" : "float4",
-                                  emu[i].msl_slot, emu[i].bh);
-        if (p > strlen(k_border_helpers) + (size_t)n * 256 + 128 - 8) { free(pre); free(out); return NULL; }
+                                  emu[i].msl_slot, emu[i].bh,
+                                  emu[i].msl_slot, (int)emu[i].compare_op);
+        if (p > strlen(k_border_helpers) + (size_t)n * 384 + 128 - 8) { free(pre); free(out); return NULL; }
         memcpy(pre + p, k_border_helpers, strlen(k_border_helpers) + 1);
 
         const char *anchor = strstr(out, "using namespace metal;");

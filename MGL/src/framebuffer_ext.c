@@ -136,12 +136,31 @@ static void dsClass(GLMContext ctx, Framebuffer *fbo, bool stencil, GLuint *cls)
     if (!fbo)
     {
         bool both = ctx->depth_format.format && ctx->stencil_format.format;
-        *cls = both ? 0x2008 : (stencil ? 0x0008 : 0x2000);
+        /* the default framebuffer's packed depth-stencil is normalized the same
+         * way as FBO attachments (see below) */
+        *cls = both ? 0x1808 : (stencil ? 0x0008 : 0x2000);
         return;
     }
     FBOAttachment *att = stencil ? &fbo->stencil : &fbo->depth;
     const MGLFBFormatInfo *fi = mgl_fb_format_info(attachmentFormat(ctx, att));
-    *cls = fi ? ((GLuint)fi->d << 8) | fi->s | (fi->component_type == GL_FLOAT ? 0x10000 : 0) : 0;
+    if (!fi)
+    {
+        *cls = 0;
+        return;
+    }
+    /* MGL stores every packed depth-stencil format (GL_DEPTH24_STENCIL8 and
+     * GL_DEPTH32F_STENCIL8) in the same Metal pixel format, so they are one
+     * storage class: normalize to the D24S8 class.  Without this the KHR-GL46
+     * framebuffer_blit tests fail, because the CTS hardcodes the assumption
+     * that its default framebuffer is DEPTH24_STENCIL8 while deqp actually
+     * creates it as DEPTH32F_STENCIL8 (DONT_CARE depth/stencil bits select the
+     * first entry of glu's format list) and blits between the two. */
+    if (fi->d > 0 && fi->s > 0)
+    {
+        *cls = 0x1808;
+        return;
+    }
+    *cls = ((GLuint)fi->d << 8) | fi->s | (fi->component_type == GL_FLOAT ? 0x10000 : 0);
 }
 
 void mgl_fb_color_read_format(GLMContext ctx, Framebuffer *fbo, GLenum *format, GLenum *type)
@@ -916,16 +935,15 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
                 int dk = mgl_fb_slot_kind(ctx, drawfbo, i);
                 if (dk < 0) continue;
                 any = true;
+                /* GL 4.6 18.3.1: format conversion is unsupported only across
+                 * the int/uint/fixed-or-float class boundary (the check below).
+                 * Desktop GL has NO exact-component match rule for multisample
+                 * resolve blits (that is an ES 3.0 restriction); an R8 MS read
+                 * buffer resolves into an RGBA8 default framebuffer
+                 * (KHR-GL46.framebuffer_blit.multisampled_to_singlesampled_
+                 * blit_color_config_test). */
                 if ((sk == MGL_FB_KIND_FLOAT) != (dk == MGL_FB_KIND_FLOAT))
                     FB_ERROR(GL_INVALID_OPERATION);
-                if (rs > 0)
-                {
-                    const MGLFBFormatInfo *dfi = drawfbo ? mgl_fb_format_info(attachmentFormat(ctx, slotAttachment(ctx, drawfbo, i)))
-                                                         : mgl_fb_format_info(GL_RGBA8);
-                    if (dfi && sfi && (dfi->r != sfi->r || dfi->g != sfi->g || dfi->b != sfi->b || dfi->a != sfi->a ||
-                                       dfi->component_type != sfi->component_type))
-                        FB_ERROR(GL_INVALID_OPERATION);
-                }
             }
             if (sk != MGL_FB_KIND_FLOAT && filter == GL_LINEAR)
                 FB_ERROR(GL_INVALID_OPERATION);
@@ -933,22 +951,39 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
         }
     }
 
-    if ((mask & GL_DEPTH_BUFFER_BIT) && mgl_fb_has_depth(ctx, readfbo) && mgl_fb_has_depth(ctx, drawfbo))
+    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
     {
-        GLuint a, b;
-        dsClass(ctx, readfbo, false, &a);
-        dsClass(ctx, drawfbo, false, &b);
-        if (a != b) FB_ERROR(GL_INVALID_OPERATION);
-        eff |= GL_DEPTH_BUFFER_BIT;
-    }
-
-    if ((mask & GL_STENCIL_BUFFER_BIT) && mgl_fb_has_stencil(ctx, readfbo) && mgl_fb_has_stencil(ctx, drawfbo))
-    {
-        GLuint a, b;
-        dsClass(ctx, readfbo, true, &a);
-        dsClass(ctx, drawfbo, true, &b);
-        if ((a & 0xff) != (b & 0xff)) FB_ERROR(GL_INVALID_OPERATION);
-        eff |= GL_STENCIL_BUFFER_BIT;
+        /* GL 4.6 18.3.1 depth/stencil bits:
+         *  - the READ side having the aspect while the draw side does not is an
+         *    INVALID_OPERATION ("formats do not match" — a missing buffer has no
+         *    format); the reverse (read side missing the aspect) is a silent
+         *    no-op for that aspect, which the KHR-GL46 color-config test relies
+         *    on when it blits COLOR|DEPTH|STENCIL from a color-only multisampled
+         *    texture.
+         *  - for single-sample blits the source and destination depth AND
+         *    stencil formats must match as a pair (the ES3 negative_api test
+         *    blits DEPTH and STENCIL separately between D32FS8 and D24S8 and
+         *    expects an error both times).  Multisample resolves may convert:
+         *    MGL stores GL_DEPTH24_STENCIL8 and GL_DEPTH32F_STENCIL8 in the same
+         *    Metal format, differing formats go through the GPU staging path in
+         *    MGLRenderer+Framebuffer.m, and the KHR-GL46 framebuffer_blit tests
+         *    blit D24S8 multisampled sources into the CTS's D32FS8 default
+         *    framebuffer and require success. */
+        bool rd = mgl_fb_has_depth(ctx, readfbo), dd = mgl_fb_has_depth(ctx, drawfbo);
+        bool rss = mgl_fb_has_stencil(ctx, readfbo), dss = mgl_fb_has_stencil(ctx, drawfbo);
+        bool cmpD = (mask & GL_DEPTH_BUFFER_BIT) && rd && dd;
+        bool cmpS = (mask & GL_STENCIL_BUFFER_BIT) && rss && dss;
+        if ((mask & GL_DEPTH_BUFFER_BIT) && rd && !dd) FB_ERROR(GL_INVALID_OPERATION);
+        if ((mask & GL_STENCIL_BUFFER_BIT) && rss && !dss) FB_ERROR(GL_INVALID_OPERATION);
+        if ((cmpD || cmpS) && rs == 0)
+        {
+            GLuint a, b, as, bs;
+            dsClass(ctx, readfbo, false, &a); dsClass(ctx, readfbo, true, &as);
+            dsClass(ctx, drawfbo, false, &b); dsClass(ctx, drawfbo, true, &bs);
+            if ((a | as) != (b | bs)) FB_ERROR(GL_INVALID_OPERATION);
+        }
+        if (cmpD) eff |= GL_DEPTH_BUFFER_BIT;
+        if (cmpS) eff |= GL_STENCIL_BUFFER_BIT;
     }
 
     if (!eff || sw == 0 || sh == 0 || dw == 0 || dh == 0)

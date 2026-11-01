@@ -1435,7 +1435,9 @@ static void *mapBufferRange(GLMContext ctx, Buffer *ptr, GLintptr offset, GLsize
                                          GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT)) == 0,
                              GL_INVALID_VALUE, NULL);
 
-    ERROR_CHECK_RETURN_VALUE(length != 0, GL_INVALID_OPERATION, NULL);
+    /* length == 0 is legal (GL 4.6 removed the INVALID_VALUE): dEQP's
+     * readDataMapped() maps 0 bytes for an empty tessellation varyings record
+     * and requires a non-NULL pointer with no error. */
     ERROR_CHECK_RETURN_VALUE(ptr->mapped == GL_FALSE, GL_INVALID_OPERATION, NULL);
     ERROR_CHECK_RETURN_VALUE(access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT), GL_INVALID_OPERATION, NULL);
 

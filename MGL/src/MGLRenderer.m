@@ -473,14 +473,60 @@ static char kComputeFallbackKey;
  * instead of dropping the whole dispatch. */
 - (id<MTLTexture>) computeFallbackTexture
 {
+    return [self computeFallbackTextureForType: MTLTextureType2D];
+}
+
+/* GL 8.17's incomplete-texture (0,0,0,1) sample must also reach slots whose MSL
+ * type is NOT texture2d<float>: a 2D fallback bound to a texture2d_array /
+ * texture_cube slot is a Metal type mismatch and the sample never lands
+ * (dEQP-GL45-ES31 texture.gather.*-2darray / *-cube incomplete.mipmap_incomplete
+ * kept reading the real mip chain).  One 1x1 RGBA8 texture per needed type. */
+- (id<MTLTexture>) computeFallbackTextureForType: (MTLTextureType)type
+{
+    if (type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray ||
+        type > MTLTextureTypeCubeArray)
+        type = MTLTextureType2D;          /* exotic slots: plain 2D keeps them bound */
+
+    static const char *key[6] = {"fb2d", "fb1d", "fb3d", "fb2da", "fbcube", "fbcubea"};
     NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
-    id<MTLTexture> tex = d[@"tex"];
+    const char *k = NULL;
+    switch (type)
+    {
+        case MTLTextureType1D:          k = key[1]; break;
+        case MTLTextureType3D:          k = key[2]; break;
+        case MTLTextureType2DArray:     k = key[3]; break;
+        case MTLTextureTypeCube:        k = key[4]; break;
+        case MTLTextureTypeCubeArray:   k = key[5]; break;
+        default:                        k = key[0]; break;
+    }
+    id<MTLTexture> tex = d[[NSString stringWithUTF8String: k]];
     if (tex)
         return tex;
 
-    MTLTextureDescriptor *desc =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
-                                                            width: 1 height: 1 mipmapped: NO];
+    MTLTextureDescriptor *desc;
+    switch (type)
+    {
+        case MTLTextureType1D:
+        case MTLTextureType3D:
+        case MTLTextureType2DArray:
+        case MTLTextureTypeCubeArray:
+            desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                                      width: 1 height: 1
+                                                                mipmapped: NO];
+            desc.textureType = type;
+            desc.arrayLength = 1;
+            break;
+        case MTLTextureTypeCube:
+            desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                                     size: 1
+                                                                 mipmapped: NO];
+            break;
+        default:
+            desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                                      width: 1 height: 1
+                                                                mipmapped: NO];
+            break;
+    }
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     /* geom r60: the (0,0,0,1) texel must actually LAND in the texture — with
      * Private storage the replaceRegion below is CPU access to a private texture
@@ -496,20 +542,26 @@ static char kComputeFallbackKey;
          * alpha byte outside the texture, so the texel read (0,0,0,0) and GL 8.17
          * incomplete sampling returned alpha 0 instead of 1 */
         const uint32_t black = 0xff000000u;
-        [tex replaceRegion: MTLRegionMake2D(0, 0, 1, 1) mipmapLevel: 0 withBytes: &black bytesPerRow: 4];
+        NSUInteger slices = (type == MTLTextureTypeCube) ? 6 : 1;
+        for (NSUInteger s = 0; s < slices; s++)
+            [tex replaceRegion: MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel: 0 slice: s
+                      withBytes: &black bytesPerRow: 4 bytesPerImage: 4];
 
-        MTLSamplerDescriptor *sdesc = [[MTLSamplerDescriptor alloc] init];
-        sdesc.minFilter = MTLSamplerMinMagFilterNearest;
-        sdesc.magFilter = MTLSamplerMinMagFilterNearest;
-        sdesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
-        sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-        sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-        id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor: sdesc];
-
-        objc_setAssociatedObject(self, &kComputeFallbackKey,
-                                 @{ @"tex": tex,
-                                    @"sampler": sampler ?: [NSNull null] },
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSMutableDictionary *nd = (d ? [NSMutableDictionary dictionaryWithDictionary: d]
+                                     : [NSMutableDictionary dictionary]);
+        nd[[NSString stringWithUTF8String: k]] = tex;
+        if (!d[@"sampler"])
+        {
+            MTLSamplerDescriptor *sdesc = [[MTLSamplerDescriptor alloc] init];
+            sdesc.minFilter = MTLSamplerMinMagFilterNearest;
+            sdesc.magFilter = MTLSamplerMinMagFilterNearest;
+            sdesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+            sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+            sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+            id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor: sdesc];
+            nd[@"sampler"] = sampler ?: [NSNull null];
+        }
+        objc_setAssociatedObject(self, &kComputeFallbackKey, nd, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return tex;
 }
@@ -2355,9 +2407,9 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
              * EXISTENCE was validated at creation; KHR-GL46.texture_gather.
              * incomplete-texture/-last-comp replace level 1 with 1x1 under a 32x32
              * level 0 and expect a black sample). */
-            if (mgl_texture_incomplete_for_sampling(ptr))
+            if (mgl_texture_incomplete_for_unit(ctx, ptr, (GLuint)unit))
             {
-                id<MTLTexture> ftex = [self computeFallbackTexture];
+                id<MTLTexture> ftex = [self computeFallbackTextureForType: texture.textureType];
                 id<MTLSamplerState> fsamp = [self computeFallbackSampler];
 
                 if (ftex)
@@ -6717,6 +6769,14 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
             }
         } else {
             [blockSelf recordGPUSuccess];
+            if (getenv("MGL_CB_GPUTIME")) {
+                static _Atomic unsigned long long tns = 0, ncb = 0;
+                unsigned long long ns = (unsigned long long)((buffer.GPUEndTime - buffer.GPUStartTime) * 1e9);
+                unsigned long long n = ++ncb;
+                unsigned long long t = (tns += ns);
+                if (n % 100 == 0)
+                    fprintf(stderr, "CBGPUTIME n=%llu avg_us_per_cb=%.1f\n", n, (double)t / 1000.0 / (double)n);
+            }
 
             // AGX Recovery: Clear recovery mode on success
             if (blockSelf->_gpuErrorRecoveryMode) {

@@ -1106,6 +1106,22 @@ static void updateTexSummary(Texture *tex)
 }
 
 /* (re)define a level; content becomes undefined unless written afterwards */
+/* generic compressed internal formats (GL 4.6 table 8.13): legal for TexImage,
+ * stored uncompressed at the driver's choice, but the level is marked so
+ * ClearTexImage / ClearTexSubImage reject it like a real compressed format */
+static bool tdIsGenericCompressed(GLenum internalformat)
+{
+    switch (internalformat)
+    {
+        case GL_COMPRESSED_RED: case GL_COMPRESSED_RG:
+        case GL_COMPRESSED_RGB: case GL_COMPRESSED_RGBA:
+        case GL_COMPRESSED_SRGB: case GL_COMPRESSED_SRGB_ALPHA:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool defineLevel(GLMContext ctx, Texture *tex, GLuint face, GLuint level, GLenum ifmt, GLuint w, GLuint h, GLuint d)
 {
     if (!ensureLevels(ctx, tex))
@@ -1138,6 +1154,7 @@ static bool defineLevel(GLMContext ctx, Texture *tex, GLuint face, GLuint level,
     l->depth = l->complete ? d : 0;
     l->mtl_format = l->complete ? ifmt : 0;
     l->pitch = 0;
+    l->gen_compressed = GL_FALSE;   /* texImage sets it for generic-compressed ifmts */
 
     updateTexSummary(tex);
 
@@ -1822,6 +1839,16 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
 
     if (!defineLevel(ctx, tex, t.face, level, ifmt, width, height, depth))
         return;
+
+    if (tdIsGenericCompressed(internalformat))
+    {
+        /* the level is stored as the resolved uncompressed format, but keep the
+         * generic-compressed marker for ClearTexImage/ClearTexSubImage (the CTS
+         * expects GL_INVALID_OPERATION, like for a real compressed texture) */
+        TextureLevel *l = texLevel(tex, t.face, level);
+        if (l)
+            l->gen_compressed = GL_TRUE;
+    }
 
     if (!tex->access)
         tex->access = GL_READ_ONLY;
@@ -3510,7 +3537,11 @@ static void clearTex(GLMContext ctx, GLuint texture, GLint level, GLint x, GLint
     TD_CHECK(l && l->complete, GL_INVALID_OPERATION);
 
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face0 < 6 ? face0 : 0, level));
-    TD_CHECK(f && !(f->flags & TDF_COMPRESSED), GL_INVALID_OPERATION);
+    /* compressed levels reject the clear — including levels created with a
+     * GENERIC compressed internal format (GL_COMPRESSED_RGBA...), which are
+     * stored uncompressed but flagged gen_compressed at TexImage time
+     * (KHR-GL46 clear_tex_image.negative_*_compressed_texture) */
+    TD_CHECK(f && !(f->flags & TDF_COMPRESSED) && !l->gen_compressed, GL_INVALID_OPERATION);
 
     err = tdCheckFormatCompat(f, format, type, TD_PIX_SUBIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
@@ -3526,7 +3557,10 @@ static void clearTex(GLMContext ctx, GLuint texture, GLint level, GLint x, GLint
             cx = cy = cz = 0;
             cw = lf->width; ch = lf->height; cd = lf->depth;
         }
-        TD_CHECK(cw >= 0 && ch >= 0 && cd >= 0, GL_INVALID_OPERATION);
+        /* GL 4.6 9.2.3: negative dimensions are GL_INVALID_VALUE — checked before
+         * the bounds test below, whose unsigned wrap would report INVALID_OPERATION
+         * instead (KHR-GL46 clear_tex_image.negative_..._negative_dimension) */
+        TD_CHECK(cw >= 0 && ch >= 0 && cd >= 0, GL_INVALID_VALUE);
         TD_CHECK(cx >= 0 && cy >= 0 && cz >= 0 && (GLuint)(cx + cw) <= lf->width && (GLuint)(cy + ch) <= lf->height &&
                  (GLuint)(cz + cd) <= lf->depth, GL_INVALID_OPERATION);
         if (!cw || !ch || !cd)
@@ -3932,8 +3966,15 @@ static void generateMipmap(GLMContext ctx, Texture *tex, GLenum bad_target_error
     }
 
     const TDFormat *f = tdFormatInfo(bl->mtl_format);
+    /* GL 4.6 §8.18: mip generation needs renderable + filterable; depth formats
+     * qualify (DEPTH_COMPONENT16/24/32F are filterable, table 8.25) — Metal's
+     * blit generateMipmaps handles Depth16Unorm/Depth32Float on Apple GPUs, and
+     * MGL stores DEPTH_COMPONENT16 as Depth32Float (TDK_D16F).  KHR-GL46
+     * texture_query_levels shadow cases generateMipmap a DEPTH_COMPONENT16 chain.
+     * Stencil and DEPTH_STENCIL stay rejected (not filterable), as do integer /
+     * compressed. */
     TD_CHECK(f && (f->flags & TDF_RENDERABLE) && (f->flags & TDF_FILTERABLE) &&
-             !(f->flags & (TDF_INTEGER | TDF_DEPTH | TDF_STENCIL | TDF_COMPRESSED)), GL_INVALID_OPERATION);
+             !(f->flags & (TDF_INTEGER | TDF_STENCIL | TDF_COMPRESSED)), GL_INVALID_OPERATION);
 
     bool lin = (tex->target == GL_TEXTURE_1D || tex->target == GL_TEXTURE_1D_ARRAY);
     GLuint m = bl->width;

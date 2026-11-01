@@ -2381,6 +2381,265 @@ TEST(ClipDistance130Link)
     while (glGetError() != GL_NO_ERROR) {}
 }
 
+/* ---- CPU-fallback regressions (dEQP-GL45-ES31 tessellation.primitive_discard) ----
+ *
+ * The CTS shape: hundreds of patches in one draw.  The GPU emulated tessellator's
+ * worst-case scratch (>= ~165 KB/patch) busts its 64 MB budget around 400 patches,
+ * so the draw falls back to the CPU reference path AFTER the VS/TCS kernels ran.
+ * Three independent bugs lived on that path, all fixed:
+ *   1. the CPU blob builder skipped TCS patch outputs whose canonical key is 0
+ *      (GL location 0) — the blob member stayed zero and the TES produced garbage
+ *      positions (all-black image);
+ *   2. the plain TES variant was not compiled for the LATE fallback (the condition
+ *      only knew gpu_emulated || use_cpu_reference), so the plain indexed draw ran
+ *      with a post-tessellation pipeline + tessellation vertex descriptor and
+ *      rasterized nothing;
+ *   3. transform-feedback capture recorded one record per UNIQUE vertex instead of
+ *      one per EMITTED vertex in emission order (wrong record count).
+ * GL requires XFB capture AND rasterization from the same draw: the image checks
+ * hold with glBeginTransformFeedback active. */
+static const char *kPdVs =
+    "#version 450\n"
+    "out gl_PerVertex { vec4 gl_Position; };\n"
+    "in float in_v_attr;\n"
+    "out float in_tc_attr;\n"
+    "void main() { in_tc_attr = in_v_attr; }\n";
+static const char *kPdFs =
+    "#version 450\n"
+    "layout(location=0) out vec4 o_color;\n"
+    "void main() { o_color = vec4(1.0); }\n";
+static const char *kPdTcs =
+    "#version 450\n"
+    "layout(vertices = 1) out;\n"
+    "in float in_tc_attr[];\n"
+    "patch out vec2 in_te_scale;    /* implicit location 0: canonical key 0 */\n"
+    "patch out vec2 in_te_offset;\n"
+    "void main() {\n"
+    "    in_te_scale  = vec2(in_tc_attr[6], in_tc_attr[7]);\n"
+    "    in_te_offset = vec2(in_tc_attr[8], in_tc_attr[9]);\n"
+    "    gl_TessLevelInner[0] = in_tc_attr[0];\n"
+    "    gl_TessLevelInner[1] = in_tc_attr[1];\n"
+    "    gl_TessLevelOuter[0] = in_tc_attr[2];\n"
+    "    gl_TessLevelOuter[1] = in_tc_attr[3];\n"
+    "    gl_TessLevelOuter[2] = in_tc_attr[4];\n"
+    "    gl_TessLevelOuter[3] = in_tc_attr[5];\n"
+    "}\n";
+static const char *kPdTes =
+    "#version 450\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "patch in vec2 in_te_scale;\n"
+    "patch in vec2 in_te_offset;\n"
+    "out vec3 out_te_tessCoord;\n"
+    "void main() {\n"
+    "    out_te_tessCoord = gl_TessCoord;\n"
+    "    gl_Position = vec4(gl_TessCoord.xy * in_te_scale + in_te_offset, 0.0, 1.0);\n"
+    "}\n";
+
+#define PD_COLS 32
+#define PD_ROWS 16
+#define PD_PATCHES (PD_COLS * PD_ROWS)   /* 512: beyond the 64 MB emulated budget */
+
+static GLuint pd_setup(void)
+{
+    /* per-vertex float: [0..5] levels, [6,7] scale, [8,9] offset — 10 verts/patch */
+    static float attr[PD_PATCHES * 10];
+    GLuint vao, buf;
+
+    for (int i = 0; i < PD_PATCHES; i++) {
+        float *p = attr + i * 10;
+        p[0] = 1; p[1] = 1;              /* inner: minimal grid */
+        p[2] = 3; p[3] = 3; p[4] = 3; p[5] = 3;   /* outer */
+        p[6] = 2.0f / PD_COLS; p[7] = 2.0f / PD_ROWS;
+        p[8] = (float)(i % PD_COLS) / PD_COLS * 2.0f - 1.0f;
+        p[9] = (float)(i / PD_COLS) / PD_ROWS * 2.0f - 1.0f;
+    }
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_ARRAY_BUFFER, buf);
+    glBufferData(GL_ARRAY_BUFFER, sizeof attr, attr, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, 4, NULL);
+    glPatchParameteri(GL_PATCH_VERTICES, 10);
+    return vao;
+}
+
+/* pixel inside grid cell (col,row) of a 256x256 viewport: the triangle-domain
+ * patch covers the lower-left TRIANGLE of its cell (u+v<=1), so probe at a
+ * quarter point — the cell centre lies exactly on the hypotenuse (u=v=0.5),
+ * which the rasterizer's fill rule may or may not cover */
+static void pd_cell(int col, int row, float out[4])
+{
+    int x = (int)((col + 0.25f) * (256.0f / PD_COLS));
+    int y = (int)((row + 0.25f) * (256.0f / PD_ROWS));
+
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, out);
+}
+
+TEST(TessCpuFallbackPatchBlobKey0)
+{
+    /* state isolation: earlier suite tests leave cull / depth / scissor / stencil
+     * enabled, and can leave a PIXEL_PACK_BUFFER / read-FBO bound (glReadPixels
+     * then lands in the buffer, not the probed array) — the pixel probes below
+     * assume an unfiltered raster and a clean readback path */
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glViewport(0, 0, 256, 256);
+    GLuint vao = pd_setup();
+    GLuint prog = glCreateProgram();
+    struct { int t; const char *s; } st[4] = {
+        { GL_VERTEX_SHADER, kPdVs }, { GL_FRAGMENT_SHADER, kPdFs },
+        { GL_TESS_CONTROL_SHADER, kPdTcs }, { GL_TESS_EVALUATION_SHADER, kPdTes },
+    };
+    for (int i = 0; i < 4; i++) {
+        GLuint sh = glCreateShader(st[i].t);
+        glShaderSource(sh, 1, &st[i].s, NULL);
+        glCompileShader(sh);
+        glAttachShader(prog, sh);
+        glDeleteShader(sh);
+    }
+    glLinkProgram(prog);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (link != GL_TRUE) {
+        char log[1024] = "";
+        glGetProgramInfoLog(prog, sizeof log, NULL, log);
+        printf("TessCpuFallbackPatchBlobKey0 link: %s\n", log);
+        glDeleteProgram(prog);
+        glDeleteVertexArrays(1, &vao);
+        return;
+    }
+    glUseProgram(prog);
+
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, PD_PATCHES * 10);
+    EXPECT_NO_GL_ERROR();
+
+    /* every cell must be lit by its patch: the blob carries the per-patch scale
+     * and offset (the location-0 member was the all-black bug) */
+    float c[4];
+    int lit = 0, probes = 0;
+    for (int row = 0; row < PD_ROWS; row++)
+        for (int col = 0; col < PD_COLS; col++) {
+            pd_cell(col, row, c);
+            probes++;
+            if (c[0] > 0.5f) lit++;
+        }
+    EXPECT_EQ_INT(lit, probes);
+    pd_cell(0, 0, c);          EXPECT_TRUE(c[0] > 0.5f);
+    pd_cell(PD_COLS - 1, PD_ROWS - 1, c); EXPECT_TRUE(c[0] > 0.5f);
+
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+}
+
+TEST(TessXfbCpuFallbackRasterizes)
+{
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glViewport(0, 0, 256, 256);
+    GLuint vao = pd_setup();
+    GLuint prog = glCreateProgram();
+    struct { int t; const char *s; } st[4] = {
+        { GL_VERTEX_SHADER, kPdVs }, { GL_FRAGMENT_SHADER, kPdFs },
+        { GL_TESS_CONTROL_SHADER, kPdTcs }, { GL_TESS_EVALUATION_SHADER, kPdTes },
+    };
+    for (int i = 0; i < 4; i++) {
+        GLuint sh = glCreateShader(st[i].t);
+        glShaderSource(sh, 1, &st[i].s, NULL);
+        glCompileShader(sh);
+        glAttachShader(prog, sh);
+        glDeleteShader(sh);
+    }
+    const char *xfb_v[] = { "out_te_tessCoord" };
+    glTransformFeedbackVaryings(prog, 1, xfb_v, GL_SEPARATE_ATTRIBS);
+    glLinkProgram(prog);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (link != GL_TRUE) { glDeleteProgram(prog); glDeleteVertexArrays(1, &vao); return; }
+    glUseProgram(prog);
+
+    GLuint xfb, qgen, qwr;
+    glGenBuffers(1, &xfb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xfb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 1 << 22, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xfb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glGenQueries(1, &qgen);
+    glGenQueries(1, &qwr);
+
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, qgen);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, qwr);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_PATCHES, 0, PD_PATCHES * 10);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    EXPECT_NO_GL_ERROR();
+
+    GLint gen = -1, wr = -1;
+    glGetQueryObjectiv(qgen, GL_QUERY_RESULT, &gen);
+    glGetQueryObjectiv(qwr, GL_QUERY_RESULT, &wr);
+    EXPECT_TRUE(gen > 0);
+    EXPECT_TRUE(wr > 0);
+    EXPECT_EQ_INT(gen, wr);
+
+    /* records: one per EMITTED vertex in emission order — 3 per triangle, and the
+     * three tcoords of a triangle are distinct barycentrics (a UNIQUE-vertex-order
+     * stream repeats the same coordinates) */
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xfb);
+    const float *rec = (const float *)glMapBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, GL_READ_ONLY);
+    EXPECT_TRUE(rec != NULL);
+    if (rec) {
+        int ntri = wr < 4096 ? wr : 4096;
+        int bad = 0;
+        for (int t = 0; t < ntri; t++) {
+            const float *a = rec + (size_t)t * 9, *b = a + 3, *c = b + 3;
+            for (int k = 0; k < 9; k++)
+                if (!(rec[(size_t)t * 9 + k] >= 0.0f && rec[(size_t)t * 9 + k] <= 1.0f)) bad++;
+            if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]) bad++;   /* degenerate dup */
+            if (b[0] == c[0] && b[1] == c[1] && b[2] == c[2]) bad++;
+            if (a[0] == c[0] && a[1] == c[1] && a[2] == c[2]) bad++;
+        }
+        EXPECT_EQ_INT(bad, 0);
+        glUnmapBuffer(GL_TRANSFORM_FEEDBACK_BUFFER);
+    }
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+
+    /* GL 4.6: transform feedback does NOT disable rasterization — the image must
+     * be identical to the non-capturing draw (this was the all-black failure) */
+    float c[4];
+    int lit = 0, probes = 0;
+    for (int row = 0; row < PD_ROWS; row++)
+        for (int col = 0; col < PD_COLS; col++) {
+            pd_cell(col, row, c);
+            probes++;
+            if (c[0] > 0.5f) lit++;
+        }
+    EXPECT_EQ_INT(lit, probes);
+
+    glDeleteQueries(1, &qgen);
+    glDeleteQueries(1, &qwr);
+    glDeleteBuffers(1, &xfb);
+    glDeleteProgram(prog);
+    glDeleteVertexArrays(1, &vao);
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -2435,6 +2694,8 @@ int main(void)
     RUN(TessRingGenerationHammer);
     RUN(TessHugePatchCountDropped);
     RUN(TessErrors);
+    RUN(TessCpuFallbackPatchBlobKey0);
+    RUN(TessXfbCpuFallbackRasterizes);
     RUN(TessDefaultLevels);
     RUN(TessLayerFromVertexStage);
     RUN(TessLayerFromEvaluationStage);

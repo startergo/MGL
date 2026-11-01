@@ -733,7 +733,7 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
          * fallback for those units; this vertex-stage refresh must not overwrite
          * it with the real mip chain again (KHR-GL46.texture_gather.
          * incomplete-texture / -last-comp read level-0 data otherwise) */
-        if (mgl_texture_incomplete_for_sampling(ptr))
+        if (mgl_texture_incomplete_for_unit(ctx, ptr, (GLuint)binding))
         {
             id<MTLTexture> ftex = [self computeFallbackTexture];
             id<MTLSamplerState> fsamp = [self computeFallbackSampler];

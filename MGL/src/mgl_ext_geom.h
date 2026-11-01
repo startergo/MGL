@@ -432,6 +432,12 @@ struct MGLExtState_geom {
      * atomic is in flight).  Maintained where .dirty is set; recomputed by the
      * resolve pass itself. */
     bool img_atom_any;
+    /* true when a dirty sidecar belongs to an imageBuffer (GL_TEXTURE_BUFFER)
+     * image: a CPU read of the backing buffer (map/subdata) must first resolve
+     * the sidecar back into the buffer-aliased texture — dEQP-GL45-ES31
+     * image_load_store.buffer.atomic.* maps with no glMemoryBarrier.
+     * Maintained alongside .dirty; recomputed by the resolve pass. */
+    bool img_atom_tb_dirty;
     /* r83: draw-time sidecar GATE memo misses — how often the "any stage declares
      * a storage image with an atomic sidecar slot" flag had to be recomputed from
      * the resource lists (every program pays ONE miss; a hit costs a 7-word
@@ -590,6 +596,9 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
 
 /* GL 8.17 sampling completeness (geometry.c; used by bindTextures) */
 bool mgl_texture_incomplete_for_sampling(const Texture *tex);
+/* same, with the SAMPLER OBJECT bound to the unit overriding the texture's
+ * sampler state (GL 4.6 9.2.3) — pass unit >= TEXTURE_UNITS for "no sampler" */
+bool mgl_texture_incomplete_for_unit(GLMContext ctx, const Texture *tex, GLuint unit);
 
 
 #endif

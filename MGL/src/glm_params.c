@@ -188,6 +188,14 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetIntegerv(GL_MAX_VARYING_FLOATS,&glm_ctx->state.var.max_varying_floats);
     glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_vertex_texture_image_units);
     glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,&glm_ctx->state.var.max_combined_texture_image_units);
+    /* tess: the bootstrap (host GL) context reports 80, but GL 4.6 core requires
+     * MAX_COMBINED_TEXTURE_IMAGE_UNITS >= 96 and MGL's unit tables are sized
+     * TEXTURE_UNITS = 128 (glm_limits.h) — the Metal binding is dense per stage,
+     * so 96 units are genuinely usable.  Raise the limit to the spec minimum
+     * (dEQP-GL45-ES31 tessellation.state_query.max_combined_texture_image_units
+     * expects >= 96). */
+    if (glm_ctx->state.var.max_combined_texture_image_units < 96)
+        glm_ctx->state.var.max_combined_texture_image_units = 96;
     glGetIntegerv(GL_CURRENT_PROGRAM,&glm_ctx->state.var.current_program);
     glGetIntegerv(GL_STENCIL_BACK_REF,&glm_ctx->state.var.stencil_back_ref);
     glGetIntegerv(GL_STENCIL_BACK_VALUE_MASK,&glm_ctx->state.var.stencil_back_value_mask);

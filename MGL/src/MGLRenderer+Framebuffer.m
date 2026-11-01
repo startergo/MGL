@@ -2047,7 +2047,14 @@ typedef struct DSBlitParams {
         return;
     }
 
-    if (dst.tex.sampleCount > 1)
+    /* GPU staging path (fbStageAspect + depth/stencil export render): used for
+     * multisampled destinations, and for sources whose Metal format differs from
+     * the destination's — GL stores some depth formats differently per object
+     * kind (DEPTH_COMPONENT16 textures are Depth32Float, its renderbuffers are
+     * Depth16Unorm), and the byte-exact CPU resample below cannot convert
+     * between them (KHR-GL46.framebuffer_blit multisampled_to_singlesampled_
+     * blit_depth_config_test, MS renderbuffer -> depth texture). */
+    if (dst.tex.sampleCount > 1 || src.tex.pixelFormat != dst.tex.pixelFormat)
     {
         [self fbBlitDepthStencilToMS:&src to:&dst req:req depth:wantD stencil:wantS];
         return;

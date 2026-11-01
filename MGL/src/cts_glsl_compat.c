@@ -1812,6 +1812,127 @@ static char *rewrite_cull_distance_ext(const char *src)
     return out.buf;
 }
 
+/* GL_ARB_texture_query_levels is core in GLSL 4.30 and absent from glslang's
+ * desktop extension tables (unlike its sibling ARB_texture_query_lod), so a
+ * `#version 400 core / #extension GL_ARB_texture_query_levels: require` shader
+ * (KHR-GL46.texture_query_levels.*) fails to compile with "extension not
+ * supported".  textureQueryLevels() parses from 4.30 on, so lift the version to
+ * 430 and drop the directive — the same treatment rewrite_cull_distance_ext
+ * gives GL_ARB_cull_distance (core 450).  #ifdef guards fold like the CTS
+ * expects (MGL always exposes 4.6 core features). */
+static char *rewrite_texture_query_levels_ext(const char *src)
+{
+    if (!src || !strstr(src, "GL_ARB_texture_query_levels"))
+        return NULL;
+    size_t len = strlen(src);
+    int enable_seen = 0, disable_seen = 0;
+    unsigned version = 0;
+    int have_version = 0;
+
+    for (size_t i = 0; i < len; )
+    {
+        while (i < len && (src[i] == ' ' || src[i] == '\t')) i++;
+        if (i >= len) break;
+        if (src[i] == '#')
+        {
+            char dir[24];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            if (!strcmp(dir, "version"))
+            {
+                char vs[16];
+                mglc_token(src, len, j, vs, sizeof vs);
+                version = (unsigned)atoi(vs);
+                have_version = 1;
+            }
+            else if (!strcmp(dir, "extension"))
+            {
+                char nm[64], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                k = skip_ws_comments(src, len, k);
+                if (k < len && src[k] == ':') k = mglc_token(src, len, k + 1, beh, sizeof beh);
+                else beh[0] = 0;
+                if (!strcmp(nm, "GL_ARB_texture_query_levels"))
+                {
+                    if (!strcmp(beh, "disable")) disable_seen = 1;
+                    else enable_seen = 1;
+                }
+            }
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        while (i < len && src[i] != '\n') i++;
+        if (i < len) i++;
+    }
+    if (!enable_seen && !disable_seen)
+        return NULL;
+    int bump = enable_seen && (!have_version || version < 430);
+
+    Str out = {0};
+    size_t i = 0;
+    while (i < len)
+    {
+        size_t ls = i;
+        while (i < len && (src[i] == ' ' || src[i] == '\t')) i++;
+        if (i < len && src[i] == '#')
+        {
+            char dir[24];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            size_t e = j;
+            while (e < len && src[e] != '\n') e++;
+            if (!strcmp(dir, "version") && bump)
+            {
+                /* replace only the number token, keep `core'/`compatibility' */
+                char vs[16];
+                size_t k = mglc_token(src, len, j, vs, sizeof vs);
+                str_append(&out, src + ls, j - ls);
+                str_append(&out, " 430", 4);
+                str_append(&out, src + k, e - k);
+                i = e;
+                continue;
+            }
+            if (!strcmp(dir, "extension"))
+            {
+                char nm[64], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                size_t k2 = skip_ws_comments(src, len, k);
+                if (k2 < len && src[k2] == ':') k2 = mglc_token(src, len, k2 + 1, beh, sizeof beh);
+                else beh[0] = 0;
+                if (!strcmp(nm, "GL_ARB_texture_query_levels") && beh[0])
+                {
+                    /* the directive disappears: the built-in is core from 4.30
+                     * on (and the version is lifted); a GL_-prefixed macro
+                     * definition is not allowed */
+                    i = e;
+                    continue;
+                }
+            }
+            if (!strcmp(dir, "ifndef") || !strcmp(dir, "ifdef"))
+            {
+                char nm[64];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                size_t r = skip_ws_line(src, len, k);
+                if (!strcmp(nm, "GL_ARB_texture_query_levels") && (r >= len || src[r] == '\n'))
+                {
+                    str_append(&out, src + ls, i - ls);
+                    /* "#if 0"/"#if 1" are FIVE bytes: six would copy the
+                     * literal's NUL and truncate everything after it */
+                    str_append(&out, !strcmp(dir, "ifndef") ? "#if 0" : "#if 1", 5);
+                    i = e;
+                    continue;
+                }
+            }
+            str_append(&out, src + ls, e - ls);
+            i = e;
+            continue;
+        }
+        while (i < len && src[i] != '\n') i++;
+        if (i < len) i++;
+        str_append(&out, src + ls, i - ls);
+    }
+    str_push(&out, '\0');
+    return out.buf;
+}
+
 static char *reject_pp_strictness(const char *src)
 {
     if (!src) return NULL;
@@ -2297,6 +2418,11 @@ char *mgl_cts_glsl_compat_generated(const char *src)
     char *r;
     r = rewrite_cull_distance_ext(src0);
     if (r) { owned0 = r; src0 = owned0; }
+    /* GL_ARB_texture_query_levels: core in 4.30 but unknown to glslang's desktop
+     * extension table — lift the version, drop the directive
+     * (KHR-GL46.texture_query_levels.*) */
+    r = rewrite_texture_query_levels_ext(src0);
+    if (r) { free(owned0); owned0 = r; src0 = owned0; }
     /* the extension-less group-vote spellings must be renamed to the ARB ones in
      * the generated variants too (the geometry kernel embeds the user's source) */
     r = rewrite_subgroup_vote_ext(src0);
@@ -3031,6 +3157,14 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
         if (culled) { owned = culled; src = owned; }
     }
     {
+        /* GL_ARB_texture_query_levels: core in GLSL 4.30 but likewise absent
+         * from glslang's desktop extension table (KHR-GL46.texture_query_levels
+         * compiles `#version 400 core` + `#extension ...: require`): lift the
+         * version, drop the directive */
+        char *tql = rewrite_texture_query_levels_ext(src);
+        if (tql) { free(owned); owned = tql; src = owned; }
+    }
+    {
         /* the extension-less spellings of the GL_ARB_shader_group_vote
          * built-ins (allInvocations/anyInvocation/allInvocationsEqual) are
          * not in glslang's desktop-GL tables: rename to the ARB names and
@@ -3206,6 +3340,67 @@ static char **gather_offsets_resolve(const char *src, size_t len, const char *ar
     return offs;
 }
 
+/* an INLINE constant offsets argument: "ivec2[4](E0, E1, E2, E3)" (or ivec2[](...)
+ * / a brace list) handed straight to textureGatherOffsets.  Returns the four
+ * element expressions, or NULL when the argument is not a constant constructor
+ * (dynamic offsets keep the documented approximation below).
+ * dEQP-GL45-ES31 texture.gather.offsets.* passes the four offsets inline. */
+static char **gather_offsets_inline(const char *arg, size_t alen)
+{
+    if (alen == 0 || alen >= 1024) return NULL;
+    if (strncmp(arg, "ivec2", 5) != 0) return NULL;
+    const char *p = arg + 5;
+    const char *end = arg + alen;
+    if (p < end && *p == '[')
+    {
+        p++;
+        if (p < end && *p == ']') p++;                        /* ivec2[](...) */
+        else while (p < end && isdigit((unsigned char)*p)) p++;   /* ivec2[4](...) */
+        if (p >= end || *p != ']') return NULL;
+        p++;
+    }
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p != '(') return NULL;
+
+    /* split the four top-level element expressions of the constructor — the
+     * same walk gather_offsets_resolve() does for a named const array: the
+     * constructor's own '(' and ')' are the walk bounds, an element's parens
+     * keep depth > 0 across its commas, and a split happens at a top-level
+     * ',' or at the constructor's closing ')' */
+    size_t open_off = (size_t)(p - arg);
+    size_t close_off = match_paren(arg, alen, open_off);
+    if (close_off >= alen) return NULL;
+    char **offs = calloc(4, sizeof(char *));
+    if (!offs) return NULL;
+    int n = 0;
+    size_t start = open_off + 1, depth = 0;
+    for (size_t j = start; j <= close_off && n < 4; j++)
+    {
+        if (j < close_off && (arg[j] == '(' || arg[j] == '[')) depth++;
+        else if (j < close_off && (arg[j] == ')' || arg[j] == ']')) depth--;
+        if (j == close_off || (arg[j] == ',' && depth == 0))
+        {
+            const char *s = arg + start, *e = arg + j;
+            while (s < e && isspace((unsigned char)s[0])) s++;
+            while (e > s && isspace((unsigned char)e[-1])) e--;
+            if (s >= e) { for (int k = 0; k < 4; k++) free(offs[k]); free(offs); return NULL; }
+            offs[n] = malloc(e - s + 1);
+            if (!offs[n]) { for (int k = 0; k < 4; k++) free(offs[k]); free(offs); return NULL; }
+            memcpy(offs[n], s, e - s);
+            offs[n][e - s] = 0;
+            n++;
+            start = j + 1;
+        }
+    }
+    if (n != 4)
+    {
+        for (int k = 0; k < 4; k++) free(offs[k]);
+        free(offs);
+        return NULL;
+    }
+    return offs;
+}
+
 static char *rewrite_gather_offsets(const char *src)
 {
     if (!strstr(src, "textureGatherOffsets")) return NULL;
@@ -3276,21 +3471,23 @@ static char *rewrite_gather_offsets(const char *src)
         const char *ctor = gather_offsets_ctor(src, len, args[0], strlen(args[0]));
 
         /* argument order: non-shadow (S, P, offsets[, component]), shadow
-         * (S, P, refZ, offsets) — find which argument is the const array */
+         * (S, P, refZ, offsets) — find which argument is the const array.
+         * off_arg may only move when that argument really resolved: leaving it
+         * at 3 after BOTH attempts failed swapped the component and offsets
+         * arguments and emitted "textureGatherOffset(S, P, <ctor>, 0[0])" —
+         * invalid GLSL ("left of '[' is not of type array..."), which failed
+         * every 4-arg textureGatherOffsets call (dEQP-GL45-ES31
+         * texture.gather.offsets.* min_required_offset / implementation_offset) */
         char **offs = NULL;
         int off_arg = 2;
-        if (nargs >= 4)
+        int last_arg = (nargs >= 4) ? 3 : 2;
+        for (int a = 2; a <= last_arg && !offs; a++)
         {
-            offs = gather_offsets_resolve(src, len, args[2], strlen(args[2]));
+            offs = gather_offsets_resolve(src, len, args[a], strlen(args[a]));
             if (!offs)
-            {
-                offs = gather_offsets_resolve(src, len, args[3], strlen(args[3]));
-                off_arg = 3;
-            }
-        }
-        else
-        {
-            offs = gather_offsets_resolve(src, len, args[2], strlen(args[2]));
+                offs = gather_offsets_inline(args[a], strlen(args[a]));
+            if (offs)
+                off_arg = a;
         }
         const char *comp = (nargs >= 4) ? args[off_arg == 2 ? 3 : 2] : "0";
         const char *arr = (nargs >= 4) ? args[off_arg] : args[2];

@@ -380,6 +380,8 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 /* geom r60: the geometry-emulation bind paths (MGLRenderer+Geometry.m) share the
  * renderer's 1x1 black fallback for GL 8.17 incomplete-texture sampling */
 - (id<MTLTexture>) computeFallbackTexture;
+/* GL 8.17 incomplete-texture fallback matching the MSL slot's texture type */
+- (id<MTLTexture>) computeFallbackTextureForType: (MTLTextureType)type;
 /* geom r60: the compute bind path binds samplers at their own MSL index */
 - (NSUInteger) geomComputeSamplerSlotForImage: (const char *)img_name textureSlot: (NSUInteger)tslot;
 - (id<MTLSamplerState>) computeFallbackSampler;

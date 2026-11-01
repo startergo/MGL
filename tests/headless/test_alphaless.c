@@ -181,6 +181,14 @@ TEST(r3g3b2_upload_swizzle_a)
     EXPECT_NO_GL_ERROR();
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
     EXPECT_NO_GL_ERROR();
+    /* single-level storage: NEAREST min filter keeps the texture COMPLETE —
+     * the default NEAREST_MIPMAP_LINEAR would sample the GL 8.17 incomplete
+     * colour (0,0,0,1) instead of the uploaded data (fixed with the r46
+     * mip-chain completeness rule; the filters used to be set on `dst` by
+     * mistake) */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    EXPECT_NO_GL_ERROR();
     GLint a = 7;
     glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, &a);
     EXPECT_EQ_INT(a, GL_ALPHA);

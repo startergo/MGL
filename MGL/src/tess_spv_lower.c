@@ -29,6 +29,8 @@
 #define SPV_OP_TYPE_POINTER     32
 #define SPV_OP_FUNCTION         54
 #define SPV_OP_CONSTANT         43
+#define SPV_OP_PHI              245
+#define SPV_OP_COMPOSITE_EXTRACT 81
 #define SPV_OP_VARIABLE         59
 #define SPV_OP_LOAD             61
 #define SPV_OP_STORE            62
@@ -416,6 +418,97 @@ static uint32_t spv_lower_composite_len(const struct SpvLowerCtx *c, uint32_t ty
 
 struct SpvNewConst { uint32_t id, type, value; };
 
+/* GUARD (process-abort protection): SPIRV-Cross's
+ * emit_tessellation_access_chain asserts (index != uint32_t(-1)) when a
+ * post-tessellation access chain descends into an ARRAY-typed FIELD of an
+ * Input interface variable — arrays cannot be flattened into tessellation
+ * stage-in attributes, so the member never receives an interface member index.
+ * Chains this lowering rewrites are removed from the module, but chains it
+ * LEAVES (a constant trailing index, or a site dropped during validation)
+ * stay and abort the process inside SPIRV-Cross (observed: dEQP-GL45-ES31
+ * tessellation.user_defined_io.per_vertex_block.vertex_io_array_size_implicit
+ * .triangles).  Returning true here makes the caller decline the whole
+ * lowering: MGL then compiles the ORIGINAL module, which SPIRV-Cross rejects
+ * cleanly ("Trying to dynamically index into an array interface variable in
+ * tessellation"), so the link fails normally instead of crashing the runner. */
+static bool spv_lower_fatal_remaining(const struct SpvLowerCtx *c,
+                                      const struct SpvLowerSite *sites, uint32_t n_sites)
+{
+    for (uint32_t k = 0; k < c->ninst; k++)
+    {
+        uint32_t idx[96], nidx = 0, segs[8][2], nsegs = 0;
+
+        if (c->op[k] != SPV_OP_ACCESSCHAIN && c->op[k] != SPV_OP_INBOUNDSAC)
+            continue;
+        bool is_site = false;
+        for (uint32_t s = 0; s < n_sites; s++)
+            if (sites[s].inst != 0xffffffff && sites[s].inst == k) { is_site = true; break; }
+        if (is_site)
+            continue;                                   /* rewritten: not in the output module */
+
+        /* splice the chain and any inner chains into one index list; segments
+         * are collected outermost..innermost and applied innermost-first */
+        int cur = (int)k;
+        uint32_t root_var = 0;
+        for (int depth = 0; depth < 8; depth++)
+        {
+            uint32_t off = c->off[cur], wc = c->wc[cur];
+            if (wc < 5)
+                break;                                 /* no index operands */
+            segs[nsegs][0] = off + 4;
+            segs[nsegs][1] = off + wc;
+            if (nsegs < 7) nsegs++;
+            uint32_t base = c->w[off + 3];
+            int b = spv_lower_find(c, base);
+            if (b < 0) { root_var = 0; break; }
+            if (c->op[b] == SPV_OP_ACCESSCHAIN || c->op[b] == SPV_OP_INBOUNDSAC) { cur = b; continue; }
+            if (c->op[b] == SPV_OP_VARIABLE) root_var = base;
+            break;
+        }
+        if (!root_var)
+            continue;
+        int rv = spv_lower_find(c, root_var);
+        if (rv < 0 || c->op[rv] != SPV_OP_VARIABLE)
+            continue;
+        if (c->w[c->off[rv] + 3] != SPV_SC_INPUT)  /* OpVariable: type, result, storage */
+            continue;                                   /* only stage-in interfaces matter */
+        for (int s = (int)nsegs - 1; s >= 0 && nidx < 96; s--)
+            for (uint32_t j = segs[s][0]; j < segs[s][1] && nidx < 96; j++)
+                idx[nidx++] = c->w[j];
+        if (!nidx)
+            continue;
+
+        /* walk the type path: the variable's OWN top-level array dimension
+         * (teBlock[i] / gl_in[i]) is indexable; any ARRAY step after a struct
+         * member descent is fatal */
+        uint32_t t = spv_lower_pointee(c, c->w[c->off[rv] + 1]);
+        bool member_depth = false;
+        for (uint32_t q = 0; q < nidx && t; q++)
+        {
+            int kind = spv_lower_type_kind(c, t);
+            if (kind == SPV_T_STRUCT)
+            {
+                int64_t lit = spv_lower_const(c, idx[q]);
+                if (lit < 0)
+                    return true;                       /* dynamic member index: unsupported too */
+                t = spv_lower_elem_type(c, t, (uint32_t)lit);
+                member_depth = true;
+            }
+            else if (kind == SPV_T_ARRAY)
+            {
+                if (member_depth)
+                    return true;                       /* into an array field: assert in SPIRV-Cross */
+                t = spv_lower_elem_type(c, t, 0);
+            }
+            else if (kind == SPV_T_MATRIX || kind == SPV_T_VECTOR)
+                t = spv_lower_elem_type(c, t, 0);       /* matrix members are legal in stage_in */
+            else
+                break;
+        }
+    }
+    return false;
+}
+
 uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n)
 {
     struct SpvLowerCtx c;
@@ -470,19 +563,68 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
             sites[s].inst = 0xffffffff;
             continue;
         }
-        /* the index type: a constant used as an index in the prefix — this
-         * chain's own (k > 4) or, for split chains whose first operand already
-         * IS the dynamic index, an inner chain's constant */
+        /* the index type: from an index operand of the chain — this chain's
+         * own first index (k > 4) or, for split chains whose first operand
+         * already IS the dynamic index, the inner chain's.  A CONSTANT gives
+         * it directly, but the control-point index is usually a loop Phi /
+         * OpLoad (its result type is operand 1 for those too); rejecting
+         * non-constant indices dropped every block-form site and SPIRV-Cross
+         * refused the module (dEQP-GL45-ES31 tessellation.user_defined_io
+         * .per_vertex_block.*). */
+        idx_type = 0;
         if (sites[s].k > 4)
             ck = spv_lower_find(&c, c.w[off + 4]);
         else if (sites[s].prefix_n)
             ck = spv_lower_find(&c, sites[s].prefix[0]);
-        if (ck < 0 || c.op[ck] != SPV_OP_CONSTANT)
+        if (ck < 0)
         {
             sites[s].inst = 0xffffffff;
             continue;
         }
-        idx_type = c.w[c.off[ck] + 1];
+        if (c.op[ck] == SPV_OP_CONSTANT || c.op[ck] == SPV_OP_PHI ||
+            c.op[ck] == SPV_OP_LOAD || c.op[ck] == SPV_OP_VARIABLE ||
+            c.op[ck] == SPV_OP_ACCESSCHAIN || c.op[ck] == SPV_OP_COMPOSITE_EXTRACT)
+            idx_type = c.w[c.off[ck] + 1];
+        if (!idx_type)
+        {
+            sites[s].inst = 0xffffffff;
+            continue;
+        }
+    }
+
+    /* guard 1 — ARRAY-field sites: the copy loop lowers a site by emitting one
+     * access chain PER ARRAY ELEMENT that descends into the field with a
+     * constant index.  For MATRIX fields that is fine (Metal stage-in structs
+     * allow matrix members and column indexing), but ARRAY fields cannot map to
+     * tessellation stage-in attributes at all: SPIRV-Cross leaves the member
+     * without an interface member index and asserts in
+     * emit_tessellation_access_chain (process abort, kills cts-runner) instead
+     * of reporting a compile error.  Decline such modules: MGL compiles the
+     * original SPIR-V, which SPIRV-Cross rejects cleanly ("Trying to
+     * dynamically index into an array interface variable in tessellation"),
+     * so the link fails normally.  (dEQP-GL45-ES31
+     * user_defined_io.per_vertex_block.vertex_io_array_size_implicit.*) */
+    for (uint32_t s = 0; s < n_sites; s++)
+    {
+        if (sites[s].inst == 0xffffffff)
+            continue;
+        if (spv_lower_type_kind(&c, sites[s].arr_type) == SPV_T_ARRAY)
+        {
+            if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL tess lower: declining — array-field site cannot be lowered for the tessellation stage-in\n");
+            return NULL;
+        }
+    }
+
+    /* guard 2: any access chain that still descends into an array-typed FIELD of
+     * an Input interface (a constant trailing index the lowering does not
+     * rewrite, or a site dropped during validation) aborts SPIRV-Cross —
+     * decline the lowering entirely in that case */
+    if (n_sites && spv_lower_fatal_remaining(&c, sites, n_sites))
+    {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess lower: declining — remaining array-field access chain would abort SPIRV-Cross\n");
+        return NULL;
     }
 
     /* per-site ids: element pointer, element value, function variable */
@@ -548,6 +690,17 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
        the freshly allocated ones */
     #define SPV_PTR_OF(_storage, _pointee) spv_lower_ptr_of(&c, new_types, n_new_types, (_storage), (_pointee))
 
+    /* id bound: the copy loop below allocates TWO fresh ids per copied element
+     * (arrptr/loaded) as it emits — the bound must cover them or SPIRV-Cross
+     * indexes ids[] past its size and crashes in analyze_variable_scope
+     * (headless test_tess_dynio: mat2 member of a tess INPUT block). */
+    uint32_t bound = next_id;
+    for (uint32_t s = 0; s < n_sites; s++)
+    {
+        if (sites[s].inst == 0xffffffff) continue;
+        bound += 2u * spv_lower_composite_len(&c, sites[s].arr_type);
+    }
+
     out = (uint32_t *)malloc(out_cap * sizeof(uint32_t));
     if (!out) { spv_lower_teardown(&c); return NULL; }
 
@@ -572,7 +725,7 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
 
     /* header (new bound) */
     for (int q = 0; q < 5; q++)
-        LOW_PUSH(q == 3 ? next_id : words[q]);
+        LOW_PUSH(q == 3 ? bound : words[q]);
 
     for (uint32_t k = 0; k < c.ninst; k++)
     {
@@ -639,6 +792,12 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
                     if (new_consts[q].type == idx_type && new_consts[q].value == e)
                         ce = new_consts[q].id;
                 if (!ce) { ok = false; break; }
+
+                /* one fresh result id PER element: the same arrptr[s]/loaded[s]
+                 * for every e defined id 317 len times ("Id 317 is defined more
+                 * than once") whenever a module carried several such sites */
+                arrptr[s] = next_id++;
+                loaded[s] = next_id++;
 
                 /* %eptr = AccessChain ptrIn_elem %base <prefix> %e
                  * words: hdr, rtype, result, base, [4, k) indices (+ split-chain

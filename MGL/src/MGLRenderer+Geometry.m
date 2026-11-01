@@ -2219,33 +2219,27 @@ static BOOL g3DShadowLive = NO;  /* any shadow exists (shadows are never freed b
  * program's address is recycled constantly by CTS-style apps). */
 - (bool) geomProgramUsesImages: (Program *)p
 {
-    static struct { const void *prog, *msl; bool has; } cache[4];
+    /* NOTE: deliberately NOT cached.  A static cache keyed by the Program
+     * pointer goes stale when the object is freed and a new Program is
+     * allocated at the same address — and for COMPUTE-only programs the old
+     * key's msl field was NULL for every entry, so any compute program at a
+     * reused address matched any cached entry (dEQP-GL45-ES31
+     * image_load_store.3d.*_single_layer: the sync then saw uses_images=0 for
+     * a program WITH an image uniform, never refreshed the 3D shadow plane and
+     * bound the raw texture3d at the shader's texture2d argument — all
+     * imageStore writes were lost, order-dependently).  The direct scan is six
+     * pointer dereferences per stage. */
     if (!p)
         return false;
-    const void *msl = (const void *)p->spirv[_FRAGMENT_SHADER].msl_str;
-    if (!msl)
-        msl = (const void *)p->spirv[_VERTEX_SHADER].msl_str;
-
-    for (int i = 0; i < 4; i++)
-        if (cache[i].prog == (const void *)p && cache[i].msl == msl)
-            return cache[i].has;
-
-    bool has = false;
-    for (int s = 0; s < _MAX_SHADER_TYPES && !has; s++)
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
     {
         if (!p->shader_slots[s])
             continue;
         const SpirvResourceList *l = &p->spirv_resources_list[s][SPVC_RESOURCE_TYPE_STORAGE_IMAGE];
         if (l && l->count)
-            has = true;
+            return true;
     }
-
-    int ci = 0;
-    for (int i = 1; i < 4; i++) if (!cache[i].prog) { ci = i; break; }
-    cache[ci].prog = (const void *)p;
-    cache[ci].msl = msl;
-    cache[ci].has = has;
-    return has;
+    return false;
 }
 
 - (const char *) geom3DPlaneMslType: (GLenum) internalformat
@@ -2757,33 +2751,48 @@ static GLenum mglImageCastFormat(uint8_t bpp, GLuint kind)
      * keys its "binding unchanged, contents persist" check on the view's address
      * (geomImageAtomicBuffer) and the array layout signs it into its signature
      * (geomImageAtomicArrayLayout), so a fresh view per call would discard the
-     * sidecar (and its accumulated atomics) on every draw.  A view keeps its parent
-     * texture alive, so keying on the parent's address cannot alias a new texture. */
+     * sidecar (and its accumulated atomics) on every draw.  The cache is keyed on
+     * the view OBJECT, which the map retains: a retained view's address can never
+     * be reused by a different texture.  (The previous key was the view's address
+     * rendered into an NSString — the string does NOT retain the view, so after a
+     * view was released a freshly allocated view at the same address hit the
+     * stale entry and bound a cast of the WRONG texture; the pixelFormat guard
+     * could not catch it since the formats matched.  Order-dependent wrong-image
+     * writes in the dEQP image_load_store groups.) */
     {
-        static NSMutableDictionary<NSString *, id<MTLTexture>> *castCache = nil;
+        static NSMapTable<id<MTLTexture>, NSMutableDictionary<NSNumber *, id<MTLTexture>> *> *castCache = nil;
         static dispatch_once_t once;
-        NSString *key;
-        id<MTLTexture> cached;
-
-        dispatch_once(&once, ^{ castCache = [NSMutableDictionary dictionary]; });
-        key = [NSString stringWithFormat: @"%p:%u", (void *)view, (unsigned)want];
-        @synchronized (castCache) { cached = castCache[key]; }
-        if (cached && cached.pixelFormat == want)
-            return cached;
-        @try {
-            id<MTLTexture> rv = [view newTextureViewWithPixelFormat: want];
-            if (gEnv.debug)
-                NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
-                      iu->unit, (int)view.pixelFormat, (int)want, elem_class,
-                      (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
-                      rv ? "" : " FAILED");
-            if (rv) {
-                @synchronized (castCache) { castCache[key] = rv; }
-                return rv;
+        dispatch_once(&once, ^{ castCache = [NSMapTable mapTableWithStrongToStrongObjects]; });
+        @synchronized (castCache) {
+            NSMutableDictionary<NSNumber *, id<MTLTexture>> *byFmt = [castCache objectForKey: view];
+            if (!byFmt)
+            {
+                byFmt = [NSMutableDictionary dictionary];
+                [castCache setObject: byFmt forKey: view];
             }
-        } @catch (NSException *e) {
-            NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
-                  (int)view.pixelFormat, (int)want, e);
+            NSNumber *key = @((NSUInteger)want);
+            id<MTLTexture> cached = byFmt[key];
+            if (getenv("MGL_IUV_TRACE"))
+                fprintf(stderr, "MGL iuv: unit=%d fmt=%u view=%p want=%d cached=%d\n",
+                        iu ? (int)iu->unit : -1, iu ? (unsigned)iu->internalformat : 0,
+                        (__bridge void *)view, (int)want, cached ? 1 : 0);
+            if (cached)
+                return cached;
+            @try {
+                id<MTLTexture> rv = [view newTextureViewWithPixelFormat: want];
+                if (gEnv.debug)
+                    NSLog(@"MGL geom: image-unit %u format view %d -> %d (elem_class %u, kind %u%s)",
+                          iu->unit, (int)view.pixelFormat, (int)want, elem_class,
+                          (fi->comp_type == GL_INT) ? 1u : (fi->comp_type == GL_UNSIGNED_INT) ? 2u : 0u,
+                          rv ? "" : " FAILED");
+                if (rv) {
+                    byFmt[key] = rv;
+                    return rv;
+                }
+            } @catch (NSException *e) {
+                NSLog(@"MGL geom: image-unit format view (%d -> %d) failed: %@",
+                      (int)view.pixelFormat, (int)want, e);
+            }
         }
     }
     return view;
@@ -3085,6 +3094,8 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     {
         g->img_atom[unit].dirty = true;         /* bound to a dispatch: contents may change */
         g->img_atom_any = true;
+        if (view.textureType == MTLTextureTypeTextureBuffer)
+            g->img_atom_tb_dirty = true;        /* a CPU buffer read must resolve first */
         return buf;                             /* same binding: the contents persist */
     }
 
@@ -3118,6 +3129,8 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                                                  * a stale elems>0 sent the seed and the resolve
                                                  * down the array paths against one sidecar) */
     g->img_atom_any = true;
+    if (view.textureType == MTLTextureTypeTextureBuffer)
+        g->img_atom_tb_dirty = true;            /* a CPU buffer read must resolve first */
     g->stat_sidecar_allocs++;
     g->img_atom[unit].ms = (view.textureType == MTLTextureType2DMultisample ||
                             view.textureType == MTLTextureType2DMultisampleArray);
@@ -3336,10 +3349,18 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                    "    uint v = side[t]; tex.write(V, uint3(r % dims.x, r / dims.x, z));";
             break;
         case MTLTextureTypeCube:
+            /* a plain cube: read/write take (coord, face) — the shared cube_array
+             * declaration here needed (coord, face, ARRAY) and never compiled,
+             * so every cube image atomic was silently skipped (dEQP-GL45-ES31
+             * image_load_store.cube.atomic.*) */
+            tex = "texturecube";
+            body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
+                   "    uint v = side[t]; tex.write(V, uint2(r % dims.x, r / dims.x), z);";
+            break;
         case MTLTextureTypeCubeArray:
             tex = "texturecube_array";
             body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
-                   "    uint v = side[t]; tex.write(V, uint2(r % dims.x, r / dims.x), z);";
+                   "    uint v = side[t]; tex.write(V, uint2(r % dims.x, r / dims.x), z / 6u, z % 6u);";
             break;
         case MTLTextureType1D:
             tex = "texture1d";
@@ -3434,10 +3455,15 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
                    "    T v = tex.read(uint3(r % dims.x, r / dims.x, z)).x; side[t] = W;";
             break;
         case MTLTextureTypeCube:
+            /* plain cube: (coord, face); cube_array takes (coord, face, array) */
+            tex = "texturecube";
+            body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
+                   "    T v = tex.read(uint2(r % dims.x, r / dims.x), z).x; side[t] = W;";
+            break;
         case MTLTextureTypeCubeArray:
             tex = "texturecube_array";
             body = "uint ww = dims.x * dims.x; uint z = t / ww; uint r = t % ww;\n"
-                   "    T v = tex.read(uint2(r % dims.x, r / dims.x), z).x; side[t] = W;";
+                   "    T v = tex.read(uint2(r % dims.x, r / dims.x), z / 6u, z % 6u).x; side[t] = W;";
             break;
         case MTLTextureType1D:
             tex = "texture1d";
@@ -3621,7 +3647,7 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     if (!pso) { g->img_atom[unit].needs_seed = false; return false; }
 
     dims[0] = (uint32_t)view.width;
-    dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
+    dims[1] = (uint32_t)view.height;    /* 3D too: the seed kernel linearizes x + w*(y + h*z) */
     if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
     else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)view.arrayLength;
     else if (tt == MTLTextureTypeCube)        dims[2] = 6;
@@ -4252,9 +4278,15 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         tt = view.textureType;
         pf = view.pixelFormat;
         /* only the REAL texels resolve — the sidecar may carry a padded row (2D pitch
-         * 16) and its tail must not be written back (nor read out of bounds) */
+         * 16) and its tail must not be written back (nor read out of bounds).
+         * dims = {w, h, layers}: for 3D h is the HEIGHT and depth counts as the
+         * layer dimension (the resolve kernel linearizes x + w*(y + h*z), exactly
+         * spvMglAI3D's layout).  r45 passed view.depth as dims[1] too, so a 64x64x8
+         * image resolved as 64x8x8: only a ninth of the words reached the texture
+         * and under the wrong (x, y, z) — every 3D image atomic came back
+         * transposed (dEQP-GL45-ES31 image_load_store.3d.atomic.*) */
         dims[0] = (uint32_t)view.width;
-        dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
+        dims[1] = (uint32_t)view.height;
         if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
         else if (tt == MTLTextureTypeCube)        dims[2] = 6;
         else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)(view.arrayLength * 6);
@@ -4277,15 +4309,6 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                     u, (unsigned long long)total, sv ? sv[0] : 0, sv && total > 1 ? sv[1] : 0,
                     sv && total > 2 ? sv[2] : 0, sv && total > 3 ? sv[3] : 0);
         }
-        dims[3] = (uint32_t)total;
-
-        dims[0] = (uint32_t)view.width;
-        dims[1] = (uint32_t)(tt == MTLTextureType3D ? view.depth : view.height);
-        if (tt == MTLTextureType2DArray)          dims[2] = (uint32_t)view.arrayLength;
-        else if (tt == MTLTextureTypeCube)        dims[2] = 6;
-        else if (tt == MTLTextureTypeCubeArray)   dims[2] = (uint32_t)(view.arrayLength * 6);
-        else if (tt == MTLTextureType3D)          dims[2] = (uint32_t)view.depth;
-        else                                     dims[2] = 1;
         dims[3] = (uint32_t)total;
 
         [enc setComputePipelineState: pso];
@@ -4349,8 +4372,15 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
      * its .dirty cleared, but a binding that changed mid-resolve (or a skipped
      * element) may have left one set. */
     g->img_atom_any = false;
+    g->img_atom_tb_dirty = false;
     for (int u = 0; u < TEXTURE_UNITS; u++)
-        if (g->img_atom[u].buf && g->img_atom[u].dirty) { g->img_atom_any = true; break; }
+        if (g->img_atom[u].buf && g->img_atom[u].dirty)
+        {
+            g->img_atom_any = true;
+            id<MTLTexture> dv = (__bridge id<MTLTexture>)g->img_atom[u].view;
+            if (dv.textureType == MTLTextureTypeTextureBuffer)
+                g->img_atom_tb_dirty = true;
+        }
 }
 
 /* r83: the draw-time sidecar GATE, memoized — "does ANY stage of the bound program
@@ -5020,9 +5050,12 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                      * shared 1x1 fallback, not the real mip chain (bindTextures'
                      * normal path does this for the non-emulated stages;
                      * KHR-GL46.texture_gather.incomplete-texture[-last-comp]) */
-                    if (mgl_texture_incomplete_for_sampling(tex))
+                    if (mgl_texture_incomplete_for_unit(ctx, tex, (GLuint)unit))
                     {
-                        id<MTLTexture> ftex = [self computeFallbackTexture];
+                        /* GL 8.17: incomplete -> (0,0,0,1); match the slot's texture
+                         * TYPE or the sample never lands (see MGLRenderer.m
+                         * computeFallbackTextureForType) */
+                        id<MTLTexture> ftex = [self computeFallbackTextureForType: texture.textureType];
                         id<MTLSamplerState> fsamp = [self computeFallbackSampler];
                         if (ftex && fsamp)
                         {
@@ -5262,9 +5295,11 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     {
                         /* GL 8.17: incomplete texture -> shared 1x1 fallback (see
                          * geomBindRenderStageTextures) */
-                        if (mgl_texture_incomplete_for_sampling(tex))
+                        if (mgl_texture_incomplete_for_unit(ctx, tex, (GLuint)unit))
                         {
-                            id<MTLTexture> ftex = [self computeFallbackTexture];
+                            /* GL 8.17: incomplete -> (0,0,0,1); match the slot's
+                             * texture TYPE (computeFallbackTextureForType) */
+                            id<MTLTexture> ftex = [self computeFallbackTextureForType: texture.textureType];
                             id<MTLSamplerState> fsamp = [self computeFallbackSampler];
                             if (ftex && fsamp)
                             {

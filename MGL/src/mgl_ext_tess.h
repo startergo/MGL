@@ -302,6 +302,17 @@ struct MGLExtState_tess {
      * next one) — see the MGLTessCapture contract above */
     MGLTessCapture capture;
 
+    /* THIS draw renders through the plain (non-post-tessellation) TES variant:
+     * set by extTessDrawPatches right before the CPU-reference render's
+     * processGLState, cleared at every draw start.  mgl_tess_plain_render
+     * consults it so the render pipeline is rebuilt as a PLAIN pipeline even
+     * when the fallback decision came late (GPU tessellator scratch too large
+     * after the kernels ran — no MGL_TESS_CPU, no capture, no emulated domain),
+     * which otherwise drew the plain indexed draw with a post-tessellation
+     * pipeline and rasterized nothing (dEQP-GL45-ES31 tessellation
+     * primitive_discard: all-black image with a correct capture). */
+    bool cpu_render_now;
+
     /* gl_MaxShaderCompilerThreads (ARB/KHR_parallel_shader_compile): a hint
      * MGL stores for glGet only (compiles are synchronous, so completion is
      * immediate); 0xFFFFFFFF = "no limit", the spec's initial state */

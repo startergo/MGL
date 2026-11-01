@@ -627,11 +627,13 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
                 return GL_INVALID_OPERATION;
             break;
         case GL_STENCIL_INDEX:
-            /* glTexImage cannot upload stencil data at all (GL 4.6 table 8.11: the
-             * stencil internal formats are TexStorage-only), SubImage and the clears
-             * can (table 8.14) */
             if (!tex_stencil) return GL_INVALID_OPERATION;
-            if (op == TD_PIX_TEXIMAGE) return GL_INVALID_OPERATION;
+            /* Desktop GL 4.6 table 8.11 only rejects the MISMATCHED combos (format
+             * STENCIL_INDEX against a non-stencil internal format); TexImage with a
+             * stencil internal format + STENCIL_INDEX/UNSIGNED_BYTE is legal (the
+             * TexStorage-only rule is an ES restriction).  KHR-GL46
+             * texture_stencil8.multisample allocates STENCIL_INDEX8 textures via
+             * texImage2D/texImage3D. */
             break;
         default:
             /* stencil-indexed textures also answer GL_RED_INTEGER READS (the
@@ -653,8 +655,6 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
             }
             break;
     }
-    if (op == TD_PIX_TEXIMAGE && f->base == GL_STENCIL_INDEX)
-        return GL_INVALID_OPERATION;      /* no stencil internal format for TexImage */
     (void)type;
     return GL_NO_ERROR;
 }

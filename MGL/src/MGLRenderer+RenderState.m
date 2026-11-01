@@ -658,7 +658,7 @@ static bool rs_mode_is_polygon(GLenum m)
             }
             if (rs->border_msl && rs->border_msl_src == (const void *)msl)
             {
-                char berr[2048] = "";
+                char *berr_msg = NULL;
                 if (getenv("MGL_BORDER_DUMP"))
                 {
                     char p_[256];
@@ -666,10 +666,18 @@ static bool rs_mode_is_polygon(GLenum m)
                     FILE *f = fopen(p_, "wb");
                     if (f) { fwrite(rs->border_msl, 1, strlen(rs->border_msl), f); fclose(f); }
                 }
-                id<MTLLibrary> blib = [self extProgramLibraryForMSL: rs->border_msl key: nil error: berr];
-                if (getenv("MGL_BORDER_DEBUG") && berr[0])
-                    fprintf(stderr, "MGL border: variant compile: %.400s\n", berr);
+                id<MTLLibrary> blib = [self extProgramLibraryForMSL: rs->border_msl key: nil error: &berr_msg];
+                if (berr_msg)
+                {
+                    if (getenv("MGL_BORDER_DEBUG"))
+                        fprintf(stderr, "MGL border: variant compile: %.600s\n", berr_msg);
+                    free(berr_msg);   /* strdup'd message from the compiler */
+                }
                 id<MTLFunction> bfn = blib ? [blib newFunctionWithName: base.name] : nil;
+                if (getenv("MGL_BORDER_DEBUG") && !bfn && blib)
+                    fprintf(stderr, "MGL border: fn '%s' not among [%@] (head: %.200s)\n",
+                            [base.name UTF8String], [blib functionNames],
+                            rs->border_msl ? rs->border_msl : "");
                 if (getenv("MGL_BORDER_DEBUG"))
                     fprintf(stderr, "MGL border: variant fn=%s\n", bfn ? "OK" : "MISSING");
                 if (bfn)
