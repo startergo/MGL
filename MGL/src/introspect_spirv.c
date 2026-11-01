@@ -1396,6 +1396,75 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
     /* lk[] remembers, per leaf uniform in walk order, whether its GL type was rewritten for
      * the GPU (bool->int, double->float): introspection still reports GL_BOOL/GL_DOUBLE */
     const SType *ty = &m->t[t];
+    /* a sampler/image member hoisted out of a default-block struct (see
+     * mgl_hoist_struct_samplers: MSL has no textures in buffer-backed structs) is one
+     * plain uniform here, named "u_mglhoist_b_mglhoist_s".  GL requires the dotted
+     * spelling ("u.b.s") in every program-interface query, so swap in the recorded
+     * GL path before anything derives a resource name from it.  An array of structs
+     * (the uniform declaration itself arrayed) enumerates one resource per element
+     * (GL 4.6 §7.3.1) — n_outer leading dimensions belong to the declaration, the
+     * rest are the member's own bottom-level array. */
+    char gl_name[512];
+    const char *base_name = name;
+    int n_outer = -1;
+    if (strstr(name, "_mglhoist_") && !strchr(name, '.')) {
+        /* the array's shape as SPIR-V sees it ("3", "2,3"): it selects the right
+         * recorded spelling when the same uniform name was hoisted with more than
+         * one shape in this process (glcts runs many cases in one process) */
+        char shape[64];
+        size_t so = 0;
+        for (uint32_t at = t; so + 1 < sizeof shape; ) {
+            if (m->t[at].kind != T_ARRAY && m->t[at].kind != T_RARRAY) break;
+            if (so) shape[so++] = ',';
+            so += (size_t)snprintf(shape + so, sizeof shape - so, "%u", m->t[at].count);
+            at = m->t[at].elem;
+        }
+        shape[so] = 0;
+        if (mgl_hoist_gl_path2(name, so ? shape : NULL, gl_name, sizeof gl_name, &n_outer))
+            base_name = gl_name;
+        else
+            n_outer = -1;
+    }
+    name = base_name;
+    if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) && n_outer > 0) {
+        /* "S u[N];" hoisted to "u_mglhoist_m[N]": GL enumerates N resources "u[i].m" —
+         * the element index belongs to the VARIABLE, so it is inserted before the
+         * member path ("u[0].b.s"), and every dimension of the declaration expands
+         * ("u[0][1].b.s").  Their locations are consecutive, exactly the layout one
+         * flattened entry of size N*M would have taken, so glUniform1i on "u[i].m[j]"
+         * and the sampler-unit shadow both keep working. */
+        uint32_t dims[4], strides[4], total = 1;
+        int nd = 0;
+        uint32_t at = t;
+        while (nd < 4 && (m->t[at].kind == T_ARRAY || m->t[at].kind == T_RARRAY) && nd < n_outer) {
+            uint32_t st = 0;
+            get_dec(m, at, -1, SpvDecorationArrayStride, &st);
+            dims[nd] = m->t[at].count ? m->t[at].count : 1;
+            strides[nd] = st;
+            total *= dims[nd];
+            at = m->t[at].elem;
+            nd++;
+        }
+        const char *dot = strchr(name, '.');
+        int hlen = dot ? (int)(dot - name) : (int)strlen(name);
+        for (uint32_t k = 0; k < total; k++) {
+            uint32_t rem = k, off = offset;
+            char nm[512];
+            snprintf(nm, sizeof nm, "%.*s", hlen, name);
+            for (int i = 0; i < nd; i++) {
+                uint32_t div = 1;
+                for (int j = i + 1; j < nd; j++) div *= dims[j];
+                uint32_t idx = (rem / div) % dims[i];
+                rem -= idx * div;
+                off += idx * strides[i];
+                snprintf(nm + strlen(nm), sizeof nm - strlen(nm), "[%u]", idx);
+            }
+            snprintf(nm + strlen(nm), sizeof nm - strlen(nm), "%s", dot ? dot : "");
+            walk_default(ip, m, stage, nm, at, off, explicit_loc, loc_cursor,
+                         spv_id, res_type, elem_cursor, hidden_prefix, lk, lki);
+        }
+        return;
+    }
     if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) ) {
         uint32_t base = m->t[ty->elem].kind == T_ARRAY ? 0 : 1;
         uint32_t es, ea, stride;
@@ -1625,7 +1694,14 @@ static void walk_block(BlockWalk *bw, const char *name, uint32_t t, uint32_t off
              * nested members inherit their parent's answer */
             bool saved = bw->cur_used;
             if (is_block) bw->cur_used = bw->used_all || ((bw->used_mask >> i) & 1);
-            walk_block(bw, nm, ty->mem[i], offset + mo, ms, rm, depth == 0 ? 0 : depth + 1);
+            /* depth 0 means "directly under the block's own struct": a member of a
+             * NESTED struct is not a top-level member any more, so its arrays are
+             * enumerated per element (GL 4.6 §7.3.1 / the CTS reference: only the
+             * block member's own array collapses to name[0] for a buffer block).
+             * The old "depth == 0 ? 0 : depth + 1" kept depth 0 for a member struct
+             * as well, so an array inside it was collapsed too
+             * (buffer_variable.resource_list.var_struct_array_*) */
+            walk_block(bw, nm, ty->mem[i], offset + mo, ms, rm, is_block ? 0 : depth + 1);
             bw->cur_used = saved;
         }
         return;

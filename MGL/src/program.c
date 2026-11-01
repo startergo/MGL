@@ -3394,6 +3394,26 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
      * fails the Metal compile (KHR-GL46.draw_indirect.advanced-twoPass-
      * transformFeedback-*).  msl_reserved.c re-declares the GL names as int
      * locals in the entry body so every expression sees the int type GL uses. */
+    /* SPIRV-Cross emits `thread const <T>&` for the parameters it hoists into helper
+     * functions, but when the hoisted global is a plain (default-block) uniform the
+     * entry point holds it as `constant <T>& ... [[buffer(N)]]`: passing a constant
+     * reference to a thread-const reference parameter does not compile in Metal
+     * ("no matching function for call").  This happens whenever the introspection
+     * patch was rejected and the original module is used — an array of matrices as
+     * an interface variable is the case that forces that fallback (dEQP PIQ
+     * program_input/program_output/transform_feedback_varying *.array.mat*).
+     * By value is the GLSL `in` semantics anyway, and the rewrite only touches
+     * single-identifier types (float4, float2x2, struct tags), never template
+     * parameters like spvUnsafeArray<...>. */
+    if (ptr->spirv[stage].msl_str)
+    {
+        char *fixed = mgl_fp64_fix_msl_scalar_params(ptr->spirv[stage].msl_str);
+        if (fixed)
+        {
+            free(ptr->spirv[stage].msl_str);
+            ptr->spirv[stage].msl_str = fixed;
+        }
+    }
     if (stage == _VERTEX_SHADER && ptr->spirv[stage].msl_str)
     {
         char *fixed = mgl_msl_fix_vertex_id_builtins(ptr->spirv[stage].msl_str);
@@ -3875,30 +3895,89 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
      * slots by name also breaks any consumer that reflects producer and consumer
      * separately (the geometry emulation's VS→GS record layout, transform feedback). */
     {
+        bool overlap_retry = false;
         glslang_mapper_t *mapper = glslang_glsl_mapper_create();
         glslang_resolver_t *resolver = NULL;
         int mapped = 0;
+        int attempt;
 
-        if (mapper)
+        for (attempt = 0; attempt < 2; attempt++)
         {
-            int first = -1;
-            for (int i = 0; i < obj->num_attached; i++)
+            if (mapper)
             {
-                int t = (int)obj->attached[i]->glm_type;
-                if (first < 0 || t < first) first = t;
+                int first = -1;
+                for (int i = 0; i < obj->num_attached; i++)
+                {
+                    int t = (int)obj->attached[i]->glm_type;
+                    if (first < 0 || t < first) first = t;
+                }
+                if (first >= 0)
+                    resolver = glslang_glsl_resolver_create(glsl_program, (glslang_stage_t)first);
+                if (resolver)
+                    mapped = glslang_program_map_io_with_resolver_and_mapper(glsl_program, resolver, mapper);
             }
-            if (first >= 0)
-                resolver = glslang_glsl_resolver_create(glsl_program, (glslang_stage_t)first);
-            if (resolver)
-                mapped = glslang_program_map_io_with_resolver_and_mapper(glsl_program, resolver, mapper);
-        }
-        if (resolver) glslang_glsl_resolver_delete(resolver);
-        if (mapper) glslang_glsl_mapper_delete(mapper);
+            if (resolver) glslang_glsl_resolver_delete(resolver);
+            resolver = NULL;
 
+            if (mapped) break;
+            {
+                const char *info = glslang_program_get_info_log(glsl_program);
+                overlap_retry = info && strstr(info, "Uniform location overlaps across stages");
+                if (!overlap_retry || attempt)
+                {
+                    mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
+                    glslang_program_delete(glsl_program);
+                    return false;
+                }
+            }
+
+            /* r86: the io-mapper baked the previous program's uniform locations into
+             * an intermediate shared through the compile cache, and re-mapping it here
+             * collides with this program's own assignment — two single-stage programs
+             * (each of which mapped its own location 0) combined into one monolithic
+             * program, dEQP separate_shader.random.*.  The tombstones taken above stop
+             * the cache from handing that intermediate to other shader objects; for
+             * THIS link every stage is recompiled from its source and the link is
+             * redone with fresh intermediates.  The program goes first: it still
+             * references the handles the recompiles release. */
+            glslang_program_delete(glsl_program);
+            glsl_program = NULL;
+            if (getenv("MGL_NO_MIXED_RETRY")) return false;
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+            {
+                Shader *s_ = obj->attached[i_];
+                if (s_->compiled_glsl_shader &&
+                    mgl_glslang_cache_group(s_->compiled_glsl_shader))
+                    mgl_glslang_cache_unshare(s_->compiled_glsl_shader);
+                mglCompileShader(ctx, s_->name);
+                if (!s_->compiled_glsl_shader || !MGL_SHADER_OBJ(s_)->compile_status)
+                {
+                    mgl_append_info_log(log, "ERROR: %s shader %u recompile failed\n",
+                                        stage_label(s_->glm_type), s_->name);
+                    return false;
+                }
+            }
+            glsl_program = glslang_program_create();
+            if (!glsl_program)
+            {
+                mgl_append_info_log(log, "ERROR: glslang program creation failed\n");
+                return false;
+            }
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+                glslang_program_add_shader(glsl_program, obj->attached[i_]->compiled_glsl_shader);
+            if (!glslang_program_link(glsl_program, GLSLANG_MSG_DEFAULT_BIT))
+            {
+                const char *info2 = glslang_program_get_info_log(glsl_program);
+                mgl_append_info_log(log, "%s", (info2 && *info2) ? info2 : "ERROR: GLSL link failed\n");
+                glslang_program_delete(glsl_program);
+                return false;
+            }
+            mapped = 0;
+        }
+        if (mapper) glslang_glsl_mapper_delete(mapper);
         if (!mapped)
         {
-            const char *info = glslang_program_get_info_log(glsl_program);
-            mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
+            mgl_append_info_log(log, "ERROR: GLSL I/O mapping failed\n");
             glslang_program_delete(glsl_program);
             return false;
         }

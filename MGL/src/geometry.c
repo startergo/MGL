@@ -1745,12 +1745,19 @@ static GLuint geom_double_iface(GLuint rows, GLuint cols, GLuint elems, char *bu
 /* emit "name = <value>;" statements reconstructing v from the word buffer.
  * open/close delimit the word access: <open> + " + N" + <close>.  `index` is the vertex
  * index expression for geometry-stage inputs (which are arrays of the record per vertex). */
+/* is this var's GLSL expression "name.member" (an interface block member, or a member of
+ * a struct-typed interface variable)?  An anonymous block's member is its own name. */
+static bool geom_var_dotted(const MGLGeomVar *v)
+{
+    return v->member[0] && (v->plain_struct || strcmp(v->name, v->member));
+}
+
 /* the access path of a varying inside the rewritten shader: a named interface block
  * member is reached through its instance ("b.c"); an anonymous block member (the
  * reflection records the member name itself) and a plain varying use the bare name */
 static const char *geom_var_expr(char *buf, size_t cap, const MGLGeomVar *v)
 {
-    if (v->member[0] && strcmp(v->name, v->member))
+    if (geom_var_dotted(v))
         snprintf(buf, cap, "%s.%s", v->name, v->member);
     else
         snprintf(buf, cap, "%s", v->name);
@@ -3502,6 +3509,14 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         {
             const char *inst = spv_name(m, v->id);
             bool anon = !inst || !inst[0];
+            /* a plain struct-typed interface variable ("out StructType v;") is collected the
+             * same way, but it is NOT a block: the members are named through the VARIABLE
+             * ("v.m"), never through the type name, and the generated code keeps the struct
+             * declaration, so the store/clear expressions must go through "v.m" even when
+             * the variable and the member happen to share a name (dEQP PIQ
+             * transform_feedback_varying.*.struct.*) */
+            bool plain = !spv_deco(m, t->id, SpvDecorationBlock, NULL) &&
+                         !spv_deco(m, t->id, SpvDecorationBufferBlock, NULL);
             GLuint next_loc = location;
 
             for (int mi = 0; mi < t->n_members && n < MGL_GEOM_MAX_VARYINGS; mi++)
@@ -3563,9 +3578,10 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 memset(out, 0, sizeof(*out));
                 snprintf(out->name, sizeof(out->name), "%s", anon ? mn : inst);
                 snprintf(out->member, sizeof(out->member), "%s", anon ? "" : mn);
+                if (plain) out->plain_struct = true;
                 /* the block NAME (a non-anonymous interface block's type name) names the
                  * member through the API: glTransformFeedbackVaryings writes "Block.member" */
-                if (!anon)
+                if (!anon && !plain)
                 {
                     const char *bn = spv_name(m, t->id);
                     if (bn && bn[0]) snprintf(out->block, sizeof(out->block), "%s", bn);
@@ -6010,7 +6026,19 @@ static char *geom_blank_comments(const char *src)
     return out;
 }
 
+static char *geom_strip_plain_uniforms_at(const char *src, GeomPlainUni *uni, int *nuni, int max, char **removed, size_t *at);
+
 static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *nuni, int max, char **removed)
+{
+    return geom_strip_plain_uniforms_at(src, uni, nuni, max, removed, NULL);
+}
+
+/* strip the plain (default-block) uniforms of src; *at receives the offset in the
+ * returned text where the FIRST declaration was removed — the re-declared
+ * default-uniform block must go there (a member's struct type is lexically
+ * declared before the uniform that used it, but not necessarily before the top
+ * of the source, where the block used to be emitted) */
+static char *geom_strip_plain_uniforms_at(const char *src, GeomPlainUni *uni, int *nuni, int max, char **removed, size_t *at)
 {
     SB out;
     SB rm;
@@ -6020,6 +6048,7 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
     memset(&out, 0, sizeof(out));
     memset(&rm, 0, sizeof(rm));
     *nuni = 0;
+    if (at) *at = (size_t)-1;
 
     while (pos < len)
     {
@@ -6105,11 +6134,36 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
 
             {
                 char id[32];
-                size_t n = read_ident(src + pos, id, sizeof(id));
+                size_t stmt = pos;      /* statement start (may hold leading qualifiers) */
+                size_t upos = pos;      /* where the storage qualifier sits */
+                size_t n;
+
+                /* "highp uniform vec4 x;" — precision (and precise/invariant) qualifiers
+                 * may precede the storage qualifier.  The CTS spells its unused-uniform
+                 * placeholder exactly this way (es31fProgramInterfaceQueryTests), and a
+                 * declaration the scanner does not recognize stays a plain uniform in the
+                 * capture variant, which SPIRV-Cross buffers at an auto index that
+                 * collides with the pinned user blocks ("cannot reserve 'buffer'
+                 * resource location at index N") and fails the whole program link. */
+                for (;;)
+                {
+                    size_t qn = read_ident(src + upos, id, sizeof(id));
+                    size_t k;
+
+                    if (!qn || (strcmp(id, "highp") && strcmp(id, "mediump") &&
+                                strcmp(id, "lowp") && strcmp(id, "precise") &&
+                                strcmp(id, "invariant")))
+                        break;
+                    k = upos + qn;
+                    while (k < len && isspace((unsigned char)src[k])) k++;
+                    if (k >= len) break;
+                    upos = k;
+                }
+                n = read_ident(src + upos, id, sizeof(id));
 
                 if (n && !strcmp(id, "uniform") && end < len && src[end - 1] == ';')
                 {
-                    const char *body = src + pos + n;   /* between "uniform" and ';' */
+                    const char *body = src + upos + n;   /* between "uniform" and ';' */
                     const char *bend = src + end - 1;
                     char type[96] = "";
                     bool keep = false;
@@ -6240,12 +6294,17 @@ static char *geom_strip_plain_uniforms(const char *src, GeomPlainUni *uni, int *
                     {
                         /* opaque or unsupported: keep this declaration verbatim (the
                          * already-removed ones stay removed — they are re-declared from
-                         * the default-uniform block, so they must NOT be reset here) */
-                        sb_put(&out, "%.*s", (int)(end - pos), src + pos);
+                         * the default-uniform block, so they must NOT be reset here);
+                         * from the statement start, so a leading precision qualifier
+                         * survives */
+                        sb_put(&out, "%.*s", (int)(end - stmt), src + stmt);
                     }
                     else
                     {
-                        if (removed) sb_put(&rm, "%.*s\n", (int)(end - pos), src + pos);
+                        if (removed) sb_put(&rm, "%.*s\n", (int)(end - stmt), src + stmt);
+                        /* the re-declared block replaces this spot: every type it
+                         * mentions is lexically declared by here */
+                        if (at && *at == (size_t)-1) *at = out.len;
                     }
                     pos = end;
                     continue;
@@ -6797,7 +6856,25 @@ static char *geom_pin_builtins(const char *glsl, GLuint clip_words)
     return b.s;
 }
 
+static char *geom_gen_capture_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
+                                        const SpvModule *vs_m, char **log);
+
 static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
+                                   const SpvModule *vs_m, char **log)
+{
+    /* the program's own compile hoisted the sampler/image members of default-block struct
+     * uniforms out of the structs (they cannot live in an MSL buffer); the capture variant
+     * must do the same, or its re-declared default-uniform block carries a struct that
+     * still has the sampler inside ("member of block cannot be or contain a sampler") */
+    char *hoisted = mgl_hoist_struct_samplers(vs_src);
+    char *out;
+    if (hoisted) vs_src = hoisted;
+    out = geom_gen_capture_glsl_inner(ctx, gp, vs_src, vs_m, log);
+    free(hoisted);
+    return out;
+}
+
+static char *geom_gen_capture_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, const char *vs_src,
                                    const SpvModule *vs_m, char **log)
 {
     char *renamed = rename_main(vs_src, "mgl_geom_vs_main");
@@ -6807,6 +6884,8 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     GeomPlainUni uni[MGL_GEOM_MAX_VARYINGS];
     GeomDubMember dub[MGL_GEOM_MAX_VARYINGS];
     int nuni_ = 0, ndub = 0;
+    size_t dub_at = (size_t)-1;
+    bool dub_spliced = false;
     SB b;
 
     if (!renamed)
@@ -6819,9 +6898,26 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     /* plain (default-block) uniforms are re-declared below as one block that matches the
      * program's default-uniform buffer (see geom_emit_dub_block) */
     nuni_ = 0;
+    dub_at = (size_t)-1;
     {
-        char *stripped = geom_strip_plain_uniforms(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src);
+        char *stripped = geom_strip_plain_uniforms_at(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src, &dub_at);
         if (!stripped) { free(nover); return NULL; }
+        if (nuni_ && geom_dub_layout((SpvModule *)vs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
+        {
+            /* splice the re-declared block in at the first removed declaration, now: the
+             * later source rewrites (plain outputs, pinned inputs, widened builtins)
+             * shift the text and would invalidate the offset — and a member's struct
+             * type is only declared by that point, not at the top of the source */
+            size_t at = (dub_at == (size_t)-1 || dub_at > strlen(stripped)) ? strlen(stripped) : dub_at;
+            SB t;
+            memset(&t, 0, sizeof(t));
+            sb_put(&t, "%.*s", (int)at, stripped);
+            geom_emit_dub_block(&t, uni, nuni_, dub, ndub);
+            sb_put(&t, "%s", stripped + at);
+            free(stripped);
+            stripped = t.s ? t.s : xstrdup("");
+            dub_spliced = true;
+        }
         if (nuni_) { free(nover); nover = stripped; }
         else free(stripped);
     }
@@ -6849,11 +6945,10 @@ static char *geom_gen_capture_glsl(GLMContext ctx, MGLGeomProgram *gp, const cha
     sb_put(&b, "#version 460 core\n");
 
     /* re-declare the stripped plain uniforms (or put them back if the program's
-     * default-uniform block could not be read) — ahead of the source, so the names are
-     * in scope for it */
-    if (nuni_ && geom_dub_layout((SpvModule *)vs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
-        geom_emit_dub_block(&b, uni, nuni_, dub, ndub);
-    else if (removed_src)
+     * default-uniform block could not be read) — the block was already spliced into the
+     * source at the first removed declaration (dub_spliced), so only the fallback is
+     * left here */
+    if (!dub_spliced && removed_src)
     {
         sb_put(&b, "%s", removed_src);
         nuni_ = 0;
@@ -7043,7 +7138,23 @@ static char *geom_dedupe_iface_structs(const char *src)
     return out;
 }
 
+static char *geom_gen_kernel_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src,
+                                       const SpvModule *gs_m, char **log);
+
 static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src,
+                                  const SpvModule *gs_m, char **log)
+{
+    /* see geom_gen_capture_glsl: the kernel is generated from the un-hoisted source and
+     * would re-declare a sampler-bearing struct inside the default-uniform block */
+    char *hoisted = mgl_hoist_struct_samplers(gs_src);
+    char *out;
+    if (hoisted) gs_src = hoisted;
+    out = geom_gen_kernel_glsl_inner(ctx, gp, gs_src, gs_m, log);
+    free(hoisted);
+    return out;
+}
+
+static char *geom_gen_kernel_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, const char *gs_src,
                                   const SpvModule *gs_m, char **log)
 {
     char gl_in_name[64];
@@ -7056,6 +7167,8 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     GeomPlainUni uni[MGL_GEOM_MAX_VARYINGS];
     GeomDubMember dub[MGL_GEOM_MAX_VARYINGS];
     int nuni_ = 0, ndub = 0;
+    size_t dub_at = (size_t)-1;
+    bool dub_spliced = false;
     char *transformed = geom_transform_source(main_renamed ? main_renamed : gs_base, gp->in_verts,
                                               gl_in_name, sizeof(gl_in_name), NULL, NULL);
     free(main_renamed);
@@ -7096,8 +7209,24 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     }
     /* plain (default-block) uniforms are re-declared below as one block that matches the
      * program's default-uniform buffer (see geom_emit_dub_block) */
-    stripped_src = geom_strip_plain_uniforms(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src);
+    stripped_src = geom_strip_plain_uniforms_at(nover, uni, &nuni_, MGL_GEOM_MAX_VARYINGS, &removed_src, &dub_at);
     if (!stripped_src) { free(nover); return NULL; }
+    if (nuni_ && geom_dub_layout((SpvModule *)gs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
+    {
+        /* splice the re-declared block in at the first removed declaration, now: the
+         * leading-preprocessor hoist below shifts the text and would invalidate the
+         * offset.  A member's struct type is lexically declared by here, and any macro
+         * its array size uses is #defined before the uniform as well. */
+        size_t at = (dub_at == (size_t)-1 || dub_at > strlen(stripped_src)) ? strlen(stripped_src) : dub_at;
+        SB t;
+        memset(&t, 0, sizeof(t));
+        sb_put(&t, "%.*s", (int)at, stripped_src);
+        geom_emit_dub_block(&t, uni, nuni_, dub, ndub);
+        sb_put(&t, "%s", stripped_src + at);
+        free(stripped_src);
+        stripped_src = t.s ? t.s : xstrdup("");
+        dub_spliced = true;
+    }
     if (nuni_) { free(nover); nover = stripped_src; }
     else free(stripped_src);
 
@@ -7153,11 +7282,9 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
     }
 
     /* re-declare the stripped plain uniforms (or put them back if the program's
-     * default-uniform block could not be read) — ahead of the source, so the names are
-     * in scope for it */
-    if (nuni_ && geom_dub_layout((SpvModule *)gs_m, dub, &ndub, MGL_GEOM_MAX_VARYINGS))
-        geom_emit_dub_block(&b, uni, nuni_, dub, ndub);
-    else if (removed_src)
+     * default-uniform block could not be read) — the block was already spliced in at the
+     * first removed declaration (dub_spliced), so only the fallback is left here */
+    if (!dub_spliced && removed_src)
     {
         sb_put(&b, "%s", removed_src);
         nuni_ = 0;
@@ -7481,7 +7608,7 @@ static char *geom_gen_kernel_glsl(GLMContext ctx, MGLGeomProgram *gp, const char
         /* a named output block member is zero-initialized through the instance ("b.c");
          * a global instance in GLSL is zero-initialized anyway, this is belt and braces */
         char src[192];
-        if (gp->out_v[i].member[0] && strcmp(gp->out_v[i].name, gp->out_v[i].member))
+        if (geom_var_dotted(&gp->out_v[i]))
             snprintf(src, sizeof(src), "%s.%s", gp->out_v[i].name, gp->out_v[i].member);
         else
             snprintf(src, sizeof(src), "%s", gp->out_v[i].name);
@@ -7522,7 +7649,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         /* a named output block member is emitted as a plain varying of its own: the
          * raster side links to the fragment stage's input block by location, so the
          * member's name is irrelevant here (and the instance name would collide) */
-        if (v->member[0] && strcmp(v->name, v->member))
+        if (geom_var_dotted(v))
             snprintf(name, sizeof(name), "mgl_ob%d", i);
         else
             snprintf(name, sizeof(name), "%s", v->name);
@@ -7603,7 +7730,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
     {
         MGLGeomVar *v = &gp->out_v[i];
         char name[160];
-        if (v->member[0] && strcmp(v->name, v->member))
+        if (geom_var_dotted(v))
             snprintf(name, sizeof(name), "mgl_ob%d", i);
         else
             snprintf(name, sizeof(name), "%s", v->name);
@@ -10360,10 +10487,11 @@ static void geom_xfb_reset(GLMContext ctx, MGLXfbProgram *xp)
 
 static GLenum geom_var_type(const MGLGeomVar *v)
 {
-    /* matrices: the type constant names columns x rows (GL_FLOAT_MAT2x3 is a mat2x3, i.e.
-     * 2 columns of vec3).  MGLGeomVar.rows holds the SPIR-V OpTypeMatrix's ColumnCount and
-     * .cols the column type's vector size, so rows is the GL column count and cols the row
-     * count; the tables are indexed [v->rows][v->cols]. */
+    /* the type constant names columns x rows (GL_FLOAT_MAT2x3 is a mat2x3, i.e. 2 columns
+     * of vec3).  MGLGeomVar.rows is the components per column and .cols the number of
+     * columns (see the collector and glsl_type_name), so the tables are indexed
+     * [v->cols][v->rows] — indexing them the other way round reported every non-square
+     * matrix type transposed (dEQP PIQ transform_feedback_varying.type.*.mat3x4). */
     if (v->cols > 1)
     {
         static const GLenum fq[5][5] = {
@@ -10381,7 +10509,7 @@ static GLenum geom_var_type(const MGLGeomVar *v)
             {0, 0, GL_DOUBLE_MAT4x2, GL_DOUBLE_MAT4x3, GL_DOUBLE_MAT4},
         };
         if (v->rows >= 1 && v->rows <= 4 && v->cols >= 1 && v->cols <= 4)
-            return (v->base == GL_DOUBLE) ? dq[v->rows][v->cols] : fq[v->rows][v->cols];
+            return (v->base == GL_DOUBLE) ? dq[v->cols][v->rows] : fq[v->cols][v->rows];
         return v->base == GL_INT ? GL_INT : GL_FLOAT;
     }
     switch (v->base)
@@ -10440,7 +10568,7 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         for (int k = 0; k < nvars && dn < 64; k++)
         {
             if (vars[k].xfb_buffer < 0) continue;
-            if (vars[k].member[0] && strcmp(vars[k].name, vars[k].member))
+            if (geom_var_dotted(&vars[k]))
                 snprintf(dnames[dn], sizeof(dnames[dn]), "%s.%s", vars[k].name, vars[k].member);
             else
                 snprintf(dnames[dn], sizeof(dnames[dn]), "%s", vars[k].name);
@@ -10558,6 +10686,8 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         if (!strcmp(name, "gl_Position"))
         {
             v->type = GL_FLOAT_VEC4;
+            v->size = 1;          /* ARRAY_SIZE of a builtin is always 1 (dEQP PIQ
+                                  * array_size.*.builtin_gl_position) */
             v->comp_kind = GL_FLOAT;
             v->rows = 4;
             v->columns = 1;
@@ -10572,6 +10702,7 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         if (!strcmp(name, "gl_PointSize"))
         {
             v->type = GL_FLOAT;
+            v->size = 1;      /* ARRAY_SIZE of a scalar builtin is 1 */
             v->comp_kind = GL_FLOAT;
             v->rows = 1;
             v->columns = 1;

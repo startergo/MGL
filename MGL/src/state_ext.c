@@ -898,6 +898,15 @@ static bool rs_is_strip(GLenum mode)
 static bool rs_program_has_flat(GLMContext ctx)
 {
     Program *p = ctx->state.program;
+    /* a bound program PIPELINE draws with ctx->state.program == NULL — the composite
+     * is substituted only inside processGLState (MGL_PIPELINE_PROGRAM_SCOPE) — so the
+     * probe must consult the pipeline's fragment stage program directly, or a flat
+     * varying through a pipeline never rotates the provoking vertex and takes Metal's
+     * FIRST vertex instead of GL's last (dEQP GL45-ES31 separate_shader.random.111:
+     * flat vec2 var0 read vertex 0's value through the pipeline, last vertex's through
+     * the monolithic program). */
+    if (!p && ctx->state.program_pipeline)
+        p = ctx->state.program_pipeline->stage_programs[_FRAGMENT_SHADER];
     const char *msl = p ? p->spirv[_FRAGMENT_SHADER].msl_str : NULL;
     if (!msl) return false;
     /* perf: memoize the substring probe — rs_provoking_rewrite() runs per draw

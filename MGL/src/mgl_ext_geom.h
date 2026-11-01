@@ -154,6 +154,9 @@ typedef struct MGLGeomVar {
     GLuint  words;          /* 32-bit words per vertex */
     GLuint  offset;         /* word offset inside the record */
     bool    flat, noperspective, centroid, sample;
+    bool    plain_struct;  /* a struct-typed interface variable ("out StructType v;"),
+                           * not an interface block: expressions go through "v.m" and the
+                           * API name is "v.m", even when v and m share a spelling */
     GLuint  stream;         /* outputs: stream the varying is declared for */
     char    expr[128];      /* writer side: expression of the producing stage output */
     int     xfb_buffer;     /* shader-declared capture buffer (xfb_buffer=), -1 when not captured */

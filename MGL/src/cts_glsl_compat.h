@@ -6,6 +6,7 @@
 #define MGL_CTS_GLSL_COMPAT_H
 
 #include "glm_context.h"
+#include <stdbool.h>
 
 /* Returns a malloc'd rewritten copy of `src`, or NULL when it can be compiled as is.
  * The caller frees the result. */
@@ -55,9 +56,16 @@ void mgl_cts_bool_paths_free(MGLBoolPaths *p);
  * uniforms (SPIRV-Cross cannot lower them to MSL); returns a malloc'd copy or
  * NULL when the source has none.  mgl_hoist_lookup_name() maps the GL dotted
  * spelling ("s.c", "s[0].c") back to the hoisted name ("s_mglhoist_c",
- * "s_mglhoist_c[0]"). */
+ * "s_mglhoist_c[0]").  mgl_hoist_gl_path() is the inverse for introspection
+ * (the resource list must carry the dotted GL name), and
+ * mgl_hoist_outer_dims() tells how many leading dimensions of the hoisted
+ * array belong to the uniform declaration (arrays of structs enumerate per
+ * element, GL 4.6 §7.3.1). */
 char *mgl_hoist_struct_samplers(const char *src);
 char *mgl_reject_reserved_declarators(const char *src);   /* "#error ..." source or NULL */
 int mgl_hoist_lookup_name(const char *name, char *out, size_t outn);
+bool mgl_hoist_gl_path(const char *hoisted, char *out, size_t outn);
+bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t outn, int *n_outer);
+int  mgl_hoist_outer_dims(const char *hoisted);
 
 #endif

@@ -43,6 +43,8 @@ static const char *mgl_test_current = "";
 #define EXPECT_TRUE(c) do { mgl_test_checks++; if (!(c)) MGL_FAIL("expected true: %s", #c); } while (0)
 #define EXPECT_EQ_INT(a, b) do { mgl_test_checks++; long long _a = (long long)(a), _b = (long long)(b); \
         if (_a != _b) MGL_FAIL("%s == %lld, expected %lld", #a, _a, _b); } while (0)
+#define EXPECT_NE(a, b) do { mgl_test_checks++; long long _a = (long long)(a), _b = (long long)(b); \
+    if (_a == _b) MGL_FAIL("expected %lld != %lld (%s vs %s)", _a, _b, #a, #b); } while (0)
 #define EXPECT_NEAR(a, b, eps) do { mgl_test_checks++; double _a = (a), _b = (b); \
         if (fabs(_a - _b) > (eps)) MGL_FAIL("%s == %f, expected %f", #a, _a, _b); } while (0)
 #define EXPECT_STREQ(a, b) do { mgl_test_checks++; const char *_a = (const char *)(a), *_b = (b); \

@@ -520,6 +520,12 @@ static MGLIndexKeyState index_key_state(GLMContext ctx, bool restart, uint32_t r
     st.restart_on = restart ? 1 : 0;
     st.lastpv = (ctx->state.ext_rstate && ctx->state.ext_rstate->provoking_vertex == GL_LAST_VERTEX_CONVENTION) ? 1 : 0;
     st.program = ctx->state.program;
+    /* geom/rstate: the flat-varying probe also consults the pipeline's fragment stage
+     * when no program is current (rs_program_has_flat), so the scan-cache key must
+     * distinguish pipelines that differ only there — two pipelines over the same
+     * element range would otherwise share the cached rewrite decision. */
+    if (!st.program && ctx->state.program_pipeline)
+        st.program = ctx->state.program_pipeline->stage_programs[_FRAGMENT_SHADER];
     return st;
 }
 

@@ -2036,6 +2036,48 @@ static bool bs_binding_value(BScan *s, unsigned *val)
     return true;
 }
 
+/* declared element count of the declaration being classified: the "[N]" after the
+ * instance name — for a block instance array that name follows the block body, so skip
+ * to the matching '}' first.  1 when the declaration is not arrayed. */
+static unsigned bs_decl_count(const char *p, const char *end, char nxt)
+{
+    unsigned long n = 1;
+
+    if (!p || p >= end) return 1;
+    if (nxt == '{')
+    {
+        int depth = 0;
+        while (p < end)
+        {
+            if (*p == '{') depth++;
+            else if (*p == '}')
+            {
+                if (--depth == 0) { p++; break; }
+            }
+            p++;
+        }
+        while (p < end && (isspace((unsigned char)*p) || is_ident_char((unsigned char)*p))) p++;
+    }
+    else
+    {
+        while (p < end && is_ident_char((unsigned char)*p)) p++;
+    }
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p < end && *p == '[')
+    {
+        p++;
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (p < end && isdigit((unsigned char)*p))
+        {
+            unsigned long v = 0;
+            while (p < end && isdigit((unsigned char)*p)) v = v * 10 + (unsigned)(*p++ - '0');
+            while (p < end && isspace((unsigned char)*p)) p++;
+            if (p < end && *p == ']') n = v ? v : 1;
+        }
+    }
+    return (unsigned)n;
+}
+
 static char *reject_binding_range(const char *src, const MGLCompatBindingLimits *lim)
 {
     BScan s = { src, src + strlen(src) };
@@ -2097,6 +2139,20 @@ static char *reject_binding_range(const char *src, const MGLCompatBindingLimits 
             break;
         }
         const char *b = a ? bs_ident(&s, &b_n) : NULL;
+        for (;;)
+        {
+            if (bs_word_is(b, b_n, "readonly") || bs_word_is(b, b_n, "writeonly") ||
+                bs_word_is(b, b_n, "coherent") || bs_word_is(b, b_n, "restrict") ||
+                bs_word_is(b, b_n, "volatile") || bs_word_is(b, b_n, "precisely") ||
+                bs_word_is(b, b_n, "highp") || bs_word_is(b, b_n, "mediump") ||
+                bs_word_is(b, b_n, "lowp"))
+            {
+                bs_ws(&s);
+                b = bs_ident(&s, &b_n);            /* qualifiers after "uniform" */
+                continue;
+            }
+            break;
+        }
         bs_ws(&s);
         char nxt = s.p < s.end ? *s.p : 0;
 
@@ -2110,14 +2166,20 @@ static char *reject_binding_range(const char *src, const MGLCompatBindingLimits 
             limit = lim->image_units;
         else if (bs_word_is(a, a_n, "uniform") && b_n >= 7 && strncmp(b, "sampler", 7) == 0)
             limit = lim->combined_texture_units;
-        /* buffer blocks are handled by reject_ssbo_binding_range (array extents
-         * included); block instance arrays are not checked here */
+        /* buffer blocks are handled by reject_ssbo_binding_range (array extents included) */
 
-        if (limit && binding >= limit)
+        if (limit)
         {
-            snprintf(err, sizeof err,
-                     "layout(binding=%u) exceeds the implementation limit (%u)", binding, limit);
-            return pp_error_source(src, err);
+            /* an instance array occupies binding .. binding+N-1: the LAST index must stay
+             * under the limit too (GLSL 4.60 4.4.5 / dEQP layout_binding.negative
+             * *_binding_over_max_array, which picks binding = limit + 1 - N) */
+            unsigned count = bs_decl_count(s.p, s.end, nxt);
+            if (binding >= limit || (count > 1 && binding + count - 1 >= limit))
+            {
+                snprintf(err, sizeof err,
+                         "layout(binding=%u) exceeds the implementation limit (%u)", binding, limit);
+                return pp_error_source(src, err);
+            }
         }
     }
     return NULL;
@@ -2455,10 +2517,114 @@ static int mglc_collect_structs(const char *s, size_t len, MGLCStruct *st, int m
     return nst;
 }
 
+/* Hoisted-name → GL-name table.  The hoist (a source-level rewrite: default-block
+ * structs cannot hold samplers in MSL) renames "u.b.s" to "u_mglhoist_b_mglhoist_s",
+ * which the SPIR-V-level introspection then reports verbatim — but GL requires the
+ * dotted spelling in every program-interface query (dEQP PIQ *.sampler_struct).
+ * Every hoisted declaration records its GL path here, so introspection can name the
+ * resource back.  n_outer = how many leading array dimensions of the hoisted array
+ * came from the uniform declaration (an array of structs enumerates per element,
+ * GL 4.6 §7.3.1; member arrays are bottom-level arrays reported as name[0]). */
+typedef struct MGLHoistRec {
+    struct MGLHoistRec *next;
+    char hoisted[160];   /* "u_mglhoist_b_mglhoist_s" */
+    char gl[192];        /* "u.b.s" (no array suffix) */
+    int  n_outer;
+    char dims[64];       /* declared array dims, outer-first ("[3]", "[2][3]") */
+    unsigned seq;        /* record order: the newest matching shape wins */
+} MGLHoistRec;
+
+static MGLHoistRec *g_hoist_recs;
+static unsigned g_hoist_seq;
+
+static void mgl_hoist_record(const char *hoisted, const char *prefix, const char *member,
+                             int n_outer, const char *dims)
+{
+    MGLHoistRec *r;
+    char gl[192];
+    size_t o = 0;
+
+    /* "u_mglhoist_b" + ".s" -> "u.b.s" */
+    for (const char *p = prefix; *p && o + 2 < sizeof gl; p++) {
+        if (!strncmp(p, "_mglhoist_", 10)) { gl[o++] = '.'; p += 9; }
+        else gl[o++] = *p;
+    }
+    if (o + strlen(member) + 1 >= sizeof gl) return;
+    gl[o] = 0;
+    snprintf(gl + o, sizeof gl - o, ".%s", member);
+
+    for (r = g_hoist_recs; r; r = r->next)
+        if (!strcmp(r->hoisted, hoisted) && !strcmp(r->dims, dims) && r->n_outer == n_outer) return;
+    r = malloc(sizeof *r);
+    if (!r) return;
+    snprintf(r->hoisted, sizeof r->hoisted, "%s", hoisted);
+    snprintf(r->gl, sizeof r->gl, "%s", gl);
+    snprintf(r->dims, sizeof r->dims, "%s", dims);
+    r->n_outer = n_outer;
+    r->seq = ++g_hoist_seq;
+    r->next = g_hoist_recs;
+    g_hoist_recs = r;
+}
+
+/* GL dotted spelling of a hoisted uniform name ("u_mglhoist_b_mglhoist_s" -> "u.b.s").
+ * dims (may be NULL) is the array's shape as SPIR-V sees it, outer-first and
+ * comma-separated ("3", "2,3"); among the spellings recorded for the name the newest
+ * one whose shape matches wins, so a program linking an older shader still resolves
+ * after a later shader re-used the same uniform name with a different shape.
+ * *n_outer receives the number of leading dimensions that belong to the uniform
+ * declaration (an array of structs enumerates per element, GL 4.6 §7.3.1).
+ * Returns false when the name was not hoisted. */
+bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t outn, int *n_outer)
+{
+    MGLHoistRec *best = NULL;
+    char cand[64];
+
+    for (MGLHoistRec *r = g_hoist_recs; r; r = r->next) {
+        if (strcmp(r->hoisted, hoisted)) continue;
+        if (!best || r->seq > best->seq) best = r;
+        /* candidate shape: "[2][3]" -> "2,3" */
+        cand[0] = 0;
+        {
+            size_t o = 0;
+            for (const char *p = r->dims; *p; p++) {
+                const char *e;
+                if (*p != '[' || !(e = strchr(p, ']'))) continue;
+                size_t n = (size_t)(e - p - 1);
+                if (o) cand[o++] = ',';
+                if (o + n + 1 >= sizeof cand) { cand[0] = 0; break; }
+                memcpy(cand + o, p + 1, n);
+                o += n;
+                p = e;
+            }
+            cand[o] = 0;
+        }
+        if (dims && !strcmp(cand, dims) && (!best || r->seq > best->seq)) best = r;
+    }
+    if (!best) return false;
+    snprintf(out, outn, "%s", best->gl);
+    if (n_outer) *n_outer = best->n_outer;
+    return true;
+}
+
+bool mgl_hoist_gl_path(const char *hoisted, char *out, size_t outn)
+{
+    return mgl_hoist_gl_path2(hoisted, NULL, out, outn, NULL);
+}
+
+/* number of leading dimensions of a hoisted array that belong to the uniform
+ * declaration ("S u[2];" with member "sampler2D m[3]" -> 1), 0 when the uniform
+ * itself is not an array; -1 when the name was not hoisted */
+int mgl_hoist_outer_dims(const char *hoisted)
+{
+    for (MGLHoistRec *r = g_hoist_recs; r; r = r->next)
+        if (!strcmp(r->hoisted, hoisted)) return r->n_outer;
+    return -1;
+}
+
 /* enumerate the opaque member paths of struct si; appends "NAME__m1[..]__mk"
  * declarations to out, dims accumulating outer-uniform dims first */
 static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *prefix,
-                            const char *dims, Str *out)
+                            const char *dims, int n_outer, Str *out)
 {
     for (int k = 0; k < st[si].nm; k++) {
         const MGLCMember *m = &st[si].m[k];
@@ -2467,6 +2633,13 @@ static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *p
         char nd[192];
         snprintf(nd, sizeof nd, "%s%s", dims, m->mdims);
         if (m->opaque) {
+            /* remember the GL spelling of this hoisted uniform: introspection must
+             * report "u.b.sampler" for the hoisted "u_mglhoist_b_mglhoist_sampler"
+             * (GL 4.6 §7.3.1 dotted names), and n_outer leading array dimensions of
+             * the hoisted array belong to the uniform declaration itself (an array
+             * of structs expands per element, the member arrays do not).  See
+             * mgl_hoist_gl_path2(). */
+            mgl_hoist_record(np, prefix, m->mname, n_outer, nd);
             str_append(out, "\nuniform ", 9);
             str_append(out, m->mtype, strlen(m->mtype));
             str_append(out, " ", 1);
@@ -2476,7 +2649,7 @@ static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *p
         } else {
             int sub = mglc_struct_find(st, nst, m->mtype);
             if (sub >= 0 && st[sub].has_opaque)
-                mglc_enum_paths(st, nst, sub, np, nd, out);
+                mglc_enum_paths(st, nst, sub, np, nd, n_outer, out);
         }
     }
 }
@@ -2547,7 +2720,9 @@ char *mgl_hoist_struct_samplers(const char *src)
                 if (getenv("MGL_HOIST_DEBUG")) fprintf(stderr, "HOIST: uniform type=%s var=%s dims=%s si=%d\n", type, var, dims, si);
                 if (si >= 0 && st[si].has_opaque) {
                     Str decls = {0};
-                    mglc_enum_paths(st, nst, si, var, dims, &decls);
+                    int n_outer = 0;
+                    for (const char *d = dims; *d; d++) n_outer += (*d == '[');
+                    mglc_enum_paths(st, nst, si, var, dims, n_outer, &decls);
                     if (decls.buf) {
                         str_push(&decls, 0);
                         char *p = decls.buf;
@@ -2682,8 +2857,23 @@ char *mgl_hoist_struct_samplers(const char *src)
                             const MGLCMember *m = &st[si].m[mi];
                             if (!m->opaque)
                                 str_append(&out, src + m->decl_off, m->decl_end - m->decl_off);
-                            else if (!any_kept && mi == 0)
-                                str_append(&out, "\n    float mgl_hoist_pad; /* opaque-only struct */\n", 49);
+                            else if (!any_kept && mi == 0) {
+                                /* a struct whose members are all opaque still needs one
+                                 * non-opaque member (GLSL forbids an empty struct).
+                                 * highp is spelled out: the pad is injected into every
+                                 * stage, and glslang's cross-stage symbol validation
+                                 * rejects the same uniform with a different default
+                                 * precision ("have precision conflict cross stage") —
+                                 * an ES fragment shader defaults float to mediump.
+                                 * (The old fixed length passed here was two bytes
+                                 * short, which truncated the closing of the emitted
+                                 * block comment, and the following '}' + ';' landed
+                                 * inside it: every shader whose uniform struct held
+                                 * only samplers or images then failed with "End of
+                                 * input in comment" — dEQP PIQ *.sampler_struct.) */
+                                static const char pad[] = "\n    highp float mgl_hoist_pad; /* opaque-only struct */\n";
+                                str_append(&out, pad, sizeof(pad) - 1);
+                            }
                         }
                     } else {
                         str_append(&out, src + j3 + 1, k - (j3 + 1));
@@ -2715,7 +2905,9 @@ char *mgl_hoist_struct_samplers(const char *src)
                     str_append(&out, src + i, j6 - i);            /* the declaration */
                     if (si >= 0 && st[si].has_opaque) {
                         Str decls = {0};
-                        mglc_enum_paths(st, nst, si, var, dims, &decls);
+                        int n_outer = 0;
+                        for (const char *d = dims; *d; d++) n_outer += (*d == '[');
+                        mglc_enum_paths(st, nst, si, var, dims, n_outer, &decls);
                         if (decls.buf) {
                             str_push(&decls, 0);
                             str_append(&out, decls.buf, decls.len - 1);  /* no NUL inside */
