@@ -180,8 +180,14 @@ typedef struct MGLIProgram {
      * (possibly new) struct type, `start`/`count` the flattened member group,
      * `mtype` the original array-of-matrix type (still in the module, unused),
      * `var` the plain variable that was re-typed (0 for block-member flattens).
-     * reflect_io reassembles the original single resource from these. */
-    struct { int stage; uint32_t st, start, count, mtype, var; char name[64]; } *flat;
+     * reflect_io reassembles the original single resource from these.
+     * geom r88: `kind` 1 records describe a flattened ARRAY OF PATCH INTERFACE
+     * BLOCKS (SPIRV-Cross cannot emit those at all): one record per original
+     * block member, `count` = array elements, `stride` = members per element,
+     * `mtype` = the ORIGINAL member type, `start` = the first flattened member
+     * (element 0).  `sc` is the storage class the record was made for (the
+     * pass now runs per direction and is re-run on the no-pack retry). */
+    struct { int stage; uint32_t sc, st, start, count, mtype, var, stride; uint8_t kind; char name[64]; } *flat;
     int      nflat;
 } MGLIProgram;
 

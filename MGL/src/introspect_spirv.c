@@ -1071,6 +1071,25 @@ static int64_t flat_idx_const(const SMod *m, uint32_t id)
     return (int32_t)m->cval[id];
 }
 
+/* id of an existing int (or uint) constant with value `val`, else create one
+ * (geom r88: member-index remaps for chains through block-array roots) */
+static uint32_t flat_find_int_const(SMod *m, Inserts *ins, uint32_t *next_id, uint32_t val)
+{
+    for (uint32_t c = 1; c <= m->bound; c++)
+        if (m->isconst[c] == 1 && m->t[m->ctype[c]].kind == T_INT && (uint32_t)(int32_t)m->cval[c] == val &&
+            m->in[m->cinst[c]].w && (m->in[m->cinst[c]].w[0] & 0xffff) == SpvOpConstant) return c;
+    /* need an int type; reuse the first one in the module */
+    uint32_t it = 0;
+    for (uint32_t c = 1; c <= m->bound && !it; c++)
+        if (m->t[c].kind == T_INT && m->t[c].width == 32) it = c;
+    if (!it) return 0;
+    uint32_t id = (*next_id)++; mgrow(m, id);
+    uint32_t o[3] = { it, id, val };
+    ins_op(&ins->globals, SpvOpConstant, 3, o);
+    m->isconst[id] = 1; m->ctype[id] = it; m->cval[id] = val; m->cinst[id] = 0;   /* 0 = header, never an OpConstant */
+    return id;
+}
+
 /* replace instruction i with an owned copy of nw[0..len): works for both the
  * pre-function emission loop (which reads in[i].w/len) and the function-body
  * emission (which copies in[i].w/len verbatim) */
@@ -1092,47 +1111,81 @@ static void flat_emit_member_name(SMod *m, Inserts *ins, uint32_t st, uint32_t m
     m->nmn++;
 }
 
+static void flatten_io_matrix_arrays_dir(SMod *m, MGLIProgram *ip, int stage, Inserts *ins,
+                                         uint32_t *next_id, const char *src, uint32_t want);
+
 static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Inserts *ins,
                                      uint32_t *next_id, const char *src)
 {
-    if (stage == _COMPUTE_SHADER || stage >= MGLI_STAGES) return;
-    uint32_t want = (stage != _VERTEX_SHADER) ? SpvStorageClassInput : SpvStorageClassOutput;
+    return flatten_io_matrix_arrays_dir(m, ip, stage, ins, next_id, src,
+                                        (stage != _VERTEX_SHADER) ? SpvStorageClassInput : SpvStorageClassOutput);
+}
 
-    /* the pass runs again for the no_pack retry: drop this stage's records */
+/* geom r88: one call per storage direction.  r87 ran Input for every stage but
+ * vertex (which ran Output): TES/GS/TCS OUTPUTS with arrays of matrices
+ * (dEQP …program_output.type.separable_tess_eval.array.mat3x2, block arrays in
+ * VS outputs) stayed unflattened and failed to translate. */
+static void flatten_io_matrix_arrays_dir(SMod *m, MGLIProgram *ip, int stage, Inserts *ins,
+                                         uint32_t *next_id, const char *src, uint32_t want)
+{
+    if (stage == _COMPUTE_SHADER || stage >= MGLI_STAGES) return;
+
+    /* the pass runs again for the no_pack retry and once per direction: drop
+     * this stage's records made for THIS direction only */
     int w = 0;
-    for (int i = 0; i < ip->nflat; i++) if (ip->flat[i].stage != stage) ip->flat[w++] = ip->flat[i];
+    for (int i = 0; i < ip->nflat; i++)
+        if (ip->flat[i].stage != stage || ip->flat[i].sc != want) ip->flat[w++] = ip->flat[i];
     ip->nflat = w;
 
     FlatCand cand[16]; int ncand = 0;
     FlatVar pcand[8];  int npc = 0;
+    /* geom r88: candidate structs reached through an ARRAY (interface block
+     * arrays `out Block {..} inst[3];`, TCS/TE/GS per-vertex runtime arrays).
+     * Chains into them are [root][elem][member][...]; pf==1 pointers below can
+     * be either a block variable itself or the [root][elem] sub-chain. */
+    uint32_t arr_root[8]; int narr_root = 0;
 
     for (uint32_t v = 1; v <= m->bound; v++) {
         if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != want || is_builtin_var(m, v)) continue;
         bool patch = get_dec(m, v, -1, SpvDecorationPatch, NULL) != 0;
         uint32_t pt = pointee(m, m->vtype[v]);
         uint32_t st = pt;
+        bool is_arr_root = false;
         if (m->t[pt].kind == T_ARRAY || m->t[pt].kind == T_RARRAY) {
             uint32_t et = m->t[pt].elem;
             if (m->t[et].kind == T_STRUCT) {
                 st = et;   /* arrayed interface block instance */
+                is_arr_root = true;
             } else {
                 /* plain variable that IS an array of matrices.  Never a
                  * per-vertex interface: those are runtime arrays at the
-                 * arrayed stages, and VS outputs / FS inputs are not arrayed. */
+                 * arrayed stages, and VS outputs / FS inputs are not arrayed.
+                 * (geom r88: TES and GS outputs are not arrayed either —
+                 * `layout(location=0) out mat3x2 x[2];` in a TES is a plain
+                 * array over 2 and must flatten like a VS output.) */
                 if (m->t[pt].kind == T_ARRAY && m->t[et].kind == T_MATRIX && npc < 8 &&
-                    (stage == _FRAGMENT_SHADER || stage == _VERTEX_SHADER || patch))
+                    (stage == _FRAGMENT_SHADER || stage == _VERTEX_SHADER || patch ||
+                     (want == SpvStorageClassOutput &&
+                      (stage == _TESS_EVALUATION_SHADER || stage == _GEOMETRY_SHADER))))
                     pcand[npc].v = v, pcand[npc++].mtype = pt;
                 continue;
             }
         }
         if (m->t[st].kind != T_STRUCT) continue;
+        bool has_cand = false;
         for (uint32_t mi = 0; mi < m->t[st].nmem && ncand < 16; mi++) {
             uint32_t mt = m->t[st].mem[mi];
-            if (m->t[mt].kind == T_ARRAY && m->t[m->t[mt].elem].kind == T_MATRIX && m->t[mt].count > 1)
+            if (m->t[mt].kind == T_ARRAY && m->t[m->t[mt].elem].kind == T_MATRIX && m->t[mt].count > 1) {
                 cand[ncand].st = st, cand[ncand].mi = mi, cand[ncand++].mtype = mt;
+                has_cand = true;
+            }
         }
+        if (is_arr_root && has_cand && narr_root < 8) arr_root[narr_root++] = v;
     }
-    if (!ncand && !npc) return;
+    if (!ncand && !npc) {
+        if (getenv("MGL_FLAT_DEBUG")) fprintf(stderr, "MGL flat st=%d sc=%u: no candidates\n", stage, want);
+        return;
+    }
 
     /* value type map: declared result type of every SSA value (composites) */
     uint32_t bound1 = m->bound + 1;
@@ -1152,8 +1205,17 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
         if (res && res < bound1) vty[res] = m->in[i].w[1];
     }
 
-    /* pointer flags: 1 = pointer to a candidate struct, 2 = plain-var root */
+    /* pointer flags: 1 = pointer to a candidate struct, 2 = plain-var root,
+     * 3 = arrayed root (block array / per-vertex runtime array of a candidate
+     * struct; chains into it start with the element index) */
     uint8_t *pf = zalloc(bound1);
+    bool arr_woelem[8] = {0};   /* whole-element pointer taken on an arrayed root */
+    uint32_t arr_st[8];         /* the candidate struct of each arrayed root */
+    for (int r = 0; r < narr_root; r++) {
+        uint32_t at = pointee(m, m->vtype[arr_root[r]]);
+        arr_st[r] = m->t[at].elem;
+        pf[arr_root[r]] = 3;
+    }
     for (int c = 0; c < ncand; c++) pf[cand[c].st] = 1;
     for (size_t i = 1; i < m->n; i++) {
         uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
@@ -1171,6 +1233,14 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
             pf[m->in[i].w[2]] = 1;
         else if (op == SpvOpCopyObject && wc >= 4 && pf[m->in[i].w[3]])
             pf[m->in[i].w[2]] = pf[m->in[i].w[3]];
+        else if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 5 &&
+                 pf[m->in[i].w[3]] == 3) {
+            /* [root][elem] → pointer to the block element; a chain stopping
+             * there takes a whole-element pointer (infeasible for the group) */
+            if (wc == 4 + 1) pf[m->in[i].w[2]] = 1;
+            for (int r = 0; r < narr_root; r++)
+                if (arr_root[r] == m->in[i].w[3] && wc == 5) arr_woelem[r] = true;
+        }
     }
     for (int c = 0; c < npc; c++) pf[pcand[c].v] = 2;
 
@@ -1180,6 +1250,19 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
         uint32_t st = cand[c].st, mtype = cand[c].mtype;
         uint32_t mi = cand[c].mi;
         ok[c] = 1;
+        /* 0. arrayed roots: no whole-element / whole-array uses of the block */
+        for (int r = 0; r < narr_root && ok[c]; r++) {
+            if (arr_st[r] != st) continue;
+            if (arr_woelem[r]) ok[c] = 0;
+            for (size_t i = 1; i < m->n && ok[c]; i++) {
+                uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
+                if (op == SpvOpLoad && wc >= 4 && m->in[i].w[3] == arr_root[r]) ok[c] = 0;
+                else if (op == SpvOpStore && wc >= 3 && m->in[i].w[1] == arr_root[r]) ok[c] = 0;
+                else if (op == SpvOpCopyMemory && wc >= 4 &&
+                         (m->in[i].w[1] == arr_root[r] || m->in[i].w[2] == arr_root[r])) ok[c] = 0;
+            }
+        }
+        if (!ok[c]) continue;
         /* 1. the array type must not be used anywhere else (composites, nulls,
          *    whole-array values, other pointers) */
         for (size_t i = 1; i < m->n && ok[c]; i++) {
@@ -1206,6 +1289,14 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
                 if (mi_c < 0 || (uint32_t)mi_c != mi) continue;
                 if (wc == 5) { ok[c] = 0; break; }             /* whole array ptr */
                 if (flat_idx_const(m, m->in[i].w[5]) < 0) { ok[c] = 0; break; }
+            } else if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 6 &&
+                       pf[m->in[i].w[3]] == 3) {
+                /* block array / per-vertex instance: [root][elem][member][...] */
+                int64_t mi_c = flat_idx_const(m, m->in[i].w[5]);
+                if (mi_c < 0) { ok[c] = 0; break; }            /* dynamic member */
+                if ((uint32_t)mi_c != mi) continue;
+                if (wc == 6) { ok[c] = 0; break; }             /* whole member ptr */
+                if (flat_idx_const(m, m->in[i].w[6]) < 0) { ok[c] = 0; break; }
             } else if (op == SpvOpCompositeExtract && wc >= 5 && vty[m->in[i].w[3]] == st) {
                 if (m->in[i].w[4] == mi && wc == 5) { ok[c] = 0; break; }
             } else if (op == SpvOpCompositeInsert && wc >= 6 && vty[m->in[i].w[4]] == st) {
@@ -1247,12 +1338,22 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
     for (int c0 = 0; c0 < ncand; c0++) {
         if (!ok[c0] || cand[c0].st == 0) continue;
         uint32_t st = cand[c0].st;
+        /* snapshot member names: the re-emit loop below runs AFTER the module's
+         * OpMemberName instructions for `st` are killed and the parsed-name
+         * table is stripped of `st` — reading member_name() there lost every
+         * surviving (non-group) member name, which SPIRV-Cross then MSL-names
+         * _m0/_m1… (geom r88) */
+        char memname[64][72];
+        for (uint32_t mi = 0; mi < m->t[st].nmem && mi < 64; mi++) {
+            const char *nm = member_name(m, st, mi);
+            snprintf(memname[mi], sizeof memname[0], "%s", nm ? nm : "");
+        }
         struct { uint32_t old_mi, new_mi, mtype; } grp[8]; int ngrp = 0;
         char grpname[8][64];
         for (int c = c0; c < ncand; c++) {
             if (cand[c].st != st || !ok[c]) continue;
             cand[c].st = 0;   /* consumed by this struct's rewrite */
-            snprintf(grpname[ngrp], 64, "%s", member_name(m, st, cand[c].mi) ? member_name(m, st, cand[c].mi) : "");
+            snprintf(grpname[ngrp], 64, "%s", memname[cand[c].mi]);
             grp[ngrp].old_mi = cand[c].mi;
             grp[ngrp].mtype = cand[c].mtype;
             ngrp++;
@@ -1279,10 +1380,11 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
         ip->flat = realloc(ip->flat, (ip->nflat + ngrp) * sizeof *ip->flat);
         for (int g = 0; g < ngrp; g++) {
             memset(&ip->flat[ip->nflat], 0, sizeof ip->flat[0]);
-            ip->flat[ip->nflat].stage = stage; ip->flat[ip->nflat].st = st;
+            ip->flat[ip->nflat].stage = stage; ip->flat[ip->nflat].sc = want; ip->flat[ip->nflat].st = st;
             ip->flat[ip->nflat].start = grp[g].new_mi;
             ip->flat[ip->nflat].count = m->t[grp[g].mtype].count;
             ip->flat[ip->nflat].mtype = grp[g].mtype; ip->flat[ip->nflat].var = 0;
+            ip->flat[ip->nflat].kind = 0;
             snprintf(ip->flat[ip->nflat].name, sizeof ip->flat[0].name, "%s", grpname[g]);
             ip->nflat++;
         }
@@ -1324,7 +1426,7 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
         for (uint32_t mi = 0; mi < m->t[st].nmem; mi++) {
             int g = -1;
             for (int gg = 0; gg < ngrp; gg++) if (grp[gg].old_mi == mi) g = gg;
-            const char *nm = member_name(m, st, mi);
+            const char *nm = (mi < 64) ? memname[mi] : member_name(m, st, mi);
             if (!nm || !*nm) continue;
             if (g >= 0) {
                 for (uint32_t e = 0; e < m->t[grp[g].mtype].count; e++) {
@@ -1379,6 +1481,33 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
                     uint32_t *nw = malloc(4 * wc);
                     memcpy(nw, m->in[i].w, 4 * wc);
                     nw[4] = cid;
+                    flat_replace_inst(m, i, nw, wc);
+                }
+            } else if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 6 &&
+                       pf[m->in[i].w[3]] == 3) {
+                /* block-array / per-vertex instance: [root][elem][member][rest]
+                 * → keep [root][elem], collapse [member][k] → [member'+k] */
+                int64_t mi_c = flat_idx_const(m, m->in[i].w[5]);
+                if (mi_c < 0) continue;
+                uint32_t mi = (uint32_t)mi_c;
+                int g = -1;
+                for (int gg = 0; gg < ngrp; gg++) if (grp[gg].old_mi == mi) g = gg;
+                if (g >= 0) {
+                    if (wc < 7) continue;
+                    int64_t k = flat_idx_const(m, m->in[i].w[6]);
+                    if (k < 0 || (uint32_t)k >= m->t[grp[g].mtype].count) continue;
+                    uint32_t *nw = malloc(4 * (wc - 1));
+                    nw[0] = ((uint32_t)(wc - 1) << 16) | op;
+                    memcpy(&nw[1], &m->in[i].w[1], 4 * 4);   /* result, ptr type, base, elem idx */
+                    nw[5] = m->in[i].w[6];   /* k IS the new member index value */
+                    memcpy(&nw[6], &m->in[i].w[7], (wc - 7) * 4);
+                    flat_replace_inst(m, i, nw, wc - 1);
+                } else if (mi < 64 && newidx_of[mi] >= 0 && newidx_of[mi] != (int)mi) {
+                    uint32_t cid = flat_find_int_const(m, ins, next_id, (uint32_t)newidx_of[mi]);
+                    if (!cid) continue;
+                    uint32_t *nw = malloc(4 * wc);
+                    memcpy(nw, m->in[i].w, 4 * wc);
+                    nw[5] = cid;
                     flat_replace_inst(m, i, nw, wc);
                 }
             } else if (op == SpvOpCompositeExtract && wc >= 5 && vty[m->in[i].w[3]] == st) {
@@ -1495,14 +1624,214 @@ static void flatten_io_matrix_arrays(SMod *m, MGLIProgram *ip, int stage, Insert
         m->vtype[v] = ptr2;
         ip->flat = realloc(ip->flat, (ip->nflat + 1) * sizeof *ip->flat);
         memset(&ip->flat[ip->nflat], 0, sizeof ip->flat[0]);
-        ip->flat[ip->nflat].stage = stage; ip->flat[ip->nflat].st = st2;
+        ip->flat[ip->nflat].stage = stage; ip->flat[ip->nflat].sc = want; ip->flat[ip->nflat].st = st2;
         ip->flat[ip->nflat].start = 0; ip->flat[ip->nflat].count = N;
         ip->flat[ip->nflat].mtype = mtype; ip->flat[ip->nflat].var = v;
+        ip->flat[ip->nflat].kind = 0;
         snprintf(ip->flat[ip->nflat].name, sizeof ip->flat[0].name, "%s", nm);
         ip->nflat++;
     }
     free(vty);
     free(pf);
+}
+
+#pragma mark - arrays of patch interface blocks (SPIRV-Cross cannot emit them)
+
+/* glslang emits `patch out Blk { M m; } inst[N];` as a Patch-decorated Output
+ * variable of type array<Blk,N>.  SPIRV-Cross's MSL backend moves every patch
+ * variable into the per-patch io struct and hits an unimplemented path there
+ * (a Variant bad-cast that surfaces as the error string "nullptr"), so the
+ * whole stage fails to translate — dEQP-GL45-ES31
+ * program_interface_query.program_output.*.interface_blocks.patch_out.block_array.*.
+ *
+ * Metal has no such restriction once the array is gone: flatten inst[N] into
+ * ONE patch block whose member k*nmem+mi is member mi of element k
+ * (element-major — the order both GL and SPIRV-Cross assign locations),
+ * rewrite every access [inst][k][mi][rest…] to [inst][k*nmem+mi][rest…], and
+ * record the original shape for reflection (ip->flat kind 1: the GL view of an
+ * interface block array is one resource per member, named <BlockName>.<member>
+ * — the CTS's own reference notes "there is no array index specifier even if
+ * the interface is declared as an array of instances").  TCS patch outputs and
+ * TES patch inputs both apply.  Location decorations stay on the variable:
+ * SPIRV-Cross assigns the members sequential locations from it, which for the
+ * element-major member order equals GL's block-array packing (§9.2.5 /
+ * ARB_enhanced_layouts), and reflection keeps reporting -1 / the explicit
+ * source location only (§11.1.1). */
+static void flatten_patch_block_arrays(SMod *m, MGLIProgram *ip, int stage, Inserts *ins,
+                                       uint32_t *next_id, const char *src)
+{
+    (void)src;
+    if (stage != _TESS_CONTROL_SHADER && stage != _TESS_EVALUATION_SHADER) return;
+    uint32_t want = (stage == _TESS_CONTROL_SHADER) ? SpvStorageClassOutput : SpvStorageClassInput;
+
+    /* the pass re-runs on the no_pack retry: drop this stage's kind-1 records */
+    int w = 0;
+    for (int i = 0; i < ip->nflat; i++)
+        if (ip->flat[i].stage != stage || ip->flat[i].kind != 1) ip->flat[w++] = ip->flat[i];
+    ip->nflat = w;
+
+    for (uint32_t v = 1; v <= m->bound; v++) {
+        if (!m->isvar[v] || !m->vglobal[v] || m->vsc[v] != want) continue;
+        uint32_t pt = pointee(m, m->vtype[v]);
+        if (m->t[pt].kind != T_ARRAY) continue;                        /* block arrays only */
+        uint32_t st = m->t[pt].elem;
+        if (m->t[st].kind != T_STRUCT || !get_dec(m, st, -1, SpvDecorationBlock, NULL)) continue;
+        if (!get_dec(m, v, -1, SpvDecorationPatch, NULL)) {
+            /* members must ALL be patch (SPIRV-Cross's is_patch_block rule) */
+            if (!m->t[st].nmem) continue;
+            bool all_patch = true;
+            for (uint32_t mi = 0; mi < m->t[st].nmem && all_patch; mi++)
+                if (!get_dec(m, st, (int32_t)mi, SpvDecorationPatch, NULL)) all_patch = false;
+            if (!all_patch) continue;
+        }
+        if (is_builtin_var(m, v)) continue;
+        uint32_t N = m->t[pt].count, nmem = m->t[st].nmem;
+        if (!N || !nmem || N * nmem > 64) continue;
+        /* arrays of matrices inside the members: left to the r87 pass, whose
+         * records key on the struct id — a combined shape has no coverage */
+        bool skip = false;
+        for (uint32_t mi = 0; mi < nmem && !skip; mi++) {
+            uint32_t mt = m->t[st].mem[mi];
+            if (m->t[mt].kind == T_ARRAY && m->t[m->t[mt].elem].kind == T_MATRIX) skip = true;
+        }
+        for (int f = 0; f < ip->nflat && !skip; f++)
+            if (ip->flat[f].stage == stage && ip->flat[f].st == st) skip = true;
+        if (skip) continue;
+
+        /* feasibility: the array type is only the variable's own type, and
+         * every use of the variable is an access chain [v][k][mi][rest…] with
+         * constant k and mi (no whole array / element / member pointers) */
+        bool ok = true;
+        for (size_t i = 1; i < m->n && ok; i++) {
+            uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
+            if (op == SpvOpName || op == SpvOpMemberName || op == SpvOpDecorate ||
+                op == SpvOpMemberDecorate)
+                continue;
+            if (op == SpvOpTypeArray && m->in[i].w[1] == pt) continue;
+            if (op == SpvOpTypeStruct && m->in[i].w[1] == st) continue;
+            if (op == SpvOpTypePointer && wc >= 4 && m->in[i].w[3] == pt) continue;   /* replaced */
+            for (uint32_t k = 1; k < wc && ok; k++)
+                if (m->in[i].w[k] == pt) ok = false;
+        }
+        for (size_t i = 1; i < m->n && ok; i++) {
+            uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
+            if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 4 &&
+                m->in[i].w[3] == v) {
+                int64_t k = (wc >= 5) ? flat_idx_const(m, m->in[i].w[4]) : -1;
+                int64_t mi = (wc >= 6) ? flat_idx_const(m, m->in[i].w[5]) : -1;
+                if (wc < 6 || k < 0 || (uint64_t)k >= N || mi < 0) ok = false;
+            } else if (op == SpvOpLoad && wc >= 4 && m->in[i].w[3] == v) ok = false;
+            else if (op == SpvOpStore && wc >= 3 && m->in[i].w[1] == v) ok = false;
+            else if (op == SpvOpCopyMemory && wc >= 4 && (m->in[i].w[1] == v || m->in[i].w[2] == v)) ok = false;
+            else if (op == SpvOpCopyObject && wc >= 4 && m->in[i].w[3] == v) ok = false;
+            else if (op == SpvOpPtrAccessChain && wc >= 4 && m->in[i].w[3] == v) ok = false;
+        }
+        if (!ok) {
+            if (getenv("MGL_FLAT_DEBUG")) fprintf(stderr, "MGL pblock st=%d var %u '%s': shape not flattenable\n",
+                                                  stage, v, id_name(m, v) ? id_name(m, v) : "?");
+            continue;
+        }
+
+        /* member names / decorations snapshot (the originals are killed below) */
+        char memname[64][72];
+        struct { int32_t mem; uint32_t d, lit; int has_lit; } dcs[128]; int ndcs = 0;
+        for (uint32_t mi = 0; mi < nmem; mi++) {
+            const char *nm = member_name(m, st, mi);
+            snprintf(memname[mi], sizeof memname[0], "%s", nm ? nm : "");
+        }
+        for (size_t i = 0; i < m->ndec; i++) {
+            const SDec *x = &m->dec[i];
+            if (x->id == st && x->m >= 0 && !m->in[x->inst].dead && ndcs < 128) {
+                uint32_t d = x->d;
+                int has_lit = (d == SpvDecorationLocation || d == SpvDecorationComponent ||
+                               d == SpvDecorationOffset || d == SpvDecorationIndex ||
+                               d == SpvDecorationBuiltIn);
+                dcs[ndcs].mem = x->m, dcs[ndcs].d = d, dcs[ndcs].lit = x->lit,
+                dcs[ndcs].has_lit = has_lit, ndcs++;
+            }
+        }
+
+        /* the flattened struct: member k*nmem+mi = member mi of element k */
+        uint32_t st2 = (*next_id)++; mgrow(m, st2);
+        m->t[st2].kind = T_STRUCT;
+        m->t[st2].nmem = N * nmem;
+        m->t[st2].mem = malloc((N * nmem + 1) * 4);
+        {
+            uint32_t o[70];
+            o[0] = st2;
+            for (uint32_t e = 0; e < N * nmem && e < 69; e++)
+                o[1 + e] = m->t[st].mem[e % nmem], m->t[st2].mem[e] = m->t[st].mem[e % nmem];
+            ins_op(&ins->globals, SpvOpTypeStruct, (int)(N * nmem + 1), o);
+        }
+        {   /* keep the BLOCK name: reflect_io uses it as the resource prefix */
+            uint32_t id0 = st2;
+            ins_string_op(&ins->names, SpvOpName, 1, &id0, id_name(m, st) ? id_name(m, st) : "MGLPatchBlock");
+        }
+        new_dec(m, ins, st2, -1, SpvDecorationBlock, 0, 0);
+        for (uint32_t k = 0; k < N; k++)
+            for (uint32_t mi = 0; mi < nmem; mi++) {
+                uint32_t ni = k * nmem + mi;
+                char n2[80];
+                snprintf(n2, sizeof n2, "%s_%u", memname[mi], k);
+                flat_emit_member_name(m, ins, st2, ni, n2);
+                for (int d = 0; d < ndcs; d++)
+                    if ((uint32_t)dcs[d].mem == mi)
+                        new_dec(m, ins, st2, (int32_t)ni, dcs[d].d, dcs[d].has_lit, dcs[d].lit);
+            }
+
+        /* pointer + retyped variable (same id) */
+        uint32_t ptr2 = (*next_id)++; mgrow(m, ptr2);
+        m->t[ptr2].kind = T_POINTER;
+        m->t[ptr2].storage = m->vsc[v];
+        m->t[ptr2].elem = st2;
+        {
+            uint32_t o[4] = { ptr2, m->vsc[v], st2 };
+            ins_op(&ins->globals, SpvOpTypePointer, 3, o);
+            uint32_t ov[3] = { ptr2, v, m->vsc[v] };
+            ins_op(&ins->globals, SpvOpVariable, 3, ov);
+        }
+        for (size_t i = 1; i < m->n; i++)
+            if ((m->in[i].w[0] & 0xffff) == SpvOpVariable && m->in[i].w[2] == v) {
+                m->in[i].dead = 1;
+                break;
+            }
+        m->vtype[v] = ptr2;
+
+        /* access chains: [v][k][mi][rest] → [v][k*nmem+mi][rest] */
+        for (size_t i = 1; i < m->n; i++) {
+            uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
+            if ((op != SpvOpAccessChain && op != SpvOpInBoundsAccessChain) || wc < 6) continue;
+            if (m->in[i].w[3] != v) continue;
+            int64_t k = flat_idx_const(m, m->in[i].w[4]);
+            int64_t mi = flat_idx_const(m, m->in[i].w[5]);
+            if (k < 0 || (uint64_t)k >= N || mi < 0) continue;
+            uint32_t cid = flat_find_int_const(m, ins, next_id, (uint32_t)(k * nmem + mi));
+            if (!cid) continue;
+            uint32_t *nw = malloc(4 * (wc - 1));
+            nw[0] = ((uint32_t)(wc - 1) << 16) | op;
+            memcpy(&nw[1], &m->in[i].w[1], 4 * 4);   /* result, ptr type, base, — */
+            nw[4] = cid;
+            memcpy(&nw[5], &m->in[i].w[6], (wc - 6) * 4);
+            flat_replace_inst(m, i, nw, wc - 1);
+        }
+
+        /* records: one per original member; members of element k>0 of the same
+         * original member sit at start + k*nmem */
+        ip->flat = realloc(ip->flat, (ip->nflat + (int)nmem) * sizeof *ip->flat);
+        for (uint32_t mi = 0; mi < nmem; mi++) {
+            memset(&ip->flat[ip->nflat], 0, sizeof ip->flat[0]);
+            ip->flat[ip->nflat].stage = stage; ip->flat[ip->nflat].sc = want;
+            ip->flat[ip->nflat].st = st2; ip->flat[ip->nflat].start = mi;
+            ip->flat[ip->nflat].count = N; ip->flat[ip->nflat].stride = nmem;
+            ip->flat[ip->nflat].mtype = m->t[st].mem[mi]; ip->flat[ip->nflat].var = v;
+            ip->flat[ip->nflat].kind = 1;
+            snprintf(ip->flat[ip->nflat].name, sizeof ip->flat[0].name, "%s", memname[mi]);
+            ip->nflat++;
+        }
+        if (getenv("MGL_FLAT_DEBUG"))
+            fprintf(stderr, "MGL pblock st=%d var %u '%s': flattened %u x %u members -> struct %u\n",
+                    stage, v, id_name(m, v) ? id_name(m, v) : "?", N, nmem, st2);
+    }
 }
 
 static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t *out_n, MGLIProgram *ip, const char *src)
@@ -1518,8 +1847,16 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
 
     /* 0. flatten stage-in/out arrays of matrices (SPIRV-Cross cannot emit
      * them); everything below — locations, MSL, reflection — works on the
-     * flattened module */
-    flatten_io_matrix_arrays(m, ip, stage, &ins, &next_id, src);
+     * flattened module.  geom r88: both directions per stage (r87 only did
+     * Input for non-vertex stages, so TES/GS OUTPUT arrays of matrices still
+     * failed to translate).  Vertex INPUTS stay out: they are vertex
+     * attributes, bound by location, and never arrays of matrices in GL. */
+    flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassOutput);
+    if (stage != _VERTEX_SHADER)
+        flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassInput);
+    /* 0b. flatten arrays of patch interface blocks (SPIRV-Cross cannot emit
+     * those at all: "nullptr" bad-cast in its patch io-struct code) */
+    flatten_patch_block_arrays(m, ip, stage, &ins, &next_id, src);
     KV *tc = NULL; int ntc = 0; /* mapped type cache */
     KV *mpt = NULL; int nmpt = 0; /* rewritten access-chain result id -> mapped pointee type */
 
@@ -2523,6 +2860,29 @@ static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t 
                         stage, input ? "in" : "out", v, st, id_name(m, st), iname, loc, prefix, block_patch, expl);
             for (uint32_t i = 0; i < m->t[st].nmem; i++) {
                 char nm[512];
+                /* geom r88 kind 1: this struct is a flattened ARRAY OF PATCH
+                 * INTERFACE BLOCKS; members start + k*stride are element k of
+                 * the same original member.  GL sees ONE resource per original
+                 * member (the CTS reference: "no array index specifier even if
+                 * the interface is declared as an array of instances"). */
+                int f1 = -1;
+                for (int f = 0; f < ip->nflat; f++)
+                    if (ip->flat[f].stage == stage && ip->flat[f].kind == 1 && ip->flat[f].st == st &&
+                        i >= ip->flat[f].start && ip->flat[f].stride &&
+                        (i - ip->flat[f].start) % ip->flat[f].stride == 0 &&
+                        (i - ip->flat[f].start) / ip->flat[f].stride < ip->flat[f].count) { f1 = f; break; }
+                if (f1 >= 0) {
+                    if ((i - ip->flat[f1].start) / ip->flat[f1].stride == 0) {
+                        if (prefix[0]) snprintf(nm, sizeof nm, "%s.%s", prefix, ip->flat[f1].name);
+                        else snprintf(nm, sizeof nm, "%s", ip->flat[f1].name);
+                        uint32_t ml; bool mexpl = get_dec(m, st, (int32_t)i, SpvDecorationLocation, &ml) != 0;
+                        if (mexpl) loc = (GLint)ml;
+                        loc = io_leaf_walk(arr, narr, m, stage, nm, ip->flat[f1].mtype, (GLint)loc, 0,
+                                           block_patch, -1, expl || mexpl, need_expl);
+                    }
+                    /* elements >0 of the same member: same GL resource */
+                    continue;
+                }
                 /* a flattened array-of-matrix group (SPIRV-Cross cannot emit
                  * them): reassemble the ORIGINAL single member resource from
                  * the recorded array type; the other members of the group are
@@ -3151,6 +3511,10 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
 
     for (int s = 0; s < MGLI_STAGES; s++) {
         if (!ptr->shader_slots[s] || !ptr->spirv[s].ir || !ptr->spirv[s].size) continue;
+        if (getenv("MGL_FLAT_DEBUG"))
+            fprintf(stderr, "MGL proc: prog=%u stage %d words=%zu first_word=%08x\n",
+                    ptr->name, s, ptr->spirv[s].size,
+                    ptr->spirv[s].size ? ptr->spirv[s].ir[5] : 0);
         sc[s].r = mod_parse(ptr->spirv[s].ir, ptr->spirv[s].size);
         if (!sc[s].r) { fprintf(stderr, "MGL introspect: stage %d: cannot parse SPIR-V\n", s); continue; }
         sc[s].present = 1;

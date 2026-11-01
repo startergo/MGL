@@ -417,7 +417,12 @@ static int build_emulated(GLenum mode, const VertexSource *src, GLsizei count, I
             return MGL_PRIM_LINE;
 
         case GL_TRIANGLES_ADJACENCY:
-            /* same restart rule, 6 indices per group, the triangle is (i1, i3, i5) */
+            /* same restart rule, 6 indices per group.  The triangle is
+             * (i0, i2, i4) — i1, i3, i5 are the adjacency vertices (GL 4.6
+             * §10.1.13; the r86h/i version picked (i2, i4, i5), which rendered
+             * the adjacency vertices as the primitive: KHR-GL46
+             * draw_indirect.basic-mode-*-triangles_adjacency showed extra
+             * triangles). */
             {
                 GLsizei run = 0;
                 for (GLsizei k = 0; k < count; k++)
@@ -425,9 +430,9 @@ static int build_emulated(GLenum mode, const VertexSource *src, GLsizei count, I
                     if (vs_is_restart(src, k)) { run = 0; continue; }
                     if (++run == 6)
                     {
-                        il_push(out, vs_get(src, k - 4));
-                        il_push(out, vs_get(src, k - 2));
-                        il_push(out, vs_get(src, k));
+                        il_push(out, vs_get(src, k - 5));
+                        il_push(out, vs_get(src, k - 3));
+                        il_push(out, vs_get(src, k - 1));
                         run = 0;
                     }
                 }

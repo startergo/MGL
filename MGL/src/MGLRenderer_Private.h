@@ -231,6 +231,11 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (void) geomReleaseImageAtomics;
 - (id<MTLComputePipelineState>) geomAtomResolvePso: (MTLTextureType) tt format: (MTLPixelFormat) pf;
 - (void) geomResolveImageAtomics;
+/* geom r88: DEFINE a freshly created multisample texture's contents as zero —
+ * Metal leaves private MS storage undefined, and the image-atomic sidecar seed
+ * (and any unwritten-texel read) must not observe recycled garbage.  Called
+ * from texextCreateMultisampleTexture (MGLRenderer+TextureExt.m). */
+- (void) geomDefineMultisampleTexture: (id<MTLTexture>) t;
 /* geom: SSBO runtime-array .length() — bind SPIRV-Cross's spvBufferSizeConstants
  * (bound-range byte size of the SSBO at each Metal buffer index) to the render or
  * compute tables; no-op when the stage MSL does not reference it */

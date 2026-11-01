@@ -367,7 +367,13 @@ static struct MGLExtMetal_texext s_texext_metal_funcs = {
     if (info->has_format_views)
         desc.usage |= MTLTextureUsagePixelFormatView;
 
-    return [_device newTextureWithDescriptor: desc];
+    id<MTLTexture> ms = [_device newTextureWithDescriptor: desc];
+    /* geom r88: glTexImage*Multisample takes no data and private storage reads
+     * back UNDEFINED (recycled) bytes — define the texture as zero with one
+     * empty clear pass (see geomDefineMultisampleTexture) so every consumer,
+     * notably the image-atomic sidecar seed, is deterministic */
+    if (ms) [self geomDefineMultisampleTexture: ms];
+    return ms;
 }
 
 - (GLsizei) texextSampleCountFor: (GLenum) internalformat samples: (GLsizei) samples

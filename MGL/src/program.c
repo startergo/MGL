@@ -348,6 +348,17 @@ typedef struct LinkCacheEnt {
     MGLProgramObj *snap;                          /* owns a full linked executable */
     struct { uint32_t var; GLint gl; } *attrib_gl; int nattrib_gl;
     uint8_t *dub_leaf[MGLI_STAGES]; int dub_leaf_n[MGLI_STAGES];
+    /* geom r88: the flattening records (mgl_ext_introspect.h MGLIProgram.flat —
+     * arrays of matrices / patch interface blocks flattened at SPIR-V level by
+     * mgl_introspect_patch_stage).  Without them a cache hit introspects the
+     * ALREADY-FLATTENED snapshot module and reports the flattened element names
+     * (TargetInterface.target_0/1/2) instead of the canonical member
+     * (TargetInterface.target, array size 3) — dEQP-GL45-ES31 program_interface_
+     * query program_input.{array_size,location,name_length,is_per_patch}.
+     * interface_blocks.patch_in.block_array.*: the resource_list case populates
+     * this cache, the property cases then hit it.  Stored as raw bytes (the
+     * record type is anonymous in the header). */
+    uint8_t *flat; size_t flat_bytes; int nflat;
     struct { char *name; uint32_t *vals; int nvals; int wide; } *inits[MGLI_STAGES];
     int ninits[MGLI_STAGES];
     /* tess: the vs-only vertex stage's compute-kernel variant — the link cache
@@ -379,6 +390,7 @@ static void link_ent_clear(GLMContext ctx, LinkCacheEnt *e)
     e->vs_kernel_entry[0] = 0;
     e->vs_kernel_spirv_entry[0] = 0;
     free(e->attrib_gl); e->attrib_gl = NULL; e->nattrib_gl = 0;
+    free(e->flat); e->flat = NULL; e->flat_bytes = 0; e->nflat = 0;
     for (int s = 0; s < MGLI_STAGES; s++)
     {
         free(e->dub_leaf[s]); e->dub_leaf[s] = NULL; e->dub_leaf_n[s] = 0;
@@ -681,6 +693,19 @@ static void link_isnap_restore(GLMContext ctx, GLuint program, const LinkCacheEn
             }
         }
     }
+    if (ip->flat) { free(ip->flat); ip->flat = NULL; }
+    ip->nflat = 0;
+    if (e->flat && e->nflat)
+    {
+        ip->flat = malloc(e->flat_bytes);
+        if (ip->flat)
+        {
+            memcpy(ip->flat, e->flat, e->flat_bytes);
+            ip->nflat = e->nflat;
+            if (getenv("MGL_LINK_CACHE_DEBUG"))
+                fprintf(stderr, "MGL link cache: HIT restored flat n=%d\n", e->nflat);
+        }
+    }
 }
 
 /* try to satisfy obj's link from the cache; returns true on a hit (obj holds the
@@ -831,6 +856,18 @@ static void link_cache_put(GLMContext ctx, MGLProgramObj *obj, const uint64_t k[
         {
             memcpy(e->attrib_gl, ip->attrib_gl, ip->nattrib_gl * sizeof(*e->attrib_gl));
             e->nattrib_gl = ip->nattrib_gl;
+        }
+    }
+    if (ip->flat && ip->nflat)
+    {
+        e->flat = malloc((size_t)ip->nflat * sizeof(*ip->flat));
+        if (e->flat)
+        {
+            memcpy(e->flat, ip->flat, (size_t)ip->nflat * sizeof(*ip->flat));
+            e->flat_bytes = (size_t)ip->nflat * sizeof(*ip->flat);
+            e->nflat = ip->nflat;
+            if (getenv("MGL_LINK_CACHE_DEBUG"))
+                fprintf(stderr, "MGL link cache: PUT captured flat n=%d bytes=%zu\n", e->nflat, e->flat_bytes);
         }
     }
     for (int s = 0; s < MGLI_STAGES; s++)
@@ -3148,11 +3185,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
          * block instance arrays (uniform UB {..} ub[12]) expand to one entry
          * each, see mapGLBuffersToMTLBufferMap */
         int ac_base = 0;
-        for (int t = 0; t < 3; t++)
+        for (int t = 0; t < (stage == _COMPUTE_SHADER ? 4 : 3); t++)
         {
             int type = t == 0 ? SPVC_RESOURCE_TYPE_UNIFORM_BUFFER
                     : t == 1 ? SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT
-                             : SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
+                    : t == 2 ? SPVC_RESOURCE_TYPE_STORAGE_BUFFER
+                             : SPVC_RESOURCE_TYPE_STORAGE_IMAGE;
+            /* geom r88: for the COMPUTE stage STORAGE_IMAGE counts too — every
+             * image with atomic accesses gets a SPIRV-Cross `<name>_atomic`
+             * sidecar MTLBuffer argument (the format-less MS store lowering
+             * widened the set, and test_capszoo's zoo hit the collision:
+             * img0_atomic [[buffer(0)]] vs atCounter [[buffer(0)]] — "cannot
+             * reserve 'buffer' resource location at index 0").  Compute only:
+             * there mgl_msl_fix_image_atomics keeps SPIRV-Cross's indices
+             * (start = -1) while the render stages rebase the sidecar arguments
+             * above all user buffers, so for those the extra gap only moved
+             * atCounter and broke vs_atomic_counter's binding (count stayed 0).
+             * Over-counting just leaves gaps, which are legal. */
             for (GLuint i = 0; i < ptr->spirv_resources_list[stage][type].count; i++)
             {
                 unsigned as = ptr->spirv_resources_list[stage][type].list[i].array_size;

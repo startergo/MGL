@@ -1261,7 +1261,28 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
                     todo[ntodo].var = var;
                     todo[ntodo].base_ptr = base_ptr;
                     todo[ntodo].arrayed = (defb[imgt] & 2u) != 0;
-                    todo[ntodo].ncomp = ms_format_components(defb[imgt] >> 16);
+                    /* GLSL images WITHOUT a format qualifier (legal with writeonly —
+                     * KHR-GL46.multi_bind's fillMSTexture) come out of glslang with
+                     * ImageFormat Unknown; the binding's format rules at run time.
+                     * The sidecar layout is a 32-bit word per component regardless
+                     * (4*(sample + S*texel) + channel, seed/flush/fold agree), so when
+                     * the format is Unknown derive the width from the image's SAMPLED
+                     * TYPE: 32-bit base (uint/int/float) -> 4 word components; anything
+                     * else keeps the drop path.  Without this the whole WRITE was kept
+                     * on texture2d_ms, mgl_msl_fix_ms_image_writes dropped it, and the
+                     * store silently vanished (dispatch_bind_image_textures). */
+                    {
+                        int nc = ms_format_components(defb[imgt] >> 16);
+                        if (nc == 0)
+                        {
+                            uint32_t st = defa[imgt];
+                            uint32_t base = (defop[st] == SpvOpTypeVector) ? defa[st] : st;
+                            uint32_t width = (defop[base] == SpvOpTypeInt ||
+                                              defop[base] == SpvOpTypeFloat) ? defa[base] : 0;
+                            if (width == 32) nc = 4;
+                        }
+                        todo[ntodo].ncomp = nc;
+                    }
                     ntodo++;
                 }
             }
@@ -3520,6 +3541,58 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                          !spv_deco(m, t->id, SpvDecorationBufferBlock, NULL);
             GLuint next_loc = location;
 
+            /* geom r88c: the introspection flattening (r87/r88a, introspect_spirv.c
+             * flatten_io_matrix_arrays_dir) re-types a stage-in/out ARRAY OF MATRICES
+             * into a struct of N members named <var>_0 .. <var>_(N-1), all of ONE
+             * matrix type.  GL still sees ONE array resource ("name", elems = N) —
+             * reassemble it here so the whole-array tf capture resolves
+             * (dEQP-GL45-ES31 transform_feedback_varying.type.separable_geometry.
+             * whole_array.mat3x4: without this the per-member entries made xfb
+             * resolve "target" as a block instance and the capture matched nothing).
+             * Structural detection: every member has the same type id and is named
+             * <varname>_<member index>. */
+            do {
+                SpvType *mt;
+                char want[96];
+                bool ok = true;
+                int mi;
+
+                if (anon || !inst || t->n_members < 1) break;
+                mt = spv_find_type(m, t->members[0]);
+                while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+                if (!mt || (mt->kind != SPVT_MAT && mt->kind != SPVT_VEC &&
+                            mt->kind != SPVT_FLOAT && mt->kind != SPVT_INT && mt->kind != SPVT_BOOL))
+                    break;
+                for (mi = 0; mi < t->n_members; mi++)
+                {
+                    const char *mn = spv_member_name(m, t->id, mi);
+                    if (t->members[mi] != t->members[0]) { ok = false; break; }
+                    snprintf(want, sizeof want, "%s_%d", inst, mi);
+                    if (!mn || strcmp(mn, want)) { ok = false; break; }
+                }
+                if (!ok) break;
+
+                out = &vars[n++];
+                memset(out, 0, sizeof(*out));
+                snprintf(out->name, sizeof(out->name), "%s", inst);
+                out->elems = (GLuint)t->n_members;
+                out->xfb_buffer = -1;
+                out->xfb_offset = 0xffffffffu;
+                out->location = location;
+                out->base = mt->kind == SPVT_FLOAT ? (mt->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
+                            mt->kind == SPVT_INT ? (mt->is_signed ? GL_INT : GL_UNSIGNED_INT) :
+                            mt->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, mt);
+                out->rows = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n :
+                            mt->kind == SPVT_VEC ? mt->n : 1;
+                out->cols = mt->kind == SPVT_MAT ? mt->n : 1;
+                out->words = out->elems * out->cols * out->rows * base_words(out->base);
+                out->flat = spv_deco(m, v->id, SpvDecorationFlat, NULL);
+                out->noperspective = spv_deco(m, v->id, SpvDecorationNoPerspective, NULL);
+                if (spv_deco(m, v->id, SpvDecorationStream, &tmp)) out->stream = tmp;
+                if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
+                if (spv_deco(m, v->id, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
+                goto flat_merged;    /* one canonical array entry replaces the member list */
+            } while (0);
             for (int mi = 0; mi < t->n_members && n < MGL_GEOM_MAX_VARYINGS; mi++)
             {
                 const char *mn = spv_member_name(m, t->id, mi);
@@ -3608,6 +3681,8 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 else if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
                 if (spv_member_deco(m, t->id, mi, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
             }
+            continue;
+        flat_merged: ;
             continue;
         }
 

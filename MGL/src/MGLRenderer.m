@@ -2645,8 +2645,22 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if ([self texdataBindMTLTexture: tex])
         return true;
 
+    id<MTLTexture> keepOld = nil;   /* r88 (geom): see below — a pure ACCESS flip keeps contents */
     if (tex->dirty_bits)
     {
+        /* r88 (geom): a PURE ACCESS flip (glBindImageTexture WRITE_ONLY <-> READ_WRITE
+         * / READ_ONLY) only changes the Metal USAGE flags, never the storage identity —
+         * but this recreation used to throw the contents away.  KHR-GL46.multi_bind
+         * dispatch_bind_image_textures fills a texture zoo (imageStore / SubImage),
+         * then glBindImageTextures rebinds everything READ_WRITE: the flip wiped
+         * every texture to fresh zeros before the verifying dispatch.  Keep the old
+         * MTLTexture alive across the recreation and blit it into the new one (same
+         * size/format/sampleCount; the full-texture copy works for MS and array too). */
+        if (tex->dirty_bits == DIRTY_TEXTURE_ACCESS && tex->mtl_data)
+        {
+            keepOld = (__bridge id<MTLTexture>)tex->mtl_data;
+            CFRetain((__bridge CFTypeRef)keepOld);
+        }
         // release mtl data
         if (tex->mtl_data)
         {
@@ -2684,10 +2698,32 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
         tex->params.mtl_data = (void *)CFBridgingRetain([self createMTLSamplerForTexParam:&tex->params target:tex->target]);
         // Sampler creation should not fail even in recovery mode
-        if (!tex->params.mtl_data) {
-            NSLog(@"MGL WARNING: Sampler creation failed, using default");
+        if (!tex->params.mtl_data) {            NSLog(@"MGL WARNING: Sampler creation failed, using default");
             tex->params.mtl_data = (void *)CFBridgingRetain([_device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]]);
         }
+    }
+
+    /* r88 (geom): the ACCESS-flip recreation above must PRESERVE CONTENTS — blit the
+     * retained old texture into the fresh one before anyone reads it.  Recorded on
+     * the shared command buffer (FIFO: this pass precedes every later encoder that
+     * touches the texture); the old texture is only used by this pass, so dropping
+     * the extra retain right after encoding is safe (the buffer retains it). */
+    if (keepOld && tex->mtl_data)
+    {
+        id<MTLTexture> newT = (__bridge id<MTLTexture>)tex->mtl_data;
+        [self endRenderEncoding];
+        if (!_currentCommandBuffer && ![self newCommandBuffer]) newT = nil;
+        if (newT)
+        {
+            id<MTLBlitCommandEncoder> benc = [_currentCommandBuffer blitCommandEncoder];
+            if (benc)
+            {
+                [benc copyFromTexture: keepOld toTexture: newT];
+                [benc endEncoding];
+            }
+        }
+        CFRelease((__bridge CFTypeRef)keepOld);
+        keepOld = nil;
     }
 
     return true;

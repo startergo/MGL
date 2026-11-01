@@ -2279,8 +2279,18 @@ static char *reject_binding_range(const char *src, const MGLCompatBindingLimits 
 
         char err[96];
         unsigned limit = 0;
+        bool per_element_binding = true;   /* block/sampler/image arrays take binding..binding+N-1 */
         if (bs_word_is(a, a_n, "uniform") && bs_word_is(b, b_n, "atomic_uint"))
+        {
             limit = lim->atomic_bindings;
+            /* atomic_uint ARRAYS stay in ONE buffer binding point at consecutive
+             * offsets (GLSL 4.60 §4.4.2.3 / ARB_shader_atomic_counters) — only
+             * binding itself has to be < GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS.
+             * The r86 count rule here wrongly rejected KHR-GL46
+             * layout_binding.atomic_uint_layout_binding_atomic_*_array_size
+             * (binding=0, atomic_uint[N]) and geometry_shader.api.max_atomic_counters. */
+            per_element_binding = false;
+        }
         else if (bs_word_is(a, a_n, "uniform") && b && nxt == '{')
             limit = lim->ubo_bindings;                     /* uniform block */
         else if (bs_word_is(a, a_n, "uniform") && b_n >= 5 && strncmp(b, "image", 5) == 0)
@@ -2294,7 +2304,7 @@ static char *reject_binding_range(const char *src, const MGLCompatBindingLimits 
             /* an instance array occupies binding .. binding+N-1: the LAST index must stay
              * under the limit too (GLSL 4.60 4.4.5 / dEQP layout_binding.negative
              * *_binding_over_max_array, which picks binding = limit + 1 - N) */
-            unsigned count = bs_decl_count(s.p, s.end, nxt);
+            unsigned count = per_element_binding ? bs_decl_count(s.p, s.end, nxt) : 1;
             if (binding >= limit || (count > 1 && binding + count - 1 >= limit))
             {
                 snprintf(err, sizeof err,

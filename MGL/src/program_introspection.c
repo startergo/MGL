@@ -962,6 +962,13 @@ GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum progra
         }
     for (int i = 0; i < n; i++) if (!strcmp(resource_name(ip, programInterface, i), name)) return (GLuint)i;
     for (int i = 0; i < n; i++) if (name_matches_var(resource_name(ip, programInterface, i), name)) return (GLuint)i;
+    if (getenv("MGL_GPI_DEBUG"))
+    {
+        fprintf(stderr, "MGL gpi: MISS iface=%#x name='%s' n=%d:", programInterface, name, n);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, " [%d]='%s'", i, resource_name(ip, programInterface, i));
+        fprintf(stderr, "\n");
+    }
     return GL_INVALID_INDEX;
 }
 

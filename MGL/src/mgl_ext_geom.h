@@ -426,6 +426,24 @@ struct MGLExtState_geom {
              * Elements past 8 fall back to binding+e (arrays that long with a
              * remap are pathological; consecutive default). */
             GLuint eunits[8]; } img_atom[TEXTURE_UNITS];
+    /* r88: a sidecar whose unit was REBOUND to a different texture before its
+     * stores resolved is RETIRED here instead of dropped — the entry keeps the
+     * record's own retained buffer + view, and the next geomResolveImageAtomics
+     * flushes it into the OLD texture (KHR-GL46.multi_bind's fillMSTexture
+     * fills a whole texture zoo through ONE image unit with no barrier between
+     * the fills; without this every fill but the last was lost).  Single-image
+     * MULTISAMPLE records only (elems <= 1, ms): the array-element records
+     * derive their views from the live image units and cannot be reconstructed
+     * after a rebind — those keep the old drop (rare, pathological; GL leaves
+     * the un-barriered contents undefined anyway).  Bounded at 16; an overflow
+     * keeps the old drop. */
+    struct { void *buf, *view; } img_retired[16];
+    int img_retired_n;
+    /* r88: image-unit VIEW cache — geomImageUnitView runs twice per walk and a
+     * fresh view object per call made every arrayed-image draw reallocate its
+     * sidecar (see the tail of geomImageUnitView).  The view is retained. */
+    struct { void *base; void *view; uint32_t type, level, slice0, slices; } view_cache[16];
+    int view_cache_n;
     void *atom_dummy;      /* the 4-byte sink for oversized (refused) sidecars */
     /* r82: "any sidecar dirty" — the O(1) early-out of geomResolveImageAtomics
      * (glMemoryBarrier pays one load instead of a 128-slot scan when no image
