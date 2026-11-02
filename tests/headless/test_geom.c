@@ -2581,6 +2581,101 @@ TEST(tessellation_point_mode_into_gs)
 
 /* primitive restart with a geometry shader: the restarted runs are separate primitives and
  * the capture pass never sees the restart index */
+
+TEST(primitive_restart_points_gl_primitive_id_in)
+{
+    /* POINTS + restart mid-list (dEQP geometry_shading.basic.primitive_id_in_restarted):
+     * indices [3, 2, restart, 1] give 3 points with gl_PrimitiveIDIn 0,1,2 — the
+     * CPU-assembly path used the restart-free count as the sequence length and
+     * dropped the point after the restart */
+    const char *gs =
+        "#version 450 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices = 1) out;\n"
+        "layout(location=0) out float id;\n"
+        "void main(){ gl_Position = gl_in[0].gl_Position; id = float(gl_PrimitiveIDIn);"
+        " EmitVertex(); EndPrimitive(); }\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in float id;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = vec4(1.0, id / 2.0, 0.0, 1.0); }\n";
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    GLuint p = program(vs, gs, fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    /* own 256x256 framebuffer: the default drawable is 1024x768 and the point
+     * coordinates below are exact only for a known viewport */
+    GLint saved_vp[4] = { 0, 0, 0, 0 };
+    glGetIntegerv(GL_VIEWPORT, saved_vp);
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    EXPECT_EQ_INT(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
+    glViewport(0, 0, 256, 256);
+    glUseProgram(p);
+    clear_black();
+    glPointSize(32.0f);
+    static const float v[8] = { -0.5f, 0.5f, 0.5f, 0.5f, -0.5f, -0.5f, 0.5f, -0.5f };
+    static const GLushort idx16[4] = { 3, 2, 0xffff, 1 };
+    GLuint vao2 = 0, vbo2 = 0, ebo = 0;
+    glGenVertexArrays(1, &vao2);
+    glGenBuffers(1, &vbo2);
+    glGenBuffers(1, &ebo);
+    glBindVertexArray(vao2);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+    glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx16, idx16, GL_STATIC_DRAW);
+
+    /* one restarting draw (GL_PRIMITIVE_RESTART with the ushort index) */
+    glEnable(GL_PRIMITIVE_RESTART);
+    glPrimitiveRestartIndex(0xffff);
+    glDrawElements(GL_POINTS, 4, GL_UNSIGNED_SHORT, 0);
+    glDisable(GL_PRIMITIVE_RESTART);
+    EXPECT_NO_GL_ERROR();
+
+    /* points for vertices 3, 2, 1 (drawn in that order): gl_PrimitiveIDIn 0, 1, 2 */
+    struct { int x, y; float g; } want[3] = { { 192, 64, 0.0f }, { 64, 64, 0.5f }, { 192, 192, 1.0f } };
+    for (int i = 0; i < 3; i++)
+    {
+        unsigned char px[4];
+        glFinish();
+        glReadPixels(want[i].x, want[i].y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        EXPECT_TRUE(px[0] > 200);
+        EXPECT_TRUE(px[1] == (unsigned char)(want[i].g * 255.0f + 0.5f));
+    }
+    /* vertex 0's quadrant stays empty */
+    unsigned char px[4];
+    glFinish();
+    glReadPixels(64, 192, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    EXPECT_TRUE(px[0] == 0 && px[1] == 0);
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao2);
+    glDeleteBuffers(1, &vbo2);
+    glDeleteBuffers(1, &ebo);
+    /* restore the state the next test sees: point size, framebuffer, viewport */
+    glPointSize(1.0f);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(saved_vp[0], saved_vp[1], saved_vp[2], saved_vp[3]);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glDeleteProgram(p);
+}
+
 TEST(primitive_restart_with_gs)
 {
     const char *gs =
@@ -4970,6 +5065,7 @@ int main(void)
     RUN_IF(tessellation_point_mode_into_gs);
     RUN_IF(xfb_of_tes_output);
     RUN_IF(xfb_of_tes_gs_output);
+    RUN_IF(primitive_restart_points_gl_primitive_id_in);
     RUN_IF(primitive_restart_with_gs);
     RUN_IF(pool_rotation_hazard);
     RUN_IF(wild_index_survives_cpu_assembly);

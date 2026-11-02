@@ -298,6 +298,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
             [self extBufEnsureCommandBuffer];
             [self endRenderEncoding];
 
+            NSLog(@"MGL TRAIL MGLRenderer+Draw.m:301 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
             id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
             [blit synchronizeResource: b];
             [blit endEncoding];
@@ -813,6 +814,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
      * current program/pipeline uses image units) */
     [self geom3DImageShadowSync];
 
+    NSLog(@"MGL TRAIL MGLRenderer+Draw.m:816 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc)
         return false;
@@ -912,6 +914,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     [self extBufEnsureCommandBuffer];
     [self endRenderEncoding];
 
+    NSLog(@"MGL TRAIL MGLRenderer+Draw.m:915 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     [blit copyFromBuffer: (__bridge id<MTLBuffer>)src->data.mtl_data sourceOffset: so
                 toBuffer: (__bridge id<MTLBuffer>)dst->data.mtl_data destinationOffset: dof size: size];

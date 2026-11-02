@@ -183,6 +183,9 @@ typedef struct MGLAtomicCounterVar
     const char *name;      /* points at name_buf once collected in program.c */
     char name_buf[256];
     unsigned offset;       /* SpvDecorationOffset, byte offset into the counter buffer */
+    unsigned dims[4];      /* array dimensions, OUTERMOST first (atomic_uint a[2][3] -> 2,3);
+                            * ndims 0 = not an array (a plain counter) */
+    int      ndims;
 } MGLAtomicCounterVar;
 
 typedef struct MGLGeomProgram {
@@ -525,7 +528,25 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
 /* arrays-of-matrices stage inputs (e.g. `in mat2x3 d[2]`): lowers the variable to
  * N element-typed inputs + a private shadow so SPIRV-Cross can emit MSL; returns
  * NULL when the module has nothing to lower (or cannot be lowered) */
+/* glsl_block_compat.c: anonymous interface blocks (`buffer { ... } blk;`) and
+ * inline struct declarations in a block's member list are rejected by glslang's
+ * grammar; rewrites the GLSL source (name the block, hoist the struct).  Returns
+ * NULL when the source needs no rewriting. */
+char *mgl_glsl_block_compat(const char *src);
 uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n);
+/* geom_opaque_flatten.c: arrays-of-arrays of an OPAQUE type (sampler2D u[2][3]) —
+ * SPIRV-Cross's MSL backend rejects them outright ("Arrays of arrays of textures
+ * are not supported in MSL"); the MSL-view module is flattened to one array of
+ * the total element count with linearized index expressions.  Returns NULL when
+ * the module has nothing to flatten (or a use the pass cannot linearize). */
+uint32_t *mgl_spirv_flatten_opaque_arrays(const uint32_t *in, size_t n, size_t *out_n);
+/* stage-gated entry used by program.c compile_stage and introspect_spirv.c msl_accepts
+ * for the GEOMETRY stage only: the emulation kernel's MSL needs the flattened module.
+ * Other stages keep the documented gap (the VS/FS link of an arrays-of-arrays sampler
+ * fails — test_hoist86 nested_struct_array_samplers pins it), and the pass is NOT
+ * chained into the shared mgl_spirv_prepare_for_msl (tess domain): a miss there
+ * clobbered the caller's word count. */
+uint32_t *mgl_geom_flatten_gs_opaque(const uint32_t *in, size_t n, size_t *out_n);
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);

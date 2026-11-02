@@ -28,6 +28,7 @@
 
 #include "shaders.h"
 #include "cts_glsl_compat.h"
+#include "mgl_ext_geom.h"       /* mgl_glsl_block_compat (glsl_block_compat.c) */
 extern char *mgl_reject_struct_member_qualifiers(const char *src);
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
@@ -1037,6 +1038,19 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         {
             free(compat);
             compat = tcompat;
+        }
+    }
+    {
+        /* geom (glsl_block_compat.c): anonymous interface blocks and inline struct
+         * declarations inside a block are GL-legal but outside glslang's grammar —
+         * rewrite them (dEQP-GL45-ES31 PIQ
+         * shader_storage_block.buffer_data_size.{named,unnamed}_block) */
+        const char *cur = compat ? compat : mgl_introspect_shader_source(ctx, ptr);
+        char *bcompat = mgl_glsl_block_compat(cur);
+        if (bcompat)
+        {
+            free(compat);
+            compat = bcompat;
         }
     }
     initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */

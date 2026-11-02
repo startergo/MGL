@@ -26,11 +26,11 @@
  */
 
 #import "MGLRenderer_Private.h"
+#include <pthread.h>
 #import "MGLRenderer+Compat.h"
 
 #import <objc/runtime.h>
 #include <stdatomic.h>
-#include <pthread.h>
 #include <sched.h>
 #include <string.h>
 #include <stdlib.h>

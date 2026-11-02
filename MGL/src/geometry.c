@@ -3940,6 +3940,70 @@ bool mgl_msl_vertex_returns_void(const char *msl, const char *entry)
  * not use: 24 for the render stages (24..30 are pinned by the tessellation /
  * transform-feedback / geometry emulation and SPIRV-Cross's buffer-size slot), 30
  * for the compute stage, whose only reserved slot is the buffer-size slot 30. */
+
+/* Linearise one or more consecutive `[expr]` groups of an atomic-counter reference
+ * (`&n[i0]`, `&n[i0][i1]`, ...) into the flat device-buffer index of the ONE pointer
+ * argument the injection declares.  GL lays atomic-counter arrays out as consecutive
+ * 4-byte words: element (i0..ik) of `n[D0][D1]..[Dk]` sits at word
+ * ((i0)*D1*D2.. + (i1)*D2.. + ..), plus the declaration's `offset` base `w`.  `after`
+ * points at the first '['; the index text is appended to `idx` (which the caller has
+ * already opened with `[`), and `*end_out` receives the position one past the last
+ * ']'.  Missing trailing groups (a whole inner array addressed) keep the stride
+ * product of the un-indexed dimensions, which is the SPIR-V addressing.  Returns
+ * false when the brackets are unbalanced, more groups than dimensions are present,
+ * or the flattened text would overflow — the caller then gives up on this set. */
+static bool ac_linear_index(const MGLAtomicCounterVar *v, const char *after, unsigned w,
+                            char *idx, size_t idx_sz, const char **end_out)
+{
+    size_t o = strlen(idx);
+    int ng = 0;
+    const char *g = after;
+    const char *ends[5] = { NULL };
+
+    while (*g == '[' && ng < 5)
+    {
+        const char *e = g + 1;
+        int depth = 1;
+        while (*e)
+        {
+            if (*e == '[') depth++;
+            else if (*e == ']' && --depth == 0) { e++; break; }
+            e++;
+        }
+        if (depth != 0 || (size_t)(e - g) > 200)
+            return false;
+        ends[ng++] = e;
+        g = e;
+    }
+    if (!ng || ng > 5)
+        return false;
+    if (ng > (v ? v->ndims : 0))
+        return false;   /* deeper indexing than the declaration has dimensions */
+
+    /* [(w)+((i0))*S0+((i1))*S1+...]: Sk is the element product behind dimension k */
+    if (w)
+        o += (size_t)snprintf(idx + o, idx_sz - o, "(%u)+(", w);
+    else
+        idx[o++] = '(';
+    for (int k = 0; k < ng; k++)
+    {
+        uint32_t stride = 1;
+        for (int d = k + 1; d < (v ? v->ndims : 0) && d < 4; d++) stride *= v->dims[d];
+        const char *body = (k ? ends[k - 1] : after) + 1;
+        size_t el = (size_t)(ends[k] - (k ? ends[k - 1] : after)) - 2;   /* inside [ ] */
+        if (k)
+            idx[o++] = '+';
+        o += (size_t)snprintf(idx + o, idx_sz - o, "(%.*s)", (int)el, body);
+        if (stride != 1)
+            o += (size_t)snprintf(idx + o, idx_sz - o, "*%u", stride);
+        if (o + 16 >= idx_sz)
+            return false;
+    }
+    snprintf(idx + o, idx_sz - o, ")");
+    *end_out = ends[ng - 1];
+    return true;
+}
+
 static char *inject_atomic_counters_core(const char *msl, const char *entry,
                                          const MGLAtomicCounterVar *vars, int nvars,
                                          int max_metal_index, int forced_base, int *indices_out);
@@ -3958,10 +4022,16 @@ char *mgl_msl_inject_atomic_counters(const char *msl, const char *entry,
     if (!xformed)
         return NULL;
 
-    char *out = inject_atomic_counters_core(xformed, entry, vars, nvars,
-                                            max_metal_index, forced_base, indices_out);
-    free(xformed);
-    return out;
+    if (getenv("MGL_GEOM_DEBUG"))
+        fprintf(stderr, "MGL geom: atomic-counter injection, pre-MSL:\n%s\n", msl);
+    {
+        char *out = inject_atomic_counters_core(xformed, entry, vars, nvars,
+                                                max_metal_index, forced_base, indices_out);
+        if (out && getenv("MGL_GEOM_DEBUG"))
+            fprintf(stderr, "MGL geom: atomic-counter injection, post-MSL:\n%s\n", out);
+        free(xformed);
+        return out;
+    }
 }
 
 /* Apple GPUs do not make a write through a `texture2d<..., access::read_write>`
@@ -5725,7 +5795,7 @@ static char *inject_atomic_counters_core(const char *msl, const char *entry,
         {
             const char *after = q + strlen(bad);
             size_t bl = strlen(bad);
-            char good[512];
+            char good[768];
 
             if (isalnum((unsigned char)*after) || *after == '_')
             {
@@ -5734,18 +5804,13 @@ static char *inject_atomic_counters_core(const char *msl, const char *entry,
             }
             if (*after == '[')
             {
-                const char *e = after + 1;
-                int bd = 1;
-                while (*e)
-                {
-                    if (*e == '[') bd++;
-                    else if (*e == ']' && --bd == 0) { e++; break; }
-                    e++;
-                }
-                if (bd != 0 || (size_t)(e - after) > 200)
+                char idx[640];
+                const char *e = NULL;
+                idx[0] = '['; idx[1] = 0;
+                if (!ac_linear_index(&vars[i], after, w, idx, sizeof idx, &e))
                     return NULL;    /* the rewrite loop below would reject it too */
-                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u+(%.*s)]",
-                         vars[i].name, w, (int)(e - after - 2), after + 1);
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s%s]",
+                         vars[i].name, idx);
                 bl += (size_t)(e - after);
             }
             else if (w)
@@ -5789,7 +5854,7 @@ static char *inject_atomic_counters_core(const char *msl, const char *entry,
         for (char *q = out; (q = strstr(q, bad)) != NULL; )
         {
             const char *after = q + strlen(bad);
-            char good[512];
+            char good[768];
             size_t bl = strlen(bad), gl;
 
             /* a longer variable name sharing this prefix (a / ac): not a match */
@@ -5801,23 +5866,23 @@ static char *inject_atomic_counters_core(const char *msl, const char *entry,
 
             if (*after == '[')
             {
-                /* copy the whole bracket group: &n[i] -> &n[(w)+(i)] — the group
-                 * itself is part of the replaced span (e points one past `]`) */
-                const char *e = after + 1;
-                int depth = 1;
-                while (*e)
-                {
-                    if (*e == '[') depth++;
-                    else if (*e == ']' && --depth == 0) { e++; break; }
-                    e++;
-                }
-                if (depth != 0 || (size_t)(e - after) > 200)
+                /* copy ALL the bracket groups: &n[i] -> &n[(w)+(i)] and, for an
+                 * array of arrays, &n[i][j] -> &n[(w)+((i))*D+(j)] (D = inner
+                 * size) — the flattened index addresses the one flat pointer the
+                 * argument declaration gives (dEQP-GL45-ES31 PIQ atomic-counter
+                 * array.var_array_array: `uniform atomic_uint var_array_array[2][3]`
+                 * is indexed with two subscripts, which a `device atomic_uint*`
+                 * does not accept) */
+                char idx[640];
+                const char *e = NULL;
+                idx[0] = '['; idx[1] = 0;
+                if (!ac_linear_index(&vars[i], after, w, idx, sizeof idx, &e))
                 {
                     free(out);
                     return NULL;
                 }
-                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s[%u+(%.*s)]",
-                         vars[i].name, w, (int)(e - after - 2), after + 1);
+                snprintf(good, sizeof good, "(volatile device atomic_uint*)&%s%s]",
+                         vars[i].name, idx);
                 bl += (size_t)(e - after);
             }
             else if (w)
@@ -8205,6 +8270,22 @@ done:
  * array declaration is one variable of OpTypeArray).  Returns the total number of
  * declarations in the module (filling at most `max`); *n_counters / *n_buffers report
  * the counters used (array elements count individually) and the distinct buffers. */
+/* per-dimension sizes of an atomic-counter (or any) declaration, OUTERMOST first:
+ * walks the OpTypeArray chain through pointer types */
+static int spv_array_dims(SpvModule *m, uint32_t type_id, unsigned *dims, int maxd)
+{
+    SpvType *t = spv_find_type(m, type_id);
+    int n = 0;
+    while (t && t->kind == SPVT_PTR) t = spv_find_type(m, t->elem);
+    while (t && t->kind == SPVT_ARRAY && n < maxd)
+    {
+        dims[n++] = t->n ? t->n : 1;
+        t = spv_find_type(m, t->elem);
+        while (t && t->kind == SPVT_PTR) t = spv_find_type(m, t->elem);
+    }
+    return n;
+}
+
 static int geom_module_ac_vars(SpvModule *m, MGLAtomicCounterVar *vars, GLuint *bindings,
                                int max, int *n_counters, int *n_buffers)
 {
@@ -8220,6 +8301,18 @@ static int geom_module_ac_vars(SpvModule *m, MGLAtomicCounterVar *vars, GLuint *
         if (v->storage != SpvStorageClassAtomicCounter) continue;
         spv_value_type(m, v->type_id, &asz);
         spv_deco(m, v->id, SpvDecorationBinding, &bind);
+        {
+            /* spv_value_type reports only the OUTERMOST length: an array of arrays
+             * (atomic_uint a[2][3]) must count every element (6 counters) */
+            unsigned dm[4];
+            int nd = spv_array_dims(m, v->type_id, dm, 4);
+            if (nd > 1)
+            {
+                uint32_t total = 1;
+                for (int k = 0; k < nd; k++) total *= dm[k];
+                asz = total;
+            }
+        }
         nac += (int)asz;
         for (int k = 0; k < nacb; k++)
             if (dbind[k] == bind) { seen = true; break; }
@@ -8233,6 +8326,7 @@ static int geom_module_ac_vars(SpvModule *m, MGLAtomicCounterVar *vars, GLuint *
             vars[nvars].name = vars[nvars].name_buf;
             vars[nvars].offset = 0;
             spv_deco(m, v->id, SpvDecorationOffset, &vars[nvars].offset);
+            vars[nvars].ndims = spv_array_dims(m, v->type_id, vars[nvars].dims, 4);
             bindings[nvars] = bind;
             nvars++;
         }
@@ -8498,12 +8592,17 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         goto done;
     }
 
-    /* total output component limit */
+    /* total output component limit — the GL rule (GL 4.6 11.1.3.4 / dEQP's
+     * componentsPerVertex gate in es31fGeometryShaderTests): gl_Position (4) +
+     * the USER output varyings, times max_vertices.  The emulation record also
+     * carries point size / layer / viewport index / primitive id / clip+cull
+     * words, but those built-ins do not count toward
+     * MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS and the GPU budget is guarded by
+     * MGL_GEOM_BUDGET_BYTES (256MB) instead. */
     {
-        GLuint comps = 0;
+        GLuint comps = 4 * gp->max_vertices;
         for (i = 0; i < gp->n_out; i++)
             comps += gp->out_v[i].words * gp->max_vertices;
-        comps += (4 + 1 + 1 + 1 + 1 + 2 * gp->out_clip_size) * gp->max_vertices;
         if (comps > (GLuint)2048)
         {
             mgl_append_log(log, "ERROR: geometry: %u total output components exceeds the limit %u\n",
@@ -9841,9 +9940,15 @@ static uint32_t *geom_index_list(GLMContext ctx, GLenum type, size_t offset, GLs
     Buffer *eb = ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL;
     uint32_t *out = xmalloc(sizeof(uint32_t) * (size_t)(count > 0 ? count : 1));
     const uint8_t *p;
+    /* the type's largest representable value, reported for the callers' min/max
+     * window EXCLUSION: when restart is disabled it still keeps a stray sentinel
+     * out of the window, and when it is enabled the CPU assembly route overrides
+     * this with the draw's real sentinel (fixed-index mode or a custom
+     * glPrimitiveRestartIndex) after the call — geom_index_list does NOT know the
+     * restart state. */
     GLuint restart = (type == GL_UNSIGNED_BYTE) ? 0xff : (type == GL_UNSIGNED_SHORT) ? 0xffff : 0xffffffffu;
 
-    *restart_out = restart;
+    if (restart_out) *restart_out = restart;
 
     mgl_buffers_prepare_cpu_read(ctx, eb);
     if (!eb->data.buffer_data)
@@ -9912,10 +10017,16 @@ static uint32_t geom_affine_stride(GLenum mode, uint32_t in_verts, bool provokin
     }
 }
 
-static uint32_t geom_restart_index(GLMContext ctx)
+static uint32_t geom_restart_index(GLMContext ctx, GLenum type)
 {
+    /* PRIMITIVE_RESTART_FIXED_INDEX (which wins when both modes are enabled, the
+     * same precedence the CPU assembly route's split uses) restarts at the largest
+     * value the index TYPE can represent; plain PRIMITIVE_RESTART uses
+     * glPrimitiveRestartIndex.  0xffffffff doubles as the "no restart" sentinel:
+     * the prep kernel's restart_en (and the CPU route's rst) gate that case. */
+    if (ctx->state.caps.primitive_restart_fixed_index)
+        return (type == GL_UNSIGNED_BYTE) ? 0xffu : (type == GL_UNSIGNED_SHORT) ? 0xffffu : 0xffffffffu;
     if (!ctx->state.caps.primitive_restart) return 0xffffffffu;
-    if (ctx->state.caps.primitive_restart_fixed_index) return 0xffffffffu;  /* the fixed index */
     return (uint32_t)ctx->state.var.primitive_restart_index;
 }
 
@@ -10310,7 +10421,7 @@ void mgl_geom_route(GLMContext ctx, GLenum mode, bool indexed, GLenum type, size
     d.instances = instances;
     d.basevertex = basevertex;
     d.baseinstance = baseinstance;
-    d.restart = geom_restart_index(ctx);
+    d.restart = geom_restart_index(ctx, type);
     d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
     /* affine direct draws (glDrawArrays*): the primitive windows are a fixed stride apart,
      * so the geometry kernel can derive them arithmetically and the whole prep stage
@@ -10360,21 +10471,42 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
     GLsizei index_count = 0;
     GLuint i;
 
-    /* build the vertex sequence and (for indexed draws) the capture index list: primitive
-     * restart entries are removed from the capture draw */
+    /* build the vertex sequence and (for indexed draws) the capture index list.
+     * A RESTART only splits a run when primitive restart is actually ENABLED —
+     * geom_restart_index returns the 0xffffffff sentinel when it is not, and a
+     * WILD index with that value must survive assembly untouched (test_geom
+     * wild_index_survives_cpu_assembly).  Restart entries are removed from the
+     * sequence; split[i] marks that a restart precedes sequence position i.
+     * (dEQP geometry_shading.basic.primitive_id_in_restarted: POINTS
+     * [3, 2, restart, 1] must yield 3 points with gl_PrimitiveIDIn 0,1,2.) */
+    uint8_t *split = (uint8_t *)calloc((size_t)(d->count > 0 ? d->count : 1) + 1, 1);
+    if (!split) return false;
     if (d->indexed)
     {
         uint32_t *raw = geom_index_list(ctx, d->type, d->offset, d->count, &restart);
-        if (!raw) return false;
+        if (!raw) { free(split); return false; }
         seq = xmalloc(sizeof(uint32_t) * (size_t)(d->count > 0 ? d->count : 1));
         indices = xmalloc(sizeof(uint32_t) * (size_t)(d->count > 0 ? d->count : 1));
+        bool rst = ctx->state.caps.primitive_restart || ctx->state.caps.primitive_restart_fixed_index;
+        /* the sentinel that opens a new run: geom_restart_index already carries the
+         * right value for both modes (the fixed-index mode wins when both are on,
+         * returning the type max; a custom glPrimitiveRestartIndex otherwise) */
+        uint32_t rstv = d->restart;
+        (void)restart;
+        GLuint k = 0;
         for (GLsizei j = 0; j < d->count; j++)
         {
-            seq[j] = raw[j];
-            if (raw[j] != restart) indices[index_count++] = raw[j];
+            if (rst && raw[j] == rstv)
+                split[k] = 1;              /* the next kept entry opens a new run */
+            else
+            {
+                seq[k] = raw[j];
+                indices[index_count++] = raw[j];
+                k++;
+            }
         }
         free(raw);
-        nseq = (uint64_t)index_count;
+        nseq = k;    /* restart entries are not part of the sequence */
     }
     else
     {
@@ -10397,26 +10529,32 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
     {
         free(seq);
         free(indices);
+        free(split);
         return true;              /* nothing to draw */
     }
     if (d->indexed) vmin += (uint32_t)d->basevertex, vmax += (uint32_t)d->basevertex;
 
-    /* split on primitive restart and assemble */
+    /* split on primitive restart and assemble.  split[i] marks that a restart precedes
+     * sequence position i, i.e. a NEW RUN OPENS at i — the boundary does not consume i
+     * (the restart entries themselves were dropped while building seq), so the walk
+     * advances s = e, never s = e + 1: that swallowed the run after a trailing restart
+     * and the last primitive of [3, 2, restart, 1] never reached the GS. */
     {
         uint64_t s = 0;
 
         nprims = 0;
         while (s < nseq)
         {
-            uint64_t e = s;
-            while (e < nseq && seq[e] != restart) e++;
+            uint64_t e = s + 1;
+            while (e < nseq && !split[e]) e++;
             nprims += geom_prim_count(gs_in, d->mode, e - s);
-            s = e + 1;
+            s = e;
         }
         if (!nprims)
         {
             free(seq);
             free(indices);
+            free(split);
             return true;
         }
 
@@ -10425,6 +10563,7 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
         {
             free(seq);
             free(indices);
+            free(split);
             ERROR_RETURN(GL_OUT_OF_MEMORY);
             return true;
         }
@@ -10434,8 +10573,8 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
             s = 0;
             while (s < nseq)
             {
-                uint64_t e = s;
-                while (e < nseq && seq[e] != restart) e++;
+                uint64_t e = s + 1;
+                while (e < nseq && !split[e]) e++;
                 if (e > s)
                 {
                     uint32_t *sub = xmalloc(sizeof(uint32_t) * (size_t)(e - s));
@@ -10445,12 +10584,13 @@ static bool geom_route_cpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d, G
                                         prims + np * gp->in_verts, nprims - np);
                     free(sub);
                 }
-                s = e + 1;
+                s = e;
             }
             (void)np;
         }
     }
     free(seq);
+    free(split);
 
     d->indices = indices;
     d->index_count = index_count;
@@ -10524,8 +10664,14 @@ static bool geom_route_gpu(GLMContext ctx, MGLGeomProgram *gp, MGLGeomDraw *d)
 
             if (ix)
             {
+                /* with a custom glPrimitiveRestartIndex the sentinel to keep out of
+                 * the window is THAT value (d->restart), not the type max; when
+                 * restart is disabled d->restart is the no-restart sentinel and the
+                 * type max still keeps a stray 0xffffffff from sizing a >4GB window */
+                uint32_t excl = (ctx->state.caps.primitive_restart ||
+                                 ctx->state.caps.primitive_restart_fixed_index) ? d->restart : restart;
                 for (GLsizei i = 0; i < d->count; i++)
-                    if (ix[i] != restart)
+                    if (ix[i] != excl)
                     {
                         if (ix[i] < vmin) vmin = ix[i];
                         if (ix[i] > vmax) vmax = ix[i];
@@ -10612,7 +10758,7 @@ bool mgl_geom_route_indirect(GLMContext ctx, GLenum mode, GLenum type, Buffer *i
     d.cmd_buffer = ibuf ? ibuf->data.mtl_data : NULL;
     d.cmd_offset = offset;
     d.cmd_layout = type ? 2 : 1;
-    d.restart = geom_restart_index(ctx);
+    d.restart = geom_restart_index(ctx, type);
     d.provoking_first = ctx->state.var.provoking_vertex == GL_FIRST_VERTEX_CONVENTION;
     d.count_bound = bound;
 

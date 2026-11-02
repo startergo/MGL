@@ -38,6 +38,7 @@
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_tess.h"        /* mgl_tess_prepare_spirv: isolines test-compile in msl_accepts */
+#include "mgl_ext_geom.h"        /* mgl_geom_flatten_gs_opaque: stage-gated gate/compile agreement */
 #include <ctype.h>
 
 #include "cts_glsl_compat.h"   /* bool/bvecN block members: GLSL type recovery (cts domain) */
@@ -3206,21 +3207,46 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
                 ab = ip->nabufs++;
             }
             ip->abufs[ab].stages |= 1u << stage;
-            char nm[512];
-            uint32_t cnt = m->t[t].kind == T_ARRAY ? m->t[t].count : 1;
-            if (m->t[t].kind == T_ARRAY) snprintf(nm, sizeof nm, "%s[0]", id_name(m, v)); else snprintf(nm, sizeof nm, "%s", id_name(m, v));
-            int created, ui = add_uniform(ip, nm, &created);
-            MGLIUniform *u = &ip->uniforms[ui];
-            if (created) {
-                u->type = GL_UNSIGNED_INT_ATOMIC_COUNTER; u->size = (GLint)cnt; u->offset = (GLint)off;
-                u->array_stride = m->t[t].kind == T_ARRAY ? 4 : 0; u->matrix_stride = 0;
-                u->atomic_buffer_index = ab; u->kind = MGLI_K_UINT; u->cols = u->rows = 1; u->opaque_class = 3;
-                MGLIAtomicBuffer *a = &ip->abufs[ab];
-                a->members = realloc(a->members, (a->member_count + 1) * sizeof(int));
-                a->members[a->member_count++] = ui;
-                if ((GLint)(off + 4 * cnt) > a->data_size) a->data_size = (GLint)(off + 4 * cnt);
+            /* array dimensions, outermost first (walk_default's convention: every
+             * dimension but the bottom-level array enumerates one resource
+             * "name[i0][i1]..[0]", whose size is the bottom-level count — so
+             * `atomic_uint ac[2][3]` reports "ac[0][0]" and "ac[1][0]", size 3) */
+            uint32_t adims[6];
+            int nad = 0;
+            for (uint32_t at = t; nad < 6 && m->t[at].kind == T_ARRAY; at = m->t[at].elem)
+                adims[nad++] = m->t[at].count ? m->t[at].count : 1;
+            uint32_t rows = 1, leafsz = 1, total = 1;
+            for (int q = 0; q < nad; q++) total *= adims[q];
+            for (int q = 0; q + 1 < nad; q++) rows *= adims[q];
+            leafsz = nad ? adims[nad - 1] : 1;
+            for (uint32_t row = 0; row < rows; row++) {
+                char nm[512];
+                size_t no = 0;
+                uint32_t rem = row;
+                snprintf(nm + no, sizeof nm - no, "%s", id_name(m, v));
+                no = strlen(nm);
+                for (int q = 0; q + 1 < nad; q++) {
+                    uint32_t stride = 1;
+                    for (int d = q + 1; d + 1 < nad; d++) stride *= adims[d];
+                    no += (size_t)snprintf(nm + no, sizeof nm - no, "[%u]", rem / stride);
+                    rem %= stride;
+                }
+                if (nad) no += (size_t)snprintf(nm + no, sizeof nm - no, "[0]");
+                (void)no;
+                int created, ui = add_uniform(ip, nm, &created);
+                MGLIUniform *u = &ip->uniforms[ui];
+                if (created) {
+                    u->type = GL_UNSIGNED_INT_ATOMIC_COUNTER; u->size = (GLint)leafsz;
+                    u->offset = (GLint)(off + row * leafsz * 4);
+                    u->array_stride = nad ? 4 : 0; u->matrix_stride = 0;
+                    u->atomic_buffer_index = ab; u->kind = MGLI_K_UINT; u->cols = u->rows = 1; u->opaque_class = 3;
+                    MGLIAtomicBuffer *a = &ip->abufs[ab];
+                    a->members = realloc(a->members, (a->member_count + 1) * sizeof(int));
+                    a->members[a->member_count++] = ui;
+                    if ((GLint)(off + 4 * total) > a->data_size) a->data_size = (GLint)(off + 4 * total);
+                }
+                u->stages |= 1u << stage;
             }
-            u->stages |= 1u << stage;
             continue;
         }
         bool ubo = m->vsc[v] == SpvStorageClassUniform && !get_dec(m, st, -1, SpvDecorationBufferBlock, NULL);
@@ -3230,6 +3256,12 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         if (v == s->dub_var) continue;
         const char *bname = id_name(m, st);
         const char *iname = id_name(m, v);
+        /* glsl_block_compat.c names an ANONYMOUS block `mgl_anon_block_N`
+         * (glslang's grammar requires a block name): GL names such a block by
+         * its INSTANCE name, so swap it in; an anonymous block without an
+         * instance name (members as globals) keeps the synthetic name. */
+        if (bname && !strncmp(bname, "mgl_anon_block_", 15) && iname && *iname)
+            bname = iname;
         uint32_t binding = 0; get_dec(m, v, -1, SpvDecorationBinding, &binding);
         /* glslang auto-mapped bindings are not explicit: GL defaults un-bound blocks to binding point 0 */
         if (binding && !src_explicit_qual(src, bname, ubo ? "uniform" : "buffer", "binding")) binding = 0;
@@ -3436,6 +3468,20 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
             swapped = norm;          /* freed below with `swapped` */
             words = swapped;
             n = swapped_n;
+        }
+        /* geom: compile_stage flattens opaque arrays-of-arrays for the geometry
+         * stage's kernel MSL — accept exactly that module (mgl_ext_geom.h) */
+        if (stage == _GEOMETRY_SHADER)
+        {
+            size_t flat_n = 0;
+            uint32_t *flat = mgl_geom_flatten_gs_opaque(words, n, &flat_n);
+            if (flat)
+            {
+                if (swapped) free(swapped);
+                swapped = flat;
+                words = swapped;
+                n = flat_n;
+            }
         }
     }
 

@@ -1381,8 +1381,6 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
 
 @implementation MGLRenderer (Geometry)
 
-/* ---------------- the transform feedback pack, Metal side ---------------- */
-
 /* wait for the pack's own command buffer (see geom_xfb_gpu_wait) */
 - (void) geomXfbWait
 {
@@ -1773,10 +1771,10 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                 gPackJoinCb = nil;
                 if (geomEnvRead(), gEnv.debug)
                     fprintf(stderr, "geom: pack JOINED the kernel encoder cb=%p\n",
-                            (void *)(__bridge void *)_currentCommandBuffer);
+                            (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
             }
             else
-                enc = [_currentCommandBuffer computeCommandEncoder];
+    enc = [_currentCommandBuffer computeCommandEncoder];
             if (!enc) return false;
             [enc pushDebugGroup: @"MGL geometry xfb pack"];
 
@@ -1882,7 +1880,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                 fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
                         tfb[b].buf->data.mtl_data,
                         (unsigned long long)BUF()->current_serial(ctx),
-                        (void *)(__bridge void *)_currentCommandBuffer);
+                        (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
         }
 
     /* publish the advanced offsets to the next draw's pack */
@@ -1934,7 +1932,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         fprintf(stderr, "\n");
     }
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+        fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     return true;
 }
 
@@ -3921,7 +3919,20 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
     pf = t.pixelFormat;
 
     [self endRenderEncoding];
-    if (!_currentCommandBuffer && ![self newCommandBuffer]) return;
+    /* The define runs LAZILY from the first bind of a multisample texture — the
+     * call chain can start anywhere, e.g. glClear -> fb_status -> attachment
+     * sample count -> bindMTLTexture -> ... -> here (dEQP-GL45-ES31
+     * geometry_shading.layered *_2d_multisample_array), and the current command
+     * buffer can already be COMMITTED (a flush between the test cases).  An
+     * encoder requested on a committed buffer aborts inside IOGPU
+     * ("_status < MTLCommandBufferStatusCommitted ... setCurrentCommandEncoder"),
+     * so take a fresh one. */
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+    {
+        if (![self newCommandBuffer])
+            return;
+        ctx->state.dirty_bits |= DIRTY_ALL;     /* encoder state does not carry over */
+    }
 
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     if (pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float)
@@ -4381,7 +4392,6 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
             g->img_atom[u].dirty = false;
         }
     }
-
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
 
     for (int u = 0; u < TEXTURE_UNITS; u++)
@@ -5078,7 +5088,6 @@ static bool geomAnyAtomicSlot(GLMContext ctx)
     }
 
     if (!n_pending) return;
-
     enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc) return;
     for (int i = 0; i < n_pending; i++)
@@ -6199,12 +6208,29 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
 
     /* capture variant header lives in its own buffer; with GPU assembly the prep kernel
      * fills in the vertex range.  An implicit draw is a direct non-indexed draw: the range
-     * is CPU-known (first..first+count), so the variant gets it here as well */
+     * is CPU-known (first..first+count), so the variant gets it here as well.
+     *
+     * The record slot the variant writes is (gl_VertexID - ch[0] + (gl_InstanceID -
+     * ch[2]) * ch[1]) * in_words and the geometry kernel reads (vid - hdr[12] + inst *
+     * hdr[6]) with hdr[12] = vstart - basevertex and hdr[6] = vcount, so the capture
+     * header must carry the SAME window: ch[0] = the first record slot's vertex id and
+     * ch[1] = the record stride per instance = vcount.  ch[0] used d->first — 0 for an
+     * indexed draw — so an indexed CPU-assembly draw whose index range does not start
+     * at 0 stored its records at absolute index values, past the capacity clamp: every
+     * such vertex read back as zeros (the first geometry draw of a process runs the CPU
+     * route, the prep PSO not being built yet, which is where this surfaced).
+     * gl_VertexID in the variant is the fetched index + baseVertex unless the MSL
+     * references [[base_vertex]] (SPIRV-Cross subtracts it), hence the vid_absolute
+     * split; d->vstart already includes basevertex. */
     {
         uint32_t *ch = (uint32_t *)gVsout.contents + gVsoutOff / 4;
         const bool cap_direct = !gpu_assembly || implicit;
-        ch[0] = cap_direct && gp->vid_absolute ? (uint32_t)d->first : 0;
-        ch[1] = (uint32_t)(cap_direct ? (d->count > 0 ? d->count : 0) : 0);
+        if (cap_direct && d->indexed)
+            ch[0] = gp->vid_absolute ? (uint32_t)d->vstart
+                                     : (uint32_t)((uint32_t)d->vstart - (uint32_t)d->basevertex);
+        else
+            ch[0] = cap_direct && gp->vid_absolute ? (uint32_t)d->first : 0;
+        ch[1] = (uint32_t)(cap_direct ? (d->vcount ? d->vcount : (d->count > 0 ? d->count : 0)) : 0);
         ch[2] = gp->iid_absolute ? (uint32_t)d->baseinstance : 0;
         ch[3] = (uint32_t)gp->in_words;
     }
@@ -6243,7 +6269,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
 
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+        fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
     if (from_tess)
     {
@@ -6253,7 +6279,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * the geometry kernel below dispatches into it too, because only dispatches within
          * one encoder are guaranteed to be ordered — the kernel's indirect threadgroup count
          * (prep[4], written here on the GPU) must be visible when that dispatch is issued. */
-        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
         id<MTLBuffer> ring = (__bridge id<MTLBuffer>)d->tess_ring;
         uint32_t cfg[10];
         NSUInteger wg = 64, nt = bound > (NSUInteger)d->count ? bound : (NSUInteger)d->count;
@@ -6294,7 +6320,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
     else if (gpu_assembly && !implicit)   /* affine direct draws need no assembly at all */
     {
-        id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
         Buffer *eb = d->indexed ? (ctx->state.vao ? ctx->state.vao->element_array.buffer : NULL) : NULL;
         bool have_eb = false;
 
@@ -6956,7 +6982,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     }
 
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer);
+        fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     if ((geomEnvRead(), gEnv.draw))
     {
         /* diagnostic only: wait for this draw's kernels, then dump the assembly header, the

@@ -505,6 +505,7 @@ static struct MGLExtMetal_texext s_texext_metal_funcs = {
         own_cb = YES;
     }
 
+    NSLog(@"MGL TRAIL MGLRenderer+TextureExt.m:508 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit copyFromTexture: old toTexture: fresh];
     [blit endEncoding];

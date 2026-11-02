@@ -2709,6 +2709,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* geom: the GEOMETRY stage's emulation kernel MSL cannot carry arrays-of-arrays
+     * of samplers/images (SPIRV-Cross's MSL backend rejects them): flatten to one
+     * array of the total count (geom_opaque_flatten.c).  The stage gate matters:
+     * other stages keep the documented link-failure gap, and the acceptance gate
+     * (msl_accepts) applies the same stage-gated pass so both agree. */
+    if (stage == _GEOMETRY_SHADER)
+    {
+        size_t flat_words = 0;
+        uint32_t *flat = mgl_geom_flatten_gs_opaque(prepared, prepared_words, &flat_words);
+        if (flat)
+        {
+            free(prepared);
+            prepared = flat;
+            prepared_words = flat_words;
+        }
+    }
+
     /* GL rectangle textures: SPIRV-Cross's MSL backend has no DimRect mapping
      * (it emits `unknown_texture_type`, which never compiles), so the MSL-facing
      * module rewrites the image Dim of every OpTypeImage from Rect to 2D.  The
@@ -3033,10 +3050,24 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                     if (natvars < MGL_MAX_ATOMIC_VARS && strlen(rname) < sizeof atvars[0].name_buf)
                     {
                         MGLAtomicCounterVar *v = &atvars[natvars++];
+                        unsigned ndim = spvc_type_get_num_array_dimensions(rtype);
                         memset(v, 0, sizeof *v);
                         v->name = v->name_buf;
                         snprintf(v->name_buf, sizeof v->name_buf, "%s", rname);
                         v->offset = (unsigned)spvc_compiler_get_decoration(compiler, list[i].id, SpvDecorationOffset);
+                        /* array dimensions, outermost first: the MSL injection flattens
+                         * array-of-array subscripts (&n[i][j]) into one buffer index.
+                         * spvc reports dimensions INNERMOST first (SPIRType::array is
+                         * built by appending each outer OpTypeArray length at the back),
+                         * so reverse them into subscript order */
+                        v->ndims = (int)((ndim < 4) ? ndim : 4);
+                        for (unsigned d = 0; d < (unsigned)v->ndims; d++)
+                        {
+                            unsigned di = (ndim - 1) - d;   /* spvc dimension index */
+                            SpvId dim = spvc_type_get_array_dimension(rtype, di);
+                            v->dims[d] = spvc_type_array_dimension_is_literal(rtype, di)
+                                             ? (unsigned)dim : 1;   /* spec-constant: unknown */
+                        }
                     }
                     break;
                 }

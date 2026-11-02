@@ -19,6 +19,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#include <pthread.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
@@ -200,7 +201,6 @@ unsigned mglExtHookCacheCount(id self, const char *suffix)
  * 2=pipeline descriptor walk 3=newRenderPipelineState (cache miss)
  * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
 #include <mach/mach_time.h>
-#include <pthread.h>
 #define MGL_PROF_BUCKETS 30
 uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];   /* shared with the Compat category counters */
 static int mgl_prof_on = -1;
@@ -3070,6 +3070,16 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // I can't remember why this is here...
     @autoreleasepool {
 
+    /* the buffer can be committed by an earlier readback/present while the GL
+     * state still references it (IOGPU asserts at the next encoder: "failed
+     * assertion _status < MTLCommandBufferStatusCommitted ... setCurrentCommandEncoder") */
+    if (_currentCommandBuffer && _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+    {
+        NSLog(@"MGL: newRenderEncoder on a committed buffer — making a new one");
+        if (![self newCommandBuffer])
+            return false;
+    }
+
     // AGX ERROR THROTTLING: Check if we should skip render encoder creation
     // BUT allow limited render encoder creation for essential functionality
     if ([self shouldSkipGPUOperations]) {
@@ -3177,7 +3187,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         if (enc_count < 30 || (++enc_count % 500) == 0)
             fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p\n",
                     (unsigned long long)enc_count, (void *)ctx->state.framebuffer,
-                    (void *)(__bridge void *)_currentCommandBuffer);
+                    (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
         enc_count++;
         (void)enc_frame;
     }

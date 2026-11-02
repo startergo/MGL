@@ -1171,7 +1171,12 @@ static char *strip_invariant_on_input(const char *src)
             size_t ds = i;
             while (ds > 0 && out[ds - 1] != ';' && out[ds - 1] != '{' && out[ds - 1] != '}') ds--;
             size_t de = i;
-            while (de < len && out[de] != ';') de++;
+            /* stop at the block-open too: `layout(...) uniform invariant { ... }` puts
+             * the keyword where the block NAME goes (a reserved word — glslang must
+             * reject it).  Scanning to the ';' crossed the braces and mistook a member
+             * type (`int a;`) for the declared type, splicing the keyword out and
+             * turning an illegal block into an anonymous one (test_reserved slot 4). */
+            while (de < len && out[de] != ';' && out[de] != '{') de++;
             bool has_out = false, has_type = false;
             for (size_t k = ds; k < de; k++)
             {
