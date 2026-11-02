@@ -1807,6 +1807,11 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
     if (!df || !df->end_valid || !m->enabled)
         return false;
 
+    /* texext (r48): texture-buffer read stamps are outside every list this
+     * snapshot compares — never skip the stamp walk while one can be bound */
+    if (ctx->state.ext_texext && ctx->state.ext_texext->buffer_texture_count)
+        return false;
+
     if ([self extBufSerial] != df->end_serial)
         return false;
 
@@ -2155,12 +2160,11 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
     uint64_t gen = compatEncGen(m, (__bridge void *)enc);
     struct MGLCompatBindShadow *sh = &m->vsamp[idx];
 
-    if (sh->obj == (__bridge void *)samp && sh->gen == gen && sh->encoder == (__bridge void *)enc)
-    {
-        mgl_compat_bind_skip++;
-        return;
-    }
-
+    /* r48: no pointer-skip for samplers — Metal recycles MTLSamplerState
+     * addresses, so a fresh state at a recycled address would be dropped as
+     * "already bound" (stale GL_TEXTURE_LOD_BIAS / filters;
+     * KHR-GL46.texture_lod_bias_all).  The texture-resolve gate already
+     * suppresses redundant walk calls, so this costs an idempotent Metal set. */
     [enc setVertexSamplerState: samp atIndex: idx];
     sh->obj = (__bridge void *)samp;
     sh->offset = 0;
@@ -2183,12 +2187,9 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
     uint64_t gen = compatEncGen(m, (__bridge void *)enc);
     struct MGLCompatBindShadow *sh = &m->fsamp[idx];
 
-    if (sh->obj == (__bridge void *)samp && sh->gen == gen && sh->encoder == (__bridge void *)enc)
-    {
-        mgl_compat_bind_skip++;
-        return;
-    }
-
+    /* r48: no pointer-skip for samplers — Metal recycles MTLSamplerState
+     * addresses, so a fresh state at a recycled address would be dropped as
+     * "already bound" (stale GL_TEXTURE_LOD_BIAS / filters). */
     [enc setFragmentSamplerState: samp atIndex: idx];
     sh->obj = (__bridge void *)samp;
     sh->offset = 0;

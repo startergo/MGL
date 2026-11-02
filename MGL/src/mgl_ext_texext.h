@@ -75,6 +75,14 @@ typedef struct MGLTexExtInfo_t {
 /* GL-side state, reachable as ctx->state.ext_texext; allocated in mgl_ext_init_texext(). */
 struct MGLExtState_texext {
     MGLTexExtInfo *buckets[MGL_TEXEXT_BUCKETS];
+
+    /* live MGL_TEXEXT_BUFFER textures with a data store: when > 0 the draw path
+     * stamps read_serial on the backing buffers (a buffer sampled as a texture
+     * buffer is outside the buffer-map lists, so without this stamp a queued
+     * draw's read is invisible to the rename logic and a following
+     * glBufferSubData / glMapBufferRange writes into memory the GPU still
+     * samples — dEQP texture_buffer.render_modify) */
+    GLuint buffer_texture_count;
 };
 
 /* Metal hooks, reachable as ctx->mtl_funcs.ext_texext; filled by MGLRenderer+TextureExt.m. */

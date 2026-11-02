@@ -611,8 +611,10 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
         if (spv_lower_type_kind(&c, sites[s].arr_type) == SPV_T_ARRAY)
         {
             if (getenv("MGL_TESS_DEBUG"))
-                fprintf(stderr, "MGL tess lower: declining — array-field site cannot be lowered for the tessellation stage-in\n");
-            return NULL;
+                fprintf(stderr, "MGL tess lower: array-field site %s (MGL_TESS_ARRAY_LOWER=1 lowers it)\n",
+                        getenv("MGL_TESS_ARRAY_LOWER") ? "accepted" : "declined");
+            if (!getenv("MGL_TESS_ARRAY_LOWER"))
+                return NULL;
         }
     }
 
@@ -1112,4 +1114,1122 @@ uint32_t *mgl_spirv_prepare_for_msl(const uint32_t *words, size_t n, size_t *n_o
     else if (mid)
         free(mid);
     return out ? out : mid;
+}
+
+/* ------------------------------------------------------------------ dissolve
+ * SPIRV-Cross flattens a per-vertex INPUT interface block of a tessellation
+ * evaluation shader ("in TheBlock { S s; float fa[3]; S sa[2]; } vb[];") into
+ * stage-in attributes, but its member-index resolution is only correct for
+ * members that need no splitting: "vb[1].fa[2]" resolves through the ARRAY
+ * member's un-split index and reads another member's attribute, and a
+ * whole-member load ("S t = vb[0].s;") asserts in emit_tessellation_access_chain
+ * (process abort).  Dissolve such a block into one plain per-vertex variable
+ * per block member ("vb_s", "vb_fa", ...): SPIRV-Cross's plain-variable
+ * splitting is correct, and the flattened leaf names it generates
+ * ("vb_s_x", "vb_fa_0", "vb_sa_0_z_1", ...) are identical to the block's, so
+ * MGL's record canonicalization matches them by name unchanged.  The block
+ * variable itself stays in the module (name lookups keep working); it only
+ * becomes unused.  Returns a fresh module, or NULL when nothing needed
+ * dissolving or an unsupported pattern was met (caller keeps the original). */
+
+/* kind of a TYPE id: SPV_T_* of the type instruction defining it */
+static int spv_dis_kind(const uint32_t *words, size_t n, uint32_t type)
+{
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op >= 19 && op <= 33 && words[k + 1] == type)
+        {
+            switch (op)
+            {
+                case SPV_OP_TYPE_ARRAY:  return SPV_T_ARRAY;
+                case SPV_OP_TYPE_MATRIX: return SPV_T_MATRIX;
+                case SPV_OP_TYPE_STRUCT: return SPV_T_STRUCT;
+                case SPV_OP_TYPE_VECTOR: return SPV_T_VECTOR;
+                default:                 return SPV_T_OTHER;
+            }
+        }
+        k += wc;
+    }
+    return SPV_T_OTHER;
+}
+
+/* value of an int OpConstant id (0xffffffff when not a 32-bit constant) */
+static uint32_t spv_dis_const(const uint32_t *words, size_t n, uint32_t id)
+{
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == SPV_OP_CONSTANT && wc == 4 && words[k + 2] == id)
+            return words[k + 3];
+        k += wc;
+    }
+    return 0xffffffffu;
+}
+
+/* the OpName string of an id ("" when unnamed) */
+static void spv_dis_name(const uint32_t *words, size_t n, uint32_t id,
+                         char *out, size_t cap)
+{
+    out[0] = 0;
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == 5 /* OpName */ && wc >= 3 && words[k + 1] == id)
+        {
+            const uint32_t *w = words + k + 2;
+            const uint32_t *we = words + k + wc;
+            size_t o = 0;
+
+            for (; w < we && o + 4 < cap; w++)
+                for (int b = 0; b < 4; b++)
+                {
+                    char ch = (char)((*w >> (8 * b)) & 255);
+
+                    if (!ch) { w = we; break; }
+                    out[o++] = ch;
+                }
+            out[o] = 0;
+            return;
+        }
+        k += wc;
+    }
+}
+
+/* how many stage-in LOCATIONS a type consumes (a struct/array counts its
+ * leaves; vectors/matrices count their columns; doubles count double) */
+static uint32_t spv_dis_leaf_count(const uint32_t *words, size_t n, uint32_t type)
+{
+    int kind = spv_dis_kind(words, n, type);
+
+    if (kind == SPV_T_ARRAY)
+    {
+        uint32_t elem = 0, len_id = 0;
+
+        for (size_t k = 5; k < n; )
+        {
+            uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+            if (wc == 0 || k + wc > n) break;
+            if (op == SPV_OP_TYPE_ARRAY && wc >= 4 && words[k + 1] == type)
+            {
+                elem = words[k + 2];
+                len_id = words[k + 3];
+                break;
+            }
+            k += wc;
+        }
+        {
+            uint32_t len = spv_dis_const(words, n, len_id);
+
+            if (!elem || len == 0xffffffffu) return 1;
+            return len * spv_dis_leaf_count(words, n, elem);
+        }
+    }
+    if (kind == SPV_T_STRUCT)
+    {
+        uint32_t total = 0;
+
+        for (size_t k = 5; k < n; )
+        {
+            uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+            if (wc == 0 || k + wc > n) break;
+            if (op == SPV_OP_TYPE_STRUCT && wc >= 3 && words[k + 1] == type)
+            {
+                for (uint32_t q = 0; q + 2 < wc; q++)
+                    total += spv_dis_leaf_count(words, n, words[k + 2 + q]);
+                break;
+            }
+            k += wc;
+        }
+        return total ? total : 1;
+    }
+    if (kind == SPV_T_MATRIX)
+    {
+        uint32_t cols = 0;
+
+        for (size_t k = 5; k < n; )
+        {
+            uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+            if (wc == 0 || k + wc > n) break;
+            if (op == SPV_OP_TYPE_MATRIX && wc == 5 && words[k + 1] == type)
+            {
+                cols = words[k + 4];
+                break;
+            }
+            k += wc;
+        }
+        return cols ? cols : 1;
+    }
+    /* scalar/vector: one location (fp64 counts two) */
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == 22 /* OpTypeFloat */ && wc >= 4 && words[k + 1] == type)
+        {
+            uint32_t bits = words[k + 3];
+
+            return bits == 64 ? 2 : 1;
+        }
+        k += wc;
+    }
+    return 1;
+}
+
+/* OpMemberName of a struct field; false when unnamed */
+static bool spv_dis_field_name(const uint32_t *words, size_t n, uint32_t stype,
+                               uint32_t f, char *name, size_t name_sz)
+{
+    size_t k;
+
+    for (k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == 6 /* OpMemberName */ && wc >= 4 && words[k + 1] == stype &&
+            words[k + 2] == f)
+        {
+            size_t len = (wc - 3) * 4;
+
+            snprintf(name, name_sz, "%.*s", (int)len, (const char *)(words + k + 3));
+            for (size_t q = strlen(name) + 1; q < len; q++)
+                if (((const char *)(words + k + 3))[q])
+                    name[0] = 0;      /* embedded NUL: a packed multi-name word */
+            return name[0] != 0;
+        }
+        k += wc;
+    }
+    return false;
+}
+
+/* dissolved per-vertex block member variables */
+struct DissolveJob
+{
+    uint32_t var;               /* the block interface variable */
+    uint32_t block_type;        /* the Block-decorated struct */
+    uint32_t arr_len_id;        /* constant id of the control-point array length */
+    uint32_t n_members;
+    uint32_t member_type[64];
+    char member_name[64][64];
+    int32_t member_loc[64];     /* OpMemberDecorate Location, -1 when absent */
+    uint32_t base_loc;          /* derived Location for the dissolved members */
+    uint32_t member_slot[64];   /* first location slot of each member */
+    uint32_t new_var[64];
+    /* struct-ARRAY members dissolve to one variable per (element, field) leaf
+     * instead: SPIRV-Cross mis-flattens per-vertex inputs whose element type
+     * is a struct (wrong attribute for [cp][i].field chains) */
+    uint32_t leaf_var[64][96];
+    uint32_t leaf_elems[64];    /* element count, 0 = plain single-variable member */
+    uint32_t leaf_fields[64];   /* field count of the element struct */
+};
+
+uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n)
+{
+    struct DissolveJob jobs[8];
+    int n_jobs = 0;
+    uint32_t next_id;
+    uint32_t *work = NULL;
+    size_t i;
+    uint32_t names_out[8192], deco_out[4096], type_out[4096], var_out[8 * 64 * 5];
+    size_t n_names = 0, n_deco = 0, n_type = 0, n_var = 0;
+
+    *out_n = 0;
+    if (!words || n < 8)
+        return NULL;
+    next_id = words[3];
+
+    /* 1) block struct types (OpDecorate <type> Block) */
+    {
+        uint32_t blocks[16];
+        int n_blocks = 0;
+
+        for (i = 5; i < n; )
+        {
+            uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+            if (wc == 0 || i + wc > n) break;
+            if (op == SPV_OP_DECORATE && wc >= 3 && words[i + 2] == 2 /* Block */ &&
+                n_blocks < 16)
+                blocks[n_blocks++] = words[i + 1];
+            i += wc;
+        }
+        if (!n_blocks)
+            return NULL;
+
+        /* 2) INPUT variables of pointer-to-array<block> */
+        for (i = 5; i < n && n_jobs < 8; )
+        {
+            uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+            if (wc == 0 || i + wc > n) break;
+            if (op == SPV_OP_VARIABLE && wc >= 4 && words[i + 3] == SPV_SC_INPUT)
+            {
+                uint32_t ptr = words[i + 1], vid = words[i + 2];
+                uint32_t pointee = 0, elem = 0, len_id = 0, block = 0;
+
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 >= 19 && op2 <= 33 && words[k + 1] == ptr)
+                    {
+                        pointee = words[k + 3];
+                        break;
+                    }
+                    k += wc2;
+                }
+                if (pointee)
+                    for (size_t k = 5; k < n; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 >= 19 && op2 <= 33 && words[k + 1] == pointee)
+                        {
+                            if (op2 == SPV_OP_TYPE_ARRAY && wc2 >= 4)
+                            {
+                                elem = words[k + 2];
+                                len_id = words[k + 3];
+                            }
+                            break;
+                        }
+                        k += wc2;
+                    }
+                for (int b = 0; b < n_blocks; b++)
+                    if (elem && elem == blocks[b]) { block = elem; break; }
+                if (block)
+                {
+                    struct DissolveJob *job = &jobs[n_jobs];
+
+                    memset(job, 0, sizeof *job);
+                    bool skip = false;
+                    uint32_t var_loc = 0;
+                    bool have_var_loc = false;
+
+                    memset(job, 0, sizeof *job);
+                    job->var = vid;
+                    job->block_type = block;
+                    job->arr_len_id = len_id;
+
+                    /* the block VARIABLE's Location (glslang decorates the
+                     * variable, not the members): keep the dissolved members
+                     * in declaration order after it */
+                    for (size_t k = 5; k < n; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 == SPV_OP_DECORATE && wc2 >= 4 && words[k + 1] == vid &&
+                            words[k + 2] == 30 /* Location */)
+                        {
+                            var_loc = words[k + 3];
+                            have_var_loc = true;
+                            break;
+                        }
+                        k += wc2;
+                    }
+
+                    for (size_t k = 5; k < n; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 == SPV_OP_TYPE_STRUCT && words[k + 1] == block && wc2 >= 2)
+                        {
+                            job->n_members = wc2 - 2;
+                            for (uint32_t q = 0; q < job->n_members && q < 64; q++)
+                                job->member_type[q] = words[k + 2 + q];
+                            break;
+                        }
+                        k += wc2;
+                    }
+                    if (!job->n_members)
+                        skip = true;
+                    if (job->n_members > 64)
+                        job->n_members = 64;
+                    for (size_t k = 5; k < n && !skip; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 == 72 /* OpMemberDecorate */ && wc2 >= 4 &&
+                            words[k + 1] == block && words[k + 3] == 11 /* BuiltIn */)
+                        {
+                            /* a built-in interface (gl_PerVertex): SPIRV-Cross's
+                             * built-in handling must stay in charge */
+                            skip = true;
+                        }
+                        k += wc2;
+                    }
+                    for (uint32_t q = 0; q < 64; q++) job->member_loc[q] = -1;
+                    job->base_loc = have_var_loc ? var_loc : 0u;
+                    {
+                        uint32_t slot = 0;
+
+                        for (uint32_t q = 0; q < job->n_members; q++)
+                        {
+                            job->member_slot[q] = slot;
+                            slot += spv_dis_leaf_count(words, n, job->member_type[q]);
+                        }
+                    }
+
+                    for (size_t k = 5; k < n; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 == 72 /* OpMemberDecorate */ && wc2 >= 4 &&
+                            words[k + 1] == block)
+                        {
+                            uint32_t mi = words[k + 2];
+
+                            if (mi < job->n_members)
+                            {
+                                if (words[k + 3] == 30 /* Location */ && wc2 >= 5)
+                                    job->member_loc[mi] = (int32_t)words[k + 4];
+                                else if (words[k + 3] == 0 /* Flat */ ||
+                                         words[k + 3] == 16 /* NoPerspective */ ||
+                                         words[k + 3] == 3 /* Centroid */)
+                                    job->member_loc[mi] |= 0;  /* kept implicit */
+                            }
+                        }
+                        if (op2 == 6 /* OpMemberName */ && wc2 >= 4 && words[k + 1] == block)
+                        {
+                            uint32_t mi = words[k + 2];
+
+                            if (mi < job->n_members)
+                            {
+                                const uint32_t *w = words + k + 3;
+                                const uint32_t *we = words + k + wc2;
+                                size_t o = 0;
+
+                                while (w < we && o + 4 < sizeof job->member_name[0])
+                                {
+                                    for (int b = 0; b < 4; b++)
+                                    {
+                                        char ch = (char)((*w >> (8 * b)) & 255);
+
+                                        if (!ch) { w = we; break; }
+                                        job->member_name[mi][o++] = ch;
+                                    }
+                                    w++;
+                                }
+                                job->member_name[mi][o] = 0;
+                            }
+                        }
+                        k += wc2;
+                    }
+                    for (uint32_t q = 0; q < job->n_members; q++)
+                        if (!job->member_name[q][0])
+                            snprintf(job->member_name[q], sizeof job->member_name[q],
+                                     "m%u", q);
+                    if (!skip)
+                        n_jobs++;
+                }
+            }
+            i += wc;
+        }
+        if (!n_jobs)
+            return NULL;
+    }
+
+    /* 3) which jobs actually need it: an access chain rooted at the block var
+     *    descends into a member.  A chain that stops at the control-point
+     *    index (whole-element load) cannot be dissolved — drop the job.  A
+     *    dropped job whose whole access loads a STRUCT-typed aggregate is
+     *    UNSAFE: SPIRV-Cross aborts (emit_tessellation_access_chain) on such
+     *    chains when compiling the original block, so the whole module must
+     *    be declined instead (see the tail of this function). */
+    bool unsafe = false;
+    for (int j = 0; j < n_jobs; j++)
+    {
+        bool whole = false, whole_struct = false, descend = false;
+
+        for (i = 5; i < n; )
+        {
+            uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+            if (wc == 0 || i + wc > n) break;
+            if ((op == SPV_OP_ACCESSCHAIN || op == SPV_OP_INBOUNDSAC) && wc >= 5 &&
+                words[i + 3] == jobs[j].var)
+            {
+                if (wc >= 7)
+                    descend = true;
+                else if (wc == 6)
+                {
+                    /* a chain that stops AT a member: dissolvable when the
+                     * member flattens to attributes — scalar/vector/matrix/
+                     * array all do; only a STRUCT (or an array of structs)
+                     * is a whole-element load SPIRV-Cross aborts on */
+                    uint32_t mval = spv_dis_const(words, n, words[i + 5]);
+                    int kind = SPV_T_OTHER;
+
+                    if (mval != 0xffffffffu && mval < jobs[j].n_members)
+                        kind = spv_dis_kind(words, n, jobs[j].member_type[mval]);
+                    if (kind == SPV_T_STRUCT)
+                    {
+                        /* an ARRAY of structs is equally fatal (SPIRV-Cross
+                         * mis-flattens it), anything else is flattenable */
+                        whole = true;
+                        whole_struct = true;
+                    }
+                    else
+                        descend = true;
+                }
+                else
+                {
+                    whole = true;
+                    whole_struct = true;    /* a whole block element is a struct load */
+                }
+            }
+            i += wc;
+        }
+        if (whole || !descend)
+        {
+            if (whole_struct)
+                unsafe = true;
+            jobs[j] = jobs[n_jobs - 1];
+            n_jobs--;
+            j--;
+        }
+    }
+    if (unsafe)
+    {
+        /* SPIRV-Cross cannot compile this module without aborting (whole
+         * struct-typed interface loads); hand back a copy whose magic is
+         * corrupted so every SPIRV-Cross compile fails CLEANLY (parser
+         * error) and MGL reports a shader/link error instead of crashing.
+         * Checked before the no-jobs exit: a dropped job is what set it. */
+        uint32_t *bad = malloc(n * 4);
+
+        if (!bad)
+            return NULL;
+        memcpy(bad, words, n * 4);
+        bad[0] ^= 1;
+        *out_n = n;
+        return bad;
+    }
+    if (!n_jobs)
+        return NULL;
+
+    /* 4) plan the new instructions (names, decorations, types, variables) */
+    for (int j = 0; j < n_jobs; j++)
+    {
+        struct DissolveJob *job = &jobs[j];
+        char iname[64];
+
+        spv_dis_name(words, n, job->var, iname, sizeof iname);
+        if (!iname[0])
+            snprintf(iname, sizeof iname, "blk%u", job->var);
+
+        for (uint32_t m = 0; m < job->n_members; m++)
+        {
+            uint32_t arr = 0, ptr = 0;
+
+            /* a member that is an ARRAY OF STRUCTS dissolves to one variable
+             * per (element, field) leaf: SPIRV-Cross's per-vertex input
+             * flattening mis-binds [cp][i].field chains for array<struct>
+             * elements (it picks the field by the wrong index). Leaf names
+             * "<inst>_mgl_ds_<member>_<i>_<field>" keep the same strings the
+             * split names had, so the record keying is unchanged. */
+            if (spv_dis_kind(words, n, job->member_type[m]) == SPV_T_ARRAY)
+            {
+                uint32_t elem = 0, len_id = 0, ecount = 0, efields = 0;
+                size_t k;
+
+                for (k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == SPV_OP_TYPE_ARRAY && wc2 == 4 && words[k + 1] == job->member_type[m])
+                    {
+                        elem = words[k + 2];
+                        len_id = words[k + 3];
+                        break;
+                    }
+                    k += wc2;
+                }
+                if (elem && spv_dis_kind(words, n, elem) == SPV_T_STRUCT)
+                {
+                    uint32_t lv = spv_dis_const(words, n, len_id);
+
+                    ecount = (lv != 0xffffffffu) ? lv : 0;
+                    for (k = 5; k < n; )
+                    {
+                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                        if (wc2 == 0 || k + wc2 > n) break;
+                        if (op2 == SPV_OP_TYPE_STRUCT && wc2 >= 3 && words[k + 1] == elem)
+                        {
+                            efields = wc2 - 2;
+                            break;
+                        }
+                        k += wc2;
+                    }
+                }
+                if (ecount && efields && ecount * efields <= 96)
+                {
+                    bool ok = true;
+                    uint32_t slot = job->member_loc[m] >= 0 ?
+                                    (uint32_t)job->member_loc[m] :
+                                    job->base_loc + job->member_slot[m];
+
+                    /* validate every field first (scalar/vector/matrix or an
+                     * array of them, NAMED): a bad field falls back to the
+                     * whole-member variable for this member only */
+                    for (uint32_t f = 0; f < efields && ok; f++)
+                    {
+                        char fname[64];
+                        uint32_t ftype = 0;
+                        int fkind;
+                        size_t k2;
+
+                        for (k2 = 5; k2 < n; )
+                        {
+                            uint32_t wc3 = words[k2] >> 16, op3 = words[k2] & 0xffff;
+
+                            if (wc3 == 0 || k2 + wc3 > n) break;
+                            if (op3 == SPV_OP_TYPE_STRUCT && wc3 >= 3 && words[k2 + 1] == elem)
+                            {
+                                ftype = words[k2 + 2 + f];
+                                break;
+                            }
+                            k2 += wc3;
+                        }
+                        fkind = ftype ? spv_dis_kind(words, n, ftype) : SPV_T_STRUCT;
+                        if (fkind == SPV_T_STRUCT ||
+                            !spv_dis_field_name(words, n, elem, f, fname, sizeof fname))
+                            ok = false;
+                    }
+                    if (!ok)
+                        goto leaf_fallback;
+
+                    for (uint32_t f = 0; f < efields; f++)
+                    {
+                        char fname[64];
+                        uint32_t ftype = 0;
+                        size_t k2;
+
+                        for (k2 = 5; k2 < n; )
+                        {
+                            uint32_t wc3 = words[k2] >> 16, op3 = words[k2] & 0xffff;
+
+                            if (wc3 == 0 || k2 + wc3 > n) break;
+                            if (op3 == SPV_OP_TYPE_STRUCT && wc3 >= 3 && words[k2 + 1] == elem)
+                            {
+                                ftype = words[k2 + 2 + f];
+                                break;
+                            }
+                            k2 += wc3;
+                        }
+                        if (!ftype || spv_dis_kind(words, n, ftype) == SPV_T_STRUCT ||
+                            !spv_dis_field_name(words, n, elem, f, fname, sizeof fname))
+                            ok = false;
+                        if (ok)
+                        {
+                            /* an ARRAY field splits into several attributes,
+                             * so a leaf's slot must advance by its leaf count */
+                            uint32_t stride = spv_dis_leaf_count(words, n, ftype);
+
+                            for (uint32_t e = 0; e < ecount; e++)
+                            {
+                                uint32_t larr = 0, lptr = 0;
+
+                                for (size_t k3 = 5; k3 < n; )
+                                {
+                                    uint32_t wc4 = words[k3] >> 16, op4 = words[k3] & 0xffff;
+
+                                    if (wc4 == 0 || k3 + wc4 > n) break;
+                                    if (op4 == SPV_OP_TYPE_ARRAY && wc4 == 4 &&
+                                        words[k3 + 2] == ftype && words[k3 + 3] == job->arr_len_id)
+                                        larr = words[k3 + 1];
+                                    if (op4 == SPV_OP_TYPE_POINTER && wc4 == 4 &&
+                                        words[k3 + 2] == SPV_SC_INPUT && words[k3 + 3] == larr)
+                                        lptr = words[k3 + 1];
+                                    k3 += wc4;
+                                }
+                                if (!larr)
+                                {
+                                    larr = next_id++;
+                                    type_out[n_type++] = (4u << 16) | SPV_OP_TYPE_ARRAY;
+                                    type_out[n_type++] = larr;
+                                    type_out[n_type++] = ftype;
+                                    type_out[n_type++] = job->arr_len_id;
+                                }
+                                if (!lptr)
+                                {
+                                    lptr = next_id++;
+                                    type_out[n_type++] = (4u << 16) | SPV_OP_TYPE_POINTER;
+                                    type_out[n_type++] = lptr;
+                                    type_out[n_type++] = SPV_SC_INPUT;
+                                    type_out[n_type++] = larr;
+                                }
+                                job->leaf_var[m][e * efields + f] = next_id++;
+                                var_out[n_var++] = (4u << 16) | SPV_OP_VARIABLE;
+                                var_out[n_var++] = lptr;
+                                var_out[n_var++] = job->leaf_var[m][e * efields + f];
+                                var_out[n_var++] = SPV_SC_INPUT;
+                                deco_out[n_deco++] = (4u << 16) | SPV_OP_DECORATE;
+                                deco_out[n_deco++] = job->leaf_var[m][e * efields + f];
+                                deco_out[n_deco++] = 30 /* Location */;
+                                deco_out[n_deco++] = slot;
+                                slot += stride;
+                                {
+                                    char full[160];
+                                    uint32_t buf[40];
+                                    size_t words_n = 0;
+
+                                    snprintf(full, sizeof full, "%s_mgl_ds_%s_%u_%s",
+                                             iname, job->member_name[m], e, fname);
+                                    {
+                                        const char *c = full;
+                                        size_t rem = strlen(full) + 1;
+
+                                        while (rem > 0 && words_n < 40)
+                                        {
+                                            uint32_t w = 0;
+
+                                            for (int b = 0; b < 4 && rem > 0; b++)
+                                            {
+                                                w |= (uint32_t)(unsigned char)*c << (8 * b);
+                                                c++;
+                                                rem--;
+                                            }
+                                            buf[words_n++] = w;
+                                        }
+                                    }
+                                    names_out[n_names++] = (uint32_t)((words_n + 2) << 16) | 5 /* OpName */;
+                                    names_out[n_names++] = job->leaf_var[m][e * efields + f];
+                                    for (size_t q = 0; q < words_n; q++) names_out[n_names++] = buf[q];
+                                }
+                            }
+                        }
+                    }
+                    if (ok)
+                    {
+                        job->leaf_elems[m] = ecount;
+                        job->leaf_fields[m] = efields;
+                        continue;   /* no whole-member variable for this member */
+                    }
+leaf_fallback:
+                    /* a bad leaf (nested struct field / unnamed member):
+                     * this member keeps its whole-member variable; its chains
+                     * keep the original indices (SPIRV-Cross flattens them) */
+                    ;
+                }
+            }
+
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == SPV_OP_TYPE_ARRAY && wc2 == 4 &&
+                    words[k + 2] == job->member_type[m] &&
+                    words[k + 3] == job->arr_len_id)
+                    arr = words[k + 1];
+                if (op2 == SPV_OP_TYPE_POINTER && wc2 == 4 &&
+                    words[k + 2] == SPV_SC_INPUT && words[k + 3] == arr)
+                    ptr = words[k + 1];
+                k += wc2;
+            }
+            if (!arr)
+            {
+                arr = next_id++;
+                type_out[n_type++] = (4u << 16) | SPV_OP_TYPE_ARRAY;
+                type_out[n_type++] = arr;
+                type_out[n_type++] = job->member_type[m];
+                type_out[n_type++] = job->arr_len_id;
+            }
+            if (!ptr)
+            {
+                ptr = next_id++;
+                type_out[n_type++] = (4u << 16) | SPV_OP_TYPE_POINTER;
+                type_out[n_type++] = ptr;
+                type_out[n_type++] = SPV_SC_INPUT;
+                type_out[n_type++] = arr;
+            }
+            job->new_var[m] = next_id++;
+            var_out[n_var++] = (4u << 16) | SPV_OP_VARIABLE;
+            var_out[n_var++] = ptr;
+            var_out[n_var++] = job->new_var[m];
+            var_out[n_var++] = SPV_SC_INPUT;
+            if (job->member_loc[m] >= 0)
+            {
+                deco_out[n_deco++] = (4u << 16) | SPV_OP_DECORATE;
+                deco_out[n_deco++] = job->new_var[m];
+                deco_out[n_deco++] = 30 /* Location */;
+                deco_out[n_deco++] = (uint32_t)job->member_loc[m];
+            }
+            else
+            {
+                /* SPIRV-Cross needs a Location to give the stage-in member an
+                 * [[attribute(N)]]; any distinct value works — MGL binds by
+                 * the emitted attribute numbers.  Space members by their leaf
+                 * count so no two leaves land on the same slot. */
+                deco_out[n_deco++] = (4u << 16) | SPV_OP_DECORATE;
+                deco_out[n_deco++] = job->new_var[m];
+                deco_out[n_deco++] = 30 /* Location */;
+                deco_out[n_deco++] = job->base_loc + job->member_slot[m];
+            }
+            /* the name carries the block instance AND member so the record
+             * canonicalization can strip the prefix and re-key by the block
+             * member path (tess_annotate_keys); "mgl_ds" marks the variable
+             * as dissolved there */
+            {
+                char full[160];
+                uint32_t buf[40];
+                size_t words_n;
+
+                snprintf(full, sizeof full, "%s_mgl_ds_%s", iname, job->member_name[m]);
+                words_n = (strlen(full) + 4) / 4;
+                if (words_n <= 40)
+                {
+                    memset(buf, 0, sizeof buf);
+                    memcpy(buf, full, strlen(full));
+                    names_out[n_names++] = (uint32_t)((2 + words_n) << 16) | 5u;
+                    names_out[n_names++] = job->new_var[m];
+                    for (size_t q = 0; q < words_n; q++)
+                        names_out[n_names++] = buf[q];
+                }
+            }
+        }
+    }
+
+    /* 5) plan the chain rewrites (applied while emitting: the member index
+     *    is dropped, so each rewritten instruction is ONE word shorter) */
+    {
+        uint32_t rw_off[512], rw_type[512], rw_base[512];
+        uint8_t rw_drop2[512];      /* leaf rewrite: drop elem+field indices too */
+        int n_rw = 0;
+
+        for (i = 5; i < n && n_rw < 512; )
+        {
+            uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+            if (wc == 0 || i + wc > n) break;
+            if ((op == SPV_OP_ACCESSCHAIN || op == SPV_OP_INBOUNDSAC) && wc >= 6)
+            {
+                for (int j = 0; j < n_jobs; j++)
+                    if (words[i + 3] == jobs[j].var)
+                    {
+                        uint32_t mval = spv_dis_const(words, n, words[i + 5]);
+                        int found_m = -1;
+
+                        if (mval != 0xffffffffu && mval < jobs[j].n_members)
+                            found_m = (int)mval;
+                        if (found_m < 0)
+                            goto bail;
+                        if (wc == 6)
+                        {
+                            /* stops AT the member: fine for everything that
+                             * flattens to attributes; only a struct element
+                             * (or array of structs, handled as leaves) can't */
+                            int kind = spv_dis_kind(words, n, jobs[j].member_type[found_m]);
+
+                            if (kind == SPV_T_STRUCT)
+                                goto bail;
+                        }
+
+                        {
+                            uint32_t pointee = jobs[j].member_type[found_m];
+                            uint32_t lv_elem = 0xffffffffu, lv_field = 0xffffffffu;
+                            bool leaf = jobs[j].leaf_elems[found_m] != 0;
+                            uint32_t q = 6;
+
+                            if (leaf)
+                            {
+                                /* the member path is [elem, field, ...]: fold
+                                 * the two constants into the leaf variable */
+                                uint32_t e = spv_dis_const(words, n, words[i + 6]);
+                                uint32_t f = spv_dis_const(words, n, words[i + 7]);
+
+                                if (wc < 8 || spv_dis_kind(words, n, pointee) != SPV_T_ARRAY)
+                                    goto unsafe_exit;      /* whole struct element: SPIRV-Cross aborts */
+                                if (e >= jobs[j].leaf_elems[found_m] ||
+                                    f >= jobs[j].leaf_fields[found_m])
+                                    goto bail;              /* dynamic index: clean reject */
+                                /* first interior step must land on the struct */
+                                {
+                                    uint32_t elem_t = 0;
+
+                                    for (size_t k = 5; k < n; )
+                                    {
+                                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                                        if (wc2 == 0 || k + wc2 > n) break;
+                                        if (op2 == SPV_OP_TYPE_ARRAY && wc2 >= 4 &&
+                                            words[k + 1] == pointee)
+                                        {
+                                            elem_t = words[k + 2];
+                                            break;
+                                        }
+                                        k += wc2;
+                                    }
+                                    if (!elem_t || spv_dis_kind(words, n, elem_t) != SPV_T_STRUCT)
+                                        goto bail;
+                                }
+                                lv_elem = e;
+                                lv_field = f;
+                                pointee = 0;        /* set after resolving the field below */
+                                q = 8;              /* walk the deeper path only */
+                                for (uint32_t d = 6; d <= 7; d++)
+                                {
+                                    uint32_t cval = spv_dis_const(words, n, words[i + d]);
+
+                                    if (cval == 0xffffffffu) goto bail;
+                                    for (size_t k = 5; k < n; )
+                                    {
+                                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                                        if (wc2 == 0 || k + wc2 > n) break;
+                                        if (op2 == SPV_OP_TYPE_ARRAY && wc2 >= 4 &&
+                                            words[k + 1] == jobs[j].member_type[found_m])
+                                        {
+                                            uint32_t st = words[k + 2];
+
+                                            for (size_t k2 = 5; k2 < n; )
+                                            {
+                                                uint32_t wc3 = words[k2] >> 16, op3 = words[k2] & 0xffff;
+
+                                                if (wc3 == 0 || k2 + wc3 > n) break;
+                                                if (op3 == SPV_OP_TYPE_STRUCT && wc3 >= 3 &&
+                                                    words[k2 + 1] == st)
+                                                {
+                                                    pointee = words[k2 + 2 + (d == 6 ? 0 : cval)];
+                                                    /* d==6 resolves the ELEMENT (array
+                                                     * index), d==7 the FIELD of it */
+                                                    if (d == 6) pointee = st;
+                                                    break;
+                                                }
+                                                k2 += wc3;
+                                            }
+                                            break;
+                                        }
+                                        k += wc2;
+                                    }
+                                }
+                            }
+
+                            for (; q < wc; q++)
+                            {
+                                int kind = spv_dis_kind(words, n, pointee);
+                                uint32_t idx_id = words[i + q], nxt = 0;
+
+                                if (kind == SPV_T_ARRAY)
+                                {
+                                    for (size_t k = 5; k < n; )
+                                    {
+                                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                                        if (wc2 == 0 || k + wc2 > n) break;
+                                        if (op2 == SPV_OP_TYPE_ARRAY && wc2 >= 4 &&
+                                            words[k + 1] == pointee)
+                                        {
+                                            nxt = words[k + 2];
+                                            break;
+                                        }
+                                        k += wc2;
+                                    }
+                                    if (!nxt) goto bail;
+                                }
+                                else if (kind == SPV_T_STRUCT)
+                                {
+                                    uint32_t cval = spv_dis_const(words, n, idx_id);
+
+                                    if (cval == 0xffffffffu) goto bail;
+                                    for (size_t k = 5; k < n; )
+                                    {
+                                        uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                                        if (wc2 == 0 || k + wc2 > n) break;
+                                        if (op2 == SPV_OP_TYPE_STRUCT && wc2 >= 3 &&
+                                            words[k + 1] == pointee)
+                                        {
+                                            if (cval + 2 >= wc2) goto bail;
+                                            nxt = words[k + 2 + cval];
+                                            break;
+                                        }
+                                        k += wc2;
+                                    }
+                                    if (!nxt) goto bail;
+                                }
+                                pointee = nxt;
+                            }
+                            /* find-or-create an Input pointer for the new pointee */
+                            {
+                                uint32_t ptr = 0;
+
+                                for (size_t k = 5; k < n; )
+                                {
+                                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                                    if (wc2 == 0 || k + wc2 > n) break;
+                                    if (op2 == SPV_OP_TYPE_POINTER && wc2 == 4 &&
+                                        words[k + 2] == SPV_SC_INPUT &&
+                                        words[k + 3] == pointee)
+                                    {
+                                        ptr = words[k + 1];
+                                        break;
+                                    }
+                                    k += wc2;
+                                }
+                                if (!ptr)
+                                {
+                                    if (n_type + 4 > sizeof type_out / sizeof type_out[0])
+                                        goto bail;
+                                    ptr = next_id++;
+                                    type_out[n_type++] = (4u << 16) | SPV_OP_TYPE_POINTER;
+                                    type_out[n_type++] = ptr;
+                                    type_out[n_type++] = SPV_SC_INPUT;
+                                    type_out[n_type++] = pointee;
+                                }
+                                rw_off[n_rw] = (uint32_t)i;
+                                rw_type[n_rw] = ptr;
+                                rw_base[n_rw] = leaf ?
+                                    jobs[j].leaf_var[found_m][lv_elem * jobs[j].leaf_fields[found_m] + lv_field] :
+                                    jobs[j].new_var[found_m];
+                                rw_drop2[n_rw] = leaf ? 1 : 0;
+                                n_rw++;
+                            }
+                        }
+                        break;
+                    }
+            }
+            i += wc;
+        }
+
+        /* 6) emit the new module: names / decorations / types / variables
+         *    inserted at the end of the debug-annotation block, the chain
+         *    rewrites applied inline, the id bound bumped */
+        {
+            size_t insert_at = 0, insert_names = 0, first_func = 0;
+            uint32_t *out;
+            size_t o = 0, need;
+
+            for (i = 5; i < n; )
+            {
+                uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+                if (wc == 0 || i + wc > n) break;
+                if (op == SPV_OP_FUNCTION)
+                {
+                    first_func = i;
+                    break;
+                }
+                if (op >= 2 && op <= 8)            /* the debug section (names) */
+                    insert_names = i + wc;
+                if (op == SPV_OP_DECORATE || op == 72 /* OpMemberDecorate */ ||
+                    op == 73 /* OpGroupDecorate */)
+                    insert_at = i + wc;            /* the annotation section */
+                i += wc;
+            }
+            if (!first_func)
+                goto bail;
+            if (getenv("MGL_TESS_DEBUG3"))
+                fprintf(stderr, "dissolve: names@%zu annot=%zu first_func=%zu names=%zu deco=%zu type=%zu var=%zu\n",
+                        insert_names, insert_at, first_func, n_names, n_deco, n_type, n_var);
+
+            need = n + n_names + n_deco + n_type + n_var + 8;
+            out = (uint32_t *)malloc(need * sizeof(uint32_t));
+            if (!out)
+                goto bail;
+
+            for (i = 0; i < n; )
+            {
+                if (i == 0)
+                {
+                    /* the fixed 5-word header: magic, version, generator,
+                     * id bound, schema */
+                    for (uint32_t q = 0; q < 5; q++)
+                        out[o++] = (q == 3) ? (next_id > words[3] ? next_id : words[3])
+                                            : words[q];
+                    i = 5;
+                    continue;
+                }
+                if (i == insert_names)
+                {
+                    for (size_t q = 0; q < n_names; q++) out[o++] = names_out[q];
+                }
+                if (i == insert_at)
+                {
+                    for (size_t q = 0; q < n_deco; q++) out[o++] = deco_out[q];
+                }
+                if (i == first_func)
+                {
+                    /* all existing types, constants and globals precede the
+                     * first function, so the new types and variables can
+                     * reference anything defined above */
+                    for (size_t q = 0; q < n_type; q++) out[o++] = type_out[q];
+                    for (size_t q = 0; q < n_var; q++) out[o++] = var_out[q];
+                }
+                {
+                    uint32_t wc = words[i] >> 16;
+                    int rw = -1;
+
+                    if (!wc) break;
+                    for (int q = 0; q < n_rw; q++)
+                        if (rw_off[q] == i) { rw = q; break; }
+                    if (rw >= 0)
+                    {
+                        /* AccessChain minus the member index */
+                        uint32_t op = words[i] & 0xffff;
+                        uint32_t drop = rw_drop2[rw] ? 3 : 1;
+
+                        out[o++] = ((wc - drop) << 16) | op;
+                        out[o++] = rw_type[rw];
+                        out[o++] = words[i + 2];
+                        out[o++] = rw_base[rw];
+                        out[o++] = words[i + 4];        /* the control-point index */
+                        for (uint32_t q = 5 + drop; q < wc; q++)
+                            out[o++] = words[i + q];
+                        i += wc;
+                    }
+                    else
+                    {
+                        for (uint32_t q = 0; q < wc; q++)
+                            out[o++] = words[i + q];
+                        i += wc;
+                    }
+                }
+            }
+            *out_n = o;
+            return out;
+        }
+    }
+
+unsafe_exit:
+    /* a chain loads a whole struct-typed aggregate of a block that would
+     * otherwise dissolve: SPIRV-Cross ABORTS compiling such a module, so
+     * decline it entirely — return a copy with corrupted magic so every
+     * compile fails cleanly and MGL reports a shader/link error */
+    free(work);
+    {
+        uint32_t *bad = malloc(n * 4);
+
+        if (bad)
+        {
+            memcpy(bad, words, n * 4);
+            bad[0] ^= 1;
+            *out_n = n;
+            return bad;
+        }
+        return NULL;
+    }
+bail:
+    free(work);
+    return NULL;
 }

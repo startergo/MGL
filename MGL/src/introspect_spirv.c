@@ -3294,6 +3294,7 @@ static bool module_has_fp64(const uint32_t *words, size_t n)
 
 static bool msl_accepts(const uint32_t *words, size_t n, int stage)
 {
+        fprintf(stderr, "MGL msl_accepts: stage=%d n=%zu\n", stage, n);
     /* SPIRV-Cross rejects double types in buffers, which the GL view of a
      * software-fp64 module legitimately contains (fp64.c lowers it later). */
     if (module_has_fp64(words, n)) return true;
@@ -3309,6 +3310,18 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
     if (stage == _TESS_EVALUATION_SHADER &&
         (swapped = mgl_tess_prepare_spirv(words, n, &swapped_n)) != NULL)
     {
+            fprintf(stderr, "MGL msl_accepts: swapped n=%zu first=%08x\n",
+                    swapped_n, swapped_n ? swapped[0] : 0);
+        if (mgl_tess_module_declined(swapped, swapped_n))
+        {
+                fprintf(stderr, "MGL msl_accepts: declined marker seen (n=%zu first=%08x)\n",
+                        swapped_n, swapped_n ? swapped[0] : 0);
+            /* the module needs transforms SPIRV-Cross cannot compile without
+             * aborting (whole struct-typed interface loads): do not compile
+             * anything here — the link reports a clean stage error */
+            free(swapped);
+            return false;
+        }
         words = swapped;
         n = swapped_n;
     }

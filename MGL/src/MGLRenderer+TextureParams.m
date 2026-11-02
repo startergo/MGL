@@ -198,8 +198,21 @@ static bool texparamTextureInfo(GLMContext glm_ctx, Texture *tex, MGLTexParamMtl
 
 static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
 {
-    if (obj)
-        CFBridgingRelease(obj);
+    if (!obj)
+        return;
+
+    /* r48: keep the released cache's sampler alive for one more generation.
+     * Metal recycles MTLSamplerState addresses, and the compat encoder bind
+     * shadow keys on the pointer — a fresh sampler allocated at a recycled
+     * address would be skipped as "already bound", leaving a stale
+     * GL_TEXTURE_LOD_BIAS / filter on the encoder (KHR-GL46
+     * texture_lod_bias_all). */
+    static __strong id<MTLSamplerState> g_shadowKeepAliveSampler = nil;
+    id o = (__bridge id)obj;
+    if ([o isKindOfClass:[MGLTexParamCache class]])
+        g_shadowKeepAliveSampler = ((MGLTexParamCache *)o).sampler;
+
+    CFBridgingRelease(obj);
 }
 
 @implementation MGLRenderer (TextureParams)
@@ -294,7 +307,6 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     if (max_lod < min_lod) max_lod = min_lod;
     desc.lodMinClamp = min_lod;
     desc.lodMaxClamp = max_lod;
-
     /* GL 4.6 14.2.2: TEXTURE_LOD_BIAS applies to every sampling stage, clamped
      * to +-GL_MAX_TEXTURE_LOD_BIAS (16) at use.  MTLSamplerDescriptor.lodBias
      * DOES exist (the header's "not representable" note was wrong) — it was

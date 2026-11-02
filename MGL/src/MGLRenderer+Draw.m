@@ -13,6 +13,7 @@
 #include <time.h>
 
 #import "MGLRenderer+Compat.h"   /* compat: bind shadow + upload ring (perf session 3) */
+#include "mgl_ext_texext.h"           /* MGLTexExtInfo: texture-buffer read stamps (r48) */
 
 #include "mgl_ext_buffers.h"
 #include "mgl_ext_xfb.h"
@@ -529,6 +530,44 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     }
 }
 
+/* texext (r48): stamp read_serial on buffers backing GL_TEXTURE_BUFFER textures
+ * bound to active units. Those buffers are sampled as textures, so they never
+ * appear in the buffer-map lists — without a stamp, mgl_buffers_prepare_cpu_write
+ * sees no pending GPU read, skips the rename and a CPU write races the queued
+ * draw (dEQP-GL45-ES31 texture_buffer.render_modify stale-texel failures). */
+- (void) extBufStampTextureBufferReads: (uint64_t) serial
+{
+    GLMContext ctx = self->ctx;   /* MGLRenderer_Private.h: context macros need this exact name */
+    if (!ctx->state.ext_texext || !ctx->state.ext_texext->buffer_texture_count)
+        return;
+
+    for (int w = 0; w < 4; w++)
+    {
+        unsigned bits = ctx->state.active_texture_mask[w];
+        while (bits)
+        {
+            int unit = w * 32 + __builtin_ctz(bits);
+            bits &= bits - 1;
+
+            Texture *tex = ctx->state.active_textures[unit];
+            if (!tex || tex->target != GL_TEXTURE_BUFFER)
+                continue;
+
+            MGLTexExtInfo *info = mgl_texext_info(ctx, tex);
+            if (!info || info->kind != MGL_TEXEXT_BUFFER || !info->buffer_name)
+                continue;
+
+            Buffer *buf = (Buffer *)searchHashTable(&ctx->state.buffer_table, info->buffer_name);
+            if (!buf || !buf->data.mtl_data)
+                continue;
+
+            MGLBufferTrack *t = mgl_buffers_track(ctx, buf, true);
+            if (t)
+                t->read_serial = serial;
+        }
+    }
+}
+
 - (void) extBufEndDraw
 {
     /* compat perf session 12: the serial stamps are a no-op while the
@@ -541,6 +580,12 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
     [self extBufStampList: &ctx->state.vertex_buffer_map_list serial: serial];
     [self extBufStampList: &ctx->state.fragment_buffer_map_list serial: serial];
+
+    /* texext: a buffer sampled as a texture buffer is not in the buffer-map
+     * lists, but the GPU reads it the same — stamp it so a following
+     * glBufferSubData / glMapBufferRange renames instead of racing (dEQP
+     * texture_buffer.render_modify) */
+    [self extBufStampTextureBufferReads: serial];
 
     if (VAO() && VAO_STATE(element_array.buffer))
         mgl_buffers_mark_gpu_use(ctx, VAO_STATE(element_array.buffer), false);
@@ -843,6 +888,10 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
             if ([self extBufStorageBinding: buf]) t->write_serial = serial;
         }
     }
+
+    /* texext: same hazard as the draw path — a texture buffer sampled by the
+     * kernel must be stamped as GPU-read */
+    [self extBufStampTextureBufferReads: serial];
 
     if (indirect)
         mgl_buffers_mark_gpu_use(ctx, indirect, false);

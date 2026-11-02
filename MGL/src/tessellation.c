@@ -1346,51 +1346,90 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
  * member-array indices lowered), or NULL when neither applies. */uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n)
 {
     bool has_isolines = false;
-    uint32_t entry_id = 0, *copy;
-    size_t i = 5;
+    uint32_t entry_id = 0;
+    const uint32_t *cur;
+    uint32_t *dis, *copy = NULL;
+    size_t i = 5, cn;
 
     *out_n = 0;
     if (!words || n < 5)
         return NULL;
 
-    while (i < n)
+    /* per-vertex INPUT interface blocks first: SPIRV-Cross mis-resolves (and
+     * aborts on) access chains into their split members, so dissolve them
+     * into one plain per-vertex variable per block member before anything
+     * else looks at the module (tess_spv_lower.c) */
+    dis = mgl_tess_dissolve_vertex_input_blocks(words, n, &cn);
+    if (dis && mgl_tess_module_declined(dis, cn))
     {
-        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
-        if (wc == 0 || i + wc > n) break;
-        if (op == SPV_OP_ENTRYPOINT && wc >= 2 && words[i + 1] == 2 /* TessEvaluation */)
-            entry_id = words[i + 2];
-        i += wc;
+        /* declined marker (whole struct-typed interface loads): nothing else
+         * may rebuild this module — a rebuild would resurrect a module that
+         * aborts SPIRV-Cross; return the marker so every compile fails
+         * cleanly and the link reports a stage error */
+        *out_n = cn;
+        return dis;
     }
-    if (!entry_id)
-        return NULL;
+    cur = dis ? dis : words;
+    if (!dis)
+        cn = n;
 
     i = 5;
-    while (i < n)
+    while (i < cn)
     {
-        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
-        if (wc == 0 || i + wc > n) break;
-        if (op == SPV_OP_EXECUTIONMODE && wc >= 3 && words[i + 1] == entry_id &&
-            words[i + 2] == SPV_EM_ISOLINES)
+        uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
+        if (wc == 0 || i + wc > cn) break;
+        if (op == SPV_OP_ENTRYPOINT && wc >= 4 && cur[i + 1] == 2 /* TessellationEvaluation */)
+            entry_id = cur[i + 2];
+        i += wc;
+    }
+
+    if (!entry_id)
+    {
+        free(dis);
+        return NULL;
+    }
+
+    i = 5;
+    while (i < cn)
+    {
+        uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
+        if (wc == 0 || i + wc > cn) break;
+        if (op == SPV_OP_EXECUTIONMODE && wc >= 3 && cur[i + 1] == entry_id &&
+            cur[i + 2] == SPV_EM_ISOLINES)
             has_isolines = true;
         i += wc;
     }
 
     if (!has_isolines)
     {
-        /* even without isolines, dynamic member-array indexing may need lowering */
-        return mgl_tess_lower_dynamic_io(words, n, out_n);
+        /* even without isolines, dynamic member-array indexing may need
+         * lowering; when that did not fire the dissolve result (if any) is
+         * still the module to use */
+        uint32_t *lowered = mgl_tess_lower_dynamic_io(cur, cn, out_n);
+
+        if (lowered)
+        {
+            free(dis);
+            return lowered;
+        }
+        *out_n = cn;
+        return dis;
     }
 
-    copy = (uint32_t *)malloc(n * sizeof(uint32_t));
+    copy = (uint32_t *)malloc(cn * sizeof(uint32_t));
     if (!copy)
+    {
+        free(dis);
         return NULL;
-    memcpy(copy, words, n * sizeof(uint32_t));
+    }
+    memcpy(copy, cur, cn * sizeof(uint32_t));
+    free(dis);
 
     i = 5;
-    while (i < n)
+    while (i < cn)
     {
         uint32_t wc = copy[i] >> 16, op = copy[i] & 0xffff;
-        if (wc == 0 || i + wc > n) break;
+        if (wc == 0 || i + wc > cn) break;
         if (op == SPV_OP_EXECUTIONMODE && wc >= 3 && copy[i + 1] == entry_id &&
             copy[i + 2] == SPV_EM_ISOLINES)
             copy[i + 2] = SPV_EM_QUADS;     /* isolines -> quad domain emulation */
@@ -1401,16 +1440,16 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
         /* SPIRV-Cross cannot codegen dynamic indices into interface member
          * arrays for TES inputs — lower them (tess_spv_lower.c) */
         size_t ln = 0;
-        uint32_t *lowered = mgl_tess_lower_dynamic_io(copy, n, &ln);
+        uint32_t *lowered = mgl_tess_lower_dynamic_io(copy, cn, &ln);
         if (lowered)
         {
             free(copy);
             copy = lowered;
-            n = ln;
+            cn = ln;
         }
     }
 
-    *out_n = n;
+    *out_n = cn;
     return copy;
 }
 
@@ -1495,16 +1534,40 @@ static bool msl_matrix_type(const char *t, size_t *align, size_t *size)
 static size_t round_up(size_t v, size_t a) { return a ? ((v + a - 1) / a) * a : v; }
 
 /* alignment/size of a possibly-arrayed element type: "float3", "spvUnsafeArray<float3, 4>", "float4x4" */
+/* the comma separating the element type from N in "spvUnsafeArray<T, N>" — the
+ * FIRST comma at angle-bracket depth 0 (T may itself be an array: commas inside) */
+static const char *msl_array_split(const char *t)
+{
+    int depth = 0;
+
+    if (!t)
+        return NULL;
+    for (const char *p = t + 15; *p; p++)
+    {
+        if (*p == '<')
+            depth++;
+        else if (*p == '>')
+        {
+            if (depth == 0)
+                return NULL;
+            depth--;
+        }
+        else if (*p == ',' && depth == 0)
+            return p;
+    }
+    return NULL;
+}
+
 static bool msl_element_type(const char *t, size_t *align, size_t *size)
 {
     if (!strncmp(t, "spvUnsafeArray<", 15))
     {
-        char inner[64];
+        char inner[96];
         long n = 0;
         /* spvUnsafeArray<T, N> */
-        const char *comma = strchr(t + 15, ',');
-        const char *close = strchr(t, '>');
-        if (!comma || !close || close < comma || (size_t)(comma - (t + 15)) >= sizeof(inner))
+        const char *comma = msl_array_split(t);
+        const char *close = comma ? strchr(comma, '>') : NULL;
+        if (!comma || !close || (size_t)(comma - (t + 15)) >= sizeof(inner))
             return false;
         memcpy(inner, t + 15, comma - (t + 15));
         inner[comma - (t + 15)] = 0;
@@ -1525,9 +1588,59 @@ static bool msl_element_type(const char *t, size_t *align, size_t *size)
     return false;
 }
 
-/* find "struct NAME { ... };" in msl; parse members and layout */
-static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct *out)
+/* "spvUnsafeArray<T, N>" -> T (nesting-aware) and N; the element STRIDE is the
+ * T copy rounded to T's own alignment (Metal's C layout of T elements[N]) */
+static bool msl_array_inner(const char *t, char *inner, size_t cap, long *n)
 {
+    int depth = 0;
+    const char *p;
+
+    if (!t || strncmp(t, "spvUnsafeArray<", 15))
+        return false;
+    for (p = t + 15; *p; p++)
+    {
+        if (*p == '<')
+            depth++;
+        else if (*p == '>')
+        {
+            if (depth == 0)
+                break;
+            depth--;
+        }
+        else if (*p == ',' && depth == 0)
+            break;
+    }
+    if (*p != ',' || p == t + 15)
+        return false;
+    if ((size_t)(p - (t + 15)) + 1 > cap)
+        return false;
+    memcpy(inner, t + 15, (size_t)(p - (t + 15)));
+    inner[p - (t + 15)] = 0;
+    {
+        const char *gt = strchr(p, '>');
+
+        if (!gt)
+            return false;
+        *n = strtol(p + 1, NULL, 10);
+    }
+    return *n > 0;
+}
+
+static size_t msl_array_stride(const char *t)
+{
+    char inner[96];
+    long n = 0;
+    size_t a = 1, s = 0;
+
+    if (!msl_array_inner(t, inner, sizeof inner, &n))
+        return 0;
+    if (!msl_element_type(inner, &a, &s))
+        return 0;
+    return round_up(s, a);
+}
+
+/* find "struct NAME { ... };" in msl; parse members and layout */
+static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct *out){
     char head[256];
     const char *p, *open, *close;
     size_t off = 0;
@@ -1658,6 +1771,8 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                 out->members[out->count].size = cs;
                 out->members[out->count].attr = attr_num;
                 out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
+                out->members[out->count].array_idx2 = 0;
+                out->members[out->count].flat_dims = 0;
                 out->members[out->count].is_tess_level = 0;
                 snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", coltype);
                 snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s_%d", namebuf, col);
@@ -1668,6 +1783,66 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         }
         if (!msl_element_type(type, &align, &size))
         {
+            /* an array of structs ("spvUnsafeArray<S, N> inst"): the canonical record
+             * keeps ONE ARRAY PER FIELD ("inst_<field>" of N elements) so a dynamic
+             * element index stays a real array index in the rewritten stage body
+             * (".inst[i].x" -> ".inst_x[i]"; dEQP ES31 user_defined_io blockSa) */
+            char elem[128] = "";
+            long es = 1;
+            if (!strncmp(type, "spvUnsafeArray<", 15))
+            {
+                const char *cm = msl_array_split(type);
+
+                if (cm && (size_t)(cm - (type + 15)) < sizeof elem)
+                {
+                    const char *cnt = cm + 1;
+                    memcpy(elem, type + 15, (size_t)(cm - (type + 15)));
+                    elem[cm - (type + 15)] = 0;
+                    while (*cnt == ' ') cnt++;
+                    es = strtol(cnt, NULL, 10);
+                    if (es <= 0 || es > 64) es = 1;
+                }
+            }
+
+            if (elem[0])
+            {
+                struct MslStruct sub;
+                size_t run_end = 0;
+
+                if (!msl_parse_struct(msl, elem, &sub))
+                    continue;   /* unsupported member type: skip */
+
+                for (int f = 0; f < sub.count; f++)
+                {
+                    char ftype[160];
+                    size_t fa = 0, fs = 0;
+
+                    if (out->count >= MGL_TESS_MAX_PATCH_MEMBERS) break;
+                    if (sub.members[f].size == 0) continue;
+                    if (!msl_element_type(sub.members[f].type, &fa, &fs))
+                        continue;   /* a struct-in-struct field: unsupported */
+                    /* the field array: N copies of the field; an array field nests
+                     * ("spvUnsafeArray<spvUnsafeArray<float, 2>, N>") */
+                    snprintf(ftype, sizeof ftype, "spvUnsafeArray<%s, %ld>",
+                             sub.members[f].type, es);
+                    cursor = round_up(cursor, fa);
+                    out->members[out->count].offset = cursor;
+                    out->members[out->count].size = (size_t)es * round_up(fs, fa);
+                    out->members[out->count].attr = attr_num;
+                    out->members[out->count].array_idx = 0;  /* set by tess_annotate_keys */
+                    out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].flat_dims = 0;
+                    out->members[out->count].is_tess_level = 0;
+                    snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", ftype);
+                    snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s_%s", namebuf, sub.members[f].name);
+                    cursor += out->members[out->count].size;
+                    if (cursor > run_end) run_end = cursor;
+                    out->count++;
+                }
+                cursor = run_end;
+                continue;
+            }
+
             /* a struct-typed member ("<Struct> inst;"): inline the struct's own fields
              * ("<inst>_<field>"), matching the flattened form the other stages use */
             struct MslStruct sub;
@@ -1693,6 +1868,8 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                     out->members[out->count].size = sub.members[f].size;
                     out->members[out->count].attr = attr_num;
                     out->members[out->count].array_idx = 0; /* set by tess_annotate_keys */
+                    out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].flat_dims = 0;
                     out->members[out->count].is_tess_level = 0;
                     snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", sub.members[f].type);
                     snprintf(out->members[out->count].name, sizeof out->members[out->count].name, "%s_%s", namebuf, sub.members[f].name);
@@ -1709,6 +1886,8 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         out->members[out->count].size = size;
         out->members[out->count].attr = attr_num;
         out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
+        out->members[out->count].array_idx2 = 0;
+        out->members[out->count].flat_dims = 0;
         out->members[out->count].is_tess_level =
             !strcmp(namebuf, "gl_TessLevel") || !strcmp(namebuf, "gl_TessLevelOuter") ? 1 :
             !strcmp(namebuf, "gl_TessLevelInner") ? 2 : 0;
@@ -1841,14 +2020,186 @@ static bool tess_stage_var_named(GLMContext ctx, Program *prog, int stage,
         }
         if (!found_type && !found_id)
             return false;
+        if (found_type)
+        {
+            /* an OpMemberName hit only names a VARYING when its struct is an
+             * interface BLOCK: a plain value struct's field names (e.g. S.x)
+             * are not varyings and must not resolve a flattened base */
+            size_t m2 = 5;
+            bool block = false;
 
+            while (m2 + 3 < n)
+            {
+                uint32_t wc2 = ir[m2] >> 16, op2 = ir[m2] & 0xffff;
+
+                if (wc2 == 0) break;
+                if (op2 == 71 /* OpDecorate */ && ir[m2 + 1] == found_type &&
+                    ir[m2 + 2] == 2 /* Block */)
+                {
+                    block = true;
+                    break;
+                }
+                m2 += wc2;
+            }
+            if (!block)
+                return false;
+        }
     }
     return true;
+}
+
+/* Instance names of the stage module's interface blocks (patch or per-vertex,
+ * input or output).  SPIRV-Cross flattens a block into the stage struct with
+ * member names "<instance>_<member>..."; the instance prefix is what
+ * distinguishes WHICH block a flattened member belongs to, so keying by the
+ * block-relative name needs the prefix list (tess_annotate_keys). */
+static int tess_block_instance_names(GLMContext ctx, Program *prog, int stage,
+                                     char out[][128], int max)
+{
+    uint32_t *ir;
+    size_t n;
+    int cnt = 0;
+
+    if (!ctx || !prog || !out || max <= 0 || stage < 0 || stage >= _MAX_SHADER_TYPES)
+        return 0;
+    ir = prog->spirv[stage].ir;
+    n = prog->spirv[stage].size;
+    if (!ir || n < 8)
+        return 0;
+    {
+        uint32_t blocks[32];
+        int n_blocks = 0;
+        size_t m = 5;
+
+        while (m + 3 < n && n_blocks < 32)
+        {
+            uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+            if (wc == 0) break;
+            if (op == 71 /* OpDecorate */ && wc >= 3 && ir[m + 2] == 2 /* Block */)
+                blocks[n_blocks++] = ir[m + 1];
+            m += wc;
+        }
+        if (!n_blocks)
+            return 0;
+
+        /* 2) pointer types onto a block (directly or through an array — a
+         * per-vertex block is "array<TheBlock>") */
+        uint32_t ptrs[64];
+        int n_ptrs = 0;
+        m = 5;
+        while (m + 3 < n && n_ptrs < 64)
+        {
+            uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+
+            if (wc == 0) break;
+            if (op == 32 /* OpTypePointer */ && wc == 4)
+            {
+                uint32_t pointee = ir[m + 3];
+                bool is_block = false;
+                size_t k = 5;
+
+                while (k + 3 < n)
+                {
+                    uint32_t w2 = ir[k] >> 16, o2 = ir[k] & 0xffff;
+                    if (w2 == 0) break;
+                    /* only a type DEFINITION has ir[k+1] as a result id —
+                     * OpName/OpDecorate reference the array in an operand slot
+                     * and would end the strip early */
+                    if (o2 >= 19 && o2 <= 33 && ir[k + 1] == pointee)
+                    {
+                        if (o2 == 28 /* OpTypeArray */ && w2 >= 4)
+                            pointee = ir[k + 2];
+                        break;
+                    }
+                    k += w2;
+                }
+                    for (int b = 0; b < n_blocks; b++)
+                        if (pointee == blocks[b]) { is_block = true; break; }
+                if (tess_trace() && getenv("MGL_TESS_DEBUG3"))
+                    fprintf(stderr, "   ptr m=%zu pointee=%u resolved=%u is_block=%d (blocks:",
+                            m, ir[m + 3], pointee, is_block);
+                if (tess_trace() && getenv("MGL_TESS_DEBUG3"))
+                {
+                    for (int b = 0; b < n_blocks; b++) fprintf(stderr, " %u", blocks[b]);
+                    fprintf(stderr, ")\n");
+                }
+                if (is_block)
+                    ptrs[n_ptrs++] = ir[m + 1];
+            }
+            m += wc;
+        }
+        if (!n_ptrs)
+            return 0;
+
+        /* 3) interface variables of those pointer types: OpName of the variable */
+        m = 5;
+        while (m + 3 < n && cnt < max)
+        {
+            uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+            if (wc == 0) break;
+            if (op == 59 /* OpVariable */ && wc >= 4)
+            {
+                uint32_t rtype = ir[m + 1], vid = ir[m + 2];
+                bool hit = false;
+
+                for (int p = 0; p < n_ptrs; p++)
+                    if (ptrs[p] == rtype) { hit = true; break; }
+                if (hit)
+                {
+                    /* the variable's OpName */
+                    size_t k = 5;
+
+                    while (k + 3 < n)
+                    {
+                        uint32_t w2 = ir[k] >> 16, o2 = ir[k] & 0xffff;
+                        if (w2 == 0) break;
+                        if (o2 == 5 /* OpName */ && ir[k + 1] == vid && w2 >= 3)
+                        {
+                            char buf[128];
+                            size_t o = 0;
+                            const uint32_t *w = ir + k + 2;
+                            const uint32_t *we = ir + k + w2;
+
+                            for (; w < we && o + 4 < sizeof buf; w++)
+                                for (int b = 0; b < 4; b++)
+                                {
+                                    char c = (char)((*w >> (8 * b)) & 255);
+                                    if (!c) { w = we; break; }
+                                    buf[o++] = c;
+                                }
+                            buf[o] = 0;
+                            if (o)
+                            {
+                                bool dup = false;
+
+                                for (int q = 0; q < cnt; q++)
+                                    if (!strcmp(out[q], buf)) { dup = true; break; }
+                                if (!dup)
+                                    snprintf(out[cnt++], 128, "%s", buf);
+                            }
+                            break;
+                        }
+                        k += w2;
+                    }
+                }
+            }
+            m += wc;
+        }
+    }
+    return cnt;
 }
 
 static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                                struct MslStruct *s, const SpirvResourceList *rl)
 {
+    char prefixes[8][128];
+    int n_prefixes = tess_block_instance_names(ctx, names_prog, stage, prefixes, 8);
+
+    if (tess_trace() && getenv("MGL_TESS_DEBUG2"))
+        fprintf(stderr, "MGL tess: stage %d block instance prefixes (%d): %s%s%s%s\n", stage,
+                n_prefixes, n_prefixes > 0 ? prefixes[0] : "-", n_prefixes > 1 ? " " : "",
+                n_prefixes > 1 ? prefixes[1] : "", n_prefixes > 2 ? " ..." : "");
+
     for (int i = 0; i < s->count; i++)
     {
         MGLTessPatchMember *m = &s->members[i];
@@ -1882,13 +2233,18 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                 {
                     m->key = key;
                     m->array_idx = (uint32_t)atoi(m->name + n);
+                    m->flat_dims = 1;
                     continue;
                 }
             }
         }
 
         base[0] = 0;
-        if (rl)
+        /* a DISSOLVED member variable (mgl_tess_dissolve_vertex_input_blocks)
+         * reflects under its own name with a SYNTHETIC location: never key it
+         * by that — the producer keeps the whole block and keys by the hashed
+         * block-relative path, so both sides must agree (the ds branch below) */
+        if (rl && !strstr(m->name, "mgl_ds_"))
             for (GLuint j = 0; j < rl->count; j++)
                 if (rl->list && !strcmp(rl->list[j].name, m->name))
                 {
@@ -1897,6 +2253,166 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                     break;
                 }
         if (!found)
+        {
+            /* interface-block member reached with the INSTANCE prefix
+             * ("<instance>_<member>..."): strip the whole instance name and key
+             * by the block-relative path.  The generic split below would key by
+             * a struct FIELD name ("x"), which every block member containing
+             * that field hashes identically to (blockS.x and blockSa[0].x
+             * collided) — the record then dropped one of them.  Two flattened
+             * dimensions are recognised along the way: "<m>_<i>_<field>" (i =
+             * the struct-array element) and a trailing "_<j>" (an array-field
+             * element). */
+            for (int q = 0; q < n_prefixes && !found; q++)
+            {
+                size_t pl = strlen(prefixes[q]);
+
+                if (!strncmp(m->name, prefixes[q], pl) && m->name[pl] == '_' && m->name[pl + 1])
+                {
+                    char rest[128], b2[128];
+                    uint32_t fidx = m->array_idx, fidx2 = 0;
+                    bool mid = false, ds = false;
+                    char ds_mbr[80];
+                    size_t rn;
+
+                    snprintf(rest, sizeof rest, "%s", m->name + pl + 1);
+
+                    /* a DISSOLVED member variable of this block (created by
+                     * mgl_tess_dissolve_vertex_input_blocks in the module
+                     * handed to SPIRV-Cross; the GL-view module keeps the
+                     * block, so detect it by the "mgl_ds_<member>" marker):
+                     * the leaf path is "<member>_<leaf...>" with a struct-array
+                     * element index FIRST and an array-field element LAST */
+                    if (!strncmp(rest, "mgl_ds_", 7) && rest[7])
+                    {
+                        char *sep = strchr(rest + 7, '_');
+
+                        if (sep && (size_t)(sep - (rest + 7)) < sizeof ds_mbr)
+                        {
+                            memcpy(ds_mbr, rest + 7, sep - (rest + 7));
+                            ds_mbr[sep - (rest + 7)] = 0;
+                            snprintf(rest, sizeof rest, "%s", sep + 1);
+                            ds = true;
+                        }
+                        else if (!sep && strlen(rest + 7) < sizeof ds_mbr)
+                        {
+                            /* a leaf member without further path: the whole
+                             * remainder IS the member name */
+                            snprintf(ds_mbr, sizeof ds_mbr, "%s", rest + 7);
+                            rest[0] = 0;
+                            ds = true;
+                        }
+                    }
+
+                    /* "<head>_<digits>_<tail>" with head a declared block member:
+                     * the digits are a struct-array ELEMENT index (the canonical
+                     * record stores one field array per member, so the element
+                     * becomes array_idx and the head/tail re-join) */
+                    /* a DISSOLVED member's leaf: a LEADING "<digits>_" (or bare
+                     * digits) is the struct-array element index */
+                    if (ds)
+                    {
+                        size_t dn = 0;
+
+                        while (rest[dn] >= '0' && rest[dn] <= '9') dn++;
+                        if (dn && (rest[dn] == '_' || !rest[dn]))
+                        {
+                            fidx = (uint32_t)atoi(rest);
+                            mid = true;
+                            if (rest[dn])
+                                memmove(rest, rest + dn + 1, strlen(rest + dn + 1) + 1);
+                            else
+                                rest[0] = 0;
+                        }
+                    }
+                    else for (char *b = rest; (b = strchr(b, '_')) != NULL; b++)
+                    {
+                        char *d = b + 1;
+                        size_t dn = 0, hn, tn;
+
+                        while (d[dn] >= '0' && d[dn] <= '9') dn++;
+                        if (!dn || d[dn] != '_') continue;
+                        hn = (size_t)(b - rest);
+                        if (hn >= sizeof b2) break;
+                        memcpy(b2, rest, hn);
+                        b2[hn] = 0;
+                        if (!tess_stage_var_named(ctx, names_prog, stage, b2)) continue;
+                        tn = strlen(d + dn + 1);
+                        if (hn + 1 + tn + 1 > sizeof rest) break;
+                        fidx = (uint32_t)atoi(d);     /* d points into rest: read before the rebase */
+                        mid = true;
+                        {
+                            char tail[96];
+
+                            snprintf(tail, sizeof tail, "%s", d + dn + 1);
+                            snprintf(rest, sizeof rest, "%s_%s", b2, tail);
+                        }
+                        break;
+                    }
+
+                    /* a trailing "_<digits>" group: the array-FIELD element —
+                     * the second canonical dimension when a mid index was found
+                     * above, the plain array element otherwise */
+                    rn = strlen(rest);
+                    {
+                        size_t dn = 0;
+
+                        while (dn < rn && rest[rn - 1 - dn] >= '0' && rest[rn - 1 - dn] <= '9') dn++;
+                        if (dn && rn - dn > 1 && rest[rn - 1 - dn] == '_')
+                        {
+                            if (mid)
+                                fidx2 = (uint32_t)atoi(rest + rn - dn);
+                            else
+                                fidx = (uint32_t)atoi(rest + rn - dn);
+                            rest[rn - 1 - dn] = 0;
+                        }
+                    }
+
+                    /* the block-relative path keys the slot: a reflected
+                     * location when the member is one (rare for blocks), the
+                     * stable name hash otherwise; a dissolved member's leaf
+                     * keys by "<member>_<leaf path>" — the same string the
+                     * producer's whole-block member derives */
+                    bool matched = false;
+                    char ds_base[160];
+
+                    if (ds)
+                    {
+                        if (rest[0])
+                            snprintf(ds_base, sizeof ds_base, "%s_%s", ds_mbr, rest);
+                        else
+                            snprintf(ds_base, sizeof ds_base, "%s", ds_mbr);
+                    }
+                    else
+                        snprintf(ds_base, sizeof ds_base, "%s", rest);
+
+                    if (!ds && rl)
+                        for (GLuint j = 0; j < rl->count; j++)
+                        if (rl->list)
+                        {
+                            const char *nm = rl->list[j].name;
+                            size_t nl = nm ? strlen(nm) : 0, bl = strlen(ds_base);
+
+                            if (nm && (!strcmp(nm, ds_base) ||
+                                (nl == bl + 3 && !strncmp(nm, ds_base, bl) && !strcmp(nm + bl, "[0]"))))
+                            {
+                                key = (uint32_t)rl->list[j].location;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    if (!matched) key = tess_name_hash(ds_base);
+                    m->array_idx = fidx;
+                    m->array_idx2 = fidx2;
+                    m->flat_dims = fidx2 ? 2u : (fidx ? 1u : 0u);
+                    if (getenv("MGL_TESS_DEBUG2"))
+                        fprintf(stderr, "MGL tess annotate[blk]: '%s' -> base '%s' idx=%u idx2=%u dims=%u\n",
+                                m->name, ds_base, fidx, fidx2, m->flat_dims);
+                    found = true;
+                }
+            }
+        }
+        if (!found && !strstr(m->name, "mgl_ds_"))
         {
             /* flattened array element ("<name>_<q>") and/or interface-block
              * member reached with the instance prefix ("<instance>_<member>",
@@ -1932,6 +2448,8 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                     }
                 }
             }
+                fprintf(stderr, "MGL tess annotate[gen]: stage %d '%s' base='%s' fidx=%u\n",
+                        stage, m->name, base, fidx);
             if (!base[0])
             {
                 char b2[128];
@@ -1976,19 +2494,44 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                     }
                 if (!matched) key = tess_name_hash(base);
                 m->array_idx = fidx;
+                m->flat_dims = fidx ? 1u : 0u;
                 found = true;
             }
         }
         if (!found)
             key = tess_builtin_key(m->name);
         if (!found && !key)
-            key = tess_name_hash(m->name);   /* unreflected (block member / gl_ extra) */
+        {
+            /* a dissolved variable no block prefix claimed: key by the
+             * block-relative path after the marker, mirroring the ds branch
+             * of the prefix path so the producer pairs with it */
+            const char *ds = strstr(m->name, "mgl_ds_");
+            const char *n = ds ? ds + 7 : m->name;
+            size_t len = strlen(n);
+            char b2[128];
+
+            /* an element ("<slot>_<q>") of an ARRAY slot that itself could not
+             * be resolved to a declared variable (a STRUCT FIELD split, e.g.
+             * S.z[2] naming "vb_s_z_0"): key by the stripped slot name so it
+             * pairs with the producer's whole "vb_s_z" slot, and record the
+             * element index for the stride fixup */
+            while (len > 1 && n[len - 1] >= '0' && n[len - 1] <= '9')
+                len--;
+            if (!ds && len > 1 && n[len - 1] == '_' && len - 1 < sizeof b2)
+            {
+                snprintf(b2, sizeof b2, "%.*s", (int)(len - 1), n);
+                key = tess_name_hash(b2);
+                m->array_idx = (uint32_t)atoi(n + len);
+                m->flat_dims = 1;
+            }
+            else
+                key = tess_name_hash(n);   /* unreflected (block member / gl_ extra) */
+        }
         m->key = key;
     }
 }
 
-/* Interface blocks reach the MSL stage structs as flattened members whose names
- * SPIRV-Cross prefixes differently on the two sides of an interface
+/* Interface blocks reach the MSL stage structs as flattened members whose names * SPIRV-Cross prefixes differently on the two sides of an interface
  * ("<instance>_<member>" on the consumer, "m_<id>_<member>" for an anonymous
  * block on the producer), so neither the reflected names nor the name hash
  * line up: the producer's and the consumer's copy of the same GL member
@@ -2074,7 +2617,8 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                 if (out->m[j].key != m->key)
                     continue;
                 if (o_arr || m_arr ||
-                    (!o_arr && !m_arr && out->m[j].array_idx == m->array_idx))
+                    (!o_arr && !m_arr && out->m[j].array_idx == m->array_idx &&
+                     out->m[j].array_idx2 == m->array_idx2))
                 {
                     found = j;          /* same varying (whole array or an element) */
                     if (!o_arr && m_arr)
@@ -2097,8 +2641,11 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                     }
                     break;
                 }
-                if (o_arr && !m_arr && m->array_idx != 0)
-                    absorbed = true;   /* element of an array slot already present */
+                /* a flattened element of an array slot already present: any
+                 * element, including the [0][0] of a two-dimensional slot
+                 * (flat_dims marks the member as flattened even then) */
+                if (o_arr && !m_arr && m->flat_dims > 0)
+                    absorbed = true;
                 if (!o_arr && !m_arr && m->array_idx != 0 &&
                     msl_matrix_type(out->m[j].type, &dummy_align, &dummy_size))
                     absorbed = true;   /* flattened MATRIX COLUMN of a matrix slot already
@@ -2124,6 +2671,8 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                 snprintf(out->m[found].name, sizeof out->m[found].name, "%s", m->name);
                 out->m[found].size = m->size;
                 out->m[found].array_idx = m->array_idx;
+                out->m[found].array_idx2 = m->array_idx2;
+                out->m[found].flat_dims = m->flat_dims;
                 if (whole_matrix)
                 {
                     /* a WHOLE matrix replaces its column slots: drop the other
@@ -2271,7 +2820,55 @@ static void tess_canon_member_lines(char **buf, size_t *len, size_t *cap,
         /* the canonical slot is the whole array, the stage uses flattened elements */
         char elem[120];
         uint32_t n = msl_array_len(cm->type);
+        bool two_dim = false;
+        char inner_type[120];
+        long n2 = 0;
 
+        if (stage)
+            for (int j = 0; j < nstage; j++)
+                if (stage[j].key == cm->key && stage[j].size > 0 &&
+                    strstr(stage[j].type, "spvUnsafeArray") == NULL && stage[j].flat_dims == 2)
+                    two_dim = true;
+
+        if (two_dim && !msl_array_inner(cm->type, inner_type, sizeof inner_type, &n2))
+            two_dim = false;
+
+        if (two_dim)
+        {
+            /* a struct-array FIELD slot ("name_<field>" of spvUnsafeArray<T, N>
+             * with T itself an array): the stage flattens BOTH dimensions — one
+             * element line per (outer, inner) pair */
+            char e2[120];
+
+            if (n2 > 0 && tess_canon_element_type(inner_type, rename_arr, e2, sizeof e2))
+            {
+                for (uint32_t a = 0; a < n; a++)
+                    for (long b = 0; b < n2; b++)
+                    {
+                        const char *nm = NULL;
+                        char pad[64];
+
+                        if (stage)
+                            for (int j = 0; j < nstage; j++)
+                                if (stage[j].key == cm->key && stage[j].size > 0 &&
+                                    stage[j].array_idx == a &&
+                                    stage[j].array_idx2 == (uint32_t)b &&
+                                    strstr(stage[j].type, "spvUnsafeArray") == NULL)
+                                {
+                                    nm = stage[j].name;
+                                    break;
+                                }
+                        if (!nm)
+                        {
+                            snprintf(pad, sizeof pad, "mgl_k%08x_%u_%ld", cm->key, a, b);
+                            nm = pad;
+                        }
+                        str_append(buf, len, cap, "%s    %s %s;\n", *first ? "\n" : "", e2, nm);
+                        *first = false;
+                    }
+                return;
+            }
+        }
         if (tess_canon_element_type(cm->type, rename_arr, elem, sizeof elem))
             for (uint32_t e = 0; e < n; e++)
             {
@@ -2281,7 +2878,7 @@ static void tess_canon_member_lines(char **buf, size_t *len, size_t *cap,
                 if (stage)
                     for (int j = 0; j < nstage; j++)
                         if (stage[j].key == cm->key && stage[j].size > 0 &&
-                            stage[j].array_idx == e &&
+                            stage[j].array_idx == e && stage[j].flat_dims != 2 &&
                             strstr(stage[j].type, "spvUnsafeArray") == NULL)
                         {
                             nm = stage[j].name;
@@ -2427,18 +3024,57 @@ static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, con
                 expanded = true;         /* canon has m_<field> members */
         }
         if (present || !expanded) continue;
+        if (tess_trace() && getenv("MGL_TESS_DEBUG2"))
+            fprintf(stderr, "MGL tess flatten: body member '%s' (present=%d expanded=%d)\n", m, present, expanded);
 
         char pat[224];
         if (ml + 3 >= sizeof pat) continue;
-        snprintf(pat, sizeof pat, ".%s.", m);
+        snprintf(pat, sizeof pat, ".%s", m);
         for (char *w = msl; (w = strstr(w, pat)) != NULL; )
         {
+            /* a member access continues with ".field" or "[index].field" */
+            if (w[ml + 1] != '.' && w[ml + 1] != '[')
+            { w += ml + 1; continue; }
             /* longest chain ".f1[.f2...] whose joined name m_f1[_f2...] is a canon
              * member; the replacement always SHRINKS the text (each '.' consumed) */
             char joined[256];
+            char idx_txt[32];
             snprintf(joined, sizeof joined, "%s", m);
             const char *p = w + ml + 1;               /* first '.' of ".f1" */
             bool any = false;
+            idx_txt[0] = 0;
+            /* an array-of-struct member first appears as ".m[<i>].<f>...": the
+             * canonical record stores one array per field ("m_<f>", N elements),
+             * so hoist the field out of the index — ".m[i].f[j]" becomes
+             * ".m_f[i][j]" and a DYNAMIC i stays a real array index.  The fold
+             * only applies when canon carries the field-array member. */
+            if (*p == '[')
+            {
+                const char *cl = strchr(p, ']');
+                char fld[96];
+                size_t il, fl;
+
+                if (!cl || cl[1] != '.') { w += ml + 1; continue; }
+                il = (size_t)(cl - (p + 1));
+                if (il == 0 || il >= sizeof idx_txt) { w += ml + 1; continue; }
+                fl = 0;
+                while (cl[2 + fl] && (isalnum((unsigned char)cl[2 + fl]) || cl[2 + fl] == '_')) fl++;
+                if (!fl || fl >= sizeof fld) { w += ml + 1; continue; }
+                {
+                    char cand[300];
+
+                    if (snprintf(cand, sizeof cand, "%s_%.*s", joined, (int)fl, cl + 2) >= (int)sizeof cand)
+                    { w += ml + 1; continue; }
+                    bool hit = false;
+                    for (int k = 0; k < canon->n; k++)
+                        if (strcmp(canon->m[k].name, cand) == 0) { hit = true; break; }
+                    if (!hit) { w += ml + 1; continue; }
+                    snprintf(joined, sizeof joined, "%s", cand);
+                    memcpy(idx_txt, p + 1, il); idx_txt[il] = 0;
+                    p = cl + 2 + fl;               /* right after the field name */
+                    any = true;
+                }
+            }
             while (*p == '.')
             {
                 size_t fl = 0;
@@ -2456,13 +3092,26 @@ static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, con
                 any = true;
             }
             if (!any) { w += ml + 1; continue; }
-            size_t jlen = strlen(joined);
-            size_t consumed = 1 + ml + (size_t)(p - (w + ml + 1));
-            if (jlen >= consumed) { w += consumed; continue; }
-            memmove(w + 1 + jlen, w + consumed, strlen(w + consumed) + 1);
-            memcpy(w + 1, joined, jlen);
-            changed = true;
-            w += 1 + jlen;
+            /* replacement: "." + joined [+ "[" + idx_txt + "]"]; the folded array
+             * index goes AFTER the hoisted field names.  The array fold SHRINKS
+             * the span (one '.' consumed); a plain struct field fold is
+             * length-neutral ("vb_s.x" -> "vb_s_x") and must splice too */
+            {
+                char rep[320];
+                size_t consumed = 1 + ml + (size_t)(p - (w + ml + 1));
+                size_t rl;
+
+                if (snprintf(rep, sizeof rep, ".%s%s%s%s", joined, idx_txt[0] ? "[" : "",
+                             idx_txt[0] ? idx_txt : "", idx_txt[0] ? "]" : "") >= (int)sizeof rep)
+                { w += ml + 1; continue; }
+                rl = strlen(rep);
+                if (rl > consumed) { w += consumed; continue; }
+                if (rl < consumed)
+                    memmove(w + rl, w + consumed, strlen(w + consumed) + 1);
+                memcpy(w, rep, rl);
+                changed = true;
+                w += rl;
+            }
         }
     }
     return changed;
@@ -4613,12 +5262,25 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                         /* flattened element ("name_N", array_idx N) of a canonical
                          * spvUnsafeArray patch output: advance the source by the element
                          * stride (the GPU blob map needed the same fix) */
-                        if (m->array_idx && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
+                        /* flattened element ("name_N", array_idx N) of a canonical
+                         * spvUnsafeArray patch output: advance the source by the element
+                         * stride (the GPU blob map needed the same fix); a struct-array
+                         * field element steps a second dimension inside the field */
+                        if (m->flat_dims && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
                         {
-                            size_t align = 1, whole = 0;
+                            size_t stride = msl_array_stride(tp->tcs_patch_out[j].type);
 
-                            if (msl_element_type(tp->tcs_patch_out[j].type, &align, &whole))
-                                so += m->array_idx * (whole / msl_array_len(tp->tcs_patch_out[j].type));
+                            if (stride)
+                                so += m->array_idx * stride;
+                            if (stride && m->array_idx2)
+                            {
+                                char inner[96];
+                                long n2 = 0;
+
+                                if (msl_array_inner(tp->tcs_patch_out[j].type, inner, sizeof inner, &n2) &&
+                                    msl_array_stride(inner))
+                                    so += m->array_idx2 * msl_array_stride(inner);
+                            }
                         }
                         memcpy(dst + m->offset, src + so, m->size);
                         break;
@@ -6666,6 +7328,15 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
     Program *program = tp->program;
     const char *vs_msl = program->spirv[_VERTEX_SHADER].msl_str;
     const char *tcs_msl = tp->has_tcs ? program->spirv[_TESS_CONTROL_SHADER].msl_str : NULL;
+    if (tcs_msl && getenv("MGL_DUMP_TCS"))
+    {
+        char fn[128];
+
+        snprintf(fn, sizeof fn, "%s", getenv("MGL_DUMP_TCS"));
+        FILE *f = fopen(fn, "w");
+
+        if (f) { fputs(tcs_msl, f); fclose(f); }
+    }
     const char *tes_msl = program->spirv[_TESS_EVALUATION_SHADER].msl_str;
 
     struct MslStruct vs_out, tcs_in, tcs_out, tes_cp, tcs_po, tes_pi;
@@ -6779,6 +7450,8 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                         {
                             dstarr[d][j].key = src->key;
                             dstarr[d][j].array_idx = src->array_idx;
+                            dstarr[d][j].array_idx2 = src->array_idx2;
+                            dstarr[d][j].flat_dims = src->flat_dims;
                             break;
                         }
             }
@@ -6825,7 +7498,8 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
             !tess_canon_union(&canon_tcs, tes_side, 2))
         {
             if (tess_trace())
-                fprintf(stderr, "MGL tess: canonical record union failed; layouts kept per-stage\n");
+                fprintf(stderr, "MGL tess: canonical record union failed (vs=%d tcs=%d); layouts kept per-stage\n",
+                        canon.n, canon_tcs.n);
             return;
         }
     }
@@ -6899,18 +7573,33 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
             for (int j = 0; j < tp->num_cp_record; j++)
                 if (tp->tes_cp[i].key == rec->m[j].key &&
                     /* the record splits matrix columns into "_0"/"_1" entries with the
-                     * same key: take THIS member's own slot, not the first match */
+                     * same key: take THIS member's own slot, not the first match; a
+                     * FLATTENED ARRAY ELEMENT (flat_dims) takes the whole-array slot —
+                     * the first match — and steps inside it by the stride (only when
+                     * that slot really is an array: a split matrix column has the same
+                     * flat_dims and must keep matching its own column slot) */
                     (tp->tes_cp[i].array_idx == 0 || rec->m[j].array_idx == tp->tes_cp[i].array_idx ||
-                     !strcmp(rec->m[j].name, tp->tes_cp[i].name)))
+                     !strcmp(rec->m[j].name, tp->tes_cp[i].name) ||
+                     (tp->tes_cp[i].flat_dims && strstr(rec->m[j].type, "spvUnsafeArray"))))
                 {
                     tp->tes_cp[i].offset = rec->m[j].offset;
-                    if (tp->tes_cp[i].array_idx && strstr(rec->m[j].type, "spvUnsafeArray"))
+                    if (tp->tes_cp[i].flat_dims && strstr(rec->m[j].type, "spvUnsafeArray"))
                     {
-                        size_t align = 1, size = 0;
+                        size_t stride = msl_array_stride(rec->m[j].type);
 
-                        if (msl_element_type(rec->m[j].type, &align, &size))
+                        if (stride)
                             tp->tes_cp[i].offset = rec->m[j].offset +
-                                tp->tes_cp[i].array_idx * (size / msl_array_len(rec->m[j].type));
+                                tp->tes_cp[i].array_idx * stride;
+                        if (stride && tp->tes_cp[i].array_idx2)
+                        {
+                            char inner[96];
+                            long n2 = 0;
+
+                            if (msl_array_inner(rec->m[j].type, inner, sizeof inner, &n2) &&
+                                msl_array_stride(inner))
+                                tp->tes_cp[i].offset += tp->tes_cp[i].array_idx2 *
+                                    msl_array_stride(inner);
+                        }
                     }
                     else if (tp->tes_cp[i].array_idx &&
                              msl_matrix_type(rec->m[j].type, &malign, &msize))
@@ -6950,15 +7639,31 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                 /* flattened array element ("name_N", array_idx N) of a canonical
                  * spvUnsafeArray member: advance by the element stride (mirrors the
                  * control-point fixup above — without it every element read at the
-                 * array's base offset, and 'patch in int r[16]' returned r[0] always) */
-                if (tp->tes_patch_in[i].array_idx && strstr(canon_patch.m[j].type, "spvUnsafeArray"))
+                 * array's base offset, and 'patch in int r[16]' returned r[0] always).
+                 * A struct-array FIELD element carries a second dimension
+                 * ("name_<i>_<field>_<j>", array_idx2) stepping inside the field */
+                if (tp->tes_patch_in[i].flat_dims && strstr(canon_patch.m[j].type, "spvUnsafeArray"))
                 {
-                    size_t align = 1, size = 0;
+                    size_t stride = msl_array_stride(canon_patch.m[j].type);
 
-                    if (msl_element_type(canon_patch.m[j].type, &align, &size))
+                    if (getenv("MGL_TESS_DEBUG2"))
+                        fprintf(stderr, "MGL tess: stride fixup '%s' canon '%s %s' dims=%u idx=%u idx2=%u stride=%zu\n",
+                                tp->tes_patch_in[i].name, canon_patch.m[j].type,
+                                canon_patch.m[j].name, tp->tes_patch_in[i].flat_dims,
+                                tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].array_idx2, stride);
+                    if (stride)
                         tp->tes_patch_in[i].offset = canon_patch.m[j].offset +
-                            tp->tes_patch_in[i].array_idx *
-                            (size / msl_array_len(canon_patch.m[j].type));
+                            tp->tes_patch_in[i].array_idx * stride;
+                    if (stride && tp->tes_patch_in[i].array_idx2)
+                    {
+                        char inner[96];
+                        long n2 = 0;
+
+                        if (msl_array_inner(canon_patch.m[j].type, inner, sizeof inner, &n2) &&
+                            msl_array_stride(inner))
+                            tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx2 *
+                                msl_array_stride(inner);
+                    }
                 }
                 break;
             }
@@ -7373,13 +8078,23 @@ static MGLTessProgram *tess_build_pair(GLMContext ctx, MGLTessProgram *tp, Progr
             if (pair->tes_cp[i].key == canon_tcs.m[j].key)
             {
                 pair->tes_cp[i].offset = canon_tcs.m[j].offset;
-                if (pair->tes_cp[i].array_idx && strstr(canon_tcs.m[j].type, "spvUnsafeArray"))
+                if (pair->tes_cp[i].flat_dims && strstr(canon_tcs.m[j].type, "spvUnsafeArray"))
                 {
-                    size_t align = 1, size = 0;
+                    size_t stride = msl_array_stride(canon_tcs.m[j].type);
 
-                    if (msl_element_type(canon_tcs.m[j].type, &align, &size))
+                    if (stride)
                         pair->tes_cp[i].offset = canon_tcs.m[j].offset +
-                            pair->tes_cp[i].array_idx * (size / msl_array_len(canon_tcs.m[j].type));
+                            pair->tes_cp[i].array_idx * stride;
+                    if (stride && pair->tes_cp[i].array_idx2)
+                    {
+                        char inner[96];
+                        long n2 = 0;
+
+                        if (msl_array_inner(canon_tcs.m[j].type, inner, sizeof inner, &n2) &&
+                            msl_array_stride(inner))
+                            pair->tes_cp[i].offset += pair->tes_cp[i].array_idx2 *
+                                msl_array_stride(inner);
+                    }
                 }
                 break;
             }
@@ -8262,13 +8977,23 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
                     /* flattened element ("name_N", array_idx N) of a canonical
                      * spvUnsafeArray patch output: advance the source by the element
                      * stride — without it every element copied element 0's bytes into
-                     * its slot ('patch out int r[16]' read back as r[0] everywhere) */
-                    if (m->array_idx && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
+                     * its slot ('patch out int r[16]' read back as r[0] everywhere);
+                     * a struct-array field element steps the inner dimension too */
+                    if (m->flat_dims && strstr(tp->tcs_patch_out[j].type, "spvUnsafeArray"))
                     {
-                        size_t align = 1, whole = 0;
+                        size_t stride = msl_array_stride(tp->tcs_patch_out[j].type);
 
-                        if (msl_element_type(tp->tcs_patch_out[j].type, &align, &whole))
-                            elem = whole / msl_array_len(tp->tcs_patch_out[j].type);
+                        if (stride)
+                            elem = stride;
+                        if (m->array_idx2)
+                        {
+                            char inner[96];
+                            long n2 = 0;
+
+                            if (msl_array_inner(tp->tcs_patch_out[j].type, inner, sizeof inner, &n2) &&
+                                msl_array_stride(inner))
+                                src += (uint32_t)(m->array_idx2 * msl_array_stride(inner));
+                        }
                     }
                     src += (uint32_t)(m->array_idx * elem);
                     size = (uint32_t)m->size;

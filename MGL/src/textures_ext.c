@@ -85,6 +85,9 @@ void mgl_texext_info_free(GLMContext ctx, const Texture *tex)
         {
             MGLTexExtInfo *dead = *p;
             *p = dead->next;
+            if (dead->kind == MGL_TEXEXT_BUFFER && dead->buffer_name &&
+                ctx->state.ext_texext->buffer_texture_count)
+                ctx->state.ext_texext->buffer_texture_count--;
             free(dead);
             return;
         }
@@ -344,6 +347,8 @@ static void texBufferCommon(GLMContext ctx, const char *func, Texture *tex, GLen
     }
 
     info->kind = MGL_TEXEXT_BUFFER;
+    if (!info->buffer_name && buffer)
+        ctx->state.ext_texext->buffer_texture_count++;
     info->buffer_name = buffer;
     info->buffer_format = internalformat;
     info->buffer_ranged = buffer ? ranged : GL_FALSE;

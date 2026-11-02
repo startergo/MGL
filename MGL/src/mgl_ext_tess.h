@@ -88,6 +88,14 @@ typedef struct MGLTessPatchMember_t {
     int     is_tess_level;  /* TES patch-in: 1 = gl_TessLevel/Outer, 2 = gl_TessLevelInner */
     uint32_t array_idx;     /* flattened array element (SPIRV-Cross "name_<i>" members of an
                              * arrayed varying "name"): 0 for plain members */
+    uint32_t array_idx2;    /* second flattened dimension: the inner element index of a
+                             * struct-array field ("<m>_<i>_<f>_<j>" — "blockSa_0_z_1" has
+                             * array_idx=0 (the struct element) and array_idx2=1 (z[1])); 0
+                             * when the varying has no second dimension */
+    uint32_t flat_dims;     /* how many flattened array dimensions the member name carries
+                             * (0 = the whole member, 1 = array_idx, 2 = array_idx2 too) —
+                             * distinguishes element [0][0] of a flattened slot from an
+                             * unflattened member when merging records */
     uint32_t key;           /* canonical interface key: GL varying location, a fixed slot for
                              * builtins, or a name hash for members no stage reflection
                              * resolves (blocks) — identical across stages (see
@@ -469,6 +477,18 @@ bool mgl_tess_stage_bound(GLMContext ctx);
 /* SPIR-V preparation: isolines are emulated on the quad domain (rewrites the execution mode) */
 uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n);
 uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n);
+/* true when prepare_spirv's result is the DECLINED marker (a copy whose magic
+ * is corrupt): the module cannot be compiled by SPIRV-Cross without aborting
+ * and must be failed cleanly instead of being compiled */
+static inline bool mgl_tess_module_declined(const uint32_t *words, size_t n)
+{
+    return n >= 1 && words && (words[0] & 0xffffffffu) == (0x07230203u ^ 1u);
+}
+
+/* dissolve per-vertex INPUT interface blocks of a tessellation stage into one
+ * plain per-vertex variable per block member (SPIRV-Cross mis-resolves and
+ * aborts on split members of such blocks); see tess_spv_lower.c */
+uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n);
 
 /* glslang's OpenGL target emits the legacy OpSubgroupAll/Any/AllEqualKHR
  * opcodes for the GL_ARB_shader_group_vote built-ins; SPIRV-Cross's MSL
