@@ -3663,6 +3663,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 out->elems = melems;
                 out->xfb_buffer = -1;
                 out->xfb_offset = 0xffffffffu;
+                out->xfb_stride = 0xffffffffu;
                 out->location = spv_member_deco(m, t->id, mi, SpvDecorationLocation, &mloc) ?
                                 mloc : next_loc;
                 next_loc = out->location + consumed;
@@ -3680,6 +3681,8 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_member_deco(m, t->id, mi, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
                 else if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
                 if (spv_member_deco(m, t->id, mi, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
+                if (spv_member_deco(m, t->id, mi, SpvDecorationXfbStride, &tmp) ||
+                    spv_deco(m, v->id, SpvDecorationXfbStride, &tmp)) out->xfb_stride = tmp;
             }
             continue;
         flat_merged: ;
@@ -3700,6 +3703,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         out->location = location;
         out->xfb_buffer = -1;
         out->xfb_offset = 0xffffffffu;
+        out->xfb_stride = 0xffffffffu;
         out->base = t->kind == SPVT_FLOAT ? (t->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
                     t->kind == SPVT_INT ? (t->is_signed ? GL_INT : GL_UNSIGNED_INT) :
                     t->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, t);
@@ -3717,6 +3721,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         if (spv_deco(m, v->id, SpvDecorationStream, &tmp)) out->stream = tmp;
         if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
         if (spv_deco(m, v->id, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
+        if (spv_deco(m, v->id, SpvDecorationXfbStride, &tmp)) out->xfb_stride = tmp;
         (void)location;
     }
 
@@ -10690,6 +10695,10 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
 {
     GLuint dbuffer[64], doffset[64];
     GLsizei dn = 0;
+    GLuint dbuf_stride[MGL_XFB_MAX_BUFFERS];
+    bool dbuf_dbl[MGL_XFB_MAX_BUFFERS];
+    bool dbuf_seen[MGL_XFB_MAX_BUFFERS];
+    bool dbuf_have_stride[MGL_XFB_MAX_BUFFERS];
     GLuint buffer = 0, offset = 0, n = 0, xn = 0;
     MGLXfbVarying *v;
     char dnames[64][192];
@@ -10706,19 +10715,40 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
     if (!xp->pending_count)
     {
         /* shader-declared capture (xfb_buffer / xfb_offset on outputs, including interface
-         * block members): GL 4.6 13.3.2 — with no API-specified varyings, every output that
-         * declares an xfb_buffer is captured into that buffer at its declared offset */
+         * block members): GL 4.6 11.1.2.1 — only outputs that declare an xfb_offset are
+         * captured (a bare xfb_buffer / xfb_stride selects the buffer and its stride but
+         * captures nothing); an explicit xfb_stride sizes the buffer's per-vertex record,
+         * otherwise it is derived from the captures (aligned to 8 when the buffer holds
+         * doubles, ARB_enhanced_layouts) */
+        memset(dbuf_stride, 0xff, sizeof dbuf_stride);
+        memset(dbuf_dbl, 0, sizeof dbuf_dbl);
+        memset(dbuf_seen, 0, sizeof dbuf_seen);
+        memset(dbuf_have_stride, 0, sizeof dbuf_have_stride);
         for (int k = 0; k < nvars && dn < 64; k++)
         {
             if (vars[k].xfb_buffer < 0) continue;
+            GLuint b = (GLuint)vars[k].xfb_buffer;
+            if (b < MGL_XFB_MAX_BUFFERS)
+            {
+                dbuf_seen[b] = true;
+                if (vars[k].xfb_stride != 0xffffffffu && vars[k].xfb_stride < dbuf_stride[b])
+                    dbuf_stride[b] = vars[k].xfb_stride;
+                if (vars[k].base == GL_DOUBLE) dbuf_dbl[b] = true;
+            }
+            if (vars[k].xfb_offset == 0xffffffffu) continue;   /* no xfb_offset: not captured */
             if (geom_var_dotted(&vars[k]))
                 snprintf(dnames[dn], sizeof(dnames[dn]), "%s.%s", vars[k].name, vars[k].member);
             else
                 snprintf(dnames[dn], sizeof(dnames[dn]), "%s", vars[k].name);
-            dbuffer[dn] = (GLuint)vars[k].xfb_buffer;
+            dbuffer[dn] = b;
             doffset[dn] = vars[k].xfb_offset;
             dn++;
         }
+        /* declared buffers with an explicit stride publish it even when nothing is
+         * captured into them (the stride query must not report the derived 0) */
+        for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+            if (dbuf_seen[b] && dbuf_stride[b] != 0xffffffffu)
+            { xp->stride[b] = dbuf_stride[b]; dbuf_have_stride[b] = true; }
         if (!dn) return;             /* nothing captured for this program */
         /* capture in ascending (buffer, offset) order */
         for (GLsizei a = 1; a < dn; a++)
@@ -10968,9 +10998,12 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                 offset += v->words * 4;
             else
             {
-                /* declared capture: the stride of a buffer is the extent of its captures */
+                /* declared capture: the stride of a buffer is the extent of its captures,
+                 * unless an xfb_stride was declared for it (already set above); a buffer
+                 * holding doubles aligns its derived stride to 8 basic machine units */
                 GLuint end = offset + v->words * 4;
-                if (end > xp->stride[buffer]) xp->stride[buffer] = end;
+                if (dbuf_dbl[buffer]) end = (end + 7u) & ~7u;
+                if (!dbuf_have_stride[buffer] && end > xp->stride[buffer]) xp->stride[buffer] = end;
             }
         }
         xp->buffer_mask |= (1u << v->buffer);

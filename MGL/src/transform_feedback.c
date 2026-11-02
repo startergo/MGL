@@ -31,6 +31,7 @@
                                   * user VS (GL_ARB_cull_distance lifting, ...) */
 
 char *mgl_program_fix_vertex_gathers(const char *msl);  /* program.c: AGX vertex gather emulation */
+extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);  /* compat r91: mgl_layout_validate.c */
 #include "mgl_ext_geom.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
@@ -1460,20 +1461,36 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
         GLuint w = v->src_word;
         /* The fp64 lowering only supports whole-variable (or single-index)
          * access to double stage outputs; reading element-wise requires a
-         * Function-storage copy first ("copy it to a local first"). */
+         * Function-storage copy first ("copy it to a local first").  An
+         * ARRAY-typed local is itself a construct the fp64 lowering cannot
+         * lower (MSL has no double arrays) — emit one scalar local per
+         * element instead. */
         char var[32], tyname[64];
         const char *expr;
+        char (*evar)[48] = NULL;
         if (v->comp_kind == GL_DOUBLE) {
             xfb_glsl_type_name(v, tyname, sizeof tyname);
-            snprintf(var, sizeof var, "mgl_xfb_v%u", i);
-            xfb_cat(&s, "    %s %s = %s;\n", tyname, var, v->expr);
+            if (v->size > 1 && v->size <= 256) {
+                char scalar[64];
+                size_t bl = strcspn(tyname, "[");
+                snprintf(scalar, sizeof scalar, "%.*s", (int)bl, tyname);
+                evar = calloc((size_t)v->size, sizeof *evar);
+                for (GLint e = 0; e < v->size; e++) {
+                    snprintf(evar[e], 48, "mgl_xfb_v%u_%d", i, e);
+                    xfb_cat(&s, "    %s %s = (%s)[%d];\n", scalar, evar[e], v->expr, e);
+                }
+            } else {
+                snprintf(var, sizeof var, "mgl_xfb_v%u", i);
+                xfb_cat(&s, "    %s %s = %s;\n", tyname, var, v->expr);
+            }
             expr = var;
         } else {
             expr = v->expr;
         }
         for (GLint e = 0; e < v->size; e++) {
             char elem[320];
-            if (whole_arrays[i]) snprintf(elem, sizeof(elem), "(%s)[%d]", expr, e);
+            if (evar) snprintf(elem, sizeof(elem), "(%s)", evar[e]);
+            else if (whole_arrays[i]) snprintf(elem, sizeof(elem), "(%s)[%d]", expr, e);
             else snprintf(elem, sizeof(elem), "(%s)", expr);
             for (GLuint col = 0; col < v->columns; col++) {
                 for (GLuint row = 0; row < v->rows; row++) {
@@ -1492,6 +1509,7 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
                 }
             }
         }
+        free(evar);
     }
 
     /* locate main()'s closing brace and splice the statements in front of it */
@@ -1678,6 +1696,19 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
      * lower them exactly like compile_stage does before translating to MSL
      * (MSL has no doubles; raw u64 words + soft-float calls) */
     {
+        /* compat r91: MSL cannot emit arrays-of-matrices in output variables —
+         * split them BEFORE the fp64 pass, as compile_stage does */
+        {
+            size_t aw = 0;
+            uint32_t *aomo = mgl_spirv_lower_aom_output(ir, words, &aw);
+            if (aomo)
+            {
+                if (ir == patched) { patched = aomo; free((void *)ir); }
+                else patched = aomo;
+                ir = patched;
+                words = aw;
+            }
+        }
         bool is64 = false;
         size_t lw = 0;
         char log[256] = {0};
@@ -2025,8 +2056,18 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     xp->linked = true;
     xp->mode = xp->pending_mode;
 
-    /* in-shader xfb qualifiers override glTransformFeedbackVaryings */
+    /* in-shader xfb qualifiers override glTransformFeedbackVaryings (GL 4.6 11.1.2.1:
+     * "the values specified by TransformFeedbackVaryings are ignored, and the set of
+     * variables captured for transform feedback is derived from the layout qualifiers")
+     * — the pending names are hidden from the resolvers while the declared layout is
+     * resolved, then restored: a later relink that drops the qualifiers must find them */
+    char **decl_pending = NULL;
+    GLsizei decl_pending_count = 0;
     if (shader_xfb || stage_xfb) {
+        decl_pending = xp->pending;
+        decl_pending_count = xp->pending_count;
+        xp->pending = NULL;
+        xp->pending_count = 0;
         if (p->shader_slots[_GEOMETRY_SHADER]) {
             /* geometry stage outputs (incl. named interface blocks): the geometry domain
              * resolves the declared xfb_buffer / xfb_offset layout against its own table */
@@ -2039,10 +2080,15 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         }
         xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false,
                  p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
-        if (xp->from_shader || xp->link_failed) return;
+        if (xp->from_shader || xp->link_failed) { xp->pending = decl_pending; xp->pending_count = decl_pending_count; return; }
         xfb_clear_linked(ctx, xp);
         xp->linked = true;
         xp->mode = xp->pending_mode;
+        /* a declared buffer set with no captured variable (only xfb_stride) is a
+         * complete declared layout — the pending names stay ignored */
+        xp->pending = decl_pending;
+        xp->pending_count = decl_pending_count;
+        return;
     }
 
     if (xp->pending_count == 0) return;

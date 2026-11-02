@@ -50,6 +50,11 @@ static uint64_t mgl_link_group_seq;
 #include "mgl_ext_tess.h"
 #include "shaders.h"
 #include "fp64.h"
+
+/* compat r86/r91 (mgl_layout_validate.c): GLSL layout rules glslang does not
+ * check, and the MSL array-of-matrix output lowering */
+extern char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words);
+extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);
 #include "buffers.h"
 #include "msl_reserved.h"
 #include "spirv_vote.h"
@@ -2605,7 +2610,40 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* compat r86: layout rules glslang does not check — explicit block member
+     * offsets (overlap / alignment, GLSL 4.60 4.4.5) and in/out location
+     * limits (11.1.1).  Must run BEFORE the fp64 pass: it sizes members with
+     * the GL types, and double blocks are lowered to integer arrays.  Array
+     * members are excluded from the check (glslang's implicit array growth
+     * makes their decorations inconsistent — the r48 fix pass re-lays those
+     * blocks out later). */
+    {
+        char *vlog = mgl_layout_validate_stage(ctx, stage, prepared, prepared_words);
+        if (vlog)
+        {
+            mgl_append_info_log(log, "%s", vlog);
+            free(vlog);
+            free(prepared);
+            return false;
+        }
+    }
+
     bool lowered64 = false;
+
+    /* compat r91: MSL cannot emit arrays-of-matrices in output variables
+     * either (`layout(location=0) flat out dmat2 goku[3]`) — split into
+     * per-element outputs + a flushed private shadow BEFORE the fp64 pass,
+     * which would otherwise explode the array copy (mgl_layout_validate.c) */
+    {
+        size_t aomo_words = 0;
+        uint32_t *aomo = mgl_spirv_lower_aom_output(prepared, prepared_words, &aomo_words);
+        if (aomo)
+        {
+            free(prepared);
+            prepared = aomo;
+            prepared_words = aomo_words;
+        }
+    }
 
     /* fp64: lower software doubles (u64 bit patterns + soft-float calls).
      * ptr->spirv[stage].ir above keeps the GL view (real double types) for
@@ -2708,6 +2746,7 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
             prepared = off_fixed;
         }
     }
+
 
     /* geom: arrays-of-matrices stage inputs (`in mat2x3 d[2]`) — SPIRV-Cross's MSL
      * backend cannot emit them, which fails the whole link.  Lower them to
@@ -3847,6 +3886,8 @@ static bool mgl_link_log_is_tess_patch_false_positive(const char *log)
     return saw_block;
 }
 
+
+
 static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, ReflectAcc *acc, char **log)
 {
     glslang_program_t *glsl_program;
@@ -4113,6 +4154,7 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             }
             memcpy((void *)mods[stage], glslang_program_SPIRV_get_ptr(glsl_program), size * 4);
             sizes[stage] = size;
+
         }
 
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)

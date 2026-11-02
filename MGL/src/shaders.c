@@ -28,6 +28,7 @@
 
 #include "shaders.h"
 #include "cts_glsl_compat.h"
+extern char *mgl_reject_struct_member_qualifiers(const char *src);
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
@@ -282,7 +283,15 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
         input->default_profile = GLSLANG_ES_PROFILE;
     }
     //input->messages = 0xFFFF & ~GLSLANG_MSG_RELAXED_ERRORS_BIT;
-    input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
+    /* compat r87: an ES-profile shader ('#version N es') must keep strict ES
+     * semantics — RELAXED_ERRORS demotes real ES compile errors (ES 3.1
+     * textureGatherOffset's constant-offset rule, the mandatory default
+     * sampler precision) to warnings, which let invalid ES shaders through
+     * (dEQP-GL45-ES31 debug.negative_coverage.shader_function.*).  Desktop
+     * GLSL keeps the historical relaxed behaviour. */
+    input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT;
+    if (!es_profile)
+        input->messages |= GLSLANG_MSG_RELAXED_ERRORS_BIT;
     {
         /* glslang rejects gl_PerVertex block redeclarations below GLSL 4.10
          * unless GL_ARB_separate_shader_objects is enabled, while Mesa and
@@ -1000,12 +1009,25 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
      * RAW source: the introspect pass rewrites subroutines away (cts_glsl_compat.c) */
     char *reserved_reject = mgl_reject_reserved_declarators(ptr->src);
     if (!reserved_reject)
+        reserved_reject = mgl_reject_struct_member_qualifiers(ptr->src);
+    if (!reserved_reject)
         /* tess: gl_ClipDistance/gl_CullDistance indexed with a non-constant expression
          * without an explicit-size redeclaration is a compile error (GLSL 4.6 §7.1) —
          * the introspect pass pins the arrays, so this also needs the raw source */
         reserved_reject = mgl_tess_reject_dynamic_distance_index(ptr->src);
-    char *compat = mgl_cts_glsl_compat_limited(
-        reserved_reject ? reserved_reject : mgl_introspect_shader_source(ctx, ptr), &bl);
+    if (reserved_reject)
+    {
+        /* a raw-source rejection is final: the compile must fail with this
+         * message.  It used to be fed through mgl_cts_glsl_compat_limited(),
+         * which returns NULL when no rewrite pass fires on it — the error was
+         * then dropped and the ORIGINAL source compiled cleanly (a struct
+         * member `layout(shared)' qualifier compiled). */
+        mgl_set_info_log(&ptr->log, "%s", reserved_reject);
+        free(reserved_reject);
+        obj->compile_status = GL_FALSE;
+        return;
+    }
+    char *compat = mgl_cts_glsl_compat_limited(mgl_introspect_shader_source(ctx, ptr), &bl);
     {
         /* tess: a gl_PerVertex (gl_in) redeclared as a subset of the producer's members is
          * legal GL; glslang's cross-stage link rejects it — expand it (mgl_ext_tess.h) */

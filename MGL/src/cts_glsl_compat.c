@@ -126,6 +126,60 @@ static int entry_is_gl_packing(const char *src, size_t start, size_t end)
     return (l == 6 && !strncmp(src + start, "shared", 6)) || (l == 6 && !strncmp(src + start, "packed", 6));
 }
 
+/* does the block that this layout(...) list belongs to have members with an
+ * explicit offset/align qualifier?  Scans from the closing ')' to the block
+ * body (a '{' before the ';') and its members' layout lists.  Returns false
+ * when no block follows (e.g. a global interface declaration). */
+static bool block_members_carry_offset_align(const char *src, size_t len, size_t close)
+{
+    size_t i = close + 1;
+    while (i < len && (isspace((unsigned char)src[i]) || src[i] == '\n')) i++;
+    while (i < len && is_ident_char((unsigned char)src[i]))
+    {
+        size_t e = i;
+        while (e < len && is_ident_char((unsigned char)src[e])) e++;
+        /* the interface keyword(s) between the layout list and the '{' */
+        if (e - i == 7 && strncmp(src + i, "uniform", 7) == 0) { /* keep scanning */ }
+        else if (e - i == 6 && strncmp(src + i, "buffer", 6) == 0) { }
+        else if (e - i == 3 && strncmp(src + i, "out", 3) == 0) { }
+        else if (e - i == 2 && strncmp(src + i, "in", 2) == 0) { }
+        else return false;          /* not an interface block: no members */
+        i = e;
+        while (i < len && (isspace((unsigned char)src[i]) || src[i] == '\n')) i++;
+        if (i < len && src[i] == '{') break;
+        /* a block name (or a second layout list) can follow */
+        if (i < len && src[i] != '{') { /* named block: skip the identifier */ 
+            if (!is_ident_char((unsigned char)src[i])) return false;
+            while (i < len && is_ident_char((unsigned char)src[i])) i++;
+            while (i < len && (isspace((unsigned char)src[i]) || src[i] == '\n')) i++;
+            if (i < len && src[i] == '{') break;
+            return false;
+        }
+    }
+    if (i >= len || src[i] != '{') return false;
+    i++;
+    /* scan the block body for a member layout(...offset=/align=...) */
+    while (i < len && src[i] != '}')
+    {
+        if (src[i] == '/' && i + 1 < len && src[i+1] == '/')
+        {
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        if (src[i] == '/' && i + 1 < len && src[i+1] == '*')
+        {
+            i += 2;
+            while (i + 1 < len && !(src[i] == '*' && src[i+1] == '/')) i++;
+            i = i + 2 < len ? i + 2 : len;
+            continue;
+        }
+        if (at_word(src, len, i, "offset") || at_word(src, len, i, "align"))
+            return true;
+        i++;
+    }
+    return false;
+}
+
 /*
  * Rewrite `src`: drop shared/packed from every layout(...) qualifier list.
  * Returns a malloc'd copy (caller frees), or NULL when nothing needed changing.
@@ -160,6 +214,19 @@ static char *strip_gl_block_packings(const char *src)
                 size_t close = match_paren(src, len, open);
                 if (close < len)
                 {
+                    /* compat r87: GLSL 4.60 4.4.5 — offset/align on a member
+                     * require the block to declare std140 or std430; shared and
+                     * packed blocks must therefore keep their packing (and fail
+                     * to compile) when a member of the block that follows the
+                     * layout list carries an explicit offset/align qualifier.
+                     * The positive shared/packed cases (no member qualifiers)
+                     * are still rewritten to glslang's SPIR-V packing. */
+                    if (block_members_carry_offset_align(src, len, close))
+                    {
+                        i = close + 1;
+                        str_append(&out, src + open, close + 1 - open);
+                        continue;
+                    }
                     /* split the list at top-level commas */
                     size_t nent = 0, kept = 0;
                     size_t e = open + 1;
@@ -394,9 +461,24 @@ static GatherDim gather_dim_of(const char *src, const char *expr, size_t len)
     return GATHER_T_UNKNOWN;
 }
 
+/* compat r87: is this an ES-profile source ("#version N es")?  ES semantics
+ * forbid the dynamic texel offsets the two gather rewrites below exist to
+ * legalize for Metal (ES 3.1: the offset must be a constant expression) — for
+ * those shaders the rewrite must not run so glslang reports the real compile
+ * error (dEQP-GL45-ES31 debug.negative_coverage.shader_function.*). */
+static bool src_is_es_profile(const char *src)
+{
+    const char *v = strstr(src, "#version");
+    if (!v) return false;
+    size_t n = strcspn(v, "\n");
+    while (n > 0 && (v[n-1] == ' ' || v[n-1] == '\t' || v[n-1] == '\r')) n--;
+    return n >= 3 && strncmp(v + n - 3, " es", 3) == 0;
+}
+
 static char *rewrite_gather_var_offset(const char *src)
 {
     if (getenv("MGL_NO_GATHER_RW")) return NULL;
+    if (src_is_es_profile(src)) return NULL;
     if (!strstr(src, "textureGatherOffset") && !strstr(src, "textureGather(")) return NULL;
     size_t len = strlen(src);
     Str out = {0};
@@ -1198,6 +1280,94 @@ static int mglc_is_reserved(const char *w)
         if (c < 0) hi = mid - 1; else lo = mid + 1;
     }
     return 0;
+}
+
+/* GLSL 4.60: plain structure members accept no qualifiers at all — storage,
+ * interpolation, auxiliary, layout, packing, memory, invariant and precise
+ * qualifiers are all illegal there (GLSL 4.60 4.1.10 "members ... cannot have
+ * qualifiers", 4.3/4.4 storage+layout, 4.7.2 precise: variables, parameters
+ * and return types only — Mesa: "only precision qualifiers may be applied to
+ * structure members").  offset/align on interface BLOCK members are legal and
+ * are handled where blocks are parsed (mgl_layout_validate.c).
+ * glslang already rejects every one of those on members except `precise`,
+ * which it wrongly accepts, and `layout(...)`, which never reaches glslang:
+ * strip_gl_block_packings() below would drop a `layout(shared)` member
+ * qualifier first.  Scan the RAW source (before any rewrite) and reject.
+ * Desktop only: ESSL allows precision qualifiers on members (and rejects the
+ * others itself).  KHR-GL46.shaders.negative.non_precision_qualifiers_in_
+ * struct_members walks the whole non-precision list ("const", "in",
+ * "layout(shared)", "precise", ...). */
+char *mgl_reject_struct_member_qualifiers(const char *src);
+
+static char *reject_struct_member_qualifiers_impl(const char *src)
+{
+    if (src_is_es_profile(src)) return NULL;
+    if (!strstr(src, "struct")) return NULL;
+
+    size_t i = 0, len = strlen(src);
+    while (i < len)
+    {
+        /* outside struct bodies: keep comments and preprocessor lines out of
+         * the keyword scan (a '#define STRUCT layout(shared)' must not fire) */
+        if (src[i] == '/' && i + 1 < len && src[i+1] == '/')
+        { while (i < len && src[i] != '\n') i++; continue; }
+        if (src[i] == '/' && i + 1 < len && src[i+1] == '*')
+        { i += 2; while (i + 1 < len && !(src[i] == '*' && src[i+1] == '/')) i++; i = i + 2 < len ? i + 2 : len; continue; }
+        if (src[i] == '#')
+        { while (i < len && src[i] != '\n') i++; continue; }
+        if (at_word(src, len, i, "struct"))
+        {
+            /* the definition's '{' may be on another line; ';' first means
+             * this is not a definition (or an error glslang will report) */
+            size_t b = i + 6;
+            while (b < len && src[b] != '{' && src[b] != ';') b++;
+            if (b < len && src[b] == '{')
+            {
+                size_t e = b + 1, depth = 1;
+                int pp = 0;   /* a preprocessor line inside the body: its branch
+                               * may or may not be taken, so stop verifying this
+                               * body (never a false rejection) and let glslang's
+                               * own preprocessor decide */
+                while (e < len && depth)
+                {
+                    if (src[e] == '/' && e + 1 < len && src[e+1] == '/')
+                    { while (e < len && src[e] != '\n') e++; continue; }
+                    if (src[e] == '/' && e + 1 < len && src[e+1] == '*')
+                    { e += 2; while (e + 1 < len && !(src[e] == '*' && src[e+1] == '/')) e++; e = e + 2 < len ? e + 2 : len; continue; }
+                    if (src[e] == '#')
+                    { pp = 1; while (e < len && src[e] != '\n') e++; continue; }
+                    if (src[e] == '{') { depth++; e++; continue; }
+                    if (src[e] == '}') { depth--; e++; continue; }
+                    if (!pp && at_word(src, len, e, "layout"))
+                    {
+                        char *err = NULL;
+                        if (asprintf(&err, "ERROR: 'layout qualifier' : struct members cannot have "
+                                           "layout qualifiers (GLSL 4.60 4.1.10)\n") < 0)
+                            return NULL;
+                        return err;
+                    }
+                    if (!pp && at_word(src, len, e, "precise"))
+                    {
+                        char *err = NULL;
+                        if (asprintf(&err, "ERROR: 'precise' : struct members cannot be qualified "
+                                           "precise (GLSL 4.60 4.7.2)\n") < 0)
+                            return NULL;
+                        return err;
+                    }
+                    e++;
+                }
+                i = e;
+                continue;
+            }
+        }
+        i++;
+    }
+    return NULL;
+}
+
+char *mgl_reject_struct_member_qualifiers(const char *src)
+{
+    return reject_struct_member_qualifiers_impl(src);
 }
 
 char *mgl_reject_reserved_declarators(const char *src);   /* shaders.c: before the
@@ -3414,6 +3584,7 @@ static char **gather_offsets_inline(const char *arg, size_t alen)
 static char *rewrite_gather_offsets(const char *src)
 {
     if (!strstr(src, "textureGatherOffsets")) return NULL;
+    if (src_is_es_profile(src)) return NULL;
     size_t len = strlen(src);
     Str out = {0};
     size_t i = 0;

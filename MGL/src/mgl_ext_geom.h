@@ -161,6 +161,7 @@ typedef struct MGLGeomVar {
     char    expr[128];      /* writer side: expression of the producing stage output */
     int     xfb_buffer;     /* shader-declared capture buffer (xfb_buffer=), -1 when not captured */
     GLuint  xfb_offset;     /* shader-declared capture byte offset (xfb_offset=) */
+    GLuint  xfb_stride;     /* shader-declared byte stride of that buffer (xfb_stride=), 0xffffffff = none */
 } MGLGeomVar;
 
 typedef struct { char name[64]; int msl; } MGLGeomTexSlot;
