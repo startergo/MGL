@@ -364,6 +364,16 @@ static void xfbReleaseProgramC(GLMContext glm_ctx, MGLXfbProgram *xp)
         return NULL;
     }
 
+    if (getenv("MGL_XFB_DEBUG") && rec)
+    {
+        unsigned n = xp->record_words * 4 > 24 ? 24 : xp->record_words * 4;
+        const uint32_t *h = rec - MGL_XFB_HEADER_WORDS;
+        fprintf(stderr, "[xfb] capture record prog=%u (%u words/vertex, hdr=%u,%u,%u,%u):",
+                (unsigned)xp->name, xp->record_words, h[0], h[1], h[2], h[3]);
+        for (unsigned i = 0; i < n; i++) fprintf(stderr, " %08x", rec[i]);
+        fprintf(stderr, "\n");
+    }
+
     return rec;
 }
 

@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "spirv.h"
 
@@ -636,7 +637,12 @@ static int lv_stage_location_limit(GLMContext ctx, int stage, bool input)
         {
             case _VERTEX_SHADER:          return (vs_out < tcs_in ? vs_out : tcs_in) / 4;
             case _TESS_CONTROL_SHADER:    return (tcs_out < tes_in ? tcs_out : tes_in) / 4;
-            case _TESS_EVALUATION_SHADER: return (tes_out < gs_in ? tes_out : gs_in) / 4;
+            case _TESS_EVALUATION_SHADER: return tes_out / 4;
+                /* compat r96d: the TES OUTPUT budget is its own cap (128 components = 32
+                 * locations); the GS input cap applies to what the GS declares as inputs,
+                 * not to TES outputs the GS does not consume — pairing them rejected
+                 * TES-declared xfb captures (xfb_get_program_resource_api_dmat3/4, the
+                 * dummy GS in those programs declares only its own varyings) */
             case _GEOMETRY_SHADER:        return (gs_out < fs_in ? gs_out : fs_in) / 4;
             default:                      return 1 << 30;   /* fragment: MAX_DRAW_BUFFERS */
         }
@@ -686,6 +692,53 @@ static bool lv_split_group_min(LvModule *m, uint32_t var, uint32_t *minloc,
         (*count)++;
     }
     return *count > 0 && *minloc != 0xffffffffu;
+}
+
+/* compat r96e: component ALIASING of non-vertex inputs is a link error (GL
+ * 4.6 11.1.1: "the components... declared for two inputs assigned to the same
+ * location must not overlap" — vertex inputs may alias, that side is the
+ * attribute path).  KHR-Single-GL46.enhanced_layouts.input_component_aliasing*
+ * covers TCS/TES/GS/FS; the vertex variant must link. */
+static char *lv_input_component_aliasing(LvModule *m, int stage)
+{
+    if (stage == _VERTEX_SHADER) return NULL;
+    uint8_t mask[128] = {0};
+    char who[128][128] = {{0}};
+    for (int v = 0; v < m->n_vars; v++)
+    {
+        uint32_t var = m->vars[v].id;
+        if (m->vars[v].storage != SpvStorageClassInput) continue;
+        uint32_t loc, comp = 0;
+        if (!lv_deco(m, var, SpvDecorationLocation, &loc)) continue;
+        if (lv_deco(m, var, SpvDecorationComponent, &comp) && (comp > 3)) continue;  /* R2 covers */
+        LvType *t = lv_find(m, m->vars[v].type);
+        if (!t || t->kind != LV_PTR) continue;
+        LvType *bt = lv_find(m, t->elem);
+        while (bt && bt->kind == LV_ARRAY) bt = lv_find(m, bt->elem);
+        if (!bt) continue;
+        unsigned ncomp = 1, span = lv_locations(m, t->elem);
+        if (bt->kind == LV_MAT) bt = lv_find(m, bt->elem);   /* align like a column */
+        if (bt && bt->kind == LV_VEC) { ncomp = bt->n; if (bt->bits == 64) ncomp *= 2; }
+        else if (bt && bt->bits == 64) ncomp = 2;
+        if (ncomp > 4) ncomp = 4;
+        uint32_t mk = ((1u << ncomp) - 1u) << comp;
+        if (loc < 128)
+        {
+            if ((mask[loc] & mk) && strcmp(who[loc], lv_name(m, var) ? lv_name(m, var) : "?"))
+            {
+                char *l = NULL;
+                if (asprintf(&l, "ERROR: 'component' : input '%s' aliases the components of "
+                                  "'%s' at location %u of the %s stage's inputs\n",
+                             lv_name(m, var) ? lv_name(m, var) : "?", who[loc], loc,
+                             lv_stage_label(stage)) < 0) l = NULL;
+                return l;
+            }
+            mask[loc] |= mk;
+            snprintf(who[loc], sizeof who[loc], "%s", lv_name(m, var) ? lv_name(m, var) : "?");
+            for (uint32_t s = 1; s < span && loc + s < 128; s++) mask[loc + s] = 0xF;
+        }
+    }
+    return NULL;
 }
 
 static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, char **log)
@@ -806,6 +859,12 @@ char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, s
                            rest of the pipeline (SPIRV-Cross will complain) */
     }
 
+    /* R0 (r96e): component aliasing of non-vertex inputs */
+    {
+        char *alias = lv_input_component_aliasing(m, stage);
+        if (alias) { free(m); return alias; }
+    }
+
     /* R1: interface blocks with explicit member offsets */
     for (int i = 0; i < m->n_types && ok; i++)
     {
@@ -860,6 +919,424 @@ char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, s
 
     free(m);
     return ok ? NULL : log;
+}
+
+/* ------------------------------------------------------------------ R3 (compat r96)
+ * glslang's link-time auto-map numbers location-less per-vertex interface
+ * arrays (TCS in/out, TES in, GS in) with VULKAN flattening: an
+ * `in uint foo[];` occupies gl_MaxPatchVertices CONTIGUOUS slots, so the
+ * invented Location lands far past the GL per-vertex budget while GL assigns
+ * first-free (KHR-Single-GL46.enhanced_layouts.varying_components_gvec4_float:
+ * `vs_tcs_result` is invented at 63 although the interface only uses locations
+ * 0 and 31) — R2 above would then reject a program GL accepts.  Renumber, on
+ * BOTH sides of every stage boundary so producer and consumer stay consistent,
+ * every interface group whose invented location does not fit the boundary's
+ * location budget; groups that fit keep glslang's (jointly consistent) number.
+ * Explicitly located variables are never moved. */
+void mgl_layout_renumber_io(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask);
+void mgl_layout_renumber_io_srcs(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask,
+                                 const char **srcs);
+
+typedef struct {
+    int       stage;         /* module the variable lives in */
+    uint32_t  var;
+    uint32_t  loc;
+    bool      has_loc;
+    unsigned  width;         /* GL locations per vertex */
+    bool      input;         /* an input of its stage (else an output) */
+    bool      user_loc;      /* `location` qualifier in the GLSL source (never renumbered) */
+} RnVar;
+
+typedef struct {
+    char      name[128];
+    RnVar     v[4];          /* producer + consumer (+ per-vertex split siblings) */
+    int       nv;
+    uint32_t  newloc;
+    bool      renum;
+    int       cap;           /* tightest per-vertex location budget of its entries */
+} RnGroup;
+
+static unsigned rn_width(LvModule *m, int stage, bool input, uint32_t var, uint32_t ptr_type)
+{
+    LvType *p = lv_find(m, ptr_type);
+    if (!p || p->kind != LV_PTR) return 1;
+    uint32_t t = p->elem;
+    /* per-vertex interfaces strip ONE array level (io_loc_count rule) */
+    bool arrayed = false;
+    if (stage == _GEOMETRY_SHADER || stage == _TESS_EVALUATION_SHADER) arrayed = input;
+    else if (stage == _TESS_CONTROL_SHADER) arrayed = true;
+    if (arrayed && !lv_deco(m, var, 28 /* Patch */, NULL))
+    {
+        LvType *a = lv_find(m, t);
+        if (a && (a->kind == LV_ARRAY || a->kind == LV_RTARRAY)) t = a->elem;
+    }
+    return lv_locations(m, t) ? lv_locations(m, t) : 1;
+}
+
+/* is the variable an interface-block INSTANCE (block type decoration)? */
+static bool rn_block_instance(LvModule *m, uint32_t ptr_type)
+{
+    LvType *p = lv_find(m, ptr_type);
+    if (!p || p->kind != LV_PTR) return false;
+    LvType *t = lv_find(m, p->elem);
+    while (t && t->kind == LV_ARRAY) t = lv_find(m, t->elem);
+    return t && t->kind == LV_STRUCT &&
+           (lv_deco(m, t->id, SpvDecorationBlock, NULL) ||
+            lv_deco(m, t->id, SpvDecorationBufferBlock, NULL));
+}
+
+static void rn_set_loc(uint32_t *ir, size_t words, uint32_t var, uint32_t loc)
+{
+    for (size_t i = 5; i < words; )
+    {
+        uint32_t wc = ir[i] >> 16, op = ir[i] & 0xffff;
+        if (wc == 0 || i + wc > words) return;
+        if (op == SpvOpDecorate && wc >= 4 && ir[i + 1] == var && ir[i + 2] == 30 /* Location */)
+            ir[i + 3] = loc;
+        i += wc;
+    }
+}
+
+/* compat r96c: names whose declaration in the GLSL source carries an explicit
+ * `location` qualifier.  glslang's link-time auto-map INVENTS Location
+ * decorations for location-less interfaces, so the decoration alone cannot say
+ * whether a number past the budget is a user location (GL must fail the link)
+ * or glslang's Vulkan flattening (GL accepts; R3 renumbers).  The source can.
+ * A declaration is scanned from each `location` keyword to the terminating
+ * ';' and its LAST identifier (the declared name, before any '[') is taken. */
+static int rn_src_located(const char *src, char set[][80], int max)
+{
+    int n = 0;
+    if (!src) return 0;
+    for (const char *p = src; *p && n < max; p++)
+    {
+        if (strncmp(p, "location", 8) != 0) continue;
+        if ((p > src && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) ||
+            (isalnum((unsigned char)p[8]) || p[8] == '_')) continue;   /* first_input_location */
+        const char *e = p;
+        while (*e && *e != ';' && *e != '{') e++;
+        const char *last = NULL;
+        size_t lastlen = 0;
+        for (const char *q = p; q < e; )
+        {
+            if (isalpha((unsigned char)*q) || *q == '_')
+            {
+                const char *s = q;
+                while (q < e && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                last = s; lastlen = (size_t)(q - s);
+            }
+            else q++;
+        }
+        if (last && lastlen > 0 && lastlen < 80)
+        {
+            int dup = 0;
+            for (int i = 0; i < n; i++) if (!strncmp(set[i], last, lastlen) && !set[i][lastlen]) { dup = 1; break; }
+            if (!dup)
+            {
+                memcpy(set[n], last, lastlen);
+                set[n][lastlen] = 0;
+                n++;
+            }
+        }
+        p = e ? e - 1 : p;   /* past the declaration (loop adds 1) */
+    }
+    return n;
+}
+
+void mgl_layout_renumber_io(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask)
+{
+    mgl_layout_renumber_io_srcs(ctx, mods, sizes, mask, NULL);
+}
+
+void mgl_layout_renumber_io_srcs(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask,
+                                 const char **srcs)
+{
+    const bool dbg = getenv("MGL_RENUM_DEBUG") != NULL;
+    if (getenv("MGL_NO_RENUM")) return;
+    LvModule *mod[_MAX_SHADER_TYPES] = {0};
+    int order[_MAX_SHADER_TYPES], norder = 0;
+    char located[_MAX_SHADER_TYPES][64][80];
+    int nlocated[_MAX_SHADER_TYPES] = {0};
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+        if (srcs && srcs[s]) nlocated[s] = rn_src_located(srcs[s], located[s], 64);
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+    {
+        if (!(mask & (1u << s)) || !mods[s] || !sizes[s]) continue;
+        if (s == _COMPUTE_SHADER) continue;
+        mod[s] = calloc(1, sizeof *mod[s]);
+        if (!mod[s] || !lv_parse(mods[s], sizes[s], mod[s])) { free(mod[s]); mod[s] = NULL; continue; }
+        order[norder++] = s;
+    }
+    if (dbg) fprintf(stderr, "[RENUM] entry: norder=%d stages:", norder);
+    if (dbg) for (int i = 0; i < norder; i++) fprintf(stderr, " %d", order[i]);
+    if (dbg) fprintf(stderr, "\n");
+    if (norder < 1)
+    {
+        for (int s = 0; s < _MAX_SHADER_TYPES; s++) free(mod[s]);
+        return;
+    }
+
+    /* one interface walk per stage boundary (+ a solo walk for a stage edge
+     * that has no partner in this program: a separable / single-stage link
+     * still must fit the caps, and GL numbers its varyings first-free) */
+    for (int b = 0; b < norder; b++)
+    {
+        int pa = order[b];
+        int pb = (b + 1 < norder) ? order[b + 1] : -1;   /* consumer stage */
+
+        for (int side = 0; side < 2; side++)
+        {
+            /* side 0: outputs of pa (paired with pb's inputs when pb >= 0)
+             * side 1: inputs of pa when it is the FIRST stage (no producer) */
+            int st, other;
+            uint32_t want, other_want;
+            if (side == 0)
+            {
+                if (pa == _FRAGMENT_SHADER) continue;
+                st = pa; other = pb;
+                want = SpvStorageClassOutput; other_want = SpvStorageClassInput;
+            }
+            else
+            {
+                if (b != 0 || pa == _VERTEX_SHADER) continue;
+                st = pa; other = -1;
+                want = SpvStorageClassInput; other_want = SpvStorageClassOutput;
+            }
+            int cap = lv_stage_location_limit(ctx, st, want == SpvStorageClassInput);
+            RnGroup groups[128];
+            int ng = 0;
+
+            for (int which = 0; which < 2; which++)
+            {
+                int s2 = which ? other : st;
+                uint32_t w2 = which ? other_want : want;
+                bool in_side = (w2 == SpvStorageClassInput);
+                LvModule *m = s2 >= 0 ? mod[s2] : NULL;
+                if (!m) continue;
+                for (int v = 0; v < m->n_vars; v++)
+                {
+                    uint32_t var = m->vars[v].id;
+                    if (m->vars[v].storage != w2) continue;
+                    if (lv_deco(m, var, SpvDecorationBuiltIn, NULL)) continue;
+                    if (rn_block_instance(m, m->vars[v].type)) continue;
+                    const char *nm = lv_name(m, var);
+                    if (!nm || !*nm) continue;
+                    uint32_t loc = 0;
+                    bool has = lv_deco(m, var, 30 /* Location */, &loc);
+
+                    RnGroup *g = NULL;
+                    for (int i = 0; i < ng; i++)
+                        if (!strcmp(groups[i].name, nm)) { g = &groups[i]; break; }
+                    if (!g)
+                    {
+                        if (ng >= (int)(sizeof groups / sizeof groups[0])) continue;
+                        g = &groups[ng++];
+                        memset(g, 0, sizeof *g);
+                        g->newloc = 0xffffffffu;
+                        g->cap = 0x7fffffff;
+                        snprintf(g->name, sizeof g->name, "%s", nm);
+                    }
+                    if (g->nv < (int)(sizeof g->v / sizeof g->v[0]))
+                    {
+                        RnVar *rv = &g->v[g->nv++];
+                        rv->stage = s2; rv->var = var; rv->loc = loc; rv->has_loc = has;
+                        rv->input = in_side;
+                        rv->width = rn_width(m, s2, in_side, var, m->vars[v].type);
+                        rv->user_loc = false;
+                        for (int u = 0; u < nlocated[s2]; u++)
+                            if (!strcmp(located[s2][u], nm)) { rv->user_loc = true; break; }
+                        /* compat r96c: the budget that matters for a variable is its
+                         * OWN stage's (a VS->GS boundary pairs 32-location VS outputs
+                         * with 16-location GS inputs); use the tightest of the pair */
+                        int vcap = lv_stage_location_limit(ctx, s2, in_side);
+                        if (vcap < g->cap) g->cap = vcap;
+                    }
+                }
+            }
+
+            /* which groups must move: invented location past the interface
+             * budget, or a producer/consumer disagreement (glslang keeps both
+             * sides jointly consistent, so that is a safety net only)
+             *
+             * compat r96c: a USER-written location past the cap must FAIL the
+             * link (GL 4.6 11.1.1; the R2 cap check rejects it), so only
+             * locations glslang INVENTED may be renumbered.  Two shapes are
+             * glslang's flattening: (a) the span starts inside the budget and
+             * overflows by WIDTH (vs_tcs_result[] flattened from 0), and (b)
+             * the span starts past the cap because earlier flattened groups
+             * densely consumed the whole budget below it.  A lone high
+             * location over a sparse interface is a user location. */
+            {
+                uint8_t all_used[1024] = {0};
+                for (int i = 0; i < ng; i++)
+                {
+                    RnGroup *g = &groups[i];
+                    for (int k = 0; k < g->nv; k++)
+                    {
+                        if (!g->v[k].has_loc) continue;
+                        for (unsigned x = 0; x < g->v[k].width && g->v[k].loc + x < 1024; x++)
+                            all_used[g->v[k].loc + x] = 1;
+                    }
+                }
+                for (int i = 0; i < ng; i++)
+                {
+                    RnGroup *g = &groups[i];
+                    bool user = false;
+                    for (int k = 0; k < g->nv; k++) if (g->v[k].user_loc) user = true;
+                    for (int k = 0; k < g->nv && !g->renum; k++)
+                    {
+                        if (!g->v[k].has_loc) continue;
+                        if (user) break;   /* an explicit location never moves */
+                        if (g->v[k].loc + g->v[k].width <= (uint32_t)g->cap) continue;
+                        if (g->v[k].loc < (uint32_t)g->cap) { g->renum = true; break; }   /* (a) */
+                        /* (b): every slot below min(loc, cap) is used — but NOT by this
+                         * group's own span (a wide flattened array reaching past the cap
+                         * is shape (a) and already handled) */
+                        uint32_t lim = g->v[k].loc < (uint32_t)g->cap ? g->v[k].loc : (uint32_t)g->cap;
+                        bool dense = true;
+                        for (uint32_t s = 0; s < lim; s++)
+                        {
+                            if (all_used[s]) continue;
+                            if (g->v[k].loc <= s && s < g->v[k].loc + g->v[k].width) continue;
+                            dense = false; break;
+                        }
+                        if (dense) { g->renum = true; break; }
+                    }
+                    if (!g->renum && g->nv == 2 && g->v[0].has_loc && g->v[1].has_loc &&
+                        g->v[0].loc != g->v[1].loc)
+                        g->renum = true;
+                }
+            }
+
+            /* span map from the groups that keep their numbers */
+            uint8_t used[1024] = {0};
+            for (int i = 0; i < ng; i++)
+            {
+                RnGroup *g = &groups[i];
+                if (g->renum) continue;
+                for (int k = 0; k < g->nv; k++)
+                {
+                    if (!g->v[k].has_loc) continue;
+                    for (unsigned x = 0; x < g->v[k].width && g->v[k].loc + x < 1024; x++)
+                        used[g->v[k].loc + x] = 1;
+                }
+            }
+            /* first-fit for the moved groups, ordered by their old location */
+            for (;;)
+            {
+                int pick = -1;
+                for (int i = 0; i < ng; i++)
+                {
+                    RnGroup *g = &groups[i];
+                    if (!g->renum || g->newloc != 0xffffffffu) continue;
+                    if (pick < 0) { pick = i; continue; }
+                    uint32_t a = g->v[0].has_loc ? g->v[0].loc : 0;
+                    uint32_t b2 = groups[pick].v[0].has_loc ? groups[pick].v[0].loc : 0;
+                    if (a < b2 || (a == b2 && strcmp(g->name, groups[pick].name) < 0)) pick = i;
+                }
+                if (pick < 0) break;
+                RnGroup *g = &groups[pick];
+                unsigned w = 1;
+                for (int k = 0; k < g->nv; k++) if (g->v[k].width > w) w = g->v[k].width;
+                uint32_t base = 0xffffffffu;
+                for (uint32_t s = 0; s + w <= (uint32_t)g->cap; s++)
+                {
+                    bool free_span = true;
+                    for (unsigned x = 0; x < w; x++) if (used[s + x]) { free_span = false; break; }
+                    if (free_span) { base = s; break; }
+                }
+                if (base == 0xffffffffu)
+                {
+                    /* no room inside the budget: leave it alone; R2 rejects it */
+                    g->renum = false;
+                    continue;
+                }
+                for (unsigned x = 0; x < w; x++) used[base + x] = 1;
+                g->newloc = base;
+            }
+
+            for (int i = 0; i < ng; i++)
+            {
+                RnGroup *g = &groups[i];
+                if (!g->renum || g->newloc == 0xffffffffu) continue;
+                for (int k = 0; k < g->nv; k++)
+                {
+                    if (!g->v[k].has_loc) continue;   /* introspect assigns those */
+                    rn_set_loc(mods[g->v[k].stage], sizes[g->v[k].stage], g->v[k].var, g->newloc);
+                    if (dbg)
+                        fprintf(stderr, "[RENUM] '%s' stage %d var %u: %u -> %u (cap %d)\n",
+                                g->name, g->v[k].stage, g->v[k].var, g->v[k].loc, g->newloc, cap);
+                }
+            }
+        }
+    }
+
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++) free(mod[s]);
+}
+
+/* ------------------------------------------------------------------ R4 (compat r96)
+ * A hardware post-tessellation evaluation shader reads control-point and
+ * per-patch inputs through [[attribute(N)]] whose index SPIRV-Cross takes from
+ * the GLSL location.  Metal bounds those indices at 0..30, GL budgets 32
+ * TCS-output / TES-input locations, so a legal `layout(location=31) in vec4`
+ * fails the Metal compile ("attribute parameter is out of bounds").  The index
+ * only keys MGL's own vertex descriptor (built from this same MSL text), so
+ * renumbering the attributes densely in order of appearance keeps the data
+ * flow — and also gives cp and per-patch inputs (two separate GL location
+ * spaces) non-colliding descriptor slots. */
+char *mgl_msl_compress_tes_attributes(const char *msl)
+{
+    if (!msl || getenv("MGL_NO_TES_ATTRCOMP")) return NULL;
+    const char *p = msl;
+    bool touched = false;
+
+    /* pass 1: does anything actually need moving - an index past Metal's 0..30
+     * bound, or the same index reused by two sites (the cp and per-patch
+     * structs key one descriptor table)? */
+    int seen[128], count[128], nseen = 0;
+    while ((p = strstr(p, "[[attribute(")) != NULL)
+    {
+        int v = atoi(p + 12);
+        if (v > 30) touched = true;
+        bool known = false;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i] == v) { count[i]++; known = true; }
+        if (!known && nseen < 128) { seen[nseen] = v; count[nseen] = 1; nseen++; }
+        p += 12;
+    }
+    for (int i = 0; i < nseen && !touched; i++)
+        if (count[i] > 1) touched = true;
+    if (!touched) return NULL;
+
+    /* pass 2: rewrite.  Every [[attribute(N)]] site is a distinct stage-in
+     * member (a member that spans two slots carries both, adjacent); the one
+     * vertex-descriptor attribute table they key is shared by the cp and the
+     * per-patch structs, so sites are numbered sequentially — unique by
+     * construction, which also stops cp/per-patch location-space collisions. */
+    char *out = malloc(strlen(msl) + 64);
+    if (!out) return NULL;
+    {
+        const char *src = msl;
+        char *dst = out;
+        int next = 0;
+
+        while (*src)
+        {
+            if (src[0] == '[' && src[1] == '[' && !strncmp(src, "[[attribute(", 12))
+            {
+                dst += sprintf(dst, "[[attribute(%d)", next++);
+                src += 12;
+                while (*src && *src != ')') src++;
+                if (*src == ')') src++;
+                continue;
+            }
+            *dst++ = *src++;
+        }
+        *dst = 0;
+    }
+    return out;
 }
 
 /* ===================================================================== *
@@ -988,14 +1465,37 @@ uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n
         for (uint32_t e = 0; e < v[k].count; e++)
             elem_ids[k][e] = next_id++;
 
-    /* map: every constant-index access chain into the array resolves to the
-     * element variable itself (same Output/matrix pointer type) */
+    /* a store of the WHOLE array to the variable must be rewritten into a
+     * store per element variable (OpCompositeExtract each element); a direct
+     * OpLoad of the dropped variable cannot be expressed here - that aborts
+     * the lowering (the caller keeps the original module). */
+    bool array_load = false;
+    for (size_t o = 5; o + 5 <= n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpLoad && wc >= 4)
+            for (int k = 0; k < nv; k++) if (in[o + 3] == v[k].var) array_load = true;
+        o += wc;
+    }
+    if (array_load)
+    {
+        if (trace) fprintf(stderr, "aom-out: whole-array load present - lowering aborted\n");
+        free(m);
+        return NULL;
+    }
+
+    /* map: every constant-index access chain into the array that consumes
+     * EXACTLY the array index resolves to the element variable itself (same
+     * Output/matrix pointer type).  Deeper chains (into the matrix columns)
+     * are rewritten in the emit loop: base -> element var, first index
+     * dropped. */
     for (size_t o = 5; o + 5 <= n; )
     {
         uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
         if (wc == 0 || o + wc > n) break;
         const uint32_t *w = in + o;
-        if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 5)
+        if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc == 5)
         {
             for (int k = 0; k < nv; k++)
                 if (w[3] == v[k].var)
@@ -1084,11 +1584,49 @@ uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n
             for (int k = 0; k < nv; k++) if (w[1] == v[k].var) drop = true;
             if (drop) { o += wc; continue; }
         }
+        /* a store of the whole array to the dropped variable becomes a store
+         * of each element: OpStore elem[e], OpCompositeExtract(value, e) */
+        if (op == SpvOpStore && wc == 3)
+        {
+            int hit = -1;
+            for (int k = 0; k < nv; k++) if (w[1] == v[k].var) hit = k;
+            if (hit >= 0)
+            {
+                uint32_t val = w[2];
+                for (uint32_t e = 0; e < v[hit].count; e++)
+                {
+                    uint32_t ext = next_id++;
+                    uint32_t xw[4] = { v[hit].elem_t, ext, val, e };
+                    aom_o_inst(&out, SpvOpCompositeExtract, 5, xw);
+                    uint32_t sw[2] = { elem_ids[hit][e], ext };
+                    aom_o_inst(&out, SpvOpStore, 3, sw);
+                }
+                o += wc;
+                continue;
+            }
+        }
         if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && wc >= 5)
         {
             bool drop = false;
             for (int mi = 0; mi < nmap; mi++) if (map[mi].from == w[2]) { drop = true; break; }
             if (drop) { o += wc; continue; }
+            if (wc > 5)
+            {
+                for (int k = 0; k < nv; k++)
+                    if (w[3] == v[k].var)
+                    {
+                        uint32_t idx = lv_const(m, w[4]);
+                        uint32_t nw[64];
+                        nw[0] = w[1]; nw[1] = w[2]; nw[2] = elem_ids[k][idx];
+                        uint32_t nn = 3;
+                        for (uint32_t q = 5; q < wc && nn < 64; q++) nw[nn++] = w[q];
+                        aom_o_inst(&out, op, nn + 1, nw);
+                        o += wc;
+                        drop = true;    /* emitted already */
+                        break;
+                    }
+                if (drop) continue;
+            }
         }
         if (op == SpvOpEntryPoint && wc >= 3)
         {
@@ -1115,11 +1653,24 @@ uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n
             }
         }
 
+        /* The map (access-chain result -> element variable) must be applied to
+         * ID operands only: rewriting every word corrupted non-id literals —
+         * an OpExecutionMode whose mode literal collided with a mapped id was
+         * rewritten into an element-variable id ("Invalid execution mode
+         * operand", enhanced_layouts.xfb_stride_dmat2_te). */
         aom_o_push(&out, w[0]);
+        bool subst_all_ids = (op == SpvOpPhi || op == SpvOpSelect);
         for (size_t q = 1; q < (size_t)wc; q++)
         {
+            bool is_id =
+                subst_all_ids ||
+                (op == SpvOpLoad && q == 3) ||
+                (op == SpvOpStore && q == 1) ||
+                (op == SpvOpCopyMemory && (q == 1 || q == 2)) ||
+                ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && q == 3);
             uint32_t x = w[q];
-            for (int mi = 0; mi < nmap; mi++) if (x == map[mi].from) { x = map[mi].to; break; }
+            if (is_id)
+                for (int mi = 0; mi < nmap; mi++) if (x == map[mi].from) { x = map[mi].to; break; }
             aom_o_push(&out, x);
         }
         o += wc;

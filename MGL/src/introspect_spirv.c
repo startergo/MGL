@@ -282,6 +282,8 @@ static void ins_string_op(WBuf *b, uint32_t op, int n, const uint32_t *ops, cons
 
 static void new_dec(SMod *m, Inserts *ins, uint32_t id, int32_t mem, uint32_t d, int has_lit, uint32_t lit)
 {
+    if (d == SpvDecorationLocation && getenv("MGL_LOC_DEBUG"))
+        fprintf(stderr, "MGL newdec: id=%u mem=%d loc=%u\n", id, mem, lit);
     if (mem < 0) { uint32_t o[3] = { id, d, lit }; ins_op(&ins->decs, SpvOpDecorate, has_lit ? 3 : 2, o); }
     else { uint32_t o[4] = { id, (uint32_t)mem, d, lit }; ins_op(&ins->decs, SpvOpMemberDecorate, has_lit ? 4 : 3, o); }
     /* register for lookups (inst index 0 is never dead) */
@@ -553,12 +555,13 @@ typedef struct {
 
 static void stage_set_loc(StageCtx *s, uint32_t var, uint32_t loc, int index)
 {
+    if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: set var=%u loc=%u ix=%d\n", var, loc, index);
     s->locs = realloc(s->locs, (s->nlocs + 1) * sizeof(*s->locs));
     s->locs[s->nlocs++] = (typeof(*s->locs)){ var, loc, index };
 }
 
 /* location bitmap helpers */
-typedef struct { uint8_t used[1024]; } LocMap;
+typedef struct { uint8_t used[1024]; uint32_t type[1024]; } LocMap;
 static bool loc_free(const LocMap *lm, uint32_t base, uint32_t n)
 {
     if (base + n > 1024) return false;
@@ -569,6 +572,28 @@ static void loc_take(LocMap *lm, uint32_t base, uint32_t n) { for (uint32_t i = 
 static bool loc_taken(const LocMap *lm, uint32_t base, uint32_t n)
 { for (uint32_t i = 0; i < n && base + i < 1024; i++) if (lm->used[base + i]) return true; return false; }
 static uint32_t loc_alloc(LocMap *lm, uint32_t n) { for (uint32_t b = 0; b < 1024; b++) if (loc_free(lm, b, n)) { loc_take(lm, b, n); return b; } return 0; }
+
+/* compat r96e: base (scalar element) type id of a vertex-input type, for the
+ * aliasing rule — variables sharing a location must have the same base type.
+ * Unwraps arrays/pointers, matrices align like their column vector. */
+static uint32_t attr_base_type(const SMod *m, uint32_t tid)
+{
+    uint32_t t = pointee(m, tid);
+    for (int guard = 0; guard < 16 && t <= m->bound; guard++)
+    {
+        SType *ty = &m->t[t];
+        if (ty->kind == T_ARRAY) { t = ty->elem; continue; }
+        if (ty->kind == T_MATRIX) { t = ty->elem; continue; }
+        if (ty->kind == T_VECTOR) { t = ty->elem; continue; }
+        break;
+    }
+    return t;
+}
+static uint32_t attr_base_at(const SMod *m, const LocMap *lm, uint32_t gl)
+{
+    (void)m;
+    return gl < 1024 ? lm->type[gl] : 0;
+}
 
 static bool stage_is_arrayed_io(int stage, bool input)
 {
@@ -625,9 +650,17 @@ static void assign_interface_locations(StageCtx *sc, MGLIProgram *ip, const char
                 if (eloc) { gl = l; gl_fixed = true; }
                 else if (bound >= 0) { gl = (uint32_t)bound; gl_fixed = true; }
                 else { gl = loc_alloc(&lmg, ng); gl_fixed = false; }
-                if (gl_fixed && loc_taken(&lmg, gl, ng)) { ip->attrib_conflict = 1;
-                    if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: conflict var=%u name=%s gl=%u ng=%u n=%u pass=%d\n", v, id_name(m, v), gl, ng, n, pass); }
+                /* compat r96e: vertex inputs may ALIAS — variables of the same base
+                 * type may share a location and component range (GL 4.6 11.1.1;
+                 * KHR-Single-GL46.enhanced_layouts.input_component_aliasing* expects
+                 * the vertex variant to LINK).  Conflict only on overlapping
+                 * components of a DIFFERENT base type. */
+                if (gl_fixed && loc_taken(&lmg, gl, ng) && attr_base_type(m, m->vtype[v]) != attr_base_at(m, &lmg, gl)) {
+                    ip->attrib_conflict = 1;
+                    if (getenv("MGL_LOC_DEBUG")) fprintf(stderr, "MGL loc: conflict var=%u name=%s gl=%u ng=%u n=%u pass=%d\n", v, id_name(m, v), gl, ng, n, pass);
+                }
                 loc_take(&lmg, gl, ng);
+                if (gl < 1024) lmg.type[gl] = attr_base_type(m, m->vtype[v]);
                 vins = realloc(vins, (nvins + 1) * sizeof *vins);
                 vins[nvins].v = v; vins[nvins].gl = gl; vins[nvins].ng = ng; vins[nvins].n = n;
                 nvins++;

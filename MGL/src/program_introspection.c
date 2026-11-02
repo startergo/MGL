@@ -838,6 +838,10 @@ static void xfb_sync(GLMContext ctx, MGLIProgram *ip)
     const MGLXfbProgram *x = ip->prog ? mgl_xfb_program_info(ctx, ip->prog) : NULL;
     g_xfb = (x && x->linked && !x->link_failed) ? x : NULL;
     ip->nxfb = g_xfb ? (int)g_xfb->count : 0;
+    if (getenv("MGL_GPI_DEBUG"))
+        fprintf(stderr, "MGL gpi: xfb_sync prog=%u x=%p linked=%d failed=%d count=%u\n",
+                ip->prog ? ip->prog->name : 0, (const void*)x, x ? x->linked : -1,
+                x ? x->link_failed : -1, x ? (unsigned)x->count : 0u);
 }
 
 static int xfb_buffer_count(MGLIProgram *ip)

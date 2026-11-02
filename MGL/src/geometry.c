@@ -3540,6 +3540,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
             bool plain = !spv_deco(m, t->id, SpvDecorationBlock, NULL) &&
                          !spv_deco(m, t->id, SpvDecorationBufferBlock, NULL);
             GLuint next_loc = location;
+            int m0 = 0;   /* compat r96c: index of the first member var below */
 
             /* geom r88c: the introspection flattening (r87/r88a, introspect_spirv.c
              * flatten_io_matrix_arrays_dir) re-types a stage-in/out ARRAY OF MATRICES
@@ -3593,6 +3594,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_deco(m, v->id, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
                 goto flat_merged;    /* one canonical array entry replaces the member list */
             } while (0);
+            m0 = n;   /* compat r96c: the member vars this loop emits (whole-struct xfb) */
             for (int mi = 0; mi < t->n_members && n < MGL_GEOM_MAX_VARYINGS; mi++)
             {
                 const char *mn = spv_member_name(m, t->id, mi);
@@ -3683,6 +3685,40 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_member_deco(m, t->id, mi, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
                 if (spv_member_deco(m, t->id, mi, SpvDecorationXfbStride, &tmp) ||
                     spv_deco(m, v->id, SpvDecorationXfbStride, &tmp)) out->xfb_stride = tmp;
+            }
+            /* compat r96c: a PLAIN structure output captured as a whole
+             * (`layout(xfb_offset = N) out Goku goku;` — ARB_enhanced_layouts)
+             * captures every member in declaration order.  SPIR-V decorates only
+             * the variable, so the members' xfb offsets are derived here from the
+             * std430 layout (the layout a captured structure's members follow),
+             * the base being the variable's own xfb_offset. */
+            if (plain && spv_deco(m, v->id, SpvDecorationOffset, &tmp))
+            {
+                unsigned off = 0;
+                for (int mi2 = 0; mi2 < t->n_members; mi2++)
+                {
+                    MGLGeomVar *mv = &vars[m0 + mi2];
+                    unsigned sb = base_words(mv->base) * 4u;
+                    unsigned ma = (mv->rows == 3 ? 4u : mv->rows) * sb;   /* column align */
+                    unsigned ms = mv->rows * sb;                          /* column size  */
+                    if (mv->cols > 1)
+                    {
+                        ms = mv->cols * ((ms + ma - 1) & ~(ma - 1));      /* array of columns */
+                        ma = ma;  /* a matrix aligns like its column vector */
+                    }
+                    if (mv->elems > 1)
+                    {
+                        unsigned stride = (ms + ma - 1) & ~(ma - 1);
+                        ms = mv->elems * stride;
+                    }
+                    off = (off + ma - 1) & ~(ma - 1);
+                    if (mv->xfb_offset == 0xffffffffu) mv->xfb_offset = tmp + off;
+                    off += ms;
+                }
+                /* the members inherit the buffer of the variable */
+                if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp))
+                    for (int mi2 = 0; mi2 < t->n_members; mi2++)
+                        if (vars[m0 + mi2].xfb_buffer < 0) vars[m0 + mi2].xfb_buffer = (int)tmp;
             }
             continue;
         flat_merged: ;
@@ -9482,7 +9518,10 @@ static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             free(llog);
             return false;
         }
-        free(llog);
+        /* llog stays owned by this frame: geom_derive_exprs() only fills it on
+         * warning/error paths, and the single free is after the clip-reflection
+         * block below (removing a second free(llog) here — it double-freed and
+         * aborted the process whenever a warning had allocated the log). */
         {
             const char *vs_src = geom_vs_source(ctx, MGL_PROGRAM_OBJ(program));
             char *vs_dec = NULL;
@@ -9513,6 +9552,8 @@ static bool geom_ensure(GLMContext ctx, MGLGeomProgram *gp, Program *program)
                 geom_layout(gp);
             }
             free(vs_dec);
+            if (getenv("MGL_GEOM_TRACE_DRAW"))
+                fprintf(stderr, "geom_ensure: free(llog=%p)\n", (void *)llog);
             free(llog);
         }
     }
@@ -10796,6 +10837,8 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                 dbuffer[b - 1] = tb; doffset[b - 1] = to;
             }
         n = (GLuint)dn;
+        xp->from_shader = true;   /* compat r96c: offsets/strides come from layout(xfb_*) qualifiers —
+                                   * the draw-time pack must not re-derive a tight interleaved layout */
     }
     else
     {
@@ -11659,7 +11702,12 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
      * recomputed from the final word counts, exactly as the link-time resolver
      * would have done with these numbers.  Without this a double varying whose
      * words only became known now packs into a zero-stride record and every
-     * write is dropped ("full: drop" in the encode kernel). */
+     * write is dropped ("full: drop" in the encode kernel).
+     * NOT for a shader-declared layout (compat r96c): its offsets/strides are
+     * explicit qualifiers (xfb_offset/xfb_stride), authoritative over the word
+     * counts — e.g. `layout(xfb_offset = 16) out Goku goku;` records members at
+     * 16/32/48 with stride 64. */
+    if (!xp->from_shader)
     {
         GLuint off[4] = { 0, 0, 0, 0 };
 

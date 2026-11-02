@@ -2800,6 +2800,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
 
     ptr = ctx->state.program;
+    /* compat r96: with a program PIPELINE bound (glUseProgramStages — the CTS
+     * links every separable stage program into a pipeline) ctx->state.program
+     * is NULL; resolve the stage's program from the pipeline so buffer maps
+     * (uniform/SSBO/atomic) are built for it too — without this the transform-
+     * feedback capture pass bound no uniform buffers and captured zeros
+     * (KHR-GL46.enhanced_layouts.xfb_explicit_location_*). */
+    if (ptr == NULL && ctx->state.program_pipeline &&
+        stage < _MAX_SHADER_TYPES)
+        ptr = ctx->state.program_pipeline->stage_programs[stage];
     if (ptr == NULL)
         return 0;
 
@@ -2829,6 +2838,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
 
     ptr = ctx->state.program;
+    if (ptr == NULL && ctx->state.program_pipeline &&
+        stage < _MAX_SHADER_TYPES)
+        ptr = ctx->state.program_pipeline->stage_programs[stage];
     assert(ptr);
 
     assert(index < ptr->spirv_resources_list[stage][type].count);
@@ -2858,6 +2870,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
 
     ptr = ctx->state.program;
+    if (ptr == NULL && ctx->state.program_pipeline &&
+        stage < _MAX_SHADER_TYPES)
+        ptr = ctx->state.program_pipeline->stage_programs[stage];
     assert(ptr);
 
     assert(index < ptr->spirv_resources_list[stage][type].count);

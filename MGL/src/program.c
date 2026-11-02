@@ -3157,6 +3157,26 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* compat r96: a hardware post-tessellation TES reads its control-point and
+     * per-patch inputs through [[attribute(N)]] with N taken from the GLSL
+     * location — but Metal bounds those indices at 0..30 while GL budgets 32
+     * TCS-out/TES-in locations (enhanced_layouts.varying_components_* uses
+     * location 31 as the last legal slot).  The indices only key the vertex
+     * descriptor (MGL builds that from this same MSL), so renumbering them
+     * densely in order of appearance is invisible to the data flow. */
+    if (stage == _TESS_EVALUATION_SHADER && strstr(result, "[[attribute(") &&
+        strstr(result, "patch("))
+    {
+        extern char *mgl_msl_compress_tes_attributes(const char *msl);
+        char *compressed = mgl_msl_compress_tes_attributes(result);
+        if (compressed)
+        {
+            result = compressed;
+            if (tess_owned && tess_owned != result) free(tess_owned);
+            tess_owned = compressed;
+        }
+    }
+
     /* gl_DrawID / gl_BaseVertex: the demoted DrawIndex declaration and the
      * arrays-draw base-vertex correction read the draw-parameters buffer
      * (tessellation.c; bound by MGLRenderer+Draw.m) */
@@ -4155,6 +4175,26 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             memcpy((void *)mods[stage], glslang_program_SPIRV_get_ptr(glsl_program), size * 4);
             sizes[stage] = size;
 
+        }
+
+        /* compat r96: glslang's link-time auto-map numbers location-less
+         * per-vertex interface arrays (TCS in/out, TES/GS in) with Vulkan
+         * flattening — the invented Location can land past the GL per-vertex
+         * budget and the r86 link-time validator would then reject a program
+         * GL accepts (enhanced_layouts.varying_components_*).  Renumber both
+         * sides of every boundary, consistently (mgl_layout_validate.c). */
+        {
+            extern void mgl_layout_renumber_io_srcs(GLMContext ctx, uint32_t **mods, size_t *sizes,
+                                                    unsigned mask, const char **srcs);
+            const char *lsrcs[_MAX_SHADER_TYPES] = {0};
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+            {
+                Shader *s_ = obj->attached[i_];
+                int st_ = s_ ? (int)s_->glm_type : -1;
+                if (st_ >= 0 && st_ < _MAX_SHADER_TYPES && s_->src && !lsrcs[st_])
+                    lsrcs[st_] = s_->src;
+            }
+            mgl_layout_renumber_io_srcs(ctx, (uint32_t **)mods, sizes, mask, lsrcs);
         }
 
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)

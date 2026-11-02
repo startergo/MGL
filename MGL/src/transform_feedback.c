@@ -169,6 +169,10 @@ static MGLXfbProgram *xfb_prog(GLMContext ctx, Program *p, bool create)
 
 static void xfb_clear_linked(GLMContext ctx, MGLXfbProgram *xp)
 {
+    if (getenv("MGL_XFB_DEBUG"))
+        fprintf(stderr, "[xfb] clear_linked: prog=%u count=%u from=%d caller=%p\n",
+                xp ? xp->name : 0, xp ? (unsigned)xp->count : 0u, xp ? xp->from_shader : 0,
+                __builtin_return_address(0));
     for (GLuint i = 0; i < xp->count; i++) {
         free(xp->vars[i].name);
         free(xp->vars[i].expr);
@@ -459,11 +463,10 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
 
     MGLXfbProgram *xp = xfb_prog(ctx, p, false);
     if (!xp || !xp->linked || xp->link_failed || xp->count == 0 || xp->buffer_mask == 0) {
-        if (getenv("MGL_DEBUG"))
-            fprintf(stderr, "MGL DEBUG: BeginTransformFeedback: xfb program state "
-                    "xp=%p linked=%d failed=%d count=%u mask=%u\n", (void *)xp,
-                    xp ? xp->linked : -1, xp ? xp->link_failed : -1,
-                    xp ? xp->count : 0u, xp ? xp->buffer_mask : 0u);
+        if (getenv("MGL_DEBUG") || getenv("MGL_XFB_DEBUG"))
+            fprintf(stderr, "MGL xfb begin: reject xp=%p linked=%d fail=%d count=%u mask=%u\n",
+                    (void*)xp, xp ? xp->linked : -1, xp ? xp->link_failed : -1,
+                    xp ? (unsigned)xp->count : 0u, xp ? xp->buffer_mask : 0u);
         XFB_ERR(GL_INVALID_OPERATION);
     }
 
@@ -473,9 +476,8 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
         GLintptr off;
         xfb_binding_size(ctx, o, b, &buf, &off);
         if (!buf) {
-            if (getenv("MGL_DEBUG"))
-                fprintf(stderr, "MGL DEBUG: BeginTransformFeedback: no buffer at %u (mask %u)\n",
-                        b, xp->buffer_mask);
+            if (getenv("MGL_DEBUG") || getenv("MGL_XFB_DEBUG"))
+                fprintf(stderr, "MGL xfb begin: buffer %u not bound (mask %u)\n", b, xp->buffer_mask);
             XFB_ERR(GL_INVALID_OPERATION);
         }
         if (buf->mapped && !(buf->access & GL_MAP_PERSISTENT_BIT)) XFB_ERR(GL_INVALID_OPERATION);
@@ -798,6 +800,7 @@ static bool xfb_glsl_to_spirv(GLMContext ctx, const char *src, int force_version
     glslang_program_delete(prog);
     glslang_shader_delete(sh);
     if (!*ir) { *log = strdup("out of memory"); return false; }
+    if (getenv("MGL_XFB_DEBUG")) { FILE *f = fopen("/tmp/xfb_repro.spv", "w"); if (f) { fwrite(*ir, 4, *words, f); fclose(f); } }
     return true;
 }
 
@@ -1116,8 +1119,17 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
         }
     }
     xp->record_words = src_word;
+    if (getenv("MGL_XFB_DEBUG"))
+        fprintf(stderr, "[xfb] layout: %u captured varyings, record_words=%u, stride[0]=%u\n",
+                (unsigned)xp->count, xp->record_words, xp->stride[0]);
     return true;
 }
+
+static MGLXfbVarying *xfb_push_var(MGLXfbProgram *xp);
+static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
+                               const char *vname, const char *prefix, MGLXfbProgram *xp,
+                               GLuint buffer, bool *whole_arrays, size_t whole_cap,
+                               unsigned *src_word_io);
 
 /* shader path: outputs decorated with xfb_buffer / xfb_offset (layout qualifiers) */
 static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram *xp, bool *whole_arrays, size_t whole_cap)
@@ -1126,6 +1138,7 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
     size_t n = 0;
     GLuint src_word = 0;
     GLuint explicit_stride[MGL_XFB_MAX_BUFFERS] = {0};
+    bool flattened[MGL_XFB_MAX_BUFFERS] = {false};
     SpvId seen[256];
     size_t nseen = 0;
 
@@ -1241,6 +1254,29 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
 
                 if (buf >= MGL_XFB_MAX_BUFFERS) { xfb_fail(xp, "xfb_buffer of %s exceeds GL_MAX_TRANSFORM_FEEDBACK_BUFFERS", name, NULL); return false; }
 
+                /* compat r96: a structure instance captured as a whole
+                 * (xfb_offset on the variable) flattens to its members.
+                 * r->type_id is the POINTER type (SPIRV-Cross), whose handle
+                 * mirrors the pointee's basetype/array shape but carries no
+                 * member names — the struct itself is r->base_type_id
+                 * (non-block) / the member type (block). */
+                {
+                    spvc_type_id flat_tid = is_block ? tid : r->base_type_id;
+                    spvc_type ttest = spvc_compiler_get_type_handle(c, flat_tid);
+                    if (ttest && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
+                        spvc_type_get_num_array_dimensions(ttest) == 0)
+                    {
+                        if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
+                        if (!xfb_flatten_struct(c, flat_tid, (unsigned)off, var_name, "",
+                                                xp, buf, whole_arrays, whole_cap, &src_word))
+                            return false;
+                        flattened[buf] = true;   /* glslang's whole-struct XfbStride
+                                                  * decoration is not the flattened end */
+                        xp->buffer_mask |= 1u << buf;
+                        continue;
+                    }
+                }
+
                 MGLXfbVarying *v = xfb_push_var(xp);
                 if (!v) return false;
                 bool whole = false;
@@ -1267,11 +1303,169 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
 
     for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++) {
         if (explicit_stride[b]) {
-            if (explicit_stride[b] < xp->stride[b]) { xfb_fail(xp, "xfb_stride is too small for the captured outputs", NULL, NULL); return false; }
-            xp->stride[b] = explicit_stride[b];
+            if (explicit_stride[b] < xp->stride[b] && !flattened[b]) { xfb_fail(xp, "xfb_stride is too small for the captured outputs", NULL, NULL); return false; }
+            if (explicit_stride[b] > xp->stride[b] || !flattened[b]) xp->stride[b] = explicit_stride[b];
         }
     }
     xp->record_words = src_word;
+    if (getenv("MGL_XFB_DEBUG"))
+        fprintf(stderr, "[xfb] shader-layout: %u captured varyings, record_words=%u, stride[0]=%u\n",
+                (unsigned)xp->count, xp->record_words, xp->stride[0]);
+    return true;
+}
+
+/* compat r96: capturing a whole structure instance (`layout(xfb_offset=N) out
+ * Goku goku;` — ARB_enhanced_layouts) captures every member in declaration
+ * order; SPIR-V only decorates the variable, so lay the members out by the
+ * std430 rules (which is what a captured struct's members follow). */
+static unsigned xfb_scalar_bytes(spvc_basetype bt)
+{
+    switch (bt)
+    {
+        case SPVC_BASETYPE_FP64: case SPVC_BASETYPE_INT64: case SPVC_BASETYPE_UINT64:
+            return 8u;
+        case SPVC_BASETYPE_FP16: case SPVC_BASETYPE_INT16: case SPVC_BASETYPE_UINT16:
+            return 2u;
+        case SPVC_BASETYPE_INT8: case SPVC_BASETYPE_UINT8:
+            return 1u;
+        default:
+            return 4u;
+    }
+}
+
+static unsigned xfb_std430_size(spvc_compiler c, spvc_type_id tid);
+
+static unsigned xfb_std430_align_type(spvc_compiler c, spvc_type_id tid);
+
+/* std430 base alignment of a scalar/vector member (GL 4.6 7.6.2.2): a
+ * two-/four-component vector aligns to N*scalar, a THREE-component one to
+ * 4*scalar (vec3 -> 16, dvec3 -> 32, dvec2/dvec4 -> 16/32 ...).  A matrix
+ * handle reports the COLUMN's vector size, which is exactly the alignment a
+ * matrix shares with its column vector. */
+static unsigned xfb_std430_align(spvc_type t)
+{
+    unsigned ve = spvc_type_get_vector_size(t);
+    unsigned s = xfb_scalar_bytes(spvc_type_get_basetype(t));
+    return (ve == 3 ? 4u : ve) * s;
+}
+
+static unsigned xfb_std430_align_type(spvc_compiler c, spvc_type_id tid)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, tid);
+    spvc_basetype bt = spvc_type_get_basetype(t);
+    if (bt == SPVC_BASETYPE_STRUCT)
+    {
+        unsigned m = spvc_type_get_num_member_types(t), a = 1;
+        for (unsigned i = 0; i < m; i++)
+        {
+            unsigned ma = xfb_std430_align_type(c, spvc_type_get_member_type(t, i));
+            if (ma > a) a = ma;
+        }
+        return (a + 15u) & ~15u;    /* struct alignment rounds to 16 */
+    }
+    return xfb_std430_align(t);
+}
+
+static unsigned xfb_std430_size(spvc_compiler c, spvc_type_id tid)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, tid);
+    spvc_basetype bt = spvc_type_get_basetype(t);
+    if (bt == SPVC_BASETYPE_STRUCT)
+    {
+        unsigned m = spvc_type_get_num_member_types(t), off = 0, a = 1;
+        for (unsigned i = 0; i < m; i++)
+        {
+            spvc_type_id mt = spvc_type_get_member_type(t, i);
+            unsigned ma = xfb_std430_align_type(c, mt);
+            unsigned ms = xfb_std430_size(c, mt);
+            if (ma > a) a = ma;
+            off = (off + ma - 1) & ~(ma - 1);
+            off += ms;
+        }
+        unsigned sa = (a + 15u) & ~15u;
+        return (off + sa - 1) & ~(sa - 1);
+    }
+    unsigned cols = spvc_type_get_columns(t);
+    if (cols > 1)
+    {
+        /* a matrix is an array of columns: stride = the column's alignment
+         * rounded over the column's size (vec3 column: 16, dvec3: 32) */
+        unsigned a = xfb_std430_align(t);
+        unsigned vs = spvc_type_get_vector_size(t) * xfb_scalar_bytes(bt);
+        unsigned stride = (vs + a - 1) & ~(a - 1);
+        return cols * stride;
+    }
+    return spvc_type_get_vector_size(t) * xfb_scalar_bytes(bt);
+}
+
+/* flatten one captured struct instance into per-member varyings */
+static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
+                               const char *vname, const char *prefix, MGLXfbProgram *xp,
+                               GLuint buffer, bool *whole_arrays, size_t whole_cap,
+                               unsigned *src_word_io)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, tid);
+    unsigned members = spvc_type_get_num_member_types(t);
+    unsigned off = 0;
+
+    for (unsigned m = 0; m < members; m++)
+    {
+        spvc_type_id mt = spvc_type_get_member_type(t, m);
+        const char *mn = spvc_compiler_get_member_name(c, tid, m);
+        char fallback[16];
+        if (!mn || !mn[0]) { snprintf(fallback, sizeof fallback, "m%u", m); mn = fallback; }
+        char name[256], expr[256], sub[256];
+
+        /* a captured structure's members follow the std430 layout */
+        unsigned ma = xfb_std430_align_type(c, mt);
+        unsigned ms = xfb_std430_size(c, mt);
+        off = (off + ma - 1) & ~(ma - 1);
+
+        if (vname && vname[0])
+        {
+            snprintf(name, sizeof name, "%s.%s", vname, mn);
+            snprintf(expr, sizeof expr, "%s%s.%s", prefix, vname, mn);
+            snprintf(sub, sizeof sub, "%s.", name);   /* nested members: goku.inner.x */
+        }
+        else
+        {
+            snprintf(name, sizeof name, "%s", mn);
+            snprintf(expr, sizeof expr, "%s%s", prefix, mn);
+            snprintf(sub, sizeof sub, "%s.", name);
+        }
+
+        /* a nested plain structure keeps flattening in declaration order */
+        spvc_type mt_handle = spvc_compiler_get_type_handle(c, mt);
+        if (mt_handle && spvc_type_get_basetype(mt_handle) == SPVC_BASETYPE_STRUCT &&
+            spvc_type_get_num_array_dimensions(mt_handle) == 0)
+        {
+            if (!xfb_flatten_struct(c, mt, base_off + off, sub, "", xp, buffer,
+                                    whole_arrays, whole_cap, src_word_io))
+                return false;
+            off += ms;
+            continue;
+        }
+
+        MGLXfbVarying *v = xfb_push_var(xp);
+        if (!v) return false;
+        bool whole = false;
+        const char *err = xfb_leaf(c, mt, 0, v, &whole);
+        v->name = strdup(name);
+        if (err || !v->words)
+        {
+            xfb_fail(xp, "xfb output %s: %s", name, err ? err : "empty capture");
+            return false;
+        }
+        if (xp->count - 1 < whole_cap) whole_arrays[xp->count - 1] = whole;
+        v->expr = strdup(expr);
+        v->buffer = buffer;
+        v->offset = base_off + off;
+        v->src_word = *src_word_io;
+        *src_word_io += v->words;
+        xp->buffer_mask |= 1u << buffer;
+        if (v->offset + v->words * 4 > xp->stride[buffer]) xp->stride[buffer] = v->offset + v->words * 4;
+        off += ms;
+    }
     return true;
 }
 
@@ -2058,6 +2252,13 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     Shader *last = p->shader_slots[_GEOMETRY_SHADER] ? p->shader_slots[_GEOMETRY_SHADER] :
                    p->shader_slots[_TESS_EVALUATION_SHADER];
     bool stage_xfb = last && last->src && strstr(last->src, "xfb_");
+    /* compat r96d: capture declared on an earlier stage is legal and resolved from
+     * THAT stage (KHR-Single-GL46.enhanced_layouts.xfb_get_program_resource_api_*:
+     * TES outputs with layout(xfb_*) while a pass-through GS is attached must link
+     * and report the declared layout — the GS table would be empty) */
+    Shader *tes = p->shader_slots[_TESS_EVALUATION_SHADER];
+    bool tes_xfb = !stage_xfb && tes && tes->src && strstr(tes->src, "xfb_");
+    if (tes_xfb) stage_xfb = true;
 
     if (!xp && !shader_xfb && !stage_xfb) return;
     if (!xp) xp = xfb_prog(ctx, p, true);
@@ -2079,7 +2280,7 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         decl_pending_count = xp->pending_count;
         xp->pending = NULL;
         xp->pending_count = 0;
-        if (p->shader_slots[_GEOMETRY_SHADER]) {
+        if (p->shader_slots[_GEOMETRY_SHADER] && !tes_xfb) {
             /* geometry stage outputs (incl. named interface blocks): the geometry domain
              * resolves the declared xfb_buffer / xfb_offset layout against its own table */
             mgl_geom_xfb_link(ctx, p, true);
@@ -2278,6 +2479,10 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
     if (d->count <= 0 || d->instances <= 0) return keep_draw;
 
     MGLXfbProgram *xp = xfb_prog(ctx, prog, false);
+    if (getenv("MGL_XFB_DEBUG"))
+        fprintf(stderr, "[xfb] process_draw: tf=%u prog_name=%u xp=%s(%u) rec_words=%u\n",
+                (unsigned)o->name, prog ? (unsigned)prog->name : 0,
+                xp ? "found" : "none", xp ? xp->name : 0, xp ? xp->record_words : 0);
     if (!xp || !xp->linked || xp->link_failed) return keep_draw;
 
     /* vertex sequence of one instance (absolute vertex ids, restart markers) */
@@ -2352,6 +2557,11 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
 
     uint64_t written = 0;
     bool scattered_on_gpu = false;
+
+    if (getenv("MGL_XFB_DEBUG"))
+        fprintf(stderr, "[xfb] copy: k=%u np=%u fit=%llu rec_words=%u msl=%p M=%p\n",
+                (unsigned)k, (unsigned)np, (unsigned long long)fit, xp->record_words,
+                (void *)xp->msl, (void *)M);
 
     if (fit && xp->record_words && xp->msl && M && M->capture) {
         /* GL runs the vertex stage once: with rasterizer discard (or no fragment stage)

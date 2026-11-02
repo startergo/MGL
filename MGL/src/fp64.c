@@ -348,7 +348,17 @@ static bool parse(F64 *f)
         spv_context ctx = spvContextCreate(SPV_ENV_UNIVERSAL_1_0);
         spv_diagnostic diag = NULL;
         if (spvBinaryParse(ctx, f, f->w, f->n, NULL, fill_vty, &diag) != SPV_SUCCESS) {
-            if (diag && diag->error) fail(f, "fp64: module parse: %s", diag->error);
+            if (diag && diag->error)
+            {
+                if (getenv("MGL_FP64_DUMP"))
+                {
+                    char p[128];
+                    snprintf(p, sizeof p, "%s/fp64fail_%p.spv", getenv("MGL_FP64_DUMP"), (void *)f->w);
+                    FILE *o = fopen(p, "wb");
+                    if (o) { fwrite(f->w, 4, f->n, o); fclose(o); }
+                }
+                fail(f, "fp64: module parse: %s", diag->error);
+            }
             else fail(f, "fp64: module parse failed");
             if (diag) spvDiagnosticDestroy(diag);
             spvContextDestroy(ctx);

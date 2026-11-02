@@ -230,10 +230,11 @@ static bool framebuffer_complete(GLMContext ctx)
     if (!fbo)
         return true; // default framebuffer is always complete
 
-    // mglCheckFramebufferStatus dereferences colour attachment 0
-    if (fbo->color_attachments[0].buf.tex == NULL)
-        return true;
-
+    /* mglCheckFramebufferStatus handles the no-attachment case itself:
+     * GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT unless the framebuffer
+     * has positive GL_FRAMEBUFFER_DEFAULT_* dimensions — and a draw into an
+     * incomplete one must fail with GL_INVALID_FRAMEBUFFER_OPERATION
+     * (GLES31 debug.negative_coverage.get_error.vertex_array.draw_arrays). */
     return mglCheckFramebufferStatus(ctx, GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 }
 
@@ -250,6 +251,14 @@ static GLenum draw_dbg(GLMContext ctx, GLenum mode, bool uses_elements, int why)
 
 static GLenum validate_draw_state(GLMContext ctx, GLenum mode, bool uses_elements)
 {
+    /* The framebuffer-completeness check runs first: the CTS debug
+     * negative-coverage suite expects GL_INVALID_FRAMEBUFFER_OPERATION to
+     * win over the vertex-array/program GL_INVALID_OPERATION conditions when
+     * both apply (get_error.vertex_array.draw_arrays draws into a
+     * no-attachment FBO with an unbuffered enabled array). */
+    if (!framebuffer_complete(ctx))
+        return GL_INVALID_FRAMEBUFFER_OPERATION;
+
     if (!validate_vao(ctx, uses_elements))
         return draw_dbg(ctx, mode, uses_elements, 1);
 
@@ -265,9 +274,6 @@ static GLenum validate_draw_state(GLMContext ctx, GLenum mode, bool uses_element
 
     if (!xfb_mode_ok(ctx, mode))
         return draw_dbg(ctx, mode, uses_elements, 4);
-
-    if (!framebuffer_complete(ctx))
-        return GL_INVALID_FRAMEBUFFER_OPERATION;
 
     return 0;
 }
