@@ -154,6 +154,12 @@ typedef struct MGLIProgram {
     int      uniform_loc_max;   /* GL_MAX_UNIFORM_LOCATIONS as reported (link check) */
     int      uniform_loc_overflow; /* an explicit location reaches past uniform_loc_max (link error) */
     int      attrib_overflow;  /* vertex inputs exceed MAX_VERTEX_ATTRIBS vectors (link error) */
+    int      block_member_overlap; /* two explicitly-offset members of one block overlap (link error,
+                                       geom r90: glslang accepts them, KHR-Single
+                                       enhanced_layouts.{ssb,uniform_block}_member_overlapping_offsets_*) */
+    int      io_components_overflow; /* a stage's active in/outs exceed MAX_*_(IN|OUT)PUT_COMPONENTS
+                                        (link error, GL 4.6 11.1.1 — varying_location_limit_*) */
+    char     block_overlap_msg[256];
     /* conformant GL location per vertex-input variable (var id -> GL location);
        the SPIR-V Location decoration is the internal slot (see MGLIVar.slot) */
     struct { uint32_t var; GLint gl; } *attrib_gl; int nattrib_gl;

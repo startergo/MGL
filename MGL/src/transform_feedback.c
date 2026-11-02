@@ -458,15 +458,26 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
     if (!p) XFB_ERR(GL_INVALID_OPERATION);
 
     MGLXfbProgram *xp = xfb_prog(ctx, p, false);
-    if (!xp || !xp->linked || xp->link_failed || xp->count == 0 || xp->buffer_mask == 0)
+    if (!xp || !xp->linked || xp->link_failed || xp->count == 0 || xp->buffer_mask == 0) {
+        if (getenv("MGL_DEBUG"))
+            fprintf(stderr, "MGL DEBUG: BeginTransformFeedback: xfb program state "
+                    "xp=%p linked=%d failed=%d count=%u mask=%u\n", (void *)xp,
+                    xp ? xp->linked : -1, xp ? xp->link_failed : -1,
+                    xp ? xp->count : 0u, xp ? xp->buffer_mask : 0u);
         XFB_ERR(GL_INVALID_OPERATION);
+    }
 
     for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++) {
         if (!(xp->buffer_mask & (1u << b))) continue;
         Buffer *buf;
         GLintptr off;
         xfb_binding_size(ctx, o, b, &buf, &off);
-        if (!buf) XFB_ERR(GL_INVALID_OPERATION);
+        if (!buf) {
+            if (getenv("MGL_DEBUG"))
+                fprintf(stderr, "MGL DEBUG: BeginTransformFeedback: no buffer at %u (mask %u)\n",
+                        b, xp->buffer_mask);
+            XFB_ERR(GL_INVALID_OPERATION);
+        }
         if (buf->mapped && !(buf->access & GL_MAP_PERSISTENT_BIT)) XFB_ERR(GL_INVALID_OPERATION);
     }
 
@@ -2071,11 +2082,11 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         if (p->shader_slots[_GEOMETRY_SHADER]) {
             /* geometry stage outputs (incl. named interface blocks): the geometry domain
              * resolves the declared xfb_buffer / xfb_offset layout against its own table */
-            mgl_geom_xfb_link(ctx, p);
+            mgl_geom_xfb_link(ctx, p, true);
             return;
         }
         if (p->shader_slots[_TESS_EVALUATION_SHADER]) {
-            mgl_geom_tess_xfb_link(ctx, p);
+            mgl_geom_tess_xfb_link(ctx, p, true);
             return;
         }
         xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false,
@@ -2100,21 +2111,21 @@ static void xfb_post_link(GLMContext ctx, Program *p)
         /* the geometry domain captures the geometry stage's output itself (see
          * mgl_geom_xfb_link / mgl_geom_xfb_capture); the varyings resolve against the
          * geometry outputs */
-        mgl_geom_xfb_link(ctx, p);
+        mgl_geom_xfb_link(ctx, p, false);
         return;
     }
     if (p->shader_slots[_TESS_EVALUATION_SHADER]) {
         /* geom: the TES is the last pre-rasterization stage here, and the tess domain's
          * output capture is the recorded stream - the geometry domain resolves the varyings
          * against the TES outputs and packs the capture after the draw */
-        mgl_geom_tess_xfb_link(ctx, p);
+        mgl_geom_tess_xfb_link(ctx, p, false);
         return;
     }
     if (p->shader_slots[_TESS_CONTROL_SHADER]) {
         /* a separable TCS-only program: the varyings resolve against the control stage's
          * outputs; no capture is built (GL_PATCHES needs a TES, so the program can never
          * feed a draw on its own) but the link must succeed */
-        mgl_geom_tcs_xfb_link(ctx, p);
+        mgl_geom_tcs_xfb_link(ctx, p, false);
         return;
     }
 

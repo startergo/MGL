@@ -285,6 +285,51 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
         }
         return;
     }
+    /* GL 4.6 11.1.1: the per-stage in/out component budget is a link error the
+     * driver must raise (glslang doesn't check it).  geom r90. */
+    if (ip->io_components_overflow)
+    {
+        MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+        po->link_status = false;
+        {
+            const char *msg = ip->block_overlap_msg;
+            size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 16;
+            char *nl = (char *)malloc(len);
+            if (nl) {
+                nl[0] = 0;
+                if (po->info_log) { strcpy(nl, po->info_log); free(po->info_log); }
+                strcat(nl, "ERROR: ");
+                strcat(nl, msg);
+                strcat(nl, "\n");
+                po->info_log = nl;
+            }
+        }
+        return;
+    }
+
+    /* GL 4.6 4.4.5 (ARB_enhanced_layouts): two explicitly-offset members of one
+     * uniform/buffer block must not overlap — a link error the driver has to
+     * raise (glslang compiles overlapping offsets without complaint).  geom r90,
+     * KHR-Single enhanced_layouts.{ssb,uniform_block}_member_overlapping_offsets_*. */
+    if (ip->block_member_overlap)
+    {
+        MGLProgramObj *po = MGL_PROGRAM_OBJ(ptr);
+        po->link_status = false;
+        {
+            const char *msg = ip->block_overlap_msg;
+            size_t len = strlen(msg) + (po->info_log ? strlen(po->info_log) : 0) + 16;
+            char *nl = (char *)malloc(len);
+            if (nl) {
+                nl[0] = 0;
+                if (po->info_log) { strcpy(nl, po->info_log); free(po->info_log); }
+                strcat(nl, "ERROR: ");
+                strcat(nl, msg);
+                strcat(nl, "\n");
+                po->info_log = nl;
+            }
+        }
+        return;
+    }
     build_subroutines(ctx, ip, ptr);
     /* GL 4.6 §7.4.2: a subroutine uniform with an empty set of compatible
      * subroutines fails the link (KHR-GL46.shader_subroutine.subroutine_uniform_wo_matching_subroutines) */

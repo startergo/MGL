@@ -180,6 +180,195 @@ static bool block_members_carry_offset_align(const char *src, size_t len, size_t
     return false;
 }
 
+
+/* ARB_enhanced_layouts: member offset/align qualifiers are only meaningful in a
+ * block declared std140 or std430 — a shared/packed/default-packed block with
+ * them is a compile error.  `list_start` is a layout(...) MEMBER list position;
+ * returns true when the enclosing uniform/buffer block has no std140/std430. */
+static int member_layout_list_has_offset_or_align(const char *src, size_t open, size_t close)
+{
+    for (size_t e = open + 1; e < close; )
+    {
+        size_t start = e;
+        int depth = 0;
+        while (e < close && (depth || src[e] != ','))
+        {
+            if (src[e] == '(') depth++;
+            else if (src[e] == ')') depth--;
+            e++;
+        }
+        size_t s = start;
+        while (s < e && isspace((unsigned char)src[s])) s++;
+        if (at_word(src, e, s, "offset") || at_word(src, e, s, "align")) return 1;
+        if (e < close) e++;
+    }
+    return 0;
+}
+
+/* skip whitespace/comments backwards; returns the new index (< i) */
+static size_t skip_back_ws(const char *src, size_t i)
+{
+    while (i > 0)
+    {
+        while (i > 0 && isspace((unsigned char)src[i - 1])) i--;
+        if (i >= 2 && src[i - 1] == '/' && src[i - 2] == '*')
+        {
+            i -= 2;
+            while (i >= 2 && !(src[i - 1] == '/' && src[i - 2] == '*')) i--;
+            if (i >= 2) i -= 2;
+            continue;
+        }
+        if (i >= 2 && src[i - 1] == '/' && src[i - 2] == '/')
+        {
+            i -= 2;
+            while (i > 0 && src[i - 1] != '\n') i--;
+            continue;
+        }
+        return i;
+    }
+    return 0;
+}
+
+/* an auxiliary/storage qualifier that may sit between the layout(...) list and
+ * the interface keyword ("layout(std430) readonly buffer B { ... }")? */
+static int back_token_is_qualifier(const char *src, size_t end, size_t *start_out)
+{
+    static const char *qs[] = { "readonly", "writeonly", "coherent", "volatile",
+                                "restrict", "uniform", "buffer", "in", "out", NULL };
+    size_t s = end;
+    while (s > 0 && is_ident_char((unsigned char)src[s - 1])) s--;
+    if (s == end) return 0;
+    for (int k = 0; qs[k]; k++)
+    {
+        size_t l = strlen(qs[k]);
+        if (end - s == l && !strncmp(src + s, qs[k], l))
+        {
+            *start_out = s;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* the layout(...) list right before the block keyword?  returns the open paren
+ * index, or len when there is none.  Storage/auxiliary qualifiers between the
+ * list and the keyword ("readonly") are stepped over. */
+static size_t back_layout_open(const char *src, size_t i, size_t len)
+{
+    i = skip_back_ws(src, i);
+    for (int guard = 0; guard < 8; guard++)
+    {
+        size_t q = 0;
+        if (i > 0 && src[i - 1] == ')') break;      /* the layout list itself */
+        if (!back_token_is_qualifier(src, i, &q)) return len;
+        i = skip_back_ws(src, q);                   /* over "readonly" etc. */
+    }
+    if (i == 0 || src[i - 1] != ')') return len;
+    size_t depth = 0, j = i;
+    while (j > 0)
+    {
+        j--;
+        if (src[j] == ')') depth++;
+        else if (src[j] == '(' && --depth == 0) break;
+    }
+    size_t l = skip_back_ws(src, j);
+    if (l >= 6 && at_word(src, len, l - 6, "layout")) return j;
+    return len;
+}
+
+static int member_std_check(const char *src, size_t len, size_t kw)
+{
+    size_t open = back_layout_open(src, kw, len);
+    if (open < len)
+    {
+        size_t close = match_paren(src, len, open);
+        if (close < len)
+        {
+            for (size_t e = open + 1; e < close; e++)
+                if (at_word(src, close, e, "std140") || at_word(src, close, e, "std430")) return 0;
+        }
+    }
+    return 1;   /* uniform/buffer block without an explicit std140/std430 packing */
+}
+
+static int member_layout_needs_std(const char *src, size_t len, size_t list_start)
+{
+    size_t i = skip_back_ws(src, list_start);
+    /* scan back to the block's opening brace (over previous members) */
+    while (i > 0 && src[i - 1] != '{') i = skip_back_ws(src, i - 1);
+    if (i == 0) return 0;
+    i = skip_back_ws(src, i - 1);                    /* past '{' */
+    while (i > 0 && is_ident_char((unsigned char)src[i - 1])) i--;   /* name (or keyword) */
+    size_t ns = i;
+    size_t ke = skip_back_ws(src, ns);
+    size_t ks = ke;
+    while (ks > 0 && is_ident_char((unsigned char)src[ks - 1])) ks--;   /* keyword before the name */
+    if (ke - ks == 7 && !strncmp(src + ks, "uniform", 7)) return member_std_check(src, len, ks);
+    if (ke - ks == 6 && !strncmp(src + ks, "buffer", 6)) return member_std_check(src, len, ks);
+    /* anonymous block: the scan consumed the keyword as the "name" */
+    if (ns + 7 <= len && !strncmp(src + ns, "uniform", 7)) return member_std_check(src, len, ns);
+    if (ns + 6 <= len && !strncmp(src + ns, "buffer", 6)) return member_std_check(src, len, ns);
+    return 0;
+}
+
+/* ARB_enhanced_layouts: a shared/packed block must not carry explicit member
+ * offsets/alignments — GL 4.6 4.4.5 ("member offsets are only meaningful with
+ * std140/std430").  When such a block is found the shared/packed qualifier is
+ * kept so glslang rejects the shader ('not allowed when generating SPIR-V'),
+ * which is the compile error the CTS ssb/uniform_block_layout_qualifier_conflict_
+ * {shared,packed}_* negative tests require.  `from` is just past the layout(...)
+ * close paren; return true when the following block body declares offset/align. */
+static int gl_packing_block_has_member_layout(const char *src, size_t len, size_t from)
+{
+    /* skip to the block's opening brace (over qualifiers, names and further
+     * layout(...) lists); a ';' first means this layout was not a block */
+    size_t i = from;
+    while (i < len)
+    {
+        if (src[i] == ';') return 0;
+        if (src[i] == '{') break;
+        if (src[i] == '/' && i + 1 < len && (src[i + 1] == '/' || src[i + 1] == '*'))
+        {
+            i = skip_ws_comments(src, len, i);
+            continue;
+        }
+        if (at_word(src, len, i, "layout"))
+        {
+            size_t open = skip_ws_comments(src, len, i + 6);
+            if (open < len && src[open] == '(')
+            {
+                size_t close = match_paren(src, len, open);
+                if (close < len) { i = close + 1; continue; }
+            }
+        }
+        i++;
+    }
+    if (i >= len) return 0;
+    /* find the matching close brace */
+    size_t depth = 0, j = i;
+    while (j < len)
+    {
+        if (src[j] == '/' && j + 1 < len && (src[j + 1] == '/' || src[j + 1] == '*'))
+        {
+            j = skip_ws_comments(src, len, j);
+            continue;
+        }
+        if (src[j] == '{') depth++;
+        else if (src[j] == '}' && --depth == 0) break;
+        j++;
+    }
+    if (j > len) j = len;
+    /* member qualifiers inside the body? */
+    for (size_t k = i + 1; k + 6 < j; k++)
+    {
+        if (at_word(src, (size_t)j, k, "offset") || at_word(src, (size_t)j, k, "align")) return 1;
+        if (src[k] == '/' && k + 1 < j && (src[k + 1] == '/' || src[k + 1] == '*'))
+            k = skip_ws_comments(src, (size_t)j, k) - 1;
+    }
+    return 0;
+}
+
+
 /*
  * Rewrite `src`: drop shared/packed from every layout(...) qualifier list.
  * Returns a malloc'd copy (caller frees), or NULL when nothing needed changing.
@@ -214,6 +403,42 @@ static char *strip_gl_block_packings(const char *src)
                 size_t close = match_paren(src, len, open);
                 if (close < len)
                 {
+                    /* ARB_enhanced_layouts: member offset/align outside an
+                     * explicit std140/std430 block.  glslang silently honors
+                     * them for default-packed buffer blocks, so poison the
+                     * identifier — glslang then reports the unknown layout
+                     * qualifier and the compile fails, as the CTS negative
+                     * tests (ssb_layout_qualifier_conflict__<stage>) require. */
+                    if (member_layout_list_has_offset_or_align(src, open, close) &&
+                        member_layout_needs_std(src, len, i))
+                    {
+                        changed = 1;
+                        str_append(&out, src + i, open + 1 - i);
+                        size_t e = open + 1;
+                        while (e < close)
+                        {
+                            if (at_word(src, close, e, "offset") || at_word(src, close, e, "align"))
+                            {
+                                str_append(&out, "mgl_needs_std_", 14);
+                                str_append(&out, src + e, 6);
+                                e += 6;
+                                continue;
+                            }
+                            if (src[e] == '/' && e + 1 < close &&
+                                (src[e + 1] == '/' || src[e + 1] == '*'))
+                            {
+                                size_t ne = skip_ws_comments(src, close, e);
+                                str_append(&out, src + e, ne - e);
+                                e = ne;
+                                continue;
+                            }
+                            str_append(&out, src + e, 1);
+                            e++;
+                        }
+                        str_append(&out, src + close, 1);
+                        i = close + 1;
+                        continue;
+                    }
                     /* compat r87: GLSL 4.60 4.4.5 — offset/align on a member
                      * require the block to declare std140 or std430; shared and
                      * packed blocks must therefore keep their packing (and fail
@@ -244,7 +469,7 @@ static char *strip_gl_block_packings(const char *src)
                         if (!entry_is_gl_packing(src, start, e)) kept++;
                         if (e < close) e++;   /* skip the comma */
                     }
-                    if (kept < nent)
+                    if (kept < nent && !gl_packing_block_has_member_layout(src, len, close + 1))
                     {
                         changed = 1;
                         if (kept == 0)

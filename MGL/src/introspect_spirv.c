@@ -2604,8 +2604,7 @@ static int add_block(MGLIBlock **arr, int *n, const char *name, int *created)
 }
 
 static void add_io(MGLIVar **arr, int *n, const SMod *m, int stage, const char *name, uint32_t t, GLint loc, GLint index, GLint comp, GLint patch, GLint slot)
-{
-    for (int i = 0; i < *n; i++) if (!strcmp((*arr)[i].name, name)) { (*arr)[i].stages |= 1u << stage; return; }
+{    for (int i = 0; i < *n; i++) if (!strcmp((*arr)[i].name, name)) { (*arr)[i].stages |= 1u << stage; return; }
     *arr = realloc(*arr, (*n + 1) * sizeof(MGLIVar));
     MGLIVar *v = &(*arr)[*n]; memset(v, 0, sizeof *v);
     v->name = xstrdup(name);
@@ -2756,6 +2755,39 @@ static uint32_t builtin_array_active_len(const SMod *m, uint32_t v, uint32_t cou
 }
 
 static bool src_explicit_qual(const char *src, const char *name, const char *dir, const char *qual);
+
+/* GL enum -> (columns, rows, is-double) of the leaf type; false for built-ins /
+ * opaque / struct leaves (callers budget those as one 4-wide slot). */
+static bool io_gl_shape(GLenum t, GLint *cols, GLint *rows, bool *dbl)
+{
+    static const GLenum singles[] = { GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4,
+                                      GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4,
+                                      GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3,
+                                      GL_UNSIGNED_INT_VEC4, GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3,
+                                      GL_BOOL_VEC4, GL_DOUBLE, GL_DOUBLE_VEC2 };
+    static const GLint  srows[]   = { 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2 };
+    static const GLenum dsingles[] = { GL_DOUBLE_VEC3, GL_DOUBLE_VEC4 };
+    for (int i = 0; i < (int)(sizeof singles / sizeof singles[0]); i++) {
+        if (singles[i] != t) continue;
+        *cols = 1; *rows = srows[i]; *dbl = (t == GL_DOUBLE || t == GL_DOUBLE_VEC2);
+        return true;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (dsingles[i] == t) { *cols = 1; *rows = i + 3; *dbl = true; return true; }
+    }
+    static const GLenum mats[] = { GL_FLOAT_MAT2, GL_FLOAT_MAT3, GL_FLOAT_MAT4,
+                                   GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4, GL_FLOAT_MAT3x2,
+                                   GL_FLOAT_MAT3x4, GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3,
+                                   GL_DOUBLE_MAT2, GL_DOUBLE_MAT3, GL_DOUBLE_MAT4,
+                                   GL_DOUBLE_MAT2x3, GL_DOUBLE_MAT2x4, GL_DOUBLE_MAT3x2,
+                                   GL_DOUBLE_MAT3x4, GL_DOUBLE_MAT4x2, GL_DOUBLE_MAT4x3 };
+    static const GLint  mcols[] = { 2, 3, 4, 2, 2, 3, 3, 4, 4, 2, 3, 4, 2, 2, 3, 3, 4, 4 };
+    static const GLint  mrows[] = { 2, 3, 4, 3, 4, 2, 4, 2, 3, 2, 3, 4, 3, 4, 2, 4, 2, 3 };
+    for (int i = 0; i < 18; i++) {
+        if (mats[i] == t) { *cols = mcols[i]; *rows = mrows[i]; *dbl = i >= 9; return true; }
+    }
+    return false;
+}
 
 static void reflect_io(MGLIProgram *ip, const SMod *m, int stage, const uint8_t *active, bool input, MGLIVar **arr, int *narr, const char *src)
 {
@@ -3173,6 +3205,42 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
         if (nel) {
             eused = block_elem_use(m, v);
             if (eused == ~(uint64_t)0) { /* dynamic element index: every element counts */ }
+        }
+
+        /* GL 4.6 4.4.5 (ARB_enhanced_layouts): explicitly offset members of one block
+         * must not overlap.  glslang accepts overlapping offsets (both compile and
+         * link of the shader alone succeed), so the driver's link must reject the
+         * program.  Overlap between an explicit member and an auto-laid-out one is
+         * impossible (auto layout resumes after the previous member's end). */
+        if (!ip->block_member_overlap && (ubo || ssbo) && m->t[st].kind == T_STRUCT && m->t[st].nmem >= 2) {
+            for (uint32_t i = 0; i < m->t[st].nmem && !ip->block_member_overlap; i++) {
+                uint32_t oi = 0, oj = 0;
+                if (!get_dec(m, st, (int32_t)i, SpvDecorationOffset, &oi)) continue;
+                int rmi = 0; uint32_t msi = 0;
+                if (get_dec(m, st, (int32_t)i, SpvDecorationRowMajor, NULL)) rmi = 1;
+                get_dec(m, st, (int32_t)i, SpvDecorationMatrixStride, &msi);
+                uint32_t si = block_type_size(m, m->t[st].mem[i], msi, rmi);
+                if (!si) continue;   /* runtime array: unbounded, overlap is not
+                                      * decidable — glslang lays two runtime arrays of
+                                      * one block at increasing offsets with the first
+                                      * member still "open" */
+                for (uint32_t j = i + 1; j < m->t[st].nmem && !ip->block_member_overlap; j++) {
+                    if (!get_dec(m, st, (int32_t)j, SpvDecorationOffset, &oj)) continue;
+                    int rmj = 0; uint32_t msj = 0;
+                    if (get_dec(m, st, (int32_t)j, SpvDecorationRowMajor, NULL)) rmj = 1;
+                    get_dec(m, st, (int32_t)j, SpvDecorationMatrixStride, &msj);
+                    uint32_t sj = block_type_size(m, m->t[st].mem[j], msj, rmj);
+                    if (!sj) continue;
+                    if (oi < oj + sj && oj < oi + si) {
+                        ip->block_member_overlap = 1;
+                        snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
+                                 "block member offsets overlap: '%s' member %u "
+                                 "(offset %u, size %u) overlaps member %u (offset %u, size %u)",
+                                 bname[0] ? bname : "<unnamed block>",
+                                 i, oi, si, j, oj, sj);
+                    }
+                }
+            }
         }
         for (uint32_t e = 0; e < (nel ? nel : 1); e++) {
             char nm[512];
@@ -3611,6 +3679,84 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
                    stage_source(ctx, ptr, ip->last_stage));
     for (int s = _GEOMETRY_SHADER; s >= _VERTEX_SHADER; s--)
         if (sc[s].present && sc[s].r) { reflect_io(ip, sc[s].r, s, sc[s].active, false, &ip->vtx_outputs, &ip->nvtx_outputs, stage_source(ctx, ptr, s)); break; }
+
+    /* GL 4.6 11.1.1: the per-stage input/output component budgets.  glslang does
+     * not check the consumed locations against them, so a program whose active
+     * outputs (or the consumer stage's inputs) exceed MAX_*_(IN|OUT)PUT_COMPONENTS
+     * must fail to link here (KHR-Single enhanced_layouts.varying_location_limit_*).
+     * TCS outputs / TES inputs are arrays over the patch, budgeted PER ELEMENT. */
+    {
+        static const char *snames[MGLI_STAGES] = { "vertex", "tessellation control", "tessellation evaluation",
+                                                   "geometry", "fragment", "compute" };
+        for (int s = 0; s < MGLI_STAGES && !ip->io_components_overflow; s++) {
+            if (!sc[s].present || !sc[s].r || s == _COMPUTE_SHADER) continue;
+            for (int dir = 0; dir < 2; dir++) {
+                MGLIVar *list = NULL; int nlist = 0;
+                reflect_io(ip, sc[s].r, s, sc[s].active, dir == 0, &list, &nlist, stage_source(ctx, ptr, s));
+                GLint lim = 0;
+                if (dir == 0) {  /* inputs */
+                    if (s == _VERTEX_SHADER) {   /* MAX_VERTEX_ATTRIBS: attrib_overflow above */
+                        for (int i = 0; i < nlist; i++) free(list[i].name);
+                        free(list); continue;
+                    }
+                    lim = 128;   /* GL_MAX_TESS_(CONTROL|EVALUATION)_INPUT_COMPONENTS as get.c reports */
+                    if (s == _GEOMETRY_SHADER) lim = STATE_VAR(max_geometry_input_components) ? STATE_VAR(max_geometry_input_components) : 128;
+                    else if (s == _FRAGMENT_SHADER) lim = STATE_VAR(max_fragment_input_components) ? STATE_VAR(max_fragment_input_components) : 128;
+                } else {
+                    lim = 128;   /* MAX_TESS_(CONTROL|EVALUATION)_OUTPUT_COMPONENTS: 128 */
+                    if (s == _VERTEX_SHADER) lim = STATE_VAR(max_vertex_output_components) ? STATE_VAR(max_vertex_output_components) : 128;
+                    else if (s == _GEOMETRY_SHADER) lim = STATE_VAR(max_geometry_output_components) ? STATE_VAR(max_geometry_output_components) : 128;
+                }
+                GLuint comps = 0;
+                if (getenv("MGL_IO_BUDGET_DEBUG"))
+                    for (int i = 0; i < nlist; i++)
+                        fprintf(stderr, "io-budget stage=%d dir=%d var='%s' loc=%d size=%d type=0x%x patch=%d\n",
+                                s, dir, list[i].name, (int)list[i].location, (int)list[i].size,
+                                list[i].type, list[i].is_per_patch);
+                for (int i = 0; i < nlist; i++) {
+                    MGLIVar *v = &list[i];
+                    if (v->location < 0) continue;      /* built-ins (gl_Position ...) are not budgeted */
+                    GLint cols = 1, rows = 1; bool dbl = false;
+                    if (!io_gl_shape(v->type, &cols, &rows, &dbl)) { comps += 4; continue; }
+                    GLuint slots = (GLuint)cols * ((rows >= 3 && dbl) ? 2 : 1);
+                    GLuint cnt = (GLuint)(v->size > 0 ? v->size : 1);
+                    if (((s == _TESS_CONTROL_SHADER) ||
+                         (s == _TESS_EVALUATION_SHADER && dir == 0)) && !v->is_per_patch) {
+                        /* per-vertex patch interface: budgeted PER ELEMENT.  The TES
+                         * input arrays come EXPANDED (one entry per patch vertex,
+                         * element 0 at the array's base location) — count only the
+                         * element-0 entry; TCS-side arrays stay one entry with the
+                         * full size, so clamp it to a single element. */
+                        const char *b = strchr(v->name, '[');
+                        if (b && !(b[1] == '0' && b[2] == ']')) continue;
+                        cnt = 1;
+                    }
+                    comps += slots * cnt * 4;
+                    /* GL 4.6 11.1.1: the location space itself is capped too — an
+                     * explicit location reaching past the budget's vectors is a link
+                     * error even when only a few components are actually used */
+                    if ((GLuint)(v->location + 1) * 4 > (GLuint)lim ||
+                        (GLuint)(v->location + slots * cnt) * 4 > (GLuint)lim) {
+                        comps = (GLuint)lim + 1;        /* force the error below */
+                        snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
+                                 "%s '%s' of the %s stage uses location %d, beyond the "
+                                 "%d-component (%d-vector) limit",
+                                 dir == 0 ? "input" : "output", v->name, snames[s],
+                                 (int)v->location, lim, lim / 4);
+                    }
+                }
+                for (int i = 0; i < nlist; i++) free(list[i].name);
+                free(list);
+                if (comps > (GLuint)lim) {
+                    ip->io_components_overflow = 1;
+                    snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
+                             "active %s of the %s stage consume %u components, more than the %d-component limit",
+                             dir == 0 ? "inputs" : "outputs", snames[s], comps, lim);
+                }
+            }
+        }
+    }
+
     if (!assign_uniform_locations(ip)) {
         fprintf(stderr, "MGL introspect: program %u: colliding explicit uniform locations\n", ip->prog ? ip->prog->name : 0);
         return false;

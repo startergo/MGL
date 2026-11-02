@@ -117,8 +117,13 @@ typedef struct {
     uint32_t next_id, id_limit;
     uint32_t libshift;       /* id base where the library is merged in */
 
-    struct { uint32_t sid; uint32_t mem[32]; uint32_t n; } ifmem[32];
-    size_t nifmem;
+    struct { uint32_t sid; uint32_t mem[32]; uint32_t n; } *ifmem;
+    size_t nifmem, capifmem;   /* geom r90: was a fixed [32] — soft-float modules
+                                * (xfb capture variants merge the whole library)
+                                * declare dozens of interface structs and the
+                                * registry filled long before the late slot
+                                * structs were created, so smember() fell back to
+                                * the (garbage) module def lookups */
 
     /* stage-IO element wrappers (see iface_slot_struct) */
     struct { uint32_t id, orig; } pstruct[32]; size_t npstruct;
@@ -154,7 +159,7 @@ typedef struct {
      * SPIRV-Cross's tessellation stage-IO flattening consumes a second-level
      * chain's array index as a block-MEMBER index and walks off the struct. */
     struct { uint32_t base; uint32_t nidx; uint32_t idx[12];
-             uint32_t sl0, sln; } *expc;
+             uint32_t sl0, sln; uint32_t sup; } *expc;
     uint32_t *attrsgeom;     /* attribute ptr type -> (nelem<<16)|(cols<<8)|rows, 0 = plain */
     uint32_t *attrorig;      /* attribute ptr type -> original pointee type id */
     uint8_t  *ioiface;       /* pointer type id -> stage IO with the u32-pair repr */
@@ -450,6 +455,17 @@ static uint32_t struct_nmembers(F64 *f, uint32_t sid)
 }
 
 /* member type of an (possibly interface-remapped) struct */
+static bool ifmem_grow(F64 *f)
+{
+    if (f->nifmem < f->capifmem) return true;
+    size_t cap = f->capifmem ? f->capifmem * 2 : 96;
+    void *p = realloc(f->ifmem, cap * sizeof(*f->ifmem));
+    if (!p) return false;                 /* OOM: leave the struct unregistered */
+    f->ifmem = p;
+    f->capifmem = cap;
+    return true;
+}
+
 static uint32_t smember(F64 *f, uint32_t sid, uint32_t i)
 {
     for (size_t k = 0; k < f->nifmem; k++)
@@ -700,7 +716,7 @@ static uint32_t iface_slot_struct(F64 *f, uint32_t nslots, uint32_t rows)
     free(o);
     f->ty[id].kind = K_STRUCT; f->ty[id].has64 = 0; f->ty[id].is64 = 0; f->ty[id].def = 0;
     /* register the members so smember()/struct_nmembers() work without a def */
-    if (f->nifmem < 32) {
+    if (ifmem_grow(f)) {
         f->ifmem[f->nifmem].sid = id;
         for (uint32_t i = 0; i < nslots && i < 32; i++) f->ifmem[f->nifmem].mem[i] = mty;
         f->ifmem[f->nifmem].n = nslots;
@@ -857,7 +873,7 @@ static uint32_t iface_struct(F64 *f, uint32_t orig)
     for (uint32_t i = 0; i < nm; i++) o[i + 1] = mem[i];
     binst(&f->pre, SpvOpTypeStruct, o, nm + 1);
     free(o);
-    if (nm < 32 && f->nifmem < 32) {
+    if (nm < 32 && ifmem_grow(f)) {
         f->ifmem[f->nifmem].sid = id;
         f->ifmem[f->nifmem].n = nm;
         for (uint32_t i = 0; i < nm; i++) f->ifmem[f->nifmem].mem[i] = mem[i];
@@ -1678,7 +1694,7 @@ static uint32_t iface_to_reg(F64 *f, uint32_t v, uint32_t ity, uint32_t orig)
                                        : iface_slot_struct(f, es, n);
             }
             {
-                uint32_t mty = struct_member(f, ity, 0);
+                uint32_t mty = smember(f, ity, 0);
                 uint32_t comps[16];
 
                 for (uint32_t i = 0; i < cnt && i < 16; i++) {
@@ -2830,17 +2846,21 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
         for (uint32_t q = 0; q < nout && q < 12; q++) f->expc[rid].idx[q] = out[q];
         f->expc[rid].sl0 = 0;
         f->expc[rid].sln = arrlen(f, curi);
+        f->expc[rid].sup = 1;
         return;
     }
     if (f->ty[curi].kind == K_ARR && f->iface[curi] && elemreg && f->elemslice[rid]) {
         /* a member slice of the flat slot array: the same treatment, the slot
-         * window is [sl0, sl0+sln) */
+         * window is [sl0, sl0+sln).  The element index itself was FOLDED away
+         * (the slice's slots are addressed absolutely), so nidx can be 0 —
+         * `sup` is what marks the chain suppressed, not nidx. */
         f->vty[rid] = newrt;
         f->expc[rid].base = base;
         f->expc[rid].nidx = nout > 12 ? 12 : nout;
         for (uint32_t q = 0; q < nout && q < 12; q++) f->expc[rid].idx[q] = out[q];
         f->expc[rid].sl0 = f->elemidx[rid] * f->elemstride[rid];
         f->expc[rid].sln = f->elemstride[rid];
+        f->expc[rid].sup = 1;
         return;
     }
 
@@ -2907,7 +2927,7 @@ static uint32_t iface_slot_ptr(F64 *f, uint32_t ptr, uint32_t arrty, uint32_t j)
 {
     uint32_t sloty = f->ty[arrty].elem;
 
-    if (f->expc[ptr].nidx)
+    if (f->expc[ptr].sup)
     {
         uint32_t pty = f->vty[ptr];
         uint32_t storage = (pty && f->ty[pty].kind == K_PTR) ? f->ty[pty].n : SpvStorageClassOutput;
@@ -3511,6 +3531,51 @@ static bool rw_body_inst(F64 *f, size_t j)
     case SpvOpInBoundsAccessChain:
         rw_access(f, j, true);
         return true;
+    case SpvOpCompositeExtract: {
+        /* whole-array load of a std140 buffer array of scalar doubles
+         * (`out double g[3] = ubo.uni[3];` compiles to OpLoad of the array
+         * then per-element extracts).  widen_buffer_array() turns the
+         * elements into vec<lanes>(u64) so the natural MSL stride matches the
+         * decorated one; the extract must then take element i AND lane 0 —
+         * the plain u64 the lowered code everywhere else works with.  Called
+         * from the body pass the widening is memoized, so the def pass later
+         * re-emits the very same array type. */
+        uint32_t comp = iw[3];
+        uint32_t ct = comp < f->cap_ids ? f->vty[comp] : 0;
+        uint32_t lanes = (ct && ct < f->cap_ids && f->ty[ct].kind == K_ARR)
+                             ? (f->warr[ct] ? f->warr[ct] : widen_buffer_array(f, ct)) : 0;
+        if (!lanes) return false;       /* composite is not a widened buffer array */
+        if (wc > 5) {
+            fail(f, "fp64: nested extract from a widened buffer array is not supported");
+            return true;
+        }
+        uint32_t elem = xcomp(f, f->ty[ct].elem, comp, iw[4]);
+        emit_result(f, iw[1], iw[2], xcomp(f, f->f64ty, elem, 0));
+        return true;
+    }
+    case SpvOpCompositeInsert: {
+        /* same shape on the write side: insert a plain u64 into element i of
+         * a widened buffer-array value — splice it into lane 0 of that
+         * element, leaving the padding lanes of the std140 slot alone. */
+        uint32_t comp = iw[4];
+        uint32_t ct = comp < f->cap_ids ? f->vty[comp] : 0;
+        uint32_t lanes = (ct && ct < f->cap_ids && f->ty[ct].kind == K_ARR)
+                             ? (f->warr[ct] ? f->warr[ct] : widen_buffer_array(f, ct)) : 0;
+        if (!lanes) return false;
+        if (wc > 6) {
+            fail(f, "fp64: nested insert into a widened buffer array is not supported");
+            return true;
+        }
+        uint32_t vt = f->ty[ct].elem;
+        uint32_t elem = xcomp(f, vt, comp, iw[5]);
+        uint32_t lane = nid(f);
+        uint32_t oi[5] = {vt, lane, iw[3], elem, 0};
+        binst(&f->body, SpvOpCompositeInsert, oi, 5);
+        uint32_t res = nid(f);
+        uint32_t or_[5] = {iw[1], res, lane, comp, iw[5]};
+        binst(&f->body, SpvOpCompositeInsert, or_, 5);
+        return true;
+    }
     case SpvOpCopyMemory: {
         uint32_t dst = iw[1], src = iw[2];
         uint32_t pty = f->vty[src];
@@ -4266,6 +4331,7 @@ done:
     free(f.decs); free(f.mdecs);
     free(f.iface); free(f.iforig); free(f.rowmajor); free(f.roworig); free(f.rowmap);
     free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.attrslotidx); free(f.attrsgeom); free(f.attrorig); free(f.attrmat); free(f.elemslice); free(f.elemidx); free(f.elemstride); free(f.elemorig); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
+    free(f.ifmem);
     free(f.vc);
     free(f.pre.w); free(f.preann.w); free(f.lead.w); free(f.defs.w); free(f.body.w);
     free(f.libdefs.w); free(f.libfns.w); free(f.hdradd.w);

@@ -591,7 +591,7 @@ int  mgl_geom_mode_code(GLenum mode);
 uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 
 /* transform feedback of the geometry output (called from the xfb domain) */
-void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program);
+void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program, bool from_shader);
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
                           const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
 
@@ -600,11 +600,11 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
  * varyings against the TES's SPIR-V (called from the xfb domain's link hook); the draw-time
  * route runs the tessellated draw with the output capture on and packs the captured records
  * into the transform feedback buffers (one thread per record, all on stream 0). */
-void mgl_geom_tess_xfb_link(GLMContext ctx, struct Program_t *program);
+void mgl_geom_tess_xfb_link(GLMContext ctx, struct Program_t *program, bool from_shader);
 /* a separable TCS-only program with transform feedback varyings: the names resolve against
  * the control stage's outputs (arrays); no capture is built — GL_PATCHES needs a TES, so
  * the program can never feed a draw by itself, but the link must succeed (GL 4.6 13.3.2) */
-void mgl_geom_tcs_xfb_link(GLMContext ctx, struct Program_t *program);
+void mgl_geom_tcs_xfb_link(GLMContext ctx, struct Program_t *program, bool from_shader);
 bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t offset,
                              GLint first, GLsizei count, GLsizei instances,
                              GLint basevertex, GLuint baseinstance);

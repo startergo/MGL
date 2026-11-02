@@ -7815,6 +7815,25 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
             if (v->location + slots > next_loc) next_loc = v->location + slots;
             continue;
         }
+        if (v->base != GL_DOUBLE && v->cols > 1 && v->elems > 1)
+        {
+            /* a non-double ARRAY OF MATRICES cannot be a stage output ("MSL cannot
+             * emit arrays-of-matrices in input and output variables"): emit one
+             * matrix per element at the element's own locations — exactly the shape
+             * the fragment stage's module was flattened to by flatten_io_matrix_arrays
+             * (member <name>_<e> at location L + e*cols), and the link is by location
+             * anyway.  dEQP-GL45-ES31 transform_feedback_varying.type.vertex_geo_
+             * fragment.{array,whole_array}.mat3x4 (xfb of a GS-through matrix array). */
+            for (GLuint e = 0; e < v->elems; e++)
+                sb_put(&b, "layout(location = %u) %s%s%s out %s mgl_vm%d_%u;\n",
+                       v->location + e * v->cols,
+                       v->flat ? "flat " : "", v->noperspective ? "noperspective " : "",
+                       v->centroid ? "centroid " : "",
+                       glsl_type_name(v->base, v->rows, v->cols), i, e);
+            if (v->location + v->elems * v->cols > next_loc)
+                next_loc = v->location + v->elems * v->cols;
+            continue;
+        }
         sb_put(&b, "layout(location = %u) %s%s%s out %s %s%s;\n", v->location,
                v->flat ? "flat " : "", v->noperspective ? "noperspective " : "",
                v->centroid ? "centroid " : "", glsl_type_name(v->base, v->rows, v->cols), name, arr);
@@ -7924,10 +7943,18 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         for (GLuint e = 0; e < (v->elems > 0 ? v->elems : 1u); e++)
         {
             char arr[32] = "";
+            char dst[192];
             /* an array element's words are contiguous: cols * rows * base words each */
             GLuint base = v->offset + e * v->cols * v->rows * comp_words(v->base);
-            if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", e);
-            sb_put(&b, "    %s%s = ", name, arr);
+            /* the flattened matrix array writes its per-element output mgl_vm<i>_<e> */
+            if (v->base != GL_DOUBLE && v->cols > 1 && v->elems > 1)
+                snprintf(dst, sizeof(dst), "mgl_vm%d_%u", i, e);
+            else
+            {
+                if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", e);
+                snprintf(dst, sizeof(dst), "%s%s", name, arr);
+            }
+            sb_put(&b, "    %s = ", dst);
             if (v->cols > 1)
             {
                 char mname[64];
@@ -10691,7 +10718,7 @@ static void geom_xfb_fail(GLMContext ctx, MGLXfbProgram *xp, const char *msg)
 static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                              const MGLGeomVar *vars, int nvars,
                              GLuint pos_word, GLuint psize_word,
-                             const char *stage)
+                             const char *stage, bool from_shader)
 {
     GLuint dbuffer[64], doffset[64];
     GLsizei dn = 0;
@@ -10711,8 +10738,13 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
     memset(sepo, 0, sizeof sepo);
 
     geom_xfb_reset(ctx, xp);
-    xp->mode = xp->pending_mode;
-    if (!xp->pending_count)
+    /* ARB_enhanced_layouts (GL 4.6 11.1.2.1 + issue 18): when the recording stage
+     * declares any xfb_* layout qualifiers, the glTransformFeedbackVaryings list is
+     * IGNORED — the captured set is exactly the outputs with an xfb_offset.  A
+     * variable with only xfb_buffer/xfb_stride (no offset) is NOT captured. */
+    if (from_shader) xp->mode = GL_INTERLEAVED_ATTRIBS;
+    else xp->mode = xp->pending_mode;
+    if (from_shader || !xp->pending_count)
     {
         /* shader-declared capture (xfb_buffer / xfb_offset on outputs, including interface
          * block members): GL 4.6 11.1.2.1 — only outputs that declare an xfb_offset are
@@ -10813,9 +10845,12 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
 
     for (GLuint i = 0; i < n; i++)
     {
-        const char *name = xp->pending_count ? xnames[i] : dnames[i];
+        /* from_shader: the API list was ignored, the names/buffers come from the
+         * shader-declared table even when a pending API list exists */
+        bool use_shader = from_shader || !xp->pending_count;
+        const char *name = use_shader ? dnames[i] : xnames[i];
 
-        if (!xp->pending_count)
+        if (use_shader)
         {
             buffer = dbuffer[i];
             offset = doffset[i];
@@ -11013,21 +11048,21 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         xp->stride[buffer] = offset;
 }
 
-void mgl_geom_xfb_link(GLMContext ctx, Program *program)
+void mgl_geom_xfb_link(GLMContext ctx, Program *program, bool from_shader)
 {
     MGLGeomProgram *gp = geom_prog_slot(ctx, program, false);
     MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
 
     if (!gp || !xp) return;
     geom_xfb_resolve(ctx, xp, gp->out_v, gp->n_out, gp->out_pos_off, gp->out_psize_off,
-                     "geometry stage");
+                     "geometry stage", from_shader);
 }
 
 /* transform feedback from a tessellation evaluation stage (no geometry shader): the TES's
  * SPIR-V outputs are the recorded stream.  The per-record word offsets of the tess output
  * capture differ from this table, so the pack refreshes src_word from the published member
  * table on every draw. */
-void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program)
+void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program, bool from_shader)
 {
     MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
     MGLGeomVar vars[MGL_GEOM_MAX_VARYINGS];
@@ -11053,14 +11088,14 @@ void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program)
     spv_free(m);
     /* gl_Position is the first word of every capture record; the tess output capture does not
      * record gl_PointSize (a TES writing it would be dropped) */
-    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage");
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage", from_shader);
 }
 
 /* transform feedback varyings on a SEPARABLE TCS-only program (no vs/tes/gs): the names
  * resolve against the control stage's outputs, which are per-vertex arrays (and per-patch
  * outs).  Such a program can never feed a draw by itself (GL_PATCHES needs a TES), so the
  * link only fills the varying table — no capture is built. */
-void mgl_geom_tcs_xfb_link(GLMContext ctx, Program *program)
+void mgl_geom_tcs_xfb_link(GLMContext ctx, Program *program, bool from_shader)
 {
     MGLXfbProgram *xp = geom_xfb_prog(ctx, program, true);
     MGLGeomVar vars[MGL_GEOM_MAX_VARYINGS];
@@ -11084,7 +11119,7 @@ void mgl_geom_tcs_xfb_link(GLMContext ctx, Program *program)
     if (!geom_reflect_stage(m, false, vars, &n, NULL))
         n = 0;
     spv_free(m);
-    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation control stage");
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation control stage", from_shader);
 }
 
 /* the active transform feedback object (the xfb domain's current-object rule) */

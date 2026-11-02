@@ -5177,6 +5177,23 @@ static bool tess_generate(GLMContext ctx, MGLTessProgram *tp, const float *facto
     return true;
 }
 
+/* producer/consumer patch-member match: the canonical key (varying location) is
+ * the primary match, but when BOTH sides are flattened per-element members —
+ * tess r48 dissolves a per-patch block ARRAY into "name_0..N" plain typed
+ * members — the element indices must match too, or every consumer element copies
+ * producer element 0 (patch_block_array_pipeline: targetInstance_target_1/2 read
+ * back targetInstance_target_0).  A source kept as one spvUnsafeArray member
+ * (flat_dims 0) still lets any consumer element match; the caller's stride
+ * compensation steps to the element then. */
+static bool tess_patch_member_matches(const MGLTessPatchMember *p, const MGLTessPatchMember *m)
+{
+    if (p->key != m->key) return false;
+    if (!p->flat_dims || !m->flat_dims) return true;
+    if (p->array_idx != m->array_idx) return false;
+    if (p->flat_dims > 1 && m->flat_dims > 1 && p->array_idx2 != m->array_idx2) return false;
+    return true;
+}
+
 /* build the per-patch data blob consumed by the rewritten TES (TES patchIn layout):
  * - members written by the TCS are copied from the read-back patch output struct
  * - the tessellation level members are filled from the factors
@@ -5255,13 +5272,10 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                  * exclusion and was always correct. */
                 for (int j = 0; j < tp->num_tcs_patch_out; j++)
                 {
-                    if (tp->tcs_patch_out[j].key == m->key)
+                    if (tess_patch_member_matches(&tp->tcs_patch_out[j], m))
                     {
                         size_t so = tp->tcs_patch_out[j].offset;
 
-                        /* flattened element ("name_N", array_idx N) of a canonical
-                         * spvUnsafeArray patch output: advance the source by the element
-                         * stride (the GPU blob map needed the same fix) */
                         /* flattened element ("name_N", array_idx N) of a canonical
                          * spvUnsafeArray patch output: advance the source by the element
                          * stride (the GPU blob map needed the same fix); a struct-array
@@ -7632,41 +7646,53 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
      * buffer at draw time) */
     for (int i = 0; i < tp->num_tes_patch_in; i++)
     {
-        for (int j = 0; j < canon_patch.n; j++)
-            if (tp->tes_patch_in[i].key == canon_patch.m[j].key)
+        /* the canonical slot: exact name first (split MATRIX COLUMNS share one key,
+         * so key-only matching would hand every column slot 0), then the canonical
+         * key with the flattened element index (tess_patch_member_matches — both
+         * sides flattened per element: element N must take element N's slot, not
+         * slot 0; patch_block_array_pipeline read element 0 back for all three) */
+        int slot = -1;
+        for (int j = 0; j < canon_patch.n && slot < 0; j++)
+            if (!strcmp(canon_patch.m[j].name, tp->tes_patch_in[i].name))
+                slot = j;
+        for (int j = 0; j < canon_patch.n && slot < 0; j++)
+            if (tess_patch_member_matches(&canon_patch.m[j], &tp->tes_patch_in[i]))
+                slot = j;
+        if (slot >= 0)
+        {
+            const MGLTessPatchMember *cm = &canon_patch.m[slot];
+
+            tp->tes_patch_in[i].offset = cm->offset;
+            /* flattened array element ("name_N", array_idx N) of a canonical
+             * spvUnsafeArray member: advance by the element stride (mirrors the
+             * control-point fixup above — without it every element read at the
+             * array's base offset, and 'patch in int r[16]' returned r[0] always).
+             * A struct-array FIELD element carries a second dimension
+             * ("name_<i>_<field>_<j>", array_idx2) stepping inside the field */
+            if (tp->tes_patch_in[i].flat_dims && strstr(cm->type, "spvUnsafeArray"))
             {
-                tp->tes_patch_in[i].offset = canon_patch.m[j].offset;
-                /* flattened array element ("name_N", array_idx N) of a canonical
-                 * spvUnsafeArray member: advance by the element stride (mirrors the
-                 * control-point fixup above — without it every element read at the
-                 * array's base offset, and 'patch in int r[16]' returned r[0] always).
-                 * A struct-array FIELD element carries a second dimension
-                 * ("name_<i>_<field>_<j>", array_idx2) stepping inside the field */
-                if (tp->tes_patch_in[i].flat_dims && strstr(canon_patch.m[j].type, "spvUnsafeArray"))
+                size_t stride = msl_array_stride(cm->type);
+
+                if (getenv("MGL_TESS_DEBUG2"))
+                    fprintf(stderr, "MGL tess: stride fixup '%s' canon '%s %s' dims=%u idx=%u idx2=%u stride=%zu\n",
+                            tp->tes_patch_in[i].name, cm->type, cm->name,
+                            tp->tes_patch_in[i].flat_dims,
+                            tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].array_idx2, stride);
+                if (stride)
+                    tp->tes_patch_in[i].offset = cm->offset +
+                        tp->tes_patch_in[i].array_idx * stride;
+                if (stride && tp->tes_patch_in[i].array_idx2)
                 {
-                    size_t stride = msl_array_stride(canon_patch.m[j].type);
+                    char inner[96];
+                    long n2 = 0;
 
-                    if (getenv("MGL_TESS_DEBUG2"))
-                        fprintf(stderr, "MGL tess: stride fixup '%s' canon '%s %s' dims=%u idx=%u idx2=%u stride=%zu\n",
-                                tp->tes_patch_in[i].name, canon_patch.m[j].type,
-                                canon_patch.m[j].name, tp->tes_patch_in[i].flat_dims,
-                                tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].array_idx2, stride);
-                    if (stride)
-                        tp->tes_patch_in[i].offset = canon_patch.m[j].offset +
-                            tp->tes_patch_in[i].array_idx * stride;
-                    if (stride && tp->tes_patch_in[i].array_idx2)
-                    {
-                        char inner[96];
-                        long n2 = 0;
-
-                        if (msl_array_inner(canon_patch.m[j].type, inner, sizeof inner, &n2) &&
-                            msl_array_stride(inner))
-                            tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx2 *
-                                msl_array_stride(inner);
-                    }
+                    if (msl_array_inner(cm->type, inner, sizeof inner, &n2) &&
+                        msl_array_stride(inner))
+                        tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx2 *
+                            msl_array_stride(inner);
                 }
-                break;
             }
+        }
         if (tess_trace())
             fprintf(stderr, "MGL tess: tes_patch_in[%d] '%s' key=%x idx=%u off=%zu (stride %zu)\n",
                     i, tp->tes_patch_in[i].name, tp->tes_patch_in[i].key,
@@ -7677,14 +7703,22 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
         tp->tcs_patch_out_size = canon_patch.size;  /* the TCS patchOut is rewritten below */
 
     /* the TCS patch output members (the rewritten kernel's canonical patchOut struct)
-     * sit at the canonical offsets as well */
+     * sit at the canonical offsets as well — same slot rule as the TES patch-ins
+     * above: exact name, else canonical key + flattened element index (a flattened
+     * per-element producer must carry ITS OWN offset or every element copies
+     * element 0 through the blob map) */
     for (int i = 0; i < tp->num_tcs_patch_out; i++)
-        for (int j = 0; j < canon_patch.n; j++)
-            if (tp->tcs_patch_out[i].key == canon_patch.m[j].key)
-            {
-                tp->tcs_patch_out[i].offset = canon_patch.m[j].offset;
-                break;
-            }
+    {
+        int slot = -1;
+        for (int j = 0; j < canon_patch.n && slot < 0; j++)
+            if (!strcmp(canon_patch.m[j].name, tp->tcs_patch_out[i].name))
+                slot = j;
+        for (int j = 0; j < canon_patch.n && slot < 0; j++)
+            if (tess_patch_member_matches(&canon_patch.m[j], &tp->tcs_patch_out[i]))
+                slot = j;
+        if (slot >= 0)
+            tp->tcs_patch_out[i].offset = canon_patch.m[slot].offset;
+    }
 
     /* ---- producer rewrites: whichever kernel writes a record whose SPIRV-Cross
      * struct differs from the canonical layout is recompiled with the canonical
@@ -8947,6 +8981,9 @@ static char *tcs_inject_float_levels(const char *msl)
  * TES patch-in record: for every TES patch-in member, either the tessellation
  * levels (from the half factor record) or a byte range of the TCS patch output,
  * matched by varying name exactly like tess_build_patch_blob does on the CPU. */
+/* patch members match through tess_patch_member_matches() (defined above
+ * tess_build_patch_blob): canonical key first, flattened element index second. */
+
 void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
 {
     int n = 0;
@@ -8965,11 +9002,12 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
         else
         {
             /* copy from the TCS patch output record, matched by varying location
-             * (the canonical key — names may differ between the stages) */
+             * (the canonical key — names may differ between the stages; flattened
+             * per-element members additionally match their element index) */
             bool found = false;
             for (int j = 0; j < tp->num_tcs_patch_out && !found; j++)
             {
-                if (tp->tcs_patch_out[j].key == m->key)
+                if (tess_patch_member_matches(&tp->tcs_patch_out[j], m))
                 {
                     size_t elem = 0;
 
