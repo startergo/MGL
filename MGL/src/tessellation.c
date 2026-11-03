@@ -2789,6 +2789,7 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                     }
                 }
             }
+            if (tess_trace() && getenv("MGL_TESS_DEBUG2"))
                 fprintf(stderr, "MGL tess annotate[gen]: stage %d '%s' base='%s' fidx=%u\n",
                         stage, m->name, base, fidx);
             if (!base[0])

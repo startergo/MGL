@@ -303,6 +303,11 @@ static const char *mgl_extensions[] = {
     "GL_ARB_program_interface_query",
     "GL_ARB_provoking_vertex",
     "GL_ARB_robustness",
+    /* KHR alias of ARB_robustness (same 4.5-core-promoted entry points; the
+     * CTS resolves glGetGraphicsResetStatus through this string on pre-4.5
+     * context types — without it KHR-GL44's device-lost check calls NULL and
+     * every case in the gl3cts packages segfaults) */
+    "GL_KHR_robustness",
     "GL_ARB_sampler_objects",
     "GL_ARB_seamless_cube_map",
     "GL_ARB_separate_shader_objects",
