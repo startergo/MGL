@@ -2498,6 +2498,36 @@ static uint32_t block_type_size(const SMod *m, uint32_t t, uint32_t mstride, int
     }
 }
 
+/* GL 4.6 §9.2.3 (ARB_program_interface_query): GL_BUFFER_DATA_SIZE of a uniform /
+ * shader-storage block is the MINIMUM buffer size for the block.  GLSL's only legal
+ * runtime ("unsized") array position is the LAST member of a block, and that minimum
+ * must cover one element of it — dEQP-GL45-ES31 PIQ shader_storage_block.buffer_data_size.*
+ * checks the lower bound exactly that way (its "tight packing" size sums the members
+ * with the trailing unsized array as a single element).  block_type_size() returns 0
+ * for a runtime array (the block-member-overlap check relies on that), so the
+ * query-side minimum adds offset + ArrayStride of the trailing array here. */
+static uint32_t block_min_gl_size(const SMod *m, uint32_t st)
+{
+    uint32_t sz = block_type_size(m, st, 0, 0);
+    const SType *ty = &m->t[st];
+    if (ty->kind != T_STRUCT || ty->nmem == 0)
+        return sz;
+    uint32_t ra = ty->mem[ty->nmem - 1];
+    if (m->t[ra].kind != T_RARRAY)
+        return sz;
+    uint32_t off = 0, stride = 0;
+    get_dec(m, st, (int32_t)ty->nmem - 1, SpvDecorationOffset, &off);
+    if (!get_dec(m, ra, -1, SpvDecorationArrayStride, &stride) || !stride)
+    {
+        /* SPIR-V blocks always carry ArrayStride; fall back to the element size
+         * (or 4) rather than report a too-small minimum */
+        stride = block_type_size(m, m->t[ra].elem, 0, 0);
+        if (!stride) stride = 4;
+    }
+    if (off + stride > sz) sz = off + stride;
+    return sz;
+}
+
 typedef struct {
     MGLIProgram *ip; const SMod *m; int stage; int block; bool ssbo;
     int top_level; GLint top_size, top_stride;
@@ -3345,7 +3375,7 @@ static void reflect_stage(MGLIProgram *ip, StageCtx *s, int stage, const char *s
             if (created) {
                 b->binding = (GLint)(binding + e);
                 b->array_element = nel ? (int)e : -1;
-                uint32_t sz = block_type_size(m, st, 0, 0);
+                uint32_t sz = block_min_gl_size(m, st);   /* trailing unsized array = 1 element */
                 b->data_size = (GLint)(ubo ? align_up(sz, 16) : sz);
             }
             /* usage-based stage bits (GL 4.6 §9.2: REFERENCED_BY_X_SHADER is 1 only if
