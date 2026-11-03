@@ -2709,15 +2709,13 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
-    /* geom: the GEOMETRY stage's emulation kernel MSL cannot carry arrays-of-arrays
-     * of samplers/images (SPIRV-Cross's MSL backend rejects them): flatten to one
-     * array of the total count (geom_opaque_flatten.c).  The stage gate matters:
-     * other stages keep the documented link-failure gap, and the acceptance gate
-     * (msl_accepts) applies the same stage-gated pass so both agree. */
-    if (stage == _GEOMETRY_SHADER)
+    /* geom: NO MSL view can carry arrays-of-arrays of samplers/images
+     * (SPIRV-Cross's MSL backend rejects them): flatten to one array of the
+     * total count (geom_opaque_flatten.c), every stage.  The acceptance gate
+     * (msl_accepts) applies the same pass so both agree. */
     {
         size_t flat_words = 0;
-        uint32_t *flat = mgl_geom_flatten_gs_opaque(prepared, prepared_words, &flat_words);
+        uint32_t *flat = mgl_spirv_flatten_opaque_aoa(prepared, prepared_words, &flat_words);
         if (flat)
         {
             free(prepared);

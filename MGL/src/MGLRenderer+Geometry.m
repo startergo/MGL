@@ -27,6 +27,7 @@
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_queries.h"   /* discard-skip: active pre-raster query counters */
 #include "mgl_ext_texdata.h"    /* mgl_texdata_level_geometry: image-unit level completeness */
+#include "mgl_ext_vattrib.h"   /* the vertex fetch plan (shadow/const slots of the capture pass) */
 #include "texdata_formats.h"   /* tdFormatInfo: image-unit format reinterpretation */
 #include "MGLRenderer_Private.h"
 #import "MGLRenderer+Compat.h"   /* compat: bind shadow (perf session 3) */
@@ -53,6 +54,13 @@
  * buffers domain category) */
 #define GEOM()   ((struct MGLExtState_geom *)ctx->state.ext_geom)
 #define BUF()    (ctx->mtl_funcs.ext_buffers)
+
+/* r100: capture-pass setup-cache counters (tests/headless/mgl_geom_diag.h) */
+static uint64_t gCapHits = 0, gCapMisses = 0;
+uint64_t mgl_geom_capcache_stat(int which)
+{
+    return which == 0 ? gCapHits : gCapMisses;
+}
 
 /* per-process scratch (the buffers are shared storage; they are only used by encoders of
  * the command buffer they were written for, so a single set can serve every draw) */
@@ -140,7 +148,7 @@ static struct {
      * stages — the skipped stage's consumers keep reading the same VOLUME of data (a
      * previous draw's records / counters), so the difference of two runs is the stage's
      * own cost.  Development diagnostics only; never set by the library itself. */
-    bool skip_capture, skip_kernel, skip_order, skip_raster, gputime, skip_gs, no_barrier, skip_scan, skip_copy, no_implicit;
+    bool skip_capture, skip_kernel, skip_order, skip_raster, gputime, skip_gs, no_barrier, skip_scan, skip_copy, no_implicit, nocapcache;
     int scan_reps;
 } gEnv = { 0, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, 0 };
 
@@ -156,6 +164,7 @@ static void geomEnvRead(void)
     gEnv.dump = getenv("MGL_GEOM_DUMP") != NULL;
     gEnv.serial_prep = getenv("MGL_GEOM_SERIAL_PREP") != NULL;   /* A/B the serial kernel */
     gEnv.skip_capture = getenv("MGL_GEOM_SKIP_CAPTURE") != NULL;
+    gEnv.nocapcache = getenv("MGL_GEOM_NOCAPCACHE") != NULL;   /* r100 A/B: disable the capture-pass setup cache */
     gEnv.skip_kernel = getenv("MGL_GEOM_SKIP_KERNEL") != NULL;
     gEnv.skip_order = getenv("MGL_GEOM_SKIP_ORDER") != NULL;
     gEnv.skip_raster = getenv("MGL_GEOM_SKIP_RASTER") != NULL;
@@ -5292,8 +5301,25 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
 
     /* the same mapping the renderer builds for a normal stage; the list already expands
      * instance arrays (one entry per element at consecutive slots), matching the flat
-     * layout geom_build_pins assigns to the generated kernels */
-    if (![self mapGLBuffersToMTLBufferMap: &list stage: _GEOMETRY_SHADER]) return false;
+     * layout geom_build_pins assigns to the generated kernels.
+     * r100: the walk is a pure function of (program, the four buffer rows, the stage's
+     * default-uniform buffer) — identical discipline to the capture-pass setup cache —
+     * so an unchanged fingerprint binds from the snapshot instead.  DIRTY_BUFFER stays
+     * a hard miss: updateDirtyBaseBufferList folds buffer resizes into the entries. */
+    {
+        uint64_t fp = geomStageFingerprint(ctx, ctx->state.program, _GEOMETRY_SHADER);
+        if (gp->kernel_prog != ctx->state.program || gp->kernel_fp != fp)
+        {
+            if (![self mapGLBuffersToMTLBufferMap: &list stage: _GEOMETRY_SHADER]) return false;
+            if (ctx->state.dirty_bits & DIRTY_BUFFER)
+                [self updateDirtyBaseBufferList: &list];
+            gp->kernel_map = list;
+            gp->kernel_prog = ctx->state.program;
+            gp->kernel_fp = fp;
+        }
+        else
+            list = gp->kernel_map;          /* struct copy; `list' keeps being read below */
+    }
     if (gEnv.ssbo_dbg)
     {
         NSLog(@"MGL geom: gs kernel resource list: count=%u", list.count);
@@ -5902,6 +5928,96 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     return true;
 }
 
+/* ---- r100: capture-pass setup cache ------------------------------------------
+ * The capture pass rebuilds three things per draw that only depend on the program's
+ * own layout plus a handful of GL state: the VERTEX-stage buffer map (the resource
+ * walk through getProgramBindingCount/getProgramBinding + updateDirtyBaseBufferList),
+ * the vertex descriptor / fetch plan (two descriptor allocations + the plan walk) and
+ * the descriptor-key hash (62 descriptor reads).  The fingerprint below covers every
+ * input of those:
+ *   - the program identity (its introspection: resource set, dub, slot map, capture
+ *     variant) and, for a separable pipeline, the pipeline's VERTEX-stage program
+ *     (vattribIntrospectProgram introspects through that one);
+ *   - the four indexed binding rows the resource walk reads (_UNIFORM_BUFFER,
+ *     _UNIFORM_CONSTANT, _SHADER_STORAGE_BUFFER, _ATOMIC_COUNTER_BUFFER: 84 rows of
+ *     buffer/offset/size/pointer each);
+ *   - the VAO: identity + the full binding table (buffer, offset, stride, divisor)
+ *     and attribute formats (size/type/normalized/integer/long/offset/binding +
+ *     the enabled set) — everything vattribGenerateVertexDescriptor and
+ *     vattribMapVertexBuffers read;
+ *   - the default-uniform Buffer* (reallocated by a relink, which also swaps the
+ *     program record — this covers a same-pointer program whose dub was re-created).
+ * A relink frees and re-zeroes the gp (mgl_geom_post_link), so a stale snapshot can
+ * never survive a rebuild of the capture variant itself. */
+static Program *geomCapturePipeVS(GLMContext ctx, Program *program)
+{
+    if (program && program->name == 0 && ctx->state.program_pipeline)
+        return MGL_PIPELINE_OBJ(ctx->state.program_pipeline)->base.stage_programs[_VERTEX_SHADER];
+    return NULL;
+}
+
+/* the buffer-INPUT side of both fingerprints: program identity + the four indexed
+ * binding rows + the default-uniform Buffer* of `stage' (reallocated by a relink,
+ * which also swaps the gp, so the identity pair stays exact) */
+static uint64_t geomStageFingerprint(GLMContext ctx, Program *program, int stage)
+{
+    uint64_t h = 1469598103934665603ULL;
+#define GEOM_FNV64(v) do { h = (h ^ (uint64_t)(uintptr_t)(v)) * 1099511628211ULL; } while (0)
+    static const int rows[4] = { _UNIFORM_BUFFER, _UNIFORM_CONSTANT,
+                                 _SHADER_STORAGE_BUFFER, _ATOMIC_COUNTER_BUFFER };
+    GEOM_FNV64(program);
+    GEOM_FNV64(mgl_introspect_default_uniform_buffer(ctx, program, stage, 0));
+    for (int t = 0; t < 4; t++)
+    {
+        BufferBaseTarget *r = &ctx->state.buffer_base[rows[t]].buffers[0];
+        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++, r++)
+        {
+            GEOM_FNV64(r->buffer);
+            GEOM_FNV64(r->offset);
+            GEOM_FNV64(r->size);
+            GEOM_FNV64(r->buf);
+        }
+    }
+#undef GEOM_FNV64
+    return h;
+}
+
+static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
+{
+    uint64_t h = geomStageFingerprint(ctx, program, _VERTEX_SHADER);
+#define GEOM_FNV64(v) do { h = (h ^ (uint64_t)(uintptr_t)(v)) * 1099511628211ULL; } while (0)
+    GEOM_FNV64(geomCapturePipeVS(ctx, program));
+    GEOM_FNV64(ctx->state.vao);
+    {
+        MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
+        if (va)
+        {
+            GEOM_FNV64(va->base.enabled_attribs);
+            for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+            {
+                GEOM_FNV64(va->binding[b].buffer);
+                GEOM_FNV64(va->binding[b].buffer_name);
+                GEOM_FNV64(va->binding[b].offset);
+                GEOM_FNV64(va->binding[b].stride);
+                GEOM_FNV64(va->binding[b].divisor);
+            }
+            for (int a = 0; a < MAX_ATTRIBS; a++)
+            {
+                MGLVertexAttribFormat *f = &va->fmt[a];
+                GEOM_FNV64(f->size);
+                GEOM_FNV64(f->type);
+                GEOM_FNV64(f->normalized);
+                GEOM_FNV64(f->integer);
+                GEOM_FNV64(f->is_long);
+                GEOM_FNV64(f->relativeoffset);
+                GEOM_FNV64(f->binding);
+            }
+        }
+    }
+#undef GEOM_FNV64
+    return h;
+}
+
 - (bool) geomDraw: (MGLGeomDraw *) d
 {
     if ((geomEnvRead(), gEnv.draw))
@@ -6469,21 +6585,60 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
     /* ---- 1. vertex capture pass ---- */
     if (!from_tess && !(geomEnvRead(), gEnv.skip_capture))      /* the tess producer already wrote the records */
     {
-        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
-        MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
         id<MTLRenderCommandEncoder> saved = _currentRenderEncoder;
         id<MTLRenderCommandEncoder> enc;
         id<MTLFunction> fn = (__bridge id<MTLFunction>)gp->capture_function;
-        MTLVertexDescriptor *vd;
+        MTLVertexDescriptor *vd = nil;
+        id<MTLRenderPipelineState> pso = nil;
+        uint64_t vdkey = 0;
         Program *saved_program = ctx->state.program;
         Shader *saved_vs = NULL;
         void *saved_vs_fn = NULL;
+        BufferMapList *active_map;   /* what the bind loop below reads: the shared list,
+                                      * or the snapshot when the setup cache hits */
 
         if (!fn)
         {
             NSLog(@"MGL geom: the vertex capture variant is not compiled");
             return false;
         }
+
+        /* r100: the map walk + descriptor build + key hash below are a pure function of
+         * the fingerprint (see geomCaptureFingerprint); an unchanged one reuses the gp's
+         * snapshot — two descriptor allocations, the resource walk and the 62-read key
+         * hash per draw become one fingerprint pass.  A relink frees the gp, so the
+         * snapshot can never describe another capture variant.  Buffer materialisation
+         * and content flushes do NOT gate the hit: the bind loop below re-runs
+         * updateDirtyBuffer / bindMTLBuffer / the setVertexBytes fast path per entry,
+         * every draw, exactly as before (small CPU-shadowed buffers stay dirty by
+         * design — setVertexBytes reads them live at encode time). */
+        uint64_t fp = geomCaptureFingerprint(ctx, program);
+        bool setup_cached = (gp->capture_prog == program &&
+                             gp->capture_pipe_vs == geomCapturePipeVS(ctx, program) &&
+                             gp->capture_fp == fp && gp->capture_vd != NULL && !gEnv.nocapcache);
+        MTLRenderPassDescriptor *rp = [[MTLRenderPassDescriptor alloc] init];
+
+        if (setup_cached)
+        {
+            gCapHits++;
+            vd = (__bridge MTLVertexDescriptor *)gp->capture_vd;
+            vdkey = gp->capture_vd_key;
+            active_map = &gp->capture_map;
+            /* the fetch plan was rebuilt for the RASTER pass since (its pass-through
+             * function has no attributes): put the capture pass's own back — the
+             * shadow/const binds below read it, and the raster pass rebuilds the
+             * plan again after this pass (DIRTY_VAO is re-armed at the end of it) */
+            struct MGLExtState_vattrib *vas = ctx->state.ext_vattrib;
+            if (vas) vas->plan = gp->capture_plan;
+            /* stored together with capture_vd_key in the miss path below */
+            pso = (__bridge id<MTLRenderPipelineState>)gp->capture_pso;
+            _currentRenderEncoder = nil;    /* mirror the build path: nothing may
+                                             * encode on the GL encoder inside this pass */
+        }
+        else
+        {
+            gCapMisses++;
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
 
         /* the vertex descriptor and the buffer map describe the *real* vertex stage, so the
          * capture function stands in for it while they are built */
@@ -6522,7 +6677,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
         /* the capture PSO only depends on (capture function, vertex layout): cache it on
          * the geom program instead of rebuilding (newRenderPipelineStateWithDescriptor)
          * on every draw */
-        uint64_t vdkey = (uint64_t)(uintptr_t)fn;
+        vdkey = (uint64_t)(uintptr_t)fn;
         {
             uint64_t h = 1469598103934665603ULL;
             for (NSUInteger i = 0; i < 31; i++)
@@ -6543,7 +6698,6 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             }
             vdkey ^= h;
         }
-        id<MTLRenderPipelineState> pso;
         if (gp->capture_pso && gp->capture_pso_key == vdkey)
         {
             pso = (__bridge id<MTLRenderPipelineState>)gp->capture_pso;
@@ -6562,6 +6716,31 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             if (gp->capture_pso) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_pso);
             gp->capture_pso = (void *)CFBridgingRetain(pso);
             gp->capture_pso_key = vdkey;
+        }
+
+        /* r100: store the setup snapshot the hit path above binds from.  The fetch plan
+         * is copied too: the raster pass's walk rebuilds the shared one for its
+         * pass-through function before the next draw. */
+        if (gp->capture_vd) ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_vd);
+        gp->capture_vd = (void *)CFBridgingRetain(vd);
+        gp->capture_vd_key = vdkey;
+        gp->capture_map = ctx->state.vertex_buffer_map_list;
+        {
+            struct MGLExtState_vattrib *vas = ctx->state.ext_vattrib;
+            if (vas) gp->capture_plan = vas->plan;
+        }
+        gp->capture_prog = program;
+        gp->capture_pipe_vs = geomCapturePipeVS(ctx, program);
+        gp->capture_fp = fp;
+        active_map = &ctx->state.vertex_buffer_map_list;
+        }
+
+        if (!pso)
+        {
+            /* unreachable: the snapshot and the PSO are stored together */
+            NSLog(@"MGL geom: capture pipeline missing after cache hit");
+            _currentRenderEncoder = saved;
+            return false;
         }
 
         rp.renderTargetWidth = 1;
@@ -6599,10 +6778,14 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
          * between the two points is still picked up. */
         ctx->state.program = program;
         {
-            for (int i = 0; i < (int)ctx->state.vertex_buffer_map_list.count; i++)
+            /* r100: `active_map` — the list just built, or the gp's snapshot on a cache
+             * hit (identical contents by the fingerprint); the loop re-reads
+             * b->data.mtl_data per entry either way, so a buffer materialised since the
+             * snapshot was taken is still picked up */
+            for (int i = 0; i < (int)active_map->count; i++)
             {
-                Buffer *b = ctx->state.vertex_buffer_map_list.buffers[i].buf;
-                GLintptr off = ctx->state.vertex_buffer_map_list.buffers[i].offset;
+                Buffer *b = active_map->buffers[i].buf;
+                GLintptr off = active_map->buffers[i].offset;
                 if (gEnv.trace)
                     NSLog(@"MGL geom trace: capture bind i=%d buf=%p mtl=%p size=%d data=%p dirty=%llx w0=%08x w1=%08x",
                           i, b, b ? b->data.mtl_data : NULL, b ? (int)b->size : -1,
@@ -6669,6 +6852,45 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
                               offset: (NSUInteger)off
                              atIndex: (NSUInteger)gp->vs_ac_msl[i]];
             }
+
+            /* r99: the vertex fetch plan vattribGenerateVertexDescriptor just built also
+             * routes some inputs through CPU-side deliveries — converted (shadow)
+             * streams at the high buffer indices and the current generic values of
+             * disabled attributes at MGL_VA_CONST_BUFFER_INDEX — and extVattribPreDraw
+             * binds those on the RASTER encoder only.  This pass's vertex function reads
+             * them through the very same [[stage_in]] slots, so bind them HERE, on this
+             * private encoder (vattribBindShadow/vattribBindConstants detect that it is
+             * not the current encoder and encode on it directly).  Without this, a GS
+             * program with a misaligned-stride array or a disabled attribute read zeros
+             * (the ring/compat binds went to the nil current encoder). */
+            {
+                struct MGLExtState_vattrib *vas = ctx->state.ext_vattrib;
+                if (vas && vas->plan.valid)
+                {
+                    MGLVattribDrawPlan *plan = &vas->plan;
+                    MGLVertexArrayFull *cva = mgl_va_full(ctx->state.vao);
+                    for (int a = 0; a < MAX_ATTRIBS; a++)
+                    {
+                        if (plan->fetch[a] != MGL_VA_FETCH_SHADOW)
+                            continue;
+                        /* the source binding comes from the OWNING GL attribute (fp64
+                         * word slots are renumbered past the plain inputs) — same owner
+                         * logic as extVattribPreDraw; dvec3/dvec4 word slots share one
+                         * stream owned by the low slot */
+                        int own_gl = (plan->owner_gl[a] >= 0 && plan->owner_gl[a] < MAX_ATTRIBS) ? plan->owner_gl[a] : a;
+                        if (cva->binding[cva->fmt[own_gl].binding].buffer == NULL)
+                            continue;
+                        int owner = (plan->dbl[a] == 2) ? a - 1 : a;
+                        if (owner != a)
+                            continue;   /* bound when the low slot is reached */
+                        if (plan->shadow_index[a] < 0)
+                            continue;
+                        [self vattribBindShadow: a index: plan->shadow_index[a] encoder: enc];
+                    }
+                    if (plan->const_mask)
+                        [self vattribBindConstants: enc];
+                }
+            }
         }
 
         /* the vertex stage's textures sample in the capture variant just like in the
@@ -6687,7 +6909,7 @@ static bool geom_discard_skippable(GLMContext ctx, Program *program)
             uint32_t sizes[MAX_MAPPED_BUFFERS];
             GLuint n = 0;
 
-            [self geomFillSSBOSizes: sizes list: &ctx->state.vertex_buffer_map_list count: &n];
+            [self geomFillSSBOSizes: sizes list: active_map count: &n];
             if (n)
                 [enc setVertexBytes: sizes length: (NSUInteger)n * sizeof *sizes
                             atIndex: MGL_GEOM_KERNEL_SIZE_BUFFER];

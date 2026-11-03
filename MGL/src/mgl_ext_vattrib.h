@@ -127,6 +127,11 @@ float mgl_va_uf10_to_float(GLuint v);
 @interface MGLRenderer (VertexAttrib)
 - (bool) vattribMapVertexBuffers: (BufferMapList *) buffer_map;
 - (MTLVertexDescriptor *) vattribGenerateVertexDescriptor;
+/* geom r99: the geometry capture pass binds the fetch plan's converted (shadow)
+ * streams and current-generic-value block on its PRIVATE render encoder — these
+ * route to the encoder they are handed when it is not the current one */
+- (void) vattribBindShadow: (int) attrib index: (int) index encoder: (id<MTLRenderCommandEncoder>) enc;
+- (void) vattribBindConstants: (id<MTLRenderCommandEncoder>) enc;
 @end
 MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized);
 MTLVertexFormat mglVertexFormatForAttrib(GLenum type, GLint size, bool normalized, bool integer);

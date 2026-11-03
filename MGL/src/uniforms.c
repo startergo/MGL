@@ -69,19 +69,39 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                      * remember every element's unit (base+e is only the default) so the
                      * renderers' array walks can honour strided units
                      * (shader_image_load_store.advanced-sso-simple binds g_image[0..3]
-                     * to units 0,2,4,6).  The pipeline composite shares this array. */
-                    if (u->size > 1)
+                     * to units 0,2,4,6).  The pipeline composite shares this array.
+                     * The unit table spans the WHOLE Metal array — an opaque
+                     * arrays-of-arrays / hoisted struct member flattens to one array of
+                     * the total element count (geom_opaque_flatten.c) while the GL view
+                     * reports one resource per outer row (two uniforms "u.i[0].a[0]"
+                     * and "u.i[1].a[0]" share one 4-slot array), so each GL element
+                     * lands at its FLAT index (st[].elem_base + e).  array_size stays
+                     * the REFLECTED MSL array length (0 = scalar resource: the image
+                     * binders key on that) — never grown here. */
                     {
-                        if (!l->list[k].unit_vals || l->list[k].array_size < (GLuint)u->size)
+                        GLuint need = (GLuint)(u->st[s].elem_base + u->size);
+                        if (!l->list[k].unit_vals)
                         {
-                            free(l->list[k].unit_vals);
-                            l->list[k].unit_vals = (GLuint *)calloc((size_t)u->size, sizeof(GLuint));
-                            if (l->list[k].unit_vals)
-                                l->list[k].array_size = (GLuint)u->size;
+                            GLuint n = l->list[k].array_size > need ? l->list[k].array_size : need;
+                            l->list[k].unit_vals = (GLuint *)calloc((size_t)n, sizeof(GLuint));
+                        }
+                        else if (l->list[k].array_size && need > l->list[k].array_size)
+                        {
+                            /* a GL view wider than the reflected array (cannot happen
+                             * for a flattened module, kept for safety): grow, keeping
+                             * the elements already recorded */
+                            GLuint *nv = (GLuint *)calloc((size_t)need, sizeof(GLuint));
+                            if (nv)
+                            {
+                                memcpy(nv, l->list[k].unit_vals,
+                                       (size_t)l->list[k].array_size * sizeof(GLuint));
+                                free(l->list[k].unit_vals);
+                                l->list[k].unit_vals = nv;
+                            }
                         }
                         if (l->list[k].unit_vals)
                             for (int e = 0; e < u->size; e++)
-                                l->list[k].unit_vals[e] = ((uint32_t *)u->shadow)[e];
+                                l->list[k].unit_vals[u->st[s].elem_base + e] = ((uint32_t *)u->shadow)[e];
                     }
                 }
             ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_IMAGE_UNIT_STATE;

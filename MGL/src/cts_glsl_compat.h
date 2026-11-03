@@ -66,6 +66,12 @@ char *mgl_reject_reserved_declarators(const char *src);   /* "#error ..." source
 int mgl_hoist_lookup_name(const char *name, char *out, size_t outn);
 bool mgl_hoist_gl_path(const char *hoisted, char *out, size_t outn);
 bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t outn, int *n_outer);
+/* mgl_hoist_gl_path2 plus the per-segment array dims of the hoisted path
+ * (seg[0] = the uniform declaration's dims, the last = the opaque member's own
+ * bottom-level array): every segment but the last enumerates one GL resource
+ * per element with the subscript right behind that segment ("u.i[1].a[0]"). */
+bool mgl_hoist_gl_path3(const char *hoisted, const char *dims, char *out, size_t outn,
+                        char seg[8][48], int *nseg);
 int  mgl_hoist_outer_dims(const char *hoisted);
 
 #endif

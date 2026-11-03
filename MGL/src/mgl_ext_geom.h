@@ -29,6 +29,7 @@
 
 #include "glm_context.h"
 #include "mgl_ext.h"
+#include "mgl_ext_vattrib.h"   /* MGLVattribDrawPlan (the capture-pass setup cache) */
 
 /* the linked program's private half (MGLProgramObj), opaque here */
 struct MGLProgramObj_t;
@@ -298,6 +299,28 @@ typedef struct MGLGeomProgram {
      * Keyed on the vertex-descriptor layout hash + the capture function pointer. */
     void   *capture_pso;
     uint64_t capture_pso_key;
+    /* r100: the whole capture-pass SETUP — the vertex buffer map, the vertex descriptor,
+     * the fetch plan and the PSO key — is a pure function of (program, the pipeline's
+     * vertex program, the four buffer_base rows, the VAO's binding/format tables and the
+     * default-uniform buffer identity).  Rebuilding it cost two descriptor allocations
+     * plus the resource-map walk per draw (~10 us of the ~170 us CPU budget); an
+     * unchanged fingerprint binds from this snapshot instead.  capture_prog == NULL
+     * (fresh / freed program) disables it. */
+    void    *capture_vd;          /* retained MTLVertexDescriptor */
+    uint64_t capture_vd_key;      /* the vdkey the PSO is cached under */
+    BufferMapList capture_map;    /* the folded VERTEX-stage map (updateDirtyBaseBufferList
+                                   * already applied when it was built) */
+    MGLVattribDrawPlan capture_plan;  /* the vertex fetch plan of the capture variant: the
+                                       * shared plan is rebuilt for the raster pass-through
+                                       * between draws, the capture pass restores this copy */
+    uint64_t capture_fp;
+    struct Program_t *capture_prog;
+    struct Program_t *capture_pipe_vs;   /* the separable pipeline's VS (vattrib introspection) */
+    /* r100: the emit kernel's own GEOMETRY-stage buffer map snapshot (same fingerprint
+     * discipline, see geomBindStageBuffers) */
+    BufferMapList kernel_map;
+    uint64_t kernel_fp;
+    struct Program_t *kernel_prog;
     /* r84: the "does this variant declare spvBufferSizeConstants" probe scanned the
      * whole MSL text on EVERY draw (strstr over tens of KB in geomBindStageBuffers and
      * the capture bind).  Memoized on the text pointer: a gp rebuild installs a NEW
@@ -540,13 +563,16 @@ uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n)
  * the total element count with linearized index expressions.  Returns NULL when
  * the module has nothing to flatten (or a use the pass cannot linearize). */
 uint32_t *mgl_spirv_flatten_opaque_arrays(const uint32_t *in, size_t n, size_t *out_n);
-/* stage-gated entry used by program.c compile_stage and introspect_spirv.c msl_accepts
- * for the GEOMETRY stage only: the emulation kernel's MSL needs the flattened module.
- * Other stages keep the documented gap (the VS/FS link of an arrays-of-arrays sampler
- * fails — test_hoist86 nested_struct_array_samplers pins it), and the pass is NOT
- * chained into the shared mgl_spirv_prepare_for_msl (tess domain): a miss there
- * clobbered the caller's word count. */
-uint32_t *mgl_geom_flatten_gs_opaque(const uint32_t *in, size_t n, size_t *out_n);
+/* stage-neutral, miss-safe entry used by program.c compile_stage and
+ * introspect_spirv.c msl_accepts for EVERY stage (any MSL view, not just the
+ * geometry emulation kernel, cannot carry arrays-of-arrays of an opaque type;
+ * test_hoist86 nested_struct_array_samplers exercises the VS).  Returns NULL
+ * when the module has nothing to flatten (or a use the pass cannot linearize);
+ * *out_n is then restored to n — the raw pass clobbers it on a miss, which must
+ * not reach the caller, and the pass is NOT chained into the shared
+ * mgl_spirv_prepare_for_msl (tess domain): a miss there clobbered the caller's
+ * word count. */
+uint32_t *mgl_spirv_flatten_opaque_aoa(const uint32_t *in, size_t n, size_t *out_n);
 /* MSL pass (program.c): drop the `volatile` address-space qualifier SPIRV-Cross emits
  * for GLSL coherent/volatile SSBO blocks (not parseable MSL, not implementable) */
 char *mgl_geom_strip_msl_volatile(const char *msl);

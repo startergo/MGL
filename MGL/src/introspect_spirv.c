@@ -38,7 +38,7 @@
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_program.h"
 #include "mgl_ext_tess.h"        /* mgl_tess_prepare_spirv: isolines test-compile in msl_accepts */
-#include "mgl_ext_geom.h"        /* mgl_geom_flatten_gs_opaque: stage-gated gate/compile agreement */
+#include "mgl_ext_geom.h"        /* mgl_spirv_flatten_opaque_aoa: gate/compile agreement */
 #include <ctype.h>
 
 #include "cts_glsl_compat.h"   /* bool/bvecN block members: GLSL type recovery (cts domain) */
@@ -2294,7 +2294,8 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
      * rest are the member's own bottom-level array. */
     char gl_name[512];
     const char *base_name = name;
-    int n_outer = -1;
+    char seg[8][48];
+    int nseg = 0;
     if (strstr(name, "_mglhoist_") && !strchr(name, '.')) {
         /* the array's shape as SPIR-V sees it ("3", "2,3"): it selects the right
          * recorded spelling when the same uniform name was hoisted with more than
@@ -2308,23 +2309,27 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             at = m->t[at].elem;
         }
         shape[so] = 0;
-        if (mgl_hoist_gl_path2(name, so ? shape : NULL, gl_name, sizeof gl_name, &n_outer))
+        if (mgl_hoist_gl_path3(name, so ? shape : NULL, gl_name, sizeof gl_name, seg, &nseg))
             base_name = gl_name;
         else
-            n_outer = -1;
+            nseg = 0;
     }
     name = base_name;
-    if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) && n_outer > 0) {
-        /* "S u[N];" hoisted to "u_mglhoist_m[N]": GL enumerates N resources "u[i].m" —
-         * the element index belongs to the VARIABLE, so it is inserted before the
-         * member path ("u[0].b.s"), and every dimension of the declaration expands
-         * ("u[0][1].b.s").  Their locations are consecutive, exactly the layout one
-         * flattened entry of size N*M would have taken, so glUniform1i on "u[i].m[j]"
-         * and the sampler-unit shadow both keep working. */
+    if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) && nseg >= 2) {
+        /* "S u[N];" hoisted to "u_mglhoist_m[N]", and every ARRAYED member along
+         * the dotted path ("u.i[2].a[2]" -> "u_mglhoist_i_mglhoist_a[2][2]"):
+         * GL enumerates one resource per element of each such dimension, with
+         * the subscript right behind ITS segment ("u[0].m", "u.i[1].a") — only
+         * the LAST segment's dims (the hoisted opaque member's own array) stay a
+         * bottom-level array reported as "name[0]" + size, exactly the layout a
+         * flattened entry of the total count would have taken, so glUniform1i on
+         * every element and the sampler-unit shadow both keep working. */
         uint32_t dims[4], strides[4], total = 1;
-        int nd = 0;
+        int nd = 0, nexp = 0;
+        for (int q = 0; q + 1 < nseg; q++)
+            for (const char *c = seg[q]; *c; c++) nexp += (*c == '[');
         uint32_t at = t;
-        while (nd < 4 && (m->t[at].kind == T_ARRAY || m->t[at].kind == T_RARRAY) && nd < n_outer) {
+        while (nd < 4 && nd < nexp && (m->t[at].kind == T_ARRAY || m->t[at].kind == T_RARRAY)) {
             uint32_t st = 0;
             get_dec(m, at, -1, SpvDecorationArrayStride, &st);
             dims[nd] = m->t[at].count ? m->t[at].count : 1;
@@ -2333,25 +2338,49 @@ static void walk_default(MGLIProgram *ip, const SMod *m, int stage, const char *
             at = m->t[at].elem;
             nd++;
         }
-        const char *dot = strchr(name, '.');
-        int hlen = dot ? (int)(dot - name) : (int)strlen(name);
-        for (uint32_t k = 0; k < total; k++) {
-            uint32_t rem = k, off = offset;
-            char nm[512];
-            snprintf(nm, sizeof nm, "%.*s", hlen, name);
-            for (int i = 0; i < nd; i++) {
-                uint32_t div = 1;
-                for (int j = i + 1; j < nd; j++) div *= dims[j];
-                uint32_t idx = (rem / div) % dims[i];
-                rem -= idx * div;
-                off += idx * strides[i];
-                snprintf(nm + strlen(nm), sizeof nm - strlen(nm), "[%u]", idx);
+        if (nd == nexp) {
+            /* the dotted path segments of the GL name ("u", "i", "a") */
+            const char *path[8];
+            int npath = 0;
+            for (const char *p = name; *p && npath < 8; ) {
+                path[npath++] = p;
+                const char *dot = strchr(p, '.');
+                if (!dot) break;
+                p = dot + 1;
             }
-            snprintf(nm + strlen(nm), sizeof nm - strlen(nm), "%s", dot ? dot : "");
-            walk_default(ip, m, stage, nm, at, off, explicit_loc, loc_cursor,
-                         spv_id, res_type, elem_cursor, hidden_prefix, lk, lki);
+            for (uint32_t k = 0; k < total; k++) {
+                uint32_t idx[4], rem = k, off = offset;
+                char nm[512];
+                nm[0] = 0;
+                for (int i = 0; i < nd; i++) {
+                    uint32_t div = 1;
+                    for (int j = i + 1; j < nd; j++) div *= dims[j];
+                    idx[i] = (rem / div) % dims[i];
+                    rem -= idx[i] * div;
+                    off += idx[i] * strides[i];
+                }
+                /* per segment: the identifier, then the subscripts of ITS dims */
+                int lvl = 0;
+                for (int j = 0; j < npath; j++) {
+                    if (j) strncat(nm, ".", sizeof nm - strlen(nm) - 1);
+                    size_t hl = 0;
+                    while (path[j][hl] && path[j][hl] != '.') hl++;
+                    strncat(nm, path[j], (hl < sizeof nm - strlen(nm) - 1) ? hl : sizeof nm - strlen(nm) - 1);
+                    if (j + 1 >= nseg) continue;         /* the last segment keeps its array */
+                    for (const char *c = seg[j]; *c; c++) {
+                        if (*c != '[' || lvl >= nd) continue;
+                        char sub[16];
+                        snprintf(sub, sizeof sub, "[%u]", idx[lvl++]);
+                        strncat(nm, sub, sizeof nm - strlen(nm) - 1);
+                    }
+                }
+                walk_default(ip, m, stage, nm, at, off, explicit_loc, loc_cursor,
+                             spv_id, res_type, elem_cursor, hidden_prefix, lk, lki);
+            }
+            return;
         }
-        return;
+        /* a shape the segments cannot describe (deeper than 4 expanded levels):
+         * fall through to the generic array walk */
     }
     if ((ty->kind == T_ARRAY || ty->kind == T_RARRAY) ) {
         uint32_t base = m->t[ty->elem].kind == T_ARRAY ? 0 : 1;
@@ -3469,16 +3498,15 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
             words = swapped;
             n = swapped_n;
         }
-        /* geom: compile_stage flattens opaque arrays-of-arrays for the geometry
-         * stage's kernel MSL — accept exactly that module (mgl_ext_geom.h) */
-        if (stage == _GEOMETRY_SHADER)
+        /* geom: compile_stage flattens opaque arrays-of-arrays for EVERY stage's
+         * MSL view — accept exactly that module (mgl_ext_geom.h) */
         {
             size_t flat_n = 0;
-            uint32_t *flat = mgl_geom_flatten_gs_opaque(words, n, &flat_n);
+            uint32_t *flat = mgl_spirv_flatten_opaque_aoa(words, n, &flat_n);
             if (flat)
             {
                 if (swapped) free(swapped);
-                swapped = flat;
+                swapped = flat;          /* freed below with `swapped` */
                 words = swapped;
                 n = flat_n;
             }

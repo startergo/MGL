@@ -2068,6 +2068,9 @@ static void geom_free_prog(GLMContext ctx, MGLGeomProgram *gp)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->draw_library);
     if (gp->capture_pso && ctx->mtl_funcs.ext_program)
         ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_pso);
+    /* r100: the capture-pass setup cache */
+    if (gp->capture_vd && ctx->mtl_funcs.ext_program)
+        ctx->mtl_funcs.ext_program->release_obj(ctx, gp->capture_vd);
     free(gp->kernel_msl);
     free(gp->kernel_entry);
     free(gp->final_entry);
@@ -6909,8 +6912,17 @@ static char *geom_pin_capture_inputs(const char *glsl, const SpvModule *vs_m)
                 break;
             }
             p = q;
+            /* skip separator chars; '(' is deliberately NOT here — it must reach the
+             * balanced-paren skip below, which consumes a whole layout(...) group.
+             * (r99 fix: with '(' in this list the open paren was eaten here, the
+             * paren skip then started INSIDE the group at `location', the '=' stopped
+             * the scan and `layout(location=N) in ...' — the most common declaration
+             * form — was never pinned; the capture variant kept glslang's numbering
+             * while the raster pipeline binds at the introspection slots, so any
+             * program whose slots are renumbered (dvec3/dvec4/double-matrix inputs,
+             * whose word pairs are packed wide-first) read the wrong attributes) */
             while (p < e && (glsl[p] == ' ' || glsl[p] == '\t' ||
-                             glsl[p] == ',' || glsl[p] == '(' || glsl[p] == ')')) p++;
+                             glsl[p] == ',' || glsl[p] == ')')) p++;
             /* layout(...) qualifier contents are skipped as non-ident chars above */
             if (p < e && glsl[p] == '(')
             {
@@ -9578,6 +9590,17 @@ void mgl_geom_post_link(GLMContext ctx, Program *program)
     if (!gp || !obj) return;
     if (gp->synthetic)
         geom_free_prog(ctx, gp);          /* a real geometry stage supersedes the cull emulation */
+    else if (gp->capture_function || gp->kernel_msl)
+    {
+        /* r100: a RE-LINK rebuilds every generated string/function; the old ones were
+         * simply overwritten before (leaking the retained MTL functions and the MSL
+         * text on every relink), and the capture-pass setup cache went stale.  Free
+         * the previous build first — geom_free_prog zeroes the slot, so name/program
+         * are restored right after (the pattern of the two other slot (re)users). */
+        geom_free_prog(ctx, gp);
+        gp->name = program->name;
+        gp->program = program;
+    }
 
     gp->gs_exec = program->shader_slots[_GEOMETRY_SHADER];
     gp->deferred = !program->shader_slots[_VERTEX_SHADER];

@@ -3067,6 +3067,10 @@ typedef struct MGLHoistRec {
     char gl[192];        /* "u.b.s" (no array suffix) */
     int  n_outer;
     char dims[64];       /* declared array dims, outer-first ("[3]", "[2][3]") */
+    char seg[8][48];     /* per-path-segment dims: seg[0]=the uniform declaration,
+                          * seg[1..]=the members along the path, LAST = the hoisted
+                          * (opaque) member's own bottom-level array */
+    int  nseg;           /* number of segments (>= 2 when seg[] was recorded) */
     unsigned seq;        /* record order: the newest matching shape wins */
 } MGLHoistRec;
 
@@ -3074,11 +3078,12 @@ static MGLHoistRec *g_hoist_recs;
 static unsigned g_hoist_seq;
 
 static void mgl_hoist_record(const char *hoisted, const char *prefix, const char *member,
-                             int n_outer, const char *dims)
+                             const char *dims, const char seg[8][48], int nseg)
 {
     MGLHoistRec *r;
     char gl[192];
     size_t o = 0;
+    int n_outer = 0;
 
     /* "u_mglhoist_b" + ".s" -> "u.b.s" */
     for (const char *p = prefix; *p && o + 2 < sizeof gl; p++) {
@@ -3089,28 +3094,34 @@ static void mgl_hoist_record(const char *hoisted, const char *prefix, const char
     gl[o] = 0;
     snprintf(gl + o, sizeof gl - o, ".%s", member);
 
+    for (const char *d = seg[0]; *d; d++) n_outer += (*d == '[');
+
+    /* dedup on the FULL signature: two shaders may hoist the same name to the
+     * same total shape with the dimensions attributed to DIFFERENT segments
+     * ("uniform S u[3]" -> seg[0]="[3]", vs "uniform S u; struct S { sampler2D
+     * s[3]; }" -> seg[1]="[3]"); both records must survive, mgl_hoist_find's
+     * newest-wins picks the one the last-compiled shader recorded */
     for (r = g_hoist_recs; r; r = r->next)
-        if (!strcmp(r->hoisted, hoisted) && !strcmp(r->dims, dims) && r->n_outer == n_outer) return;
+        if (!strcmp(r->hoisted, hoisted) && !strcmp(r->dims, dims) && r->nseg == nseg) {
+            int same = 1;
+            for (int q = 0; q < nseg; q++)
+                if (strcmp(r->seg[q], seg[q])) { same = 0; break; }
+            if (same) return;
+        }
     r = malloc(sizeof *r);
     if (!r) return;
     snprintf(r->hoisted, sizeof r->hoisted, "%s", hoisted);
     snprintf(r->gl, sizeof r->gl, "%s", gl);
     snprintf(r->dims, sizeof r->dims, "%s", dims);
+    for (int k = 0; k < nseg && k < 8; k++) snprintf(r->seg[k], sizeof r->seg[0], "%s", seg[k]);
+    r->nseg = nseg;
     r->n_outer = n_outer;
     r->seq = ++g_hoist_seq;
     r->next = g_hoist_recs;
     g_hoist_recs = r;
 }
 
-/* GL dotted spelling of a hoisted uniform name ("u_mglhoist_b_mglhoist_s" -> "u.b.s").
- * dims (may be NULL) is the array's shape as SPIR-V sees it, outer-first and
- * comma-separated ("3", "2,3"); among the spellings recorded for the name the newest
- * one whose shape matches wins, so a program linking an older shader still resolves
- * after a later shader re-used the same uniform name with a different shape.
- * *n_outer receives the number of leading dimensions that belong to the uniform
- * declaration (an array of structs enumerates per element, GL 4.6 §7.3.1).
- * Returns false when the name was not hoisted. */
-bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t outn, int *n_outer)
+static MGLHoistRec *mgl_hoist_find(const char *hoisted, const char *dims)
 {
     MGLHoistRec *best = NULL;
     char cand[64];
@@ -3136,9 +3147,42 @@ bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t
         }
         if (dims && !strcmp(cand, dims) && (!best || r->seq > best->seq)) best = r;
     }
+    return best;
+}
+
+/* GL dotted spelling of a hoisted uniform name ("u_mglhoist_b_mglhoist_s" -> "u.b.s").
+ * dims (may be NULL) is the array's shape as SPIR-V sees it, outer-first and
+ * comma-separated ("3", "2,3"); among the spellings recorded for the name the newest
+ * one whose shape matches wins, so a program linking an older shader still resolves
+ * after a later shader re-used the same uniform name with a different shape.
+ * *n_outer receives the number of leading dimensions that belong to the uniform
+ * declaration (an array of structs enumerates per element, GL 4.6 §7.3.1).
+ * Returns false when the name was not hoisted. */
+bool mgl_hoist_gl_path2(const char *hoisted, const char *dims, char *out, size_t outn, int *n_outer)
+{
+    MGLHoistRec *best = mgl_hoist_find(hoisted, dims);
     if (!best) return false;
     snprintf(out, outn, "%s", best->gl);
     if (n_outer) *n_outer = best->n_outer;
+    return true;
+}
+
+/* mgl_hoist_gl_path2 plus the per-segment array dims of the hoisted path:
+ * seg[0] = the uniform declaration's own dims ("u[3]" -> "[3]"), seg[1..] the
+ * dims of each member along the dotted path, the LAST entry the hoisted opaque
+ * member's own (bottom-level) array — which GL keeps as "name[0]" + ARRAY_SIZE,
+ * while every EARLIER segment's dims enumerate one resource per element with the
+ * subscript inserted right behind that segment ("u.i[1].a[0]", GL 4.6 §7.3.1).
+ * *nseg receives the segment count.  Returns false when the name was not
+ * hoisted or was recorded before the per-segment table existed. */
+bool mgl_hoist_gl_path3(const char *hoisted, const char *dims, char *out, size_t outn,
+                        char seg[8][48], int *nseg)
+{
+    MGLHoistRec *best = mgl_hoist_find(hoisted, dims);
+    if (!best || best->nseg < 2) return false;
+    snprintf(out, outn, "%s", best->gl);
+    for (int k = 0; k < best->nseg && k < 8; k++) snprintf(seg[k], 48, "%s", best->seg[k]);
+    if (nseg) *nseg = best->nseg;
     return true;
 }
 
@@ -3158,24 +3202,48 @@ int mgl_hoist_outer_dims(const char *hoisted)
 }
 
 /* enumerate the opaque member paths of struct si; appends "NAME__m1[..]__mk"
- * declarations to out, dims accumulating outer-uniform dims first */
+ * declarations to out.  seg[0..nseg-1] hold the dims of the path so far —
+ * seg[0] the uniform declaration's own dims, seg[j] the j-th member's — and the
+ * members of si are segment nseg; every dimension found is recorded per segment
+ * (MGLHoistRec.seg) so introspection can place each subscript inside the dotted
+ * GL name ("u.i[1].a[0]"). */
 static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *prefix,
-                            const char *dims, int n_outer, Str *out)
+                            char seg[8][48], int nseg, Str *out)
 {
     for (int k = 0; k < st[si].nm; k++) {
         const MGLCMember *m = &st[si].m[k];
         char np[256];
         snprintf(np, sizeof np, "%s_mglhoist_%s", prefix, m->mname);
+        /* the dims suffix of the hoisted declaration: every segment so far plus
+         * this member's (this is what the SPIR-V type of the hoisted uniform
+         * will look like, outer dimension first) */
         char nd[192];
-        snprintf(nd, sizeof nd, "%s%s", dims, m->mdims);
+        {
+            size_t o = 0;
+            nd[0] = 0;
+            for (int q = 0; q < nseg; q++) {
+                size_t l = strlen(seg[q]);
+                if (o + l >= sizeof nd) { nd[0] = 0; break; }
+                memcpy(nd + o, seg[q], l);
+                o += l;
+            }
+            size_t l = strlen(m->mdims);
+            if (o + l >= sizeof nd) nd[0] = 0;
+            else { memcpy(nd + o, m->mdims, l); nd[o + l] = 0; }
+        }
         if (m->opaque) {
             /* remember the GL spelling of this hoisted uniform: introspection must
              * report "u.b.sampler" for the hoisted "u_mglhoist_b_mglhoist_sampler"
-             * (GL 4.6 §7.3.1 dotted names), and n_outer leading array dimensions of
-             * the hoisted array belong to the uniform declaration itself (an array
-             * of structs expands per element, the member arrays do not).  See
-             * mgl_hoist_gl_path2(). */
-            mgl_hoist_record(np, prefix, m->mname, n_outer, nd);
+             * (GL 4.6 §7.3.1 dotted names), per segment so a subscripted member
+             * keeps its place in the name ("u.i[0].a", not "u[0].i.a").  See
+             * mgl_hoist_gl_path3(). */
+            if (nseg < 8) {
+                char snap[8][48];
+                int q;
+                for (q = 0; q < nseg; q++) snprintf(snap[q], sizeof snap[0], "%s", seg[q]);
+                snprintf(snap[nseg], sizeof snap[0], "%s", m->mdims);
+                mgl_hoist_record(np, prefix, m->mname, nd, snap, nseg + 1);
+            }
             str_append(out, "\nuniform ", 9);
             str_append(out, m->mtype, strlen(m->mtype));
             str_append(out, " ", 1);
@@ -3184,8 +3252,12 @@ static void mglc_enum_paths(const MGLCStruct *st, int nst, int si, const char *p
             str_append(out, ";", 1);
         } else {
             int sub = mglc_struct_find(st, nst, m->mtype);
-            if (sub >= 0 && st[sub].has_opaque)
-                mglc_enum_paths(st, nst, sub, np, nd, n_outer, out);
+            if (sub >= 0 && st[sub].has_opaque) {
+                if (nseg < 8) {
+                    snprintf(seg[nseg], sizeof seg[0], "%s", m->mdims);
+                    mglc_enum_paths(st, nst, sub, np, seg, nseg + 1, out);
+                }
+            }
         }
     }
 }
@@ -3256,9 +3328,9 @@ char *mgl_hoist_struct_samplers(const char *src)
                 if (getenv("MGL_HOIST_DEBUG")) fprintf(stderr, "HOIST: uniform type=%s var=%s dims=%s si=%d\n", type, var, dims, si);
                 if (si >= 0 && st[si].has_opaque) {
                     Str decls = {0};
-                    int n_outer = 0;
-                    for (const char *d = dims; *d; d++) n_outer += (*d == '[');
-                    mglc_enum_paths(st, nst, si, var, dims, n_outer, &decls);
+                    char seg[8][48];
+                    snprintf(seg[0], sizeof seg[0], "%s", dims);
+                    mglc_enum_paths(st, nst, si, var, seg, 1, &decls);
                     if (decls.buf) {
                         str_push(&decls, 0);
                         char *p = decls.buf;
@@ -3441,9 +3513,9 @@ char *mgl_hoist_struct_samplers(const char *src)
                     str_append(&out, src + i, j6 - i);            /* the declaration */
                     if (si >= 0 && st[si].has_opaque) {
                         Str decls = {0};
-                        int n_outer = 0;
-                        for (const char *d = dims; *d; d++) n_outer += (*d == '[');
-                        mglc_enum_paths(st, nst, si, var, dims, n_outer, &decls);
+                        char seg[8][48];
+                        snprintf(seg[0], sizeof seg[0], "%s", dims);
+                        mglc_enum_paths(st, nst, si, var, seg, 1, &decls);
                         if (decls.buf) {
                             str_push(&decls, 0);
                             str_append(&out, decls.buf, decls.len - 1);  /* no NUL inside */

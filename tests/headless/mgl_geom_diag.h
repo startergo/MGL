@@ -18,6 +18,10 @@ void mgl_geom_xfb_log_read_name(void *ctx, unsigned buf_name, const char *what);
  * no image atomics (and that each pass runs exactly once when one does). */
 uint64_t mgl_geom_ms_stat(int which);
 
+/* r100: capture-pass setup-cache counters (hit / miss) of the current process —
+ * proves the cache engages on steady state and misses on state changes. */
+uint64_t mgl_geom_capcache_stat(int which);
+
 #ifdef __cplusplus
 }
 #endif

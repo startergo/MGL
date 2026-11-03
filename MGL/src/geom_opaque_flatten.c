@@ -468,10 +468,14 @@ bail:
     return NULL;
 }
 
-/* stage-gated entry (mgl_ext_geom.h): only the geometry stage's MSL view runs the
- * flattening.  On a miss the pass has already cleared *out_n — restore it, or the
- * caller frees a module it thinks is empty. */
-uint32_t *mgl_geom_flatten_gs_opaque(const uint32_t *in, size_t n, size_t *out_n)
+/* stage-neutral, miss-safe entry used by program.c compile_stage and
+ * introspect_spirv.c msl_accepts for EVERY stage: any stage's MSL view cannot
+ * carry arrays-of-arrays of an opaque type.  On a miss the pass has already
+ * cleared *out_n — restore it, or the caller frees a module it thinks is empty
+ * (the r97e regression), and the pass is NOT chained into the shared
+ * mgl_spirv_prepare_for_msl (tess domain): a miss there clobbered the caller's
+ * word count. */
+uint32_t *mgl_spirv_flatten_opaque_aoa(const uint32_t *in, size_t n, size_t *out_n)
 {
     uint32_t *out = mgl_spirv_flatten_opaque_arrays(in, n, out_n);
     if (!out)

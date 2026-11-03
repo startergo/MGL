@@ -1,6 +1,10 @@
 /*
  * test_hoist86.c — nested struct/array samplers in the default uniform block:
- * the GL names ("u.i[1].a[0]") of members hoisted out of MSL-unfriendly structs
+ * the GL names ("u.i[1].a[0]") of members hoisted out of MSL-unfriendly structs,
+ * plus arrays-of-arrays of opaque uniforms (uniform sampler2D s[2][3]), which
+ * SPIRV-Cross's MSL backend cannot emit — MGL flattens them to one array of the
+ * total element count in the MSL-view module (geom_opaque_flatten.c) while the
+ * GL view keeps the multi-dimensional shape.
  */
 #include "mgl_test.h"
 
@@ -52,21 +56,174 @@ TEST(nested_struct_array_samplers)
         "precision highp float;\n"
         "out vec4 c; void main() { c = vec4(1); }\n";
     /* a sampler array inside an array of structs hoists to an array of arrays of
-     * textures, which MSL does not support: the link must fail (documented gap) */
+     * textures, which MSL does not support natively: the MSL view flattens it to
+     * one array of 4 (geom_opaque_flatten.c) and the link must SUCCEED, with the
+     * GL dotted per-element names visible to every query */
     GLint linked = 0;
     GLuint p = build2(vs, fs, &linked);
     glGetProgramiv(p, GL_LINK_STATUS, &linked);
-    EXPECT_EQ_INT(linked, GL_FALSE);
+    EXPECT_EQ_INT(linked, GL_TRUE);
     if (!linked) { glDeleteProgram(p); return; }
     list_uniforms(p);
     const char *names[4] = { "u.i[0].a[0]", "u.i[0].a[1]", "u.i[1].a[0]", "u.i[1].a[1]" };
+    GLint locs[4];
     for (int i = 0; i < 4; i++) {
         GLint idx = glGetProgramResourceIndex(p, GL_UNIFORM, names[i]);
         EXPECT_NE(idx, -1);
-        GLint loc = glGetUniformLocation(p, names[i]);
-        EXPECT_NE(loc, -1);
+        locs[i] = glGetUniformLocation(p, names[i]);
+        EXPECT_NE(locs[i], -1);
     }
+    /* the four elements have consecutive locations in row-major order */
+    for (int i = 1; i < 4; i++)
+        EXPECT_EQ_INT(locs[i] - locs[0], i);
+    /* "u.i[0].a" (element 0 by base name) resolves to the first resource */
+    EXPECT_NE(glGetUniformLocation(p, "u.i[0].a"), -1);
+    EXPECT_NE((int)glGetProgramResourceIndex(p, GL_UNIFORM, "u.i[0].a"), -1);
+    /* an element outside the innermost array is not an active uniform */
+    EXPECT_EQ_INT(glGetUniformLocation(p, "u.i[0].a[2]"), -1);
     glDeleteProgram(p);
+}
+
+/* a solid-color 2D texture */
+static GLuint solid_tex(GLfloat r, GLfloat g, GLfloat b)
+{
+    GLuint t;
+    GLubyte px[4] = { (GLubyte)(r * 255), (GLubyte)(g * 255), (GLubyte)(b * 255), 255 };
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    return t;
+}
+
+/* draw one fullscreen triangle and return the center pixel */
+static void draw_fullscreen(GLuint p, GLubyte out[4])
+{
+    static GLuint vao;
+    if (!vao) glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    mgl_read_rgba(64, 64, out);
+}
+
+TEST(nested_struct_array_samplers_render)
+{
+    /* pixel-verify the per-element sampler units through the flattened array:
+     * each element's unit is set individually (NOT base+e), so the right color
+     * per element proves both the name->location and the MSL-slot mapping */
+    const char *vs = "#version 330 core\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0, 1); }\n";
+    const char *fs = "#version 310 es\n"
+        "precision highp float;\n"
+        "struct Inner { highp sampler2D a[2]; };\n"
+        "struct S { Inner i[2]; };\n"
+        "uniform S u;\n"
+        "uniform int sel;\n"
+        "out vec4 c;\n"
+        "void main() {\n"
+        "  if (sel == 0)      c = texture(u.i[0].a[0], vec2(0.5));\n"
+        "  else if (sel == 1) c = texture(u.i[0].a[1], vec2(0.5));\n"
+        "  else if (sel == 2) c = texture(u.i[1].a[0], vec2(0.5));\n"
+        "  else               c = texture(u.i[1].a[1], vec2(0.5)); }\n";
+    GLuint p = build(vs, fs);
+    if (!p) return;
+    list_uniforms(p);
+    glUseProgram(p);
+    const char *names[4] = { "u.i[0].a[0]", "u.i[0].a[1]", "u.i[1].a[0]", "u.i[1].a[1]" };
+    GLint locs[4];
+    for (int i = 0; i < 4; i++) {
+        locs[i] = glGetUniformLocation(p, names[i]);
+        EXPECT_NE(locs[i], -1);
+    }
+    /* units deliberately out of order: element e -> unit perm[e] */
+    GLuint tex[4];
+    const GLfloat col[4][3] = { {1,0,0}, {0,1,0}, {0,0,1}, {1,1,0} };
+    const int perm[4] = { 7, 3, 9, 5 };         /* element -> unit */
+    for (int i = 0; i < 4; i++) tex[i] = solid_tex(col[i][0], col[i][1], col[i][2]);
+    for (int i = 0; i < 4; i++) {
+        glActiveTexture(GL_TEXTURE0 + perm[i]);
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    for (int i = 0; i < 4; i++) glUniform1i(locs[i], perm[i]);
+    GLint sel_loc = glGetUniformLocation(p, "sel");
+    EXPECT_NE(sel_loc, -1);
+    for (int i = 0; i < 4; i++) {
+        GLubyte px[4];
+        glUniform1i(sel_loc, i);
+        draw_fullscreen(p, px);
+        printf("   sel=%d px = %d,%d,%d,%d\n", i, px[0], px[1], px[2], px[3]);
+        EXPECT_NEAR(px[0], col[i][0] * 255, 4);
+        EXPECT_NEAR(px[1], col[i][1] * 255, 4);
+        EXPECT_NEAR(px[2], col[i][2] * 255, 4);
+        EXPECT_NEAR(px[3], 255, 4);
+    }
+    for (int i = 0; i < 4; i++) glDeleteTextures(1, &tex[i]);
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(direct_aoa_samplers)
+{
+    /* uniform sampler2D s[2][3] — arrays-of-arrays without any struct: the MSL
+     * view flattens to s[6]; GL names are "s[i][j]", locations consecutive */
+    const char *vs = "#version 330 core\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0, 1); }\n";
+    const char *fs = "#version 430 core\n"
+        "uniform sampler2D s[2][3];\n"
+        "uniform int sel;\n"
+        "out vec4 c;\n"
+        "void main() {\n"
+        "  if (sel == 0)      c = texture(s[0][0], vec2(0.5));\n"
+        "  else if (sel == 1) c = texture(s[0][2], vec2(0.5));\n"
+        "  else if (sel == 2) c = texture(s[1][0], vec2(0.5));\n"
+        "  else               c = texture(s[1][2], vec2(0.5)); }\n";
+    GLuint p = build(vs, fs);
+    if (!p) return;
+    list_uniforms(p);
+    glUseProgram(p);
+    GLint locs[6];
+    const char *nm[6] = { "s[0][0]", "s[0][1]", "s[0][2]", "s[1][0]", "s[1][1]", "s[1][2]" };
+    for (int i = 0; i < 6; i++) {
+        GLint idx = glGetProgramResourceIndex(p, GL_UNIFORM, nm[i]);
+        EXPECT_NE(idx, -1);
+        locs[i] = glGetUniformLocation(p, nm[i]);
+        EXPECT_NE(locs[i], -1);
+    }
+    for (int i = 1; i < 6; i++)
+        EXPECT_EQ_INT(locs[i] - locs[0], i);
+    GLuint tex[6];
+    const GLfloat col[6][3] = { {1,0,0}, {0,1,0}, {0,0,1}, {1,1,0}, {0,1,1}, {1,0,1} };
+    const int perm[6] = { 11, 2, 8, 4, 6, 1 };
+    for (int i = 0; i < 6; i++) tex[i] = solid_tex(col[i][0], col[i][1], col[i][2]);
+    for (int i = 0; i < 6; i++) {
+        glActiveTexture(GL_TEXTURE0 + perm[i]);
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    for (int i = 0; i < 6; i++) glUniform1i(locs[i], perm[i]);
+    GLint sel_loc = glGetUniformLocation(p, "sel");
+    EXPECT_NE(sel_loc, -1);
+    const int selmap[4] = { 0, 2, 3, 5 };
+    for (int i = 0; i < 4; i++) {
+        GLubyte px[4];
+        glUniform1i(sel_loc, i);
+        draw_fullscreen(p, px);
+        printf("   sel=%d px = %d,%d,%d,%d\n", i, px[0], px[1], px[2], px[3]);
+        EXPECT_NEAR(px[0], col[selmap[i]][0] * 255, 4);
+        EXPECT_NEAR(px[1], col[selmap[i]][1] * 255, 4);
+        EXPECT_NEAR(px[2], col[selmap[i]][2] * 255, 4);
+        EXPECT_NEAR(px[3], 255, 4);
+    }
+    for (int i = 0; i < 6; i++) glDeleteTextures(1, &tex[i]);
+    glDeleteProgram(p);
+    EXPECT_NO_GL_ERROR();
 }
 
 TEST(struct_array_of_samplers)
@@ -93,6 +250,8 @@ TEST(struct_array_of_samplers)
 int main(void)
 {
     RUN(nested_struct_array_samplers);
+    RUN(nested_struct_array_samplers_render);
+    RUN(direct_aoa_samplers);
     RUN(struct_array_of_samplers);
     return mgl_test_summary();
 }

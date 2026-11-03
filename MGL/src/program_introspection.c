@@ -985,6 +985,46 @@ void mglGetProgramInterfaceiv(GLMContext ctx, GLuint program, GLenum programInte
     if (params) *params = v;
 }
 
+/* GL 4.6 §7.3.1 "names identifying active variables": for the VARIABLE
+ * interfaces a query name may identify an ELEMENT of an array resource
+ * ("a[1]", "u.i[0].a[1]"); the index of the active resource containing it is
+ * returned.  The element index must be a canonical decimal (no sign, no
+ * leading zeros) and inside the resource's array size, else the name does not
+ * identify an active resource (GL_INVALID_INDEX, no GL error). */
+static GLuint resource_index_elem(MGLIProgram *ip, GLenum I, const char *name)
+{
+    size_t ln = strlen(name);
+    if (ln <= 3 || name[ln - 1] != ']') return GL_INVALID_INDEX;
+    const char *lb = strrchr(name, '[');
+    if (!lb || lb == name) return GL_INVALID_INDEX;
+    size_t il = (size_t)(&name[ln - 1] - (lb + 1));
+    if (il == 0 || il > 9) return GL_INVALID_INDEX;
+    for (size_t q = 0; q < il; q++) {
+        if (lb[1 + q] < '0' || lb[1 + q] > '9') return GL_INVALID_INDEX;
+        if (q == 0 && lb[1] == '0' && il > 1) return GL_INVALID_INDEX;
+    }
+    long idx = lb[1] - '0';
+    for (size_t q = 1; q < il; q++) idx = idx * 10 + (lb[1 + q] - '0');
+    char base[512];
+    if ((size_t)(lb - name) + 1 >= sizeof base) return GL_INVALID_INDEX;
+    memcpy(base, name, (size_t)(lb - name));
+    base[lb - name] = 0;
+    int n = resource_count(ip, I);
+    for (int i = 0; i < n; i++) {
+        const char *rn = resource_name(ip, I, i);
+        if (strcmp(rn, base) && !name_matches_var(rn, base)) continue;
+        long sz;
+        if (I == GL_UNIFORM) sz = pub_uniform(ip, i)->size;
+        else if (I == GL_PROGRAM_INPUT) sz = ip->inputs[i].size;
+        else if (I == GL_PROGRAM_OUTPUT) sz = ip->outputs[i].size;
+        else if (I == GL_BUFFER_VARIABLE) sz = ip->bvars[i].size;
+        else if (I == GL_TRANSFORM_FEEDBACK_VARYING) sz = xfb_info(ip, i).size;
+        else return GL_INVALID_INDEX;
+        return (idx < sz) ? (GLuint)i : GL_INVALID_INDEX;
+    }
+    return GL_INVALID_INDEX;
+}
+
 GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum programInterface, const GLchar *name)
 {
     MGLIProgram *ip = mgli_program_checked(ctx, program, false);
@@ -1011,6 +1051,14 @@ GLuint  mglGetProgramResourceIndex(GLMContext ctx, GLuint program, GLenum progra
         }
     for (int i = 0; i < n; i++) if (!strcmp(resource_name(ip, programInterface, i), name)) return (GLuint)i;
     for (int i = 0; i < n; i++) if (name_matches_var(resource_name(ip, programInterface, i), name)) return (GLuint)i;
+    /* GL 4.6 §7.3.1: for the variable interfaces a query name may identify an
+     * ELEMENT of an array resource ("a[1]") — return the containing resource */
+    if (programInterface == GL_UNIFORM || programInterface == GL_BUFFER_VARIABLE ||
+        programInterface == GL_PROGRAM_INPUT || programInterface == GL_PROGRAM_OUTPUT ||
+        programInterface == GL_TRANSFORM_FEEDBACK_VARYING) {
+        GLuint ei = resource_index_elem(ip, programInterface, name);
+        if (ei != GL_INVALID_INDEX) return ei;
+    }
     if (getenv("MGL_GPI_DEBUG"))
     {
         fprintf(stderr, "MGL gpi: MISS iface=%#x name='%s' n=%d:", programInterface, name, n);

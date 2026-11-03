@@ -5020,6 +5020,246 @@ TEST(r55_indirect_firstindex_and_primcount)
     glDeleteVertexArrays(1, &vao);
 }
 
+/* ---- r99: the capture pass must feed the same vertex fetch plan the raster pass feeds
+ * (converted shadow streams, current generic values, renumbered fp64 word slots) ---- */
+
+static const char *r99_pass_tri_gs =
+    "#version 450 core\n"
+    "layout(triangles) in;\n"
+    "layout(triangle_strip, max_vertices = 3) out;\n"
+    "layout(location = 0) in vec4 v_col[];\n"
+    "layout(location = 0) out vec4 g_col;\n"
+    "void main(){\n"
+    "  for (int i = 0; i < 3; i++) { gl_Position = gl_in[i].gl_Position; g_col = v_col[i]; EmitVertex(); }\n"
+    "  EndPrimitive();\n"
+    "}\n";
+
+static const char *r99_col_fs =
+    "#version 450 core\n"
+    "layout(location = 0) in vec4 g_col;\n"
+    "layout(location = 0) out vec4 color;\n"
+    "void main(){ color = g_col; }\n";
+
+static const float r99_quad[] = { -1.0f, -1.0f,   1.0f, -1.0f,   -1.0f, 1.0f,   1.0f, 1.0f };
+
+/* vs must output the tested color at location 0; setup() specifies attribute 1 on the
+ * bound VAO.  Renders with and without the geometry shader; both must give exp. */
+static void r99_draw_case(const char *vs_src, const char *name, int exp_r, int exp_g, int exp_b,
+                          void (*setup)(void))
+{
+    GLuint p_nogs = program(vs_src, NULL, r99_col_fs);
+    GLuint p_gs   = program(vs_src, r99_pass_tri_gs, r99_col_fs);
+    GLuint vao, vbo;
+
+    (void)name;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    /* earlier tests leave an 8x8 viewport / scissor / discard behind: reset the bits
+     * this case depends on (it reads the full-screen quad at (32,32)) */
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, 64, 64);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof r99_quad, r99_quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+    if (setup) setup();
+
+    for (int with_gs = 0; with_gs <= 1; with_gs++)
+    {
+        GLuint p = with_gs ? p_gs : p_nogs;
+        glUseProgram(p);
+        glClearColor(0, 0, 1, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        EXPECT_PIXEL(32, 32, exp_r, exp_g, exp_b, 255, 4);   /* gs and no-gs must agree */
+    }
+    glUseProgram(0);
+    glDeleteProgram(p_nogs);
+    glDeleteProgram(p_gs);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    EXPECT_NO_GL_ERROR();
+}
+
+TEST(r99_gs_const_attrib)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in vec4 col;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_col = col; }\n";
+    /* attribute 1 stays disabled: the current generic value must reach the capture
+     * variant (const slot 29 on the capture encoder) */
+    glVertexAttrib4f(1, 0.25f, 0.5f, 0.75f, 1.0f);
+    r99_draw_case(vs, "r99_gs_const_attrib", 64, 128, 191, NULL);
+}
+
+static unsigned char r99_mis[4 * 10];
+static void r99_setup_misaligned(void)
+{
+    for (int i = 0; i < 4; i++)
+    {
+        float xy[2] = { 1.0f, 0.5f };
+        memcpy(&r99_mis[i * 10], xy, 8);
+    }
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof r99_mis, r99_mis, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(1);
+    /* stride 10: not a multiple of 4 -> fixed-function fetch impossible, the CPU
+     * converted (shadow) stream must be bound on the capture encoder */
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 10, (void *)0);
+}
+
+TEST(r99_gs_shadow_attrib)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in vec2 v;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_col = vec4(v.x, v.y, 0.5, 1.0); }\n";
+    r99_draw_case(vs, "r99_gs_shadow_attrib", 255, 128, 128, r99_setup_misaligned);
+}
+
+static double r99_dbls[4 * 2];
+static void r99_setup_dvec4_short(void)
+{
+    for (int i = 0; i < 4; i++) { r99_dbls[i * 2] = 0.25; r99_dbls[i * 2 + 1] = 0.5; }
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof r99_dbls, r99_dbls, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(1);
+    /* size-2 double array feeding a dvec4: z,w come from the current generic value,
+     * and the fp64 word slots are renumbered past the plain inputs — the capture
+     * variant must be pinned to the program's slots (r99 pin fix) */
+    glVertexAttribLPointer(1, 2, GL_DOUBLE, 16, (void *)0);
+    glVertexAttribL4d(1, 9.0, 9.0, 0.75, 1.0);
+}
+
+TEST(r99_gs_dvec4_padded)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in dvec4 d;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_col = vec4(float(d.x), float(d.y), float(d.z), 1.0); }\n";
+    r99_draw_case(vs, "r99_gs_dvec4_padded", 64, 128, 191, r99_setup_dvec4_short);
+}
+
+/* ---- r100: the capture-pass setup cache must hit on steady draws and miss (and still
+ * render correctly) whenever an input of the cached map/descriptor/plan changes ---- */
+
+static void r100_draw_once(GLuint p, int exp_r, int exp_g, int exp_b, const char *tag)
+{
+    glUseProgram(p);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    EXPECT_PIXEL(32, 32, exp_r, exp_g, exp_b, 255, 4);
+    (void)tag;
+}
+
+TEST(r100_capcache_invalidation)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec2 pos;\n"
+        "layout(location=1) in vec2 v;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "layout(std140, binding=0) uniform UBO { vec4 tint; };\n"
+        "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_col = vec4(v.x, v.y, 0.5, 1.0) * tint; }\n";
+    GLuint p_gs = program(vs, r99_pass_tri_gs, r99_col_fs);
+    GLuint vao, vbo, ubo;
+
+    glDisable(GL_RASTERIZER_DISCARD);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, 64, 64);
+
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ubo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof r99_quad, r99_quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+    /* attribute 1: aligned stream, converted (shadow) is not needed — plain direct */
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof r99_quad, r99_quad, GL_STATIC_DRAW);   /* separate VBO below */
+    GLuint vbo2;
+    glGenBuffers(1, &vbo2);
+    static const float ones[8] = { 1,1, 1,1, 1,1, 1,1 };
+    glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+    glBufferData(GL_ARRAY_BUFFER, sizeof ones, ones, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8, (void *)0);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+    {
+        float tint[4] = { 1, 1, 1, 1 };
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof tint, tint, GL_STATIC_DRAW);
+    }
+    glUseProgram(p_gs);
+
+    uint64_t m0 = mgl_geom_capcache_stat(1);
+    r100_draw_once(p_gs, 255, 255, 128, "first");
+    uint64_t h1 = mgl_geom_capcache_stat(0), m1 = mgl_geom_capcache_stat(1);
+    EXPECT_TRUE(m1 > m0);                              /* the first draw is always a miss */
+    /* steady state: nothing changed, every following draw must hit the snapshot */
+    for (int i = 0; i < 4; i++) r100_draw_once(p_gs, 255, 255, 128, "steady");
+    uint64_t h2 = mgl_geom_capcache_stat(0), m2 = mgl_geom_capcache_stat(1);
+    EXPECT_TRUE(h2 > h1);
+    EXPECT_EQ_INT((int)m2, (int)m1);                   /* no extra miss while state holds */
+
+    /* (a) attribute-format change: the fetch plan / descriptor must be rebuilt —
+     * re-upload attribute 1's data packed at stride 10 first, so the value stays
+     * (1,1) after the misaligned (CPU-converted) layout takes over */
+    {
+        unsigned char packed[4 * 10];
+        for (int i = 0; i < 4; i++)
+        {
+            float xy[2] = { 1.0f, 1.0f };
+            memcpy(&packed[i * 10], xy, 8);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+        glBufferData(GL_ARRAY_BUFFER, sizeof packed, packed, GL_STATIC_DRAW);
+    }
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 10, (void *)0);   /* misaligned: shadow */
+    r100_draw_once(p_gs, 255, 255, 128, "fmt");
+    uint64_t h3 = mgl_geom_capcache_stat(0), m3 = mgl_geom_capcache_stat(1);
+    EXPECT_TRUE(m3 > m2);
+    (void)h3;
+
+    /* (b) UBO rebind at the same index with different content: the map must rebuild
+     * (the row hash catches the pointer change) and the new uniform must apply */
+    GLuint ubo2;
+    glGenBuffers(1, &ubo2);
+    {
+        float tint[4] = { 0.5f, 1, 1, 1 };
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo2);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof tint, tint, GL_STATIC_DRAW);
+    }
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo2);
+    r100_draw_once(p_gs, 128, 255, 128, "ubo");
+    EXPECT_TRUE(mgl_geom_capcache_stat(1) > m3);
+
+    glDeleteBuffers(1, &ubo2);
+    glDeleteBuffers(1, &vbo2);
+    glDeleteBuffers(1, &ubo);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p_gs);
+    EXPECT_NO_GL_ERROR();
+}
+
 int main(void)
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
@@ -5095,5 +5335,9 @@ int main(void)
     RUN_IF(r54_srgb_readback_raw);
     RUN_IF(r54_compressed_no_3d);
     RUN_IF(r55_indirect_firstindex_and_primcount);
+    RUN_IF(r99_gs_const_attrib);
+    RUN_IF(r99_gs_shadow_attrib);
+    RUN_IF(r99_gs_dvec4_padded);
+    RUN_IF(r100_capcache_invalidation);
     return mgl_test_summary();
 }

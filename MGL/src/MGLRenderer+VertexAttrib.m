@@ -743,6 +743,13 @@ static bool vattribIsDoubleType(GLenum t)
     if (base && start >= 0 && start + elem <= size)
         n = (b->stride == 0) ? 1 : (size_t)((size - start - elem) / b->stride) + 1;
 
+    /* geom r99: this method is also called with the geometry capture pass's PRIVATE
+     * render encoder (MGLRenderer+Geometry.m), which is never _currentRenderEncoder —
+     * the compat fast paths below would then encode on the wrong encoder (nil during
+     * that pass: a silent no-op, so the stream was never bound).  `own` switches the
+     * three bind sites to the encoder this method was handed. */
+    bool own = (enc != nil && enc != _currentRenderEncoder);
+
     /* gpuaudit: the converted stream only depends on the source bytes and the layout,
      * so it is cached as an MTLBuffer keyed on the buffer's content generation instead
      * of being rebuilt (calloc + per-element conversion + newBufferWithBytes) per draw */
@@ -750,7 +757,10 @@ static bool vattribIsDoubleType(GLenum t)
                                               dbl ? MGL_VA_KIND_DOUBLE : kind) : NULL;
     if (cached)
     {
-        [self compatBindVertexBuffer:(__bridge id<MTLBuffer>)cached offset:0 atIndex:(NSUInteger)index];
+        if (own)
+            [enc setVertexBuffer: (__bridge id<MTLBuffer>)cached offset: 0 atIndex: (NSUInteger)index];
+        else
+            [self compatBindVertexBuffer:(__bridge id<MTLBuffer>)cached offset:0 atIndex:(NSUInteger)index];
         return;
     }
 
@@ -812,12 +822,18 @@ static bool vattribIsDoubleType(GLenum t)
 
     if (len <= 4096)
     {
-        [self compatRingVertexBytes:out length:len atIndex:(NSUInteger)index];
+        if (own)
+            [enc setVertexBytes: out length: len atIndex: (NSUInteger)index];   /* geom capture encoder */
+        else
+            [self compatRingVertexBytes:out length:len atIndex:(NSUInteger)index];
     }
     else
     {
         id<MTLBuffer> tmp = [_device newBufferWithBytes: out length: len options: MTLResourceStorageModeShared];
-        [self compatBindVertexBuffer:tmp offset:0 atIndex:(NSUInteger)index];
+        if (own)
+            [enc setVertexBuffer: tmp offset: 0 atIndex: (NSUInteger)index];    /* geom capture encoder */
+        else
+            [self compatBindVertexBuffer:tmp offset:0 atIndex:(NSUInteger)index];
     }
 
     free(out);
@@ -882,8 +898,13 @@ static bool vattribIsDoubleType(GLenum t)
 
     /* compat perf: constant attribs stream through the argument ring; the
      * memcmp in compatRingVertexBytes skips the encode call whenever the
-     * current-attribute block is unchanged between draws */
-    [self compatRingVertexBytes:data length:sizeof(data) atIndex:(NSUInteger)MGL_VA_CONST_BUFFER_INDEX];
+     * current-attribute block is unchanged between draws.
+     * geom r99: the geometry capture pass hands its private encoder here — the
+     * ring would encode on the wrong (nil) encoder, so bind directly then. */
+    if (enc != nil && enc != _currentRenderEncoder)
+        [enc setVertexBytes: data length: sizeof(data) atIndex: (NSUInteger)MGL_VA_CONST_BUFFER_INDEX];
+    else
+        [self compatRingVertexBytes:data length:sizeof(data) atIndex:(NSUInteger)MGL_VA_CONST_BUFFER_INDEX];
 }
 
 /* auto-called at the end of processGLState(draw_command = true) */
