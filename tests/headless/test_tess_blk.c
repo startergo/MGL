@@ -125,6 +125,10 @@ TEST(TessBlkStructMember)
 
 TEST(TessBlkArrayMember)
 {
+    /* OPT-IN (MGL_TESS_ARRAY_LOWER=1): lowering everything regresses nine
+     * dEQP per_patch_block cases and aborts two others (r51 CTS batch), so
+     * the pass stays gated until the patch-record path handles it */
+    setenv("MGL_TESS_ARRAY_LOWER", "1", 1);
     static const char *tcs =
         TCS_HEAD
         "out BlkV { float fa[3]; } vb[];\nout vec4 tc_pos[];\nvoid main() {\n"
@@ -238,6 +242,75 @@ TEST(TessBlkWholeStructLoadDeclined)
     EXPECT_EQ_INT(lk, 0);   /* declined: link error, no crash */
 }
 
+TEST(TessBlkDynamicArrayIndex)
+{
+    /* a DYNAMIC index into an array member: mgl_tess_lower_dynamic_io copies
+     * the per-vertex elements into a function-local array (attribute arrays
+     * cannot be dynamically indexed on Metal) */
+    static const char *tcs =
+        TCS_HEAD
+        "out BlkV { float fa[3]; } vb[];\nout vec4 tc_pos[];\nvoid main() {\n"
+        "  tc_pos[gl_InvocationID] = vs_pos[gl_InvocationID];\n"
+        "  vb[gl_InvocationID].fa[0]=1.0; vb[gl_InvocationID].fa[1]=2.0; vb[gl_InvocationID].fa[2]=3.0;\n" TCS_TAIL;
+    static const char *tes =
+        TES_HEAD
+        "in BlkV { float fa[3]; } vb[];\nout vec4 col;\nvoid main() {\n"
+        "  float acc = 0.0;\n"
+        "  for (int i = 0; i < 3; i++) acc += vb[1].fa[i] * float(i + 1);\n"
+        "  bool ok = acc == 14.0;\n" TES_TAIL;
+    EXPECT_EQ_INT(draw_and_expect_green(tcs, tes), 0);
+}
+
+/* --- patch block ARRAY + per-vertex block in ONE program (r53) -----------
+ * exercises: the per-vertex dissolve skipping member-Patch blocks, the
+ * canon-body matrix-merge NOT firing on per-element vec4 leaves, the
+ * ||-short-circuit fix in the body flatten, and per-element canon slots */
+TEST(TessBlkMixedWithPatchArray)
+{
+    static const char *tcs =
+        TCS_HEAD
+        "out BlkV { S s; } vb[];\n"
+        "patch out PB { S ps; float w[2]; } pb[2];\n"
+        "out vec4 tc_pos[];\nvoid main() {\n"
+        "  tc_pos[gl_InvocationID] = vs_pos[gl_InvocationID];\n"
+        "  vb[gl_InvocationID].s.x = 1; vb[gl_InvocationID].s.y = vec4(1,0,0,1);\n"
+        "  vb[gl_InvocationID].s.z[0] = 0.5; vb[gl_InvocationID].s.z[1] = 0.25;\n"
+        "  pb[0].ps.x = 7; pb[0].ps.y = vec4(2,3,4,5); pb[0].ps.z[0] = 0.75; pb[0].ps.z[1] = 0.5;\n"
+        "  pb[0].w[0] = 1.5; pb[0].w[1] = 2.5;\n"
+        "  pb[1].ps.x = 8; pb[1].ps.y = vec4(6,7,8,9); pb[1].ps.z[0] = 0.125; pb[1].ps.z[1] = 0.375;\n"
+        "  pb[1].w[0] = 3.5; pb[1].w[1] = 4.5;\n" TCS_TAIL;
+    static const char *tes =
+        TES_HEAD
+        "in BlkV { S s; } vb[];\n"
+        "patch in PB { S ps; float w[2]; } pb[2];\n"
+        "out vec4 col;\nvoid main() {\n"
+        "  bool ok = vb[0].s.x==1 && vb[0].s.z[1]==0.25 && vb[1].s.y.x==1.0;\n"
+        "  int e = int(gl_TessCoord.x); if (e > 1) e = 1;\n"
+        "  ok = ok && pb[e].ps.x == 7 + e && pb[e].w[1] == 2.5 + float(e)\n"
+        "       && pb[e].ps.z[0] == 0.75 - 0.625*float(e) && pb[e].ps.y.z == 4.0 + float(e);\n" TES_TAIL;
+    EXPECT_EQ_INT(draw_and_expect_green(tcs, tes), 0);
+}
+
+TEST(TessBlkPatchArrayLen1)
+{
+    static const char *tcs =
+        TCS_HEAD
+        "patch out PB1 { float q; vec4 v; } pb1[1];\n"
+        "out BlkA { float fa[3]; } va[];\n"
+        "out vec4 tc_pos[];\nvoid main() {\n"
+        "  tc_pos[gl_InvocationID] = vs_pos[gl_InvocationID];\n"
+        "  va[gl_InvocationID].fa[0] = 0.25; va[gl_InvocationID].fa[1] = 0.5; va[gl_InvocationID].fa[2] = 0.75;\n"
+        "  pb1[0].q = 1.25; pb1[0].v = vec4(9,8,7,6);\n" TCS_TAIL;
+    static const char *tes =
+        TES_HEAD
+        "patch in PB1 { float q; vec4 v; } pb1[1];\n"
+        "in BlkA { float fa[3]; } va[];\n"
+        "out vec4 col;\nvoid main() {\n"
+        "  int i = int(gl_TessCoord.y * 2.0); if (i > 2) i = 2;\n"
+        "  bool ok = va[0].fa[1] == 0.5 && va[2].fa[i] >= 0.25 && pb1[0].q == 1.25 && pb1[0].v.z == 7.0;\n" TES_TAIL;
+    EXPECT_EQ_INT(draw_and_expect_green(tcs, tes), 0);
+}
+
 int main(void)
 {
     RUN(TessBlkPlainMembers);
@@ -247,6 +320,9 @@ int main(void)
     RUN(TessBlkMixedMembers);
     RUN(TessPlainStructVaryings);
     RUN(TessBlkWholeStructLoadDeclined);
+    RUN(TessBlkDynamicArrayIndex);
+    RUN(TessBlkMixedWithPatchArray);
+    RUN(TessBlkPatchArrayLen1);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_summary();
 }

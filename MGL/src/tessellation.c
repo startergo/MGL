@@ -85,7 +85,7 @@ static const char *tess_pervtx_name[4] = {
     "gl_Position", "gl_PointSize", "gl_ClipDistance", "gl_CullDistance",
 };
 
-/* find the matching close brace, skipping // and /* comments */
+/* find the matching close brace, skipping // and * comments */
 static size_t tess_skip_ws_comments(const char *s, size_t i)
 {
     for (;;)
@@ -443,7 +443,7 @@ static char *tess_vs_member_to_block(const char *src)
         int n, cull_member;
         int version = 0;
         char *fin;
-        size_t fin_len, at = insert_at > 0 ? (size_t)insert_at : 0;
+        size_t at = insert_at > 0 ? (size_t)insert_at : 0;
         const char *v = strstr(src, "#version");
         fclose(mem);
         if (v) version = atoi(v + strlen("#version"));
@@ -1347,6 +1347,8 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
 {
     bool has_isolines = false;
     uint32_t entry_id = 0;
+    struct SpvDissolveMap dmaps[64];
+    uint32_t n_dmaps = 0;
     const uint32_t *cur;
     uint32_t *dis, *copy = NULL;
     size_t i = 5, cn;
@@ -1359,61 +1361,146 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
      * aborts on) access chains into their split members, so dissolve them
      * into one plain per-vertex variable per block member before anything
      * else looks at the module (tess_spv_lower.c) */
-    dis = mgl_tess_dissolve_vertex_input_blocks(words, n, &cn);
-    if (dis && mgl_tess_module_declined(dis, cn))
     {
-        /* declined marker (whole struct-typed interface loads): nothing else
-         * may rebuild this module — a rebuild would resurrect a module that
-         * aborts SPIRV-Cross; return the marker so every compile fails
-         * cleanly and the link reports a stage error */
-        *out_n = cn;
-        return dis;
-    }
-    cur = dis ? dis : words;
-    if (!dis)
-        cn = n;
+        int partial = 0;
 
-    i = 5;
-    while (i < cn)
-    {
-        uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
-        if (wc == 0 || i + wc > cn) break;
-        if (op == SPV_OP_ENTRYPOINT && wc >= 4 && cur[i + 1] == 2 /* TessellationEvaluation */)
-            entry_id = cur[i + 2];
-        i += wc;
-    }
+        dis = mgl_tess_dissolve_vertex_input_blocks(words, n, &cn, dmaps, 64,
+                                                    &n_dmaps, &partial);
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess prepare: dissolve -> %s (%zu words, %u maps, partial=%d)\n",
+                    dis ? (mgl_tess_module_declined(dis, cn) ? "DECLINED(marker)" : "ok") : "NULL",
+                    cn, n_dmaps, partial);
+        if (dis && mgl_tess_module_declined(dis, cn))
+        {
+            /* declined marker (whole struct-typed interface loads): nothing else
+             * may rebuild this module — a rebuild would resurrect a module that
+             * aborts SPIRV-Cross; return the marker so every compile fails
+             * cleanly and the link reports a stage error */
+            if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL tess prepare: dissolve DECLINED (marker) — module unusable\n");
+            *out_n = cn;
+            return dis;
+        }
 
-    if (!entry_id)
-    {
-        free(dis);
-        return NULL;
-    }
+        /* the module the lower runs on (and falls back to) */
+        {
+            const uint32_t *lbase = dis ? dis : words;
+            size_t lbase_n = dis ? cn : n;
 
-    i = 5;
-    while (i < cn)
-    {
-        uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
-        if (wc == 0 || i + wc > cn) break;
-        if (op == SPV_OP_EXECUTIONMODE && wc >= 3 && cur[i + 1] == entry_id &&
-            cur[i + 2] == SPV_EM_ISOLINES)
-            has_isolines = true;
-        i += wc;
-    }
+            cur = lbase;
+            cn = lbase_n;
+        }
+        if (dis)
+        {
+            /* re-scan execution modes on the dissolved module below */
+        }
 
-    if (!has_isolines)
-    {
-        /* even without isolines, dynamic member-array indexing may need
-         * lowering; when that did not fire the dissolve result (if any) is
-         * still the module to use */
-        uint32_t *lowered = mgl_tess_lower_dynamic_io(cur, cn, out_n);
+        i = 5;
+        while (i < cn)
+        {
+            uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
+            if (wc == 0 || i + wc > cn) break;
+            if (op == SPV_OP_ENTRYPOINT && wc >= 4 && cur[i + 1] == 2 /* TessellationEvaluation */)
+                entry_id = cur[i + 2];
+            i += wc;
+        }
 
-        if (lowered)
+        if (!entry_id)
         {
             free(dis);
-            return lowered;
+            return NULL;
         }
-        *out_n = cn;
-        return dis;
+
+        i = 5;
+        while (i < cn)
+        {
+            uint32_t wc = cur[i] >> 16, op = cur[i] & 0xffff;
+            if (wc == 0 || i + wc > cn) break;
+            if (op == SPV_OP_EXECUTIONMODE && wc >= 3 && cur[i + 1] == entry_id &&
+                cur[i + 2] == SPV_EM_ISOLINES)
+                has_isolines = true;
+            i += wc;
+        }
+
+        if (!has_isolines)
+        {
+            /* even without isolines, dynamic member-array indexing may need
+             * lowering; when that did not fire the dissolve result (if any) is
+             * still the module to use.
+             *
+             * The lowering rewrites the dynamic chains to constant-indexed
+             * copies in function-local storage, re-rooted at the DISSOLVED
+             * member variables when the dissolve had to leave a chain on the
+             * original block (dynamic member indices): the block variable
+             * must end up unreferenced, otherwise its attribute span collides
+             * with the dissolved variables' on the stage-in.  When the lower
+             * declines such a PARTIAL module, fall back to the original
+             * words, which SPIRV-Cross rejects cleanly (link error). */
+            uint32_t *lowered = mgl_tess_lower_dynamic_io(cur, cn, out_n,
+                                                          dis ? dmaps : NULL,
+                                                          dis ? n_dmaps : 0);
+
+            if (lowered)
+            {
+                if (getenv("MGL_TESS_DUMP_PREP"))
+                {
+                    char path[512];
+                    snprintf(path, sizeof path, "%s/prep_lowered.spv", getenv("MGL_TESS_DUMP_PREP"));
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fwrite(lowered, 4, *out_n, f); fclose(f); }
+                }
+                if (lowered != dis)
+                    free(dis);
+                return lowered;
+            }
+            if (partial && dis)
+            {
+                /* declined with chains still on the block: the dissolved
+                 * module would collide on the attribute slots */
+                if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL tess prepare: lower declined a partial dissolve — using the original module\n");
+                free(dis);
+                if (mgl_tess_module_has_block_leafmember_chains(words, n))
+                {
+                    /* the original module would ABORT SPIRV-Cross (direct
+                     * leaf-member chains on a composite block): decline with
+                     * a corrupted-magic marker so every compile fails
+                     * cleanly and the link reports a stage error */
+                    uint32_t *bad = (uint32_t *)malloc(64);
+
+                    if (bad)
+                    {
+                        bad[0] = 0x07230203u ^ 1u;
+                        *out_n = 16;
+                        return bad;
+                    }
+                }
+                *out_n = n;
+                cur = malloc(n * 4);
+                if (cur)
+                {
+                    memcpy(cur, words, n * 4);
+                    return cur;
+                }
+                *out_n = 0;
+                return NULL;
+            }
+            if (!dis && mgl_tess_module_has_block_leafmember_chains(words, n))
+            {
+                /* no dissolve at all (bail) and the lower declined: the
+                 * original module's leaf-member chains would abort */
+                uint32_t *bad = (uint32_t *)malloc(64);
+
+                if (bad)
+                {
+                    bad[0] = 0x07230203u ^ 1u;
+                    *out_n = 16;
+                    return bad;
+                }
+            }
+            *out_n = cn;
+            return dis;
+        }
     }
 
     copy = (uint32_t *)malloc(cn * sizeof(uint32_t));
@@ -1438,9 +1525,18 @@ static int spv_tess_domain(const uint32_t *ir, size_t n, int *spacing, int *ccw,
 
     {
         /* SPIRV-Cross cannot codegen dynamic indices into interface member
-         * arrays for TES inputs — lower them (tess_spv_lower.c) */
+         * arrays for TES inputs — lower them (tess_spv_lower.c).  The
+         * dissolve maps apply VERBATIM to this module: the isolines->quad
+         * swap above only rewrites one ExecutionMode word, every id (the
+         * block variables, their members, the dissolved variables) is
+         * unchanged.  Passing NULL here left the dynamic-member sites
+         * re-rooted at the ORIGINAL block: SPIRV-Cross then flattened the
+         * block AND the dissolved variables — duplicate [[attribute(N)]]
+         * and a link failure (dEQP per_vertex_block isolines). */
         size_t ln = 0;
-        uint32_t *lowered = mgl_tess_lower_dynamic_io(copy, cn, &ln);
+        uint32_t *lowered = mgl_tess_lower_dynamic_io(copy, cn, &ln,
+                                                      dis ? dmaps : NULL,
+                                                      dis ? n_dmaps : 0);
         if (lowered)
         {
             free(copy);
@@ -1772,6 +1868,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                 out->members[out->count].attr = attr_num;
                 out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
                 out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].array_idx3 = 0;
                 out->members[out->count].flat_dims = 0;
                 out->members[out->count].is_tess_level = 0;
                 snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", coltype);
@@ -1810,7 +1907,68 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                 size_t run_end = 0;
 
                 if (!msl_parse_struct(msl, elem, &sub))
+                {
+                    /* arrays-of-arrays — a dissolved patch-block ARRAY member
+                     * ("spvUnsafeArray<spvUnsafeArray<S, Ni>, Ne>"): flatten the
+                     * struct per field with BOTH dimensions wrapped around the
+                     * field type (Blk[2] with S{..z[2]..}: "<n>_z" : float[e][i][j]) */
+                    long es2 = 1;
+                    char in2[128] = "";
+
+                    if (strncmp(elem, "spvUnsafeArray<", 15) == 0)
+                    {
+                        const char *cm2 = msl_array_split(elem);
+                        const char *cnt2 = cm2 ? cm2 + 1 : NULL;
+
+                        if (cm2 && (size_t)(cm2 - (elem + 15)) < sizeof in2)
+                        {
+                            memcpy(in2, elem + 15, (size_t)(cm2 - (elem + 15)));
+                            in2[cm2 - (elem + 15)] = 0;
+                            while (*cnt2 == ' ') cnt2++;
+                            es2 = strtol(cnt2, NULL, 10);
+                            if (es2 <= 0 || es2 > 64) es2 = 1;
+                        }
+                    }
+                    if (in2[0] && msl_parse_struct(msl, in2, &sub))
+                    {
+                        for (int f = 0; f < sub.count; f++)
+                        {
+                            char wrap[256], wrap2[320];
+                            size_t fa = 0, fs = 0;
+
+                            if (out->count >= MGL_TESS_MAX_PATCH_MEMBERS) break;
+                            if (sub.members[f].size == 0) continue;
+                            if (!msl_element_type(sub.members[f].type, &fa, &fs))
+                                continue;
+                            snprintf(wrap, sizeof wrap, "spvUnsafeArray<%s, %ld>",
+                                     sub.members[f].type, es2);
+                            snprintf(wrap2, sizeof wrap2, "spvUnsafeArray<%s, %ld>", wrap, es);
+                            cursor = round_up(cursor, fa);
+                            out->members[out->count].offset = cursor;
+                            out->members[out->count].size =
+                                (size_t)es * (size_t)es2 * round_up(fs, fa);
+
+                            out->members[out->count].attr = 0;
+                            out->members[out->count].array_idx = 0;
+                            out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].array_idx3 = 0;
+                            out->members[out->count].array_idx3 = 0;
+                            out->members[out->count].flat_dims = 0;
+                            out->members[out->count].is_tess_level = 0;
+                            snprintf(out->members[out->count].type,
+                                     sizeof out->members[out->count].type, "%s", wrap2);
+                            snprintf(out->members[out->count].name,
+                                     sizeof out->members[out->count].name, "%s_%s",
+                                     namebuf, sub.members[f].name);
+                            cursor += out->members[out->count].size;
+                            if (cursor > run_end) run_end = cursor;
+                            out->count++;
+                        }
+                        cursor = run_end;
+                        continue;
+                    }
                     continue;   /* unsupported member type: skip */
+                }
 
                 for (int f = 0; f < sub.count; f++)
                 {
@@ -1831,6 +1989,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                     out->members[out->count].attr = attr_num;
                     out->members[out->count].array_idx = 0;  /* set by tess_annotate_keys */
                     out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].array_idx3 = 0;
                     out->members[out->count].flat_dims = 0;
                     out->members[out->count].is_tess_level = 0;
                     snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", ftype);
@@ -1869,6 +2028,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
                     out->members[out->count].attr = attr_num;
                     out->members[out->count].array_idx = 0; /* set by tess_annotate_keys */
                     out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].array_idx3 = 0;
                     out->members[out->count].flat_dims = 0;
                     out->members[out->count].is_tess_level = 0;
                     snprintf(out->members[out->count].type, sizeof out->members[out->count].type, "%s", sub.members[f].type);
@@ -1887,6 +2047,7 @@ static bool msl_parse_struct(const char *msl, const char *name, struct MslStruct
         out->members[out->count].attr = attr_num;
         out->members[out->count].array_idx = 0;     /* set by tess_annotate_keys */
         out->members[out->count].array_idx2 = 0;
+                    out->members[out->count].array_idx3 = 0;
         out->members[out->count].flat_dims = 0;
         out->members[out->count].is_tess_level =
             !strcmp(namebuf, "gl_TessLevel") || !strcmp(namebuf, "gl_TessLevelOuter") ? 1 :
@@ -1982,7 +2143,6 @@ static bool tess_stage_var_named(GLMContext ctx, Program *prog, int stage,
     /* 1) find the name: OpMemberName -> (struct type, member), OpName -> id */
     {
         size_t m = 5;
-        int found_member = -1;
         uint32_t found_type = 0, found_id = 0;
 
         while (m + 3 < n)
@@ -2008,7 +2168,6 @@ static bool tess_stage_var_named(GLMContext ctx, Program *prog, int stage,
                 {
                     if (op == 6)
                     {
-                        found_member = (int)ir[m + 2];
                         found_type = ir[m + 1];
                     }
                     else
@@ -2189,11 +2348,109 @@ static int tess_block_instance_names(GLMContext ctx, Program *prog, int stage,
     return cnt;
 }
 
+/* Parse a dissolved patch-block-ARRAY leaf name "mgl_ds_<member>_<e>_<path>"
+ * (<path>: "" | "<k>" | "<field>" | "<i>_<field>" | "<i>_<field>_<j>") into the
+ * block element (array_idx), the struct-array/plain-field element (array_idx2),
+ * the innermost element (array_idx3) and the index-free path the slot is keyed
+ * by ("blockSa_z").  Returns 0 = not a ds leaf. */
+static int tess_ds_leaf_key(const char *name, uint32_t *idx, uint32_t *idx2,
+                            uint32_t *idx3, uint32_t *dims, char *base, size_t base_sz)
+{
+    char rest[128], field[80] = "";
+    char *r, *u;
+    const char *mbr = name + 7;
+    char *sep;
+    uint32_t e = 0, i2 = 0, j3 = 0;
+
+    if (strncmp(name, "mgl_ds_", 7) || !name[7])
+        return 0;
+    sep = strchr(mbr, '_');
+    snprintf(rest, sizeof rest, "%s", sep ? sep + 1 : "");
+    if (sep && (size_t)(sep - mbr) >= base_sz)
+        return 0;
+
+    r = rest;
+    while (*r == ' ') r++;
+    if (*r >= '0' && *r <= '9')
+    {
+        e = (uint32_t)strtoul(r, &u, 10);
+        if (*u == '_') r = u + 1;
+        else r = u;                            /* a bare element index: the
+                                                 * FIRST (and only) dimension */
+    }
+    if (*r >= '0' && *r <= '9')
+    {
+        uint32_t v = (uint32_t)strtoul(r, &u, 10);
+
+        if (*u == '_' && u[1])
+        {
+            i2 = v;                          /* "<i>_<field>[_<j>]" */
+            r = u + 1;
+        }
+        else
+        {
+            i2 = v;                          /* plain field element "<k>" */
+            r = u;
+        }
+    }
+    {
+        size_t fl = 0;
+
+        while (r[fl] && (isalnum((unsigned char)r[fl]) || r[fl] == '_')) fl++;
+        if (fl && fl < sizeof field) snprintf(field, sizeof field, "%s", r);
+    }
+    {
+        char *lb = field[0] ? strrchr(field, '_') : NULL;
+
+        if (lb && lb[1] >= '0' && lb[1] <= '9' && lb != field)
+        {
+            char *ue;
+
+            j3 = (uint32_t)strtoul(lb + 1, &ue, 10);
+            if (*ue) j3 = 0;
+            else *lb = 0;
+        }
+    }
+    snprintf(base, base_sz, "%.*s%s%s", (int)(sep ? (size_t)(sep - mbr) : strlen(mbr)),
+             mbr, field[0] ? "_" : "", field);
+    *idx = e;
+    *idx2 = i2;
+    *idx3 = j3;
+    *dims = (j3 ? 3u : 0u) | (i2 ? 2u : 0u) | (e ? 1u : 0u);
+    return 1;
+}
+
 static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                                struct MslStruct *s, const SpirvResourceList *rl)
 {
     char prefixes[8][128];
+    /* the producer's block instance names (for whole-block members) plus the
+     * CONSUMER's (the TES's dissolved variables carry the consumer's
+     * instance name: "teBlock_mgl_ds_...").  GL matches blocks by the block
+     * TYPE, so producer and consumer instance names legitimately differ
+     * (dEQP: tcBlock / teBlock). */
     int n_prefixes = tess_block_instance_names(ctx, names_prog, stage, prefixes, 8);
+
+    if (stage != _TESS_EVALUATION_SHADER && names_prog->spirv[_TESS_EVALUATION_SHADER].ir)
+    {
+        char extra[8][128];
+        int n_extra = tess_block_instance_names(ctx, names_prog, _TESS_EVALUATION_SHADER,
+                                                extra, 8);
+
+        for (int q = 0; q < n_extra && n_prefixes < 8; q++)
+        {
+            int dup = 0;
+
+            for (int w = 0; w < n_prefixes; w++)
+                if (!strcmp(prefixes[w], extra[q]))
+                {
+                    dup = 1;
+                    break;
+                }
+            if (!dup)
+                snprintf(prefixes[n_prefixes++], 128, "%s", extra[q]);
+        }
+    }
 
     if (tess_trace() && getenv("MGL_TESS_DEBUG2"))
         fprintf(stderr, "MGL tess: stage %d block instance prefixes (%d): %s%s%s%s\n", stage,
@@ -2206,7 +2463,10 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
         uint32_t key = 0;
         bool found = false;
         char base[128];                 /* the bare GL name of the varying */
-        uint32_t idx = m->array_idx;
+
+        if (strstr(m->name, "mgl_ds_") && getenv("MGL_TESS_DEBUG2"))
+            fprintf(stderr, "MGL tess annotate[key]: member '%s' (prefixes %d: %s)\n",
+                    m->name, n_prefixes, n_prefixes ? prefixes[0] : "-");
 
         /* builtins first: gl_Position & co must key to their fixed slots on every
          * side of the record.  The generic path below would otherwise name-hash
@@ -2240,6 +2500,25 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
         }
 
         base[0] = 0;
+        /* a dissolved patch-block-ARRAY leaf carries the marker FIRST (it is not
+         * prefixed by any block instance): key it by the index-free path now —
+         * the prefix scan below would never fire for it */
+        if (!strncmp(m->name, "mgl_ds_", 7) && m->name[7])
+        {
+            char ds_base_l[128];
+
+            if (tess_ds_leaf_key(m->name, &m->array_idx, &m->array_idx2,
+                                 &m->array_idx3, &m->flat_dims,
+                                 ds_base_l, sizeof ds_base_l))
+            {
+                m->key = tess_name_hash(ds_base_l);
+                if (getenv("MGL_TESS_DEBUG2"))
+                    fprintf(stderr, "MGL tess annotate[ds0]: '%s' -> base '%s' idx=%u idx2=%u idx3=%u dims=%u\n",
+                            m->name, ds_base_l, m->array_idx, m->array_idx2,
+                            m->array_idx3, m->flat_dims);
+                continue;
+            }
+        }
         /* a DISSOLVED member variable (mgl_tess_dissolve_vertex_input_blocks)
          * reflects under its own name with a SYNTHETIC location: never key it
          * by that — the producer keeps the whole block and keys by the hashed
@@ -2270,8 +2549,8 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                 if (!strncmp(m->name, prefixes[q], pl) && m->name[pl] == '_' && m->name[pl + 1])
                 {
                     char rest[128], b2[128];
-                    uint32_t fidx = m->array_idx, fidx2 = 0;
-                    bool mid = false, ds = false;
+                    uint32_t fidx = m->array_idx, fidx2 = 0, fidx3 = 0;
+                    bool mid = false, mid2 = false, ds = false;
                     char ds_mbr[80];
                     size_t rn;
 
@@ -2304,12 +2583,31 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                         }
                     }
 
-                    /* "<head>_<digits>_<tail>" with head a declared block member:
-                     * the digits are a struct-array ELEMENT index (the canonical
-                     * record stores one field array per member, so the element
-                     * becomes array_idx and the head/tail re-join) */
-                    /* a DISSOLVED member's leaf: a LEADING "<digits>_" (or bare
-                     * digits) is the struct-array element index */
+                    /* a dissolved patch-block-ARRAY leaf: the name is
+                     * "mgl_ds_<member>_<e>_<path>" with <path> one of
+                     * "" | "<k>" | "<field>" | "<i>_<field>" | "<i>_<field>_<j>"
+                     * (the element index e selects the block-array element,
+                     * i the struct-array element, j/k the innermost array
+                     * element).  Keyed by the path WITHOUT indices so the
+                     * producer's field members ("mgl_ds_<member>_<field>",
+                     * typed array[e][i][j]) hash identically. */
+                    if (ds)
+                    {
+                        char ds_base_l[128];
+
+                        if (tess_ds_leaf_key(m->name, &m->array_idx, &m->array_idx2,
+                                             &m->array_idx3, &m->flat_dims,
+                                             ds_base_l, sizeof ds_base_l))
+                        {
+                            key = tess_name_hash(ds_base_l);
+                            if (getenv("MGL_TESS_DEBUG2"))
+                                fprintf(stderr, "MGL tess annotate[ds]: '%s' -> base '%s' idx=%u idx2=%u idx3=%u dims=%u\n",
+                                        m->name, ds_base_l, m->array_idx, m->array_idx2,
+                                        m->array_idx3, m->flat_dims);
+                            found = true;
+                            break;
+                        }
+                    }
                     if (ds)
                     {
                         size_t dn = 0;
@@ -2336,11 +2634,49 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                         if (hn >= sizeof b2) break;
                         memcpy(b2, rest, hn);
                         b2[hn] = 0;
-                        if (!tess_stage_var_named(ctx, names_prog, stage, b2)) continue;
+                        if (!tess_stage_var_named(ctx, names_prog, stage, b2))
+                        {
+                            if (getenv("MGL_TESS_DEBUG2"))
+                                fprintf(stderr, "MGL tess annotate[mid]: '%s' head '%s' not a stage var\n", m->name, b2);
+                            continue;
+                        }
                         tn = strlen(d + dn + 1);
                         if (hn + 1 + tn + 1 > sizeof rest) break;
                         fidx = (uint32_t)atoi(d);     /* d points into rest: read before the rebase */
                         mid = true;
+                        {
+                            char tail[96];
+
+                            snprintf(tail, sizeof tail, "%s", d + dn + 1);
+                            snprintf(rest, sizeof rest, "%s_%s", b2, tail);
+                        }
+                        break;
+                    }
+
+                    /* a dissolved patch-block ARRAY element adds a SECOND mid
+                     * index ("blockSa_<e>_<i>_<field>_<j>"): array_idx keeps
+                     * the block element (e), array_idx2 takes the struct-array
+                     * element (i) and the trailing index (j) moves to
+                     * array_idx3 — the canonical member's type is three
+                     * dimensions deep ("float[e][i][j]") */
+                    if (mid && !ds)
+                    for (char *b = rest; (b = strchr(b, '_')) != NULL; b++)
+                    {
+                        char *d = b + 1;
+                        size_t dn = 0, hn, tn;
+
+                        while (d[dn] >= '0' && d[dn] <= '9') dn++;
+                        if (!dn || d[dn] != '_') continue;
+                        hn = (size_t)(b - rest);
+                        if (hn >= sizeof b2) break;
+                        memcpy(b2, rest, hn);
+                        b2[hn] = 0;
+                        if (!tess_stage_var_named(ctx, names_prog, stage, b2))
+                            continue;
+                        tn = strlen(d + dn + 1);
+                        if (hn + 1 + tn + 1 > sizeof rest) break;
+                        fidx3 = (uint32_t)atoi(d);
+                        mid2 = true;
                         {
                             char tail[96];
 
@@ -2382,6 +2718,9 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                             snprintf(ds_base, sizeof ds_base, "%s_%s", ds_mbr, rest);
                         else
                             snprintf(ds_base, sizeof ds_base, "%s", ds_mbr);
+                        if (getenv("MGL_TESS_DEBUG2"))
+                            fprintf(stderr, "MGL tess annotate[ds]: '%s' -> mbr '%s' rest '%s' mid=%d fidx=%u fidx2=%u base '%s'\n",
+                                    m->name, ds_mbr, rest, (int)mid, fidx, fidx2, ds_base);
                     }
                     else
                         snprintf(ds_base, sizeof ds_base, "%s", rest);
@@ -2403,11 +2742,13 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
                         }
                     if (!matched) key = tess_name_hash(ds_base);
                     m->array_idx = fidx;
-                    m->array_idx2 = fidx2;
-                    m->flat_dims = fidx2 ? 2u : (fidx ? 1u : 0u);
+                    m->array_idx2 = mid2 ? fidx3 : fidx2;   /* second dim: struct-array element */
+                    m->array_idx3 = mid2 ? fidx2 : 0;       /* third dim: the innermost element */
+                    m->flat_dims = (m->array_idx3 ? 3u : 0u) |
+                                   (fidx2 ? 2u : (fidx ? 1u : 0u));
                     if (getenv("MGL_TESS_DEBUG2"))
-                        fprintf(stderr, "MGL tess annotate[blk]: '%s' -> base '%s' idx=%u idx2=%u dims=%u\n",
-                                m->name, ds_base, fidx, fidx2, m->flat_dims);
+                        fprintf(stderr, "MGL tess annotate[blk]: '%s' -> base '%s' idx=%u idx2=%u idx3=%u dims=%u\n",
+                                m->name, ds_base, fidx, m->array_idx2, m->array_idx3, m->flat_dims);
                     found = true;
                 }
             }
@@ -2512,12 +2853,13 @@ static void tess_annotate_keys(GLMContext ctx, Program *names_prog, int stage,
 
             /* an element ("<slot>_<q>") of an ARRAY slot that itself could not
              * be resolved to a declared variable (a STRUCT FIELD split, e.g.
-             * S.z[2] naming "vb_s_z_0"): key by the stripped slot name so it
-             * pairs with the producer's whole "vb_s_z" slot, and record the
-             * element index for the stride fixup */
+             * S.z[2] naming "vb_s_z_0" — or the same leaf under a dissolved
+             * variable, "vb_mgl_ds_s_z_0"): key by the stripped slot name so
+             * it pairs with the producer's whole "vb_s_z" slot, and record
+             * the element index for the stride fixup */
             while (len > 1 && n[len - 1] >= '0' && n[len - 1] <= '9')
                 len--;
-            if (!ds && len > 1 && n[len - 1] == '_' && len - 1 < sizeof b2)
+            if (len > 1 && n[len - 1] == '_' && len - 1 < sizeof b2)
             {
                 snprintf(b2, sizeof b2, "%.*s", (int)(len - 1), n);
                 key = tess_name_hash(b2);
@@ -2616,6 +2958,21 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
 
                 if (out->m[j].key != m->key)
                     continue;
+                /* a dissolved patch-block-ARRAY leaf: its indices select a
+                 * position INSIDE the array slot (stride math at bind time),
+                 * never a slot (or a merge) of its own */
+                if (o_arr && !m_arr && !strncmp(m->name, "mgl_ds_", 7))
+                {
+                    absorbed = true;
+                    break;
+                }
+                /* two ARRAY members of the same key but DIFFERENT element
+                 * index ("pb_ps_0_z" / "pb_ps_1_z": the z field of block
+                 * element 0 and 1 of a dissolved patch block array) are two
+                 * SLOTS, not one varying — merging them drops element 1 and
+                 * its reads land inside element 0's array */
+                if (o_arr && m_arr && out->m[j].array_idx != m->array_idx)
+                    continue;
                 if (o_arr || m_arr ||
                     (!o_arr && !m_arr && out->m[j].array_idx == m->array_idx &&
                      out->m[j].array_idx2 == m->array_idx2))
@@ -2644,8 +3001,12 @@ static bool tess_canon_union(struct CanonRec *out, struct MslStruct *const *in, 
                 /* a flattened element of an array slot already present: any
                  * element, including the [0][0] of a two-dimensional slot
                  * (flat_dims marks the member as flattened even then) */
-                if (o_arr && !m_arr && m->flat_dims > 0)
-                    absorbed = true;
+                if (o_arr && !m_arr && (m->flat_dims > 0 ||
+                                        !strncmp(m->name, "mgl_ds_", 7)))
+                    absorbed = true;   /* a dissolved patch-block-ARRAY leaf:
+                                        * its indices select a position INSIDE
+                                        * the array slot (stride math at bind
+                                        * time), never a slot of its own */
                 if (!o_arr && !m_arr && m->array_idx != 0 &&
                     msl_matrix_type(out->m[j].type, &dummy_align, &dummy_size))
                     absorbed = true;   /* flattened MATRIX COLUMN of a matrix slot already
@@ -3032,6 +3393,7 @@ static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, con
         snprintf(pat, sizeof pat, ".%s", m);
         for (char *w = msl; (w = strstr(w, pat)) != NULL; )
         {
+            bool skip_w = false;
             /* a member access continues with ".field" or "[index].field" */
             if (w[ml + 1] != '.' && w[ml + 1] != '[')
             { w += ml + 1; continue; }
@@ -3050,28 +3412,55 @@ static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, con
              * only applies when canon carries the field-array member. */
             if (*p == '[')
             {
-                const char *cl = strchr(p, ']');
+                const char *cl;
                 char fld[96];
                 size_t il, fl;
+                char idx_all[64];
 
-                if (!cl || cl[1] != '.') { w += ml + 1; continue; }
-                il = (size_t)(cl - (p + 1));
-                if (il == 0 || il >= sizeof idx_txt) { w += ml + 1; continue; }
+                /* collect EVERY consecutive index group (a dissolved
+                 * patch-block ARRAY member reads ".m[e][i].<field>[j]": the
+                 * canonical field member is "m_<field>" with dimensions
+                 * [e][i][j]) */
+                idx_all[0] = 0;
+                cl = p;
+                for (;;)
+                {
+                    const char *e2 = strchr(cl + 1, ']');
+                    bool bad = false;
+
+                    if (!e2) bad = true;
+                    else
+                    {
+                        if (idx_all[0]) strncat(idx_all, "][", 2);
+                        if ((size_t)(e2 - (cl + 1)) + strlen(idx_all) + 2 >= sizeof idx_all)
+                            bad = true;
+                        else
+                        {
+                            strncat(idx_all, cl + 1, (size_t)(e2 - (cl + 1)));
+                            cl = e2 + 1;
+                        }
+                    }
+                    if (bad) { skip_w = true; break; }
+                    if (*cl != '[') break;
+                }
+                if (skip_w) { w += ml + 1; continue; }
+                if (*cl != '.') { w += ml + 1; continue; }
+                il = strlen(idx_all);
                 fl = 0;
-                while (cl[2 + fl] && (isalnum((unsigned char)cl[2 + fl]) || cl[2 + fl] == '_')) fl++;
+                while (cl[1 + fl] && (isalnum((unsigned char)cl[1 + fl]) || cl[1 + fl] == '_')) fl++;
                 if (!fl || fl >= sizeof fld) { w += ml + 1; continue; }
                 {
                     char cand[300];
 
-                    if (snprintf(cand, sizeof cand, "%s_%.*s", joined, (int)fl, cl + 2) >= (int)sizeof cand)
+                    if (snprintf(cand, sizeof cand, "%s_%.*s", joined, (int)fl, cl + 1) >= (int)sizeof cand)
                     { w += ml + 1; continue; }
                     bool hit = false;
                     for (int k = 0; k < canon->n; k++)
                         if (strcmp(canon->m[k].name, cand) == 0) { hit = true; break; }
                     if (!hit) { w += ml + 1; continue; }
                     snprintf(joined, sizeof joined, "%s", cand);
-                    memcpy(idx_txt, p + 1, il); idx_txt[il] = 0;
-                    p = cl + 2 + fl;               /* right after the field name */
+                    memcpy(idx_txt, idx_all, il); idx_txt[il] = 0;
+                    p = cl + 1 + fl;               /* right after the field name */
                     any = true;
                 }
             }
@@ -3117,6 +3506,73 @@ static bool tess_flatten_body_access(char *msl, const struct MslStruct *own, con
     return changed;
 }
 
+/* the matrix-column merge below may only fire for a varying that THIS stage
+ * writes as a whole matrix: the parse splits matrix members into columns, so
+ * the only witness left is the struct BODY's declaration ("float2x2 m;") —
+ * the per-element leaves of a dissolved patch-block ARRAY ("pb_v_0"/"pb_v_1")
+ * are also adjacent same-key float4s and would merge into a bogus matrix */
+static bool canon_body_matrix(const struct MslStruct *own, const char *base0, int run, int rows)
+{
+    const char *body = own ? own->body : NULL;
+    char want[32];
+
+    if (!body || !base0[0])
+        return false;
+    snprintf(want, sizeof want, "float%dx%d", run, rows);
+    while (*body)
+    {
+        const char *semi = strchr(body, ';'), *decl = body;
+
+        if (!semi)
+            break;
+        body = semi + 1;
+        {
+            const char *attr = memchr(decl, '[', (size_t)(semi - decl));
+
+            if (attr)
+                semi = attr;
+        }
+        /* identifier: last token of the declaration */
+        {
+            const char *e = semi, *s, *ts, *te;
+            size_t ml, tl;
+            char tmp[192];
+            const char *ds;
+
+            while (e > decl && !isalnum((unsigned char)e[-1]) && e[-1] != '_') e--;
+            s = e;
+            while (s > decl && (isalnum((unsigned char)s[-1]) || s[-1] == '_')) s--;
+            if (s == e)
+                continue;
+            ml = (size_t)(e - s);
+            if (ml >= sizeof tmp)
+                continue;
+            memcpy(tmp, s, ml);
+            tmp[ml] = 0;
+            /* type: the token right before the identifier */
+            te = s;
+            while (te > decl && (te[-1] == ' ' || te[-1] == '\t' || te[-1] == '\n')) te--;
+            ts = te;
+            while (ts > decl && (isalnum((unsigned char)ts[-1]) || ts[-1] == '_')) ts--;
+            tl = (size_t)(te - ts);
+            if (tl != strlen(want) || strncmp(ts, want, tl))
+                continue;
+            if (!strcmp(tmp, base0))
+                return true;
+            /* the dissolved spelling "<inst>_mgl_ds_<member>" keys the same
+             * varying as the canon column base "<inst>_<member>" */
+            ds = strstr(tmp, "mgl_ds_");
+            if (ds)
+            {
+                memmove((void *)ds, ds + 7, strlen(ds + 7) + 1);
+                if (!strcmp(tmp, base0))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own,                            const struct CanonRec *canon)
 {
     char *buf = NULL;
@@ -3131,30 +3587,48 @@ static void tess_canon_body(char *out, size_t cap, const struct MslStruct *own, 
          * whose MSL keeps the interface whole write `m = float2x2(...)' — a body
          * of loose float2 columns would leave those stores nameless.  (Layout is
          * unchanged: a float<C>x<R> occupies the same C*R*4 bytes as the C
-         * columns it replaces.) */
+         * columns it replaces.)  Only for a stage that really has the whole
+         * matrix (canon_own_matrix): a dissolved patch-block ARRAY's per-element
+         * vec4 leaves ("pb_ps_0_y"/"pb_ps_1_y", "pb_v_0"/"pb_v_1") are adjacent
+         * same-key float4s too and must keep their own slots. */
+        size_t bl0 = strlen(canon->m[i].name);
+
         if (!strncmp(canon->m[i].type, "float", 5) && strlen(canon->m[i].type) == 6 &&
-            strstr(canon->m[i].name, "_0"))
+            bl0 >= 2 && !strcmp(canon->m[i].name + bl0 - 2, "_0"))
         {
             int run = 1;
-            size_t bl = strlen(canon->m[i].name);
+            size_t bl = bl0;
 
             while (i + run < canon->n && canon->m[i + run].key == canon->m[i].key &&
                    !strcmp(canon->m[i + run].type, canon->m[i].type))
             {
                 char suf[8];
+                size_t rl = strlen(canon->m[i + run].name);
 
                 snprintf(suf, sizeof suf, "_%d", run);
-                if (!strstr(canon->m[i + run].name, suf))
+                /* the run member must END in the column suffix and share the
+                 * base (matrix columns are "<base>_0..C-1" — a dissolved
+                 * element leaf ends in its own field path) */
+                if (rl <= (size_t)run ||
+                    strcmp(canon->m[i + run].name + rl - strlen(suf), suf))
+                    break;
+                if (strncmp(canon->m[i + run].name, canon->m[i].name, bl - 2) ||
+                    strcmp(canon->m[i + run].name + bl - 2, suf))
                     break;
                 run++;
             }
             if (run >= 2 && run <= 4 && bl > 2 && bl - 2 < sizeof base0)
             {
-                MGLTessPatchMember whole = canon->m[i];
-
-
                 memcpy(base0, canon->m[i].name, bl - 2);
                 base0[bl - 2] = 0;                  /* strip the "_0" column suffix */
+                if (!canon_body_matrix(own, base0, run, canon->m[i].type[5] - '0'))
+                    run = 1;                        /* no whole-matrix writer: keep
+                                                 * the separate column slots */
+            }
+            if (run >= 2 && run <= 4 && bl > 2 && bl - 2 < sizeof base0)
+            {
+                MGLTessPatchMember whole = canon->m[i];
+
                 snprintf(whole.type, sizeof whole.type, "float%dx%d", run,
                          canon->m[i].type[5] - '0');
                 whole.size = canon->m[i].size * run;
@@ -3824,6 +4298,9 @@ static char *rewrite_tes(const char *msl, const MGLTessProgram *tp)
             }
         }
         str_append(&out, &len, &cap, "};\n");
+        if (getenv("MGL_TESS_DEBUG2"))
+            fprintf(stderr, "MGL tess TES mgl_cp_rec (%u members):\n%s\n", tp->num_cp_record,
+                    out ? strstr(out, "struct mgl_cp_rec") : "(nil)");
     }
     else
     {
@@ -5294,6 +5771,15 @@ static void tess_build_patch_blob(GLMContext ctx, MGLTessProgram *tp,
                                 if (msl_array_inner(tp->tcs_patch_out[j].type, inner, sizeof inner, &n2) &&
                                     msl_array_stride(inner))
                                     so += m->array_idx2 * msl_array_stride(inner);
+                                if (m->array_idx3)
+                                {
+                                    char inner2[96];
+                                    long n3 = 0;
+
+                                    if (msl_array_inner(inner, inner2, sizeof inner2, &n3) &&
+                                        msl_array_stride(inner2))
+                                        so += m->array_idx3 * msl_array_stride(inner2);
+                                }
                             }
                         }
                         memcpy(dst + m->offset, src + so, m->size);
@@ -7389,6 +7875,11 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
     }
 
     /* attach varying locations to every member */
+    if (getenv("MGL_TESS_DEBUG2") && have_tcs_po)
+        for (int i = 0; i < tcs_po.count; i++)
+            fprintf(stderr, "MGL tess tcs_po[%d] '%s' type '%s' @%zu (%zu b)\n",
+                    i, tcs_po.members[i].name, tcs_po.members[i].type,
+                    tcs_po.members[i].offset, tcs_po.members[i].size);
     tess_annotate_keys(ctx, program, _VERTEX_SHADER, &vs_out, have_vs ?
         &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT] : NULL);
     tess_annotate_keys(ctx, program, _VERTEX_SHADER, &tcs_in, have_tcs_in ?
@@ -7465,6 +7956,7 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
                             dstarr[d][j].key = src->key;
                             dstarr[d][j].array_idx = src->array_idx;
                             dstarr[d][j].array_idx2 = src->array_idx2;
+                            dstarr[d][j].array_idx3 = src->array_idx3;
                             dstarr[d][j].flat_dims = src->flat_dims;
                             break;
                         }
@@ -7646,52 +8138,91 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
      * buffer at draw time) */
     for (int i = 0; i < tp->num_tes_patch_in; i++)
     {
-        /* the canonical slot: exact name first (split MATRIX COLUMNS share one key,
-         * so key-only matching would hand every column slot 0), then the canonical
-         * key with the flattened element index (tess_patch_member_matches — both
-         * sides flattened per element: element N must take element N's slot, not
-         * slot 0; patch_block_array_pipeline read element 0 back for all three) */
-        int slot = -1;
-        for (int j = 0; j < canon_patch.n && slot < 0; j++)
-            if (!strcmp(canon_patch.m[j].name, tp->tes_patch_in[i].name))
-                slot = j;
-        for (int j = 0; j < canon_patch.n && slot < 0; j++)
-            if (tess_patch_member_matches(&canon_patch.m[j], &tp->tes_patch_in[i]))
-                slot = j;
-        if (slot >= 0)
-        {
-            const MGLTessPatchMember *cm = &canon_patch.m[slot];
+        int best = -1, exact = 0;
 
-            tp->tes_patch_in[i].offset = cm->offset;
-            /* flattened array element ("name_N", array_idx N) of a canonical
-             * spvUnsafeArray member: advance by the element stride (mirrors the
-             * control-point fixup above — without it every element read at the
-             * array's base offset, and 'patch in int r[16]' returned r[0] always).
-             * A struct-array FIELD element carries a second dimension
-             * ("name_<i>_<field>_<j>", array_idx2) stepping inside the field */
-            if (tp->tes_patch_in[i].flat_dims && strstr(cm->type, "spvUnsafeArray"))
+        for (int j = 0; j < canon_patch.n; j++)
+            if (tp->tes_patch_in[i].key == canon_patch.m[j].key)
             {
-                size_t stride = msl_array_stride(cm->type);
-
-                if (getenv("MGL_TESS_DEBUG2"))
-                    fprintf(stderr, "MGL tess: stride fixup '%s' canon '%s %s' dims=%u idx=%u idx2=%u stride=%zu\n",
-                            tp->tes_patch_in[i].name, cm->type, cm->name,
-                            tp->tes_patch_in[i].flat_dims,
-                            tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].array_idx2, stride);
-                if (stride)
-                    tp->tes_patch_in[i].offset = cm->offset +
-                        tp->tes_patch_in[i].array_idx * stride;
-                if (stride && tp->tes_patch_in[i].array_idx2)
+                /* flattened array elements share one key ("name_N" carries
+                 * array_idx N): prefer the canonical element of the SAME
+                 * index — a dissolved/flattened patch block array has one
+                 * canonical member per element, and taking the first would
+                 * read element 0 for all of them (mirrors the control-point
+                 * fixup above) */
+                if (tp->tes_patch_in[i].array_idx == canon_patch.m[j].array_idx)
                 {
-                    char inner[96];
-                    long n2 = 0;
-
-                    if (msl_array_inner(cm->type, inner, sizeof inner, &n2) &&
-                        msl_array_stride(inner))
-                        tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx2 *
-                            msl_array_stride(inner);
+                    best = j;
+                    exact = 1;
+                    break;
                 }
+                if (best < 0)
+                    best = j;    /* fallback: array base (spvUnsafeArray) or
+                                  * an unmatched element index */
             }
+        if (best >= 0)
+        {
+            int j = best;
+
+            tp->tes_patch_in[i].offset = canon_patch.m[j].offset;
+                /* flattened array element ("name_N", array_idx N) of a canonical
+                 * spvUnsafeArray member: advance by the element stride (mirrors the
+                 * control-point fixup above — without it every element read at the
+                 * array's base offset, and 'patch in int r[16]' returned r[0] always).
+                 * Only for a BASE match — an exact element match already carries its
+                 * own offset.  A struct-array FIELD element carries a second dimension
+                 * ("name_<i>_<field>_<j>", array_idx2) stepping inside the field */
+                if (tp->tes_patch_in[i].flat_dims && strstr(canon_patch.m[j].type, "spvUnsafeArray"))
+                {
+                    size_t stride = msl_array_stride(canon_patch.m[j].type);
+
+                    if (getenv("MGL_TESS_DEBUG2"))
+                        fprintf(stderr, "MGL tess: stride fixup '%s' canon '%s %s' dims=%u idx=%u idx2=%u idx3=%u stride=%zu exact=%d\n",
+                                tp->tes_patch_in[i].name, canon_patch.m[j].type,
+                                canon_patch.m[j].name, tp->tes_patch_in[i].flat_dims,
+                                tp->tes_patch_in[i].array_idx, tp->tes_patch_in[i].array_idx2,
+                                tp->tes_patch_in[i].array_idx3, stride, exact);
+                    /* the FIRST dimension steps the whole array member — an
+                     * exact element match already carries its own offset */
+                    if (!exact && stride)
+                        tp->tes_patch_in[i].offset = canon_patch.m[j].offset +
+                            tp->tes_patch_in[i].array_idx * stride;
+                    /* the SECOND and THIRD dimensions step INSIDE the array
+                     * member (a struct-array field element, and the innermost
+                     * element of a dissolved patch-block ARRAY field): these
+                     * apply for base AND exact matches alike */
+                    if (stride)
+                    {
+                        char inner[96];
+                        long n2 = 0;
+                        size_t s_in = 0;
+
+                        /* A 1-D slot ("spvUnsafeArray<float, 2>") has a
+                         * NON-array inner type, so msl_array_stride(inner) is
+                         * 0 — its element stride IS the slot stride
+                         * ("pb_ps_0_z_1" must step 4 bytes, not 0) */
+                        if (msl_array_inner(canon_patch.m[j].type, inner, sizeof inner, &n2) &&
+                            msl_array_stride(inner))
+                            s_in = msl_array_stride(inner);
+                        else
+                            s_in = stride;
+                        if (tp->tes_patch_in[i].array_idx2)
+                            tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx2 * s_in;
+                        if (tp->tes_patch_in[i].array_idx3)
+                        {
+                            char inner2[96];
+                            long n3 = 0;
+                            size_t s_in2 = 0;
+
+                            if (s_in != stride &&
+                                msl_array_inner(inner, inner2, sizeof inner2, &n3) &&
+                                msl_array_stride(inner2))
+                                s_in2 = msl_array_stride(inner2);
+                            else
+                                s_in2 = s_in;
+                            tp->tes_patch_in[i].offset += tp->tes_patch_in[i].array_idx3 * s_in2;
+                        }
+                    }
+                }
         }
         if (tess_trace())
             fprintf(stderr, "MGL tess: tes_patch_in[%d] '%s' key=%x idx=%u off=%zu (stride %zu)\n",
@@ -7709,15 +8240,25 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
      * element 0 through the blob map) */
     for (int i = 0; i < tp->num_tcs_patch_out; i++)
     {
-        int slot = -1;
-        for (int j = 0; j < canon_patch.n && slot < 0; j++)
-            if (!strcmp(canon_patch.m[j].name, tp->tcs_patch_out[i].name))
-                slot = j;
-        for (int j = 0; j < canon_patch.n && slot < 0; j++)
-            if (tess_patch_member_matches(&canon_patch.m[j], &tp->tcs_patch_out[i]))
-                slot = j;
-        if (slot >= 0)
-            tp->tcs_patch_out[i].offset = canon_patch.m[slot].offset;
+        int best = -1;
+
+        for (int j = 0; j < canon_patch.n; j++)
+            if (tp->tcs_patch_out[i].key == canon_patch.m[j].key)
+            {
+                /* same key on both: prefer the canonical slot of the SAME
+                 * element index (a dissolved patch-block ARRAY keeps one slot
+                 * per element — "pb_ps_0_z"/"pb_ps_1_z" — and the first match
+                 * would write element 1 into element 0's slot) */
+                if (tp->tcs_patch_out[i].array_idx == canon_patch.m[j].array_idx)
+                {
+                    best = j;
+                    break;
+                }
+                if (best < 0)
+                    best = j;
+            }
+        if (best >= 0)
+            tp->tcs_patch_out[i].offset = canon_patch.m[best].offset;
     }
 
     /* ---- producer rewrites: whichever kernel writes a record whose SPIRV-Cross
@@ -7796,10 +8337,18 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
              * record splits (the TES's scalar-only attributes); the kernel body's
              * "<expr>.member.field" accesses must follow or the rewrite fails to
              * compile and the draw falls back with garbage varyings */
-            if (tess_flatten_body_access(msl, &tcs_in, &canon) ||
-                tess_flatten_body_access(msl, &tcs_out, &canon_tcs) ||
-                tess_flatten_body_access(msl, &tcs_po, &canon_patch))
-                changed = true;
+            /* NOT a || chain: it short-circuits after the first pass that
+             * changed something and the patchOut accesses would keep the
+             * pre-canonical member paths (TCS recompile fails, nothing draws) */
+            {
+                bool fl = false;
+
+                fl |= tess_flatten_body_access(msl, &tcs_in, &canon);
+                fl |= tess_flatten_body_access(msl, &tcs_out, &canon_tcs);
+                fl |= tess_flatten_body_access(msl, &tcs_po, &canon_patch);
+                if (fl)
+                    changed = true;
+            }
             /* triangle domains: write MTLTriangleTessellationFactorsHalf (8-byte factor
              * records) instead of the quad struct (see mgl_tess_factor_stride) */
             if (tp->domain == MGL_TESS_DOMAIN_TRIANGLES)
@@ -9028,10 +9577,29 @@ void mgl_tess_build_blob_map(GLMContext ctx, MGLTessProgram *tp)
                             char inner[96];
                             long n2 = 0;
 
+                            /* A 1-D slot ("spvUnsafeArray<float, 2>") has a NON-array
+                             * inner type, so msl_array_stride(inner) is 0 — the element
+                             * stride is then the member size ("pb_ps_0_z_1" must copy
+                             * 4 bytes further than z_0, not 0) */
                             if (msl_array_inner(tp->tcs_patch_out[j].type, inner, sizeof inner, &n2) &&
                                 msl_array_stride(inner))
                                 src += (uint32_t)(m->array_idx2 * msl_array_stride(inner));
+                            else
+                                src += (uint32_t)(m->array_idx2 * m->size);
+                            if (m->array_idx3)
+                            {
+                                char inner2[96];
+                                long n3 = 0;
+
+                                if (msl_array_inner(inner, inner2, sizeof inner2, &n3) &&
+                                    msl_array_stride(inner2))
+                                    src += (uint32_t)(m->array_idx3 * msl_array_stride(inner2));
+                                else
+                                    src += (uint32_t)(m->array_idx3 * m->size);
+                            }
                         }
+                        else if (m->array_idx3)
+                            src += (uint32_t)(m->array_idx3 * m->size);
                     }
                     src += (uint32_t)(m->array_idx * elem);
                     size = (uint32_t)m->size;

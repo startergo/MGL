@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include "mgl_ext_tess.h"
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -216,6 +217,28 @@ struct SpvLowerSite
     uint32_t prefix[8]; /* split chains: the inner chains' CONSTANT indices, in
                          * application order (walked before this chain's own) */
     uint32_t prefix_n;
+    uint8_t  is_patch;  /* per-patch array site (the top-level array index of a
+                         * Patch-decorated Input variable — no control point) */
+    uint8_t  leaf_mode; /* struct/array element: copy leaf-by-leaf (a whole
+                         * element load would abort SPIRV-Cross) */
+    uint8_t  dmap;      /* 1-based index into the dissolve map: the chain is
+                         * rooted at a dissolved block and its leaf copies must
+                         * use the dissolved per-(element,field) variables, so
+                         * the original block variable stays unreferenced */
+    uint32_t leaf_off;  /* first path in the shared leaf table */
+    uint32_t leaf_n;    /* number of leaf paths of ONE element */
+};
+
+/* OpDecorate <id> Patch (decoration 15 in this toolchain's spirv.h) */
+#define SPV_DEC_PATCH 15  /* this toolchain's spirv.h: NoPerspective=13, Patch=15 */
+
+/* a leaf path of a composite: constant indices from the composite to a
+ * scalar/vector/matrix (anything loadable as one stage-in attribute member) */
+struct SpvLowerLeaf
+{
+    uint32_t idx[6];    /* constant indices, outermost first */
+    uint32_t depth;
+    uint32_t type;      /* leaf type */
 };
 
 /* Does this access chain dynamically index an array/matrix MEMBER of an Input
@@ -225,6 +248,9 @@ struct SpvLowerSite
  * base is another chain, not the variable.  Resolve through up to four
  * intermediate chains; their indices must be constant (the rewrite re-roots the
  * element copy at the variable and concatenates them). */
+static bool spv_lower_var_is_patch(const struct SpvLowerCtx *c, uint32_t var);
+static uint32_t spv_lower_composite_len(const struct SpvLowerCtx *c, uint32_t type);
+
 static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLowerSite *site)
 {
     uint32_t off = c->off[inst], wc = c->wc[inst];
@@ -283,11 +309,34 @@ static bool spv_lower_offends(struct SpvLowerCtx *c, uint32_t inst, struct SpvLo
         return false;
 
     j = off + 4;                                    /* first index operand */
+    site->is_patch = spv_lower_var_is_patch(c, c->def[var]);
     if (prefix_n == 0 && spv_lower_type_kind(c, cur) == SPV_T_ARRAY)
     {
-        /* the control-point array: its index may be dynamic (gl_in[i]) */
-        cur = spv_lower_elem_type(c, cur, 0);
-        j++;
+        if (site->is_patch)
+        {
+            /* a per-PATCH array ('patch in Blk b[2]'): the top-level index
+             * selects the patch block, NOT a control point — SPIRV-Cross
+             * flattens it into attribute leaves, so a dynamic index here is
+             * an ordinary lowerable site */
+            if (spv_lower_const(c, c->w[off + 4]) < 0)
+            {
+                site->inst = inst;
+                site->k = 4;
+                site->arr_type = cur;
+                site->elem_type = 0;            /* filled by the caller */
+                site->root = 0;
+                site->prefix_n = 0;
+                return true;
+            }
+            cur = spv_lower_elem_type(c, cur, 0);
+            j++;
+        }
+        else
+        {
+            /* the control-point array: its index may be dynamic (gl_in[i]) */
+            cur = spv_lower_elem_type(c, cur, 0);
+            j++;
+        }
         if (!cur || j >= off + wc)
             return false;
     }
@@ -402,6 +451,143 @@ static uint32_t spv_lower_ptr_of(const struct SpvLowerCtx *c,
 }
 
 /* array/matrix length of a composite type (literal) */
+/* OpDecorate <id> Patch: the variable carries per-patch data (no control
+ * point dimension) — SPIRV-Cross flattens its array into attribute leaves */
+/* SPIRV-Cross's is_patch_block rule: a Block-decorated struct whose EVERY
+ * member carries the Patch member-decoration — glslang's encoding of a GL
+ * per-patch interface block ('patch out Blk { ... } name', the Patch lands on
+ * the block MEMBERS, not the variable).  Returns 1 when `type` is such a
+ * block. */
+static int spv_patch_block_type(const uint32_t *words, size_t n, uint32_t type)
+{
+    int have_block = 0, n_members = 0, all_patch = 1;
+
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == 71 /*OpDecorate*/ && wc >= 3 && words[k + 1] == type && words[k + 2] == 2 /*Block*/)
+            have_block = 1;
+        if (op == 30 /*OpTypeStruct*/ && wc >= 2 && words[k + 1] == type)
+            n_members = wc - 2;
+        k += wc;
+    }
+    if (!have_block || n_members <= 0)
+    {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL dissolve: patch_block_type(%u): have_block=%d n_members=%d\n",
+                    type, have_block, n_members);
+        return 0;
+    }
+    for (int m = 0; m < n_members && all_patch; m++)
+    {
+        int found = 0;
+
+        for (size_t k = 5; k < n && !found; )
+        {
+            uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+            if (wc == 0 || k + wc > n) break;
+            if (op == 72 /*OpMemberDecorate*/ && wc >= 4 && words[k + 1] == type &&
+                words[k + 2] == (uint32_t)m && words[k + 3] == SPV_DEC_PATCH)
+                found = 1;
+            k += wc;
+        }
+        if (!found)
+        {
+            all_patch = 0;
+            if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL dissolve: patch_block_type(%u): member %d has no Patch\n", type, m);
+        }
+    }
+    return all_patch;
+}
+
+static bool spv_lower_var_is_patch(const struct SpvLowerCtx *c, uint32_t var)
+{
+    for (uint32_t k = 0; k < c->ninst; k++)
+        if (c->op[k] == 71 /*OpDecorate*/ && c->wc[k] >= 3 &&
+            c->w[c->off[k] + 1] == var && c->w[c->off[k] + 2] == SPV_DEC_PATCH)
+            return true;
+    /* glslang's per-patch interface BLOCKS carry Patch on the block members
+     * (spv_patch_block_type): those variables are patch variables too, or the
+     * dynamic-IO lower would rewrite their chains as per-vertex ones */
+    {
+        uint32_t pointee = 0, elem = 0;
+
+        for (uint32_t k = 0; k < c->ninst; k++)
+            if (c->op[k] == 59 /*OpVariable*/ && c->wc[k] >= 4 && c->w[c->off[k] + 2] == var)
+            {
+                for (uint32_t q = 0; q < c->ninst; q++)
+                    if (c->op[q] == 32 /*OpTypePointer*/ && c->wc[q] >= 4 &&
+                        c->w[c->off[q] + 1] == c->w[c->off[k] + 1])
+                    {
+                        pointee = c->w[c->off[q] + 3];
+                        break;
+                    }
+                break;
+            }
+        if (!pointee)
+            return false;
+        /* one array level: 'patch out Blk b[2]' */
+        for (uint32_t q = 0; q < c->ninst; q++)
+            if (c->op[q] == 28 /*OpTypeArray*/ && c->wc[q] >= 4 && c->w[c->off[q] + 1] == pointee)
+            {
+                elem = c->w[c->off[q] + 2];
+                break;
+            }
+        return spv_patch_block_type(c->w, c->n, elem ? elem : pointee) != 0;
+    }
+}
+
+/* collect the leaf paths of `type`; returns how many were written to `out`
+ * (0 = too many / unresolvable — the caller declines the site) */
+static uint32_t spv_lower_leaves(const struct SpvLowerCtx *c, uint32_t type,
+                                 uint32_t *path, uint32_t depth,
+                                 struct SpvLowerLeaf *out, uint32_t cap)
+{
+    int kind = spv_lower_type_kind(c, type);
+
+    if (kind != SPV_T_STRUCT && kind != SPV_T_ARRAY)
+    {
+        if (!cap || depth > 6)
+            return 0;
+        out[0].depth = depth;
+        out[0].type = type;
+        for (uint32_t q = 0; q < depth; q++)
+            out[0].idx[q] = path[q];
+        return 1;
+    }
+    if (depth >= 6)
+        return 0;
+    {
+        uint32_t n = 0;
+        uint32_t cnt = (kind == SPV_T_ARRAY) ? spv_lower_composite_len(c, type) : 0;
+        if (kind == SPV_T_STRUCT)
+        {
+            int k = spv_lower_find(c, type);
+            if (k < 0)
+                return 0;
+            cnt = c->wc[k] - 2;         /* member operands */
+        }
+        if (cnt > 64)
+            return 0;
+        for (uint32_t i = 0; i < cnt; i++)
+        {
+            uint32_t sub, elem = spv_lower_elem_type(c, type, i);
+            if (!elem)
+                return 0;
+            path[depth] = i;
+            sub = spv_lower_leaves(c, elem, path, depth + 1, out + n, cap - n);
+            if (!sub)
+                return 0;
+            n += sub;
+        }
+        return n;
+    }
+}
+
 static uint32_t spv_lower_composite_len(const struct SpvLowerCtx *c, uint32_t type)
 {
     int k = spv_lower_find(c, type);
@@ -417,6 +603,20 @@ static uint32_t spv_lower_composite_len(const struct SpvLowerCtx *c, uint32_t ty
 }
 
 struct SpvNewConst { uint32_t id, type, value; };
+
+/* an OpConstant id (module or pre-declared) of `value` with `type`, or 0 */
+static uint32_t spv_lower_const_id(const struct SpvLowerCtx *c, uint32_t type, uint32_t value,
+                                   const struct SpvNewConst *new_consts, uint32_t n_new_consts)
+{
+    for (uint32_t q = 0; q < c->ninst; q++)
+        if (c->op[q] == SPV_OP_CONSTANT && c->wc[q] >= 4 &&
+            c->w[c->off[q] + 1] == type && (int32_t)c->w[c->off[q] + 3] == (int32_t)value)
+            return c->def[q];
+    for (uint32_t q = 0; q < n_new_consts; q++)
+        if (new_consts[q].type == type && new_consts[q].value == value)
+            return new_consts[q].id;
+    return 0;
+}
 
 /* GUARD (process-abort protection): SPIRV-Cross's
  * emit_tessellation_access_chain asserts (index != uint32_t(-1)) when a
@@ -483,6 +683,7 @@ static bool spv_lower_fatal_remaining(const struct SpvLowerCtx *c,
          * member descent is fatal */
         uint32_t t = spv_lower_pointee(c, c->w[c->off[rv] + 1]);
         bool member_depth = false;
+        bool patch_var = spv_lower_var_is_patch(c, root_var);
         for (uint32_t q = 0; q < nidx && t; q++)
         {
             int kind = spv_lower_type_kind(c, t);
@@ -497,7 +698,18 @@ static bool spv_lower_fatal_remaining(const struct SpvLowerCtx *c,
             else if (kind == SPV_T_ARRAY)
             {
                 if (member_depth)
-                    return true;                       /* into an array field: assert in SPIRV-Cross */
+                {
+                    /* into an array FIELD: a DYNAMIC index aborts SPIRV-Cross
+                     * (the flattened attribute leaves cannot be selected at
+                     * run time); a constant index resolves into one leaf and
+                     * is fine */
+                    if (spv_lower_const(c, idx[q]) < 0)
+                        return true;
+                    t = spv_lower_elem_type(c, t, 0);
+                    continue;
+                }
+                if (patch_var && spv_lower_const(c, idx[q]) < 0)
+                    return true;                       /* patch-array index: fatal unless a site */
                 t = spv_lower_elem_type(c, t, 0);
             }
             else if (kind == SPV_T_MATRIX || kind == SPV_T_VECTOR)
@@ -509,11 +721,1367 @@ static bool spv_lower_fatal_remaining(const struct SpvLowerCtx *c,
     return false;
 }
 
-uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n)
+#define SPV_LOWER_MAX_LEAVES 2048
+/* helper: push an OpName into a word buffer */
+static void namebuf_words(char *buf, size_t *n, uint32_t id, const char *name);
+static int64_t spv_dis_const(const uint32_t *words, size_t n, uint32_t id);
+static uint32_t spv_dis_leaf_count(const uint32_t *words, size_t n, uint32_t type);
+static void namebuf_words(char *buf, size_t *n, uint32_t id, const char *name)
+{
+    size_t need = strlen(name);
+    size_t w4 = need / 4 + 1;      /* always at least one NUL byte (SPIR-V §2.2.1) */
+    uint32_t *b = (uint32_t *)buf;
+
+    b[(*n)++] = (uint32_t)(((2 + w4) << 16) | 5);
+    b[(*n)++] = id;
+    memset(b + *n, 0, w4 * 4);
+    memcpy(b + *n, name, need);
+    (*n) += w4;
+}
+
+/* ---- entry-copy emitter for the TES per-element form ----
+ * The entry block copies each dissolved patch variable into the function-
+ * local block array.  SPIRV-Cross's emit_tessellation_io_load can only
+ * flatten LEAF loads (scalars/vectors) from a chain — loading a struct or
+ * matrix needs stage_in_ptr_var_id, which is 0 when the TES has no per-vertex
+ * inputs ("Cannot resolve expression type"), and whole-ARRAY member stores
+ * lower to an MSL copy template that cannot match spvUnsafeArray against the
+ * local's plain C array member.  So the copy walks the member's type tree and
+ * emits one AccessChain/Load/Store per SCALAR-or-VECTOR leaf. */
+struct TessCopyCtx
+{
+    const uint32_t *words;
+    size_t n;
+    uint32_t *ins_types;              /* new pointer types + int constants */
+    size_t *n_types, cap_types;
+    uint32_t *ins_entry;              /* the copy instructions */
+    size_t *n_entry, cap_entry;
+    uint32_t *next_id;
+    uint32_t local_var, src_var;      /* dst base (Private) / src (Input) */
+    uint32_t dst_sc;                  /* storage class of the dst chain's pointer type */
+    uint32_t dst_idx[10], src_idx[10];
+    int dst_n, src_n;
+    uint32_t cst_id[24];              /* small int constants found in the module */
+    uint32_t cst_val[24];
+    int n_cst;
+    int n_leaf;
+};
+
+static uint32_t tess_copy_cst(const struct TessCopyCtx *c, uint32_t v)
+{
+    for (int t = 0; t < c->n_cst; t++)
+        if (c->cst_val[t] == v) return c->cst_id[t];
+    return 0;
+}
+
+static uint32_t spv_lower_ptr_type(const uint32_t *words, size_t n, uint32_t *ins_types,
+                                   size_t *n_types, size_t cap_types, uint32_t *next_id,
+                                   uint32_t sc, uint32_t pointee);
+
+/* returns 0 = done, -1 = decline (shape too deep / missing constant) */
+static int tess_copy_walk(struct TessCopyCtx *c, uint32_t type, int depth)
+{
+    const uint32_t *words = c->words;
+    size_t n = c->n;
+
+    if (depth > 5 || c->dst_n >= 10 || c->src_n >= 10 || c->n_leaf > 512)
+        return -1;
+    for (size_t q = 5; q < n; )
+    {
+        uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+        if (wq == 0 || q + wq > n) break;
+        if (oq == 28 /*OpTypeArray*/ && wq >= 4 && words[q + 1] == type)
+        {
+            uint32_t elem = words[q + 2], len_id = words[q + 3];
+            int64_t len = spv_dis_const(words, n, len_id);
+            uint32_t idx;
+
+            if (len < 0 || len > 16)
+                return -1;
+            for (int64_t i = 0; i < len; i++)
+            {
+                idx = tess_copy_cst(c, (uint32_t)i);
+                if (!idx) return -1;
+                c->dst_idx[c->dst_n++] = idx;
+                c->src_idx[c->src_n++] = idx;
+                if (tess_copy_walk(c, elem, depth + 1)) return -1;
+                c->dst_n--;
+                c->src_n--;
+            }
+            return 0;
+        }
+        if (oq == 24 /*OpTypeMatrix*/ && wq >= 4 && words[q + 1] == type)
+        {
+            uint32_t col = words[q + 2], ncol = words[q + 3], idx;
+
+            if (ncol < 2 || ncol > 4) return -1;
+            for (uint32_t i = 0; i < ncol; i++)
+            {
+                idx = tess_copy_cst(c, i);
+                if (!idx) return -1;
+                c->dst_idx[c->dst_n++] = idx;
+                c->src_idx[c->src_n++] = idx;
+                if (tess_copy_walk(c, col, depth + 1)) return -1;
+                c->dst_n--;
+                c->src_n--;
+            }
+            return 0;
+        }
+        if (oq == 30 /*OpTypeStruct*/ && wq >= 2 && words[q + 1] == type)
+        {
+            uint32_t nmem = wq - 2, idx;
+
+            if (nmem > 16) return -1;
+            for (uint32_t j = 0; j < nmem; j++)
+            {
+                idx = tess_copy_cst(c, j);
+                if (!idx) return -1;
+                c->dst_idx[c->dst_n++] = idx;
+                c->src_idx[c->src_n++] = idx;
+                if (tess_copy_walk(c, words[q + 2 + j], depth + 1)) return -1;
+                c->dst_n--;
+                c->src_n--;
+            }
+            return 0;
+        }
+        q += wq;
+    }
+    /* leaf: scalar / vector — one chain pair + load + store.  The source
+     * chain may be EMPTY (a plain scalar member reads the variable itself);
+     * a zero-index OpAccessChain is invalid SPIR-V and aborts SPIRV-Cross's
+     * active-builtin scan, so load the variable directly in that case. */
+    {
+        uint32_t ipf = spv_lower_ptr_type(words, n, c->ins_types, c->n_types,
+                                          c->cap_types, c->next_id, c->dst_sc, type);
+        uint32_t iaptr = (c->src_n > 0) ?
+                         spv_lower_ptr_type(words, n, c->ins_types, c->n_types,
+                                            c->cap_types, c->next_id, 1, type) : 0;
+        uint32_t need = (uint32_t)(4 + c->dst_n) +
+                        (c->src_n > 0 ? (uint32_t)(4 + c->src_n) : 0) + 4 + 3;
+        uint32_t ac, acv, ld;
+
+        if (!ipf) return -1;
+        if (*c->n_entry + need > c->cap_entry) return -1;
+        ac = (*c->next_id)++;
+        ld = (*c->next_id)++;
+        c->ins_entry[(*c->n_entry)++] = (uint32_t)(((4 + c->dst_n) << 16) | 65);
+        c->ins_entry[(*c->n_entry)++] = ipf;
+        c->ins_entry[(*c->n_entry)++] = ac;
+        c->ins_entry[(*c->n_entry)++] = c->local_var;
+        for (int k = 0; k < c->dst_n; k++) c->ins_entry[(*c->n_entry)++] = c->dst_idx[k];
+        if (c->src_n > 0)
+        {
+            acv = (*c->next_id)++;
+            c->ins_entry[(*c->n_entry)++] = (uint32_t)(((4 + c->src_n) << 16) | 65);
+            c->ins_entry[(*c->n_entry)++] = iaptr;
+            c->ins_entry[(*c->n_entry)++] = acv;
+            c->ins_entry[(*c->n_entry)++] = c->src_var;
+            for (int k = 0; k < c->src_n; k++) c->ins_entry[(*c->n_entry)++] = c->src_idx[k];
+        }
+        else
+            acv = c->src_var;             /* load the variable directly */
+        c->ins_entry[(*c->n_entry)++] = (4u << 16) | 61;      /* OpLoad */
+        c->ins_entry[(*c->n_entry)++] = type;
+        c->ins_entry[(*c->n_entry)++] = ld;
+        c->ins_entry[(*c->n_entry)++] = acv;
+        c->ins_entry[(*c->n_entry)++] = (3u << 16) | 62;      /* OpStore */
+        c->ins_entry[(*c->n_entry)++] = ac;
+        c->ins_entry[(*c->n_entry)++] = ld;
+        c->n_leaf++;
+    }
+    return 0;
+}
+
+/* find-or-create a pointer type: search the module first, then the pending
+ * insertion set, and only then mint a new id (0 = out of insertion room) */
+static uint32_t spv_lower_ptr_type(const uint32_t *words, size_t n, uint32_t *ins_types,
+                                   size_t *n_types, size_t cap_types, uint32_t *next_id,
+                                   uint32_t sc, uint32_t pointee)
+{
+    for (size_t q = 5; q < n; )
+    {
+        uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+        if (wq == 0 || q + wq > n) break;
+        if (oq == 32 /*OpTypePointer*/ && wq >= 4 && words[q + 2] == sc &&
+            words[q + 3] == pointee)
+            return words[q + 1];
+        q += wq;
+    }
+    for (size_t q = 0; q + 4 <= *n_types; q += 4)
+        if ((ins_types[q] & 0xffff) == 32 && ins_types[q + 2] == sc &&
+            ins_types[q + 3] == pointee)
+            return ins_types[q + 1];
+    if (*n_types + 4 > cap_types)
+        return 0;
+    ins_types[(*n_types)++] = (4u << 16) | 32;
+    ins_types[(*n_types)++] = *next_id;
+    ins_types[(*n_types)++] = sc;
+    ins_types[(*n_types)++] = pointee;
+    return (*next_id)++;
+}
+
+/* ------------------------------------------------------------------ per-patch interface blocks
+ * GL allows per-patch interface blocks, singly ('patch out Blk { ... } b;')
+ * and as ARRAYS ('patch out Blk { ... } b[2];').  glslang encodes them as a
+ * Block struct whose members carry the Patch decoration (spv_patch_block_type
+ * — SPIRV-Cross's is_patch_block).  SPIRV-Cross's tessellation access chains
+ * resolve such a variable's members through a member-index map that is only
+ * correct for members that need no splitting, and the TCS compile of an
+ * array-of-blocks dies with "Bad cast".  Rewrite: dissolve the block into one
+ * plain PATCH variable per block member ('ppBlock_s' : S or array<S,2>,
+ * 'ppBlock_fa' : float[3] or array<float[3],2>) — plain patch variables are
+ * buffer-backed in the TCS kernel and attribute-flattened in the TES, and
+ * SPIRV-Cross handles both correctly.
+ *
+ * Declines (NULL) on anything it cannot rewrite; the caller keeps the
+ * original module, which fails the link cleanly. */
+struct PArrJob
+{
+    uint32_t var, storage, block, len_id, base_loc;
+    int array_form;                 /* 1 = 'Blk b[N]' (element index precedes the member), 0 = 'Blk b' */
+    uint32_t n_members, member_type[32], member_slot[32], member_loc[32];
+    char member_name[32][48];
+    uint32_t new_var[32];
+    /* TES-input form: one plain patch variable per (member, element) plus a
+     * module-scope PRIVATE 'Blk[N]' copied at the entry block — the local
+     * keeps dynamic element/member indices working (no variable selection
+     * needed) and is visible from helper functions (SPIRV-Cross localizes
+     * it into the entry point and passes it down to every callee) */
+    int is_tes;
+    uint32_t local_var, block_slots, n_elem, pointee;
+    uint32_t new_var2[8][32];       /* [element][member] */
+};
+
+/* rewrite an OpEntryPoint's interface-id operand list into dst: the dissolved
+ * block variables leave, their replacements join (SPIRV-Cross only recognizes
+ * stage IO listed here).  Returns the words written to dst. */
+static size_t spv_rewrite_entry_point(const uint32_t *words, size_t i,
+                                      const struct PArrJob *jobs, int n_jobs,
+                                      uint32_t *dst)
+{
+    uint32_t wc = words[i] >> 16;
+    size_t p = 3, oh = 0, o = 0;
+
+    while (p < wc)
+    {
+        uint32_t v = words[i + p];
+
+        if (!(v & 0xff000000u) || !(v & 0xff0000u) || !(v & 0xff00u) || !(v & 0xffu))
+        {
+            p++;                     /* the word carrying the name's NUL */
+            break;
+        }
+        p++;
+    }
+    memcpy(dst + o, words + i, p * 4);
+    oh = o;
+    o += p;
+    for (uint32_t q = (uint32_t)p; q < wc; q++)
+    {
+        int drop = 0;
+
+        for (int j = 0; j < n_jobs; j++)
+            if (words[i + q] == jobs[j].var) drop = 1;
+        if (!drop) dst[o++] = words[i + q];
+    }
+    for (int j = 0; j < n_jobs; j++)
+    {
+        if (jobs[j].is_tes)
+        {
+            for (uint32_t e = 0; e < jobs[j].n_elem; e++)
+                for (uint32_t m2 = 0; m2 < jobs[j].n_members; m2++)
+                    dst[o++] = jobs[j].new_var2[e][m2];
+        }
+        else
+            for (uint32_t m2 = 0; m2 < jobs[j].n_members; m2++)
+                dst[o++] = jobs[j].new_var[m2];
+    }
+    dst[oh] = (uint32_t)(((o - oh) << 16) | 15);
+    return o;
+}
+
+/* execution model of the module's first OpEntryPoint (0 = none found) */
+static uint32_t spv_entry_model(const uint32_t *words, size_t n)
+{
+    for (size_t k = 5; k < n; )
+    {
+        uint32_t wc = words[k] >> 16, op = words[k] & 0xffff;
+
+        if (wc == 0 || k + wc > n) break;
+        if (op == 15 /*OpEntryPoint*/ && wc >= 4)
+            return words[k + 1];
+        if (op == 54 /*OpFunction*/)
+            break;                  /* entry points precede the functions */
+        k += wc;
+    }
+    return 0;
+}
+
+uint32_t *mgl_tess_dissolve_patch_block_arrays(const uint32_t *words, size_t n, size_t *out_n)
+{
+    struct PArrJob jobs[8];
+    int n_jobs = 0;
+    uint32_t next_id = words[3];
+    uint32_t *out = NULL;
+    uint32_t model = spv_entry_model(words, n);
+
+    *out_n = 0;
+    if (!words || n < 8)
+        return NULL;
+
+    if (getenv("MGL_TESS_DUMP_DISSOLVE"))
+    {
+        char path[512];
+        static int seq = 0;
+
+        snprintf(path, sizeof path, "%s/in_%d.spv", getenv("MGL_TESS_DUMP_DISSOLVE"), seq++);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(words, 4, n, f); fclose(f); }
+    }
+
+    /* 1) interface variables whose pointee is a patch block ('Blk b') or an
+     *    array of one ('Blk b[N]') */
+    for (size_t i = 5; i < n && n_jobs < 8; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+        if (wc == 0 || i + wc > n) break;
+        if (op == 59 /*OpVariable*/ && wc >= 4 &&
+            (words[i + 3] == 1 /*Input*/ || words[i + 3] == 3 /*Output*/))
+        {
+            uint32_t vid = words[i + 2];
+            uint32_t ptr = words[i + 1];
+            uint32_t pointee = 0, elem = 0, block = 0, len_id = 0, base_loc = 0xffffffffu;
+            int array_form = 0, taken = 0, have_struct = 0;
+            uint32_t n_elem_next = 1;
+
+            if (getenv("MGL_TESS_DEBUG"))
+                fprintf(stderr, "MGL dissolve: scan var %u storage %u ptr %u\n", vid, words[i + 3], ptr);
+
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == 32 /*OpTypePointer*/ && wc2 >= 4 && words[k + 1] == ptr)
+                {
+                    pointee = words[k + 3];
+                    break;
+                }
+                k += wc2;
+            }
+            if (pointee)
+            {
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 28 /*OpTypeArray*/ && wc2 >= 4 && words[k + 1] == pointee)
+                    {
+                        elem = words[k + 2];
+                        len_id = words[k + 3];
+                        break;
+                    }
+                    k += wc2;
+                }
+            }
+            if (elem && spv_patch_block_type(words, n, elem))
+            {
+                array_form = 1;
+                block = elem;
+            }
+            /* single patch blocks ('patch out Blk { ... } b;') are NOT
+             * dissolved: SPIRV-Cross handles them natively (the flattened
+             * member names map onto MGL's records) and rewriting them breaks
+             * the MSL for nested struct/array members — only the array form
+             * ('Blk b[N]') needs the rewrite */
+            if (!block)
+            {
+                if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL dissolve: var %u: not an array-of-patch-block (pointee %u elem %u)\n",
+                            vid, pointee, elem);
+                i += wc;
+                continue;
+            }
+            if (array_form)
+            {
+                int32_t len = -1;
+
+                for (size_t k = 5; k < n && len < 0; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 43 /*OpConstant*/ && wc2 >= 4 && words[k + 2] == len_id)
+                    {
+                        len = (int32_t)words[k + 3];
+                        break;
+                    }
+                    k += wc2;
+                }
+                if (len <= 0 || len > 8)
+                {
+                    if (getenv("MGL_TESS_DEBUG"))
+                        fprintf(stderr, "MGL dissolve: var %u: block array length %d out of range\n", vid, len);
+                    i += wc;
+                    continue;
+                }
+                n_elem_next = (uint32_t)len;
+            }
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == 71 /*OpDecorate*/ && wc2 >= 4 &&
+                    words[k + 1] == vid && words[k + 2] == 30 /*Location*/)
+                {
+                    base_loc = words[k + 3];
+                    break;
+                }
+                k += wc2;
+            }
+            for (int j = 0; j < n_jobs; j++)
+                if (jobs[j].var == vid)
+                    taken = 1;
+            if (taken || base_loc == 0xffffffffu)
+            {
+                if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL dissolve: var %u: taken=%d base_loc=%u\n", vid, taken, base_loc);
+                /* no explicit location on the block: MGL assigns interface
+                 * locations at link time elsewhere; dissolving without them
+                 * would mis-place the attributes — leave the module alone */
+                i += wc;
+                continue;
+            }
+            {
+                struct PArrJob *job = &jobs[n_jobs];
+
+                memset(job, 0, sizeof *job);
+                job->var = vid;
+                job->storage = words[i + 3];
+                job->block = block;
+                job->len_id = len_id;
+                job->base_loc = base_loc;
+                job->array_form = array_form;
+                job->n_elem = n_elem_next;
+                job->pointee = pointee;
+                /* TES inputs (storage Input in a TessellationEvaluation
+                 * module) take the per-element + local-copy form: the member
+                 * arrays of a dissolved variable cannot be emitted as
+                 * attributes once they become arrays-of-arrays */
+                job->is_tes = (model == 2 /*TessellationEvaluation*/ && words[i + 3] == 1 /*Input*/);
+                if (getenv("MGL_TESS_DEBUG"))
+                    fprintf(stderr, "MGL dissolve: job var %u is_tes=%d (model %u storage %u)\n",
+                            vid, job->is_tes, model, words[i + 3]);
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 30 /*OpTypeStruct*/ && wc2 >= 2 && words[k + 1] == block)
+                    {
+                        job->n_members = wc2 - 2;
+                        if (job->n_members > 32)
+                            job->n_members = 32;
+                        for (uint32_t m = 0; m < job->n_members; m++)
+                            job->member_type[m] = words[k + 2 + m];
+                        have_struct = 1;
+                        break;
+                    }
+                    k += wc2;
+                }
+                if (!have_struct || !job->n_members)
+                {
+                    i += wc;
+                    continue;
+                }
+                /* member names / Locations / location slots */
+                {
+                    uint32_t slot = 0;
+
+                    for (uint32_t m = 0; m < job->n_members; m++)
+                    {
+                        snprintf(job->member_name[m], sizeof job->member_name[m], "m%u", m);
+                        job->member_loc[m] = 0xffffffffu;
+                        job->member_slot[m] = slot;
+                        slot += spv_dis_leaf_count(words, n, job->member_type[m]);
+                    }
+                    job->block_slots = slot;
+                }
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 72 /*OpMemberDecorate*/ && wc2 >= 5 && words[k + 1] == block &&
+                        words[k + 3] == 30 /*Location*/ && words[k + 2] < job->n_members)
+                        job->member_loc[words[k + 2]] = words[k + 4];
+                    if (op2 == 6 /*OpMemberName*/ && wc2 >= 4 && words[k + 1] == block &&
+                        words[k + 2] < job->n_members)
+                    {
+                        const uint32_t *w = words + k + 3;
+                        const uint32_t *we = words + k + wc2;
+                        size_t o = 0;
+                        uint32_t mi = words[k + 2];
+
+                        while (w < we && o + 4 < sizeof job->member_name[0])
+                        {
+                            for (int b = 0; b < 4; b++)
+                            {
+                                char ch = (char)((*w >> (8 * b)) & 255);
+
+                                if (!ch) { w = we; break; }
+                                job->member_name[mi][o++] = ch;
+                            }
+                            w++;
+                        }
+                        job->member_name[mi][o] = 0;
+                    }
+                    k += wc2;
+                }
+                n_jobs++;
+            }
+        }
+        i += wc;
+    }
+    if (!n_jobs)
+    {
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL dissolve: no jobs after scan\n");
+        return NULL;
+    }
+
+    /* 2) every chain rooted at a job var must have a CONSTANT member index;
+     *    whole-variable / whole-element uses decline the transform.  Only the
+     *    opcodes whose relevant operand can BE a variable id are inspected —
+     *    matching raw word 3 would hit OpConstant literals and storage-class
+     *    numbers that merely equal the variable's id. */
+    for (size_t i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+        if (wc == 0 || i + wc > n) break;
+        if (op == 65 /*OpAccessChain*/ || op == 70 /*OpInBoundsAccessChain*/)
+        {
+            for (int j = 0; j < n_jobs; j++)
+            {
+                if (words[i + 3] != jobs[j].var)
+                    continue;
+                if (wc < (uint32_t)(jobs[j].array_form ? 6 : 5))
+                {
+                    if (!jobs[j].is_tes)
+                    {
+                        if (getenv("MGL_TESS_DEBUG"))
+                            fprintf(stderr, "MGL dissolve: var %u: chain wc %u too short (whole-element use)\n",
+                                    jobs[j].var, wc);
+                        return NULL;   /* chain [var, elem]: whole-element pointer */
+                    }
+                    /* TES: re-roots to the local — any chain length is fine */
+                    break;
+                }
+                if (jobs[j].is_tes)
+                    break;            /* the local composite takes any indices */
+                {
+                    uint32_t midx = words[i + (jobs[j].array_form ? 5 : 4)];
+                    int64_t m = spv_dis_const(words, n, midx);
+
+                    if (m < 0 || (uint32_t)m >= jobs[j].n_members)
+                    {
+                        if (getenv("MGL_TESS_DEBUG"))
+                            fprintf(stderr, "MGL dissolve: var %u: chain op %u wc %u: member idx %u not const\n",
+                                    jobs[j].var, op, wc, midx);
+                        return NULL;   /* dynamic member index: leave */
+                    }
+                }
+                break;
+            }
+        }
+        else if (op == 61 /*OpLoad*/ || op == 62 /*OpStore*/ || op == 46 /*OpCopyMemory*/)
+        {
+            /* word 3 is the pointer for OpLoad, the object for OpStore /
+             * OpCopyMemory (their pointer is word 2) */
+            for (int j = 0; j < n_jobs; j++)
+                if (words[i + 3] == jobs[j].var || words[i + 2] == jobs[j].var)
+                {
+                    if (getenv("MGL_TESS_DEBUG"))
+                        fprintf(stderr, "MGL dissolve: var %u: op %u uses the variable directly\n",
+                                jobs[j].var, op);
+                    return NULL;
+                }
+        }
+        i += wc;
+    }
+
+    /* 3) create the replacement variables (TCS: one plain patch array per
+     *    member; TES: per-(member,element) + an entry-copied local) */
+    {
+        uint32_t ins_types[8 * 32 * 8], ins_vars[8 * 32 * 4], ins_deco[8 * 32 * 12];
+        uint32_t ins_entry[8 * 40 * 12];
+        size_t n_types = 0, n_vars = 0, n_deco = 0, n_entry = 0;
+        char namebuf[8 * 32 * 6];
+        size_t namebuf_n = 0;
+        /* Input→Function pointer-type map for TES chains re-rooted at the
+         * entry-copied local (filled by the pre-pass below block 3) */
+        uint32_t job_rt_from[64], job_rt_to[64];
+        int job_rt_n = 0;
+
+        for (int j = 0; j < n_jobs; j++)
+        {
+            struct PArrJob *job = &jobs[j];
+            char iname[128];
+            size_t inl = 0;
+
+            for (size_t q = 5; q < n; )
+            {
+                uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                if (wq == 0 || q + wq > n) break;
+                if (oq == 5 /*OpName*/ && wq >= 3 && words[q + 1] == job->var)
+                {
+                    const uint32_t *w = words + q + 2;
+                    const uint32_t *we = words + q + wq;
+
+                    while (w < we && inl + 4 < sizeof iname)
+                    {
+                        for (int b = 0; b < 4; b++)
+                        {
+                            char ch = (char)((*w >> (8 * b)) & 255);
+
+                            if (!ch) { w = we; break; }
+                            iname[inl++] = ch;
+                        }
+                        w++;
+                    }
+                    break;
+                }
+                q += wq;
+            }
+            iname[inl] = 0;
+            if (!inl)
+                snprintf(iname, sizeof iname, "patcharr");
+
+            if (job->is_tes)
+            {
+                /* ---- TES input form: per-(member,element) patch variables
+                 * ---- + a module-scope PRIVATE 'Blk[N]' copied at the entry
+                 * block.  The member variables are single-level composites —
+                 * the attribute shape SPIRV-Cross can always emit — and the
+                 * local keeps dynamic element/member indices working. */
+                uint32_t int_type = 0;
+                uint32_t consts_ids[16];   /* small int constants 0..15 */
+                uint32_t consts_val[16];
+                int n_cst = 0;
+
+                for (size_t q = 5; q < n; )
+                {
+                    uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                    if (wq == 0 || q + wq > n) break;
+                    if (oq == 21 /*OpTypeInt*/ && wq >= 4 && words[q + 2] == 32)
+                    {
+                        int_type = words[q + 1];
+                        break;
+                    }
+                    q += wq;
+                }
+                if (!int_type)
+                    return NULL;
+                for (size_t q = 5; q < n && n_cst < 16; )
+                {
+                    uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                    if (wq == 0 || q + wq > n) break;
+                    if (oq == 43 /*OpConstant*/ && wq >= 4 && words[q + 1] == int_type &&
+                        words[q + 3] < 16)
+                    {
+                        int seen = 0;
+
+                        for (int t = 0; t < n_cst; t++)
+                            if (consts_val[t] == words[q + 3]) seen = 1;
+                        if (!seen)
+                        {
+                            consts_ids[n_cst] = words[q + 2];
+                            consts_val[n_cst] = words[q + 3];
+                            n_cst++;
+                        }
+                    }
+                    q += wq;
+                }
+                /* create the missing ones (e/m indices) */
+                for (uint32_t v = 0; v < 16 && n_cst < 16; v++)
+                {
+                    int seen = 0;
+
+                    for (int t = 0; t < n_cst; t++)
+                        if (consts_val[t] == v) seen = 1;
+                    if (!seen && v >= job->n_elem + job->n_members)
+                        break;
+                    if (seen)
+                        continue;
+                    if (n_types + 4 > sizeof ins_types / 4) return NULL;
+                    ins_types[n_types++] = (4u << 16) | 43;   /* OpConstant */
+                    ins_types[n_types++] = int_type;
+                    consts_ids[n_cst] = next_id++;
+                    ins_types[n_types++] = consts_ids[n_cst];
+                    consts_val[n_cst] = v;
+                    ins_types[n_types++] = v;
+                    n_cst++;
+                }
+
+                /* module-scope PRIVATE 'Blk[N]' (the entry block only holds the
+                 * copies into it).  SPIRV-Cross localizes Private globals into
+                 * the entry function (localize_global_variables) and then
+                 * plumbs them into every helper that touches them
+                 * (extract_global_variables_from_functions — which SKIPS
+                 * Function-storage locals, so a Function local referenced
+                 * from a helper compiles to an undeclared identifier:
+                 * KHR PIQ program_input patch_in.block_array.* reads the
+                 * block from readInputs(), not main()).  Private storage
+                 * keeps the re-rooted chains legal SPIR-V from any function. */
+                {
+                    uint32_t pp = 0;
+
+                    for (size_t q = 5; q < n; )
+                    {
+                        uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                        if (wq == 0 || q + wq > n) break;
+                        if (oq == 32 && wq >= 4 && words[q + 2] == 6 /*Private*/ &&
+                            words[q + 3] == job->pointee)
+                        {
+                            pp = words[q + 1];
+                            break;
+                        }
+                        q += wq;
+                    }
+                    if (!pp)
+                    {
+                        pp = next_id++;
+                        if (n_types + 4 > sizeof ins_types / 4) return NULL;
+                        ins_types[n_types++] = (4u << 16) | 32;
+                        ins_types[n_types++] = pp;
+                        ins_types[n_types++] = 6 /*Private*/;
+                        ins_types[n_types++] = job->pointee;
+                    }
+                    job->local_var = next_id++;
+                    if (n_vars + 4 > sizeof ins_vars / 4) return NULL;
+                    ins_vars[n_vars++] = (4u << 16) | 59;   /* OpVariable */
+                    ins_vars[n_vars++] = pp;
+                    ins_vars[n_vars++] = job->local_var;
+                    ins_vars[n_vars++] = 6 /*Private*/;
+                }
+
+                for (uint32_t e = 0; e < job->n_elem; e++)
+                    for (uint32_t m = 0; m < job->n_members; m++)
+                    {
+                        uint32_t mt = job->member_type[m];
+                        uint32_t aptr = 0, loc;
+                        int cst_e = -1, cst_m = -1;
+
+                        for (int t = 0; t < n_cst; t++)
+                        {
+                            if (consts_val[t] == e) cst_e = t;
+                            if (consts_val[t] == m) cst_m = t;
+                        }
+                        /* ptr Input<memberType> for the per-element variable */
+                        for (size_t q = 5; q < n; )
+                        {
+                            uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                            if (wq == 0 || q + wq > n) break;
+                            if (oq == 32 && wq >= 4 && words[q + 2] == 1 /*Input*/ &&
+                                words[q + 3] == mt)
+                            {
+                                aptr = words[q + 1];
+                                break;
+                            }
+                            q += wq;
+                        }
+                        for (size_t q = 0; q + 4 <= n_types; q += 4)
+                            if ((ins_types[q] & 0xffff) == 32 && ins_types[q + 2] == 1 &&
+                                ins_types[q + 3] == mt)
+                            {
+                                aptr = ins_types[q + 1];
+                                break;
+                            }
+                        if (!aptr)
+                        {
+                            aptr = next_id++;
+                            if (n_types + 4 > sizeof ins_types / 4) return NULL;
+                            ins_types[n_types++] = (4u << 16) | 32;
+                            ins_types[n_types++] = aptr;
+                            ins_types[n_types++] = 1 /*Input*/;
+                            ins_types[n_types++] = mt;
+                        }
+                        /* ptr Input<memberType> was minted above (aptr); the
+                         * local's store chain types are minted by
+                         * tess_copy_walk with dst_sc (Private) storage */
+                        job->new_var2[e][m] = next_id++;
+                        if (n_vars + 4 > sizeof ins_vars / 4) return NULL;
+                        ins_vars[n_vars++] = (4u << 16) | 59;
+                        ins_vars[n_vars++] = aptr;
+                        ins_vars[n_vars++] = job->new_var2[e][m];
+                        ins_vars[n_vars++] = 1 /*Input*/;
+                        loc = job->member_loc[m] != 0xffffffffu
+                                  ? job->member_loc[m] + e * job->block_slots
+                                  : job->base_loc + e * job->block_slots + job->member_slot[m];
+                        if (n_deco + 7 > sizeof ins_deco / 4) return NULL;
+                        ins_deco[n_deco++] = (3u << 16) | 71;
+                        ins_deco[n_deco++] = job->new_var2[e][m];
+                        ins_deco[n_deco++] = SPV_DEC_PATCH;
+                        ins_deco[n_deco++] = (4u << 16) | 71;
+                        ins_deco[n_deco++] = job->new_var2[e][m];
+                        ins_deco[n_deco++] = 30 /*Location*/;
+                        ins_deco[n_deco++] = loc;
+                        {
+                            char full[192];
+
+                            snprintf(full, sizeof full, "mgl_ds_%s_%u", job->member_name[m], e);
+                            if (namebuf_n + 1 + strlen(full) / 4 + 1 > sizeof namebuf / 4)
+                                return NULL;
+                            namebuf_words(namebuf, &namebuf_n, job->new_var2[e][m], full);
+                        }
+                        /* entry copy: local[e][m] = var, one leaf at a time
+                         * (see struct TessCopyCtx above for why composites
+                         * cannot be stored or loaded whole here) */
+                        if (cst_e < 0 || cst_m < 0)
+                            return NULL;
+                        {
+                            struct TessCopyCtx cc;
+
+                            memset(&cc, 0, sizeof cc);
+                            cc.words = words;
+                            cc.n = n;
+                            cc.ins_types = ins_types;
+                            cc.n_types = &n_types;
+                            cc.cap_types = sizeof ins_types / 4;
+                            cc.ins_entry = ins_entry;
+                            cc.n_entry = &n_entry;
+                            cc.cap_entry = sizeof ins_entry / 4;
+                            cc.next_id = &next_id;
+                            cc.local_var = job->local_var;
+                            cc.src_var = job->new_var2[e][m];
+                            cc.dst_sc = 6 /*Private — matches the local's storage*/;
+                            cc.dst_n = 2;
+                            cc.dst_idx[0] = consts_ids[cst_e];
+                            cc.dst_idx[1] = consts_ids[cst_m];
+                            cc.src_n = 0;
+                            memcpy(cc.cst_id, consts_ids, sizeof consts_ids);
+                            memcpy(cc.cst_val, consts_val, sizeof consts_val);
+                            cc.n_cst = n_cst;
+                            if (tess_copy_walk(&cc, mt, 0))
+                                return NULL;
+                        }
+                    }
+                continue;
+            }
+
+            for (uint32_t m = 0; m < job->n_members; m++)
+            {
+                uint32_t at = job->member_type[m], aptr = 0;
+
+                /* array form: array<memberType,N> with the block array's length */
+                if (job->array_form)
+                {
+                    at = 0;
+                    for (size_t q = 5; q < n; )
+                    {
+                        uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                        if (wq == 0 || q + wq > n) break;
+                        if (oq == 28 && wq == 4 && words[q + 2] == job->member_type[m] &&
+                            words[q + 3] == job->len_id)
+                        {
+                            at = words[q + 1];
+                            break;
+                        }
+                        q += wq;
+                    }
+                    for (size_t q = 0; q + 4 <= n_types; q += 4)
+                        if ((ins_types[q] & 0xffff) == 28 && ins_types[q + 2] == job->member_type[m] &&
+                            ins_types[q + 3] == job->len_id)
+                        {
+                            at = ins_types[q + 1];
+                            break;
+                        }
+                    if (!at)
+                    {
+                        at = next_id++;
+                        if (n_types + 4 > sizeof ins_types / 4) return NULL;
+                        ins_types[n_types++] = (4u << 16) | 28;
+                        ins_types[n_types++] = at;
+                        ins_types[n_types++] = job->member_type[m];
+                        ins_types[n_types++] = job->len_id;
+                    }
+                }
+                for (size_t q = 5; q < n; )
+                {
+                    uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                    if (wq == 0 || q + wq > n) break;
+                    if (oq == 32 && wq >= 4 && words[q + 2] == job->storage &&
+                        words[q + 3] == at)
+                    {
+                        aptr = words[q + 1];
+                        break;
+                    }
+                    q += wq;
+                }
+                for (size_t q = 0; q + 4 <= n_types; q += 4)
+                    if ((ins_types[q] & 0xffff) == 32 && ins_types[q + 2] == job->storage &&
+                        ins_types[q + 3] == at)
+                    {
+                        aptr = ins_types[q + 1];
+                        break;
+                    }
+                if (!aptr)
+                {
+                    aptr = next_id++;
+                    if (n_types + 4 > sizeof ins_types / 4) return NULL;
+                    ins_types[n_types++] = (4u << 16) | 32;
+                    ins_types[n_types++] = aptr;
+                    ins_types[n_types++] = job->storage;
+                    ins_types[n_types++] = at;
+                }
+                job->new_var[m] = next_id++;
+                if (n_vars + 4 > sizeof ins_vars / 4) return NULL;
+                ins_vars[n_vars++] = (4u << 16) | 59;
+                ins_vars[n_vars++] = aptr;
+                ins_vars[n_vars++] = job->new_var[m];
+                ins_vars[n_vars++] = job->storage;
+                {
+                    uint32_t loc = job->member_loc[m] != 0xffffffffu
+                                       ? job->member_loc[m]
+                                       : job->base_loc + job->member_slot[m];
+
+                    if (n_deco + 7 > sizeof ins_deco / 4) return NULL;
+                    ins_deco[n_deco++] = (3u << 16) | 71;
+                    ins_deco[n_deco++] = job->new_var[m];
+                    ins_deco[n_deco++] = SPV_DEC_PATCH;
+                    ins_deco[n_deco++] = (4u << 16) | 71;
+                    ins_deco[n_deco++] = job->new_var[m];
+                    ins_deco[n_deco++] = 30 /*Location*/;
+                    ins_deco[n_deco++] = loc;
+                }
+                {
+                    char full[192];
+                    size_t need, w4;
+
+                    snprintf(full, sizeof full, "mgl_ds_%s", job->member_name[m]);
+                    need = strlen(full);
+                    w4 = need / 4 + 1;          /* keep in sync with namebuf_words */
+                    if (namebuf_n + 1 + w4 > sizeof namebuf / 4) return NULL;
+                    namebuf_words(namebuf, &namebuf_n, job->new_var[m], full);
+                }
+            }
+        }
+
+        /* TES chains re-rooted at the entry-copied local keep their result
+         * type, whose storage class must follow the BASE (Private, not
+         * Input).  Mint a Private counterpart for every rewritten chain's
+         * Input pointer type up front — the rebuild looks the mapping up by
+         * the old id (ins_types is emitted at the first OpFunction, before
+         * any rewritten chain, so the new types dominate their uses). */
+        {
+            uint32_t rt_map_from[64], rt_map_to[64];
+            int n_rt_map = 0;
+
+            for (int j = 0; j < n_jobs; j++)
+            {
+                if (!jobs[j].is_tes)
+                    continue;
+                for (size_t i = 5; i < n; )
+                {
+                    uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+                    int known = 0;
+
+                    if (wc == 0 || i + wc > n) break;
+                    if ((op == 65 || op == 70) && wc >= 4 && words[i + 3] == jobs[j].var)
+                    {
+                        uint32_t rt = words[i + 1];
+
+                        for (int t = 0; t < n_rt_map; t++)
+                            if (rt_map_from[t] == rt) known = 1;
+                        if (!known && n_rt_map < 64)
+                        {
+                            uint32_t pointee = 0, nt;
+
+                            for (size_t q = 5; q < n; )
+                            {
+                                uint32_t wq = words[q] >> 16, oq = words[q] & 0xffff;
+
+                                if (wq == 0 || q + wq > n) break;
+                                if (oq == 32 && wq >= 4 && words[q + 1] == rt)
+                                {
+                                    pointee = words[q + 3];
+                                    break;
+                                }
+                                q += wq;
+                            }
+                            nt = pointee ? spv_lower_ptr_type(words, n, ins_types, &n_types,
+                                                             sizeof ins_types / 4, &next_id,
+                                                             6 /*Private*/, pointee) : 0;
+                            if (nt)
+                            {
+                                rt_map_from[n_rt_map] = rt;
+                                rt_map_to[n_rt_map] = nt;
+                                n_rt_map++;
+                            }
+                        }
+                    }
+                    i += wc;
+                }
+            }
+            memcpy(job_rt_from, rt_map_from, sizeof rt_map_from);
+            memcpy(job_rt_to, rt_map_to, sizeof rt_map_to);
+            job_rt_n = n_rt_map;
+        }
+
+        /* 4) rebuild: names go into the DEBUG section (after the last existing
+         *    OpName/OpMemberName), decorations into the ANNOTATION section
+         *    (after the last existing OpDecorate/OpMemberDecorate), types+vars
+         *    before the first function, chains rewritten (member dropped for
+         *    the TCS per-member form; re-rooted to the entry-copied local for
+         *    the TES per-element form), and the entry copy right after the
+         *    entry block's OpLabel */
+        {
+            size_t first_fn = 0, last_name = 0, last_deco = 0, last_hdr = 0;
+            size_t name_at, deco_at, o = 0;
+            size_t entry_fn = 0, entry_fn_at = 0;
+            size_t first_label = 0;    /* entry block of the ENTRY-POINT function */
+            int want_entry = 0;
+
+            for (int j = 0; j < n_jobs; j++)
+                want_entry |= jobs[j].is_tes;
+
+            for (size_t i = 5; i < n; )
+            {
+                uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+                if (wc == 0 || i + wc > n) break;
+                if (op == 15 /*OpEntryPoint*/ && wc >= 4 && !entry_fn)
+                    entry_fn = words[i + 2];      /* id of the entry function */
+                if (op == 54 && !first_fn) first_fn = i;
+                if (op == 54 && wc >= 4 && words[i + 2] == entry_fn && entry_fn)
+                    entry_fn_at = i;              /* the entry point's OpFunction */
+                if (want_entry && entry_fn_at && !first_label && op == 248 /*OpLabel*/)
+                    first_label = i;
+                if (!first_fn)
+                {
+                    if (op == 5 || op == 6)          /* OpName / OpMemberName */
+                        last_name = i + wc;
+                    if (op == 71 || op == 72)        /* OpDecorate / OpMemberDecorate */
+                        last_deco = i + wc;
+                    if (op == 14 || op == 15 || op == 16)  /* header block */
+                        last_hdr = i + wc;
+                }
+                i += wc;
+            }
+            name_at = last_name ? last_name : (last_hdr ? last_hdr : 5);
+            deco_at = last_deco ? last_deco : name_at;
+            if (!first_fn || (want_entry && !first_label) || deco_at < name_at)
+                return NULL;
+            /* the entry copy goes after the entry block's OpVariable run —
+             * function OpVariables must stay the first instructions of the
+             * first block (SPIR-V §2.6) */
+            if (want_entry)
+            {
+                size_t k = first_label + (words[first_label] >> 16);
+
+                while (k < n && (words[k] & 0xffff) == 59 /*OpVariable*/)
+                    k += words[k] >> 16;
+                first_label = k;      /* insertion point (kept in first_label) */
+            }
+
+            out = (uint32_t *)malloc((n + namebuf_n + n_deco + n_types + n_vars +
+                                      n_entry + 8 * 32 * 32 + 64) * 4);
+            if (!out)
+                return NULL;
+            memcpy(out + o, words, 5 * 4);      /* module header */
+            o = 5;
+            for (size_t i = 5; i < name_at; )
+            {
+                uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+                if (wc == 0 || i + wc > name_at) break;
+                if (op == 5 /*OpName*/ && wc >= 3)
+                {
+                    int dead = 0;
+
+                    for (int j = 0; j < n_jobs; j++)
+                        if (words[i + 1] == jobs[j].var) dead = 1;
+                    if (dead)
+                    {
+                        i += wc;
+                        continue;
+                    }
+                }
+                if (op == 15 /*OpEntryPoint*/ && wc >= 4)
+                    o += spv_rewrite_entry_point(words, i, jobs, n_jobs, out + o);
+                else
+                {
+                    memcpy(out + o, words + i, wc * 4);
+                    o += wc;
+                }
+                i += wc;
+            }
+            memcpy(out + o, namebuf, namebuf_n * 4);
+            o += namebuf_n;
+            /* between the debug and annotation anchors: drop decorations that
+             * target the stripped block variables (a dangling OpDecorate on an
+             * undefined id is invalid SPIR-V) */
+            for (size_t i = name_at; i < deco_at; )
+            {
+                uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+                if (wc == 0 || i + wc > deco_at) break;
+                if ((op == 71 || op == 72 || op == 5 || op == 6) && wc >= 3)
+                {
+                    int dead = 0;
+
+                    for (int j = 0; j < n_jobs; j++)
+                        if (words[i + 1] == jobs[j].var) dead = 1;
+                    if (dead)
+                    {
+                        i += wc;
+                        continue;
+                    }
+                }
+                memcpy(out + o, words + i, wc * 4);
+                o += wc;
+                i += wc;
+            }
+            memcpy(out + o, ins_deco, n_deco * 4);
+            o += n_deco;
+            for (size_t i = deco_at; i < n; )
+            {
+                uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+                int rwj = -1, rw_tes = 0;
+                int64_t m = -1;
+
+                if (wc == 0 || i + wc > n) break;
+                for (int j = 0; j < n_jobs; j++)
+                    if (words[i + 3] == jobs[j].var && (op == 65 || op == 70))
+                    {
+                        if (jobs[j].is_tes)
+                        {
+                            /* any chain re-roots to the local with ALL its
+                             * indices preserved */
+                            if (wc >= 4)
+                            {
+                                rwj = j;
+                                rw_tes = 1;
+                            }
+                            break;
+                        }
+                        if (wc >= (uint32_t)(jobs[j].array_form ? 6 : 5))
+                        {
+                            rwj = j;
+                            m = spv_dis_const(words, n, words[i + (jobs[j].array_form ? 5 : 4)]);
+                            break;
+                        }
+                    }
+                if ((op == 71 /*OpDecorate*/ || op == 5 /*OpName*/) && wc >= 3)
+                {
+                    /* decorations/names of the stripped variable would dangle */
+                    int dead = 0;
+
+                    for (int j = 0; j < n_jobs; j++)
+                        if (words[i + 1] == jobs[j].var) dead = 1;
+                    if (dead)
+                    {
+                        i += wc;
+                        continue;
+                    }
+                }
+                if (op == 59 /*OpVariable*/ && wc >= 4)
+                {
+                    /* the dissolved block variable itself is DEAD: every use was
+                     * rewritten to a member variable.  SPIRV-Cross force-emits
+                     * Output variables regardless of the entry point's interface
+                     * list, so an unstripped declaration would come back as an
+                     * arrays-of-arrays struct member alongside the replacement
+                     * (and duplicate the canonical record). */
+                    int dead = 0;
+
+                    for (int j = 0; j < n_jobs; j++)
+                        if (words[i + 2] == jobs[j].var) dead = 1;
+                    if (dead)
+                    {
+                        i += wc;
+                        continue;
+                    }
+                }
+                if (op == 54 && first_fn == i)
+                {
+                    memcpy(out + o, ins_types, n_types * 4);
+                    o += n_types;
+                    memcpy(out + o, ins_vars, n_vars * 4);
+                    o += n_vars;
+                }
+                if (op == 15 /*OpEntryPoint*/ && wc >= 4)
+                {
+                    o += spv_rewrite_entry_point(words, i, jobs, n_jobs, out + o);
+                    i += wc;
+                    continue;
+                }
+                if (want_entry && first_label == i)
+                {
+                    memcpy(out + o, ins_entry, n_entry * 4);
+                    o += n_entry;
+                }
+                if (rwj >= 0 && rw_tes)
+                {
+                    memcpy(out + o, words + i, wc * 4);
+                    out[o + 3] = jobs[rwj].local_var;   /* re-root at the local */
+                    /* the chain's result type must follow the base's storage
+                     * class (Private): swap in the minted counterpart */
+                    for (int t = 0; t < job_rt_n; t++)
+                        if (job_rt_from[t] == words[i + 1])
+                        {
+                            out[o + 1] = job_rt_to[t];
+                            break;
+                        }
+                    o += wc;
+                    i += wc;
+                    continue;
+                }
+                if (rwj >= 0 && m >= 0 && (uint32_t)m < jobs[rwj].n_members)
+                {
+                    uint32_t drop = jobs[rwj].array_form ? 5 : 4;   /* the member index */
+
+                    out[o++] = ((wc - 1) << 16) | op;
+                    out[o++] = words[i + 1];
+                    out[o++] = words[i + 2];
+                    out[o++] = jobs[rwj].new_var[m];
+                    for (uint32_t q = 4; q < wc; q++)
+                        if (q != drop)
+                            out[o++] = words[i + q];
+                    i += wc;
+                    continue;
+                }
+                memcpy(out + o, words + i, wc * 4);
+                o += wc;
+                i += wc;
+            }
+            out[3] = next_id;
+            *out_n = o;
+            return out;
+        }
+    }
+}
+
+
+/* does this module contain a chain rooted at a per-vertex BLOCK variable that
+ * ENDS at a direct member with a dynamic control-point index?  (SPIRV-Cross
+ * asserts on those — "emit_tessellation_access_chain: index != -1" — when the
+ * block also has composite members: the block's member-index map is polluted
+ * by the flattened composites.  The dissolve normally rewrites these chains
+ * away; if it did not run, compiling the module can abort the process.) */
+bool mgl_tess_module_has_block_leafmember_chains(const uint32_t *words, size_t n)
+{
+    struct SpvLowerCtx c;
+
+    if (!spv_lower_setup(&c, words, n))
+        return false;
+
+    for (uint32_t k = 0; k < c.ninst; k++)
+    {
+        uint32_t off, wc, base, idx[8], nidx = 0;
+        int var, q;
+        uint32_t t;
+        bool member_depth = false;
+
+        if (c.op[k] != SPV_OP_ACCESSCHAIN && c.op[k] != SPV_OP_INBOUNDSAC)
+            continue;
+        off = c.off[k];
+        wc = c.wc[k];
+        if (wc < 6)
+            continue;
+        base = c.w[off + 3];
+        var = spv_lower_find(&c, base);
+        if (var < 0 || c.op[var] != SPV_OP_VARIABLE || c.w[c.off[var] + 3] != SPV_SC_INPUT)
+            continue;
+        if (spv_lower_var_is_patch(&c, base))
+            continue;
+        t = spv_lower_pointee(&c, c.w[c.off[var] + 1]);
+        if (spv_lower_type_kind(&c, t) != SPV_T_ARRAY)
+            continue;
+        t = spv_lower_elem_type(&c, t, 0);
+        if (spv_lower_type_kind(&c, t) != SPV_T_STRUCT)
+            continue;
+        {
+            bool is_block = false;
+
+            for (uint32_t d = 0; d < c.ninst; d++)
+                if (c.op[d] == 71 /*OpDecorate*/ && c.wc[d] >= 3 &&
+                    c.w[c.off[d] + 1] == t && c.w[c.off[d] + 2] == 2 /*Block*/)
+                {
+                    is_block = true;
+                    break;
+                }
+            if (!is_block)
+                continue;
+        }
+        /* needs a Location (a user block; gl_PerVertex chains are fine) */
+        {
+            bool loc = false;
+
+            for (uint32_t d = 0; d < c.ninst; d++)
+                if (c.op[d] == 71 /*OpDecorate*/ && c.wc[d] >= 4 &&
+                    c.w[c.off[d] + 1] == base && c.w[c.off[d] + 2] == 30 /*Location*/)
+                {
+                    loc = true;
+                    break;
+                }
+            if (!loc)
+                continue;
+        }
+        for (q = 4; q < (int)wc && nidx < 8; q++)
+            idx[nidx++] = c.w[off + q];
+        /* dynamic control point + the chain ends at a member: the risky shape */
+        if (spv_lower_const(&c, idx[0]) >= 0)
+            continue;
+        for (q = 1; q < (int)nidx; q++)
+        {
+            int kind = spv_lower_type_kind(&c, t);
+
+            if (kind == SPV_T_STRUCT)
+            {
+                int64_t lit = spv_lower_const(&c, idx[q]);
+
+                if (lit < 0)
+                    break;
+                t = spv_lower_elem_type(&c, t, (uint32_t)lit);
+                member_depth = true;
+            }
+            else if (kind == SPV_T_ARRAY || kind == SPV_T_MATRIX)
+            {
+                if (member_depth && spv_lower_const(&c, idx[q]) < 0)
+                    break;              /* dynamic member-array index: throws cleanly */
+                t = spv_lower_elem_type(&c, t, 0);
+                member_depth = true;
+            }
+            else
+                break;
+            if (q + 1 == (int)nidx)
+                return true;            /* ends at a member of the block */
+        }
+    }
+    return false;
+}
+
+uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n,
+                                    const struct SpvDissolveMap *maps, uint32_t n_maps)
 {
     struct SpvLowerCtx c;
     struct SpvLowerSite sites[64];
-    uint32_t n_sites = 0, next_id;
+    struct SpvLowerLeaf leaf_tab[SPV_LOWER_MAX_LEAVES];
+    uint32_t n_leaves = 0, n_sites = 0, next_id;
     struct SpvNewType new_types[192];
     uint32_t n_new_types = 0;
     struct SpvNewConst new_consts[256];
@@ -563,6 +2131,67 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
             sites[s].inst = 0xffffffff;
             continue;
         }
+        /* struct- or array-typed elements cannot be copied with one whole
+         * element load (a struct load from a flattened stage-in aborts
+         * SPIRV-Cross: "Cannot resolve expression type") — copy leaf by leaf
+         * instead, one constant-indexed load per leaf (dEQP
+         * user_defined_io.per_vertex_block.*, per_patch_block_array.*) */
+        {
+            uint32_t arr_elem = spv_lower_elem_type(&c, sites[s].arr_type, 0);
+            int ek = spv_lower_type_kind(&c, arr_elem);
+            if (ek == SPV_T_STRUCT || ek == SPV_T_ARRAY || sites[s].dmap)
+            {
+                uint32_t path[6];
+                sites[s].leaf_mode = 1;
+                sites[s].leaf_off = n_leaves;
+                sites[s].leaf_n = spv_lower_leaves(&c, arr_elem, path, 0,
+                                                   leaf_tab + n_leaves,
+                                                   SPV_LOWER_MAX_LEAVES - n_leaves);
+                n_leaves += sites[s].leaf_n;
+                if (!sites[s].leaf_n || n_leaves > SPV_LOWER_MAX_LEAVES)
+                {
+                    sites[s].inst = 0xffffffff;
+                    continue;
+                }
+            }
+        }
+        /* a site rooted at a DISSOLVED block's original variable: the chain
+         * member index (words[off+5]) names the member; if that member was
+         * dissolved per-(element,field), the leaf copies must read the
+         * dissolved variables, not the block (the block's attribute span
+         * would collide with the dissolved variables') */
+        if (maps && n_maps)
+        {
+            uint32_t base = c.w[off + 3];
+            int is_block_var = 0;
+
+            for (uint32_t q = 0; q < n_maps; q++)
+                if (maps[q].var == base)
+                {
+                    is_block_var = 1;
+                    break;
+                }
+            if (is_block_var)
+            {
+                int64_t mval = (sites[s].k > 5) ? spv_lower_const(&c, c.w[off + 5]) : -1;
+
+                for (uint32_t q = 0; q < n_maps; q++)
+                    if (maps[q].var == base && maps[q].member == (uint32_t)mval &&
+                        (maps[q].elems || maps[q].var0))
+                    {
+                        sites[s].dmap = (uint8_t)(q + 1);
+                        break;
+                    }
+                if (!sites[s].dmap)
+                {
+                    /* the member was not leaf-dissolved: keeping the chain
+                     * rooted at the block risks the attribute collision */
+                    sites[s].inst = 0xffffffff;
+                    continue;
+                }
+            }
+        }
+
         /* the index type: from an index operand of the chain — this chain's
          * own first index (k > 4) or, for split chains whose first operand
          * already IS the dynamic index, the inner chain's.  A CONSTANT gives
@@ -592,29 +2221,23 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
         }
     }
 
-    /* guard 1 — ARRAY-field sites: the copy loop lowers a site by emitting one
-     * access chain PER ARRAY ELEMENT that descends into the field with a
-     * constant index.  For MATRIX fields that is fine (Metal stage-in structs
-     * allow matrix members and column indexing), but ARRAY fields cannot map to
-     * tessellation stage-in attributes at all: SPIRV-Cross leaves the member
-     * without an interface member index and asserts in
-     * emit_tessellation_access_chain (process abort, kills cts-runner) instead
-     * of reporting a compile error.  Decline such modules: MGL compiles the
-     * original SPIR-V, which SPIRV-Cross rejects cleanly ("Trying to
-     * dynamically index into an array interface variable in tessellation"),
-     * so the link fails normally.  (dEQP-GL45-ES31
-     * user_defined_io.per_vertex_block.vertex_io_array_size_implicit.*) */
+    /* guard 1 — ARRAY-field sites used to be declined wholesale.  The copy
+     * chains descend into the field with CONSTANT indices, which SPIRV-Cross
+     * resolves into the flattened attribute leaves; the historic failures
+     * came from struct-typed elements (whole-element loads, now copied
+     * leaf-by-leaf) and per-PATCH arrays mis-read as control-point arrays
+     * (now sites of their own).  MGL_TESS_ARRAY_DECLINE restores the old
+     * behaviour for A/B-testing. */
     for (uint32_t s = 0; s < n_sites; s++)
     {
         if (sites[s].inst == 0xffffffff)
             continue;
-        if (spv_lower_type_kind(&c, sites[s].arr_type) == SPV_T_ARRAY)
+        if (spv_lower_type_kind(&c, sites[s].arr_type) == SPV_T_ARRAY &&
+            getenv("MGL_TESS_ARRAY_DECLINE"))
         {
             if (getenv("MGL_TESS_DEBUG"))
-                fprintf(stderr, "MGL tess lower: array-field site %s (MGL_TESS_ARRAY_LOWER=1 lowers it)\n",
-                        getenv("MGL_TESS_ARRAY_LOWER") ? "accepted" : "declined");
-            if (!getenv("MGL_TESS_ARRAY_LOWER"))
-                return NULL;
+                fprintf(stderr, "MGL tess lower: array-field site declined (MGL_TESS_ARRAY_DECLINE)\n");
+            return NULL;
         }
     }
 
@@ -675,6 +2298,13 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
         (void)spv_lower_type_alloc(new_types, &n_new_types, 192, &next_id, SPV_SC_FUNCTION, arr_elem);
         (void)spv_lower_type_alloc(new_types, &n_new_types, 192, &next_id, SPV_SC_FUNCTION, sites[s].arr_type);
         (void)spv_lower_type_alloc(new_types, &n_new_types, 192, &next_id, SPV_SC_FUNCTION, sites[s].elem_type);
+        if (sites[s].leaf_mode)
+            for (uint32_t q = 0; q < sites[s].leaf_n; q++)
+            {
+                uint32_t lt = leaf_tab[sites[s].leaf_off + q].type;
+                (void)spv_lower_type_alloc(new_types, &n_new_types, 192, &next_id, SPV_SC_INPUT, lt);
+                (void)spv_lower_type_alloc(new_types, &n_new_types, 192, &next_id, SPV_SC_FUNCTION, lt);
+            }
     }
     /* drop sites whose pointer types could not be provided */
     for (uint32_t s = 0; s < n_sites; s++)
@@ -686,6 +2316,17 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
             !spv_lower_ptr_of(&c, new_types, n_new_types, SPV_SC_FUNCTION, sites[s].arr_type) ||
             !spv_lower_ptr_of(&c, new_types, n_new_types, SPV_SC_FUNCTION, sites[s].elem_type))
             sites[s].inst = 0xffffffff;
+        if (sites[s].leaf_mode && sites[s].inst != 0xffffffff)
+            for (uint32_t q = 0; q < sites[s].leaf_n; q++)
+            {
+                uint32_t lt = leaf_tab[sites[s].leaf_off + q].type;
+                if (!spv_lower_ptr_of(&c, new_types, n_new_types, SPV_SC_INPUT, lt) ||
+                    !spv_lower_ptr_of(&c, new_types, n_new_types, SPV_SC_FUNCTION, lt))
+                {
+                    sites[s].inst = 0xffffffff;
+                    break;
+                }
+            }
     }
 
     /* helper to resolve a (storage, pointee) pointer type from the module or
@@ -700,7 +2341,9 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
     for (uint32_t s = 0; s < n_sites; s++)
     {
         if (sites[s].inst == 0xffffffff) continue;
-        bound += 2u * spv_lower_composite_len(&c, sites[s].arr_type);
+        bound += sites[s].leaf_mode
+                     ? 3u * spv_lower_composite_len(&c, sites[s].arr_type) * sites[s].leaf_n
+                     : 3u * spv_lower_composite_len(&c, sites[s].arr_type);
     }
 
     out = (uint32_t *)malloc(out_cap * sizeof(uint32_t));
@@ -782,7 +2425,118 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
             uint32_t ptr_chain = SPV_PTR_OF(SPV_SC_FUNCTION, st->elem_type);
             bool ok = ptr_in && ptr_fn_e && ptr_chain && arr_elem && len;
 
-            for (uint32_t e = 0; ok && e < len; e++)
+            if (st->leaf_mode)
+            {
+                const struct SpvDissolveMap *dm =
+                    st->dmap ? &maps[st->dmap - 1] : NULL;
+
+                /* leaf-by-leaf element copy: one constant-indexed load per
+                 * leaf, stored into the function-local array.  Both sides
+                 * descend with CONSTANT indices only, which SPIRV-Cross
+                 * resolves into the flattened attribute leaves; the ORIGINAL
+                 * dynamic index stays on the chain, re-rooted at the copy.
+                 * A dissolved site reads the DISSOLVED per-(element,field)
+                 * variables (base + [cp] + the leaf path below the field). */
+                for (uint32_t e = 0; ok && e < len; e++)
+                {
+                    uint32_t ce = spv_lower_const_id(&c, idx_type, e, new_consts, n_new_consts);
+                    if (!ce) { ok = false; break; }
+                    for (uint32_t q = 0; q < st->leaf_n; q++)
+                    {
+                        const struct SpvLowerLeaf *lf = &leaf_tab[st->leaf_off + q];
+                        uint32_t lt = lf->type;
+                        uint32_t ptr_in_lf = SPV_PTR_OF(SPV_SC_INPUT, lt);
+                        uint32_t ptr_fn_lf = SPV_PTR_OF(SPV_SC_FUNCTION, lt);
+                        uint32_t aptr = next_id++, lval = next_id++, sptr = next_id++;
+                        uint32_t lidx[6];
+                        uint32_t srcvar = 0;
+
+                        for (uint32_t p = 0; p < lf->depth; p++)
+                        {
+                            lidx[p] = spv_lower_const_id(&c, idx_type, lf->idx[p],
+                                                         new_consts, n_new_consts);
+                            if (!lidx[p]) { ok = false; break; }
+                        }
+                        if (!ok) break;
+                        if (dm)
+                        {
+                            /* leaf-dissolved member: field = the leaf path's
+                             * first index (depth 0: the single field of a
+                             * plain array member); whole-member member: the
+                             * element index stays an operand */
+                            uint32_t f = lf->depth ? lf->idx[0] : 0;
+
+                            if (dm->elems &&
+                                (f >= dm->fields || e * dm->fields + f >= 96))
+                            {
+                                ok = false;
+                                break;
+                            }
+                            srcvar = dm->elems ? dm->leaf[e * dm->fields + f] : dm->var0;
+                        }
+
+                        /* %aptr = AccessChain ptrIn_leaf <src base> ... */
+                        LOW_PUSH(((dm ? (dm->elems ? (4u + (lf->depth ? lf->depth : 1u))
+                                                   : (6u + lf->depth))
+                                      : (st->k + 1u + st->prefix_n + lf->depth)) << 16) |
+                                 SPV_OP_ACCESSCHAIN);
+                        LOW_PUSH(ptr_in_lf);
+                        LOW_PUSH(aptr);
+                        if (st->root)
+                        {
+                            LOW_PUSH(st->root);
+                            for (uint32_t p = 0; p < st->prefix_n; p++)
+                                LOW_PUSH(st->prefix[p]);
+                        }
+                        else if (!dm)
+                            LOW_PUSH(c.w[off + 3]);
+                        if (dm)
+                        {
+                            /* the dissolved variable already carries the
+                             * member (and, for leaf vars, the element) */
+                            LOW_PUSH(srcvar);
+                            LOW_PUSH(c.w[off + 4]);            /* control point */
+                            if (dm->elems)
+                            {
+                                for (uint32_t p = 1; p < lf->depth; p++)
+                                    LOW_PUSH(lidx[p]);
+                            }
+                            else
+                            {
+                                LOW_PUSH(ce);
+                                for (uint32_t p = 0; p < lf->depth; p++)
+                                    LOW_PUSH(lidx[p]);
+                            }
+                        }
+                        else
+                        {
+                            for (uint32_t p = 4; p < st->k; p++)
+                                LOW_PUSH(c.w[off + p]);
+                            LOW_PUSH(ce);
+                            for (uint32_t p = 0; p < lf->depth; p++)
+                                LOW_PUSH(lidx[p]);
+                        }
+
+                        LOW_PUSH((4u << 16) | SPV_OP_LOAD);
+                        LOW_PUSH(lt);
+                        LOW_PUSH(lval);
+                        LOW_PUSH(aptr);
+
+                        /* %sptr = AccessChain ptrFn_leaf %fvar e leaf */
+                        LOW_PUSH(((5u + lf->depth) << 16) | SPV_OP_ACCESSCHAIN);
+                        LOW_PUSH(ptr_fn_lf);
+                        LOW_PUSH(sptr);
+                        LOW_PUSH(fvar[s]);
+                        LOW_PUSH(ce);
+                        for (uint32_t p = 0; p < lf->depth; p++)
+                            LOW_PUSH(lidx[p]);
+                        LOW_PUSH((3u << 16) | SPV_OP_STORE);
+                        LOW_PUSH(sptr);
+                        LOW_PUSH(lval);
+                    }
+                }
+            }
+            else for (uint32_t e = 0; ok && e < len; e++)
             {
                 /* a constant with value e (module or fresh) */
                 uint32_t ce = 0;
@@ -800,6 +2554,7 @@ uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out
                  * than once") whenever a module carried several such sites */
                 arrptr[s] = next_id++;
                 loaded[s] = next_id++;
+                elemc[s] = next_id++;
 
                 /* %eptr = AccessChain ptrIn_elem %base <prefix> %e
                  * words: hdr, rtype, result, base, [4, k) indices (+ split-chain
@@ -1101,13 +2856,38 @@ uint32_t *mgl_spirv_lower_draw_index(const uint32_t *words, size_t n, size_t *ou
 /* the shared MSL preparation: every module handed to SPIRV-Cross's MSL
  * backend (program.c compile_stage, introspect_spirv.c msl_accepts) runs
  * through this so the acceptance gate and the real compile agree.  Returns a
- * fresh malloc'd module with both lowerings applied, or NULL when neither
+ * fresh malloc'd module with the lowerings applied, or NULL when none
  * fired (the caller's module is unchanged). */
 uint32_t *mgl_spirv_prepare_for_msl(const uint32_t *words, size_t n, size_t *n_out)
 {
     uint32_t *mid = mgl_spirv_lower_subgroup_vote(words, n, n_out);
     const uint32_t *cur = mid ? mid : words;
     size_t cn = mid ? *n_out : n;
+
+    /* arrays of per-patch interface blocks ("patch out Blk b[2]"): Vulkan
+     * (and SPIRV-Cross's tessellation access chains) do not have them — the
+     * Patch-decorated BLOCK variable's member-index map is broken and the
+     * TCS compile dies with "Bad cast".  Dissolve into one plain patch ARRAY
+     * variable per block member FIRST (plain patch variables are legal and
+     * buffer/attribute-backed on both sides).  Fires only in tessellation
+     * stages (the Patch decoration exists nowhere else). */
+    {
+        size_t pn = 0;
+        uint32_t *pd = mgl_tess_dissolve_patch_block_arrays(cur, cn, &pn);
+
+        if (getenv("MGL_TESS_DEBUG"))
+            fprintf(stderr, "MGL tess prepare_for_msl: patch-block-array dissolve -> %s (%zu words)\n",
+                    pd ? "ok" : "declined", pd ? pn : 0);
+        if (pd)
+        {
+            if (mid)
+                free(mid);
+            mid = pd;
+            cur = mid;
+            cn = pn;
+        }
+    }
+
     uint32_t *out = mgl_spirv_lower_draw_index(cur, cn, n_out);
     if (!out)
         *n_out = cn;                    /* the pass clears n_out on a miss */
@@ -1156,8 +2936,9 @@ static int spv_dis_kind(const uint32_t *words, size_t n, uint32_t type)
     return SPV_T_OTHER;
 }
 
-/* value of an int OpConstant id (0xffffffff when not a 32-bit constant) */
-static uint32_t spv_dis_const(const uint32_t *words, size_t n, uint32_t id)
+/* value of an int OpConstant id (-1 when not a 32-bit constant; callers that
+ * store it into a uint32_t still see the 0xffffffffu sentinel) */
+static int64_t spv_dis_const(const uint32_t *words, size_t n, uint32_t id)
 {
     for (size_t k = 5; k < n; )
     {
@@ -1168,7 +2949,7 @@ static uint32_t spv_dis_const(const uint32_t *words, size_t n, uint32_t id)
             return words[k + 3];
         k += wc;
     }
-    return 0xffffffffu;
+    return -1;
 }
 
 /* the OpName string of an id ("" when unnamed) */
@@ -1334,17 +3115,24 @@ struct DissolveJob
     uint32_t leaf_fields[64];   /* field count of the element struct */
 };
 
-uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n)
+uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n,
+                                                struct SpvDissolveMap *maps, uint32_t max_maps,
+                                                uint32_t *n_maps_out, int *partial_out)
 {
     struct DissolveJob jobs[8];
     int n_jobs = 0;
     uint32_t next_id;
     uint32_t *work = NULL;
     size_t i;
+    uint32_t n_maps_local = 0;
     uint32_t names_out[8192], deco_out[4096], type_out[4096], var_out[8 * 64 * 5];
     size_t n_names = 0, n_deco = 0, n_type = 0, n_var = 0;
 
     *out_n = 0;
+    if (n_maps_out)
+        *n_maps_out = 0;
+    if (partial_out)
+        *partial_out = 0;
     if (!words || n < 8)
         return NULL;
     next_id = words[3];
@@ -1377,6 +3165,27 @@ uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n,
             {
                 uint32_t ptr = words[i + 1], vid = words[i + 2];
                 uint32_t pointee = 0, elem = 0, len_id = 0, block = 0;
+                int is_patch = 0;
+
+                /* per-PATCH arrays ('patch in Blk b[2]') are NOT per-vertex
+                 * blocks: leave them alone (the dynamic-IO lower handles a
+                 * dynamic patch-array index).  glslang decorates per-patch
+                 * interface BLOCKS on the members (OpMemberDecorate <type> m
+                 * Patch), not on the variable, so the variable-level scan
+                 * alone misses 'patch in TheBlock {...} b[2]' and the block
+                 * would dissolve as PER-VERTEX — its member variables would
+                 * collide with the per-patch ones the patch-block-array
+                 * dissolve creates later (tess_spv_lower.c) */
+                for (size_t k = 5; k < n && !is_patch; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 71 /*OpDecorate*/ && wc2 >= 3 &&
+                        words[k + 1] == vid && words[k + 2] == SPV_DEC_PATCH)
+                        is_patch = 1;
+                    k += wc2;
+                }
 
                 for (size_t k = 5; k < n; )
                 {
@@ -1409,6 +3218,15 @@ uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n,
                     }
                 for (int b = 0; b < n_blocks; b++)
                     if (elem && elem == blocks[b]) { block = elem; break; }
+                /* member-level Patch on the block type (glslang's form):
+                 * a per-patch block array — skip it here */
+                if (!is_patch && block && spv_patch_block_type(words, n, block))
+                    is_patch = 1;
+                if (is_patch)
+                {
+                    i += wc;
+                    continue;
+                }
                 if (block)
                 {
                     struct DissolveJob *job = &jobs[n_jobs];
@@ -1912,6 +3730,27 @@ leaf_fallback:
     /* 5) plan the chain rewrites (applied while emitting: the member index
      *    is dropped, so each rewritten instruction is ONE word shorter) */
     {
+        /* export the member -> dissolved-variable map for the dynamic-IO
+         * lower (leaf members: one variable per element/field) */
+        for (int j = 0; j < n_jobs && maps && n_maps_local < max_maps; j++)
+            for (int m = 0; m < (int)jobs[j].n_members &&
+                            n_maps_local < max_maps; m++)
+            {
+                struct SpvDissolveMap *e = &maps[n_maps_local];
+
+                e->var = jobs[j].var;
+                e->member = (uint32_t)m;
+                e->elems = jobs[j].leaf_elems[m];
+                e->fields = jobs[j].leaf_fields[m];
+                e->var0 = jobs[j].new_var[m];
+                if (e->elems && e->fields && e->elems * e->fields <= 96)
+                    for (uint32_t q = 0; q < e->elems * e->fields; q++)
+                        e->leaf[q] = jobs[j].leaf_var[m][q];
+                n_maps_local++;
+            }
+        if (n_maps_out)
+            *n_maps_out = n_maps_local;
+
         uint32_t rw_off[512], rw_type[512], rw_base[512];
         uint8_t rw_drop2[512];      /* leaf rewrite: drop elem+field indices too */
         int n_rw = 0;
@@ -1929,10 +3768,12 @@ leaf_fallback:
                         uint32_t mval = spv_dis_const(words, n, words[i + 5]);
                         int found_m = -1;
 
+#define DISSOLVE_PARTIAL() do { if (partial_out) *partial_out = 1; goto next_chain; } while (0)
+
                         if (mval != 0xffffffffu && mval < jobs[j].n_members)
                             found_m = (int)mval;
                         if (found_m < 0)
-                            goto bail;
+                            DISSOLVE_PARTIAL();  /* dynamic member index: leave for the lower */
                         if (wc == 6)
                         {
                             /* stops AT the member: fine for everything that
@@ -1961,7 +3802,7 @@ leaf_fallback:
                                     goto unsafe_exit;      /* whole struct element: SPIRV-Cross aborts */
                                 if (e >= jobs[j].leaf_elems[found_m] ||
                                     f >= jobs[j].leaf_fields[found_m])
-                                    goto bail;              /* dynamic index: clean reject */
+                                    DISSOLVE_PARTIAL();       /* dynamic index: the lower copies it */
                                 /* first interior step must land on the struct */
                                 {
                                     uint32_t elem_t = 0;
@@ -1980,7 +3821,7 @@ leaf_fallback:
                                         k += wc2;
                                     }
                                     if (!elem_t || spv_dis_kind(words, n, elem_t) != SPV_T_STRUCT)
-                                        goto bail;
+                                        DISSOLVE_PARTIAL();       /* unusable interior: leave for the lower */
                                 }
                                 lv_elem = e;
                                 lv_field = f;
@@ -1990,7 +3831,7 @@ leaf_fallback:
                                 {
                                     uint32_t cval = spv_dis_const(words, n, words[i + d]);
 
-                                    if (cval == 0xffffffffu) goto bail;
+                                    if (cval == 0xffffffffu) DISSOLVE_PARTIAL();   /* e/f const missing */
                                     for (size_t k = 5; k < n; )
                                     {
                                         uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
@@ -2044,13 +3885,13 @@ leaf_fallback:
                                         }
                                         k += wc2;
                                     }
-                                    if (!nxt) goto bail;
+                                    if (!nxt) DISSOLVE_PARTIAL();   /* leave for the lower */
                                 }
                                 else if (kind == SPV_T_STRUCT)
                                 {
                                     uint32_t cval = spv_dis_const(words, n, idx_id);
 
-                                    if (cval == 0xffffffffu) goto bail;
+                                    if (cval == 0xffffffffu) DISSOLVE_PARTIAL();
                                     for (size_t k = 5; k < n; )
                                     {
                                         uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
@@ -2109,6 +3950,7 @@ leaf_fallback:
                         break;
                     }
             }
+next_chain: ;
             i += wc;
         }
 

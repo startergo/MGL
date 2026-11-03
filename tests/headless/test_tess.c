@@ -547,6 +547,101 @@ TEST(TessArrayedVarying)
     glDeleteProgram(prog);
 }
 
+/* ---- patch block ARRAY (dEQP user_defined_io per_patch_block_array shape) ----
+ * every leaf of a 2-element patch block array is compared against the value the
+ * TCS wrote; the TES colours grey with the FIRST FAILING leaf index (green when
+ * everything matches) so a bad mapping shows up leaf-exactly in one pixel. */
+static const char *kTcsBlkArr =
+    "#version 450 core\n"
+    "struct S { int x; vec4 y; float z[2]; };\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "patch out TheBlock {\n"
+    "  float blockFa[3];\n"
+    "  S     blockSa[2];\n"
+    "  float blockF;\n"
+    "} tcBlock[2];\n"
+    "void main() {\n"
+    "  for (int e = 0; e < 2; e++) {\n"
+    "    tcBlock[e].blockFa = float[3](1.5 + float(e), 2.5 + float(e), 3.5 + float(e));\n"
+    "    tcBlock[e].blockSa[0].x = 3 + e;  tcBlock[e].blockSa[1].x = 5 + e;\n"
+    "    tcBlock[e].blockSa[0].y = vec4(4.0 + float(e), 5.0, 6.0, 7.0);\n"
+    "    tcBlock[e].blockSa[1].y = vec4(8.0 + float(e), 9.0, 10.0, 11.0);\n"
+    "    tcBlock[e].blockSa[0].z = float[2](0.5 + float(e), 1.5);\n"
+    "    tcBlock[e].blockSa[1].z = float[2](2.5 + float(e), 3.5);\n"
+    "    tcBlock[e].blockF = 12.5 + float(e);\n"
+    "  }\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *kTesBlkArr =
+    "#version 450 core\n"
+    "struct S { int x; vec4 y; float z[2]; };\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "patch in TheBlock {\n"
+    "  float blockFa[3];\n"
+    "  S     blockSa[2];\n"
+    "  float blockF;\n"
+    "} teBlock[2];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "int g_fail = -1;\n"
+    "void chk(float got, float want, int idx) { if (g_fail < 0 && got != want) g_fail = idx; }\n"
+    "void chk4(vec4 got, vec4 want, int idx) { if (g_fail < 0 && got != want) g_fail = idx; }\n"
+    "void main() {\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  for (int e = 0; e < 2; e++) {\n"
+    "    chk(teBlock[e].blockFa[0], 1.5 + float(e), e * 14 + 0);\n"
+    "    chk(teBlock[e].blockFa[1], 2.5 + float(e), e * 14 + 1);\n"
+    "    chk(teBlock[e].blockFa[2], 3.5 + float(e), e * 14 + 2);\n"
+    "    chk(float(teBlock[e].blockSa[0].x), float(3 + e), e * 14 + 3);\n"
+    "    chk4(teBlock[e].blockSa[0].y, vec4(4.0 + float(e), 5.0, 6.0, 7.0), e * 14 + 4);\n"
+    "    chk(teBlock[e].blockSa[0].z[0], 0.5 + float(e), e * 14 + 5);\n"
+    "    chk(teBlock[e].blockSa[0].z[1], 1.5, e * 14 + 6);\n"
+    "    chk(float(teBlock[e].blockSa[1].x), float(5 + e), e * 14 + 7);\n"
+    "    chk4(teBlock[e].blockSa[1].y, vec4(8.0 + float(e), 9.0, 10.0, 11.0), e * 14 + 8);\n"
+    "    chk(teBlock[e].blockSa[1].z[0], 2.5 + float(e), e * 14 + 9);\n"
+    "    chk(teBlock[e].blockSa[1].z[1], 3.5, e * 14 + 10);\n"
+    "    chk(teBlock[e].blockF, 12.5 + float(e), e * 14 + 11);\n"
+    "  }\n"
+    "  if (g_fail < 0) f_col = vec4(0.0, 1.0, 0.0, 1.0);\n"
+    "  else            f_col = vec4(0.1 + float(g_fail) * 0.02, 0.0, 0.0, 1.0);\n"
+    "}\n";
+
+TEST(TessPatchBlockArrayValues)
+{
+    glViewport(0, 0, 512, 512);   /* these pixel checks assume a 512x512 window */
+    GLuint prog = make_program(kTcsBlkArr, kTesBlkArr);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (link)
+    {
+        glUseProgram(prog);
+        setup_patch_vao(kTriPos, kTriCol, 3);
+        draw_reference_patch();
+        float c[4];
+        {
+            int px, py;
+            corner_px(0, &px, &py);
+            read_px(px, py, c);   /* inside the triangle near corner 0 */
+        }
+        /* red-ish = the first failing leaf: (r - 0.1) / 0.02 */
+        EXPECT_NEAR(c[0], 0.0f, 0.02f);
+        EXPECT_NEAR(c[1], 1.0f, 0.02f);
+        if (c[0] > 0.05f)
+            fprintf(stderr, "TessPatchBlockArrayValues: first failing leaf %d\n",
+                    (int)((c[0] - 0.1f) / 0.02f + 0.5f));
+        check_strict_half("patch block array hw", 18000);
+    }
+    glDeleteProgram(prog);
+}
+
 TEST(TessErrors)
 {
     GLuint p = glCreateProgram();
@@ -2688,6 +2783,7 @@ int main(void)
     RUN(TessReorderedInputs);
     RUN(TessPerPatchVaryings);
     RUN(TessArrayedVarying);
+    RUN(TessPatchBlockArrayValues);
     RUN(TessProgramQueries);
     RUN(TessCountQueriesExact);
     RUN(TessRingBigBlockRecycle);

@@ -92,6 +92,10 @@ typedef struct MGLTessPatchMember_t {
                              * struct-array field ("<m>_<i>_<f>_<j>" — "blockSa_0_z_1" has
                              * array_idx=0 (the struct element) and array_idx2=1 (z[1])); 0
                              * when the varying has no second dimension */
+    uint32_t array_idx3;    /* third flattened dimension: for a dissolved patch-block ARRAY
+                             * the name carries the block element FIRST
+                             * ("<m>_<e>_<i>_<f>_<j>" — array_idx=e, array_idx2=i,
+                             * array_idx3=j); 0 otherwise */
     uint32_t flat_dims;     /* how many flattened array dimensions the member name carries
                              * (0 = the whole member, 1 = array_idx, 2 = array_idx2 too) —
                              * distinguishes element [0][0] of a flattened slot from an
@@ -476,7 +480,28 @@ bool mgl_tess_stage_bound(GLMContext ctx);
 
 /* SPIR-V preparation: isolines are emulated on the quad domain (rewrites the execution mode) */
 uint32_t *mgl_tess_prepare_spirv(const uint32_t *words, size_t n, size_t *out_n);
-uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n);
+/* dissolved-variable map: which per-vertex variables replaced the members of
+ * a dissolved input block, so the dynamic-IO lower can re-root its leaf-copy
+ * chains there (keeping the original block variable unreferenced — a
+ * half-used block plus its dissolved members would collide on the stage-in
+ * attribute slots) */
+struct SpvDissolveMap
+{
+    uint32_t var;               /* the original block interface variable */
+    uint32_t member;            /* member index within the block */
+    uint32_t elems;             /* leaf member: element count (0 = whole-member variable) */
+    uint32_t fields;            /* leaf member: field count of the element struct */
+    uint32_t var0;              /* whole-member variable */
+    uint32_t leaf[96];          /* leaf variables, [element * fields + field] */
+};
+
+/* true when the module still has chains ending at a direct member of a
+ * per-vertex block (SPIRV-Cross asserts on those when the block has composite
+ * members — used to fail the link cleanly instead of aborting) */
+bool mgl_tess_module_has_block_leafmember_chains(const uint32_t *words, size_t n);
+
+uint32_t *mgl_tess_lower_dynamic_io(const uint32_t *words, size_t n, size_t *out_n,
+                                    const struct SpvDissolveMap *maps, uint32_t n_maps);
 /* true when prepare_spirv's result is the DECLINED marker (a copy whose magic
  * is corrupt): the module cannot be compiled by SPIRV-Cross without aborting
  * and must be failed cleanly instead of being compiled */
@@ -488,7 +513,15 @@ static inline bool mgl_tess_module_declined(const uint32_t *words, size_t n)
 /* dissolve per-vertex INPUT interface blocks of a tessellation stage into one
  * plain per-vertex variable per block member (SPIRV-Cross mis-resolves and
  * aborts on split members of such blocks); see tess_spv_lower.c */
-uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n);
+/* dissolve per-vertex INPUT interface blocks; maps (caller storage, may be
+ * NULL) receives the member->dissolved-variable map; *partial_out reports
+ * that at least one chain was left on the original block variable (dynamic
+ * member indices: the dynamic-IO lower rewrites those; if it declines, the
+ * caller must fall back to the ORIGINAL module, which SPIRV-Cross rejects
+ * cleanly instead of colliding on the stage-in attribute slots) */
+uint32_t *mgl_tess_dissolve_vertex_input_blocks(const uint32_t *words, size_t n, size_t *out_n,
+                                                struct SpvDissolveMap *maps, uint32_t max_maps,
+                                                uint32_t *n_maps_out, int *partial_out);
 
 /* glslang's OpenGL target emits the legacy OpSubgroupAll/Any/AllEqualKHR
  * opcodes for the GL_ARB_shader_group_vote built-ins; SPIRV-Cross's MSL

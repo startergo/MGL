@@ -4550,6 +4550,18 @@ static MTLVertexFormat tessMemberFormat(const char *type)
         vd.layouts[MGL_TESS_VD_PATCH].stepFunction = MTLVertexStepFunctionPerPatch;
         vd.layouts[MGL_TESS_VD_PATCH].stepRate = 1;
     }
+    if (getenv("MGL_TESS_DEBUG"))
+    {
+        NSMutableString *ps = [NSMutableString string];
+        for (int i = 0; i < tp->num_tes_patch_in; i++)
+        {
+            MGLTessPatchMember *m = &tp->tes_patch_in[i];
+            if (m->attr < 0) continue;
+            [ps appendFormat:@" a%d@%zu lvl=%d", m->attr, m->offset, m->is_tess_level];
+        }
+        [ps appendFormat:@" patch_stride=%zu", (size_t)vd.layouts[MGL_TESS_VD_PATCH].stride];
+        NSLog(@"MGL tess: tes vd PATCH:%@", ps);
+    }
     if (any_factors)
     {
         vd.layouts[MGL_TESS_VD_FACTORS].stride = 24;  /* mgl_tess_levels_f: float o[4], in[2] */
