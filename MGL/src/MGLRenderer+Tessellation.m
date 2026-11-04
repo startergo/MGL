@@ -2194,8 +2194,13 @@ static void tessRetireCapture(GLMContext ctx)
     /* Counting queries on tessellated output need EXACT vertex counts; the
      * hardware path computes tess factors on the GPU, so its counts are not
      * knowable on the CPU.  Take the exact-count CPU reference path while
-     * such a query is active (rare: measurement runs only). */
-    if (mgl_queries_tess_counts_active(ctx))
+     * such a query is active (rare: measurement runs only) — but NEVER when a
+     * consumer needs the TES-output capture (geometry stage, TES transform
+     * feedback): the CPU reference path tessellates into CPU buffers and
+     * publishes no capture, so the geometry kernel would read an empty capture
+     * and emit nothing (queries.c's mgl_queries_tess_counts_active already
+     * drops the generated/clipping words when a GS is attached). */
+    if (mgl_queries_tess_counts_active(ctx) && !tp->capture)
         use_cpu_reference = true;
     bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode &&
                         !use_cpu_reference && !tp->capture;   /* capture needs the GPU-visible stream */

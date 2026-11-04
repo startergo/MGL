@@ -5260,7 +5260,358 @@ TEST(r100_capcache_invalidation)
     EXPECT_NO_GL_ERROR();
 }
 
+/* --- r101: dEQP-GL45-ES31 tessellation_geometry_interaction.feedback -------------
+ *
+ * TCS 4->9 amplification, TES triangles, GS converting to points, transform
+ * feedback in POINTS mode WHILE RASTERIZING, with a PRIMITIVES_GENERATED query
+ * open: the geometry kernel emitted zero vertices on this path (ctl[0]==0) and
+ * the PG query read 0 (the tess CPU estimate was the only contributor). */
+static const char *r101_vs =
+    "#version 450 core\n"
+    "layout(location=0) in vec2 pos;\n"
+    "layout(location=0) out vec2 v_pos;\n"
+    "void main(){ gl_Position = vec4(pos, 0.0, 1.0); v_pos = pos; }\n";
+
+static const char *r101_tcs =
+    "#version 450 core\n"
+    "layout(vertices=9) out;\n"
+    "layout(location=0) in vec2 v_pos[];\n"
+    "layout(location=0) out vec2 tc_pos[];\n"
+    "void main(){\n"
+    "  int r = gl_InvocationID / 3, c = gl_InvocationID % 3;\n"
+    "  float u = -0.5f + 0.5f * float(c), w = -0.5f + 0.5f * float(r);\n"
+    "  tc_pos[gl_InvocationID] = vec2(u, w);\n"
+    "  gl_out[gl_InvocationID].gl_Position = vec4(u, w, 0.0, 1.0);\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+    "    gl_TessLevelInner[0] = 3.0;\n"
+    "  }\n"
+    "}\n";
+
+static const char *r101_tes =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec2 tc_pos[];\n"
+    "layout(location=0) out vec2 tf_pos;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  tf_pos = gl_Position.xy;\n"
+    "}\n";
+
+static const char *r101_gs_points =
+    "#version 450 core\n"
+    "layout(triangles) in;\n"
+    "layout(points, max_vertices = 3) out;\n"
+    "layout(location=0) in vec2 tf_pos[];\n"
+    "layout(location=0) out vec2 g_pos;\n"
+    "void main(){\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    gl_Position = gl_in[i].gl_Position;\n"
+    "    gl_PointSize = 6.0;\n"
+    "    g_pos = tf_pos[i];\n"
+    "    EmitVertex();\n"
+    "  }\n"
+    "  EndPrimitive();\n"
+    "}\n";
+
+static const char *r101_gs_fs =
+    "#version 450 core\n"
+    "layout(location=0) in vec2 g_pos;\n"
+    "layout(location=0) out vec4 color;\n"
+    "void main(){ color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+static GLuint r101_prog(const char *gs)
+{
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r101_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, r101_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, r101_tes));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r101_gs_fs));
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char l[2048] = ""; GLsizei n = 0;
+        glGetProgramInfoLog(p, sizeof l, &n, l);
+        printf("r101 link log: %s\n", l);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    return p;
+}
+
+static void r101_draw_with_xfb(GLuint p, GLuint tbuf, GLuint qpg, GLuint qwr,
+                               float *xfb_out, int xfb_floats)
+{
+    static const float quad4[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    if (!vao)
+    {
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+    }
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad4, quad4, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+
+    glViewport(0, 0, 128, 128);
+    glEnable(GL_PROGRAM_POINT_SIZE);   /* the GS writes gl_PointSize */
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tbuf);
+    glUseProgram(p);
+    glPatchParameteri(GL_PATCH_VERTICES, 4);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (qpg) glBeginQuery(GL_PRIMITIVES_GENERATED, qpg);
+    if (qwr) glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, qwr);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_PATCHES, 0, 4);
+    glEndTransformFeedback();
+    if (qwr) glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    if (qpg) glEndQuery(GL_PRIMITIVES_GENERATED);
+    EXPECT_NO_GL_ERROR();
+
+    memset(xfb_out, 0, (size_t)xfb_floats * sizeof(float));
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, (GLsizeiptr)(xfb_floats * sizeof(float)), xfb_out);
+}
+
+static int r101_grid_ok(const float *out, int n)
+{
+    /* every captured point must be a tessellated vertex of the [-0.5,0.5] grid */
+    int n_ok = 0;
+    for (int i = 0; i < n; i++)
+        if (out[i * 2] >= -0.5f - 1e-4f && out[i * 2] <= 0.5f + 1e-4f &&
+            out[i * 2 + 1] >= -0.5f - 1e-4f && out[i * 2 + 1] <= 0.5f + 1e-4f)
+            n_ok++;
+    return n_ok;
+}
+
+/* every captured point must also have been rasterized: NDC -> window pixel */
+static int r101_raster_matches(const float *out, int n)
+{
+    int ok = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int px = (int)((out[i * 2] + 1.0f) * 0.5f * 128.0f);
+        int py = (int)((out[i * 2 + 1] + 1.0f) * 0.5f * 128.0f);
+        GLubyte p[4];
+        if (px < 0 || px > 127 || py < 0 || py > 127) continue;
+        mgl_read_rgba(px, py, p);
+        if (p[1] > 200 && p[0] < 50) ok++;
+    }
+    return ok;
+}
+
+static int r101_green_samples(void)
+{
+    /* full-image count: 39 six-pixel points must cover well over a hundred pixels */
+    GLubyte img[128 * 128 * 4];
+    int green = 0;
+    glFinish();
+    glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    for (int i = 0; i < 128 * 128; i++)
+        if (img[i * 4 + 1] > 200 && img[i * 4] < 50) green++;
+    return green;
+}
+
+/* the full CTS shape: PG query + rasterizing while capturing */
+TEST(r101_tess_gs_xfb_points_query)
+{
+    GLuint p = r101_prog(r101_gs_points);
+    if (!p) return;
+    static const char *vars[2] = { "g_pos", NULL };
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) return;
+
+    GLuint tbuf = 0, qpg = 0, qwr = 0;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 8192, NULL, GL_STREAM_READ);
+    glGenQueries(1, &qpg);
+    glGenQueries(1, &qwr);
+
+    float out[80];
+    r101_draw_with_xfb(p, tbuf, qpg, qwr, out, 80);
+
+    GLint pg = -1, written = -1;
+    glGetQueryObjectiv(qpg, GL_QUERY_RESULT, &pg);
+    glGetQueryObjectiv(qwr, GL_QUERY_RESULT, &written);
+    printf("  r101 query: PG=%d written=%d xfb[0]=%g,%g xfb[1]=%g,%g\n",
+           pg, written, out[0], out[1], out[2], out[3]);
+
+    /* 13 tessellated triangles x 3 points each */
+    EXPECT_EQ_INT(pg, 39);
+    EXPECT_EQ_INT(written, 39);
+    EXPECT_EQ_INT(r101_grid_ok(out, 39), 39);
+    EXPECT_EQ_INT(r101_raster_matches(out, 39), 39);
+
+    int green = r101_green_samples();
+    printf("  r101 green samples: %d\n", green);
+    EXPECT_TRUE(green > 20);
+
+    glDeleteQueries(1, &qpg);
+    glDeleteQueries(1, &qwr);
+    glDeleteBuffers(1, &tbuf);
+    glDeleteProgram(p);
+}
+
+/* the same draw WITHOUT any query open — isolates the query's reset word from
+ * the capture itself */
+TEST(r101_tess_gs_xfb_points_no_query)
+{
+    GLuint p = r101_prog(r101_gs_points);
+    if (!p) return;
+    static const char *vars[2] = { "g_pos", NULL };
+    glTransformFeedbackVaryings(p, 1, vars, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) return;
+
+    GLuint tbuf = 0;
+    glGenBuffers(1, &tbuf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tbuf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 8192, NULL, GL_STREAM_READ);
+
+    float out[80];
+    r101_draw_with_xfb(p, tbuf, 0, 0, out, 80);
+    printf("  r101 no-query: xfb[0]=%g,%g xfb[1]=%g,%g\n", out[0], out[1], out[2], out[3]);
+    EXPECT_EQ_INT(r101_grid_ok(out, 39), 39);
+    EXPECT_EQ_INT(r101_raster_matches(out, 39), 39);
+
+    int green = r101_green_samples();
+    printf("  r101 no-query green samples: %d\n", green);
+    EXPECT_TRUE(green > 20);
+
+    glDeleteBuffers(1, &tbuf);
+    glDeleteProgram(p);
+}
+
+/* gl_PointSize read/add across every pre-raster stage (r101): the VS sets 2, the
+ * TCS passes it, the TES adds 2, the GS adds 2 — 6 px.  Exercises the TES capture
+ * record's gl_PointSize member and the geometry import mapping it onto the input
+ * record's point-size word. */
+static const char *r101_ps_vs =
+    "#version 450 core\n"
+    "void main(){ gl_Position = vec4(0.0, 0.0, 0.0, 1.0); gl_PointSize = 2.0; }\n";
+static const char *r101_ps_tcs =
+    "#version 450 core\n"
+    "layout(vertices=1) out;\n"
+    "void main(){\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  gl_out[gl_InvocationID].gl_PointSize = gl_in[gl_InvocationID].gl_PointSize;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=1.0; gl_TessLevelOuter[1]=1.0; gl_TessLevelOuter[2]=1.0; gl_TessLevelOuter[3]=1.0;\n"
+    "    gl_TessLevelInner[0]=1.0; gl_TessLevelInner[1]=1.0;\n"
+    "  }\n"
+    "}\n";
+static const char *r101_ps_tes =
+    "#version 450 core\n"
+    "layout(quads, point_mode) in;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[0].gl_Position;\n"
+    "  gl_PointSize = gl_in[0].gl_PointSize + 2.0;\n"
+    "}\n";
+static const char *r101_ps_gs =
+    "#version 450 core\n"
+    "layout(points) in;\n"
+    "layout(points, max_vertices=1) out;\n"
+    "void main(){\n"
+    "  gl_Position = gl_in[0].gl_Position;\n"
+    "  gl_PointSize = gl_in[0].gl_PointSize + 2.0;\n"
+    "  EmitVertex();\n"
+    "}\n";
+static const char *r101_ps_fs =
+    "#version 450 core\n"
+    "layout(location=0) out vec4 c;\n"
+    "void main(){ c = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+/* widest run of green pixels on the framebuffer's centre row = the point's size */
+static int r101_point_width(void)
+{
+    GLubyte img[129 * 4];
+    int run = 0, best = 0;
+    glFinish();
+    glReadPixels(0, 64, 129, 1, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    for (int x = 0; x < 129; x++)
+    {
+        if (img[x * 4 + 1] > 200 && img[x * 4] < 50) { run++; if (run > best) best = run; }
+        else run = 0;
+    }
+    return best;
+}
+
+TEST(r101_point_size_through_tess_and_gs)
+{
+    GLuint vao, vbo;
+    static const float v[4] = { 0, 0, 0, 1 };
+    GLuint p = glCreateProgram();
+    const char *gs_srcs[1] = { r101_ps_gs };
+    struct { const char *name; GLuint p; int want; } cases[2];
+    int fails = 0;
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r101_ps_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, r101_ps_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, r101_ps_tes));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r101_ps_fs));
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) { glDeleteProgram(p); return; }
+    cases[0].name = "tess_add";       cases[0].p = p;   cases[0].want = 4;
+
+    GLuint pg = glCreateProgram();
+    glAttachShader(pg, compile(GL_VERTEX_SHADER, r101_ps_vs));
+    glAttachShader(pg, compile(GL_TESS_CONTROL_SHADER, r101_ps_tcs));
+    glAttachShader(pg, compile(GL_TESS_EVALUATION_SHADER, r101_ps_tes));
+    glAttachShader(pg, compile(GL_GEOMETRY_SHADER, gs_srcs[0]));
+    glAttachShader(pg, compile(GL_FRAGMENT_SHADER, r101_ps_fs));
+    glLinkProgram(pg);
+    glGetProgramiv(pg, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    cases[1].name = "tess_add_gs_add"; cases[1].p = pg;  cases[1].want = 6;
+
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glViewport(0, 0, 129, 129);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glPatchParameteri(GL_PATCH_VERTICES, 1);
+
+    for (int i = 0; i < 2; i++)
+    {
+        int w;
+        glUseProgram(cases[i].p);
+        glClearColor(1, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_PATCHES, 0, 1);
+        w = r101_point_width();
+        printf("  r101 point_size[%s]: width %d (want %d)\n", cases[i].name, w, cases[i].want);
+        EXPECT_EQ_INT(w, cases[i].want);
+        if (w != cases[i].want) fails++;
+    }
+
+    glDeleteProgram(p);
+    glDeleteProgram(pg);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    (void)fails;
+}
+
 int main(void)
+
 {
     /* TEST_ONLY=<name> runs a single test (debugging a state cascade between tests) */
     const char *only = getenv("TEST_ONLY");
@@ -5339,5 +5690,8 @@ int main(void)
     RUN_IF(r99_gs_shadow_attrib);
     RUN_IF(r99_gs_dvec4_padded);
     RUN_IF(r100_capcache_invalidation);
+    RUN_IF(r101_tess_gs_xfb_points_query);
+    RUN_IF(r101_tess_gs_xfb_points_no_query);
+    RUN_IF(r101_point_size_through_tess_and_gs);
     return mgl_test_summary();
 }

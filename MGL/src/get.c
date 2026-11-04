@@ -792,8 +792,13 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
             PUT1(5 * MGL_MAX_IMAGE_UNITS);
         case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES: PUT1(5 * MGL_MAX_IMAGE_UNITS + MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
 
-        /* points / lines (Metal rasterizes 1-pixel lines and points up to 511 px) */
+        /* points / lines (Metal rasterizes 1-pixel lines and points up to 511 px);
+         * GL_POINT_SIZE_RANGE and GL_ALIASED_POINT_SIZE_RANGE are the same value in a
+         * core context (GL 4.6 table 23.52 — smooth points are gone, every point is
+         * aliased) — dEQP's ES31 point_size cases read the ALIASED name to decide
+         * whether they can run. */
         case GL_POINT_SIZE_RANGE: PUT2(1.0, 511.0);
+        case GL_ALIASED_POINT_SIZE_RANGE: PUT2(1.0, 511.0);
         case GL_POINT_SIZE_GRANULARITY: PUT1(1.0);
         case GL_ALIASED_LINE_WIDTH_RANGE: PUT2(1.0, 1.0);
         case GL_SMOOTH_LINE_WIDTH_RANGE: PUT2(1.0, 1.0);

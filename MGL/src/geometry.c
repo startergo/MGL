@@ -10157,6 +10157,23 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     d.tess_pairs[d.tess_npairs++] = 1; d.tess_pairs[d.tess_npairs++] = 1;
     d.tess_pairs[d.tess_npairs++] = 2; d.tess_pairs[d.tess_npairs++] = 2;
     d.tess_pairs[d.tess_npairs++] = 3; d.tess_pairs[d.tess_npairs++] = 3;
+    /* gl_in[].gl_PointSize: the capture record carries the evaluation stage's
+     * gl_PointSize output as a one-word member (mgl_tess_capture_msl); map it onto
+     * the input record's point-size word, which geom_layout placed at in_psize_off.
+     * Without it a geometry shader reading gl_in[].gl_PointSize always saw 0 (dEQP
+     * ES31 point_size vertex_set_control_pass_eval_add_geometry_add).  A capture
+     * whose TES never writes gl_PointSize has no such member: gl_in[].gl_PointSize
+     * is then undefined per GL, the record word stays 0. */
+    if (gp->in_has_psize)
+    {
+        for (int m2 = 0; m2 < (int)c->members; m2++)
+            if (!strcmp(c->member[m2].name, "gl_PointSize"))
+            {
+                d.tess_pairs[d.tess_npairs++] = c->member[m2].offset;
+                d.tess_pairs[d.tess_npairs++] = gp->in_psize_off;
+                break;
+            }
+    }
     for (int i = 0; i < gp->n_in; i++)
     {
         int j = -1, jspan = 1;

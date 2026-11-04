@@ -705,6 +705,17 @@ void mgl_queries_note_tess(GLMContext ctx, uint64_t tes_invocations, uint64_t te
     if (!S)
         return;
     count_active(S, MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS, tes_invocations);
+    /* With a geometry shader following the tessellation stages, the post-geometry
+     * counters belong to the geometry stage: PRIMITIVES_GENERATED(stream 0) comes
+     * from the geometry kernel's per-stream counters (ctl[17], folded by
+     * mgl_geom_qacc at every geometry draw) and counting the tessellated
+     * primitives here too double-counts — dEQP-GL45-ES31
+     * tessellation_geometry_interaction.feedback.* expects the GS-emitted count
+     * only (39, not 39+13).  CLIPPING_INPUT/OUTPUT likewise describe the
+     * primitives reaching the clip stage, i.e. post-GS, which the geometry path
+     * owns (same rule as mgl_queries_note_draw's has_gs branch for VS->GS). */
+    if (program_has_stage(ctx, _GEOMETRY_SHADER))
+        return;
     count_active(S, MGL_QB_CLIPPING_INPUT_PRIMITIVES, tessellated_primitives);
     count_active(S, MGL_QB_CLIPPING_OUTPUT_PRIMITIVES, tessellated_primitives);
     count_active(S, MGL_QB_PRIMITIVES_GENERATED + 0, tessellated_primitives);
@@ -722,6 +733,15 @@ bool mgl_queries_tess_counts_active(GLMContext ctx)
     struct MGLExtState_queries *S = QS(ctx);
     if (!S)
         return false;
+    /* With a geometry shader attached, the generated/clipping primitive counts are
+     * the geometry stage's (mgl_geom_qacc's per-stream words, see note_tess); asking
+     * the tess domain for them here would force its CPU-reference path, which
+     * produces no TES-output capture and so breaks every TES->GS draw (the geometry
+     * kernel reads an empty capture and emits nothing - dEQP
+     * tessellation_geometry_interaction.feedback.*).  Only the exact TES invocation
+     * count still needs that path. */
+    if (program_has_stage(ctx, _GEOMETRY_SHADER))
+        return S->active[MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS] != NULL;
     return S->active[MGL_QB_TESS_EVALUATION_SHADER_INVOCATIONS] != NULL ||
            S->active[MGL_QB_CLIPPING_INPUT_PRIMITIVES] != NULL ||
            S->active[MGL_QB_CLIPPING_OUTPUT_PRIMITIVES] != NULL ||

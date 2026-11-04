@@ -1142,11 +1142,14 @@ static const char *kGeomCtlMSL =
     " * worst-case bound) never run the geometry kernel to publish a zero themselves */\n"
     "kernel void mgl_geom_lzero(constant uint* in [[buffer(0)]],\n"
     "                           device uint* lc  [[buffer(1)]],\n"
+    "                           device uint* cnt [[buffer(2)]],\n"
     "                           uint t [[thread_position_in_grid]])\n"
     "{\n"
     "    if (t >= in[0]) return;\n"
     "    lc[t] = 0u;\n"
     "    lc[in[0] + t] = 0u;\n"
+    "    cnt[t] = 0u;   /* tess-fed draws dispatch the GS kernel indirectly: stale\n"
+    "                      counts of never-run threads must not reach the xfb pack */\n"
     "}\n"
     "\n"
     "/* order pass 1a: chunk-parallel exclusive prefix scan of the per-thread list counts\n"
@@ -7011,6 +7014,7 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
             [enc setComputePipelineState: gLzeroPso];
             [enc setBytes: zero_in length: sizeof zero_in atIndex: 0];
             [enc setBuffer: gIdx offset: (NSUInteger)idx_cap * 2 * sizeof(uint32_t) atIndex: 1];
+            [enc setBuffer: gCnt offset: gCntOff atIndex: 2];   /* per-thread emitted counts */
             [enc dispatchThreadgroups: MTLSizeMake((NSUInteger)zgroups, 1, 1)
                   threadsPerThreadgroup: MTLSizeMake(zwg, 1, 1)];
         }

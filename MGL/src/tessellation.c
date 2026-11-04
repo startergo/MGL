@@ -7235,6 +7235,17 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             snprintf(types[tp->cap_members_n], 48, "float");
             tp->cap_members[tp->cap_members_n].offset = off;
         }
+        else if (!strcmp(m, "gl_PointSize"))
+        {
+            /* one float word: a following geometry stage reads gl_in[].gl_PointSize
+             * from the capture record (dEQP ES31 point_size
+             * vertex_set_control_pass_eval_add_geometry_add: the VS's size + the
+             * evaluation stage's + the geometry stage's), and a transform feedback
+             * session capturing the evaluation stage records it by name */
+            w = 1;
+            snprintf(types[tp->cap_members_n], 48, "float");
+            tp->cap_members[tp->cap_members_n].offset = off;
+        }
         else if (!strncmp(m, "gl_", 3))
             continue;               /* other builtins are not captured */
         else if (!tess_msl_type_words(rec.members[i].type, &w))
