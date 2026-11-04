@@ -146,6 +146,13 @@ typedef struct MGLTessCapture {
     size_t   index_offset;   /* byte offset of the uint32 vertex index list */
     size_t   count_offset;   /* byte offset of the uint32 counts: [0] records (GPU-written),
                               * [1] index entries (GPU-written) */
+    size_t   tes_invocations_offset;   /* geom (r102): byte offset of the uint32 TES invocation
+                              * count (the GPU tessellator's totals[0], one per tessellated
+                              * coordinate) on the GPU-emulated path only; 0 on the CPU
+                              * reference path, whose invocations the CPU already counted
+                              * (mgl_tess_note_draw) — a geometry-stage consumer folds this
+                              * word into its query accumulator so GL_TESS_EVALUATION_SHADER_
+                              * INVOCATIONS stays exact when a GS owns the capture */
     uint32_t stride;         /* record stride in 32-bit words */
     uint32_t records;        /* record capacity of the ring block (sizing bound) */
     uint32_t indices;        /* index list capacity in uint32 words (sizing bound) */

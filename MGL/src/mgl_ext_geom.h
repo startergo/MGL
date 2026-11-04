@@ -158,6 +158,13 @@ typedef struct MGLGeomVar {
     bool    plain_struct;  /* a struct-typed interface variable ("out StructType v;"),
                            * not an interface block: expressions go through "v.m" and the
                            * API name is "v.m", even when v and m share a spelling */
+    bool    block_array;   /* the block/struct INSTANCE has an array dimension ("out B{..}
+                           * inst[2];"): the collected entry is one ELEMENT of it — the
+                           * expression is "inst[index].member[..]", xfb_offset advances by
+                           * the std430 block size per element and each element's members
+                           * consume a fresh set of locations */
+    GLuint  index;         /* block_array: element index the entry stands for */
+    GLuint  block_elems;   /* block_array: the instance's element count */
     GLuint  stream;         /* outputs: stream the varying is declared for */
     char    expr[128];      /* writer side: expression of the producing stage output */
     int     xfb_buffer;     /* shader-declared capture buffer (xfb_buffer=), -1 when not captured */
@@ -396,6 +403,11 @@ typedef struct MGLGeomDraw {
      * sizing bounds: the actual counts are GPU-written). */
     void    *tess_ring;
     size_t   tess_recs_off, tess_idx_off, tess_cnt_off;
+    size_t   tess_tesinv_off;                     /* r102: byte offset of the TES invocation
+                                                   * count word inside tess_ring (MGLTessCapture.
+                                                   * tes_invocations_offset), folded into query
+                                                   * accumulator word 9 at every tess-fed draw;
+                                                   * 0 = none (CPU-counted / not queried) */
     uint32_t tess_stride;                       /* words per tess record */
     uint32_t tess_prim;                         /* its output primitive type */
     uint32_t tess_rec_cap, tess_idx_cap;        /* record / index-list capacities */

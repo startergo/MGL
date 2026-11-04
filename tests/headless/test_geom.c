@@ -5462,6 +5462,569 @@ TEST(r101_tess_gs_xfb_points_query)
     glDeleteProgram(p);
 }
 
+/* r102: an ARRAY-OF-BLOCKS output instance ("layout(xfb_offset=0, xfb_stride=128) out
+ * Goku { vec4 a,b,c; } goku[2];") — GL 4.6 11.1.2.5: the block follows std430, the
+ * elements are captured consecutively, each element aligned to the block alignment, so
+ * element 1's members sit at 48/64/80 inside the 128-byte record; the kernel's store
+ * expressions must carry the element index ("goku[1].b" — "goku.b" is not well-formed
+ * for an array instance) and glTransformFeedbackVaryings names them "goku[0].b"
+ * (KHR-Single-GL46 enhanced_layouts.xfb_block_stride_geometry). */
+static const char *r102_ba_vs =
+    "#version 430 core\n"
+    "in vec4 in_vs;\n"
+    "out vec4 vs_gs;\n"
+    "void main(){ vs_gs = in_vs; }\n";
+static const char *r102_ba_gs =
+    "#version 430 core\n"
+    "#extension GL_ARB_enhanced_layouts : require\n"
+    "layout(points) in;\n"
+    "layout(triangle_strip, max_vertices = 4) out;\n"
+    "layout (xfb_offset = 0, xfb_stride = 128) out Goku {\n"
+    "    vec4 gohan;\n"
+    "    vec4 goten;\n"
+    "    vec4 chichi;\n"
+    "} goku[2];\n"
+    "out gl_PerVertex { vec4 gl_Position; };\n"
+    "in  vec4 vs_gs[];\n"
+    "out vec4 gs_fs;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 result = vs_gs[0];\n"
+    "    goku[0].gohan  = vec4(1, 0, 0, 0);\n"
+    "    goku[0].goten  = vec4(0, 0, 1, 0);\n"
+    "    goku[0].chichi = vec4(0, 1, 0, 0);\n"
+    "    goku[1].gohan  = vec4(0, 1, 1, 1);\n"
+    "    goku[1].goten  = vec4(1, 1, 0, 1);\n"
+    "    goku[1].chichi = vec4(1, 0, 1, 1);\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(-1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(-1, 1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(1, 1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "}\n";
+static const char *r102_ba_fs =
+    "#version 430 core\n"
+    "in  vec4 gs_fs;\n"
+    "out vec4 fs_out;\n"
+    "void main(){ fs_out = gs_fs; }\n";
+
+static const char *r102_ba_gs_noxfb =
+    "#version 430 core\n"
+    "layout(points) in;\n"
+    "layout(triangle_strip, max_vertices = 4) out;\n"
+    "out Goku {\n"
+    "    vec4 gohan;\n"
+    "    vec4 goten;\n"
+    "    vec4 chichi;\n"
+    "} goku[2];\n"
+    "out gl_PerVertex { vec4 gl_Position; };\n"
+    "in  vec4 vs_gs[];\n"
+    "out vec4 gs_fs;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 result = vs_gs[0];\n"
+    "    goku[0].gohan  = vec4(1, 0, 0, 0);\n"
+    "    goku[0].goten  = vec4(0, 0, 1, 0);\n"
+    "    goku[0].chichi = vec4(0, 1, 0, 0);\n"
+    "    goku[1].gohan  = vec4(0, 1, 1, 1);\n"
+    "    goku[1].goten  = vec4(1, 1, 0, 1);\n"
+    "    goku[1].chichi = vec4(1, 0, 1, 1);\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(-1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(-1, 1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "    gs_fs = result;\n"
+    "    gl_Position = vec4(1, 1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "}\n";
+
+TEST(r102_xfb_block_array_geometry)
+{
+    GLuint p = glCreateProgram(), tfb = 0, vao = 0, vbo = 0;
+    GLint ok = 0;
+    float out[64];
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r102_ba_vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, r102_ba_gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r102_ba_fs));
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+
+    /* shader-declared capture: 48 bytes of block per element, 128-byte stride */
+    glGenBuffers(1, &tfb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4 * 128 * 4, NULL, GL_STREAM_READ);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    {
+        static const float in[4] = { 1, 1, 1, 1 };
+        glBufferData(GL_ARRAY_BUFFER, sizeof in, in, GL_STATIC_DRAW);
+    }
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glUseProgram(p);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    EXPECT_NO_GL_ERROR();
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    printf("  r102 block-array record: e0 %.1f,%.1f,%.1f %.1f,%.1f,%.1f | e1@48 %.1f,%.1f,%.1f %.1f,%.1f,%.1f\n",
+           out[0], out[1], out[3], out[4], out[5], out[6],
+           out[12], out[13], out[15], out[16], out[17], out[18]);
+    /* element 0 at 0/16/32 */
+    EXPECT_EQ_INT(out[0] != 0.0f && out[1] == 0.0f && out[3] == 0.0f, 1);
+    EXPECT_EQ_INT(out[4] == 0.0f && out[6] == 1.0f, 1);
+    EXPECT_EQ_INT(out[9] == 1.0f, 1);
+    /* element 1 at 48/64/80 */
+    EXPECT_EQ_INT(out[12] == 0.0f && out[13] == 1.0f && out[15] == 1.0f, 1);
+    EXPECT_EQ_INT(out[17] == 1.0f, 1);
+    EXPECT_EQ_INT(out[20] == 1.0f && out[21] == 0.0f && out[23] == 1.0f, 1);
+    /* the second record (second emitted vertex) starts at byte 128 */
+    EXPECT_EQ_INT(out[32] != 0.0f || out[33] != 0.0f, 1);
+
+    /* the API path: the program above declares xfb layout, and shader-declared capture
+     * then ignores the API list (GL 4.6 11.1.2.1) — build the same GS WITHOUT xfb
+     * qualifiers and name element 1's members ("goku[1].gohan"); the API re-lays the
+     * capture out: 3 members x 16 bytes, 48-byte stride, element 1's values */
+    {
+        static const GLchar *vars[3] = { "goku[1].gohan", "goku[1].goten", "goku[1].chichi" };
+        GLuint p2 = glCreateProgram();
+        GLint stride = -1, ok2 = 0;
+        GLenum props[1] = { GL_TRANSFORM_FEEDBACK_BUFFER_STRIDE };
+        GLint len = 0;
+        glAttachShader(p2, compile(GL_VERTEX_SHADER, r102_ba_vs));
+        glAttachShader(p2, compile(GL_GEOMETRY_SHADER, r102_ba_gs_noxfb));
+        glAttachShader(p2, compile(GL_FRAGMENT_SHADER, r102_ba_fs));
+        glTransformFeedbackVaryings(p2, 3, vars, GL_INTERLEAVED_ATTRIBS);
+        glLinkProgram(p2);
+        glGetProgramiv(p2, GL_LINK_STATUS, &ok2);
+        if (!ok2)
+        {
+            char log[4096] = ""; GLsizei len2 = 0;
+            glGetProgramInfoLog(p2, sizeof log, &len2, log);
+            printf("  r102 api-path link log:\n%s\n", log);
+        }
+        EXPECT_EQ_INT(ok2, GL_TRUE);
+        if (!ok2) goto api_done;
+        glGetProgramResourceiv(p2, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 1, props, 1, &len, &stride);
+        printf("  r102 api-path stride=%d (want 48)\n", stride);
+        EXPECT_EQ_INT(stride, 48);
+        glUseProgram(p2);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4 * 48 * 4, NULL, GL_STREAM_READ);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb);
+        glBeginTransformFeedback(GL_TRIANGLES);
+        glDrawArrays(GL_POINTS, 0, 1);
+        glEndTransformFeedback();
+        EXPECT_NO_GL_ERROR();
+        memset(out, 0, sizeof out);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+        printf("  r102 api-path record: %.1f,%.1f,%.1f %.1f,%.1f,%.1f %.1f,%.1f,%.1f\n",
+               out[0], out[1], out[3], out[4], out[5], out[6], out[8], out[9], out[10]);
+        EXPECT_EQ_INT(out[0] == 0.0f && out[1] == 1.0f && out[3] == 1.0f, 1);
+        EXPECT_EQ_INT(out[5] == 1.0f, 1);
+        EXPECT_EQ_INT(out[10] == 1.0f && out[11] == 1.0f, 1);
+        EXPECT_EQ_INT(out[12] == 0.0f && out[13] == 1.0f, 1);   /* second vertex at byte 48 */
+    api_done:
+        glDeleteProgram(p2);
+    }
+    (void)0;
+    glDeleteProgram(p);
+    glDeleteBuffers(1, &tfb);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+}
+
+/* r102: GL_TESS_EVALUATION_SHADER_INVOCATIONS must stay exact when a geometry stage
+ * owns the TES-output capture: the GPU tessellator's coordinate count (one word in the
+ * tess ring) is folded into query accumulator word 9 at every tess-fed geometry draw —
+ * the GPU path never runs the CPU reference counter, so before r102 the query read 0.
+ * Ground truth: the same program without the geometry shader, which takes the CPU
+ * reference path (mgl_tess_note_draw).  Also: instanced draws, a query spanning both
+ * programs (GPU + CPU counting must add), and point_mode (whose capture publishes
+ * totals[0] directly — the other offset-derivation branch). */
+static const char *r102_tiq_vs =
+    "#version 450 core\n"
+    "void main(){ gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+static const char *r102_tiq_tcs =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "void main(){\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=3.0; gl_TessLevelOuter[1]=3.0; gl_TessLevelOuter[2]=3.0;\n"
+    "    gl_TessLevelInner[0]=3.0;\n"
+    "  }\n"
+    "}\n";
+static const char *r102_tiq_tes =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) out vec2 tf_pos;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  tf_pos = gl_Position.xy;\n"
+    "}\n";
+static const char *r102_tiq_gs =
+    "#version 450 core\n"
+    "layout(triangles) in;\n"
+    "layout(points, max_vertices = 3) out;\n"
+    "layout(location=0) in vec2 tf_pos[];\n"
+    "layout(location=0) out vec2 g_pos;\n"
+    "void main(){\n"
+    "  for (int i = 0; i < 3; i++) {\n"
+    "    gl_Position = gl_in[i].gl_Position;\n"
+    "    g_pos = tf_pos[i];\n"
+    "    EmitVertex();\n"
+    "  }\n"
+    "  EndPrimitive();\n"
+    "}\n";
+static const char *r102_tiq_fs_gs =
+    "#version 450 core\n"
+    "layout(location=0) in vec2 g_pos;\n"
+    "layout(location=0) out vec4 color;\n"
+    "void main(){ color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+static const char *r102_tiq_fs_plain =
+    "#version 450 core\n"
+    "layout(location=0) in vec2 tf_pos;\n"
+    "layout(location=0) out vec4 color;\n"
+    "void main(){ color = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+static const char *r102_tiq_tcs_pt =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "void main(){\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0]=2.0; gl_TessLevelOuter[1]=3.0; gl_TessLevelOuter[2]=2.0;\n"
+    "    gl_TessLevelInner[0]=3.0;\n"
+    "  }\n"
+    "}\n";
+static const char *r102_tiq_tes_pt =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw, point_mode) in;\n"
+    "layout(location=0) out vec2 tf_pos;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+    "  tf_pos = gl_Position.xy;\n"
+    "}\n";
+static const char *r102_tiq_gs_pt =
+    "#version 450 core\n"
+    "layout(points) in;\n"
+    "layout(points, max_vertices = 1) out;\n"
+    "layout(location=0) in vec2 tf_pos[];\n"
+    "layout(location=0) out vec2 g_pos;\n"
+    "void main(){\n"
+    "  gl_Position = gl_in[0].gl_Position;\n"
+    "  g_pos = tf_pos[0];\n"
+    "  EmitVertex();\n"
+    "  EndPrimitive();\n"
+    "}\n";
+
+static GLuint r102_tiq_prog(GLboolean with_gs, GLboolean point_mode)
+{
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r102_tiq_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, point_mode ? r102_tiq_tcs_pt : r102_tiq_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, point_mode ? r102_tiq_tes_pt : r102_tiq_tes));
+    if (with_gs)
+        glAttachShader(p, compile(GL_GEOMETRY_SHADER, point_mode ? r102_tiq_gs_pt : r102_tiq_gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, with_gs ? r102_tiq_fs_gs : r102_tiq_fs_plain));
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    return p;
+}
+
+static GLint r102_tiq_query(GLuint p, int draws)
+{
+    GLuint q = 0;
+    GLint v = -1;
+    glGenQueries(1, &q);
+    glUseProgram(p);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q);
+    for (int i = 0; i < draws; i++)
+        glDrawArrays(GL_PATCHES, 0, 3);
+    glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+    EXPECT_NO_GL_ERROR();
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &v);
+    glDeleteQueries(1, &q);
+    return v;
+}
+
+TEST(r102_tes_invocations_with_gs)
+{
+    static const float tri[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0, 0.5f };
+    GLuint vao = 0, vbo = 0, p_plain, p_gs;
+    GLint one, three, g_one, g_three;
+
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof tri, tri, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glViewport(0, 0, 32, 32);
+
+    p_plain = r102_tiq_prog(GL_FALSE, GL_FALSE);
+    p_gs = r102_tiq_prog(GL_TRUE, GL_FALSE);
+    one = r102_tiq_query(p_plain, 1);
+    three = r102_tiq_query(p_plain, 3);
+    g_one = r102_tiq_query(p_gs, 1);
+    g_three = r102_tiq_query(p_gs, 3);
+    printf("  r102 tes invocations: plain 1=%d 3=%d | gs 1=%d 3=%d\n", one, three, g_one, g_three);
+    EXPECT_NE(one, 0);
+    EXPECT_EQ_INT(three, one * 3);
+    EXPECT_EQ_INT(g_one, one);
+    EXPECT_EQ_INT(g_three, three);
+
+    /* instanced: both paths double */
+    {
+        GLuint q = 0;
+        GLint vp = 0, vg = 0;
+        glGenQueries(1, &q);
+        glUseProgram(p_plain);
+        glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q);
+        glDrawArraysInstanced(GL_PATCHES, 0, 3, 2);
+        glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &vp);
+        glUseProgram(p_gs);
+        glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q);
+        glDrawArraysInstanced(GL_PATCHES, 0, 3, 2);
+        glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &vg);
+        printf("  r102 tes invocations instanced x2: plain=%d gs=%d (single=%d)\n", vp, vg, one);
+        EXPECT_EQ_INT(vp, one * 2);
+        EXPECT_EQ_INT(vg, one * 2);
+        glDeleteQueries(1, &q);
+    }
+
+    /* a query spanning both programs: the GS draw's GPU-folded count plus the plain
+     * draws' CPU counts must add up */
+    {
+        GLuint q = 0;
+        GLint v = 0;
+        glGenQueries(1, &q);
+        glUseProgram(p_gs);
+        glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        glUseProgram(p_plain);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &v);
+        printf("  r102 tes invocations mixed (1 gs + 2 plain) = %d (want %d)\n", v, one * 3);
+        EXPECT_EQ_INT(v, one * 3);
+        glDeleteQueries(1, &q);
+    }
+    glDeleteProgram(p_plain);
+    glDeleteProgram(p_gs);
+
+    /* point_mode: the capture publishes totals[0] directly */
+    {
+        GLuint pp = r102_tiq_prog(GL_FALSE, GL_TRUE), pg = r102_tiq_prog(GL_TRUE, GL_TRUE);
+        GLint vp = r102_tiq_query(pp, 1), vg = r102_tiq_query(pg, 1);
+        printf("  r102 tes invocations point_mode: plain=%d gs=%d\n", vp, vg);
+        EXPECT_NE(vp, 0);
+        EXPECT_EQ_INT(vg, vp);
+        glDeleteProgram(pp);
+        glDeleteProgram(pg);
+    }
+
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    EXPECT_NO_GL_ERROR();
+}
+
+/* r102: a dmat ARRAY captured through a tess-fed geometry stage.  Two parts: the kernel
+ * compiles (SPIRV-Cross maps a uniform-block dmat array to a raw C array while the
+ * thread-local output is an spvUnsafeArray, and `goku = uni_goku;` lowered to
+ * `goku[0] = uni_goku[0]` had no assignment operator — the kernel compiles with
+ * native arrays + a device/constant-source array-copy overload), and the 12 doubles of
+ * the 3 dmat2s land in the record in order (KHR-Single-GL46
+ * enhanced_layouts.xfb_explicit_location_dmat*_geometry). */
+static const char *r102_dm_vs =
+    "#version 430 core\n"
+    "in vec4 in_vs;\n"
+    "out vec4 vs_tcs;\n"
+    "void main(){ vs_tcs = in_vs; }\n";
+static const char *r102_dm_tcs =
+    "#version 430 core\n"
+    "layout(vertices = 1) out;\n"
+    "in  vec4 vs_tcs[];\n"
+    "out vec4 tcs_tes[];\n"
+    "void main()\n"
+    "{\n"
+    "    tcs_tes[gl_InvocationID] = vs_tcs[gl_InvocationID];\n"
+    "    gl_TessLevelOuter[0] = 1.0;\n"
+    "    gl_TessLevelOuter[1] = 1.0;\n"
+    "}\n";
+static const char *r102_dm_tes =
+    "#version 430 core\n"
+    "layout(isolines, point_mode) in;\n"
+    "in  vec4 tcs_tes[];\n"
+    "out vec4 tes_gs;\n"
+    "void main(){ tes_gs = tcs_tes[0]; }\n";
+static const char *r102_dm_gs =
+    "#version 430 core\n"
+    "#extension GL_ARB_enhanced_layouts : require\n"
+    "layout (location = 0, xfb_offset = 0) flat out dmat2 goku[3];\n"
+    "layout(std140, binding = 0) uniform Goku { dmat2 uni_goku[3]; };\n"
+    "layout(points) in;\n"
+    "layout(points, max_vertices = 1) out;\n"
+    "in  vec4 tes_gs[];\n"
+    "out vec4 gs_fs;\n"
+    "void main()\n"
+    "{\n"
+    "    goku = uni_goku;\n"
+    "    gs_fs = tes_gs[0];\n"
+    "    gl_Position = vec4(-1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "}\n";
+static const char *r102_dm_fs =
+    "#version 430 core\n"
+    "in  vec4 gs_fs;\n"
+    "out vec4 fs_out;\n"
+    "void main(){ fs_out = gs_fs; }\n";
+
+TEST(r102_xfb_dmat_array_tess_gs)
+{
+    static const double dval[12] = { 1.0 / 3.0, 2.0 / 3.0, 4.0 / 5.0, 7.0 / 9.0,
+                                     11.0 / 13.0, 17.0 / 19.0, 23.0 / 29.0, 31.0 / 37.0,
+                                     41.0 / 43.0, 47.0 / 53.0, 59.0 / 61.0, 67.0 / 71.0 };
+    GLuint p = glCreateProgram(), tfb = 0, ubo = 0, vao = 0, vbo = 0;
+    double out[24];
+    GLint ok = 0;
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r102_dm_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, r102_dm_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, r102_dm_tes));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, r102_dm_gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r102_dm_fs));
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[4096] = ""; GLsizei len = 0;
+        glGetProgramInfoLog(p, sizeof log, &len, log);
+        printf("  r102 dmat link:\n%s\n", log);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) return;
+
+    glGenBuffers(1, &tfb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4 * 96, NULL, GL_STREAM_READ);
+    glGenBuffers(1, &ubo);
+    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+    {
+        double u[12];
+        int i;
+        for (i = 0; i < 12; i++) u[i] = dval[i];
+        glBufferData(GL_UNIFORM_BUFFER, sizeof u, u, GL_STATIC_DRAW);
+    }
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    {
+        static const float in[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        glBufferData(GL_ARRAY_BUFFER, sizeof in, in, GL_STATIC_DRAW);
+    }
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glUseProgram(p);
+    glPatchParameteri(GL_PATCH_VERTICES, 1);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glEndTransformFeedback();
+    EXPECT_NO_GL_ERROR();
+
+    memset(out, 0, sizeof out);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    printf("  r102 dmat record: %.6f %.6f %.6f %.6f ... %.6f\n",
+           out[0], out[1], out[2], out[3], out[11]);
+    for (int i = 0; i < 12; i++)
+    {
+        EXPECT_NEAR(out[i], dval[i], 1e-6);
+        EXPECT_NEAR(out[12 + i], dval[i], 1e-6);
+    }
+    glDeleteProgram(p);
+    glDeleteBuffers(2, (GLuint[]){ tfb, ubo });
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+}
+
+/* r102: outputs assigned to the same transform feedback buffer must be written in the
+ * same vertex stream (GL 4.6 11.1.2.4) — a link error, not a silent capture
+ * (KHR-Single-GL46 enhanced_layouts.xfb_multiple_vertex_streams). */
+static const char *r102_sc_gs =
+    "#version 430 core\n"
+    "#extension GL_ARB_enhanced_layouts : require\n"
+    "layout (xfb_buffer = 1, xfb_stride = 64) out;\n"
+    "layout (xfb_buffer = 3, xfb_stride = 64) out;\n"
+    "layout(points) in;\n"
+    "layout(triangle_strip, max_vertices = 4) out;\n"
+    "layout (xfb_buffer = 1, xfb_offset = 0) out vec4 chichi;\n"
+    "layout (stream = 1, xfb_buffer = 1, xfb_offset = 32) out vec4 gotenks;\n"
+    "out gl_PerVertex { vec4 gl_Position; };\n"
+    "in  vec4 vs_gs[];\n"
+    "out vec4 gs_fs;\n"
+    "void main()\n"
+    "{\n"
+    "    chichi = vec4(0, 0, 0, 1);\n"
+    "    gotenks = vec4(1, 1, 1, 1);\n"
+    "    gs_fs = vs_gs[0];\n"
+    "    gl_Position = vec4(-1, -1, 0, 1);\n"
+    "    EmitVertex();\n"
+    "}\n";
+
+TEST(r102_xfb_stream_buffer_conflict)
+{
+    GLuint p = glCreateProgram();
+    GLint ok = 0;
+    char log[4096] = "";
+    GLsizei len = 0;
+
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r102_ba_vs));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, r102_sc_gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r102_ba_fs));
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    glGetProgramInfoLog(p, sizeof log, &len, log);
+    printf("  r102 stream-conflict link ok=%d log: %s\n", ok, log);
+    EXPECT_EQ_INT(ok, GL_FALSE);
+    EXPECT_TRUE(strstr(log, "vertex streams") != NULL);
+    glDeleteProgram(p);
+}
+
 /* the same draw WITHOUT any query open — isolates the query's reset word from
  * the capture itself */
 TEST(r101_tess_gs_xfb_points_no_query)
@@ -5693,5 +6256,9 @@ int main(void)
     RUN_IF(r101_tess_gs_xfb_points_query);
     RUN_IF(r101_tess_gs_xfb_points_no_query);
     RUN_IF(r101_point_size_through_tess_and_gs);
+    RUN_IF(r102_tes_invocations_with_gs);
+    RUN_IF(r102_xfb_block_array_geometry);
+    RUN_IF(r102_xfb_dmat_array_tess_gs);
+    RUN_IF(r102_xfb_stream_buffer_conflict);
     return mgl_test_summary();
 }

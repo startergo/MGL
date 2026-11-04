@@ -2078,6 +2078,9 @@ static void tessPublishCapture(GLMContext ctx, id<MTLBuffer> ring, MGLTessProgra
     c->records_offset = recs_off;
     c->index_offset = idx_off;
     c->count_offset = cnt_off;
+    c->tes_invocations_offset = 0;   /* set by the GPU-emulated publish only (see the
+                                      * capture block in extTessDrawPatches); the CPU
+                                      * reference path counted on the CPU already */
     c->stride = tp->cap_stride;
     c->records = recs_cap;
     c->indices = idx_cap;
@@ -3525,6 +3528,12 @@ ph_vs = tessPhaseBegin();
              * NOT a record map — consumers must not re-index through it
              * (MGLTessCapture.emission_order, geometry.c's tess->geometry import) */
             ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.emission_order = true;
+            /* geom (r102): the GPU tessellator's totals[0] is the exact TES invocation
+             * count (one per tessellated coordinate; cap_pub_count is &totals[1] except
+             * point_mode, which publishes &totals[0]) — publish it so a geometry stage
+             * that owns this capture can fold the number into its query accumulator */
+            ((struct MGLExtState_tess *)ctx->state.ext_tess)->capture.tes_invocations_offset =
+                cap_pub_count - (tp->point_mode ? 0 : 4);
         }
         {
             id<MTLEvent> ev2 = [_device newEvent];

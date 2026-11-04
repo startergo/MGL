@@ -50,6 +50,7 @@
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_tess.h"     /* the TES-output capture producer (geometry behind tessellation) */
+#include "mgl_ext_queries.h"  /* mgl_queries_tess_counts_active: TES-invocation query gate (r102) */
 #include "mgl_ext_program.h"
 #include "mgl_ext_introspect.h"   /* subroutine source rewrite for the capture variant */
 #include "fp64.h"             /* software doubles: lower the generated variants like program.c does */
@@ -1780,7 +1781,12 @@ static bool geom_var_dotted(const MGLGeomVar *v)
 static const char *geom_var_expr(char *buf, size_t cap, const MGLGeomVar *v)
 {
     if (geom_var_dotted(v))
-        snprintf(buf, cap, "%s.%s", v->name, v->member);
+    {
+        if (v->block_array)
+            snprintf(buf, cap, "%s[%u].%s", v->name, v->index, v->member);
+        else
+            snprintf(buf, cap, "%s.%s", v->name, v->member);
+    }
     else
         snprintf(buf, cap, "%s", v->name);
     return buf;
@@ -2482,7 +2488,8 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
                                const char *entry, bool disable_rasterization, char **log,
                                int pin_stage, const int *pins_glsl, const int *pins_msl, int pin_count,
                                const GeomPin *pins2, int npins2,
-                               MGLGeomTexSlot *slots, int *nslots, int max_slots)
+                               MGLGeomTexSlot *slots, int *nslots, int max_slots,
+                               bool native_arrays)
 {
     spvc_context sctx;
     spvc_parsed_ir pir;
@@ -2570,6 +2577,15 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
          * this argument (kernel and capture variants alike) */
         spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_BUFFER_SIZE_BUFFER_INDEX,
                                        MGL_GEOM_KERNEL_SIZE_BUFFER);
+        /* geom r102: thread-local arrays as NATIVE arrays.  SPIRV-Cross maps a GLSL
+         * array in thread storage to spvUnsafeArray<T,N>, but a uniform-block member
+         * array keeps its raw C-array shape; copying one to the other (`goku = uni_goku;`
+         * — a dmat array, KHR-Single-GL46 enhanced_layouts.xfb_explicit_location_dmat2_
+         * geometry) then lowers to `goku[0] = uni_goku[0]`, spvUnsafeArray<ulong2,2> =
+         * ulong2[2], for which no assignment operator exists and Metal rejects the
+         * kernel.  With native arrays the copy is a per-component loop and compiles. */
+        if (native_arrays)
+            spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_FORCE_NATIVE_ARRAYS, SPVC_TRUE);
         spvc_compiler_install_compiler_options(comp, opt);
     }
 
@@ -3722,6 +3738,72 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp))
                     for (int mi2 = 0; mi2 < t->n_members; mi2++)
                         if (vars[m0 + mi2].xfb_buffer < 0) vars[m0 + mi2].xfb_buffer = (int)tmp;
+            }
+            /* geom r102: a named block (or plain struct) INSTANCE with an array dimension
+             * ("out Goku { vec4 gohan; } goku[2];") — the entries collected above are
+             * ELEMENT 0.  GL 4.6 11.1.2.5 (ARB_enhanced_layouts): a captured block follows
+             * the std430 rules unless members carry explicit offsets, and an array of
+             * blocks is captured element-consecutively, each element aligned to the
+             * block's alignment.  So element e's members sit e * <element size> past
+             * element 0's, consume a fresh set of locations, and the kernel's
+             * store/clear expressions must carry the element index ("goku[e].gohan") —
+             * the element-0 entry alone would name "goku.gohan", which is not
+             * well-formed for an array instance at all (KHR-Single-GL46
+             * enhanced_layouts.xfb_block_stride_geometry). */
+            {
+                SpvType *raw = spv_find_type(m, v->type_id);
+                while (raw && raw->kind == SPVT_PTR) raw = spv_find_type(m, raw->elem);
+                bool inst_is_array = raw && raw->kind == SPVT_ARRAY &&
+                                     spv_find_type(m, raw->elem) == t;
+                if (!inputs && !anon && inst_is_array && n > m0)
+                {
+                    int nm = n - m0;
+                    GLuint e, i2;
+                    unsigned stride = 0, maxa = 1, walk = 0, expl_end = 0;
+                    /* per-member std430 size/alignment (the walk the plain-struct offset
+                     * derivation above uses), and the end an explicit member offset implies */
+                    for (i2 = 0; i2 < (GLuint)nm; i2++)
+                    {
+                        MGLGeomVar *mv = &vars[m0 + i2];
+                        unsigned sb = base_words(mv->base) * 4u;
+                        unsigned ma = (mv->rows == 3 ? 4u : mv->rows) * sb;
+                        unsigned ms = mv->rows * sb;
+                        uint32_t moff = 0;
+                        if (spv_member_deco(m, t->id, (int)i2, SpvDecorationOffset, &moff))
+                            expl_end = (moff + ms > expl_end) ? moff + ms : expl_end;
+                        if (mv->cols > 1)
+                            ms = mv->cols * ((ms + ma - 1) & ~(ma - 1));
+                        if (mv->elems > 1)
+                            ms = mv->elems * ((ms + ma - 1) & ~(ma - 1));
+                        walk = (walk + ma - 1) & ~(ma - 1);
+                        walk += ms;
+                        if (ma > maxa) maxa = ma;
+                    }
+                    stride = (expl_end > walk ? expl_end : walk);
+                    stride = (stride + maxa - 1) & ~(maxa - 1);
+                    /* the location span one element's members consume (explicit member
+                     * locations are honored in order; the span is what followed them) */
+                    GLuint span = (next_loc > vars[m0].location) ? next_loc - vars[m0].location : 0;
+                    for (i2 = 0; i2 < (GLuint)nm; i2++)
+                    {
+                        vars[m0 + i2].block_array = true;
+                        vars[m0 + i2].index = 0;
+                        vars[m0 + i2].block_elems = elems ? elems : 1;
+                    }
+                    for (e = 1; e < (elems ? elems : 1) && n < MGL_GEOM_MAX_VARYINGS; e++)
+                    {
+                        for (i2 = 0; i2 < (GLuint)nm && n < MGL_GEOM_MAX_VARYINGS; i2++)
+                        {
+                            MGLGeomVar *mv = &vars[m0 + i2], *nv = &vars[n];
+                            *nv = *mv;          /* element 0's entry: type, flatness, stride */
+                            nv->index = e;
+                            nv->location = mv->location + span * e;
+                            if (mv->xfb_offset != 0xffffffffu)
+                                nv->xfb_offset = mv->xfb_offset + stride * e;
+                            n++;
+                        }
+                    }
+                }
             }
             continue;
         flat_merged: ;
@@ -7867,12 +7949,11 @@ static char *geom_gen_kernel_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, cons
     for (int i = 0; i < gp->n_out; i++)
     {
         /* a named output block member is zero-initialized through the instance ("b.c");
-         * a global instance in GLSL is zero-initialized anyway, this is belt and braces */
+         * a global instance in GLSL is zero-initialized anyway, this is belt and braces.
+         * r102: an array-of-blocks instance is initialized element-wise
+         * ("goku[e].c") — the store/clear expression is shared with mgl_store_output */
         char src[192];
-        if (geom_var_dotted(&gp->out_v[i]))
-            snprintf(src, sizeof(src), "%s.%s", gp->out_v[i].name, gp->out_v[i].member);
-        else
-            snprintf(src, sizeof(src), "%s", gp->out_v[i].name);
+        geom_var_expr(src, sizeof(src), &gp->out_v[i]);
         sb_put(&b, "    %s%s = %s(0);\n", src, gp->out_v[i].elems > 1 ? "[0]" : "",
                glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, gp->out_v[i].cols));
     }
@@ -8492,6 +8573,48 @@ bool mgl_geom_compile_stage(GLMContext ctx, Program *program, void *obj_p, int s
         if (vm) spv_free(vm);
     }
 
+    /* geom r102: GL 4.6 11.1.2.4 — every output assigned to a transform feedback buffer
+     * must be written in the same vertex stream; streams have no relative order, so two
+     * streams in one buffer is a link error (KHR-Single-GL46 enhanced_layouts.
+     * xfb_multiple_vertex_streams).  Vertex streams exist only in a geometry stage. */
+    for (int a = 0; a < gp->n_out; a++)
+    {
+        char na[160];
+        if (gp->out_v[a].xfb_buffer < 0) continue;
+        if (geom_var_dotted(&gp->out_v[a]))
+        {
+            if (gp->out_v[a].block_array)
+                snprintf(na, sizeof(na), "%s[%u].%s", gp->out_v[a].name, gp->out_v[a].index,
+                         gp->out_v[a].member);
+            else
+                snprintf(na, sizeof(na), "%s.%s", gp->out_v[a].name, gp->out_v[a].member);
+        }
+        else
+            snprintf(na, sizeof(na), "%s", gp->out_v[a].name);
+        for (int b = a + 1; b < gp->n_out; b++)
+        {
+            char nb[160];
+            if (gp->out_v[b].xfb_buffer != gp->out_v[a].xfb_buffer) continue;
+            if (gp->out_v[b].stream == gp->out_v[a].stream) continue;
+            if (geom_var_dotted(&gp->out_v[b]))
+            {
+                if (gp->out_v[b].block_array)
+                    snprintf(nb, sizeof(nb), "%s[%u].%s", gp->out_v[b].name, gp->out_v[b].index,
+                             gp->out_v[b].member);
+                else
+                    snprintf(nb, sizeof(nb), "%s.%s", gp->out_v[b].name, gp->out_v[b].member);
+            }
+            else
+                snprintf(nb, sizeof(nb), "%s", gp->out_v[b].name);
+            mgl_append_log(log, "ERROR: geometry: outputs '%s' (stream %u) and '%s' (stream %u) are "
+                                "assigned to the same transform feedback buffer %d from different "
+                                "vertex streams\n",
+                           na, gp->out_v[a].stream, nb, gp->out_v[b].stream,
+                           gp->out_v[a].xfb_buffer);
+            goto done;
+        }
+    }
+
     /* a named output interface block ("out B { vec4 c; } b;") is rewritten to a plain
      * struct + instance in the generated kernel (the body keeps writing b.c) and its
      * members are re-emitted as ordinary location-addressed varyings on the raster side,
@@ -9024,7 +9147,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     pins_msl[0] = MGL_GEOM_MSL_VSOUT;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->capture_entry, true, &log,
                             SpvExecutionModelVertex, pins_gl, pins_msl, 1, pins2, npins2,
-                            gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
+                            gp->tex_slots_vs, &gp->n_tex_slots_vs, 64, true);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("vertex capture variant MSL failed: %s", log ? log : "?");
     /* a vertex stage writing gl_CullDistance leaves BuiltInCullDistance stores pointing
@@ -9137,7 +9260,7 @@ build:
     pins_gl[7] = MGL_GEOM_SSBO_LSCR;     pins_msl[7] = MGL_GEOM_MSL_LSCR;
     msl = geom_spirv_to_msl(ctx, GL_COMPUTE_SHADER, ir, words, gp->kernel_entry, false, &log,
                             SpvExecutionModelGLCompute, pins_gl, pins_msl, 8, pins2, npins2,
-                            gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
+                            gp->tex_slots_gs, &gp->n_tex_slots_gs, 64, true);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("kernel MSL failed: %s", log ? log : "?");
     /* image atomics: the kernel MSL carries SPIRV-Cross's `<name>_atomic [[buffer(0)]]`
@@ -9156,6 +9279,42 @@ build:
                       "budget (MGL_GEOM_KERNEL_USER_SLOTS)");
         free(msl);
         msl = fixed;
+    }
+
+    /* geom r102: force_native_arrays makes SPIRV-Cross copy an array out of a uniform
+     * block with its spvArrayCopyFromStackToStack1 helper, but for a DEVICE source
+     * (uniform-block member arrays keep the raw C-array shape) it emits only the call —
+     * its helper template is defined for thread-to-thread copies, so Metal sees "no
+     * matching function" (`goku = uni_goku;` on a dmat array, KHR-Single-GL46
+     * enhanced_layouts.xfb_explicit_location_dmat*_geometry).  Supply the device-source
+     * overload ourselves, unless SPIRV-Cross already emitted it. */
+    if (strstr(msl, "spvArrayCopyFromStackToStack1") &&
+        !strstr(msl, "spvArrayCopyFromStackToStack1(thread T (&dst)[N], constant T (&src)[N])") &&
+        !strstr(msl, "spvArrayCopyFromStackToStack1(thread T (&dst)[N], const device T (&src)[N])"))
+    {
+        static const char arrcopy[] =
+            "template<typename T, size_t N>\n"
+            "static inline __attribute__((always_inline))\n"
+            "void spvArrayCopyFromStackToStack1(thread T (&dst)[N], constant T (&src)[N])\n"
+            "{\n"
+            "    for (size_t i = 0; i < N; ++i) dst[i] = src[i];\n"
+            "}\n"
+            "template<typename T, size_t N>\n"
+            "static inline __attribute__((always_inline))\n"
+            "void spvArrayCopyFromStackToStack1(thread T (&dst)[N], const device T (&src)[N])\n"
+            "{\n"
+            "    for (size_t i = 0; i < N; ++i) dst[i] = src[i];\n"
+            "}\n";
+        const char *anchor = "#include <metal_stdlib>\n";
+        const char *at = strstr(msl, anchor);
+        char *out;
+        size_t pre = at ? (size_t)(at - msl) + strlen(anchor) : 0;
+        out = xmalloc(strlen(msl) + sizeof arrcopy + 1);
+        memcpy(out, msl, pre);
+        memcpy(out + pre, arrcopy, sizeof arrcopy - 1);
+        memcpy(out + pre + sizeof arrcopy - 1, msl + pre, strlen(msl) - pre + 1);
+        free(msl);
+        msl = out;
     }
 
     /* the kernel must have a stable name: SPIRV-Cross always emits "kernel void main0(".
@@ -9231,7 +9390,7 @@ build:
     free(glsl);
     pins_gl[0] = MGL_GEOM_SSBO_DRAW;     pins_msl[0] = MGL_GEOM_MSL_DRAW;
     msl = geom_spirv_to_msl(ctx, GL_VERTEX_SHADER, ir, words, gp->draw_entry, false, &log,
-                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, NULL, 0, NULL, NULL, 0);
+                            SpvExecutionModelVertex, pins_gl, pins_msl, 1, NULL, 0, NULL, NULL, 0, true);
     free(ir); ir = NULL; words = 0;
     if (!msl) GEOM_FAIL("pass-through vertex function MSL failed: %s", log ? log : "?");
 
@@ -10153,6 +10312,14 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
     d.tess_cnt_off = c->count_offset;
     d.tess_stride = c->stride;
     d.tess_prim = c->prim;
+    /* r102: while a GL_TESS_EVALUATION_SHADER_INVOCATIONS query is open (with a geometry
+     * stage bound, mgl_queries_tess_counts_active answers exactly that), fold the GPU
+     * tessellator's invocation count into the query accumulator (word 9): the GPU-emulated
+     * tess path never runs the CPU reference counter, so without this the query reads 0.
+     * tes_invocations_offset is 0 on the CPU reference path, whose invocations the CPU
+     * already counted (mgl_tess_note_draw) — folding there would double-count. */
+    if (c->tes_invocations_offset && mgl_queries_tess_counts_active(ctx))
+        d.tess_tesinv_off = c->tes_invocations_offset;
     d.tess_pairs[d.tess_npairs++] = 0; d.tess_pairs[d.tess_npairs++] = 0;
     d.tess_pairs[d.tess_npairs++] = 1; d.tess_pairs[d.tess_npairs++] = 1;
     d.tess_pairs[d.tess_npairs++] = 2; d.tess_pairs[d.tess_npairs++] = 2;
@@ -10996,7 +11163,13 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             }
             if (vars[k].xfb_offset == 0xffffffffu) continue;   /* no xfb_offset: not captured */
             if (geom_var_dotted(&vars[k]))
-                snprintf(dnames[dn], sizeof(dnames[dn]), "%s.%s", vars[k].name, vars[k].member);
+            {
+                if (vars[k].block_array)
+                    snprintf(dnames[dn], sizeof(dnames[dn]), "%s[%u].%s",
+                             vars[k].name, vars[k].index, vars[k].member);
+                else
+                    snprintf(dnames[dn], sizeof(dnames[dn]), "%s.%s", vars[k].name, vars[k].member);
+            }
             else
                 snprintf(dnames[dn], sizeof(dnames[dn]), "%s", vars[k].name);
             dbuffer[dn] = b;
@@ -11051,8 +11224,16 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                     if (vars[k].member[0] && !strcmp(vars[k].name, nm))
                     {
                         xsrc[xn] = q;
-                        snprintf(xnames[xn++], sizeof(xnames[0]), "%s.%s",
-                                 vars[k].name, vars[k].member);
+                        /* r102: an ARRAY-OF-BLOCKS instance ("out B{..} b[2];") has one
+                         * collected entry per (element, member) — name each element's
+                         * member so the resolver below picks the element's own entry
+                         * (offset advanced by the std430 block size) */
+                        if (vars[k].block_array)
+                            snprintf(xnames[xn++], sizeof(xnames[0]), "%s[%u].%s",
+                                     vars[k].name, vars[k].index, vars[k].member);
+                        else
+                            snprintf(xnames[xn++], sizeof(xnames[0]), "%s.%s",
+                                     vars[k].name, vars[k].member);
                     }
             }
             else
@@ -11161,6 +11342,29 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
         /* a user output of the stage: either a plain varying, or an interface block member
          * written as instance.member ("b.c"); an interface block instance with a single
          * member also names that member */
+        /* r102: an ARRAY-OF-BLOCKS instance is named "inst[e].member" — the element index
+         * sits on the instance name, before the member.  Normalize to "inst.member" and
+         * remember the element; the collected table holds one entry per (element, member). */
+        char belem_nrm[192];
+        GLuint belem = 0;
+        bool bhave_elem = false;
+        {
+            const char *bd = strchr(name, '.');
+            const char *bb = name ? strchr(name, '[') : NULL;
+            if (bd && bb && bb < bd)
+            {
+                char *bxend;
+                long be = strtol(bb + 1, &bxend, 10);
+                if (be >= 0 && bxend && bxend[0] == ']' && bxend[1] == '.')
+                {
+                    snprintf(belem_nrm, sizeof(belem_nrm), "%.*s%s",
+                             (int)(bb - name), name, bxend + 1);
+                    name = belem_nrm;
+                    belem = (GLuint)be;
+                    bhave_elem = true;
+                }
+            }
+        }
         /* a trailing "[N]" selects ONE array element (GL 4.6 13.3.1: "the name may include
          * an array index"); without it the whole array is captured.  Strip it before the
          * name/member match and remember the element for the offset below. */
@@ -11220,6 +11424,36 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             xp->link_log = log;
             xp->link_failed = true;
             return;
+        }
+        /* r102: the matched entry of an array-of-blocks instance is one ELEMENT — select
+         * the named element's own entry (xfb_offset already advanced by the element's
+         * std430 block size); without an index the pending name expanded to one entry per
+         * element above, so this only narrows an explicit "inst[e].member" */
+        if (vars[j].block_array)
+        {
+            if (geom_env(1))
+                fprintf(stderr, "geom: xfbcap block-array narrow '%s' belem=%u have=%d\n",
+                        name, belem, (int)bhave_elem);
+            if (bhave_elem && belem >= vars[j].block_elems)
+            {
+                char *log = NULL;
+                mgl_append_info_log(&log, "ERROR: transform feedback varying '%s' indexes past the "
+                                          "end of the array-of-blocks instance '%s'\n", name, vars[j].name);
+                free(xp->link_log);
+                xp->link_log = log;
+                xp->link_failed = true;
+                return;
+            }
+            if (bhave_elem)
+            {
+                int k;
+                for (k = 0; k < nvars; k++)
+                    if (vars[k].block_array && vars[k].index == belem &&
+                        !strcmp(vars[k].name, vars[j].name) &&
+                        !strcmp(vars[k].member, vars[j].member))
+                        break;
+                if (k < nvars) j = k;
+            }
         }
 
         const MGLGeomVar *g = &vars[j];
@@ -11757,6 +11991,7 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     for (GLsizei i = 0; i < xp->count; i++)
     {
         MGLXfbVarying *v = &xp->vars[i];
+        char gname[192];               /* "inst[e].member" flattened to "inst_e_member" */
         const char *nm = v->name ? v->name : "";
         uint32_t w = v->words;
         bool found = false;
@@ -11788,6 +12023,24 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                     i, nm, v->words, v->type, v->buffer, v->offset);
 
         if (!strcmp(nm, "gl_Position")) { v->src_word = 0; continue; }   /* always first */
+        /* r102: an array-of-blocks element is named "inst[e].member" in GL but the
+         * capture record flattens it the way SPIRV-Cross does, "inst_e_member" —
+         * normalize once so the exact/suffix matches below see the flattened form */
+        {
+            const char *gd = strchr(nm, '.');
+            const char *gb = strchr(nm, '[');
+            if (gd && gb && gb < gd)
+            {
+                char *gxend;
+                long ge = strtol(gb + 1, &gxend, 10);
+                if (ge >= 0 && gxend && gxend[0] == ']' && gxend[1] == '.')
+                {
+                    snprintf(gname, sizeof(gname), "%.*s_%ld_%s",
+                             (int)(gb - nm), nm, ge, gxend + 2);
+                    nm = gname;
+                }
+            }
+        }
         for (uint32_t k = 0; k < c->members; k++)
         {
             const char *cn = c->member[k].name;
@@ -11822,6 +12075,9 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                 v->src_word = c->member[k].offset;
                 if (!w) w = c->member[k].words;
                 found = true;
+                if (geom_env(1))
+                    fprintf(stderr, "geom: tessxfb hit var '%s' -> member '%s' src_word=%u\n",
+                            nm, cn, c->member[k].offset);
                 break;
             }
         }

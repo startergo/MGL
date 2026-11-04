@@ -248,6 +248,7 @@ static id<MTLComputePipelineState> gXfbPrePso, gXfbScatterPso, gXfbFinPso, gXfbB
 static id<MTLComputePipelineState> gXfbTessPso, gXfbTessFinPso;
 static id<MTLComputePipelineState> gFinPso;
 static id<MTLComputePipelineState> gQaccPso;      /* query accumulator (see mgl_geom_qacc) */
+static id<MTLBuffer> gZero4;                      /* the qacc's "no TES count this draw" word */
 static id<MTLBuffer> gQacc;                       /* 8 persistent query words, shared storage */
 static uint32_t gQaccReset;                       /* words that restart at the next draw */
 static bool gQaccRan;                             /* an update was encoded since the last begin */
@@ -1122,16 +1123,23 @@ static const char *kGeomCtlMSL =
     " * primitive as the shader closed it).  Word 8: GEOMETRY_SHADER_INVOCATIONS\n"
     " * (ctl[21], one bump per (input primitive, invocation) thread - the only exact\n"
     " * source for indirect draws whose vertex/instance counts are GPU-side only,\n"
-    " * KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries). */\n"
+    " * KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries).\n"
+    " * Word 9 (r102): TESS_EVALUATION_SHADER_INVOCATIONS of a tess-fed draw - the GPU\n"
+    " * tessellator's coordinate count word in the tess ring (MGLTessCapture.\n"
+    " * tes_invocations_offset); buffer(3) points at it when the draw folds it, and at a\n"
+    " * zero word otherwise (the CPU reference path counted its invocations on the CPU).\n"
+    " */\n"
     "kernel void mgl_geom_qacc(device mgl_geom_ctl& c [[buffer(0)]],\n"
     "                          device uint* acc [[buffer(1)]],\n"
-    "                          constant uint& reset_mask [[buffer(2)]])\n"
+    "                          constant uint& reset_mask [[buffer(2)]],\n"
+    "                          constant uint* tes [[buffer(3)]])\n"
     "{\n"
     "    for (uint w = 0u; w < 16u; w++)\n"
     "    {\n"
     "        uint v = (w < 4u) ? c.mgl_ctl[17u + w]\n"
     "                : (w < 8u) ? c.mgl_ctl[9u + w]\n"
-    "                : (w == 8u) ? c.mgl_ctl[21u] : 0u;   /* w8: GEOMETRY_SHADER_INVOCATIONS */\n"
+    "                : (w == 8u) ? c.mgl_ctl[21u]          /* GEOMETRY_SHADER_INVOCATIONS */\n"
+    "                : (w == 9u) ? tes[0u] : 0u;           /* TES invocations (tess-fed draws) */\n"
     "        if ((reset_mask >> w) & 1u) acc[w] = v;\n"
     "        else                        acc[w] += v;\n"
     "    }\n"
@@ -7135,7 +7143,8 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
             {
                 uint32_t mask = gQaccReset;
                 if (gEnv.qdebug)
-                    fprintf(stderr, "geom: qacc dispatch mask=%x\n", mask);
+                    fprintf(stderr, "geom: qacc dispatch mask=%x tesinv@%zu\n", mask,
+                            d->tess_tesinv_off);
                 gQaccReset = 0;
                 gQaccRan = true;
                 gQaccCb = _currentCommandBuffer;
@@ -7143,6 +7152,20 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
                 [enc setBuffer: gCtl offset: 0 atIndex: 0];
                 [enc setBuffer: gQacc offset: 0 atIndex: 1];
                 [enc setBytes: &mask length: sizeof mask atIndex: 2];
+                /* word 9's TES invocation count: the tess ring's GPU-written word when this
+                 * draw folds it, a zero word otherwise (the CPU reference path already
+                 * counted its invocations on the CPU) — the binding must be re-issued on
+                 * every dispatch, Metal keeps encoder bindings alive across kernels */
+                if (d->tess_tesinv_off && d->tess_ring)
+                    [enc setBuffer: (__bridge id<MTLBuffer>)d->tess_ring
+                             offset: d->tess_tesinv_off atIndex: 3];
+                else
+                {
+                    if (!gZero4)
+                        gZero4 = [_device newBufferWithLength: 4
+                                                  options: MTLResourceStorageModeShared];
+                    [enc setBuffer: gZero4 offset: 0 atIndex: 3];
+                }
                 [enc dispatchThreadgroups: MTLSizeMake(1, 1, 1)
                       threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
             }

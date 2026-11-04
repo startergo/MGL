@@ -263,14 +263,20 @@ static void begin_query(GLMContext ctx, GLenum target, GLuint index, GLuint id)
      * GEOMETRY_SHADER_INVOCATIONS is accumulator word 8: the geometry kernel bumps
      * ctl[21] once per (input primitive, invocation) thread — the exact count for
      * indirect draws too, where the CPU-side vertex/instance estimate sees zeros
-     * (KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries). */
+     * (KHR-GL46.pipeline_statistics_query_tests_ARB.*geometry_shader_queries).
+     * TESS_EVALUATION_SHADER_INVOCATIONS is word 9 (r102): the geometry draw folds the
+     * GPU tessellator's invocation count of a tess-fed capture into it, so the count
+     * stays exact when a geometry stage owns the capture (queries.c never runs the CPU
+     * reference counter then).  No geometry draw in the period -> the read reports 0
+     * and the CPU's note_tess counts stand alone. */
     if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
         target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES ||
-        target == GL_GEOMETRY_SHADER_INVOCATIONS)
+        target == GL_GEOMETRY_SHADER_INVOCATIONS || target == GL_TESS_EVALUATION_SHADER_INVOCATIONS)
     {
         unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
                         (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index :
-                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u : 0u;
+                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u :
+                        (target == GL_TESS_EVALUATION_SHADER_INVOCATIONS) ? 9u : 0u;
         if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_begin)
             ctx->mtl_funcs.ext_geom->query_begin(ctx, 1u << word);
     }
@@ -310,11 +316,12 @@ static void end_query(GLMContext ctx, GLenum target, GLuint index)
      * into the CPU-tracked part here; queries without a geometry-stage draw read 0 */
     if (target == GL_PRIMITIVES_GENERATED || target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED ||
         target == GL_CLIPPING_INPUT_PRIMITIVES || target == GL_CLIPPING_OUTPUT_PRIMITIVES ||
-        target == GL_GEOMETRY_SHADER_INVOCATIONS)
+        target == GL_GEOMETRY_SHADER_INVOCATIONS || target == GL_TESS_EVALUATION_SHADER_INVOCATIONS)
     {
         unsigned word = (target == GL_PRIMITIVES_GENERATED) ? index :
                         (target == GL_GEOMETRY_SHADER_PRIMITIVES_EMITTED) ? 4u + index :
-                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u : 0u;
+                        (target == GL_GEOMETRY_SHADER_INVOCATIONS) ? 8u :
+                        (target == GL_TESS_EVALUATION_SHADER_INVOCATIONS) ? 9u : 0u;
         if (ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->query_read)
         {
             uint64_t v = 0;
