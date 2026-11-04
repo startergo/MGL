@@ -674,6 +674,51 @@ static bool lv_block_storage(LvModule *m, LvType *t, uint32_t *storage_out)
  * MAX_TESS_CONTROL_TOTAL_OUTPUT_COMPONENTS), so only the lowest-location
  * element of such a split group may be checked (varying_block_member_locations
  * _tessellation_* regressed otherwise). */
+/* tess r59: GL matches a producer OUTPUT to the next stage's INPUT by NAME
+ * (GLSL 4.60 4.3.9); an output the next stage does not declare is INACTIVE —
+ * it is given no interpolator storage and must not count against the
+ * producer's location cap, however many of them transform feedback captures
+ * (GL 4.6 13.2: "captured outputs need not be inputs of the subsequent
+ * stage").  KHR-GL46.transform_feedback.get_xfb_varying links 30 unconsumed
+ * mat2 vertex outputs (= 60 locations, all interleaved-captured, 120 <= 128
+ * components) against a fragment stage that consumes nothing, and conformant
+ * desktop GL links it — hardware interpolator budgets only cover the ACTIVE
+ * (consumed) interface.  Returns true when `cm` (the next stage's module)
+ * declares an input matching `var`: same variable/instance name, or the same
+ * block TYPE name for interface blocks.  A NULL consumer means "unknown"
+ * (separable stage): every output is treated as consumed — the pre-r59
+ * behavior. */
+static bool lv_consumed_by(LvModule *cm, LvModule *m, uint32_t var, LvType *bt)
+{
+    if (!cm) return true;
+    const char *name = lv_name(m, var);
+    bool is_block = bt && bt->kind == LV_STRUCT && lv_deco(m, bt->id, SpvDecorationBlock, NULL);
+    const char *bname = is_block ? lv_name(m, bt->id) : NULL;
+
+    if ((!name || !*name) && (!bname || !*bname)) return true;  /* unnamed: cannot prove unused */
+
+    for (int v = 0; v < cm->n_vars; v++)
+    {
+        if (cm->vars[v].storage != SpvStorageClassInput) continue;
+        LvType *cp = lv_find(cm, cm->vars[v].type);
+        if (!cp || cp->kind != LV_PTR) continue;
+        const char *cn = lv_name(cm, cm->vars[v].id);
+        if (cn && name && *name && !strcmp(cn, name)) return true;
+        if (bname && *bname)
+        {
+            LvType *cb = lv_find(cm, cp->elem);
+            while (cb && cb->kind == LV_ARRAY) cb = lv_find(cm, cb->elem);
+            if (cb && cb->kind == LV_STRUCT &&
+                lv_deco(cm, cb->id, SpvDecorationBlock, NULL))
+            {
+                const char *cbn = lv_name(cm, cb->id);
+                if (cbn && !strcmp(cbn, bname)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool lv_split_group_min(LvModule *m, uint32_t var, uint32_t *minloc,
                                unsigned *count)
 {
@@ -741,7 +786,7 @@ static char *lv_input_component_aliasing(LvModule *m, int stage)
     return NULL;
 }
 
-static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, char **log)
+static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, LvModule *cm, char **log)
 {
     for (int v = 0; v < m->n_vars; v++)
     {
@@ -766,6 +811,11 @@ static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, char **lo
         LvType *bt = t;
         while (bt && bt->kind == LV_ARRAY) bt = lv_find(m, bt->elem);
         t = bt;
+
+        /* an OUTPUT the next stage does not consume is inactive (no
+         * interpolator storage): the location cap guards the ACTIVE
+         * interface only — see lv_consumed_by above */
+        if (!input && !lv_consumed_by(cm, m, var, t)) continue;
 
         /* interface BLOCK instances cannot be checked against the per-stage
          * location cap: glslang's AUTO_MAP_LOCATIONS (on for every GL shader
@@ -845,7 +895,8 @@ static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, char **lo
 
 /* ------------------------------------------------------------------ entry point */
 
-char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words)
+char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
+                                const uint32_t *consumer_ir, size_t consumer_words)
 {
     LvModule *m = calloc(1, sizeof *m);
     char *log = NULL;
@@ -914,8 +965,18 @@ char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, s
         ok = lv_check_block(m, t, std430, &log);
     }
 
-    /* R2: varying location limits */
-    if (ok) ok = lv_check_locations(ctx, m, stage, &log);
+    /* R2: varying location limits.  consumer_ir = the next stage's module
+     * (NULL for a separable stage or when there is none): an output it does
+     * not declare is inactive and skips the cap (lv_consumed_by). */
+    if (ok)
+    {
+        LvModule *cm = NULL;
+        LvModule cmstore;
+        if (consumer_ir && consumer_words >= 5 && consumer_ir[0] == SpvMagicNumber &&
+            lv_parse(consumer_ir, consumer_words, &cmstore))
+            cm = &cmstore;
+        ok = lv_check_locations(ctx, m, stage, cm, &log);
+    }
 
     free(m);
     return ok ? NULL : log;

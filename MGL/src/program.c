@@ -53,7 +53,8 @@ static uint64_t mgl_link_group_seq;
 
 /* compat r86/r91 (mgl_layout_validate.c): GLSL layout rules glslang does not
  * check, and the MSL array-of-matrix output lowering */
-extern char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words);
+extern char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
+                                       const uint32_t *consumer_ir, size_t consumer_words);
 extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);
 #include "buffers.h"
 #include "msl_reserved.h"
@@ -2508,7 +2509,7 @@ static void sep_vs_kernel_cache(GLMContext ctx, GLuint name, const uint32_t *pre
 
 static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const uint32_t *words,
                           size_t nwords, const char *entry, ReflectAcc *acc, char **log,
-                          bool tess_pipeline)
+                          bool tess_pipeline, const uint32_t *consumer_ir, size_t consumer_words)
 {
     Program *ptr = &dst->base;
     spvc_context context = NULL;
@@ -2618,7 +2619,8 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
      * makes their decorations inconsistent — the r48 fix pass re-lays those
      * blocks out later). */
     {
-        char *vlog = mgl_layout_validate_stage(ctx, stage, prepared, prepared_words);
+        char *vlog = mgl_layout_validate_stage(ctx, stage, prepared, prepared_words,
+                                               consumer_ir, consumer_words);
         if (vlog)
         {
             mgl_append_info_log(log, "%s", vlog);
@@ -4231,8 +4233,28 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             if (!(mask & SHADER_MASK_BIT(stage)) || !mods[stage])
                 continue;
 
+            /* the next attached stage (VS->TCS->TES->GS->FS): its declared
+             * inputs decide which of this stage's outputs are ACTIVE for the
+             * link-time location cap — an output it does not consume (e.g.
+             * only captured by transform feedback) is inactive and must not
+             * count (GL 4.6 13.2, 11.1.2.1; the modules are freed per stage
+             * below, and the consumer is always compiled after this one, so
+             * mods[consumer] is still live here) */
+            const uint32_t *consumer_ir = NULL;
+            size_t consumer_words = 0;
+            for (int c = stage + 1; c <= _FRAGMENT_SHADER; c++)
+            {
+                if ((mask & SHADER_MASK_BIT(c)) && mods[c])
+                {
+                    consumer_ir = mods[c];
+                    consumer_words = sizes[c];
+                    break;
+                }
+            }
+
             ok = compile_stage(ctx, dst, stage, mods[stage], sizes[stage], "main", acc, log,
-                               (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
+                               (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0,
+                               consumer_ir, consumer_words);
             free((void *)mods[stage]);
 
             /* executable stages keep the GLSL source / type of the shader they came from
@@ -4292,7 +4314,7 @@ static bool link_spirv_attached(GLMContext ctx, MGLProgramObj *obj, MGLProgramOb
         Shader *s = obj->attached[i];
         MGLShaderObj *so = MGL_SHADER_OBJ(s);
         ok = compile_stage(ctx, dst, s->glm_type, so->spirv, so->spirv_words, so->spirv_entry, acc, log,
-                           (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
+                           (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0, NULL, 0);
     }
 
     return ok;
@@ -4414,7 +4436,7 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
             if (mask & SHADER_MASK_BIT(stage))
                 ok = compile_stage(ctx, scratch, stage, words[stage], counts[stage], entries[stage], &acc, &log,
-                              (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0);
+                              (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0, NULL, 0);
     }
 
     /* GL link rule: a program with a compute shader must have a work group size.

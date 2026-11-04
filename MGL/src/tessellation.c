@@ -1000,12 +1000,90 @@ char *tess_shadow_implicit_lod(const char *src)
     return out;
 }
 
+/* r59: see the mgl_tess_glsl_compat comment.  An ES-profile source that
+ * declares a sampler*Shadow and calls textureLod on it: enable
+ * GL_EXT_texture_shadow_lod (glslang requires the extension by name even where
+ * the call is core) and, below ESSL 3.20, present the shader as the ESSL 3.20
+ * it is equivalent to.  Returns a new string (caller frees) or NULL when
+ * nothing applies. */
+static char *tess_es_shadow_lod(const char *src)
+{
+    const char *vline;
+    int vern = 0;
+    char tok[8] = "";
+
+    if (!src)
+        return NULL;
+    vline = strstr(src, "#version ");
+    if (!vline)
+        return NULL;
+    if (sscanf(vline, "#version %d %7s", &vern, tok) != 2 ||
+        strcmp(tok, "es") != 0)
+        return NULL;
+    if (!strstr(src, "textureLod(") || !strstr(src, "Shadow") || !strstr(src, "sampler"))
+        return NULL;
+
+    /* keep everything after the version line; enable the extension right
+     * below it (and bump a pre-3.20 version: "#version 310 es" and
+     * "#version 320 es" are the same 15 characters) */
+    {
+        const char *eol = strchr(vline, '\n');
+        size_t head = eol ? (size_t)(eol - src) + 1 : strlen(src);
+        const char *rest = src + head;
+        char *out;
+        size_t len = head + 64 + strlen(rest);
+
+        /* already enabled (idempotence on re-entry) */
+        if (strstr(src, "GL_EXT_texture_shadow_lod"))
+            return NULL;
+        out = (char *)malloc(len);
+        if (!out)
+            return NULL;
+        memcpy(out, src, head);
+        out[head] = 0;
+        if (vern < 320)
+        {
+            char *v = strstr(out, "#version ");
+
+            if (v)
+                memcpy(v, "#version 320 es", 15);
+        }
+        snprintf(out + strlen(out), len - strlen(out),
+                 "#extension GL_EXT_texture_shadow_lod : enable\n%s", rest);
+        return out;
+    }
+}
+
 char *mgl_tess_glsl_compat(GLenum type, const char *src)
 {
     if (!src ||
         (type != GL_TESS_CONTROL_SHADER && type != GL_TESS_EVALUATION_SHADER &&
-         type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER))
+         type != GL_GEOMETRY_SHADER && type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER &&
+         type != GL_COMPUTE_SHADER))
         return NULL;
+    /* r59: an ES-profile TCS/TES/GS/VS/CS with an explicit textureLod on a
+     * *Shadow sampler: the call is core GLSL from ESSL 3.20 / desktop 1.30,
+     * but glslang's ES tables gate it behind GL_EXT_texture_shadow_lod AND an
+     * ES version >= 320 ("GL_EXT_texture_shadow_lod not supported for this ES
+     * version", ParseHelper).  dEQP-GL45-ES31's opaque_type_indexing
+     * translation emits textureLod(samplerCubeShadow[N], coords, 0.0) in the
+     * non-fragment stages at 310 es, so the link dies before any draw.  Turn
+     * the extension on (the context exposes it) and present the shader as the
+     * ESSL 3.20 it is equivalent to — MGL implements the full ES 3.2 surface
+     * through desktop 4.6.  Fragment stays out (its texture() is implicit-lod
+     * and the dEQP negative suites must keep their error behavior). */
+    if (type != GL_FRAGMENT_SHADER)
+    {
+        char *r = tess_es_shadow_lod(src);
+
+        if (r)
+        {
+            char *rest = mgl_tess_glsl_compat(type, r);
+
+            if (rest) { free(r); return rest; }
+            return r;
+        }
+    }
     /* GL_EXT_texture_shadow_lod / core GLSL 4.6: implicit-lod texture() on a shadow
      * sampler outside the fragment stage samples the base level (GL 4.6 8.14.1),
      * but glslang gates the overload behind an extension it only enables for ES
@@ -6980,19 +7058,25 @@ static bool tess_msl_type_words(const char *type, uint32_t *words)
  * capture record's MSL repr pads each dvecR column to whole uint4 slots, but
  * every consumer of the capture (the geometry domain's import and the xfb
  * publish) reads the doubles compactly, two words each.  0 = not a double
- * varying (u32/float members keep their natural size). */
-static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char *name)
+ * varying (u32/float members keep their natural size).
+ * tess_out_shape reports the GL shape: array elements x matrix columns x
+ * vector rows. */
+static bool tess_out_shape(GLMContext ctx, MGLTessProgram *tp, const char *name,
+                           uint32_t *elems, uint32_t *cols, uint32_t *rows)
 {
     Program *prog = tp->program;
     uint32_t *ir;
     size_t n, m;
 
+    if (elems) *elems = 1;
+    if (cols) *cols = 1;
+    if (rows) *rows = 1;
     if (!prog || !name || !*name)
-        return 0;
+        return false;
     ir = prog->spirv[_TESS_EVALUATION_SHADER].ir;
     n = prog->spirv[_TESS_EVALUATION_SHADER].size;
     if (!ir || n < 8 || !ctx)
-        return 0;
+        return false;
 
     /* find the member/variable by name: OpName (variables) or OpMemberName
      * (interface block members) */
@@ -7067,7 +7151,7 @@ static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char 
                 /* walk the (pointer-stripped) type: array * matrix columns *
                  * vector rows doubles */
                 {
-                    uint32_t elems = 1, cols = 1, rows = 1, isdbl = 0, pass = 0;
+                    uint32_t l_elems = 1, l_cols = 1, l_rows = 1, isdbl = 0, pass = 0;
 
                     while (ty && pass++ < 8)
                     {
@@ -7095,28 +7179,193 @@ static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char 
                                         }
                                         c += wcc;
                                     }
-                                    elems *= alen;
+                                    l_elems *= alen;
                                     ty = ir[v + 2];
                                     break;
                                 }
-                                if (ov == 24) { cols = ir[v + 3]; ty = ir[v + 2]; break; }   /* matrix */
-                                if (ov == 23) { rows = ir[v + 3]; ty = ir[v + 2]; break; }   /* vector */
-                                if (ov == 22) { isdbl = (ir[v + 2] == 64); ty = 0; break; }  /* float */
+                                if (ov == 24) { l_cols = ir[v + 3]; ty = ir[v + 2]; break; }   /* matrix */
+                                if (ov == 23) { l_rows = ir[v + 3]; ty = ir[v + 2]; break; }   /* vector */
+                                if (ov == 22) { isdbl = (ir[v + 2] == 64); ty = 0; break; }    /* float */
                                 ty = 0;
                                 break;
                             }
                             v += wv;
                         }
                     }
-                    if (isdbl)
-                        return elems * cols * rows;
-                    return 0;
+                    if (elems) *elems = l_elems;
+                    if (cols) *cols = l_cols;
+                    if (rows) *rows = l_rows;
+                    return isdbl != 0;
                 }
             }
         }
         m += wc;
     }
-    return 0;
+    return false;
+}
+
+static uint32_t tess_out_doubles(GLMContext ctx, MGLTessProgram *tp, const char *name)
+{
+    uint32_t elems, cols, rows;
+
+    if (!tess_out_shape(ctx, tp, name, &elems, &cols, &rows))
+        return 0;
+    return elems * cols * rows;
+}
+
+/* r59: doubles of ONE SLOT of a split fp64 member "<base>_<slot>".  SPIRV-Cross
+ * flattens a multi-location double output into one uint4/uint2 stage attribute
+ * per slot ("goku_0", "goku_1", ...), and a column with an odd width
+ * (dvec3 / dmatNx3) leaves its last slot's tail half PADDED — the observed
+ * dmat2x3 capture read {.125,.25,.375,<pad>,.5,.625} with .75 lost past the
+ * record end.  The compact capture record must carry only the VALID doubles of
+ * this slot: cslots = ceil(rows/2) uint4 slots per column, k = the slot's row
+ * offset within its column, min(2, rows-2k) doubles.  Returns 0 (member not a
+ * split fp64 slot) when no GL-view output name matches the base. */
+static uint32_t tess_split_slot_doubles(GLMContext ctx, MGLTessProgram *tp,
+                                        const char *member, const char *msl_type,
+                                        uint32_t *elems, uint32_t *cols, uint32_t *rows)
+{
+    Program *prog = tp->program;
+    uint32_t *ir;
+    size_t n, len, bl;
+    char base[128];
+    long slot;
+    const char *digit;
+
+    if (!prog || !member || !msl_type)
+        return 0;
+    if (strncmp(msl_type, "uint", 4) != 0)
+        return 0;                     /* only fp64 reprs are uint2/uint4 slots */
+    len = strlen(member);
+    if (len < 2 || len >= sizeof base + 3)
+        return 0;
+    digit = member + len;
+    while (digit > member && digit[-1] >= '0' && digit[-1] <= '9') digit--;
+    if (digit == member + len || digit == member || digit[-1] != '_')
+        return 0;                     /* no "_<digits>" tail */
+    slot = strtol(digit, NULL, 10);
+    bl = (size_t)(digit - 1 - member);    /* base name without the trailing '_' */
+    if (!bl || bl >= sizeof base)
+        return 0;
+
+    /* the base may itself be SPIRV-Cross's block flattening ("<instance>_<member>"),
+     * so match the LONGEST GL-view output name that the base starts or ends at
+     * an '_' boundary of; scan every OpName / OpMemberName of the GL-view module */
+    ir = prog->spirv[_TESS_EVALUATION_SHADER].ir;
+    n = prog->spirv[_TESS_EVALUATION_SHADER].size;
+    if (!ir || n < 8 || !ctx)
+        return 0;
+    snprintf(base, sizeof base, "%.*s", (int)bl, member);
+
+    {
+        char cand[8][128];
+        size_t candlen[8];
+        int ncand = 0;
+
+        for (size_t m = 5; m + 3 < n; )
+        {
+            uint32_t wc = ir[m] >> 16, op = ir[m] & 0xffff;
+
+            if (wc == 0) break;
+            if (op == 5 || op == 6)
+            {
+                char buf[128];
+                size_t o = 0;
+                const uint32_t *w = ir + m + (op == 5 ? 2 : 3);
+                const uint32_t *we = ir + m + wc;
+
+                for (; w < we && o + 4 < sizeof buf; w++)
+                {
+                    for (int b = 0; b < 4; b++)
+                    {
+                        char c = (char)((*w >> (8 * b)) & 255);
+                        if (!c) { w = we; break; }
+                        buf[o++] = c;
+                    }
+                }
+                buf[o] = 0;
+                /* exact base ("goku" of "goku_0"), a prefix at an '_' boundary
+                 * ("inst" of "inst_m") or a suffix behind one ("m" of
+                 * "inst_m"): a block instance resolves to a struct, not a
+                 * double, so trying longest-first and skipping non-double
+                 * candidates picks the member */
+                if (o && o <= bl && !strncmp(base, buf, o) &&
+                    (o == bl || base[o] == '_'))
+                {
+                    int dup = 0;
+
+                    for (int q = 0; q < ncand; q++)
+                        if (candlen[q] == o && !memcmp(cand[q], buf, o)) dup = 1;
+                    if (!dup && ncand < 8)
+                    {
+                        memcpy(cand[ncand], buf, o + 1);
+                        candlen[ncand] = o;
+                        ncand++;
+                    }
+                }
+                if (o && o < bl && !strncmp(base + bl - o, buf, o) && base[bl - o - 1] == '_')
+                {
+                    int dup = 0;
+
+                    for (int q = 0; q < ncand; q++)
+                        if (candlen[q] == o && !memcmp(cand[q], buf, o)) dup = 1;
+                    if (!dup && ncand < 8)
+                    {
+                        memcpy(cand[ncand], buf, o + 1);
+                        candlen[ncand] = o;
+                        ncand++;
+                    }
+                }
+            }
+            m += wc;
+        }
+        /* longest first: a longer candidate is the more specific interface name */
+        for (int pass = 0; pass < ncand - 1; pass++)
+            for (int q = 0; q + 1 < ncand; q++)
+                if (candlen[q] < candlen[q + 1])
+                {
+                    char tmp[128];
+                    size_t tl = candlen[q];
+
+                    memcpy(tmp, cand[q], sizeof cand[q]);
+                    strcpy(cand[q], cand[q + 1]); candlen[q] = candlen[q + 1];
+                    memcpy(cand[q + 1], tmp, sizeof tmp); candlen[q + 1] = tl;
+                }
+        for (int q = 0; q < ncand; q++)
+        {
+            if (tess_out_shape(ctx, tp, cand[q], elems, cols, rows))
+            {
+                if (tess_trace())
+                    fprintf(stderr, "MGL tess: split member '%s' = slot %ld of '%s' (%ux%ux%u)\n",
+                            member, slot, cand[q], (unsigned)*elems, (unsigned)*cols, (unsigned)*rows);
+                goto resolved;
+            }
+        }
+        if (tess_trace())
+            fprintf(stderr, "MGL tess: split member '%s': no double GL-view output base\n", member);
+        return 0;
+    resolved:;
+    }
+
+    /* slot geometry: elems * cols * ceil(rows/2) uint4 slots (uint2 for a bare
+     * double scalar); slot i holds min(2, rows - 2k) doubles where k is its
+     * offset within its column */
+    {
+        uint32_t cslots = (*rows + 1) / 2;
+        uint32_t total = *elems * *cols * (cslots ? cslots : 1);
+
+        if ((uint32_t)slot >= total)
+            return 0;                 /* not a slot of this variable: plain member */
+        {
+            uint32_t k = (uint32_t)slot % cslots;
+            uint32_t d = *rows - 2 * k;
+
+            if (d > 2) d = 2;
+            if (*cols <= 1 && *rows <= 1) d = 1;   /* uint2 scalar slot */
+            return d;
+        }
+    }
 }
 
 char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
@@ -7127,6 +7376,9 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
     uint32_t dbls[MGL_TESS_CAPTURE_MAX];    /* per member: double count (0 = plain u32/float member) */
     uint32_t slotsz[MGL_TESS_CAPTURE_MAX];  /* ... words per fp64 slot: 2 (uint2) or 4 (uint4) */
     uint32_t slotn[MGL_TESS_CAPTURE_MAX];   /* ... slots in the MSL repr (1 for a bare uint2/uint4) */
+    uint32_t mrow[MGL_TESS_CAPTURE_MAX];    /* ... GL shape: vector rows (columns of the fp64 slots) */
+    uint32_t mcol[MGL_TESS_CAPTURE_MAX];    /* ... GL shape: matrix columns */
+    uint32_t marr[MGL_TESS_CAPTURE_MAX];    /* ... GL shape: array elements */
     char cap_retname[96];
     bool void_ret = false;                 /* the entry returns void (store-only TES) */
     struct MslStruct rec;
@@ -7197,6 +7449,9 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         dbls[tp->cap_members_n] = 0;
         slotsz[tp->cap_members_n] = 0;
         slotn[tp->cap_members_n] = 1;
+        mrow[tp->cap_members_n] = 1;
+        mcol[tp->cap_members_n] = 1;
+        marr[tp->cap_members_n] = 1;
         if (!strcmp(m, "gl_Position"))
         {
             w = 4;
@@ -7258,7 +7513,25 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
         else
         {
             const char *t = rec.members[i].type;
-            uint32_t d = tess_out_doubles(ctx, tp, m);
+            uint32_t d = 0;
+            uint32_t rows = 1, cols = 1, elems = 1;
+
+            if (tess_out_shape(ctx, tp, m, &elems, &cols, &rows))
+                d = elems * cols * rows;
+            if (!d)
+            {
+                /* r59: a SPLIT fp64 member ("<base>_<slot>", SPIRV-Cross's
+                 * per-location flattening) — carry only the VALID doubles of
+                 * this slot (tess_split_slot_doubles); odd-width columns pad
+                 * their tail half, and a raw uint4 copy fed that pad into the
+                 * xfb record (dmatNx3 captured {.125,.25,.375,0,.5,.625} with
+                 * .75 past the record end) */
+                d = tess_split_slot_doubles(ctx, tp, m, t, &elems, &cols, &rows);
+                rows = cols = elems = 1;   /* the slot is one member; doubles are flat */
+            }
+            mrow[tp->cap_members_n] = rows;
+            mcol[tp->cap_members_n] = cols;
+            marr[tp->cap_members_n] = elems;
 
             snprintf(types[tp->cap_members_n], 48, "%s", t);
             tp->cap_members[tp->cap_members_n].offset = off;
@@ -7388,38 +7661,66 @@ char *mgl_tess_capture_msl(GLMContext ctx, MGLTessProgram *tp)
             {
                 /* the doubles sit two per uint4 slot (one per uint2 slot) with
                  * a possibly padded tail: copy them out compactly, two words
-                 * per double */
+                 * per double.  An ARRAY member (spvUnsafeArray of slots) is
+                 * column-structured — the slot of double d of element e /
+                 * column c / row r is e*cols*cslots + c*cslots + r/2, half
+                 * r&1 — a flat d/2 walk would read a padded tail half as a
+                 * data double whenever a column has odd width (dmatNx3) */
                 uint32_t sw = slotsz[i];     /* words per slot: 2 or 4 */
                 uint32_t spdbl = sw / 2;     /* doubles per slot: 1 or 2 */
 
+                char wname[24];
+
+                snprintf(wname, sizeof wname, "mgl_w%u", (unsigned)i);
                 str_append(&k, &len, &cap,
-                           "device uint* mgl_w = (device uint*)((device uchar*)mgl_cap + "
-                           "(size_t)mgl_vid * %uu + %uu); (void)mgl_w;\n",
-                           tp->cap_stride * 4u, cm->offset * 4u);
+                           "device uint* %s = (device uint*)((device uchar*)mgl_cap + "
+                           "(size_t)mgl_vid * %uu + %uu); (void)%s;\n",
+                           wname, tp->cap_stride * 4u, cm->offset * 4u, wname);
                 for (uint32_t d = 0; d < dbls[i]; d++)
                 {
-                    uint32_t slot = d / spdbl;
-                    const char *lo = (spdbl == 2 && (d & 1)) ? ".z" : ".x";
-                    const char *hi = (spdbl == 2 && (d & 1)) ? ".w" : ".y";
+                    uint32_t slot, half;
+                    const char *lo, *hi;
                     char ix[16];
 
+                    if (arr && mcol[i] * mrow[i] > 1)
+                    {
+                        uint32_t cs = (mrow[i] + 1) / 2;
+                        uint32_t per = mcol[i] * cs;
+                        uint32_t e = d / (mcol[i] * mrow[i]);
+                        uint32_t rem = d % (mcol[i] * mrow[i]);
+                        uint32_t c = rem / mrow[i];
+                        uint32_t r = rem % mrow[i];
+
+                        slot = e * per + c * cs + r / 2;
+                        half = r & 1;
+                    }
+                    else
+                    {
+                        slot = d / spdbl;
+                        half = (spdbl == 2 && (d & 1)) ? 1 : 0;
+                    }
+                    lo = half ? ".z" : ".x";
+                    hi = half ? ".w" : ".y";
                     ix[0] = 0;
                     if (arr) snprintf(ix, sizeof ix, "[%u]", slot);
-                    str_append(&k, &len, &cap, "mgl_w[%u] = %s.%s%s%s; mgl_w[%u] = %s.%s%s%s;\n",
-                               2 * d, varname, cm->name, ix, lo,
-                               2 * d + 1, varname, cm->name, ix, hi);
+                    str_append(&k, &len, &cap, "%s[%u] = %s.%s%s%s; %s[%u] = %s.%s%s%s;\n",
+                               wname, 2 * d, varname, cm->name, ix, lo,
+                               wname, 2 * d + 1, varname, cm->name, ix, hi);
                 }
             }
             else if (arr)
             {
                 /* plain (non-double) slot array: element-wise copy — a struct
                  * copy across address spaces would not compile */
+                char wname[24];
+
+                snprintf(wname, sizeof wname, "mgl_w%u", (unsigned)i);
                 str_append(&k, &len, &cap,
-                           "device uint* mgl_w = (device uint*)((device uchar*)mgl_cap + "
+                           "device uint* %s = (device uint*)((device uchar*)mgl_cap + "
                            "(size_t)mgl_vid * %uu + %uu);\n",
-                           tp->cap_stride * 4u, cm->offset * 4u);
+                           wname, tp->cap_stride * 4u, cm->offset * 4u);
                 for (uint32_t q = 0; q < slotn[i] && q < 32; q++)
-                    str_append(&k, &len, &cap, "mgl_w[%u] = %s.%s[%u];\n", q, varname, cm->name, q);
+                    str_append(&k, &len, &cap, "%s[%u] = %s.%s[%u];\n", wname, q, varname, cm->name, q);
             }
             else
                 str_append(&k, &len, &cap,

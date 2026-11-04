@@ -6277,7 +6277,12 @@ static char *geom_plain_outputs(const char *src)
 typedef struct {
     char name[64];
     char type[96];      /* GLSL type as written, e.g. "ivec2", "float", "Foo" */
-    char arr[48];       /* array suffix as written, e.g. "[4]" ("" for a scalar) */
+    char arr[192];     /* array suffix as written, "[4]" or "[gl_MaxTFInterleavedComponents / 8]"
+                        * (r59: a 48-byte buffer rejected real-world constant-expression sizes
+                        * like the enhanced_layouts glsl_constant_integral_expression suffix
+                        * (49 chars), the declaration was then kept as a free-standing
+                        * uniform, and SPIRV-Cross buffered it at an auto index that
+                        * collided with the pinned default-uniforms buffer) */
 } GeomPlainUni;
 
 typedef struct {
@@ -6540,7 +6545,7 @@ static char *geom_strip_plain_uniforms_at(const char *src, GeomPlainUni *uni, in
                                 const char *nb = e;   /* end of the declarator */
                                 const char *ne;
                                 char name[64];
-                                char arr[48] = "";
+                                char arr[192] = "";   /* r59: constant-expression sizes are long */
                                 size_t nn;
 
                                 while (nb > c && isspace((unsigned char)nb[-1])) nb--;

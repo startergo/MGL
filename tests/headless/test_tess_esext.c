@@ -247,9 +247,135 @@ TEST(TessEsExtIsolinesOnePatchVertex)
     glDeleteVertexArrays(1, &vao);
 }
 
+/* r59: dEQP-GL45-ES31 opaque_type_indexing tessellation_* — an ES-profile TCS
+ * with an explicit textureLod on a sampler*Shadow (glslang gates the overload
+ * behind GL_EXT_texture_shadow_lod + an ES version >= 320; MGL's compat pass
+ * enables the extension and presents the shader as the ESSL 3.20 it is
+ * equivalent to).  The compare must actually run: LEQUAL against 0.75/0.25.
+ * r60: the ES3.1 alias strings live in a separate droppable commit — a
+ * '#extension GL_EXT_tessellation_shader' source is only meaningful when that
+ * alias is advertised, so the test self-skips (PASS + note) without it. */
+static int tess_es_alias_advertised(void)
+{
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n; i++)
+        if (glGetStringi(GL_EXTENSIONS, i) &&
+            !strcmp((const char *)glGetStringi(GL_EXTENSIONS, i), "GL_EXT_tessellation_shader"))
+            return 1;
+    return 0;
+}
+
+TEST(TessEsShadowLodCompat)
+{
+    GLuint tex[2];
+    float lvl0[4] = { 0.25f, 0.25f, 0.25f, 0.25f };
+    float lvl1[4] = { 0.75f, 0.75f, 0.75f, 0.75f };
+    if (!tess_es_alias_advertised())
+    {
+        printf("SKIP TessEsShadowLodCompat (GL_EXT_tessellation_shader not advertised; droppable alias commit absent)\n");
+        return;
+    }
+    glGenTextures(2, tex);
+
+    const char *tcs =
+        "#version 310 es\n"
+        "#extension GL_EXT_tessellation_shader : require\n"
+        "uniform highp sampler2DArrayShadow s[2];\n"
+        "layout (vertices = 1) out;\n"
+        "out highp vec2 tc_res[];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0;\n"
+        "    gl_TessLevelOuter[2] = 1.0; gl_TessLevelOuter[3] = 1.0;\n"
+        "    gl_TessLevelInner[0] = 1.0; gl_TessLevelInner[1] = 1.0;\n"
+        "    tc_res[gl_InvocationID] = vec2(textureLod(s[0], vec4(0.5, 0.5, 0.0, 0.5), 0.0),\n"
+        "                                    textureLod(s[1], vec4(0.5, 0.5, 0.0, 0.5), 0.0));\n"
+        "}\n";
+    const char *tes =
+        "#version 310 es\n"
+        "#extension GL_EXT_tessellation_shader : require\n"
+        "layout (triangles) in;\n"
+        "in highp vec2 tc_res[];\n"
+        "out mediump vec4 col;\n"
+        "void main()\n"
+        "{\n"
+        "    col = vec4(tc_res[0], 0.0, 1.0);\n"
+        "    gl_Position = vec4(gl_TessCoord.xy * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "in vec4 col;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() { o = col; }\n";
+    const char *vs =
+        "#version 460 core\n"
+        "void main() { gl_Position = vec4(0, 0, 0, 1); }\n";
+
+    /* one-layer depth arrays on units 0 and 1 */
+    for (int i = 0; i < 2; i++)
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex[i]);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24, 2, 2, 1, 0,
+                     GL_DEPTH_COMPONENT, GL_FLOAT, i ? lvl1 : lvl0);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    }
+
+    GLuint p = glCreateProgram();
+    GLenum ty[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    const char *src[4] = { vs, tcs, tes, fs };
+    for (int i = 0; i < 4; i++)
+    {
+        GLuint sh = glCreateShader(ty[i]);
+        glShaderSource(sh, 1, &src[i], NULL);
+        glCompileShader(sh);
+        glAttachShader(p, sh);
+        glDeleteShader(sh);
+    }
+    glLinkProgram(p);
+    GLint link = -1;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    if (link != GL_TRUE)
+    {
+        char log[2048];
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        printf("  link log: %s", log);
+    }
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+    glUniform1iv(glGetUniformLocation(p, "s"), 2, (GLint[]){ 0, 1 });
+
+    GLuint fbo, ctex;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGenTextures(1, &ctex);
+    glBindTexture(GL_TEXTURE_2D, ctex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 8, 8);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ctex, 0);
+    glViewport(0, 0, 8, 8);
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glPatchParameteri(GL_PATCH_VERTICES, 1);
+    glDrawArrays(GL_PATCHES, 0, 1);
+    EXPECT_NO_GL_ERROR();
+    unsigned char px[3] = { 0, 0, 0 };
+    glReadPixels(1, 1, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+    printf("  shadow px: (%d %d %d) want (0 255 0)\n", px[0], px[1], px[2]);
+    EXPECT_EQ_INT(px[0], 0);    /* unit 0: 0.5 <= 0.25 fails */
+    EXPECT_EQ_INT(px[1], 255);  /* unit 1: 0.5 <= 0.75 passes */
+
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
 int main(void)
 {
     RUN(TessEsExtIsolinesOnePatchVertex);
     RUN(TessEsExtIsolinesCtsSweep);
+    RUN(TessEsShadowLodCompat);
     return mgl_test_summary();
 }
