@@ -347,6 +347,14 @@ typedef struct MGLGeomProgram {
  * is the recorded vertex stream (see mgl_geom_tess_xfb_route).  The varying table is
  * MGLXfbProgram's, resolved against the TES's outputs with src_word refreshed from the
  * published member table on every pack. */
+typedef struct MGLGeomXfbSplit {
+    uint32_t var;         /* xp->vars index */
+    uint32_t col_w0;      /* words of the column's first part (double2 slot) */
+    uint32_t col_w1;      /* words of the column's second part (the double1 tail) */
+    uint32_t col_sstride; /* words per column in the CAPTURE record (padded slots) */
+    uint32_t col_dstride; /* words per column in the GL record (col_w0+col_w1) */
+} MGLGeomXfbSplit;
+
 typedef struct MGLGeomTessXfbSource {
     void    *ring;          /* the tess ring (id<MTLBuffer>) */
     size_t   records;       /* byte offset of the first capture record */
@@ -354,6 +362,13 @@ typedef struct MGLGeomTessXfbSource {
     uint32_t stride;        /* words per capture record */
     uint32_t capacity;      /* record capacity: the dispatch bound */
     uint32_t per_prim;      /* captured vertices per primitive (primitive counter) */
+    /* geom r105d: padded-double-column copy specs for slot-mapped varyings (SPIRV-Cross
+     * flattens an ARRAY OF DOUBLE MATRICES into m<id>_<i> members whose odd-width
+     * columns occupy whole uint4 slots: a dvec3 column = double2 slot + a double1 slot
+     * whose tail is padding).  Without a spec the pack copies the var's words
+     * contiguously; with one it copies col_w0 + col_w1 words per column. */
+    const MGLGeomXfbSplit *splits;
+    uint32_t splits_n;
 } MGLGeomTessXfbSource;
 
 typedef struct MGLGeomDraw {

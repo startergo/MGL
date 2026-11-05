@@ -1062,6 +1062,10 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
             if (offset > xp->stride[buffer]) xp->stride[buffer] = offset;
             buffer++;
             offset = 0;
+            /* geom r105k: the interleaved-component limit is PER BUFFER (GL 4.6
+             * 13.2.2), so a new buffer starts a new component count — the CTS
+             * interleaves 90 components into buffer 0 and 72 into buffer 1 */
+            total_components = 0;
             if (buffer >= MGL_XFB_MAX_BUFFERS) { xfb_fail(xp, "too many gl_NextBuffer entries", NULL, NULL); return false; }
             v->buffer = buffer;
             continue;
@@ -1398,6 +1402,86 @@ static unsigned xfb_std430_size(spvc_compiler c, spvc_type_id tid)
     return spvc_type_get_vector_size(t) * xfb_scalar_bytes(bt);
 }
 
+/* geom r105: the PACKED alignment of a captured-struct member tree — the largest
+ * scalar base inside it.  GL 4.6 13.2.2 packs a captured structure with scalar
+ * alignment only ({float a; mat2 b;} captures a@0, b col0@4, b col1@12 — 20 bytes);
+ * the same rule the geometry stage's whole-struct capture uses (geom r104).
+ * 0 marks a shape the packer cannot walk. */
+static unsigned xfb_packed_align(spvc_compiler c, spvc_type_id tid)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, tid);
+    unsigned dims, cols;
+
+    if (!t) return 0;
+    dims = spvc_type_get_num_array_dimensions(t);
+    cols = spvc_type_get_columns(t);
+    if (spvc_type_get_basetype(t) == SPVC_BASETYPE_STRUCT)
+    {
+        unsigned mx = 0;
+
+        if (dims) return 0;   /* array-of-struct member: not packable here */
+        for (unsigned m = 0; m < spvc_type_get_num_member_types(t); m++)
+        {
+            unsigned a = xfb_packed_align(c, spvc_type_get_member_type(t, m));
+
+            if (!a) return 0;
+            if (a > mx) mx = a;
+        }
+        return mx;
+    }
+    if (dims > 1) return 0;
+    if (dims == 1) return xfb_packed_align(c, spvc_type_get_base_type_id(t));
+    /* a matrix's columns align like the column vector's scalar; a vector aligns
+     * like its scalar base (vec3 -> 4, dvec3 -> 8) */
+    (void)cols;
+    return xfb_scalar_bytes(spvc_type_get_basetype(t));
+}
+
+/* geom r105: the packed SIZE of a captured-struct member: matrix = cols × the
+ * packed column (vec3 -> 12 bytes, dvec3 -> 24), array = n × the packed element
+ * (each element aligned to the element's own scalar alignment), nested struct =
+ * its packed extent rounded up to its packed alignment. */
+static unsigned xfb_packed_size(spvc_compiler c, spvc_type_id tid)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, tid);
+    unsigned dims, cols;
+
+    if (!t) return 0;
+    dims = spvc_type_get_num_array_dimensions(t);
+    cols = spvc_type_get_columns(t);
+    if (spvc_type_get_basetype(t) == SPVC_BASETYPE_STRUCT)
+    {
+        unsigned mx = xfb_packed_align(c, tid), off = 0;
+
+        if (!mx || dims) return 0;
+        for (unsigned m = 0; m < spvc_type_get_num_member_types(t); m++)
+        {
+            spvc_type_id mt = spvc_type_get_member_type(t, m);
+            unsigned a = xfb_packed_align(c, mt), sz = xfb_packed_size(c, mt);
+
+            if (!a || !sz) return 0;
+            off = (off + a - 1) & ~(a - 1);
+            off += sz;
+        }
+        return (off + mx - 1) & ~(mx - 1);
+    }
+    if (dims > 1) return 0;
+    if (dims == 1)
+    {
+        spvc_type_id et = spvc_type_get_base_type_id(t);
+        unsigned a = xfb_packed_align(c, et), es = xfb_packed_size(c, et);
+
+        if (!a || !es) return 0;
+        return ((es + a - 1) & ~(a - 1)) * (unsigned)spvc_type_get_array_dimension(t, 0);
+    }
+    /* scalar or vector or matrix (columns share one packed stride) */
+    {
+        unsigned vs = (unsigned)spvc_type_get_vector_size(t) * xfb_scalar_bytes(spvc_type_get_basetype(t));
+
+        return vs * (cols ? cols : 1u);
+    }
+}
+
 /* flatten one captured struct instance into per-member varyings */
 static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
                                const char *vname, const char *prefix, MGLXfbProgram *xp,
@@ -1416,22 +1500,31 @@ static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_
         if (!mn || !mn[0]) { snprintf(fallback, sizeof fallback, "m%u", m); mn = fallback; }
         char name[256], expr[256], sub[256];
 
-        /* a captured structure's members follow the std430 layout */
-        unsigned ma = xfb_std430_align_type(c, mt);
-        unsigned ms = xfb_std430_size(c, mt);
+        /* a captured structure's members are PACKED with scalar alignment only
+         * (GL 4.6 13.2.2: {float a; mat2 b;} captures a@0, b col0@4, b col1@12
+         * — 20 bytes; geom r105, was std430) */
+        unsigned ma = xfb_packed_align(c, mt);
+        unsigned ms = xfb_packed_size(c, mt);
+        if (!ma || !ms)
+        {
+            xfb_fail(xp, "xfb struct member %s cannot be packed for capture",
+                     mn ? mn : "?", NULL);
+            return false;
+        }
         off = (off + ma - 1) & ~(ma - 1);
 
         if (vname && vname[0])
         {
             snprintf(name, sizeof name, "%s.%s", vname, mn);
             snprintf(expr, sizeof expr, "%s%s.%s", prefix, vname, mn);
-            snprintf(sub, sizeof sub, "%s.", name);   /* nested members: goku.inner.x */
+            snprintf(sub, sizeof sub, "%s", name);   /* nested members: goku.inner.x —
+                                                      * the next level appends ".<member>" */
         }
         else
         {
             snprintf(name, sizeof name, "%s", mn);
             snprintf(expr, sizeof expr, "%s%s", prefix, mn);
-            snprintf(sub, sizeof sub, "%s.", name);
+            snprintf(sub, sizeof sub, "%s", name);
         }
 
         /* a nested plain structure keeps flattening in declaration order */
@@ -1673,9 +1766,20 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
         char var[32], tyname[64];
         const char *expr;
         char (*evar)[48] = NULL;
-        if (v->comp_kind == GL_DOUBLE) {
+        /* geom r105l: a STRUCT MEMBER leaf always goes through a local too: the
+         * fp64 lowering treats a stage variable of a double-bearing struct as a
+         * "double stage variable" and refuses component access even into its
+         * FLOAT members ({double a; vec3 b;} captured whole — "copy it to a
+         * local first").  The name of a struct-member varying carries a '.'. */
+        bool member_leaf = v->name && strchr(v->name, '.') != NULL;
+        if (v->comp_kind == GL_DOUBLE || member_leaf) {
             xfb_glsl_type_name(v, tyname, sizeof tyname);
-            if (v->size > 1 && v->size <= 256) {
+            if ((v->size > 1 || whole_arrays[i]) && v->size <= 256) {
+                /* geom r105g: a 1-ELEMENT array is still an array — the whole-array
+                 * subscript must select the element even for size 1, or the scalar
+                 * temp below assigned `out dmat3 b0_v1[1]` to a dmat3 and the
+                 * capture variant failed to compile (xfb_get_program_resource_api
+                 * dmat3/dmat3x4 vertex) */
                 char scalar[64];
                 size_t bl = strcspn(tyname, "[");
                 snprintf(scalar, sizeof scalar, "%.*s", (int)bl, tyname);

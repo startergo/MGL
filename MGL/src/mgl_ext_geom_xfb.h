@@ -26,6 +26,9 @@
 #include "mgl_ext_geom.h"
 
 #define MGL_GEOM_XFB_MAX_VARS  32
+/* geom r105d: 9 words — src_word, dst_off, words, buffer, stream, and the
+ * padded-double-column copy spec (col_w0/col_w1/col_sstride/col_dstride;
+ * col_dstride == 0 selects the plain contiguous copy) */
 #define MGL_GEOM_XFB_WG        64
 
 /* the GPU counter block: [0] object name, [1] vertices (all streams, block total),

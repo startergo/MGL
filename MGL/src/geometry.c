@@ -3777,6 +3777,8 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 memset(out, 0, sizeof(*out));
                 snprintf(out->name, sizeof(out->name), "%s", inst);
                 out->elems = (GLuint)t->n_members;
+                out->arr = true;   /* the source declared an ARRAY of matrices: every
+                                    * store/load expression indexes it (see r103) */
                 out->xfb_buffer = -1;
                 out->xfb_offset = 0xffffffffu;
                 out->location = location;
@@ -3792,6 +3794,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_deco(m, v->id, SpvDecorationStream, &tmp)) out->stream = tmp;
                 if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp)) out->xfb_buffer = (int)tmp;
                 if (spv_deco(m, v->id, SpvDecorationOffset, &tmp)) out->xfb_offset = tmp;
+                if (spv_deco(m, v->id, SpvDecorationXfbStride, &tmp)) out->xfb_stride = tmp;
                 goto flat_merged;    /* one canonical array entry replaces the member list */
             } while (0);
             m0 = n;   /* compat r96c: the member vars this loop emits (whole-struct xfb) */
@@ -4036,6 +4039,19 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                     t->kind == SPVT_VEC ? t->n : 1;
         out->cols = t->kind == SPVT_MAT ? t->n : 1;
         out->elems = elems;
+        /* the source declared an ARRAY (even of just one element — `out mat2 x[1];`):
+         * the rewritten shader keeps that declaration, so every store/load expression
+         * must index it ("x[0][c].r"), exactly like a 1-element array member (r103).
+         * The input side carries the primitive's vertex dimension as its outermost
+         * array layer, which the reflection strips above — test one level below it. */
+        {
+            SpvType *raw = spv_find_type(m, v->type_id);
+
+            while (raw && raw->kind == SPVT_PTR) raw = spv_find_type(m, raw->elem);
+            if (inputs && raw && raw->kind == SPVT_ARRAY)
+                raw = spv_find_type(m, raw->elem);
+            out->arr = raw && raw->kind == SPVT_ARRAY;
+        }
         out->words = elems * out->cols * out->rows * base_words(out->base);
         out->flat = spv_deco(m, v->id, SpvDecorationFlat, NULL);
         out->noperspective = spv_deco(m, v->id, SpvDecorationNoPerspective, NULL);
@@ -9425,6 +9441,11 @@ build:
                       program->spirv[_GEOMETRY_SHADER].size, &e2);
         SpvModule *k_gs = NULL;
         glsl = geom_gen_kernel_glsl(ctx, gp, gs_src, p_gs, &log);
+        if (getenv("MGL_GEOM_DUMP"))
+            for (int i = 0; i < gp->n_out; i++)
+                fprintf(stderr, "geomdbg: out_v[%d] '%s' elems=%u cols=%u rows=%u arr=%d words=%u off=%u\n",
+                        i, gp->out_v[i].name, gp->out_v[i].elems, gp->out_v[i].cols,
+                        gp->out_v[i].rows, (int)gp->out_v[i].arr, gp->out_v[i].words, gp->out_v[i].offset);
         if (!glsl) GEOM_FAIL("kernel generation failed");
         geom_dump("kernel.glsl", glsl);
         if (!geom_glsl_to_spirv(ctx, GL_COMPUTE_SHADER, glsl, 450, &ir, &words, &log))
@@ -12121,6 +12142,175 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
  * draw runs with the capture enabled and still rasterizes normally, then this pack writes
  * the captured records into the transform feedback buffers. */
 
+/* SPIRV-Cross cannot emit an ARRAY OF MATRICES (or an array of structs of matrices) as a
+ * Metal stage output, so it splits such a TES output into one synthesized variable per
+ * column ("m<id>_<i>") and every connection to the GL name is lost — the name matches in
+ * mgl_geom_tess_xfb_route find nothing and the varying captures zero words
+ * (enhanced_layouts xfb_explicit_location_mat*_tessellation_evaluation).
+ *
+ * The capture record's structure is still deterministic: every USER output contributes one
+ * record member per flattened column-vector slot, and the members sit in the record in
+ * SPIRV-Cross's interface order, i.e. (location, component) order of the original outputs
+ * (gl_Position is hoisted to word 0; builtin clip/cull/point-size members trail the user
+ * members at higher offsets).  So map the varying by SLOT ORDINAL: reflect the TES's own
+ * SPIR-V (the same geom_reflect_stage the link-time resolver used), count the slots of the
+ * outputs that precede this one by location, then take that many consecutive members of
+ * the published capture table, filtered to user members and sorted by offset.
+ * `vidx` selects one element of an arrayed output (consume just its columns).
+ * Returns false when the shape cannot be reconciled (caller keeps the no-match rule). */
+static bool geom_tess_xfb_slot_map(GLMContext ctx, Program *program, MGLXfbVarying *v,
+                                   uint32_t vindex, const MGLTessCapture *c, const char *nm,
+                                   uint32_t vidx, MGLGeomXfbSplit *splits, uint32_t *splits_n,
+                                   uint32_t cap){
+    MGLGeomVar vars[MGL_GEOM_MAX_VARYINGS];
+    SpvModule *m = NULL;
+    const MGLTessCaptureMember *user[MGL_TESS_CAPTURE_MAX];
+    uint32_t nuser = 0, slot0 = 0, slots;
+    int n = 0, j = -1;
+    const char *dot;
+
+    if (!program || !program->spirv[_TESS_EVALUATION_SHADER].ir || !c)
+        return false;
+    m = spv_parse(program->spirv[_TESS_EVALUATION_SHADER].ir,
+                  program->spirv[_TESS_EVALUATION_SHADER].size, NULL);
+    if (!m)
+        return false;
+    if (!geom_reflect_stage(m, false, vars, &n, NULL))
+        n = 0;
+    spv_free(m);
+    if (n <= 0)
+        return false;
+
+    /* the varying's own output entry: a plain name, "<instance>.<member>" /
+     * "<block>.<member>", a bare block member, or an array-of-blocks element already
+     * flattened to "<instance>_<element>_<member>" by the caller */
+    dot = strchr(nm, '.');
+    for (int k = 0; k < n && j < 0; k++)
+    {
+        if (dot)
+        {
+            size_t ilen = (size_t)(dot - nm);
+
+            if ((!strncmp(vars[k].name, nm, ilen) && vars[k].name[ilen] == 0 ||
+                 vars[k].block[0] && !strncmp(vars[k].block, nm, ilen) && vars[k].block[ilen] == 0) &&
+                !strcmp(vars[k].member, dot + 1))
+                j = k;
+        }
+        else
+        {
+            if (!strcmp(vars[k].name, nm) ||
+                (vars[k].block[0] && !strcmp(vars[k].member, nm)))
+                j = k;
+            if (j < 0 && vars[k].block_array)
+            {
+                char flat[192];
+
+                snprintf(flat, sizeof flat, "%s_%u_%s", vars[k].name, vars[k].index, vars[k].member);
+                if (!strcmp(flat, nm))
+                    j = k;
+            }
+        }
+    }
+    if (j < 0)
+        return false;
+
+    /* the member stream SPIRV-Cross flattens a user output to (in record order):
+     * one member per (array element, matrix column) — except a DOUBLE column wider
+     * than two components, which becomes double2 + double<N-2> parts in two whole
+     * uint4 slots (the second slot's tail is padding for odd N) */
+    {
+        bool dbl = vars[j].base == GL_DOUBLE;
+
+        slots = vars[j].elems * vars[j].cols * (dbl && vars[j].rows > 2 ? 2 : 1);
+    }
+    if (vidx)
+    {
+        if (vidx >= vars[j].elems)
+            return false;
+        {
+            bool dbl = vars[j].base == GL_DOUBLE;
+            uint32_t per = vars[j].cols * (dbl && vars[j].rows > 2 ? 2 : 1);
+
+            slot0 = vidx * per;
+            slots = per;
+        }
+    }
+    for (int k = 0; k < n; k++)
+        if (vars[k].location < vars[j].location)
+        {
+            bool dbl = vars[k].base == GL_DOUBLE;
+
+            slot0 += vars[k].elems * vars[k].cols * (dbl && vars[k].rows > 2 ? 2 : 1);
+        }
+
+    /* the capture table's user members, in record order (gl_Position sits at word 0;
+     * gl_ClipDistance_N / gl_CullDistance_N / gl_PointSize are the trailing builtins) */
+    for (uint32_t k = 0; k < c->members && nuser < MGL_TESS_CAPTURE_MAX; k++)
+    {
+        const char *cn = c->member[k].name;
+
+        if (!strncmp(cn, "gl_", 3) || !strcmp(cn, "mgl_rs_PointSize"))
+            continue;
+        user[nuser++] = &c->member[k];
+    }
+    for (uint32_t a = 1; a < nuser; a++)          /* offset-ascending = location order */
+        for (uint32_t b = a; b > 0 && user[b - 1]->offset > user[b]->offset; b--)
+        {
+            const MGLTessCaptureMember *t = user[b];
+
+            user[b] = user[b - 1];
+            user[b - 1] = t;
+        }
+    if (nuser < 1 || slot0 >= nuser || slot0 + slots > nuser)
+    {
+        if (geom_env(1))
+            fprintf(stderr, "geom: tessxfb slot map '%s': slot0=%u+%u > %u user members\n",
+                    nm, slot0, slots, nuser);
+        return false;
+    }
+
+    /* validate the span and derive the copy spec: the published words must cover the
+     * varying's words; a DOUBLE matrix with 3-component columns pads its second slot
+     * (valid 6 words in 8) and copies per-column parts instead of one range */
+    {
+        uint32_t tw = 0;
+
+        for (uint32_t k = 0; k < slots; k++)
+            tw += user[slot0 + k]->words;
+        if (tw != v->words)
+        {
+            bool dbl = vars[j].base == GL_DOUBLE;
+            uint32_t percol = dbl && vars[j].rows > 2 ? 2 : 1, ncols = vars[j].elems * vars[j].cols;
+
+            if (dbl && vars[j].rows == 3 && slots == ncols * 2 && tw == ncols * 8 && v->words == ncols * 6)
+            {
+                /* dvec3 columns: double2 slot (4 words) + double1 slot (2 valid of 4) */
+                if (splits && *splits_n < cap)
+                {
+                    splits[*splits_n].var = vindex;
+                    splits[*splits_n].col_w0 = 4;
+                    splits[*splits_n].col_w1 = 2;
+                    splits[*splits_n].col_sstride = 8;
+                    splits[*splits_n].col_dstride = 6;
+                    (*splits_n)++;
+                }
+            }
+            else
+            {
+                if (geom_env(1))
+                    fprintf(stderr, "geom: tessxfb slot map '%s': span words %u != %u\n",
+                            nm, tw, v->words);
+                return false;
+            }
+        }
+    }
+    v->src_word = user[slot0]->offset;
+    if (geom_env(1))
+        fprintf(stderr, "geom: tessxfb slot map '%s' -> user slot %u src_word=%u (%u slots)\n",
+                nm, slot0, v->src_word, slots);
+    return true;
+}
+
 bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t offset,
                              GLint first, GLsizei count, GLsizei instances,
                              GLint basevertex, GLuint baseinstance)
@@ -12137,8 +12327,13 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     BufferBaseTarget live[4];           /* base binds re-sized after binding (below) */
     const MGLTessCapture *c;
     MGLGeomTessXfbSource src;
+    MGLGeomXfbSplit splits[8];      /* geom r105d: padded dvec3-column copy specs */
+    uint32_t splits_n = 0;
     GLuint b;
     bool ok;
+
+    src.splits = splits;
+    src.splits_n = 0;
 
     if (!program || !o || !o->active || !xp || !xp->count)
     {
@@ -12214,6 +12409,7 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
         char vbase[256];
         uint32_t vidx = 0;
         bool indexed = false;
+        bool slot_mapped = false;
 
         if (nm[0])
         {
@@ -12338,7 +12534,10 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
                 found = true;
             }
         }
-        if (indexed && found && v->words)
+        if (!found && v->type != GL_NONE)
+            found = slot_mapped = geom_tess_xfb_slot_map(ctx, program, v, (uint32_t)i, c, nm,
+                                                         indexed ? vidx : 0, splits, &splits_n, 8);
+        if (indexed && found && v->words && !slot_mapped)
         {
             /* element `vidx` of the array member: advance by whole elements
              * (the GL type of "Block.member[i]" is the ELEMENT type) */
@@ -12381,6 +12580,8 @@ bool mgl_geom_tess_xfb_route(GLMContext ctx, bool indexed, GLenum type, size_t o
     }
 
     memset(&src, 0, sizeof src);
+    src.splits = splits;
+    src.splits_n = splits_n;      /* r105d: the per-column copy specs from the slot map */
     src.ring = c->buffer_object;
     src.records = c->records_offset;
     src.counts = c->count_offset;

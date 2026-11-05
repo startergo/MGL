@@ -26,7 +26,7 @@ for G_ in $SUBGROUPS; do
     --deqp-log-decompiled-spirv=disable --deqp-log-empty-loginfo=disable \
     --deqp-log-filename="$OUTDIR/$G_.qpa" > "$OUTDIR/$G_.out" 2> "$OUTDIR/$G_.err"
   rc=$?
-  awk '/^#beginTestCaseResult /{c=$2} /^ <Result StatusCode=/{s=$2; gsub(/StatusCode=|"|>/,"",s); if (s!="Pass") print s, c}' "$OUTDIR/$G_.qpa" \
+  awk '/^#beginTestCaseResult /{c=$2} /<Result StatusCode=/{match($0,/StatusCode="[A-Za-z]+"/); s=substr($0,RSTART+12,RLENGTH-13); if (s!="Pass") print s, c}' "$OUTDIR/$G_.qpa" \
     | sed 's/^/  /' > "$OUTDIR/$G_.fails"
   p=$(grep -c '^#beginTestCaseResult' "$OUTDIR/$G_.qpa")
   f=$(grep -c '^  Fail' "$OUTDIR/$G_.fails" || true)

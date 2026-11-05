@@ -54,7 +54,7 @@ static uint64_t mgl_link_group_seq;
 /* compat r86/r91 (mgl_layout_validate.c): GLSL layout rules glslang does not
  * check, and the MSL array-of-matrix output lowering */
 extern char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
-                                       const uint32_t *consumer_ir, size_t consumer_words);
+                                       const uint32_t *consumer_ir, size_t consumer_words, bool separable);
 extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);
 #include "buffers.h"
 #include "msl_reserved.h"
@@ -2625,7 +2625,8 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
      * blocks out later). */
     {
         char *vlog = mgl_layout_validate_stage(ctx, stage, prepared, prepared_words,
-                                               consumer_ir, consumer_words);
+                                               consumer_ir, consumer_words,
+                                               dst && dst->separable);
         if (vlog)
         {
             mgl_append_info_log(log, "%s", vlog);

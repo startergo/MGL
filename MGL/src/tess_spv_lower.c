@@ -1019,6 +1019,195 @@ static uint32_t spv_entry_model(const uint32_t *words, size_t n)
     return 0;
 }
 
+/* geom r105h: a LENGTH-1 array of a plain interface block as a TES OUTPUT
+ * ('layout(xfb_stride=128) out Goku { ... } goku[1];' — enhanced_layouts
+ * xfb_block_stride) trips SPIRV-Cross: it flattens the block into per-member stage
+ * outputs but bridges them through the UNINDEXED instance ("out.goku_gohan =
+ * goku.gohan;" while goku stays a spvUnsafeArray<Goku, 1>) and the MSL does not
+ * compile.  Retype the variable to the plain block and splice the single constant
+ * element index from its access chains — the form SPIRV-Cross emits correctly.
+ * Returns a fresh module (caller frees) or NULL when nothing matched. */
+static uint32_t *spv_strip_len1_out_blocks(const uint32_t *words, size_t n, size_t *out_n)
+{
+    /* var id -> the ptr-to-struct type to retarget to */
+    uint32_t vars[8], newtys[8];
+    uint32_t next_id = words[3];
+    int n_vars = 0;
+    uint32_t *buf = NULL;
+    size_t o = 0;
+
+    *out_n = 0;
+    for (size_t i = 5; i < n && n_vars < 8; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+
+        if (wc == 0 || i + wc > n) break;
+        if (op == 59 /*OpVariable*/ && wc >= 4 && words[i + 3] == 3 /*Output*/)
+        {
+            /* the pointer's pointee must be OpTypeArray of a Block struct with len 1 */
+            uint32_t ptr = words[i + 1], arr = 0, elem = 0, len_cst = 0, len = 0, is_block = 0;
+
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == 32 /*OpTypePointer*/ && wc2 >= 4 && words[k + 1] == ptr)
+                    arr = words[k + 3];
+                k += wc2;
+            }
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == 28 /*OpTypeArray*/ && wc2 >= 4 && words[k + 1] == arr)
+                {
+                    elem = words[k + 2];
+                    len_cst = words[k + 3];
+                }
+                k += wc2;
+            }
+            if (elem)
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 43 /*OpConstant*/ && wc2 >= 4 && words[k + 2] == len_cst)
+                        len = words[k + 3];
+                    if (op2 == 71 /*OpDecorate*/ && wc2 >= 3 && words[k + 1] == elem &&
+                        words[k + 2] == 2 /*Block*/)
+                        is_block = 1;
+                    k += wc2;
+                }
+            if (is_block && len == 1)
+            {
+                vars[n_vars] = words[i + 2];
+                newtys[n_vars] = 0;   /* filled while emitting (one new ptr type each) */
+                n_vars++;
+            }
+        }
+        i += wc;
+    }
+    if (!n_vars) return NULL;
+
+    buf = malloc(n * 4 * 4 + 64);
+    if (!buf) return NULL;
+    for (uint32_t w = 0; w < 5; w++) buf[w] = words[w];   /* magic..schema */
+    o = 5;
+    for (size_t i = 5; i < n; )
+    {
+        uint32_t wc = words[i] >> 16, op = words[i] & 0xffff;
+        int own = -1;
+
+        if (wc == 0 || i + wc > n) { free(buf); return NULL; }
+
+        /* retarget the variable's type to a fresh ptr(Block) — emitted right here */
+        if (op == 59 /*OpVariable*/)
+            for (int v = 0; v < n_vars; v++)
+                if (vars[v] == words[i + 2] && !newtys[v])
+                {
+                    newtys[v] = next_id++;
+                    own = v;
+                    break;
+                }
+
+        if (own >= 0)
+        {
+            /* find the block struct id for this variable in two passes (the array
+             * type usually PRECEDES its pointer in the module) */
+            uint32_t arr2 = 0, elem2 = 0;
+
+            for (size_t k = 5; k < n; )
+            {
+                uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                if (wc2 == 0 || k + wc2 > n) break;
+                if (op2 == 32 && wc2 >= 4 && words[k + 1] == words[i + 1]) arr2 = words[k + 3];
+                k += wc2;
+            }
+            if (arr2)
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 28 && wc2 >= 4 && words[k + 1] == arr2) elem2 = words[k + 2];
+                    k += wc2;
+                }
+            buf[o++] = 4 << 16 | 32;            /* OpTypePointer */
+            buf[o++] = newtys[own];
+            buf[o++] = 3 /*Output*/;
+            buf[o++] = elem2;
+            /* the variable's result type becomes the fresh pointer */
+            buf[o] = 4 << 16 | 59;               /* OpVariable */
+            buf[o + 1] = newtys[own];
+            buf[o + 2] = words[i + 2];
+            buf[o + 3] = 3 /*Output*/;
+            o += 4;
+            i += wc;
+            continue;
+        }
+
+        if ((op == 65 /*OpAccessChain*/ || op == 66 /*OpInBoundsAccessChain*/) && wc >= 4)
+        {
+            int v = -1;
+
+            for (int q = 0; q < n_vars; q++)
+                if (vars[q] == words[i + 3]) { v = q; break; }
+            /* leading index must be the constant 0: its value id is the 4th word */
+            if (v >= 0 && wc >= 5)
+            {
+                uint32_t zero_id = words[i + 4], is_zero = 0;
+
+                for (size_t k = 5; k < n; )
+                {
+                    uint32_t wc2 = words[k] >> 16, op2 = words[k] & 0xffff;
+
+                    if (wc2 == 0 || k + wc2 > n) break;
+                    if (op2 == 43 /*OpConstant*/ && wc2 >= 4 && words[k + 2] == zero_id &&
+                        words[k + 3] == 0)
+                        is_zero = 1;
+                    k += wc2;
+                }
+                if (is_zero)
+                {
+                    /* emit wc-1 words: header, result type, result id, base, then the
+                     * indices AFTER the dropped constant 0 */
+                    buf[o] = (wc - 1) << 16 | op;
+                    buf[o + 1] = words[i + 1];
+                    buf[o + 2] = words[i + 2];
+                    buf[o + 3] = words[i + 3];
+                    for (uint32_t w = 4; w + 1 < wc; w++)
+                        buf[o + w] = words[i + w + 1];
+                    o += wc - 1;
+                    i += wc;
+                    continue;
+                }
+            }
+        }
+
+        for (uint32_t w = 0; w < wc; w++) buf[o + w] = words[i + w];
+        o += wc;
+        i += wc;
+    }
+
+    /* the header's bound grows by the new ids */
+    buf[3] = next_id;
+    *out_n = o;
+    if (getenv("MGL_TESS_DUMP_DISSOLVE"))
+    {
+        char path[512];
+        static int seq = 0;
+
+        snprintf(path, sizeof path, "%s/strip1_%d.spv", getenv("MGL_TESS_DUMP_DISSOLVE"), seq++);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(buf, 4, o, f); fclose(f); }
+    }
+    return buf;
+}
+
 uint32_t *mgl_tess_dissolve_patch_block_arrays(const uint32_t *words, size_t n, size_t *out_n)
 {
     struct PArrJob jobs[8];
@@ -1030,6 +1219,26 @@ uint32_t *mgl_tess_dissolve_patch_block_arrays(const uint32_t *words, size_t n, 
     *out_n = 0;
     if (!words || n < 8)
         return NULL;
+
+    /* geom r105h: strip length-1 OUTPUT block arrays to the plain block first (see
+     * spv_strip_len1_out_blocks) — only the evaluation stage declares those */
+    if (model == 2 /*TessellationEvaluation*/)
+    {
+        size_t sn = 0;
+        uint32_t *stripped = spv_strip_len1_out_blocks(words, n, &sn);
+
+        if (stripped)
+        {
+            uint32_t *done = mgl_tess_dissolve_patch_block_arrays(stripped, sn, out_n);
+
+            if (done) { free(stripped); return done; }
+            /* no patch jobs: the stripped module is the result */
+            if (getenv("MGL_TESS_DUMP_DISSOLVE"))
+                fprintf(stderr, "MGL dissolve: len-1 output block stripped, no patch jobs\n");
+            *out_n = sn;
+            return stripped;
+        }
+    }
 
     if (getenv("MGL_TESS_DUMP_DISSOLVE"))
     {

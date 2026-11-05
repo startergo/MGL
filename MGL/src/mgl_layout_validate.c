@@ -710,10 +710,13 @@ static bool lv_block_storage(LvModule *m, LvType *t, uint32_t *storage_out)
  * block TYPE name for interface blocks.  A NULL consumer means "unknown"
  * (separable stage): every output is treated as consumed — the pre-r59
  * behavior. */
+/* geom r105i: set per link — a SEPARABLE program has no cross-stage interface
+ * (its stages are validated against their own modules only) */
+static bool lv_separable;
+
 static bool lv_consumed_by(LvModule *cm, LvModule *m, uint32_t var, LvType *bt)
 {
-    if (!cm) return true;
-    const char *name = lv_name(m, var);
+    if (!cm) return true;    const char *name = lv_name(m, var);
     bool is_block = bt && bt->kind == LV_STRUCT && lv_deco(m, bt->id, SpvDecorationBlock, NULL);
     const char *bname = is_block ? lv_name(m, bt->id) : NULL;
 
@@ -836,8 +839,15 @@ static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, LvModule 
 
         /* an OUTPUT the next stage does not consume is inactive (no
          * interpolator storage): the location cap guards the ACTIVE
-         * interface only — see lv_consumed_by above */
-        if (!input && !lv_consumed_by(cm, m, var, t)) continue;
+         * interface only — see lv_consumed_by above.
+         * geom r105i: a SEPARABLE program has no cross-stage interface at link
+         * (GL 4.6 11.1.2.1: stages link independently) — the consumer in the
+         * same link is another program object's stage, so glslang's per-stage
+         * auto locations say nothing about a shared interface.  enhanced_layouts
+         * xfb_get_program_resource_api links 4 dmat3[1] outputs (24 locations)
+         * plus tes_gs at location 24 with a 16-input geometry stage in the
+         * pipeline and expects success. */
+        if (!input && (lv_separable || !lv_consumed_by(cm, m, var, t))) continue;
 
         /* interface BLOCK instances cannot be checked against the per-stage
          * location cap: glslang's AUTO_MAP_LOCATIONS (on for every GL shader
@@ -898,7 +908,12 @@ static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, LvModule 
                 fprintf(stderr, "[LV] %sput var '%s' loc=%u eff=%u slots=%u limit=%d (stage %d)\n",
                         input ? "in" : "out", lv_name(m, var) ? lv_name(m, var) : "?",
                         loc, eff, slots, limit, stage);
-            if (eff + slots > (uint32_t)limit)
+            /* geom r105i: separable — glslang's AUTO_MAP_LOCATIONS numbers every
+             * stage of the LINK SET against the same space (the GS's 'in vec4
+             * tes_gs' lands at location 24 after four dmat3[1] outputs), but the
+             * stages of a separable program form no interface, so the caps do
+             * not apply to those invented locations. */
+            if (!lv_separable && eff + slots > (uint32_t)limit)
             {
                 if (log)
                 {
@@ -1135,12 +1150,13 @@ char *mgl_layout_combined_limits(GLMContext ctx, uint32_t **mods, size_t *sizes,
 }
 
 char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
-                                const uint32_t *consumer_ir, size_t consumer_words)
+                                const uint32_t *consumer_ir, size_t consumer_words, bool separable)
 {
     LvModule *m = calloc(1, sizeof *m);
     char *log = NULL;
     bool ok = true;
 
+    lv_separable = separable;
     if (!m) return NULL;
     if (!lv_parse(ir, words, m))
     {

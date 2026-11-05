@@ -956,6 +956,12 @@ static uint32_t iface_ty(F64 *f, uint32_t orig)
     Ty *t = &f->ty[orig];
     switch (t->kind) {
     case K_FLOAT:
+        /* geom r105e: a FLOAT member of a mixed struct stays a float — the uint2
+         * slot mapping is for DOUBLE scalars only.  Retyping it made the other
+         * stage's float member (which geometry.c emits as float) meet a uint2
+         * here, and SPIRV-Cross bridged the store with a NUMERIC conversion:
+         * a captured {float a; dvec3 d;} recorded bit garbage for a. */
+        if (!is_f64(f, orig)) return orig;
         return iface_of_scalar_or_vec(f, orig);
     case K_VEC:
         if (is_f64(f, t->elem)) return iface_of_scalar_or_vec(f, orig);
@@ -2728,9 +2734,13 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
                 if (curi != curo) patched = true;
             }
             i += 1;
-        } else if (t->kind == K_MAT && ifmode) {
+        } else if (t->kind == K_MAT && ifmode && is_f64_scalar_or_vec(f, t->elem)) {
             /* column of a flat-lying stage-IO matrix: the column spans
-             * ceil(R/2) uint4 locations, so the index is scaled */
+             * ceil(R/2) uint4 locations, so the index is scaled.
+             * (geom r105e: DOUBLE matrices only — a FLOAT matrix member of a mixed
+             * struct keeps its native type and the generic walk below handles it;
+             * slotting it read float3 columns as ulong2 and the MSL failed to
+             * compile, so the whole capture variant fell back to writing zeros.) */
             uint32_t rows = veclen(f, t->elem);
             uint32_t slots = (rows + 1) / 2;
             if (nout >= 24) { fail(f, "fp64: access chain too long"); return; }

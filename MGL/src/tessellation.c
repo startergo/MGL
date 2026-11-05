@@ -7124,7 +7124,10 @@ static bool tess_out_shape(GLMContext ctx, MGLTessProgram *tp, const char *name,
         if (op == 5 /* OpName */)
             tid = ir[m + 1];
         else if (op == 6 /* OpMemberName */)
-            tid = 0;                 /* handled below: need the member index */
+            tid = ir[m + 1];        /* the struct type; the member index is ir[m+2]
+                                     * (geom r105: this was left 0, so an interface
+                                     * block member never resolved its shape and its
+                                     * odd-width double columns recorded padded) */
         if (op == 5 || op == 6)
         {
             char buf[128];

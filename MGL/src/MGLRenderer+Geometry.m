@@ -1586,7 +1586,27 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 4] = 0u;                               /* stream 0 */
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 5] = 0u;   /* chunk 0: dense copy (see above) */
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 6] = 0u;   /* gap 0 */
+        /* geom r105j: a slot-mapped DOUBLE matrix with 3-component columns (a
+         * SPIRV-Cross-flattened array of dmatNx3) records each column as a full
+         * uint4 slot + a uint4 slot holding ONE valid double: 6 valid words per
+         * 8-word column — copy with that skip.  Rows of 2 or 4 fill their slots
+         * densely and keep the plain copy.  Only the SLOT-MAPPED vars (the
+         * src->splits list the slot map built): the name-matched capture record
+         * is compact upstream (r59/r60) and must stay dense. */
+        for (uint32_t g = 0; src->splits && g < src->splits_n && g < MGL_GEOM_XFB_MAX_VARS; g++)
+        {
+            GLuint v = src->splits[g].var;
+
+            if (v >= xp->count || v >= MGL_GEOM_XFB_MAX_VARS) continue;
+            if (src->splits[g].col_dstride != 6 || src->splits[g].col_sstride != 8) continue;
+            vars[v * MGL_GEOM_XFB_VAR_WORDS + 5] = 6u;
+            vars[v * MGL_GEOM_XFB_VAR_WORDS + 6] = 2u;
+        }
     }
+    /* geom r105d: upstream r97c added chunk/gap (words 5/6) for padded copies and
+     * r59/r60 compact the TES capture record itself, so the per-column split specs
+     * this pass used are no longer needed — the slot map's single contiguous range
+     * covers the compact record. */
     if (geomEnvRead(), gEnv.xfb)
         for (GLuint v = 0; v < xp->count && v < 8; v++)
             fprintf(stderr, "geom: tess pack vars[%u]: src_word=%u dst_off=%u words=%u buffer=%u stride=%u tfsize=%u rows=%u cols=%u kind=%04x chunk=%u gap=%u\n",

@@ -24,7 +24,7 @@ for P in "$@"; do
     --deqp-log-decompiled-spirv=disable --deqp-log-empty-loginfo=disable \
     --deqp-log-filename="$OUTDIR/$N.qpa" > "$OUTDIR/$N.out" 2> "$OUTDIR/$N.err"
   rc=$?
-  awk '/^#beginTestCaseResult /{c=$2} /^ <Result StatusCode=/{s=$2; gsub(/StatusCode=|"|>/,"",s); if (s!="Pass") print s, c}' "$OUTDIR/$N.qpa" \
+  awk '/^#beginTestCaseResult /{c=$2} /<Result StatusCode=/{match($0,/StatusCode="[A-Za-z]+"/); s=substr($0,RSTART+12,RLENGTH-13); if (s!="Pass") print s, c}' "$OUTDIR/$N.qpa" \
     | sed 's/^/  /' > "$OUTDIR/$N.fails"
   p=$(grep -c '^#beginTestCaseResult' "$OUTDIR/$N.qpa")
   f=$(grep -c '^  Fail' "$OUTDIR/$N.fails" || true)
