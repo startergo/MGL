@@ -1806,7 +1806,7 @@ static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const
     for (GLuint e = 0; e < v->elems; e++)
     {
         char elem_prefix[64] = "";
-        if (v->elems > 1) snprintf(elem_prefix, sizeof(elem_prefix), "[%u]", e);
+        if (v->elems > 1 || v->arr) snprintf(elem_prefix, sizeof(elem_prefix), "[%u]", e);   /* r103 */
 
         if (v->cols > 1)
         {
@@ -1871,7 +1871,7 @@ static void gen_varying_store(SB *b, const MGLGeomVar *v, const char *dest, cons
     for (GLuint e = 0; e < v->elems; e++)
     {
         char ep[32] = "";
-        if (v->elems > 1) snprintf(ep, sizeof(ep), "[%u]", e);
+        if (v->elems > 1 || v->arr) snprintf(ep, sizeof(ep), "[%u]", e);   /* r103: 1-element arrays still index */
 
         for (GLuint c = 0; c < v->cols; c++)
         {
@@ -3515,6 +3515,187 @@ static char *geom_transform_source(const char *src, unsigned in_verts, char *gl_
 
 /* ------------------------------------------------------------------ reflection */
 
+/* geom r103: the GL base type of a leaf member type (mirrors the member loop's
+ * resolution, incl. software-lowered fp64 members whose GL view is GL_DOUBLE) */
+static GLenum geom_type_base(SpvModule *m, SpvType *mt)
+{
+    return mt->kind == SPVT_FLOAT ? (mt->bits == 64 ? GL_DOUBLE : GL_FLOAT) :
+           mt->kind == SPVT_INT ? (mt->is_signed ? GL_INT : GL_UNSIGNED_INT) :
+           mt->kind == SPVT_BOOL ? GL_BOOL : spv_scalar_base(m, mt);
+}
+
+/* geom r103: GL 4.6 13.2.2 transform-feedback packing of a structure captured as a
+ * whole (`layout(xfb_offset = N) out TestStruct goku;`): every member starts
+ * aligned to the SIZE OF ITS SCALAR BASE TYPE only, matrix components and array
+ * elements pack contiguously (no std430 column/vec3 padding), and an inner
+ * structure's span is aligned to the largest scalar its members use.  (std430 was
+ * wrong: the CTS packs `struct { float a; mat2 b; }` as a@0, b@4 — KHR-Single-GL46
+ * enhanced_layouts.xfb_struct_explicit_location_*.) */
+static GLuint geom_plain_scalar_bytes(GLenum base)
+{
+    return base_words(base) * 4u;
+}
+
+/* largest scalar size used anywhere under struct `sid` (drives nested-struct
+ * alignment); 0 if the tree holds a shape we cannot flatten */
+static GLuint geom_struct_max_scalar(SpvModule *m, uint32_t sid)
+{
+    SpvType *st = spv_find_type(m, sid);
+    if (!st || st->kind != SPVT_STRUCT) return 0;
+    GLuint mx = 0;
+    for (int mi = 0; mi < st->n_members; mi++)
+    {
+        SpvType *mt = spv_find_type(m, st->members[mi]);
+        while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+        if (mt && mt->kind == SPVT_ARRAY) mt = spv_find_type(m, mt->elem);
+        while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+        if (!mt) return 0;
+        if (mt->kind == SPVT_STRUCT)
+        {
+            GLuint inner = geom_struct_max_scalar(m, mt->id);
+            if (!inner) return 0;
+            if (inner > mx) mx = inner;
+        }
+        else if (mt->kind == SPVT_VEC || mt->kind == SPVT_MAT ||
+                 mt->kind == SPVT_FLOAT || mt->kind == SPVT_INT || mt->kind == SPVT_BOOL)
+        {
+            GLuint sb = geom_plain_scalar_bytes(geom_type_base(m, mt));
+            if (sb > mx) mx = sb;
+        }
+        else return 0;
+    }
+    return mx;
+}
+
+/* geom r103: assign the packed xfb offsets to the leaf entries collected for the
+ * struct tree rooted at `sid` (the member loop and geom_plain_flatten emit leaves
+ * depth-first in declaration order).  Returns the offset just past this struct's
+ * packed span, aligned to its largest scalar. */
+static unsigned geom_plain_pack(SpvModule *m, uint32_t sid, unsigned off, int *idx,
+                                MGLGeomVar *vars, int n)
+{
+    SpvType *st = spv_find_type(m, sid);
+    GLuint mx = geom_struct_max_scalar(m, sid);
+    if (!st || !mx) return off;
+    for (int mi = 0; mi < st->n_members; mi++)
+    {
+        SpvType *mt = spv_find_type(m, st->members[mi]);
+        while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+        if (mt && mt->kind == SPVT_ARRAY) mt = spv_find_type(m, mt->elem);
+        while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+        if (mt && mt->kind == SPVT_STRUCT)
+        {
+            GLuint inner_max = geom_struct_max_scalar(m, mt->id);
+            if (!inner_max) return off;
+            unsigned a = (off + inner_max - 1) & ~(inner_max - 1);
+            unsigned end = geom_plain_pack(m, mt->id, a, idx, vars, n);
+            off = (end + inner_max - 1) & ~(inner_max - 1);
+        }
+        else if (*idx < n)
+        {
+            MGLGeomVar *mv = &vars[*idx];
+            GLuint sb = geom_plain_scalar_bytes(mv->base);
+            unsigned a = (off + sb - 1) & ~(sb - 1);
+            unsigned sz = mv->words * 4u;
+            if (mv->xfb_offset == 0xffffffffu) mv->xfb_offset = a;
+            off = a + sz;
+            (*idx)++;
+        }
+    }
+    return (off + mx - 1) & ~(mx - 1);
+}
+
+/* geom r103: flatten a NESTED plain-struct member of a whole-captured plain struct
+ * output into leaf capture entries with dotted member paths ("goku.inner.a"),
+ * depth-first in declaration order — the order geom_plain_pack assigns offsets
+ * in.  Array-of-struct members are not flattened (the caller reports them). */
+static bool geom_plain_flatten(SpvModule *m, SpvVar *v, uint32_t sid, const char *path,
+                               GLuint *next_loc, MGLGeomVar *vars, int *n, char **log)
+{
+    SpvType *st = spv_find_type(m, sid);
+    uint32_t tmp_stream;
+    const char *vname = spv_name(m, v->id);
+    if (!st || st->kind != SPVT_STRUCT)
+    {
+        mgl_append_log(log, "ERROR: geometry: unsupported nested member type under %s\n", vname);
+        return false;
+    }
+    for (int mi = 0; mi < st->n_members && *n < MGL_GEOM_MAX_VARYINGS; mi++)
+    {
+        const char *mn = spv_member_name(m, sid, mi);
+        uint32_t mid = st->members[mi];
+        SpvType *mt = spv_find_type(m, mid);
+        GLuint melems = 1, mrows, mcols;
+        GLenum mbase;
+
+        if (!mn) continue;
+        while (mt && mt->kind == SPVT_PTR) { mt = spv_find_type(m, mt->elem); mid = mt->id; }
+        bool isarr = false;             /* r103: this member carries its own [] dimension */
+        if (mt && mt->kind == SPVT_ARRAY)
+        {
+            isarr = true;
+            melems = mt->n;
+            mt = spv_find_type(m, mt->elem);
+            while (mt && mt->kind == SPVT_PTR) mt = spv_find_type(m, mt->elem);
+        }
+        if (!mt || melems == 0 || mt->kind == SPVT_ARRAY)
+        {
+            mgl_append_log(log, "ERROR: geometry: unsupported nested member array under %s\n", vname);
+            return false;
+        }
+        if (mt->kind == SPVT_STRUCT)
+        {
+            char sub[128];
+            snprintf(sub, sizeof sub, "%s%s%s", path, *path ? "." : "", mn);
+            if (melems > 1)
+            {
+                mgl_append_log(log, "ERROR: geometry: array-of-structure member %s.%s is not supported\n",
+                               vname, sub);
+                return false;
+            }
+            if (!geom_plain_flatten(m, v, mt->id, sub, next_loc, vars, n, log)) return false;
+            continue;
+        }
+        if (mt->kind != SPVT_VEC && mt->kind != SPVT_MAT &&
+            mt->kind != SPVT_FLOAT && mt->kind != SPVT_INT && mt->kind != SPVT_BOOL)
+        {
+            mgl_append_log(log, "ERROR: geometry: unsupported interface block member type for %s.%s%s\n",
+                           vname, path, mn);
+            return false;
+        }
+
+        MGLGeomVar *out = &vars[(*n)++];
+        memset(out, 0, sizeof(*out));
+        snprintf(out->name, sizeof(out->name), "%s", vname);
+        snprintf(out->member, sizeof(out->member), "%s%s%s", path, *path ? "." : "", mn);
+        out->plain_struct = true;
+        out->arr = isarr;   /* r103: keep [i] indexing for 1-element array members */
+        out->elems = melems;
+        out->xfb_buffer = -1;
+        out->xfb_offset = 0xffffffffu;
+        out->xfb_stride = 0xffffffffu;
+        out->location = *next_loc;
+        mbase = geom_type_base(m, mt);
+        mrows = mt->kind == SPVT_MAT ? spv_find_type(m, mt->elem)->n : mt->kind == SPVT_VEC ? mt->n : 1;
+        mcols = mt->kind == SPVT_MAT ? mt->n : 1;
+        *next_loc = out->location + melems * mcols * (mbase == GL_DOUBLE ? (mrows + 1) / 2 : 1u);
+        out->base = mbase;
+        out->rows = mrows;
+        out->cols = mcols;
+        out->words = melems * mcols * mrows * base_words(mbase);
+        out->flat = spv_deco(m, v->id, SpvDecorationFlat, NULL);
+        out->noperspective = spv_deco(m, v->id, SpvDecorationNoPerspective, NULL);
+        if (spv_deco(m, v->id, SpvDecorationStream, &tmp_stream)) out->stream = tmp_stream;
+        if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp_stream)) out->xfb_buffer = (int)tmp_stream;
+        if (spv_member_deco(m, sid, mi, SpvDecorationXfbBuffer, &tmp_stream)) out->xfb_buffer = (int)tmp_stream;
+        /* NOTE: the variable's own Offset decoration ("the struct starts here") is
+         * deliberately NOT copied onto leaves — geom_plain_pack walks it; an explicit
+         * MEMBER offset (rare) still wins. */
+        if (spv_member_deco(m, sid, mi, SpvDecorationOffset, &tmp_stream)) out->xfb_offset = tmp_stream;
+    }
+    return true;
+}
+
 static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int *count, char **log)
 {
     int n = 0;
@@ -3640,11 +3821,35 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                  * the length becomes elems — one layer only, the rewritten shader declares it
                  * as a struct member with its own [] dimension, which the generators unroll */
                 GLuint melems = 1;
+                bool was_array = false;   /* r103: the member carries its own [] dimension */
                 if (mt && mt->kind == SPVT_ARRAY)
                 {
+                    was_array = true;
                     melems = mt->n;
                     mid = mt->elem;
                     mt = spv_find_type(m, mid);
+                }
+                if (mt && mt->kind == SPVT_STRUCT)
+                {
+                    /* geom r103: a nested structure member of a whole-captured PLAIN
+                     * structure output flattens into dotted leaf entries
+                     * ("goku.inner_struct_a.a") depth-first in declaration order —
+                     * geom_plain_pack then assigns the packed 13.2.2 offsets.
+                     * Interface BLOCKS with nested members stay unsupported. */
+                    if (!inputs && plain)
+                    {
+                        if (melems > 1)
+                        {
+                            mgl_append_log(log, "ERROR: geometry: array-of-structure member %s.%s is not supported\n",
+                                           anon ? "?" : inst, mn);
+                            return false;
+                        }
+                        if (!geom_plain_flatten(m, v, mt->id, mn, &next_loc, vars, &n, log)) return false;
+                        continue;
+                    }
+                    mgl_append_log(log, "ERROR: geometry: unsupported interface block member type for %s.%s\n",
+                                   anon ? "?" : inst, mn);
+                    return false;
                 }
                 if (!mt || melems == 0 || (mt->kind == SPVT_ARRAY) ||
                     (mt->kind != SPVT_VEC && mt->kind != SPVT_MAT &&
@@ -3673,6 +3878,7 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 memset(out, 0, sizeof(*out));
                 snprintf(out->name, sizeof(out->name), "%s", anon ? mn : inst);
                 snprintf(out->member, sizeof(out->member), "%s", anon ? "" : mn);
+                out->arr = was_array;   /* r103: keep [i] indexing for 1-element array members */
                 if (plain) out->plain_struct = true;
                 /* the block NAME (a non-anonymous interface block's type name) names the
                  * member through the API: glTransformFeedbackVaryings writes "Block.member" */
@@ -3705,39 +3911,23 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                 if (spv_member_deco(m, t->id, mi, SpvDecorationXfbStride, &tmp) ||
                     spv_deco(m, v->id, SpvDecorationXfbStride, &tmp)) out->xfb_stride = tmp;
             }
-            /* compat r96c: a PLAIN structure output captured as a whole
+            /* compat r96c / geom r103: a PLAIN structure output captured as a whole
              * (`layout(xfb_offset = N) out Goku goku;` — ARB_enhanced_layouts)
              * captures every member in declaration order.  SPIR-V decorates only
-             * the variable, so the members' xfb offsets are derived here from the
-             * std430 layout (the layout a captured structure's members follow),
-             * the base being the variable's own xfb_offset. */
+             * the variable, so the members' xfb offsets are derived here.  r96c
+             * used the std430 layout; GL 4.6 13.2.2 actually packs captured
+             * structures with SCALAR alignment only (matrices/array elements
+             * contiguous, inner structs aligned to their largest scalar) — which
+             * is what geom_plain_pack walks, nested struct members included
+             * (flattened to dotted leaves above). */
             if (plain && spv_deco(m, v->id, SpvDecorationOffset, &tmp))
             {
-                unsigned off = 0;
-                for (int mi2 = 0; mi2 < t->n_members; mi2++)
-                {
-                    MGLGeomVar *mv = &vars[m0 + mi2];
-                    unsigned sb = base_words(mv->base) * 4u;
-                    unsigned ma = (mv->rows == 3 ? 4u : mv->rows) * sb;   /* column align */
-                    unsigned ms = mv->rows * sb;                          /* column size  */
-                    if (mv->cols > 1)
-                    {
-                        ms = mv->cols * ((ms + ma - 1) & ~(ma - 1));      /* array of columns */
-                        ma = ma;  /* a matrix aligns like its column vector */
-                    }
-                    if (mv->elems > 1)
-                    {
-                        unsigned stride = (ms + ma - 1) & ~(ma - 1);
-                        ms = mv->elems * stride;
-                    }
-                    off = (off + ma - 1) & ~(ma - 1);
-                    if (mv->xfb_offset == 0xffffffffu) mv->xfb_offset = tmp + off;
-                    off += ms;
-                }
+                int pidx = m0;
+                geom_plain_pack(m, t->id, tmp, &pidx, vars, n);
                 /* the members inherit the buffer of the variable */
                 if (spv_deco(m, v->id, SpvDecorationXfbBuffer, &tmp))
-                    for (int mi2 = 0; mi2 < t->n_members; mi2++)
-                        if (vars[m0 + mi2].xfb_buffer < 0) vars[m0 + mi2].xfb_buffer = (int)tmp;
+                    for (int mi2 = m0; mi2 < n; mi2++)
+                        if (vars[mi2].xfb_buffer < 0) vars[mi2].xfb_buffer = (int)tmp;
             }
             /* geom r102: a named block (or plain struct) INSTANCE with an array dimension
              * ("out Goku { vec4 gohan; } goku[2];") — the entries collected above are
@@ -3781,6 +3971,18 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                     }
                     stride = (expl_end > walk ? expl_end : walk);
                     stride = (stride + maxa - 1) & ~(maxa - 1);
+                    /* geom r103: a PLAIN struct instance array packs per 13.2.2 (not
+                     * std430) — the element stride is the packed span the offset walk
+                     * above assigned, aligned to the struct's largest scalar. */
+                    if (plain)
+                    {
+                        int scratch = m0;
+                        unsigned span = geom_plain_pack(m, t->id, 0, &scratch, vars, n);
+                        GLuint ms = geom_struct_max_scalar(m, t->id);
+                        if (ms < 1) ms = 1;
+                        unsigned pstride = (span + ms - 1) & ~(ms - 1);
+                        stride = pstride;
+                    }
                     /* the location span one element's members consume (explicit member
                      * locations are honored in order; the span is what followed them) */
                     GLuint span = (next_loc > vars[m0].location) ? next_loc - vars[m0].location : 0;
@@ -7959,7 +8161,7 @@ static char *geom_gen_kernel_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, cons
          * ("goku[e].c") — the store/clear expression is shared with mgl_store_output */
         char src[192];
         geom_var_expr(src, sizeof(src), &gp->out_v[i]);
-        sb_put(&b, "    %s%s = %s(0);\n", src, gp->out_v[i].elems > 1 ? "[0]" : "",
+        sb_put(&b, "    %s%s = %s(0);\n", src, (gp->out_v[i].elems > 1 || gp->out_v[i].arr) ? "[0]" : "",
                glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, gp->out_v[i].cols));
     }
     sb_put(&b, "    mgl_gs_main();\n");
@@ -11514,6 +11716,13 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
 
     if (xp->pending_count && !separate)
         xp->stride[buffer] = offset;
+
+    if (getenv("MGL_GEOM_XFB_TRACE"))
+        for (GLuint i = 0; i < xp->count; i++)
+            fprintf(stderr, "geom: xvar[%u] '%s' size=%d rows=%d cols=%d words=%u src_word=%u buf=%d off=%u stride=%u\n",
+                    i, xp->vars[i].name, xp->vars[i].size, xp->vars[i].rows,
+                    xp->vars[i].columns, xp->vars[i].words, xp->vars[i].src_word,
+                    xp->vars[i].buffer, xp->vars[i].offset, xp->stride[xp->vars[i].buffer]);
 }
 
 void mgl_geom_xfb_link(GLMContext ctx, Program *program, bool from_shader)

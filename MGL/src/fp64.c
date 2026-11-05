@@ -104,6 +104,7 @@ typedef struct {
     uint32_t *rowmap;        /* original matrix type -> row-major repr */
 
     Buf hdradd;              /* OpCapability / OpExtInstImport additions */
+    Buf prename;             /* OpName/OpMemberName for cloned/new ids (debug section) */
     Buf preann;              /* decorations for new types (annotation section) */
     Buf pre;                 /* new types/constants (start of def section) */
     Buf lead;                /* relocated module type defs, before `pre` */
@@ -124,6 +125,27 @@ typedef struct {
                                 * registry filled long before the late slot
                                 * structs were created, so smember() fell back to
                                 * the (garbage) module def lookups */
+    /* r103 (geom): interface clone struct defs whose emission is deferred to the
+       def section, right after the original struct's own definition.  They used to
+       ride in `pre`, but `pre` precedes the module's def section, so a clone whose
+       members are unmapped ORIGINAL types forward-referenced them; SPIRV-Cross only
+       chokes on that when its same-named-struct aliasing (glslang #304/#307
+       workaround) recurses into a member type that is not parsed yet — which is
+       exactly what two same-named clones do (KHR-GL46 enhanced_layouts.
+       xfb_struct_explicit_location_geometry: `flat out OuterStruct goku` where the
+       struct mixes fp64 and float members).  Emitted at the original's position,
+       every member is already defined and the module stays parseable. */
+    uint32_t ifc_orig[96];     /* original struct id */
+    uint32_t ifc_id[96];       /* deferred clone id (def words rebuilt from ifmem) */
+    size_t nifc;
+    /* r104 (geom): deferring the clone def (above) left every `pre` instruction
+       that REFERENCES the clone behind in `pre` — the array-of-clone that a
+       stage-IO variable's pointer is rebuilt with, then that pointer — so `pre`
+       forward-referenced an id that only appears in the def section and
+       SPIRV-Cross rejected the whole module ("nullptr", KHR-GL46
+       gpu_shader_fp64.fp64.varyings: `%_arr_TC_DATA_0_uint_4 = OpTypeArray
+       %TC_DATA_0` in `pre` while `%TC_DATA_0` is emitted after the original
+       block).  splice_ifc_tails() moves them after the clone, see below. */
 
     /* stage-IO element wrappers (see iface_slot_struct) */
     struct { uint32_t id, orig; } pstruct[32]; size_t npstruct;
@@ -835,13 +857,21 @@ static void iface_copy_block_meta(F64 *f, uint32_t orig, uint32_t mapped)
         uint32_t op = f->ins[j].op, wc = f->ins[j].wc;
         const uint32_t *iw = f->w + f->ins[j].off;
         if (op == SpvOpName && wc >= 3 && iw[1] == orig) {
-            bpush(&f->preann, (wc << 16) | SpvOpName);
-            bpush(&f->preann, mapped);
-            for (uint32_t i = 2; i < wc; i++) bpush(&f->preann, iw[i]);
+            /* r103 (geom): names are DEBUG-section instructions — they must precede
+               every OpDecorate of the module.  They used to ride in `preann`, which
+               the assembler appends after the whole original module, so a module with
+               any decoration carried its cloned-type names in the annotation section;
+               SPIRV-Cross rejects that layout ("Name is in an invalid layout section")
+               and the whole link failed (KHR-GL46 enhanced_layouts.
+               xfb_struct_explicit_location_geometry: `flat out TestStruct` whose
+               members hold fp64 gets its struct cloned by this pass and named here). */
+            bpush(&f->prename, (wc << 16) | SpvOpName);
+            bpush(&f->prename, mapped);
+            for (uint32_t i = 2; i < wc; i++) bpush(&f->prename, iw[i]);
         } else if (op == SpvOpMemberName && wc >= 4 && iw[1] == orig) {
-            bpush(&f->preann, (wc << 16) | SpvOpMemberName);
-            bpush(&f->preann, mapped);
-            for (uint32_t i = 2; i < wc; i++) bpush(&f->preann, iw[i]);
+            bpush(&f->prename, (wc << 16) | SpvOpMemberName);
+            bpush(&f->prename, mapped);
+            for (uint32_t i = 2; i < wc; i++) bpush(&f->prename, iw[i]);
         }
     }
     for (size_t i = 0; i < f->nmdecs; i++) {
@@ -881,14 +911,26 @@ static uint32_t iface_struct(F64 *f, uint32_t orig)
     uint32_t *o = malloc((nm + 1) * sizeof(uint32_t));
     o[0] = id;
     for (uint32_t i = 0; i < nm; i++) o[i + 1] = mem[i];
-    binst(&f->pre, SpvOpTypeStruct, o, nm + 1);
-    free(o);
+    bool deferred = false;
     if (nm < 32 && ifmem_grow(f)) {
         f->ifmem[f->nifmem].sid = id;
         f->ifmem[f->nifmem].n = nm;
         for (uint32_t i = 0; i < nm; i++) f->ifmem[f->nifmem].mem[i] = mem[i];
         f->nifmem++;
+        /* r103 (geom): defer the def to the original struct's position in the def
+           section (see the ifc_* comment above) — the clone then never forward
+           references an unmapped member type.  If the table is full, fall back to
+           the old `pre` position (still parsed by SPIRV-Cross, just laid out
+           loosely). */
+        if (f->nifc < 96) {
+            f->ifc_orig[f->nifc] = orig;
+            f->ifc_id[f->nifc] = id;
+            f->nifc++;
+            deferred = true;
+        }
     }
+    if (!deferred) binst(&f->pre, SpvOpTypeStruct, o, nm + 1);
+    free(o);
     free(mem);
     iface_copy_block_meta(f, orig, id);
     return iface_mark(f, id, orig);
@@ -4062,10 +4104,103 @@ static void fp64_attr_slots(F64 *f)
             onw[0] = (uint32_t)(2 + nw) << 16 | 5 /* OpName */;
             onw[1] = hi;
             memcpy(onw + 2, nm, nb);
-            for (size_t i = 0; i < 2 + nw; i++) bpush(&f->hdradd, onw[i]);
+            /* r104 (geom): names are debug-section instructions; `hdradd` is
+               flushed right before OpMemoryModel, where an OpName is an invalid
+               logical layout ("Name cannot appear before the memory model
+               instruction") — prename is emitted ahead of the first annotation,
+               the last legal spot. */
+            for (size_t i = 0; i < 2 + nw; i++) bpush(&f->prename, onw[i]);
         }
         if (f->failed) return;
     }
+}
+
+/* r104 (geom): see the ifc comment in struct F64.  Walk the finished `pre`
+   buffer and move every type instruction that references a deferred interface
+   clone (directly, or through another moved instruction) out of `pre` and into
+   that clone's tail, then splice each tail into `defs` right after the clone's
+   own def — restoring the baseline's local ordering (clone, array, pointer)
+   which r103's deferral broke.  Must run once all `pre`/`defs` appends are
+   done, i.e. between the def-section walk and the output assembly. */
+static void splice_ifc_tails(F64 *f)
+{
+    if (!f->nifc || !f->pre.n || !f->defs.n) return;
+
+    /* owned-id table: clone ids, then the result ids of moved instructions */
+    size_t cap = f->nifc + 256;
+    uint32_t *oid = malloc(cap * sizeof(uint32_t));
+    uint32_t *oown = malloc(cap * sizeof(uint32_t));
+    if (!oid || !oown) { free(oid); free(oown); return; }
+    size_t nown = 0;
+    for (size_t k = 0; k < f->nifc; k++) { oid[nown] = f->ifc_id[k]; oown[nown] = (uint32_t)k; nown++; }
+
+    Buf tails[96];
+    for (size_t k = 0; k < f->nifc; k++) tails[k] = (Buf){0};
+    Buf keep = {0};
+    bool moved = false;
+
+    size_t i = 0;
+    while (i < f->pre.n) {
+        uint32_t wc = f->pre.w[i] >> 16, op = f->pre.w[i] & 0xffff;
+        if (wc < 2 || i + wc > f->pre.n) {   /* malformed tail: keep verbatim */
+            for (size_t r = i; r < f->pre.n; r++) bpush(&keep, f->pre.w[r]);
+            break;
+        }
+        int tgt = -1;   /* the referenced clone with the LATEST def position */
+        if (op == SpvOpTypeArray || op == SpvOpTypeStruct || op == SpvOpTypeFunction) {
+            for (uint32_t w = 2; w < wc; w++) {          /* word 1 = result id */
+                uint32_t id = f->pre.w[i + w];
+                for (size_t o = 0; o < nown; o++)
+                    if (oid[o] == id) {
+                        if (tgt < 0 || f->ty[f->ifc_orig[oown[o]]].def > f->ty[f->ifc_orig[tgt]].def)
+                            tgt = (int)oown[o];
+                        break;
+                    }
+            }
+        } else if (op == SpvOpTypePointer) {
+            uint32_t id = f->pre.w[i + 3];               /* pointee (word 2 is the storage class) */
+            for (size_t o = 0; o < nown; o++)
+                if (oid[o] == id) { tgt = (int)oown[o]; break; }
+        }
+        if (tgt >= 0) {
+            for (uint32_t w = 0; w < wc; w++) bpush(&tails[tgt], f->pre.w[i + w]);
+            if (nown < cap) { oid[nown] = f->pre.w[i + 1]; oown[nown] = (uint32_t)tgt; nown++; }
+            moved = true;
+        } else {
+            for (uint32_t w = 0; w < wc; w++) bpush(&keep, f->pre.w[i + w]);
+        }
+        i += wc;
+    }
+    free(f->pre.w);
+    f->pre = keep;
+    if (!moved) {
+        for (size_t k = 0; k < f->nifc; k++) free(tails[k].w);
+        free(oid); free(oown);
+        return;
+    }
+
+    /* re-emit `defs` with each tail following its clone's OpTypeStruct */
+    Buf nd = {0};
+    size_t j = 0;
+    while (j < f->defs.n) {
+        uint32_t wc = f->defs.w[j] >> 16, op = f->defs.w[j] & 0xffff;
+        if (wc < 2 || j + wc > f->defs.n) {
+            for (size_t r = j; r < f->defs.n; r++) bpush(&nd, f->defs.w[r]);
+            break;
+        }
+        for (uint32_t w = 0; w < wc; w++) bpush(&nd, f->defs.w[j + w]);
+        if (op == SpvOpTypeStruct) {
+            uint32_t rid = f->defs.w[j + 1];
+            for (size_t k = 0; k < f->nifc; k++)
+                if (f->ifc_id[k] == rid && tails[k].n)
+                    for (size_t t = 0; t < tails[k].n; t++) bpush(&nd, tails[k].w[t]);
+        }
+        j += wc;
+    }
+    free(f->defs.w);
+    f->defs = nd;
+    for (size_t k = 0; k < f->nifc; k++) free(tails[k].w);
+    free(oid); free(oown);
 }
 
 uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool vertex_inputs,
@@ -4200,7 +4335,7 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
             onw[0] = (uint32_t)(2 + nw) << 16 | 5 /* OpName */;
             onw[1] = f.lib->fns[i].id + f.libshift;
             memcpy(onw + 2, nm, nb);
-            for (size_t k = 0; k < 2 + nw; k++) bpush(&f.preann, onw[k]);
+            for (size_t k = 0; k < 2 + nw; k++) bpush(&f.prename, onw[k]);   /* r103: debug section (see iface_copy_block_meta) */
         }
     }
 
@@ -4217,6 +4352,21 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     for (size_t j = f.first_def; j < f.first_fn; j++) {
         if (f.failed) goto done;
         const uint32_t *iw = f.w + f.ins[j].off;
+        /* r103 (geom): emit deferred interface clone structs right after the
+           original struct def — at that point every member type (mapped ones in
+           `pre`, unmapped ones earlier in the def section) is already defined. */
+        for (size_t k = 0; k < f.nifc; k++) {
+            if (f.ty[f.ifc_orig[k]].def == j) {
+                for (size_t m = 0; m < f.nifmem; m++) {
+                    if (f.ifmem[m].sid != f.ifc_id[k]) continue;
+                    uint32_t o[34];
+                    o[0] = f.ifc_id[k];
+                    for (uint32_t q = 0; q < f.ifmem[m].n; q++) o[q + 1] = f.ifmem[m].mem[q];
+                    binst(&f.defs, SpvOpTypeStruct, o, f.ifmem[m].n + 1);
+                    break;
+                }
+            }
+        }
         uint32_t r2 = (f.ins[j].wc >= 3 && inst_has_result(f.ins[j].op)) ? iw[2] : 0;
         if (!rw_def_inst(&f, j, r2)) {
             if (f.ins[j].op == SpvOpTypeFloat && iw[2] == 64)
@@ -4251,6 +4401,11 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
     }
     if (f.failed) goto done;
 
+    /* r104 (geom): move `pre` types that reference a deferred clone after that
+       clone's def in `defs` (see splice_ifc_tails) */
+    splice_ifc_tails(&f);
+    if (f.failed) goto done;
+
     /* header + annotations */
     {
         for (uint32_t i = 0; i < 5; i++) bpush(&out, f.w[i]);
@@ -4258,6 +4413,21 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
         for (size_t j = 0; j < f.first_def; j++) {
             uint32_t op = f.ins[j].op, wc = f.ins[j].wc;
             const uint32_t *iw = f.w + f.ins[j].off;
+            /* r103: flush the collected OpName/OpMemberName instructions right before
+               the module's first annotation — the last point they may occupy (names
+               after an OpDecorate are an invalid logical layout, and SPIRV-Cross's
+               parser rejects the module).  A module without annotations flushes them
+               after the loop, still ahead of the def section.  r104: match every
+               annotation opcode (DecorationGroup / DecorateId / the *String
+               extensions), not just the 71..75 range — a module whose first
+               annotation is one of those would still flush too late. */
+            bool ann = (op >= SpvOpDecorate && op <= SpvOpGroupMemberDecorate) ||
+                       op == SpvOpDecorateId || op == SpvOpDecorateString ||
+                       op == SpvOpMemberDecorateString;
+            if (f.prename.n && ann) {
+                for (size_t i = 0; i < f.prename.n; i++) bpush(&out, f.prename.w[i]);
+                f.prename.n = 0;
+            }
             if (!cap_done && op != SpvOpCapability) {
                 uint32_t o[1] = {SpvCapabilityInt64};
                 binst(&out, SpvOpCapability, o, 1);
@@ -4300,6 +4470,8 @@ uint32_t *mgl_fp64_lower_module(const uint32_t *words, size_t nwords, bool verte
         for (size_t i = 0; i < f.hdradd.n; i++) bpush(&out, f.hdradd.w[i]);
     }
 
+    for (size_t i = 0; i < f.prename.n; i++) bpush(&out, f.prename.w[i]);
+    f.prename.n = 0;
     for (size_t i = 0; i < f.preann.n; i++) bpush(&out, f.preann.w[i]);
     for (size_t i = 0; i < f.lead.n; i++) bpush(&out, f.lead.w[i]);
     for (size_t i = 0; i < f.pre.n; i++) bpush(&out, f.pre.w[i]);
@@ -4343,7 +4515,7 @@ done:
     free(f.attrslot); free(f.attrn); free(f.attrhi); free(f.attrhity); free(f.attrcomp); free(f.attrslotidx); free(f.attrsgeom); free(f.attrorig); free(f.attrmat); free(f.elemslice); free(f.elemidx); free(f.elemstride); free(f.elemorig); free(f.ioiface); free(f.arrlane); free(f.elemreg); free(f.warr);
     free(f.ifmem);
     free(f.vc);
-    free(f.pre.w); free(f.preann.w); free(f.lead.w); free(f.defs.w); free(f.body.w);
+    free(f.pre.w); free(f.preann.w); free(f.prename.w); free(f.lead.w); free(f.defs.w); free(f.body.w);
     free(f.libdefs.w); free(f.libfns.w); free(f.hdradd.w);
     if (f.failed) {
         if (outw) { free(outw); outw = NULL; }

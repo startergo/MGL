@@ -163,6 +163,10 @@ typedef struct MGLGeomVar {
                            * expression is "inst[index].member[..]", xfb_offset advances by
                            * the std430 block size per element and each element's members
                            * consume a fresh set of locations */
+    bool    arr;          /* geom r103: the leaf is declared as an ARRAY (even when
+                           * elems == 1 — `struct S { float a[1]; };`): the GLSL
+                           * expression must index it ("goku.a[0]") or glslang rejects
+                           * the conversion of the whole array in the generated kernel */
     GLuint  index;         /* block_array: element index the entry stands for */
     GLuint  block_elems;   /* block_array: the instance's element count */
     GLuint  stream;         /* outputs: stream the varying is declared for */

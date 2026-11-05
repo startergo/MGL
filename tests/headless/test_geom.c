@@ -5982,6 +5982,218 @@ TEST(r102_xfb_dmat_array_tess_gs)
     glDeleteBuffers(1, &vbo);
 }
 
+/* r104: regression for KHR-GL46.gpu_shader_fp64.fp64.varyings — a five-stage
+ * program carrying fp64 varyings in interface BLOCKS through every stage
+ * (VS -> TCS -> TES -> GS -> FS).  The fp64 lowering clones each stage's block
+ * struct; r103 deferred those clone defs into the def section (fixing the
+ * same-named-struct aliasing crash) but left the array-of-clone and pointer
+ * types in `pre`, forward-referencing the clone: SPIRV-Cross rejected the
+ * module ("nullptr") and the link failed.  The member mix mirrors the CTS's
+ * first variable batch { double, double[2], dvec2, dvec2[2], dvec3 } so the
+ * dvec3 second-location attribute path (mgl_hi) is exercised too. */
+#define R104B(p, q) \
+    q "double " p "variable0;\n" \
+    q "double " p "variable1[2];\n" \
+    q "dvec2 " p "variable2;\n" \
+    q "dvec2 " p "variable3[2];\n" \
+    q "dvec3 " p "variable4;\n"
+
+static const char *r104_fp_vs =
+    "#version 400 core\n"
+    "#extension GL_ARB_vertex_attrib_64bit : require\n"
+    "in double in_vs_variable0;\n"
+    "in double in_vs_variable1[2];\n"
+    "in dvec2 in_vs_variable2;\n"
+    "in dvec2 in_vs_variable3[2];\n"
+    "in dvec3 in_vs_variable4;\n"
+    "out VS_DATA\n{\n" R104B("vs_", "") "};\n"
+    "void main()\n{\n"
+    "  vs_variable0 = 1.0LF + in_vs_variable0;\n"
+    "  vs_variable1[0] = 2.0LF + in_vs_variable1[0];\n"
+    "  vs_variable1[1] = 3.0LF + in_vs_variable1[1];\n"
+    "  vs_variable2 = dvec2(4.0LF, 5.0LF) + in_vs_variable2;\n"
+    "  vs_variable3[0] = dvec2(6.0LF, 7.0LF) + in_vs_variable3[0];\n"
+    "  vs_variable3[1] = dvec2(8.0LF, 9.0LF) + in_vs_variable3[1];\n"
+    "  vs_variable4 = dvec3(0.25LF, 0.75LF, 1.0LF) + in_vs_variable4;\n"
+    "  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "}\n";
+static const char *r104_fp_tcs =
+    "#version 400 core\n"
+    "layout(vertices = 4) out;\n"
+    "in VS_DATA\n{\n" R104B("vs_", "") "} in_data[];\n"
+    "out TC_DATA\n{\n" R104B("tc_", "") "} out_data[];\n"
+    "void main()\n{\n"
+    "  out_data[gl_InvocationID].tc_variable0 = in_data[0].vs_variable0;\n"
+    "  out_data[gl_InvocationID].tc_variable1[0] = in_data[0].vs_variable1[0];\n"
+    "  out_data[gl_InvocationID].tc_variable1[1] = in_data[0].vs_variable1[1];\n"
+    "  out_data[gl_InvocationID].tc_variable2 = in_data[0].vs_variable2;\n"
+    "  out_data[gl_InvocationID].tc_variable3[0] = in_data[0].vs_variable3[0];\n"
+    "  out_data[gl_InvocationID].tc_variable3[1] = in_data[0].vs_variable3[1];\n"
+    "  out_data[gl_InvocationID].tc_variable4 = in_data[0].vs_variable4;\n"
+    "  gl_TessLevelInner[0] = 1.0; gl_TessLevelInner[1] = 1.0;\n"
+    "  gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0;\n"
+    "  gl_TessLevelOuter[2] = 1.0; gl_TessLevelOuter[3] = 1.0;\n"
+    "}\n";
+static const char *r104_fp_tes =
+    "#version 400 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "in TC_DATA\n{\n" R104B("tc_", "") "} in_data[];\n"
+    "out TE_DATA\n{\n" R104B("te_", "") "} out_data;\n"
+    "void main()\n{\n"
+    "  out_data.te_variable0 = in_data[0].tc_variable0;\n"
+    "  out_data.te_variable1[0] = in_data[0].tc_variable1[0];\n"
+    "  out_data.te_variable1[1] = in_data[0].tc_variable1[1];\n"
+    "  out_data.te_variable2 = in_data[0].tc_variable2;\n"
+    "  out_data.te_variable3[0] = in_data[0].tc_variable3[0];\n"
+    "  out_data.te_variable3[1] = in_data[0].tc_variable3[1];\n"
+    "  out_data.te_variable4 = in_data[0].tc_variable4;\n"
+    "  gl_Position = gl_in[0].gl_Position;\n"
+    "}\n";
+static const char *r104_fp_gs =
+    "#version 400 core\n"
+    "layout(triangles) in;\n"
+    "layout(triangle_strip, max_vertices = 4) out;\n"
+    "in TE_DATA\n{\n" R104B("te_", "") "} in_data[];\n"
+    "out GS_DATA\n{\n" R104B("gs_", "flat ") "};\n"
+    "void main()\n{\n"
+    "  gs_variable0 = in_data[0].te_variable0;\n"
+    "  gs_variable1 = in_data[0].te_variable1;\n"
+    "  gs_variable2 = in_data[0].te_variable2;\n"
+    "  gs_variable3 = in_data[0].te_variable3;\n"
+    "  gs_variable4 = in_data[0].te_variable4;\n"
+    "  gl_Position = vec4(-1.0, -1.0, 0.0, 1.0); EmitVertex();\n"
+    "  gl_Position = vec4( 1.0, -1.0, 0.0, 1.0); EmitVertex();\n"
+    "  gl_Position = vec4(-1.0,  1.0, 0.0, 1.0); EmitVertex();\n"
+    "  gl_Position = vec4( 1.0,  1.0, 0.0, 1.0); EmitVertex();\n"
+    "  EndPrimitive();\n"
+    "}\n";
+static const char *r104_fp_fs =
+    "#version 400 core\n"
+    "in GS_DATA\n{\n" R104B("gs_", "flat ") "} in_data;\n"
+    "layout(location = 0) out vec4 col;\n"
+    "void main()\n{ col = vec4(in_data.gs_variable4, 1.0); }\n";
+
+TEST(r104_fp64_block_varyings_five_stage)
+{
+    { GLuint _t; GLuint _f = block_fbo(&_t, 32, 32); (void)_f; }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, compile(GL_VERTEX_SHADER, r104_fp_vs));
+    glAttachShader(p, compile(GL_TESS_CONTROL_SHADER, r104_fp_tcs));
+    glAttachShader(p, compile(GL_TESS_EVALUATION_SHADER, r104_fp_tes));
+    glAttachShader(p, compile(GL_GEOMETRY_SHADER, r104_fp_gs));
+    glAttachShader(p, compile(GL_FRAGMENT_SHADER, r104_fp_fs));
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[4096] = ""; GLsizei len = 0;
+        glGetProgramInfoLog(p, sizeof log, &len, log);
+        printf("  r104 fp64-block link:\n%s\n", log);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (!ok) { glDeleteProgram(p); return; }
+
+    glUseProgram(p);
+    clear_black();
+    /* one vertex per attribute slot: dvec3@0(+1), double@2, double[2]@3(+4),
+     * dvec2@5, dvec2[2]@6(+7) — all zero so the FS must see exactly (0.25, 0.75, 1.0) */
+    GLuint vao = 0, vbo = 0;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    {
+        static const double z[6] = { 0, 0, 0, 0, 0, 0 };
+        glBufferData(GL_ARRAY_BUFFER, sizeof z, z, GL_STATIC_DRAW);
+    }
+    for (int loc = 0; loc < 8; loc++)
+    {
+        glEnableVertexAttribArray(loc);
+        glVertexAttribLPointer(loc, 1, GL_DOUBLE, 0, (void *)0);
+    }
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte c[4];
+    px(16, 16, c);
+    EXPECT_TRUE(c[0] > 48 && c[0] < 80);    /* 0.25 */
+    EXPECT_TRUE(c[1] > 176 && c[1] < 205);  /* 0.75 */
+    EXPECT_TRUE(c[2] > 240);                /* 1.0 */
+    for (int loc = 0; loc < 8; loc++) glDisableVertexAttribArray(loc);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteProgram(p);
+
+    /* and the same program with the whole GS block captured interleaved: the
+     * record starts with gs_variable0 == 1.0 (bits 0x3FF0000000000000) */
+    GLuint px2 = glCreateProgram();
+    glAttachShader(px2, compile(GL_VERTEX_SHADER, r104_fp_vs));
+    glAttachShader(px2, compile(GL_TESS_CONTROL_SHADER, r104_fp_tcs));
+    glAttachShader(px2, compile(GL_TESS_EVALUATION_SHADER, r104_fp_tes));
+    glAttachShader(px2, compile(GL_GEOMETRY_SHADER, r104_fp_gs));
+    glAttachShader(px2, compile(GL_FRAGMENT_SHADER, r104_fp_fs));
+    static const char *xfbv[] = { "gs_variable0", "gs_variable1[0]", "gs_variable1[1]", "gs_variable2",
+                                  "gs_variable3[0]", "gs_variable3[1]", "gs_variable4" };
+    glTransformFeedbackVaryings(px2, 7, xfbv, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(px2);
+    ok = 0;
+    glGetProgramiv(px2, GL_LINK_STATUS, &ok);
+    if (!ok)
+    {
+        char log[4096] = ""; GLsizei len = 0;
+        glGetProgramInfoLog(px2, sizeof log, &len, log);
+        printf("  r104 fp64-block xfb link:\n%s\n", log);
+    }
+    EXPECT_EQ_INT(ok, GL_TRUE);
+    if (ok)
+    {
+        GLuint tfb = 0, q = 0, vao2 = 0, vbo2 = 0;
+        glGenBuffers(1, &tfb);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb);
+        glGenQueries(1, &q);
+        glGenVertexArrays(1, &vao2);
+        glGenBuffers(1, &vbo2);
+        glBindVertexArray(vao2);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+        {
+            static const double z[6] = { 0, 0, 0, 0, 0, 0 };
+            glBufferData(GL_ARRAY_BUFFER, sizeof z, z, GL_STATIC_DRAW);
+        }
+        for (int loc = 0; loc < 8; loc++)
+        {
+            glEnableVertexAttribArray(loc);
+            glVertexAttribLPointer(loc, 1, GL_DOUBLE, 0, (void *)0);
+        }
+        glUseProgram(px2);
+        glEnable(GL_RASTERIZER_DISCARD);
+        glBeginTransformFeedback(GL_TRIANGLES);
+        glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+        glDrawArrays(GL_PATCHES, 0, 3);
+        glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+        glEndTransformFeedback();
+        glDisable(GL_RASTERIZER_DISCARD);
+        EXPECT_NO_GL_ERROR();
+        GLint n = 0;
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &n);
+        EXPECT_EQ_INT(n, 2);   /* one 4-vertex triangle_strip = 2 triangles captured */
+        GLuint rec[64] = { 0 };
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, tfb);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof rec, rec);
+        printf("  r104 xfb record head: %08x %08x %08x %08x\n", rec[0], rec[1], rec[2], rec[3]);
+        EXPECT_EQ_INT(rec[0], 0);              /* low  word of double 1.0 */
+        EXPECT_EQ_INT(rec[1], 0x3ff00000);     /* high word of double 1.0 */
+        glDeleteQueries(1, &q);
+        glDeleteBuffers(1, &tfb);
+        for (int loc = 0; loc < 8; loc++) glDisableVertexAttribArray(loc);
+        glDeleteVertexArrays(1, &vao2);
+        glDeleteBuffers(1, &vbo2);
+    }
+    glDeleteProgram(px2);
+}
+
 /* r102: outputs assigned to the same transform feedback buffer must be written in the
  * same vertex stream (GL 4.6 11.1.2.4) — a link error, not a silent capture
  * (KHR-Single-GL46 enhanced_layouts.xfb_multiple_vertex_streams). */
@@ -6173,6 +6385,195 @@ TEST(r101_point_size_through_tess_and_gs)
     (void)fails;
 }
 
+static const char *xfb_struct_vs =
+    "#version 460 core\n"
+    "void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+static const char *xfb_struct_fs =
+    "#version 460 core\n"
+    "layout(location = 0) out vec4 fs_out;\n"
+    "void main() { fs_out = vec4(1.0); }\n";
+
+/* ---------------------------------------------------------------- r103
+ * KHR-Single-GL46.enhanced_layouts.xfb_struct_explicit_location_geometry:
+ * a PLAIN structure output captured as a whole follows the GL 4.6 13.2.2
+ * transform-feedback packing (scalar-size alignment, packed matrix columns and
+ * array elements), NOT std430 — `struct { float a; mat2 b; }` captures as
+ * a@0, b@4 (24 bytes per record with no column padding). */
+TEST(xfb_plain_struct_packed)
+{
+    const char *gs =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices = 4) out;\n"
+        "struct TestStruct {\n"
+        "    float a;\n"
+        "    mat2 b;\n"
+        "};\n"
+        "layout (location = 0, xfb_offset = 0) flat out TestStruct goku;\n"
+        "void main()\n"
+        "{\n"
+        "    goku.a = 1.5;\n"
+        "    goku.b = mat2(2.5, 3.5, 4.5, 5.5);\n"
+        "    gl_Position = vec4(0, 0, 0, 1);\n"
+        "    EmitVertex();\n"
+        "}\n";
+    /* a VS/FS pair that does not declare v_pos (the CTS shape: the fragment
+     * stage only sees the GS's own outputs, and xfb-only struct outputs are
+     * not consumed by any stage) */
+    GLuint p = program(xfb_struct_vs, gs, xfb_struct_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);
+
+    /* the capture dissolves the struct into its leaves */
+    GLint nv = 0;
+    glGetProgramiv(p, GL_TRANSFORM_FEEDBACK_VARYINGS, &nv);
+    EXPECT_EQ_INT(nv, 2);
+    char nm[128];
+    GLint sz = 0;
+    GLenum ty = 0;
+    glGetTransformFeedbackVarying(p, 0, sizeof nm, NULL, &sz, &ty, nm);
+    EXPECT_STREQ(nm, "goku.a");
+
+    GLuint tfo, bo;
+    glGenBuffers(1, &bo);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glGenTransformFeedbacks(1, &tfo);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfo);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, bo);
+    glUseProgram(p);
+    setup(1, quad);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    float out[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+    /* packed: a@0, b col0@4 (2.5, 3.5), b col1@12 (4.5, 5.5), record 20 bytes */
+    EXPECT_NEAR(out[0], 1.5f, 1e-6);
+    EXPECT_NEAR(out[1], 2.5f, 1e-6);
+    EXPECT_NEAR(out[2], 3.5f, 1e-6);
+    EXPECT_NEAR(out[3], 4.5f, 1e-6);
+    EXPECT_NEAR(out[4], 5.5f, 1e-6);
+    glDeleteProgram(p);
+    glDeleteTransformFeedbacks(1, &tfo);
+    glDeleteBuffers(1, &bo);
+}
+
+/* r103: nested plain structures flatten to dotted leaf entries
+ * ("goku.inner_struct_a.a"); each inner struct aligns to its largest scalar and
+ * the leaves pack per 13.2.2.  Arrayed members (float a[3], double c[2]) capture
+ * their elements back-to-back.  The GLSL->SPIR-V round trip through the fp64
+ * lowering used to fail on this shape (cloned-type OpName layout + struct def
+ * order), so this also covers that link path. */
+TEST(xfb_plain_struct_nested_arrays)
+{
+    const char *gs =
+        "#version 460 core\n"
+        "layout(points) in;\n"
+        "layout(points, max_vertices = 4) out;\n"
+        "struct TestStruct {\n"
+        "    float a[3];\n"
+        "    double b;\n"
+        "    double c[2];\n"
+        "};\n"
+        "struct OuterStruct {\n"
+        "    TestStruct inner_struct_a;\n"
+        "    TestStruct inner_struct_b;\n"
+        "};\n"
+        "layout (location = 0, xfb_offset = 0) flat out OuterStruct goku;\n"
+        "layout(std140, binding = 0) uniform Goku {\n"
+        "    TestStruct uni_goku;\n"
+        "};\n"
+        "void main()\n"
+        "{\n"
+        "    goku.inner_struct_a = uni_goku;\n"
+        "    goku.inner_struct_b = uni_goku;\n"
+        "    gl_Position = vec4(0, 0, 0, 1);\n"
+        "    EmitVertex();\n"
+        "}\n";
+    /* a VS/FS pair that does not declare v_pos (the CTS shape: the fragment
+     * stage only sees the GS's own outputs, and xfb-only struct outputs are
+     * not consumed by any stage) */
+    GLuint p = program(xfb_struct_vs, gs, xfb_struct_fs);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);
+
+    GLint nv = 0;
+    glGetProgramiv(p, GL_TRANSFORM_FEEDBACK_VARYINGS, &nv);
+    EXPECT_EQ_INT(nv, 6);   /* 3 leaves per inner struct */
+
+    /* std140 feed of Goku: float a[3] has 16-byte element stride (1@0, 2@16, 3@32),
+     * double b@48, double c[2] with 16-byte stride (5@64, 6@80) */
+    unsigned char u[96];
+    float fa[3] = { 1.0f, 2.0f, 3.0f };
+    double b = 4.0, c0 = 5.0, c1 = 6.0;
+    memset(u, 0, sizeof u);
+    memcpy(u + 0, &fa[0], 4);
+    memcpy(u + 16, &fa[1], 4);
+    memcpy(u + 32, &fa[2], 4);
+    memcpy(u + 48, &b, 8);
+    memcpy(u + 64, &c0, 8);
+    memcpy(u + 80, &c1, 8);
+    GLuint ubo;
+    glGenBuffers(1, &ubo);
+    glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof u, u, GL_STATIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+
+    GLuint tfo, bo;
+    glGenBuffers(1, &bo);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glGenTransformFeedbacks(1, &tfo);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfo);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, bo);
+    glUseProgram(p);
+    setup(1, quad);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_POINTS, 0, 1);
+    glEndTransformFeedback();
+    glDisable(GL_RASTERIZER_DISCARD);
+    EXPECT_NO_GL_ERROR();
+
+    unsigned char raw[128];
+    memset(raw, 0, sizeof raw);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof raw, raw);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+    /* packed record: ia: a@0(12) b@16(8) c@24,32 -> span 40; ib @40: a@40,44,48,
+     * b@56, c@64,72 -> 80 bytes total */
+    float f[3], f2[3];
+    double d[8];
+    memcpy(f, raw, sizeof f);
+    memcpy(d, raw + 16, sizeof d);
+    memcpy(f2, raw + 40, sizeof f2);
+    EXPECT_NEAR(f[0], 1.0f, 1e-6);
+    EXPECT_NEAR(f[1], 2.0f, 1e-6);
+    EXPECT_NEAR(f[2], 3.0f, 1e-6);
+    EXPECT_NEAR(d[0], 4.0, 1e-12);   /* ia.b    @16 */
+    EXPECT_NEAR(d[1], 5.0, 1e-12);   /* ia.c[0] @24 */
+    EXPECT_NEAR(d[2], 6.0, 1e-12);   /* ia.c[1] @32 */
+    EXPECT_NEAR(f2[0], 1.0f, 1e-6);  /* ib.a    @40 */
+    EXPECT_NEAR(f2[1], 2.0f, 1e-6);
+    EXPECT_NEAR(f2[2], 3.0f, 1e-6);
+    EXPECT_NEAR(d[5], 4.0, 1e-12);   /* ib.b    @56 */
+    EXPECT_NEAR(d[6], 5.0, 1e-12);   /* ib.c[0] @64 */
+    EXPECT_NEAR(d[7], 6.0, 1e-12);   /* ib.c[1] @72 */
+    glDeleteProgram(p);
+    glDeleteTransformFeedbacks(1, &tfo);
+    glDeleteBuffers(1, &bo);
+    glDeleteBuffers(1, &ubo);
+}
+
 int main(void)
 
 {
@@ -6249,6 +6650,8 @@ int main(void)
     RUN_IF(r54_srgb_readback_raw);
     RUN_IF(r54_compressed_no_3d);
     RUN_IF(r55_indirect_firstindex_and_primcount);
+    RUN_IF(xfb_plain_struct_packed);
+    RUN_IF(xfb_plain_struct_nested_arrays);
     RUN_IF(r99_gs_const_attrib);
     RUN_IF(r99_gs_shadow_attrib);
     RUN_IF(r99_gs_dvec4_padded);
@@ -6259,6 +6662,7 @@ int main(void)
     RUN_IF(r102_tes_invocations_with_gs);
     RUN_IF(r102_xfb_block_array_geometry);
     RUN_IF(r102_xfb_dmat_array_tess_gs);
+    RUN_IF(r104_fp64_block_varyings_five_stage);
     RUN_IF(r102_xfb_stream_buffer_conflict);
     return mgl_test_summary();
 }
