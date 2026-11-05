@@ -1473,6 +1473,83 @@ TEST(TessCountQueriesExact)
     EXPECT_EQ_INT(inv, 0);
 }
 
+/* r65: the same counting queries while a TES-output transform-feedback capture
+ * owns the draw (no geometry stage).  The draw must still count exactly — the
+ * CPU reference path publishes the capture too, so forcing it for the query
+ * keeps xfb working (XFB_PRIMITIVES_WRITTEN below) while every tess count query
+ * (invocations, generated, clipping in/out) reads the exact number instead of 0
+ * (the GPU-emulated path publishes count words but only a geometry draw folds
+ * them into the query accumulator). */
+TEST(TessCountQueriesWithXfbCapture)
+{
+    const char *tes_xfb =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location=0) in vec4 tc_col[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "layout(xfb_buffer=0, xfb_offset=0) out vec4 tes_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  tes_col = tc_col[0];\n"
+        "  f_col = tc_col[0];\n"
+        "}\n";
+    GLuint prog = make_program(kTcsLvl1, tes_xfb);
+    GLuint tfo = 0, buf = 0, q[6] = { 0 };
+    GLint patches = -1, inv = -1, written = -1, pg = -1, cin = -1, cout = -1;
+
+    glUseProgram(prog);
+    setup_patch_vao(kTriPos, kTriCol, 3);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+
+    glGenBuffers(1, &buf);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, buf);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glGenTransformFeedbacks(1, &tfo);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, tfo);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, buf);
+
+    for (int i = 0; i < 6; i++) glGenQueries(1, &q[i]);
+    glEnable(GL_RASTERIZER_DISCARD);
+    glBeginQuery(GL_TESS_CONTROL_SHADER_PATCHES, q[0]);
+    glBeginQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS, q[1]);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q[2]);
+    glBeginQuery(GL_PRIMITIVES_GENERATED, q[3]);
+    glBeginQuery(GL_CLIPPING_INPUT_PRIMITIVES, q[4]);
+    glBeginQuery(GL_CLIPPING_OUTPUT_PRIMITIVES, q[5]);
+    glBeginTransformFeedback(GL_TRIANGLES);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glEndQuery(GL_TESS_CONTROL_SHADER_PATCHES);
+    glEndQuery(GL_TESS_EVALUATION_SHADER_INVOCATIONS);
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glEndQuery(GL_PRIMITIVES_GENERATED);
+    glEndQuery(GL_CLIPPING_INPUT_PRIMITIVES);
+    glEndQuery(GL_CLIPPING_OUTPUT_PRIMITIVES);
+    glDisable(GL_RASTERIZER_DISCARD);
+
+    glGetQueryObjectiv(q[0], GL_QUERY_RESULT, &patches);
+    glGetQueryObjectiv(q[1], GL_QUERY_RESULT, &inv);
+    glGetQueryObjectiv(q[2], GL_QUERY_RESULT, &written);
+    glGetQueryObjectiv(q[3], GL_QUERY_RESULT, &pg);
+    glGetQueryObjectiv(q[4], GL_QUERY_RESULT, &cin);
+    glGetQueryObjectiv(q[5], GL_QUERY_RESULT, &cout);
+    printf("  [xfb capture] patches=%d TES_INVOCATIONS=%d XFB_WRITTEN=%d PG=%d CLIP_IN=%d CLIP_OUT=%d\n",
+           patches, inv, written, pg, cin, cout);
+    EXPECT_EQ_INT(patches, 1);
+    EXPECT_EQ_INT(inv, 3);      /* one triangle at all-1 levels: three vertices */
+    EXPECT_EQ_INT(written, 1);
+    EXPECT_EQ_INT(pg, 1);
+    EXPECT_EQ_INT(cin, 1);
+    EXPECT_EQ_INT(cout, 1);
+    for (int i = 0; i < 6; i++) glDeleteQueries(1, &q[i]);
+    glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+    glDeleteTransformFeedbacks(1, &tfo);
+    glDeleteBuffers(1, &buf);
+    glDeleteProgram(prog);
+}
+
 /* Ring memory bound: a burst of draws whose emulated scratch exceeds
  * TESS_RING_BIG (4 MB) must not pin one buffer per slot — a freed draw reuses
  * a warm big slot (at most a couple grow for in-flight work), and retired big
@@ -3045,6 +3122,7 @@ int main(void)
     RUN(TessPatchBlockArrayValues);
     RUN(TessProgramQueries);
     RUN(TessCountQueriesExact);
+    RUN(TessCountQueriesWithXfbCapture);
     RUN(TessRingBigBlockRecycle);
     RUN(TessRingGenerationHammer);
     RUN(TessHugePatchCountDropped);

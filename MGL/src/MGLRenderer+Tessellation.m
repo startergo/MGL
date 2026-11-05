@@ -2197,14 +2197,31 @@ static void tessRetireCapture(GLMContext ctx)
     /* Counting queries on tessellated output need EXACT vertex counts; the
      * hardware path computes tess factors on the GPU, so its counts are not
      * knowable on the CPU.  Take the exact-count CPU reference path while
-     * such a query is active (rare: measurement runs only) — but NEVER when a
-     * consumer needs the TES-output capture (geometry stage, TES transform
-     * feedback): the CPU reference path tessellates into CPU buffers and
-     * publishes no capture, so the geometry kernel would read an empty capture
-     * and emit nothing (queries.c's mgl_queries_tess_counts_active already
-     * drops the generated/clipping words when a GS is attached). */
-    if (mgl_queries_tess_counts_active(ctx) && !tp->capture)
-        use_cpu_reference = true;
+     * such a query is active (rare: measurement runs only).  With a TES-output
+     * capture the CPU reference path publishes the capture too (the render-phase
+     * block below runs the capture kernel over the CPU-built stream), so a
+     * capture whose only consumer is transform feedback also takes it — without
+     * this the GPU-emulated path publishes the count words but nothing folds
+     * them (the geometry draw is the only folder), and every tess count query
+     * read 0 while TES xfb was active (r65).  A GEOMETRY stage keeps the GPU
+     * path: the geometry repack folds the GPU tessellator's exact invocation
+     * count into query accumulator word 9 (r102), and queries.c's
+     * mgl_queries_note_tess already leaves the post-geometry words to it. */
+    if (mgl_queries_tess_counts_active(ctx))
+    {
+        bool has_gs;
+        if (ctx->state.program)
+            has_gs = ctx->state.program->shader_slots[_GEOMETRY_SHADER] != NULL;
+        else if (ctx->state.program_pipeline)
+        {
+            Program *sp = ctx->state.program_pipeline->stage_programs[_GEOMETRY_SHADER];
+            has_gs = sp && sp->shader_slots[_GEOMETRY_SHADER] != NULL;
+        }
+        else
+            has_gs = false;
+        if (!tp->capture || !has_gs)
+            use_cpu_reference = true;
+    }
     bool use_hardware = (tp->domain != MGL_TESS_DOMAIN_ISOLINES) && !tp->point_mode &&
                         !use_cpu_reference && !tp->capture;   /* capture needs the GPU-visible stream */
     if (tTrace())
