@@ -2081,9 +2081,32 @@ void mglTexImage3D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
 /* TexSubImage                                                              */
 /* ------------------------------------------------------------------------ */
 
-/* checks a GL-geometry sub region against a level; returns error */
-static GLenum checkSubRegion(Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d)
+/* GL 4.6 §8.5/§8.6: level > floor(log2(max-dimension-of-target)) → INVALID_VALUE.
+ * The limit is derived from GL_MAX_TEXTURE_SIZE / GL_MAX_3D_TEXTURE_SIZE per
+ * target (matching dEQP ES31 debug.negative_coverage texture.*_max_level). */
+static bool texLevelTooBig(GLMContext ctx, Texture *tex, GLint level)
 {
+    GLuint maxdim = limitOr(STATE_VAR(max_texture_size) ? (GLuint)STATE_VAR(max_texture_size) : 16384, 16384);
+    if (tex)
+    {
+        if (tex->target == GL_TEXTURE_3D)
+            maxdim = limitOr(STATE_VAR(max_3d_texture_size) ? (GLuint)STATE_VAR(max_3d_texture_size) : 2048, 2048);
+        else if (tex->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && tex->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+            maxdim = limitOr(STATE_VAR(max_cube_map_texture_size) ? (GLuint)STATE_VAR(max_cube_map_texture_size) : 16384, 16384);
+    }
+    GLuint bits = 0;
+    while ((1u << bits) < maxdim && bits < 31)
+        bits++;
+    return (GLuint)level > bits;
+}
+
+/* checks a GL-geometry sub region against a level; returns error */
+static GLenum checkSubRegion(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d)
+{
+    /* this check precedes the "level not defined" INVALID_OPERATION below */
+    if (texLevelTooBig(ctx, tex, level))
+        return GL_INVALID_VALUE;
+
     TextureLevel *l = texLevel(tex, face, level);
 
     if (w < 0 || h < 0 || d < 0)
@@ -2110,7 +2133,7 @@ static void texSubImage(GLMContext ctx, Texture *tex, GLuint face, int dims, GLi
     err = tdValidateFormatType(format, type);
     TD_CHECK(err == GL_NO_ERROR, err);
 
-    err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+    err = checkSubRegion(ctx, tex, face, level, x, y, z, w, h, d);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     const TDFormat *f = tdFormatInfo(levelFormat(tex, face, level));
@@ -2520,7 +2543,7 @@ static void compressedTexImage(GLMContext ctx, GLenum target, int dims, GLint le
     TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_ENUM);
     TD_CHECK(compressedAllowedOnTarget(f, t.tex_target), dims == 1 ? GL_INVALID_ENUM : GL_INVALID_OPERATION);
     TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, t.tex_target), GL_INVALID_VALUE);
-    TD_CHECK(border == 0, GL_INVALID_VALUE);
+    TD_CHECK(border == 0, GL_INVALID_OPERATION);
     TD_CHECK(imageSize >= 0, GL_INVALID_VALUE);
 
     err = checkSize(ctx, t.tex_target, level, width, height, depth);
@@ -2598,6 +2621,7 @@ static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int
 
     TD_CHECK(tex, GL_INVALID_OPERATION);
     TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
+    TD_CHECK(!texLevelTooBig(ctx, tex, level), GL_INVALID_VALUE);
 
     const TDFormat *f = tdFormatInfo(format);
     TD_CHECK(f && (f->flags & TDF_COMPRESSED), GL_INVALID_ENUM);
@@ -2612,7 +2636,7 @@ static void compressedTexSubImage(GLMContext ctx, Texture *tex, GLuint face, int
     TD_CHECK(l->mtl_format == format || online_rgtc, GL_INVALID_OPERATION);
     TD_CHECK(dims != 1, GL_INVALID_OPERATION);
 
-    err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+    err = checkSubRegion(ctx, tex, face, level, x, y, z, w, h, d);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     TD_CHECK((x % f->block_w) == 0 && (y % f->block_h) == 0, GL_INVALID_OPERATION);
@@ -2907,7 +2931,7 @@ static void getCompressed(GLMContext ctx, Texture *tex, GLuint face, GLint level
     }
     else
     {
-        err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+        err = checkSubRegion(ctx, tex, face, level, x, y, z, w, h, d);
         TD_CHECK(err == GL_NO_ERROR, err);
         TD_CHECK((x % f->block_w) == 0 && (y % f->block_h) == 0, GL_INVALID_OPERATION);
         TD_CHECK((w % f->block_w) == 0 || (GLuint)(x + w) == l->width, GL_INVALID_OPERATION);
@@ -3130,7 +3154,7 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     }
     else
     {
-        err = checkSubRegion(tex, face, level, x, y, z, w, h, d);
+        err = checkSubRegion(ctx, tex, face, level, x, y, z, w, h, d);
         TD_CHECK(err == GL_NO_ERROR, err);
     }
 
@@ -3382,7 +3406,7 @@ static void copyTexSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint lev
     TD_CHECK(tex, GL_INVALID_OPERATION);
     TD_CHECK(level >= 0 && level < TD_MAX_LEVELS, GL_INVALID_VALUE);
 
-    err = checkSubRegion(tex, face, level, xoffset, yoffset, zoffset, width, height, 1);
+    err = checkSubRegion(ctx, tex, face, level, xoffset, yoffset, zoffset, width, height, 1);
     TD_CHECK(err == GL_NO_ERROR, err);
 
     err = readFramebufferCheck(ctx);
@@ -3826,23 +3850,23 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
     if (srcTarget == GL_TEXTURE_1D_ARRAY)
     {
         TD_CHECK(srcY + srcHeight <= 1, GL_INVALID_VALUE);   /* single-row image */
-        err = checkSubRegion(st, sface0, srcLevel, srcX, srcZ, 0, srcWidth, srcDepth, srcHeight);
+        err = checkSubRegion(ctx, st, sface0, srcLevel, srcX, srcZ, 0, srcWidth, srcDepth, srcHeight);
         TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
     }
     else
     {
-        err = checkSubRegion(st, sface0, srcLevel, srcX, srcY, scube ? 0 : srcZ, srcWidth, srcHeight, scube ? 1 : srcDepth);
+        err = checkSubRegion(ctx, st, sface0, srcLevel, srcX, srcY, scube ? 0 : srcZ, srcWidth, srcHeight, scube ? 1 : srcDepth);
         TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
     }
     if (dstTarget == GL_TEXTURE_1D_ARRAY)
     {
         TD_CHECK(dstY + dh <= 1, GL_INVALID_VALUE);          /* single-row image */
-        err = checkSubRegion(dt, dface0, dstLevel, dstX, dstZ, 0, dw, srcDepth, dh);
+        err = checkSubRegion(ctx, dt, dface0, dstLevel, dstX, dstZ, 0, dw, srcDepth, dh);
         TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
     }
     else
     {
-        err = checkSubRegion(dt, dface0, dstLevel, dstX, dstY, dcube ? 0 : dstZ, dw, dh, dcube ? 1 : srcDepth);
+        err = checkSubRegion(ctx, dt, dface0, dstLevel, dstX, dstY, dcube ? 0 : dstZ, dw, dh, dcube ? 1 : srcDepth);
         TD_CHECK(err == GL_NO_ERROR, GL_INVALID_VALUE);
     }
 

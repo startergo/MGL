@@ -248,13 +248,12 @@ TEST(map_flag_combinations)
     EXPECT_NO_GL_ERROR();
 
     /* map errors */
-    /* GL 4.6: glMapBufferRange with length 0 is LEGAL and must return a
-     * non-NULL pointer (dEQP-GL45-ES31 tessellation.user_defined_io maps an
-     * empty varyings record) — the buffer stays mapped until unmap */
+    /* GL 4.5 §8.3 / ES 3.1: length 0 is GL_INVALID_OPERATION (dEQP-GL45-ES31
+     * debug.negative_coverage.get_error.buffer.map_buffer_range expects it;
+     * Mesa does the same for every API) */
     w = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, 0, GL_MAP_READ_BIT);
-    EXPECT_TRUE(w != NULL);
-    EXPECT_NO_GL_ERROR();
-    glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+    EXPECT_TRUE(w == NULL);
+    EXPECT_GL_ERROR(GL_INVALID_OPERATION);
     glMapBufferRange(GL_COPY_WRITE_BUFFER, -1, 4, GL_MAP_READ_BIT);     EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glMapBufferRange(GL_COPY_WRITE_BUFFER, 250, 8, GL_MAP_READ_BIT);    EXPECT_GL_ERROR(GL_INVALID_VALUE);
     glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, 4, 0);                    EXPECT_GL_ERROR(GL_INVALID_OPERATION);

@@ -386,8 +386,21 @@ static unsigned lv_type_align(LvModule *m, LvType *t, bool std430, bool row_majo
             return lv_vec_align(m, t->id);
         case LV_MAT:
         {
-            /* rules 5/7: an array of column (row) vectors */
-            unsigned elem = lv_vec_align(m, t->elem);
+            /* rules 5/7: an array of column (row) vectors — a row-major matrix
+             * is laid out as ROWS, each a vector of t->n (column count)
+             * components (KHR-GL46 es_31_compatibility
+             * shader_storage_buffer_object.basic-matrixOperations: row_major
+             * mat2x3 aligns to 8, not to the vec3 column alignment) */
+            unsigned elem;
+            if (row_major)
+            {
+                LvType *e = lv_find(m, t->elem);
+                unsigned bs = e ? e->bits / 8 : 4;
+                unsigned n = t->n;
+                elem = (n == 2) ? 2 * bs : (n == 3 || n == 4) ? 4 * bs : bs;
+            }
+            else
+                elem = lv_vec_align(m, t->elem);
             return std430 ? elem : (elem < 16 ? 16 : elem);
         }
         case LV_ARRAY:
@@ -433,7 +446,16 @@ static unsigned lv_matrix_size(LvModule *m, LvType *t, bool std430, bool row_maj
     if (lv_deco(m, t->id, SpvDecorationMatrixStride, &stride)) { /* type decoration */ }
     if (!stride)
     {
-        unsigned elem = lv_vec_align(m, t->elem);
+        unsigned elem;
+        if (row_major)
+        {
+            LvType *e = lv_find(m, t->elem);
+            unsigned bs = e ? e->bits / 8 : 4;
+            unsigned n = t->n;
+            elem = (n == 2) ? 2 * bs : (n == 3 || n == 4) ? 4 * bs : bs;
+        }
+        else
+            elem = lv_vec_align(m, t->elem);
         stride = std430 ? elem : (elem < 16 ? 16 : elem);
     }
     return (row_major ? t->rows : t->n) * stride;
@@ -895,6 +917,223 @@ static bool lv_check_locations(GLMContext ctx, LvModule *m, int stage, LvModule 
 
 /* ------------------------------------------------------------------ entry point */
 
+/* ------------------------------------------------------------------ r97b: resource limits */
+
+static uint64_t lv_type_bytes(LvModule *m, uint32_t id, int depth)
+{
+    LvType *t = lv_find(m, id);
+    if (!t || depth > 8) return 0;
+    switch (t->kind)
+    {
+    case LV_INT: case LV_FLOAT: case LV_BOOL:
+        return t->bits ? (uint64_t)t->bits / 8 : 4;
+    case LV_VEC:
+        return (uint64_t)t->n * lv_type_bytes(m, t->elem, depth + 1);
+    case LV_MAT:
+        return (uint64_t)t->n * (uint64_t)t->rows * lv_type_bytes(m, t->elem, depth + 1);
+    case LV_ARRAY:
+    {
+        uint64_t n = t->length;
+        if (!n && t->length_id) n = lv_const(m, t->length_id);
+        return n * lv_type_bytes(m, t->elem, depth + 1);
+    }
+    case LV_RTARRAY:
+        return 0;
+    case LV_STRUCT:
+    {
+        uint64_t s = 0;
+        for (int i = 0; i < t->n_members; i++)
+            s += lv_type_bytes(m, m->membertab[t->members + i], depth + 1);
+        return s;
+    }
+    default:
+        return 0;
+    }
+}
+
+
+/* is this OpVariable a shader-storage block instance?  (glslang emits
+ * StorageBuffer storage; older SPIR-V used Uniform + BufferBlock) */
+static bool lv_is_ssbo_var(LvModule *m, int i)
+{
+    if (m->vars[i].storage == 12) return true;
+    if (m->vars[i].storage != 2) return false;
+    LvType *p = lv_find(m, m->vars[i].type);
+    if (!p || p->kind != LV_PTR) return false;
+    LvType *t = lv_find(m, p->elem);
+    while (t && t->kind == LV_ARRAY) t = lv_find(m, t->elem);
+    return t && t->kind == LV_STRUCT && lv_deco(m, t->id, SpvDecorationBufferBlock, NULL) != 0;
+}
+
+static char *lv_resource_limits(GLMContext ctx, LvModule *m, int stage, const uint32_t *ir, size_t words)
+{
+    /* --- compute local work-group size / shared memory ------------------- */
+    if (stage == _COMPUTE_SHADER)
+    {
+        GLint mx = 0, my = 0, mz = 0, inv = 0, sh = 0;
+        mglGetIntegeri_v(ctx, GL_MAX_COMPUTE_WORK_GROUP_SIZE, 0, &mx);
+        mglGetIntegeri_v(ctx, GL_MAX_COMPUTE_WORK_GROUP_SIZE, 1, &my);
+        mglGetIntegeri_v(ctx, GL_MAX_COMPUTE_WORK_GROUP_SIZE, 2, &mz);
+        mglGetIntegerv(ctx, GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &inv);
+        for (size_t i = 5; i < words; )
+        {
+            uint32_t wc = ir[i] >> 16, op = ir[i] & 0xffff;
+            if (wc == 0 || i + wc > words) break;
+            if (op == 16 /*OpExecutionMode*/ && wc >= 6 && ir[i + 2] == 17 /*LocalSize*/)
+            {
+                uint32_t x = ir[i + 3], y = ir[i + 4], z = ir[i + 5];
+                if ((mx && x > (uint32_t)mx) || (my && y > (uint32_t)my) || (mz && z > (uint32_t)mz))
+                {
+                    char *l = (char *)malloc(160);
+                    if (l) snprintf(l, 160,
+                        "ERROR: local work-group size (%u,%u,%u) exceeds GL_MAX_COMPUTE_WORK_GROUP_SIZE (%d,%d,%d)\n",
+                        x, y, z, mx, my, mz);
+                    return l;
+                }
+                if (inv && (uint64_t)x * y * z > (uint64_t)inv)
+                {
+                    char *l = (char *)malloc(160);
+                    if (l) snprintf(l, 160,
+                        "ERROR: local work-group size (%u,%u,%u) exceeds GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS (%d)\n",
+                        x, y, z, inv);
+                    return l;
+                }
+            }
+            i += wc;
+        }
+        /* shared (Workgroup-storage) variables */
+        mglGetIntegerv(ctx, GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &sh);
+        if (sh)
+        {
+            uint64_t total = 0;
+            for (int i = 0; i < m->n_vars; i++)
+            {
+                if (m->vars[i].storage != 4 /*Workgroup*/) continue;
+                LvType *p = lv_find(m, m->vars[i].type);
+                if (!p || p->kind != LV_PTR) continue;
+                uint64_t b = lv_type_bytes(m, p->elem, 0);
+                total += b;
+                if (getenv("MGL_LV_DEBUG"))
+                    printf("MGL lv: workgroup var %u bytes %llu\n", m->vars[i].id, (unsigned long long)b);
+            }
+            if (total > (uint64_t)sh)
+            {
+                char *l = (char *)malloc(160);
+                if (l) snprintf(l, 160,
+                    "ERROR: shared-memory usage (%llu bytes) exceeds GL_MAX_COMPUTE_SHARED_MEMORY_SIZE (%d)\n",
+                    (unsigned long long)total, sh);
+                return l;
+            }
+        }
+    }
+
+    /* --- per-stage uniform / shader-storage block counts ----------------- */
+    {
+        unsigned n_ub = 0, n_ssbo = 0;
+        for (int i = 0; i < m->n_vars; i++)
+        {
+            if (m->vars[i].storage != 2 /*Uniform*/ && m->vars[i].storage != 12 /*StorageBuffer*/)
+                continue;
+            const char *nm = lv_name(m, m->vars[i].id);
+            if (nm && nm[0] == 'm' && nm[1] == 'g' && nm[2] == 'l' && nm[3] == '_')
+                continue;   /* MGL-injected emulation blocks are not user blocks */
+            LvType *p = lv_find(m, m->vars[i].type);
+            if (!p || p->kind != LV_PTR) continue;
+            LvType *t = lv_find(m, p->elem);
+            unsigned instances = 1;
+            while (t && t->kind == LV_ARRAY)
+            {
+                uint64_t n = t->length;
+                if (!n && t->length_id) n = lv_const(m, t->length_id);
+                instances *= (unsigned)(n ? n : 1);
+                t = lv_find(m, t->elem);
+            }
+            if (!t || t->kind != LV_STRUCT) continue;
+            if (!lv_deco(m, t->id, SpvDecorationBlock, NULL) &&
+                !lv_deco(m, t->id, SpvDecorationBufferBlock, NULL))
+                continue;   /* plain (non-block) uniform */
+            if (lv_is_ssbo_var(m, i)) n_ssbo += instances;
+            else n_ub += instances;
+        }
+        static const GLenum ub_pname[_MAX_SHADER_TYPES] = {
+            GL_MAX_VERTEX_UNIFORM_BLOCKS, GL_MAX_TESS_CONTROL_UNIFORM_BLOCKS,
+            GL_MAX_TESS_EVALUATION_UNIFORM_BLOCKS, GL_MAX_GEOMETRY_UNIFORM_BLOCKS,
+            GL_MAX_FRAGMENT_UNIFORM_BLOCKS, GL_MAX_COMPUTE_UNIFORM_BLOCKS
+        };
+        static const GLenum ssbo_pname[_MAX_SHADER_TYPES] = {
+            GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS,
+            GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS, GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS,
+            GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS
+        };
+        if (stage >= 0 && stage < _MAX_SHADER_TYPES)
+        {
+            GLint lim = 0;
+            mglGetIntegerv(ctx, ub_pname[stage], &lim);
+            if (lim && n_ub > (unsigned)lim)
+            {
+                char *l = (char *)malloc(160);
+                if (l) snprintf(l, 160, "ERROR: %u uniform blocks exceed the stage limit (%d)\n", n_ub, lim);
+                return l;
+            }
+            mglGetIntegerv(ctx, ssbo_pname[stage], &lim);
+            if (lim && n_ssbo > (unsigned)lim)
+            {
+                char *l = (char *)malloc(160);
+                if (l) snprintf(l, 160, "ERROR: %u shader storage blocks exceed the stage limit (%d)\n", n_ssbo, lim);
+                return l;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* combined shader-storage block count across all stages (r97b): Metal has no
+ * combined limit, GL does — GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS.  Called from
+ * program.c at link time with every compiled module. */
+char *mgl_layout_combined_limits(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask)
+{
+    unsigned n_ssbo = 0;
+    for (int s = 0; s < _MAX_SHADER_TYPES; s++)
+    {
+        if (!(mask & (1u << s)) || !mods[s] || !sizes[s]) continue;
+        LvModule *m = calloc(1, sizeof *m);
+        if (!m || !lv_parse(mods[s], sizes[s], m)) { free(m); continue; }
+        for (int i = 0; i < m->n_vars; i++)
+        {
+            if (!lv_is_ssbo_var(m, i)) continue;
+            const char *nm = lv_name(m, m->vars[i].id);
+            if (nm && nm[0] == 'm' && nm[1] == 'g' && nm[2] == 'l' && nm[3] == '_')
+                continue;   /* MGL-injected emulation blocks are not user blocks */
+            LvType *p = lv_find(m, m->vars[i].type);
+            if (!p || p->kind != LV_PTR) continue;
+            LvType *t = lv_find(m, p->elem);
+            unsigned instances = 1;
+            while (t && t->kind == LV_ARRAY)
+            {
+                uint64_t n = t->length;
+                if (!n && t->length_id) n = lv_const(m, t->length_id);
+                instances *= (unsigned)(n ? n : 1);
+                t = lv_find(m, t->elem);
+            }
+            if (!t || t->kind != LV_STRUCT) continue;
+            if (lv_deco(m, t->id, SpvDecorationBufferBlock, NULL) ||
+                lv_deco(m, t->id, SpvDecorationBlock, NULL))
+                n_ssbo += instances;
+        }
+        free(m);
+    }
+    GLint lim = 0;
+    mglGetIntegerv(ctx, GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS, &lim);
+    if (lim && n_ssbo > (unsigned)lim)
+    {
+        char *l = (char *)malloc(160);
+        if (l) snprintf(l, 160, "ERROR: %u shader storage blocks across stages exceed GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS (%d)\n",
+                        n_ssbo, lim);
+        return l;
+    }
+    return NULL;
+}
+
 char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
                                 const uint32_t *consumer_ir, size_t consumer_words)
 {
@@ -908,6 +1147,16 @@ char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, s
         free(m);
         return NULL;    /* a module we cannot read: leave the decision to the
                            rest of the pipeline (SPIRV-Cross will complain) */
+    }
+
+    /* R0b (r97b): GL-reported resource limits are tighter than the Metal
+     * hardware's — enforce them so over-limit shaders fail instead of running
+     * (dEQP-GL45-ES31 debug.negative_coverage.{shader_storage,compute}.*:
+     * local work-group size / invocations, per-stage uniform & shader-storage
+     * block counts, shared-memory size) */
+    {
+        char *rl = lv_resource_limits(ctx, m, stage, ir, words);
+        if (rl) { free(m); return rl; }
     }
 
     /* R0 (r96e): component aliasing of non-vertex inputs */

@@ -790,7 +790,11 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
             /* the combined limit is the sum over the active stages' independent Metal
              * texture tables (GL 4.6 Table 23.55 only floors this at 8) */
             PUT1(5 * MGL_MAX_IMAGE_UNITS);
-        case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES: PUT1(5 * MGL_MAX_IMAGE_UNITS + MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
+        case GL_MAX_COMBINED_SHADER_OUTPUT_RESOURCES:
+            /* ARB_shader_storage_buffer_object: max combined image uniforms +
+             * max combined shader storage blocks + max draw buffers — the SSBO term
+             * is the combined limit below (5 * per-stage), not the binding count */
+            PUT1(5 * MGL_MAX_IMAGE_UNITS + 5 * MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS + MAX_COLOR_ATTACHMENTS);
 
         /* points / lines (Metal rasterizes 1-pixel lines and points up to 511 px);
          * GL_POINT_SIZE_RANGE and GL_ALIASED_POINT_SIZE_RANGE are the same value in a
@@ -908,8 +912,22 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_MAX_TESS_EVALUATION_SHADER_STORAGE_BLOCKS:
         case GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS:
         case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS:
-        case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS:
         case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS: PUT1(MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS);
+        /* the combined limit is per-stage counts SUMMED over the active stages —
+         * Mesa's default does exactly this (st_extensions.c: sum of the
+         * VS+TCS+TES+GS+FS per-stage MaxShaderStorageBlocks, max'd against the
+         * compute pipeline's) and dEQP counts it the same way
+         * (es31fNegativeShaderStorageTests max_combined_block_number_limit and
+         * es31fProgramInterfaceDefinitionUtil getCombinedProgramResourceUsage):
+         * a block shared by name across stages counts once per stage, so a
+         * 4-stage program with a 3-instance block array needs 12 combined slots
+         * while never using more than 8 binding points — the same relation the
+         * uniform blocks above have (per-stage 14 / combined 70).  Keeping the
+         * combined limit equal to the binding count made r97b's link check
+         * reject dEQP-GL45-ES31 program_interface_query.*.referenced_by
+         * *.{vertex_tess_fragment,vertex_geo_fragment,vertex_tess_geo_fragment}
+         * .block_array (NotSupported instead of Pass). */
+        case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS: PUT1(5 * MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS);
         case GL_MAX_SHADER_STORAGE_BLOCK_SIZE: PUT1(1 << 27);
         case GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT: PUT1(LIMIT(STATE_VAR(shader_storage_buffer_offset_alignment), 16));
 

@@ -311,6 +311,26 @@ static int member_layout_needs_std(const char *src, size_t len, size_t list_star
     return 0;
 }
 
+/* the layout(...) list `close`+1 belongs to an atomic-counter declaration
+ * ("layout(binding=n, offset=n) uniform atomic_uint x;") — its offset
+ * qualifier is the atomic-counter offset of GLSL 4.4.6, not an
+ * ARB_enhanced_layouts member offset, so it is legal without any std block
+ * (dEQP ES31 compute basic.atomic_counter_* declares it that way). */
+static int layout_precedes_atomic_uint(const char *src, size_t len, size_t close)
+{
+    size_t i = skip_ws_comments(src, len, close + 1);
+    for (int k = 0; k < 2 && i < len; k++)
+    {
+        if (!is_ident_char((unsigned char)src[i])) break;
+        size_t j = i;
+        while (j < len && is_ident_char((unsigned char)src[j])) j++;
+        if (j - i == 11 && !strncmp(src + i, "atomic_uint", 11)) return 1;
+        if (j - i != 7 || strncmp(src + i, "uniform", 7)) break;
+        i = skip_ws_comments(src, len, j);
+    }
+    return 0;
+}
+
 /* ARB_enhanced_layouts: a shared/packed block must not carry explicit member
  * offsets/alignments — GL 4.6 4.4.5 ("member offsets are only meaningful with
  * std140/std430").  When such a block is found the shared/packed qualifier is
@@ -410,7 +430,8 @@ static char *strip_gl_block_packings(const char *src)
                      * qualifier and the compile fails, as the CTS negative
                      * tests (ssb_layout_qualifier_conflict__<stage>) require. */
                     if (member_layout_list_has_offset_or_align(src, open, close) &&
-                        member_layout_needs_std(src, len, i))
+                        member_layout_needs_std(src, len, i) &&
+                        !layout_precedes_atomic_uint(src, len, close))
                     {
                         changed = 1;
                         str_append(&out, src + i, open + 1 - i);
@@ -1428,6 +1449,227 @@ static char *pp_error_source(const char *src, const char *msg)
     return out;
 }
 
+static char *pp_error_source(const char *src, const char *msg);
+static size_t mglc_token(const char *s, size_t len, size_t i, char *out, size_t outn);
+
+/* gl_NumSamples is a desktop (3.2+) / ES 3.2 built-in and textureGatherOffsets
+ * comes from GL_EXT_gpu_shader5 below ES 3.2; glslang's ESSL 3.10 tables accept
+ * them anyway (textureGatherOffsets at least in the vertex stage).  Reject both
+ * in ES sources below 3.20 unless the matching extension is enabled
+ * — dEQP-GL45-ES31 debug.negative_coverage.shader_directive.
+ * {sample_variables,gpu_shader_5}.  (gl_SampleID / gl_SamplePosition /
+ * gl_SampleMask[In] / precise / fma are rejected by glslang itself.) */
+static char *reject_es3x_ext_builtins(const char *src)
+{
+    if (!src) return NULL;
+    size_t len = strlen(src);
+    unsigned version = 0;
+    int is_es = 0, oes_sv = 0, ext_gs5 = 0;
+    /* pass 1: #version / #extension directives */
+    for (size_t i = 0; i < len; ) {
+        i = skip_ws_comments(src, len, i);
+        if (i >= len) break;
+        if (src[i] == '#') {
+            char dir[32];
+            size_t j = mglc_token(src, len, i + 1, dir, sizeof dir);
+            if (!strcmp(dir, "version")) {
+                char vs[16], pr[16];
+                j = mglc_token(src, len, j, vs, sizeof vs);
+                j = skip_ws_comments(src, len, j);
+                j = mglc_token(src, len, j, pr, sizeof pr);
+                version = (unsigned)atoi(vs);
+                is_es = !strcmp(pr, "es");
+            } else if (!strcmp(dir, "extension")) {
+                char nm[96], beh[24];
+                size_t k = mglc_token(src, len, j, nm, sizeof nm);
+                k = skip_ws_comments(src, len, k);
+                if (k < len && src[k] == ':') k = mglc_token(src, len, k + 1, beh, sizeof beh);
+                if (!strcmp(beh, "enable") || !strcmp(beh, "require") || !strcmp(beh, "warn")) {
+                    if (!strcmp(nm, "GL_OES_sample_variables")) oes_sv = 1;
+                    else if (!strcmp(nm, "GL_EXT_gpu_shader5")) ext_gs5 = 1;
+                }
+            }
+            while (i < len && src[i] != '\n') i++;
+            continue;
+        }
+        i++;
+    }
+    if (!is_es || version >= 320) return NULL;
+    /* pass 2: identifier scan with comments skipped */
+    const struct { const char *tok; int *flag; const char *msg; } feats[2] = {
+        { "gl_NumSamples",        &oes_sv,
+          "gl_NumSamples requires GLSL ES 3.20 or GL_OES_sample_variables" },
+        { "textureGatherOffsets", &ext_gs5,
+          "textureGatherOffsets requires GLSL ES 3.20 or GL_EXT_gpu_shader5" },
+    };
+    for (int f = 0; f < 2; f++) {
+        if (*feats[f].flag) continue;
+        for (size_t i = 0; i < len; ) {
+            i = skip_ws_comments(src, len, i);
+            if (i >= len) break;
+            if (is_ident_char((unsigned char)src[i])) {
+                char tok[40]; size_t n = 0, j = i;
+                while (j < len && is_ident_char((unsigned char)src[j]) && n + 1 < sizeof tok)
+                    tok[n++] = src[j++];
+                tok[n] = 0;
+                if (!strcmp(tok, feats[f].tok))
+                    return pp_error_source(src, feats[f].msg);
+                i = j;
+                continue;
+            }
+            i++;
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ r97d: SSBO member
+ * array-size matching across stages at link time.
+ *
+ * glslang's program link UNIFIES a block member declared as an unsized array
+ * in one stage with a sized declaration in another (the desktop uniform-block
+ * rule), so both per-stage SPIR-V modules already carry the same size and the
+ * mismatch is invisible downstream — but ES 3.1 / desktop GL both require an
+ * exact match and dEQP-GL45-ES31 debug.negative_coverage.ssbo_block expects a
+ * link error.  The check therefore runs on the stage sources, the only place
+ * the unsized declaration still exists (a heuristic source scan; preprocessor
+ * conditionals and prefix array types "float[2] a;" are not understood). */
+
+#define MGL_SSBOMAX 64
+typedef struct {
+    char block[96];
+    char member[64];
+    unsigned size;      /* 0 = unsized */
+    int stage;
+} SsboMbr;
+
+static int ident_len(const char *s)
+{
+    int n = 0;
+    while ((unsigned char)s[n] && is_ident_char((unsigned char)s[n])) n++;
+    return n;
+}
+
+char *mgl_link_ssbo_array_mismatch(const char **srcs, int nstages, const char **stage_names)
+{
+    SsboMbr tab[MGL_SSBOMAX];
+    int n = 0;
+
+    for (int st = 0; st < nstages; st++)
+    {
+        if (!srcs[st]) continue;
+        /* strip comments so block/member scanning cannot be confused by them */
+        size_t len = strlen(srcs[st]);
+        char *s = (char *)malloc(len + 1);
+        if (!s) continue;
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++)
+        {
+            if (srcs[st][i] == '/' && i + 1 < len && srcs[st][i + 1] == '/')
+            {
+                while (i < len && srcs[st][i] != '\n') i++;
+                if (i < len) s[w++] = '\n';
+                continue;
+            }
+            if (srcs[st][i] == '/' && i + 1 < len && srcs[st][i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(srcs[st][i] == '*' && srcs[st][i + 1] == '/')) i++;
+                i++;
+                s[w++] = ' ';
+                continue;
+            }
+            s[w++] = srcs[st][i];
+        }
+        s[w] = 0;
+
+        for (size_t i = 0; i + 7 < w; i++)
+        {
+            /* "buffer <Name> [instance] {" starts a shader storage block */
+            if (!(s[i] == 'b' && !strncmp(s + i, "buffer", 6)))
+                continue;
+            if (i && is_ident_char((unsigned char)s[i - 1])) continue;
+            if (i + 6 < w && is_ident_char((unsigned char)s[i + 6])) continue;
+            size_t j = i + 6;
+            while (j < w && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) j++;
+            int bl = ident_len(s + j);
+            if (!bl || bl >= 95) { i = j; continue; }
+            char bname[96];
+            memcpy(bname, s + j, bl); bname[bl] = 0;
+            j += bl;
+            /* optional instance name (possibly arrayed) then '{' */
+            while (j < w && s[j] != '{' && s[j] != ';') j++;
+            if (j >= w || s[j] == ';') { i = j; continue; }
+            int depth = 1;
+            j++;
+            while (j < w && depth >= 1)
+            {
+                if (s[j] == '{') depth++;
+                else if (s[j] == '}') depth--;
+                else if (depth == 1 && s[j] == '[')
+                {
+                    /* member array size: [<n>] or [] ; the member name is the
+                     * identifier immediately before '[' */
+                    size_t k = j + 1;
+                    unsigned sz = 0;
+                    while (k < w && (s[k] == ' ' || s[k] == '\t')) k++;
+                    if (k < w && isdigit((unsigned char)s[k]))
+                        while (k < w && isdigit((unsigned char)s[k])) { sz = sz * 10 + (unsigned)(s[k] - '0'); k++; }
+                    while (k < w && (s[k] == ' ' || s[k] == '\t')) k++;
+                    if (k < w && s[k] == ']')
+                    {
+                        k++;
+                        while (k < w && (s[k] == ' ' || s[k] == '\t')) k++;
+                        if (k < w && s[k] == ';')   /* "name[size];" = a member */
+                        {
+                            size_t e = j;
+                            while (e > 0 && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\n')) e--;
+                            size_t b = e;
+                            while (b > 0 && is_ident_char((unsigned char)s[b - 1])) b--;
+                            int nl = (int)(e - b);
+                            if (nl > 0 && nl < 63 && n < MGL_SSBOMAX)
+                            {
+                                memcpy(tab[n].block, bname, (size_t)bl + 1);
+                                memcpy(tab[n].member, s + b, (size_t)nl);
+                                tab[n].member[nl] = 0;
+                                tab[n].size = sz;
+                                tab[n].stage = st;
+                                n++;
+                            }
+                        }
+                    }
+                }
+                j++;
+            }
+            i = j;
+        }
+        free(s);
+    }
+
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+        {
+            if (tab[a].stage == tab[b].stage) continue;
+            if (strcmp(tab[a].block, tab[b].block) || strcmp(tab[a].member, tab[b].member)) continue;
+            if (tab[a].size != tab[b].size)
+            {
+                char da[16], db[16];
+                if (tab[a].size) snprintf(da, sizeof da, "%u", tab[a].size);
+                else snprintf(da, sizeof da, "unsized");
+                if (tab[b].size) snprintf(db, sizeof db, "%u", tab[b].size);
+                else snprintf(db, sizeof db, "unsized");
+                char *l = (char *)malloc(256);
+                if (l)
+                    snprintf(l, 256,
+                             "ERROR: linking %s and %s stages: array size of member %s of block %s does not match (%s vs %s)\n",
+                             stage_names[tab[a].stage], stage_names[tab[b].stage],
+                             tab[a].member, tab[a].block, da, db);
+                return l;
+            }
+        }
+    return NULL;
+}
+
 /* a leftover token ends a #if/#elif/#else/#endif directive; only reject when no macro
  * expansion could legally consume it: numbers never can, identifiers only when they are
  * not defined as macros (an object-like macro may expand to nothing, and a macro may
@@ -1445,8 +1687,6 @@ static bool pp_leftover_is_error(PpTok *t, const char **macros, int nmacros)
     return false;                                /* punctuation: a macro may bracket it */
 }
 
-static char *pp_error_source(const char *src, const char *msg);
-static size_t mglc_token(const char *s, size_t len, size_t i, char *out, size_t outn);
 
 /* ===== reserved words in positions glslang still accepts ====================
  *
@@ -3617,6 +3857,8 @@ char *mgl_cts_glsl_compat_limited(const char *src, const MGLCompatBindingLimits 
         char *res = reject_reserved_declarators(src);
         if (res) return res;
         res = reject_integer_mix(src);
+        if (res) return res;
+        res = reject_es3x_ext_builtins(src);
         if (res) return res;
     }
     {

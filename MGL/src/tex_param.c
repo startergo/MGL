@@ -30,6 +30,8 @@
 #include <strings.h>
 #include <limits.h>
 #include "glm_context.h"
+#define MGL_RSTATE_INTERNAL      /* mgl_rs_dirty_pipeline (LOD_BIAS -> PSO content, r48) */
+#include "mgl_ext_rstate.h"
 #include "mgl_ext_texparam.h"
 #include "tex_param_internal.h"
 
@@ -669,6 +671,14 @@ static void tp_apply(GLMContext ctx, Texture *tex, GLenum pname, const void *v, 
     {
         mglTexParamInvalidate(ctx, &tex->params);
         ctx->state.dirty_bits |= DIRTY_TEX;
+
+        /* tess (r48): GL_TEXTURE_LOD_BIAS is baked into specialised pipeline
+         * functions (explicit-LOD `level()` fold) and into the sampler state
+         * (implicit lookups) — a changed bias must move the PSO content hash
+         * the same frame, before the draw gate builds its key
+         * (KHR-GL46.texture_lod_bias_all) */
+        if (pname == GL_TEXTURE_LOD_BIAS)
+            mgl_rs_dirty_pipeline(ctx);
     }
 }
 

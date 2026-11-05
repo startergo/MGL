@@ -963,12 +963,18 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
          *  - for single-sample blits the source and destination depth AND
          *    stencil formats must match as a pair (the ES3 negative_api test
          *    blits DEPTH and STENCIL separately between D32FS8 and D24S8 and
-         *    expects an error both times).  Multisample resolves may convert:
-         *    MGL stores GL_DEPTH24_STENCIL8 and GL_DEPTH32F_STENCIL8 in the same
-         *    Metal format, differing formats go through the GPU staging path in
-         *    MGLRenderer+Framebuffer.m, and the KHR-GL46 framebuffer_blit tests
-         *    blit D24S8 multisampled sources into the CTS's D32FS8 default
-         *    framebuffer and require success. */
+         *    expects an error both times — NOT implemented: it contradicts
+         *    KHR-GL46 framebuffer_blit.scissor_blit, which blits D32FS8
+         *    renderbuffers into D24S8 renderbuffers and requires success;
+         *    the classes below deliberately treat the two formats as equal,
+         *    which also matches desktop GL on macOS.  dEQP
+         *    debug.negative_coverage.get_error.buffer.blit_framebuffer is a
+         *    known 1-case gap).  Multisample resolves may convert: MGL stores
+         *    GL_DEPTH24_STENCIL8 and GL_DEPTH32F_STENCIL8 in the same Metal
+         *    format, differing formats go through the GPU staging path in
+         *    MGLRenderer+Framebuffer.m, and the KHR-GL46 tests blit D24S8
+         *    multisampled sources into the CTS's D32FS8 default framebuffer
+         *    and require success. */
         bool rd = mgl_fb_has_depth(ctx, readfbo), dd = mgl_fb_has_depth(ctx, drawfbo);
         bool rss = mgl_fb_has_stencil(ctx, readfbo), dss = mgl_fb_has_stencil(ctx, drawfbo);
         bool cmpD = (mask & GL_DEPTH_BUFFER_BIT) && rd && dd;

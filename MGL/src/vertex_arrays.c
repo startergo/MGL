@@ -609,6 +609,11 @@ static void setEnabled(GLMContext ctx, VertexArray *vao, GLuint index, bool enab
 
 void mglEnableVertexAttribArray(GLMContext ctx, GLuint index)
 {
+    /* GL 4.6 §10.3.1/§2.3: the INVALID_VALUE index-range error takes precedence
+       over the no-bound-VAO INVALID_OPERATION (dEQP ES31 debug.negative_coverage
+       .vertex_array.enable_vertex_attrib_array expects exactly this order) */
+    if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
+
     if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     setEnabled(ctx, VAO(), index, true);
@@ -616,6 +621,9 @@ void mglEnableVertexAttribArray(GLMContext ctx, GLuint index)
 
 void mglDisableVertexAttribArray(GLMContext ctx, GLuint index)
 {
+    /* same precedence as mglEnableVertexAttribArray */
+    if (index >= maxAttribs(ctx)) VA_ERROR(GL_INVALID_VALUE);
+
     if (VAO() == NULL) VA_ERROR(GL_INVALID_OPERATION);
 
     setEnabled(ctx, VAO(), index, false);

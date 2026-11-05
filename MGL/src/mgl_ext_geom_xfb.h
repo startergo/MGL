@@ -46,7 +46,7 @@
  * (2 bits per buffer: a buffer's write offset advances by ITS stream's vertices),
  * [22] the bitmask of the buffers this pass writes (the capacity test) */
 #define MGL_GEOM_XFB_IN_WORDS     24
-#define MGL_GEOM_XFB_VAR_WORDS    5
+#define MGL_GEOM_XFB_VAR_WORDS    7
 #define MGL_GEOM_XFB_SLOT_WORDS   (MGL_GEOM_XFB_IN_WORDS + MGL_GEOM_XFB_MAX_VARS * MGL_GEOM_XFB_VAR_WORDS)
 #define MGL_GEOM_XFB_RING         4    /* draws in flight */
 

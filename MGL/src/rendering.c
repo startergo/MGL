@@ -210,6 +210,11 @@ void mgl_fb_set_draw_buffers(GLMContext ctx, Framebuffer *fbo, GLsizei n, const 
     if (n && !bufs)
         return;
 
+    /* GL 4.6 §17.4.1: on the default framebuffer DrawBuffers must be called with
+       n == 1 (INVALID_OPERATION) — checked for every n, even all-GL_NONE sets */
+    if (!fbo && !single && n != 1)
+        FB_ERROR(GL_INVALID_OPERATION);
+
     for (GLsizei i = 0; i < n; i++)
     {
         GLenum b = bufs[i];

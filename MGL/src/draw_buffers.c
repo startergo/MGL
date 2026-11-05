@@ -905,6 +905,25 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
                       GLint first, GLsizei count, GLsizei instances, GLint basevertex, GLuint baseinstance)
 {
     uint64_t p7 = mgl_prof_begin(7);
+
+    /* draw-time validation runs BEFORE the zero-count discard: GL performs it
+     * even when the draw transfers no vertices (dEQP ES31
+     * debug.negative_coverage.get_error.advanced_blend draws with count 0 and
+     * expects GL_INVALID_OPERATION from the KHR_blend_equation_advanced
+     * qualifier / draw-buffer rules; the queries hook's own counts still skip
+     * zero-count draws internally). */
+    {
+        uint64_t t24 = mgl_prof_begin(24);
+        bool ok = mgl_ext_pre_draw(ctx, mode, count, instances, indexed, indexed ? type : 0,
+                                   indexed ? offset : 0);
+        mgl_prof_end(24, t24);
+        if (!ok)
+        {
+            mgl_prof_end(7, p7);
+            return;
+        }
+    }
+
     if (count <= 0 || instances <= 0)
     {
         mgl_prof_end(7, p7);
@@ -937,18 +956,6 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
     {
         ctx->error_func(ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return;
-    }
-
-    {
-        uint64_t t24 = mgl_prof_begin(24);
-        bool ok = mgl_ext_pre_draw(ctx, mode, count, instances, indexed, indexed ? type : 0,
-                                   indexed ? offset : 0);
-        mgl_prof_end(24, t24);
-        if (!ok)
-        {
-            mgl_prof_end(7, p7);
-            return;
-        }
     }
 
     /* a geometry stage runs through its own path: capture pass + kernel + pass-through

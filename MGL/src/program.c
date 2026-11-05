@@ -984,6 +984,11 @@ void mglDeleteProgram(GLMContext ctx, GLuint program)
     ptr = findProgram(ctx, program);
     if (!ptr)
     {
+        /* GL 4.6 §5.1: deleting a name that is not a program object is an
+           INVALID_OPERATION when the name exists as a shader object
+           (dEQP ES31 debug.negative_coverage.shader.delete_program) */
+        if (findShader(ctx, program))
+            ERROR_RETURN(GL_INVALID_OPERATION);
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
     }
@@ -4226,6 +4231,35 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
                     lsrcs[st_] = s_->src;
             }
             mgl_layout_renumber_io_srcs(ctx, (uint32_t **)mods, sizes, mask, lsrcs);
+
+            /* r97d: SSBO member array sizes must match exactly across stages —
+             * glslang unifies an unsized member with a sized one at program link,
+             * so the SPIR-V carries no trace; the sources are the only witness */
+            {
+                extern char *mgl_link_ssbo_array_mismatch(const char **srcs, int nstages, const char **stage_names);
+                static const char *mgl_stage_names[_MAX_SHADER_TYPES] = {
+                    "vertex", "tessellation control", "tessellation evaluation", "geometry", "fragment", "compute"};
+                char *mm = mgl_link_ssbo_array_mismatch(lsrcs, _MAX_SHADER_TYPES, mgl_stage_names);
+                if (mm)
+                {
+                    mgl_append_info_log(log, "%s", mm);
+                    free(mm);
+                    ok = false;
+                }
+            }
+        }
+
+        /* r97b: combined shader-storage block count across stages — Metal has
+         * no such limit, GL does (dEQP ES31 shader_storage.max_combined) */
+        {
+            extern char *mgl_layout_combined_limits(GLMContext ctx, uint32_t **mods, size_t *sizes, unsigned mask);
+            char *cl = mgl_layout_combined_limits(ctx, mods, sizes, mask);
+            if (cl)
+            {
+                mgl_append_info_log(log, "%s", cl);
+                free(cl);
+                ok = false;
+            }
         }
 
         for (int stage = 0; stage < _MAX_SHADER_TYPES && ok; stage++)
@@ -4256,7 +4290,6 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
                                (mask & SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)) != 0,
                                consumer_ir, consumer_words);
             free((void *)mods[stage]);
-
             /* executable stages keep the GLSL source / type of the shader they came from
              * (the xfb domain re-translates the vertex stage from source for capture) */
             if (ok && dst->base.shader_slots[stage])

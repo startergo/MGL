@@ -416,6 +416,19 @@ static bool buffers_get_indexed(GLMContext ctx, GLenum pname, GLuint index, GLui
         mglGetIntegerv(ctx, GL_MAX_UNIFORM_BUFFER_BINDINGS, &n);
         max = n > 0 ? (GLuint)n : MAX_BINDABLE_BUFFERS;
     }
+    else if (slot == 1 || slot == 2)
+    {
+        /* SSBO / atomic-counter index space ends at the reported limit
+         * (GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS / GL_MAX_ATOMIC_COUNTER_
+         * BUFFER_BINDINGS): querying past it is GL_INVALID_VALUE (ES31
+         * debug.negative_coverage.state.get_integeri_v) */
+        GLint n = 0;
+        mglGetIntegerv(ctx, slot == 1 ? GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
+                                      : GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, &n);
+        if (n <= 0 || (GLuint)n > MAX_BINDABLE_BUFFERS)
+            n = (int)MAX_BINDABLE_BUFFERS;
+        max = (GLuint)n;
+    }
     if (index >= max)
     {
         ctx->error_func(ctx, "mglGetIntegeri_v", GL_INVALID_VALUE);

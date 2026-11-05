@@ -856,7 +856,7 @@ static const char *kGeomXfbMSL =
     "\n"
     "#define WG " MGL_GEOM_STR(MGL_GEOM_XFB_WG) "\n"
     "\n"
-    "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; uint stream; };\n"
+    "struct mgl_geom_xfb_var { uint src_word; uint dst_off; uint words; uint buffer; uint stream; uint chunk; uint gap; };\n"
     "\n"
     "kernel void mgl_geom_xfb_prefix(constant uint* in [[buffer(0)]],\n"
     "                                const device uint* recs [[buffer(4)]],\n"
@@ -1063,7 +1063,10 @@ static const char *kGeomXfbMSL =
     "        if (!stride || !vr.words) continue;\n"
     "        uint pos = xfb[3 + vr.buffer] + t * stride + vr.dst_off;\n"
     "        if (pos + vr.words * 4u > in[8 + vr.buffer]) continue;   /* full: drop, as GL does */\n"
-    "        for (uint w = 0u; w < vr.words; w++) d[(pos + w * 4u) / 4u] = rec[vr.src_word + w];\n"
+    "        for (uint w = 0u; w < vr.words; w++) {\n"
+    "            uint ci = vr.chunk ? (w / vr.chunk) : 0u;\n"
+    "            d[(pos + w * 4u) / 4u] = rec[vr.src_word + w + ci * vr.gap];\n"
+    "        }\n"
     "    }\n"
     "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[1], 1u, memory_order_relaxed);\n"
     "    atomic_fetch_add_explicit((volatile device atomic_uint*)&xfb[8], 1u, memory_order_relaxed);\n"
@@ -1565,10 +1568,15 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     in[12] = src->per_prim;                /* captured vertices per primitive */
 
     memset(vars, 0, sizeof vars);
-    /* stride MUST be MGL_GEOM_XFB_VAR_WORDS (5): the kernel's mgl_geom_xfb_var has a
-     * trailing stream field the tess path leaves 0 (the TES captures one stream), and a
-     * 4-word pack shifted every var past the first onto the wrong fields — the second
-     * varying copied one word of gl_Position.x into the first buffer's y slot. */
+    /* stride MUST be MGL_GEOM_XFB_VAR_WORDS (7): the kernel's mgl_geom_xfb_var has
+     * trailing stream/chunk/gap fields.  chunk/gap (r97c) walked the pad half-slot
+     * that follows every odd-length double column of a matrix kept in fp64 SLOT
+     * form; r59/r60 compacted the capture record (each split "<name>_<i>" member
+     * carries only its VALID doubles, w = 2*valid), so the record is now dense and
+     * the pad skip must stay OFF — leaving it on read the record as
+     * [c0: d0 d1 d2] (gap) [c1: d5 d6 past-end] (dmat2x3 came back as
+     * 1 2 3 5 6 0, test_compat_xfbdmat.c / KHR-GL46
+     * enhanced_layouts.xfb_stride_dmat{2x3,3,4x3}_tessellation_evaluation). */
     for (GLuint v = 0; v < xp->count && v < MGL_GEOM_XFB_MAX_VARS; v++)
     {
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 0] = (uint32_t)xp->vars[v].src_word;   /* the capture record's word offset */
@@ -1576,13 +1584,17 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 2] = (uint32_t)xp->vars[v].words;
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 3] = (uint32_t)xp->vars[v].buffer;
         vars[v * MGL_GEOM_XFB_VAR_WORDS + 4] = 0u;                               /* stream 0 */
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 5] = 0u;   /* chunk 0: dense copy (see above) */
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 6] = 0u;   /* gap 0 */
     }
     if (geomEnvRead(), gEnv.xfb)
         for (GLuint v = 0; v < xp->count && v < 8; v++)
-            fprintf(stderr, "geom: tess pack vars[%u]: src_word=%u dst_off=%u words=%u buffer=%u stride=%u tfsize=%u\n",
+            fprintf(stderr, "geom: tess pack vars[%u]: src_word=%u dst_off=%u words=%u buffer=%u stride=%u tfsize=%u rows=%u cols=%u kind=%04x chunk=%u gap=%u\n",
                     v, vars[v * MGL_GEOM_XFB_VAR_WORDS + 0], vars[v * MGL_GEOM_XFB_VAR_WORDS + 1],
                     vars[v * MGL_GEOM_XFB_VAR_WORDS + 2], vars[v * MGL_GEOM_XFB_VAR_WORDS + 3],
-                    in[3 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]], in[8 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]]);
+                    in[3 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]], in[8 + vars[v * MGL_GEOM_XFB_VAR_WORDS + 3]],
+                    xp->vars[v].rows, xp->vars[v].columns, xp->vars[v].comp_kind,
+                    vars[v * MGL_GEOM_XFB_VAR_WORDS + 5], vars[v * MGL_GEOM_XFB_VAR_WORDS + 6]);
 
     if (!gXfbFence) gXfbFence = [_device newFence];
 
@@ -1726,11 +1738,14 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
     memset(vars, 0, sizeof vars);
     for (GLuint v = 0; v < xp->count; v++)
     {
-        vars[v * 5 + 0] = (uint32_t)xp->vars[v].src_word;
-        vars[v * 5 + 1] = (uint32_t)xp->vars[v].offset;
-        vars[v * 5 + 2] = (uint32_t)xp->vars[v].words;
-        vars[v * 5 + 3] = (uint32_t)xp->vars[v].buffer;
-        vars[v * 5 + 4] = (uint32_t)xp->vars[v].stream;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 0] = (uint32_t)xp->vars[v].src_word;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 1] = (uint32_t)xp->vars[v].offset;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 2] = (uint32_t)xp->vars[v].words;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 3] = (uint32_t)xp->vars[v].buffer;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 4] = (uint32_t)xp->vars[v].stream;
+        /* the geom capture record is compact: chunk/gap stay 0 (whole-var copy) */
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 5] = 0u;
+        vars[v * MGL_GEOM_XFB_VAR_WORDS + 6] = 0u;
         /* the per-buffer captured extent: the scatter's capacity test checks the last
          * vertex of a primitive against the buffer's largest varying (bytes) */
         if (xp->vars[v].words)
