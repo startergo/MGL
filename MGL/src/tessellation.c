@@ -6657,6 +6657,16 @@ void mgl_ext_init_tess(GLMContext ctx)
     /* ARB/KHR_parallel_shader_compile: the spec's initial "no limit" state */
     S->max_shader_compiler_threads = (GLint)0xFFFFFFFFu;
 
+    /* GL_ARB_ES3_2_compatibility table 23.10 initial bounding box */
+    S->primitive_bounding_box[0] = -1.0f;
+    S->primitive_bounding_box[1] = -1.0f;
+    S->primitive_bounding_box[2] = -1.0f;
+    S->primitive_bounding_box[3] = 1.0f;
+    S->primitive_bounding_box[4] = 1.0f;
+    S->primitive_bounding_box[5] = 1.0f;
+    S->primitive_bounding_box[6] = 1.0f;
+    S->primitive_bounding_box[7] = 1.0f;
+
     mgl_ext_register_post_link(mgl_ext_post_link_tess);
     mgl_program_register_programiv_hook(mgl_tess_program_completion_status);
 }
@@ -6671,6 +6681,30 @@ bool mgl_ext_get_tess(GLMContext ctx, GLenum pname, GLenum type, void *data)
         GLint v = ctx->state.ext_tess ? ctx->state.ext_tess->max_shader_compiler_threads
                                       : (GLint)0xFFFFFFFFu;
         mgl_get_store(type, data, 0, (double)v);
+        return true;
+    }
+    if (pname == GL_PRIMITIVE_BOUNDING_BOX_ARB)       /* 0x92BE, 8xR */
+    {
+        static const float init[8] = { -1, -1, -1, 1, 1, 1, 1, 1 };
+        const float *b = ctx->state.ext_tess ? ctx->state.ext_tess->primitive_bounding_box : init;
+        for (int i = 0; i < 8; i++)
+            mgl_get_store(type, data, i, (double)b[i]);
+        return true;
+    }
+    if (pname == GL_MULTISAMPLE_LINE_WIDTH_RANGE_ARB) /* 0x9381, 2xR+, min (1,1) */
+    {
+        /* Metal rasterizes lines one pixel wide; multisampled line widths
+         * match MGL's aliased/smooth line range exactly (get.c reports 1,1),
+         * so the spec's minimum is what is supported.  Per the ES 3.2 /
+         * ARB_ES3_2_compatibility text an unsupported requested width falls
+         * back to the nearest supported one (1.0). */
+        mgl_get_store(type, data, 0, 1.0);
+        mgl_get_store(type, data, 1, 1.0);
+        return true;
+    }
+    if (pname == GL_MULTISAMPLE_LINE_WIDTH_GRANULARITY_ARB)   /* 0x9382, R+ */
+    {
+        mgl_get_store(type, data, 0, 1.0);
         return true;
     }
     return false;
@@ -10130,4 +10164,153 @@ bool mgl_tess_stage_bound(GLMContext ctx)
     if (ctx->state.program_pipeline)
         return MGL_PIPELINE_OBJ(ctx->state.program_pipeline)->base.stage_programs[_TESS_EVALUATION_SHADER] != NULL;
     return false;
+}
+
+/* ---- GL_ARB_ES3_2_compatibility -------------------------------------------- */
+
+/* glslang (11.x, external/) has no E_GL_ARB_ES3_2_compatibility: it rejects
+ * '#extension GL_ARB_ES3_2_compatibility : require' outright, and the
+ * gl_BoundingBox[] per-patch output is only built in for ESSL 3.20
+ * (#version 320 es, Initialize.cpp "profile == EEsProfile && version >= 320").
+ * The desktop flavour of the extension (dEQP-GL45-ES31 primitive_bounding_box's
+ * core(4,5) shader specialization: #version 460 + the require + gl_BoundingBox
+ * writes in the TCS) is therefore rewritten before glslang sees the source:
+ * the directive is consumed and gl_BoundingBox becomes an ordinary per-patch
+ * output array — which is exactly what the ES 3.20 path lowers to anyway (the
+ * patch-record canonicalizer keys per-patch arrays; no tess-factor semantics).
+ * The bounding box stays a rendering hint (no Metal effect) either way. */
+static bool tess_es32_ident(const char *p)
+{
+    if (p == NULL || *p != 'g' || strncmp(p, "gl_BoundingBox", 14) != 0)
+        return false;
+    if (p > (const char *)0 && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))
+        return false;
+    return !(isalnum((unsigned char)p[14]) || p[14] == '_');
+}
+
+char *mgl_tess_es32_compat(GLenum type, const char *src)
+{
+    static const char ext[] = "#extension GL_ARB_ES3_2_compatibility";
+    const char *e;
+
+    if (!src || !(e = strstr(src, ext)))
+        return NULL;
+
+    bool bbox = (type == GL_TESS_CONTROL_SHADER) && tess_es32_ident(strstr(src, "gl_BoundingBox"));
+    size_t cap = strlen(src) + 96 + 1;
+    char *out = (char *)malloc(cap);
+
+    if (!out)
+        return NULL;
+
+    char *w = out;
+    const char *p = src;
+
+    while (*p)
+    {
+        /* find the next line */
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        const char *line = p;
+        size_t skip = 0;               /* leading whitespace */
+        while (skip < len && (line[skip] == ' ' || line[skip] == '\t'))
+            skip++;
+
+        if (skip + sizeof ext - 1 <= len && strncmp(line + skip, ext, sizeof ext - 1) == 0)
+        {
+            /* the directive line.  behaviour: "require", "warn" (or absent = on)
+             * make the ES3.2 builtins available; "disable" does not. */
+            const char *b = line + skip + sizeof ext - 1;
+            const char *bend = line + len;
+            bool off = (b < bend && *b == ':');
+            if (off)
+            {
+                while (b < bend && (*b == ' ' || *b == '\t' || *b == ':'))
+                    b++;
+                off = (b + 6 < bend && strncmp(b, "disable", 7) == 0);
+            }
+
+            if (bbox && !off)
+            {
+                const char decl[] = "patch out highp vec4 mgl_es32_bbox[2]; /* gl_BoundingBox (ARB_ES3_2) */";
+                memcpy(w, decl, sizeof decl - 1);
+                w += sizeof decl - 1;
+            }
+            else
+            {
+                const char decl[] = "/* GL_ARB_ES3_2_compatibility */";
+                memcpy(w, decl, sizeof decl - 1);
+                w += sizeof decl - 1;
+            }
+        }
+        else if (bbox)
+        {
+            /* copy the line, renaming gl_BoundingBox as we go */
+            for (size_t i = 0; i < len; i++)
+            {
+                if (tess_es32_ident(line + i))
+                {
+                    const char ren[] = "mgl_es32_bbox";
+                    memcpy(w, ren, sizeof ren - 1);
+                    w += sizeof ren - 1;
+                    i += 14 - 1;
+                }
+                else
+                    *w++ = line[i];
+            }
+        }
+        else
+        {
+            memcpy(w, line, len);
+            w += len;
+        }
+
+        if (nl)
+            *w++ = '\n';
+        p = nl ? nl + 1 : p + len;
+    }
+
+    *w = '\0';
+    return out;
+}
+
+/* glPrimitiveBoundingBoxARB (ARB_ES3_2_compatibility §14.1pbb): the default
+ * clip-space bounding box of primitives emitted by the tessellation primitive
+ * generator / a geometry shader.  Purely an optimization hint on Metal: the
+ * tiler bounds-boxes real geometry, and the spec allows fragments outside the
+ * box either way, so the value is only stored for glGetFloatv et al.  A
+ * tessellation control shader that writes gl_BoundingBox[] re-specifies the
+ * box per patch on hardware that uses it; MGL captures it as a plain per-patch
+ * output (shaders.c rewrites the desktop builtin) with the same no-effect
+ * semantics.  No GL errors are defined for this command. */
+void mglPrimitiveBoundingBoxARB(GLMContext ctx, GLfloat minX, GLfloat minY, GLfloat minZ, GLfloat minW,
+                                GLfloat maxX, GLfloat maxY, GLfloat maxZ, GLfloat maxW)
+{
+    if (!ctx->state.ext_tess)
+        mgl_ext_init_tess(ctx);
+    if (!ctx->state.ext_tess)
+        return;
+    float *b = ctx->state.ext_tess->primitive_bounding_box;
+
+    b[0] = minX;
+    b[1] = minY;
+    b[2] = minZ;
+    b[3] = minW;
+    b[4] = maxX;
+    b[5] = maxY;
+    b[6] = maxZ;
+    b[7] = maxW;
+}
+
+/* the exported entry point (gl.xml lists only the ARB name for this
+ * extension; ES uses glPrimitiveBoundingBoxEXT/OES which MGL does not
+ * advertise).  Direct dispatch like entry_ext_compat.c's non-core aliases. */
+extern GLMContext _ctx;
+extern void mgl_lazy_init(void);
+
+void glPrimitiveBoundingBoxARB(GLfloat minX, GLfloat minY, GLfloat minZ, GLfloat minW,
+                               GLfloat maxX, GLfloat maxY, GLfloat maxZ, GLfloat maxW)
+{
+    mgl_lazy_init();
+    mglPrimitiveBoundingBoxARB(_ctx, minX, minY, minZ, minW, maxX, maxY, maxZ, maxW);
 }

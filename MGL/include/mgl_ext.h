@@ -54,15 +54,19 @@ struct MGLExtMetal_compat;
 /* glGet value types (match get.c) */
 enum { MGL_GET_BOOL = 0, MGL_GET_INT = 1, MGL_GET_FLOAT = 2, MGL_GET_DOUBLE = 3, MGL_GET_INT64 = 4 };
 
-/* store element [index] of a glGet result in the caller's requested type */
+/* store element [index] of a glGet result in the caller's requested type.
+ * Float -> integer conversions ROUND TO NEAREST (GL 4.6 §2.4: "values are
+ * converted ... rounding to nearest"; ties either way, the CTS accepts
+ * half-up and half-down) — a C truncation is off by one for fractional
+ * values like the primitive bounding box's -1.7. */
 static inline void mgl_get_store(GLuint type, void *data, int index, double v)
 {
     switch (type) {
         case MGL_GET_BOOL:   ((GLboolean *)data)[index] = v != 0.0 ? GL_TRUE : GL_FALSE; break;
-        case MGL_GET_INT:    ((GLint *)data)[index] = (GLint)v; break;
+        case MGL_GET_INT:    ((GLint *)data)[index] = (GLint)(v < 0 ? v - 0.5 : v + 0.5); break;
         case MGL_GET_FLOAT:  ((GLfloat *)data)[index] = (GLfloat)v; break;
         case MGL_GET_DOUBLE: ((GLdouble *)data)[index] = v; break;
-        case MGL_GET_INT64:  ((GLint64 *)data)[index] = (GLint64)v; break;
+        case MGL_GET_INT64:  ((GLint64 *)data)[index] = (GLint64)(v < 0 ? v - 0.5 : v + 0.5); break;
     }
 }
 

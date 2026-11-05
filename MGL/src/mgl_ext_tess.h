@@ -182,6 +182,10 @@ void mgl_tess_set_capture(GLMContext ctx, Program *program, bool enable);
  * built-in set (added outputs are never written, added inputs never read).
  * Returns a malloc'd rewritten source, or NULL when no rewrite is needed. */
 char *mgl_tess_glsl_compat(GLenum type, const char *src);
+/* GL_ARB_ES3_2_compatibility on desktop GLSL: consume the (glslang-unknown)
+ * extension directive and rename gl_BoundingBox[] to a plain patch out array
+ * (shaders.c compile chain).  Returns a malloc'd source or NULL. */
+char *mgl_tess_es32_compat(GLenum type, const char *src);
 /* GLSL 4.6 §7.1: reject a non-constant index write to an unsized gl_ClipDistance /
  * gl_CullDistance.  Runs on the RAW source in the compile path (shaders.c): the
  * introspect pass pins and folds the declarations away.  Returns an #error source. */
@@ -336,6 +340,20 @@ struct MGLExtState_tess {
      * MGL stores for glGet only (compiles are synchronous, so completion is
      * immediate); 0xFFFFFFFF = "no limit", the spec's initial state */
     GLint max_shader_compiler_threads;
+
+    /* GL_PRIMITIVE_BOUNDING_BOX_ARB (GL_ARB_ES3_2_compatibility §14.1pbb): the
+     * clip-space bounding box of the primitives a tessellator / geometry stage
+     * will emit.  It is an optimization HINT — the spec ("the rasterizer will
+     * generate fragments with window coordinates inside the windows space
+     * bounding volume, but may or may not generate fragments ... outside the
+     * bounding volume") explicitly allows an implementation to rasterize the
+     * unclipped primitives, which is what Metal's tiler already does with its
+     * own per-primitive bounds.  So MGL stores the state for glGet (and the
+     * dEQP state-query group) and has no rendering effect; a tessellation
+     * control shader's gl_BoundingBox[] is accepted as an ordinary per-patch
+     * output (see shaders.c's ES3.2 compatibility rewrite).  Initial state per
+     * spec table 23.10: -1, -1, -1, 1, 1, 1, 1, 1. */
+    float primitive_bounding_box[8];
 
     /* GL 4.6 §17.3.4 late per-fragment tests: fragment shaders that write to
      * memory (images / SSBOs / atomic counters) and do not declare

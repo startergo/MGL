@@ -1041,6 +1041,18 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         }
     }
     {
+        /* tess: '#extension GL_ARB_ES3_2_compatibility' + the gl_BoundingBox[]
+         * per-patch output are unknown to glslang on desktop GLSL (mgl_ext_tess.h);
+         * consume the directive and rename the builtin to a plain patch out */
+        const char *cur = compat ? compat : mgl_introspect_shader_source(ctx, ptr);
+        char *e32 = mgl_tess_es32_compat(ptr->type, cur);
+        if (e32)
+        {
+            free(compat);
+            compat = e32;
+        }
+    }
+    {
         /* geom (glsl_block_compat.c): anonymous interface blocks and inline struct
          * declarations inside a block are GL-legal but outside glslang's grammar —
          * rewrite them (dEQP-GL45-ES31 PIQ

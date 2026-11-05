@@ -3486,6 +3486,7 @@ static bool module_has_fp64(const uint32_t *words, size_t n)
 
 static bool msl_accepts(const uint32_t *words, size_t n, int stage)
 {
+    if (getenv("MGL_TESS_DEBUG"))
         fprintf(stderr, "MGL msl_accepts: stage=%d n=%zu\n", stage, n);
     /* SPIRV-Cross rejects double types in buffers, which the GL view of a
      * software-fp64 module legitimately contains (fp64.c lowers it later). */
@@ -3502,10 +3503,12 @@ static bool msl_accepts(const uint32_t *words, size_t n, int stage)
     if (stage == _TESS_EVALUATION_SHADER &&
         (swapped = mgl_tess_prepare_spirv(words, n, &swapped_n)) != NULL)
     {
+        if (getenv("MGL_TESS_DEBUG"))
             fprintf(stderr, "MGL msl_accepts: swapped n=%zu first=%08x\n",
                     swapped_n, swapped_n ? swapped[0] : 0);
         if (mgl_tess_module_declined(swapped, swapped_n))
         {
+            if (getenv("MGL_TESS_DEBUG"))
                 fprintf(stderr, "MGL msl_accepts: declined marker seen (n=%zu first=%08x)\n",
                         swapped_n, swapped_n ? swapped[0] : 0);
             /* the module needs transforms SPIRV-Cross cannot compile without
@@ -3844,7 +3847,7 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
                     if (s == _VERTEX_SHADER) lim = STATE_VAR(max_vertex_output_components) ? STATE_VAR(max_vertex_output_components) : 128;
                     else if (s == _GEOMETRY_SHADER) lim = STATE_VAR(max_geometry_output_components) ? STATE_VAR(max_geometry_output_components) : 128;
                 }
-                GLuint comps = 0;
+                GLuint comps = 0, patch_comps = 0;
                 if (getenv("MGL_IO_BUDGET_DEBUG"))
                     for (int i = 0; i < nlist; i++)
                         fprintf(stderr, "io-budget stage=%d dir=%d var='%s' loc=%d size=%d type=0x%x patch=%d\n",
@@ -3857,6 +3860,15 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
                     if (!io_gl_shape(v->type, &cols, &rows, &dbl)) { comps += 4; continue; }
                     GLuint slots = (GLuint)cols * ((rows >= 3 && dbl) ? 2 : 1);
                     GLuint cnt = (GLuint)(v->size > 0 ? v->size : 1);
+                    if (v->is_per_patch) {
+                        /* GL 4.6 11.1.3.4: per-patch outputs (gl_BoundingBox,
+                         * per-patch blocks) are budgeted against
+                         * MAX_TESS_PATCH_COMPONENTS (120), not the per-vertex
+                         * MAX_TESS_(CONTROL|EVALUATION)_(IN|OUT)PUT_COMPONENTS
+                         * budget the arrays above count against. */
+                        patch_comps += slots * cnt * 4;
+                        continue;
+                    }
                     if (((s == _TESS_CONTROL_SHADER) ||
                          (s == _TESS_EVALUATION_SHADER && dir == 0)) && !v->is_per_patch) {
                         /* per-vertex patch interface: budgeted PER ELEMENT.  The TES
@@ -3884,11 +3896,16 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
                 }
                 for (int i = 0; i < nlist; i++) free(list[i].name);
                 free(list);
-                if (comps > (GLuint)lim) {
+                if (comps > (GLuint)lim || patch_comps > 120u) {
                     ip->io_components_overflow = 1;
-                    snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
-                             "active %s of the %s stage consume %u components, more than the %d-component limit",
-                             dir == 0 ? "inputs" : "outputs", snames[s], comps, lim);
+                    if (patch_comps > 120u)
+                        snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
+                                 "active per-patch %s of the %s stage consume %u components, more than the 120-component limit",
+                                 dir == 0 ? "inputs" : "outputs", snames[s], patch_comps);
+                    else
+                        snprintf(ip->block_overlap_msg, sizeof ip->block_overlap_msg,
+                                 "active %s of the %s stage consume %u components, more than the %d-component limit",
+                                 dir == 0 ? "inputs" : "outputs", snames[s], comps, lim);
                 }
             }
         }

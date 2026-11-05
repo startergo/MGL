@@ -372,10 +372,174 @@ TEST(TessEsShadowLodCompat)
     while (glGetError() != GL_NO_ERROR) {}
 }
 
+/* dEQP-GL45-ES31 opaque_type_indexing sampler.*.compute.*shadow (r63): a
+ * shadow sampler ARRAY in a compute kernel occupies [[sampler(b)]]..b+n-1;
+ * binding every element at the array's base slot left element 1 on Metal's
+ * default sampler, whose missing compare function made sample_compare return
+ * the raw depth. */
+TEST(Es32ComputeShadowSamplerArray)
+{
+    GLuint t0, t1, sbo, prog;
+    /* 2x2 depth, row-major upload: row 0 = (0.25, 0.75), row 1 = (0.25, 0.75) */
+    float d[4] = { 0.25f, 0.75f, 0.25f, 0.75f };
+    static const char *cs =
+        "#version 320 es\n"
+        "uniform highp sampler2DShadow samp[2];\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(binding = 0) buffer Out { highp float o[4]; };\n"
+        "void main()\n"
+        "{\n"
+        "    o[0] = texture(samp[0], vec3(0.25, 0.5, 0.5));\n"
+        "    o[1] = texture(samp[0], vec3(0.25, 0.5, 0.125));\n"
+        "    o[2] = texture(samp[1], vec3(0.75, 0.5, 0.5));\n"
+        "    o[3] = texture(samp[1], vec3(0.75, 0.5, 0.9));\n"
+        "}\n";
+
+    glGenTextures(1, &t0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, 2, 2, 0, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+
+    glGenTextures(1, &t1);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, t1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, 2, 2, 0, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+
+    prog = mgl_make_program_cs(cs);
+    EXPECT_NE(prog, 0);
+    if (!prog) return;
+
+    glGenBuffers(1, &sbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, sbo);
+    float zero[4] = { -1, -1, -1, -1 };
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof zero, zero, GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sbo);
+
+    glUseProgram(prog);
+    glDispatchCompute(1, 1, 1);
+    EXPECT_NO_GL_ERROR();
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    float *m = glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_READ_ONLY);
+
+    if (m) {
+        /* NEAREST at (0.25,0.5) -> texel(0,1) = 0.25; at (0.75,0.5) -> texel(1,1) = 0.75;
+         * GL_LEQUAL: result = (ref <= depth) */
+        printf("  shadow array: %g %g %g %g (expect 0 1 1 0)\n", m[0], m[1], m[2], m[3]);
+        mgl_test_checks++;
+        if (m[0] != 0.0f || m[1] != 1.0f || m[2] != 1.0f || m[3] != 0.0f)
+            MGL_FAIL("compute shadow sampler array element 1 lost its compare function");
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    } else {
+        MGL_FAIL("map failed");
+    }
+    glDeleteProgram(prog);
+    glDeleteBuffers(1, &sbo);
+    glDeleteTextures(1, &t0);
+    glDeleteTextures(1, &t1);
+}
+
+/* dEQP-GL45-ES31 opaque_type_indexing atomic_counter.*_vertex (r63): an
+ * atomic_uint ARRAY is one buffer binding (the elements live inside it), not
+ * one Metal argument per element; the per-element expansion filled all 32
+ * vertex buffer slots and failed the draw. */
+TEST(Es32AtomicCounterArrayVertex)
+{
+    static const char *vs =
+        "#version 320 es\n"
+        "layout(binding = 0) uniform atomic_uint counter[1024];\n"
+        "in highp vec4 a_position;\n"
+        "flat out highp uint r0;\n"
+        "flat out highp uint r1;\n"
+        "flat out highp uint r2;\n"
+        "flat out highp uint r3;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = a_position;\n"
+        "    gl_PointSize = 1.0;\n"
+        "    r0 = atomicCounterIncrement(counter[2]);\n"
+        "    r1 = atomicCounterIncrement(counter[2]);\n"
+        "    r2 = atomicCounterIncrement(counter[0]);\n"
+        "    r3 = atomicCounterIncrement(counter[0]);\n"
+        "}\n";
+    static const char *fs =
+        "#version 320 es\n"
+        "flat in highp uint r0, r1, r2, r3;\n"
+        "layout(location = 0) out highp uvec4 o;\n"
+        "void main() { o = uvec4(r0, r1, r2, r3); }\n";
+    GLuint p = mgl_make_program(vs, fs);
+
+    EXPECT_NE(p, 0);
+    if (!p) return;
+
+    GLuint cbo;
+    glGenBuffers(1, &cbo);
+    glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, cbo);
+    GLuint zero[1024] = { 0 };
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof zero, zero, GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 0, cbo);
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 1, 1);
+    GLuint fbo;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0);
+
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    float pos[4] = { 0, 0, 0, 1 };
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    GLint a = glGetAttribLocation(p, "a_position");
+    glEnableVertexAttribArray(a);
+    glVertexAttribPointer(a, 4, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glViewport(0, 0, 1, 1);
+    glUseProgram(p);
+    glDrawArrays(GL_POINTS, 0, 1);
+    EXPECT_NO_GL_ERROR();
+
+    GLuint px[4];
+    glReadPixels(0, 0, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, px);
+    printf("  atomic array vertex: %u %u %u %u (expect 0 1 0 1)\n", px[0], px[1], px[2], px[3]);
+    mgl_test_checks++;
+    if (px[0] != 0 || px[1] != 1 || px[2] != 0 || px[3] != 1)
+        MGL_FAIL("vertex atomic counter array return values wrong");
+
+    GLuint cnt[4] = { 0 };
+    glGetBufferSubData(GL_ATOMIC_COUNTER_BUFFER, 0, sizeof cnt, cnt);
+    mgl_test_checks++;
+    if (cnt[0] != 2 || cnt[2] != 2)
+        MGL_FAIL("vertex atomic counter array buffer wrong");
+
+    glDeleteProgram(p);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &cbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &tex);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 int main(void)
 {
     RUN(TessEsExtIsolinesOnePatchVertex);
     RUN(TessEsExtIsolinesCtsSweep);
     RUN(TessEsShadowLodCompat);
+    RUN(Es32ComputeShadowSamplerArray);
+    RUN(Es32AtomicCounterArrayVertex);
     return mgl_test_summary();
 }

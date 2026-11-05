@@ -684,6 +684,16 @@ static char kComputeFallbackKey;
                     SpirvResource *sres = &STATE(program)->spirv_resources_list[stage][spvc_type].list[i];
 
                     elems = sres->array_size ? sres->array_size : 1;
+
+                    /* an atomic_uint ARRAY (layout(binding=0) uniform atomic_uint c[1024])
+                     * is a SINGLE buffer binding whose storage holds every element —
+                     * GL 4.6 7.7.2 lays the counters out inside the bound buffer and
+                     * SPIRV-Cross emits one [[buffer(b)]] device pointer.  Expanding it
+                     * like a uniform/SSBO instance array consumed one Metal argument per
+                     * element, filled all 32 vertex buffer slots and failed the draw
+                     * (dEQP opaque_type_indexing atomic_counter.*_vertex). */
+                    if (spvc_type == SPVC_RESOURCE_TYPE_ATOMIC_COUNTER)
+                        elems = 1;
                 }
 
                 for (GLuint e = 0; e < elems && buffer_map->count < MAX_MAPPED_BUFFERS; e++)

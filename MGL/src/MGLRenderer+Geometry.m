@@ -5189,7 +5189,15 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
  * program); fall back to the texture index when it cannot be found. */
 - (NSUInteger) geomComputeSamplerSlotForImage: (const char *)img_name textureSlot: (NSUInteger)tslot
 {
-    static struct { const void *program; const void *msl; char name[96]; NSUInteger slot; } cache[8];
+    /* the parse result is the array's BASE sampler slot; per element e the MSL
+     * argument (array<sampler, n> sSmplr [[sampler(base)]]) occupies base..base+n-1.
+     * The caller passes this resource's texture slot (mtl_index + e), so e is
+     * recovered from the pair's [[texture(base)]] declaration.  Binding every
+     * element at the base slot left array elements past 0 on Metal's default
+     * sampler -- a shadow sampler array's element 1 then lost its compare
+     * function and sample_compare returned the raw depth (dEQP
+     * opaque_type_indexing sampler.*shadow compute). */
+    static struct { const void *program; const void *msl; char name[96]; NSUInteger smp_base; NSUInteger tex_base; bool hit; } cache[8];
     if (!ctx || !ctx->state.program) return tslot;
     const char *msl = ctx->state.program->spirv[_COMPUTE_SHADER].msl_str;
     if (!msl || !img_name || !*img_name) return tslot;
@@ -5201,26 +5209,39 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
     for (int i = 0; i < 8; i++)
         if (cache[i].program == (const void *)ctx->state.program && cache[i].msl == (const void *)msl &&
             strncmp(cache[i].name, img_name, sizeof cache[i].name) == 0)
-            return cache[i].slot;
+        {
+            if (!cache[i].hit) return tslot;
+            NSUInteger e = (tslot >= cache[i].tex_base) ? (tslot - cache[i].tex_base) : 0;
+            return cache[i].smp_base + e;
+        }
     for (int i = 0; i < 8; i++) if (!cache[i].program) { ci = i; break; }
     if (ci < 0) { ci = 0; memset(cache, 0, sizeof cache); }
 
     /* the pair is emitted adjacently: ... texture2d<float> s [[texture(1)]],
-     * sampler sSmplr [[sampler(0)]] ... */
-    char pat[128];
+     * sampler sSmplr [[sampler(0)]] ...  (arrays: array<texture2d<float>, n> s
+     * [[texture(1)]], array<sampler, n> sSmplr [[sampler(0)]>) */
+    char pat[128], tpat[128];
     snprintf(pat, sizeof pat, "%sSmplr [[sampler(", img_name);
+    snprintf(tpat, sizeof tpat, "%s [[texture(", img_name);
     const char *hit = strstr(msl, pat);
-    NSUInteger slot = tslot;
-    if (hit)
+    const char *thit = strstr(msl, tpat);
+    NSUInteger smp_base = tslot, tex_base = tslot;
+    if (hit && thit)
     {
         int v = atoi(hit + strlen(pat));
-        if (v >= 0) slot = (NSUInteger)v;
+        int w = atoi(thit + strlen(tpat));
+        if (v >= 0) smp_base = (NSUInteger)v;
+        if (w >= 0) tex_base = (NSUInteger)w;
     }
     cache[ci].program = (const void *)ctx->state.program;
     cache[ci].msl = (const void *)msl;
     snprintf(cache[ci].name, sizeof cache[ci].name, "%s", img_name);
-    cache[ci].slot = slot;
-    return slot;
+    cache[ci].smp_base = smp_base;
+    cache[ci].tex_base = tex_base;
+    cache[ci].hit = (hit && thit) ? true : false;
+    if (!cache[ci].hit) return tslot;
+    NSUInteger e = (tslot >= tex_base) ? (tslot - tex_base) : 0;
+    return smp_base + e;
 }
 
 - (void) geomBindRenderStageTextures: (id<MTLRenderCommandEncoder>) enc stage: (int) stage

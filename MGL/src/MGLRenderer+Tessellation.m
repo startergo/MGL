@@ -3569,6 +3569,13 @@ ph_vs = tessPhaseBegin();
                 for (unsigned k = 0; k < 8; k++)
                     NSLog(@"emudbg:  coord[%u] = (%.3f,%.3f,%.3f,%.3f)", k,
                           coord[k * 4], coord[k * 4 + 1], coord[k * 4 + 2], coord[k * 4 + 3]);
+                {
+                    /* TEMP-DIAG: the totals pair consumers read (capture count) */
+                    const uint32_t *tt = (const uint32_t *)((const uint8_t *)ring.contents +
+                                            dbg_emu_off + (size_t)(total_patches * 2) * 4);
+                    NSLog(@"emudbg:  totals pair = %u %u  (dbg_emu_off=%zu patches=%zu)",
+                          tt[0], tt[1], (size_t)dbg_emu_off, (size_t)total_patches);
+                }
                 if (off_capture)
                 {
                     const float *crec = (const float *)((const uint8_t *)ring.contents + off_capture);
@@ -4016,6 +4023,18 @@ ph_vs = tessPhaseBegin();
                     if (ccenc)
                     {
                         memcpy((uint8_t *)ring.contents + cnt_off, &n, 4);
+                {
+                    /* the geometry import reads cnt[0] = records, cnt[1] = indices
+                     * (prims = nidx / k).  The GPU path's count pair lives in the
+                     * tessellator's totals and has both; this CPU-written word had
+                     * only the record count, so the import assembled ZERO primitives
+                     * (dEQP primitive_bounding_box's 1152-patch grid hit the CPU
+                     * fallback through the scratch budget and drew nothing).  In
+                     * emission order the record count IS the index-list length;
+                     * point_mode has one record (and one primitive) per vertex. */
+                    uint32_t cpair[2] = { n, tp->point_mode ? n : icount };
+                    memcpy((uint8_t *)ring.contents + cnt_off, cpair, sizeof cpair);
+                }
                         if (icount)
                         {
                             /* perm[i] = coords[index[i]]: float4 gather in emission order */

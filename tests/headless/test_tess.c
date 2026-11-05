@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <dlfcn.h>
 #include "glcorearb.h"
 #include "mgl_test.h"
 #include "mgl_tess_diag.h"
@@ -2735,6 +2736,264 @@ TEST(TessXfbCpuFallbackRasterizes)
     glDeleteVertexArrays(1, &vao);
 }
 
+    /* ---- GL_ARB_ES3_2_compatibility ----------------------------------------- */
+
+/* glPrimitiveBoundingBoxARB is exported and dlsym-resolvable (the CTS binds
+ * entry points by name), the state is queryable in every glGet type, and the
+ * initial value is the spec's (-1,-1,-1,1,1,1,1,1).  It is a rendering hint
+ * only (spec 23.10 / §14.1pbb: fragments outside the box "may or may not be
+ * generated"), so no rendering effect is expected or verified. */
+TEST(TessES32EntryAndState)
+{
+    typedef void (*pbb_t)(float, float, float, float, float, float, float, float);
+    pbb_t fn = (pbb_t)dlsym(RTLD_DEFAULT, "glPrimitiveBoundingBoxARB");
+
+    EXPECT_NE((void *)fn, NULL);
+    if (!fn)
+        return;
+
+    /* initial value */
+    float v[8] = { 0 };
+    glGetFloatv(GL_PRIMITIVE_BOUNDING_BOX_ARB, v);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (v[0] != -1 || v[1] != -1 || v[2] != -1 || v[3] != 1 ||
+        v[4] != 1 || v[5] != 1 || v[6] != 1 || v[7] != 1)
+    {
+        printf("  bad initial bbox: %g %g %g %g / %g %g %g %g\n",
+               v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        MGL_FAIL("initial GL_PRIMITIVE_BOUNDING_BOX_ARB wrong");
+    }
+
+    fn(-2.0f, -0.75f, -1.5f, 1.25f, 0.5f, 0.25f, 2.5f, 2.0f);
+    glGetFloatv(GL_PRIMITIVE_BOUNDING_BOX_ARB, v);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (v[0] != -2.0f || v[1] != -0.75f || v[2] != -1.5f || v[3] != 1.25f ||
+        v[4] != 0.5f || v[5] != 0.25f || v[6] != 2.5f || v[7] != 2.0f)
+        MGL_FAIL("glPrimitiveBoundingBoxARB state not stored");
+
+    /* same state through the other glGet types (dEQP state_query group) */
+    GLboolean b[8];
+    glGetBooleanv(GL_PRIMITIVE_BOUNDING_BOX_ARB, b);
+    mgl_test_checks++;
+    if (b[0] != GL_TRUE || b[7] != GL_TRUE)
+        MGL_FAIL("GetBooleanv(GL_PRIMITIVE_BOUNDING_BOX_ARB)");
+
+    GLint i[8] = { 0 };
+    glGetIntegerv(GL_PRIMITIVE_BOUNDING_BOX_ARB, i);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (i[0] != -2 || i[4] != 1)     /* GL rounds float->int to nearest */
+    {
+        printf("  int = %d %d %d %d / %d %d %d %d\n", i[0], i[1], i[2], i[3], i[4], i[5], i[6], i[7]);
+        MGL_FAIL("GetIntegerv(GL_PRIMITIVE_BOUNDING_BOX_ARB)");
+    }
+
+    GLint64 q[8] = { 0 };
+    glGetInteger64v(GL_PRIMITIVE_BOUNDING_BOX_ARB, q);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (q[0] != -2)
+    {
+        printf("  int64 = %lld\n", (long long)q[0]);
+        MGL_FAIL("GetInteger64v(GL_PRIMITIVE_BOUNDING_BOX_ARB)");
+    }
+
+    /* restore the default for other tests */
+    fn(-1, -1, -1, 1, 1, 1, 1, 1);
+}
+
+TEST(TessES32LineWidthQueries)
+{
+    float r[2] = { 0, 0 }, g = 0;
+
+    glGetFloatv(GL_MULTISAMPLE_LINE_WIDTH_RANGE_ARB, r);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (!(r[0] >= 1.0f && r[1] >= r[0]))
+    {
+        printf("  ms line width range = %g..%g\n", r[0], r[1]);
+        MGL_FAIL("GL_MULTISAMPLE_LINE_WIDTH_RANGE_ARB < spec minimum (1,1)");
+    }
+
+    glGetFloatv(GL_MULTISAMPLE_LINE_WIDTH_GRANULARITY_ARB, &g);
+    EXPECT_NO_GL_ERROR();
+    mgl_test_checks++;
+    if (!(g > 0.0f))
+        MGL_FAIL("GL_MULTISAMPLE_LINE_WIDTH_GRANULARITY_ARB must be positive");
+}
+
+/* desktop GLSL + '#extension GL_ARB_ES3_2_compatibility : require' + the
+ * gl_BoundingBox[] per-patch output (the dEQP primitive_bounding_box TCS
+ * specialization for a core context) links and draws; the bounding box is a
+ * no-effect hint (see mgl_tess_es32_compat). */
+TEST(TessES32DesktopBoundingBoxShader)
+{
+    static const char *vs =
+        "#version 460 core\n"
+        "out vec4 vs_col;\n"
+        "void main()\n"
+        "{\n"
+        "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "    vs_col = vec4(0, 1, 0, 1);\n"
+        "}\n";
+    static const char *tcs =
+        "#version 460 core\n"
+        "#extension GL_ARB_ES3_2_compatibility : require\n"
+        "layout(vertices=3) out;\n"
+        "in vec4 vs_col[];\n"
+        "out vec4 tcs_col[];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "    tcs_col[gl_InvocationID] = vs_col[gl_InvocationID];\n"
+        "    gl_TessLevelOuter[0] = 1.0;\n"
+        "    gl_TessLevelOuter[1] = 1.0;\n"
+        "    gl_TessLevelOuter[2] = 1.0;\n"
+        "    gl_TessLevelInner[0] = 1.0;\n"
+        "    gl_BoundingBox[0] = vec4(-1.0, -1.0, -1.0, 1.0);\n"
+        "    gl_BoundingBox[1] = vec4( 1.0,  1.0,  1.0, 1.0);\n"
+        "}\n";
+    static const char *tes =
+        "#version 460 core\n"
+        "layout(triangles, equal_spacing) in;\n"
+        "in vec4 tcs_col[];\n"
+        "out vec4 tes_col;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = (gl_in[0].gl_Position * gl_TessCoord.x +\n"
+        "                   gl_in[1].gl_Position * gl_TessCoord.y +\n"
+        "                   gl_in[2].gl_Position * gl_TessCoord.z);\n"
+        "    tes_col = tcs_col[0];\n"
+        "}\n";
+    static const char *fs =
+        "#version 460 core\n"
+        "in vec4 tes_col; out vec4 o;\n"
+        "void main(){ o = tes_col; }\n";
+    GLuint p = mgl_make_program5(vs, tcs, tes, NULL, fs);
+
+    EXPECT_NE(p, 0);
+    if (!p)
+        return;
+
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte px[3] = { 0, 0, 0 };
+    glReadPixels(8, 8, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+    mgl_test_checks++;
+    if (px[1] < 200)
+        MGL_FAIL("expected green");
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* ESSL 3.20 (#version 320 es): gl_BoundingBox is a core builtin there and
+ * glslang lowers it to a plain patch out array, which MGL captures in the
+ * TCS record like any per-patch array (no tess-factor semantics). */
+TEST(TessES32Essl320Tess)
+{
+    static const char *vs =
+        "#version 320 es\n"
+        "out highp vec4 vs_col;\n"
+        "void main()\n"
+        "{\n"
+        "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+        "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "    vs_col = vec4(0, 1, 0, 1);\n"
+        "}\n";
+    static const char *tcs =
+        "#version 320 es\n"
+        "layout(vertices=3) out;\n"
+        "in highp vec4 vs_col[];\n"
+        "out highp vec4 tcs_col[];\n"
+        "void main()\n"
+        "{\n"
+        "    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "    tcs_col[gl_InvocationID] = vs_col[gl_InvocationID];\n"
+        "    gl_TessLevelOuter[0] = 1.0;\n"
+        "    gl_TessLevelOuter[1] = 1.0;\n"
+        "    gl_TessLevelOuter[2] = 1.0;\n"
+        "    gl_TessLevelInner[0] = 1.0;\n"
+        "    gl_BoundingBox[0] = vec4(-1.0, -1.0, -1.0, 1.0);\n"
+        "    gl_BoundingBox[1] = vec4( 1.0,  1.0,  1.0, 1.0);\n"
+        "}\n";
+    static const char *tes =
+        "#version 320 es\n"
+        "layout(triangles, equal_spacing) in;\n"
+        "in highp vec4 tcs_col[];\n"
+        "out highp vec4 tes_col;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = (gl_in[0].gl_Position * gl_TessCoord.x +\n"
+        "                   gl_in[1].gl_Position * gl_TessCoord.y +\n"
+        "                   gl_in[2].gl_Position * gl_TessCoord.z);\n"
+        "    tes_col = tcs_col[0];\n"
+        "}\n";
+    static const char *fs =
+        "#version 320 es\n"
+        "in highp vec4 tes_col; out highp vec4 o;\n"
+        "void main(){ o = tes_col; }\n";
+    GLuint p = mgl_make_program5(vs, tcs, tes, NULL, fs);
+
+    EXPECT_NE(p, 0);
+    if (!p)
+        return;
+
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glUseProgram(p);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    EXPECT_NO_GL_ERROR();
+    GLubyte px[3] = { 0, 0, 0 };
+    glReadPixels(8, 8, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+    mgl_test_checks++;
+    if (px[1] < 200)
+        MGL_FAIL("expected green");
+    glDeleteProgram(p);
+    glDeleteVertexArrays(1, &vao);
+}
+
+/* ESSL 3.20 audit: every shader stage accepts '#version 320 es' (geometry and
+ * tessellation are ES 3.2 core; no EXT extension directives needed) */
+TEST(TessES32Essl320Stages)
+{
+    static const char *gs =
+        "#version 320 es\n"
+        "layout(points) in; layout(points, max_vertices=1) out;\n"
+        "void main(){ gl_Position = vec4(0); EmitVertex(); }\n";
+    static const char *cs =
+        "#version 320 es\n"
+        "layout(local_size_x=1) in;\n"
+        "layout(binding=0) buffer B { highp vec4 v[]; };\n"
+        "void main(){ v[0] = vec4(1.0); }\n";
+    GLuint s = glCreateShader(GL_GEOMETRY_SHADER);
+    GLint ok = 0;
+
+    glShaderSource(s, 1, &gs, NULL);
+    glCompileShader(s);
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    EXPECT_NE(ok, 0);
+    glDeleteShader(s);
+
+    s = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(s, 1, &cs, NULL);
+    glCompileShader(s);
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    EXPECT_NE(ok, 0);
+    glDeleteShader(s);
+}
+
 int main(void)
 {
     if (getenv("GRID")) {
@@ -2800,6 +3059,12 @@ int main(void)
     RUN(FragLateTestsSideEffects);
     RUN(DrawIdSurvivesLinkCache);
     RUN(ClipDistance130Link);
+
+    RUN(TessES32EntryAndState);
+    RUN(TessES32LineWidthQueries);
+    RUN(TessES32DesktopBoundingBoxShader);
+    RUN(TessES32Essl320Tess);
+    RUN(TessES32Essl320Stages);
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }

@@ -297,6 +297,15 @@ Texture *mgl_fb_attachment_texture(GLMContext ctx, FBOAttachment *att)
         return rb->tex;
     }
 
+    /* deleted while attached to this (unbound) framebuffer: the image is
+     * "specifically not detached" (GL 4.6 5.1.3, ARB_framebuffer_object
+     * DeleteTextures) and keeps the storage — textures.c parks the object
+     * under the sentinel name, so the attachment is still complete and
+     * renderable (dEQP-GL45-ES31 primitive_bounding_box's glu::Texture
+     * destroys the colour attachment before the first draw). */
+    if (att->buf.tex && att->buf.tex->name == TEX_OBJ_RES_NAME)
+        return att->buf.tex;
+
     Texture *tex = findTexture(ctx, att->texture);
     if (!tex || tex != att->buf.tex)
         return NULL;
@@ -311,6 +320,8 @@ static bool attachmentIsLive(GLMContext ctx, FBOAttachment *att)
         Renderbuffer *rb = findRenderbuffer(ctx, att->texture);
         return rb && rb == att->buf.rbo;
     }
+    if (att->buf.tex && att->buf.tex->name == TEX_OBJ_RES_NAME)
+        return true;
     Texture *tex = findTexture(ctx, att->texture);
     return tex && tex == att->buf.tex;
 }

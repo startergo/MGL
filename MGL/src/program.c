@@ -3988,15 +3988,24 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
     {
         uint64_t same_group = 0;
         bool same_set = true;
+        int n_grouped = 0, n_fresh = 0;
         for (int i_ = 0; i_ < obj->num_attached; i_++)
         {
             Shader *s_ = obj->attached[i_];
             if (!s_->compiled_glsl_shader) { same_set = false; break; }
             uint64_t g_ = mgl_glslang_cache_group(s_->compiled_glsl_shader);
-            if (g_ == 0) continue;                 /* never linked: fresh, safe */
+            if (g_ == 0) { n_fresh++; continue; }   /* never linked: fresh */
+            n_grouped++;
             if (same_group == 0) same_group = g_;
             else if (same_group != g_) { same_set = false; break; }
         }
+        /* fresh stages ADDED to a previously linked set make a different stage
+         * set (dEQP primitive_bounding_box links VS+TCS+TES+FS, then
+         * VS+TCS+TES+GS+FS from the same shaders): the stale baked locations
+         * then fail the cross-stage check ("Layout location qualifier must
+         * match") before any re-mapping can run. */
+        if (n_fresh > 0 && n_grouped > 0)
+            same_set = false;
         if (!same_set)
             /* stale intermediates from two DIFFERENT programs are mixed in:
              * stop sharing every attached stage that carries one */

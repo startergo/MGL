@@ -255,6 +255,7 @@ static void buildCompressedFormats(void)
  * (no binary formats exposed), pipeline statistics, sparse, bindless. */
 static const char *mgl_extensions[] = {
     "GL_ARB_ES2_compatibility",
+    "GL_ARB_ES3_2_compatibility",
     "GL_ARB_ES3_compatibility",
     "GL_ARB_arrays_of_arrays",
     "GL_ARB_base_instance",

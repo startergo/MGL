@@ -225,6 +225,8 @@ static const char *error_name(GLenum error)
 /* called by error_func() for every GL error */
 void mgl_debug_report_error(GLMContext ctx, const char *func, GLenum error)
 {
+    if (getenv("MGL_ERR_TRACE"))
+        fprintf(stderr, "MGL-ERR %s: 0x%04x (%s)\n", func ? func : "?", error, error_name(error));
     if (!ctx || !DBG(ctx) || !ctx->state.caps.debug_output)
         return;
 
