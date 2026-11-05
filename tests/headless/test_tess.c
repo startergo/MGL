@@ -47,11 +47,11 @@ static const char *kTesTri =
     "  f_col = gl_TessCoord.x * tc_col[0] + gl_TessCoord.y * tc_col[1] + gl_TessCoord.z * tc_col[2];\n"
     "}\n";
 
-static GLuint make_program(const char *tcs, const char *tes)
+static GLuint make_program_full(const char *vs, const char *tcs, const char *tes)
 {
     GLuint p = glCreateProgram();
     struct { GLenum t; const char *s; } srcs[4] = {
-        { GL_VERTEX_SHADER, kVs },
+        { GL_VERTEX_SHADER, vs },
         { GL_TESS_CONTROL_SHADER, tcs },
         { GL_TESS_EVALUATION_SHADER, tes },
         { GL_FRAGMENT_SHADER, kFs },
@@ -75,6 +75,11 @@ static GLuint make_program(const char *tcs, const char *tes)
     }
     glLinkProgram(p);
     return p;
+}
+
+static GLuint make_program(const char *tcs, const char *tes)
+{
+    return make_program_full(kVs, tcs, tes);
 }
 
 /* full-viewport triangle covering the lower-left half: corners (0,1),(0,0),(1,0) */
@@ -1374,9 +1379,391 @@ TEST(TessIndexedAndInstanced)
     glDeleteProgram(prog);
 }
 
-TEST(TessOrientationCulling)
+/* ------------------------------------------------------------------ instanced patches
+ * glDrawArraysInstanced(GL_PATCHES, ...): the TCS kernel writes one half-factor
+ * record per (instance, patch) — the GLOBAL patch index — while gl_PrimitiveID
+ * restarts at 0 for every instance (GL 4.6 table 11.1).  A regression in the
+ * MSL rewrite (the record subscript matched only `spvTessLevel[gl_PrimitiveID]`,
+ * not the `int(...)`-cast spelling SPIRV-Cross also emits) wrote every patch's
+ * factors to record [0]: instance 1 was culled by the hardware tessellator and
+ * rendered nothing.  These tests render two instances with a per-instance
+ * attribute and check the image exactly. */
+
+static const char *kInstVs =
+    "#version 450 core\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "layout(location=2) in vec4 a_ic;        /* xy offset (divisor 1), z colour */\n"
+    "out vec2 v_pos; out float v_sel;\n"
+    "void main() { v_pos = a_pos * 0.25 + a_ic.xy; v_sel = a_ic.z; }\n";
+static const char *kInstTcs =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec2 v_pos[]; layout(location=1) in float v_sel[];\n"
+    "layout(location=0) out vec2 tc_pos[]; layout(location=1) out float tc_sel[];\n"
+    "void main() {\n"
+    "  tc_pos[gl_InvocationID] = v_pos[gl_InvocationID];\n"
+    "  tc_sel[gl_InvocationID] = v_sel[gl_InvocationID];\n"
+    "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0]=3.0; gl_TessLevelOuter[1]=3.0;\n"
+    "    gl_TessLevelOuter[2]=3.0; gl_TessLevelInner[0]=3.0; }\n"
+    "}\n";
+static const char *kInstTes =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec2 tc_pos[]; layout(location=1) in float tc_sel[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  vec2 p = gl_TessCoord.x * tc_pos[0] + gl_TessCoord.y * tc_pos[1] + gl_TessCoord.z * tc_pos[2];\n"
+    "  gl_Position = vec4(p, 0.0, 1.0);\n"
+    "  float s = gl_TessCoord.x * tc_sel[0] + gl_TessCoord.y * tc_sel[1] + gl_TessCoord.z * tc_sel[2];\n"
+    "  f_col = (s > 0.5) ? vec4(0, 1, 0, 1) : vec4(1, 0, 0, 1);\n"
+    "}\n";
+static const char *kInstTesNoTcs =
+    "#version 450 core\n"
+    "layout(triangles, equal_spacing, ccw) in;\n"
+    "layout(location=0) in vec2 v_pos[]; layout(location=1) in float v_sel[];\n"
+    "layout(location=0) out vec4 f_col;\n"
+    "void main() {\n"
+    "  vec2 p = gl_TessCoord.x * v_pos[0] + gl_TessCoord.y * v_pos[1] + gl_TessCoord.z * v_pos[2];\n"
+    "  gl_Position = vec4(p, 0.0, 1.0);\n"
+    "  float s = gl_TessCoord.x * v_sel[0] + gl_TessCoord.y * v_sel[1] + gl_TessCoord.z * v_sel[2];\n"
+    "  f_col = (s > 0.5) ? vec4(0, 1, 0, 1) : vec4(1, 0, 0, 1);\n"
+    "}\n";
+
+/* control triangle: pos*0.25 gives legs of 1.0 in NDC; instance 0 shifts it to
+ * (-0.35,-0.35) -> red triangle {x>=-0.6, y>=-0.6, x+y<=-0.2}; instance 1 shifts
+ * to (0.35,0.35) and draws second -> green {x>=0.1, y>=0.1, x+y<=1.2} */
+static const float kInstPos[3][2] = { { -1, -1 }, { 3, -1 }, { -1, 3 } };
+static const float kInstIc[2][4] = {
+    { -0.35f, -0.35f, 0.0f, 0.0f },
+    {  0.35f,  0.35f, 1.0f, 0.0f },
+};
+
+/* exact image check for the two-instance draw: every pixel centre strictly
+ * inside a triangle must carry that instance's colour, everything outside both
+ * stays clear.  A 1.5-pixel band around each triangle edge is skipped (shared
+ * edge sampling / rasterization rules). */
+static void check_two_instance_image(const char *tag, int with_green)
 {
-    glViewport(0, 0, 200, 200);   /* these pixel checks assume a 200x200 window */
+    static float img[512 * 512 * 4];
+    GLint vp[4] = { 0, 0, 0, 0 };
+    int w, h, bad = 0, red = 0, green = 0;
+
+    glGetIntegerv(GL_VIEWPORT, vp);
+    w = vp[2] > 0 ? vp[2] : 96;
+    h = vp[3] > 0 ? vp[3] : 96;
+    if (w > 512 || h > 512) w = h = 512;
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, img);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            const float *c = &img[(y * w + x) * 4];
+            float nx = (x + 0.5f) / w * 2 - 1, ny = (y + 0.5f) / h * 2 - 1;
+            /* margins: ~1.5 px in NDC units; skip pixels within any boundary band */
+            float mx = 3.0f / w, my = 3.0f / h;
+            int in_r = (nx >= -0.6f + mx) && (ny >= -0.6f + my) && (nx + ny <= -0.2f - mx - my);
+            int in_g = with_green && (nx >= 0.1f + mx) && (ny >= 0.1f + my) && (nx + ny <= 1.2f - mx - my);
+            int near_r = (fabsf(nx + 0.6f) < mx) || (fabsf(ny + 0.6f) < my) ||
+                         (fabsf(nx + ny + 0.2f) < mx + my);
+            int near_g = with_green && ((fabsf(nx - 0.1f) < mx) || (fabsf(ny - 0.1f) < my) ||
+                         (fabsf(nx + ny - 1.2f) < mx + my));
+            int lit = (c[0] + c[1] + c[2]) > 0.2f;
+
+            if (near_r || near_g) continue;                  /* skip edge bands */
+            if (c[0] > 0.9f && c[1] < 0.1f) red++;
+            if (c[1] > 0.9f && c[0] < 0.1f) green++;
+            if (in_r && !(c[0] > 0.5f && c[1] < 0.5f))
+            { if (bad++ < 6) printf("  %s: want red at %d,%d got %.2f %.2f %.2f\n", tag, x, y, c[0], c[1], c[2]); }
+            else if (in_g && !(c[1] > 0.5f && c[0] < 0.5f))
+            { if (bad++ < 6) printf("  %s: want green at %d,%d got %.2f %.2f %.2f\n", tag, x, y, c[0], c[1], c[2]); }
+            else if (!in_r && !in_g && lit)
+            { if (bad++ < 6) printf("  %s: want clear at %d,%d got %.2f %.2f %.2f\n", tag, x, y, c[0], c[1], c[2]); }
+        }
+    printf("  %s: red=%d green=%d bad=%d\n", tag, red, green, bad);
+    EXPECT_TRUE(red > 200);
+    if (with_green) EXPECT_TRUE(green > 200);
+    EXPECT_EQ_INT(bad, 0);
+}
+
+static void setup_inst_vao(void)
+{
+    GLuint vao, b[2];
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(2, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof kInstPos, kInstPos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof kInstIc, kInstIc, GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glVertexAttribDivisor(2, 1);
+    glEnableVertexAttribArray(2);
+}
+
+TEST(TessInstancedPerInstanceAttrib)
+{
+    glViewport(0, 0, 96, 96);
+    GLuint prog = make_program_full(kInstVs, kInstTcs, kInstTes);
+    glUseProgram(prog);
+    setup_inst_vao();
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstanced(GL_PATCHES, 0, 3, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    check_two_instance_image("tcs-2inst", 1);
+    glDeleteProgram(prog);
+}
+
+TEST(TessInstancedNoTcsDefaultLevels)
+{
+    /* no TCS: the TES reads the vertex kernel's output record directly (its
+       inputs must match the VS outputs by name); the default levels come from
+       glPatchParameterfv.  Both instances must still render. */
+    glViewport(0, 0, 96, 96);
+    GLuint prog = make_program_full(kInstVs, NULL, kInstTesNoTcs);
+    glUseProgram(prog);
+    setup_inst_vao();
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, (float[4]){ 3, 3, 3, 3 });
+    glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, (float[2]){ 3, 3 });
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstanced(GL_PATCHES, 0, 3, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    check_two_instance_image("notcs-2inst", 1);
+    glDeleteProgram(prog);
+}
+
+TEST(TessInstancedPerPatchLevels)
+{
+    /* gl_PrimitiveID restarts at 0 for every instance (GL 4.6): two patches per
+       instance, patch 1 writes level 3 and patch 0 writes 0 (culled).  Every
+       instance must therefore render exactly one triangle — its patch 1.  If
+       gl_PrimitiveID counted across instances, instance 1's patch 1 would be
+       patch 3 overall and cull, leaving one triangle. */
+    static const char *tcs_pid =
+        "#version 450 core\n"
+        "layout(vertices=3) out;\n"
+        "layout(location=0) in vec2 v_pos[]; layout(location=1) in float v_sel[];\n"
+        "layout(location=0) out vec2 tc_pos[]; layout(location=1) out float tc_sel[];\n"
+        "void main() {\n"
+        "  tc_pos[gl_InvocationID] = v_pos[gl_InvocationID];\n"
+        "  tc_sel[gl_InvocationID] = v_sel[gl_InvocationID];\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    float lv = (gl_PrimitiveID == 1) ? 3.0 : 0.0;\n"
+        "    gl_TessLevelOuter[0]=lv; gl_TessLevelOuter[1]=lv; gl_TessLevelOuter[2]=lv;\n"
+        "    gl_TessLevelInner[0]=lv; }\n"
+        "}\n";
+    glViewport(0, 0, 96, 96);
+    GLuint prog = make_program_full(kInstVs, tcs_pid, kInstTes);
+    glUseProgram(prog);
+    /* 6 vertices = 2 patches per instance, both the same base triangle: patch 1
+       (level 3) renders where patch 0 (level 0, culled) would be, so the image
+       is exactly the two-instance reference below */
+    GLuint vao, b[2];
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(2, b);
+    float pos6[6][2];
+    for (int i = 0; i < 6; i++)
+    {
+        pos6[i][0] = kInstPos[i % 3][0];
+        pos6[i][1] = kInstPos[i % 3][1];
+    }
+    const float ic[2][4] = { { -0.35f, -0.35f, 0.0f, 0.0f }, { 0.35f, 0.35f, 1.0f, 0.0f } };
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos6, pos6, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof ic, ic, GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glVertexAttribDivisor(2, 1);
+    glEnableVertexAttribArray(2);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstanced(GL_PATCHES, 0, 6, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    check_two_instance_image("primid-2x2", 1);
+    glDeleteProgram(prog);
+}
+
+TEST(TessInstancedIndexedTwoInstances)
+{
+    /* indexed patches with instanceCount 2: the per-instance offset must reach
+       both instances; patch 1 (indices 3..5) is the shifted triangle */
+    glViewport(0, 0, 96, 96);
+    GLuint prog = make_program_full(kInstVs, kInstTcs, kInstTes);
+    glUseProgram(prog);
+    GLuint vao, b[3];
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(3, b);
+    float pos6[6][2];
+    for (int i = 0; i < 3; i++)
+    {
+        pos6[i][0] = kInstPos[i][0];  pos6[i][1] = kInstPos[i][1];
+        pos6[3 + i][0] = kInstPos[i][0]; pos6[3 + i][1] = kInstPos[i][1];
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos6, pos6, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    const float ic[2][4] = {
+        { -0.35f, -0.35f, 0.0f, 0.0f },
+        {  0.35f,  0.35f, 1.0f, 0.0f },
+    };
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof ic, ic, GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glVertexAttribDivisor(2, 1);
+    glEnableVertexAttribArray(2);
+    const unsigned short ix[6] = { 0, 1, 2, 3, 4, 5 };
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b[2]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof ix, ix, GL_STATIC_DRAW);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElementsInstanced(GL_PATCHES, 6, GL_UNSIGNED_SHORT, NULL, 2);
+    EXPECT_NO_GL_ERROR();
+    glFinish();
+    check_two_instance_image("indexed-2inst", 1);
+    glDeleteProgram(prog);
+}
+
+/* ------------------------------------------------------------------ GPU/CPU parity
+ * The MGL_TESS_CPU reference path must render pixel-identical images to the
+ * hardware drawPatches path — it is the arbiter for every "which side is wrong"
+ * investigation.  The env flag is read once per process, so the test re-execs
+ * itself with MGL_TESS_CPU=1 and compares full-image hashes over a small case
+ * family (plain, instanced, no-TCS). */
+#include <mach-o/dyld.h>
+#include <unistd.h>
+
+static void parity_render(const char *tag, unsigned long long *hash, int *lit)
+{
+    const int W = 96;
+    GLuint vao, b[2];
+    glViewport(0, 0, W, W);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(2, b);
+    glBindBuffer(GL_ARRAY_BUFFER, b[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof kInstPos, kInstPos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, b[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof kInstIc, kInstIc, GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glVertexAttribDivisor(2, 1);
+    glEnableVertexAttribArray(2);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glClearColor(0, 0, 0, 1);
+
+    struct { const char *name; const char *tcs; const char *tes; int instances; } cases[] = {
+        { "tri",      kInstTcs, kInstTes,      1 },
+        { "tri_inst", kInstTcs, kInstTes,      2 },
+        { "notcs",    NULL,     kInstTesNoTcs, 2 },
+    };
+    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++)
+    {
+        GLuint prog = make_program_full(kInstVs, cases[c].tcs, cases[c].tes);
+        glUseProgram(prog);
+        glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, (float[4]){ 3, 3, 3, 3 });
+        glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, (float[2]){ 3, 3 });
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArraysInstanced(GL_PATCHES, 0, 3, cases[c].instances);
+        glFinish();
+        while (glGetError() != GL_NO_ERROR) {}
+        static float img[96 * 96 * 4];
+        unsigned long long h = 1469598103934665603ULL;
+        int l = 0;
+        glReadPixels(0, 0, W, W, GL_RGBA, GL_FLOAT, img);
+        for (int i = 0; i < W * W; i++) {
+            if (img[i*4] + img[i*4+1] + img[i*4+2] > 0.2f) l++;
+            for (int k = 0; k < 4; k++) {
+                unsigned u;
+                memcpy(&u, &img[i*4+k], 4);
+                h ^= u; h *= 1099511628211ULL;
+            }
+        }
+        if (hash) hash[c] = h;
+        if (lit) lit[c] = l;
+        printf("PARITY %s_%s lit=%d hash=%llu\n", tag, cases[c].name, l, h);
+        glDeleteProgram(prog);
+    }
+    glDeleteBuffers(2, b);
+    glDeleteVertexArrays(1, &vao);
+}
+
+static int tess_parity_child(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "--cpu-parity-child") != 0)
+        return 0;
+    parity_render("cpu", NULL, NULL);
+    fflush(stdout);
+    exit(0);
+}
+
+TEST(TessCpuReferenceParity)
+{
+    char self[4096];
+    uint32_t sz = sizeof self;
+    unsigned long long own_h[3];
+    int own_l[3];
+    int fds[2];
+    char line[256];
+
+    if (_NSGetExecutablePath(self, &sz) != 0)
+    { printf("  parity: self path failed\n"); return; }
+
+    parity_render("gpu", own_h, own_l);         /* this process: hardware path */
+
+    fflush(stdout);
+    if (pipe(fds) != 0) { EXPECT_TRUE(0); return; }
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        char *const env[] = { (char *)"MGL_TESS_CPU=1", NULL };
+        dup2(fds[1], 1);
+        close(fds[0]); close(fds[1]);
+        execve(self, (char *const[]){ self, (char *)"--cpu-parity-child", NULL }, env);
+        _exit(127);
+    }
+    close(fds[1]);
+    FILE *f = fdopen(fds[0], "r");
+    int n = 0, ok = 0;
+    while (fgets(line, sizeof line, f))
+    {
+        if (strncmp(line, "PARITY cpu_", 11) == 0 && n < 3)
+        {
+            int l = 0;
+            unsigned long long h = 0;
+            if (sscanf(line + 11, "%*[^=]=%d hash=%llu", &l, &h) == 2)
+            {
+                int match = (l == own_l[n]) && (h == own_h[n]);
+                printf("  parity case %d: cpu lit=%d hash=%llu vs gpu lit=%d hash=%llu %s\n",
+                       n, l, h, own_l[n], own_h[n], match ? "MATCH" : "MISMATCH");
+                ok += match;
+            }
+            n++;
+        }
+    }
+    fclose(f);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    EXPECT_EQ_INT(n, 3);
+    EXPECT_EQ_INT(ok, 3);
+}
+
+TEST(TessOrientationCulling)
+{    glViewport(0, 0, 200, 200);   /* these pixel checks assume a 200x200 window */
     /* front-face culling with vertex_order: a ccw patch in patch space must render
        with CULL_FACE BACK when glFrontFace matches the rstate convention */
     GLuint prog = make_program(kTcsTri, kTesTri);
@@ -3071,8 +3458,15 @@ TEST(TessES32Essl320Stages)
     glDeleteShader(s);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (tess_parity_child(argc, argv))
+        return 0;
+    RUN(TessInstancedPerInstanceAttrib);
+    RUN(TessInstancedNoTcsDefaultLevels);
+    RUN(TessInstancedPerPatchLevels);
+    RUN(TessInstancedIndexedTwoInstances);
+
     if (getenv("GRID")) {
         GLuint prog = make_program(kTcsTri, kTesTri);
         glUseProgram(prog);
@@ -3106,6 +3500,7 @@ int main(void)
     RUN(TessXfbPoints);
     RUN(TessGeometryMultiPatch);
     RUN(TessIndexedAndInstanced);
+    RUN(TessCpuReferenceParity);
     RUN(TessIndexedRestart);
     RUN(TessIndexedNoRescan);
     RUN(TessRestartCheckCached);

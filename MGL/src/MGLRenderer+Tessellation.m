@@ -1594,15 +1594,29 @@ static id<MTLComputePipelineState> tessGatherPSO(id<MTLDevice> device)
         "                            constant uint& minv [[buffer(7)]],\n"
         "                            constant uint& restart [[buffer(8)]],\n"
         "                            constant uint& modulo [[buffer(9)]],\n"
+        "                            constant uint& ninst [[buffer(10)]],\n"
+        "                            constant uint& vstride [[buffer(11)]],\n"
         "                            uint3 gid [[thread_position_in_grid]]) {\n"
         "    if (gid.x >= total) return;\n"
-        "    uint g = (modulo != 0u) ? (gid.x % modulo) : gid.x;\n"
+        "    /* gid.x enumerates (instance, index occurrence): dst holds one record per\n"
+        "       occurrence PER INSTANCE (the TCS reads cp record patch*pvin+i with the\n"
+        "       patch counted across instances).  The raw path passes modulo == 0 and\n"
+        "       total == count * ninst; the widened path passes the gapless list length\n"
+        "       in modulo.  The source records are the vertex kernel's output, laid out\n"
+        "       instance-major: record [instance * vstride + vertex], vstride = the\n"
+        "       vertex kernel's grid width.  (The old kernel indexed the source by the\n"
+        "       vertex alone and read the element buffer at gid.x: with instances > 1 it\n"
+        "       read past the element buffer and copied instance 0's records for every\n"
+        "       instance — per-instance attributes never reached instances > 0.) */\n"
+        "    uint occ_count = (modulo != 0u) ? modulo : ((ninst > 1u) ? (total / ninst) : total);\n"
+        "    uint g    = (occ_count != 0u) ? (gid.x % occ_count) : gid.x;\n"
+        "    uint inst = (occ_count != 0u) ? (gid.x / occ_count) : 0u;\n"
         "    uint v;\n"
         "    if (itype == 0u) v = ib[g];\n"
         "    else if (itype == 1u) v = ((device const ushort*)ib)[g];\n"
         "    else v = ((device const uint*)ib)[g];\n"
         "    if (restart != 0xffffffffu && v == restart) return;\n"
-        "    v += base - minv;\n"
+        "    v += base - minv + inst * vstride;\n"
         "    for (uint w = 0; w < words; w++)\n"
         "        dst[gid.x * words + w] = ((device const uint*)srcbuf)[v * words + w];\n"
         "}\n";
@@ -2905,6 +2919,12 @@ ph_vs = tessPhaseBegin();
         for (int gi = 0; gi < 6; gi++)
             [cenc setBytes: &gparams[gi] length: sizeof(uint32_t) atIndex: 3 + gi];
         [cenc setBytes: &tess_gather_modulo length: sizeof(uint32_t) atIndex: 9];
+        {
+            uint32_t ninst_g = (uint32_t)(instances > 0 ? instances : 1);
+            uint32_t vstride_g = (uint32_t)vcount;
+            [cenc setBytes: &ninst_g length: sizeof(uint32_t) atIndex: 10];
+            [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+        }
         [cenc dispatchThreadgroups: MTLSizeMake(groups, 1, 1) threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
 
         cp_source = ring;
@@ -2930,6 +2950,12 @@ ph_vs = tessPhaseBegin();
         [cenc setBuffer: ring offset: off_tcs_cp atIndex: 2];
         for (int gi = 0; gi < 7; gi++)
             [cenc setBytes: &gparams[gi] length: sizeof(uint32_t) atIndex: 3 + gi];
+        {
+            uint32_t ninst_g = (uint32_t)(instances > 0 ? instances : 1);
+            uint32_t vstride_g = (uint32_t)vcount;
+            [cenc setBytes: &ninst_g length: sizeof(uint32_t) atIndex: 10];
+            [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+        }
         [cenc dispatchThreadgroups: MTLSizeMake(groups, 1, 1) threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
         if (tTrace())
             NSLog(@"MGL tess: gather: gc=%u base=%u itype=%u minv=%u restart=%x modulo=%u widened=%d vfirst=%d vcount=%u",

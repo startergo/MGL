@@ -9626,28 +9626,60 @@ static char *tcs_patch_primid(const char *msl)
             names[n++] = po_name;
         for (int i = 0; i < n; i++)
         {
-            char *nw, *w;
-            char pat[160];
+            char *w = out;
+            size_t nl = strlen(names[i]);
 
-            snprintf(pat, sizeof pat, "%s[gl_PrimitiveID]", names[i]);
-            while ((w = strstr(out, pat)) != NULL)
+            /* the record subscript must become the GLOBAL patch index.  Two
+             * spellings occur: the plain `spvTessLevel[gl_PrimitiveID]` and the
+             * cast one `spvTessLevel[int(gl_PrimitiveID)]` (SPIRV-Cross inserts
+             * the int() cast when the access-chain index it recovered is signed).
+             * The plain-only pattern silently missed the cast spelling, so every
+             * patch of an instanced draw wrote factor record [gl_PrimitiveID %
+             * patches-per-instance] == [0] — the later patches' half records stayed
+             * zero and the hardware tessellator culled them (verified: a 2-instance
+             * GL_PATCHES draw rendered only instance 0).  Match BOTH. */
+            while ((w = strstr(w, names[i])) != NULL)
             {
-                char repl[160];
-                size_t off = (size_t)(w - out);
-                size_t tail_len = len - off - strlen(pat);   /* bytes behind the pattern */
+                char *at = w + nl;         /* just past the name */
+                char *idx, *end;
 
-                snprintf(repl, sizeof repl, "%s[mgl_pid_g]", names[i]);
-                nw = (char *)malloc(off + strlen(repl) + tail_len + 1);
-                if (!nw)
-                    break;
-                memcpy(nw, out, off);
-                memcpy(nw + off, repl, strlen(repl));
-                memcpy(nw + off + strlen(repl), w + strlen(pat), tail_len + 1);  /* + NUL */
-                free(out);
-                out = nw;
-                len = off + strlen(repl) + tail_len;
-                cap = len + 1;
-                w = out;
+                if (*at != '[')
+                {
+                    w = at;
+                    continue;
+                }
+                idx = at + 1;
+                if (strncmp(idx, "int(gl_PrimitiveID)]", 20) == 0)
+                    end = idx + 19;        /* at the ']' */
+                else if (strncmp(idx, "uint(gl_PrimitiveID)]", 21) == 0)
+                    end = idx + 20;
+                else if (strncmp(idx, "gl_PrimitiveID]", 15) == 0)
+                    end = idx + 14;
+                else
+                {
+                    w = at + 1;
+                    continue;
+                }
+                {
+                    char repl[160];
+                    size_t off = (size_t)(w - out);
+                    size_t span = (size_t)(end - w) + 1;    /* name[..] inclusive */
+                    size_t tail_len = len - off - span;
+                    char *nw;
+
+                    snprintf(repl, sizeof repl, "%s[mgl_pid_g]", names[i]);
+                    nw = (char *)malloc(off + strlen(repl) + tail_len + 1);
+                    if (!nw)
+                        break;
+                    memcpy(nw, out, off);
+                    memcpy(nw + off, repl, strlen(repl));
+                    memcpy(nw + off + strlen(repl), end + 1, tail_len + 1);  /* + NUL */
+                    free(out);
+                    out = nw;
+                    len = off + strlen(repl) + tail_len;
+                    cap = len + 1;
+                    w = out + off + strlen(repl);
+                }
             }
         }
     }
