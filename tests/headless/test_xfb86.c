@@ -12,9 +12,13 @@ static const char *kVS = "#version 400\n"
     "in vec4 vertex;\n"
     "void main (void) { gl_Position = vertex; }\n";
 static const char *kFS = "#version 400\n"
-    "in vec4 color;\n"
+    "in vec4 color;\n"     /* declared only: the streams GS emits pos0/pos1 and
+                            * no `color' output, and a statically referenced
+                            * input with no matching output is a link error
+                            * (GL 4.6 §7.4.1) — the capture tests never read
+                            * the FS output */
     "out vec4 outColor;\n"
-    "void main (void) { outColor = color; }\n";
+    "void main (void) { outColor = vec4(1.0); }\n";
 
 static GLuint link_xfb(const char *gs, const char *const *vars, int nvars, GLenum mode)
 {

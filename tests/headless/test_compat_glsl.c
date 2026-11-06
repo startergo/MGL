@@ -183,9 +183,12 @@ TEST(glsl_150_gl_per_vertex_redeclaration)
     if (!p) printf("     build log: %s\n", log);
     glDeleteProgram(p);
 
-    /* without the redeclaration the same shader must of course still work */
+    /* without the redeclaration the same shader must of course still work
+     * (the FS's vN needs the VS's vN: GL 4.6 7.4.1 makes an unmatched
+     * statically used input a link error) */
     const char *vs2 =
-        "#version 150\nin vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }\n";
+        "#version 150\nin vec3 position;\nout vec3 vN;\n"
+        "void main() { gl_Position = vec4(position, 1.0); vN = position; }\n";
     GLuint p2 = build(vs2, fs, log, sizeof log);
     EXPECT_TRUE(p2 != 0);
     glDeleteProgram(p2);

@@ -4061,10 +4061,26 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
              * with a note instead of failing the link (tessellation_shader_tc_barriers
              * barrier_guarded_read_write_calls links a 'patch out int r[16]' pair). */
             mgl_append_info_log(log, "WARNING: %s", info);
+            /* glslang's TIntermediate error count is sticky and lives on the
+             * shared TShader, not the program: every later link that borrows
+             * this stage fails silently (TProgram::linkStage returns
+             * getNumErrors()==0 with an empty log) — tombstone it */
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+                if (obj->attached[i_]->compiled_glsl_shader)
+                    mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
         }
         else
         {
             mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL link failed\n");
+            /* same sticky-error poisoning: a failed link (type mismatches,
+             * negative dEQP cases, ...) must stop every attached stage from
+             * being borrowable, or the next program linking the same sources
+             * dies with an empty "GLSL link failed" — dEQP
+             * shaders.linkage.gl45.tessellation.varying.rules.{output,
+             * internal}_{different_precision,superfluous_declaration} */
+            for (int i_ = 0; i_ < obj->num_attached; i_++)
+                if (obj->attached[i_]->compiled_glsl_shader)
+                    mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
             glslang_program_delete(glsl_program);
             return false;
         }
@@ -4164,6 +4180,11 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             {
                 const char *info2 = glslang_program_get_info_log(glsl_program);
                 mgl_append_info_log(log, "%s", (info2 && *info2) ? info2 : "ERROR: GLSL link failed\n");
+                /* sticky-error poisoning again — these were fresh compiles,
+                 * but their intermediates just took this link's error count */
+                for (int i_ = 0; i_ < obj->num_attached; i_++)
+                    if (obj->attached[i_]->compiled_glsl_shader)
+                        mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
                 glslang_program_delete(glsl_program);
                 return false;
             }
@@ -4295,6 +4316,21 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             {
                 mgl_append_info_log(log, "%s", cl);
                 free(cl);
+                ok = false;
+            }
+        }
+
+        /* tess r67: GL 4.6 §7.4.1 — a statically referenced input with no
+         * matching output in the previous attached stage is a link error;
+         * glslang's I/O mapper numbers the orphan and reports nothing, and the
+         * consumer then reads a record nobody writes (stale ring data) */
+        {
+            extern char *mgl_link_io_unmatched(const uint32_t *const *mods, const size_t *sizes, unsigned mask);
+            char *io = mgl_link_io_unmatched(mods, sizes, mask);
+            if (io)
+            {
+                mgl_append_info_log(log, "%s", io);
+                free(io);
                 ok = false;
             }
         }

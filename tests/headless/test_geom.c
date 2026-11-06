@@ -428,10 +428,13 @@ TEST(link_error_no_varying)
         "void main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n";
     GLuint p = program(vs, gs, fs);
     GLint ok = 0;
-    /* a geometry input the vertex stage never writes stays undefined in GL — the link
-     * must succeed (KHR-GL46.geometry_shader.output.vertex_emit_at_end) */
+    /* a statically used geometry input the vertex stage never writes has no
+     * matching output — a link error per GL 4.6 §7.4.1 (the geom emulation
+     * zero-fills such slots only across SEPARATE programs, where the interface
+     * mismatch stays legal: KHR-GL46.geometry_shader.output.vertex_emit_at_end
+     * links matched shaders and keeps passing either way) */
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    EXPECT_EQ_INT(ok, GL_TRUE);
+    EXPECT_EQ_INT(ok, GL_FALSE);
     glDeleteProgram(p);
 }
 

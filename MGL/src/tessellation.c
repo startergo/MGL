@@ -10201,6 +10201,341 @@ bool mgl_tess_stage_bound(GLMContext ctx)
     return false;
 }
 
+/* ---- link-time shader-interface matching (GL 4.6 §7.4.1) -------------------
+ *
+ * "For program objects containing multiple shaders, LinkProgram will check for
+ * mismatches on interfaces between shader stages in the program being linked
+ * and generate a link error if a mismatch is detected.  A link error is
+ * generated if any statically referenced input variable or block does not have
+ * a matching output."
+ *
+ * glslang links the attached stages but never reports an unmatched input: the
+ * GLSL I/O mapper assigns the orphan a fresh location of its own and the link
+ * succeeds, so MGL compiles a consumer (TCS/TES/GS/FS) that reads a record
+ * nobody writes — undefined content that lands in stale capture/ring buffers.
+ * The check below walks the per-stage SPIR-V modules the link driver already
+ * holds and rejects a statically referenced input with no matching output in
+ * the previous attached stage:
+ *
+ *   - matching is by NAME (GL 4.6 §7.4.1: no location qualifier, names equal;
+ *     interface blocks match by BLOCK name — instance names may differ — and
+ *     per-vertex interface arrays are matched with the outer array stripped),
+ *     or by LOCATION when both sides carry one (an explicit layout(location)
+ *     pair whose names differ on purpose is legal: GL 4.6 §7.4.1 again, and
+ *     MGL's own TessReorderedInputs test does it);
+ *   - "statically referenced" = the variable id appears in some function body
+ *     (a declared-but-unused input is NOT a link error, GL 4.6 §7.4.1);
+ *   - built-ins are excluded: glslang's stage merge checks gl_PerVertex /
+ *     gl_in / gl_out redeclarations itself (§7.4.1 last paragraph).
+ *
+ * Only stages linked into ONE program object are checked; separable programs
+ * linked apart may mismatch (values undefined, no error — §7.4.1), and a
+ * program's first attached stage has no producer by construction.
+ * MGL_NO_IO_CHECK disables the check for debugging. */
+
+/* SPIR-V opcodes/decorations this walker needs (unified1); SPV_OP_VARIABLE is
+ * the late-fragment-test enum further down, the rest are local */
+enum {
+    SPV_OP_NAME            = 5,
+    SPV_OP_TYPE_ARRAY      = 28,
+    SPV_OP_TYPE_STRUCT     = 30,
+    SPV_OP_TYPE_RTARRAY    = 44,
+    SPV_OP_FUNCTION        = 54,
+    SPV_OP_FUNCTION_END    = 56,
+    SPV_OP_DECORATE        = 71,
+    SPV_DEC_BLOCK          = 2,
+    SPV_DEC_BUILTIN        = 11,
+    SPV_DEC_LOCATION       = 30,
+    SPV_SC_INPUT           = 1,
+    SPV_SC_OUTPUT          = 3,
+};
+
+#define IOV_MAX      192     /* user interface variables per stage face */
+#define IOV_NAMES    512
+#define IOV_DECOS    1024
+#define IOV_ARRS     256
+#define IOV_NAMELEN  96
+
+typedef struct {
+    uint32_t id, type;
+    char     key[IOV_NAMELEN];   /* block name for blocks, else variable name */
+    uint32_t loc;
+    bool     has_loc, used;
+} IoFace;
+
+typedef struct {
+    IoFace in[IOV_MAX], out[IOV_MAX];
+    int n_in, n_out;
+} IoStage;
+
+typedef struct {
+    struct { uint32_t id; char name[IOV_NAMELEN]; } names[IOV_NAMES];
+    int n_names;
+    struct { uint32_t id; uint16_t deco; uint32_t val; } decos[IOV_DECOS];
+    int n_decos;
+    /* one deref table for OpTypePointer / OpTypeArray / OpTypeRuntimeArray:
+     * id -> pointee / element type, so a variable's type resolves through any
+     * chain of them (an interface block instance is a pointer to a struct, a
+     * per-vertex block array a pointer to an array of structs) */
+    struct { uint32_t id, elem; } arrs[IOV_ARRS];
+    int n_arrs;
+} IoScan;
+
+static const char *iov_name(IoScan *sc, uint32_t id)
+{
+    for (int i = 0; i < sc->n_names; i++)
+        if (sc->names[i].id == id)
+            return sc->names[i].name;
+    return NULL;
+}
+
+static bool iov_deco(IoScan *sc, uint32_t id, uint16_t deco, uint32_t *val)
+{
+    for (int i = 0; i < sc->n_decos; i++)
+        if (sc->decos[i].id == id && sc->decos[i].deco == deco)
+        {
+            if (val) *val = sc->decos[i].val;
+            return true;
+        }
+    return false;
+}
+
+/* resolve a variable's type through pointers and (per-vertex / trailing)
+ * arrays to its element struct: matching treats "vec4 v[]" and "vec4 v" as the
+ * same interface variable and keys blocks by their struct (block) type */
+static uint32_t iov_deref(IoScan *sc, uint32_t type)
+{
+    for (int depth = 0; depth < 5; depth++)
+    {
+        uint32_t elem = 0;
+        for (int i = 0; i < sc->n_arrs; i++)
+            if (sc->arrs[i].id == type) { elem = sc->arrs[i].elem; break; }
+        if (!elem) return type;
+        type = elem;
+    }
+    return type;
+}
+
+/* collect one stage's Input/Output faces; returns false on a malformed module
+ * (the caller then skips the check rather than failing the link) */
+static bool iov_collect(const uint32_t *ir, size_t words, IoStage *st)
+{
+    IoScan scan;
+    memset(&scan, 0, sizeof scan);
+    memset(st, 0, sizeof *st);
+    if (!ir || words < 5 || ir[0] != 0x07230203u)
+        return false;
+
+    /* pass 1: names, decorations, array types, interface variables */
+    for (size_t i = 5; i < words; )
+    {
+        uint32_t wc = ir[i] >> 16, op = ir[i] & 0xffff;
+        if (wc == 0 || i + wc > words)
+            return false;
+        const uint32_t *w = ir + i;
+
+        switch (op)
+        {
+        case SPV_OP_NAME:
+            if (wc >= 3 && scan.n_names < IOV_NAMES)
+            {
+                size_t room = (wc - 2) * 4;
+                scan.names[scan.n_names].id = w[1];
+                memcpy(scan.names[scan.n_names].name, &w[2],
+                       room < IOV_NAMELEN ? room : IOV_NAMELEN - 1);
+                scan.names[scan.n_names].name[IOV_NAMELEN - 1] = 0;
+                scan.n_names++;
+            }
+            break;
+        case SPV_OP_DECORATE:
+            if (wc >= 3 && scan.n_decos < IOV_DECOS)
+            {
+                scan.decos[scan.n_decos].id = w[1];
+                scan.decos[scan.n_decos].deco = (uint16_t)w[2];
+                scan.decos[scan.n_decos].val = wc >= 4 ? w[3] : 0;
+                scan.n_decos++;
+            }
+            break;
+        case SPV_OP_TYPE_ARRAY:
+        case SPV_OP_TYPE_RTARRAY:
+            if (wc >= 4 && scan.n_arrs < IOV_ARRS)
+            {
+                scan.arrs[scan.n_arrs].id = w[1];
+                scan.arrs[scan.n_arrs].elem = w[2];
+                scan.n_arrs++;
+            }
+            break;
+        case SPV_OP_TYPE_POINTER:
+            if (wc >= 4 && scan.n_arrs < IOV_ARRS)
+            {
+                scan.arrs[scan.n_arrs].id = w[1];
+                scan.arrs[scan.n_arrs].elem = w[3];
+                scan.n_arrs++;
+            }
+            break;
+        case SPV_OP_VARIABLE:
+        {
+            if (wc < 4) break;
+            uint32_t storage = w[3];
+            if (storage != SPV_SC_INPUT && storage != SPV_SC_OUTPUT) break;
+            uint32_t var = w[2];
+            if (iov_deco(&scan, var, SPV_DEC_BUILTIN, NULL)) break;
+
+            /* match key: the block name for an interface block (instance names
+             * may differ across the boundary), the variable name otherwise */
+            uint32_t elem = iov_deref(&scan, w[1]);
+            const char *key = NULL;
+            bool block = false;
+            if (iov_deco(&scan, elem, SPV_DEC_BLOCK, NULL))
+            {
+                key = iov_name(&scan, elem);
+                block = true;
+            }
+            if (!key)
+                key = iov_name(&scan, var);
+            if (!key || !*key) break;                    /* unnamed: built-in instance */
+            if (key[0] == 'g' && key[1] == 'l' && key[2] == '_') break;
+
+            IoFace *f;
+            if (storage == SPV_SC_INPUT)
+            {
+                if (st->n_in >= IOV_MAX) break;
+                f = &st->in[st->n_in++];
+            }
+            else
+            {
+                if (st->n_out >= IOV_MAX) break;
+                f = &st->out[st->n_out++];
+            }
+            f->id = var;
+            f->type = w[1];
+            f->has_loc = iov_deco(&scan, var, SPV_DEC_LOCATION, &f->loc);
+            f->used = false;
+            snprintf(f->key, sizeof f->key, "%s", key);
+            (void)block;
+            break;
+        }
+        default:
+            break;
+        }
+        i += wc;
+    }
+
+    /* pass 2: "statically referenced" — the variable id appears as an operand
+     * inside a function body (OpFunction..OpFunctionEnd).  Inputs are read
+     * only, so any operand use is a read; OpName/OpDecorate/OpEntryPoint are
+     * outside function bodies and cannot produce a false positive. */
+    bool in_func = false;
+    for (size_t i = 5; i < words; )
+    {
+        uint32_t wc = ir[i] >> 16, op = ir[i] & 0xffff;
+        if (wc == 0 || i + wc > words)
+            break;
+        if (op == SPV_OP_FUNCTION) in_func = true;
+        else if (op == SPV_OP_FUNCTION_END) in_func = false;
+        else if (in_func)
+        {
+            for (uint32_t k = 1; k < wc; k++)
+            {
+                uint32_t id = ir[i + k];
+                for (int v = 0; v < st->n_in; v++)
+                    if (st->in[v].id == id) { st->in[v].used = true; break; }
+                for (int v = 0; v < st->n_out; v++)
+                    if (st->out[v].id == id) { st->out[v].used = true; break; }
+            }
+        }
+        i += wc;
+    }
+    return true;
+}
+
+/* the check itself: one line per statically referenced input with no matching
+ * output, or NULL when the interfaces are consistent.  Runs on the final
+ * (post-I/O-mapping) modules so location matching sees the numbers GL uses. */
+char *mgl_link_io_unmatched(const uint32_t *const *mods, const size_t *sizes, unsigned mask)
+{
+    static const char *sn[_MAX_SHADER_TYPES] = {
+        "vertex", "tessellation control", "tessellation evaluation", "geometry", "fragment", "compute" };
+    int order[_MAX_SHADER_TYPES], norder = 0;
+
+    if (getenv("MGL_NO_IO_CHECK"))
+        return NULL;
+    for (int s = 0; s <= _FRAGMENT_SHADER; s++)
+        if ((mask & SHADER_MASK_BIT(s)) && mods[s] && sizes[s] > 5)
+            order[norder++] = s;
+    if (norder < 2)
+        return NULL;
+
+    IoStage *sts = (IoStage *)calloc((size_t)norder, sizeof *sts);
+    if (!sts)
+        return NULL;
+    for (int b = 0; b < norder; b++)
+        if (!iov_collect(mods[order[b]], sizes[order[b]], &sts[b]))
+        {
+            /* a module the walker cannot parse must not fail a link glslang
+             * accepted: skip the whole check (the MSL compile still catches
+             * broken modules) */
+            free(sts);
+            return NULL;
+        }
+
+    if (getenv("MGL_IO_DEBUG"))
+        for (int b = 0; b < norder; b++)
+        {
+            fprintf(stderr, "[IO] stage %d:\n", order[b]);
+            for (int i = 0; i < sts[b].n_in; i++)
+                fprintf(stderr, "[IO]   in  '%s' loc=%u(%d) used=%d\n",
+                        sts[b].in[i].key, sts[b].in[i].loc, sts[b].in[i].has_loc,
+                        sts[b].in[i].used);
+            for (int i = 0; i < sts[b].n_out; i++)
+                fprintf(stderr, "[IO]   out '%s' loc=%u(%d) used=%d\n",
+                        sts[b].out[i].key, sts[b].out[i].loc, sts[b].out[i].has_loc,
+                        sts[b].out[i].used);
+        }
+
+    char *log = (char *)malloc(4096);
+    size_t len = 0;
+    if (!log)
+    {
+        free(sts);
+        return NULL;
+    }
+    log[0] = 0;
+
+    for (int b = 0; b + 1 < norder && len + 256 < 4096; b++)
+    {
+        IoStage *prod = &sts[b], *cons = &sts[b + 1];
+        for (int c = 0; c < cons->n_in; c++)
+        {
+            IoFace *in = &cons->in[c];
+            if (!in->used)
+                continue;                         /* declared only: legal */
+
+            bool matched = false;
+            for (int p = 0; p < prod->n_out && !matched; p++)
+            {
+                if (!strcmp(prod->out[p].key, in->key))
+                    matched = true;               /* by name / block name */
+                else if (in->has_loc && prod->out[p].has_loc &&
+                         prod->out[p].loc == in->loc)
+                    matched = true;               /* by explicit location */
+            }
+            if (!matched)
+                len += (size_t)snprintf(log + len, 4096 - len,
+                                        "ERROR: linking %s and %s stages: input `%s' has no matching output\n",
+                                        sn[order[b]], sn[order[b + 1]], in->key);
+        }
+    }
+
+    free(sts);
+    if (!len)
+    {
+        free(log);
+        return NULL;
+    }
+    return log;
+}
+
 /* ---- GL_ARB_ES3_2_compatibility -------------------------------------------- */
 
 /* glslang (11.x, external/) has no E_GL_ARB_ES3_2_compatibility: it rejects

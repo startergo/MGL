@@ -135,11 +135,14 @@ TEST(basevertex_vertex_id)
     EXPECT_NO_GL_ERROR();
 }
 
-/* An FS input with no matching VS output is undefined in GL (the link is
- * legal); MGL's pipeline creation then fails and the draw is skipped.  It must
- * not wedge the GPU: glFinish returns (the abandoned command buffer of the
- * error-recovery path can never complete — regression test for a hang where
- * waitUntilCompleted blocked forever at 0% CPU). */
+/* An FS input with no matching VS output ACROSS SEPARATE PROGRAMS is undefined
+ * in GL (the interface mismatch between separately linked programs stays legal
+ * — GL 4.6 §7.4.1 makes it a link error only inside ONE program, which the r67
+ * shader-interface check now enforces); MGL's pipeline creation then fails
+ * (Apple's Metal refuses an FS input no previous stage writes) and the draw is
+ * skipped.  It must not wedge the GPU: glFinish returns (the abandoned command
+ * buffer of the error-recovery path can never complete — regression test for a
+ * hang where waitUntilCompleted blocked forever at 0% CPU). */
 TEST(unwritten_fs_input_no_hang)
 {
     static const char *fs_bad =
@@ -147,12 +150,54 @@ TEST(unwritten_fs_input_no_hang)
         "in vec4 no_such_output;\n"
         "layout(location=0) out vec4 o_color;\n"
         "void main() { o_color = no_such_output; }\n";
+    /* a VS with no user outputs: in a pipeline with fs_bad the FS input has no
+     * producer (a VS writing a location-0 vec4 would satisfy Metal by slot and
+     * the draw would run on undefined data instead of failing) */
+    static const char *vs_plain =
+        "#version 460 core\n"
+        "layout(location=0) in vec2 a_pos;\n"
+        "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
 
-    GLuint prog = mgl_make_program(vs, fs_bad);
-    EXPECT_TRUE(prog != 0);                    /* the link itself is legal */
-    if (!prog)
-        return;
-    glUseProgram(prog);
+    /* single program: the same interface mismatch is a §7.4.1 link error */
+    {
+        GLuint p = glCreateProgram();
+        GLuint s0 = glCreateShader(GL_VERTEX_SHADER), s1 = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(s0, 1, &vs_plain, NULL); glCompileShader(s0);
+        glShaderSource(s1, 1, &fs_bad, NULL); glCompileShader(s1);
+        glAttachShader(p, s0); glAttachShader(p, s1);
+        glDeleteShader(s0); glDeleteShader(s1);
+        glLinkProgram(p);
+        GLint link = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &link);
+        EXPECT_EQ_INT(link, GL_FALSE);
+        glDeleteProgram(p);
+    }
+
+    /* separable programs in a pipeline: legal link, undefined interface */
+    GLuint pv = glCreateProgram(), pf = glCreateProgram();
+    GLuint sv = glCreateShader(GL_VERTEX_SHADER), sf = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(sv, 1, &vs_plain, NULL); glCompileShader(sv);
+    glShaderSource(sf, 1, &fs_bad, NULL); glCompileShader(sf);
+    glAttachShader(pv, sv); glDeleteShader(sv);
+    glAttachShader(pf, sf); glDeleteShader(sf);
+    glProgramParameteri(pv, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glProgramParameteri(pf, GL_PROGRAM_SEPARABLE, GL_TRUE);
+    glLinkProgram(pv);
+    glLinkProgram(pf);
+    GLint lv = 0, lf = 0;
+    glGetProgramiv(pv, GL_LINK_STATUS, &lv);
+    glGetProgramiv(pf, GL_LINK_STATUS, &lf);
+    EXPECT_EQ_INT(lv, GL_TRUE);                 /* each links on its own */
+    EXPECT_EQ_INT(lf, GL_TRUE);
+
+    GLuint pipe = 0;
+    glGenProgramPipelines(1, &pipe);
+    glBindProgramPipeline(pipe);
+    glUseProgram(0);                            /* the current program would
+                                                   override the pipeline stages */
+    glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, pv);
+    glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, pf);
+    EXPECT_NO_GL_ERROR();
 
     GLuint vao, vbo;
     glGenVertexArrays(1, &vao);
@@ -181,6 +226,10 @@ TEST(unwritten_fs_input_no_hang)
     glReadPixels(3, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, p);
     printf("  unwritten-input draw skipped, pixel = %d %d %d %d\n", p[0], p[1], p[2], p[3]);
     EXPECT_TRUE(p[0] == 0 && p[1] == 0);       /* draw skipped: the clear colour */
+    EXPECT_NO_GL_ERROR();
+    glDeleteProgramPipelines(1, &pipe);
+    glDeleteProgram(pv);
+    glDeleteProgram(pf);
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &tex);
 }

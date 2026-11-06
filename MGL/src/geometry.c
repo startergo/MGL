@@ -11565,10 +11565,15 @@ static bool geom_route_tess(GLMContext ctx, MGLGeomProgram *gp, bool indexed, GL
                 c->member[m].name[cl - wl - 1] == '_' &&
                 !strcmp(c->member[m].name + cl - wl, want))
                 hit = 1;               /* "<instance>_<member>" */
-            if (!hit && cl > wl + 2)
+            if (!hit && cl >= wl + 2)
             {
                 /* "<...>_<member>_<digits>": strip the element index, then the
-                 * instance prefix (either or both may be present) */
+                 * instance prefix (either or both may be present).  cl >= wl+2
+                 * covers the single-digit suffix too — a flattened MATRIX
+                 * arrives as "<name>_0","<name>_1" columns whose first element
+                 * is exactly name+'_'+digit (dEQP
+                 * shaders.linkage.gl45.tessellation_geometry.varying.types.mat*,
+                 * "no capture member for te_out/" trace) */
                 const char *e = c->member[m].name + cl;
                 const char *d = e;
 

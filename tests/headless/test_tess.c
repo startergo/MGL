@@ -365,6 +365,197 @@ TEST(TessUnusedTcsInput)
     glDeleteProgram(prog);
 }
 
+/* ---- GL 4.6 7.4.1 (shader interface matching, r67) ----------------------
+ *
+ * "A link error is generated if any statically referenced input variable or
+ * block does not have a matching output" (inside ONE program object).  glslang
+ * auto-maps the orphan and reports nothing, so the consumer would read a record
+ * nobody writes. */
+
+static const char *kTcsNoExtra =
+    "#version 450 core\n"
+    "layout(vertices=3) out;\n"
+    "layout(location=0) in vec4 v_col[];\n"
+    "layout(location=0) out vec4 tc_col[];\n"
+    "void main() {\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  if (gl_InvocationID == 0) {\n"
+    "    gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0;\n"
+    "    gl_TessLevelInner[0] = 2.0;\n"
+    "  }\n"
+    "}\n";
+
+TEST(TessLinkUnmatchedInput)
+{
+    /* statically used TES input with no TCS output: link error */
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "in vec4 tc_missing[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = tc_missing[0];\n"
+        "}\n";
+    GLuint p = make_program(kTcsNoExtra, tes);
+    GLint link = -1;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_FALSE);
+    char log[1024] = "";
+    glGetProgramInfoLog(p, sizeof log - 1, NULL, log);
+    EXPECT_TRUE(strstr(log, "has no matching output") != NULL);
+    glDeleteProgram(p);
+
+    /* the same declaration never used: NOT a link error (7.4.1 only rejects
+     * statically referenced inputs) */
+    const char *tes_unused =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "in vec4 tc_missing[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = vec4(1.0);\n"
+        "}\n";
+    p = make_program(kTcsNoExtra, tes_unused);
+    link = -1;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glDeleteProgram(p);
+    while (glGetError() != GL_NO_ERROR) { }
+}
+
+TEST(TessLinkUnmatchedByLocation)
+{
+    /* explicit locations: the TCS writes 0, the TES also reads 5 */
+    const char *tcs =
+        "#version 450 core\n"
+        "layout(vertices=3) out;\n"
+        "layout(location=0) in vec4 v_col[];\n"
+        "layout(location=0) out vec4 tc_a[];\n"
+        "void main() {\n"
+        "  tc_a[gl_InvocationID] = v_col[gl_InvocationID];\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0;\n"
+        "    gl_TessLevelInner[0] = 2.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location=0) in vec4 tc_a[];\n"
+        "layout(location=5) in vec4 tc_b[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = tc_a[0] + tc_b[1];\n"
+        "}\n";
+    GLuint p = make_program(tcs, tes);
+    GLint link = -1;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_FALSE);
+    glDeleteProgram(p);
+    while (glGetError() != GL_NO_ERROR) { }
+}
+
+TEST(TessLinkBlockInstanceNames)
+{
+    /* interface blocks match by BLOCK name: the TCS's instance-less out block
+     * feeds the TES's differently-named in block instance */
+    const char *tcs =
+        "#version 450 core\n"
+        "layout(vertices=3) out;\n"
+        "layout(location=0) in vec4 v_col[];\n"
+        "out StageOut { vec4 col; } tcs_o[];\n"
+        "void main() {\n"
+        "  tcs_o[gl_InvocationID].col = v_col[gl_InvocationID];\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0;\n"
+        "    gl_TessLevelInner[0] = 2.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "in StageOut { vec4 col; } tc_in[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = gl_TessCoord.x * tc_in[0].col + gl_TessCoord.y * tc_in[1].col\n"
+        "        + gl_TessCoord.z * tc_in[2].col;\n"
+        "}\n";
+    GLuint p = make_program(tcs, tes);
+    GLint link = -1;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (link)
+    {
+        glUseProgram(p);
+        glViewport(0, 0, 512, 512);
+        setup_patch_vao(kTriPos, kTriCol, 3);
+        draw_reference_patch();
+        check_strict_half("block-instance-names", 18000);
+    }
+    glDeleteProgram(p);
+}
+
+TEST(TessLinkCacheAfterFailure)
+{
+    /* glslang's TIntermediate error count is sticky and lives on the shared
+     * TShader: a FAILED link used to poison the compile cache so the next
+     * program linking the same sources died with an empty "GLSL link failed"
+     * (dEQP shaders.linkage.gl45.tessellation.varying.rules).  A failed link
+     * must not break the next one. */
+    const char *tcs_bad =
+        "#version 450 core\n"
+        "layout(vertices=3) out;\n"
+        "layout(location=0) in float v_col[];\n"     /* type mismatch vs the VS */
+        "layout(location=0) out float tc_col[];\n"
+        "void main() {\n"
+        "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0;\n"
+        "    gl_TessLevelInner[0] = 2.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes_bad =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location=0) in float tc_col[];\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  f_col = vec4(tc_col[0]);\n"
+        "}\n";
+    GLuint bad = make_program(tcs_bad, tes_bad);
+    GLint link = -1;
+    glGetProgramiv(bad, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_FALSE);                 /* the type mismatch itself */
+    glDeleteProgram(bad);
+
+    /* the same VS and FS sources must still link a good TCS/TES pair */
+    GLuint good = make_program(kTcsTri, kTesTri);
+    link = -1;
+    glGetProgramiv(good, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glDeleteProgram(good);
+    while (glGetError() != GL_NO_ERROR) { }
+}
+
 /* TCS writes locations 1, 0, 2 in that source order; the TES declares 2, 0, 1 */
 static const char *kTcsOrder =
     "#version 450 core\n"
@@ -2244,6 +2435,124 @@ TEST(TessGeometryMultiPatch)
     glDeleteProgram(p);
 }
 
+/* --- matrix varyings through the TES capture into the geometry stage ------
+ * The geometry import pairs capture members with geometry inputs by name; a
+ * flattened MATRIX arrives as "<name>_0","<name>_1" columns, and the
+ * single-digit suffix used to fall through the pairing ("no capture member
+ * for te_out/") — dEQP shaders.linkage.gl45.tessellation_geometry.varying.
+ * types.mat*. */
+static GLuint make_5stage_program(const char *vs, const char *tcs, const char *tes,
+                                  const char *gs, const char *fs)
+{
+    GLuint p = glCreateProgram();
+    struct { GLenum t; const char *s; } srcs[5] = {
+        { GL_VERTEX_SHADER, vs }, { GL_TESS_CONTROL_SHADER, tcs },
+        { GL_TESS_EVALUATION_SHADER, tes }, { GL_GEOMETRY_SHADER, gs },
+        { GL_FRAGMENT_SHADER, fs },
+    };
+    for (int i = 0; i < 5; i++)
+    {
+        GLuint sh = glCreateShader(srcs[i].t);
+        glShaderSource(sh, 1, &srcs[i].s, NULL);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char b[2048];
+            glGetShaderInfoLog(sh, sizeof b, NULL, b);
+            fprintf(stderr, "  %s stage compile: %s\n",
+                    srcs[i].t == GL_VERTEX_SHADER ? "vertex" :
+                    srcs[i].t == GL_TESS_CONTROL_SHADER ? "tcs" :
+                    srcs[i].t == GL_TESS_EVALUATION_SHADER ? "tes" :
+                    srcs[i].t == GL_GEOMETRY_SHADER ? "gs" : "fs", b);
+        }
+        glAttachShader(p, sh);
+        glDeleteShader(sh);
+    }
+    glLinkProgram(p);
+    GLint link = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    if (!link) {
+        char b[2048];
+        glGetProgramInfoLog(p, sizeof b, NULL, b);
+        fprintf(stderr, "  5-stage link: %s\n", b);
+    }
+    return p;
+}
+
+TEST(TessGeometryMatrixVarying)
+{
+    const char *vs =
+        "#version 450 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "layout(location=1) in vec4 a_col;\n"
+        "layout(location=0) out mat2 v_m;\n"
+        "void main() {\n"
+        "  gl_Position = a_pos;\n"
+        "  v_m = mat2(a_col.xy, a_col.zw);\n"
+        "}\n";
+    const char *tcs =
+        "#version 450 core\n"
+        "layout(vertices=3) out;\n"
+        "layout(location=0) in mat2 v_m[];\n"
+        "layout(location=0) out mat2 tc_m[];\n"
+        "void main() {\n"
+        "  tc_m[gl_InvocationID] = v_m[gl_InvocationID];\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) {\n"
+        "    gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 3.0; gl_TessLevelOuter[2] = 3.0;\n"
+        "    gl_TessLevelInner[0] = 3.0;\n"
+        "  }\n"
+        "}\n";
+    const char *tes =
+        "#version 450 core\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location=0) in mat2 tc_m[];\n"
+        "layout(location=0) out mat2 te_m;\n"
+        "void main() {\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position\n"
+        "               + gl_TessCoord.y * gl_in[1].gl_Position\n"
+        "               + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  te_m = tc_m[0] * gl_TessCoord.x + tc_m[1] * gl_TessCoord.y\n"
+        "       + tc_m[2] * gl_TessCoord.z;\n"
+        "}\n";
+    const char *gs =
+        "#version 450 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices=3) out;\n"
+        "layout(location=0) in mat2 te_m[];\n"
+        "layout(location=0) out mat2 g_m;\n"
+        "void main() {\n"
+        "  for (int i = 0; i < 3; i++) {\n"
+        "    g_m = te_m[i];\n"
+        "    gl_Position = gl_in[i].gl_Position; EmitVertex();\n"
+        "  }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 450 core\n"
+        "layout(location=0) in mat2 g_m;\n"
+        "layout(location=0) out vec4 f_col;\n"
+        "void main() { f_col = vec4(g_m[0], g_m[1]); }\n";
+
+    GLuint p = make_5stage_program(vs, tcs, tes, gs, fs);
+    EXPECT_TRUE(p != 0);
+    if (p) {
+        glUseProgram(p);
+        /* a_col = (1, 0.5, 0.25, 0.75) -> mat2 columns (1, .5) and (.25, .75):
+         * the FS receives them back through all five stages */
+        const float pos[3][4] = { { -1,-1,0,1 }, { 0,1,0,1 }, { 1,-1,0,1 } };
+        const float col[3][4] = { { 1,0.5f,0.25f,0.75f },
+                                   { 1,0.5f,0.25f,0.75f },
+                                   { 1,0.5f,0.25f,0.75f } };
+        setup_patch_vao(pos, col, 3);
+        draw_reference_patch();
+        EXPECT_PIXEL(100, 190, 255, 128, 64, 191, 6);
+        EXPECT_PIXEL(100, 5,   255, 128, 64, 191, 6);
+    }
+    glDeleteProgram(p);
+}
+
 /* --- gl_Layer from the vertex / evaluation stage (ARB_shader_viewport_layer_array)
  *
  * Metal needs MTLRenderPipelineDescriptor.inputPrimitiveTopology once the final
@@ -3499,6 +3808,7 @@ int main(int argc, char **argv)
     RUN(TessFourPatches);
     RUN(TessXfbPoints);
     RUN(TessGeometryMultiPatch);
+    RUN(TessGeometryMatrixVarying);
     RUN(TessIndexedAndInstanced);
     RUN(TessCpuReferenceParity);
     RUN(TessIndexedRestart);
@@ -3511,6 +3821,10 @@ int main(int argc, char **argv)
     RUN(TessOrientationCulling);
     RUN(TessUnusedTesInput);
     RUN(TessUnusedTcsInput);
+    RUN(TessLinkUnmatchedInput);
+    RUN(TessLinkUnmatchedByLocation);
+    RUN(TessLinkBlockInstanceNames);
+    RUN(TessLinkCacheAfterFailure);
     RUN(TessReorderedInputs);
     RUN(TessPerPatchVaryings);
     RUN(TessArrayedVarying);
