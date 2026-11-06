@@ -3403,13 +3403,26 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                                                  * atomics silently wrote into the
                                                  * argument ring).  At 16+ the uniforms
                                                  * keep slot 0 and both paths agree.
-                                                 * FRAGMENT ONLY: tess/GS emulation
+                                                 * FRAGMENT and VERTEX only: the
+                                                 * VERTEX stage shares the reserved
+                                                 * [16,24) range — compat r99: with
+                                                 * auto indices a VS image atomic got
+                                                 * buffer(0), and
+                                                 * geomBindImageAtomicBuffersRender's
+                                                 * setVertexBuffer:atIndex:0 clobbered
+                                                 * the vertex-attribute slot 0 (the
+                                                 * position data): the draw went
+                                                 * degenerate and NO fragment stage
+                                                 * ran — the CTS allStages-oneImage
+                                                 * VS CompSwap landed but the FS adds
+                                                 * never did.  tess/GS emulation
                                                  * stages dispatch as compute kernels
-                                                 * whose buffer tables do not follow the
-                                                 * fragment bind-list convention (the
-                                                 * forced 16 broke
+                                                 * whose buffer tables do not follow
+                                                 * the render bind-list convention
+                                                 * (the forced 16 broke
                                                  * shader_image_load_store.atomicTCS) */
-                                                stage == _FRAGMENT_SHADER ? 16 : -1,
+                                                (stage == _FRAGMENT_SHADER ||
+                                                 stage == _VERTEX_SHADER) ? 16 : -1,
                                                 aslots, &naslots, 32, &dub_msl);
         if (!fixed)
         {

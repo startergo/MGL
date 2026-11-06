@@ -57,6 +57,9 @@ enum { TD_PROXY_1D, TD_PROXY_2D, TD_PROXY_3D, TD_PROXY_RECT, TD_PROXY_1D_ARRAY, 
 /* ------------------------------------------------------------------------ */
 
 static GLuint limitOr(GLuint v, GLuint dflt) { return (v == 0 || v > (1u << 15)) ? dflt : v; }
+
+/* compat r99: implicit image-atomic sidecar sync before texture reads */
+extern void mgl_compat_image_atom_sync(GLMContext ctx);
 static GLuint maxTexSize(GLMContext ctx)   { return limitOr(STATE_VAR(max_texture_size), 16384); }
 static GLuint max3DSize(GLMContext ctx)    { return limitOr(STATE_VAR(max_3d_texture_size), 2048); }
 static GLuint maxCubeSize(GLMContext ctx)  { return limitOr(STATE_VAR(max_cube_map_texture_size), 16384); }
@@ -3125,6 +3128,10 @@ static void getTexImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     Texture *qview = tex;
 
     tex = view_redirect(ctx, tex, &face, &level, &z);
+
+    /* compat r99: image-atomic sidecars must be flushed into the texture before it
+     * is read back (GL 4.6 §8.25 implicit sync; no-op unless one is dirty) */
+    mgl_compat_image_atom_sync(ctx);
 
     TD_CHECK(level >= 0 && (GLuint)level <= maxLevelForTarget(ctx, tex->target), GL_INVALID_VALUE);
 

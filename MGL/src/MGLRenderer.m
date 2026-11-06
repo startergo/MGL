@@ -642,6 +642,21 @@ static char kComputeFallbackKey;
                 // introspect: default-block uniforms live in a per-program, per-stage buffer
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)
                 {
+                    /* compat r99: when glslang stripped every default-block uniform of
+                     * this stage (dub_msl == 0xffffffff — no mgl_DefaultUniforms argument
+                     * exists in the MSL), DO NOT reserve a map entry: the entry kept the
+                     * ordinal-0 slot, shifted every following SSBO/UBO ordinal past its
+                     * MSL argument index, and the binder's `mtl_index ?: i` fallback then
+                     * bound the first SSBO (always MSL buffer 0 there) at the SECOND SSBO's
+                     * slot.  dEQP ES31 compute.basic.ssbo_cmd_barrier_{single,multiple}:
+                     * a no-dub program with blocks Input [[buffer(0)]] and Output
+                     * [[buffer(1)]] read Input from the Output buffer and saw zeros. */
+                    if (stage == _COMPUTE_SHADER &&
+                        STATE(program) && STATE(program)->spirv[stage].dub_msl == 0xffffffffu)
+                    {
+                        buffers_to_be_mapped--;   /* consumed with no map entry */
+                        continue;
+                    }
                     Buffer *dub = mgl_introspect_default_uniform_buffer(ctx, ctx->state.program, stage, i);
                     /* perf: latch the knob once — getenv takes the environment lock and
                      * this runs per default-uniform binding per stage per draw (same class

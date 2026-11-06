@@ -1396,6 +1396,14 @@ static bool geomCanAssembleGPUC(GLMContext glm_ctx)
     return [r geomCanAssembleGPU];
 }
 
+/* compat r99: implicit image-atomic sync at command boundaries (GL 4.6 §8.25) —
+ * the sidecar buffers must be flushed into their textures before any later read */
+static void geomResolveImageAtomicsC(GLMContext glm_ctx)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)glm_ctx->mtl_funcs.mtlObj;
+    [r geomResolveImageAtomics];
+}
+
 /* (defined in MGLRenderer+Draw.m; declared here so this category can create a
  * command buffer for shadow copies at readback time) */
 @interface MGLRenderer (Geom3DShadowPriv)
@@ -2138,6 +2146,7 @@ void geom_xfb_gpu_reset(GLMContext ctx)
     m->can_assemble_gpu = geomCanAssembleGPUC;
     m->query_begin = geomQueryBeginC;
     m->query_read = geomQueryReadC;
+    m->resolve_image_atomics = geomResolveImageAtomicsC;
 }
 
 /* ---- compute pipelines of the geometry kernel ---- */
@@ -3188,14 +3197,25 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
      * r88: a DIRTY single-image MULTISAMPLE record is RETIRED (img_retired[])
      * instead of dropped — its stores have not reached the texture yet, and the
      * next resolve still can rasterize them from the record's own retained
-     * buffer + view (see mgl_ext_geom.h). */
-    if (g->img_atom[unit].dirty && g->img_atom[unit].ms &&
-        g->img_atom[unit].elems <= 1 && g->img_atom[unit].buf &&
+     * buffer + view (see mgl_ext_geom.h).
+     * compat r99: a DIRTY non-MS record is retired too.  GL orders the image
+     * writes of one dispatch before any later command; rebinding the unit to a
+     * DIFFERENT texture with no glMemoryBarrier in between (dEQP ES31
+     * synchronization.inter_call.with_memory_barrier.image_atomic_multiple_*:
+     * writer1 -> image A, writer2 -> image B on the same unit, ONE barrier, then
+     * the verifier) used to DROP sidecar A — its atomic writes were lost and the
+     * verifier read zeros.  Retired non-MS records resolve through the COMPUTE
+     * path in geomResolveImageAtomics.  ARRAY records (elems > 1) still drop —
+     * the retired resolve handles single images only (test_geom_imgarr
+     * compute_array_atomic_remapped_units regressed when they retired). */
+    if (g->img_atom[unit].dirty && g->img_atom[unit].elems <= 1 &&
+        g->img_atom[unit].buf &&
         g->img_atom[unit].view && g->img_retired_n < 16 && !getenv("MGL_NO_RETIRE"))
     {
         int r = g->img_retired_n++;
         g->img_retired[r].buf = g->img_atom[unit].buf;      /* ownership moves */
         g->img_retired[r].view = g->img_atom[unit].view;
+        g->img_retired[r].ms = g->img_atom[unit].ms;        /* compat r99: pick the flush path */
         g->img_atom[unit].buf = NULL;
         g->img_atom[unit].view = NULL;
         g->img_atom[unit].dirty = false;
@@ -4364,7 +4384,10 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     for (int u = 0; u < TEXTURE_UNITS; u++)
         if (g->img_atom[u].buf && g->img_atom[u].dirty && g->img_atom[u].ms)
             any_ms = true;
-    if (g->img_retired_n > 0) any_ms = true;     /* retired records are all multisample */
+    for (int r = 0; r < g->img_retired_n; r++)
+        if (g->img_retired[r].ms) { any_ms = true; break; }
+        /* compat r99: retired records may now be non-MS (compute-resolved below) —
+         * only an MS record needs the pre-encoder flush/commit */
     if (any_ms)
     {
         [self flushCommandBuffer: false];
@@ -4382,16 +4405,33 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
      * retained view outlives it and the flush only writes it; Metal command
      * buffers retain the resources an encoder references, so dropping the +1
      * retain right after encoding is safe. */
+    int keep_retired = 0;
     for (int r = 0; r < g->img_retired_n; r++)
     {
         id<MTLBuffer> rb = (__bridge id<MTLBuffer>)g->img_retired[r].buf;
         id<MTLTexture> rv = (__bridge id<MTLTexture>)g->img_retired[r].view;
-        if (rb && rv && [self geomMsFlushView: rb offset: 0 view: rv unit: -1])
-            g->stat_flushes++;
+        if (rb && rv && g->img_retired[r].ms)
+        {
+            if ([self geomMsFlushView: rb offset: 0 view: rv unit: -1])
+                g->stat_flushes++;
+            if (g->img_retired[r].buf) { CFRelease((CFTypeRef)g->img_retired[r].buf); g->img_retired[r].buf = NULL; }
+            if (g->img_retired[r].view) { CFRelease((CFTypeRef)g->img_retired[r].view); g->img_retired[r].view = NULL; }
+            continue;
+        }
+        /* compat r99: a retired non-MS record resolves through the COMPUTE path —
+         * keep it for the pass after the encoder exists (it needs a compute encoder,
+         * which is only opened below).  Ordering is safe: the retired record is
+         * always the OLDER stores of the same unit, and the active record's resolve
+         * below runs after this walk on the same encoder. */
+        if (rb && rv)
+        {
+            g->img_retired[keep_retired++] = g->img_retired[r];
+            continue;
+        }
         if (g->img_retired[r].buf) { CFRelease((CFTypeRef)g->img_retired[r].buf); g->img_retired[r].buf = NULL; }
         if (g->img_retired[r].view) { CFRelease((CFTypeRef)g->img_retired[r].view); g->img_retired[r].view = NULL; }
     }
-    g->img_retired_n = 0;
+    g->img_retired_n = keep_retired;
 
     /* multisample sidecars rasterize back into their textures first (render passes,
      * one per unit — an MS image ARRAY does one per element, from its region inside
@@ -4447,6 +4487,16 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
             g->img_atom[u].dirty = false;
         }
     }
+    /* compat r99: this resolve now also runs IMPLICITLY (GL 4.6 §8.25 — image-unit
+     * writes visible to subsequent commands) from the readback paths, where an
+     * earlier glReadPixels may have COMMITTED _currentCommandBuffer.  The seed path
+     * above renews the buffer; this one must too, or IOGPU asserts at the encoder:
+     * "_status < MTLCommandBufferStatusCommitted ... setCurrentCommandEncoder"
+     * (test_geom_imgarr fragment_array_atomic_lands). */
+    [self endRenderEncoding];
+    if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+        if (![self newCommandBuffer])
+            return;
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
 
     for (int u = 0; u < TEXTURE_UNITS; u++)
@@ -4612,6 +4662,65 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                 }
             }
         }
+    }
+
+    /* compat r99: RETIRED non-MS sidecars (an image unit rebound to a different
+     * texture while its sidecar was dirty) resolve through the same COMPUTE path
+     * as the active ones — single-image only (an arrayed record retires the whole
+     * array, and a retired texture buffer's GL-buffer writeback is not tracked —
+     * both stay unsupported, as before r99). */
+    for (int r = 0; r < g->img_retired_n; r++)
+    {
+        id<MTLBuffer> rb = (__bridge id<MTLBuffer>)g->img_retired[r].buf;
+        id<MTLTexture> rv = (__bridge id<MTLTexture>)g->img_retired[r].view;
+        uint32_t rdims[4];
+        NSUInteger rtotal;
+        id<MTLComputePipelineState> rpso;
+
+        if (!rb || !rv) continue;
+        MTLTextureType rtt = rv.textureType;
+        if (rtt == MTLTextureTypeTextureBuffer || rtt == MTLTextureType2DMultisample ||
+            rtt == MTLTextureType2DMultisampleArray)
+            continue;                       /* covered above (ms) / unsupported here */
+        MTLPixelFormat rpf = rv.pixelFormat;
+        rdims[0] = (uint32_t)rv.width;
+        rdims[1] = (uint32_t)rv.height;
+        if (rtt == MTLTextureType2DArray)        rdims[2] = (uint32_t)rv.arrayLength;
+        else if (rtt == MTLTextureTypeCube)      rdims[2] = 6;
+        else if (rtt == MTLTextureTypeCubeArray) rdims[2] = (uint32_t)(rv.arrayLength * 6);
+        else if (rtt == MTLTextureType3D)        rdims[2] = (uint32_t)rv.depth;
+        else                                    rdims[2] = 1;
+        if (!geomImageAtomicTexels(rv)) continue;
+        rtotal = (NSUInteger)rdims[0] * rdims[1] * rdims[2];
+        rdims[3] = (uint32_t)rtotal;
+        rpso = [self geomAtomResolvePso: rtt format: rpf];
+        if (!rpso) continue;
+
+        [enc setComputePipelineState: rpso];
+        [enc setBuffer: rb offset: 0 atIndex: 0];
+        [enc setTexture: rv atIndex: 0];
+        [enc setBytes: &rdims length: sizeof(rdims) atIndex: 1];
+        if (gEnv.debug)
+            fprintf(stderr, "MGL geom: img-atom resolve RETIRED r=%d type=%lu w=%u total=%u\n", r,
+                    (unsigned long)rtt, rdims[0], rdims[3]);
+        [enc dispatchThreads: MTLSizeMake(rtotal, 1, 1)
+        threadsPerThreadgroup: MTLSizeMake(64 > rpso.maxTotalThreadsPerThreadgroup ?
+                                           rpso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
+        g->stat_resolves++;
+
+        CFRelease((CFTypeRef)g->img_retired[r].buf);
+        g->img_retired[r].buf = NULL;
+        CFRelease((CFTypeRef)g->img_retired[r].view);
+        g->img_retired[r].view = NULL;
+    }
+    {
+        int keep = 0;
+        for (int r = 0; r < g->img_retired_n; r++)
+        {
+            if (g->img_retired[r].buf || g->img_retired[r].view)
+                g->img_retired[keep++] = g->img_retired[r];
+        }
+        g->img_retired_n = keep;
     }
     [enc endEncoding];
     ctx->state.dirty_bits |= DIRTY_ALL;      /* the encoder state must be rebuilt */

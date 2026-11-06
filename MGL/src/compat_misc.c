@@ -16,6 +16,7 @@
 #include "mgl.h"
 #include "glm_context.h"
 #include "mgl_ext_compat.h"
+#include "mgl_ext_geom.h"     /* ext_geom: image-atomic sidecar sync hook (compat r99) */
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 
 #define CS() (ctx->state.ext_compat)
@@ -1883,4 +1884,17 @@ void mglIndexMask(GLMContext ctx, GLuint mask)
 
     /* no color-index framebuffer: tracked, no effect (documented gap) */
     STATE(var.index_writemask) = mask;
+}
+
+/* compat r99 — GL 4.6 §8.25/§9.3 implicit image-atomic sync: writes through image
+ * units (the geom domain's sidecar buffers) are visible to every SUBSEQUENT command
+ * without a glMemoryBarrier.  Call this before anything READS a texture (readPixels,
+ * getTexImage, sampling in a draw, blit/copy sources); it is O(1) when no sidecar is
+ * dirty, so it is safe on every read path.  Fixed dEQP ES31 compute.basic.
+ * image_atomic_op_local_size_{1,8}: the CTS readPixels right after glDispatchCompute
+ * and saw the pre-dispatch texture. */
+void mgl_compat_image_atom_sync(GLMContext ctx)
+{
+    if (ctx && ctx->mtl_funcs.ext_geom && ctx->mtl_funcs.ext_geom->resolve_image_atomics)
+        ctx->mtl_funcs.ext_geom->resolve_image_atomics(ctx);
 }

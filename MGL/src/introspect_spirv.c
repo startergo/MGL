@@ -3161,17 +3161,21 @@ static void compute_active(StageCtx *s, const uint32_t *words, size_t n)
         for (uint32_t k = 0; k < s->ndub; k++) s->dub_active[k] = 1;
         for (uint32_t v = 1; v <= r->bound; v++) if (r->isvar[v] && r->vglobal[v]) s->bused[v] = MGL_BUSED_UNKNOWN;
     }
-    /* Uniform blocks stay ACTIVE when they are declared but none of their members is
-     * referenced: GL 4.6 §7.6.2 ("resources may still be consumed ... implementations
-     * may consider them active"), and glslang does not strip the block from the SPIR-V,
-     * so conformant drivers list them (KHR-GL46.shaders.uniform_block.random.* looks up
-     * exactly such blocks with glGetUniformBlockIndex).  SPIRV-Cross's active-interface
-     * analysis DCEs them — keep every declared UBO variable of the module.  (SSBOs and
-     * default-block members keep the exact-active rules.) */
+    /* Uniform AND STORAGE blocks stay ACTIVE when they are declared but none of their
+     * members is referenced: GL 4.6 §7.6.2 ("resources may still be consumed ...
+     * implementations may consider them active"), and glslang does not strip the block
+     * from the SPIR-V, so conformant drivers list them (KHR-GL46.shaders.uniform_block.
+     * random.* looks up exactly such blocks with glGetUniformBlockIndex).  compat r99:
+     * dEQP ES31 ssbo.layout.random.* likewise looks up declared-but-unused SSBOs with
+     * glGetProgramResourceIndex — 32 cases failed "Buffer block 'BlockD' not found" /
+     * "Invalid shared layout".  SPIRV-Cross's active-interface analysis DCEs them —
+     * keep every declared UBO and SSBO variable of the module.  (Default-block members
+     * keep the exact-active rules.) */
     for (uint32_t v = 1; v <= r->bound; v++) {
-        if (!r->isvar[v] || !r->vglobal[v] || r->vsc[v] != SpvStorageClassUniform) continue;
-        uint32_t st = strip_arrays(r, pointee(r, r->vtype[v]));
-        if (get_dec(r, st, -1, SpvDecorationBufferBlock, NULL)) continue;   /* SSBO */
+        if (!r->isvar[v] || !r->vglobal[v]) continue;
+        if (r->vsc[v] != SpvStorageClassUniform && r->vsc[v] != SpvStorageClassStorageBuffer) continue;
+        /* both UBOs (Uniform w/o BufferBlock) and SSBOs (Uniform w/ BufferBlock or
+         * StorageBuffer) stay listed */
         s->active[v] = 1;
     }
     if (c) spvc_context_destroy(c);

@@ -21,6 +21,8 @@
 
 extern Renderbuffer *findRenderbuffer(GLMContext ctx, GLuint renderbuffer);
 extern GLint mgl_fb_samples(GLMContext ctx, Framebuffer *fbo);
+/* compat r99: implicit image-atomic sidecar sync before texture reads */
+extern void mgl_compat_image_atom_sync(GLMContext ctx);
 
 static struct MGLExtMetal_fb *fbm(GLMContext ctx) { return ctx->mtl_funcs.ext_fb; }
 
@@ -730,6 +732,10 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
     if (!fbm(ctx) || !fbm(ctx)->read)
         FB_ERROR(GL_INVALID_OPERATION);
 
+    /* compat r99: image-atomic sidecars must be flushed into the texture before it
+     * is read (GL 4.6 §8.25 implicit sync; no-op unless one is dirty) */
+    mgl_compat_image_atom_sync(ctx);
+
     /* gpuaudit: a read into a PIXEL_PACK_BUFFER whose layout the Metal side can serve
      * with a single texture->buffer blit never touches the CPU (no decode loop, no
      * pack loop, no waitUntilCompleted); everything else keeps the path below.
@@ -898,6 +904,43 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
         FB_ERROR(GL_INVALID_ENUM);
     if (filter == GL_LINEAR && (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)))
         FB_ERROR(GL_INVALID_OPERATION);
+
+    /* GL 4.6 §18.3.1: "the formats of the source and destination depth and stencil
+     * buffers must match" — an INVALID_OPERATION is generated when DEPTH_BUFFER_BIT
+     * (resp. STENCIL_BUFFER_BIT) is set and the two framebuffers' depth (stencil)
+     * attachments have different internal formats.  A missing attachment on either
+     * side is a silent no-op of the aspect (KHR-GL46 color-config blits COLOR|DEPTH|
+     * STENCIL from a color-only read FB), and a multisample source is a RESOLVE —
+     * depth formats may convert there (KHR-GL46 depth-config blits into the CTS's
+     * D32FS8 window).  compat r99: dEQP ES31 debug.negative_coverage
+     * get_error.buffer.blit_framebuffer blits DEPTH32F_STENCIL8 -> DEPTH24_STENCIL8
+     * and expects the error. */
+    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
+    {
+        for (int is_depth = 1; is_depth >= 0; is_depth--)
+        {
+            GLbitfield bit = is_depth ? GL_DEPTH_BUFFER_BIT : GL_STENCIL_BUFFER_BIT;
+            if (!(mask & bit)) continue;
+            const FBOAttachment *ra = is_depth ? &readfbo->depth : &readfbo->stencil;
+            const FBOAttachment *da = is_depth ? &drawfbo->depth : &drawfbo->stencil;
+            const Texture *rt = ra->textarget == GL_RENDERBUFFER ? ra->buf.rbo->tex : ra->buf.tex;
+            const Texture *dt = da->textarget == GL_RENDERBUFFER ? da->buf.rbo->tex : da->buf.tex;
+            if (!rt || !dt) continue;                 /* aspect missing: no-op */
+            {
+                extern GLsizei mgl_fb_attachment_samples(GLMContext ctx, FBOAttachment *att);
+                if (mgl_fb_attachment_samples(ctx, (FBOAttachment *)ra) > 1 ||
+                    mgl_fb_attachment_samples(ctx, (FBOAttachment *)da) > 1)
+                    continue;                         /* multisample: a resolve */
+            }
+            if (rt->internalformat != dt->internalformat)
+            {
+                if (getenv("MGL_BLIT_DEBUG"))
+                    fprintf(stderr, "MGL blit ds-mismatch: %s read=0x%x draw=0x%x\n",
+                            is_depth ? "depth" : "stencil", rt->internalformat, dt->internalformat);
+                FB_ERROR(GL_INVALID_OPERATION);
+            }
+        }
+    }
 
     if (mgl_fb_status(ctx, readfbo) != GL_FRAMEBUFFER_COMPLETE ||
         mgl_fb_status(ctx, drawfbo) != GL_FRAMEBUFFER_COMPLETE)

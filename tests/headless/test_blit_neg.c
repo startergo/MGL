@@ -2,6 +2,10 @@
  *  - read D32FS8 -> draw D24S8 (single-sample) : GL_INVALID_OPERATION (formats
  *    do not match), for both the DEPTH and the STENCIL bit
  *  - read without depth -> draw with depth      : silent no-op of the aspect
+ *  - multisample read (resolve)                 : formats may convert, no error
+ * compat r99: the D32FS8 -> D24S8 case now errors (dEQP ES31 debug.negative_coverage
+ * get_error.buffer.blit_framebuffer expects it) — GL compares internalformats even
+ * when MGL shares one Metal storage for both.
  *  - MS D24S8 read -> D32FS8 draw               : resolves and converts (no error)
  */
 #include "mgl_test.h"
@@ -37,9 +41,19 @@ TEST(a_ss_ds_mismatch_errors)
     glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
 
-    /* matching packed formats are fine */
+    /* matching packed formats are fine — but BOTH sides must be the same format:
+     * a D32FS8 read vs a D24S8 draw is a format mismatch and errors per GL 4.6
+     * 18.3.1 (dEQP ES31 debug.negative_coverage get_error.buffer.blit_framebuffer),
+     * even though MGL stores both as Depth32Float_Stencil8.  Make BOTH sides
+     * D24S8: */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[1]);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo[1]);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
     glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo[1]);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[0]);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo[0]);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
+    glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo[0]);
     glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
     EXPECT_GL_ERROR(GL_NO_ERROR);
 }

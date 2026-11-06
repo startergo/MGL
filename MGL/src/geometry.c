@@ -4648,11 +4648,9 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
     int nimgs = 0;
     struct { size_t at, len; char *text; } edits[256];
     int nedits = 0;
-    int msl_has_lta;
     static const char *dubnames[2] = { "mgl_DefaultUniforms_", "gl_DefaultUniformBlock" };
 
     if (!msl) return NULL;
-    msl_has_lta = (strstr(msl, "spvLinearTextureAlignment") != NULL);
     if (nslots_out) *nslots_out = 0;
     if (dub_out) *dub_out = -1;
 
@@ -4661,7 +4659,17 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
      * them from full-window quads into 64x64 images — advanced-cast, allStages-oneImage)
      * indexes past the sidecar buffer and undefined-writes GPU memory.  Re-point the
      * macro's out-of-range branch at the DUMP word the allocation carries (pitch*h,
-     * geomImageAtomicBuffer's +1 word): in-range indices are byte-identical. */
+     * geomImageAtomicBuffer's +1 word): in-range indices are byte-identical.
+     *
+     * compat r99: the row pitch is a LITERAL 16 TEXELS.  The macro's own expression uses
+     * `spvLinearTextureAlignment / 4`, but that constant is a FUNCTION CONSTANT whose
+     * default is 4 (bytes) — never specialized here — so the macro linearized DENSELY
+     * (pitch = width) while the sidecar allocation (geomImageAtomicTexels), the seed and
+     * the resolve kernels all use the 16-texel padded row.  For any image whose width is
+     * not a multiple of 16 (the CTS's 11x11 advanced-cast images) the atomics landed in
+     * the first w*h words and the resolve read them back transposed/truncated — rows
+     * beyond w*h/16 came back zero (test_compat_imgcast.c, KHR-GL46.es_31_compatibility
+     * shader_image_load_store.advanced-cast-fs/-cs). */
     {
         static const char def[] = "#define spvImage2DAtomicCoord(tc, tex)";
         const char *d = strstr(msl, def);
@@ -4676,12 +4684,8 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                 snprintf(nb, sizeof nb,
                     "((((tc).x >= 0 && (tc).y >= 0 && (tc).x < (int)(tex).get_width() && "
                     "(tc).y < (int)(tex).get_height()) ? "
-                    "((((((tex).get_width() + %s - 1) & ~(%s - 1))) * (uint)(tc).y) + (uint)(tc).x) : "
-                    "(((((tex).get_width() + %s - 1) & ~(%s - 1))) * (uint)(tex).get_height())))",
-                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
-                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
-                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u",
-                    msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u");
+                    "((((((tex).get_width() + 16u - 1) & ~(16u - 1))) * (uint)(tc).y) + (uint)(tc).x) : "
+                    "(((((tex).get_width() + 16u - 1) & ~(16u - 1))) * (uint)(tex).get_height())))");
                 edits[nedits].at = (size_t)(body - msl);
                 edits[nedits].len = (size_t)(e - body);
                 edits[nedits].text = strdup(nb);
@@ -5582,7 +5586,12 @@ char *mgl_msl_fix_image_atomics(const char *msl, int max_index, int forced_base,
                 continue;
             }
 
-            const char *al = msl_has_lta ? "spvLinearTextureAlignment / 4" : "16u";
+            /* compat r99: ARRAYED sidecars are laid out DENSELY per element
+             * (geomImageAtomicBufferArray: w*h words each, no row padding) — only
+             * the single-image 2D sidecar pads rows to 16 texels.  With 16u here the
+             * arrayed writes landed past their element window (test_geom_imgarr
+             * fragment_array_atomic_lands / compute_array_atomic_remapped_units). */
+            const char *al = "1u";
             char body[640];
             snprintf(body, sizeof body,
                 "static inline __attribute__((always_inline)) uint %s"

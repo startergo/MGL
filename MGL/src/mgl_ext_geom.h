@@ -495,7 +495,7 @@ struct MGLExtState_geom {
      * after a rebind — those keep the old drop (rare, pathological; GL leaves
      * the un-barriered contents undefined anyway).  Bounded at 16; an overflow
      * keeps the old drop. */
-    struct { void *buf, *view; } img_retired[16];
+    struct { void *buf, *view; bool ms; } img_retired[16];   /* ms: compat r99 — flush path */
     int img_retired_n;
     /* r88: image-unit VIEW cache — geomImageUnitView runs twice per walk and a
      * fresh view object per call made every arrayed-image draw reallocate its
@@ -550,6 +550,12 @@ struct MGLExtMetal_geom {
      * w+4 is GEOMETRY_SHADER_PRIMITIVES_EMITTED stream w (queries.c owns the mapping). */
     void (*query_begin)(GLMContext ctx, unsigned words);            /* bitmask of words */
     void (*query_read)(GLMContext ctx, unsigned word, uint64_t *out);
+    /* GL 4.6 §8.25/§9.3: image-unit writes become visible to SUBSEQUENT commands with no
+     * glMemoryBarrier — an implicit sync point.  The image-atomic sidecars live in buffers,
+     * so any later read of their textures (readPixels, getTexImage, sampling, blit) must
+     * first flush them back (geomResolveImageAtomics; O(1) early-out when none is dirty).
+     * compat r99 added the hook for those call sites. */
+    void (*resolve_image_atomics)(GLMContext ctx);
 };
 
 #ifdef __cplusplus
