@@ -32,6 +32,7 @@
 
 char *mgl_program_fix_vertex_gathers(const char *msl);  /* program.c: AGX vertex gather emulation */
 extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);  /* compat r91: mgl_layout_validate.c */
+extern uint32_t *mgl_spirv_lower_aoa_stage_io(const uint32_t *in, size_t n, size_t *out_n); /* geom r108: geometry.c */
 #include "mgl_ext_geom.h"
 #include "mgl_ext_geom_xfb.h"
 #include "mgl_ext_gpuaudit.h"   /* gpuaudit: xfb scatter without a CPU round trip */
@@ -937,7 +938,12 @@ static const char *xfb_leaf(spvc_compiler c, spvc_type_id tid, unsigned consumed
     unsigned dims = spvc_type_get_num_array_dimensions(t);
     unsigned left = dims - consumed;
 
-    if (left > 1) return "arrays of arrays cannot be captured";
+    /* geom r108: a whole arrays-of-arrays output (`xfb_offset` on the variable,
+     * or glTransformFeedbackVaryings("v")) captures every leaf element in
+     * row-major order, exactly like glslang's ArrayStrides lay them out: one
+     * varying whose size is the product of the remaining dimensions.  The
+     * capture statements index one level at a time (v->dims). */
+    if (left > 4) return "arrays of arrays deeper than 4 levels cannot be captured";
     spvc_basetype bt = spvc_type_get_basetype(t);
     if (bt == SPVC_BASETYPE_STRUCT) return "a structure cannot be captured as a whole";
 
@@ -951,8 +957,20 @@ static const char *xfb_leaf(spvc_compiler c, spvc_type_id tid, unsigned consumed
     v->comp_kind = bt == SPVC_BASETYPE_FP32 ? GL_FLOAT : bt == SPVC_BASETYPE_INT32 ? GL_INT :
                    bt == SPVC_BASETYPE_FP64 ? GL_DOUBLE : GL_UNSIGNED_INT;
     v->comp_per_elem = rows * cols;
-    *whole_array = left == 1;
-    v->size = left == 1 ? (GLint)spvc_type_get_array_dimension(t, 0) : 1;
+    if (left) {
+        /* the remaining dimensions, outermost first (SPIRV-Cross stores them
+         * innermost first — see the subscript walk in xfb_resolve) */
+        v->n_dims = 0;
+        for (unsigned q = 0; q < left && q < 4; q++)
+            v->dims[v->n_dims++] = (uint8_t)spvc_type_get_array_dimension(t, left - 1 - q);
+        GLuint n = 1;
+        for (unsigned q = 0; q < (unsigned)v->n_dims; q++) n *= v->dims[q];
+        v->size = (GLint)n;
+        *whole_array = true;
+    } else {
+        v->size = 1;
+        *whole_array = false;
+    }
     if (v->size < 1) return "unsized array";
     /* a double is captured as its two u32 words: bit-exact GL xfb of double
      * varyings (the capture GLSL writes unpackDouble2x32 per component) */
@@ -1288,18 +1306,38 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                      * (there is no ArrayStride decoration to read, unlike the
                      * block-instance arrays handled above).  The array
                      * dimension sits on the type_id handle (the pointer
-                     * mirror); the members live on the base_type_id struct. */
+                     * mirror); the members live on the base_type_id struct.
+                     * geom r108: also an ARRAY-OF-ARRAYS of structs — the
+                     * elements unroll in row-major order, each packing after
+                     * the previous leaf element. */
                     spvc_type ta = spvc_compiler_get_type_handle(c, r->type_id);
                     if (ttest && ta && !is_block && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
-                        spvc_type_get_num_array_dimensions(ta) == 1 && var_name && var_name[0])
+                        spvc_type_get_num_array_dimensions(ta) >= 1 && var_name && var_name[0])
                     {
                         if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
-                        unsigned n = spvc_type_get_array_dimension(ta, 0);
+                        unsigned adims = spvc_type_get_num_array_dimensions(ta);
+                        unsigned dl[3] = { 1, 1, 1 };
+                        GLuint total = 1;
+                        if (adims > 3) { xfb_fail(xp, "xfb output %s: arrays of arrays deeper than 3 levels cannot be captured", name, NULL); return false; }
+                        for (unsigned q = 0; q < adims; q++) {
+                            dl[q] = spvc_type_get_array_dimension(ta, adims - 1 - q);   /* outermost first */
+                            total *= dl[q];
+                        }
                         unsigned base = (unsigned)off;
-                        for (unsigned e = 0; e < n; e++)
+                        for (GLuint e = 0; e < total; e++)
                         {
                             char vn[256];
-                            snprintf(vn, sizeof vn, "%s[%u]", var_name, e);
+                            unsigned rem = e;
+                            char sub[3][24];
+                            for (int q = (int)adims - 1; q >= 0; q--) {
+                                snprintf(sub[q], sizeof sub[q], "[%u]", rem % dl[q]);
+                                rem /= dl[q];
+                            }
+                            snprintf(vn, sizeof vn, "%s", var_name);
+                            for (unsigned q = 0; q < adims; q++) {
+                                size_t vl = strlen(vn);
+                                snprintf(vn + vl, sizeof vn - vl, "%s", sub[q]);
+                            }
                             GLuint before = xp->count;
                             if (!xfb_flatten_struct(c, flat_tid, base, vn, "",
                                                     xp, buf, whole_arrays, whole_cap, &src_word))
@@ -1746,6 +1784,27 @@ static bool xfb_has_legacy_keywords(const char *s)
     return false;
 }
 
+/* geom r108: flat element index e of a whole arrays-of-arrays capture as a
+ * GLSL subscript chain ("[i][j]", row-major, the order glslang's ArrayStrides
+ * and the capture record use).  Single-level and scalar captures keep the old
+ * "[e]" / "" shapes. */
+static void xfb_aoa_subscript(const MGLXfbVarying *v, GLint e, char *out, size_t cap)
+{
+    out[0] = 0;
+    if (v->n_dims > 1) {
+        unsigned idx[4];
+        unsigned rem = (unsigned)e;
+        for (int q = v->n_dims - 1; q >= 0; q--) { idx[q] = rem % v->dims[q]; rem /= v->dims[q]; }
+        for (int q = 0; q < (int)v->n_dims && cap > 2; q++) {
+            int w = snprintf(out, cap, "[%u]", idx[q]);
+            if (w < 0 || (size_t)w >= cap) break;
+            out += w; cap -= (size_t)w;
+        }
+        return;
+    }
+    snprintf(out, cap, "[%d]", (int)e);
+}
+
 static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *whole_arrays)
 {
     char *body = strdup(src);
@@ -1820,7 +1879,9 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
                 evar = calloc((size_t)v->size, sizeof *evar);
                 for (GLint e = 0; e < v->size; e++) {
                     snprintf(evar[e], 48, "mgl_xfb_v%u_%d", i, e);
-                    xfb_cat(&s, "    %s %s = (%s)[%d];\n", scalar, evar[e], v->expr, e);
+                    char sub[64];
+                    xfb_aoa_subscript(v, e, sub, sizeof sub);
+                    xfb_cat(&s, "    %s %s = (%s)%s;\n", scalar, evar[e], v->expr, sub);
                 }
             } else {
                 snprintf(var, sizeof var, "mgl_xfb_v%u", i);
@@ -1833,7 +1894,11 @@ static char *xfb_capture_glsl(const char *src, MGLXfbProgram *xp, const bool *wh
         for (GLint e = 0; e < v->size; e++) {
             char elem[320];
             if (evar) snprintf(elem, sizeof(elem), "(%s)", evar[e]);
-            else if (whole_arrays[i]) snprintf(elem, sizeof(elem), "(%s)[%d]", expr, e);
+            else if (whole_arrays[i]) {
+                char sub[64];
+                xfb_aoa_subscript(v, e, sub, sizeof sub);
+                snprintf(elem, sizeof(elem), "(%s)%s", expr, sub);
+            }
             else snprintf(elem, sizeof(elem), "(%s)", expr);
             for (GLuint col = 0; col < v->columns; col++) {
                 for (GLuint row = 0; row < v->rows; row++) {
@@ -2041,6 +2106,20 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
     {
         /* compat r91: MSL cannot emit arrays-of-matrices in output variables —
          * split them BEFORE the fp64 pass, as compile_stage does */
+        {
+            /* geom r108: ...and arrays-of-arrays stage outputs (`out vec4
+             * v[2][2]`) — same per-leaf split + private shadow, geometry.c,
+             * before the other stage-IO passes */
+            size_t aoa_w = 0;
+            uint32_t *aoa = mgl_spirv_lower_aoa_stage_io(ir, words, &aoa_w);
+            if (aoa)
+            {
+                if (ir == patched) { patched = aoa; free((void *)ir); }
+                else { free(patched); patched = aoa; }
+                ir = patched;
+                words = aoa_w;
+            }
+        }
         {
             size_t aw = 0;
             uint32_t *aomo = mgl_spirv_lower_aom_output(ir, words, &aw);

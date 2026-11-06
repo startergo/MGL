@@ -1906,7 +1906,39 @@ static uint32_t reg_to_iface(F64 *f, uint32_t v, uint32_t ity, uint32_t orig)
         for (uint32_t i = 0; i < nm && i < 64; i++) {
             uint32_t im = smember(f, ity, i);
             uint32_t om = struct_member(f, orig, i);
-            comps[i] = reg_to_iface(f, xcomp(f, im, v, i), im, om);
+            if (im == om) {
+                /* a non-f64 member keeps its type (geom r105e) and its value */
+                comps[i] = xcomp(f, om, v, i);
+                continue;
+            }
+            /* geom r109: the composite v is REGISTER-form — extract each member
+             * with its OWN type and convert it here.  The old code extracted
+             * with the slot type `im`, which only ever worked through
+             * SPIRV-Cross's tolerance of the type mismatch: a scalar-double
+             * member came out as a ulong->uint2 splat TRUNCATION (the low word
+             * of a small double is zero), so a whole-struct store of a struct
+             * with a double member recorded zero for it. */
+            uint32_t mv = xcomp(f, om, v, i);
+            uint32_t fk = f->ty[om].kind;
+            if (fk == K_FLOAT || (fk == K_VEC && f->ty[om].n <= 2)) {
+                comps[i] = bitcast(f, im, mv);     /* u64 / ulong2 -> uint2 / uint4 */
+            } else if (fk == K_VEC) {
+                /* dvec3/dvec4: pack component pairs into uint4 slots, one per
+                 * GL location (the flat member repr, see iface_of_scalar_or_vec) */
+                uint32_t n = f->ty[om].n;
+                uint32_t slots = (n + 1) / 2;
+                uint32_t elems[4];
+                for (uint32_t j = 0; j < n; j += 2) {
+                    uint32_t d0 = xcomp(f, f->f64ty, mv, j);
+                    uint32_t d1 = (j + 1 < n) ? xcomp(f, f->f64ty, mv, j + 1) : k_u64(f, 0);
+                    iface_flat_set(f, elems, j / 2, d0, d1);
+                }
+                comps[i] = cstruct_n(f, im, elems, slots);
+            } else {
+                /* matrices, arrays, nested structs: the generic paths already
+                 * extract register-form columns/elements with their own types */
+                comps[i] = reg_to_iface(f, mv, im, om);
+            }
         }
         return cstruct_n(f, ity, comps, nm > 64 ? 64 : nm);
     }

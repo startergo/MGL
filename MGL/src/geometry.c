@@ -881,7 +881,14 @@ uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n)
     for (size_t o = 5; o + 4 <= n; ) {
         uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
         if (wc == 0 || o + wc > n) break;
-        if (op == SpvOpConstant) { index_type = in[o + 1]; break; }
+        if (op == SpvOpConstant && !index_type) index_type = in[o + 1];
+        if (op == SpvOpConstant) {
+            /* geom r109: must be a 32-bit INTEGER type — the first OpConstant
+             * can be a %double, whose OpConstant takes TWO value words; a
+             * one-word value under a 64-bit type makes a malformed module */
+            SpvType *it = spv_find_type(m, in[o + 1]);
+            if (it && it->kind == SPVT_INT && it->bits == 32) { index_type = in[o + 1]; break; }
+        }
         o += wc;
     }
 
@@ -1524,7 +1531,13 @@ uint32_t *mgl_spirv_lower_aom_struct_member(const uint32_t *in, size_t n, size_t
     {
         uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
         if (wc == 0 || o + wc > n) break;
-        if (op == SpvOpConstant) { index_type = in[o + 1]; break; }
+        if (op == SpvOpConstant && !index_type) index_type = in[o + 1];
+        if (op == SpvOpConstant)
+        {
+            /* geom r109: must be a 32-bit INTEGER type — see the aoa pass */
+            SpvType *it = spv_find_type(m, in[o + 1]);
+            if (it && it->kind == SPVT_INT && it->bits == 32) { index_type = in[o + 1]; break; }
+        }
         o += wc;
     }
 
@@ -1573,6 +1586,7 @@ uint32_t *mgl_spirv_lower_aom_struct_member(const uint32_t *in, size_t n, size_t
     bool globals_done = false, in_functions = false;
     bool entry_seen = false, prologue_pending = false, prologue_done = true;
     bool in_entry = false;
+    int aoa_flushes = 0;
     for (size_t o = 5; o < n; )
     {
         uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
@@ -1971,6 +1985,742 @@ uint32_t *mgl_spirv_lower_aom_struct_member(const uint32_t *in, size_t n, size_t
     if (getenv("MGL_AOM_DEBUG"))
     {
         FILE *f = fopen("/tmp/aom_struct.spv", "wb");
+        if (f) { fwrite(out.w, 4, out.n, f); fclose(f); }
+    }
+    *out_n = out.n;
+    return out.w;
+}
+
+/* ---- arrays-of-arrays stage IO (geom r108) -----------------------------------
+ * SPIRV-Cross refuses a stage Input/Output variable whose type has more than
+ * one array dimension ("MSL cannot emit arrays-of-arrays in input and output
+ * variables" — spirv_msl.cpp add_*_variable_to_interface_block keeps only
+ * var_type.array.size() == 1), so a GL 4.3-legal interface like
+ *
+ *     layout(location = 0) flat out vec4 v[2][3];      (or Inner o[2][3],
+ *     layout(location = 0) flat in  vec4 v[2][3];       mat4 m[2][3], ...)
+ *
+ * failed the whole link before this pass.  Same cure as the array-of-matrix
+ * and struct-member passes above: the variable becomes one stage variable per
+ * LEAF element — row-major location order, GL 4.6 11.1.1 gives element (i,j,…)
+ * the block of the leaf's locations at base + leafindex*span — plus a Private
+ * shadow twin of the ORIGINAL array-of-arrays type that the body keeps using
+ * under the variable's id, so dynamic indexing and helper functions work
+ * unchanged.  An Input shadow is filled in the entry prologue, an Output
+ * shadow is flushed to the leaf variables before every entry-function
+ * terminator.  xfb_* decorations transfer per leaf (offset advanced by the
+ * decorated ArrayStrides of each array level); a leaf that is a struct with
+ * an array-of-matrix member is then flattened by
+ * mgl_spirv_lower_aom_struct_member, which runs after this pass. */
+typedef struct {
+    uint32_t idx[3];      /* the leaf's element index per array level */
+    uint32_t type;        /* leaf type id */
+    uint32_t loc;         /* the leaf variable's location */
+    uint32_t xfb_off;     /* byte offset; 0xffffffff = unknown */
+} AoaLeaf;
+
+typedef struct {
+    uint32_t var, arr_t, storage, leaf_t, leaf_span, base_loc;
+    int      levels, n_lf;
+    uint32_t len[3], stride[3];
+    bool     has_loc, xfb;
+    uint32_t xfbb, xfbo, xfbs;
+    uint32_t inter[8];
+    int      n_inter;
+    AoaLeaf  lf[64];
+    uint32_t shadow, priv_ptr;
+    uint32_t elem[64], chain[64], val[64];
+} AoaVar;
+
+/* does the type (recursively, a few levels) contain a 64-bit float?
+ * r109: f64 LEAVES are now allowed through the split — the Private shadow keeps
+ * real doubles (the fp64 pass only retargets Input/Output POINTER types, never
+ * the double type ids themselves, and lowers Private doubles to soft-float
+ * values), and each per-leaf stage variable is a plain dvec/dmat the fp64 pass
+ * has always converted at its load/store boundaries.  What stays refused is a
+ * VERTEX-stage INPUT (a double ATTRIBUTE): fp64's attr-slot path
+ * (fp64_attr_slots/attr_slotarr_ty) owns those whole, and splitting first would
+ * change the attribute layout the vertex descriptor feeds. */
+static bool aoa_refuse_f64(SpvModule *m, uint32_t tid, bool vertex_input, int depth)
+{
+    if (!vertex_input) return false;
+    SpvType *t = spv_find_type(m, tid);
+    if (!t || depth > 3) return false;
+    if (t->kind == SPVT_FLOAT) return t->bits == 64;
+    if (t->kind == SPVT_VEC || t->kind == SPVT_MAT || t->kind == SPVT_ARRAY)
+        return aoa_refuse_f64(m, t->elem, vertex_input, depth + 1);
+    if (t->kind == SPVT_STRUCT)
+        for (int i = 0; i < t->n_members; i++)
+            if (aoa_refuse_f64(m, t->members[i], vertex_input, depth + 1)) return true;
+    return false;
+}
+
+uint32_t *mgl_spirv_lower_aoa_stage_io(const uint32_t *in, size_t n, size_t *out_n)
+{
+    const char *err = NULL;
+    SpvModule *m = spv_parse(in, n, &err);
+    if (!m || !m->ok) { spv_free(m); return NULL; }
+
+    /* Vertex / Fragment modules wholesale; a TessellationEvaluation OUTPUT is
+     * also a plain stage variable (its per-vertex INPUTS are
+     * arrays-of-arrays in SPIR-V that SPIRV-Cross routes through
+     * tessellation-specific storage — not ours to rewrite; the tess domain
+     * owns them).  Same for a TCS's per-vertex outputs; the geometry stage is
+     * never SPIRV-Cross'd. */
+    uint32_t model = 0xffff;
+    for (size_t o = 5; o + 4 <= n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpEntryPoint && wc >= 4 && in[o + 2] == m->entry) { model = in[o + 1]; break; }
+        o += wc;
+    }
+    bool tes = model == SpvExecutionModelTessellationEvaluation;
+    bool vtx = model == SpvExecutionModelVertex;
+    bool geo = model == SpvExecutionModelGeometry;
+    if (model != SpvExecutionModelVertex && model != SpvExecutionModelFragment && !tes && !geo)
+    { spv_free(m); return NULL; }
+
+    AoaVar sv[8];
+    int nsv = 0;
+    bool need_prologue = false, need_flush = false;
+    for (int i = 0; i < m->n_vars && nsv < 8; i++)
+    {
+        SpvVar *gv = &m->vars[i];
+        if (gv->storage != SpvStorageClassInput && gv->storage != SpvStorageClassOutput) continue;
+        if (tes && gv->storage == SpvStorageClassInput) continue;   /* per-vertex: tess owns it */
+        SpvType *pt = spv_find_type(m, gv->type_id);
+        if (!pt || pt->kind != SPVT_PTR) continue;
+        /* peel constant-length array levels off the pointee */
+        uint32_t len[3] = { 0, 0, 0 }, arrid[3] = { 0, 0, 0 };
+        int levels = 0;
+        uint32_t cur = pt->elem;
+        while (levels < 3)
+        {
+            SpvType *at = spv_find_type(m, cur);
+            if (!at || at->kind != SPVT_ARRAY || at->len_is_spec || !at->n || at->n > 64) break;
+            len[levels] = at->n;
+            arrid[levels] = at->id;
+            cur = at->elem;
+            levels++;
+        }
+        if (levels < 2) continue;          /* single arrays are MSL-legal */
+        SpvType *leaf = spv_find_type(m, cur);
+        if (!leaf || leaf->kind == SPVT_PTR) continue;
+        uint64_t count = 1;
+        for (int q = 0; q < levels; q++) count *= len[q];
+        if (count < 1 || count > 64) continue;
+        if (leaf->kind == SPVT_STRUCT)
+        {
+            bool block = false;
+            for (int d = 0; d < m->n_decos; d++)
+                if (m->decos[d].id == leaf->id &&
+                    (m->decos[d].deco == SpvDecorationBlock ||
+                     m->decos[d].deco == SpvDecorationBufferBlock)) block = true;
+            if (block) continue;          /* interface blocks are not varyings */
+        }
+        if (spv_deco(m, gv->id, SpvDecorationBuiltIn, NULL)) continue;
+        /* r109 documented gap: a TES OUTPUT with f64 leaves must stay whole for
+         * the tess capture's fp64 slot pairing (tess_split_slot_doubles matches
+         * MSL members "<base>_<slot>" against the GL-view output by NAME);
+         * split leaves are unnamed and never pair, so the doubles would drop
+         * silently.  Leave it unsplit: fp64/SPIRV-Cross fail the link loudly,
+         * as in r108. */
+        if (tes && gv->storage == SpvStorageClassOutput &&
+            aoa_refuse_f64(m, cur, true, 0))
+            continue;
+        if (aoa_refuse_f64(m, cur, vtx && gv->storage == SpvStorageClassInput, 0)) continue;
+        uint32_t base_loc = 0;
+        if (!spv_deco(m, gv->id, SpvDecorationLocation, &base_loc)) continue;
+
+        AoaVar *v = &sv[nsv];
+        memset(v, 0, sizeof *v);
+        v->var = gv->id;
+        v->arr_t = pt->elem;              /* the ORIGINAL array-of-arrays type */
+        v->storage = gv->storage;
+        v->levels = levels;
+        memcpy(v->len, len, sizeof len);
+        v->leaf_t = cur;
+        v->base_loc = base_loc;
+        v->has_loc = true;
+        v->leaf_span = aom_s_locs(m, leaf);
+        v->xfb = spv_deco(m, gv->id, SpvDecorationXfbBuffer, &v->xfbb);
+        if (v->xfb)
+        {
+            spv_deco(m, gv->id, SpvDecorationOffset, &v->xfbo);
+            spv_deco(m, gv->id, SpvDecorationXfbStride, &v->xfbs);
+            for (int q = 0; q < levels; q++)
+                if (!spv_deco_stride(m, arrid[q], &v->stride[q]))
+                {
+                    /* offsets not computable: the capture path would silently
+                     * drop the variable — keep the original shape (fails
+                     * loudly, as before) */
+                    v->xfb = false;
+                    break;
+                }
+        }
+        static const uint32_t interp[4] = { SpvDecorationFlat, SpvDecorationNoPerspective,
+                                            SpvDecorationCentroid, SpvDecorationSample };
+        for (unsigned q = 0; q < 4; q++)
+            if (spv_deco(m, gv->id, interp[q], NULL) && v->n_inter < 8)
+                v->inter[v->n_inter++] = interp[q];
+
+        int lf = 0;
+        for (uint32_t a = 0; a < len[0] && lf < 64; a++)
+            for (uint32_t b = 0; b < (levels > 1 ? len[1] : 1) && lf < 64; b++)
+                for (uint32_t c = 0; c < (levels > 2 ? len[2] : 1) && lf < 64; c++)
+                {
+                    AoaLeaf *x = &v->lf[lf];
+                    memset(x, 0, sizeof *x);
+                    x->idx[0] = a; x->idx[1] = b; x->idx[2] = c;
+                    x->type = cur;
+                    x->loc = base_loc + (uint32_t)lf * v->leaf_span;
+                    x->xfb_off = 0xffffffffu;
+                    if (v->xfb)
+                    {
+                        uint64_t off = v->xfbo;
+                        off += (uint64_t)a * v->stride[0] + (uint64_t)b * v->stride[1] +
+                               (uint64_t)c * v->stride[2];
+                        x->xfb_off = (uint32_t)off;
+                    }
+                    lf++;
+                }
+        v->n_lf = lf;
+        if (v->storage == SpvStorageClassInput) need_prologue = true;
+        else need_flush = true;
+        nsv++;
+    }
+    if (!nsv) { spv_free(m); return NULL; }
+
+    /* pointer types of the module: id -> (storage, pointee) */
+    struct { uint32_t id, storage, pointee; } pmap[256]; int npmap = 0;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpTypePointer && wc >= 4 && npmap < 256)
+        {
+            pmap[npmap].id = in[o + 1];
+            pmap[npmap].storage = in[o + 2];
+            pmap[npmap].pointee = in[o + 3];
+            npmap++;
+        }
+        o += wc;
+    }
+
+    /* every ID that (transitively) evaluates to a pointer into one of the
+     * variables; those pointers' RESULT TYPES still name the stage storage
+     * class, so after re-pointing their base at the Private shadow each one is
+     * retyped to a Private twin (same reasoning as the struct pass above). */
+    uint32_t reach[512]; int nreach = 0;
+    for (int k = 0; k < nsv; k++) reach[nreach++] = sv[k].var;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (size_t o = 5; o < n; )
+        {
+            uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+            if (wc == 0 || o + wc > n) break;
+            const uint32_t *w = in + o;
+            bool base_in = false;
+            if (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain)
+            {
+                if (wc >= 5)
+                    for (int z = 0; z < nreach; z++) if (w[3] == reach[z]) base_in = true;
+            }
+            else if (op == SpvOpCopyObject || op == SpvOpPhi || op == SpvOpSelect)
+            {
+                for (size_t q = 3; q < (size_t)wc; q++)
+                    for (int z = 0; z < nreach; z++) if (w[q] == reach[z]) base_in = true;
+            }
+            else if (op == SpvOpFunctionCall)
+            {
+                /* the variable handed to a function: the parameter's pointer
+                 * type would need the same retyping — skip the variable */
+                for (size_t q = 3; q < (size_t)wc; q++)
+                    for (int z = 0; z < nsv; z++) if (w[q] == sv[z].var) sv[z].n_lf = -1;
+            }
+            if (base_in && nreach < 512)
+            {
+                bool have = false;
+                for (int z = 0; z < nreach; z++) if (w[2] == reach[z]) have = true;
+                if (!have) { reach[nreach++] = w[2]; changed = true; }
+            }
+            o += wc;
+        }
+    }
+    for (int k = 0; k < nsv; )
+    {
+        if (sv[k].n_lf < 0)
+        {
+            memmove(&sv[k], &sv[k + 1], sizeof(AoaVar) * (size_t)(nsv - k - 1));
+            nsv--;
+            continue;
+        }
+        k++;
+    }
+    if (!nsv) { spv_free(m); return NULL; }
+
+    /* stores through a reachable pointer whose pointee is an ARRAY or a MATRIX
+     * split into per-element / per-column stores (MSL cannot copy a raw
+     * constant-space array into a thread spvUnsafeArray) */
+    struct { uint32_t ptr, val, elem, len, newchain, newval; } astores[64]; int nastores = 0;
+    struct { uint32_t type, id; } eptrs[64]; int neptrs = 0;
+    uint32_t max_alen = 0;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        const uint32_t *w = in + o;
+        if (op == SpvOpStore && wc >= 3 && nastores < 64)
+        {
+            bool reptr = false;
+            for (int z = 0; z < nreach; z++) if (w[1] == reach[z]) reptr = true;
+            if (reptr)
+            {
+                uint32_t sptr = 0;
+                for (size_t o2 = 5; o2 < n && !sptr; )
+                {
+                    uint32_t op2 = in[o2] & 0xffff, wc2 = in[o2] >> 16;
+                    if (wc2 == 0 || o2 + wc2 > n) break;
+                    if ((in[o2] & 0xffffu) == SpvOpAccessChain || (in[o2] & 0xffffu) == SpvOpInBoundsAccessChain ||
+                        (in[o2] & 0xffffu) == SpvOpPtrAccessChain || (in[o2] & 0xffffu) == SpvOpCopyObject)
+                        if (in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    if ((in[o2] & 0xffffu) == SpvOpVariable && in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    o2 += wc2;
+                }
+                uint32_t pointee = 0;
+                for (int z = 0; z < npmap; z++) if (pmap[z].id == sptr) pointee = pmap[z].pointee;
+                SpvType *pt_ = pointee ? spv_find_type(m, pointee) : NULL;
+                if (pt_ && ((pt_->kind == SPVT_ARRAY && !pt_->len_is_spec && pt_->n && pt_->n <= 64) ||
+                            (pt_->kind == SPVT_MAT && pt_->n && pt_->n <= 64)))
+                {
+                    uint32_t cnt = pt_->n;
+                    uint32_t elty = pt_->elem;
+                    bool have = false;
+                    for (int z = 0; z < nastores; z++) if (astores[z].ptr == w[1]) have = true;
+                    if (!have)
+                    {
+                        astores[nastores].ptr = w[1];
+                        astores[nastores].val = w[2];
+                        astores[nastores].elem = elty;
+                        astores[nastores].len = cnt;
+                        astores[nastores].newchain = 0;
+                        astores[nastores].newval = 0;
+                        nastores++;
+                        if (cnt > max_alen) max_alen = cnt;
+                    }
+                }
+            }
+        }
+        o += wc;
+    }
+
+    /* Private pointer twins for the reachable chains' pointees */
+    struct { uint32_t src_ptr, dst_ptr, pointee; } twins[256]; int ntwins = 0;
+    for (int r = 0; r < nreach; r++)
+        for (size_t o = 5; o < n; )
+        {
+            uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+            if (wc == 0 || o + wc > n) break;
+            const uint32_t *w = in + o;
+            if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain ||
+                 op == SpvOpCopyObject || op == SpvOpPhi || op == SpvOpSelect) && w[2] == reach[r] && wc >= 3)
+            {
+                uint32_t sptr = w[1];
+                bool have = false;
+                for (int z = 0; z < ntwins; z++) if (twins[z].src_ptr == sptr) have = true;
+                if (!have && ntwins < 256)
+                {
+                    uint32_t pointee = 0;
+                    for (int z = 0; z < npmap; z++) if (pmap[z].id == sptr) pointee = pmap[z].pointee;
+                    if (pointee)
+                    {
+                        twins[ntwins].src_ptr = sptr;
+                        twins[ntwins].pointee = pointee;
+                        twins[ntwins].dst_ptr = 0;
+                        ntwins++;
+                    }
+                }
+            }
+            o += wc;
+        }
+
+    /* integer result type for the leaf-index constants */
+    uint32_t index_type = 0;
+    for (size_t o = 5; o + 4 <= n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpConstant && !index_type) index_type = in[o + 1];
+        if (op == SpvOpConstant)
+        {
+            /* an index constant's type must be a 32-bit INTEGER type: taking
+             * the type of the module's first OpConstant can pick a %float or a
+             * %double, whose OpConstant carries a 64-bit literal (TWO value
+             * words) — emitting a one-word value under a 64-bit type produced
+             * a malformed module ("Invalid word count: OpConstant ... found 5
+             * words") whenever the first constant was a double (geom r109). */
+            SpvType *it = spv_find_type(m, in[o + 1]);
+            if (it && it->kind == SPVT_INT && it->bits == 32)
+            {
+                index_type = in[o + 1];
+                break;
+            }
+        }
+        o += wc;
+    }
+
+    uint32_t next_id = in[3] > 5 ? in[3] : 5;
+    if (!index_type) index_type = next_id++;
+    for (int k = 0; k < nsv; k++)
+    {
+        sv[k].shadow = next_id++;
+        sv[k].priv_ptr = next_id++;
+        for (int e = 0; e < sv[k].n_lf; e++)
+        {
+            sv[k].elem[e] = next_id++;
+            sv[k].chain[e] = next_id++;
+            sv[k].val[e] = next_id++;
+        }
+    }
+    for (int z = 0; z < ntwins; z++) twins[z].dst_ptr = next_id++;
+    for (int z = 0; z < nastores; z++)
+    {
+        astores[z].newchain = next_id;
+        next_id += astores[z].len;
+        astores[z].newval = next_id;
+        next_id += astores[z].len;
+    }
+
+    /* deduplicated stage/Private pointer type ids and index constants */
+    struct { uint32_t type, id; } pptrs[80]; int npptrs = 0;
+    struct { uint32_t value, id; } idxs[24]; int nidxs = 0;
+
+    AomBuf out; memset(&out, 0, sizeof out);
+    for (int i = 0; i < 5; i++) aom_push(&out, in[i]);
+
+    bool globals_done = false, in_functions = false;
+    bool entry_seen = false, prologue_pending = false, prologue_done = true;
+    bool in_entry = false;
+    int aoa_flushes = 0;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        const uint32_t *w = in + o;
+
+        if (!globals_done && op == SpvOpFunction)
+        {
+            if (index_type >= in[3])
+            {
+                uint32_t t[3] = { index_type, 32, 0 };
+                aom_inst(&out, SpvOpTypeInt, 4, t);
+            }
+            for (int k = 0; k < nsv; k++)
+            {
+                AoaVar *v = &sv[k];
+                /* Private pointer to the ORIGINAL array-of-arrays type */
+                uint32_t p1[3] = { v->priv_ptr, SpvStorageClassPrivate, v->arr_t };
+                aom_inst(&out, SpvOpTypePointer, 4, p1);
+                for (int e = 0; e < v->n_lf; e++)
+                {
+                    uint32_t sptr = 0;
+                    for (int z = 0; z < npptrs; z++)
+                        if (pptrs[z].type == (v->lf[e].type | (v->storage << 16))) sptr = pptrs[z].id;
+                    if (!sptr && npptrs < 80)
+                    {
+                        pptrs[npptrs].type = v->lf[e].type | (v->storage << 16);
+                        pptrs[npptrs].id = next_id++;
+                        sptr = pptrs[npptrs++].id;
+                        uint32_t pt[3] = { sptr, v->storage, v->lf[e].type };
+                        aom_inst(&out, SpvOpTypePointer, 4, pt);
+                    }
+                    if (!sptr) sptr = next_id++;
+                    uint32_t vv[3] = { sptr, v->elem[e], v->storage };
+                    aom_inst(&out, SpvOpVariable, 4, vv);
+                    if (v->has_loc)
+                    {
+                        uint32_t dv[3] = { v->elem[e], SpvDecorationLocation, v->lf[e].loc };
+                        aom_inst(&out, SpvOpDecorate, 4, dv);
+                    }
+                    for (int q = 0; q < v->n_inter; q++)
+                    {
+                        uint32_t dv[2] = { v->elem[e], v->inter[q] };
+                        aom_inst(&out, SpvOpDecorate, 3, dv);
+                    }
+                    if (v->xfb && v->lf[e].xfb_off != 0xffffffffu)
+                    {
+                        uint32_t b1[3] = { v->elem[e], SpvDecorationXfbBuffer, v->xfbb };
+                        aom_inst(&out, SpvOpDecorate, 4, b1);
+                        uint32_t b2[3] = { v->elem[e], SpvDecorationOffset, v->lf[e].xfb_off };
+                        aom_inst(&out, SpvOpDecorate, 4, b2);
+                        if (v->xfbs)
+                        {
+                            uint32_t b3[3] = { v->elem[e], SpvDecorationXfbStride, v->xfbs };
+                            aom_inst(&out, SpvOpDecorate, 4, b3);
+                        }
+                    }
+                }
+                uint32_t sh[3] = { v->priv_ptr, v->shadow, SpvStorageClassPrivate };
+                aom_inst(&out, SpvOpVariable, 4, sh);
+            }
+            for (int z = 0; z < ntwins; z++)
+            {
+                uint32_t pt[3] = { twins[z].dst_ptr, SpvStorageClassPrivate, twins[z].pointee };
+                aom_inst(&out, SpvOpTypePointer, 4, pt);
+            }
+            for (int z = 0; z < nastores; z++)
+            {
+                bool have = false;
+                for (int q = 0; q < neptrs; q++) if (eptrs[q].type == astores[z].elem) have = true;
+                if (!have && neptrs < 64)
+                {
+                    eptrs[neptrs].type = astores[z].elem;
+                    eptrs[neptrs].id = next_id++;
+                    uint32_t pt[3] = { eptrs[neptrs].id, SpvStorageClassPrivate, astores[z].elem };
+                    aom_inst(&out, SpvOpTypePointer, 4, pt);
+                    neptrs++;
+                }
+            }
+            for (uint32_t v2 = 0; v2 < max_alen && nidxs < 24; v2++)
+            {
+                idxs[nidxs].value = v2;
+                idxs[nidxs].id = next_id++;
+                uint32_t cv[3] = { index_type, idxs[nidxs].id, v2 };
+                aom_inst(&out, SpvOpConstant, 4, cv);
+                nidxs++;
+            }
+            globals_done = true;
+        }
+        if (op == SpvOpFunction)
+        {
+            in_functions = true;
+            if (wc >= 4 && w[2] == m->entry)
+            {
+                entry_seen = true;
+                in_entry = true;
+                if (need_prologue) { prologue_done = false; prologue_pending = false; }
+            }
+            else in_entry = false;
+        }
+        if (op == SpvOpFunctionEnd) in_entry = false;
+        if (op == SpvOpLabel && entry_seen && !prologue_done) prologue_pending = true;
+
+        if (op == SpvOpVariable)
+        {
+            bool drop = false;
+            for (int k = 0; k < nsv; k++) if (w[2] == sv[k].var) drop = true;
+            if (drop) { o += wc; continue; }
+        }
+        if ((op == SpvOpName || op == SpvOpDecorate) && wc >= 2)
+        {
+            bool drop = false;
+            for (int k = 0; k < nsv; k++) if (w[1] == sv[k].var) drop = true;
+            if (drop)
+            {
+                if (op == SpvOpName)
+                    for (int k = 0; k < nsv; k++)
+                        if (w[1] == sv[k].var)
+                        {
+                            uint32_t nw[64]; int nn = 0;
+                            nw[nn++] = sv[k].shadow;
+                            for (size_t q = 2; q < (size_t)wc && nn < 60; q++) nw[nn++] = w[q];
+                            aom_inst(&out, op, nn + 1, nw);
+                        }
+                o += wc;
+                continue;
+            }
+        }
+        if (op == SpvOpEntryPoint && wc >= 3)
+        {
+            bool hit = false;
+            for (size_t q = 3; q < (size_t)wc; q++)
+                for (int k = 0; k < nsv; k++) if (w[q] == sv[k].var) hit = true;
+            if (hit)
+            {
+                uint32_t nw[640]; int nn = 0;
+                nw[nn++] = w[1]; nw[nn++] = w[2];
+                for (size_t q = 3; q < (size_t)wc; q++)
+                {
+                    bool sub = false;
+                    for (int k = 0; k < nsv; k++) if (w[q] == sv[k].var)
+                    {
+                        for (int e = 0; e < sv[k].n_lf && nn < 600; e++) nw[nn++] = sv[k].elem[e];
+                        sub = true;
+                    }
+                    if (!sub && nn < 630) nw[nn++] = w[q];
+                }
+                aom_inst(&out, op, nn + 1, nw);
+                o += wc;
+                continue;
+            }
+        }
+
+        /* one shadow access chain for leaf (k, e) */
+        #define AOA_CHAIN(k, e_)                                                                     \
+            do {                                                                                     \
+                AoaLeaf *x = &sv[k].lf[e_];                                                          \
+                uint32_t pe = 0;                                                                    \
+                for (int z = 0; z < npptrs; z++)                                                    \
+                    if (pptrs[z].type == (x->type | (SpvStorageClassPrivate << 16))) pe = pptrs[z].id; \
+                if (!pe)                                                                            \
+                {                                                                                   \
+                    pe = next_id++;                                                                 \
+                    uint32_t pt_[3] = { pe, SpvStorageClassPrivate, x->type };                      \
+                    aom_inst(&out, SpvOpTypePointer, 4, pt_);                                       \
+                    if (npptrs < 80) { pptrs[npptrs].type = x->type | (SpvStorageClassPrivate << 16); \
+                                       pptrs[npptrs].id = pe; npptrs++; }                            \
+                }                                                                                   \
+                uint32_t cargs[8]; int cn = 0;                                                      \
+                cargs[cn++] = pe;                                                                   \
+                cargs[cn++] = sv[k].chain[e_];                                                      \
+                cargs[cn++] = sv[k].shadow;                                                         \
+                for (int q = 0; q < sv[k].levels && cn < 7; q++)                                     \
+                {                                                                                   \
+                    uint32_t val = x->idx[q];                                                       \
+                    uint32_t cid = 0;                                                               \
+                    for (int z = 0; z < nidxs; z++) if (idxs[z].value == val) cid = idxs[z].id;     \
+                    if (!cid)                                                                       \
+                    {                                                                               \
+                        cid = next_id++;                                                            \
+                        if (nidxs < 24) { idxs[nidxs].value = val; idxs[nidxs].id = cid; nidxs++; }  \
+                        uint32_t cv[3] = { index_type, cid, val };                                  \
+                        aom_inst(&out, SpvOpConstant, 4, cv);                                       \
+                    }                                                                               \
+                    cargs[cn++] = cid;                                                              \
+                }                                                                                   \
+                aom_inst(&out, SpvOpAccessChain, cn + 1, cargs);                                    \
+            } while (0)
+
+        /* Input: fill the shadow from the leaf variables at the top of the
+         * entry block (first instruction that is not a variable/phi) */
+        if (prologue_pending && !prologue_done && op != SpvOpVariable && op != SpvOpPhi && op != SpvOpLabel)
+        {
+            for (int k = 0; k < nsv; k++)
+                for (int e = 0; e < sv[k].n_lf; e++)
+                {
+                    AOA_CHAIN(k, e);
+                    uint32_t ld[3] = { sv[k].lf[e].type, sv[k].val[e], sv[k].elem[e] };
+                    aom_inst(&out, SpvOpLoad, 4, ld);
+                    uint32_t st[2] = { sv[k].chain[e], sv[k].val[e] };
+                    aom_inst(&out, SpvOpStore, 3, st);
+                }
+            prologue_done = true;
+        }
+
+        /* Output: flush the shadow to the leaf variables before every
+         * terminator of the entry function.  The chain/val ids are
+         * pre-allocated for the FIRST emission; an entry with more than one
+         * terminator (an early `return`, like the capture variant's
+         * out-of-pool guard) would re-emit the same SSA ids — allocate fresh
+         * ones per additional emission (geom r109). */
+        if (in_entry && need_flush &&
+            (op == SpvOpReturn || op == SpvOpReturnValue || op == SpvOpKill ||
+             op == SpvOpUnreachable || op == SpvOpTerminateInvocation))
+        {
+            if (aoa_flushes++)
+                for (int k = 0; k < nsv; k++)
+                {
+                    if (sv[k].storage == SpvStorageClassInput) continue;
+                    for (int e = 0; e < sv[k].n_lf; e++)
+                    {
+                        sv[k].chain[e] = next_id++;
+                        sv[k].val[e] = next_id++;
+                    }
+                }
+            for (int k = 0; k < nsv; k++)
+                for (int e = 0; e < sv[k].n_lf; e++)
+                {
+                    AOA_CHAIN(k, e);
+                    uint32_t ld[3] = { sv[k].lf[e].type, sv[k].val[e], sv[k].chain[e] };
+                    aom_inst(&out, SpvOpLoad, 4, ld);
+                    uint32_t st[2] = { sv[k].elem[e], sv[k].val[e] };
+                    aom_inst(&out, SpvOpStore, 3, st);
+                }
+        }
+        #undef AOA_CHAIN
+
+        /* split array/matrix-typed stores through a reachable pointer */
+        if (op == SpvOpStore && wc >= 3)
+        {
+            int hit = -1;
+            for (int z = 0; z < nastores; z++) if (astores[z].ptr == w[1]) hit = z;
+            if (hit >= 0)
+            {
+                uint32_t eptr = 0;
+                for (int z = 0; z < neptrs; z++) if (eptrs[z].type == astores[hit].elem) eptr = eptrs[z].id;
+                if (eptr)
+                {
+                    for (uint32_t e = 0; e < astores[hit].len; e++)
+                    {
+                        uint32_t cid = 0;
+                        for (int z = 0; z < nidxs; z++) if (idxs[z].value == e) cid = idxs[z].id;
+                        uint32_t cargs[6]; int cn = 0;
+                        cargs[cn++] = eptr;
+                        cargs[cn++] = astores[hit].newchain + e;
+                        cargs[cn++] = w[1];
+                        for (int k = 0; k < nsv; k++) if (w[1] == sv[k].var) cargs[2] = sv[k].shadow;
+                        cargs[cn++] = cid;
+                        aom_inst(&out, SpvOpAccessChain, cn + 1, cargs);
+                        uint32_t ex[4] = { astores[hit].elem, astores[hit].newval + e, w[2], e };
+                        aom_inst(&out, SpvOpCompositeExtract, 5, ex);
+                        uint32_t st[2] = { astores[hit].newchain + e, astores[hit].newval + e };
+                        aom_inst(&out, SpvOpStore, 3, st);
+                    }
+                    o += wc;
+                    continue;
+                }
+            }
+        }
+
+        /* copy the instruction, re-pointing ID operands at the shadows and
+         * retyping pointers that reached into the variable */
+        aom_push(&out, w[0]);
+        if (in_functions)
+        {
+            for (size_t q = 1; q < (size_t)wc; q++)
+            {
+                uint32_t x = w[q];
+                if (q == 1 && wc >= 3)
+                {
+                    bool is_chain = (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain ||
+                                     op == SpvOpPtrAccessChain || op == SpvOpCopyObject ||
+                                     op == SpvOpPhi || op == SpvOpSelect);
+                    if (is_chain)
+                    {
+                        bool in_reach = false;
+                        for (int z = 0; z < nreach; z++) if (w[2] == reach[z]) in_reach = true;
+                        if (in_reach)
+                            for (int z = 0; z < ntwins; z++)
+                                if (x == twins[z].src_ptr) { x = twins[z].dst_ptr; break; }
+                    }
+                }
+                bool id_pos =
+                    (op == SpvOpLoad && q == 3) ||
+                    (op == SpvOpStore && q == 1) ||
+                    ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && q == 3) ||
+                    (op == SpvOpCopyObject && q == 2) ||
+                    (op == SpvOpPhi && q >= 2) ||
+                    (op == SpvOpFunctionCall && q >= 3) ||
+                    (op == SpvOpCopyMemory && (q == 1 || q == 2));
+                if (id_pos)
+                    for (int k = 0; k < nsv; k++) if (x == sv[k].var) { x = sv[k].shadow; break; }
+                aom_push(&out, x);
+            }
+        }
+        else
+            for (size_t q = 1; q < (size_t)wc; q++) aom_push(&out, w[q]);
+        o += wc;
+    }
+    spv_free(m);
+
+    if (out.n <= 5 || !globals_done || !prologue_done) { free(out.w); return NULL; }
+    out.w[3] = next_id;   /* new bound */
+    if (getenv("MGL_AOM_DEBUG"))
+    {
+        FILE *f = fopen("/tmp/aoa_stage.spv", "wb");
         if (f) { fwrite(out.w, 4, out.n, f); fclose(f); }
     }
     *out_n = out.n;
@@ -2747,31 +3497,99 @@ static const char *geom_var_expr(char *buf, size_t cap, const MGLGeomVar *v)
 {
     if (geom_var_dotted(v))
     {
-        if (v->block_array)
+        if (v->block_array && v->sub[0])
+            snprintf(buf, cap, "%s%s.%s", v->name, v->sub, v->member);
+        else if (v->block_array)
             snprintf(buf, cap, "%s[%u].%s", v->name, v->index, v->member);
         else
             snprintf(buf, cap, "%s.%s", v->name, v->member);
     }
     else
-        snprintf(buf, cap, "%s", v->name);
+    {
+        if (v->block_array && v->sub[0])
+            snprintf(buf, cap, "%s%s", v->name, v->sub);
+        else
+            snprintf(buf, cap, "%s", v->name);
+    }
     return buf;
 }
+
+/* geom r108: the element subscript(s) of a varying's element e — "[e]" for one
+ * level, "[i][j]…" for arrays-of-arrays (row-major, the record's leaf order) */
+static void geom_elem_sub(char *buf, size_t cap, const MGLGeomVar *v, GLuint e)
+{
+    buf[0] = 0;
+    if (v->n_adims > 1)
+    {
+        unsigned idx[4], rem = e;
+        for (int q = v->n_adims - 1; q >= 0; q--) { idx[q] = rem % v->adims[q]; rem /= v->adims[q]; }
+        for (int q = 0; q < (int)v->n_adims && cap > 2; q++)
+        {
+            int w = snprintf(buf, cap, "[%u]", idx[q]);
+            if (w < 0 || (size_t)w >= cap) break;
+            buf += w; cap -= (size_t)w;
+        }
+        return;
+    }
+    if (v->elems > 1 || v->arr) snprintf(buf, cap, "[%u]", e);
+}
+
+/* the array suffix of a variable DECLARATION ("[2][3]" for arrays-of-arrays) */
+static void geom_decl_sub(char *buf, size_t cap, const MGLGeomVar *v)
+{
+    buf[0] = 0;
+    if (v->n_adims > 1)
+        for (int q = 0; q < (int)v->n_adims && cap > 2; q++)
+        {
+            int w = snprintf(buf, cap, "[%u]", v->adims[q]);
+            if (w < 0 || (size_t)w >= cap) break;
+            buf += w; cap -= (size_t)w;
+        }
+    else if (v->elems > 1)
+        snprintf(buf, cap, "[%u]", v->elems);
+}
+
+/* the element subscript for the PASS-THROUGH draw function, whose outputs are
+ * redeclared flattened (plain variables unless elems > 1 — a 1-element source
+ * array becomes a plain variable there, unlike the kernel which keeps the
+ * declaration and must index it, r103) */
+static void geom_elem_sub_flat(char *buf, size_t cap, const MGLGeomVar *v, GLuint e)
+{
+    if (v->n_adims <= 1 && v->elems <= 1)
+    {
+        buf[0] = 0;
+        return;
+    }
+    geom_elem_sub(buf, cap, v, e);
+}
+
 
 static void gen_varying_load(SB *b, const MGLGeomVar *v, const char *open, const char *close,
                              const char *index)
 {
     char prefix[192];
+    char esub[28] = "";
 
+    /* r108: a block_array entry stands for ONE element of an array-of-struct
+     * (or array-of-block) interface — the element's subscript goes between the
+     * vertex dimension and the member ("o[k][1].m"); nested arrays-of-arrays
+     * carry it pre-built in sub ("[1][0]") */
+    if (v->block_array)
+    {
+        if (v->sub[0]) snprintf(esub, sizeof esub, "%s", v->sub);
+        else snprintf(esub, sizeof esub, "[%u]", v->index);
+    }
     if (index)
-        snprintf(prefix, sizeof(prefix), "%s[%s]%s%s", v->name, index,
-                 v->member[0] ? "." : "", v->member);
+        snprintf(prefix, sizeof(prefix), "%s[%s]%s%s%s", v->name, index,
+                 esub, v->member[0] ? "." : "", v->member);
     else
-        snprintf(prefix, sizeof(prefix), "%s%s%s", v->name, v->member[0] ? "." : "", v->member);
+        snprintf(prefix, sizeof(prefix), "%s%s%s%s", v->name, esub,
+                 v->member[0] ? "." : "", v->member);
 
     for (GLuint e = 0; e < v->elems; e++)
     {
         char elem_prefix[64] = "";
-        if (v->elems > 1 || v->arr) snprintf(elem_prefix, sizeof(elem_prefix), "[%u]", e);   /* r103 */
+        geom_elem_sub(elem_prefix, sizeof(elem_prefix), v, e);   /* r103 + r108 nested */
 
         if (v->cols > 1)
         {
@@ -2836,7 +3654,7 @@ static void gen_varying_store(SB *b, const MGLGeomVar *v, const char *dest, cons
     for (GLuint e = 0; e < v->elems; e++)
     {
         char ep[32] = "";
-        if (v->elems > 1 || v->arr) snprintf(ep, sizeof(ep), "[%u]", e);   /* r103: 1-element arrays still index */
+        geom_elem_sub(ep, sizeof(ep), v, e);   /* r103 + r108 nested */
 
         for (GLuint c = 0; c < v->cols; c++)
         {
@@ -3279,6 +4097,22 @@ static bool geom_glsl_to_spirv(GLMContext ctx, GLuint glm_type, const char *src,
     glslang_program_delete(prog);
     glslang_shader_delete(shader);
 
+    /* geom r109: the variant keeps the user's plain `out dvec4 v[2][2];` as a
+     * stage output (only interface BLOCKS are plainified, see geom_plain_outputs),
+     * which the fp64 pass below cannot lower ("dynamic index into a dvec3/dvec4
+     * stage-IO array").  Split it into per-leaf outputs + a private shadow first,
+     * exactly like program.c does for the real stage modules. */
+    {
+        size_t aoa_words = 0;
+        uint32_t *aoa = mgl_spirv_lower_aoa_stage_io(out, n, &aoa_words);
+        if (aoa)
+        {
+            free(out);
+            out = aoa;
+            n = aoa_words;
+        }
+    }
+
     /* fp64: the generated variant re-declares the stage's uniform blocks and
      * keeps the body's doubles, so the software-double lowering program.c runs
      * on its own stage modules must run here too — otherwise SPIRV-Cross sees
@@ -3501,10 +4335,26 @@ static char *geom_spirv_to_msl(GLMContext ctx, GLuint glm_type, const uint32_t *
                 parse_words = vf_words;
             }
         }
+        /* geom r108: arrays-of-arrays stage IO in the generated variants (the
+         * capture variant keeps the declared `out` shape) — the same per-leaf
+         * split compile_stage applies, so SPIRV-Cross can emit the interface.
+         * A GLCompute kernel module has no stage variables, so the pass's
+         * Vertex/Fragment gate skips it. */
+        {
+            size_t aoa_words = 0;
+            uint32_t *aoa = mgl_spirv_lower_aoa_stage_io(parse_ir, parse_words, &aoa_words);
+
+            if (aoa)
+            {
+                free(fixed);
+                fixed = aoa;
+                parse_ir = fixed;
+                parse_words = aoa_words;
+            }
+        }
         r = spvc_context_parse_spirv(sctx, parse_ir, parse_words, &pir);
         free(fixed);
     }
-
     if (r != SPVC_SUCCESS)
     {
         mgl_append_log(log, "ERROR: geometry: SPIR-V parse failed (%s)\n", spvc_context_get_last_error_string(sctx));
@@ -4673,20 +5523,46 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
         MGLGeomVar *out;
         SpvType *t;
         uint32_t elems = 1;
+        uint32_t geom_nested_lens[4] = { 1, 1, 1, 1 };   /* r108: the levels of an arrays-of-arrays variable */
+        int geom_nested_n = 0;
 
         if (v->storage != want) continue;
         if (spv_deco(m, v->id, SpvDecorationBuiltIn, NULL)) continue;   /* builtins are handled separately */
         if (!spv_deco(m, v->id, SpvDecorationLocation, &location)) continue;   /* user varyings only */
 
-        t = spv_value_type(m, v->type_id, &elems);
-        if (!t) continue;
-        if (inputs)
+        /* geom r108: peel EVERY array level (a plain variable may be an
+         * arrays-of-arrays — `flat out vec4 v[2][3]`); elems is the product of
+         * the levels and adims[] keeps them for the nested subscripts.  A
+         * geometry input's outermost level is the primitive's vertices, which
+         * the rewritten shader does not redeclare, so it is stripped first. */
         {
-            /* the outermost array of a geometry input is the primitive's vertices */
-            uint32_t dummy = 1;
-            t = spv_value_type(m, v->type_id, &dummy);
+            SpvType *rt = spv_find_type(m, v->type_id);
+            uint32_t lens[8];
+            int nlens = 0;
+            while (rt && rt->kind == SPVT_PTR) rt = spv_find_type(m, rt->elem);
+            if (inputs && rt && rt->kind == SPVT_ARRAY)
+                rt = spv_find_type(m, rt->elem);
+            while (rt && rt->kind == SPVT_ARRAY && nlens < 8)
+            {
+                lens[nlens++] = rt->n ? rt->n : 1;
+                rt = spv_find_type(m, rt->elem);
+            }
+            t = rt;
             elems = 1;
+            for (int q = 0; q < nlens; q++) elems *= lens[q];
+            if (nlens > 1)
+            {
+                /* nested: record the levels on the entry once it is emitted below */
+                geom_nested_lens[0] = lens[0];
+                geom_nested_lens[1] = lens[1];
+                geom_nested_lens[2] = nlens > 2 ? lens[2] : 1;
+                geom_nested_lens[3] = nlens > 3 ? lens[3] : 1;
+                geom_nested_n = nlens > 4 ? 4 : nlens;
+            }
+            else
+                geom_nested_n = 0;
         }
+        if (!t) continue;
         /* an interface block is a struct-typed interface variable: its members consume
          * consecutive locations starting at the block's location (glslang decorates the
          * variable, not the members).  With an instance name the members are reached through
@@ -4911,9 +5787,22 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
             {
                 SpvType *raw = spv_find_type(m, v->type_id);
                 while (raw && raw->kind == SPVT_PTR) raw = spv_find_type(m, raw->elem);
-                bool inst_is_array = raw && raw->kind == SPVT_ARRAY &&
-                                     spv_find_type(m, raw->elem) == t;
-                if (!inputs && !anon && inst_is_array && n > m0)
+                /* a geometry input's outermost array layer is the primitive's
+                 * vertices (gen_varying_load re-indexes it separately) — strip
+                 * it before testing for an element array */
+                if (inputs && raw && raw->kind == SPVT_ARRAY)
+                    raw = spv_find_type(m, raw->elem);
+                /* r108: peel EVERY level — an arrays-of-arrays of structs
+                 * ("out Goku { .. } goku[2][3];") unrolls leaf-by-leaf, exactly
+                 * like the single-level case, in row-major order */
+                bool inst_is_array = false;
+                if (raw && raw->kind == SPVT_ARRAY)
+                {
+                    SpvType *rn = raw;
+                    while (rn && rn->kind == SPVT_ARRAY) rn = spv_find_type(m, rn->elem);
+                    inst_is_array = rn == t;
+                }
+                if (!anon && inst_is_array && n > m0)
                 {
                     int nm = n - m0;
                     GLuint e, i2;
@@ -4959,6 +5848,16 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                         vars[m0 + i2].block_array = true;
                         vars[m0 + i2].index = 0;
                         vars[m0 + i2].block_elems = elems ? elems : 1;
+                        vars[m0 + i2].sub[0] = 0;
+                        if (geom_nested_n > 1)
+                        {
+                            for (int q = 0; q < geom_nested_n; q++)
+                            {
+                                char one[12];
+                                snprintf(one, sizeof one, "[0]");
+                                strlcat(vars[m0 + i2].sub, one, sizeof vars[m0 + i2].sub);
+                            }
+                        }
                     }
                     for (e = 1; e < (elems ? elems : 1) && n < MGL_GEOM_MAX_VARYINGS; e++)
                     {
@@ -4970,6 +5869,23 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
                             nv->location = mv->location + span * e;
                             if (mv->xfb_offset != 0xffffffffu)
                                 nv->xfb_offset = mv->xfb_offset + stride * e;
+                            nv->sub[0] = 0;
+                            if (geom_nested_n > 1)
+                            {
+                                /* row-major leaf subscripts ("[1][0]") */
+                                unsigned idx[4], rem = e;
+                                for (int q = geom_nested_n - 1; q >= 0; q--)
+                                {
+                                    idx[q] = rem % geom_nested_lens[q];
+                                    rem /= geom_nested_lens[q];
+                                }
+                                for (int q = 0; q < geom_nested_n; q++)
+                                {
+                                    char one[12];
+                                    snprintf(one, sizeof one, "[%u]", idx[q]);
+                                    strlcat(nv->sub, one, sizeof nv->sub);
+                                }
+                            }
                             n++;
                         }
                     }
@@ -5008,7 +5924,9 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
          * the rewritten shader keeps that declaration, so every store/load expression
          * must index it ("x[0][c].r"), exactly like a 1-element array member (r103).
          * The input side carries the primitive's vertex dimension as its outermost
-         * array layer, which the reflection strips above — test one level below it. */
+         * array layer, which the reflection strips above — test one level below it.
+         * r108: nested levels are recorded for the "[i][j]" subscripts; the record
+         * walk itself already used the product. */
         {
             SpvType *raw = spv_find_type(m, v->type_id);
 
@@ -5016,6 +5934,18 @@ static bool geom_reflect_stage(SpvModule *m, bool inputs, MGLGeomVar *vars, int 
             if (inputs && raw && raw->kind == SPVT_ARRAY)
                 raw = spv_find_type(m, raw->elem);
             out->arr = raw && raw->kind == SPVT_ARRAY;
+        }
+        if (geom_nested_n > 1)
+        {
+            /* r109: doubles carry the nested shape too — every generator that
+             * touches the record (kernel load/store, capture writer) walks the
+             * leaves with geom_elem_sub and packs/unpacks (lo,hi) pairs; the
+             * raster side's slot index is flat (leaf * cols * ceil(rows/2)),
+             * so adims only reach the GLSL-shaped expressions */
+            for (int q = 0; q < geom_nested_n && q < 4; q++)
+                out->adims[q] = (uint8_t)geom_nested_lens[q];
+            out->n_adims = (uint8_t)geom_nested_n;
+            out->arr = true;   /* every expression indexes the leaves */
         }
         out->words = elems * out->cols * out->rows * base_words(out->base);
         out->flat = spv_deco(m, v->id, SpvDecorationFlat, NULL);
@@ -9151,8 +10081,20 @@ static char *geom_gen_kernel_glsl_inner(GLMContext ctx, MGLGeomProgram *gp, cons
          * ("goku[e].c") — the store/clear expression is shared with mgl_store_output */
         char src[192];
         geom_var_expr(src, sizeof(src), &gp->out_v[i]);
-        sb_put(&b, "    %s%s = %s(0);\n", src, (gp->out_v[i].elems > 1 || gp->out_v[i].arr) ? "[0]" : "",
-               glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, gp->out_v[i].cols));
+        const char *tyname = glsl_type_name(gp->out_v[i].base, gp->out_v[i].rows, gp->out_v[i].cols);
+        if (gp->out_v[i].n_adims > 1)
+        {
+            /* r108: arrays-of-arrays — every leaf must be cleared ("m[0][0] = ..") */
+            for (GLuint e = 0; e < gp->out_v[i].elems; e++)
+            {
+                char sub[64];
+                geom_elem_sub(sub, sizeof sub, &gp->out_v[i], e);
+                sb_put(&b, "    %s%s = %s(0);\n", src, sub, tyname);
+            }
+        }
+        else
+            sb_put(&b, "    %s%s = %s(0);\n", src, (gp->out_v[i].elems > 1 || gp->out_v[i].arr) ? "[0]" : "",
+                   tyname);
     }
     sb_put(&b, "    mgl_gs_main();\n");
     sb_put(&b, "    mgl_gs_end_stream_primitive(mgl_stream);\n");
@@ -9184,7 +10126,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
         MGLGeomVar *v = &gp->out_v[i];
         char arr[32] = "";
         char name[160];
-        if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", v->elems);
+        geom_decl_sub(arr, sizeof(arr), v);   /* r108: nested ("[2][3]") too */
         /* a named output block member is emitted as a plain varying of its own: the
          * raster side links to the fragment stage's input block by location, so the
          * member's name is irrelevant here (and the instance name would collide) */
@@ -9342,7 +10284,7 @@ static char *geom_gen_draw_glsl(GLMContext ctx, MGLGeomProgram *gp, char **log)
                 snprintf(dst, sizeof(dst), "mgl_vm%d_%u", i, e);
             else
             {
-                if (v->elems > 1) snprintf(arr, sizeof(arr), "[%u]", e);
+                geom_elem_sub_flat(arr, sizeof(arr), v, e);   /* r108: flattened outputs; nested too */
                 snprintf(dst, sizeof(dst), "%s%s", name, arr);
             }
             sb_put(&b, "    %s = ", dst);
@@ -9545,8 +10487,17 @@ static bool geom_derive_exprs(MGLGeomProgram *gp, Program *vs_program, char **lo
                         vs_out[j].name, vs_out[j].base, vs_out[j].rows, vs_out[j].cols, vs_out[j].elems);
             goto done;
         }
-        snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s%s%s", vs_out[j].name,
-                 vs_out[j].member[0] ? "." : "", vs_out[j].member);
+        /* r107b/r108: the writer-side expression of a block_array (array-of-struct
+         * or array-of-block) entry carries its element subscript — the capture
+         * preamble stores v->expr verbatim */
+        char esub[28] = "";
+        if (vs_out[j].block_array)
+        {
+            if (vs_out[j].sub[0]) snprintf(esub, sizeof esub, "%s", vs_out[j].sub);
+            else snprintf(esub, sizeof esub, "[%u]", vs_out[j].index);
+        }
+        snprintf(gp->in_v[i].expr, sizeof(gp->in_v[i].expr), "%s%s%s%s", vs_out[j].name,
+                 esub, vs_out[j].member[0] ? "." : "", vs_out[j].member);
     }
     ok = true;
 
@@ -14048,7 +14999,7 @@ static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp)
         const char *ty = glsl_type_name(v->base, v->rows, v->cols);
         char arr[24];
         if (!ty) { free(b.s); return NULL; }
-        if (v->elems > 1) snprintf(arr, sizeof arr, "[%u]", v->elems); else arr[0] = 0;
+        geom_decl_sub(arr, sizeof arr, v);   /* r108: nested ("[2][3]") too */
         sb_put(&b, "%s%s%sin %s mgl_ci%d%s[];\n", v->flat ? "flat " : "",
                v->noperspective ? "noperspective " : "", v->centroid ? "centroid " : "",
                ty, i, arr);
@@ -14060,7 +15011,7 @@ static char *geom_gen_cull_gs_glsl(MGLGeomProgram *gp)
         const char *ty = glsl_type_name(v->base, v->rows, v->cols);
         char arr[24];
         if (!ty) { free(b.s); return NULL; }
-        if (v->elems > 1) snprintf(arr, sizeof arr, "[%u]", v->elems); else arr[0] = 0;
+        geom_decl_sub(arr, sizeof arr, v);   /* r108: nested ("[2][3]") too */
         sb_put(&b, "%s%s%sout %s mgl_co%d%s;\n", v->flat ? "flat " : "",
                v->noperspective ? "noperspective " : "", v->centroid ? "centroid " : "",
                ty, i, arr);
@@ -14473,8 +15424,18 @@ static bool geom_cull_reflect(GLMContext ctx, MGLGeomProgram *gp, Program *progr
 
         snprintf(iv->name, sizeof iv->name, "mgl_ci%d", i);
         snprintf(ov->name, sizeof ov->name, "mgl_co%d", i);
-        snprintf(iv->expr, sizeof iv->expr, "%s%s%s", vs_out[i].name,
-                 vs_out[i].member[0] ? "." : "", vs_out[i].member);
+        /* r108: keep a block_array entry's element subscript in the writer-side
+         * expression (the member was flattened into a plain mgl_ci variable) */
+        {
+            char esub[28] = "";
+            if (vs_out[i].block_array)
+            {
+                if (vs_out[i].sub[0]) snprintf(esub, sizeof esub, "%s", vs_out[i].sub);
+                else snprintf(esub, sizeof esub, "[%u]", vs_out[i].index);
+            }
+            snprintf(iv->expr, sizeof iv->expr, "%s%s%s%s", vs_out[i].name,
+                     esub, vs_out[i].member[0] ? "." : "", vs_out[i].member);
+        }
         snprintf(iv->block, sizeof iv->block, "%s", vs_out[i].block);
         snprintf(ov->block, sizeof ov->block, "%s", vs_out[i].block);
         iv->member[0] = ov->member[0] = 0;

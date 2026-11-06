@@ -168,7 +168,15 @@ typedef struct MGLGeomVar {
                            * expression must index it ("goku.a[0]") or glslang rejects
                            * the conversion of the whole array in the generated kernel */
     GLuint  index;         /* block_array: element index the entry stands for */
+    char    sub[24];       /* geom r108: block_array of an arrays-of-arrays instance: the
+                            * element's subscript chain as written ("[1][0]"), built by the
+                            * unroll; empty for a single level ("[%u]" of index is used) */
     GLuint  block_elems;   /* block_array: the instance's element count */
+    uint8_t adims[4];      /* geom r108: lengths of the nested array dimensions of a
+                            * PLAIN (non-block) interface variable, outermost first;
+                            * n_adims 0 = at most one level (the legacy elems/arr fields),
+                            * n_adims > 1 = arrays-of-arrays, elems is then the product */
+    uint8_t n_adims;
     GLuint  stream;         /* outputs: stream the varying is declared for */
     char    expr[128];      /* writer side: expression of the producing stage output */
     int     xfb_buffer;     /* shader-declared capture buffer (xfb_buffer=), -1 when not captured */

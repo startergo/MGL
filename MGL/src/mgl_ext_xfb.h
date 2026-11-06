@@ -55,6 +55,9 @@ typedef struct MGLXfbVarying_t {
     GLuint   stream;        /* the stream the varying is declared for (geometry output; 0
                              * otherwise).  Only stream 0 rasterizes, but GL captures every
                              * stream, each into the buffers its varyings name */
+    uint8_t  dims[4];       /* geom r108: per-level lengths of a whole arrays-of-arrays
+                             * capture, outermost first (n_dims 0/1 = the old single level) */
+    uint8_t  n_dims;
 } MGLXfbVarying;
 
 /* per program object */

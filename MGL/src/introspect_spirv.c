@@ -3888,12 +3888,16 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
                         continue;
                     }
                     if (((s == _TESS_CONTROL_SHADER) ||
-                         (s == _TESS_EVALUATION_SHADER && dir == 0)) && !v->is_per_patch) {
+                         (s == _TESS_EVALUATION_SHADER && dir == 0) ||
+                         (s == _GEOMETRY_SHADER && dir == 0)) && !v->is_per_patch) {
                         /* per-vertex patch interface: budgeted PER ELEMENT.  The TES
                          * input arrays come EXPANDED (one entry per patch vertex,
                          * element 0 at the array's base location) — count only the
                          * element-0 entry; TCS-side arrays stay one entry with the
-                         * full size, so clamp it to a single element. */
+                         * full size, so clamp it to a single element.  geom r108: a
+                         * geometry input is the same shape (an array over the
+                         * primitive's vertices — reflect_stage expands it too), and
+                         * MAX_GEOMETRY_INPUT_COMPONENTS is likewise per vertex. */
                         const char *b = strchr(v->name, '[');
                         if (b && !(b[1] == '0' && b[2] == ']')) continue;
                         cnt = 1;

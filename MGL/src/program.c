@@ -56,6 +56,7 @@ static uint64_t mgl_link_group_seq;
 extern char *mgl_layout_validate_stage(GLMContext ctx, int stage, const uint32_t *ir, size_t words,
                                        const uint32_t *consumer_ir, size_t consumer_words, bool separable);
 extern uint32_t *mgl_spirv_lower_aom_output(const uint32_t *in, size_t n, size_t *out_n);
+extern uint32_t *mgl_spirv_lower_aoa_stage_io(const uint32_t *in, size_t n, size_t *out_n);  /* geom r108: geometry.c */
 #include "buffers.h"
 #include "msl_reserved.h"
 #include "spirv_vote.h"
@@ -2638,6 +2639,23 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
 
     bool lowered64 = false;
 
+    /* geom r108: arrays-of-arrays OUTPUT variables (`flat out vec4 v[2][3]`,
+     * `out Inner o[2][3]`) — SPIRV-Cross cannot emit them ("MSL cannot emit
+     * arrays-of-arrays in input and output variables"), which failed the whole
+     * link.  Split into per-leaf variables + a private shadow BEFORE the other
+     * stage-IO passes and the fp64 pass (geometry.c); a struct leaf is then
+     * flattened by the aom-struct pass below. */
+    {
+        size_t aoa_words = 0;
+        uint32_t *aoa = mgl_spirv_lower_aoa_stage_io(prepared, prepared_words, &aoa_words);
+        if (aoa)
+        {
+            free(prepared);
+            prepared = aoa;
+            prepared_words = aoa_words;
+        }
+    }
+
     /* compat r91: MSL cannot emit arrays-of-matrices in output variables
      * either (`layout(location=0) flat out dmat2 goku[3]`) — split into
      * per-element outputs + a flushed private shadow BEFORE the fp64 pass,
@@ -2784,6 +2802,22 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+
+    /* geom r108: ...and arrays-of-arrays stage INPUTS (`flat in vec4 v[2][3]`)
+     * — same per-leaf split + private shadow, geometry.c.  Runs after the fp64
+     * pass like mgl_spirv_lower_aom_input (fp64 leaves are refused by the pass
+     * itself). */
+    if (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER)
+    {
+        size_t aoa_words = 0;
+        uint32_t *aoa = mgl_spirv_lower_aoa_stage_io(prepared, prepared_words, &aoa_words);
+        if (aoa)
+        {
+            free(prepared);
+            prepared = aoa;
+            prepared_words = aoa_words;
+        }
+    }
 
     /* geom: arrays-of-matrices stage inputs (`in mat2x3 d[2]`) — SPIRV-Cross's MSL
      * backend cannot emit them, which fails the whole link.  Lower them to
