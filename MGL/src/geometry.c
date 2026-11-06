@@ -1012,6 +1012,971 @@ uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n)
     return out.w;
 }
 
+/* ---- arrays-of-matrices inside stage-IO STRUCTS: lower to element outputs ----
+ * SPIRV-Cross refuses a stage Input/Output VARIABLE whose struct (recursively)
+ * holds a member of array-of-matrix type ("MSL cannot emit arrays-of-matrices
+ * in input and output variables"; Metal stage structs cannot carry them), which
+ * failed the whole link for GLSL-legal interfaces like
+ *
+ *     struct TestStruct { mat2x3 a[3]; uvec4 b[1]; dvec4 c; };
+ *     layout (location = 0, xfb_offset = 0) flat out TestStruct goku;
+ *     goku = uni_goku;                        (KHR-Single-GL46.enhanced_layouts
+ *                                              xfb_struct_explicit_location_*)
+ *
+ * mgl_spirv_lower_aom_output / _aom_input above handle whole variables of
+ * array-of-matrix type; this is the struct-member case.  The struct variable
+ * becomes one stage variable per flattened member — an array-of-matrix member
+ * explodes into one matrix variable per element, a nested struct that
+ * (recursively) contains such a member flattens, everything else stays one
+ * variable — plus a Private shadow of the ORIGINAL struct under the variable's
+ * id.  Nothing in the function bodies changes: an Output shadow is flushed to
+ * the element variables before every terminator of the entry function, an
+ * Input shadow is filled in the entry prologue (the _aom_input pattern, which
+ * also keeps dynamic indexing and helper functions working).
+ *
+ * Element locations follow GL 4.6 11.1.1 counting (a dvec3/dvec4 column takes
+ * two locations), honouring explicit member Location decorations; the FS-side
+ * mirror struct is lowered identically, so both sides agree whether the base
+ * variable carries a Location or is assigned in order of appearance.  xfb
+ * decorations transfer per element when member offsets are known, exactly like
+ * _aom_output does.  The GL view of the module keeps the struct, so
+ * introspection still reports the original interface. */
+typedef struct {
+    uint32_t path[4];      /* member indices from the variable's struct down */
+    int      depth;
+    uint32_t type;         /* element type id (a matrix for exploded members) */
+    uint32_t loc;          /* assigned location */
+    uint32_t src_struct;   /* struct holding the final member (for decorations) */
+    uint32_t src_member;   /* its member index */
+    uint32_t xfb_base;     /* member Offset (path sum), 0xffffffff = unknown */
+    uint32_t stride;       /* ArrayStride of the exploded array, 0 if none */
+    uint32_t e;            /* element index for exploded entries, 0xffffffff = plain */
+} AomSEntry;
+
+typedef struct {
+    uint32_t var, struct_t, shadow_t, storage, base_loc;
+    bool     has_loc, xfb;
+    uint32_t xfbb, xfbo, xfbs;
+    uint32_t arr_len;      /* geom r107: >0 for an ARRAY-of-struct root (out Inner o[2]) */
+    uint32_t arr_t;        /* its ARRAY of shadow_t type id */
+    uint32_t inter[8];     /* interpolation decorations on the variable */
+    int      n_inter;
+    AomSEntry en[64];
+    int      n_en;
+    uint32_t shadow, priv_ptr;
+    uint32_t elem[64];     /* element variables */
+    uint32_t chain[64];    /* shadow access chains */
+    uint32_t val[64];      /* load/store temporaries */
+} AomSVar;
+
+/* locations a type consumes in the stage interface (GL 4.6 11.1.1) */
+static uint32_t aom_s_locs(SpvModule *m, SpvType *t)
+{
+    if (!t) return 1;
+    if (t->kind == SPVT_VEC)
+    {
+        /* the parser does not propagate component size onto vector types */
+        SpvType *el = spv_find_type(m, t->elem);
+        uint32_t bits = el ? el->bits : t->bits;
+        return (bits == 64 && t->n >= 3) ? 2 : 1;
+    }
+    if (t->kind == SPVT_MAT)
+    {
+        SpvType *col = spv_find_type(m, t->elem);
+        SpvType *cel = col ? spv_find_type(m, col->elem) : NULL;
+        uint32_t cbits = cel ? cel->bits : (col ? col->bits : 32);
+        return (cbits == 64 && col && col->n >= 3) ? t->n * 2 : t->n;
+    }
+    if (t->kind == SPVT_ARRAY && !t->len_is_spec && t->n)
+        return t->n * aom_s_locs(m, spv_find_type(m, t->elem));
+    if (t->kind == SPVT_STRUCT)
+    {
+        uint32_t s = 0;
+        for (int i = 0; i < t->n_members; i++)
+            s += aom_s_locs(m, spv_find_type(m, t->members[i]));
+        return s ? s : 1;
+    }
+    return 1;   /* scalar */
+}
+
+/* component bits of a vector/matrix type through its element chain */
+static uint32_t aom_s_bits(SpvModule *m, SpvType *t)
+{
+    for (int i = 0; t && i < 3; i++)
+    {
+        if (t->kind == SPVT_FLOAT || t->kind == SPVT_INT || t->kind == SPVT_BOOL) return t->bits;
+        t = spv_find_type(m, t->elem);
+    }
+    return 32;
+}
+
+static bool aom_s_is_f64_vec(SpvModule *m, SpvType *t)
+{
+    return t && t->kind == SPVT_VEC && aom_s_bits(m, t) == 64;
+}
+
+static bool aom_s_is_f64_mat(SpvModule *m, SpvType *t)
+{
+    SpvType *col = (t && t->kind == SPVT_MAT) ? spv_find_type(m, t->elem) : NULL;
+    return col && aom_s_is_f64_vec(m, col);
+}
+
+/* does the struct (recursively) hold an array-of-matrix member? */
+static bool aom_s_has(SpvModule *m, uint32_t struct_t, int depth)
+{
+    SpvType *t = spv_find_type(m, struct_t);
+    if (!t || t->kind != SPVT_STRUCT || depth > 3) return false;
+    for (int i = 0; i < t->n_members; i++)
+    {
+        SpvType *mt = spv_find_type(m, t->members[i]);
+        if (!mt) continue;
+        if (mt->kind == SPVT_ARRAY && !mt->len_is_spec && mt->n && mt->n <= 64)
+        {
+            SpvType *el = spv_find_type(m, mt->elem);
+            if (el && (el->kind == SPVT_MAT || aom_s_is_f64_vec(m, el) ||
+                       (el->kind == SPVT_FLOAT && el->bits == 64))) return true;
+        }
+        if (mt->kind == SPVT_STRUCT && aom_s_has(m, mt->id, depth + 1)) return true;
+    }
+    return false;
+}
+
+/* flatten one struct's members into the entry list; *loc runs the interface
+ * location counter (explicit member Locations override).  Returns false when
+ * the shape cannot be expressed. */
+static bool aom_s_collect(SpvModule *m, uint32_t struct_t, uint32_t *loc,
+                          AomSEntry *en, int *n_en, int cap,
+                          uint32_t *path, int depth, uint32_t xfb_base)
+{
+    SpvType *t = spv_find_type(m, struct_t);
+    if (!t || t->kind != SPVT_STRUCT) return false;
+    for (int i = 0; i < t->n_members; i++)
+    {
+        uint32_t mt_id = t->members[i];
+        SpvType *mt = spv_find_type(m, mt_id);
+        if (!mt) return false;
+        uint32_t mloc, moff;
+        if (spv_member_deco(m, struct_t, (uint32_t)i, SpvDecorationLocation, &mloc))
+            *loc = mloc;
+        uint32_t this_xfb = xfb_base;
+        if (xfb_base != 0xffffffffu &&
+            spv_member_deco(m, struct_t, (uint32_t)i, SpvDecorationOffset, &moff))
+            this_xfb = (xfb_base == 0xfffffffeu) ? moff : xfb_base + moff;
+
+        if (mt->kind == SPVT_STRUCT && aom_s_has(m, mt_id, depth + 1))
+        {
+            /* nested struct containing an array-of-matrix member: flatten it */
+            if (depth + 1 > 3) return false;
+            path[depth] = (uint32_t)i;
+            if (!aom_s_collect(m, mt_id, loc, en, n_en, cap, path, depth + 1, this_xfb))
+                return false;
+            continue;
+        }
+        if (mt->kind == SPVT_ARRAY && !mt->len_is_spec && mt->n && mt->n <= 64)
+        {
+            SpvType *el = spv_find_type(m, mt->elem);
+            bool elmat = el && el->kind == SPVT_MAT;
+            /* an f64 element type also explodes: a stage VARIABLE of
+             * array-of-double type confuses the fp64 slot lowering (its store
+             * conversion packs uint4 slots while the variable becomes
+             * uint2[N]), while per-element scalar/dvec/dmat variables take the
+             * well-trodden path */
+            bool elf64 = el && ((el->kind == SPVT_FLOAT && el->bits == 64) ||
+                                (el->kind == SPVT_VEC && aom_s_is_f64_vec(m, el)) ||
+                                (el->kind == SPVT_MAT && aom_s_is_f64_mat(m, el)));
+            if (el && (elmat || elf64))
+            {
+                uint32_t stride = 0;
+                spv_deco_stride(m, mt_id, &stride);
+                for (uint32_t e = 0; e < mt->n; e++)
+                {
+                    if (*n_en >= cap) return false;
+                    AomSEntry *x = &en[(*n_en)++];
+                    memset(x, 0, sizeof *x);
+                    memcpy(x->path, path, sizeof(uint32_t) * (size_t)depth);
+                    x->path[depth] = (uint32_t)i;
+                    x->depth = depth + 1;
+                    x->type = mt->elem;
+                    x->loc = *loc;
+                    x->src_struct = struct_t;
+                    x->src_member = (uint32_t)i;
+                    x->xfb_base = this_xfb;
+                    x->stride = stride;
+                    x->e = e;
+                    *loc += aom_s_locs(m, el);
+                }
+                continue;
+            }
+        }
+        /* plain member (scalar/vector/matrix/array/struct without an aom member) */
+        if (*n_en >= cap) return false;
+        {
+            AomSEntry *x = &en[(*n_en)++];
+            memset(x, 0, sizeof *x);
+            memcpy(x->path, path, sizeof(uint32_t) * (size_t)depth);
+            x->path[depth] = (uint32_t)i;
+            x->depth = depth + 1;
+            x->type = mt_id;
+            x->loc = *loc;
+            x->src_struct = struct_t;
+            x->src_member = (uint32_t)i;
+            x->xfb_base = this_xfb;
+            x->stride = 0;
+            x->e = 0xffffffffu;
+            *loc += aom_s_locs(m, mt);
+        }
+    }
+    return true;
+}
+
+uint32_t *mgl_spirv_lower_aom_struct_member(const uint32_t *in, size_t n, size_t *out_n)
+{
+    const char *err = NULL;
+    SpvModule *m = spv_parse(in, n, &err);
+    if (!m || !m->ok) { spv_free(m); return NULL; }
+
+    AomSVar sv[8];
+    int nsv = 0;
+    bool need_prologue = false, need_flush = false;
+    for (int i = 0; i < m->n_vars && nsv < 8; i++)
+    {
+        SpvVar *gv = &m->vars[i];
+        if (gv->storage != SpvStorageClassInput && gv->storage != SpvStorageClassOutput) continue;
+        SpvType *pt = spv_find_type(m, gv->type_id);
+        if (!pt || pt->kind != SPVT_PTR) continue;
+        SpvType *st = spv_find_type(m, pt->elem);
+        /* geom r107: an ARRAY-of-struct root (out Inner o[2], the r88 shape
+         * that introspection's flatten refuses when xfb decorations or
+         * whole-element aliases are present) is lowered the same way: one
+         * element entry per array element, with the element index at path[0]
+         * so the shadow chains address shadow[e].member.  Only one array
+         * level: a nested array-of-array root keeps the original shape. */
+        uint32_t arr_len = 0;
+        if (st && st->kind == SPVT_ARRAY) { arr_len = st->n; st = spv_find_type(m, st->elem); }
+        if (!st || st->kind != SPVT_STRUCT) continue;
+        /* interface blocks (UBO/SSBO) and builtins are not stage varyings */
+        bool block = false;
+        for (int d = 0; d < m->n_decos; d++)
+            if (m->decos[d].id == st->id &&
+                (m->decos[d].deco == SpvDecorationBlock || m->decos[d].deco == SpvDecorationBufferBlock))
+                block = true;
+        if (block) continue;
+        if (spv_deco(m, gv->id, SpvDecorationBuiltIn, NULL)) continue;
+        if (!aom_s_has(m, st->id, 0)) continue;
+        /* a Component decoration cannot survive the member split; for an
+         * array-of-struct root an explicit per-member Location would also be
+         * ambiguous across the elements (the members are shared by all of
+         * them), so both shapes stay untouched */
+        bool comp = false, mloc = false;
+        for (int d = 0; d < m->n_mdecos && !(comp && mloc); d++)
+        {
+            if (m->mdecos[d].id != st->id) continue;
+            if (m->mdecos[d].deco == SpvDecorationComponent) comp = true;
+            if (m->mdecos[d].deco == SpvDecorationLocation) mloc = true;
+        }
+        if (comp) continue;
+        if (arr_len > 1 && mloc) continue;
+
+        AomSVar *v = &sv[nsv];
+        memset(v, 0, sizeof *v);
+        v->var = gv->id;
+        v->struct_t = st->id;
+        v->storage = gv->storage;
+        v->has_loc = spv_deco(m, gv->id, SpvDecorationLocation, &v->base_loc);
+        v->xfb = spv_deco(m, gv->id, SpvDecorationXfbBuffer, &v->xfbb);
+        if (v->xfb)
+        {
+            spv_deco(m, gv->id, SpvDecorationOffset, &v->xfbo);
+            spv_deco(m, gv->id, SpvDecorationXfbStride, &v->xfbs);
+        }
+        static const uint32_t interp[4] = { SpvDecorationFlat, SpvDecorationNoPerspective,
+                                            SpvDecorationCentroid, SpvDecorationSample };
+        for (unsigned q = 0; q < 4; q++)
+            if (spv_deco(m, gv->id, interp[q], NULL) && v->n_inter < 8)
+                v->inter[v->n_inter++] = interp[q];
+
+        uint32_t loc = v->has_loc ? v->base_loc : 0;
+        uint32_t path[4];
+        /* 0xfffffffe = "no variable offset yet: the first member offset found
+         * on the path is absolute"; 0xffffffff = "xfb offsets unknown".
+         * An array-of-struct root has no per-element packed offsets at this
+         * point (the capture path packs the flattened entries itself), so its
+         * seed is always "unknown". */
+        uint32_t xfb_seed = v->xfb && !arr_len ? (v->xfbo ? v->xfbo : 0xfffffffeu) : 0xffffffffu;
+        if (!arr_len)
+        {
+            if (!aom_s_collect(m, st->id, &loc, v->en, &v->n_en, 64, path, 0, xfb_seed))
+            {
+                if (getenv("MGL_AOM_DEBUG"))
+                    fprintf(stderr, "aom-struct: var %u shape too complex - skipped\n", gv->id);
+                continue;
+            }
+        }
+        else
+        {
+            /* element 0 sets the shape and the per-element location span; the
+             * remaining elements reuse it with path[0] = the element index */
+            AomSEntry en0[64];
+            int nen0 = 0;
+            uint32_t loc0 = loc;
+            if (!aom_s_collect(m, st->id, &loc0, en0, &nen0, 64, path, 0, xfb_seed) || nen0 < 1 ||
+                (size_t)(arr_len * nen0) > 64)
+            {
+                if (getenv("MGL_AOM_DEBUG"))
+                    fprintf(stderr, "aom-struct: var %u array root %u x %d entries too complex - skipped\n",
+                            gv->id, arr_len, nen0);
+                continue;
+            }
+            uint32_t span = loc0 - loc;
+            bool deep = false;
+            for (int q = 0; q < nen0; q++) if (en0[q].depth > 3) deep = true;
+            if (deep)
+            {
+                if (getenv("MGL_AOM_DEBUG"))
+                    fprintf(stderr, "aom-struct: var %u array root nested too deep - skipped\n", gv->id);
+                continue;
+            }
+            v->n_en = 0;
+            for (uint32_t e = 0; e < arr_len; e++)
+                for (int q = 0; q < nen0; q++)
+                {
+                    AomSEntry *ne = &v->en[v->n_en++];
+                    *ne = en0[q];
+                    for (int d2 = ne->depth - 1; d2 >= 0; d2--) ne->path[d2 + 1] = ne->path[d2];
+                    ne->path[0] = e;
+                    ne->depth++;
+                    ne->loc += e * span;
+                    if (ne->xfb_base != 0xffffffffu && ne->xfb_base != 0xfffffffeu) ne->xfb_base = 0xffffffffu;
+                }
+        }
+        v->arr_len = arr_len;
+        if (v->storage == SpvStorageClassInput) need_prologue = true;
+        else need_flush = true;
+        nsv++;
+    }
+    if (!nsv) { spv_free(m); return NULL; }
+
+    /* pointer types of the module: id -> (storage, pointee) */
+    struct { uint32_t id, storage, pointee; } pmap[256]; int npmap = 0;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpTypePointer && wc >= 4 && npmap < 256)
+        {
+            pmap[npmap].id = in[o + 1];
+            pmap[npmap].storage = in[o + 2];
+            pmap[npmap].pointee = in[o + 3];
+            npmap++;
+        }
+        o += wc;
+    }
+
+    /* every ID that (transitively) evaluates to a pointer into one of the
+     * variables: the variable itself, access chains rooted at it, pointer
+     * copies / phis / selects of those.  Those pointers' RESULT TYPES still
+     * name the stage storage class; retargeting the variable alone would leave
+     * chains claiming Output pointers into the Private shadow (the fp64 pass
+     * then lowers their stores in slot form — a hard MSL error), so each one
+     * is retyped to a Private twin. */
+    uint32_t reach[512]; int nreach = 0;
+    for (int k = 0; k < nsv; k++) reach[nreach++] = sv[k].var;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        for (size_t o = 5; o < n; )
+        {
+            uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+            if (wc == 0 || o + wc > n) break;
+            const uint32_t *w = in + o;
+            bool base_in = false;
+            if (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain)
+            {
+                if (wc >= 5)
+                    for (int z = 0; z < nreach; z++) if (w[3] == reach[z]) base_in = true;
+            }
+            else if (op == SpvOpCopyObject || op == SpvOpPhi || op == SpvOpSelect)
+            {
+                for (size_t q = 3; q < (size_t)wc; q++)
+                    for (int z = 0; z < nreach; z++) if (w[q] == reach[z]) base_in = true;
+            }
+            else if (op == SpvOpFunctionCall)
+            {
+                /* an IO variable handed to a function: the parameter's pointer
+                 * type would need the same retyping — skip the variable */
+                for (size_t q = 3; q < (size_t)wc; q++)
+                    for (int z = 0; z < nsv; z++) if (w[q] == sv[z].var) { sv[z].n_en = -1; }
+            }
+            if (base_in && nreach < 512)
+            {
+                bool have = false;
+                for (int z = 0; z < nreach; z++) if (w[2] == reach[z]) have = true;
+                if (!have) { reach[nreach++] = w[2]; changed = true; }
+            }
+            o += wc;
+        }
+    }
+    /* drop variables whose id escaped into a function call */
+    for (int k = 0; k < nsv; )
+    {
+        if (sv[k].n_en < 0)
+        {
+            memmove(&sv[k], &sv[k + 1], sizeof(AomSVar) * (size_t)(nsv - k - 1));
+            nsv--;
+            continue;
+        }
+        k++;
+    }
+    if (!nsv) { spv_free(m); return NULL; }
+
+    /* stores through a reachable pointer whose pointee is an ARRAY or a MATRIX:
+     * MSL cannot copy a raw array out of a `constant` UBO into a thread
+     * spvUnsafeArray (goku.d[0] = uni_goku.d[0] — after the fp64 pass a double
+     * matrix in a UBO IS a raw ulongN[M] array), so they are split into
+     * per-element / per-column stores */
+    struct { uint32_t ptr, val, elem, len, newchain, newval; } astores[64]; int nastores = 0;
+    struct { uint32_t type, id; } eptrs[64]; int neptrs = 0;
+    uint32_t max_alen = 0;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        const uint32_t *w = in + o;
+        if (op == SpvOpStore && wc >= 3 && nastores < 64)
+        {
+            bool reptr = false;
+            for (int z = 0; z < nreach; z++) if (w[1] == reach[z]) reptr = true;
+            if (reptr)
+            {
+                /* the pointer's instruction: find its result type's pointee */
+                uint32_t sptr = 0;
+                for (size_t o2 = 5; o2 < n && !sptr; )
+                {
+                    uint32_t op2 = in[o2] & 0xffff, wc2 = in[o2] >> 16;
+                    if (wc2 == 0 || o2 + wc2 > n) break;
+                    if ((in[o2] & 0xffffu) == SpvOpAccessChain || (in[o2] & 0xffffu) == SpvOpInBoundsAccessChain ||
+                        (in[o2] & 0xffffu) == SpvOpPtrAccessChain || (in[o2] & 0xffffu) == SpvOpCopyObject)
+                        if (in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    if ((in[o2] & 0xffffu) == SpvOpVariable && in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    o2 += wc2;
+                }
+                uint32_t pointee = 0;
+                for (int z = 0; z < npmap; z++) if (pmap[z].id == sptr) pointee = pmap[z].pointee;
+                SpvType *pt_ = pointee ? spv_find_type(m, pointee) : NULL;
+                if (pt_ && ((pt_->kind == SPVT_ARRAY && !pt_->len_is_spec && pt_->n && pt_->n <= 64) ||
+                            (pt_->kind == SPVT_MAT && pt_->n && pt_->n <= 64)))
+                {
+                    uint32_t cnt = pt_->n;
+                    uint32_t elty = pt_->elem;
+                    bool have = false;
+                    for (int z = 0; z < nastores; z++) if (astores[z].ptr == w[1]) have = true;
+                    if (!have)
+                    {
+                        astores[nastores].ptr = w[1];
+                        astores[nastores].val = w[2];
+                        astores[nastores].elem = elty;
+                        astores[nastores].len = cnt;
+                        astores[nastores].newchain = 0;
+                        astores[nastores].newval = 0;
+                        nastores++;
+                        if (cnt > max_alen) max_alen = cnt;
+                    }
+                }
+            }
+        }
+        o += wc;
+    }
+
+    /* the Private pointer twins for the reachable chains' pointees */
+    struct { uint32_t src_ptr, dst_ptr, pointee; } twins[256]; int ntwins = 0;
+    for (int r = 0; r < nreach; r++)
+        for (size_t o = 5; o < n; )
+        {
+            uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+            if (wc == 0 || o + wc > n) break;
+            const uint32_t *w = in + o;
+            if ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain || op == SpvOpPtrAccessChain ||
+                 op == SpvOpCopyObject || op == SpvOpPhi || op == SpvOpSelect) && w[2] == reach[r] && wc >= 3)
+            {
+                uint32_t sptr = w[1];
+                bool have = false;
+                for (int z = 0; z < ntwins; z++) if (twins[z].src_ptr == sptr) have = true;
+                if (!have && ntwins < 256)
+                {
+                    uint32_t pointee = 0;
+                    for (int z = 0; z < npmap; z++) if (pmap[z].id == sptr) pointee = pmap[z].pointee;
+                    if (pointee)
+                    {
+                        twins[ntwins].src_ptr = sptr;
+                        twins[ntwins].pointee = pointee;
+                        twins[ntwins].dst_ptr = 0;   /* allocated below */
+                        ntwins++;
+                    }
+                }
+            }
+            o += wc;
+        }
+
+    /* integer result type for the path-index constants */
+    uint32_t index_type = 0;
+    for (size_t o = 5; o + 4 <= n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        if (op == SpvOpConstant) { index_type = in[o + 1]; break; }
+        o += wc;
+    }
+
+    uint32_t next_id = in[3] > 5 ? in[3] : 5;
+    if (!index_type) index_type = next_id++;
+    /* geom r107: the Private shadow needs a DUPLICATED struct type id only
+     * when the fp64 pass will rewrite the original struct's type id into its
+     * interface (slot) clone, which a Function-storage copy cannot satisfy.
+     * In fp64-free modules reuse the original id: glslang lowers an `out`/
+     * `inout` parameter to a copy-out temporary, so `o = param` stores and
+     * `param = o` loads move the WHOLE struct between the shadow and a plain
+     * local — with two distinct type ids SPIRV-Cross emits two MSL structs
+     * with no conversion between them. */
+    bool need_twin = false;
+    for (int t = 0; t < m->n_types && !need_twin; t++)
+        if (m->types[t].kind == SPVT_FLOAT && m->types[t].bits == 64) need_twin = true;
+    for (int k = 0; k < nsv; k++)
+    {
+        sv[k].shadow = next_id++;
+        sv[k].shadow_t = need_twin ? next_id++ : sv[k].struct_t;   /* duplicate struct for the shadow */
+        if (sv[k].arr_len) sv[k].arr_t = next_id++;                /* ARRAY of the shadow struct */
+        sv[k].priv_ptr = next_id++;          /* ptr Private -> the shadow (struct, or array of it) */
+        for (int e = 0; e < sv[k].n_en; e++)
+        {
+            sv[k].elem[e] = next_id++;
+            sv[k].chain[e] = next_id++;
+            sv[k].val[e] = next_id++;
+        }
+    }
+    for (int z = 0; z < ntwins; z++) twins[z].dst_ptr = next_id++;
+    for (int z = 0; z < nastores; z++)
+    {
+        astores[z].newchain = next_id;
+        next_id += astores[z].len;
+        astores[z].newval = next_id;
+        next_id += astores[z].len;
+    }
+
+    /* deduplicated ptr Private -> entry type ids and index constants */
+    struct { uint32_t type, id; } pptrs[80]; int npptrs = 0;
+    struct { uint32_t value, id; } idxs[20]; int nidxs = 0;
+
+    AomBuf out; memset(&out, 0, sizeof out);
+    for (int i = 0; i < 5; i++) aom_push(&out, in[i]);
+
+    bool globals_done = false, in_functions = false;
+    bool entry_seen = false, prologue_pending = false, prologue_done = true;
+    bool in_entry = false;
+    for (size_t o = 5; o < n; )
+    {
+        uint32_t op = in[o] & 0xffff, wc = in[o] >> 16;
+        if (wc == 0 || o + wc > n) break;
+        const uint32_t *w = in + o;
+
+        if (!globals_done && op == SpvOpFunction)
+        {
+            if (index_type >= in[3])
+            {
+                uint32_t t[3] = { index_type, 32, 0 };
+                aom_inst(&out, SpvOpTypeInt, 4, t);
+            }
+            for (int k = 0; k < nsv; k++)
+            {
+                AomSVar *v = &sv[k];
+                SpvType *src_t = spv_find_type(m, v->struct_t);
+                if (!src_t || src_t->n_members < 0 || (size_t)src_t->n_members > 128) { globals_done = false; break; }
+                /* duplicate the struct definition: the shadow must NOT share
+                 * the variable's type id — the fp64 pass rewrites THAT id into
+                 * its interface (slot) clone, which a Function-storage copy
+                 * cannot satisfy; a private twin gets the plain u64 register
+                 * form and the body's member stores stay consistent.
+                 * (geom r107: fp64-free modules keep the original id — see
+                 * need_twin above — and emit no duplicate) */
+                if (v->shadow_t != v->struct_t)
+                {
+                    uint32_t tw[2 + 128];
+                    tw[0] = v->shadow_t;
+                    for (int q = 0; q < src_t->n_members; q++) tw[1 + q] = src_t->members[q];
+                    aom_inst(&out, SpvOpTypeStruct, src_t->n_members + 2, tw);
+                }
+                if (v->arr_len)
+                {
+                    /* ARRAY of the shadow struct: constant length (dedup with the
+                     * path-index constants), then the array type and the Private
+                     * pointer to it */
+                    uint32_t clen = 0;
+                    for (int z = 0; z < nidxs; z++) if (idxs[z].value == v->arr_len) clen = idxs[z].id;
+                    if (!clen && nidxs < 20)
+                    {
+                        idxs[nidxs].value = v->arr_len;
+                        idxs[nidxs].id = next_id++;
+                        clen = idxs[nidxs++].id;
+                        uint32_t cv[3] = { index_type, clen, v->arr_len };
+                        aom_inst(&out, SpvOpConstant, 4, cv);
+                    }
+                    uint32_t at[3] = { v->arr_t, v->shadow_t, clen };
+                    aom_inst(&out, SpvOpTypeArray, 4, at);
+                }
+                uint32_t p1[3] = { v->priv_ptr, SpvStorageClassPrivate,
+                                   v->arr_len ? v->arr_t : v->shadow_t };
+                aom_inst(&out, SpvOpTypePointer, 4, p1);
+                for (int e = 0; e < v->n_en; e++)
+                {
+                    /* index constants for this entry's path */
+                    for (int q = 0; q < v->en[e].depth; q++)
+                    {
+                        uint32_t val = v->en[e].path[q];
+                        int found = -1;
+                        for (int z = 0; z < nidxs; z++) if (idxs[z].value == val) found = z;
+                        if (found < 0 && nidxs < 20)
+                        {
+                            idxs[nidxs].value = val;
+                            idxs[nidxs].id = next_id++;
+                            found = nidxs++;
+                            uint32_t cv[3] = { index_type, idxs[found].id, val };
+                            aom_inst(&out, SpvOpConstant, 4, cv);
+                        }
+                    }
+                    /* the element variable's pointer type (stage storage) */
+                    uint32_t sptr = 0;
+                    for (int z = 0; z < npptrs; z++)
+                        if (pptrs[z].type == (v->en[e].type | (v->storage << 16))) sptr = pptrs[z].id;
+                    if (!sptr && npptrs < 80)
+                    {
+                        pptrs[npptrs].type = v->en[e].type | (v->storage << 16);
+                        pptrs[npptrs].id = next_id++;
+                        sptr = pptrs[npptrs++].id;
+                        uint32_t pt[3] = { sptr, v->storage, v->en[e].type };
+                        aom_inst(&out, SpvOpTypePointer, 4, pt);
+                    }
+                    if (!sptr) sptr = next_id++;   /* over cap: allocate anyway */
+                    uint32_t vv[3] = { sptr, v->elem[e], v->storage };
+                    aom_inst(&out, SpvOpVariable, 4, vv);
+                    if (v->has_loc)
+                    {
+                        uint32_t dv[3] = { v->elem[e], SpvDecorationLocation, v->en[e].loc };
+                        aom_inst(&out, SpvOpDecorate, 4, dv);
+                    }
+                    for (int q = 0; q < v->n_inter; q++)
+                    {
+                        uint32_t dv[2] = { v->elem[e], v->inter[q] };
+                        aom_inst(&out, SpvOpDecorate, 3, dv);
+                    }
+                    /* member interpolation decorations of the final member */
+                    static const uint32_t minp[4] = { SpvDecorationFlat, SpvDecorationNoPerspective,
+                                                      SpvDecorationCentroid, SpvDecorationSample };
+                    for (unsigned q = 0; q < 4; q++)
+                        if (spv_member_deco(m, v->en[e].src_struct, v->en[e].src_member, minp[q], NULL))
+                        {
+                            uint32_t dv[2] = { v->elem[e], minp[q] };
+                            aom_inst(&out, SpvOpDecorate, 3, dv);
+                        }
+                    if (v->xfb && v->en[e].xfb_base != 0xffffffffu &&
+                        v->en[e].xfb_base != 0xfffffffeu)
+                    {
+                        uint32_t off = v->en[e].xfb_base +
+                                       (v->en[e].e == 0xffffffffu ? 0 : v->en[e].stride * v->en[e].e);
+                        uint32_t b1[3] = { v->elem[e], SpvDecorationXfbBuffer, v->xfbb };
+                        aom_inst(&out, SpvOpDecorate, 4, b1);
+                        uint32_t b2[3] = { v->elem[e], SpvDecorationOffset, off };
+                        aom_inst(&out, SpvOpDecorate, 4, b2);
+                        if (v->xfbs)
+                        {
+                            uint32_t b3[3] = { v->elem[e], SpvDecorationXfbStride, v->xfbs };
+                            aom_inst(&out, SpvOpDecorate, 4, b3);
+                        }
+                    }
+                }
+                uint32_t sh[3] = { v->priv_ptr, v->shadow, SpvStorageClassPrivate };
+                aom_inst(&out, SpvOpVariable, 4, sh);
+            }
+            /* Private twins of every reachable chain's pointer type */
+            for (int z = 0; z < ntwins; z++)
+            {
+                uint32_t pt[3] = { twins[z].dst_ptr, SpvStorageClassPrivate, twins[z].pointee };
+                aom_inst(&out, SpvOpTypePointer, 4, pt);
+            }
+            for (int z = 0; z < nastores; z++)
+            {
+                bool have = false;
+                for (int q = 0; q < neptrs; q++) if (eptrs[q].type == astores[z].elem) have = true;
+                if (!have && neptrs < 64)
+                {
+                    eptrs[neptrs].type = astores[z].elem;
+                    eptrs[neptrs].id = next_id++;
+                    uint32_t pt[3] = { eptrs[neptrs].id, SpvStorageClassPrivate, astores[z].elem };
+                    aom_inst(&out, SpvOpTypePointer, 4, pt);
+                    neptrs++;
+                }
+            }
+            for (uint32_t v2 = 0; v2 < max_alen && nidxs < 20; v2++)
+            {
+                idxs[nidxs].value = v2;
+                idxs[nidxs].id = next_id++;
+                uint32_t cv[3] = { index_type, idxs[nidxs].id, v2 };
+                aom_inst(&out, SpvOpConstant, 4, cv);
+                nidxs++;
+            }
+            globals_done = true;
+        }
+        if (op == SpvOpFunction)
+        {
+            in_functions = true;
+            if (wc >= 4 && w[2] == m->entry)
+            {
+                entry_seen = true;
+                in_entry = true;
+                if (need_prologue) { prologue_done = false; prologue_pending = false; }
+            }
+            else in_entry = false;
+        }
+        if (op == SpvOpFunctionEnd) in_entry = false;
+        if (op == SpvOpLabel && entry_seen && !prologue_done) prologue_pending = true;
+
+        if (op == SpvOpVariable)
+        {
+            bool drop = false;
+            for (int k = 0; k < nsv; k++) if (w[2] == sv[k].var) drop = true;
+            if (drop) { o += wc; continue; }
+        }
+        if ((op == SpvOpName || op == SpvOpDecorate) && wc >= 2)
+        {
+            bool drop = false;
+            for (int k = 0; k < nsv; k++) if (w[1] == sv[k].var) drop = true;
+            if (drop)
+            {
+                /* the shadow keeps the variable's name for readable MSL */
+                if (op == SpvOpName)
+                    for (int k = 0; k < nsv; k++)
+                        if (w[1] == sv[k].var)
+                        {
+                            uint32_t nw[64]; int nn = 0;
+                            nw[nn++] = sv[k].shadow;
+                            for (size_t q = 2; q < (size_t)wc && nn < 60; q++) nw[nn++] = w[q];
+                            aom_inst(&out, op, nn + 1, nw);
+                        }
+                o += wc;
+                continue;
+            }
+        }
+        if (op == SpvOpEntryPoint && wc >= 3)
+        {
+            bool hit = false;
+            for (size_t q = 3; q < (size_t)wc; q++)
+                for (int k = 0; k < nsv; k++) if (w[q] == sv[k].var) hit = true;
+            if (hit)
+            {
+                uint32_t nw[640]; int nn = 0;
+                nw[nn++] = w[1]; nw[nn++] = w[2];
+                for (size_t q = 3; q < (size_t)wc; q++)
+                {
+                    bool sub = false;
+                    for (int k = 0; k < nsv; k++) if (w[q] == sv[k].var)
+                    {
+                        for (int e = 0; e < sv[k].n_en && nn < 600; e++) nw[nn++] = sv[k].elem[e];
+                        sub = true;
+                    }
+                    if (!sub && nn < 630) nw[nn++] = w[q];
+                }
+                aom_inst(&out, op, nn + 1, nw);
+                o += wc;
+                continue;
+            }
+        }
+
+        /* helper: one shadow access chain for entry (k, e) */
+        #define AOMS_CHAIN(k, e_)                                                                    \
+            do {                                                                                     \
+                AomSEntry *x = &sv[k].en[e_];                                                        \
+                uint32_t pe = 0;                                                                    \
+                for (int z = 0; z < npptrs; z++)                                                    \
+                    if (pptrs[z].type == (x->type | (SpvStorageClassPrivate << 16))) pe = pptrs[z].id; \
+                if (!pe)                                                                            \
+                {                                                                                   \
+                    pe = next_id++;                                                                 \
+                    uint32_t pt_[3] = { pe, SpvStorageClassPrivate, x->type };                      \
+                    aom_inst(&out, SpvOpTypePointer, 4, pt_);                                       \
+                    if (npptrs < 80) { pptrs[npptrs].type = x->type | (SpvStorageClassPrivate << 16); \
+                                       pptrs[npptrs].id = pe; npptrs++; }                            \
+                }                                                                                   \
+                uint32_t cargs[8]; int cn = 0;                                                      \
+                cargs[cn++] = pe;                                                                   \
+                cargs[cn++] = sv[k].chain[e_];                                                      \
+                cargs[cn++] = sv[k].shadow;                                                         \
+                for (int q = 0; q < x->depth && cn < 6; q++)                                        \
+                {                                                                                   \
+                    uint32_t val = x->path[q];                                                      \
+                    uint32_t cid = 0;                                                               \
+                    for (int z = 0; z < nidxs; z++) if (idxs[z].value == val) cid = idxs[z].id;     \
+                    if (!cid)                                                                       \
+                    {                                                                               \
+                        cid = next_id++;                                                            \
+                        if (nidxs < 20) { idxs[nidxs].value = val; idxs[nidxs].id = cid; nidxs++; }  \
+                        uint32_t cv[3] = { index_type, cid, val };                                  \
+                        aom_inst(&out, SpvOpConstant, 4, cv);                                       \
+                    }                                                                               \
+                    cargs[cn++] = cid;                                                              \
+                }                                                                                   \
+                /* an exploded entry addresses ONE element of the member array */                   \
+                if (x->e != 0xffffffffu && cn < 7)                                                  \
+                {                                                                                   \
+                    uint32_t cid = 0;                                                               \
+                    for (int z = 0; z < nidxs; z++) if (idxs[z].value == x->e) cid = idxs[z].id;    \
+                    if (!cid)                                                                       \
+                    {                                                                               \
+                        cid = next_id++;                                                            \
+                        if (nidxs < 20) { idxs[nidxs].value = x->e; idxs[nidxs].id = cid; nidxs++; } \
+                        uint32_t cv[3] = { index_type, cid, x->e };                                 \
+                        aom_inst(&out, SpvOpConstant, 4, cv);                                       \
+                    }                                                                               \
+                    cargs[cn++] = cid;                                                              \
+                }                                                                                   \
+                aom_inst(&out, SpvOpAccessChain, cn + 1, cargs);                                    \
+            } while (0)
+
+        /* Input: fill the shadow from the element variables at the top of the
+         * entry block (first instruction that is not a variable/phi) */
+        if (prologue_pending && !prologue_done && op != SpvOpVariable && op != SpvOpPhi && op != SpvOpLabel)
+        {
+            for (int k = 0; k < nsv; k++)
+                for (int e = 0; e < sv[k].n_en; e++)
+                {
+                    AOMS_CHAIN(k, e);
+                    uint32_t ld[3] = { sv[k].en[e].type, sv[k].val[e], sv[k].elem[e] };
+                    aom_inst(&out, SpvOpLoad, 4, ld);
+                    uint32_t st[2] = { sv[k].chain[e], sv[k].val[e] };
+                    aom_inst(&out, SpvOpStore, 3, st);
+                }
+            prologue_done = true;
+        }
+
+        /* Output: flush the shadow to the element variables before every
+         * terminator of the entry function */
+        if (in_entry && need_flush &&
+            (op == SpvOpReturn || op == SpvOpReturnValue || op == SpvOpKill ||
+             op == SpvOpUnreachable || op == SpvOpTerminateInvocation))
+        {
+            for (int k = 0; k < nsv; k++)
+                for (int e = 0; e < sv[k].n_en; e++)
+                {
+                    AOMS_CHAIN(k, e);
+                    uint32_t ld[3] = { sv[k].en[e].type, sv[k].val[e], sv[k].chain[e] };
+                    aom_inst(&out, SpvOpLoad, 4, ld);
+                    uint32_t st[2] = { sv[k].elem[e], sv[k].val[e] };
+                    aom_inst(&out, SpvOpStore, 3, st);
+                }
+        }
+        #undef AOMS_CHAIN
+
+        /* split array-typed stores through a reachable pointer */
+        if (op == SpvOpStore && wc >= 3)
+        {
+            int hit = -1;
+            for (int z = 0; z < nastores; z++) if (astores[z].ptr == w[1]) hit = z;
+            if (hit >= 0)
+            {
+                uint32_t eptr = 0;
+                for (int z = 0; z < neptrs; z++) if (eptrs[z].type == astores[hit].elem) eptr = eptrs[z].id;
+                uint32_t sptr = 0;
+                for (size_t o2 = 5; o2 < n && !sptr; )
+                {
+                    uint32_t op2 = in[o2] & 0xffff, wc2 = in[o2] >> 16;
+                    if (wc2 == 0 || o2 + wc2 > n) break;
+                    if (op2 == SpvOpAccessChain || op2 == SpvOpInBoundsAccessChain || op2 == SpvOpPtrAccessChain)
+                        if (in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    if (op2 == SpvOpVariable && in[o2 + 2] == w[1]) sptr = in[o2 + 1];
+                    o2 += wc2;
+                }
+                for (int z = 0; z < ntwins; z++) if (twins[z].src_ptr == sptr) sptr = twins[z].dst_ptr;
+                if (eptr && sptr)
+                {
+                    for (uint32_t e = 0; e < astores[hit].len; e++)
+                    {
+                        uint32_t cid = 0;
+                        for (int z = 0; z < nidxs; z++) if (idxs[z].value == e) cid = idxs[z].id;
+                        uint32_t ca[4] = { eptr, astores[hit].newchain + e, w[1] /* patched below */ };
+                        (void)ca;
+                        /* chain into the element: base operand patched by the
+                         * generic re-pointing below would not see this new
+                         * instruction, so build it here directly */
+                        uint32_t cargs[6]; int cn = 0;
+                        cargs[cn++] = eptr;
+                        cargs[cn++] = astores[hit].newchain + e;
+                        cargs[cn++] = w[1];
+                        bool sub_base = false;
+                        for (int k = 0; k < nsv; k++) if (w[1] == sv[k].var) { cargs[2] = sv[k].shadow; sub_base = true; }
+                        (void)sub_base;
+                        cargs[cn++] = cid;
+                        aom_inst(&out, SpvOpAccessChain, cn + 1, cargs);
+                        uint32_t ex[4] = { astores[hit].elem, astores[hit].newval + e, w[2], e };
+                        aom_inst(&out, SpvOpCompositeExtract, 5, ex);
+                        uint32_t st[2] = { astores[hit].newchain + e, astores[hit].newval + e };
+                        aom_inst(&out, SpvOpStore, 3, st);
+                    }
+                    o += wc;
+                    continue;
+                }
+            }
+        }
+
+        /* copy the instruction, re-pointing ID operands at the shadows and
+         * retyping pointers that reached into the variable */
+        aom_push(&out, w[0]);
+        if (in_functions)
+        {
+            for (size_t q = 1; q < (size_t)wc; q++)
+            {
+                uint32_t x = w[q];
+                if (q == 1 && wc >= 3)
+                {
+                    bool is_chain = (op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain ||
+                                     op == SpvOpPtrAccessChain || op == SpvOpCopyObject ||
+                                     op == SpvOpPhi || op == SpvOpSelect);
+                    if (is_chain)
+                    {
+                        bool in_reach = false;
+                        for (int z = 0; z < nreach; z++) if (w[2] == reach[z]) in_reach = true;
+                        if (in_reach)
+                            for (int z = 0; z < ntwins; z++)
+                                if (x == twins[z].src_ptr) { x = twins[z].dst_ptr; break; }
+                    }
+                }
+                bool id_pos =
+                    (op == SpvOpLoad && q == 3) ||
+                    (op == SpvOpStore && q == 1) ||
+                    ((op == SpvOpAccessChain || op == SpvOpInBoundsAccessChain) && q == 3) ||
+                    (op == SpvOpCopyObject && q == 2) ||
+                    (op == SpvOpPhi && q >= 2) ||
+                    (op == SpvOpFunctionCall && q >= 3) ||
+                    (op == SpvOpCopyMemory && (q == 1 || q == 2));
+                if (id_pos)
+                    for (int k = 0; k < nsv; k++) if (x == sv[k].var) { x = sv[k].shadow; break; }
+                aom_push(&out, x);
+            }
+        }
+        else
+            for (size_t q = 1; q < (size_t)wc; q++) aom_push(&out, w[q]);
+        o += wc;
+    }
+    spv_free(m);
+
+    if (out.n <= 5 || !globals_done || !prologue_done) { free(out.w); return NULL; }
+    out.w[3] = next_id;   /* new bound */
+    if (getenv("MGL_AOM_DEBUG"))
+    {
+        FILE *f = fopen("/tmp/aom_struct.spv", "wb");
+        if (f) { fwrite(out.w, 4, out.n, f); fclose(f); }
+    }
+    *out_n = out.n;
+    return out.w;
+}
+
 /* ---- multisample images: loads/stores/atomics through the atomic sidecar ----
  * Metal's texture2d_ms / texture2d_ms_array are READ-ONLY, so a GL image2DMS /
  * image2DMSArray load, store or atomic cannot go through the texture argument.

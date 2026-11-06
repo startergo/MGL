@@ -2653,6 +2653,20 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         }
     }
 
+    /* geom r106: ...and inside stage-IO STRUCTS (`out struct S { mat2x3 a[3];
+     * ... } goku` — the whole struct becomes element variables + a private
+     * shadow, geometry.c, the same trick _aom_input uses) */
+    {
+        size_t aoms_words = 0;
+        uint32_t *aoms = mgl_spirv_lower_aom_struct_member(prepared, prepared_words, &aoms_words);
+        if (aoms)
+        {
+            free(prepared);
+            prepared = aoms;
+            prepared_words = aoms_words;
+        }
+    }
+
     /* fp64: lower software doubles (u64 bit patterns + soft-float calls).
      * ptr->spirv[stage].ir above keeps the GL view (real double types) for
      * introspection; everything MSL-facing uses the lowered module. */

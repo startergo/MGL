@@ -6,6 +6,7 @@
  * the CTS's glslang emits for the same source. */
 #include "mgl_test.h"
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 
 static const char *fs =
@@ -91,6 +92,69 @@ static int draw_and_read(void)
 }
 
 /* the dumped module was built with gl_ClipDistance[0] = -1.0: it must cull */
+static void regen_spv(void);
+
+/* regenerate /tmp/clip_{vs,fs}.spv: the prepared SPIR-V this test loads used
+ * to be a hand-made dump (MGL_PREPARED_DUMP of test_clipdist, renamed), so a
+ * reboot that cleared /tmp broke the test on unchanged code.  Produce them
+ * here from the same source whenever they are missing. */
+static void regen_spv(void)
+{
+    FILE *f = fopen("/tmp/clip_vs.spv", "rb");
+    if (f) { fclose(f); f = fopen("/tmp/clip_fs.spv", "rb"); if (f) { fclose(f); return; } }
+    mkdir("/tmp/clipspv", 0755);
+    setenv("MGL_PREPARED_DUMP", "/tmp/clipspv", 1);
+    /* the same vertex stage test_clipdist uses (clipNegative variant) */
+    const char *rvs =
+        "#version 450\n"
+        "layout (location = 0) in vec3 position;\n"
+        "layout (location = 1) out vec4 vColor;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_PointSize = 10.0f;\n"
+        "    gl_Position = vec4(position.x, position.y + 0.3 * gl_InstanceID, position.z, 1.0);\n"
+        "    gl_ClipDistance[0] = -1.0;\n"
+        "    gl_CullDistance[0] = 1.0;\n"
+        "    vColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
+        "}\n";
+    GLuint p = mgl_make_program(rvs, fs);
+    if (p)
+    {
+        glUseProgram(p);
+        float v[] = { -1, -1, 0, 1, -1, 0, 0, 1, 0 };
+        GLuint vbo, vao;
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof v, v, GL_STATIC_DRAW);
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glViewport(0, 0, 64, 64);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glDeleteProgram(p);
+        glDeleteBuffers(1, &vbo);
+        glDeleteVertexArrays(1, &vao);
+    }
+    unsetenv("MGL_PREPARED_DUMP");
+    const char *pairs[2][2] = { { "/tmp/clipspv/stage0.spv", "/tmp/clip_vs.spv" },
+                                { "/tmp/clipspv/stage4.spv", "/tmp/clip_fs.spv" } };
+    for (int i = 0; i < 2; i++)
+    {
+        FILE *in = fopen(pairs[i][0], "rb");
+        if (!in) continue;
+        FILE *out = fopen(pairs[i][1], "wb");
+        if (out)
+        {
+            char b[4096]; size_t n;
+            while ((n = fread(b, 1, sizeof b, in)) > 0) fwrite(b, 1, n, out);
+            fclose(out);
+        }
+        fclose(in);
+    }
+}
+
 TEST(clip_negative_spv_culls)
 {
     /* control in the same process: the same shader from GLSL must cull */
@@ -155,6 +219,7 @@ TEST(clip_negative_spv_culls)
 
 int main(void)
 {
+    regen_spv();
     RUN(clip_negative_spv_culls);
     return mgl_test_summary();
 }

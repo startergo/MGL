@@ -2481,6 +2481,39 @@ static void rw_access(F64 *f, size_t j, bool inbounds)
     uint32_t wc = f->ins[j].wc;
     uint32_t rtptr = iw[1], rid = iw[2], base = iw[3];
     uint32_t nidx = wc - 4;
+    uint32_t spliced[40];
+
+    /* r106 (geom): a chain may CONTINUE into a suppressed chain — its base was
+     * rewritten away by the whole-multi-slot-member / member-slice rules below
+     * (no instruction is emitted; loads/stores replay the recorded walk one
+     * slot at a time).  The base id then has no def in the output module and
+     * the chain would dangle (SPIRV-Cross: "Cannot resolve expression type";
+     * KHR-GL46 enhanced_layouts.xfb_struct_explicit_location_vertex stores
+     * `double c[2]` of an out struct element-by-element through chain(goku,2)).
+     * Re-run the walk over the FULL index list — the suppressed base's recorded
+     * indices (plus its folded-away element index, for a member slice) in front
+     * of this chain's own — so the array/matrix steps below apply their slot
+     * addressing to the combined chain exactly as they would have to the single
+     * equivalent chain glslang never emitted (a dmatNxM array member needs the
+     * element folded into the slice window, not appended as a raw index into
+     * the flattened member). */
+    if (base && base < f->cap_ids && f->expc[base].sup) {
+        uint32_t nb = f->expc[base].nidx;
+        uint32_t ei = f->elemslice[base] ? k_u32(f, f->elemidx[base]) : 0;
+        uint32_t add = nb + (ei ? 1 : 0);
+
+        if (4 + add + nidx > 40) { fail(f, "fp64: access chain too long"); return; }
+        spliced[1] = rtptr;
+        spliced[2] = rid;
+        spliced[3] = f->expc[base].base;
+        for (uint32_t q = 0; q < nb; q++) spliced[4 + q] = f->expc[base].idx[q];
+        if (ei) spliced[4 + nb] = ei;
+        for (uint32_t q = 0; q < nidx; q++) spliced[4 + add + q] = iw[4 + q];
+        iw = spliced;
+        base = spliced[3];
+        wc = 4 + add + nidx;
+        nidx = wc - 4;
+    }
 
     uint32_t baseptr = f->vty[base];
     if (!baseptr || f->ty[baseptr].kind != K_PTR) { fail(f, "fp64: access chain base is not a pointer"); return; }

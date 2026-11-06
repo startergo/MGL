@@ -594,6 +594,7 @@ uint32_t *mgl_spirv_lower_ms_images(const uint32_t *in, size_t n, size_t *out_n)
  * NULL when the source needs no rewriting. */
 char *mgl_glsl_block_compat(const char *src);
 uint32_t *mgl_spirv_lower_aom_input(const uint32_t *in, size_t n, size_t *out_n);
+uint32_t *mgl_spirv_lower_aom_struct_member(const uint32_t *in, size_t n, size_t *out_n);
 /* geom_opaque_flatten.c: arrays-of-arrays of an OPAQUE type (sampler2D u[2][3]) —
  * SPIRV-Cross's MSL backend rejects them outright ("Arrays of arrays of textures
  * are not supported in MSL"); the MSL-view module is flattened to one array of

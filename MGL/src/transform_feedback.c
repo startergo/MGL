@@ -1267,8 +1267,10 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 {
                     spvc_type_id flat_tid = is_block ? tid : r->base_type_id;
                     spvc_type ttest = spvc_compiler_get_type_handle(c, flat_tid);
+                    spvc_type ta_ = spvc_compiler_get_type_handle(c, r->type_id);
                     if (ttest && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
-                        spvc_type_get_num_array_dimensions(ttest) == 0)
+                        spvc_type_get_num_array_dimensions(ttest) == 0 &&
+                        (!ta_ || spvc_type_get_num_array_dimensions(ta_) == 0))
                     {
                         if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
                         if (!xfb_flatten_struct(c, flat_tid, (unsigned)off, var_name, "",
@@ -1276,6 +1278,38 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                             return false;
                         flattened[buf] = true;   /* glslang's whole-struct XfbStride
                                                   * decoration is not the flattened end */
+                        xp->buffer_mask |= 1u << buf;
+                        continue;
+                    }
+                    /* geom r107: an ARRAY of plain structs captured as a whole
+                     * (xfb_offset on the array variable) unrolls one element at
+                     * a time: element e's members pack right after element e-1,
+                     * with the packed end of the previous element as the base
+                     * (there is no ArrayStride decoration to read, unlike the
+                     * block-instance arrays handled above).  The array
+                     * dimension sits on the type_id handle (the pointer
+                     * mirror); the members live on the base_type_id struct. */
+                    spvc_type ta = spvc_compiler_get_type_handle(c, r->type_id);
+                    if (ttest && ta && !is_block && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
+                        spvc_type_get_num_array_dimensions(ta) == 1 && var_name && var_name[0])
+                    {
+                        if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
+                        unsigned n = spvc_type_get_array_dimension(ta, 0);
+                        unsigned base = (unsigned)off;
+                        for (unsigned e = 0; e < n; e++)
+                        {
+                            char vn[256];
+                            snprintf(vn, sizeof vn, "%s[%u]", var_name, e);
+                            GLuint before = xp->count;
+                            if (!xfb_flatten_struct(c, flat_tid, base, vn, "",
+                                                    xp, buf, whole_arrays, whole_cap, &src_word))
+                                return false;
+                            for (GLuint q = before; q < xp->count; q++)
+                                if (xp->vars[q].buffer == (GLuint)buf &&
+                                    xp->vars[q].offset + xp->vars[q].words * 4 > base)
+                                    base = xp->vars[q].offset + xp->vars[q].words * 4;
+                        }
+                        flattened[buf] = true;
                         xp->buffer_mask |= 1u << buf;
                         continue;
                     }
@@ -2016,6 +2050,18 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
                 else patched = aomo;
                 ir = patched;
                 words = aw;
+            }
+        }
+        /* geom r106: ...and inside stage-IO structs (geometry.c) */
+        {
+            size_t aw2 = 0;
+            uint32_t *aoms = mgl_spirv_lower_aom_struct_member(ir, words, &aw2);
+            if (aoms)
+            {
+                if (ir == patched) { patched = aoms; free((void *)ir); }
+                else patched = aoms;
+                ir = patched;
+                words = aw2;
             }
         }
         bool is64 = false;

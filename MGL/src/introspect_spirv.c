@@ -1253,7 +1253,11 @@ static void flatten_io_matrix_arrays_dir(SMod *m, MGLIProgram *ip, int stage, In
     for (int c = 0; c < ncand; c++) pf[cand[c].st] = 1;
     for (size_t i = 1; i < m->n; i++) {
         uint32_t op = m->in[i].w[0] & 0xffff, wc = m->in[i].w[0] >> 16;
-        if (wc < 4) continue;
+        if (wc < 3) continue;   /* geom r107: OpFunctionParameter has wordcount 3 —
+                                 * the old `wc < 4` guard made the parameter branch
+                                 * below dead code, so chains through a struct handed
+                                 * to a function (glslang's copy-out temp) were never
+                                 * marked and never rewritten */
         if ((op == SpvOpVariable || op == SpvOpFunctionParameter) &&
             m->t[m->in[i].w[1]].kind == T_POINTER && pf[m->t[m->in[i].w[1]].elem])
             pf[m->in[i].w[2]] = 1;
@@ -1507,10 +1511,10 @@ static void flatten_io_matrix_arrays_dir(SMod *m, MGLIProgram *ip, int stage, In
                     memcpy(&nw[5], &m->in[i].w[6], (wc - 6) * 4);
                     flat_replace_inst(m, i, nw, wc - 1);
                 } else if (mi < 64 && newidx_of[mi] >= 0 && newidx_of[mi] != (int)mi) {
-                    uint32_t cid = 0;
-                    for (uint32_t cc = 1; cc <= m->bound; cc++)
-                        if (m->isconst[cc] == 1 && (int32_t)m->cval[cc] == newidx_of[mi] &&
-                            m->t[m->ctype[cc]].kind == T_INT) { cid = cc; break; }
+                    /* geom r107: create the shifted member index constant when no
+                     * int constant with that value exists yet (the old scan-and-
+                     * give-up silently left the chain on the wrong member) */
+                    uint32_t cid = flat_find_int_const(m, ins, next_id, (uint32_t)newidx_of[mi]);
                     if (!cid) continue;
                     uint32_t *nw = malloc(4 * wc);
                     memcpy(nw, m->in[i].w, 4 * wc);
@@ -1884,10 +1888,20 @@ static uint32_t *transform_stage(GLMContext ctx, StageCtx *sc, int stage, size_t
      * flattened module.  geom r88: both directions per stage (r87 only did
      * Input for non-vertex stages, so TES/GS OUTPUT arrays of matrices still
      * failed to translate).  Vertex INPUTS stay out: they are vertex
-     * attributes, bound by location, and never arrays of matrices in GL. */
-    flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassOutput);
-    if (stage != _VERTEX_SHADER)
-        flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassInput);
+     * attributes, bound by location, and never arrays of matrices in GL.
+     *
+     * geom r107: the GEOMETRY stage module is EXCLUDED — it is never
+     * translated to MSL through SPIRV-Cross (the compute emulation rebuilds
+     * the stage from the GLSL source, geometry.c), and the kernel generator
+     * reflects the module and embeds the user source side by side: the
+     * flatten would rename struct members (m[2] -> m_0, m_1) out from under
+     * the un-renamed user code.  The generators unroll the original array
+     * member themselves. */
+    if (stage != _GEOMETRY_SHADER) {
+        flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassOutput);
+        if (stage != _VERTEX_SHADER)
+            flatten_io_matrix_arrays_dir(m, ip, stage, &ins, &next_id, src, SpvStorageClassInput);
+    }
     /* 0b. flatten arrays of patch interface blocks (SPIRV-Cross cannot emit
      * those at all: "nullptr" bad-cast in its patch io-struct code) */
     flatten_patch_block_arrays(m, ip, stage, &ins, &next_id, src);
