@@ -518,7 +518,20 @@ void mglBindTexture(GLMContext ctx, GLenum target, GLuint texture)
     }
     else
     {
-        ptr = NULL;
+        /* Mesa parity (texobj.c bind_tex_obj: name 0 binds the target's DEFAULT
+         * texture object — TexImage/TexParam into it are legal and it can be
+         * sampled, only immutable storage on it is GL_INVALID_OPERATION, which
+         * texStorage already rejects).  dEQP-GL45-ES31 (the ES31 suite run on a
+         * desktop core context) is written against ES semantics where the default
+         * texture exists: functional.shaders.framebuffer_fetch.basic.texel_fetch
+         * uploads its sampler grid into texture 0 at unit 1, re-attaches the FBO
+         * texture and re-binds 0, then samples the grid through it.  MGL used to
+         * clear the slot binding instead: the upload landed in a default object
+         * no unit ever sampled and the fetch read black.  texBindingName reports
+         * the marker name as 0, so GL_TEXTURE_BINDING_2D still queries 0, and an
+         * imageless default is skipped by the sampler bind exactly like an
+         * unbound unit was. */
+        ptr = defaultTexture(ctx, index);
     }
 
     bindTextureToUnit(ctx, STATE(active_texture), index, ptr);
@@ -693,13 +706,14 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
         if (!tex)
             continue;
 
-        // unbind from every texture unit (all targets)
+        // unbind from every texture unit (all targets); a deleted binding reverts
+        // to the slot's default texture object (Mesa _mesa_delete_textures)
         for (GLuint u = 0; u < TEXTURE_UNITS; u++)
         {
             for (GLuint i = 0; i < _MAX_TEXTURE_TYPES; i++)
             {
                 if (STATE(texture_units[u].textures[i]) == tex)
-                    bindTextureToUnit(ctx, u, i, NULL);
+                    bindTextureToUnit(ctx, u, i, defaultTexture(ctx, i));
             }
             if (STATE(active_textures[u]) == tex)
             {
@@ -857,9 +871,13 @@ void mglBindTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *
 
         if (texture == 0)
         {
+            /* breaking a binding reverts the slot to its default texture
+             * (Mesa unbind_textures_from_unit); only slots holding a real
+             * (non-default) object need the rebind */
             for (GLuint idx = 0; idx < _MAX_TEXTURE_TYPES; idx++)
-                if (STATE(texture_units[unit].textures[idx]))
-                    bindTextureToUnit(ctx, unit, idx, NULL);
+                if (STATE(texture_units[unit].textures[idx]) &&
+                    STATE(texture_units[unit].textures[idx])->name != TEX_OBJ_RES_NAME)
+                    bindTextureToUnit(ctx, unit, idx, defaultTexture(ctx, idx));
             continue;
         }
 
@@ -883,9 +901,13 @@ void mglBindTextureUnit(GLMContext ctx, GLuint unit, GLuint texture)
 
     if (texture == 0)
     {
+        /* GL 4.5 BindTextureUnit(0): "each of the targets is reset to its default
+         * texture" — Mesa unbind_textures_from_unit reverts every non-default
+         * binding of the unit to the target's default object */
         for (GLuint idx = 0; idx < _MAX_TEXTURE_TYPES; idx++)
-            if (STATE(texture_units[unit].textures[idx]))
-                bindTextureToUnit(ctx, unit, idx, NULL);
+            if (STATE(texture_units[unit].textures[idx]) &&
+                STATE(texture_units[unit].textures[idx])->name != TEX_OBJ_RES_NAME)
+                bindTextureToUnit(ctx, unit, idx, defaultTexture(ctx, idx));
         updateBindingVars(ctx);
         return;
     }
@@ -1596,6 +1618,12 @@ static bool texImageTarget(GLenum target, int dims, TDTarget *t)
     {
         case GL_TEXTURE_3D: case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP_ARRAY:
             t->tex_target = target; return true;
+        /* GL 4.6 §8.5.1: a 1D array is specified with the 3D commands (width =
+         * elements, height = layers, depth must be 1).  MGL's internal layout
+         * for _TEXTURE_1D_ARRAY is identical to the 2D spelling (height =
+         * layers), so accept it here too — compat r104; the 2D spelling above
+         * stays accepted for MGL-internal callers/tests. */
+        case GL_TEXTURE_1D_ARRAY: t->tex_target = target; return true;
         case GL_PROXY_TEXTURE_3D: case GL_PROXY_TEXTURE_2D_ARRAY: case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY:
             t->tex_target = proxyTexTarget(target); t->proxy = true; return true;
         default: return false;
@@ -1770,6 +1798,11 @@ static void texImage(GLMContext ctx, GLenum target, int dims, GLint level, GLint
         }
         TD_ERR(err);
     }
+
+    /* GL 4.6 §8.5.1 (TexImage3D errors, Mesa teximage.c): a 1D array given to
+     * the 3D commands must have depth 1 (height carries the layers). */
+    if (dims == 3 && t.tex_target == GL_TEXTURE_1D_ARRAY && depth != 1)
+        TD_ERR(GL_INVALID_VALUE);
 
     err = tdCheckFormatCompat(f, format, type, TD_PIX_TEXIMAGE);
     TD_CHECK(err == GL_NO_ERROR, err);
@@ -2206,7 +2239,9 @@ static bool subImageTarget(GLenum target, int dims, GLenum *tt, GLuint *face)
         if (isCubeFace(target)) { *tt = GL_TEXTURE_CUBE_MAP; *face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X; return true; }
         return target == GL_TEXTURE_2D || target == GL_TEXTURE_1D_ARRAY || target == GL_TEXTURE_RECTANGLE;
     }
-    return target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_CUBE_MAP_ARRAY;
+    /* 1D arrays also take the 3D update commands (y = layer, z/depth 0/1) */
+    return target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_CUBE_MAP_ARRAY ||
+           target == GL_TEXTURE_1D_ARRAY;
 }
 
 /* DSA target check for Texture*SubImage* */
@@ -2217,7 +2252,8 @@ static bool dsaTargetOk(Texture *tex, int dims)
         case 1: return tex->target == GL_TEXTURE_1D;
         case 2: return tex->target == GL_TEXTURE_2D || tex->target == GL_TEXTURE_1D_ARRAY || tex->target == GL_TEXTURE_RECTANGLE;
         default: return tex->target == GL_TEXTURE_3D || tex->target == GL_TEXTURE_2D_ARRAY ||
-                        tex->target == GL_TEXTURE_CUBE_MAP_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP;
+                        tex->target == GL_TEXTURE_CUBE_MAP_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP ||
+                        tex->target == GL_TEXTURE_1D_ARRAY;
     }
 }
 
@@ -2319,6 +2355,9 @@ static bool storageTarget(GLenum target, int dims, GLenum *tt, bool *proxy)
             {
                 case GL_TEXTURE_3D: case GL_TEXTURE_2D_ARRAY: case GL_TEXTURE_CUBE_MAP_ARRAY:
                     *tt = target; return true;
+                /* 1D arrays are also allocated by the 3D storage commands
+                 * (height = layers, depth 1) — see texImageTarget above */
+                case GL_TEXTURE_1D_ARRAY: *tt = target; return true;
                 case GL_PROXY_TEXTURE_3D: case GL_PROXY_TEXTURE_2D_ARRAY: case GL_PROXY_TEXTURE_CUBE_MAP_ARRAY:
                     *tt = proxyTexTarget(target); *proxy = true; return true;
                 default: return false;
@@ -2338,6 +2377,9 @@ static void texStorage(GLMContext ctx, Texture *tex, GLenum tt, GLenum proxy_tar
         TD_CHECK(width == height, GL_INVALID_VALUE);
     if (tt == GL_TEXTURE_CUBE_MAP_ARRAY)
         TD_CHECK(width == height && (depth % 6) == 0, GL_INVALID_VALUE);
+    /* a 1D array through the 3D storage command: height = layers, depth 1 */
+    if (tt == GL_TEXTURE_1D_ARRAY)
+        TD_CHECK(depth == 1, GL_INVALID_VALUE);
 
     GLenum err = checkSize(ctx, tt, 0, width, height, depth);
     if (err != GL_NO_ERROR)
@@ -2452,7 +2494,8 @@ void mglTextureStorage3D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum 
 {
     Texture *tex = findTexture(ctx, texture);
     TD_CHECK(tex, GL_INVALID_OPERATION);
-    TD_CHECK(tex->target == GL_TEXTURE_3D || tex->target == GL_TEXTURE_2D_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP_ARRAY,
+    TD_CHECK(tex->target == GL_TEXTURE_3D || tex->target == GL_TEXTURE_2D_ARRAY || tex->target == GL_TEXTURE_CUBE_MAP_ARRAY ||
+             tex->target == GL_TEXTURE_1D_ARRAY,   /* 3D spelling, see storageTarget */
              GL_INVALID_OPERATION);
     texStorage(ctx, tex, tex->target, 0, levels, internalformat, width, height, depth);
 }

@@ -29,6 +29,7 @@
 #include "shaders.h"
 #include "cts_glsl_compat.h"
 #include "mgl_ext_geom.h"       /* mgl_glsl_block_compat (glsl_block_compat.c) */
+#include "compat_fbfetch.h"     /* mgl_fbfetch_glsl_compat (compat_fbfetch.c) */
 extern char *mgl_reject_struct_member_qualifiers(const char *src);
 #include "glm_context.h"
 #include "mgl_ext_introspect.h"
@@ -1063,6 +1064,22 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         {
             free(compat);
             compat = bcompat;
+        }
+    }
+    {
+        /* compat (GL_EXT_shader_framebuffer_fetch): glslang does not know the
+         * extension — consume the #extension line, turn `inout' fragment
+         * outputs into readable `out's and alias gl_LastFragData to a uniform
+         * array (the MSL pass adds the [[color(n)]] fetch parameters) */
+        if (ptr->type == GL_FRAGMENT_SHADER)
+        {
+            const char *cur = compat ? compat : mgl_introspect_shader_source(ctx, ptr);
+            char *fcompat = mgl_fbfetch_glsl_compat(ptr->type, cur);
+            if (fcompat)
+            {
+                free(compat);
+                compat = fcompat;
+            }
         }
     }
     initGLSLInput(ctx, ptr->type, compat ? compat : mgl_introspect_shader_source(ctx, ptr), &glsl_input); /* introspect: subroutine rewrite */

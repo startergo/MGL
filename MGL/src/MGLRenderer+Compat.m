@@ -22,6 +22,7 @@
 #import "mgl_ext_texext.h"            /* mgl_texext_info (session 12 texture gate) */
 #import "mgl_ext_buffers.h"           /* mgl_buffers_mark_gpu_use (bindmap cache, session 13) */
 #import "mgl_ext_introspect.h"        /* default-uniform buffer revalidation (session 13) */
+#import "mgl_ext_program.h"           /* compile_msl hook (aliased-SSBO variants, r100c) */
 #import "MGLRenderer+Framebuffer.h"    /* fbApplyPipelineFormats (FBO-dirty format key) */
 #import "MGLRenderer+TextureExt.h"     /* texextAdjustPipelineDescriptor (same) */
 #include "mgl_ext_fb.h"                /* MGLRenderbufferEx (attachment GL formats in the key) */
@@ -2090,6 +2091,95 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
     e->samp = (__bridge void *)samp;
 }
 
+/* -------- GL_EXT_texture_sRGB_decode (compat r102) ------------------- */
+
+/* the plain (non-decoding) counterpart of an sRGB Metal pixel format, or
+ * MTLPixelFormatInvalid when the format does not carry an sRGB transfer */
+static MTLPixelFormat compatSRGBPlainFormat(MTLPixelFormat f)
+{
+    switch (f)
+    {
+        case MTLPixelFormatRGBA8Unorm_sRGB:  return MTLPixelFormatRGBA8Unorm;
+        case MTLPixelFormatBGRA8Unorm_sRGB:  return MTLPixelFormatBGRA8Unorm;
+        case MTLPixelFormatR8Unorm_sRGB:     return MTLPixelFormatR8Unorm;
+        case MTLPixelFormatRG8Unorm_sRGB:    return MTLPixelFormatRG8Unorm;
+        case MTLPixelFormatBC1_RGBA_sRGB:    return MTLPixelFormatBC1_RGBA;
+        case MTLPixelFormatBC2_RGBA_sRGB:    return MTLPixelFormatBC2_RGBA;
+        case MTLPixelFormatBC3_RGBA_sRGB:    return MTLPixelFormatBC3_RGBA;
+        case MTLPixelFormatBC7_RGBAUnorm_sRGB: return MTLPixelFormatBC7_RGBAUnorm;
+        case MTLPixelFormatETC2_RGB8_sRGB:   return MTLPixelFormatETC2_RGB8;
+        case MTLPixelFormatETC2_RGB8A1_sRGB: return MTLPixelFormatETC2_RGB8A1;
+        case MTLPixelFormatEAC_RGBA8_sRGB:   return MTLPixelFormatEAC_RGBA8;
+        case MTLPixelFormatASTC_4x4_sRGB:    return MTLPixelFormatASTC_4x4_LDR;
+        case MTLPixelFormatASTC_5x4_sRGB:    return MTLPixelFormatASTC_5x4_LDR;
+        case MTLPixelFormatASTC_5x5_sRGB:    return MTLPixelFormatASTC_5x5_LDR;
+        case MTLPixelFormatASTC_6x5_sRGB:    return MTLPixelFormatASTC_6x5_LDR;
+        case MTLPixelFormatASTC_6x6_sRGB:    return MTLPixelFormatASTC_6x6_LDR;
+        case MTLPixelFormatASTC_8x5_sRGB:    return MTLPixelFormatASTC_8x5_LDR;
+        case MTLPixelFormatASTC_8x6_sRGB:    return MTLPixelFormatASTC_8x6_LDR;
+        case MTLPixelFormatASTC_8x8_sRGB:    return MTLPixelFormatASTC_8x8_LDR;
+        case MTLPixelFormatASTC_10x5_sRGB:   return MTLPixelFormatASTC_10x5_LDR;
+        case MTLPixelFormatASTC_10x6_sRGB:   return MTLPixelFormatASTC_10x6_LDR;
+        case MTLPixelFormatASTC_10x8_sRGB:   return MTLPixelFormatASTC_10x8_LDR;
+        case MTLPixelFormatASTC_10x10_sRGB:  return MTLPixelFormatASTC_10x10_LDR;
+        case MTLPixelFormatASTC_12x10_sRGB:  return MTLPixelFormatASTC_12x10_LDR;
+        case MTLPixelFormatASTC_12x12_sRGB:  return MTLPixelFormatASTC_12x12_LDR;
+        default: break;
+    }
+    return MTLPixelFormatInvalid;
+}
+
+/* SKIP_DECODE sampling: hand back a plain (non-sRGB) VIEW of <base> so Metal's
+ * automatic sRGB->linear conversion does not run (the EXT extension's raw
+ * sample values).  The effective decode state follows GL sampler-object
+ * semantics (and Mesa's st_sampler_view.c): the sampler object bound to the
+ * unit replaces the texture's own parameter.  Callers pass the GL unit so the
+ * effective state resolves per unit; the view is cached per unit, keyed on
+ * every identity the decision reads.  Returns <base> unchanged when decoding
+ * stays enabled or the format has no plain counterpart. */
+- (id<MTLTexture>) compatSRGBDecodeViewForTex: (Texture *)tex base: (id<MTLTexture>)base unit: (GLuint)unit
+{
+    const GLenum decode = GL_DECODE_EXT;    const TextureParameter *sp = NULL;
+
+    if (!tex || !base || unit >= 32)
+        return base;
+
+    /* effective sampler parameters for this unit */
+    Sampler *so = (unit < TEXTURE_UNITS) ? STATE(texture_samplers[unit]) : NULL;
+    sp = so ? &so->params : &tex->params;
+    if (sp->srgb_decode != GL_SKIP_DECODE_EXT)
+        return base;
+
+    MTLPixelFormat plain = compatSRGBPlainFormat(base.pixelFormat);
+    if (plain == MTLPixelFormatInvalid || plain == base.pixelFormat)
+        return base;            /* nothing to skip */
+
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    if (!m)
+        return base;
+    struct MGLCompatSrgbView *e = &m->srgbview[unit];
+    void *so_id = (void *)so;
+    void *so_params = so ? so->params.mtl_data : NULL;
+    if (e->view && e->tex == (void *)tex && e->tex_mtl == tex->mtl_data &&
+        e->tex_params == tex->params.mtl_data && e->sampler_obj == so_id &&
+        e->sampler_params == so_params)
+        return (__bridge id<MTLTexture>)e->view;
+
+    id<MTLTexture> view = [base newTextureViewWithPixelFormat: plain];
+    if (!view)
+        return base;            /* PixelFormatView usage missing: decode, never wrong values */
+
+    if (e->view)
+        CFRelease(e->view);
+    e->tex = (void *)tex;
+    e->tex_mtl = tex->mtl_data;
+    e->tex_params = tex->params.mtl_data;
+    e->sampler_obj = so_id;
+    e->sampler_params = so_params;
+    e->view = (void *)CFBridgingRetain(view);
+    return view;
+}
+
 - (void) compatSetVertexTexture: (id<MTLTexture>)tex atIndex: (NSUInteger)idx
 {
     id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
@@ -2927,6 +3017,109 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
     [self compatCSFrameStats];       /* compat CS: per-frame stats hook */
     mgl_prof_frame();
     return true;
+}
+
+#pragma mark - aliased SSBO dispatch variants (compat_ssbo.c)
+
+static char kSSBOAliasVarKey;
+
+/* Compute-function variant whose ALIASED shader storage blocks share one Metal
+ * pointer (see compat_ssbo.c): Metal's compiler assumes distinct [[buffer(n)]]
+ * argument pointers never alias, so GL's intra-invocation ordering through two
+ * blocks bound to the same buffer range (GL 4.6 §7.12) breaks — the first
+ * block's store is forwarded to the later load
+ * (dEQP ES31 synchronization.in_invocation.ssbo_alias_overwrite).
+ *
+ * Returns nil (and costs only the small C walk of the stage's storage-block
+ * bindings) unless two storage blocks are bound to the identical buffer range
+ * right now; then a per-signature variant of the entry is compiled once and
+ * cached on the base function.  MGL_NO_SSBO_ALIAS=1 switches it off (A/B). */
+- (id<MTLFunction>) compatSSBOAliasComputeFunction: (Shader *) cs program: (Program *) program
+                                                                   map: (BufferMapList *) map
+{
+    static int sOff = -1;
+    unsigned from[16], to[16];
+    int npairs;
+    id<MTLFunction> base;
+    NSMutableDictionary *cache;
+    char sig[16 * 16 + 1];
+    NSString *key;
+    id cached;
+
+    if (sOff < 0)
+        sOff = getenv("MGL_NO_SSBO_ALIAS") != NULL;
+    if (sOff)
+        return nil;
+    if (!cs || !cs->mtl_data.function || !program)
+        return nil;
+
+    npairs = mgl_compat_ssbo_alias_pairs(ctx, map, from, to, 16);
+    if (npairs <= 0)
+        return nil;
+
+    /* signature: the variant is a pure function of which block folds onto which */
+    {
+        size_t o = 0;
+        int n = snprintf(sig + o, sizeof sig - o, "%u>%u", from[0], to[0]);
+        if (n < 0) return nil;
+        o += (size_t)n;
+        for (int i = 1; i < npairs && o + 1 < sizeof sig; i++)
+        {
+            n = snprintf(sig + o, sizeof sig - o, ",%u>%u", from[i], to[i]);
+            if (n < 0) return nil;
+            o += (size_t)n;
+        }
+    }
+
+    base = (__bridge id<MTLFunction>)cs->mtl_data.function;
+    cache = objc_getAssociatedObject(base, &kSSBOAliasVarKey);
+    if (!cache)
+    {
+        cache = [NSMutableDictionary new];
+        objc_setAssociatedObject(base, &kSSBOAliasVarKey, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    key = [NSString stringWithUTF8String: sig];
+    cached = cache[key];
+    if (cached)
+        return cached[1];
+
+    {
+        const char *msl = program->spirv[_COMPUTE_SHADER].msl_str;
+        const char *entry = program->spirv[_COMPUTE_SHADER].entry_point;
+        char *rewritten, *err = NULL;
+        void *lib = NULL, *fn = NULL;
+        bool ok;
+
+        if (!msl || !entry || !ctx->mtl_funcs.ext_program || !ctx->mtl_funcs.ext_program->compile_msl)
+            return nil;
+
+        rewritten = mgl_compat_msl_alias_ssbo(msl, entry, from, to, npairs);
+        if (!rewritten)
+        {
+            if (getenv("MGL_SSBO_DEBUG"))
+                NSLog(@"MGL compat: aliased-SSBO rewrite declined for entry %s (%d pairs)", entry, npairs);
+            return nil;
+        }
+
+        ok = ctx->mtl_funcs.ext_program->compile_msl(ctx, rewritten, entry, &lib, &fn, &err);
+        if (!ok)
+        {
+            if (getenv("MGL_SSBO_DEBUG"))
+                NSLog(@"MGL compat: aliased-SSBO variant compile failed: %s", err ? err : "?");
+            free(err);
+            free(rewritten);
+            return nil;
+        }
+        free(err);
+        if (getenv("MGL_DUMP_MSL") || getenv("MGL_SSBO_DEBUG"))
+            fprintf(stderr, "MGL: compat aliased-SSBO variant of entry %s (sig %s):\n%s\n", entry, sig, rewritten);
+        free(rewritten);
+
+        /* keep library + function alive with the cache entry (the compile hook
+         * returned both retained) */
+        cache[key] = @[ (__bridge_transfer id)lib, (__bridge_transfer id<MTLFunction>)fn ];
+        return (__bridge id<MTLFunction>)fn;
+    }
 }
 
 @end

@@ -765,6 +765,8 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
          * silently lost when this rebind overwrites that slot (KHR-GL46
          * texture_swizzle: VS access read the unswizzled base) */
         texture = [self texparamTextureForTex: ptr base: texture];
+        /* EXT_texture_sRGB_decode: SKIP_DECODE plain (non-sRGB) view */
+        texture = [self compatSRGBDecodeViewForTex: ptr base: texture unit: (GLuint)binding];
         id<MTLSamplerState> sampler = nil;
         Sampler *gl_sampler = ctx->state.texture_samplers[binding];
         if (gl_sampler && gl_sampler->mtl_data)

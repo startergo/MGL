@@ -3238,6 +3238,49 @@ static NSUInteger geomImageAtomicTexels(id<MTLTexture> view)
         g->img_atom[unit].view = NULL;
     }
     buf = nil;                                  /* ARC release before overwriting */
+
+    /* compat r100: ALIASING image units share ONE sidecar.  GL 4.6 §8.26: an image
+     * unit is a view of the texture, so two units bound to the same level address
+     * the same memory and their imageAtomic* operations MUST alias — dEQP ES31
+     * synchronization.{in,inter}_invocation.image_atomic_alias_{write,overwrite}
+     * bind one r32i texture to units 1 and 2 and exchange values between the two
+     * names.  Independent per-unit sidecars broke that: each imageAtomicExchange
+     * read only its own zeroed buffer (every value but group 0 came back wrong).
+     * Adopt the other unit's live SINGLE-image sidecar for this view (same fmt,
+     * same byte layout — both units' MSL atomic helpers compute the same offsets):
+     * both slots then hold the same MTLBuffer and the resolve de-duplicates it.
+     * A shared CLEAN sidecar re-seeds from the texture (the texture may have been
+     * written since the donor bound it — matches a fresh allocation); a DIRTY one
+     * keeps its pending atomics, because seeding would clobber them. */
+    for (GLuint v = 0; v < TEXTURE_UNITS; v++)
+    {
+        if (v == unit || !g->img_atom[v].buf || g->img_atom[v].elems) continue;
+        if (getenv("MGL_NO_SHARE")) break;   /* A/B switch of the r100 aliasing fix */
+        if (g->img_atom[v].view != (__bridge void *)view) continue;
+        if (g->img_atom[v].fmt != iu->internalformat) continue;
+        if (g->img_atom[v].bytes != (size_t)(texels * 4)) continue;
+
+        CFRetain((CFTypeRef)g->img_atom[v].buf);        /* one retain per record */
+        CFRetain((CFTypeRef)g->img_atom[v].view);
+        g->img_atom[unit].buf = g->img_atom[v].buf;
+        g->img_atom[unit].view = g->img_atom[v].view;
+        g->img_atom[unit].fmt = iu->internalformat;
+        g->img_atom[unit].bytes = (size_t)(texels * 4);
+        g->img_atom[unit].dirty = true;         /* bound to a dispatch: may change */
+        g->img_atom[unit].needs_seed = !g->img_atom[v].dirty;
+        g->img_atom[unit].elems = 0;            /* single image (an ARRAY record is not shareable) */
+        g->img_atom[unit].sig = 0;
+        g->img_atom[unit].ms = g->img_atom[v].ms;
+        g->img_atom[unit].samples = g->img_atom[v].samples;
+        g->img_atom_any = true;
+        if (view.textureType == MTLTextureTypeTextureBuffer)
+            g->img_atom_tb_dirty = true;        /* a CPU buffer read must resolve first */
+        if (gEnv.debug)
+            fprintf(stderr, "MGL geom: img-atom ALIAS unit %u adopts unit %u sidecar %p\n",
+                    unit, v, g->img_atom[unit].buf);
+        return (__bridge id<MTLBuffer>)g->img_atom[unit].buf;
+    }
+
     /* +1 DUMP word: the MSL index helpers (mgl_msl_fix_image_atomics) point
      * out-of-range image accesses at it instead of past the buffer */
     buf = [_device newBufferWithLength:texels * 4 + 4 options:MTLResourceStorageModeShared];
@@ -4439,6 +4482,14 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     }
     g->img_retired_n = keep_retired;
 
+    /* compat r100: SHARED (aliased) sidecars — two image units bound to the same
+     * view adopt one sidecar buffer (geomImageAtomicBuffer); this pass must then
+     * resolve it ONCE.  `done` collects the buffers already written back this
+     * pass (shared records beyond 64 keep the old duplicate work — idempotent,
+     * just slower). */
+    void *done[64];
+    int n_done = 0;
+
     /* multisample sidecars rasterize back into their textures first (render passes,
      * one per unit — an MS image ARRAY does one per element, from its region inside
      * the shared array side buffer); the compute resolve below then handles the rest */
@@ -4448,6 +4499,14 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
 
         if (!g->img_atom[u].elems)
         {
+            bool dup = false;
+            for (int d = 0; d < n_done; d++)
+                if (done[d] == g->img_atom[u].buf) dup = true;
+            if (dup)
+            {                                   /* an aliased unit already flushed it */
+                g->img_atom[u].dirty = false;
+                continue;
+            }
             Texture *tptr = STATE(image_units[u]).tex;   /* flush target (debug print) */
             if (gEnv.debug)
             {
@@ -4458,7 +4517,8 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                       u, (__bridge void *)sv, (__bridge void *)live, (live == sv) ? 1 : 0,
                       sv ? (unsigned long)sv.textureType : 0ul);
             }
-            if ([self geomMsFlushUnit: u]) { g->img_atom[u].dirty = false; g->stat_flushes++; }
+            if ([self geomMsFlushUnit: u]) { g->img_atom[u].dirty = false; g->stat_flushes++;
+                if (n_done < 64) done[n_done++] = g->img_atom[u].buf; }
             else if (gEnv.debug)
                 fprintf(stderr, "geom: MS sidecar flush skipped (unit %d, no PSO?)\n", u);
             continue;
@@ -4520,6 +4580,15 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         view = (__bridge id<MTLTexture>)(g->img_atom[u].view);
         g->img_atom[u].dirty = false;
         if (!buf) continue;
+
+        /* r100: a SHARED sidecar (aliased units) resolves once — the unit whose
+         * record was already written back this pass just drops its dirty flag */
+        {
+            bool dup = false;
+            for (int d = 0; d < n_done; d++)
+                if (done[d] == (void *)g->img_atom[u].buf) dup = true;
+            if (dup) continue;
+        }
 
         /* an image ARRAY's single side buffer: resolve every element region into
          * its own texture (the layout mirrors geomImageAtomicArrayLayout) */
@@ -4626,6 +4695,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         threadsPerThreadgroup: MTLSizeMake(64 > pso.maxTotalThreadsPerThreadgroup ?
                                            pso.maxTotalThreadsPerThreadgroup : 64, 1, 1)];
         g->stat_resolves++;
+        if (n_done < 64) done[n_done++] = (__bridge void *)buf;      /* r100: shared sidecars resolve once */
 
         /* r63: a TEXTURE BUFFER's atomics resolve into its SHADOW texture (buffer
          * textures are converted copies, mgl_uses_shadow): the GL buffer itself would
@@ -4688,6 +4758,23 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
         if (rtt == MTLTextureTypeTextureBuffer || rtt == MTLTextureType2DMultisample ||
             rtt == MTLTextureType2DMultisampleArray)
             continue;                       /* covered above (ms) / unsupported here */
+        /* r100: a retired record that SHARES its buffer with a record already
+         * resolved this pass (aliased units: the surviving unit's record, or an
+         * earlier retired copy) needs no second write-back — the buffer and the
+         * view are identical (sharing pinned them together), so release it. */
+        {
+            bool dup = false;
+            for (int d = 0; d < n_done; d++)
+                if (done[d] == (__bridge void *)rb) dup = true;
+            if (dup)
+            {
+                CFRelease((CFTypeRef)g->img_retired[r].buf);
+                g->img_retired[r].buf = NULL;
+                CFRelease((CFTypeRef)g->img_retired[r].view);
+                g->img_retired[r].view = NULL;
+                continue;
+            }
+        }
         MTLPixelFormat rpf = rv.pixelFormat;
         rdims[0] = (uint32_t)rv.width;
         rdims[1] = (uint32_t)rv.height;
@@ -5455,6 +5542,8 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                     }
                     id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
                     texture = [self texparamTextureForTex: tex base: texture];
+                    /* EXT_texture_sRGB_decode: SKIP_DECODE plain (non-sRGB) view */
+                    texture = [self compatSRGBDecodeViewForTex: tex base: texture unit: (GLuint)unit];
                     if (sampler) [enc setVertexSamplerState: sampler atIndex: mtl_index + e];
                 }
                 else
@@ -5716,6 +5805,8 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
                         }
                         id<MTLSamplerState> sampler = [self texparamSamplerForUnit: (GLuint)unit texture: tex];
                         texture = [self texparamTextureForTex: tex base: texture];
+                        /* EXT_texture_sRGB_decode: SKIP_DECODE plain (non-sRGB) view */
+                        texture = [self compatSRGBDecodeViewForTex: tex base: texture unit: (GLuint)unit];
                         if (sampler) [enc setSamplerState: sampler atIndex: mtl_index + e];
                     }
                     else
@@ -7755,49 +7846,42 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
 
 /* "does this stage's MSL read spvBufferSizeConstants" is immutable after link —
  * the per-draw strstr over the full MSL source was the single biggest per-draw
- * cost in glmark2 (ideas: ~4 ms/frame in two strstr scans per draw); memoize.
- * Shared with the vertex-attribute planner (round 44 added two scans of its
- * own, one per plan rebuild) via mgl_msl_has_size_constants(). */
+ * cost in glmark2 (ideas: ~4 ms/frame in two strstr scans per draw), so it is
+ * memoized ON THE PROGRAM (Spirv.sizes_scan: 0 unknown, 1 no, 2 yes).
+ * The old memo was a static array keyed on (Program*, msl_str*) + a 32-byte
+ * head memcmp, and both addresses are recycled by the allocator after a program
+ * is deleted while every generated MSL starts with the same ~60 bytes — a new
+ * program created at the dead one's addresses inherited its answer, a
+ * needs-sizes stage drew with NO size-constant bind and .length() read zeros
+ * (KHR-GL46 es_31_compatibility advanced-unsizedArrayLength-fs-* whole-group
+ * flakes; tests/headless/test_compat_ssbo_sizes.c msl_probe_alias).  Storing
+ * the scan on the object costs nothing to validate and cannot go stale. */
 static bool geomSSBOSizesNeeded(Program *p, int stage)
 {
-    /* the cache key is (program, msl pointer, stage) plus the first 32 bytes of the
-     * text: validating with strlen() cost 2 x strlen(30 KB) PER DRAW (the hit path
-     * recomputed it to compare) — a head memcmp catches the recycled-pointer case
-     * for free and no scan of the string is needed to hit */
-    static struct { const void *p, *msl; char head[32]; int stage; bool needed; } cache[32];
-    static int next;
-    const char *msl = p->spirv[stage].msl_str;
-    for (int i = 0; i < 32; i++)
-        if (cache[i].p == (void *)p && cache[i].msl == (void *)msl && cache[i].stage == stage &&
-            memcmp(cache[i].head, msl, 32) == 0)
-            return cache[i].needed;
-    bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
-    cache[next] = (typeof(cache[0])){ (void *)p, (void *)msl, {0}, stage, needed };
-    memcpy(cache[next].head, msl, 32);
-    next = (next + 1) & 31;
-    return needed;
+    uint32_t *memo = &p->spirv[stage].sizes_scan;
+
+    if (!*memo)
+        *memo = (p->spirv[stage].msl_str &&
+                strstr(p->spirv[stage].msl_str, "spvBufferSizeConstants")) ? 2 : 1;
+    return *memo == 2;
 }
 
-/* public form for code holding only the MSL text (per-draw hot paths must not
- * strstr the whole source): memoized on the string pointer, which is unique
- * and immutable per compiled stage */
+/* program-keyed form for the per-draw paths that already hold the program
+ * (the vertex-attribute planner pads the buffer map around slot 25) */
+bool mgl_program_has_size_constants(Program *p, int stage)
+{
+    if (!p || stage < 0 || stage >= _MAX_SHADER_TYPES)
+        return false;
+    return geomSSBOSizesNeeded(p, stage);
+}
+
+/* raw-text form.  Uncached on purpose: the pointer-keyed memo that used to
+ * live here is what aliased (see geomSSBOSizesNeeded above) — this entry
+ * point has no object to hang a memo on, so it just scans.  It is not on a
+ * per-draw path; the per-draw callers go through the program form. */
 bool mgl_msl_has_size_constants(const char *msl)
 {
-    /* content-keyed, not pointer-keyed: a freed program's MSL string address
-     * can be recycled for different text (test_fp64 link loops), which must
-     * not alias the memoized answer.  The fingerprint is the first 32 bytes —
-     * validating with strlen() rescanned the whole (tens-of-KB) string on
-     * every hit, and this sits on the per-draw path */
-    static struct { const void *msl; char head[32]; bool needed; } cache[64];
-    static int next;
-    if (!msl) return false;
-    for (int i = 0; i < 64; i++)
-        if (cache[i].msl == (void *)msl && memcmp(cache[i].head, msl, 32) == 0) return cache[i].needed;
-    bool needed = strstr(msl, "spvBufferSizeConstants") != NULL;
-    cache[next] = (typeof(cache[0])){ (void *)msl, {0}, needed };
-    memcpy(cache[next].head, msl, 32);
-    next = (next + 1) & 63;
-    return needed;
+    return msl && strstr(msl, "spvBufferSizeConstants") != NULL;
 }
 
 - (void) geomBindSSBOSizes: (BufferMapList *) list stage: (int) stage vertex: (bool) vertex

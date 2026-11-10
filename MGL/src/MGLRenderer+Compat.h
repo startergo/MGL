@@ -21,8 +21,28 @@
 - (void) compatCSStop;
 @end
 
+/* GL_EXT_texture_sRGB_decode (compat r102): SKIP_DECODE sampling binds a plain
+ * (non-sRGB) view of the texture's storage.  Called right after
+ * texparamTextureForTex at every sampled-image bind site; returns <base>
+ * unchanged unless the unit's effective decode state is GL_SKIP_DECODE_EXT. */
+@interface MGLRenderer (CompatSRGBDecode)
+- (id<MTLTexture>) compatSRGBDecodeViewForTex: (Texture *)tex base: (id<MTLTexture>)base unit: (GLuint)unit;
+@end
+
 /* C bridge (GL-side buffer write paths etc.) — no-op unless the env flag is on */
 void mgl_compat_cs_drain(GLMContext glm_ctx);
+
+/* compat_ssbo.c — aliased shader-storage-block support (GL 4.6 §7.12): the
+ * pairs of the stage's storage-block MSL arguments that are bound to the
+ * identical buffer range right now (0 = nothing aliases, -1 = too many), and
+ * the MSL rewrite folding each secondary block onto the primary's pointer
+ * (returns NULL when the module cannot be rewritten — caller keeps the base
+ * function, i.e. the documented no-alias behaviour) */
+int  mgl_compat_ssbo_alias_pairs(GLMContext ctx, BufferMapList *map,
+                                 unsigned *from_msl, unsigned *to_msl, int max_pairs);
+char *mgl_compat_msl_alias_ssbo(const char *msl, const char *entry,
+                                const unsigned *from_msl, const unsigned *to_msl,
+                                int npairs);
 
 /* MGL_NO_PIPE_FAST=1 disables the compat pipeline fast path (debug switch; the
  * getenv happens once, this is the draw path) */
@@ -45,6 +65,14 @@ void mglProgramRegisterMSLIdentity(const void *function, const char *msl, const 
 - (bool) compatPipelineBindNeeded;
 - (bool) compatPipelineFastPath;
 - (void) compatPipelineStore;
+/* compat r100c: compute-function variant whose ALIASED shader storage blocks
+ * (two blocks bound to the SAME buffer range, GL 4.6 §7.12) share one Metal
+ * pointer — Metal assumes distinct [[buffer(n)]] args never alias and would
+ * forward the first block's store to the later load inside one invocation.
+ * nil when no storage blocks alias (costs one small C walk; the variants are
+ * cached per signature on the base function).  See compat_ssbo.c. */
+- (id<MTLFunction>) compatSSBOAliasComputeFunction: (Shader *) cs program: (Program *) program
+                                                                   map: (BufferMapList *) map;
 /* perf session 13: uniform/storage buffer-map prefix cache.  mapBuffersToMTL
  * calls compatBindmapFast first — true means both stage lists' prefix was
  * served from the cache (only the vertex-stage attribute suffix re-ran);

@@ -247,6 +247,12 @@ typedef struct TextureParameter_t {
     GLenum  wrap_s;
     GLenum  wrap_t;
     GLenum  wrap_r;
+    /* GL_EXT_texture_sRGB_decode (compat): GL_DECODE_EXT / GL_SKIP_DECODE_EXT.
+     * Sampler-state semantics: the sampler object bound to a unit replaces
+     * the texture's value. Metal has no sampler flag for this — SKIP_DECODE
+     * sampling binds a plain (non-sRGB) view of the texture's storage
+     * (compatSRGBDecodeViewForTex, MGLRenderer+Compat.m). */
+    GLenum  srgb_decode;
     void *mtl_data;
 } TextureParameter;
 
@@ -400,6 +406,20 @@ typedef struct Spirv_t {
                              * the image-atomic emulation buffers, which shifts it off the
                              * renderer's buffer-map ordinal — mgl_msl_fix_image_atomics
                              * records it and the map binds it here (0xffffffff = none) */
+    uint32_t fbfetch;     /* compat (GL_EXT_shader_framebuffer_fetch), FRAGMENT stage only:
+                             * bits 0..7 = colour locations fetched through `inout' outputs,
+                           * bits 8..11 = gl_LastFragData range (compat_fbfetch.c), recomputed
+                           * from the shader source at every link (see run_link) */
+    uint32_t sizes_scan;  /* geom: lazy memo of "does this stage's MSL read
+                           * spvBufferSizeConstants" (0 unknown, 1 no, 2 yes).
+                           * Stored ON the program: the previous static cache keyed
+                           * on (Program*, msl_str*) + a 32-byte head memcmp aliased
+                           * across recycled program/string addresses — every
+                           * generated MSL starts with the same ~60 bytes, so the
+                           * head guard never distinguishes two shaders and a fresh
+                           * program inherited a dead one's answer (geomBindSSBOSizes
+                           * then skipped the size-constant bind and .length() read
+                           * zeros; KHR-GL46 advanced-unsizedArrayLength-fs flakes) */
 } Spirv;
 /* compat (GL_KHR_blend_equation_advanced): the per-stage blend_support_* mask is
  * NOT cached here any more — a field inside Spirv_t grew every Program and

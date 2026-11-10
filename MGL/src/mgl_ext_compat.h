@@ -573,6 +573,10 @@ void mglc_matrix_rotate(GLdouble *m, GLdouble a, GLdouble x, GLdouble y, GLdoubl
 MGLCMatrixStack *mgl_compat_matrix_stack(GLMContext ctx, GLenum mode, int *texunit);
 void mgl_compat_get_matrix(GLMContext ctx, GLenum mode, GLdouble *out);
 
+/* compat_fbfetch.c: see compat_fbfetch.h (its own header — the shared
+ * error macros must not leak into shaders.c / program.c) */
+#include "compat_fbfetch.h"
+
 /* compat_glsl.c (compat GLSL -> core GLSL translation) */
 char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
                                   const GLchar *const *string, const GLint *length);

@@ -109,6 +109,15 @@ static void read_pixel_component(GLenum format, GLenum type, const void *pixels,
 
 #define CS() (ctx->state.ext_compat)
 
+/* restore a saved unit-0 2D binding: the default texture object (name 0 is a
+ * real binding since the r103 Mesa-parity change) carries the reserved marker
+ * name, which must go back as 0 */
+static void restore_tex2d(GLMContext ctx, Texture *saved)
+{
+    mglBindTexture(ctx, GL_TEXTURE_2D,
+                   (saved && saved->name != TEX_OBJ_RES_NAME) ? saved->name : 0);
+}
+
 #pragma mark raster position
 
 void mglRasterPos2d(GLMContext ctx, GLdouble x, GLdouble y) {    MGLC_COMPAT_GUARD(ctx);
@@ -765,7 +774,7 @@ static void blit_quad(GLMContext ctx, GLint x, GLint y, GLsizei w, GLsizei h,
     memcpy(s->cur_texcoord[0], saved_tc, 4 * sizeof(GLfloat));
     s->texenv[0].env_mode = saved_env0;
     s->unit_target_mask[0] = saved_mask0;
-    mglBindTexture(ctx, GL_TEXTURE_2D, saved_tex0 ? saved_tex0->name : 0);
+    restore_tex2d(ctx, saved_tex0);
     mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
 
     s->recording = saved_recording;
@@ -1052,7 +1061,7 @@ void mglAccum(GLMContext ctx, GLenum op, GLfloat value)
         mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
         mglBindTexture(ctx, GL_TEXTURE_2D, tex);
         mglGetTexImage(ctx, GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, buf);
-        mglBindTexture(ctx, GL_TEXTURE_2D, saved ? saved->name : 0);
+        restore_tex2d(ctx, saved);
         mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
     }
 
@@ -1099,7 +1108,7 @@ void mglAccum(GLMContext ctx, GLenum op, GLfloat value)
             blit_quad(ctx, 0, 0, w, h, tex, (const GLfloat[4]){ value, value, value, value }, 0);
 
             mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
-            mglBindTexture(ctx, GL_TEXTURE_2D, saved ? saved->name : 0);
+            restore_tex2d(ctx, saved);
             mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
 
             free(buf);
@@ -1115,7 +1124,7 @@ void mglAccum(GLMContext ctx, GLenum op, GLfloat value)
         mglActiveTexture(ctx, GL_TEXTURE0 + MGLC_STIPPLE_UNIT);
         mglBindTexture(ctx, GL_TEXTURE_2D, tex);
         mglTexImage2D(ctx, GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, buf);
-        mglBindTexture(ctx, GL_TEXTURE_2D, saved ? saved->name : 0);
+        restore_tex2d(ctx, saved);
         mglActiveTexture(ctx, GL_TEXTURE0 + saved_active);
     }
 

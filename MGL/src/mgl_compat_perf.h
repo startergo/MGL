@@ -146,6 +146,22 @@ struct MGLExtMetal_compat {
         void    *samp;      /* resolved id<MTLSamplerState> */
     } vtexres[2][MGLC_BIND_SLOTS];
 
+    /* GL_EXT_texture_sRGB_decode (compat r102): SKIP_DECODE sampling binds a
+     * plain (non-sRGB) VIEW of the texture's storage.  One entry per texture
+     * unit — a unit binds one texture at a time — keyed on the identities the
+     * decode decision reads (texture object + realization + texparam cache,
+     * sampler object + its param cache); any glTexParameter / sampler param
+     * change releases the corresponding mtl_data and misses.  The view is
+     * retained here and released on replacement. */
+    struct MGLCompatSrgbView {
+        void    *tex;
+        void    *tex_mtl;
+        void    *tex_params;
+        void    *sampler_obj;
+        void    *sampler_params;
+        void    *view;      /* retained id<MTLTexture> (plain-format view) */
+    } srgbview[32];         /* TEXTURE_UNITS */
+
     struct MGLCompatRing ring;
 
     /* compat perf session 12: per-draw state-walk fast path.  Opaque here (it

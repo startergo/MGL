@@ -80,6 +80,7 @@ void mglTexParamInitDefaults(TextureParameter *p, GLenum target)
     p->swizzle_g = GL_GREEN;
     p->swizzle_b = GL_BLUE;
     p->swizzle_a = GL_ALPHA;
+    p->srgb_decode = GL_DECODE_EXT;     /* GL_EXT_texture_sRGB_decode */
 
     if (target == GL_TEXTURE_RECTANGLE)
     {
@@ -173,6 +174,7 @@ bool mglTexParamIsSamplerState(GLenum pname)
         case GL_TEXTURE_MIN_LOD: case GL_TEXTURE_MAX_LOD: case GL_TEXTURE_LOD_BIAS:
         case GL_TEXTURE_COMPARE_MODE: case GL_TEXTURE_COMPARE_FUNC:
         case GL_TEXTURE_MAX_ANISOTROPY:
+        case GL_TEXTURE_SRGB_DECODE_EXT:    /* sampler state (EXT_texture_sRGB_decode) */
             return true;
     }
     return false;
@@ -348,6 +350,17 @@ GLenum mglTexParamSet(TextureParameter *p, GLenum target, bool is_sampler, GLenu
             break;
         }
 
+        case GL_TEXTURE_SRGB_DECODE_EXT:
+        {
+            /* EXT_texture_sRGB_decode: "INVALID_ENUM is generated if <param>
+             * is not one of DECODE_EXT or SKIP_DECODE_EXT" — for textures AND
+             * sampler objects (the param is sampler state on both) */
+            GLint m = tp_value_i(v, vt, 0);
+            if (m != GL_DECODE_EXT && m != GL_SKIP_DECODE_EXT) return GL_INVALID_ENUM;
+            p->srgb_decode = m;
+            break;
+        }
+
         case GL_TEXTURE_COMPARE_FUNC:
         {
             GLint f = tp_value_i(v, vt, 0);
@@ -472,6 +485,7 @@ GLenum mglTexParamGet(GLMContext ctx, Texture *tex, TextureParameter *p, bool is
         case GL_TEXTURE_LOD_BIAS:    tp_store(out, vt, 0, p->lod_bias); return GL_NO_ERROR;
         case GL_TEXTURE_COMPARE_MODE: tp_store(out, vt, 0, p->compare_mode); return GL_NO_ERROR;
         case GL_TEXTURE_COMPARE_FUNC: tp_store(out, vt, 0, p->compare_func); return GL_NO_ERROR;
+        case GL_TEXTURE_SRGB_DECODE_EXT: tp_store(out, vt, 0, p->srgb_decode); return GL_NO_ERROR;
         case GL_TEXTURE_MAX_ANISOTROPY: tp_store(out, vt, 0, p->max_anisotropy); return GL_NO_ERROR;
 
         case GL_TEXTURE_BORDER_COLOR:

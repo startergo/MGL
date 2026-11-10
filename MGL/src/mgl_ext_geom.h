@@ -475,7 +475,10 @@ struct MGLExtState_geom {
      * id<MTLBuffer> / id<MTLTexture>), reallocated whenever the unit's bound view or
      * unit format changes.  Only atomic operations see this storage — an imageStore
      * before an imageAtomic on the same texel is an emulation gap (the texture and the
-     * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer). */
+     * sidecar do not alias; see MGLRenderer+Geometry.m geomImageAtomicBuffer).
+     * compat r100: units bound to the SAME view share one sidecar (GL 4.6 §8.26
+     * aliases them), so imageAtomic* through two unit names does alias — the
+     * resolve pass de-duplicates the shared buffer (see geomResolveImageAtomics). */
     /* dirty: the sidecar was handed to a dispatch, so it may hold atomic results —
      * geomResolveImageAtomics copies it back into the texture at barrier time.
      * ms: the unit's image is a MULTISAMPLE one (image2DMS / image2DMSArray).  Its

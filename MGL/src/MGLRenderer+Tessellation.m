@@ -1769,6 +1769,8 @@ static void tessBindStageTextures(GLMContext ctx, id<MTLComputeCommandEncoder> e
             }
             [self2 bindMTLTexture: tex];
             id<MTLTexture> texture = [self2 texparamTextureForTex: tex base: (__bridge id<MTLTexture>)tex->mtl_data];
+            /* EXT_texture_sRGB_decode: SKIP_DECODE plain (non-sRGB) view */
+            texture = [self2 compatSRGBDecodeViewForTex: tex base: texture unit: unit + e];
             id<MTLSamplerState> sampler = [self2 texparamSamplerForUnit: unit + e texture: tex];
             if (texture) [enc setTexture: texture atIndex: msl + e];
             /* the MSL sampled-image arguments pair texture(N) with sampler(N) */

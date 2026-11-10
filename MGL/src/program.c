@@ -47,6 +47,7 @@ static uint64_t mgl_link_group_seq;
 #include "mgl_ext_introspect.h"
 #include "mgl_ext_xfb.h"
 #include "mgl_ext_geom.h"
+#include "compat_fbfetch.h"     /* mgl_fbfetch_* (compat_fbfetch.c) */
 #include "mgl_ext_tess.h"
 #include "shaders.h"
 #include "fp64.h"
@@ -451,9 +452,10 @@ static MGLProgramObj *exec_clone(GLMContext ctx, const MGLProgramObj *src)
         c->base.spirv[i].mtl_library = s->mtl_library;
         /* scalars the draw / specialization paths read per program: the vertex-stage
          * gather rewrite records shadow_slots, mgl_msl_fix_image_atomics records the
-         * default-uniform buffer index */
+         * default-uniform buffer index, the size-constant probe records sizes_scan */
         c->base.spirv[i].shadow_slots = s->shadow_slots;
         c->base.spirv[i].dub_msl = s->dub_msl;
+        c->base.spirv[i].sizes_scan = s->sizes_scan;
 
         for (int j = 0; j < _MAX_SPIRV_RES; j++)
         {
@@ -3545,6 +3547,33 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         ptr->spirv[stage].msl_str = strdup(result);
     }
 
+    /* compat (GL_EXT_shader_framebuffer_fetch): the fragment entry point gains
+     * `mgl_fbfetch_n [[color(n)]]' parameters and preloads its output locals
+     * from them (Apple-GPU framebuffer fetch — compat_fbfetch.c). The code
+     * comes from the link-time source scan (run_link). */
+    if (stage == _FRAGMENT_SHADER && ptr->spirv[stage].msl_str && ptr->spirv[stage].fbfetch)
+    {
+        char *fixed = mgl_fbfetch_fix_msl(ptr->spirv[stage].msl_str, msl_entry, ptr->spirv[stage].fbfetch);
+        if (fixed)
+        {
+            free((void *)ptr->spirv[stage].msl_str);
+            ptr->spirv[stage].msl_str = fixed;
+        }
+        else if (getenv("MGL_FBFETCH_DEBUG"))
+            fprintf(stderr, "MGL fbfetch: fragment MSL shape not recognised (code 0x%x, entry %s)\n",
+                    ptr->spirv[stage].fbfetch, msl_entry);
+        if (getenv("MGL_FBFETCH_DUMP"))
+        {
+            FILE *df = fopen(getenv("MGL_FBFETCH_DUMP"), "a");
+            if (df)
+            {
+                fprintf(df, "==== fbfetch code 0x%x entry %s\n%s\n", ptr->spirv[stage].fbfetch, msl_entry,
+                        ptr->spirv[stage].msl_str ? ptr->spirv[stage].msl_str : "(null)");
+                fclose(df);
+            }
+        }
+    }
+
     /* GL texelFetch decodes sRGB textures; Metal's read() does not.  Route the
      * float-typed sampled-image read()s through sample() at the texel centre
      * (identity for non-sRGB, integer and multisample reads stay read()). */
@@ -4585,6 +4614,21 @@ static bool run_link(GLMContext ctx, MGLProgramObj *obj, int source,
     /* GL_PROGRAM_SEPARABLE semantics must be visible inside the link (the tess domain
      * compiles the separable vertex stage's compute-kernel variant for pipelines) */
     scratch->separable = obj->separable;
+
+    /* compat (GL_EXT_shader_framebuffer_fetch): the fragment stage's fetch
+     * code (colour locations / gl_LastFragData range) drives the MSL patch in
+     * compile_stage; it is recomputed from the shader SOURCE at every link —
+     * the GLSL pre-pass (mgl_fbfetch_glsl_compat) rewrote `inout'/lfd away, so
+     * the SPIR-V carries no trace of them */
+    {
+        const char *fbf_src = NULL;
+        for (int i = 0; i < obj->num_attached && !fbf_src; i++)
+            if ((int)obj->attached[i]->glm_type == _FRAGMENT_SHADER && obj->attached[i]->src)
+                fbf_src = obj->attached[i]->src;
+        if (!fbf_src && obj->base.shader_slots[_FRAGMENT_SHADER])
+            fbf_src = obj->base.shader_slots[_FRAGMENT_SHADER]->src;
+        scratch->base.spirv[_FRAGMENT_SHADER].fbfetch = fbf_src ? mgl_fbfetch_scan_source(fbf_src) : 0;
+    }
 
     if (source == LINK_FROM_ATTACHED)
     {

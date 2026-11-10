@@ -734,6 +734,29 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
     id<MTLFunction> func = (__bridge id<MTLFunction>)cs->mtl_data.function;
 
+    // the resource reflection helpers read ctx->state.program: present the
+    // compute program there from the buffer-map build on (the alias variant
+    // below needs the map of THIS dispatch; the encoder needs it too)
+    Program *saved_program = ctx->state.program;
+    ctx->state.program = program;
+
+    if (![self mapGLBuffersToMTLBufferMap: &ctx->state.compute_buffer_map_list stage: _COMPUTE_SHADER])
+    {
+        ctx->state.program = saved_program;
+        return false;
+    }
+
+    /* compat: two storage blocks bound to the same buffer range must hold the
+     * SAME Metal pointer inside the function or the compiler forwards stores
+     * across them (GL 4.6 §7.12) — nil unless such blocks are bound now
+     * (r101: pairs come from the dispatch's own buffer map) */
+    {
+        id<MTLFunction> alias_fn = [self compatSSBOAliasComputeFunction: cs program: program
+                                                                    map: &ctx->state.compute_buffer_map_list];
+        if (alias_fn)
+            func = alias_fn;
+    }
+
     id<MTLComputePipelineState> pso = objc_getAssociatedObject(func, &kComputePSOKey);
     if (!pso)
     {
@@ -742,15 +765,12 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
         if (!pso)
         {
             NSLog(@"MGL ERROR: compute pipeline creation failed: %@", err);
+            ctx->state.program = saved_program;
             return false;
         }
         objc_setAssociatedObject(func, &kComputePSOKey, pso, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    // the resource reflection helpers read ctx->state.program: present a pipeline's compute
-    // program there while this dispatch is encoded
-    Program *saved_program = ctx->state.program;
-    ctx->state.program = program;
     bool ok = [self extBufEncodeDispatch: program pso: pso x: x y: y z: z indirect: indirect offset: offset];
     ctx->state.program = saved_program;
 
@@ -760,8 +780,11 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 - (bool) extBufEncodeDispatch: (Program *) program pso: (id<MTLComputePipelineState>) pso
                             x: (GLuint) x y: (GLuint) y z: (GLuint) z indirect: (Buffer *) indirect offset: (size_t) offset
 {
-    if (![self mapGLBuffersToMTLBufferMap: &ctx->state.compute_buffer_map_list stage: _COMPUTE_SHADER])
-        return false;
+    /* the compute buffer map is built by extBufDispatchX before the alias
+     * variant is chosen (compat r101: the alias pairs read it) */
+    if (!ctx->state.compute_buffer_map_list.count)
+        if (![self mapGLBuffersToMTLBufferMap: &ctx->state.compute_buffer_map_list stage: _COMPUTE_SHADER])
+            return false;
 
     if (indirect && ![self extBufEnsure: indirect])
         return false;

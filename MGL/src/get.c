@@ -408,6 +408,31 @@ static const char *mgl_extensions[] = {
     "GL_EXT_texture_filter_anisotropic",
     "GL_KHR_debug",
     "GL_EXT_texture_compression_s3tc",
+    /* GL_EXT_texture_sRGB_decode (compat domain): GL_TEXTURE_SRGB_DECODE_EXT
+     * on textures and sampler objects.  SKIP_DECODE sampling binds a plain
+     * (non-sRGB) Metal view of the texture's storage instead of the sRGB one
+     * (compatSRGBDecodeViewForTex, MGLRenderer+Compat.m). */
+    "GL_EXT_texture_sRGB_decode",
+    /* GL_EXT_shader_framebuffer_fetch (compat domain, compat_fbfetch.c):
+     * `inout' fragment outputs and gl_LastFragData[] read the previous draw's
+     * colour through a [[color(n)]] entry-point parameter (Apple-GPU tile
+     * fetch).  MGL is always coherent (one encoder per draw), so the coherent
+     * behaviour of the non_coherent variant applies; that variant's
+     * glFramebufferFetchBarrierEXT entry point is NOT exposed. */
+    "GL_EXT_shader_framebuffer_fetch",
+    /* GL_EXT_color_buffer_float + GL_EXT_color_buffer_half_float (compat
+     * domain): float colour attachments.  Every format they cover (R16F RG16F
+     * RGBA16F R32F RG32F RGBA32F R11F_G11F_B10F, plus RGB16F from the
+     * half-float extension) is core colour-renderable in desktop GL 4.6 and
+     * MGL already renders/blends/fetches all of them (RGB16F is emulated —
+     * Metal has no rgb16Float pixel format; see test_compat_fbfetch.c).
+     * The strings exist for the ES-subset conformance packages
+     * (dEQP-GLES31/KHR-GL46 es_31_compatibility), which gate their float
+     * format cases on them exactly the way ES 3.2 gates them on core; the
+     * ARB_texture_float / EXT_packed_float entries above are the desktop
+     * spellings of the same functionality. */
+    "GL_EXT_color_buffer_float",
+    "GL_EXT_color_buffer_half_float",
     /* GL 4.6 core §17.3.8 (from GL_KHR_blend_equation_advanced): the 15 advanced
      * blend equations run in a framebuffer-fetch rewritten fragment shader
      * (compat domain, mgl_advblend.c).  The tile reads are inherently coherent,
@@ -444,7 +469,9 @@ static GLuint tex_binding(GLMContext ctx, int target_index)
         return 0;
 
     Texture *tex = STATE(texture_units[unit].textures[target_index]);
-    return tex ? tex->name : 0;
+    /* the default texture object carries the reserved marker name; GL reports
+     * binding 0 for it (texBindingName in textures.c) */
+    return (tex && tex->name != TEX_OBJ_RES_NAME) ? tex->name : 0;
 }
 
 static GLboolean cap_value(GLMContext ctx, GLenum pname, bool *found)
@@ -1142,7 +1169,10 @@ static int get_indexed_state(GLMContext ctx, GLenum pname, GLuint index, GetValu
                 {
                     Texture *t = STATE(texture_units[index].textures[tb[i].slot]);
                     gv->count = 1;
-                    gv->v[0] = t ? (GLint)t->name : 0;
+                    /* the target's default texture object carries the reserved
+                     * marker name; GL reports binding 0 for it (tex_binding
+                     * above, texBindingName in textures.c) */
+                    gv->v[0] = (t && t->name != TEX_OBJ_RES_NAME) ? (GLint)t->name : 0;
                     return 1;
                 }
             return -1;

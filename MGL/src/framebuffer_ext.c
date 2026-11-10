@@ -696,6 +696,28 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
              * working, which the strict RGBA-only reading of the spec would reject */
             if (integer != (k != MGL_FB_KIND_FLOAT))
                 FB_ERROR(GL_INVALID_OPERATION);
+
+            /* compat r104: a FLOAT-component attachment (R16F/R32F/RGBA32F/... or the
+             * 10F_11F_11F packed float) is incompatible with a plain integer-typed
+             * readback (GL_BYTE/_SHORT/_INT/_UNSIGNED_INT/... with a non-integer
+             * format) — GLES 3.0 table 3.2 (the read type for a float buffer is
+             * GL_FLOAT / GL_HALF_FLOAT), which the dEQP ES31 negative-coverage
+             * read_pixels_fbo_format_mismatch case enforces on desktop contexts now
+             * that float attachments are conformance-relevant
+             * (GL_EXT_color_buffer_float advertised).  GL_UNSIGNED_BYTE and the
+             * float-typed reads stay legal conversions (packed_pixels reads
+             * GL_RED/GL_FLOAT of R32F, fbo.read tests read UBYTE). */
+            if (fi && fi->component_type == GL_FLOAT && !integer)
+            {
+                switch (type)
+                {
+                    case GL_BYTE: case GL_SHORT: case GL_UNSIGNED_SHORT:
+                    case GL_INT: case GL_UNSIGNED_INT:
+                        FB_ERROR(GL_INVALID_OPERATION);
+                    default:
+                        break;
+                }
+            }
             aspect = MGL_FB_ASPECT_COLOR;
             break;
         }

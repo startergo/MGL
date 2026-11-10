@@ -1612,20 +1612,28 @@ typedef struct FBBlitParams {
     id<MTLTexture> stex = [self fbSampleable:src forceCopy:same];
     if (!stex) return;
 
-    /* compat s34: sRGB-encoding neutrality.  MSL read() on an _sRGB source
-     * DECODES, and while GL_FRAMEBUFFER_SRGB is off the dst renders through its
-     * plain-UNORM view, so the decoded value would be stored raw
-     * (KHR-GL46.direct_state_access.renderbuffers_storage_multisample: clear
-     * 0.25 -> resolve blit -> read back decode(0.25)=0.051).  A GL blit between
-     * color buffers of the same encoding passes the bytes through unchanged, so
-     * blit through plain-UNORM views of BOTH sides whenever the source is _sRGB
-     * (a blit whose sides differ in encoding is INVALID_OPERATION, so the dst
-     * is then _sRGB too and fbPlainUnormView is a no-op for the already-plain
-     * framebuffer_srgb-off dst).  Raw bytes in, raw bytes out — the linear-
-     * filter path therefore filters the encoded values, which is exact for the
-     * uniform sources the CTS blits and lossless for nearest. */
+    /* compat s34: sRGB-encoding neutrality while GL_FRAMEBUFFER_SRGB is OFF.
+     * MSL read() on an _sRGB source DECODES, and while GL_FRAMEBUFFER_SRGB is
+     * off the dst renders through its plain-UNORM view, so the decoded value
+     * would be stored raw (KHR-GL46.direct_state_access.renderbuffers_storage_
+     * multisample: clear 0.25 -> resolve blit -> read back decode(0.25)=0.051).
+     * A GL blit between color buffers of the same encoding passes the bytes
+     * through unchanged, so blit through plain-UNORM views of BOTH sides
+     * whenever the source is _sRGB and the cap is off.  Raw bytes in, raw bytes
+     * out — the linear-filter path therefore filters the encoded values, which
+     * is exact for the uniform sources the CTS blits and lossless for nearest.
+     *
+     * compat r104: with GL_FRAMEBUFFER_SRGB ON the copy must convert like a
+     * draw does (Mesa blit.c: the source keeps its sRGB format only while
+     * ctx->Color.sRGBEnabled, i.e. read() DECODES) — dEQP-GL45-ES31
+     * functional.fbo.srgb_write_control.framebuffer_srgb_enabled_copy_to_linear
+     * blits SRGB8_ALPHA8 into an RGBA8 framebuffer and requires the LINEARIZED
+     * value there.  The dst is left as fbTextureForAttachment resolved it
+     * (sRGB texture while the cap is on: Metal re-encodes on write; plain dst
+     * keeps the linear value), and the sample()/linear-filter path now filters
+     * the decoded values, which is the correct GL semantics. */
     FBTarget dstv;
-    if (fbPixelIsSRGB(stex.pixelFormat))
+    if (fbPixelIsSRGB(stex.pixelFormat) && !ctx->state.caps.framebuffer_srgb)
     {
         stex = [self fbPlainUnormView:stex];
         dstv = *dst;

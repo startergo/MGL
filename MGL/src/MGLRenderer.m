@@ -2418,23 +2418,44 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                                      slot:(mtl_index + e) tex:ptr])
                 continue;
 
-            RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
-            if (!ptr->mtl_data)
-                continue;
-
-
-            id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
-
-            // sampler objects bound to the unit override the texture's sampler state;
-            // swizzle / base+max level / stencil mode select a texture view (texparam)
             /* GL 8.17: sampling an INCOMPLETE texture returns (0,0,0,1) — never hand
              * the GPU a mip chain whose level sizes are inconsistent (only level
              * EXISTENCE was validated at creation; KHR-GL46.texture_gather.
              * incomplete-texture/-last-comp replace level 1 with 1x1 under a 32x32
-             * level 0 and expect a black sample). */
-            if (mgl_texture_incomplete_for_unit(ctx, ptr, (GLuint)unit))
+             * level 0 and expect a black sample), and never a texture that has NO
+             * levels at all: since compat r103 (Mesa-parity name-0 default texture)
+             * an unbound sampler unit resolves to the target's DEFAULT texture
+             * object, which typically has no storage — bindMTLTexture would run
+             * createMTLTextureFromGLTexture on it (level-less: the MGLRenderer.m
+             * "not sure how we got here" assert + 0x0x0 emergency fallback; glmark2
+             * shadow/jellyfish).  Check completeness FIRST and bind the black
+             * fallback texture without ever realizing the object. */
+            bool incomplete = mgl_texture_incomplete_for_unit(ctx, ptr, (GLuint)unit);
+            if (!incomplete)
+                RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
+            if (incomplete || !ptr->mtl_data)
             {
-                id<MTLTexture> ftex = [self computeFallbackTextureForType: texture.textureType];
+                /* the fallback mirrors the sampler's dimension; an unrealized
+                 * texture (no mtl_data) takes the type from its TARGET (the
+                 * same mapping createMTLTextureFromGLTexture uses) */
+                MTLTextureType ttype = MTLTextureType2D;
+                if (ptr->mtl_data)
+                    ttype = ((__bridge id<MTLTexture>)ptr->mtl_data).textureType;
+                else
+                    switch (ptr->target)
+                    {
+                        case GL_TEXTURE_1D: break;
+                        case GL_TEXTURE_1D_ARRAY: ttype = MTLTextureType1DArray; break;
+                        case GL_TEXTURE_2D_ARRAY: ttype = MTLTextureType2DArray; break;
+                        case GL_TEXTURE_3D: ttype = MTLTextureType3D; break;
+                        case GL_TEXTURE_CUBE_MAP: ttype = MTLTextureTypeCube; break;
+                        case GL_TEXTURE_CUBE_MAP_ARRAY: ttype = MTLTextureTypeCubeArray; break;
+                        case GL_TEXTURE_2D_MULTISAMPLE: ttype = MTLTextureType2DMultisample; break;
+                        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: ttype = MTLTextureType2DMultisampleArray; break;
+                        case GL_TEXTURE_BUFFER: ttype = MTLTextureTypeTextureBuffer; break;
+                        default: break;   /* 2D/RECT realize as 2D */
+                    }
+                id<MTLTexture> ftex = [self computeFallbackTextureForType: ttype];
                 id<MTLSamplerState> fsamp = [self computeFallbackSampler];
 
                 if (ftex)
@@ -2453,8 +2474,16 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                 continue;
             }
 
+
+            id<MTLTexture> texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
+
+            // sampler objects bound to the unit override the texture's sampler state;
+            // swizzle / base+max level / stencil mode select a texture view (texparam)
+
             id<MTLSamplerState> sampler = [self texparamSamplerForUnit:unit texture:ptr];
             texture = [self texparamTextureForTex:ptr base:texture];
+            /* EXT_texture_sRGB_decode: SKIP_DECODE swaps in a plain (non-sRGB) view */
+            texture = [self compatSRGBDecodeViewForTex:ptr base:texture unit:unit];
             assert(sampler);
 
             [self compatTexResolveRecord:(stage == _FRAGMENT_SHADER) unit:unit
@@ -2772,6 +2801,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
                     tex = STATE(active_textures[i*32+bitpos]);
                     assert(tex);
+
+                    /* compat r104 fix: a unit that was made ACTIVE but never had a
+                     * texture bound resolves to the target's DEFAULT texture object
+                     * (name 0 — compat r103 Mesa parity), which has NO levels.
+                     * There is nothing to realize, and createMTLTextureFromGLTexture
+                     * hits its level-less assert + 0x0x0 emergency fallback for it
+                     * (glmark2 [shadow]/[jellyfish] bind the shadow map on unit 1
+                     * and never touch unit 0's 2D slot).  Skip it — the sampler
+                     * loop below binds the incomplete fallback for any sampler
+                     * that actually reads such a unit. */
+                    if (tex->num_levels == 0)
+                        continue;
 
                     RETURN_FALSE_ON_FAILURE([self bindMTLTexture: tex]);
                 }
@@ -4653,7 +4694,11 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                         texture = (__bridge id<MTLTexture>)(tex_e->mtl_data);
                         sampler = [self texparamSamplerForUnit: ue texture: tex_e];
                         if (gl_texture_type == _TEXTURE)
+                        {
                             texture = [self texparamTextureForTex: tex_e base: texture];
+                            /* EXT_texture_sRGB_decode: SKIP_DECODE plain view */
+                            texture = [self compatSRGBDecodeViewForTex: tex_e base: texture unit: ue];
+                        }
                         else if (ue < TEXTURE_UNITS)
                         {
                             /* an image unit binds one mip level / layer: view of that

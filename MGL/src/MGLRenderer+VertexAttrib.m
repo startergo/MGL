@@ -27,9 +27,9 @@
 #import "mgl_ext_introspect.h"
 #import "mgl_ext_geom.h"      /* MGL_SSBO_SIZE_BUFFER_INDEX: attribute ordinals must skip it */
 #import "mgl_ext_tess.h"      /* tess: the render vertex function is the TES, not the VS */
-/* memoized spvBufferSizeConstants probe (MGLRenderer+Geometry.m) — the raw
- * strstr here runs per plan rebuild, i.e. per draw in glmark2 */
-extern bool mgl_msl_has_size_constants(const char *msl);
+/* memoized spvBufferSizeConstants probe (MGLRenderer+Geometry.m) — the per-draw
+ * probe is program-keyed (Spirv.sizes_scan); the raw-text form is uncached */
+extern bool mgl_program_has_size_constants(Program *p, int stage);
 #import "mgl_ext_program.h"   /* MGL_PIPELINE_OBJ: a bound pipeline's composite has no name */
 
 #define F4(_a_, _b_, _c_, _d_) switch (n) { case 1: return _a_; case 2: return _b_; case 3: return _c_; case 4: return _d_; } break
@@ -241,7 +241,7 @@ static GLsizei vattribDblShadowSpan(MGLVattribDrawPlan *plan, int lo, int size)
          * buffer-slot audit; same class as the fixed slot-30 const/xfb collision. */
         if (buffer_map->count == MGL_SSBO_SIZE_BUFFER_INDEX &&
             ctx->state.program &&
-            mgl_msl_has_size_constants(ctx->state.program->spirv[_VERTEX_SHADER].msl_str))
+            mgl_program_has_size_constants(ctx->state.program, _VERTEX_SHADER))
         {
             BufferMap *pad = &buffer_map->buffers[buffer_map->count];
             pad->attribute_mask = 0;
@@ -327,7 +327,7 @@ static bool vattribIsDoubleType(GLenum t)
     bool layout_done[MGL_VA_MAX_BINDINGS] = { false };
     /* the SSBO size-constant slot (see vattribMapVertexBuffers) is off limits for a
      * converted shadow stream as well */
-    bool skip_size_slot = mgl_msl_has_size_constants(program->spirv[_VERTEX_SHADER].msl_str);
+    bool skip_size_slot = mgl_program_has_size_constants(program, _VERTEX_SHADER);
 
     for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
         if (plan->binding_index[b] > max_binding_index)
