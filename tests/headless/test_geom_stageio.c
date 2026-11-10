@@ -8,6 +8,7 @@
  * block member type" / "array-of-structure member ... is not supported").
  */
 #include "mgl_test.h"
+#include <stdbool.h>
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -3496,6 +3497,240 @@ TEST(indirect_basevertex_gs)
     glDeleteProgram(p);
 }
 
+/* ------------------ baseVertex on DIRECT element draws (r135) --------------- */
+
+/* glDrawElementsBaseVertex through a GS: baseVertex 3 over indices {0,1,2}
+ * selects vertices 3-5 AND the VS's gl_VertexID is the ABSOLUTE id (3), both
+ * rasterized and captured through xfb.  The r133 fix covers the direct path
+ * too (same prep chain); this pins it. */
+static const char *bv_vs =
+    "#version 460 core\n"
+    "layout(location = 0) in vec2 pos;\n"
+    "flat out int vvid;\n"
+    "void main() { gl_Position = vec4(pos, 0.0, 1.0); vvid = gl_VertexID; }\n";
+
+TEST(basevertex_direct_gs)
+{
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "flat in int vvid[];\n"
+        "flat out int gvid;\n"
+        "void main() {\n"
+        "  gvid = vvid[0];\n"
+        "  for (int k = 0; k < 3; k++) { gl_Position = gl_in[k].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "flat in int gvid;\n"
+        "layout(location=0) out vec4 color;\n"
+        "void main(){ color = (gvid >= 3) ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    GLuint p = mgl_make_program5(bv_vs, NULL, NULL, gs, fs);
+    GLuint vao = 0, vbo = 0, ibo = 0;
+
+    if (!p) return;
+    {
+        const float verts[] = {
+            -1.0f, -1.0f,   0.0f, -1.0f,  -1.0f, 3.0f,     /* 0-2: left */
+             0.0f, -1.0f,   1.0f, -1.0f,   0.0f, 3.0f,     /* 3-5: right */
+        };
+        const GLuint idx[3] = { 0, 1, 2 };
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glGenBuffers(1, &ibo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glUseProgram(p);
+        glViewport(0, 0, 16, 16);
+        glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsBaseVertex(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 3);
+        EXPECT_NO_GL_ERROR();
+        EXPECT_PIXEL(12, 8, 0, 255, 0, 255, 8);    /* right, gl_VertexID 3 -> green */
+        EXPECT_PIXEL(3, 8, 0, 0, 255, 255, 8);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsBaseVertex(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 0);
+        EXPECT_NO_GL_ERROR();
+        EXPECT_PIXEL(3, 8, 255, 0, 0, 255, 8);     /* left, id 0 -> red */
+        EXPECT_PIXEL(12, 8, 0, 0, 255, 255, 8);
+    }
+    glDeleteBuffers(1, &ibo);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
+TEST(basevertex_xfb_absolute_vid)
+{
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(points, max_vertices = 1) out;\n"
+        "flat in int vvid[];\n"
+        "flat out int gv;\n"
+        "void main() { gv = vvid[0]; gl_Position = gl_in[0].gl_Position; EmitVertex(); EndPrimitive(); }\n";
+    const char *names[1] = { "gv" };
+    GLuint p = glCreateProgram();
+    GLuint vao = 0, vbo = 0, ibo = 0, bo = 0;
+    GLint ok = 0;
+    int out[2] = {0};
+
+    {
+        const char *srcs[2] = { bv_vs, gs };
+        const GLenum types[2] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER };
+
+        for (int i = 0; i < 2; i++)
+        {
+            GLuint sh = glCreateShader(types[i]);
+            const char *sp = srcs[i];
+
+            glShaderSource(sh, 1, &sp, NULL);
+            glCompileShader(sh);
+            glAttachShader(p, sh);
+            glDeleteShader(sh);
+        }
+    }
+    glTransformFeedbackVaryings(p, 1, names, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);
+    if (!ok) { glDeleteProgram(p); return; }
+    {
+        const float verts[] = {
+            -1.0f, -1.0f,   0.0f, -1.0f,  -1.0f, 3.0f,
+             0.0f, -1.0f,   1.0f, -1.0f,   0.0f, 3.0f,
+        };
+        const GLuint idx[3] = { 0, 1, 2 };
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        glGenBuffers(1, &ibo);
+        glGenBuffers(1, &bo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glUseProgram(p);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, bo);
+        glBeginTransformFeedback(GL_POINTS);
+        glDrawElementsBaseVertex(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 3);
+        glEndTransformFeedback();
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+        glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+        EXPECT_EQ_INT(out[0], 3);       /* the ABSOLUTE gl_VertexID, not the raw index */
+    }
+    glDeleteBuffers(1, &bo);
+    glDeleteBuffers(1, &ibo);
+    glDeleteBuffers(1, &vbo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
+
+/* ------------------------ baseInstance + GS (r137) ------------------------- */
+
+/* baseInstance on indirect draws: gl_InstanceID seen by the VS (and passed
+ * through the GS) is ABSOLUTE — baseInstance 2 with instanceCount 2 gives ids
+ * 2,3 on the arrays-indirect path AND the element-indirect path; baseInstance 0
+ * gives 0,1.  Asserted through an xfb capture of the GS's point output. */
+static void baseinstance_case(const GLuint *cmd, int cmd_words, bool elements)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "flat out int ids;\n"
+        "void main() { ids = gl_InstanceID * 10 + gl_VertexID; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(points, max_vertices = 1) out;\n"
+        "flat in int ids[];\n"
+        "flat out int gv;\n"
+        "void main() { gv = ids[0]; gl_Position = vec4(0.0, 0.0, 0.0, 1.0); EmitVertex(); EndPrimitive(); }\n";
+    const char *names[1] = { "gv" };
+    GLuint p = glCreateProgram();
+    GLuint vao = 0, ibo = 0, bo = 0, dib = 0;
+    GLint ok = 0;
+    int out[4] = {0};
+
+    {
+        const char *srcs[2] = { vs, gs };
+        const GLenum types[2] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER };
+
+        for (int i = 0; i < 2; i++)
+        {
+            GLuint sh = glCreateShader(types[i]);
+            const char *sp = srcs[i];
+
+            glShaderSource(sh, 1, &sp, NULL);
+            glCompileShader(sh);
+            glAttachShader(p, sh);
+            glDeleteShader(sh);
+        }
+    }
+    glTransformFeedbackVaryings(p, 1, names, GL_INTERLEAVED_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);
+    if (!ok) { glDeleteProgram(p); return; }
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &ibo);
+    glGenBuffers(1, &bo);
+    glGenBuffers(1, &dib);
+    glBindVertexArray(vao);
+    if (elements)
+    {
+        const GLuint idx[3] = { 0, 1, 2 };
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, dib);
+    glBufferData(GL_DRAW_INDIRECT_BUFFER, (size_t)cmd_words * 4, cmd, GL_STATIC_DRAW);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, bo);
+    glUseProgram(p);
+    glBeginTransformFeedback(GL_POINTS);
+    if (elements)
+        glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+    else
+        glDrawArraysIndirect(GL_TRIANGLES, NULL);
+    glEndTransformFeedback();
+    EXPECT_NO_GL_ERROR();
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, bo);
+    glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof out, out);
+    glDeleteBuffers(1, &bo);
+    glDeleteBuffers(1, &dib);
+    glDeleteBuffers(1, &ibo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+    EXPECT_EQ_INT(out[2], 0);
+}
+
+TEST(baseinstance_indirect_gs)
+{
+    /* arrays: count=3, instanceCount=2, first=0, baseInstance=2 */
+    const GLuint arr[4] = { 3, 2, 0, 2 };
+    /* elements: count=3, instanceCount=2, firstIndex=0, baseVertex=0, baseInstance=2 */
+    const GLuint el[5] = { 3, 2, 0, 0, 2 };
+
+    baseinstance_case(arr, 4, false);
+    baseinstance_case(el, 5, true);
+}
+
 int main(void)
 {
     GLuint vao = 0;
@@ -3546,5 +3781,8 @@ int main(void)
     RUN(restart_xfb_pid_continuity);
     RUN(mdi_elements_gs);
     RUN(indirect_basevertex_gs);
+    RUN(basevertex_direct_gs);
+    RUN(basevertex_xfb_absolute_vid);
+    RUN(baseinstance_indirect_gs);
     return mgl_test_summary();
 }
