@@ -884,6 +884,11 @@ static void xfb_collect_roots(spvc_compiler c, spvc_resources res, XfbRoots *roo
                 const char *block_name = spvc_compiler_get_name(c, r->base_type_id);
                 if (var_name && var_name[0]) {
                     xfb_add_root(roots, block_name, var_name, r->type_id, r->base_type_id);
+                    /* r114 (geom): the INSTANCE name names the block through the capture
+                     * API too ("b", "b[0].i.a") — for an ARRAY-OF-BLOCKS instance
+                     * ("out Blk{..} b[2];") it carries the array dimensions */
+                    if (!var_name || strcmp(var_name, block_name ? block_name : ""))
+                        xfb_add_root(roots, var_name, var_name, r->type_id, r->base_type_id);
                 } else {
                     unsigned nm = spvc_type_get_num_member_types(base);
                     for (unsigned m = 0; m < nm; m++) {
@@ -891,6 +896,23 @@ static void xfb_collect_roots(spvc_compiler c, spvc_resources res, XfbRoots *roo
                         spvc_type_id mt = spvc_type_get_member_type(base, m);
                         spvc_type mth = spvc_compiler_get_type_handle(c, mt);
                         xfb_add_root(roots, mn, mn, mt, spvc_type_get_base_type_id(mth));
+                        /* r112 (geom): an ANONYMOUS block's members are named
+                         * "<block>.<member>" through the capture API too (GL 4.6
+                         * 13.3.1) — register the same member under that spelling so
+                         * "Blk.t" resolves like it does for a named instance */
+                        if (block_name && block_name[0] && mn && mn[0] && strlen(block_name) + 1 + strlen(mn) < 250)
+                        {
+                            char bn[256];
+
+                            snprintf(bn, sizeof bn, "%s.%s", block_name, mn);
+                            xfb_add_root(roots, bn, mn, mt, spvc_type_get_base_type_id(mth));
+                        }
+                        /* r112 (geom): the BLOCK NAME alone captures the whole anonymous
+                         * block (GL 4.6 13.3.1) — with an EMPTY expression: the members
+                         * are addressed by their own names in the capture-variant source.
+                         * base_type_id, not the resource's pointer type_id. */
+                        if (block_name && block_name[0])
+                            xfb_add_root(roots, block_name, "", r->base_type_id, r->base_type_id);
                     }
                 }
             } else {
@@ -978,18 +1000,56 @@ static const char *xfb_leaf(spvc_compiler c, spvc_type_id tid, unsigned consumed
     return NULL;
 }
 
-/* resolve an API varying name against the reflected outputs */
-static const char *xfb_resolve(spvc_compiler c, XfbRoots *roots, const char *name, MGLXfbVarying *v, bool *whole_array)
+/* resolve an API varying name against the reflected outputs.
+ * r112 (geom): when the name resolves to a STRUCTURE — a whole plain-struct
+ * varying, a structure member of an interface block, an element of (or a whole)
+ * array of structures, or a whole interface block — the caller flattens it into
+ * one capture varying per leaf; xfb_resolve then reports success without
+ * filling v, returning the structure's type id and the expression that names
+ * its root in the capture-variant source. */
+static const char *xfb_resolve(spvc_compiler c, XfbRoots *roots, const char *name, MGLXfbVarying *v,
+                               bool *whole_array, spvc_type_id *struct_tid, char *struct_expr,
+                               size_t expr_cap)
 {
     size_t rl = strcspn(name, ".[");
     XfbRoot *root = NULL;
-    for (size_t i = 0; i < roots->count; i++)
-        if (strlen(roots->roots[i].name) == rl && !strncmp(roots->roots[i].name, name, rl)) { root = &roots->roots[i]; break; }
-    if (!root) return "is not an output of the vertex shader";
+    size_t rlen = 0;
+
+    /* r112 (geom): anonymous-block members are registered under "<block>.<member>"
+     * (and the block itself under its bare name) — try the longest dotted prefix
+     * first, then the first component (the named-instance spelling) */
+    {
+        size_t bounds[32];
+        int nb = 0;
+        const char *q = name;
+
+        /* a candidate root name ends right before a '.' (or at the whole name) */
+        while (*q && nb < 32)
+        {
+            size_t seg = strcspn(q, ".[");
+
+            if (!q[seg]) break;
+            if (q[seg] == '.')
+                bounds[nb++] = (size_t)(q - name) + seg;
+            q += seg + 1;
+        }
+        if (!strchr(name, '[') && nb < 32)
+            bounds[nb++] = strlen(name);
+        for (int b = nb - 1; b >= 0 && !root; b--)
+            for (size_t i = 0; i < roots->count; i++)
+                if (strlen(roots->roots[i].name) == bounds[b] &&
+                    !strncmp(roots->roots[i].name, name, bounds[b]))
+                { root = &roots->roots[i]; rlen = bounds[b]; break; }
+        if (!root)
+            for (size_t i = 0; i < roots->count; i++)
+                if (strlen(roots->roots[i].name) == rl && !strncmp(roots->roots[i].name, name, rl))
+                { root = &roots->roots[i]; rlen = rl; break; }
+        if (!root) return "is not an output of the vertex shader";
+    }
 
     spvc_type_id tid = root->tid, base = root->base_tid;
     unsigned consumed = 0;
-    const char *p = name + rl;
+    const char *p = name + rlen;
 
     while (*p) {
         spvc_type t = spvc_compiler_get_type_handle(c, tid);
@@ -1024,12 +1084,48 @@ static const char *xfb_resolve(spvc_compiler c, XfbRoots *roots, const char *nam
         }
     }
 
+    /* a structure (optionally still carrying array dimensions: an array of
+     * structures, or one element of it after subscripting) flattens above */
+    {
+        spvc_type ft = spvc_compiler_get_type_handle(c, tid);
+        spvc_type_id etid = tid;
+        spvc_type eh = ft;
+
+        /* the subscripts consumed this many dimensions: peel them off the type */
+        for (unsigned q = 0; q < consumed && eh; q++)
+        {
+            etid = spvc_type_get_base_type_id(eh);
+            eh = spvc_compiler_get_type_handle(c, etid);
+        }
+        if (eh && spvc_type_get_basetype(eh) == SPVC_BASETYPE_STRUCT)
+        {
+            spvc_type_id stid = etid;
+            const char *m0 = spvc_compiler_get_member_name(c, stid, 0);
+            spvc_type bh;
+
+            /* a POINTER type id (what stage-output resources report as type_id)
+             * carries the struct basetype but no member names — dereference to
+             * the resource's base_type_id in that case (an ARRAY terminal keeps
+             * its own type: the flatten peels the dimensions itself) */
+            if ((!m0 || !m0[0]) && base != stid &&
+                spvc_type_get_num_array_dimensions(eh) == 0)
+            {
+                bh = spvc_compiler_get_type_handle(c, base);
+                if (bh && spvc_type_get_basetype(bh) == SPVC_BASETYPE_STRUCT)
+                    stid = base;
+            }
+            *struct_tid = stid;
+            snprintf(struct_expr, expr_cap, "%s%s", root->expr, name + rlen);
+            return NULL;
+        }
+    }
+
     const char *err = xfb_leaf(c, tid, consumed, v, whole_array);
     if (err) return err;
 
-    size_t el = strlen(root->expr) + strlen(name + rl) + 1;
+    size_t el = strlen(root->expr) + strlen(name + rlen) + 1;
     v->expr = malloc(el);
-    snprintf(v->expr, el, "%s%s", root->expr, name + rl);
+    snprintf(v->expr, el, "%s%s", root->expr, name + rlen);
     return NULL;
 }
 
@@ -1054,8 +1150,16 @@ static MGLXfbVarying *xfb_push_var(MGLXfbProgram *xp)
     return &xp->vars[xp->count++];
 }
 
+/* r112 (geom): the API capture path may flatten a captured STRUCTURE into one
+ * varying per leaf — the same walker the shader-declared path uses */
+static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
+                               const char *vname, const char *prefix, MGLXfbProgram *xp,
+                               GLuint buffer, bool *whole_arrays, size_t whole_cap,
+                               unsigned *src_word_io, bool tight);
+
 /* API path: glTransformFeedbackVaryings list */
-static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, bool *whole_arrays)
+static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp,
+                           bool *whole_arrays, size_t whole_cap)
 {
     GLuint buffer = 0, offset = 0, total_components = 0, src_word = 0;
     bool separate = xp->mode == GL_SEPARATE_ATTRIBS;
@@ -1102,9 +1206,66 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
         }
 
         bool whole = false;
-        const char *err = xfb_resolve(c, roots, name, v, &whole);
+        spvc_type_id struct_tid = 0;
+        char struct_expr[256];
+        const char *err = xfb_resolve(c, roots, name, v, &whole, &struct_tid, struct_expr, sizeof struct_expr);
         if (err) { xfb_fail(xp, "transform feedback varying %s %s", name, err); return false; }
-        whole_arrays[xp->count - 1] = whole;
+
+        if (struct_tid)
+        {
+            /* r112 (geom): the name resolved to a STRUCTURE — a whole plain-struct
+             * varying, a structure member of an interface block, a whole block, or
+             * an array of structures / one of its elements.  It flattens into one
+             * capture varying per leaf ("goku.l[0].v"), packed TIGHTLY at 4-byte
+             * granularity like every other API-specified interleaved varying —
+             * the same layout the geometry (GS/TES) resolver produces, so a
+             * program links the same whether or not a GS consumes the outputs. */
+            unsigned base_off = separate ? 0 : offset;
+            unsigned before = xp->count - 1;
+            unsigned span = 0, comps = 0;
+
+            /* the placeholder var for the structure NAME is replaced by its
+             * leaves (glGetTransformFeedbackVarying then reports the leaves,
+             * exactly as for a program with a geometry shader attached) */
+            free(v->name);
+            v->name = NULL;
+            xp->count--;
+
+            if (!xfb_flatten_struct(c, struct_tid, base_off,
+                                    struct_expr[0] ? struct_expr : "", "",
+                                    xp, separate ? (GLuint)i : buffer, whole_arrays, whole_cap,
+                                    &src_word, true))
+                return false;
+
+            for (GLuint q = before; q < xp->count; q++)
+            {
+                MGLXfbVarying *lv = &xp->vars[q];
+
+                if (lv->buffer == (separate ? (GLuint)i : buffer) &&
+                    lv->offset + lv->words * 4 - base_off > span)
+                    span = lv->offset + lv->words * 4 - base_off;
+                comps += lv->words;
+            }
+            if (separate)
+            {
+                if (comps > MGL_XFB_MAX_SEPARATE_COMPONENTS)
+                {
+                    xfb_fail(xp, "transform feedback varying %s exceeds GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS", name, NULL);
+                    return false;
+                }
+                xp->stride[i] = span;
+                xp->buffer_mask |= 1u << i;
+            }
+            else
+            {
+                offset += span;
+                total_components += comps;
+                xp->buffer_mask |= 1u << buffer;
+            }
+            continue;
+        }
+
+        if (xp->count - 1 < whole_cap) whole_arrays[xp->count - 1] = whole;
 
         if (separate) {
             if (v->words > MGL_XFB_MAX_SEPARATE_COMPONENTS) {
@@ -1146,12 +1307,6 @@ static bool xfb_layout_api(spvc_compiler c, XfbRoots *roots, MGLXfbProgram *xp, 
                 (unsigned)xp->count, xp->record_words, xp->stride[0]);
     return true;
 }
-
-static MGLXfbVarying *xfb_push_var(MGLXfbProgram *xp);
-static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
-                               const char *vname, const char *prefix, MGLXfbProgram *xp,
-                               GLuint buffer, bool *whole_arrays, size_t whole_cap,
-                               unsigned *src_word_io);
 
 /* shader path: outputs decorated with xfb_buffer / xfb_offset (layout qualifiers) */
 static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram *xp, bool *whole_arrays, size_t whole_cap)
@@ -1243,6 +1398,7 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                 GLuint off, buf = var_buffer;
                 spvc_type_id tid;
                 char name[256], expr[256];
+                const char *mn = "";   /* geom r113: the member name, for the structure-flatten below */
 
                 if (is_block) {
                     has_off = spvc_compiler_has_member_decoration(c, r->base_type_id, m, SpvDecorationOffset);
@@ -1253,8 +1409,9 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                         buf = spvc_compiler_get_member_decoration(c, r->base_type_id, m, SpvDecorationXfbBuffer);
                     if (spvc_compiler_has_member_decoration(c, r->base_type_id, m, SpvDecorationXfbStride) && buf < MGL_XFB_MAX_BUFFERS)
                         explicit_stride[buf] = spvc_compiler_get_member_decoration(c, r->base_type_id, m, SpvDecorationXfbStride);
-                    const char *mn = spvc_compiler_get_member_name(c, r->base_type_id, m);
+                    const char *mn_ = spvc_compiler_get_member_name(c, r->base_type_id, m);
                     const char *bn = spvc_compiler_get_name(c, r->base_type_id);
+                    mn = mn_ ? mn_ : "";
                     if (var_name && var_name[0]) {
                         if (elems > 1) snprintf(name, sizeof(name), "%s[%u].%s", bn, e, mn);
                         else snprintf(name, sizeof(name), "%s.%s", bn, mn);
@@ -1282,20 +1439,56 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                  * mirrors the pointee's basetype/array shape but carries no
                  * member names — the struct itself is r->base_type_id
                  * (non-block) / the member type (block). */
-                {
-                    spvc_type_id flat_tid = is_block ? tid : r->base_type_id;
-                    spvc_type ttest = spvc_compiler_get_type_handle(c, flat_tid);
-                    spvc_type ta_ = spvc_compiler_get_type_handle(c, r->type_id);
-                    if (ttest && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
-                        spvc_type_get_num_array_dimensions(ttest) == 0 &&
-                        (!ta_ || spvc_type_get_num_array_dimensions(ta_) == 0))
                     {
-                        if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
-                        if (!xfb_flatten_struct(c, flat_tid, (unsigned)off, var_name, "",
-                                                xp, buf, whole_arrays, whole_cap, &src_word))
-                            return false;
+                        spvc_type_id flat_tid = is_block ? tid : r->base_type_id;
+                        spvc_type ttest = spvc_compiler_get_type_handle(c, flat_tid);
+                        spvc_type ta_ = spvc_compiler_get_type_handle(c, r->type_id);
+                        if (ttest && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
+                            spvc_type_get_num_array_dimensions(ttest) == 0 &&
+                            (!ta_ || spvc_type_get_num_array_dimensions(ta_) == 0))
+                        {
+                            /* geom r113: for a BLOCK member the structure starts at the
+                             * member itself — an anonymous block's member is its own name
+                             * ("i.a"), a named instance's is "b.i.a"; passing the bare
+                             * variable name made the leaves dangle ("a", "b") and the
+                             * capture variant failed to compile */
+                            char vnm[256];
+
+                            if (is_block)
+                                snprintf(vnm, sizeof vnm, "%s%s%s",
+                                         (var_name && var_name[0]) ? var_name : "",
+                                         (var_name && var_name[0]) ? "." : "", mn);
+                            else
+                                snprintf(vnm, sizeof vnm, "%s", var_name ? var_name : "");
+                            if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
+                            if (!xfb_flatten_struct(c, flat_tid, (unsigned)off, vnm, "",
+                                                    xp, buf, whole_arrays, whole_cap, &src_word, false))
+                                return false;
                         flattened[buf] = true;   /* glslang's whole-struct XfbStride
                                                   * decoration is not the flattened end */
+                        xp->buffer_mask |= 1u << buf;
+                        continue;
+                    }
+                    /* geom r113: an ARRAY-OF-STRUCT MEMBER of a captured interface
+                     * block ("layout(xfb_offset = 0) Leaf l[2];") unrolls through the
+                     * same array flatten the API path uses — one leaf run per element,
+                     * each element aligned to the element's largest scalar (GL 4.6
+                     * 13.2.2; the r107 array-of-struct VARIABLE below stays contiguous,
+                     * its rule is CTS-anchored) */
+                    if (ttest && is_block && spvc_type_get_basetype(ttest) == SPVC_BASETYPE_STRUCT &&
+                        spvc_type_get_num_array_dimensions(ttest) >= 1)
+                    {
+                        char vnm[256];
+
+                        if (var_name && var_name[0])
+                            snprintf(vnm, sizeof vnm, "%s.%s", var_name, mn);
+                        else
+                            snprintf(vnm, sizeof vnm, "%s", mn);
+                        if (off & 3) { xfb_fail(xp, "xfb_offset of %s is not a multiple of 4", name, NULL); return false; }
+                        if (!xfb_flatten_struct(c, tid, (unsigned)off, vnm, "",
+                                                xp, buf, whole_arrays, whole_cap, &src_word, false))
+                            return false;
+                        flattened[buf] = true;
                         xp->buffer_mask |= 1u << buf;
                         continue;
                     }
@@ -1340,7 +1533,7 @@ static bool xfb_layout_shader(spvc_compiler c, spvc_resources res, MGLXfbProgram
                             }
                             GLuint before = xp->count;
                             if (!xfb_flatten_struct(c, flat_tid, base, vn, "",
-                                                    xp, buf, whole_arrays, whole_cap, &src_word))
+                                                    xp, buf, whole_arrays, whole_cap, &src_word, false))
                                 return false;
                             for (GLuint q = before; q < xp->count; q++)
                                 if (xp->vars[q].buffer == (GLuint)buf &&
@@ -1555,12 +1748,115 @@ static unsigned xfb_packed_size(spvc_compiler c, spvc_type_id tid)
 }
 
 /* flatten one captured struct instance into per-member varyings */
+/* r112 (geom): flatten an ARRAY OF STRUCTURES — the captured name itself
+ * ("out S s[2];" with "s", or "s[1]"), or a member of a captured structure
+ * ("struct Leaf { vec4 v; }; struct Goku { Leaf l[2]; };").  One leaf run per
+ * element, the elements contiguous; their stride is the element's packed span
+ * aligned to its largest scalar (or to 4 bytes for an API-specified capture,
+ * which packs tightly — see xfb_layout_api). */
+static bool xfb_flatten_struct_array(spvc_compiler c, spvc_type_id atid, unsigned base_off,
+                                     const char *vname, const char *prefix, MGLXfbProgram *xp,
+                                     GLuint buffer, bool *whole_arrays, size_t whole_cap,
+                                     unsigned *src_word_io, bool tight)
+{
+    spvc_type t = spvc_compiler_get_type_handle(c, atid);
+    unsigned dims = spvc_type_get_num_array_dimensions(t);
+    unsigned lens[4], nl = 0, prod = 1;
+    spvc_type_id etid = atid;
+    spvc_type et;
+
+    if (dims > 4)
+    {
+        xfb_fail(xp, "xfb array %s has too many dimensions", vname ? vname : "?", NULL);
+        return false;
+    }
+    /* dimension list in source order (row-major), then the element type */
+    {
+        spvc_type_id walk = atid;
+        spvc_type wh = spvc_compiler_get_type_handle(c, walk);
+
+        while (wh && spvc_type_get_num_array_dimensions(wh) > 0 && nl < 4)
+        {
+            unsigned d = spvc_type_get_num_array_dimensions(wh);
+
+            lens[nl++] = spvc_type_get_array_dimension(wh, d - 1);
+            walk = spvc_type_get_base_type_id(wh);
+            wh = spvc_compiler_get_type_handle(c, walk);
+        }
+    }
+    for (unsigned q = 0; q < nl; q++) prod *= lens[q];
+    for (unsigned q = 0; q < nl; q++)
+        etid = spvc_type_get_base_type_id(spvc_compiler_get_type_handle(c, etid));
+    et = spvc_compiler_get_type_handle(c, etid);
+    if (!et || spvc_type_get_basetype(et) != SPVC_BASETYPE_STRUCT)
+    {
+        xfb_fail(xp, "xfb array %s is not an array of structures", vname ? vname : "?", NULL);
+        return false;
+    }
+    {
+    unsigned ea, es, stride;
+    bool is_blk = spvc_compiler_has_decoration(c, etid, SpvDecorationBlock) ||
+                  spvc_compiler_has_decoration(c, etid, SpvDecorationBufferBlock);
+
+    if (is_blk)
+    {
+        /* r114 (geom): an ARRAY-OF-BLOCKS instance ("out Blk{..} b[2];") strides its
+         * elements by the std430 block size — the r102 rule the geometry (GS)
+         * resolver is CTS-anchored on — NOT the 13.2.2 packing of plain structs */
+        ea = xfb_std430_align_type(c, etid);
+        es = xfb_std430_size(c, etid);
+    }
+    else
+    {
+        ea = xfb_packed_align(c, etid);
+        es = xfb_packed_size(c, etid);
+    }
+
+    if (!ea || !es)
+    {
+        xfb_fail(xp, "xfb array %s cannot be packed for capture", vname ? vname : "?", NULL);
+        return false;
+    }
+    if (tight && !is_blk) ea = 4;
+    stride = (es + ea - 1) & ~(ea - 1);
+
+    for (unsigned e = 0; e < prod; e++)
+    {
+        char evname[280];
+        unsigned rem = e;
+
+        evname[0] = 0;
+        if (vname && vname[0]) snprintf(evname, sizeof evname, "%s", vname);
+        for (int q = nl - 1; q >= 0; q--)
+        {
+            char one[24];
+
+            snprintf(one, sizeof one, "[%u]", rem % lens[q]);
+            rem /= lens[q];
+            strlcat(evname, one, sizeof evname);
+        }
+        if (!xfb_flatten_struct(c, etid, base_off + e * stride, evname, prefix, xp,
+                                buffer, whole_arrays, whole_cap, src_word_io, tight))
+            return false;
+    }
+    }
+    return true;
+}
+
 static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_off,
                                const char *vname, const char *prefix, MGLXfbProgram *xp,
                                GLuint buffer, bool *whole_arrays, size_t whole_cap,
-                               unsigned *src_word_io)
+                               unsigned *src_word_io, bool tight)
 {
     spvc_type t = spvc_compiler_get_type_handle(c, tid);
+
+    if (t && spvc_type_get_num_array_dimensions(t) > 0)
+    {
+        /* the captured name itself is an array of structures */
+        return xfb_flatten_struct_array(c, tid, base_off, vname, prefix, xp, buffer,
+                                        whole_arrays, whole_cap, src_word_io, tight);
+    }
+    {
     unsigned members = spvc_type_get_num_member_types(t);
     unsigned off = 0;
 
@@ -1572,9 +1868,45 @@ static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_
         if (!mn || !mn[0]) { snprintf(fallback, sizeof fallback, "m%u", m); mn = fallback; }
         char name[256], expr[256], sub[256];
 
+        spvc_type mth = spvc_compiler_get_type_handle(c, mt);
+
+        /* r112 (geom): an ARRAY-OF-STRUCT member unrolls one element at a time
+         * (xfb_flatten_struct_array); plain arrays of leaves keep the single
+         * entry-with-elements form below */
+        if (mth && spvc_type_get_basetype(mth) == SPVC_BASETYPE_STRUCT &&
+            spvc_type_get_num_array_dimensions(mth) > 0)
+        {
+            unsigned ea = xfb_packed_align(c, spvc_type_get_base_type_id(mth));
+            unsigned before = xp->count;
+            unsigned end = 0;
+
+            if (tight) ea = 4;
+            if (!ea)
+            {
+                xfb_fail(xp, "xfb struct member %s cannot be packed for capture", mn, NULL);
+                return false;
+            }
+            off = (off + ea - 1) & ~(ea - 1);
+            if (vname && vname[0])
+                snprintf(name, sizeof name, "%s.%s", vname, mn);
+            else
+                snprintf(name, sizeof name, "%s", mn);
+            if (!xfb_flatten_struct_array(c, mt, base_off + off, name, "", xp,
+                                          buffer, whole_arrays, whole_cap, src_word_io, tight))
+                return false;
+            for (GLuint q = before; q < xp->count; q++)
+                if (xp->vars[q].buffer == buffer &&
+                    xp->vars[q].offset + xp->vars[q].words * 4 > end)
+                    end = xp->vars[q].offset + xp->vars[q].words * 4;
+            off = end - base_off;
+            continue;
+        }
+
         /* a captured structure's members are PACKED with scalar alignment only
          * (GL 4.6 13.2.2: {float a; mat2 b;} captures a@0, b col0@4, b col1@12
-         * — 20 bytes; geom r105, was std430) */
+         * — 20 bytes; geom r105, was std430).  An API-specified capture packs
+         * tightly at 4-byte granularity (r112, matching the geometry resolver's
+         * interleaved layout and the KHR-GL46.vertex_attrib_64bit.vao rule). */
         unsigned ma = xfb_packed_align(c, mt);
         unsigned ms = xfb_packed_size(c, mt);
         if (!ma || !ms)
@@ -1583,6 +1915,7 @@ static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_
                      mn ? mn : "?", NULL);
             return false;
         }
+        if (tight) ma = 4;
         off = (off + ma - 1) & ~(ma - 1);
 
         if (vname && vname[0])
@@ -1605,7 +1938,7 @@ static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_
             spvc_type_get_num_array_dimensions(mt_handle) == 0)
         {
             if (!xfb_flatten_struct(c, mt, base_off + off, sub, "", xp, buffer,
-                                    whole_arrays, whole_cap, src_word_io))
+                                    whole_arrays, whole_cap, src_word_io, false))
                 return false;
             off += ms;
             continue;
@@ -1632,6 +1965,7 @@ static bool xfb_flatten_struct(spvc_compiler c, spvc_type_id tid, unsigned base_
         off += ms;
     }
     return true;
+    }
 }
 
 #pragma mark - link: capture variant
@@ -2260,6 +2594,7 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     spvc_resources res = NULL;
     XfbRoots roots = {0};
     bool *whole = NULL;
+    size_t whole_cap = 0;
     char *glsl = NULL;
 
     /* ARB_gl_spirv: a SPIR-V-binary vertex stage has no GLSL source — reflect its
@@ -2290,11 +2625,16 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
         goto done;
     }
 
-    whole = calloc(256 + (size_t)xp->pending_count, sizeof(bool));
+    {
+        size_t wc = 256 + (size_t)xp->pending_count;
+
+        whole = calloc(wc, sizeof(bool));
+        whole_cap = wc;
+    }
     if (api) {
         xfb_collect_roots(c, res, &roots);
         xp->mode = xp->pending_mode;
-        if (!xfb_layout_api(c, &roots, xp, whole)) goto done;
+        if (!xfb_layout_api(c, &roots, xp, whole, whole_cap)) goto done;
     } else {
         xp->mode = GL_INTERLEAVED_ATTRIBS;
         if (!xfb_layout_shader(c, res, xp, whole, 256)) goto done;
@@ -2435,16 +2775,19 @@ done:
 /* ARB_gl_spirv: a SPIR-V-binary stage has no GLSL source — its transform feedback
  * layout is declared by Offset / XfbBuffer decorations in the module (GLSL's
  * xfb_offset / xfb_buffer lower to exactly those).  Cheap instruction walk. */
-static bool xfb_spirv_has_xfb_deco(const Program *p, const Shader *sh)
+/* geom r127: stage-aware form — a program loaded from glProgramBinary has no
+ * GLSL source for the last pre-rasterization stage either, so the declared
+ * capture must be detected from THAT stage's SPIR-V decorations */
+static bool xfb_spirv_has_xfb_deco_stage(const Program *p, int stage)
 {
     const unsigned *ir;
     size_t n;
 
-    if (!sh || sh->src || !p)
+    if (!p)
         return false;
-    if (!(ir = p->spirv[_VERTEX_SHADER].ir))
+    if (!(ir = p->spirv[stage].ir))
         return false;
-    n = p->spirv[_VERTEX_SHADER].size;    if (n < 5)
+    n = p->spirv[stage].size;    if (n < 5)
         return false;
     for (size_t w = 5; w < n; )
     {
@@ -2468,6 +2811,27 @@ static bool xfb_spirv_has_xfb_deco(const Program *p, const Shader *sh)
     return false;
 }
 
+static bool xfb_spirv_has_xfb_deco(const Program *p, const Shader *sh)
+{
+    if (!sh || sh->src)
+        return false;
+    return xfb_spirv_has_xfb_deco_stage(p, _VERTEX_SHADER);
+}
+
+/* geom r126: the vertex stage's GLSL source for the xfb link — the introspected
+ * shader source when there is one, else the DECOMPILED stage SPIR-V (a program
+ * loaded from glProgramBinary has no source; the geometry stage already
+ * decompiles this way).  NULL when neither exists. */
+static char *xfb_vs_source(GLMContext ctx, Program *p, Shader *vs)
+{
+    if (vs && vs->src)
+        return mgl_introspect_shader_source(ctx, vs);
+    if (p->spirv[_VERTEX_SHADER].ir && p->spirv[_VERTEX_SHADER].size > 5)
+        return mgl_geom_decompile_stage(p->spirv[_VERTEX_SHADER].ir,
+                                        p->spirv[_VERTEX_SHADER].size, 460, NULL);
+    return NULL;
+}
+
 static void xfb_post_link(GLMContext ctx, Program *p)
 {
     if (!XFB() || !p) return;
@@ -2480,13 +2844,21 @@ static void xfb_post_link(GLMContext ctx, Program *p)
      * block member with xfb_buffer / xfb_offset) is captured through that stage's resolver */
     Shader *last = p->shader_slots[_GEOMETRY_SHADER] ? p->shader_slots[_GEOMETRY_SHADER] :
                    p->shader_slots[_TESS_EVALUATION_SHADER];
-    bool stage_xfb = last && last->src && strstr(last->src, "xfb_");
+    bool stage_xfb = (last && last->src && strstr(last->src, "xfb_")) ||
+                     /* geom r127: a binary-loaded stage has no source — detect the declared
+                      * capture from that stage's SPIR-V decorations (the VS clause above
+                      * does the same for the vertex stage) */
+                     (last && !last->src &&
+                      xfb_spirv_has_xfb_deco_stage(p, p->shader_slots[_GEOMETRY_SHADER] ?
+                                                   _GEOMETRY_SHADER : _TESS_EVALUATION_SHADER));
     /* compat r96d: capture declared on an earlier stage is legal and resolved from
      * THAT stage (KHR-Single-GL46.enhanced_layouts.xfb_get_program_resource_api_*:
      * TES outputs with layout(xfb_*) while a pass-through GS is attached must link
      * and report the declared layout — the GS table would be empty) */
     Shader *tes = p->shader_slots[_TESS_EVALUATION_SHADER];
-    bool tes_xfb = !stage_xfb && tes && tes->src && strstr(tes->src, "xfb_");
+    bool tes_xfb = !stage_xfb && tes &&
+                   (tes->src ? strstr(tes->src, "xfb_") != NULL
+                             : xfb_spirv_has_xfb_deco_stage(p, _TESS_EVALUATION_SHADER));
     if (tes_xfb) stage_xfb = true;
 
     if (!xp && !shader_xfb && !stage_xfb) return;
@@ -2519,7 +2891,7 @@ static void xfb_post_link(GLMContext ctx, Program *p)
             mgl_geom_tess_xfb_link(ctx, p, true);
             return;
         }
-        xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), false,
+        xfb_link(ctx, xp, xfb_vs_source(ctx, p, vs), false,
                  p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
         if (xp->from_shader || xp->link_failed) { xp->pending = decl_pending; xp->pending_count = decl_pending_count; return; }
         xfb_clear_linked(ctx, xp);
@@ -2560,13 +2932,29 @@ static void xfb_post_link(GLMContext ctx, Program *p)
     }
 
     if (!vs || !vs->src) {
+        /* geom r125: a program loaded from glProgramBinary has no GLSL source;
+         * decompile the vertex stage's SPIR-V so the capture variant can be
+         * generated (the geometry stage already decompiles this way) */
+        if (p->spirv[_VERTEX_SHADER].ir && p->spirv[_VERTEX_SHADER].size > 5)
+        {
+            char *vsrc = mgl_geom_decompile_stage(p->spirv[_VERTEX_SHADER].ir,
+                                                  p->spirv[_VERTEX_SHADER].size, 460, NULL);
+
+            if (vsrc)
+            {
+                xfb_link(ctx, xp, vsrc, true,
+                         p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
+                free(vsrc);
+                return;
+            }
+        }
         xfb_fail(xp, "transform feedback varyings need a vertex shader", NULL, NULL);
         return;
     }
     /* introspect: the source must run through the subroutine rewrite (glslang cannot
      * compile GLSL subroutines; mgl_introspect_shader_source also strips the
      * #extension GL_ARB_shader_subroutine directive) */
-    xfb_link(ctx, xp, mgl_introspect_shader_source(ctx, vs), true,
+    xfb_link(ctx, xp, xfb_vs_source(ctx, p, vs), true,
              p->spirv[_VERTEX_SHADER].ir, p->spirv[_VERTEX_SHADER].size);
 }
 

@@ -33,7 +33,11 @@
 
 /* the linked program's private half (MGLProgramObj), opaque here */
 struct MGLProgramObj_t;
-#define MGL_GEOM_MAX_VARYINGS       64
+/* geom r118: raised from 64 — a stage's LEAF count (flattened) can legally reach
+ * 256 (GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS 1024 / 4 per float leaf); the
+ * old cap silently TRUNCATED such interfaces (the leaf loops stop at the cap).
+ * geom_reflect_stage now refuses the link when the cap is hit instead. */
+#define MGL_GEOM_MAX_VARYINGS       256
 #define MGL_GEOM_MAX_CLIP           8
 #define MGL_GEOM_MAX_PROGRAMS       64
 #define MGL_GEOM_CTL_WORDS          32
@@ -685,6 +689,7 @@ uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 
 /* transform feedback of the geometry output (called from the xfb domain) */
 void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program, bool from_shader);
+char *mgl_geom_decompile_stage(const uint32_t *ir, size_t words, int version, char **log);   /* geom r125 */
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
                           const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
 

@@ -795,9 +795,24 @@ static uint32_t fnv1a(const uint8_t *p, size_t n)
     return h;
 }
 
-static size_t binary_size(MGLProgramObj *obj)
+/* geom r125: the transform feedback varyings state (GL 4.6 7.3.1: "a program
+ * binary includes... the transform feedback varyings") is appended as a trailing
+ * block after the stage table: [count, mode, (padded name) * count].  Binaries
+ * without the block (older writers) simply end after the stages. */
+static const MGLXfbProgram *binary_tfvp(GLMContext ctx, GLuint program)
+{
+    if (!ctx->state.ext_xfb)
+        return NULL;
+    for (GLuint i = 0; i < ctx->state.ext_xfb->prog_count; i++)
+        if (ctx->state.ext_xfb->progs[i] && ctx->state.ext_xfb->progs[i]->name == program)
+            return ctx->state.ext_xfb->progs[i];
+    return NULL;
+}
+
+static size_t binary_size(GLMContext ctx, MGLProgramObj *obj)
 {
     size_t bytes = BIN_HEADER_WORDS * 4;
+    const MGLXfbProgram *xp = binary_tfvp(ctx, obj->base.name);
 
     for (int s = 0; s < _MAX_SHADER_TYPES; s++)
     {
@@ -806,6 +821,16 @@ static size_t binary_size(MGLProgramObj *obj)
         size_t elen = obj->stage_entry[s] ? strlen(obj->stage_entry[s]) + 1 : 1;
         bytes += 8 + ((elen + 3) & ~(size_t)3) + 4 + obj->base.spirv[s].size * 4;
     }
+
+    /* the trailing transform-feedback-varyings block */
+    bytes += 8;
+    if (xp)
+        for (GLsizei i = 0; i < xp->pending_count; i++)
+        {
+            size_t nl = strlen(xp->pending[i]) + 1;
+
+            bytes += 4 + ((nl + 3) & ~(size_t)3);
+        }
 
     return bytes;
 }
@@ -817,7 +842,7 @@ GLint mgl_program_binary_length(GLMContext ctx, Program *ptr)
     if (!obj->link_status)
         return 0;
 
-    return (GLint)binary_size(obj);
+    return (GLint)binary_size(ctx, obj);
 }
 
 void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary)
@@ -846,7 +871,7 @@ void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsize
         return;
     }
 
-    size = binary_size(obj);
+    size = binary_size(ctx, obj);
     if ((size_t)bufSize < size || !binary)
     {
         if (length) *length = 0;
@@ -887,6 +912,24 @@ void mglGetProgramBinary(GLMContext ctx, GLuint program, GLsizei bufSize, GLsize
         w[pos++] = (uint32_t)ptr->spirv[s].size;
         memcpy(&w[pos], ptr->spirv[s].ir, ptr->spirv[s].size * 4);
         pos += ptr->spirv[s].size;
+    }
+
+    /* the trailing transform-feedback-varyings block (geom r125) */
+    {
+        const MGLXfbProgram *xp = binary_tfvp(ctx, program);
+
+        w[pos++] = xp ? (uint32_t)xp->pending_count : 0;
+        w[pos++] = xp ? (uint32_t)xp->pending_mode : (uint32_t)GL_INTERLEAVED_ATTRIBS;
+        if (xp)
+            for (GLsizei i = 0; i < xp->pending_count; i++)
+            {
+                size_t nl = strlen(xp->pending[i]) + 1;
+                size_t npad = (nl + 3) & ~(size_t)3;
+
+                w[pos++] = (uint32_t)npad;
+                memcpy(&w[pos], xp->pending[i], nl);
+                pos += npad / 4;
+            }
     }
 
     w[3] = fnv1a((const uint8_t *)&w[4], size - 16);
@@ -996,9 +1039,57 @@ void mglProgramBinary(GLMContext ctx, GLuint program, GLenum binaryFormat, const
         seen |= SHADER_MASK_BIT(s);
     }
 
-    if (pos != nwords || seen != mask || mask == 0)
+    if (seen != mask || mask == 0)
     {
         binary_reject(ctx, ptr, "inconsistent stage table");
+        return;
+    }
+
+    /* the trailing transform-feedback-varyings block (geom r125): older binaries
+     * end right after the stages (pos == nwords); newer ones carry
+     * [count, mode, (padded name) * count] which must be applied BEFORE the
+     * link so the capture state is rebuilt (GL 4.6 7.3.1) */
+    if (nwords - pos >= 2)
+    {
+        uint32_t tcount = w[pos];
+        uint32_t tmode = w[pos + 1];
+
+        if (nwords - pos >= 2 + (size_t)tcount)
+        {
+            size_t p2 = pos + 2;
+            bool ok = tcount <= 128 &&
+                      (tmode == (uint32_t)GL_INTERLEAVED_ATTRIBS || tmode == (uint32_t)GL_SEPARATE_ATTRIBS);
+            char *names[128];
+            char nbuf[128][192];
+            uint32_t nleft = tcount;
+
+            for (uint32_t i = 0; i < tcount && ok; i++)
+            {
+                uint32_t npad = w[p2++];
+
+                if ((npad & 3) || npad == 0 || npad > sizeof(nbuf[0]) ||
+                    p2 + npad / 4 > nwords || !memchr(&w[p2], 0, npad))
+                {
+                    ok = false;
+                    break;
+                }
+                memcpy(nbuf[i], &w[p2], npad);
+                nbuf[i][npad - 1] = 0;
+                names[i] = nbuf[i];
+                p2 += npad / 4;
+            }
+            if (ok && (nleft == 0 || p2 == nwords))
+            {
+                if (tcount)
+                    mglTransformFeedbackVaryings(ctx, program, (GLsizei)tcount,
+                                                 (const char *const *)names, (GLenum)tmode);
+                pos = p2;
+            }
+        }
+    }
+    if (pos != nwords)
+    {
+        binary_reject(ctx, ptr, "trailing bytes after the stage table");
         return;
     }
 

@@ -3545,7 +3545,6 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         ptr->spirv[stage].msl_str = strdup(result);
     }
 
-
     /* GL texelFetch decodes sRGB textures; Metal's read() does not.  Route the
      * float-typed sampled-image read()s through sample() at the texel centre
      * (identity for non-sRGB, integer and multisample reads stay read()). */
@@ -4170,6 +4169,26 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
                             info ? info : "(null)");
                 if (!overlap_retry || attempt)
                 {
+                    /* geom r115: glslang's I/O mapper cannot walk an ARRAY-OF-BLOCKS
+                     * instance across VS→GS — the same glslang limitation the link-side
+                     * false-positive detector accepts ("Array sizes must be compatible"
+                     * with two EQUAL-SIZED types, then "INTERNAL ERROR: Invalid In/Out
+                     * variable type").  A program whose only mapper complaint is that
+                     * limitation proceeds UNMAPPED: such a program never linked before,
+                     * so this strictly widens what links, and MGL's own stage-IO
+                     * matching (the geometry reflection computes locations itself) does
+                     * not depend on the mapper here. */
+                    bool aob_fp = info && strstr(info, "Array sizes must be compatible") &&
+                                  strstr(info, "Invalid In/Out variable type");
+
+                    if (aob_fp)
+                    {
+                        mgl_append_info_log(log, "WARNING: GLSL I/O mapping skipped for the array-of-blocks stage interface: %s", info);
+                        mapped = 1;
+                        glslang_glsl_mapper_delete(mapper);
+                        mapper = NULL;
+                        break;
+                    }
                     mgl_append_info_log(log, "%s", (info && *info) ? info : "ERROR: GLSL I/O mapping failed\n");
                     glslang_program_delete(glsl_program);
                     return false;
@@ -4213,14 +4232,28 @@ static bool link_glsl(GLMContext ctx, MGLProgramObj *obj, MGLProgramObj *dst, Re
             if (!glslang_program_link(glsl_program, GLSLANG_MSG_DEFAULT_BIT))
             {
                 const char *info2 = glslang_program_get_info_log(glsl_program);
-                mgl_append_info_log(log, "%s", (info2 && *info2) ? info2 : "ERROR: GLSL link failed\n");
+                bool fp2 = info2 && mgl_link_log_is_tess_patch_false_positive(info2);
+
+                if (fp2)
+                    /* geom r115: the unshare+reparse path re-links the FRESH
+                     * intermediates — the same glslang false positive (a tess
+                     * 'patch' array, or an ARRAY-OF-BLOCKS instance across
+                     * VS→GS printing two equal-sized types, then "INTERNAL
+                     * ERROR: Invalid In/Out variable type") must be accepted
+                     * here too, or the retry after a warned link dies */
+                    mgl_append_info_log(log, "WARNING: %s", info2);
+                else
+                    mgl_append_info_log(log, "%s", (info2 && *info2) ? info2 : "ERROR: GLSL link failed\n");
                 /* sticky-error poisoning again — these were fresh compiles,
                  * but their intermediates just took this link's error count */
                 for (int i_ = 0; i_ < obj->num_attached; i_++)
                     if (obj->attached[i_]->compiled_glsl_shader)
                         mgl_glslang_cache_unshare(obj->attached[i_]->compiled_glsl_shader);
-                glslang_program_delete(glsl_program);
-                return false;
+                if (!fp2)
+                {
+                    glslang_program_delete(glsl_program);
+                    return false;
+                }
             }
             mapped = 0;
         }
