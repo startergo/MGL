@@ -6388,6 +6388,16 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
                         "prim_bytes=%zu vsout_bytes=%zu threads=%llu in_words=%u out_words=%u maxverts=%u\n",
                 (unsigned)bound, d->instances, d->vcount, outv_cap, idx_cap, cap_idx, cap_prim, prim_bytes, vsout_bytes,
                 (unsigned long long)threads, gp->in_words, gp->out_words, gp->max_vertices);
+
+    /* tess r71: reserve the wide-line expansion's ring block HERE — no encoder of
+     * this draw is open yet (endRenderEncoding below closes whatever a previous
+     * draw left) and no pool range is pinned, so the ring acquire may safely end
+     * the render encoding and commit the command buffer (its pressure path; a
+     * commit with an open encoder would wedge the ring's slots).  geomMarkPools
+     * records this draw's true consumer later, and the command-buffer re-check
+     * below re-opens one if the reserve committed it. */
+    [self extTessWidelineGeomReserve: gp idxCap: (NSUInteger)idx_cap];
+
     geomPoolResetPins();
     gOutv = geomSubAlloc(self, _device, &gOutvPool, (size_t)outv_cap * gp->out_words * sizeof(uint32_t), &gOutvOff, _currentCommandBuffer);
     if (!gOutv) { geomReleaseStatics(); return false; }
@@ -7338,6 +7348,13 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
         }
 
         [enc popDebugGroup];
+        /* tess r70/r71: the wide-line expansion of this draw's line output joins
+         * the kernel encoder (Metal orders dispatches only WITHIN one compute
+         * encoder — the same rule the comment above relies on); the ring block it
+         * writes was reserved before this draw's first encoder opened (see the
+         * sizing section), so this dispatch acquires and waits on nothing */
+        [self extTessWidelineGeomPrepare: gp outv: gOutv outvOff: gOutvOff
+                                     idx: gIdx ctl: gCtl enc: enc];
         if (mgl_xfb_capturing(ctx) && !mgl_geom_xfb_paused(ctx))
         {
             /* leave the kernel encoder OPEN for the pack that follows (see the transform
@@ -7515,8 +7532,26 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
         g->vertex_override_gp = gp;
         ctx->state.dirty_bits |= DIRTY_PROGRAM;
 
+        /* tess r70/r71: the corner records of extTessWidelineGeomPrepare (staged in
+         * the geometry kernel's encoder above) replay through the SAME
+         * pass-through vertex function; lines are never culled, so the quads
+         * must not be either */
+        struct MGLExtState_tess *wlS = (struct MGLExtState_tess *)ctx->state.ext_tess;
+        GLboolean wlSavedCull = ctx->state.caps.cull_face;
+        bool wlActive = wlS && wlS->wl_geom_active;
+        /* the slot is owned from the reserve (before the kernel section): release
+         * it here even when the emit itself never ran (an error path above) */
+        int wlSlot = wlS ? wlS->wl_geom_slot : -1;
+
+        if (wlActive)
+            ctx->state.caps.cull_face = GL_FALSE;
+
         bool ok = [self geomRasterPass: d];
 
+        ctx->state.caps.cull_face = wlSavedCull;
+        [self extTessWidelineGeomRetire: wlSlot];
+        if (wlS)
+            wlS->wl_geom_active = false;
         g->vertex_override = NULL;
         g->vertex_override_gp = NULL;
         return ok;
@@ -7568,10 +7603,25 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
         MTLPrimitiveType prim = gp->out_type == GL_POINTS ? MTLPrimitiveTypePoint
                              : gp->out_type == GL_LINE_STRIP ? MTLPrimitiveTypeLine
                                                              : MTLPrimitiveTypeTriangle;
+        /* tess r70: the wideline substitution staged by extTessWidelineGeomPrepare
+         * (called from geomDraw before this pass opens) — corner records + identity
+         * indices + draw args in the tess domain's ring; the quads rasterize as
+         * triangles through the SAME pass-through vertex function (it replays
+         * whatever records are bound at MGL_GEOM_MSL_DRAW). */
+        struct MGLExtState_tess *wlS = (struct MGLExtState_tess *)ctx->state.ext_tess;
+        bool wl = wlS && wlS->wl_geom_active;
+        id<MTLBuffer> wlRecs = wl ? (__bridge id<MTLBuffer>)wlS->wl_geom_recs : nil;
+        id<MTLBuffer> wlIdx = wl ? (__bridge id<MTLBuffer>)wlS->wl_geom_idx : nil;
+        id<MTLBuffer> wlArgs = wl ? (__bridge id<MTLBuffer>)wlS->wl_geom_args : nil;
+
+        if (wl)
+            prim = MTLPrimitiveTypeTriangle;
         if (!_currentRenderEncoder) return false;
 
         /* compat perf: shadow-filtered bind */
-        [self compatBindVertexBuffer:gOutv offset:gOutvOff atIndex:MGL_GEOM_MSL_DRAW];
+        [self compatBindVertexBuffer: wl ? wlRecs : gOutv
+                              offset: wl ? wlS->wl_geom_recs_off : gOutvOff
+                             atIndex: MGL_GEOM_MSL_DRAW];
 
         if ((geomEnvRead(), gEnv.draw))
         {
@@ -7594,10 +7644,11 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
         }
         [_currentRenderEncoder drawIndexedPrimitives: prim
                                                indexType: MTLIndexTypeUInt32
-                                             indexBuffer: gIdx
-                                       indexBufferOffset: 0
-                                          indirectBuffer: gCtl
-                                    indirectBufferOffset: MGL_GEOM_ARG_OFFSET * sizeof(uint32_t)];
+                                             indexBuffer: wl ? wlIdx : gIdx
+                                       indexBufferOffset: wl ? wlS->wl_geom_idx_off : 0
+                                          indirectBuffer: wl ? wlArgs : gCtl
+                                    indirectBufferOffset: wl ? wlS->wl_geom_args_off
+                                                             : MGL_GEOM_ARG_OFFSET * sizeof(uint32_t)];
 
         /* cull diagnostics: dump the compacted index list and the emitted records once
          * the GPU has finished (a completed handler sees the final contents; an inline

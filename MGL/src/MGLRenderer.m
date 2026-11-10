@@ -3635,6 +3635,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
         vertexFunction = (__bridge id<MTLFunction>)((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override;
 
+    // tess (r70): a wide-line replay pass — glLineWidth(w > 1) is emulated by a
+    // GPU expansion of the last pre-raster stage's output into screen-space quads
+    // (mgl_ext_tess.h); the replay vertex function returns the corner records the
+    // expansion kernel wrote, replacing the app's vertex function for this draw.
+    if (ctx->state.ext_tess && ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_render_now &&
+        ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_replay_function)
+        vertexFunction = (__bridge id<MTLFunction>)((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_replay_function;
+
     // tess: under GL_RASTERIZER_DISCARD the fragment stage never runs (GL 4.6 10.4.4),
     // but Metal still validates fragment-input/vertex-output linkage when the PSO is
     // created.  A tess+geometry program's FS is written against the GEOMETRY outputs, so
@@ -4189,6 +4197,13 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // (the pass-through function reads a buffer and has no stage-in).
             bool geomOverride = ctx->state.ext_geom &&
                                 ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override != NULL;
+            /* tess r70: the wide-line replay owns the vertex stage like the geometry
+             * pass-through — it reads corner records from a buffer and takes no
+             * stage_in, so the app's vertex descriptor must not be attached (the
+             * geom override below does the same for its pass-through). */
+            bool wlOverride = ctx->state.ext_tess &&
+                              ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_render_now &&
+                              ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_replay_function != NULL;
 
             /* tess + GL_RASTERIZER_DISCARD: the fragment stage never runs (GL 4.6
              * 10.4.4), but Metal still validates fragment-input/vertex-output linkage
@@ -4214,7 +4229,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 /* isolines / point_mode / CPU reference / xfb capture render through
                  * the plain TES + indirect draw (mgl_tess_plain_render, tessellation.c) */
                 bool emulated = mgl_tess_plain_render(ctx);
-                if (!emulated)
+                /* r70 wide lines: the TES replay (like the geometry pass-through)
+                 * takes no stage_in/patch attributes — the app descriptor is nil'd
+                 * below and the tessellation descriptor must not be attached */
+                if (!emulated && !wlOverride)
                 {
                     MTLVertexDescriptor *tvd = [self extTessVertexDescriptor];
                     if (tvd)
@@ -4228,7 +4246,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 else
                     pipelineStateDescriptor.vertexDescriptor = nil;
             }
-            else if (geomOverride)
+            else if (geomOverride || wlOverride)
                 pipelineStateDescriptor.vertexDescriptor = nil;
             else
                 pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
@@ -4254,6 +4272,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 mgl_pipeline_log = getenv("MGL_DEBUG") != NULL;
 
             @try {
+                if (mgl_pipeline_log && getenv("MGL_WL_DEBUG") && ctx->state.ext_tess &&
+                    ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_render_now)
+                    NSLog(@"MGL wl: pso build topo=%ld vdnil=%d depth=%u blend=%d sample=%ld",
+                          (long)pipelineStateDescriptor.inputPrimitiveTopology,
+                          (int)(pipelineStateDescriptor.vertexDescriptor == nil),
+                          (unsigned)pipelineStateDescriptor.depthAttachmentPixelFormat,
+                          (int)pipelineStateDescriptor.colorAttachments[0].blendingEnabled,
+                          (long)pipelineStateDescriptor.sampleCount);
                 if (mgl_pipeline_log) {
                     MGL_INFO(@"MGL INFO: Creating Metal pipeline state with AGX virtualization compatibility...");
 

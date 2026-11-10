@@ -3767,10 +3767,1537 @@ TEST(TessES32Essl320Stages)
     glDeleteShader(s);
 }
 
+/* ------------------------------------------------------------------ aliased wide lines
+ * (r70, the last item of the r65 gap list).  Metal rasterizes only 1-px lines;
+ * MGL expands the last pre-raster stage's output into screen-space quads on the
+ * GPU.  A width-N line must cover EXACTLY N pixel rows/columns (the dEQP
+ * LineRenderCase demand): the expansion snaps to pixel centres. */
+
+static const char *kVsLine =
+    "#version 460 core\n"
+    "layout(location=0) in vec4 a_pos;\n"
+    "layout(location=0) out vec4 v_col;\n"
+    "void main() { gl_Position = a_pos; v_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+
+static const char *kFsId =
+    "#version 460 core\n"
+    "layout(location=0) in vec4 f_col;\n"
+    "layout(location=0) out vec4 o_col;\n"
+    "void main() { o_col = f_col; }\n";
+
+static void line_vao(const float *pos, int n)
+{
+    GLuint vao, b;
+
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(n * 2 * sizeof(float)), pos, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+}
+
+/* count the pixels lit in row y / column x of the green channel */
+static int wl_row_lit(int y, int x0, int x1)
+{
+    float c[4];
+    int n = 0;
+
+    for (int x = x0; x <= x1; x++)
+    {
+        read_px(x, y, c);
+        if (c[1] > 0.5f) n++;
+    }
+    return n;
+}
+
+static int wl_col_lit(int x, int y0, int y1)
+{
+    float c[4];
+    int n = 0;
+
+    for (int y = y0; y <= y1; y++)
+    {
+        read_px(x, y, c);
+        if (c[1] > 0.5f) n++;
+    }
+    return n;
+}
+
+TEST(TessWideLineRange)
+{
+    /* the emulation advertises [1, 64] for aliased lines */
+    GLfloat range[2] = { 0, 0 };
+    glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, range);
+    EXPECT_NEAR(range[0], 1.0, 0.001);
+    EXPECT_TRUE(range[1] >= 5.0f);
+    /* glLineWidth beyond the range clamps, width 1 stays the native path */
+    glLineWidth(1.0f);
+    EXPECT_EQ_INT(glGetError(), GL_NO_ERROR);
+    return;
+}
+
+/* compile+link an arbitrary stage set (wideline tests need their own varyings) */
+static GLuint wl_stages(const GLenum *types, const char **srcs, int n)
+{
+    GLuint p = glCreateProgram();
+
+    for (int i = 0; i < n; i++)
+    {
+        GLuint so = glCreateShader(types[i]);
+        glShaderSource(so, 1, &srcs[i], NULL);
+        glCompileShader(so);
+        GLint ok = 0;
+        glGetShaderiv(so, GL_COMPILE_STATUS, &ok);
+        if (!ok)
+        {
+            char log[2048];
+            glGetShaderInfoLog(so, sizeof log, NULL, log);
+            fprintf(stderr, "shader compile failed: %s\n", log);
+        }
+        glAttachShader(p, so);
+        glDeleteShader(so);
+    }
+    glLinkProgram(p);
+    return p;
+}
+
+static GLuint wl_program(const char *vs, const char *fs)
+{
+    const GLenum types[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[2] = { vs, fs };
+
+    return wl_stages(types, srcs, 2);
+}
+
+static GLuint wl_tess_program(const char *vs, const char *tcs, const char *tes, const char *fs)
+{
+    const GLenum types[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER,
+                              GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[4] = { vs, tcs, tes, fs };
+
+    return wl_stages(types, srcs, 4);
+}
+
+static GLuint wl_program_unused_(const char *vs, const char *fs)
+{
+    struct { GLenum t; const char *s; } st[2] = { { GL_VERTEX_SHADER, vs }, { GL_FRAGMENT_SHADER, fs } };
+    GLuint p = glCreateProgram();
+    for (int i = 0; i < 2; i++)
+    {
+        GLuint so = glCreateShader(st[i].t);
+        glShaderSource(so, 1, &st[i].s, NULL);
+        glCompileShader(so);
+        GLint ok = 0;
+        glGetShaderiv(so, GL_COMPILE_STATUS, &ok);
+        if (!ok)
+        {
+            char log[2048];
+            glGetShaderInfoLog(so, sizeof log, NULL, log);
+            fprintf(stderr, "shader compile failed: %s\n", log);
+        }
+        glAttachShader(p, so);
+        glDeleteShader(so);
+    }
+    glLinkProgram(p);
+    return p;
+}
+
+TEST(TessWideLineVerticalHorizontal)
+{
+    glViewport(0, 0, 200, 200);
+    GLuint prog = wl_program(kVsLine, kFsId);
+    GLint link = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(prog);
+
+    /* vertical line at NDC x=0 with width 5: snapped to the pixel-centre grid,
+     * exactly 5 columns light up and nothing else */
+    const float vpos[] = { 0.0f, -1.0f, 0.0f, 1.0f };
+    line_vao(vpos, 2);
+    glLineWidth(5.0f);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_row_lit(100, 0, 199), 5);
+    EXPECT_EQ_INT(wl_col_lit(98, 10, 190), 181);
+    EXPECT_EQ_INT(wl_col_lit(102, 10, 190), 181);
+    EXPECT_EQ_INT(wl_col_lit(97, 10, 190), 0);
+    EXPECT_EQ_INT(wl_col_lit(103, 10, 190), 0);
+
+    /* width 1 immediately after: the native 1-px path, exactly one pixel */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(1.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_row_lit(100, 0, 199), 1);
+
+    /* back to width 5: horizontal line at NDC y=0 */
+    glLineWidth(5.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    const float hpos[] = { -1.0f, 0.0f, 1.0f, 0.0f };
+    line_vao(hpos, 2);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 5);
+
+    /* a strip: connected arms, each exactly 5 thick, corner included */
+    glClear(GL_COLOR_BUFFER_BIT);
+    const float spos[] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.5f, 0.5f };
+    line_vao(spos, 3);
+    glDrawArrays(GL_LINE_STRIP, 0, 3);
+    glFinish();
+    {
+        /* thickness of the horizontal arm: scan a column inside its run */
+        int lo = -1, hi = -1;
+        float c[4];
+
+        for (int y = 30; y <= 70; y++)
+        {
+            read_px(100, y, c);
+            if (c[1] > 0.5f) { if (lo < 0) lo = y; hi = y; }
+        }
+        EXPECT_EQ_INT(hi - lo + 1, 5);
+        EXPECT_EQ_INT(wl_row_lit((lo + hi) / 2, 60, 100), 41);  /* continuous */
+    }
+    /* thickness of the vertical arm */
+    EXPECT_EQ_INT(wl_row_lit(100, 140, 160), 5);
+    EXPECT_EQ_INT(wl_col_lit(150, 60, 100), 41);
+    EXPECT_EQ_INT(wl_col_lit(147, 60, 100), 0);
+    EXPECT_EQ_INT(wl_col_lit(153, 60, 100), 0);
+
+    /* a clear after wide draws must wipe everything, and the native path must
+     * still work (the replay pipeline must not leak into later draws) */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+    EXPECT_EQ_INT(wl_row_lit(100, 0, 199), 0);
+    EXPECT_EQ_INT(wl_col_lit(150, 60, 100), 0);
+    glLineWidth(1.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    /* the strip's first segment as a 1-px native line: one of the two rows holds
+     * the full ~100-pixel run */
+    EXPECT_EQ_INT(wl_row_lit(49, 0, 199) + wl_row_lit(50, 0, 199), 100);
+
+    glDeleteProgram(prog);
+    return;
+}
+
+/* ------------------------------------------------------------------ isolines + wide lines
+ * (r70): the emulated isolines path takes the TES-capture + expansion + replay
+ * pipeline (mgl_ext_tess.h) when lineWidth > 1. */
+
+TEST(TessWideLineIsolines)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *tcs =
+        "#version 460 core\n"
+        "layout(vertices=2) out;\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; }\n"
+        "}\n";
+    const char *tes =
+        "#version 460 core\n"
+        "layout(isolines) in;\n"
+        "layout(location=0) out vec4 v_col;\n"
+        "void main(){\n"
+        "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+        "  v_col = vec4(0.0, 1.0, 0.0, 1.0);\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 f_col;\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = f_col; }\n";
+    GLuint p = wl_tess_program(vs, tcs, tes, fs);
+    GLint link = 0;
+
+    if (!p)
+        return;
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };   /* vec2 pairs (line_vao) */
+    line_vao(pos, 2);
+    glPatchParameteri(GL_PATCH_VERTICES, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    /* width 1 first: the plain emulated path, one pixel row (the row-flip's
+     * half-pixel convention decides 99 vs 100 — scan both) */
+    glLineWidth(1.0f);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glFinish();
+    EXPECT_TRUE(wl_row_lit(99, 0, 199) + wl_row_lit(100, 0, 199) >= 99);
+
+    /* width 5: the expansion path, exactly five rows */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(5.0f);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glFinish();
+    if (getenv("MGL_WL_DEBUG"))
+    {
+        float img[200 * 200 * 4];
+        int n = 0, minx = 999, maxx = -1, miny = 999, maxy = -1;
+        glReadPixels(0, 0, 200, 200, GL_RGBA, GL_FLOAT, img);
+        for (int y = 0; y < 200; y++)
+            for (int x = 0; x < 200; x++)
+                if (img[(y * 200 + x) * 4 + 1] > 0.5f)
+                {
+                    n++;
+                    if (x < minx) minx = x;
+                    if (x > maxx) maxx = x;
+                    if (y < miny) miny = y;
+                    if (y > maxy) maxy = y;
+                }
+        printf("iso w5 bbox x=%d..%d y=%d..%d n=%d\n", minx, maxx, miny, maxy, n);
+        fflush(stdout);
+    }
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 5);
+    EXPECT_TRUE(wl_row_lit(100, 60, 140) >= 80);
+    EXPECT_EQ_INT(wl_col_lit(47, 60, 140), 0);
+    EXPECT_EQ_INT(wl_col_lit(153, 60, 140), 0);
+
+    /* back to width 1 after the expansion path */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(1.0f);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 1);
+    glDeleteProgram(p);
+    return;
+}
+
+/* ------------------------------------------------------------------ geometry output + wide lines
+ * (r70/r71): the geometry-kernel widening (extTessWidelineGeomReserve +
+ * extTessWidelineGeomPrepare joining the kernel encoder). */
+
+TEST(TessWideLineGeometryOutput)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(lines) in;\n"
+        "layout(line_strip, max_vertices = 2) out;\n"
+        "void main(){\n"
+        "  gl_Position = gl_in[0].gl_Position; EmitVertex();\n"
+        "  gl_Position = gl_in[1].gl_Position; EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[3] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[3] = { vs, gs, fs };
+    GLuint p = wl_stages(types, srcs, 3);
+    GLint link = 0;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };
+    line_vao(pos, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    /* width 1: the geometry raster pass's native line */
+    glLineWidth(1.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_TRUE(wl_row_lit(99, 0, 199) + wl_row_lit(100, 0, 199) >= 99);
+
+    /* width 5: the expansion, exactly five rows */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(5.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 5);
+    EXPECT_TRUE(wl_row_lit(100, 60, 140) >= 80);
+
+    /* and back to 1 */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(1.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_TRUE(wl_row_lit(99, 0, 199) + wl_row_lit(100, 0, 199) >= 99);
+
+    glDeleteProgram(p);
+    return;
+}
+
+/* a multi-segment GS output: an L-shaped line_strip (three emitted vertices,
+ * two segments sharing the corner).  Neighbouring segments must snap their
+ * shared endpoint identically (the expansion kernel's pixel-centre snap) or the
+ * widened strip shows gaps/overlaps at the corner — the shape the dEQP
+ * LineRenderCase grids draw. */
+TEST(TessWideLineGeometryPolyline)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(lines) in;\n"
+        "layout(line_strip, max_vertices = 3) out;\n"
+        "void main(){\n"
+        "  gl_Position = vec4(-0.6, 0.0, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(-0.2, 0.0, 0.0, 1.0); EmitVertex();\n"
+        "  gl_Position = vec4(-0.2, 0.4, 0.0, 1.0); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[3] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[3] = { vs, gs, fs };
+    GLuint p = wl_stages(types, srcs, 3);
+    GLint link = 0;
+    int rows5 = 0, cols5 = 0, r, c, pg_ref = -1;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };  /* one GL_LINES primitive */
+    line_vao(pos, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    /* the native 1-px path first (the widened draw must not change it) */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+    EXPECT_TRUE(wl_row_lit(99, 42, 76) >= 33);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(5.0f);
+    glDrawArrays(GL_LINES, 0, 2);
+    glFinish();
+
+    /* horizontal arm: clip y=0 -> readback row 100; arm spans x in [40, 80].
+     * Exactly five rows carry the arm (measure away from the corner). */
+    for (r = 97; r <= 103; r++)
+        if (wl_row_lit(r, 42, 76) >= 33) rows5++;
+    EXPECT_EQ_INT(rows5, 5);
+    /* vertical arm: clip x=-0.2 -> column 80; the arm spans readback rows
+     * 102..139 (MGL's row order: +y up).  Exactly five columns carry it. */
+    for (c = 77; c <= 83; c++)
+        if (wl_col_lit(c, 104, 136) >= 30) cols5++;
+    EXPECT_EQ_INT(cols5, 5);
+    /* the corner itself is covered (the arms join): (80, 100) */
+    {
+        float px[4];
+        read_px(80, 100, px);
+        EXPECT_TRUE(px[1] > 0.5f);
+    }
+
+    /* queries count the geometry stage's output, never the substituted quads:
+     * one line_strip primitive emitted, regardless of line width */
+    {
+        GLuint q;
+        GLint pg = -1, clip_in = -1, clip_out = -1;
+        glGenQueries(1, &q);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLineWidth(1.0f);       /* the native path must agree exactly */
+        glBeginQuery(GL_PRIMITIVES_GENERATED, q);
+        glDrawArrays(GL_LINES, 0, 2);
+        glEndQuery(GL_PRIMITIVES_GENERATED);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &pg_ref);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLineWidth(5.0f);
+        glBeginQuery(GL_PRIMITIVES_GENERATED, q);
+        glDrawArrays(GL_LINES, 0, 2);
+        glEndQuery(GL_PRIMITIVES_GENERATED);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &pg);
+        EXPECT_EQ_INT(pg, pg_ref);   /* two segments: a 3-vertex strip counts its segments */
+        EXPECT_EQ_INT(pg, 2);
+        glBeginQuery(GL_CLIPPING_INPUT_PRIMITIVES, q);
+        glDrawArrays(GL_LINES, 0, 2);
+        glEndQuery(GL_CLIPPING_INPUT_PRIMITIVES);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &clip_in);
+        EXPECT_EQ_INT(clip_in, 2);
+        glBeginQuery(GL_CLIPPING_OUTPUT_PRIMITIVES, q);
+        glDrawArrays(GL_LINES, 0, 2);
+        glEndQuery(GL_CLIPPING_OUTPUT_PRIMITIVES);
+        glGetQueryObjectiv(q, GL_QUERY_RESULT, &clip_out);
+        EXPECT_EQ_INT(clip_out, 2);
+        glDeleteQueries(1, &q);
+    }
+
+    /* a widened line is still a line primitive to GL: never culled.  Enable
+     * front-face culling and redraw — the quads must render identically. */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glCullFace(GL_FRONT);
+    glEnable(GL_CULL_FACE);
+    glDrawArrays(GL_LINES, 0, 2);
+    glDisable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFinish();
+    rows5 = cols5 = 0;
+    for (r = 97; r <= 103; r++)
+        if (wl_row_lit(r, 42, 76) >= 33) rows5++;
+    for (c = 77; c <= 83; c++)
+        if (wl_col_lit(c, 104, 136) >= 30) cols5++;
+    EXPECT_EQ_INT(rows5, 5);
+    EXPECT_EQ_INT(cols5, 5);
+
+    glDeleteProgram(p);
+    return;
+}
+
+/* transform feedback of a geometry stage's line output WHILE the output is
+ * widened: xfb captures the emitted (pre-rasterizer) vertices — the pack joins
+ * the kernel encoder after the expansion dispatch in the same encoder */
+TEST(TessWideLineGeometryXfb)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(lines) in;\n"
+        "layout(line_strip, max_vertices = 2) out;\n"
+        "out vec2 vpos;\n"
+        "void main(){\n"
+        "  gl_Position = gl_in[0].gl_Position; vpos = gl_Position.xy; EmitVertex();\n"
+        "  gl_Position = gl_in[1].gl_Position; vpos = gl_Position.xy; EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[3] = { GL_VERTEX_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[3] = { vs, gs, fs };
+    const char *xfbv[] = { "vpos" };
+    GLuint p = glCreateProgram(), sh[3], xb, q;
+    GLint link = 0, wr = -1;
+    float *m;
+
+    for (int i = 0; i < 3; i++)
+    {
+        sh[i] = glCreateShader(types[i]);
+        glShaderSource(sh[i], 1, &srcs[i], NULL);
+        glCompileShader(sh[i]);
+        glAttachShader(p, sh[i]);
+        glDeleteShader(sh[i]);
+    }
+    glTransformFeedbackVaryings(p, 1, xfbv, GL_SEPARATE_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };
+    line_vao(pos, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glGenBuffers(1, &xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 4096, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glGenQueries(1, &q);
+
+    glLineWidth(5.0f);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(GL_LINES);
+    glDrawArrays(GL_LINES, 0, 2);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glFinish();
+
+    /* the widened line still rasterizes exactly five rows */
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 5);
+    EXPECT_TRUE(wl_row_lit(100, 60, 140) >= 80);
+
+    /* and xfb captured the two EMITTED endpoints, not the corner records */
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &wr);
+    EXPECT_EQ_INT(wr, 1);
+    glBindBuffer(GL_ARRAY_BUFFER, xb);
+    m = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+    EXPECT_TRUE(m != NULL);
+    if (m)
+    {
+        EXPECT_NEAR(m[0], -0.5f, 1e-4);
+        EXPECT_NEAR(m[1], 0.0f, 1e-4);
+        EXPECT_NEAR(m[2], 0.5f, 1e-4);
+        EXPECT_NEAR(m[3], 0.0f, 1e-4);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    }
+    glDeleteQueries(1, &q);
+    glDeleteBuffers(1, &xb);
+    glDeleteProgram(p);
+    return;
+}
+
+/* INSTANCED wide isolines (r71): the emulated patch stream folds instances in
+ * (total_patches = patches * instances), so instanced isolines widen through
+ * the same capture + expansion + replay path — two instances offset in y by a
+ * per-instance attribute, each arm exactly `width' rows (array + indexed) */
+TEST(TessWideLineIsolinesInstanced)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec2 a_pos;\n"
+        "layout(location=1) in float a_yoff;\n"
+        "out float v_yoff;\n"
+        "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_yoff = a_yoff; }\n";
+    const char *tcs =
+        "#version 460 core\n"
+        "layout(vertices=2) out;\n"
+        "in float v_yoff[];\n"
+        "out float t_yoff[];\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  t_yoff[gl_InvocationID] = v_yoff[gl_InvocationID];\n"
+        "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; }\n"
+        "}\n";
+    const char *tes =
+        "#version 460 core\n"
+        "layout(isolines) in;\n"
+        "in float t_yoff[];\n"
+        "void main(){\n"
+        "  vec4 p = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+        "  p.y += mix(t_yoff[0], t_yoff[1], gl_TessCoord.x);\n"
+        "  gl_Position = p;\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER,
+                              GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[4] = { vs, tcs, tes, fs };
+    GLuint p = wl_stages(types, srcs, 4);
+    GLint link = 0;
+    static const float pos[4] = { -0.5f, 0.0f, 0.5f, 0.0f };
+    static const float yoff[2] = { 0.3f, -0.3f };
+    GLuint vao, vbo, ibo;
+    int arm_hi, arm_lo, r;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glGenBuffers(1, &ibo);
+    glBindBuffer(GL_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof yoff, yoff, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 4, NULL);
+    glVertexAttribDivisor(1, 1);
+    glPatchParameteri(GL_PATCH_VERTICES, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+
+    /* 1-px reference: one row per instance at rows ~69 and ~129 */
+    glLineWidth(1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArraysInstanced(GL_PATCHES, 0, 2, 2);
+    glFinish();
+    EXPECT_TRUE(wl_row_lit(69, 10, 190) >= 90);
+    EXPECT_TRUE(wl_row_lit(129, 10, 190) >= 90);
+
+    /* width 5, array path: two arms of exactly 5 rows each */
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(5.0f);
+    glDrawArraysInstanced(GL_PATCHES, 0, 2, 2);
+    glFinish();
+    arm_hi = arm_lo = 0;
+    for (r = 122; r <= 138; r++)
+        if (wl_row_lit(r, 10, 190) >= 90) arm_hi++;
+    for (r = 62; r <= 78; r++)
+        if (wl_row_lit(r, 10, 190) >= 90) arm_lo++;
+    EXPECT_EQ_INT(arm_hi, 5);
+    EXPECT_EQ_INT(arm_lo, 5);
+
+    /* the same through an element buffer (the GPU index scan path) */
+    {
+        static const GLuint idx[2] = { 1, 0 };
+        GLuint ebo;
+        glGenBuffers(1, &ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsInstanced(GL_PATCHES, 2, GL_UNSIGNED_INT, NULL, 2);
+        glFinish();
+        arm_hi = arm_lo = 0;
+        for (r = 122; r <= 138; r++)
+            if (wl_row_lit(r, 10, 190) >= 90) arm_hi++;
+        for (r = 62; r <= 78; r++)
+            if (wl_row_lit(r, 10, 190) >= 90) arm_lo++;
+        EXPECT_EQ_INT(arm_hi, 5);
+        EXPECT_EQ_INT(arm_lo, 5);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDeleteBuffers(1, &ebo);
+    }
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &ibo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+    return;
+}
+
+/* xfb capture alongside the isolines widening: both consume the TES capture
+ * stream (the widening replays it, the pack copies it out) — the captured
+ * vertices must be the TES's own positions, and the line still rasterizes
+ * `width' rows wide (widening is a rasterization feature, never a stream one) */
+TEST(TessWideLineIsolinesXfb)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *tcs =
+        "#version 460 core\n"
+        "layout(vertices=2) out;\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 3.0; gl_TessLevelOuter[1] = 1.0; }\n"
+        "}\n";
+    const char *tes =
+        "#version 460 core\n"
+        "layout(isolines) in;\n"
+        "out vec2 tpos;\n"
+        "void main(){\n"
+        "  vec4 p = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+        "  tpos = p.xy;\n"
+        "  gl_Position = p;\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER,
+                              GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[4] = { vs, tcs, tes, fs };
+    const char *xfbv[] = { "tpos" };
+    GLuint p = glCreateProgram(), sh[4], xb, q;
+    GLint link = 0, wr = -1;
+    float *m;
+    int rows = 0;
+
+    for (int i = 0; i < 4; i++)
+    {
+        sh[i] = glCreateShader(types[i]);
+        glShaderSource(sh[i], 1, &srcs[i], NULL);
+        glCompileShader(sh[i]);
+        glAttachShader(p, sh[i]);
+        glDeleteShader(sh[i]);
+    }
+    glTransformFeedbackVaryings(p, 1, xfbv, GL_SEPARATE_ATTRIBS);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };
+    line_vao(pos, 2);
+    glPatchParameteri(GL_PATCH_VERTICES, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glGenBuffers(1, &xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 8192, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glGenQueries(1, &q);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glLineWidth(5.0f);
+    glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(GL_LINES);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glEndTransformFeedback();
+    glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glFinish();
+    glGetQueryObjectiv(q, GL_QUERY_RESULT, &wr);
+    glBindBuffer(GL_ARRAY_BUFFER, xb);
+    m = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+    EXPECT_TRUE(m != NULL);
+
+    /* the widened line: exactly five rows at the centre */
+    for (int r = 95; r <= 105; r++)
+        if (wl_row_lit(r, 60, 140) >= 60) rows++;
+    EXPECT_EQ_INT(rows, 5);
+
+    /* widening must never alter the captured stream: re-capture at width 1
+     * and compare float for float */
+    if (m)
+    {
+        float *m2;
+        GLint wr2 = -1;
+        GLuint xb2, q2;
+        glGenBuffers(1, &xb2);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb2);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 8192, NULL, GL_STREAM_READ);
+        glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb2);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+        glGenQueries(1, &q2);
+        glLineWidth(1.0f);
+        glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q2);
+        glBeginTransformFeedback(GL_LINES);
+        glDrawArrays(GL_PATCHES, 0, 2);
+        glEndTransformFeedback();
+        glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+        glFinish();
+        glGetQueryObjectiv(q2, GL_QUERY_RESULT, &wr2);
+        EXPECT_EQ_INT(wr2, wr);
+        glBindBuffer(GL_ARRAY_BUFFER, xb2);
+        m2 = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+        if (m2)
+        {
+            for (int i = 0; i < 2 * wr; i++)
+                EXPECT_NEAR(m2[i], m[i], 1e-6);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        }
+        glDeleteQueries(1, &q2);
+        glDeleteBuffers(1, &xb2);
+        glBindBuffer(GL_ARRAY_BUFFER, xb);
+    }
+
+    if (m)
+    {
+        /* GL isolines semantics (dEQP esextcTessellationShaderIsolines: "the
+         * number of isolines is derived from the FIRST outer level, the
+         * number of segments in each isoline from the SECOND"): outer={3,1}
+         * is THREE lines at v = 0, 1/3, 2/3, each ONE full-span segment
+         * u in [0,1].  The TES ignores v so the lines coincide; the captured
+         * stream repeats the two control points once per line. */
+        int bad = 0;
+        EXPECT_EQ_INT(wr, 3);
+        for (int i = 0; i < 2 * wr; i += 2)
+            if (m[i + 1] != 0.0f) bad++;      /* every captured y = 0 */
+        EXPECT_EQ_INT(bad, 0);
+        for (int k = 0; k < wr; k++)
+        {
+            EXPECT_NEAR(m[2 * (2 * k + 0)], -0.5f, 1e-4);   /* line k, u=0 */
+            EXPECT_NEAR(m[2 * (2 * k + 1)], 0.5f, 1e-4);    /* line k, u=1 */
+        }
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    }
+    glDeleteQueries(1, &q);
+    glDeleteBuffers(1, &xb);
+    glDeleteProgram(p);
+    return;
+}
+
+/* isolines feeding a line_strip geometry stage: both hooks in one pipeline
+ * (TES capture -> GS records -> expansion) — the dEQP
+ * primitive_bounding_box.wide_lines vertex_tessellation_geometry family */
+TEST(TessWideLineIsolinesIntoGeometry)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "void main(){ gl_Position = a_pos; }\n";
+    const char *tcs =
+        "#version 460 core\n"
+        "layout(vertices=2) out;\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; }\n"
+        "}\n";
+    const char *tes =
+        "#version 460 core\n"
+        "layout(isolines) in;\n"
+        "void main(){\n"
+        "  gl_Position = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x);\n"
+        "}\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(lines) in;\n"
+        "layout(line_strip, max_vertices = 2) out;\n"
+        "void main(){\n"
+        "  gl_Position = gl_in[0].gl_Position; EmitVertex();\n"
+        "  gl_Position = gl_in[1].gl_Position; EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "layout(location=0) out vec4 o_col;\n"
+        "void main(){ o_col = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    const GLenum types[5] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER,
+                              GL_TESS_EVALUATION_SHADER, GL_GEOMETRY_SHADER,
+                              GL_FRAGMENT_SHADER };
+    const char *srcs[5] = { vs, tcs, tes, gs, fs };
+    GLuint p = wl_stages(types, srcs, 5);
+    GLint link = 0;
+
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    const float pos[] = { -0.5f, 0.0f, 0.5f, 0.0f };
+    line_vao(pos, 2);
+    glPatchParameteri(GL_PATCH_VERTICES, 2);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glLineWidth(5.0f);
+    glDrawArrays(GL_PATCHES, 0, 2);
+    glFinish();
+    EXPECT_EQ_INT(wl_col_lit(100, 0, 199), 5);
+    EXPECT_TRUE(wl_row_lit(100, 60, 140) >= 80);
+
+    glDeleteProgram(p);
+    return;
+}
+
+/* ------------------------------------------------------------------ dEQP vtg guards (r72)
+ * The primitive_bounding_box.vertex_tessellation_geometry_fragment family:
+ * (1) its link pattern — VS+TCS+TES+FS links first, then VS+TCS+TES+GS+FS
+ *     from the SAME shader objects (the glslang intermediate cache share the
+ *     same_set handling in program.c guards; the Nov-4 CTS failures predate
+ *     that Nov-5 fix), and
+ * (2) the pipeline itself — the TCS permutes gl_Position (.wzxy), the TES
+ *     un-permutes (.zwyx -- an identity pair) with `precise`, patch and flat
+ *     varyings, and the GS 1->3 amplification.  The saved CTS evidence showed
+ *     a black viewport; the replica renders the full expected grid. */
+
+static const char *kVtgVs =
+    "#version 460 core\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "layout(location=1) in vec4 a_col;\n"
+    "out vec4 v_col;\n"
+    "void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); v_col = a_col; }\n";
+static const char *kVtgTcs =
+    "#version 460 core\n"
+    "layout(vertices=3) out;\n"
+    "in vec4 v_col[];\n"
+    "out vec4 tc_col[];\n"
+    "patch out vec3 p_dat;\n"
+    "void main(){\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position.wzxy;\n"
+    "  tc_col[gl_InvocationID] = v_col[gl_InvocationID];\n"
+    "  p_dat = vec3(1.0);\n"
+    "  gl_TessLevelOuter[0] = 2.8; gl_TessLevelOuter[1] = 2.8; gl_TessLevelOuter[2] = 2.8;\n"
+    "  gl_TessLevelInner[0] = 2.8;\n"
+    "}\n";
+static const char *kVtgTes =
+    "#version 460 core\n"
+    "layout(triangles) in;\n"
+    "in vec4 tc_col[];\n"
+    "out vec4 te_col;\n"
+    "patch in vec3 p_dat;\n"
+    "flat out vec3 te_flat;\n"
+    "precise gl_Position;\n"
+    "void main(){\n"
+    "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position.zwyx\n"
+    "               + gl_TessCoord.y * gl_in[1].gl_Position.zwyx\n"
+    "               + gl_TessCoord.z * gl_in[2].gl_Position.zwyx;\n"
+    "  te_col = tc_col[0];\n"
+    "  te_flat = p_dat;\n"
+    "}\n";
+static const char *kVtgGs =
+    "#version 460 core\n"
+    "layout(triangles) in;\n"
+    "layout(triangle_strip, max_vertices=9) out;\n"
+    "in vec4 te_col[];\n"
+    "flat in vec3 te_flat[];\n"
+    "out vec4 g_col;\n"
+    "void main(){\n"
+    "  vec4 p0 = gl_in[0].gl_Position;\n"
+    "  vec4 p1 = gl_in[1].gl_Position;\n"
+    "  vec4 p2 = gl_in[2].gl_Position;\n"
+    "  vec4 c = vec4((p0.xyz + p1.xyz + p2.xyz) / 3.0, 1.0);\n"
+    "  for (int k = 0; k < 3; k++)\n"
+    "  {\n"
+    "    vec4 a = (k == 0) ? p0 : ((k == 1) ? p1 : p2);\n"
+    "    vec4 b = (k == 0) ? p1 : ((k == 1) ? p2 : p0);\n"
+    "    g_col = te_col[0] * te_flat[0].x;\n"
+    "    gl_Position = a; EmitVertex();\n"
+    "    g_col = te_col[0] * te_flat[0].x;\n"
+    "    gl_Position = b; EmitVertex();\n"
+    "    g_col = te_col[0] * te_flat[0].x;\n"
+    "    gl_Position = c; EmitVertex();\n"
+    "    EndPrimitive();\n"
+    "  }\n"
+    "}\n";
+
+/* the dEQP link pattern: one compile per stage, the TES link first, the
+ * tess+geometry link second from the same objects */
+static int vtg_draw(int with_gs, GLuint shared[3])
+{
+    static const float pos[6] = { -0.7f, -0.7f, 0.8f, -0.5f, -0.1f, 0.8f };
+    static const float col[3][4] = { {1,0,0,1}, {0,1,0,1}, {0,0,1,1} };
+    static const char *kFsT = "#version 460 core\nin vec4 te_col;\nlayout(location=0) out vec4 o;\nvoid main(){ o = te_col; }\n";
+    static const char *kFsG = "#version 460 core\nin vec4 g_col;\nlayout(location=0) out vec4 o;\nvoid main(){ o = g_col; }\n";
+    const char *srcs[3] = { kVtgVs, kVtgTcs, kVtgTes };
+    const GLenum types[3] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER };
+    GLuint p, vao, b;
+    GLint link = 0;
+    int lit = 0;
+    float c[4];
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (!shared[i])
+        {
+            shared[i] = glCreateShader(types[i]);
+            glShaderSource(shared[i], 1, &srcs[i], NULL);
+            glCompileShader(shared[i]);
+        }
+    }
+    p = glCreateProgram();
+    for (int i = 0; i < 3; i++)
+        glAttachShader(p, shared[i]);
+    if (with_gs)
+    {
+        GLuint g = glCreateShader(GL_GEOMETRY_SHADER);
+        glShaderSource(g, 1, &kVtgGs, NULL);
+        glCompileShader(g);
+        glAttachShader(p, g);
+        glDeleteShader(g);
+    }
+    {
+        const char *fs = with_gs ? kFsG : kFsT;
+        GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(f, 1, &fs, NULL);
+        glCompileShader(f);
+        glAttachShader(p, f);
+        glDeleteShader(f);
+    }
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    if (link != GL_TRUE) { glDeleteProgram(p); return -1; }
+    glUseProgram(p);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glFinish();
+    for (int y = 0; y < 200; y++) for (int x = 0; x < 200; x++)
+    {
+        glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, c);
+        if (c[0] + c[1] + c[2] > 0.2f) lit++;
+    }
+    glDeleteProgram(p);
+    return lit;
+}
+
+TEST(TessVtgSharedShaders)
+{
+    GLuint shared[3] = {0, 0, 0};
+    int vtf = vtg_draw(0, shared);
+    int vtg = vtg_draw(1, shared);
+    EXPECT_TRUE(vtf > 500);
+    /* the three GS strips tile the input triangle: same coverage as the plain
+     * TES render (the wzxy/zwyx pair is the identity permutation) */
+    EXPECT_TRUE(vtg > vtf * 8 / 10);
+    EXPECT_TRUE(vtg < vtf * 12 / 10);
+    for (int i = 0; i < 3; i++) glDeleteShader(shared[i]);
+    return;
+}
+
+/* the full dEQP pipeline verbatim-in-shape: VS pattern transform, TCS .wzxy
+ * + bbox patch varyings, TES un-permute + precise + mirrorY(patternCenter),
+ * GS mirrorX + 1->3 amplification, FS's fragmentInsideTheBBox(gl_FragCoord).
+ * u_posScale chosen so the mirrored 16x16-cell grid lands exactly on the
+ * [-0.8,0.8] square: 25600 lit pixels, nothing blue. */
+TEST(TessVtgExactPipeline)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "layout(location=0) in vec4 a_pos;\n"
+        "layout(location=1) in vec4 a_col;\n"
+        "out vec4 vtx_color;\n"
+        "uniform vec4 u_posScale;\n"
+        "void main(){\n"
+        "  vec2 off = u_posScale.xy, sc = u_posScale.zw;\n"
+        "  gl_Position = vec4(a_pos.xy * sc + off, a_pos.z, a_pos.w);\n"
+        "  vtx_color = a_col;\n"
+        "}\n";
+    const char *tcs =
+        "#version 460 core\n"
+        "layout(vertices=3) out;\n"
+        "in vec4 vtx_color[];\n"
+        "out vec4 tess_ctrl_color[];\n"
+        "uniform float u_tessellationLevel;\n"
+        "uniform vec4 u_posScale;\n"
+        "uniform vec4 u_primitiveBBoxMin;\n"
+        "uniform vec4 u_primitiveBBoxMax;\n"
+        "patch out float vp_bbox_expansionSize;\n"
+        "patch out vec3 vp_bbox_clipMin;\n"
+        "patch out vec3 vp_bbox_clipMax;\n"
+        "void main(){\n"
+        "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position.wzxy;\n"
+        "  tess_ctrl_color[gl_InvocationID] = vtx_color[gl_InvocationID];\n"
+        "  gl_TessLevelOuter[0] = u_tessellationLevel;\n"
+        "  gl_TessLevelOuter[1] = u_tessellationLevel;\n"
+        "  gl_TessLevelOuter[2] = u_tessellationLevel;\n"
+        "  gl_TessLevelInner[0] = u_tessellationLevel;\n"
+        "  vp_bbox_expansionSize = 0.0;\n"
+        "  vp_bbox_clipMin = min(u_primitiveBBoxMin.xyz / u_primitiveBBoxMin.w, u_primitiveBBoxMin.xyz / u_primitiveBBoxMax.w);\n"
+        "  vp_bbox_clipMax = max(u_primitiveBBoxMax.xyz / u_primitiveBBoxMin.w, u_primitiveBBoxMax.xyz / u_primitiveBBoxMax.w);\n"
+        "}\n";
+    const char *tes =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "in vec4 tess_ctrl_color[];\n"
+        "out vec4 tess_color;\n"
+        "uniform vec4 u_posScale;\n"
+        "patch in float vp_bbox_expansionSize;\n"
+        "patch in vec3 vp_bbox_clipMin;\n"
+        "patch in vec3 vp_bbox_clipMax;\n"
+        "flat out float v_geo_bbox_expansionSize;\n"
+        "flat out vec3 v_geo_bbox_clipMin;\n"
+        "flat out vec3 v_geo_bbox_clipMax;\n"
+        "precise gl_Position;\n"
+        "vec4 mirrorY(vec4 p){\n"
+        "  vec2 off = u_posScale.xy, sc = u_posScale.zw;\n"
+        "  vec2 ctr = off + sc * 0.5;\n"
+        "  return vec4(p.x, 2.0 * ctr.y - p.y, p.z, p.w);\n"
+        "}\n"
+        "void main(){\n"
+        "  gl_Position = mirrorY(gl_TessCoord.x * gl_in[0].gl_Position.zwyx +\n"
+        "                        gl_TessCoord.y * gl_in[1].gl_Position.zwyx +\n"
+        "                        gl_TessCoord.z * gl_in[2].gl_Position.zwyx);\n"
+        "  tess_color = tess_ctrl_color[0];\n"
+        "  v_geo_bbox_expansionSize = vp_bbox_expansionSize;\n"
+        "  v_geo_bbox_clipMin = vp_bbox_clipMin;\n"
+        "  v_geo_bbox_clipMax = vp_bbox_clipMax;\n"
+        "}\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices=9) out;\n"
+        "in vec4 tess_color[3];\n"
+        "out vec4 geo_color;\n"
+        "uniform vec4 u_posScale;\n"
+        "flat in float v_geo_bbox_expansionSize[3];\n"
+        "flat in vec3 v_geo_bbox_clipMin[3];\n"
+        "flat in vec3 v_geo_bbox_clipMax[3];\n"
+        "flat out vec3 v_bbox_clipMin;\n"
+        "flat out vec3 v_bbox_clipMax;\n"
+        "flat out float v_bbox_expansionSize;\n"
+        "vec4 mirrorX(vec4 p){\n"
+        "  vec2 off = u_posScale.xy, sc = u_posScale.zw;\n"
+        "  vec2 ctr = off + sc * 0.5;\n"
+        "  return vec4(2.0 * ctr.x - p.x, p.y, p.z, p.w);\n"
+        "}\n"
+        "void setVis(){ v_bbox_expansionSize = v_geo_bbox_expansionSize[0]; v_bbox_clipMin = v_geo_bbox_clipMin[0]; v_bbox_clipMax = v_geo_bbox_clipMax[0]; }\n"
+        "void main(){\n"
+        "  vec4 p0 = mirrorX(gl_in[0].gl_Position);\n"
+        "  vec4 p1 = mirrorX(gl_in[1].gl_Position);\n"
+        "  vec4 p2 = mirrorX(gl_in[2].gl_Position);\n"
+        "  vec4 pc = vec4((p0.xyz + p1.xyz + p2.xyz) / 3.0, 1.0);\n"
+        "  vec4 tc = tess_color[0];\n"
+        "  gl_Position = p0; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = p1; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = pc; geo_color = tc; setVis(); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "  gl_Position = p1; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = p2; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = pc; geo_color = tc; setVis(); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "  gl_Position = p2; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = p0; geo_color = tc; setVis(); EmitVertex();\n"
+        "  gl_Position = pc; geo_color = tc; setVis(); EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "in vec4 geo_color;\n"
+        "layout(location=0) out vec4 o_color;\n"
+        "uniform ivec2 u_viewportPos;\n"
+        "uniform ivec2 u_viewportSize;\n"
+        "flat in float v_bbox_expansionSize;\n"
+        "flat in vec3 v_bbox_clipMin;\n"
+        "flat in vec3 v_bbox_clipMax;\n"
+        "bool insideBBox(float depth){\n"
+        "  vec4 wc = vec4(floor((v_bbox_clipMin.x * 0.5 + 0.5) * float(u_viewportSize.x) - v_bbox_expansionSize/2.0),\n"
+        "                 floor((v_bbox_clipMin.y * 0.5 + 0.5) * float(u_viewportSize.y) - v_bbox_expansionSize/2.0),\n"
+        "                 ceil((v_bbox_clipMax.x * 0.5 + 0.5) * float(u_viewportSize.x) + v_bbox_expansionSize/2.0),\n"
+        "                 ceil((v_bbox_clipMax.y * 0.5 + 0.5) * float(u_viewportSize.y) + v_bbox_expansionSize/2.0));\n"
+        "  if (gl_FragCoord.x < float(u_viewportPos.x) + wc.x || gl_FragCoord.x > float(u_viewportPos.x) + wc.z ||\n"
+        "      gl_FragCoord.y < float(u_viewportPos.y) + wc.y || gl_FragCoord.y > float(u_viewportPos.y) + wc.w)\n"
+        "    return false;\n"
+        "  if (depth*2.0-1.0 < v_bbox_clipMin.z - 0.001 || depth*2.0-1.0 > v_bbox_clipMax.z + 0.001)\n"
+        "    return false;\n"
+        "  return true;\n"
+        "}\n"
+        "void main(){\n"
+        "  float blue = insideBBox(gl_FragCoord.z) ? 0.0 : 1.0;\n"
+        "  o_color = vec4(geo_color.r, geo_color.g, blue, geo_color.a);\n"
+        "}\n";
+    const GLenum types[5] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER,
+                              GL_TESS_EVALUATION_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[5] = { vs, tcs, tes, gs, fs };
+    static float pos[512 * 24], col[512 * 24];
+    GLuint p, vao, b;
+    GLint link = 0, loc;
+    int lit = 0, blue = 0, n = 0;
+    float c[4];
+
+    for (int gy = 0; gy < 16; gy++)
+        for (int gx = 0; gx < 16; gx++)
+        {
+            float x0 = -0.8f + gx * 0.1f, y0 = -0.8f + gy * 0.1f, x1 = x0 + 0.1f, y1 = y0 + 0.1f;
+            float cr = ((gx + gy) & 1) ? 0.1f : 0.9f, cg = ((gx + gy) & 1) ? 0.9f : 0.1f;
+            float quad[6][2] = { {x0,y0}, {x1,y0}, {x0,y1}, {x1,y0}, {x1,y1}, {x0,y1} };
+            for (int v = 0; v < 6; v++)
+            {
+                pos[n*4+0] = quad[v][0]; pos[n*4+1] = quad[v][1];
+                pos[n*4+2] = 0.0f;       pos[n*4+3] = 1.0f;
+                col[n*4+0] = cr; col[n*4+1] = cg; col[n*4+2] = 0.0f; col[n*4+3] = 1.0f;
+                n++;
+            }
+        }
+    p = wl_stages(types, srcs, 5);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    EXPECT_EQ_INT(link, GL_TRUE);
+    if (!link) return;
+    glUseProgram(p);
+    /* patternCenter = off + sc/2; final = off + sc*(1 - x): with off=(-1,-1),
+     * sc=(1,1) the [-0.8,0.8] square maps onto itself */
+    loc = glGetUniformLocation(p, "u_posScale");
+    if (loc >= 0) glUniform4f(loc, -1.0f, -1.0f, 1.0f, 1.0f);
+    loc = glGetUniformLocation(p, "u_tessellationLevel");
+    if (loc >= 0) glUniform1f(loc, 2.8f);
+    loc = glGetUniformLocation(p, "u_primitiveBBoxMin");
+    if (loc >= 0) glUniform4f(loc, -2.0f, -2.0f, -2.0f, 1.0f);
+    loc = glGetUniformLocation(p, "u_primitiveBBoxMax");
+    if (loc >= 0) glUniform4f(loc, 2.0f, 2.0f, 2.0f, 1.0f);
+    loc = glGetUniformLocation(p, "u_viewportPos");
+    if (loc >= 0) glUniform2i(loc, 0, 0);
+    loc = glGetUniformLocation(p, "u_viewportSize");
+    if (loc >= 0) glUniform2i(loc, 200, 200);
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(0);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof col, col, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 16, NULL);
+    glEnableVertexAttribArray(1);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glViewport(0, 0, 200, 200);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_PATCHES, 0, n);
+    glFinish();
+    for (int y = 0; y < 200; y++) for (int x = 0; x < 200; x++)
+    {
+        glReadPixels(x, y, 1, 1, GL_RGBA, GL_FLOAT, c);
+        if (c[0] + c[1] + c[2] > 0.05f) lit++;
+        if (c[2] > 0.5f) blue++;
+    }
+    /* the mirrored grid covers the [-0.8,0.8] square exactly; the generous
+     * bbox marks nothing blue */
+    EXPECT_TRUE(lit > 25000);
+    EXPECT_EQ_INT(blue, 0);
+    glDeleteProgram(p);
+    return;
+}
+
+/* ------------------------------------------------------------------ TES xfb of matrices (r72)
+ * The KHR enhanced_layouts.xfb_explicit_location_{,d}mat*_tessellation_eval
+ * family: a matrix varying with an explicit xfb_offset captured from the TES.
+ * GL packs it column-major, R components per column, contiguous.  (The
+ * std140 uniform must be uploaded with padded columns — a plain {1,2,3,4}
+ * upload puts cols 3,4 into col0's padding.) */
+static const char *kXfbMatVs = "#version 460 core\nlayout(location=0) in vec2 a_pos;\nvoid main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+static const char *kXfbMatTcs = "#version 460 core\nlayout(vertices=3) out;\nvoid main(){\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "  gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0; gl_TessLevelOuter[2] = 1.0;\n"
+    "  gl_TessLevelInner[0] = 1.0;\n}\n";
+static const char *kXfbMatFs = "#version 460 core\nlayout(location=0) out vec4 o;\nvoid main(){ o = vec4(0,1,0,1); }\n";
+
+static int xfb_mat_case(const char *gltype, const void *ubuf, size_t ubytes,
+                        const float *expect, int nexpect, const char *tag)
+{
+    char tes[1024];
+    const GLenum types[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    static const float pos[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f };
+    GLuint p, vao, b, xb;
+    GLint link = 0;
+    int ok = 1;
+    const char *srcs[4];
+
+    snprintf(tes, sizeof tes,
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(std140, binding = 0) uniform Goku { %s uni_goku; };\n"
+        "layout (location = 0, xfb_offset = 0) flat out %s goku;\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  goku = uni_goku;\n"
+        "}\n", gltype, gltype);
+    srcs[0] = kXfbMatVs; srcs[1] = kXfbMatTcs; srcs[2] = tes; srcs[3] = kXfbMatFs;
+    p = glCreateProgram();
+    for (int i = 0; i < 4; i++)
+    {
+        GLuint so = glCreateShader(types[i]);
+        glShaderSource(so, 1, &srcs[i], NULL);
+        glCompileShader(so);
+        glAttachShader(p, so);
+        glDeleteShader(so);
+    }
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    if (link != GL_TRUE) { glDeleteProgram(p); return 0; }
+    glUseProgram(p);
+    {
+        GLuint idx = glGetUniformBlockIndex(p, "Goku"), ubo;
+        glGenBuffers(1, &ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glBufferData(GL_UNIFORM_BUFFER, ubytes, ubuf, GL_STATIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+        glUniformBlockBinding(p, idx, 0);
+    }
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glViewport(0, 0, 200, 200);
+    glGenBuffers(1, &xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 8192, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glFinish();
+    glBindBuffer(GL_ARRAY_BUFFER, xb);
+    {
+        float *m = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+        if (m)
+        {
+            for (int i = 0; i < nexpect; i++)
+                if (memcmp(&m[i], &expect[i], 4) != 0) ok = 0;
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        }
+        else ok = 0;
+    }
+    glDeleteBuffers(1, &xb);
+    glDeleteProgram(p);
+    return ok;
+}
+
+TEST(TessXfbMatrices)
+{
+    /* std140 mat2: two vec4-padded columns; capture = 4 floats column-major */
+    static const float ub2[8] = { 1,2,0,0,  3,4,0,0 };
+    static const float ex2[4] = { 1,2,3,4 };
+    /* std140 mat3: three vec4-padded columns; capture = 9 floats */
+    static const float ub3[12] = { 1,2,0,0,  3,4,0,0,  5,6,0,0 };
+    static const float ex3[9] = { 1,2,0, 3,4,0, 5,6,0 };
+    /* std140 dmat2: two dvec2 columns; capture = 4 doubles bit-exact */
+    static const double ubd[4] = { 1.0, 2.0, 3.0, 4.0 };
+    float exd[8];
+    memcpy(exd, ubd, sizeof ubd);
+
+    EXPECT_TRUE(xfb_mat_case("mat2", ub2, sizeof ub2, ex2, 4, "mat2"));
+    EXPECT_TRUE(xfb_mat_case("mat3", ub3, sizeof ub3, ex3, 9, "mat3"));
+    EXPECT_TRUE(xfb_mat_case("dmat2", ubd, sizeof ubd, exd, 8, "dmat2"));
+    return;
+}
+
+/* ------------------------------------------------------------------ TES xfb: block stride, struct, matrix array (r72)
+ * The remaining KHR enhanced_layouts shapes: an xfb BLOCK with xfb_stride=128
+ * (members pack per the block layout; the RECORD is padded to the stride),
+ * a struct varying at xfb_offset=16 (a 16 B gap), and a matrix ARRAY
+ * (column-major, contiguous per matrix).  */
+static int xfb_shape_case(const char *tes, const float *expect, int nexpect, const char *tag)
+{
+    const GLenum types[4] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER, GL_FRAGMENT_SHADER };
+    const char *srcs[4] = { kXfbMatVs, kXfbMatTcs, tes, kXfbMatFs };
+    static const float pos[6] = { -0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f };
+    GLuint p, vao, b, xb;
+    GLint link = 0;
+    int ok = 1;
+
+    p = glCreateProgram();
+    for (int i = 0; i < 4; i++)
+    {
+        GLuint so = glCreateShader(types[i]);
+        glShaderSource(so, 1, &srcs[i], NULL);
+        glCompileShader(so);
+        glAttachShader(p, so);
+        glDeleteShader(so);
+    }
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &link);
+    if (link != GL_TRUE)
+    {
+        char lg[2048] = {0}; GLsizei nn = 0;
+        glGetProgramInfoLog(p, sizeof lg - 1, &nn, lg);
+        printf("  %s LINK FAIL: %.200s\n", tag, lg);
+        glDeleteProgram(p);
+        return 0;
+    }
+    glUseProgram(p);
+    {
+        static const float uni[8] = { 1,2,3,4,  9,10,11,12 };   /* uni_gohan, uni_chichi */
+        GLuint idx = glGetUniformBlockIndex(p, "block0"), ubo;
+        if (idx != GL_INVALID_INDEX)
+        {
+            glGenBuffers(1, &ubo);
+            glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+            glBufferData(GL_UNIFORM_BUFFER, sizeof uni, uni, GL_STATIC_DRAW);
+            glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+            glUniformBlockBinding(p, idx, 0);
+        }
+    }
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, NULL);
+    glEnableVertexAttribArray(0);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    glViewport(0, 0, 200, 200);
+    glGenBuffers(1, &xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, xb);
+    glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 16384, NULL, GL_STREAM_READ);
+    glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, xb);
+    glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, 0);
+    glBeginTransformFeedback(GL_POINTS);
+    glDrawArrays(GL_PATCHES, 0, 3);
+    glEndTransformFeedback();
+    glFinish();
+    glBindBuffer(GL_ARRAY_BUFFER, xb);
+    {
+        float *m = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+        if (m)
+        {
+            for (int i = 0; i < nexpect; i++)
+                if (m[i] != expect[i]) { ok = 0; break; }
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        }
+        else ok = 0;
+    }
+    glDeleteBuffers(1, &xb);
+    glDeleteProgram(p);
+    return ok;
+}
+
+TEST(TessXfbBlockStrideStructArray)
+{
+    /* A. xfb block with xfb_stride = 128: members at bytes 0/16/32, the record
+     * padded to 128 (words 12..31 zero, vertex 1 at word 32) */
+    static float exb[44];
+    for (int i = 0; i < 44; i++) exb[i] = 0;
+    exb[0] = 1; exb[1] = 2; exb[2] = 3; exb[3] = 4;
+    exb[4] = 5; exb[5] = 6; exb[6] = 7; exb[7] = 8;
+    exb[8] = 9; exb[9] = 10; exb[10] = 11; exb[11] = 12;
+    for (int i = 0; i < 12; i++) exb[32 + i] = exb[i];
+    const char *tesb =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout (xfb_offset = 0, xfb_stride = 128) out Goku {\n"
+        "    vec4 gohan;\n"
+        "    vec4 goten;\n"
+        "    vec4 chichi;\n"
+        "} goku;\n"
+        "layout(binding = 0, std140) uniform block0 { vec4 uni_gohan; vec4 uni_chichi; };\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  goku.gohan = uni_gohan;\n"
+        "  goku.goten = vec4(5.0, 6.0, 7.0, 8.0);\n"
+        "  goku.chichi = uni_chichi;\n"
+        "}\n";
+    /* B. struct at xfb_offset = 16: words 0..3 zero, the members at 4..15 */
+    static float exs[16];
+    exs[4] = 1; exs[5] = 2; exs[6] = 3; exs[7] = 4;
+    exs[8] = 5; exs[9] = 6; exs[10] = 7; exs[11] = 8;
+    exs[12] = 9; exs[13] = 10; exs[14] = 11; exs[15] = 12;
+    const char *tess =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "struct Goku { vec4 gohan; vec4 goten; vec4 chichi; };\n"
+        "layout (xfb_offset = 16) out Goku goku;\n"
+        "layout(binding = 0, std140) uniform block0 { vec4 uni_gohan; vec4 uni_chichi; };\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  goku.gohan = uni_gohan;\n"
+        "  goku.goten = vec4(5.0, 6.0, 7.0, 8.0);\n"
+        "  goku.chichi = uni_chichi;\n"
+        "}\n";
+    /* C. matrix array: two column-major mat2 = 16 floats */
+    static const float exa[16] = { 1,2,3,4, 1,2,3,4, 1,2,3,4, 1,2,3,4 };
+    const char *tesa =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout (location = 0, xfb_offset = 0) flat out mat2 goku[2];\n"
+        "void main(){\n"
+        "  gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+        "  goku[0] = mat2(1.0, 2.0, 3.0, 4.0);\n"
+        "  goku[1] = mat2(1.0, 2.0, 3.0, 4.0);\n"
+        "}\n";
+
+    EXPECT_TRUE(xfb_shape_case(tesb, exb, 44, "block128"));
+    EXPECT_TRUE(xfb_shape_case(tess, exs, 16, "struct16"));
+    EXPECT_TRUE(xfb_shape_case(tesa, exa, 16, "mat2arr"));
+    return;
+}
+
 int main(int argc, char **argv)
 {
     if (tess_parity_child(argc, argv))
         return 0;
+    RUN(TessWideLineRange);
+    RUN(TessWideLineIsolines);
+    RUN(TessWideLineIsolinesInstanced);
+    RUN(TessWideLineIsolinesXfb);
+    RUN(TessVtgSharedShaders);
+    RUN(TessVtgExactPipeline);
+    RUN(TessXfbMatrices);
+    RUN(TessXfbBlockStrideStructArray);
+    RUN(TessWideLineGeometryOutput);
+    RUN(TessWideLineGeometryPolyline);
+    RUN(TessWideLineGeometryXfb);
+    RUN(TessWideLineIsolinesIntoGeometry);
+    RUN(TessWideLineVerticalHorizontal);
     RUN(TessInstancedPerInstanceAttrib);
     RUN(TessInstancedNoTcsDefaultLevels);
     RUN(TessInstancedPerPatchLevels);
@@ -3855,3 +5382,4 @@ int main(int argc, char **argv)
     printf("== %s: %d checks, %d failures\n", __FILE__, mgl_test_checks, mgl_test_failures);
     return mgl_test_failures != 0;
 }
+

@@ -61,6 +61,34 @@
 #define MGL_TESS_TES_CP         28      /* render stage: control point records */
 #define MGL_TESS_TES_PATCH      29      /* render stage: per-patch data blob */
 
+/* ------------------------------------------------------------------ aliased wide lines
+ * (r70, the last item of the r65 known-gap list).  Metal rasterizes only 1-px
+ * lines; MGL emulates glLineWidth(w > 1) by expanding every line segment of the
+ * LAST pre-rasterization stage's output into a screen-space quad on the GPU:
+ *
+ *   VS-only draws       the VS runs as the tessellation vertex kernel (the
+ *                       SPIRV-Cross vertex-for-tessellation capture variant every
+ *                       link already caches), so its outputs are records; a
+ *                       generated expansion kernel embeds the kernel's output
+ *                       struct and rewrites gl_Position; a generated replay vertex
+ *                       function returns the records.
+ *   tess isolines       the TES-output capture kernel (already the xfb/geometry
+ *                       producer) writes the records; the expansion runs on the
+ *                       generic word-record kernel; a generated replay vertex
+ *                       function (the mirror of the capture rewrite) feeds the FS.
+ *   geometry output     the geometry kernel's flat word records + its index list
+ *                       (MGLRenderer+Geometry.m) expand with the generic kernel
+ *                       and rasterize through the geom pass-through function.
+ *
+ * The corner positions are snapped to pixel centres and extended by half a pixel
+ * at each end, so a width-N line covers exactly N pixel columns/rows (what the
+ * dEQP LineRenderCase scan demands); the perpendicular is computed in window
+ * space, converted back and stored UNFIXED (GL clip space) so the ordinary
+ * rstate fixup applies at replay like for any vertex function.  Render-stage
+ * buffer index of the replay records: */
+#define MGL_TESS_WL_RECS        25      /* TCS-only reservation, free at the render stage */
+#define MGL_TESS_WL_MAX         64.0f   /* advertised ALIASED_LINE_WIDTH_RANGE maximum */
+
 #define MGL_TESS_MAX_PATCH_VERTICES  32 /* GL_MAX_PATCH_VERTICES */
 #define MGL_TESS_MAX_LEVEL           64 /* GL_MAX_TESS_GEN_LEVEL */
 
@@ -257,6 +285,11 @@ typedef struct MGLTessProgram_t {
     uint32_t cap_stride;                 /* record stride in words */
     MGLTessCaptureMember cap_members[MGL_TESS_CAPTURE_MAX];
     int      cap_members_n;
+    char   *wl_replay_msl;              /* r70 wide lines: cached TES-capture replay fn */
+    void   *wl_replay_function;         /* compiled replay vertex fn (renderer-owned) */
+    void   *wl_replay_library;
+    uint32_t wl_seg_cap;                /* isolines: the expansion's segment budget (0 = worst case) */
+    bool    wl_replay_failed;           /* generation failed once: stay on the native path */
     void    *capture_function;           /* compiled kernel (owned by the renderer) */
     void    *capture_library;
     void    *capture_pso;                /* id<MTLComputePipelineState>, bridged */
@@ -416,6 +449,59 @@ struct MGLExtState_tess {
         char     spirv_entry[128]; /* SPIR-V entry point of `words' */
     } vs_kernel[MGL_TESS_VS_KERNEL_CACHE];
     unsigned vs_kernel_n;
+
+    /* ---- aliased wide lines (see the MGL_TESS_WL_RECS block above): per-program
+     * replay (vertex function reading corner records), compiled from the cached
+     * vertex-kernel MSL on the first wide-line draw.  Keyed by the program NAME +
+     * the vs_kernel cache's MSL pointer (a relink re-compiles the kernel MSL, so a
+     * stale replay is detected by the msl address).  The expansion kernel itself
+     * is the shared word-record one (mgl_tess_wl_words_kernel_msl). */
+#define MGL_TESS_WL_CACHE 8
+    struct {
+        GLuint name;           /* program whose vertex stage is widened */
+        const char *msl;       /* vs_kernel cache MSL this was generated from (identity) */
+        void  *replay_library; /* id<MTLLibrary>  (bridged-retain) */
+        void  *replay_function;/* id<MTLFunction> (bridged-retain) */
+        size_t record_size;    /* bytes of one vertex record (the lifted MSL struct) */
+        size_t pos_off;        /* byte offset of [[position]] inside the record */
+    } wl[MGL_TESS_WL_CACHE];
+    unsigned wl_n;
+
+    /* THIS draw renders through the wide-line replay vertex function: set by the
+     * wideline paths right before processGLState (like cpu_render_now) so the
+     * render pipeline builds with wl_replay_function as the vertex stage. */
+    bool wl_render_now;
+    void *wl_replay_function;   /* id<MTLFunction> of THIS draw's replay (bridged-retain) */
+    void *wl_replay_library;    /* id<MTLLibrary> */
+    char wl_replay_entry[32];   /* its entry-point name (mgl_wl_replay / mgl_wl_tes_replay) */
+    size_t wl_rec_stride;       /* bytes per corner record (MGL_TESS_WL_RECS stream) */
+
+    /* isolines path: dedicated replay PSOs (see the note at the draw — the
+     * shared GL_PATCHES pipeline build cannot be reused for a record-replay
+     * vertex function) */
+#define MGL_TESS_WL_ISO_PSO 4
+    struct
+    {
+        void     *key_vf, *key_ff;
+        uint32_t  key_cpf, key_dpf, key_sc;
+        void     *pso;      /* id<MTLRenderPipelineState> (bridged-retain) */
+    } wl_iso_pso[MGL_TESS_WL_ISO_PSO];
+    unsigned wl_iso_pso_n;
+
+    /* the geometry raster pass's wideline substitution (reserved by
+     * extTessWidelineGeomReserve BEFORE the draw's first encoder opens, dispatched
+     * by extTessWidelineGeomPrepare into the geometry kernel's encoder, consumed +
+     * cleared by MGLRenderer+Geometry.m's raster pass): the ring block of corner
+     * records / identity indices / indirect args the shared expansion kernel
+     * writes.  wl_geom_active is set only once the dispatch succeeded; the ring
+     * slot (wl_geom_slot) is owned from the reserve until
+     * extTessWidelineGeomRetire. */
+    bool wl_geom_active;
+    bool wl_geom_reserved;   /* the reserve succeeded; the emit may run */
+    uint32_t wl_geom_cap_segs;   /* segment capacity the block was sized for */
+    void *wl_geom_recs, *wl_geom_idx, *wl_geom_args;   /* id<MTLBuffer> */
+    size_t wl_geom_recs_off, wl_geom_idx_off, wl_geom_args_off;
+    int wl_geom_slot;
 };
 
 /* Metal hooks of the tess domain */
@@ -424,6 +510,14 @@ struct MGLExtMetal_tess {
     bool (*draw_patches)(GLMContext ctx, bool indexed, GLenum type, size_t offset,
                          GLint first, GLsizei count, GLsizei instances,
                          GLint basevertex, GLint baseinstance);
+    /* aliased wide lines, VS-only pipelines (the program's vertex stage runs as the
+     * tessellation vertex kernel): segs is the CPU-built segment list (2 vertex
+     * indices per segment, GL vertex numbers before basevertex), nseg its length in
+     * SEGMENTS.  Returns false when the emulation cannot run (kernel not available);
+     * the caller falls back to the native 1-px path. */
+    bool (*wideline_lines)(GLMContext ctx, GLenum mode, const uint32_t *segs, uint32_t nseg,
+                           GLint vfirst, GLsizei vcount, GLsizei instances,
+                           GLint baseinstance);
 };
 
 /* tessellation.c (GL side) */
@@ -605,6 +699,57 @@ bool mgl_tess_cpu_reference(void);
 /* the cached separable vertex-kernel MSL of a vs-only program (NULL when absent);
  * a pipeline pair re-compiles canonical-record variants from it */
 const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry);
+
+/* ---- aliased wide lines (tessellation.c) ---- */
+/* true when this draw must take the wide-line emulation: a line primitive mode,
+ * line width > 1, rasterization on. */
+bool mgl_tess_wideline_active(GLMContext ctx, GLenum mode);
+/* the GL-side driver of a wide-line draw whose pipeline has no tessellation /
+ * geometry stage: builds the CPU segment list and hands it to the Metal hook.
+ * Returns false when the caller should fall back to the native 1-px draw. */
+bool mgl_tess_wideline_lines(GLMContext ctx, GLenum mode, bool indexed, GLenum type,
+                             size_t offset, GLint first, GLsizei count, GLsizei instances,
+                             GLint basevertex, GLint baseinstance);
+/* lift the stage-out struct of a vertex-kernel MSL and emit the replay vertex
+ * function reading corner records at MGL_TESS_WL_RECS.  `pos_off' returns the
+ * byte offset of the [[position]] member, `rec_size' the struct's byte size.
+ * NULL on failure; caller frees. */
+char *mgl_tess_wl_replay_msl(GLMContext ctx, Program *program, const char *kernel_msl,
+                             size_t *pos_off, size_t *rec_size);
+/* the replay vertex function reading packed TES-capture word records (the mirror
+ * of mgl_tess_capture_msl's record layout): generated from the plain TES MSL,
+ * needs the capture member table for the loads.  NULL on failure; caller frees. */
+char *mgl_tess_wl_tes_replay_msl(GLMContext ctx, MGLTessProgram *tp);
+/* one run of the shared word-record expansion kernel (Metal side fills the
+ * MTLBuffer pointers; byte offsets may be non-zero into a shared buffer).  The
+ * kernel writes 4 corner records + 6 indices per (segment, instance) pair and
+ * the 4-word DrawPrimitives indirect arguments. */
+typedef struct MGLWlExpand {
+    void   *src_recs;      /* id<MTLBuffer>: source vertex records */
+    size_t  src_off;
+    void   *segs;          /* id<MTLBuffer>: uint32 segment pairs (record indices) */
+    size_t  segs_off;
+    void   *dst_recs;      /* id<MTLBuffer>: corner records out */
+    size_t  dst_off;
+    void   *dst_idx;       /* id<MTLBuffer>: uint32 corner indices out */
+    size_t  idx_off;
+    void   *dst_args;      /* id<MTLBuffer>: indirect draw arguments out */
+    size_t  args_off;
+    void   *counts;        /* id<MTLBuffer>: GPU segment count source (flags bit 0) */
+    size_t  counts_off;
+    uint32_t nseg;         /* segments per instance (max, when flags bit 0) */
+    uint32_t vcount;       /* records per instance */
+    uint32_t instances;
+    uint32_t rec_stride;   /* bytes per record */
+    uint32_t pos_off;      /* byte offset of gl_Position (float4) */
+    uint32_t flags;        /* bit 0: nseg = counts[0]/2 (GPU-written) */
+} MGLWlExpand;
+/* the static MSL of the generic word-record expansion kernel (all paths):
+ * records = bytes, gl_Position at byte `pos_off', one record per `rec_stride'
+ * bytes; segments = uint32 pairs of record indices; writes 4 corner records +
+ * 6 indices per segment and the DrawPrimitives indirect arguments
+ * (vertexCount = 6*nseg, instanceCount = p.instances). */
+const char *mgl_tess_wl_words_kernel_msl(void);
 
 
 

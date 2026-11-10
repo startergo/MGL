@@ -287,6 +287,22 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 /* program domain: MSL-source -> MTLLibrary cache (compileShader: uses it) */
 - (id<MTLLibrary>) extProgramLibraryForMSL: (const char *)msl key: (NSString *)key error: (char **)error_log;
 /* tess domain: precise-math options for MSL carrying the fp64 df64 library */
+/* tess r70/r71 — aliased wide lines through the geometry raster pass: the geometry
+ * kernel's flat-word line records are widened into corner records by the shared
+ * expansion kernel (mgl_ext_tess.h).  extTessWidelineGeomReserve sizes + acquires
+ * the ring block BEFORE the draw's first encoder opens (a ring acquire may commit
+ * the current command buffer; committing with an open encoder wedges the ring) and
+ * extTessWidelineGeomPrepare dispatches the kernel into the geometry kernel's own
+ * encoder (dispatches are ordered only within one encoder).  The raster pass then
+ * swaps prim to Triangle and binds the substitute buffers; extTessWidelineGeomRetire
+ * releases the ring slot. */
+- (bool) extTessWidelineGeomReserve: (void *) gp idxCap: (NSUInteger) idx_cap;
+- (bool) extTessWidelineGeomPrepare: (void *) gp
+                               outv: (id<MTLBuffer>) outv outvOff: (size_t) outvOff
+                                idx: (id<MTLBuffer>) idx ctl: (id<MTLBuffer>) ctl
+                                enc: (id<MTLComputeCommandEncoder>) enc;
+- (void) extTessWidelineGeomRetire: (int) slot;
+
 - (MTLCompileOptions *) mslCompileOptionsForSource: (NSString *) src;
 -(bool)bindMTLProgram:(Program *)ptr;
 - (id)newDrawBuffer:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil;

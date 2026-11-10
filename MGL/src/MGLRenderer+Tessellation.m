@@ -34,6 +34,7 @@
 #import "mgl.h"
 #import "mgl_ext.h"
 #import "mgl_ext_tess.h"
+#import "mgl_ext_geom.h"      /* MGLGeomProgram: the geometry raster pass wideline hook (r70) */
 #include <mach/mach_time.h>   /* the opt-in CPU phase accounting (below) */
 #include <stdatomic.h>        /* the ring's claim/publish protocol (below) */
 #import "mgl_ext_queries.h"  /* tess-count queries force the exact CPU path */
@@ -2154,6 +2155,8 @@ static void tessRetireCapture(GLMContext ctx)
     off_levels_f += (off_vs_out_); off_patch_data += (off_vs_out_); \
     off_gpu_emu += (off_vs_out_); off_capture += (off_vs_out_); \
     off_capture_perm += (off_vs_out_); off_params += (off_vs_out_); \
+    off_wl_crecs += (off_vs_out_); off_wl_cidx += (off_vs_out_); \
+    off_wl_args += (off_vs_out_); \
 } while (0)
 
 - (bool) extTessDrawPatches: (bool) indexed type: (GLenum) type offset: (size_t) offset
@@ -2242,6 +2245,17 @@ static void tessRetireCapture(GLMContext ctx)
         NSLog(@"MGL tess: draw: tp=%p capture=%d point_mode=%d domain=%d", (void *)tp,
               tp->capture ? 1 : 0, tp->point_mode ? 1 : 0, (int)tp->domain);
     bool gpu_emulated = false;
+    /* r70/r71 wide lines: an isolines draw with lineWidth > 1 takes the capture
+     * + expansion + TES-replay path instead of the plain-TES 1-px render.  The
+     * emulated patch stream folds instances in (total_patches = patches *
+     * instances), so instanced draws widen too — the capture records bake the
+     * per-instance TES outputs and the expansion reads the GPU-written segment
+     * count of the whole stream (the stride + budget refinements happen once
+     * total_patches is known, below) */
+    bool wl_isolines = tp->domain == MGL_TESS_DOMAIN_ISOLINES && !tp->point_mode &&
+                       !use_cpu_reference && !use_hardware &&
+                       ctx->state.caps.rasterizer_discard != GL_TRUE &&
+                       ctx->state.var.line_width > 1.0f;
     if (tTrace())
         NSLog(@"MGL tess: draw path: cpu_ref=%d hw=%d kernels=%d capture=%d",
               (int)use_cpu_reference, (int)use_hardware, (int)tessKernels(ctx), (int)tp->capture);
@@ -2252,6 +2266,9 @@ static void tessRetireCapture(GLMContext ctx)
     size_t off_vsparams = 0, off_scanout = 0;   /* GPU-written VS parameter block + scan atomics */
     size_t off_capture = 0;         /* TES-output capture records (tp->capture) */
     size_t off_capture_perm = 0;    /* capture-only: coordinates in emission order */
+    size_t off_wl_crecs = 0;        /* r70 wide lines: expansion corner records */
+    size_t off_wl_cidx = 0;         /* identity indices */
+    size_t off_wl_args = 0;         /* expansion indirect draw arguments */
     size_t off_levels_f = 0;        /* float copy of the tess levels per patch */
     size_t cap_pub_records = 0, cap_pub_idx = 0, cap_pub_count = 0;   /* published offsets */
     uint32_t cap_pub_recs_cap = 0, cap_pub_idx_cap = 0;               /* and their capacities */
@@ -2326,6 +2343,41 @@ static void tessRetireCapture(GLMContext ctx)
         }
     }
     total_patches = patches * instances;
+
+    /* r70 wide lines (refinement): the capture record stride must be known
+     * before the ring staging below (the capture-kernel build normally computes
+     * it much later), and the worst-case expansion size — segments = icaps/2
+     * per patch, six corner records each — must fit a 16 MB share of the
+     * emulated budget; otherwise the draw keeps the plain 1-px path. */
+    if (wl_isolines)
+    {
+        if (!tp->cap_stride)
+        {
+            char *cmsl = mgl_tess_capture_msl(ctx, tp);
+
+            free(cmsl);
+        }
+        if (!tp->cap_stride)
+            wl_isolines = false;
+        /* the expansion budget: the worst case (4096 segments per patch, six
+         * corner records each) is capped at a 6 MB share of the emulated ring
+         * budget (the capture records of a many-patch draw already take most of
+         * the 64 MB); the expansion kernel clamps its segment count to what was
+         * allocated, so extreme cases render partially widened instead of the
+         * allocation pushing the draw over the budget (which would drop it to
+         * the CPU reference path) */
+        if (wl_isolines)
+        {
+            size_t per_seg = 6 * (size_t)tp->cap_stride * 4;
+            size_t worst = (size_t)total_patches * (size_t)4096;
+            size_t cap = (6u << 20) / per_seg;
+
+            if (worst > cap)
+                tp->wl_seg_cap = (uint32_t)(cap < 0xffffffffu ? cap : 0xffffffffu);
+            else
+                tp->wl_seg_cap = 0;             /* the worst case fits */
+        }
+    }
 
     if (ctx->state.program_pipeline)
     {
@@ -2539,7 +2591,7 @@ static void tessRetireCapture(GLMContext ctx)
                  * after the emulated scratch — the block must be sized for them, or the
                  * capture kernel writes past the pool buffer (records for big draws are
                  * megabytes).  The record layout is built on first use; build it now. */
-                if (!use_hardware && tp->capture)
+                if (!use_hardware && (tp->capture || wl_isolines))
                 {
                     char *cm = mgl_tess_capture_msl(ctx, tp);
                     free(cm);
@@ -2559,6 +2611,24 @@ static void tessRetireCapture(GLMContext ctx)
                         off_capture_perm = need;
                         need += tessRingAlign((size_t)total_patches *
                                   (size_t)icaps * 16);
+                        /* r70 wide lines: the expansion's corner records (6 per
+                         * segment, worst case), identity indices and draw args.
+                         * The worst case is huge for many patches (the emulated
+                         * budget is 64 MB for the whole draw) — beyond a 16 MB
+                         * share the draw keeps the plain 1-px path. */
+                        if (wl_isolines)
+                        {
+                            size_t wlsegs = (size_t)total_patches * (size_t)(icaps / 2);
+
+                            if (tp->wl_seg_cap && wlsegs > tp->wl_seg_cap)
+                                wlsegs = tp->wl_seg_cap;
+                            off_wl_crecs = need;
+                            need += tessRingAlign(wlsegs * 6 * (size_t)tp->cap_stride * 4);
+                            off_wl_cidx = need;
+                            need += tessRingAlign(wlsegs * 6 * 4);
+                            off_wl_args = need;
+                            need += tessRingAlign(16);
+                        }
                     }
                 }
                 /* the plain TES's parameter words (16 B) live in this draw's ring block:
@@ -2636,7 +2706,7 @@ static void tessRetireCapture(GLMContext ctx)
             }
             /* capture records: see the widened-index branch above (same in-block sizing
              * rule — the records follow the emulated scratch) */
-            if (!use_hardware && tp->capture)
+            if (!use_hardware && (tp->capture || wl_isolines))
             {
                 char *cm = mgl_tess_capture_msl(ctx, tp);
                 free(cm);
@@ -2654,6 +2724,22 @@ static void tessRetireCapture(GLMContext ctx)
                     off_capture_perm = need;
                     need += tessRingAlign((size_t)total_patches *
                               (size_t)icaps * 16);
+
+                    /* r70 wide lines: the expansion's corner records (6 per
+                     * segment, worst case), identity indices and draw args */
+                    if (wl_isolines)
+                    {
+                        size_t wlsegs = (size_t)total_patches * (size_t)(icaps / 2);
+
+                        if (tp->wl_seg_cap && wlsegs > tp->wl_seg_cap)
+                            wlsegs = tp->wl_seg_cap;
+                        off_wl_crecs = need;
+                        need += tessRingAlign(wlsegs * 6 * (size_t)tp->cap_stride * 4);
+                        off_wl_cidx = need;
+                        need += tessRingAlign(wlsegs * 6 * 4);
+                        off_wl_args = need;
+                        need += tessRingAlign(16);
+                    }
                 }
             }
             /* the plain TES's parameter words (16 B) live in this draw's ring block:
@@ -2741,7 +2827,7 @@ static void tessRetireCapture(GLMContext ctx)
                 need += tessRingAlign((size_t)total_patches * (4225 * 16 + 24576 * 4) + 4096);
             }
             /* capture records: see the indexed branch above (same in-block sizing rule) */
-            if (!use_hardware && tp->capture)
+            if (!use_hardware && (tp->capture || wl_isolines))
             {
                 char *cm = mgl_tess_capture_msl(ctx, tp);
                 free(cm);
@@ -2759,6 +2845,22 @@ static void tessRetireCapture(GLMContext ctx)
                     off_capture_perm = need;
                     need += tessRingAlign((size_t)total_patches *
                               (size_t)icaps * 16);
+
+                    /* r70 wide lines: the expansion's corner records (6 per
+                     * segment, worst case), identity indices and draw args */
+                    if (wl_isolines)
+                    {
+                        size_t wlsegs = (size_t)total_patches * (size_t)(icaps / 2);
+
+                        if (tp->wl_seg_cap && wlsegs > tp->wl_seg_cap)
+                            wlsegs = tp->wl_seg_cap;
+                        off_wl_crecs = need;
+                        need += tessRingAlign(wlsegs * 6 * (size_t)tp->cap_stride * 4);
+                        off_wl_cidx = need;
+                        need += tessRingAlign(wlsegs * 6 * 4);
+                        off_wl_args = need;
+                        need += tessRingAlign(16);
+                    }
                 }
             }
 
@@ -3354,6 +3456,7 @@ ph_vs = tessPhaseBegin();
     if (!use_cpu_reference && tessKernels(ctx))
     {
         struct TessKParams { uint32_t patches, domain, spacing, point_mode, ccw; } kp;
+
         if (tRingTrace())
             fprintf(stderr, "MGL ring: stage emu-entry slot=%d hw=%d cpu_ref=%d readback=%d cap=%d\n",
                     ring_slot, use_hardware, use_cpu_reference, need_readback, tp->capture ? 1 : 0);
@@ -3392,7 +3495,7 @@ ph_vs = tessPhaseBegin();
                              tp->domain == MGL_TESS_DOMAIN_ISOLINES ? 8192 : 18432);
         coords_cap_dbg = coords_cap;
         size_t need = (coords_off - emu_off) + coords_cap * 16 + indices_cap * 4;
-        if (tp->capture)
+        if (tp->capture || wl_isolines)
         {
             /* the layout (record stride) comes from the capture-kernel rewrite */
             char *cap_msl = mgl_tess_capture_msl(ctx, tp);
@@ -3409,9 +3512,14 @@ ph_vs = tessPhaseBegin();
             free(cap_msl);      /* the compile step below rebuilds it if needed */
         }
 
-        if (need <= (size_t)(64u << 20) && ring)
-        {
-            uint8_t *base8 = (uint8_t *)ring.contents;
+        /* r70: a wide-line isolines draw adds the expansion scratch; the default
+         * 64 MB emulated budget would push many-patch draws (whose capture
+         * worst case already takes most of it) to the CPU reference path —
+         * which renders 1-px lines.  Raise the ceiling for these draws: the
+         * ring grows a slot to fit, and one widened tessellated draw's scratch
+         * is transient. */
+        if (need <= (size_t)(wl_isolines ? 192u << 20 : 64u << 20) && ring)
+        {            uint8_t *base8 = (uint8_t *)ring.contents;
             uint32_t *base = (uint32_t *)(base8 + emu_off);
             if (tTrace())
                 NSLog(@"MGL tess: emu dispatch: patches=%u total=%u emu_off=%zu coords_off=%zu "
@@ -3724,6 +3832,47 @@ ph_vs = tessPhaseBegin();
         free(msl);
     }
 
+    /* r70 wide lines: the TES-capture replay vertex function — generated from the
+     * plain TES MSL (mgl_tess_wl_tes_replay_msl mirrors the capture rewrite),
+     * compiled once per program (see the MGL_TESS_WL_RECS block in mgl_ext_tess.h) */
+    if (wl_isolines && !tp->wl_replay_function && !tp->wl_replay_failed &&
+        ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->compile_msl)
+    {
+        char *rmsl = mgl_tess_wl_tes_replay_msl(ctx, tp);
+        void *lib = NULL, *fn = NULL;
+        char *err = NULL;
+
+        if (getenv("MGL_WL_DEBUG"))
+            fprintf(stderr, "MGL wl: iso replay gen=%p (failed=%d members=%d stride=%u)\n",
+                    (void *)rmsl, (int)tp->wl_replay_failed, tp->cap_members_n, tp->cap_stride);
+        if (!rmsl)
+            tp->wl_replay_failed = true;
+        else
+        {
+            if (getenv("MGL_DUMP_MSL"))
+            {
+                char path[256];
+
+                snprintf(path, sizeof path, "%s/wl_tes_replay.metal", getenv("MGL_DUMP_MSL"));
+                FILE *f = fopen(path, "w");
+                if (f) { fputs(rmsl, f); fclose(f); }
+            }
+            if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, rmsl, "mgl_wl_tes_replay",
+                                                         &lib, &fn, &err))
+            {
+                NSLog(@"MGL tess: wideline TES replay compile failed: %s", err ? err : "?");
+                free(err);
+                tp->wl_replay_failed = true;
+            }
+            else
+            {
+                tp->wl_replay_function = fn;
+                tp->wl_replay_library = lib;
+            }
+            free(rmsl);
+        }
+    }
+
     /* geom: when a geometry stage consumes the TES capture, geom_route_tess forced
      * GL_RASTERIZER_DISCARD — the plain-TES draw below would re-run the TES body a
      * SECOND time (its image atomics / SSBO stores would double:
@@ -3748,6 +3897,159 @@ ph_vs = tessPhaseBegin();
      * CPU wait) */
     if (gpu_emulated)
     {
+        /* r70 wide lines (isolines): the TES-capture records are widened into
+         * screen-space quads by the shared expansion kernel and replayed through
+         * the generated TES replay vertex function (mgl_ext_tess.h).  The capture
+         * ran in the compute stage above (wl_isolines forced it). */
+        if (wl_isolines && cap_pub_records && tp->wl_replay_function)
+        {
+            MGLWlExpand e;
+            uint32_t icaps_w = 8192;
+            GLboolean saved_cull = ctx->state.caps.cull_face;
+            id<MTLRenderCommandEncoder> enc;
+
+            if (getenv("MGL_WL_DEBUG"))
+                fprintf(stderr, "MGL wl: iso branch (wl=%d cap=%zu fn=%p)\n",
+                        (int)wl_isolines, cap_pub_records, tp->wl_replay_function);
+
+
+            memset(&e, 0, sizeof e);
+            e.src_recs = (__bridge void *)ring; e.src_off = cap_pub_records;
+            e.segs = (__bridge void *)ring; e.segs_off = cap_pub_idx;
+            e.dst_recs = (__bridge void *)ring; e.dst_off = off_wl_crecs;
+            e.dst_idx = (__bridge void *)ring; e.idx_off = off_wl_cidx;
+            e.dst_args = (__bridge void *)ring; e.args_off = off_wl_args;
+            e.counts = (__bridge void *)ring; e.counts_off = cap_pub_count;
+            {
+                uint64_t wlsegs = (uint64_t)total_patches * (icaps_w / 2);
+
+                if (tp->wl_seg_cap && wlsegs > tp->wl_seg_cap)
+                    wlsegs = tp->wl_seg_cap;
+                e.nseg = (uint32_t)wlsegs;
+            }
+            e.vcount = 1;                       /* global indices (1 instance) */
+            e.instances = 1;
+            e.rec_stride = tp->cap_stride * 4;
+            e.pos_off = 0;                      /* gl_Position is record word 0 */
+            e.flags = 3;                        /* nseg from the GPU count; identity pairs */
+            if (![self extTessWlExpand: ctx expand: &e on: _currentCommandBuffer enc: nil])
+            {
+                wl_isolines = false;            /* fall through to the plain draw */
+            }
+            else
+            {
+                ctx->state.caps.cull_face = GL_FALSE;   /* lines are never culled */
+                ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+                S->wl_render_now = true;
+                S->wl_replay_function = tp->wl_replay_function;
+                S->wl_replay_library = tp->wl_replay_library;
+                snprintf(S->wl_replay_entry, sizeof S->wl_replay_entry, "mgl_wl_tes_replay");
+                if (![self processGLState: true])
+                {
+                    ctx->state.caps.cull_face = saved_cull;
+                    S->wl_render_now = false;
+                    tessRingRetireOn(_currentCommandBuffer, ring_slot);
+                    return false;
+                }
+                enc = _currentRenderEncoder;
+                if (enc)
+                {
+                    /* dedicated PSO: the shared pipeline build attaches the app
+                     * vertex descriptor / tessellation fields for GL_PATCHES draws
+                     * (extTessActive), which a record-replay vertex function
+                     * cannot take — Metal drops the draw (an inputPrimitiveTopology
+                     * of Line on a non-patch function renders nothing).  The PSO is
+                     * cached by (replay fn, FS fn, formats). */
+                    id<MTLFunction> vfn = (__bridge id<MTLFunction>)tp->wl_replay_function;
+                    Shader *fsh = ctx->state.program
+                                      ? ctx->state.program->shader_slots[_FRAGMENT_SHADER]
+                                      : NULL;
+                    id<MTLFunction> ffn = fsh ? (__bridge id<MTLFunction>)fsh->mtl_data.function : nil;
+                    MTLPixelFormat cpf = _renderPassDescriptor.colorAttachments[0].texture
+                                             ? _renderPassDescriptor.colorAttachments[0].texture.pixelFormat
+                                             : MTLPixelFormatBGRA8Unorm;
+                    MTLPixelFormat dpf = _renderPassDescriptor.depthAttachment.texture
+                                             ? _renderPassDescriptor.depthAttachment.texture.pixelFormat
+                                             : MTLPixelFormatInvalid;
+                    NSUInteger sc = _renderPassDescriptor.colorAttachments[0].texture
+                                        ? _renderPassDescriptor.colorAttachments[0].texture.sampleCount
+                                        : 1;
+                    id<MTLRenderPipelineState> pso = nil;
+
+                    for (unsigned q = 0; q < S->wl_iso_pso_n && q < 4; q++)
+                        if (S->wl_iso_pso[q].key_vf == (__bridge void *)vfn &&
+                            S->wl_iso_pso[q].key_ff == (__bridge void *)ffn &&
+                            S->wl_iso_pso[q].key_cpf == (uint32_t)cpf &&
+                            S->wl_iso_pso[q].key_dpf == (uint32_t)dpf &&
+                            S->wl_iso_pso[q].key_sc == (uint32_t)sc)
+                        {
+                            pso = (__bridge id<MTLRenderPipelineState>)S->wl_iso_pso[q].pso;
+                            break;
+                        }
+                    if (!pso)
+                    {
+                        MTLRenderPipelineDescriptor *dpd = [[MTLRenderPipelineDescriptor alloc] init];
+
+                        dpd.vertexFunction = vfn;
+                        dpd.fragmentFunction = ffn;
+                        dpd.rasterSampleCount = sc;
+                        dpd.colorAttachments[0].pixelFormat = cpf;
+                        if (dpf != MTLPixelFormatInvalid)
+                        {
+                            dpd.depthAttachmentPixelFormat = dpf;
+                            if (dpf == MTLPixelFormatDepth32Float_Stencil8 ||
+                                dpf == MTLPixelFormatDepth24Unorm_Stencil8)
+                                dpd.stencilAttachmentPixelFormat = dpf;
+                        }
+                        /* the blend / write-mask state of the shared pipeline
+                         * build (the dEQP wide-line pattern renders additively —
+                         * without it the second draw's quads would replace the
+                         * first's pixels).  The shared configure ALSO
+                         * specialises the program's own vertex stage into the
+                         * descriptor (the plain TES here) and attaches the
+                         * tessellation vertex descriptor / topology, none of
+                         * which a record-replay vertex function may carry —
+                         * restore the replay pair afterwards. */
+                        [self bindBlendStateToPipelineStateDescriptor: dpd];
+                        dpd.vertexFunction = vfn;
+                        dpd.fragmentFunction = ffn;
+                        dpd.vertexDescriptor = nil;
+                        dpd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
+                        NSError *perr = nil;
+                        pso = [_device newRenderPipelineStateWithDescriptor: dpd error: &perr];
+                        if (pso && S->wl_iso_pso_n < 4)
+                        {
+                            S->wl_iso_pso[S->wl_iso_pso_n].key_vf = (__bridge void *)vfn;
+                            S->wl_iso_pso[S->wl_iso_pso_n].key_ff = (__bridge void *)ffn;
+                            S->wl_iso_pso[S->wl_iso_pso_n].key_cpf = (uint32_t)cpf;
+                            S->wl_iso_pso[S->wl_iso_pso_n].key_dpf = (uint32_t)dpf;
+                            S->wl_iso_pso[S->wl_iso_pso_n].key_sc = (uint32_t)sc;
+                            S->wl_iso_pso[S->wl_iso_pso_n].pso = (__bridge_retained void *)pso;
+                            S->wl_iso_pso_n++;
+                        }
+                        else if (!pso)
+                            NSLog(@"MGL tess: wideline isolines PSO failed: %@",
+                                  perr.localizedDescription);
+                    }
+                    if (pso)
+                        [enc setRenderPipelineState: pso];
+                    [enc setVertexBuffer: ring offset: off_wl_crecs atIndex: MGL_TESS_WL_RECS];
+                    [enc drawIndexedPrimitives: MTLPrimitiveTypeTriangle
+                                     indexType: MTLIndexTypeUInt32
+                                   indexBuffer: ring
+                             indexBufferOffset: off_wl_cidx
+                                indirectBuffer: ring
+                          indirectBufferOffset: off_wl_args];
+                }
+                ctx->state.caps.cull_face = saved_cull;
+                S->wl_render_now = false;
+                ctx->state.dirty_bits |= DIRTY_PROGRAM;
+                [self endRenderEncoding];
+                tessRingRetireOn(_currentCommandBuffer, ring_slot);
+                return enc != nil;
+            }
+        }
+
         {
             id<MTLRenderCommandEncoder> enc;
 
@@ -4398,6 +4700,539 @@ static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_
 
 #pragma mark ext hooks
 
+/* ------------------------------------------------------------------ aliased wide lines
+ * (r70).  See the MGL_TESS_WL_RECS block in mgl_ext_tess.h.  This section: the
+ * shared expansion-kernel PSO, the per-program VS replay cache, the VS-path draw
+ * driver and the isolines integration helper used by extTessDrawPatches. */
+
+static id<MTLComputePipelineState> gWlWordsPso;
+
+static id<MTLComputePipelineState> tessWlWordsPSO(id<MTLDevice> device)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    id<MTLFunction> fn;
+
+    if (gWlWordsPso)
+        return gWlWordsPso;
+    lib = [device newLibraryWithSource: [NSString stringWithUTF8String: mgl_tess_wl_words_kernel_msl()]
+                               options: nil error: &err];
+    if (!lib)
+    {
+        NSLog(@"MGL tess: wideline expansion kernel compile failed: %@",
+              err ? err.localizedDescription : @"nil");
+        return nil;
+    }
+    fn = [lib newFunctionWithName: @"mgl_wl_expand_words"];
+    gWlWordsPso = [device newComputePipelineStateWithFunction: fn error: &err];
+    if (!gWlWordsPso)
+    {
+        NSLog(@"MGL tess: wideline expansion PSO failed: %@",
+              err ? err.localizedDescription : @"nil");
+        return nil;
+    }
+    return gWlWordsPso;
+}
+
+/* one dispatch of the shared expansion kernel (params from GL state: line width,
+ * viewport, clip control).  Returns false on encoder/PSO failure. */
+- (bool) extTessWlExpand: (GLMContext) ctx expand: (const MGLWlExpand *) e
+                      on: (id<MTLCommandBuffer>) cb
+                     enc: (id<MTLComputeCommandEncoder>) join
+{
+    id<MTLComputePipelineState> pso = tessWlWordsPSO(_device);
+    id<MTLComputeCommandEncoder> enc;
+    struct
+    {
+        float vp_origin[2], vp_size[2];
+        float half_width;
+        uint32_t nseg, vcount, instances, total;
+        uint32_t rec_stride, pos_off, flip_y, flags;
+    } p;
+    const GLint *vp = &ctx->state.viewport[0];
+    float w = ctx->state.var.line_width;
+    uint32_t width_px = (uint32_t)(w + 0.5f);
+
+    if (!pso || !cb)
+        return false;
+    if (width_px < 2)
+        width_px = 2;
+
+    /* the viewport the raster pass will use (rstate: the Metal viewport IS the GL
+     * viewport, one per viewport index; the row flip lives in the vertex fixup) */
+    p.vp_origin[0] = (float)vp[0];
+    p.vp_origin[1] = (float)vp[1];
+    p.vp_size[0] = (float)vp[2];
+    p.vp_size[1] = (float)vp[3];
+    p.half_width = (float)width_px * 0.5f - 0.25f;
+    p.nseg = e->nseg;
+    p.vcount = e->vcount;
+    p.instances = e->instances ? e->instances : 1;
+    p.total = p.nseg * p.instances;
+    p.rec_stride = e->rec_stride;
+    p.pos_off = e->pos_off;
+    p.flip_y = 1;   /* GL default clip origin LOWER_LEFT (glClipControl's flip is
+                     * part of the fixup; the expansion mirrors the default) */
+    p.flags = e->flags;
+    if (e->flags & 1)
+        p.total = 0xffffffffu;      /* guard: the kernel derives it from the count */
+
+    if (join)
+        enc = join;
+    else
+    {
+        enc = [cb computeCommandEncoder];
+        if (!enc)
+            return false;
+    }
+    [enc setComputePipelineState: pso];
+    [enc setBuffer: (__bridge id<MTLBuffer>)e->src_recs offset: e->src_off atIndex: 0];
+    [enc setBuffer: (__bridge id<MTLBuffer>)e->segs offset: e->segs_off atIndex: 1];
+    [enc setBuffer: (__bridge id<MTLBuffer>)e->dst_recs offset: e->dst_off atIndex: 2];
+    [enc setBuffer: (__bridge id<MTLBuffer>)e->dst_idx offset: e->idx_off atIndex: 3];
+    [enc setBuffer: (__bridge id<MTLBuffer>)e->dst_args offset: e->args_off atIndex: 4];
+    [enc setBytes: &p length: sizeof p atIndex: 5];
+    if (e->counts)
+        [enc setBuffer: (__bridge id<MTLBuffer>)e->counts offset: e->counts_off atIndex: 6];
+    else
+    {
+        id<MTLBuffer> zb = [_device newBufferWithLength: 4 options: MTLResourceStorageModeShared];
+
+        [enc setBuffer: zb offset: 0 atIndex: 6];
+    }
+    {
+        /* one thread per (segment, instance); the GPU-count path dispatches the
+         * worst case, extra threads exit on the count guard */
+        uint32_t threads = (e->flags & 1) ? p.nseg * p.instances : p.total;
+
+        if (threads < 64)
+            threads = 64;
+        [enc dispatchThreads: MTLSizeMake(threads, 1, 1)
+             threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
+    }
+    if (!join)
+        [enc endEncoding];
+    return true;
+}
+
+/* resolve (build + cache) the wide-line replay vertex function of a program's
+ * vertex stage; on success the ext state's per-draw wl_* fields are set for the
+ * pipeline build.  Returns the cache slot or -1. */
+- (int) extTessWlReplayVS: (GLMContext) ctx program: (Program *) program
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    const char *kmsl = NULL, *entry = NULL;
+    size_t pos_off = 0, rec_size = 0;
+    char *rmsl, *patched;
+    void *lib = NULL, *fn = NULL;
+    char *err = NULL;
+    int slot = -1, i;
+
+    if (!S || !program || !ctx->mtl_funcs.ext_program || !ctx->mtl_funcs.ext_program->compile_msl)
+        return -1;
+    kmsl = mgl_tess_vs_kernel_msl(ctx, program->name, &entry);
+    if (!kmsl)
+        return -1;
+
+    for (i = 0; (uint32_t)i < S->wl_n; i++)
+        if (S->wl[i].name == program->name && S->wl[i].msl == kmsl && S->wl[i].replay_function)
+        {
+            S->wl_replay_function = S->wl[i].replay_function;
+            S->wl_replay_library = S->wl[i].replay_library;
+            snprintf(S->wl_replay_entry, sizeof S->wl_replay_entry, "mgl_wl_replay");
+            S->wl_rec_stride = S->wl[i].record_size;
+            S->wl_render_now = true;
+            return i;
+        }
+
+    if (getenv("MGL_DUMP_MSL"))
+    {
+        char path[256];
+
+        snprintf(path, sizeof path, "%s/wl_vs_kernel.metal", getenv("MGL_DUMP_MSL"));
+        FILE *f = fopen(path, "w");
+        if (f) { fputs(kmsl, f); fclose(f); }
+    }
+    rmsl = mgl_tess_wl_replay_msl(ctx, program, kmsl, &pos_off, &rec_size);
+    if (!rmsl)
+        return -1;
+    patched = mgl_rstate_patch_vertex_msl(rmsl, "mgl_wl_replay");
+    if (patched)
+    {
+        free(rmsl);
+        rmsl = patched;
+    }
+    if (getenv("MGL_DUMP_MSL"))
+    {
+        char path[256];
+
+        snprintf(path, sizeof path, "%s/wl_replay_vs.metal", getenv("MGL_DUMP_MSL"));
+        FILE *f = fopen(path, "w");
+        if (f) { fputs(rmsl, f); fclose(f); }
+    }
+    if (!ctx->mtl_funcs.ext_program->compile_msl(ctx, rmsl, "mgl_wl_replay", &lib, &fn, &err))
+    {
+        NSLog(@"MGL tess: wideline VS replay compile failed: %s", err ? err : "?");
+        free(err);
+        free(rmsl);
+        return -1;
+    }
+    free(rmsl);
+
+    /* store: round-robin eviction (release the bridged objects) */
+    slot = (S->wl_n < MGL_TESS_WL_CACHE) ? (int)S->wl_n++ : (int)(S->wl_n - 1);
+    if (S->wl_n >= MGL_TESS_WL_CACHE) S->wl_n = MGL_TESS_WL_CACHE - 1;
+    if (slot >= (int)MGL_TESS_WL_CACHE - 1 && S->wl[MGL_TESS_WL_CACHE - 1].replay_function)
+    {
+        void *objs[2] = { S->wl[MGL_TESS_WL_CACHE - 1].replay_library,
+                          S->wl[MGL_TESS_WL_CACHE - 1].replay_function };
+        if (ctx->mtl_funcs.ext_program->release_obj)
+            for (i = 0; i < 2; i++)
+                if (objs[i]) ctx->mtl_funcs.ext_program->release_obj(ctx, objs[i]);
+    }
+    S->wl[slot].name = program->name;
+    S->wl[slot].msl = kmsl;
+    S->wl[slot].replay_library = lib;
+    S->wl[slot].replay_function = fn;
+    S->wl[slot].record_size = rec_size;
+    S->wl[slot].pos_off = pos_off;
+
+    S->wl_replay_function = fn;
+    S->wl_replay_library = lib;
+    snprintf(S->wl_replay_entry, sizeof S->wl_replay_entry, "mgl_wl_replay");
+    S->wl_rec_stride = rec_size;
+    S->wl_render_now = true;
+    return slot;
+}
+
+/* the VS-path wide-line draw (GL_LINES-family with lineWidth > 1 and no
+ * tessellation/geometry stage): the vertex kernel writes the stage's output
+ * records, the shared expansion kernel widens them into corner records, and the
+ * replay vertex function rasterizes the quads. */
+- (bool) extTessWidelineLines: (GLMContext) ctx mode: (GLenum) mode
+                           segs: (const uint32_t *) segs nseg: (uint32_t) nseg
+                        vfirst: (GLint) vfirst vcount: (GLsizei) vcount
+                      instances: (GLsizei) instances baseinstance: (GLint) baseinstance
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    Program *program = ctx->state.program;
+    int wslot;
+    TessVSPlan plan;
+    id<MTLComputePipelineState> pso;
+    id<MTLBuffer> ring;
+    int ring_slot = -1;
+    size_t base, need = 0, off_segs, off_recs, off_crecs, off_cidx, off_args;
+    size_t rec_size, pos_off;
+    GLsizei inst = instances > 0 ? instances : 1;
+    id<MTLCommandBuffer> compute_cb;
+    id<MTLRenderCommandEncoder> enc;
+    MGLWlExpand e;
+    GLboolean saved_cull;
+
+    if (!program)
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail program\n");
+        return false;
+    }
+    wslot = [self extTessWlReplayVS: ctx program: program];
+    if (wslot < 0)
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail replay\n");
+        return false;
+    }
+    rec_size = S->wl[wslot].record_size;
+    pos_off = S->wl[wslot].pos_off;
+
+    if (!tessBuildVSPlan(ctx, program, &plan, vfirst, baseinstance))
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail plan\n");
+        return false;
+    }
+    pso = tessVsPSO(ctx, _device, program, &plan, NULL);
+    if (!pso)
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail pso\n");
+        return false;
+    }
+
+    /* ring block: segment list | vertex records | corner records (6/segment) | identity indices | args */
+    need = tessRingAlign((size_t)nseg * 2 * 4);
+    off_segs = need;
+    need += tessRingAlign((size_t)vcount * inst * rec_size);
+    off_recs = need;
+    need += tessRingAlign((size_t)nseg * inst * 6 * rec_size);
+    off_crecs = need;
+    need += tessRingAlign((size_t)nseg * inst * 6 * rec_size); /* 6 corner records/segment */
+    off_cidx = need;
+    need += tessRingAlign((size_t)nseg * inst * 6 * 4);        /* 6 identity indices/segment */
+    need += tessRingAlign(16);
+    off_args = need;
+    ring = tessRingAcquire(_device, need + 1024, &base, &ring_slot, self);
+    if (!ring)
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail ring (%zu bytes)\n", need);
+        return false;
+    }
+
+    /* CPU segment list upload (shared storage) */
+    memcpy((uint8_t *)ring.contents + base + off_segs, segs, (size_t)nseg * 2 * 4);
+
+    /* 1. the vertex kernel over (vcount, instances) — mirror of the tess draw path:
+     * kernels and the render pass share one command buffer, Metal runs the
+     * encoders in order, so the records are complete before the raster pass.
+     * The render encoder of an earlier draw must be closed first and the buffer
+     * it belongs to flushed (the renderer's own helpers — a raw commit leaves
+     * the framebuffer/serial bookkeeping behind, and a THIRD render encoder on
+     * one command buffer proved not to execute, see MGLRenderer+Geometry.m):
+     * every wide-line draw gets its own buffer; later draws append to the new
+     * render encoder as usual. */
+    [self endRenderEncoding];
+    [self flushCommandBuffer: NO];
+    [self newCommandBuffer];
+    compute_cb = _currentCommandBuffer;
+    if (!compute_cb || compute_cb.status >= MTLCommandBufferStatusCommitted)
+    {
+        compute_cb = [_commandQueue commandBuffer];
+        _currentCommandBuffer = compute_cb;
+    }
+    {
+        id<MTLComputeCommandEncoder> senc = [compute_cb computeCommandEncoder];
+        uint32_t params[4] = { (uint32_t)vfirst, (uint32_t)vcount, (uint32_t)inst,
+                               (uint32_t)baseinstance };
+
+        [senc setComputePipelineState: pso];
+        tessBindStageUniforms(ctx, senc, program, _VERTEX_SHADER);
+        tessBindStageTextures(ctx, senc, program, _VERTEX_SHADER);
+        if (program->uses_draw_params)
+        {
+            uint32_t dp[2] = { S->draw_id, (uint32_t)S->draw_base_vertex };
+
+            [senc setBytes: dp length: sizeof dp atIndex: MGL_DRAW_PARAMS_KERNEL];
+        }
+        if (!tessBindVSAttributes(ctx, senc, &plan, (GLuint)vcount))
+        {
+            if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail attrs\n");
+            [senc endEncoding];
+            tessRingRetireOn(compute_cb, ring_slot);
+            return false;
+        }
+        [senc setBuffer: ring offset: base + off_recs atIndex: MGL_TESS_VS_OUT_BUF];
+        [senc setBytes: params length: sizeof params atIndex: MGL_TESS_VS_PARAMS];
+        [senc setStageInRegion: MTLRegionMake2D(0, 0, (NSUInteger)vcount, (NSUInteger)inst)];
+        [senc dispatchThreadgroups: MTLSizeMake((NSUInteger)vcount, (NSUInteger)inst, 1)
+              threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+        [senc endEncoding];
+    }
+
+    /* 2. the shared expansion kernel over (segments x instances) */
+    memset(&e, 0, sizeof e);
+    e.src_recs = (__bridge void *)ring; e.src_off = base + off_recs;
+    e.segs = (__bridge void *)ring; e.segs_off = base + off_segs;
+    e.dst_recs = (__bridge void *)ring; e.dst_off = base + off_crecs;
+    e.dst_idx = (__bridge void *)ring; e.idx_off = base + off_cidx;
+    e.dst_args = (__bridge void *)ring; e.args_off = base + off_args;
+    e.nseg = nseg;
+    e.vcount = (uint32_t)vcount;
+    e.instances = (uint32_t)inst;
+    e.rec_stride = (uint32_t)rec_size;
+    e.pos_off = (uint32_t)pos_off;
+    if (![self extTessWlExpand: ctx expand: &e on: compute_cb enc: nil])
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: fail expand\n");
+        tessRingRetireOn(compute_cb, ring_slot);
+        return false;
+    }
+
+    /* 3. render: processGLState opens the render pass (into the same command
+     * buffer, after the compute encoders); the pipeline builds with the replay
+     * function (wl_render_now).  Culling is suppressed — a widened line is still
+     * a line primitive to GL and is never culled. */
+    saved_cull = ctx->state.caps.cull_face;
+    ctx->state.caps.cull_face = GL_FALSE;
+    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+    if (![self processGLState: true])
+    {
+        ctx->state.caps.cull_face = saved_cull;
+        tessRingRetireOn(_currentCommandBuffer, ring_slot);
+        S->wl_render_now = false;
+        return false;
+    }
+    enc = _currentRenderEncoder;
+    if (enc)
+    {
+        [enc setVertexBuffer: ring offset: base + off_crecs atIndex: MGL_TESS_WL_RECS];
+        [enc drawIndexedPrimitives: MTLPrimitiveTypeTriangle
+                         indexType: MTLIndexTypeUInt32
+                       indexBuffer: ring
+                 indexBufferOffset: base + off_cidx
+                    indirectBuffer: ring
+              indirectBufferOffset: base + off_args];
+    }
+    /* every MGL draw ends its render encoder — a pending glClear of the NEXT
+     * draw becomes the load action of the pass it opens, and the draw paths
+     * assume a fresh pass; leaving it open loses that clear and the next draw */
+    [self endRenderEncoding];
+    ctx->state.caps.cull_face = saved_cull;
+    S->wl_render_now = false;
+    /* the NEXT draw must not inherit this pass's pipeline (the replay vertex
+     * function + nil vertex descriptor): force the pipeline rebuild */
+    ctx->state.dirty_bits |= DIRTY_PROGRAM;
+    tessRingRetireOn(_currentCommandBuffer, ring_slot);
+    return enc != nil;
+}
+
+/* C shim of the VS-path wide-line draw (mgl_ext_tess.h hook table) */
+static bool c_wideline_lines(GLMContext ctx, GLenum mode, const uint32_t *segs, uint32_t nseg,
+                             GLint vfirst, GLsizei vcount, GLsizei instances, GLint baseinstance);
+
+/* ------------------------------------------------------------------ geometry raster pass
+ * (r70/r71): glLineWidth(w > 1) on a geometry stage's line output — the geometry
+ * kernel's records (gOutv) and its segment index list (gIdx) are widened by the
+ * shared word-record expansion kernel; the pass-through vertex function replays
+ * the corner records unchanged.  The line-segment count is GPU-written (the
+ * kernel's indirect arguments), so the expansion takes it from the args buffer.
+ *
+ * The dispatch JOINS the geometry kernel's compute encoder: Metal orders
+ * dispatches — and their memory effects — only within one encoder; a separate
+ * encoder would race the kernel's record/index writes (the geometry domain
+ * relies on the same rule for its counter block).  The ring block the corner
+ * records land in, on the other hand, may only be acquired while NO encoder is
+ * open: under ring pressure tessRingAcquire ends the render encoding and
+ * commits the current command buffer so completion handlers can retire slots,
+ * and a commit with a still-open compute encoder wedges those slots (their
+ * handlers can never fire — the r70 "joined encoder deadlock").  So the hook is
+ * split in two:
+ *   extTessWidelineGeomReserve — geomDraw calls it right after the draw's
+ *       sizing, before the first encoder opens and before the geometry pools
+ *       are sub-allocated.  A commit there is safe (no encoder, no pool pins
+ *       yet; geomMarkPools records the true consumer later), and geomDraw's
+ *       command-buffer re-check that follows re-opens one.
+ *   extTessWidelineGeomPrepare — the dispatch itself, joining the kernel
+ *       encoder; it touches no ring state (no acquire, no commit, no wait). */
+- (bool) extTessWidelineGeomReserve: (void *) gp_v idxCap: (NSUInteger) idx_cap
+{
+    GLMContext ctx = MGLgetCurrentContext();
+    MGLGeomProgram *gp = (MGLGeomProgram *)gp_v;
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)(ctx ? ctx->state.ext_tess : NULL);
+    size_t cap_segs, need, base = 0, off_crecs, off_cidx, off_args;
+    id<MTLBuffer> ring;
+    int slot = -1;
+
+    if (S)
+    {
+        S->wl_geom_active = false;
+        /* self-heal: a draw that bailed between reserve and emit leaves the slot
+         * set; release whatever generation still holds it (at most one slot can
+         * leak this way, and only on an error path) */
+        if (S->wl_geom_slot >= 0)
+            tessRingRetireOn(_currentCommandBuffer, S->wl_geom_slot);
+        S->wl_geom_slot = -1;
+        S->wl_geom_reserved = false;
+    }
+    if (!S || !gp || !ctx->mtl_funcs.ext_tess)
+        return false;
+    if (!(ctx->state.var.line_width > 1.0f))
+        return false;
+    if (ctx->state.caps.rasterizer_discard == GL_TRUE)
+        return false;       /* nothing rasterizes: the native path is free */
+    if (gp->out_type != GL_LINE_STRIP && gp->out_type != GL_LINES)
+        return false;
+    if (!tessWlWordsPSO(_device))
+        return false;       /* warm the shared kernel outside any encoder */
+
+    /* worst case: the raster index list's capacity in segments (two u32 per
+     * segment); the kernel clamps to the GPU-written count */
+    cap_segs = idx_cap / 2;
+    if (cap_segs > (1u << 21))
+        cap_segs = 1u << 21;                     /* ring sanity cap */
+    /* budget cap (the isolines path's policy): an absurd draw widens partially
+     * rather than growing the ring by hundreds of MB */
+    while (cap_segs > 1 && cap_segs * 6 * (size_t)gp->out_words * 4 > (16u << 20))
+        cap_segs /= 2;
+    /* the layout must be sequential: records first, then the identity indices,
+     * then the indirect arguments.  (r70 started the records at
+     * align(records_size) — the region then ran PAST the index region that
+     * followed it, and the identity indices overwrote the tail records of any
+     * draw with more than a couple of segments; the r70 gate kept it hidden.) */
+    off_crecs = 0;
+    need = tessRingAlign(cap_segs * 6 * (size_t)gp->out_words * 4);
+    off_cidx = need;
+    need += tessRingAlign(cap_segs * 6 * 4);
+    off_args = need;
+    need += 16;
+
+    ring = tessRingAcquire(_device, need + 1024, &base, &slot, self);
+    if (!ring)
+        return false;       /* the raster pass draws the native line */
+
+    S->wl_geom_reserved = true;
+    S->wl_geom_cap_segs = (uint32_t)cap_segs;
+    S->wl_geom_recs = (__bridge void *)ring;
+    S->wl_geom_idx = (__bridge void *)ring;
+    S->wl_geom_args = (__bridge void *)ring;
+    S->wl_geom_recs_off = base + off_crecs;
+    S->wl_geom_idx_off = base + off_cidx;
+    S->wl_geom_args_off = base + off_args;
+    S->wl_geom_slot = slot;
+    return true;
+}
+
+- (bool) extTessWidelineGeomPrepare: (void *) gp_v
+                               outv: (id<MTLBuffer>) outv outvOff: (size_t) outvOff
+                                idx: (id<MTLBuffer>) idx ctl: (id<MTLBuffer>) ctl
+                                enc: (id<MTLComputeCommandEncoder>) enc
+{
+    GLMContext ctx = MGLgetCurrentContext();
+    MGLGeomProgram *gp = (MGLGeomProgram *)gp_v;
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)(ctx ? ctx->state.ext_tess : NULL);
+    MGLWlExpand e;
+    int slot;
+
+    if (!S || !gp || !outv || !idx || !ctl || !enc || !ctx->mtl_funcs.ext_tess)
+        return false;
+    if (!S->wl_geom_reserved || S->wl_geom_slot < 0)
+        return false;       /* the reserve declined (or never ran): native path */
+
+    slot = S->wl_geom_slot;
+    memset(&e, 0, sizeof e);
+    e.src_recs = (__bridge void *)outv; e.src_off = outvOff;
+    e.segs = (__bridge void *)idx; e.segs_off = 0;
+    e.dst_recs = S->wl_geom_recs; e.dst_off = S->wl_geom_recs_off;
+    e.dst_idx = S->wl_geom_idx; e.idx_off = S->wl_geom_idx_off;
+    e.dst_args = S->wl_geom_args; e.args_off = S->wl_geom_args_off;
+    e.counts = (__bridge void *)ctl; e.counts_off = MGL_GEOM_ARG_OFFSET * 4;
+    e.nseg = S->wl_geom_cap_segs;
+    e.vcount = 1;                     /* the index list references records absolutely */
+    e.instances = 1;
+    e.rec_stride = gp->out_words * 4;
+    e.pos_off = gp->out_pos_off * 4;
+    e.flags = 1;                      /* nseg from the GPU-written index count */
+    if (![self extTessWlExpand: ctx expand: &e on: _currentCommandBuffer enc: enc])
+    {
+        tessRingRetireOn(_currentCommandBuffer, slot);
+        S->wl_geom_slot = -1;
+        S->wl_geom_reserved = false;
+        return false;                 /* the raster pass draws the native line */
+    }
+
+    S->wl_geom_active = true;
+    return true;
+}
+
+- (void) extTessWidelineGeomRetire: (int) slot
+{
+    GLMContext ctx = MGLgetCurrentContext();
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)(ctx ? ctx->state.ext_tess : NULL);
+
+    tessRingRetireOn(_currentCommandBuffer, slot);
+    if (S && S->wl_geom_slot == slot)
+    {
+        S->wl_geom_slot = -1;
+        S->wl_geom_reserved = false;
+        S->wl_geom_active = false;
+    }
+}
+
 - (void) bindExtTessFuncsToGLMContext: (GLMContext) glm_ctx
 {
     if (!glm_ctx->mtl_funcs.ext_tess)
@@ -4405,6 +5240,7 @@ static bool tessDrawPatchesHook(GLMContext ctx, bool indexed, GLenum type, size_
     if (!glm_ctx->mtl_funcs.ext_tess)
         return;
     glm_ctx->mtl_funcs.ext_tess->draw_patches = tessDrawPatchesHook;
+    glm_ctx->mtl_funcs.ext_tess->wideline_lines = c_wideline_lines;
 }
 
 
@@ -4704,6 +5540,13 @@ static MTLVertexFormat tessMemberFormat(const char *type)
             pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
             break;
         case GL_LINES: case GL_LINE_STRIP: case GL_LINE_LOOP:
+            /* a wide-line replay pass rasterizes the expansion's TRIANGLE quads,
+             * whatever GL mode produced the segments */
+            if (ctx->state.ext_tess && ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_render_now)
+            {
+                pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+                break;
+            }
             pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
             break;
         case GL_PATCHES:
@@ -4737,6 +5580,19 @@ static MTLVertexFormat tessMemberFormat(const char *type)
  * precise math instead.  All other sources keep the historic default
  * (options:nil), so the default fp64 path is unaffected.
  */
+/* C shim of the VS-path wide-line draw (mgl_ext_tess.h hook table) */
+static bool c_wideline_lines(GLMContext ctx, GLenum mode, const uint32_t *segs, uint32_t nseg,
+                             GLint vfirst, GLsizei vcount, GLsizei instances, GLint baseinstance)
+{
+    MGLRenderer *r = (__bridge MGLRenderer *)ctx->mtl_funcs.mtlObj;
+
+    if (!r)
+        return false;
+    return [r extTessWidelineLines: ctx mode: mode segs: segs nseg: nseg
+                            vfirst: vfirst vcount: vcount
+                         instances: instances baseinstance: baseinstance];
+}
+
 - (MTLCompileOptions *) mslCompileOptionsForSource: (NSString *) src
 {
     if (!src || [src rangeOfString: @"df64_"].location == NSNotFound)

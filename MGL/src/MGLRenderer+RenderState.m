@@ -924,6 +924,26 @@ static bool rs_mode_is_polygon(GLenum m)
             id<MTLFunction> vf = [self rstateSpecialize: &standin stage: _TESS_EVALUATION_SHADER];
             desc.vertexFunction = vf ? vf : (__bridge id<MTLFunction>)tp->plain_function;
         }
+        else if (ctx->state.ext_tess &&
+                 ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_render_now &&
+                 ((struct MGLExtState_tess *)ctx->state.ext_tess)->wl_replay_function)
+        {
+            /* tess r70: a wide-line replay pass.  The replay function is a STANDIN
+             * Shader (its own MSL, like the plain TES variant above), so it must be
+             * specialized through a standin too — otherwise the program's own vertex
+             * stage would be specialized over it and the fixup function constants
+             * the replay carries (mgl_rstate_patch_vertex_msl) would apply their
+             * defaults. */
+            struct MGLExtState_tess *st = (struct MGLExtState_tess *)ctx->state.ext_tess;
+            Shader standin;
+
+            memset(&standin, 0, sizeof standin);
+            standin.entry_point = st->wl_replay_entry;
+            standin.mtl_data.function = st->wl_replay_function;
+            standin.mtl_data.library = st->wl_replay_library;
+            id<MTLFunction> vf = [self rstateSpecialize: &standin stage: _VERTEX_SHADER];
+            desc.vertexFunction = vf ? vf : (__bridge id<MTLFunction>)st->wl_replay_function;
+        }
         else if (!geomOwnsVertex)
         {
             Shader *vsh = program->shader_slots[vstage];

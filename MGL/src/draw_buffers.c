@@ -724,6 +724,20 @@ static void exec_draw_raw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool in
         return;
     }
 
+    /* tess domain (r70): aliased wide lines.  Metal rasterizes only 1-px lines;
+     * lineWidth > 1 is emulated by a GPU expansion of the last pre-raster stage's
+     * output into screen-space quads (mgl_ext_tess.h).  A geometry stage takes the
+     * draw over earlier (mgl_ext_pre_draw runs the geometry pipeline, whose raster
+     * pass widens its own line output); transform-feedback capture routes above.
+     * mgl_tess_wideline_lines falls back to the native path when the emulation
+     * cannot run (no vertex kernel compiled, replay generation failed). */
+    if (mgl_tess_wideline_active(ctx, mode))
+    {
+        if (mgl_tess_wideline_lines(ctx, mode, indexed, type, offset, first, count, instances,
+                                    basevertex, (GLint)baseinstance))
+            return;
+    }
+
     int prim = native_prim(mode);
     bool adjacency = is_adjacency(mode);
     uint64_t t27 = mgl_prof_begin(27);

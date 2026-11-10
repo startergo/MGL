@@ -19,6 +19,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <limits.h>
 
 #include "glm_context.h"
 char *tess_shadow_implicit_lod(const char *src);
@@ -30,6 +31,9 @@ char *tess_shadow_implicit_lod(const char *src);
 #include "mgl_ext_tess.h"
 #include "mgl_ext_rstate.h"
 #include "mgl_ext_queries.h"
+#include "mgl_ext_buffers.h"      /* mgl_buffers_prepare_cpu_read (widelines) */
+#include "mgl_ext_geom.h"         /* MGLGeomProgram: the geometry raster pass wideline hook */
+#include "mgl_ext_introspect.h"   /* mgli_find: wideline replay locations */
 #include "mgl_ext_program.h"
 #include "spirv_cross_c.h"
 #include "glcorearb.h"
@@ -5905,12 +5909,13 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
     /* release the bridged Metal objects of the compile-once variants */
     if (ctx->mtl_funcs.ext_program && ctx->mtl_funcs.ext_program->release_obj)
     {
-        void **owned[8] = { &tp->capture_function, &tp->capture_library, &tp->capture_pso,
-                            &tp->plain_function, &tp->tcs_function, &tp->tcs_library,
-                            &tp->vs_function, &tp->vs_library };
+        void **owned[10] = { &tp->capture_function, &tp->capture_library, &tp->capture_pso,
+                             &tp->plain_function, &tp->tcs_function, &tp->tcs_library,
+                             &tp->vs_function, &tp->vs_library,
+                             &tp->wl_replay_function, &tp->wl_replay_library };
         void *extra[2] = { tp->plain_library, NULL };
 
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 10; i++)
             if (*owned[i])
             {
                 ctx->mtl_funcs.ext_program->release_obj(ctx, *owned[i]);
@@ -5920,6 +5925,7 @@ static void tess_free_program(GLMContext ctx, MGLTessProgram *tp)
             ctx->mtl_funcs.ext_program->release_obj(ctx, extra[0]);
     }
     free(tp->plain_msl);
+    free(tp->wl_replay_msl);
     free(tp);
 }
 
@@ -10683,4 +10689,932 @@ void glPrimitiveBoundingBoxARB(GLfloat minX, GLfloat minY, GLfloat minZ, GLfloat
 {
     mgl_lazy_init();
     mglPrimitiveBoundingBoxARB(_ctx, minX, minY, minZ, minW, maxX, maxY, maxZ, maxW);
+}
+
+/* ------------------------------------------------------------------ aliased wide lines
+ * (r70 — the last actionable item of the r65 known-gap list; see the
+ * MGL_TESS_WL_RECS block in mgl_ext_tess.h for the design).  GL-side pieces: the
+ * shared word-record expansion-kernel MSL, the two replay-function generators
+ * (VS-kernel records / TES-capture records) and the routing of line draws with
+ * glLineWidth(w) > 1 into the emulation.  The Metal driver of the paths lives in
+ * MGLRenderer+Tessellation.m (extTessWidelineLines / the isolines branch of
+ * extTessDrawPatches) and MGLRenderer+Geometry.m's raster pass. */
+
+static const char k_wl_words_msl[] =
+"#include <metal_stdlib>\n"
+"#include <simd/simd.h>\n"
+"using namespace metal;\n"
+"\n"
+"/* shared word-record expansion kernel: src records (bytes, gl_Position at\n"
+" * pos_off), one segment index pair per thread; writes 4 corner records + 6\n"
+" * indices per segment and the DrawPrimitives indirect arguments.  Corner\n"
+" * positions are snapped to pixel centres and the segment extended by half a\n"
+" * pixel at both ends, so a width-N line covers exactly N pixel rows/columns\n"
+" * (what the dEQP LineRenderCase scans demand); neighbouring strip segments\n"
+" * snap identically, so the widened strip stays connected.  The stored corner\n"
+" * positions are UNFIXED GL clip coordinates — the replay vertex function's\n"
+" * ordinary rstate fixup applies like for any vertex function. */\n"
+"struct MGLWLParams\n"
+"{\n"
+"    packed_float2 vp_origin;  /* Metal viewport origin (== the GL viewport) */\n"
+"    packed_float2 vp_size;\n"
+"    float   half_width;       /* pixels: round(line width) * 0.5 - 0.25: the span\n"
+"                               * still covers exactly N pixel CENTRES, but with a\n"
+"                               * 1/4-pixel margin at both edges — the clip -> window\n"
+"                               * -> clip round trip shifts by ~1e-6, and a centre\n"
+"                               * falling exactly ON an edge flips with it (dEQP's\n"
+"                               * LineRenderCase scan demands exactly N) */\n"
+"    uint32_t nseg;            /* segments per instance */\n"
+"    uint32_t vcount;          /* vertex records per instance */\n"
+"    uint32_t instances;\n"
+"    uint32_t total;           /* instances * nseg (thread guard) */\n"
+"    uint32_t rec_stride;      /* bytes per vertex record */\n"
+"    uint32_t pos_off;         /* byte offset of gl_Position (float4) in a record */\n"
+"    uint32_t flip_y;          /* 1: clip_origin LOWER_LEFT — apply the row flip */\n"
+"    uint32_t flags;           /* bit 0: nseg comes from mgl_counts[0] (GPU count) */\n"
+"};\n"
+"\n"
+"kernel void mgl_wl_expand_words(const device uchar* mgl_src [[buffer(0)]],\n"
+"                                const device uint*  mgl_segs [[buffer(1)]],\n"
+"                                device uchar*       mgl_dst [[buffer(2)]],\n"
+"                                device uint*        mgl_idx [[buffer(3)]],\n"
+"                                device uint*        mgl_args [[buffer(4)]],\n"
+"                                constant MGLWLParams& p [[buffer(5)]],\n"
+"                                const device uint*  mgl_counts [[buffer(6)]],\n"
+"                                uint t [[thread_position_in_grid]])\n"
+"{\n"
+"    /* p.flags bit 0: the segment count comes from mgl_counts[0] (the GPU-written\n"
+"     * tessellator index count of the emulated isolines path; mgl_segs then holds\n"
+"     * the tessellator's coordinate-index pairs) instead of p.nseg/p.total */\n"
+"    uint nseg = p.nseg, total = p.total;\n"
+"    if (p.flags & 1u)\n"
+"    {\n"
+"        nseg = mgl_counts[0] / 2u;\n"
+"        if (nseg > p.nseg)\n"
+"            nseg = p.nseg;               /* the allocation clamp */\n"
+"        total = nseg * p.instances;\n"
+"    }\n"
+"    if (t >= total) return;\n"
+"    uint inst = t / nseg;\n"
+"    uint s    = t % nseg;\n"
+"    /* flags bit 1: the records are in EMISSION order (the capture kernel's\n"
+"     * stream, two endpoints per segment) — the segment endpoints are then the\n"
+"     * consecutive pairs, no index list needed */\n"
+"    uint ia   = ((p.flags & 2u) ? 2u * s      : mgl_segs[2 * s])     + inst * p.vcount;\n"
+"    uint ib   = ((p.flags & 2u) ? 2u * s + 1u : mgl_segs[2 * s + 1]) + inst * p.vcount;\n"
+"    const device uchar* sa = mgl_src + (size_t)ia * p.rec_stride;\n"
+"    const device uchar* sb = mgl_src + (size_t)ib * p.rec_stride;\n"
+"\n"
+"    /* six corner records: the two triangles (A-,A+,B+) and (A-,B+,B-) as one\n"
+"     * vertex stream with identity indices — [[vertex_id]] then means the same\n"
+"     * record whichever way Metal defines it for indexed draws.  Corners at the\n"
+"     * segment's A end carry the A endpoint's varyings, at the B end the B's. */\n"
+"    for (uint c = 0; c < 6; c++)\n"
+"    {\n"
+"        const device uint* sr = (c == 2 || c == 4) ? (const device uint*)sb\n"
+"                             : (c == 5)            ? (const device uint*)sb\n"
+"                                                  : (const device uint*)sa;\n"
+"        device uint* dr = (device uint*)(mgl_dst + (size_t)(6 * t + c) * p.rec_stride);\n"
+"        for (uint w = 0, n = p.rec_stride / 4u; w < n; w++) dr[w] = sr[w];\n"
+"    }\n"
+"\n"
+"    /* window-space rectangle (mirror of the rstate fixup + Metal viewport) */\n"
+"    float4 pa = *(const device float4*)(sa + p.pos_off);\n"
+"    float4 pb = *(const device float4*)(sb + p.pos_off);\n"
+"    float4 ca = pa, cb = pb;\n"
+"    if (p.flip_y) { ca.y = -ca.y; cb.y = -cb.y; }\n"
+"    float2 wa = p.vp_origin + (float2(ca.x, ca.y) * 0.5 + 0.5) * p.vp_size;\n"
+"    float2 wb = p.vp_origin + (float2(cb.x, cb.y) * 0.5 + 0.5) * p.vp_size;\n"
+"    wa = floor(wa) + 0.5;     /* nearest pixel centre */\n"
+"    wb = floor(wb) + 0.5;\n"
+"    float2 d = wb - wa;\n"
+"    float l2 = dot(d, d);\n"
+"    float2 dir = l2 > 1e-12f ? d * rsqrt(l2) : float2(1.0, 0.0);\n"
+"    float2 nrm = float2(-dir.y, dir.x);\n"
+"    float2 a0 = wa - dir * 0.5;      /* half-pixel cap extension */\n"
+"    float2 b1 = wb + dir * 0.5;\n"
+"    float2 cpt[6];\n"
+"    cpt[0] = a0 - nrm * p.half_width;      /* A- */\n"
+"    cpt[1] = a0 + nrm * p.half_width;      /* A+ */\n"
+"    cpt[2] = b1 + nrm * p.half_width;      /* B+ */\n"
+"    cpt[3] = a0 - nrm * p.half_width;      /* A- */\n"
+"    cpt[4] = b1 + nrm * p.half_width;      /* B+ */\n"
+"    cpt[5] = b1 - nrm * p.half_width;      /* B- */\n"
+"    for (uint c = 0; c < 6; c++)\n"
+"    {\n"
+"        float2 nd = (cpt[c] - p.vp_origin) / p.vp_size * 2.0 - 1.0;\n"
+"        if (p.flip_y) nd.y = -nd.y;\n"
+"        float4 o = (c == 2 || c == 4 || c == 5) ? float4(nd, pb.z, pb.w)\n"
+"                                                : float4(nd, pa.z, pa.w);\n"
+"        *(device float4*)(mgl_dst + (size_t)(6 * t + c) * p.rec_stride + p.pos_off) = o;\n"
+"    }\n"
+"    device uint* ix = mgl_idx + 6 * t;\n"
+"    for (uint c = 0; c < 6; c++) ix[c] = 6 * t + c;\n"
+"    if (t == 0)\n"
+"    {\n"
+"        /* vertexCount covers every (segment, instance) pair — the record set is\n"
+"         * instance-specific, so instances are flattened into one index list */\n"
+"        mgl_args[0] = 6u * total;\n"
+"        mgl_args[1] = 1u;\n"
+"        mgl_args[2] = 0u;\n"
+"        mgl_args[3] = 0u;\n"
+"    }\n"
+"}\n";
+
+const char *mgl_tess_wl_words_kernel_msl(void)
+{
+    return k_wl_words_msl;
+}
+
+bool mgl_tess_wideline_active(GLMContext ctx, GLenum mode)
+{
+    if (!ctx->state.ext_tess)
+        return false;
+    switch (mode)
+    {
+        case GL_LINES:
+        case GL_LINE_STRIP:
+        case GL_LINE_LOOP:
+        case GL_LINES_ADJACENCY:
+        case GL_LINE_STRIP_ADJACENCY:
+            break;
+        default:
+            return false;
+    }
+    if (!(ctx->state.var.line_width > 1.0f))
+        return false;
+    /* rasterizer discard: nothing rasterizes, the native (1-px) path is free */
+    if (ctx->state.caps.rasterizer_discard == GL_TRUE)
+        return false;
+    return true;
+}
+
+/* find the stage-out struct of a vertex-for-tessellation kernel MSL: the first
+ * "struct <name> { ... };" whose body declares the [[position]] member.  Returns
+ * the malloc'd name and the decl's extent [decl_start, decl_end] inside msl. */
+static bool wl_ident_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static char *wl_find_out_struct(const char *msl, const char **decl_start, const char **decl_end)
+{
+    const char *p = msl;
+
+    while ((p = strstr(p, "struct ")) != NULL)
+    {
+        const char *nm = p + 7;
+        const char *ne = nm;
+        const char *open, *close, *semi;
+        long depth = 0;
+        char *name;
+
+        while (*ne == ' ') ne++;
+        while (wl_ident_char(*ne)) ne++;
+        if (ne == nm)
+        {
+            p += 7;
+            continue;
+        }
+        name = malloc((size_t)(ne - nm) + 1);
+        if (!name) return NULL;
+        memcpy(name, nm, (size_t)(ne - nm));
+        name[ne - nm] = 0;
+        /* spvUnsafeArray / spvDescriptorTable templates are not interface structs */
+        if (!strncmp(name, "spv", 3))
+        {
+            free(name);
+            p = ne;
+            continue;
+        }
+        open = strchr(ne, '{');
+        if (!open)
+        {
+            free(name);
+            p = ne;
+            continue;
+        }
+        close = open;
+        do {
+            if (*close == '{') depth++;
+            else if (*close == '}') depth--;
+            close++;
+        } while (*close && depth > 0);
+        if (depth != 0)
+        {
+            free(name);
+            return NULL;
+        }
+        semi = close;
+        while (*semi == ' ' || *semi == '\n' || *semi == '\r' || *semi == '\t') semi++;
+        {
+            size_t nl = strlen(name);
+
+            if (*semi != ';' || nl < 4 || strcmp(name + nl - 4, "_out") ||
+                !strstr(open, "gl_Position"))
+            {
+                free(name);
+                p = close;
+                continue;
+            }
+        }
+        *decl_start = p;
+        *decl_end = semi + 1;
+        return name;
+    }
+    return NULL;
+}
+
+char *mgl_tess_wl_replay_msl(GLMContext ctx, Program *program, const char *kernel_msl,
+                             size_t *pos_off, size_t *rec_size)
+{
+    const char *decl_start = NULL, *decl_end = NULL;
+    char *name, *out = NULL;
+    struct MslStruct rec;
+    size_t cap = 0, len = 0;
+    size_t i;
+
+    if (!kernel_msl)
+        return NULL;
+
+    /* the vertex-for-tessellation kernel's stage-out struct is SPIRV-Cross's
+     * "<entry>_out", WITHOUT the raster attributes (they exist only on vertex
+     * functions) — identify it by the trailing "_out" name and its gl_Position
+     * member. */
+    name = wl_find_out_struct(kernel_msl, &decl_start, &decl_end);
+    if (!name)
+    {
+            return NULL;
+    }
+
+    if (!msl_parse_struct(kernel_msl, name, &rec))
+    {
+        free(name);
+        return NULL;
+    }
+
+    /* layout: byte size of the record + the gl_Position member's offset */
+    {
+        size_t p;
+
+        for (p = 0; p < (size_t)rec.count; p++)
+            if (!strcmp(rec.members[p].name, "gl_Position"))
+                break;
+        if (p == (size_t)rec.count)
+        {
+            free(name);
+            return NULL;
+        }
+        if (pos_off)
+            *pos_off = rec.members[p].offset;
+        if (rec_size)
+            *rec_size = rec.size;
+    }
+
+    /* the kernel MSL's preamble (includes, spvUnsafeArray template, all struct
+     * decls) is reused verbatim, so the record type's layout is bit-identical */
+    str_append(&out, &len, &cap, "%.*s\n", (int)(decl_start - kernel_msl), kernel_msl);
+
+    /* the struct is re-emitted WITH the raster attributes: the members of the
+     * program's vertex-stage outputs carry their GL locations (interface
+     * introspection), gl_Position/gl_PointSize/gl_*Distance are Metal built-ins.
+     * The member sequence is unchanged, so the layout (and thus the records the
+     * kernel wrote) is unchanged. */
+    {
+        const char *body = decl_start, *close;
+        bool has_psz = false;
+
+        while (*body && *body != '{') body++;
+        close = decl_end;
+        while (close > body && close[-1] != '}') close--;
+
+        str_append(&out, &len, &cap, "struct %s\n{\n", name);
+        {
+            const char *p = body + 1;
+            size_t mi = 0;
+
+            while (p < close)
+            {
+                const char *semi = memchr(p, ';', (size_t)(close - p));
+                const char *q;
+                char stmt[512];
+                size_t slen;
+
+                if (!semi)
+                    break;
+                q = semi;
+                while (q > p && (q[-1] == '\n' || q[-1] == ' ' || q[-1] == '\t' || q[-1] == '\r')) q--;
+                if (q == p)
+                {
+                    p = semi + 1;
+                    continue;
+                }
+                slen = (size_t)(q - p);
+                if (slen >= sizeof stmt)
+                    goto fail;
+                memcpy(stmt, p, slen);
+                stmt[slen] = 0;
+
+                if (mi < (size_t)rec.count)
+                {
+                    const MGLTessPatchMember *m = &rec.members[mi];
+                    char attr[96];
+                    attr[0] = 0;
+                    if (!strcmp(m->name, "gl_Position"))
+                        snprintf(attr, sizeof attr, "[[position]]");
+                    else if (!strcmp(m->name, "gl_PointSize"))
+                        snprintf(attr, sizeof attr, "[[point_size]]");
+                    else if (!strcmp(m->name, "gl_ClipDistance") || !strcmp(m->name, "gl_CullDistance"))
+                        snprintf(attr, sizeof attr, "[[%s]]",
+                                 m->name[3] == 'C' ? "clip_distance" : "cull_distance");
+                    else if (!strncmp(m->name, "gl_ClipDistance_", 16) ||
+                             !strncmp(m->name, "gl_CullDistance_", 16))
+                        snprintf(attr, sizeof attr, "[[%s]]",
+                                 m->name[3] == 'C' ? "clip_distance" : "cull_distance");
+                    else if (!strncmp(m->name, "gl_", 3))
+                        goto fail;               /* unknown builtin: refuse */
+                    else
+                    {
+                        /* user output: its GL location from the program interface —
+                         * the raster interface location is the FRAGMENT stage's
+                         * input location (the FS inputs mirror the VS outputs
+                         * name-for-name, and only they carry a location);
+                         * arrays flatten to name_<k>, one location per element */
+                        GLint loc = -1;
+                        const char *base = m->name;
+                        size_t blen = strlen(m->name);
+                        long elem = -1;
+                        struct MGLIProgram *ipi = mgli_find(ctx, program->name);
+
+                        if (blen > 2 && m->name[blen - 2] == '_' &&
+                            m->name[blen - 1] >= '0' && m->name[blen - 1] <= '9')
+                        {
+                            elem = m->name[blen - 1] - '0';
+                            blen -= 2;
+                        }
+                        if (ipi)
+                        {
+                            for (int v = 0; v < ipi->ninputs; v++)
+                            {
+                                if (!strncmp(ipi->inputs[v].name, base, blen) &&
+                                    ipi->inputs[v].name[blen] == 0)
+                                {
+                                    loc = ipi->inputs[v].location;
+                                    break;
+                                }
+                            }
+                        }
+                        if (loc < 0)
+                        {
+                            /* not in the FS interface (an output the FS does not
+                             * read): number the unconsumed outputs in declaration
+                             * order, like glslang does for locations */
+                            loc = 0;
+                            for (size_t q = 0; q < mi; q++)
+                            {
+                                if (!strncmp(rec.members[q].name, "gl_", 3))
+                                    continue;
+                                loc++;
+                            }
+                        }
+                        if (elem >= 0)
+                            loc += (GLint)elem;
+                        snprintf(attr, sizeof attr, "[[user(locn%d)]]", (int)loc);
+                        /* integer / boolean members need the flat qualifier on the
+                         * raster interface (they carry no interpolation) */
+                        {
+                            const char *t = m->type;
+
+                            if (!strncmp(t, "int", 3) || !strncmp(t, "uint", 4) ||
+                                !strncmp(t, "bool", 4) || !strncmp(t, "short", 5) ||
+                                !strncmp(t, "ushort", 6) ||
+                                (t[0] == 'u' && t[1] == 'i' && t[2] == 'n'))
+                                snprintf(attr + strlen(attr), sizeof attr - strlen(attr),
+                                         " [[flat]]");
+                        }
+                    }
+                    str_append(&out, &len, &cap, "    %s %s %s;\n", m->type, m->name, attr);
+                    if (!strcmp(m->name, "gl_PointSize"))
+                        has_psz = true;
+                }
+                else
+                    goto fail;
+                mi++;
+                p = semi + 1;
+            }
+        }
+        /* the rstate fixup patch (mgl_rstate_patch_vertex_msl, applied next)
+         * would INSERT a synthetic point-size member at the TOP of the struct —
+         * shifting every member off the record layout the vertex kernel wrote.
+         * Declare it here, at the END, where it cannot move anything; the patcher
+         * sees an existing [[point_size]] member and only patches the return. */
+        if (!has_psz)
+            str_append(&out, &len, &cap, "    float mgl_rs_PointSize [[point_size]];\n");
+        str_append(&out, &len, &cap, "};\n");
+    }
+
+    str_append(&out, &len, &cap,
+               "/* MGL wideline replay: returns corner records (see mgl_ext_tess.h).  The\n"
+               " * records are read at the KERNEL struct's stride (%zu bytes — the\n"
+               " * point-size member above is NOT part of the kernel's record), so the\n"
+               " * record grid matches what the vertex kernel wrote. */\n"
+               "vertex %s mgl_wl_replay(uint mgl_vid [[vertex_id]],\n"
+               "                       const device uchar* mgl_recs_raw [[buffer(%d)]])\n"
+               "{\n"
+               "    const device %s* mgl_rec = (const device %s*)\n"
+               "        (mgl_recs_raw + (size_t)mgl_vid * %zu);\n"
+               "    %s out = *mgl_rec;\n"
+               "    return out;\n"
+               "}\n",
+               rec_size ? *rec_size : 0, name, MGL_TESS_WL_RECS, name, name,
+               rec_size ? *rec_size : 0, name);
+    free(name);
+    return out;
+
+fail:
+    free(name);
+    free(out);
+    return NULL;
+}
+
+/* the TES-capture word-record replay: the exact mirror of mgl_tess_capture_msl —
+ * same entry parse, same member walk, but the body LOADS the packed capture
+ * record into the plain-TES return struct instead of storing it, so the fragment
+ * stage sees its ordinary interface.  Cached in tp->wl_replay_msl. */
+char *mgl_tess_wl_tes_replay_msl(GLMContext ctx, MGLTessProgram *tp)
+{
+    char *plain = mgl_tess_plain_msl(ctx, tp);
+    char *out = NULL, *k = NULL;
+    const char *sig, *name, *open, *vid, *body, *p;
+    char retname[128];
+    char types[MGL_TESS_CAPTURE_MAX][48];
+    uint32_t dbls[MGL_TESS_CAPTURE_MAX];
+    uint32_t slotsz[MGL_TESS_CAPTURE_MAX], slotn[MGL_TESS_CAPTURE_MAX];
+    uint32_t mrow[MGL_TESS_CAPTURE_MAX], mcol[MGL_TESS_CAPTURE_MAX], marr[MGL_TESS_CAPTURE_MAX];
+    struct MslStruct rec;
+    MGLTessCaptureMember *wl_tab = NULL;
+    int wl_ntab = 0;
+    uint32_t off, stride;
+    size_t cap = 0, len = 0;
+    int i;
+
+    if (!plain)
+    {
+        if (tess_trace() || getenv("MGL_WL_DEBUG"))
+            fprintf(stderr, "MGL wl: tes replay: plain msl NULL (program=%p)\n", (void *)tp->program);
+        return NULL;
+    }
+    if (tp->wl_replay_msl)
+        return strdup(tp->wl_replay_msl);
+    if (tp->wl_replay_failed)
+        return NULL;
+
+    sig = strstr(plain, "vertex ");
+    name = open = vid = body = NULL;
+    if (sig)
+    {
+        const char *rt = sig + 7 + strspn(sig + 7, " \t\n");
+        const char *rte = rt + strcspn(rt, " \t\n");
+
+        name = rte + strspn(rte, " \t\n");
+        open = name ? strchr(name, '(') : NULL;
+        vid = strstr(plain, "uint mgl_vid [[vertex_id]]");
+        body = vid ? strchr(vid, '{') : NULL;
+        if (rt >= rte || (size_t)(rte - rt) >= sizeof retname)
+            name = NULL;
+        else
+            snprintf(retname, sizeof retname, "%.*s", (int)(rte - rt), rt);
+    }
+    if (!sig || !name || !open || !vid || !body || open > vid)
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: tes replay: entry parse (sig=%p name=%p)\n", (void*)sig, (void*)name);
+        goto fail;
+    }
+    if (!strcmp(retname, "void"))
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: tes replay: void return\n");
+        goto fail;                     /* store-only TES: nothing to rasterize */
+    }
+
+    if (!msl_parse_struct(plain, retname, &rec))
+    {
+        if (getenv("MGL_WL_DEBUG")) fprintf(stderr, "MGL wl: tes replay: struct parse (%s)\n", retname);
+        goto fail;
+    }
+
+    /* member walk: identical to capture_msl's (the offsets must match the records
+     * the capture kernel writes).  tp->cap_members is only READ here — never
+     * rewritten — and, when the capture kernel was already built, the derived
+     * table is verified against it so the two can never drift apart. */
+    {
+        MGLTessCaptureMember mine[MGL_TESS_CAPTURE_MAX];
+        const MGLTessCaptureMember *tab;
+        int nmine = 0, ntab = 0;
+
+        memset(mine, 0, sizeof mine);
+        off = 4;
+        memset(dbls, 0, sizeof dbls);
+        memset(slotsz, 0, sizeof slotsz);
+        for (i = 0; i < MGL_TESS_CAPTURE_MAX; i++) slotn[i] = 1;
+        for (i = 0; i < MGL_TESS_CAPTURE_MAX; i++) { mrow[i] = 1; mcol[i] = 1; marr[i] = 1; }
+
+        for (i = 0; i < rec.count && nmine < MGL_TESS_CAPTURE_MAX; i++)
+        {
+            const char *m = rec.members[i].name;
+            uint32_t w;
+
+            if (!strcmp(m, "mgl_rs_PointSize"))
+                continue;
+            dbls[nmine] = 0;
+            slotsz[nmine] = 0;
+            slotn[nmine] = 1;
+            mrow[nmine] = 1;
+            mcol[nmine] = 1;
+            marr[nmine] = 1;
+            if (!strcmp(m, "gl_Position"))
+            {
+                w = 4;
+                snprintf(types[nmine], 48, "float4");
+                mine[nmine].offset = 0;
+            }
+            else if (!strcmp(m, "gl_ClipDistance") || !strcmp(m, "gl_CullDistance"))
+                continue;
+            else if (!strncmp(m, "gl_ClipDistance_", 16) || !strncmp(m, "gl_CullDistance_", 16))
+            {
+                w = 1;
+                snprintf(types[nmine], 48, "float");
+                mine[nmine].offset = off;
+            }
+            else if (!strcmp(m, "gl_PointSize"))
+            {
+                w = 1;
+                snprintf(types[nmine], 48, "float");
+                mine[nmine].offset = off;
+            }
+            else if (!strncmp(m, "gl_", 3))
+                continue;
+            else if (!tess_msl_type_words(rec.members[i].type, &w))
+            {
+                if (getenv("MGL_WL_DEBUG"))
+                    fprintf(stderr, "MGL wl: tes replay: type words (%s : %s)\n",
+                            rec.members[i].type, rec.members[i].name);
+                goto fail;
+            }
+            else
+            {
+                const char *t = rec.members[i].type;
+                uint32_t d = 0;
+                uint32_t rows = 1, cols = 1, elems = 1;
+
+                if (tess_out_shape(ctx, tp, m, &elems, &cols, &rows))
+                    d = elems * cols * rows;
+                if (!d)
+                    d = tess_split_slot_doubles(ctx, tp, m, t, &elems, &cols, &rows);
+                if (!d)
+                    rows = cols = elems = 1;
+                mrow[nmine] = rows;
+                mcol[nmine] = cols;
+                marr[nmine] = elems;
+                snprintf(types[nmine], 48, "%s", t);
+                mine[nmine].offset = off;
+                if (d)
+                {
+                    uint32_t wsz = strstr(t, "uint2") ? 2 : 4;
+                    const char *nm = strstr(t, "spvUnsafeArray<");
+                    uint32_t cnt = 1;
+
+                    dbls[nmine] = d;
+                    slotsz[nmine] = wsz;
+                    if (nm && sscanf(strchr(nm, ',') + 1, "%u", &cnt) != 1)
+                        cnt = 1;
+                    slotn[nmine] = cnt;
+                    w = 2 * d;
+                }
+            }
+            snprintf(mine[nmine].name, 64, "%s", m);
+            mine[nmine].words = w;
+            if (strcmp(m, "gl_Position"))
+                off += w;
+            nmine++;
+        }
+        stride = off;
+        /* the capture record pads the stride to whole float4 slots (capture_msl:
+         * "off rounded up so that ... consumers follow the padding") */
+        stride = (stride + 3u) & ~3u;
+
+        ntab = tp->cap_members_n;
+        tab = tp->cap_members;
+        if (ntab > 0 && (ntab != nmine || tp->cap_stride != stride))
+        {
+            /* the capture table exists and disagrees with the mirror — refuse
+             * rather than replay a wrong layout */
+            goto fail;
+        }
+        for (i = 0; i < (uint32_t)ntab; i++)
+            if (strcmp(tab[i].name, mine[i].name) || tab[i].offset != mine[i].offset ||
+                tab[i].words != mine[i].words)
+            {
+                if (getenv("MGL_WL_DEBUG"))
+                    fprintf(stderr, "MGL wl: tes replay: member[%d] mismatch %s@%u/%u"
+                                    " vs %s@%u/%u\n", i,
+                            tab[i].name, tab[i].offset, tab[i].words,
+                            mine[i].name, mine[i].offset, mine[i].words);
+                goto fail;
+            }
+        ntab = nmine;
+        tab = mine;
+        wl_tab = tab;
+        wl_ntab = ntab;
+    }
+
+    /* preamble: everything the plain MSL declares before its entry (includes, the
+     * spvUnsafeArray template, every struct decl — and the rstate fixup prelude if
+     * the plain MSL was already patched; the replay then calls it directly) */
+    p = sig;
+    while (p > plain && p[-1] != '\n') p--;
+    str_append(&out, &len, &cap, "%.*s", (int)(p - plain), plain);
+    str_append(&out, &len, &cap,
+               "/* MGL wideline replay of the TES capture record (mgl_ext_tess.h) */\n"
+               "vertex %s mgl_wl_tes_replay(uint mgl_vid [[vertex_id]],\n"
+               "                           const device uint* mgl_recs [[buffer(%d)]])\n"
+               "{\n"
+               "    const device uint* mgl_wl = mgl_recs + (size_t)mgl_vid * %uu;\n"
+               "    %s out = {};\n",
+               retname, MGL_TESS_WL_RECS, stride, retname);
+
+    for (i = 0; i < wl_ntab; i++)
+    {
+        const MGLTessCaptureMember *cm = &wl_tab[i];
+        uint32_t o = cm->offset;
+
+        if (dbls[i])
+        {
+            /* the doubles sit two per uint4 slot (one per uint2 slot) with a
+             * possibly padded tail — the exact inverse of capture_msl's store
+             * walk (same slot/half arithmetic) */
+            uint32_t sw = slotsz[i];
+            uint32_t spdbl = sw / 2;
+            uint32_t d;
+
+            for (d = 0; d < dbls[i]; d++)
+            {
+                uint32_t slot, half;
+                const char *lo, *hi;
+                char ix[16];
+
+                if (strstr(types[i], "spvUnsafeArray<") && mcol[i] * mrow[i] > 1)
+                {
+                    uint32_t cs = (mrow[i] + 1) / 2;
+                    uint32_t per = mcol[i] * cs;
+                    uint32_t e = d / (mcol[i] * mrow[i]);
+                    uint32_t rem = d % (mcol[i] * mrow[i]);
+                    uint32_t c = rem / mrow[i];
+                    uint32_t r = rem % mrow[i];
+
+                    slot = e * per + c * cs + r / 2;
+                    half = r & 1;
+                }
+                else
+                {
+                    slot = d / spdbl;
+                    half = (spdbl == 2 && (d & 1)) ? 1 : 0;
+                }
+                lo = half ? ".z" : ".x";
+                hi = half ? ".w" : ".y";
+                ix[0] = 0;
+                if (strstr(types[i], "spvUnsafeArray<"))
+                    snprintf(ix, sizeof ix, "[%u]", slot);
+                str_append(&out, &len, &cap,
+                           "    out.%s%s%s = mgl_wl[%u]; out.%s%s%s = mgl_wl[%u];\n",
+                           cm->name, ix, lo, o + 2 * d,
+                           cm->name, ix, hi, o + 2 * d + 1);
+            }
+        }
+        else if (strstr(types[i], "spvUnsafeArray<"))
+        {
+            /* plain (non-double) slot array: element-wise copy (the store copied
+             * one word per element) */
+            char elem[48] = "";
+            const char *lt = strchr(types[i], '<');
+            const char *comma = lt ? strchr(lt, ',') : NULL;
+            uint32_t q;
+
+            if (comma && (size_t)(comma - lt - 1) < sizeof elem)
+            {
+                memcpy(elem, lt + 1, (size_t)(comma - lt - 1));
+                elem[comma - lt - 1] = 0;
+            }
+            if (!elem[0])
+                goto fail;
+            for (q = 0; q < slotn[i] && q < 32; q++)
+                str_append(&out, &len, &cap,
+                           "    out.%s[%u] = *(device const %s*)(mgl_wl + %u);\n",
+                           cm->name, q, elem, o + q);
+        }
+        else
+            /* scalar/vector/matrix: the capture stored the member as a whole
+             * (MSL layout of the type) — reload it the same way */
+            str_append(&out, &len, &cap,
+                       "    out.%s = *(device const %s*)(mgl_wl + %u);\n",
+                       cm->name, types[i], o);
+    }
+
+    /* apply the SAME clip fixup the plain entry applies: its prelude (which
+     * defines mgl_rs_vertex_fixup_pos) was reused verbatim in the preamble; a
+     * plain MSL compiled with MGL_TESS_NOFIXUP has none and gets none */
+    {
+        const char *pre_end = strstr(out, "vertex ");
+
+        if (pre_end && memmem(out, (size_t)(pre_end - out), "mgl_rs_vertex_fixup_pos", 22))
+            str_append(&out, &len, &cap, "    mgl_rs_vertex_fixup_pos(out.gl_Position);\n");
+    }
+    str_append(&out, &len, &cap, "    return out;\n}\n");
+
+    tp->wl_replay_msl = strdup(out);
+    free(plain);
+    return out;
+
+fail:
+    free(plain);
+    tp->wl_replay_failed = true;
+    if (tess_trace() || getenv("MGL_WL_DEBUG"))
+        fprintf(stderr, "MGL tess: wl TES replay generation failed\n");
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ line-draw routing */
+
+/* build the CPU segment list of a line draw: 2 GL vertex numbers per segment,
+ * primitive restart split out of strips, adjacency vertices skipped.  Returns a
+ * malloc'd uint32 array of 2*nseg entries (or NULL). */
+static GLsizei wl_index_size(GLenum type)
+{
+    return type == GL_UNSIGNED_BYTE ? 1 : type == GL_UNSIGNED_SHORT ? 2 : 4;
+}
+
+static uint32_t *wl_build_segments(GLMContext ctx, GLenum mode, bool indexed, GLenum type,
+                                   size_t offset, GLint first, GLsizei count, GLint basevertex,
+                                   uint32_t *nseg_out, GLint *vmin_out, GLint *vmax_out)
+{
+    uint32_t *segs = NULL;
+    uint32_t nseg = 0, cap = 0;
+    const uint8_t *cpu = NULL;
+    Buffer *ebuf = NULL;
+    uint32_t restart = 0;
+    bool restart_on = false;
+    GLint vmin = INT_MAX, vmax = INT_MIN;
+    int i;
+
+    *nseg_out = 0;
+    *vmin_out = 0;
+    *vmax_out = 0;
+
+    if (indexed)
+    {
+        GLenum itype = type ? type : GL_UNSIGNED_INT;
+        uint32_t ridx = 0;
+
+        if (ctx->state.caps.primitive_restart_fixed_index)
+        {
+            restart_on = true;
+            ridx = itype == GL_UNSIGNED_BYTE ? 0xFFu : itype == GL_UNSIGNED_SHORT ? 0xFFFFu : 0xFFFFFFFFu;
+        }
+        else if (ctx->state.caps.primitive_restart)
+        {
+            restart_on = true;
+            ridx = (uint32_t)ctx->state.var.primitive_restart_index;
+        }
+        restart = ridx;
+        ebuf = VAO_STATE(element_array.buffer);
+        if (!ebuf || !ebuf->data.buffer_data)
+            return NULL;
+        mgl_buffers_prepare_cpu_read(ctx, ebuf);
+        if (!ebuf->data.buffer_data)
+            return NULL;
+        cpu = (const uint8_t *)ebuf->data.buffer_data + offset;
+        if ((size_t)count * wl_index_size(itype) + offset > (size_t)ebuf->size)
+            return NULL;
+        type = itype;
+    }
+
+#define WL_IDX(k) (indexed ? (type == GL_UNSIGNED_BYTE ? ((const uint8_t *)cpu)[k] : \
+                              type == GL_UNSIGNED_SHORT ? ((const uint16_t *)cpu)[k] : \
+                                                          ((const uint32_t *)cpu)[k]) : \
+                             (uint32_t)((GLint)first + (GLint)(k)))
+#define WL_PUSH(a, b) do { \
+        if (nseg + 1 > cap) { \
+            uint32_t *nb = realloc(segs, (cap ? cap * 2 : 64) * 2 * sizeof *segs); \
+            if (!nb) { free(segs); return NULL; } \
+            segs = nb; cap = cap ? cap * 2 : 64; \
+        } \
+        segs[2 * nseg] = (uint32_t)((GLint)(a) + basevertex); \
+        segs[2 * nseg + 1] = (uint32_t)((GLint)(b) + basevertex); \
+        nseg++; \
+        if (vmax < (GLint)(a) + basevertex) vmax = (GLint)(a) + basevertex; \
+        if (vmax < (GLint)(b) + basevertex) vmax = (GLint)(b) + basevertex; \
+        if (vmin > (GLint)(a) + basevertex) vmin = (GLint)(a) + basevertex; \
+        if (vmin > (GLint)(b) + basevertex) vmin = (GLint)(b) + basevertex; \
+    } while (0)
+
+    /* strip-family primitives: walk the vertex stream and break at restart; each
+     * surviving run of L >= 2 vertices contributes L-1 segments.  Fixed-size
+     * modes drop incomplete groups (GL 4.6 §10.3.5 primitive restart semantics
+     * and the group sizes of the mode itself). */
+    if (mode == GL_LINES)
+    {
+        for (i = 0; i + 1 < count; i += 2)
+        {
+            if (restart_on && (WL_IDX(i) == restart || WL_IDX(i + 1) == restart))
+                continue;
+            WL_PUSH(WL_IDX(i), WL_IDX(i + 1));
+        }
+    }
+    else if (mode == GL_LINES_ADJACENCY)
+    {
+        for (i = 0; i + 3 < count; i += 4)
+        {
+            if (restart_on && (WL_IDX(i + 1) == restart || WL_IDX(i + 2) == restart))
+                continue;
+            WL_PUSH(WL_IDX(i + 1), WL_IDX(i + 2));
+        }
+    }
+    else
+    {
+        /* strips (LINE_STRIP / LINE_LOOP / LINE_STRIP_ADJACENCY): accumulate a
+         * run between restarts, then emit its segments */
+        uint32_t run[4096];
+        uint32_t nrun = 0;
+        int take_from = (mode == GL_LINE_STRIP_ADJACENCY) ? 1 : 0;
+        int take_to = (mode == GL_LINE_STRIP_ADJACENCY) ? count - 1 : count;
+
+        for (i = take_from; i < take_to && i < count; i++)
+        {
+            uint32_t v = WL_IDX(i);
+
+            if (restart_on && v == restart)
+            {
+                nrun = 0;
+                continue;
+            }
+            if (nrun < 4096)
+                run[nrun++] = v;
+        }
+        if (mode == GL_LINE_LOOP && nrun >= 2 && run[0] != run[nrun - 1])
+        {
+            if (nrun < 4096)
+                run[nrun++] = run[0];
+        }
+        for (i = 0; (uint32_t)i + 1 < nrun; i++)
+            WL_PUSH(run[i], run[i + 1]);
+    }
+#undef WL_PUSH
+#undef WL_IDX
+
+    *nseg_out = nseg;
+    *vmin_out = vmin == INT_MAX ? 0 : vmin;
+    *vmax_out = vmax == INT_MIN ? 0 : vmax;
+    return segs;
+}
+
+bool mgl_tess_wideline_lines(GLMContext ctx, GLenum mode, bool indexed, GLenum type,
+                             size_t offset, GLint first, GLsizei count, GLsizei instances,
+                             GLint basevertex, GLint baseinstance)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+    struct MGLExtMetal_tess *M = ctx->mtl_funcs.ext_tess;
+    Program *program = ctx->state.program;
+    uint32_t *segs, nseg;
+    GLint vmin, vmax, vcount;
+
+    if (!S || !M || !M->wideline_lines)
+        return false;
+
+    /* a tessellation program only draws GL_PATCHES; a geometry stage takes the
+     * draw over in MGLRenderer+Geometry.m (whose raster pass runs the expansion
+     * itself) — both mean this path must not run */
+    if (!program || program->shader_slots[_GEOMETRY_SHADER] ||
+        program->shader_slots[_TESS_EVALUATION_SHADER])
+        return false;
+
+    segs = wl_build_segments(ctx, mode, indexed, type, offset, first, count, basevertex,
+                             &nseg, &vmin, &vmax);
+    if (!segs || !nseg)
+    {
+        free(segs);
+        return segs || nseg == 0;    /* an empty draw: considered handled */
+    }
+
+    vcount = indexed ? (vmax - vmin + 1) : (first + count);
+    if (indexed)
+    {
+        /* the widened dispatch runs the vertex kernel over [vmin, vmax] only, so
+         * the segment entries become record indices (vmin-relative) */
+        for (uint32_t i = 0; i < 2 * nseg; i++)
+            segs[i] -= (uint32_t)vmin;
+    }
+    bool ok = M->wideline_lines(ctx, mode, segs, nseg, indexed ? vmin : first, vcount,
+                                instances, baseinstance);
+    free(segs);
+    return ok;
 }

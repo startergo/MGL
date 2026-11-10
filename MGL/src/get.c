@@ -38,6 +38,7 @@
 #include "mgl_ext.h"
 #include "mgl_ext_debug.h"
 #include "mgl_ext_program.h"
+#include "mgl_ext_tess.h"    /* MGL_TESS_WL_MAX (r70 aliased wide-line range) */
 #include "texdata_formats.h"
 
 /* buffers.c: the storage of an indexed buffer binding point (uniform buffer points at
@@ -805,7 +806,12 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
         case GL_POINT_SIZE_RANGE: PUT2(1.0, 511.0);
         case GL_ALIASED_POINT_SIZE_RANGE: PUT2(1.0, 511.0);
         case GL_POINT_SIZE_GRANULARITY: PUT1(1.0);
-        case GL_ALIASED_LINE_WIDTH_RANGE: PUT2(1.0, 1.0);
+        case GL_ALIASED_LINE_WIDTH_RANGE:
+            /* r70 (tess domain): wide aliased lines are emulated on the GPU (the
+             * last pre-raster stage's output is expanded into screen-space quads —
+             * mgl_ext_tess.h), so the advertised range is what the emulation covers */
+            PUT2(1.0f, MGL_TESS_WL_MAX);
+            break;
         case GL_SMOOTH_LINE_WIDTH_RANGE: PUT2(1.0, 1.0);
         case GL_SMOOTH_LINE_WIDTH_GRANULARITY: PUT1(1.0);
         case GL_SUBPIXEL_BITS: PUT1(8);
