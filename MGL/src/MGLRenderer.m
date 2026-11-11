@@ -55,9 +55,14 @@ static inline bool mglInfoLog(void)
 
 // Upper bound used by the "is this heap pointer plausible" checks below.
 // Under AddressSanitizer the heap lives far above 16 TB (e.g. 0x62e...), so the
-// bound must move or every draw silently fails in an ASan build.
+// bound must move or every draw silently fails in an ASan build.  The same is
+// true of x86_64 macOS, whose heap (and Metal object pointers) sit around
+// 0x7f.. (about 128 TB), far above arm64's 0x28.. region: there the bound is
+// the top of the 47-bit user address space.
 #if __has_feature(address_sanitizer)
 #define MGL_PLAUSIBLE_PTR_MAX  0xFFFFFFFFFFFFFULL
+#elif defined(__x86_64__)
+#define MGL_PLAUSIBLE_PTR_MAX  0x800000000000ULL
 #else
 #define MGL_PLAUSIBLE_PTR_MAX  0x100000000000ULL
 #endif
@@ -2338,6 +2343,122 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
     return [self texparamCreateSampler:tex_param target:target];
 }
 
+/* Metal's per-stage sampler argument table holds 16 entries (texture slots: 128) */
+#define MGL_MTL_SAMPLER_SLOTS 16u
+
+/* the fallback texture type mirrors the GL target of an unrealized texture
+ * (the mapping createMTLTextureFromGLTexture uses) */
+static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
+{
+    if (ptr && ptr->mtl_data)
+        return ((__bridge id<MTLTexture>)ptr->mtl_data).textureType;
+    switch (ptr ? ptr->target : 0)
+    {
+        case GL_TEXTURE_1D_ARRAY: return MTLTextureType1DArray;
+        case GL_TEXTURE_2D_ARRAY: return MTLTextureType2DArray;
+        case GL_TEXTURE_3D: return MTLTextureType3D;
+        case GL_TEXTURE_CUBE_MAP: return MTLTextureTypeCube;
+        case GL_TEXTURE_CUBE_MAP_ARRAY: return MTLTextureTypeCubeArray;
+        case GL_TEXTURE_2D_MULTISAMPLE: return MTLTextureType2DMultisample;
+        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: return MTLTextureType2DMultisampleArray;
+        case GL_TEXTURE_BUFFER: return MTLTextureTypeTextureBuffer;
+        default: return MTLTextureType2D;   /* 1D/2D/RECT realize as 2D */
+    }
+}
+
+/* Vulkan-style SEPARATE images and samplers: OpTypeImage and OpTypeSampler are
+ * distinct MSL arguments ([[texture(n)]] and [[sampler(m)]], independent index
+ * spaces), unlike GLSL's combined sampler2D, and land in the SEPARATE_IMAGE /
+ * SEPARATE_SAMPLERS resource classes.  ARB_gl_spirv itself requires combined
+ * image-samplers; translated Vulkan shaders (rsvga's SPIR-V) are the users.
+ * Convention: the image's binding names the GL texture unit it reads, and the
+ * sampler's binding names the unit whose sampler state it takes (a sampler
+ * object bound to that unit, else the parameters of that unit's texture, else of
+ * the stage's first separate image's texture).  Shared by the render and the
+ * compute binders; the caller supplies the encoder-specific setters. */
+- (bool) bindSeparateImagesSamplersStage:(int)stage
+                              setTexture:(void (^)(id<MTLTexture>, NSUInteger))setTex
+                              setSampler:(void (^)(id<MTLSamplerState>, NSUInteger))setSamp
+{
+    Program *prog = STATE(program);
+    if (!prog)
+        return true;
+    SpirvResourceList *il = &prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE];
+    SpirvResourceList *sl = &prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS];
+
+    for (GLuint i = 0; i < il->count; i++)
+    {
+        SpirvResource *sres = &il->list[i];
+        GLuint mtl_index = sres->msl_binding;
+        if (mtl_index == 0xffffffffu)   /* stripped from the MSL: no argument */
+            continue;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+        for (GLuint e = 0; e < elems; e++)
+        {
+            GLuint unit = mgl_res_elem_unit(sres, e);
+            if (unit >= TEXTURE_UNITS)
+                continue;
+            /* the image's dimension selects the unit's per-target binding */
+            Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
+            id<MTLTexture> texture = nil;
+            /* GL 8.17: an incomplete (or level-less default) texture reads (0,0,0,1):
+             * bind the black fallback without realizing it (same rule as the
+             * combined loop); a complete one is realized on first use */
+            if (ptr && !mgl_texture_incomplete_for_unit(ctx, ptr, unit))
+            {
+                RETURN_FALSE_ON_FAILURE([self bindMTLTexture: ptr]);
+                if (ptr->mtl_data)
+                {
+                    texture = (__bridge id<MTLTexture>)ptr->mtl_data;
+                    texture = [self texparamTextureForTex:ptr base:texture];
+                    /* EXT_texture_sRGB_decode: SKIP_DECODE swaps in a plain view */
+                    texture = [self compatSRGBDecodeViewForTex:ptr base:texture unit:unit];
+                }
+            }
+            if (!texture)
+                texture = [self computeFallbackTextureForType: mgl_fallback_type_for_tex(ptr)];
+            if (texture)
+                setTex(texture, mtl_index + e);
+        }
+    }
+
+    for (GLuint i = 0; i < sl->count; i++)
+    {
+        SpirvResource *sres = &sl->list[i];
+        GLuint mtl_index = sres->msl_binding;
+        if (mtl_index == 0xffffffffu)
+            continue;
+        GLuint elems = sres->array_size ? sres->array_size : 1;
+        for (GLuint e = 0; e < elems; e++)
+        {
+            GLuint unit = mgl_res_elem_unit(sres, e);
+            if (unit >= TEXTURE_UNITS || mtl_index + e >= MGL_MTL_SAMPLER_SLOTS)
+                continue;
+            /* a sampler has no dimension: take the target of a separate image of
+             * this stage reading the same unit, else the unit's most recently
+             * bound texture (mgl_texture_for_sampler with target 0) */
+            GLuint target = 0;
+            for (GLuint k = 0; k < il->count; k++)
+                if (mgl_res_elem_unit(&il->list[k], 0) == unit) { target = il->list[k].target; break; }
+            Texture *ptr = mgl_texture_for_sampler(ctx, unit, target);
+            /* no texture on the sampler's own unit (the usual Vulkan layout puts
+             * textures and samplers on different bindings): pair with the stage's
+             * first separate image, so a sampler object bound to <unit> still
+             * applies and otherwise that texture's parameters do */
+            if (!ptr && il->count)
+                ptr = mgl_texture_for_sampler(ctx, mgl_res_elem_unit(&il->list[0], 0), il->list[0].target);
+            /* texparamSamplerForUnit dereferences the texture: never pass NULL */
+            id<MTLSamplerState> sampler = ptr ? [self texparamSamplerForUnit:unit texture:ptr] : nil;
+            if (!sampler)
+                sampler = [self computeFallbackSampler];
+            if (sampler)
+                setSamp(sampler, mtl_index + e);
+        }
+    }
+    return true;
+}
+
+
 - (bool) bindTexturesToCurrentRenderEncoder
 {
     // sampled textures of the vertex and fragment stages (texdata); unbound units are skipped
@@ -2518,6 +2639,28 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                 }
             }
         }
+    }
+
+    /* Vulkan-style SEPARATE images and samplers (bindSeparateImagesSamplersStage):
+     * the combined loop above only walks SAMPLED_IMAGE */
+    for (int st = 0; st < 2; st++)
+    {
+        int stage = stages[st];
+        Program *sp = STATE(program);
+        if (!sp || (!sp->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE].count &&
+                    !sp->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count))
+            continue;
+        bool vtx = (stage != _FRAGMENT_SHADER);
+        bool ok = [self bindSeparateImagesSamplersStage:stage
+            setTexture:^(id<MTLTexture> t, NSUInteger idx) {
+                if (vtx) [self compatSetVertexTexture:t atIndex:idx];
+                else     [self compatSetFragmentTexture:t atIndex:idx];
+            }
+            setSampler:^(id<MTLSamplerState> s, NSUInteger idx) {
+                if (vtx) [self compatSetVertexSamplerState:s atIndex:idx];
+                else     [self compatSetFragmentSamplerState:s atIndex:idx];
+            }];
+        RETURN_FALSE_ON_FAILURE(ok);
     }
 
     /* storage images (glBindImageTexture) of the vertex and fragment stages: they are plain
@@ -4776,6 +4919,20 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             }
         }
     }
+
+    /* Vulkan-style SEPARATE images and samplers of the compute stage
+     * (bindSeparateImagesSamplersStage): mapped_types above only walks the
+     * SAMPLED_IMAGE and STORAGE_IMAGE classes */
+    if (STATE(program) &&
+        (STATE(program)->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE].count ||
+         STATE(program)->spirv_resources_list[_COMPUTE_SHADER][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count))
+    {
+        bool ok = [self bindSeparateImagesSamplersStage:_COMPUTE_SHADER
+            setTexture:^(id<MTLTexture> t, NSUInteger idx) { [computeCommandEncoder setTexture:t atIndex:idx]; }
+            setSampler:^(id<MTLSamplerState> s, NSUInteger idx) { [computeCommandEncoder setSamplerState:s atIndex:idx]; }];
+        RETURN_FALSE_ON_FAILURE(ok);
+    }
+
 
     ctx->state.dirty_bits &= ~(DIRTY_TEX_BINDING | DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE);
 
