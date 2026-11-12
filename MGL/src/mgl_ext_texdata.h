@@ -71,6 +71,11 @@ struct MGLExtMetal_texdata {
     bool (*download_decoded)(GLMContext ctx, Texture *tex, const TDRegion *r, float *dst);
     /* make sure the MTLTexture exists and matches the GL shape */
     bool (*realize)(GLMContext ctx, Texture *tex);
+    /* re-realize a plain GL_TEXTURE_2D colour texture on a fresh IOSurface
+     * (host presentation): the MTLTexture wraps the surface and the content
+     * carries across; *surface receives the IOSurfaceRef (caller releases).
+     * False when the shape or format cannot live on one. */
+    bool (*realize_iosurface)(GLMContext ctx, Texture *tex, void **surface);
     /* copy w x h from the current read framebuffer at (x,y) into r (r->w/h ignored) */
     GLenum (*copy_from_read_fb)(GLMContext ctx, Texture *dst, const TDRegion *r, GLint x, GLint y, GLsizei w, GLsizei h, bool depth, bool stencil);
     /* raw texel copy between two realized textures (CopyImageSubData) */

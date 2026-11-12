@@ -2501,6 +2501,87 @@ void mglTextureStorage3D(GLMContext ctx, GLuint texture, GLsizei levels, GLenum 
 }
 
 /* ------------------------------------------------------------------------ */
+/* host presentation (IOSurface)                                            */
+/* ------------------------------------------------------------------------ */
+
+/* Give texture `texture` (GL_TEXTURE_2D) single-level storage on a fresh
+ * IOSurface sized for `internalformat` x `width` x `height`, keeping the
+ * texture's content: the realized MTLTexture wraps the surface, so a host
+ * compositor (a CoreAnimation layer's contents) can show the texture as the
+ * GL draws it, with no readback.  Returns the IOSurfaceRef for the caller to
+ * release, or NULL when the shape or format cannot live on one (depth,
+ * stencil, compressed, sRGB, more than one level).
+ *
+ * The storage is redefined even when the texture already had one (unlike
+ * glTextureStorage2D); ordinary textures are untouched by this entry point. */
+void *mglTextureIOSurface2D(GLuint texture, GLenum internalformat, GLsizei width, GLsizei height)
+{
+    GLMContext ctx = MGLgetCurrentContext();
+    Texture *tex;
+
+    if (!ctx || !TDM(ctx) || !TDM(ctx)->realize_iosurface)
+        return NULL;
+
+    tex = findTexture(ctx, texture);
+    if (!tex || tex->target != GL_TEXTURE_2D)
+        return NULL;
+    if (width < 1 || height < 1)
+        return NULL;
+
+    /* refuse unsupported formats BEFORE touching the texture: only plain
+     * 8-bit RGBA/BGRA unorm storage has an IOSurface (and compositor)
+     * counterpart -- MTLPixelFormatRGBA8Unorm (70) / BGRA8Unorm (80) */
+    {
+        const TDFormat *f = tdFormatInfo(internalformat);
+        const TDFormat *sf = f ? tdStorageFormat(f) : NULL;
+        if (!sf || !sf->bpp ||
+            (sf->flags & (TDF_DEPTH | TDF_STENCIL | TDF_COMPRESSED | TDF_SRGB)) ||
+            (sf->mtl != 70u && sf->mtl != 80u))
+            return NULL;
+    }
+
+    /* keep level 0 when it already has this shape, so its content (GPU
+     * resident or a pending CPU shadow) carries into the IOSurface; only the
+     * other levels are dropped.  Otherwise the storage is redefined and the
+     * content is undefined, as with any storage redefinition. */
+    {
+        TextureLevel *l0 = tex->faces[0].levels ? texLevel(tex, 0, 0) : NULL;
+        bool keep = l0 && l0->complete && l0->mtl_format == internalformat &&
+                    l0->width == (GLuint)width && l0->height == (GLuint)height && l0->depth == 1;
+
+        if (keep)
+        {
+            for (int f = 0; f < 6; f++)
+                for (int l = (f == 0) ? 1 : 0; l < TD_MAX_LEVELS; l++)
+                    if (tex->faces[f].levels && tex->faces[f].levels[l].complete)
+                        defineLevel(ctx, tex, f, l, 0, 0, 0, 0);
+        }
+        else
+        {
+            undefineAllLevels(ctx, tex);
+            if (!defineLevel(ctx, tex, 0, 0, internalformat, width, height, 1))
+                return NULL;
+        }
+    }
+
+    tex->immutable_storage = GL_TRUE;
+    tex->num_levels = 1;
+    tex->mipmap_levels = 1;
+    tex->width = width;
+    tex->height = height;
+    tex->depth = 1;
+    tex->internalformat = internalformat;
+    tex->is_array = GL_FALSE;
+
+    {
+        void *surface = NULL;
+        if (!TDM(ctx)->realize_iosurface(ctx, tex, &surface))
+            return NULL;
+        return surface;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* compressed images                                                        */
 /* ------------------------------------------------------------------------ */
 

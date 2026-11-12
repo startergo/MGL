@@ -11,6 +11,7 @@
  */
 
 #import <objc/runtime.h>
+#import <IOSurface/IOSurface.h>
 
 #import "MGLRenderer+TextureData.h"
 #include "mgl_ext_texdata.h"
@@ -303,6 +304,163 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
 
 #pragma mark - realization
 
+/* install `nt` as tex's realized MTLTexture, carrying every GPU-resident
+ * level of the previous realization across (same geometry and format).
+ * Shadow uploads and completeness marking stay with the caller. */
+- (bool) texdataInstallTexture:(id<MTLTexture>)nt tex:(Texture *)tex shape:(const TDShape *)s
+{
+    TDTexInfo *info = mgl_texdata_info(ctx, tex);
+    const TDFormat *sf = mgl_texdata_storage_format(s->internalformat);
+    if (!info || !sf)
+        return false;
+
+    GLuint faces = mgl_texdata_num_faces(tex);
+    id<MTLTexture> old = (info->realized && tex->mtl_data) ? (__bridge id<MTLTexture>)tex->mtl_data : nil;
+    uint32_t kept[6] = { 0 };
+
+    if (old)
+    {
+        TDShape os = info->shape;
+        const TDFormat *osf = mgl_texdata_storage_format(os.internalformat);
+        bool same_fmt = old.pixelFormat == nt.pixelFormat;
+
+        for (GLuint f = 0; f < faces; f++)
+        {
+            for (GLuint l = 0; l < os.levels && l < TD_MAX_LEVELS; l++)
+            {
+                if (!(info->on_gpu[f] & (1u << l)))
+                    continue;
+
+                NSUInteger ow, oh, od, nw, nh, nd;
+                td_level_dims(&os, l, &ow, &oh, &od);
+                td_level_dims(s, l, &nw, &nh, &nd);
+
+                if (same_fmt && l < s->levels && ow == nw && oh == nh && od == nd)
+                {
+                    id<MTLBlitCommandEncoder> blit = [self texdataBlitEncoder];
+                    bool is3d = nt.textureType == MTLTextureType3D;
+                    NSUInteger slices = (tex->target == GL_TEXTURE_CUBE_MAP) ? 1 : (is3d ? 1 : od);
+                    for (NSUInteger sl = 0; sl < slices; sl++)
+                    {
+                        NSUInteger slice = (tex->target == GL_TEXTURE_CUBE_MAP) ? f : sl;
+                        [blit copyFromTexture:old sourceSlice:slice sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0)
+                                   sourceSize:MTLSizeMake(ow, oh, is3d ? od : 1)
+                                    toTexture:nt destinationSlice:slice destinationLevel:l
+                            destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    }
+                    [blit endEncoding];
+                    kept[f] |= 1u << l;
+                }
+                else if (osf)
+                {
+                    /* the level leaves the realized shape: keep its content on the CPU */
+                    TDStorage st;
+                    GLuint gw, gh, gd;
+                    mgl_texdata_level_geometry(tex, f, l, &gw, &gh, &gd);
+                    if (gw == ow && gh == oh && gd == od && mgl_texdata_shadow(ctx, tex, f, l, true, &st))
+                    {
+                        TDRegion r = { f, l, 0, 0, 0, (GLsizei)ow, (GLsizei)oh, (GLsizei)od };
+                        [self texdataDownload:old tex:tex format:osf region:&r dst:&st];
+                    }
+                }
+            }
+        }
+    }
+
+    if (tex->mtl_data)
+    {
+        CFBridgingRelease(tex->mtl_data);
+        tex->mtl_data = NULL;
+    }
+    tex->mtl_data = (void *)CFBridgingRetain(nt);
+    mglTexParamInvalidate(ctx, &tex->params);
+
+    info->shape = *s;
+    info->realized = GL_TRUE;
+    for (GLuint f = 0; f < 6; f++)
+        info->on_gpu[f] = kept[f];
+    return true;
+}
+
+/* re-realize a plain 2D colour texture on a fresh IOSurface (host
+ * presentation, mglTextureIOSurface2D): the MTLTexture wraps the surface so a
+ * CoreAnimation layer can show the texture's content as it is drawn — no
+ * readback.  The surface's fourcc matches the texture's Metal pixel format
+ * (RGBA8 <-> 'RGBA', BGRA8 <-> 'BGRA'); depth, stencil, compressed, sRGB and
+ * multi-level shapes have no compositor-representable counterpart and are
+ * refused.  *surface receives the IOSurfaceRef; the CALLER releases it (the
+ * realized MTLTexture keeps its own reference while it lives). */
+- (bool) texdataRealizeIOSurface:(Texture *)tex surface:(void **)out_surface
+{
+    TDShape s;
+    GLMContext glm = ctx;
+
+    if (!tex || !out_surface || ![self texdataHandlesTexture:tex] || !mgl_texdata_shape(glm, tex, &s))
+        return false;
+
+    const TDFormat *sf = mgl_texdata_storage_format(s.internalformat);
+    if (!sf || (sf->flags & (TDF_DEPTH | TDF_STENCIL | TDF_COMPRESSED | TDF_SRGB)))
+        return false;
+    if (s.target != GL_TEXTURE_2D || s.levels != 1 || s.depth != 1)
+        return false;
+
+    MTLPixelFormat pf = (MTLPixelFormat)sf->mtl;
+    uint32_t fourcc = 0;
+    if (pf == MTLPixelFormatRGBA8Unorm)
+        fourcc = 'RGBA';
+    else if (pf == MTLPixelFormatBGRA8Unorm)
+        fourcc = 'BGRA';
+    else
+        return false;
+    NSUInteger bpp = sf->bpp;
+
+    NSUInteger w = s.width, h = s.height;
+    NSDictionary *d = @{
+        (id)kIOSurfaceWidth: @(w),
+        (id)kIOSurfaceHeight: @(h),
+        (id)kIOSurfaceBytesPerElement: @(bpp),
+        (id)kIOSurfaceBytesPerRow: @((w * bpp + 63) & ~63ULL),
+        (id)kIOSurfacePixelFormat: @(fourcc),
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)d);
+    if (!surface)
+        return false;
+
+    /* as the present pool (MGLRenderer+Compat.m): shared storage, both usages */
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                  width:w height:h mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    /* same usage as an ordinary realization of this format
+     * (texdataNewTextureForShape): views, render target and image stores */
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView |
+               MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
+    [self texparamPrepareTextureDescriptor:td forTex:tex];
+    [self texextAdjustTextureDescriptor:td forTexture:tex];
+    id<MTLTexture> nt = [_device newTextureWithDescriptor:td iosurface:surface plane:0];
+    if (!nt)
+    {
+        CFRelease(surface);
+        return false;
+    }
+    nt.label = @"MGL IOSurface present texture";
+
+    if (![self texdataInstallTexture:nt tex:tex shape:&s])
+    {
+        CFRelease(surface);
+        return false;
+    }
+    /* finish the realization as texdataRealize does: the shape now matches,
+     * so it keeps the IOSurface texture, uploads a pending CPU shadow into it,
+     * marks the level GPU resident and clears the texture's dirty bits */
+    if (![self texdataRealize:tex] || tex->mtl_data != (__bridge void *)nt)
+    {
+        CFRelease(surface);
+        return false;
+    }
+    *out_surface = surface;
+    return true;
+}
+
 - (bool) texdataRealize:(Texture *)tex
 {
     TDShape s;
@@ -326,69 +484,8 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
         if (!nt)
             return false;
 
-        uint32_t kept[6] = { 0 };
-
-        if (old)
-        {
-            TDShape os = info->shape;
-            const TDFormat *osf = mgl_texdata_storage_format(os.internalformat);
-            bool same_fmt = old.pixelFormat == nt.pixelFormat;
-
-            for (GLuint f = 0; f < faces; f++)
-            {
-                for (GLuint l = 0; l < os.levels && l < TD_MAX_LEVELS; l++)
-                {
-                    if (!(info->on_gpu[f] & (1u << l)))
-                        continue;
-
-                    NSUInteger ow, oh, od, nw, nh, nd;
-                    td_level_dims(&os, l, &ow, &oh, &od);
-                    td_level_dims(&s, l, &nw, &nh, &nd);
-
-                    if (same_fmt && l < s.levels && ow == nw && oh == nh && od == nd)
-                    {
-                        id<MTLBlitCommandEncoder> blit = [self texdataBlitEncoder];
-                        bool is3d = nt.textureType == MTLTextureType3D;
-                        NSUInteger slices = (tex->target == GL_TEXTURE_CUBE_MAP) ? 1 : (is3d ? 1 : od);
-                        for (NSUInteger sl = 0; sl < slices; sl++)
-                        {
-                            NSUInteger slice = (tex->target == GL_TEXTURE_CUBE_MAP) ? f : sl;
-                            [blit copyFromTexture:old sourceSlice:slice sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0)
-                                       sourceSize:MTLSizeMake(ow, oh, is3d ? od : 1)
-                                        toTexture:nt destinationSlice:slice destinationLevel:l
-                                destinationOrigin:MTLOriginMake(0, 0, 0)];
-                        }
-                        [blit endEncoding];
-                        kept[f] |= 1u << l;
-                    }
-                    else if (osf)
-                    {
-                        /* the level leaves the realized shape: keep its content on the CPU */
-                        TDStorage st;
-                        GLuint gw, gh, gd;
-                        mgl_texdata_level_geometry(tex, f, l, &gw, &gh, &gd);
-                        if (gw == ow && gh == oh && gd == od && mgl_texdata_shadow(glm, tex, f, l, true, &st))
-                        {
-                            TDRegion r = { f, l, 0, 0, 0, (GLsizei)ow, (GLsizei)oh, (GLsizei)od };
-                            [self texdataDownload:old tex:tex format:osf region:&r dst:&st];
-                        }
-                    }
-                }
-            }
-        }
-
-        if (tex->mtl_data)
-        {
-            CFBridgingRelease(tex->mtl_data);
-            tex->mtl_data = NULL;
-        }
-        tex->mtl_data = (void *)CFBridgingRetain(nt);
-        mglTexParamInvalidate(glm, &tex->params);
-
-        info->shape = s;
-        info->realized = GL_TRUE;
-        for (GLuint f = 0; f < 6; f++)
-            info->on_gpu[f] = kept[f];
+        if (![self texdataInstallTexture:nt tex:tex shape:&s])
+            return false;
     }
 
     /* upload pending CPU shadows and mark every level of the shape as GPU resident */
@@ -896,6 +993,11 @@ static bool td_realize(GLMContext ctx, Texture *tex)
     @autoreleasepool { return [TDR(ctx) texdataRealize:tex]; }
 }
 
+static bool td_realize_iosurface(GLMContext ctx, Texture *tex, void **surface)
+{
+    @autoreleasepool { return [TDR(ctx) texdataRealizeIOSurface:tex surface:surface]; }
+}
+
 static GLenum td_copy_from_read_fb(GLMContext ctx, Texture *dst, const TDRegion *r, GLint x, GLint y, GLsizei w, GLsizei h, bool depth, bool stencil)
 {
     @autoreleasepool { return [TDR(ctx) texdataCopyFromReadFB:dst region:r x:x y:y width:w height:h depth:depth stencil:stencil]; }
@@ -944,8 +1046,9 @@ static void *td_buffer_contents(GLMContext ctx, Buffer *buf)
 - (void) bindExtTexdataFuncsToGLMContext: (GLMContext) glm_ctx
 {
     static struct MGLExtMetal_texdata hooks = {
-        td_upload, td_download, td_download_decoded, td_realize, td_copy_from_read_fb,
-        td_copy_image, td_generate_mipmaps, td_release, td_read_buffer_info, td_buffer_contents
+        td_upload, td_download, td_download_decoded, td_realize, td_realize_iosurface,
+        td_copy_from_read_fb, td_copy_image, td_generate_mipmaps, td_release, td_read_buffer_info,
+        td_buffer_contents
     };
 
     glm_ctx->mtl_funcs.ext_texdata = &hooks;
