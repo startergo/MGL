@@ -46,6 +46,7 @@ TEST(blend_barrier_resolves_and_is_silent)
         "glGetnUniformuivARB", "glGetnUniformdvARB", "glGetnMapdvARB", "glGetnMapfvARB",
         "glGetnMapivARB", "glGetnPixelMapfvARB", "glGetnPixelMapuivARB",
         "glGetnPixelMapusvARB", "glGetnPolygonStippleARB",
+        "glMultiDrawArraysIndirectCountARB", "glMultiDrawElementsIndirectCountARB",
     };
     for (size_t i = 0; i < sizeof need / sizeof need[0]; i++)
     {

@@ -1,6 +1,7 @@
 /* test_buffers.c — buffer objects, mapping, copies/clears, compute + barriers, indirect
  * draws (incl. GL 4.6 *IndirectCount), emulated primitive types, fences, draw errors. */
 #include "mgl_test.h"
+#include <string.h>
 #include <stdint.h>
 
 typedef struct { GLuint count, instanceCount, first, baseInstance; } DrawArraysIndirectCommand;
@@ -529,6 +530,24 @@ TEST(multi_draw_indirect_count)
     glMultiDrawArraysIndirectCount(GL_TRIANGLES, 0, 4, 3, 0);    /* count 7 clamped to 3 */
     count_read(&frags, &origin);
     EXPECT_EQ_INT(origin, 4);
+
+    /* ARB_indirect_parameters: advertised, the ARB alias draws the same, and
+     * the PARAMETER_BUFFER binding is queryable under both names */
+    {
+        GLint n = 0, found = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n; i++)
+            if (!strcmp((const char *)glGetStringi(GL_EXTENSIONS, i), "GL_ARB_indirect_parameters")) found = 1;
+        EXPECT_EQ_INT(found, 1);
+        GLint pbb = 0;
+        glGetIntegerv(GL_PARAMETER_BUFFER_BINDING_ARB, &pbb);
+        EXPECT_EQ_INT(pbb, (GLint)pb);
+        count_reset();
+        glMultiDrawArraysIndirectCountARB(GL_TRIANGLES, 0, 0, 3, 0);    /* count 2: 1 + 2 instances */
+        EXPECT_NO_GL_ERROR();
+        count_read(&frags, &origin);
+        EXPECT_EQ_INT(origin, 3);
+    }
 
     count_reset();
     glMultiDrawArraysIndirect(GL_TRIANGLES, (const void *)(uintptr_t)sizeof(DrawArraysIndirectCommand), 2, 0);

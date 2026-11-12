@@ -7395,6 +7395,19 @@ void glMultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void *indi
     ctx->dispatch.multi_draw_elements_indirect_count(ctx, mode, type, indirect, drawcount, maxdrawcount, stride);
 }
 
+/* ARB_indirect_parameters aliases (see glDrawArraysInstancedARB): the extension
+ * names the same entry points with an ARB suffix; loaders that see the
+ * extension string fetch these names. */
+void glMultiDrawArraysIndirectCountARB(GLenum mode, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
+{
+    glMultiDrawArraysIndirectCount(mode, indirect, drawcount, maxdrawcount, stride);
+}
+
+void glMultiDrawElementsIndirectCountARB(GLenum mode, GLenum type, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride)
+{
+    glMultiDrawElementsIndirectCount(mode, type, indirect, drawcount, maxdrawcount, stride);
+}
+
 void glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp)
 {
     GLMContext ctx = GET_CONTEXT();

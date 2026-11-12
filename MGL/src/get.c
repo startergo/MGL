@@ -292,6 +292,7 @@ static const char *mgl_extensions[] = {
     "GL_ARB_instanced_arrays",
     "GL_ARB_internalformat_query",
     "GL_ARB_internalformat_query2",
+    "GL_ARB_indirect_parameters",      /* core 4.6 MultiDraw*IndirectCount + PARAMETER_BUFFER; ARB-suffixed aliases in gl_core.c */
     "GL_ARB_invalidate_subdata",
     "GL_ARB_map_buffer_alignment",
     "GL_ARB_map_buffer_range",
