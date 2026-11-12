@@ -1,4 +1,13 @@
-# MGL GL 4.6 port: status (2026-11-12 08:53 EST, gl46-port @ ce9263cd)
+# MGL GL 4.6 port: status (2026-11-12 11:07 EST, gl46-port @ 110ade8d)
+
+## Merged 2026-11-12 11:07 EST: xfb queries hook without dlsym(RTLD_DEFAULT) (110ade8d)
+The user approved at 10:43 EST, after the rsvga analysis. Files: geometry.c, transform_feedback.c. No GL strings change.
+
+The geometry-shader xfb capture (both sites in geometry.c) and transform_feedback.c `xfb_queries_note()` looked up `mgl_queries_note_xfb_primitives` with `dlsym(RTLD_DEFAULT, ...)`. That only resolves when libmgl is loaded RTLD_GLOBAL; a host that dlopens it RTLD_LOCAL (rsvga's default) silently lost GL_PRIMITIVES_GENERATED / GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN counts. Both now reference the symbol directly (same library). rsvga can drop its RTLD_GLOBAL workaround.
+
+Verify: v-dlsym GREEN (0 FAILED, 817/0 x6, 298/0, Tess 84 PASS, Xfb PASS, headless rc 0).
+
+New baseline: ~/MGL-cts/baseline-110ade8d.
 
 ## Merged 2026-11-12 08:53 EST: x86_64 build fix, portable spin-wait hint (ce9263cd)
 The user approved at 08:31 EST, after reviewing the rsvga agent's universal-build notes. File: MGLRenderer+CompatCS.m only. No GL strings change.
