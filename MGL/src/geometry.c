@@ -14755,6 +14755,7 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
     uint32_t count = ctl ? ctl[0] : 0;
     uint32_t prims = ctl ? ctl[13] : 0;
     uint32_t written = 0;    /* primitives whose last vertex actually landed */
+    uint32_t landed_end = 0; /* one past the highest primitive index that landed */
     BufferBaseTarget *tfb = ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers;
 
     if (!o || !o->active || !xp || !xp->count || !count) return;
@@ -14849,18 +14850,27 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
                         }
                     }
 
-                    /* the whole primitive landed: advance every buffer by its per vertices */
-                    for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
-                        if (xp->buffer_mask & (1u << b))
-                            o->write_offset[b] += (GLsizeiptr)(per * xp->stride[b]);
+                    /* the whole primitive landed: its vertices are already at
+                     * write_offset + prim*per*stride (the position includes the
+                     * primitive's index), so the buffer advances once, below, by the
+                     * landed vertices — advancing here too put every primitive after
+                     * the first at twice its offset */
                     o->vertices[0] += per;
                     written++;
+                    if (prim + 1u > landed_end) landed_end = prim + 1u;
                 }
             }
         }
 
         close_base += thread_prims;
     }
+
+    /* the draw's captures sit at write_offset + prim*per*stride: advance every recorded
+     * buffer past the highest primitive that landed (equal to written when the indices are
+     * dense, never short of it, so a gap cannot let the next draw overwrite the tail) */
+    for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++)
+        if (xp->buffer_mask & (1u << b) && landed_end)
+            o->write_offset[b] += (GLsizeiptr)landed_end * (GLsizeiptr)per * xp->stride[b];
 
     o->prims_written[0] += written;
     o->prims_needed[0] += prims;

@@ -236,9 +236,16 @@ void mgl_buffers_prepare_cpu_read(GLMContext ctx, Buffer *buf)
     if (need == 0 && buf->data.mtl_data && bound_for_foreign_gpu_write(ctx, buf))
         need = MTLX()->current_serial(ctx);   // conservatively: everything queued so far
 
-    if (need > completed)
+    /* a completed serial only means the GPU writes have finished: a MANAGED buffer's
+     * CPU view still needs synchronizeResource once per write before it can be read
+     * (the geometry transform feedback pack's scatter writes the GPU side and the GL
+     * data store reads the CPU side), so the view is refreshed for every write_serial
+     * it has not seen — make_cpu_visible waits when the writing command buffer has
+     * not completed yet and only synchronizes otherwise. */
+    if (need && (!t || t->cpu_serial < need))
     {
         MTLX()->make_cpu_visible(ctx, buf, need);
+        if (t) t->cpu_serial = need;
 
         /* gpuaudit: the CPU view just changed because of a GPU write; cached index
          * rewrites/scans for this buffer are stale now */

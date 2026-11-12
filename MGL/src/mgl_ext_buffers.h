@@ -30,6 +30,9 @@ typedef struct MGLBufferTrack_t {
     Buffer   *buf;          /* NULL = empty, (Buffer *)1 = tombstone */
     uint64_t  read_serial;  /* last command buffer serial that read the buffer */
     uint64_t  write_serial; /* last command buffer serial that may have written it */
+    uint64_t  cpu_serial;   /* last write_serial the CPU view has synchronized
+                             * (a MANAGED buffer needs synchronizeResource once per
+                             * GPU write, however long ago it completed) */
 } MGLBufferTrack;
 
 /* GL-side state, reachable as ctx->state.ext_buffers; allocated in mgl_ext_init_buffers(). */
