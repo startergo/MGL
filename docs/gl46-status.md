@@ -1,4 +1,18 @@
-# MGL GL 4.6 port: status (2026-11-12 05:14 EST, gl46-port @ 1cbdd1ce)
+# MGL GL 4.6 port: status (2026-11-12 07:48 EST, gl46-port @ 9800bc2a)
+
+## Merged 2026-11-12 07:48 EST: patch 0003, IOSurface-backed textures, corrected (9800bc2a)
+Source: patches/0003-iosurface-backed-textures.patch (rsvga local build). The user asked at 07:28 EST to inspect it, verify its claim and merge it with any fixes. Corrected version: patches/0003-iosurface-backed-textures.fixed.patch. Files: MGLRenderer+TextureData.m, mgl_ext_texdata.h, textures.c, new tests/headless/test_iosurface_tex.c. No GL strings change.
+
+What it adds: `void *mglTextureIOSurface2D(GLuint texture, GLenum internalformat, GLsizei w, GLsizei h)` gives a GL_TEXTURE_2D single-level immutable storage on a fresh IOSurface. The realized MTLTexture wraps the surface (shared storage), so a CoreAnimation layer can show the texture as the GL draws it, with no readback; the caller releases the returned IOSurfaceRef and should glFlush/glFinish before compositing. Storage RGBA8/BGRA8 unorm only. The content copy that texdataRealize does on a shape change is factored into texdataInstallTexture.
+
+The submitted patch's claim did not hold:
+- "Content carries across the storage change" was false: the levels were redefined first, and defineLevel clears the GPU-resident bit and frees the CPU shadow, so the surface came up zeroed. Now level 0 is kept when it already has the requested format and size.
+- Refused formats were refused after the texture had been redefined (GL_RGBA16F left it immutable RGBA16F with the content gone). The format is now checked first.
+- Realization is finished like texdataRealize; the surface texture gets the ordinary usage flags (views, image stores) and the texparam/texext descriptor hooks.
+
+Verify: test_iosurface_tex 44/0 on the corrected patch and 9 failures on the submitted one; full headless gate green on 85479f97 (0 FAIL, 817/0, 298/0, Tess/Xfb PASS). CTS and glmark2 do not call the new entry point, and ordinary texture realization is the same code moved into a helper, so they were not re-run (a full official-equivalent CTS run on 1cbdd1ce is in progress).
+
+New baseline: ~/MGL-cts/baseline-9800bc2a.
 
 ## Merged 2026-11-12 05:14 EST: compat r106 (1cbdd1ce)
 This squashes gl46/compat 86c11c43 (READY r106) over 87cb342f: compat_glsl.c (+12/−2), compat_vb.c (+9) and two new headless tests. The report commit and test_scratch_xfbcompat.c (a scratch repro) are excluded. No GL strings change. The user approved the merge at 04:54 EST.
