@@ -625,6 +625,15 @@ static Program *bind_ffp(GLMContext ctx)
         return user;
     }
 
+    /* GL 4.6 7.3.1: a bound program pipeline TAKES THE PLACE of the current
+     * program — no fixed-function substitution then (compat r106: the
+     * compat-as-superset audit caught KHR-GL46.direct_state_access.
+     * program_pipelines_functional rendering nothing on a compat context:
+     * glUseProgram(0)+glBindProgramPipeline made bind_ffp install the
+     * fixed-function program and the pipeline's stages were ignored). */
+    if (STATE(program_pipeline))
+        return NULL;
+
     GLuint prog = mgl_compat_ffp_program(ctx);
 
     if (prog)

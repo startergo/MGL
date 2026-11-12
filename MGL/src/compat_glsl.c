@@ -541,8 +541,18 @@ char *mgl_compat_translate_shader(GLMContext ctx, GLuint type, GLsizei count,
         t.pos++;
     }
 
-    /* no legacy syntax and a modern #version: leave the source untouched */
-    if (t.subst == 0 && t.version >= 330 && !t.profile_compat)
+    /* no legacy syntax: leave the source untouched.  The version alone must
+     * NOT trigger the fixed-function plumbing (compat r106): the CTS's
+     * transform_feedback / other core-style tests use "#version 130"/"#version
+     * 150" shaders with zero compat tokens — running them through the compat
+     * translator upgraded them to 460 and injected the mgl* varyings /
+     * gl_PerVertex differences, which broke multi-stage links on a compat
+     * CONTEXT (KHR-GL46.transform_feedback 21/21 core vs 8/21 compat:
+     * "vertex block member gl_CullDistance has no corresponding member in
+     * geometry block").  A shader with no compat token is a plain GLSL source
+     * whatever its #version; the shared core path upgrades it to 330+ exactly
+     * like on a core context. */
+    if (t.subst == 0 && !t.profile_compat)
     {
         free(joined);
         free(t.out);
