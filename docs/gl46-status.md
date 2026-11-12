@@ -1,4 +1,14 @@
-# MGL GL 4.6 port: status (2026-11-12 07:48 EST, gl46-port @ 9800bc2a)
+# MGL GL 4.6 port: status (2026-11-12 08:10 EST, gl46-port @ 0cb9214b)
+
+## Merged 2026-11-12 08:10 EST: GL_ARB_indirect_parameters (0cb9214b)
+The user asked at 07:50 EST whether the instanced/indirect entry points are exported (all core ones are) and approved adding the two missing pieces at 07:52 EST. Files: get.c, gl_core.c, tests test_buffers.c and test_entry_ext.c.
+
+- **New GL string:** GL_ARB_indirect_parameters. Everything it covers was already implemented as GL 4.6 core: glMultiDraw{Arrays,Elements}IndirectCount, the GL_PARAMETER_BUFFER target and the GL_PARAMETER_BUFFER_BINDING query.
+- **New exports:** glMultiDrawArraysIndirectCountARB and glMultiDrawElementsIndirectCountARB, forwarding to the core entry points (loaders such as glcts fetch the ARB names once the extension is listed).
+
+Verify: green from scratch on 14eb7d68 (0 FAIL, 817/0, 298/0, Tess/Xfb PASS; test_entry_ext and test_buffers include the new checks). CTS on the verify build with the extension advertised: indirect_parameters_tests 3/3, draw_indirect 70/70, shader_draw_parameters_tests 13/13, the same as base 45309315.
+
+New baseline: ~/MGL-cts/baseline-0cb9214b.
 
 ## Merged 2026-11-12 07:48 EST: patch 0003, IOSurface-backed textures, corrected (9800bc2a)
 Source: patches/0003-iosurface-backed-textures.patch (rsvga local build). The user asked at 07:28 EST to inspect it, verify its claim and merge it with any fixes. Corrected version: patches/0003-iosurface-backed-textures.fixed.patch. Files: MGLRenderer+TextureData.m, mgl_ext_texdata.h, textures.c, new tests/headless/test_iosurface_tex.c. No GL strings change.
