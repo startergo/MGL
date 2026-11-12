@@ -3731,6 +3731,160 @@ TEST(baseinstance_indirect_gs)
     baseinstance_case(el, 5, true);
 }
 
+
+/* -------------- REPEATED baseInstance draws through a GS (r144/r145) ------
+ *
+ * A baseInstance > 0 draw through a GS worked on the FIRST draw (CPU-assembled
+ * capture) but every REPEAT (GPU-assembly path, taken once the element buffer
+ * is GPU-resident) captured NOTHING.  Two real bugs: (1) the prep kernel's
+ * staging-command binding missed the pool offset (gPrepOff) — the parsed
+ * baseInstance read garbage; (2) r142 wrote baseInstance into word 10 of the
+ * prep outputs, which is the baseVertex slot of Metal's FIVE-word
+ * MTLDrawIndexedPrimitivesIndirectArguments {count, instances, indexStart,
+ * baseVertex, baseInstance} = prep[7..11] — the capture drew indices shifted
+ * by baseInstance and wrote nothing.  r145 maps the words correctly
+ * (indexStart=0, baseVertex=0, baseInstance=GL value) on one indirect capture
+ * path for both direct and cmd_buffer draws. */
+TEST(baseinstance_repeated_element_draws)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "flat out int ids;\n"
+        "const vec2 tri[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));\n"
+        "void main() { gl_Position = vec4(tri[gl_VertexID] * 0.5, 0.0, 1.0); ids = gl_InstanceID; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "flat in int ids[];\n"
+        "flat out int g;\n"
+        "void main() {\n"
+        "  g = ids[0];\n"
+        "  for (int k = 0; k < 3; k++) { gl_Position = gl_in[k].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "flat in int g;\n"
+        "layout(location=0) out vec4 c;\n"
+        "void main() { c = (g == 2) ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    GLuint p = mgl_make_program5(vs, NULL, NULL, gs, fs);
+    GLuint vao = 0, ibo = 0;
+
+    if (!p) return;
+    {
+        const GLuint idx[3] = { 0, 1, 2 };
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &ibo);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glUseProgram(p);
+        glViewport(0, 0, 8, 8);
+        glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+        /* draw 0: CPU-assembly; draws 1-3: GPU-assembly (the buffer is GPU-resident) */
+        for (int i = 0; i < 4; i++)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 1, 0, 2);
+            EXPECT_NO_GL_ERROR();
+            EXPECT_PIXEL(4, 4, 0, 255, 0, 255, 8);   /* instance id 2 -> green, EVERY draw */
+        }
+        /* baseInstance 0 -> id 0 -> red */
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 1, 0, 0);
+        EXPECT_PIXEL(4, 4, 255, 0, 0, 255, 8);
+        /* and back to 2 */
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, 3, GL_UNSIGNED_INT, NULL, 1, 0, 2);
+        EXPECT_PIXEL(4, 4, 0, 255, 0, 255, 8);
+    }
+    glDeleteBuffers(1, &ibo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
+
+/* ---------- INDIRECT (user-buffer) baseInstance + baseVertex (r145) ------- */
+
+/* the same GPU-assembly capture path via glDrawElementsIndirect from a USER
+ * buffer: baseInstance 2 repeated 4x (all green, absolute gl_InstanceID), and
+ * a baseVertex 3 command (indices {0,1,2} + 3 -> vertices 3,4,5 = the RIGHT
+ * half — proving word 10, the baseVertex slot, is honoured independently). */
+TEST(baseinstance_indirect_userbuf_repeats)
+{
+    const char *vs =
+        "#version 460 core\n"
+        "flat out int ids;\n"
+        "const vec2 tri[6] = vec2[6](vec2(-1.0, -1.0), vec2(0.0, -1.0), vec2(-1.0, 3.0),\n"
+        "                             vec2(0.0, -1.0), vec2(1.0, -1.0), vec2(0.0, 3.0));\n"
+        "void main() { gl_Position = vec4(tri[gl_VertexID] * 1.0, 0.0, 1.0); ids = gl_InstanceID; }\n";
+    const char *gs =
+        "#version 460 core\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "flat in int ids[];\n"
+        "flat out int g;\n"
+        "void main() {\n"
+        "  g = ids[0];\n"
+        "  for (int k = 0; k < 3; k++) { gl_Position = gl_in[k].gl_Position; EmitVertex(); }\n"
+        "  EndPrimitive();\n"
+        "}\n";
+    const char *fs =
+        "#version 460 core\n"
+        "flat in int g;\n"
+        "layout(location=0) out vec4 c;\n"
+        "void main() { c = (g >= 2) ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    GLuint p = mgl_make_program5(vs, NULL, NULL, gs, fs);
+    GLuint vao = 0, ibo = 0, dib = 0;
+
+    if (!p) return;
+    {
+        const GLuint idx[6] = { 0, 1, 2, 0, 1, 2 };
+        /* { count, instanceCount, firstIndex, baseVertex, baseInstance } */
+        const GLuint bi2[5] = { 3, 1, 0, 0, 2 };
+        const GLuint bv3[5] = { 3, 1, 0, 3, 0 };
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &ibo);
+        glGenBuffers(1, &dib);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof idx, idx, GL_STATIC_DRAW);
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, dib);
+        glUseProgram(p);
+        glViewport(0, 0, 16, 16);
+        glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+
+        /* baseInstance = 2, four repeats (first may go CPU-side, rest GPU) */
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof bi2, bi2, GL_STATIC_DRAW);
+        for (int i = 0; i < 4; i++)
+        {
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+            EXPECT_NO_GL_ERROR();
+            EXPECT_PIXEL(4, 8, 0, 255, 0, 255, 8);   /* left triangle (x<0), instance id 2 -> green */
+        }
+        /* baseVertex = 3: indices {0,1,2}+3 -> vertices 3,4,5 (the RIGHT half) */
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof bv3, bv3, GL_STATIC_DRAW);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+        EXPECT_NO_GL_ERROR();
+        EXPECT_PIXEL(12, 8, 255, 0, 0, 255, 8);      /* right half (x>0), id 0 -> red */
+        EXPECT_PIXEL(4, 8, 0, 0, 255, 255, 8);       /* left untouched */
+        /* and repeated, to exercise the GPU path with baseVertex too */
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, NULL);
+        EXPECT_PIXEL(12, 8, 255, 0, 0, 255, 8);
+        EXPECT_PIXEL(4, 8, 0, 0, 255, 255, 8);
+    }
+    glDeleteBuffers(1, &dib);
+    glDeleteBuffers(1, &ibo);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     GLuint vao = 0;
@@ -3784,5 +3938,7 @@ int main(void)
     RUN(basevertex_direct_gs);
     RUN(basevertex_xfb_absolute_vid);
     RUN(baseinstance_indirect_gs);
+    RUN(baseinstance_repeated_element_draws);
+    RUN(baseinstance_indirect_userbuf_repeats);
     return mgl_test_summary();
 }

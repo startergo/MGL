@@ -475,19 +475,16 @@ static const char *kGeomPrepMSL =
     "    prep[7] = out_idx;                     /* capture indexCount    */\n"
     "    prep[8] = instances;                   /* capture instanceCount */\n"
     "    prep[9] = 0u;                          /* capture startIndex    */\n"
-    "    /* geom r133: the capture index list becomes ABSOLUTE (vtx + basevertex) and both\n"
-    "     * indirect draws publish baseVertex = 0 — the prim table and the capture list are\n"
-    "     * already absolute, and hdr[12] (the geometry kernel's record base) must be the\n"
-    "     * ABSOLUTE window start so that prim - hdr[12] lands on the capture's slot\n"
-    "     * (abs - ctl[0]).  A non-zero baseVertex used to shift every fetch twice. */\n"
-    "    /* Metal's MTLDrawIndexedPrimitivesIndirectArguments = { indexCount, instanceCount,\n"
-    "     * baseVertex, baseInstance } = prep[7..10]: the capture LIST is absolute (r133)\n"
-    "     * so baseVertex is 0, and r142 puts the GL baseInstance in word 10 — a relative\n"
-    "     * [[instance_id]] used to make the variant's (instance_id - ch[2]) negative */\n"
-    "    prep[10] = baseinstance;               /* capture baseInstance (ch[2] = baseinstance) */\n"
-    "    prep[11] = baseinstance;               /* r139: the capture IS drawn with baseInstance — the\n"
-    "                                            * variant's slot is (instance_id - ch[2]) with ch[2] =\n"
-    "                                            * baseinstance, so an absolute [[instance_id]] lands at 0 */\n"
+    "    /* r145: MTLDrawIndexedPrimitivesIndirectArguments is FIVE words at prep[7..11]:\n"
+    "     * { indexCount, instanceCount, indexStart, baseVertex, baseInstance }.  The\n"
+    "     * capture list is ABSOLUTE (r133), so indexStart = 0 and baseVertex = 0;\n"
+    "     * baseInstance = the GL value, giving the variant an ABSOLUTE [[instance_id]]\n"
+    "     * (its window arithmetic subtracts ch[2] = baseinstance).  r142's bug: it wrote\n"
+    "     * baseInstance into word 10 — the baseVertex slot — shifting every captured\n"
+    "     * index by baseInstance, so the capture drew nothing. */\n"
+    "    prep[9] = 0u;                          /* capture indexStart (absolute list) */\n"
+    "    prep[10] = 0u;                         /* capture baseVertex (absolute list) */\n"
+    "    prep[11] = baseinstance;               /* capture baseInstance (absolute [[instance_id]]) */\n"
     "    hdr[0] = out_prims;\n"
     "    hdr[1] = instances;\n"
     "    hdr[6] = vmax - vmin + 1u;\n"
@@ -576,9 +573,10 @@ static const char *kGeomPrepMSL =
     "    if (tid != 0u) return;\n"
     "    uint count = c.v[1], first = c.v[2], basevertex = c.v[4], instances = c.v[5], layout = c.v[11];\n"
     "    const device uint* u = (const device uint*)cmd;\n"
-    "    uint baseinstance = 0u;   /* r139: reaches the prefix kernel via context word 19 */\n"
+    "    uint baseinstance = 0u;   /* r139: reaches the prefix kernel via context word 20 */\n"
     "    if (layout == 1u) { count = u[0]; instances = u[1]; first = u[2]; baseinstance = u[3]; }\n"
     "    else if (layout == 2u) { count = u[0]; instances = u[1]; first = u[2]; basevertex = u[3]; baseinstance = u[4]; }\n"
+    "    else baseinstance = u[4];   /* r143: a DIRECT draw's staging command carries word 4 too */\n"
     "    uint tiles = (count + WG - 1u) / WG;\n"
     "    uint64_t rmax = (uint64_t)count + 1u;\n"
     "    uint64_t words = 5ull * tiles + 4ull * (rmax + 1ull);\n"
@@ -740,9 +738,9 @@ static const char *kGeomPrepMSL =
     "        prep[0] = out_prims; prep[1] = out_idx; prep[2] = vmax; prep[3] = vmin;\n"
     "        prep[4] = (uint)(((uint64_t)out_prims * instances * c.v[6]) / WG + 1ull);\n"
     "        prep[5] = 1u; prep[6] = 1u;\n"
-    "        prep[7] = out_idx; prep[8] = instances; prep[9] = 0u;\n"
-    "        prep[10] = prep[20];                      /* r142: Metal word 10 IS baseInstance (list absolute) */\n"
-    "        prep[11] = prep[20];                      /* r139: capture baseInstance (threaded from prepc) */\n"
+    "        prep[7] = out_idx; prep[8] = instances; prep[9] = 0u;   /* indexStart */\n"
+    "        prep[10] = 0u;                            /* r145: baseVertex (the list is absolute) */\n"
+    "        prep[11] = prep[20];                      /* r145: baseInstance (threaded from prepc, word 5 of the struct) */\n"
     "        hdr[0] = out_prims; hdr[1] = instances; hdr[6] = vmax - vmin + 1u;\n"
     "        hdr[12] = vmin + (c.v[3] != 0u ? prep[14] : 0u);   /* r133: absolute window start */\n"
     "        ctl[0] = vmin + (c.v[3] != 0u ? prep[14] : 0u);\n"
@@ -6607,6 +6605,9 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
                 cmd[2] = (uint32_t)d->basevertex;
                 cmd[3] = (uint32_t)(d->instances > 0 ? d->instances : 1);
                 cmd[4] = (uint32_t)d->baseinstance;   /* r139: the capture draws with baseInstance */
+                if (getenv("MGL_CULL_DUMP"))
+                    fprintf(stderr, "culldump: staging %u %u %u %u %u (d->bi=%d layout=%u)\n",
+                            cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], (int)d->baseinstance, (unsigned)d->cmd_layout);
             }
         }
         else
@@ -6766,9 +6767,13 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
         [enc setComputePipelineState: gPrepPso];
         [enc setBuffer: gPrep offset: gPrepOff atIndex: 0];                           /* inputs */
         {
-            /* the draw command: the user's indirect buffer, or the staging words in gPrep */
+            /* the draw command: the user's indirect buffer, or the staging words in gPrep.
+             * r144 FIX: the staging binding was missing gPrepOff — the first pool range
+             * (offset 0) worked by accident; once the pool rotated the serial kernel read
+             * the staging command from the WRONG place (garbage word 4 = baseinstance 0,
+             * found via the r143 sentinel: prep[11] = 0xABCD0000|0 while staging = 2). */
             id<MTLBuffer> cmd = gPrep;
-            size_t cmd_off = MGL_GEOM_PREP_CMD_OFF * sizeof(uint32_t);
+            size_t cmd_off = gPrepOff + MGL_GEOM_PREP_CMD_OFF * sizeof(uint32_t);
             if (d->cmd_buffer)
             {
                 cmd = (__bridge id<MTLBuffer>)d->cmd_buffer;
@@ -7215,7 +7220,8 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
 
         if (gpu_assembly && !implicit)
         {
-            /* the prep kernel wrote the draw arguments (index count, instances, bases) */
+            /* the prep kernel wrote the draw arguments — MTLDrawIndexedPrimitivesIndirectArguments
+             * at prep[7..11] = { indexCount, instanceCount, indexStart, baseVertex, baseInstance } */
             [enc drawIndexedPrimitives: MTLPrimitiveTypePoint
                              indexType: MTLIndexTypeUInt32
                            indexBuffer: gPrim
@@ -7771,7 +7777,27 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
             id<MTLBuffer> idx = gIdx, outv = gOutv, ctl = gCtl;
             size_t idx_off = 0, out_off = gOutvOff / 4;
             uint32_t ow = gp->out_words, nrec = (uint32_t)((outv.length - gOutvOff) / 4 / (ow ? ow : 1));
+            /* geom r143 diagnosis: the prep words (the capture draw's args) + the
+             * capture window, read post-GPU alongside the records */
+            id<MTLBuffer> prp = gPrep, vso = gVsout;
+            size_t prp_off = gPrepOff / 4 + MGL_GEOM_PREP_OUT_OFF, vso_off = gVsoutOff / 4;
             [_currentCommandBuffer addCompletedHandler: ^(id<MTLCommandBuffer> b) {
+                uint32_t *pp = (uint32_t *)prp.contents;
+                uint32_t *ch = (uint32_t *)vso.contents;
+
+                if (pp)
+                {
+                    fprintf(stderr, "culldump: prep7..11 = %u %u %u %u %u  ch0..3 = %u %u %u %u\n",
+                            pp[prp_off + 7], pp[prp_off + 8], pp[prp_off + 9],
+                            pp[prp_off + 10], pp[prp_off + 11],
+                            ch ? ch[vso_off + 0] : 0, ch ? ch[vso_off + 1] : 0,
+                            ch ? ch[vso_off + 2] : 0, ch ? ch[vso_off + 3] : 0);
+                    fprintf(stderr, "culldump: vsout[0..7] = %u %u %u %u %u %u %u %u\n",
+                            ch ? ch[vso_off + 4] : 0, ch ? ch[vso_off + 5] : 0,
+                            ch ? ch[vso_off + 6] : 0, ch ? ch[vso_off + 7] : 0,
+                            ch ? ch[vso_off + 8] : 0, ch ? ch[vso_off + 9] : 0,
+                            ch ? ch[vso_off + 10] : 0, ch ? ch[vso_off + 11] : 0);
+                }
                 uint32_t *ix = (uint32_t *)idx.contents;
                 uint32_t *cp = (uint32_t *)ctl.contents;
                 uint32_t n = cp ? cp[MGL_GEOM_ARG_OFFSET] : 0;
