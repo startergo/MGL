@@ -35,6 +35,17 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* spin-wait hint: YIELD on arm64, PAUSE on x86_64 (the old unguarded
+ * __builtin_arm_yield did not compile for x86_64), nothing elsewhere */
+static inline void cs_cpu_relax(void)
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    __builtin_arm_yield();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* packets */
 
@@ -206,7 +217,7 @@ static void cs_drain(MGLCSState *s)
                 if (s->prof) s->t_drain += cs_now() - pt0;
                 return;
             }
-            __builtin_arm_yield();
+            cs_cpu_relax();
         } while (cs_now() < dl);
     }
 
@@ -482,7 +493,7 @@ static void *cs_worker(void *arg)
                 uint64_t dl = cs_now() + spin;
                 do
                 {
-                    __builtin_arm_yield();
+                    cs_cpu_relax();
                     w = atomic_load_explicit(&s->written, memory_order_acquire);
                 } while (w == seen && !atomic_load_explicit(&s->exit, memory_order_relaxed) && cs_now() < dl);
             }
