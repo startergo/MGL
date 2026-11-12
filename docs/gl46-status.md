@@ -1,4 +1,14 @@
-# MGL GL 4.6 port: status (2026-11-12 11:07 EST, gl46-port @ 110ade8d)
+# MGL GL 4.6 port: status (2026-11-12 11:33 EST, gl46-port @ b9ef44f1)
+
+## Merged 2026-11-12 11:33 EST: patch 0004, GS xfb CPU-pack offsets and CPU readback sync (b9ef44f1)
+The user approved at 11:09 EST. Source: rsvga's patches/0004-geometry-xfb-pack-offsets-and-readback.fixed.patch, plus one supervisor refinement and a regression test. Files: geometry.c, draw_ext.c, mgl_ext_buffers.h, tests/headless/test_geom_cpuxfb.c. No GL strings change.
+
+- geometry.c, CPU pack of geometry-shader transform feedback (used with MGL_GEOM_CPU_XFB or when the GPU pack can't run): every vertex already lands at write_offset + (prim*per + j)*stride, yet write_offset also advanced by per*stride after each primitive, so every primitive after the first was written at twice its offset and the next draw started past a doubled end. Offsets now advance once per draw. Refinement: advance past the highest primitive index that landed rather than by the landed count, so an index gap can never let the next draw overwrite the tail.
+- draw_ext.c `mgl_buffers_prepare_cpu_read`: a GPU-written managed buffer was not synchronized for CPU reads once its write serial had completed. A per-buffer cpu_serial now tracks what the CPU has synced. On Apple Silicon this only waits on an already-completed serial; it fixes managed buffers on Intel/AMD hosts.
+
+Test: test_geom_cpuxfb (strip and points GS, several primitives per draw, two draws into one buffer, PRIMITIVES_WRITTEN, untouched tail) fails on 110ade8d with the doubled offsets and passes 132/0 with the change. Verify: v-p0004 GREEN (0 FAILED, 817/0 x6, 298/0, Tess 84 PASS, Xfb PASS, headless rc 0).
+
+New baseline: ~/MGL-cts/baseline-b9ef44f1.
 
 ## Merged 2026-11-12 11:07 EST: xfb queries hook without dlsym(RTLD_DEFAULT) (110ade8d)
 The user approved at 10:43 EST, after the rsvga analysis. Files: geometry.c, transform_feedback.c. No GL strings change.
