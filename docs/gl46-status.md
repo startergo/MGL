@@ -1,4 +1,15 @@
-# MGL GL 4.6 port: status (2026-11-12 08:10 EST, gl46-port @ 0cb9214b)
+# MGL GL 4.6 port: status (2026-11-12 08:53 EST, gl46-port @ ce9263cd)
+
+## Merged 2026-11-12 08:53 EST: x86_64 build fix, portable spin-wait hint (ce9263cd)
+The user approved at 08:31 EST, after reviewing the rsvga agent's universal-build notes. File: MGLRenderer+CompatCS.m only. No GL strings change.
+
+MGLRenderer+CompatCS.m called `__builtin_arm_yield()` unguarded in its two spin loops, so gl46-port did not compile for x86_64 ("use of unknown builtin"; the rsvga build-mgl.sh worked around it with a sed swap). A static inline `cs_cpu_relax()` now emits YIELD on arm64, PAUSE on x86_64 and nothing elsewhere; arm64 code is unchanged.
+
+Verify: x86_64 `-fsyntax-only` over all 84 MGL/src .c/.m files is clean (the ARC files with `-fobjc-arc`, as the Makefile builds them), so this was the only architecture-specific construct in MGL's own sources; the bundled externals (glslang, SPIRV-Cross, SPIRV-Tools) still need a native x86_64 build. arm64 full headless gate green on 451d35d0 (0 FAIL, 817/0, 298/0, Tess/Xfb PASS).
+
+Notes passed to the rsvga side (08:30 EST): the IOSurface path is tested on AGX (test_iosurface_tex 44/0 on the M4 Pro) but not on the Intel/AMD side or with BGRA8; patches 0001–0003 are already in gl46-port (45309315, 9800bc2a), so build-mgl.sh must not re-apply them, and the original 0003 is buggy; match the uv Python path on the host arch rather than a glob.
+
+New baseline: ~/MGL-cts/baseline-ce9263cd.
 
 ## Merged 2026-11-12 08:10 EST: GL_ARB_indirect_parameters (0cb9214b)
 The user asked at 07:50 EST whether the instanced/indirect entry points are exported (all core ones are) and approved adding the two missing pieces at 07:52 EST. Files: get.c, gl_core.c, tests test_buffers.c and test_entry_ext.c.
