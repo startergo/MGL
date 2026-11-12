@@ -14715,14 +14715,10 @@ void mgl_geom_xfb_flush(GLMContext ctx)
 
     /* the transform feedback primitive queries are counted by the queries domain */
     {
-        typedef void (*geom_note_queries_fn)(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
-        static geom_note_queries_fn note;
-        static int looked;
-        if (!looked)
-        {
-            note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
-            looked = 1;
-        }
+        /* a direct call: queries.c is in this library.  The old
+         * dlsym(RTLD_DEFAULT, ...) lookup returned NULL whenever libmgl was
+         * loaded RTLD_LOCAL, silently dropping the counts. */
+        void (*note)(GLMContext, GLuint, uint64_t, uint64_t) = mgl_queries_note_xfb_primitives;
         /* sp[s] = written, sp[s + MAX] = emitted (needed): needed > written is the overflow
          * condition of GL_TRANSFORM_FEEDBACK_OVERFLOW_ARB / _STREAM_OVERFLOW_ARB */
         if (note)
@@ -14877,14 +14873,10 @@ void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *re
 
     /* the transform feedback primitive queries are counted by the queries domain */
     {
-        typedef void (*geom_note_queries_fn)(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
-        static geom_note_queries_fn note;
-        static int looked;
-        if (!looked)
-        {
-            note = (geom_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives");
-            looked = 1;
-        }
+        /* a direct call: queries.c is in this library.  The old
+         * dlsym(RTLD_DEFAULT, ...) lookup returned NULL whenever libmgl was
+         * loaded RTLD_LOCAL, silently dropping the counts. */
+        void (*note)(GLMContext, GLuint, uint64_t, uint64_t) = mgl_queries_note_xfb_primitives;
         if (note) note(ctx, 0, written, prims);
     }
 }

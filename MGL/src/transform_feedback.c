@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include "mgl_ext_queries.h"
 
 #include <glslang_c_interface.h>
 #include "fp64.h"
@@ -52,15 +53,13 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 const glslang_resource_t *glslang_default_resource(void);
 
 /* the 'queries' domain counts TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN / overflow queries through
- * mgl_queries_note_xfb_primitives() (mgl_ext_queries.h).  Looked up at run time so this domain
- * builds with or without that branch merged. */
+ * mgl_queries_note_xfb_primitives() (mgl_ext_queries.h, queries.c — same library).  Called
+ * directly: the old dlsym(RTLD_DEFAULT, ...) lookup returned NULL whenever libmgl was loaded
+ * RTLD_LOCAL, silently dropping the counts. */
 typedef void (*xfb_note_queries_fn)(GLMContext ctx, GLuint stream, uint64_t written, uint64_t needed);
 static xfb_note_queries_fn xfb_queries_note(void)
 {
-    static int looked;
-    static xfb_note_queries_fn fn;
-    if (!looked) { fn = (xfb_note_queries_fn)dlsym(RTLD_DEFAULT, "mgl_queries_note_xfb_primitives"); looked = 1; }
-    return fn;
+    return mgl_queries_note_xfb_primitives;
 }
 
 #define XFB()               (ctx->state.ext_xfb)
