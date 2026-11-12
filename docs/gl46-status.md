@@ -1,4 +1,19 @@
-# MGL GL 4.6 port: status (2026-11-12 04:53 EST, gl46-port @ 9b8587b2)
+# MGL GL 4.6 port: status (2026-11-12 05:14 EST, gl46-port @ 1cbdd1ce)
+
+## Merged 2026-11-12 05:14 EST: compat r106 (1cbdd1ce)
+This squashes gl46/compat 86c11c43 (READY r106) over 87cb342f: compat_glsl.c (+12/−2), compat_vb.c (+9) and two new headless tests. The report commit and test_scratch_xfbcompat.c (a scratch repro) are excluded. No GL strings change. The user approved the merge at 04:54 EST.
+
+What merged: two regressions found by compat's compat-as-superset audit, which runs CTS on a compatibility-profile context (MGL_CTS_COMPAT=1, an env-gated hook compat added to the shared CTS build in ~/MGL-cts-new; default behaviour unchanged).
+- A shader with no compatibility-only tokens is plain GLSL whatever its #version. It used to go through the fixed-function translator just for a #version below 330, which upgraded it to 460 and injected mgl* varyings and gl_PerVertex differences, breaking multi-stage links on a compat context. KHR-GL46.transform_feedback on a compat context: 8/21 → 21/21.
+- bind_ffp yields to a bound program pipeline (GL 4.6 §7.3.1): glUseProgram(0) + glBindProgramPipeline rendered through the fixed-function program instead of the pipeline's stages (direct_state_access.program_pipelines_functional on a compat context).
+
+Verify: green on 45309315 and again on 87cb342f (0 FAIL, 817/0, 298/0, Tess/Xfb PASS). compat's own gates on its tip: headless 1034 PASS / 0 FAIL, multi_bind 17/17, framebuffer_fetch 44/44, transform_feedback 21/21, synchronization 104/104, es_31_compatibility 317 Pass + 38 NotSupported.
+
+glmark2 order swap (full default run, 04:22 EST): base 4477, cand 4514, cand 4526, base 4477 (+1.0%); no MGL errors.
+
+Open (compat's cross-domain finding): KHR-GL46.direct_state_access.queries_functional ends InternalError with no log text on core and compat contexts, on gl46-port 323c0cb4 and 45309315 too — pre-existing, likely a missing query-buffer entry point.
+
+New baseline: ~/MGL-cts/baseline-1cbdd1ce.
 
 ## Merged 2026-11-12 04:53 EST: geom r143–r145 (9b8587b2)
 This squashes gl46/geom 7bb5aab9 (READY r145) over 45309315: MGLRenderer+Geometry.m (+66/−20 net) and tests/headless/test_geom_stageio.c (+156). The report commits are excluded. No GL strings change. The user approved the merge at 04:52 EST.
