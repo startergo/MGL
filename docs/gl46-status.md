@@ -1,4 +1,17 @@
-# MGL GL 4.6 port: status (2026-11-12 20:27 EST, gl46-port @ c5cee355)
+# MGL GL 4.6 port: status (2026-11-13 03:55 EST, gl46-port @ 2f95cadc)
+
+## Merged 2026-11-13 03:55 EST: texture_swizzle flood + tess/geometry bounding-box hangs (b37b3ceb tess r74, 2f95cadc compat r107)
+The user pre-approved both merges at 22:53 EST Nov 12 ("merge all patches after fixes"). No GL strings change; the ES-only EXT alias hunk carried on gl46/tess (GL_EXT_gpu_shader5 / GL_EXT_tessellation_shader / GL_EXT_texture_cube_map_array) was excluded and stays held.
+
+Found by the full official CTS run (baseline-1cbdd1ce): KHR-GL46.texture_swizzle.smoke_access_* hit the 90-minute alarm (a 5.3 GB log of "Primary texture creation returned NULL ... emergency fallback texture (0x0x0)") and 7 dEQP-GL45-ES31.functional.primitive_bounding_box.*.vertex_tessellation_geometry_fragment.* cases hung. Both pass alone; they fail only after earlier cases in the same process. Bisect over baselines: first bad bd9ae9a5 (compat r103..r105), which made glBindTexture(target, 0) bind a real per-target default texture object.
+
+Root cause: the CTS between-case state reset issues glTexImage{2,3}DMultisample(..., 0, 0, ...) into those default objects. texext_alloc_levels marked the zero-extent levels complete, so every later draw tried to create a 0x0x0 Metal texture, failed, and fell back; bindMTLTexture's fallback path never cleared dirty_bits, so the fallback was released and re-created on every draw (every tess draw re-walks the texture units).
+- compat r107 (textures_ext.c, textures.c): zero-extent levels are empty/incomplete (GL 4.6 8.6.1) and the usable-level summary is recomputed (updateTexSummary now shared). Zero-extent multisample texImage stays legal (the CTS reset expects no error). Test test_compat_default_texture_degenerate.
+- tess r74 (MGLRenderer.m): the fallback path clears dirty_bits like the primary path. Test test_vtg_hang (1200 fallback creations before, 1 after).
+
+Verify: each GREEN alone and combined (0 FAILED, 817/0, 298/0, Tess 85 PASS, rc 0). Combined build: repro pair (api_errors then smoke_access) 2/2 Pass with 0 fallback lines in 11 s; the 7 vtg cases at the official 256x256 surface all Pass in 4-8 s; run.py texture_swizzle.* 501 Pass / 192 NotSupported / 4 Timeout / 0 Fail (baseline c5cee355: 497 / 192 / 8 / 0; the smoke Timeouts are load noise on the 25-s per-case limit); framebuffer_fetch 44/44; primitive_bounding_box.* 221 Pass / 6 Timeout, same as baseline. compat also reports KHR-GL46.clip_distance.coverage Pass (same cause).
+
+New baseline: ~/MGL-cts/baseline-2f95cadc. Local main moved to gl46-port (not pushed).
 
 ## Merged 2026-11-12 20:27 EST: blit segfault on the default framebuffer (c5cee355)
 The user approved at 19:38 EST (fix it directly) and 20:27 EST (merge). Files: framebuffer_ext.c, tests/headless/test_blit_neg.c. No GL strings change.
