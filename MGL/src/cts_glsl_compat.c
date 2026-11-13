@@ -851,7 +851,7 @@ static char *rewrite_gather_offsets(const char *src);
  * does not check that for OpenGL clients, so the declaration is rejected with a
  * #error line here (KHR-GL46.shader_storage_buffer_object negative-glsl-compileTime;
  * keep this in sync with MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS in get.c). */
-#define MGL_CTS_MAX_SSBO_BINDINGS 8
+#define MGL_CTS_MAX_SSBO_BINDINGS 16   /* r108: per-stage SSBO bindings 8 -> 16 (get.c) */
 
 /* walk backward over whitespace, comments and the block qualifier words that may
  * sit between "layout(...)" and the "buffer" keyword ("readonly buffer B {...}") */

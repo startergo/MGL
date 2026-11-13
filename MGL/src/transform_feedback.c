@@ -2915,19 +2915,33 @@ static char *xfb_vs_source(GLMContext ctx, Program *p, Shader *vs)
     return NULL;
 }
 
+static bool src_declares_xfb(const char *src)
+{
+    /* GL 4.6 11.1.2.1 in-shader capture qualifiers are exactly xfb_buffer,
+     * xfb_offset and xfb_stride (optionally inside layout(...)).  Scanning for
+     * the bare "xfb_" prefix (what this replaced) was fooled by any IDENTIFIER
+     * starting with "xfb_" — KHR-GL46.direct_state_access.queries_functional
+     * names its captured output "xfb_result", the scan reported a declared
+     * capture, hid the glTransformFeedbackVaryings names and linked a program
+     * with ZERO captured varyings, so glBeginTransformFeedback failed with
+     * GL_INVALID_OPERATION (compat r108; the case died as InternalError). */
+    return src && (strstr(src, "xfb_buffer") || strstr(src, "xfb_offset") ||
+                   strstr(src, "xfb_stride"));
+}
+
 static void xfb_post_link(GLMContext ctx, Program *p)
 {
     if (!XFB() || !p) return;
     Shader *vs = p->shader_slots[_VERTEX_SHADER];
     MGLXfbProgram *xp = xfb_prog(ctx, p, false);
-    bool shader_xfb = (vs && vs->src && strstr(vs->src, "xfb_")) ||
+    bool shader_xfb = (vs && vs->src && src_declares_xfb(vs->src)) ||
                       xfb_spirv_has_xfb_deco(p, vs);   /* ARB_gl_spirv binary vertex stage */
     /* the in-shader xfb qualifiers sit on the OUTPUTS of the last pre-rasterization stage:
      * a geometry or tessellation-evaluation shader declaring them (possibly an interface
      * block member with xfb_buffer / xfb_offset) is captured through that stage's resolver */
     Shader *last = p->shader_slots[_GEOMETRY_SHADER] ? p->shader_slots[_GEOMETRY_SHADER] :
                    p->shader_slots[_TESS_EVALUATION_SHADER];
-    bool stage_xfb = (last && last->src && strstr(last->src, "xfb_")) ||
+    bool stage_xfb = (last && last->src && src_declares_xfb(last->src)) ||
                      /* geom r127: a binary-loaded stage has no source — detect the declared
                       * capture from that stage's SPIR-V decorations (the VS clause above
                       * does the same for the vertex stage) */
@@ -2940,7 +2954,7 @@ static void xfb_post_link(GLMContext ctx, Program *p)
      * and report the declared layout — the GS table would be empty) */
     Shader *tes = p->shader_slots[_TESS_EVALUATION_SHADER];
     bool tes_xfb = !stage_xfb && tes &&
-                   (tes->src ? strstr(tes->src, "xfb_") != NULL
+                   (tes->src ? src_declares_xfb(tes->src)
                              : xfb_spirv_has_xfb_deco_stage(p, _TESS_EVALUATION_SHADER));
     if (tes_xfb) stage_xfb = true;
 

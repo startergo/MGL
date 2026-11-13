@@ -6470,6 +6470,13 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
 {
     glm_ctx->mtl_funcs.mtlObj = (void *)CFBridgingRetain(self);
 
+    /* compat r108: report and enforce the device's REAL threadgroup-memory
+     * limit (Apple GPUs here allow more than the GL 4.6 minimum 32768 —
+     * KHR-GL46.compute_shader.shared-struct's 36872-byte shared block runs
+     * and verifies; MGL's hardcoded 32768 failed its link) */
+    glm_ctx->state.var.max_compute_shared_memory =
+        ((GLuint)self->_device.maxThreadgroupMemoryLength > 65536 ? (GLuint)self->_device.maxThreadgroupMemoryLength : 65536);
+
     glm_ctx->mtl_funcs.mtlBindBuffer = mtlBindBuffer;
     glm_ctx->mtl_funcs.mtlBindTexture = mtlBindTexture;
     glm_ctx->mtl_funcs.mtlBindProgram = mtlBindProgram;

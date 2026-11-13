@@ -139,6 +139,10 @@ void getMacOSDefaults(GLMContext glm_ctx)
     glGetBooleanv(GL_COLOR_WRITEMASK,glm_ctx->state.var.color_writemask[0]);
 
     glGetIntegerv(GL_MAX_TEXTURE_SIZE,&glm_ctx->state.var.max_texture_size);
+    /* compat r108: GL_MAX_COMPUTE_SHARED_MEMORY_SIZE is device-derived (the
+     * renderer overrides this GL minimum with maxThreadgroupMemoryLength);
+     * get.c serves the state var, the layout validator enforces it */
+    glm_ctx->state.var.max_compute_shared_memory = 32768;
     glGetIntegerv(GL_MAX_VIEWPORT_DIMS,&glm_ctx->state.var.max_viewport_dims);
     glGetIntegerv(GL_SUBPIXEL_BITS,&glm_ctx->state.var.subpixel_bits);
     glGetFloatv(GL_POLYGON_OFFSET_UNITS,&glm_ctx->state.var.polygon_offset_units);

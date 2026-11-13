@@ -118,6 +118,11 @@ typedef struct GLMParams_t {
     GLuint color_clear_value;
     GLboolean color_writemask[MAX_COLOR_ATTACHMENTS][4];
     GLuint max_texture_size;
+    GLuint max_compute_shared_memory;   /* compat r108: the Metal device's real
+                                         * maxThreadgroupMemoryLength (>= the GL
+                                         * 4.6 minimum 32768; KHR-GL46.compute_
+                                         * shader.shared-struct declares 36872
+                                         * bytes of shared and RUNS on it) */
     GLuint max_viewport_dims;
     GLuint subpixel_bits;
     GLuint current_color;

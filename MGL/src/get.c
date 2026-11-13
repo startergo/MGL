@@ -147,7 +147,15 @@ static GLuint max_uniform_buffer_bindings(GLMContext ctx)
     return n > MAX_BINDABLE_BUFFERS ? MAX_BINDABLE_BUFFERS : n;
 }
 
-#define MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS  8
+#define MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS  16
+/* 16 per-stage SSBO bindings (>= the GL 4.6 floor of 8): MGL's SSBO bindings
+ * flow through the MAX_BINDABLE_BUFFERS-sized binding tables and SPIRV-Cross
+ * assigns Metal buffer indices sequentially (31 per function), so a stage can
+ * address 16 storage blocks alongside its UBOs — KHR-GL46.gl_spirv.
+ * spirv_validation_capabilities links a compute shader with a 10-instance SSBO
+ * block ARRAY and expects success (compat r108; the per-stage 8 left over
+ * from r97a-r98c failed its link with "10 shader storage blocks exceed the
+ * stage limit (8)"). */
 #define MGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  8
 #define MGL_MAX_TRANSFORM_FEEDBACK_BUFFERS      4
 /* 16 image units (>= the GL 4.6 floor of 8): Metal's per-function texture argument
@@ -993,7 +1001,11 @@ static bool get_limit(GLMContext ctx, GLenum pname, GetValues *gv)
 
         /* compute */
         case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS: PUT1(LIMIT(STATE_VAR(max_compute_work_group_invocations), 1024));
-        case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE: PUT1(32768);
+        case GL_MAX_COMPUTE_SHARED_MEMORY_SIZE:
+            /* device-derived (maxThreadgroupMemoryLength; compat r108), never
+             * below the GL 4.6 minimum */
+            PUT1(STATE_VAR(max_compute_shared_memory) ?
+                     STATE_VAR(max_compute_shared_memory) : 32768);
 
         /* transform feedback */
         case GL_MAX_TRANSFORM_FEEDBACK_BUFFERS: PUT1(MGL_MAX_TRANSFORM_FEEDBACK_BUFFERS);

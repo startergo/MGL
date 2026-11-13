@@ -697,27 +697,21 @@ void mgl_fb_read_pixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei
             if (integer != (k != MGL_FB_KIND_FLOAT))
                 FB_ERROR(GL_INVALID_OPERATION);
 
-            /* compat r104: a FLOAT-component attachment (R16F/R32F/RGBA32F/... or the
-             * 10F_11F_11F packed float) is incompatible with a plain integer-typed
-             * readback (GL_BYTE/_SHORT/_INT/_UNSIGNED_INT/... with a non-integer
-             * format) — GLES 3.0 table 3.2 (the read type for a float buffer is
-             * GL_FLOAT / GL_HALF_FLOAT), which the dEQP ES31 negative-coverage
-             * read_pixels_fbo_format_mismatch case enforces on desktop contexts now
-             * that float attachments are conformance-relevant
-             * (GL_EXT_color_buffer_float advertised).  GL_UNSIGNED_BYTE and the
-             * float-typed reads stay legal conversions (packed_pixels reads
-             * GL_RED/GL_FLOAT of R32F, fbo.read tests read UBYTE). */
-            if (fi && fi->component_type == GL_FLOAT && !integer)
-            {
-                switch (type)
-                {
-                    case GL_BYTE: case GL_SHORT: case GL_UNSIGNED_SHORT:
-                    case GL_INT: case GL_UNSIGNED_INT:
-                        FB_ERROR(GL_INVALID_OPERATION);
-                    default:
-                        break;
-                }
-            }
+            /* compat r108 (reverting the r104 float/integer-type rule): a
+             * FLOAT-component attachment IS compatible with a plain
+             * integer-typed readback (GL_BYTE/_SHORT/_INT/... with a
+             * non-integer format) — desktop GL converts, exactly like it
+             * converts GL_UNSIGNED_BYTE / GL_FLOAT reads.  The ES table-3.2
+             * rule my r104 implemented is only exercisable when
+             * GL_EXT_color_buffer_float is advertised, and with the string
+             * exposed (user decision, 2026-11-10) the CTS contradicts itself
+             * across packages on the SAME call: dEQP ES31 negcov wants
+             * INVALID_OPERATION for (RGBA32F, GL_RGBA, GL_INT), while
+             * KHR-GL46.packed_pixels (27 cases: 3 variants x 9 float formats)
+             * requires every such pair to SUCCEED — e.g. rgba32f_format_rgba
+             * + (GL_RGBA, GL_INT).  Mesa on desktop behaves permissively and
+             * never advertises the ES extension string; permissive + exposed
+             * is the chosen trade (net +27 / -1). */
             aspect = MGL_FB_ASPECT_COLOR;
             break;
         }

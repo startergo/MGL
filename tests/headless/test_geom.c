@@ -4530,11 +4530,13 @@ TEST(r48_ssbo_two_runtime_arrays)
  * errors (glslang does not check them for OpenGL clients) */
 TEST(r48_ssbo_layout_compile_errors)
 {
+    /* compat r108 raised the per-stage SSBO binding limit 8 -> 16 (get.c,
+     * MGL_CTS_MAX_SSBO_BINDINGS): the old out-of-range cases move with it */
     const char *bad1[] = { "#version 460 core\n",
-                           "layout(binding = 8) buffer Buffer { int x; };\n"
+                           "layout(binding = 16) buffer Buffer { int x; };\n"
                            "void main() { x = 0; }" };
     const char *bad2[] = { "#version 460 core\n",
-                           "layout(binding = 6) buffer Buffer { int x; } g[4];\n"
+                           "layout(binding = 13) buffer Buffer { int x; } g[4];\n"
                            "void main() { g[0].x = 0; }" };
     const char *bad3[] = { "#version 460 core\n",
                            "layout(std430) uniform UBO { int x; };\n"
