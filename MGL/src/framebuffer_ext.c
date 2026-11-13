@@ -937,7 +937,10 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
      * D32FS8 window).  compat r99: dEQP ES31 debug.negative_coverage
      * get_error.buffer.blit_framebuffer blits DEPTH32F_STENCIL8 -> DEPTH24_STENCIL8
      * and expects the error. */
-    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
+    /* NULL is the default (window) framebuffer: it has no FBOAttachment to compare, so
+     * the format-match check applies only between two framebuffer objects (the
+     * KHR-GL46 framebuffer_blit window-surface cases dereferenced NULL here) */
+    if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) && readfbo && drawfbo)
     {
         for (int is_depth = 1; is_depth >= 0; is_depth--)
         {
@@ -945,8 +948,8 @@ void mgl_fb_blit(GLMContext ctx, Framebuffer *readfbo, Framebuffer *drawfbo, GLi
             if (!(mask & bit)) continue;
             const FBOAttachment *ra = is_depth ? &readfbo->depth : &readfbo->stencil;
             const FBOAttachment *da = is_depth ? &drawfbo->depth : &drawfbo->stencil;
-            const Texture *rt = ra->textarget == GL_RENDERBUFFER ? ra->buf.rbo->tex : ra->buf.tex;
-            const Texture *dt = da->textarget == GL_RENDERBUFFER ? da->buf.rbo->tex : da->buf.tex;
+            const Texture *rt = ra->textarget == GL_RENDERBUFFER ? (ra->buf.rbo ? ra->buf.rbo->tex : NULL) : ra->buf.tex;
+            const Texture *dt = da->textarget == GL_RENDERBUFFER ? (da->buf.rbo ? da->buf.rbo->tex : NULL) : da->buf.tex;
             if (!rt || !dt) continue;                 /* aspect missing: no-op */
             {
                 extern GLsizei mgl_fb_attachment_samples(GLMContext ctx, FBOAttachment *att);

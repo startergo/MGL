@@ -102,11 +102,56 @@ TEST(c_ms_resolve_converts)
     EXPECT_GL_ERROR(GL_NO_ERROR);
 }
 
+/* the default framebuffer (FBO 0) has no FBOAttachment: depth/stencil blits to and
+ * from it must not dereference one (gl46-main KHR-GL46.framebuffer_blit.scissor_blit
+ * and the multisampled_to_singlesampled config tests segfaulted in mgl_fb_blit with a
+ * window surface).  Only "no crash" and "no unexpected error" are checked: whether the
+ * headless default framebuffer has a depth/stencil buffer is configuration-dependent */
+TEST(d_default_framebuffer_ds_blit_no_crash)
+{
+    static const GLbitfield masks[] = {
+        GL_DEPTH_BUFFER_BIT, GL_STENCIL_BUFFER_BIT,
+        GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
+        GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
+    };
+    GLuint f, r[2];
+    glGenFramebuffers(1, &f);
+    glGenRenderbuffers(2, r);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glBindRenderbuffer(GL_RENDERBUFFER, r[0]);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 32, 32);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, r[0]);
+    glBindRenderbuffer(GL_RENDERBUFFER, r[1]);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, r[1]);
+    EXPECT_NO_GL_ERROR();
+
+    for (int dir = 0; dir < 2; dir++)
+        for (unsigned m = 0; m < sizeof masks / sizeof masks[0]; m++)
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, dir ? 0 : f);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dir ? f : 0);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(2, 2, 8, 8);
+            glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, masks[m], GL_NEAREST);
+            glDisable(GL_SCISSOR_TEST);
+            GLenum e = glGetError();
+            mgl_test_checks++;
+            if (e != GL_NO_ERROR && e != GL_INVALID_OPERATION)
+                MGL_FAIL("dir %d mask 0x%x: unexpected error 0x%x", dir, masks[m], e);
+        }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteRenderbuffers(2, r);
+    glDeleteFramebuffers(1, &f);
+}
+
 int main(void)
 {
     RUN(a_ss_ds_mismatch_errors);
     RUN(b_missing_read_aspect_noop);
     RUN(c_ms_resolve_converts);
+    RUN(d_default_framebuffer_ds_blit_no_crash);
     return mgl_test_summary();
 }
 
