@@ -1,4 +1,24 @@
-# MGL GL 4.6 port: status (2026-11-13 03:55 EST, gl46-port @ 2f95cadc)
+# MGL GL 4.6 port: status (2026-11-13 05:55 EST, gl46-port @ 2f95cadc)
+
+## Full official-equivalent CTS run finished 2026-11-13 ~05:30 EST (baseline-1cbdd1ce, started 06:20 EST Nov 12)
+Totals vs the Nov 1 run (r7edc431): Pass 97,999 (was 95,428), Fail 661 (was 2,339), NotSupported 24,114 (was 25,017), InternalError 4 (4), QualityWarning 0 (10), Crash 21 (was 1).
+
+| group | Nov 1 (7edc431) | Nov 12-13 (1cbdd1ce) |
+|---|---|---|
+| gl45-es3 | 64 Fail / 1261 Pass | 26 Fail / 1299 Pass |
+| gl45-es31 | 1120 Fail / 28771 Pass / 0 Crash | 334 Fail / 30453 Pass / 10 Crash |
+| gl46-khr-single | 991 Fail / 4064 Pass / 1 Crash | 97 Fail / 4958 Pass / 1 Crash |
+| gl46-main cfg-0 runs 0-3 | 38/43/37/38 Fail, 0 Crash | 47/48/49/49 Fail, 4/4/1/1 Crash |
+| gl30/40/43/45-khr | small | small (gl43 5 Fail / 7 Pass) |
+
+All 21 crashes, re-run singly on baseline-2f95cadc (gl46-port with c5cee355 + tess r74 + compat r107), now Pass:
+- 6 KHR-GL46.framebuffer_blit SEGVs (cfg-0 runs 0-1): fixed by c5cee355.
+- 4 KHR-GL46.texture_swizzle.smoke_access 90-min alarms and the 7 primitive_bounding_box vertex_tessellation_geometry_fragment hangs: fixed by r74 + r107 (default-texture 0x0x0 fallback loop).
+- 3 dEQP-GL45-ES31 copy_image 90-min alarms: Pass in 2 s each. The ES31 part logs were 10-15 GB each of the same "emergency fallback" flood, so the alarms were the same slowdown, not a copy_image bug.
+- KHR-Single-GL46.enhanced_layouts.uniform_block_member_invalid_offset_alignment_mat4_vertex 90-min alarm: Pass in 16 s.
+gl46-main Fail rose by about 10 per run vs Nov 1 (not yet triaged per case). InternalError (direct_state_access.queries_functional) unchanged and still unrouted.
+
+Results: ~/MGL-cts-new/official/r1cbdd1ce (65 GB, mostly flood logs).
 
 ## Merged 2026-11-13 03:55 EST: texture_swizzle flood + tess/geometry bounding-box hangs (b37b3ceb tess r74, 2f95cadc compat r107)
 The user pre-approved both merges at 22:53 EST Nov 12 ("merge all patches after fixes"). No GL strings change; the ES-only EXT alias hunk carried on gl46/tess (GL_EXT_gpu_shader5 / GL_EXT_tessellation_shader / GL_EXT_texture_cube_map_array) was excluded and stays held.
