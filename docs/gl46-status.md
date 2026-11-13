@@ -1,4 +1,23 @@
-# MGL GL 4.6 port: status (2026-11-13 05:55 EST, gl46-port @ 2f95cadc)
+# MGL GL 4.6 port: status (2026-11-13 14:05 EST, gl46-port @ 59d72636)
+
+## Merged compat r108 + tess r75: 40 of the 42 gl46-main regressions fixed (2026-11-13 14:05 EST)
+The full run on 1cbdd1ce found 42 KHR-GL46 cases that passed on the Nov 1 build (7edc431) and failed on 2f95cadc. Each was bisected over the saved baselines and routed:
+
+| cases | first bad | fixed by |
+|---|---|---|
+| packed_pixels float formats x27 | bd9ae9a5 (compat r103-r105) | compat r108 (e6b02647) |
+| compute_shader.shared-struct, gl_spirv.spirv_validation_capabilities_test | a095741 (compat r97a-r98c) | compat r108 |
+| direct_state_access.queries_functional (InternalError) | 4c3bb48 (compat r86-r95) | compat r108 |
+| packed_pixels *_format_stencil_index x9 | 8554b98 (tess r46/r47) | tess r75 (59d72636) |
+| draw_elements_base_vertex_tests.AEP_shader_stages | d2df080b (tess r66) | tess r75 |
+| compute_shader.resources-max | dd77727 (geom r88/r89) | open (geom) |
+| gl_spirv.spirv_modules_state_queries_test | 323c0cb4 (geom r130-r134) | open (geom) |
+
+Verification (each stage separately on 2bccda0c): headless suite 0 failures; official-args caselist of the 42: each worker's cases Pass, the rest unchanged; KHR-GL46.es_31_compatibility unchanged. shader_storage_buffer_object.basic-binding is order-flaky on both builds.
+
+New regression found, open: compat r107 (2f95cadc) broke 38 KHR-GL46.es_31_compatibility.sample_variables *samples_0* cases (mask x rgba8/8i/8ui/32f, position fixed/non-fixed): 317 Pass on 1cbdd1ce and on b37b3ceb (tess r74 only), 279 Pass with r107. Routed to compat.
+
+Upstream-candidate bug #5 (from rsvga), open: an SM1-3-translated vertex shader draws nothing whenever a depth attachment is bound, even with the depth test off; VGPU10-style shaders are unaffected. SPIR-V repro pair saved in ~/MGL-cts/sup/rsvga-bug5/. Routed to compat.
 
 ## Full official-equivalent CTS run finished 2026-11-13 ~05:30 EST (baseline-1cbdd1ce, started 06:20 EST Nov 12)
 Totals vs the Nov 1 run (r7edc431): Pass 97,999 (was 95,428), Fail 661 (was 2,339), NotSupported 24,114 (was 25,017), InternalError 4 (4), QualityWarning 0 (10), Crash 21 (was 1).
