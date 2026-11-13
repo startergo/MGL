@@ -693,6 +693,8 @@ uint64_t mgl_geom_worst_prims(GLenum mode, uint64_t n);
 /* transform feedback of the geometry output (called from the xfb domain) */
 void mgl_geom_xfb_link(GLMContext ctx, struct Program_t *program, bool from_shader);
 char *mgl_geom_decompile_stage(const uint32_t *ir, size_t words, int version, char **log);   /* geom r125 */
+uint32_t *mgl_geom_spirv_named_copy(const uint32_t *in, size_t n, size_t *out_n);              /* geom r146 (ARB_gl_spirv) */
+char **mgl_geom_spirv_synth_names(const uint32_t *ir, size_t n, size_t *count);                /* geom r147 */
 void mgl_geom_xfb_capture(GLMContext ctx, MGLGeomProgram *gp, const uint32_t *records, size_t words,
                           const uint32_t *ctl, const uint32_t *cnt, size_t cnt_words);
 

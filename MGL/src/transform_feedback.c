@@ -2508,7 +2508,25 @@ static char *xfb_spirv_to_msl(GLMContext ctx, const uint32_t *ir_in, size_t word
         uint32_t *vf = mgl_spirv_vote_khr_rewrite(parse_src, parse_n, &parse_n);
 
         if (vf) parse_src = vf;
-        if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS) { free(vf); goto done; }
+        {
+            /* r146 (ARB_gl_spirv): names are non-semantic — synthesize them for the
+             * reflection-based resolver when the module came without OpName */
+            size_t named_n = 0;
+            uint32_t *named = mgl_geom_spirv_named_copy(parse_src, parse_n, &named_n);
+
+            if (named)
+            {
+                parse_src = named;
+                parse_n = named_n;
+            }
+            if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS)
+            {
+                if (named && named != vf) free(named);
+                free(vf);
+                goto done;
+            }
+            if (named && named != vf) free(named);
+        }
         free(vf);
     }
     if (spvc_context_create_compiler(sctx, SPVC_BACKEND_MSL, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &comp) != SPVC_SUCCESS) goto done;
@@ -2581,6 +2599,57 @@ done:
     return ret;
 }
 
+/* r147: after resolving a DECLARED capture, blank the reported name of any
+ * varying whose name components are ALL synthesized (a name-less SPIR-V module
+ * reports "" per ARB_gl_spirv — the synthesized spellings feed the resolver's
+ * MATCHING only, never the queries).  Component-wise so a REAL name in a mixed
+ * dotted path is still reported. */
+static bool xfb_comp_is_synth(const char *s, char **syn, size_t nsyn)
+{
+    if (!strncmp(s, "_mgl_v", 6) || !strncmp(s, "_mgl_in", 7) ||
+        !strncmp(s, "_mgl_out", 8) || !strncmp(s, "_mgl_t", 6))
+        for (size_t i = 0; i < nsyn; i++)
+            if (!strcmp(syn[i], s)) return true;
+    return false;
+}
+
+static void xfb_blank_synth_reported_names(GLMContext ctx, MGLXfbProgram *xp,
+                                           const uint32_t *orig_ir, size_t orig_words)
+{
+    size_t nsyn = 0;
+    char **syn = mgl_geom_spirv_synth_names(orig_ir, orig_words, &nsyn);
+
+    (void)ctx;
+    if (!syn) return;
+    for (GLuint i = 0; i < xp->count; i++)
+    {
+        const char *n = xp->vars[i].name;
+        size_t off = 0;
+        bool all_synth = n && n[0];
+
+        while (all_synth)
+        {
+            const char *dot = strchr(n + off, '.');
+            char comp[160];
+            size_t cl = dot ? (size_t)(dot - (n + off)) : strlen(n + off);
+
+            if (!cl || cl >= sizeof comp) { all_synth = false; break; }
+            memcpy(comp, n + off, cl);
+            comp[cl] = 0;
+            if (!xfb_comp_is_synth(comp, syn, nsyn)) { all_synth = false; break; }
+            if (!dot) break;                        /* matched the last component */
+            off += cl + 1;
+        }
+        if (all_synth)
+        {
+            free(xp->vars[i].name);
+            xp->vars[i].name = strdup("");
+        }
+    }
+    for (size_t i = 0; i < nsyn; i++) free(syn[i]);
+    free(syn);
+}
+
 static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool api,
                      const unsigned *spirv_module, size_t spirv_words)
 {
@@ -2617,11 +2686,22 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
     }
     if (spvc_context_create(&sctx) != SPVC_SUCCESS) goto done;
     spvc_context_set_error_callback(sctx, xfb_spvc_error, NULL);
-    if (spvc_context_parse_spirv(sctx, ir, words, &pir) != SPVC_SUCCESS ||
-        spvc_context_create_compiler(sctx, SPVC_BACKEND_NONE, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c) != SPVC_SUCCESS ||
-        spvc_compiler_create_shader_resources(c, &res) != SPVC_SUCCESS) {
-        xfb_fail(xp, "vertex shader reflection failed", NULL, NULL);
-        goto done;
+    {
+        /* r146 (ARB_gl_spirv): synthesize names for a name-less module before the
+         * resolver reflects it (OpName is non-semantic; results must not change) */
+        size_t named_n = 0;
+        uint32_t *named = mgl_geom_spirv_named_copy(ir, words, &named_n);
+        const uint32_t *parse_src = named ? named : ir;
+        size_t parse_n = named ? named_n : words;
+
+        if (spvc_context_parse_spirv(sctx, parse_src, parse_n, &pir) != SPVC_SUCCESS ||
+            spvc_context_create_compiler(sctx, SPVC_BACKEND_NONE, pir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &c) != SPVC_SUCCESS ||
+            spvc_compiler_create_shader_resources(c, &res) != SPVC_SUCCESS) {
+            free(named);
+            xfb_fail(xp, "vertex shader reflection failed", NULL, NULL);
+            goto done;
+        }
+        free(named);
     }
 
     {
@@ -2639,6 +2719,10 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
         if (!xfb_layout_shader(c, res, xp, whole, 256)) goto done;
         if (xp->count == 0) goto done;   /* "xfb_" appeared but nothing is captured */
         xp->from_shader = true;
+        /* r147: a name-less SPIR-V module reports "" for its captured varyings
+         * (ARB_gl_spirv) — the resolver ran over the NAMED COPY, so blank every
+         * reported name whose components are all synthesized spellings */
+        xfb_blank_synth_reported_names(ctx, xp, ir, words);
     }
 
     for (GLuint i = 0; i < xp->count; i++) {

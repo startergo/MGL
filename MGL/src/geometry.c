@@ -320,6 +320,7 @@ typedef struct {
     uint32_t id;            /* the struct type */
     uint32_t member;        /* member index */
     char     name[64];
+    bool     syn;           /* r146: synthesized */
 } SpvMemberName;
 
 /* one resource-binding pin for a generated MSL compile (see geom_build_pins) */
@@ -340,6 +341,7 @@ typedef struct {
 typedef struct {
     uint32_t id;
     char     name[160];
+    bool     syn;           /* r146: synthesized by spv_synthesize_names (name-less module) */
 } SpvName;
 
 /* per-member metadata of OpTypeStruct (interface blocks) */
@@ -464,6 +466,112 @@ static const char *spv_member_name(SpvModule *m, uint32_t type_id, uint32_t memb
 }
 
 /* parse a SPIR-V module; returns NULL and sets *err on failure */
+/* geom r146 (ARB_gl_spirv): OpName/OpMemberName are NON-SEMANTIC debug
+ * instructions — a module without them is fully valid and must produce
+ * identical results.  But the geometry generators PASTE names into the GLSL
+ * they emit (floatBitsToUint(%s), expression building, block rewrites), so an
+ * empty name silently miscompiles.  After parsing, synthesize a stable
+ * identifier for every unnamed entity from what IS semantic — the %id, or the
+ * Location decoration for interface variables — never colliding with an
+ * existing name.  The synthesized spellings feed CODE GENERATION only; the
+ * program-interface queries keep reporting the module's real (empty) names. */
+static void spv_name_unique(char *out, size_t cap, const char *base, SpvModule *m)
+{
+    snprintf(out, cap, "%s", base);
+    for (;;)
+    {
+        bool clash = false;
+
+        for (int i = 0; i < m->n_names && !clash; i++)
+            if (!strcmp(m->names[i].name, out)) clash = true;
+        for (int i = 0; i < m->n_mnames && !clash; i++)
+            if (!strcmp(m->mnames[i].name, out)) clash = true;
+        if (!clash) return;
+        strlcat(out, "_", cap);
+    }
+}
+
+static void spv_synthesize_names(SpvModule *m)
+{
+    /* unnamed STRUCT types: _mgl_t<id> */
+    for (int i = 0; i < m->n_types; i++)
+    {
+        SpvType *t = &m->types[i];
+        char base[48], nm[160];
+        int j;
+
+        if (t->kind != SPVT_STRUCT) continue;
+        for (j = 0; j < m->n_names; j++)
+            if (m->names[j].id == t->id) break;
+        if (j < m->n_names) continue;           /* named */
+        snprintf(base, sizeof base, "_mgl_t%u", t->id);
+        spv_name_unique(nm, sizeof nm, base, m);
+        m->names = realloc(m->names, sizeof(SpvName) * (size_t)(m->n_names + 1));
+        snprintf(m->names[m->n_names].name, sizeof(m->names[0].name), "%s", nm);
+        m->names[m->n_names].id = t->id;
+        m->names[m->n_names].syn = true;
+        m->n_names++;
+    }
+
+    /* unnamed struct MEMBERS: m<idx>, unique within the struct */
+    for (int i = 0; i < m->n_types; i++)
+    {
+        SpvType *t = &m->types[i];
+
+        if (t->kind != SPVT_STRUCT) continue;
+        for (int mi = 0; mi < t->n_members; mi++)
+        {
+            char nm[64];
+            int j;
+
+            for (j = 0; j < m->n_mnames; j++)
+                if (m->mnames[j].id == t->id && m->mnames[j].member == (uint32_t)mi) break;
+            if (j < m->n_mnames) continue;      /* named */
+            snprintf(nm, sizeof nm, "m%d", mi);
+            for (j = 0; j < m->n_mnames; j++)
+                if (m->mnames[j].id == t->id && !strcmp(m->mnames[j].name, nm)) break;
+            if (j < m->n_mnames) continue;      /* collision with a real member name */
+            m->mnames = realloc(m->mnames, sizeof(SpvMemberName) * (size_t)(m->n_mnames + 1));
+            snprintf(m->mnames[m->n_mnames].name, sizeof(m->mnames[0].name), "%s", nm);
+            m->mnames[m->n_mnames].id = t->id;
+            m->mnames[m->n_mnames].member = (uint32_t)mi;
+            m->mnames[m->n_mnames].syn = true;
+            m->n_mnames++;
+        }
+    }
+
+    /* unnamed VARIABLES (any storage class): interface in/out take the Location
+     * (_mgl_in<loc> / _mgl_out<loc>), everything else the %id (_mgl_v<id>) */
+    for (int i = 0; i < m->n_vars; i++)
+    {
+        SpvVar *v = &m->vars[i];
+        char base[48], nm[160];
+        int j;
+
+        for (j = 0; j < m->n_names; j++)
+            if (m->names[j].id == v->id) break;
+        if (j < m->n_names) continue;           /* named */
+        if (v->storage == SpvStorageClassInput || v->storage == SpvStorageClassOutput)
+        {
+            uint32_t loc;
+
+            if (spv_deco(m, v->id, SpvDecorationLocation, &loc))
+                snprintf(base, sizeof base, "%s%u",
+                         v->storage == SpvStorageClassInput ? "_mgl_in" : "_mgl_out", loc);
+            else
+                snprintf(base, sizeof base, "_mgl_v%u", v->id);
+        }
+        else
+            snprintf(base, sizeof base, "_mgl_v%u", v->id);
+        spv_name_unique(nm, sizeof nm, base, m);
+        m->names = realloc(m->names, sizeof(SpvName) * (size_t)(m->n_names + 1));
+        snprintf(m->names[m->n_names].name, sizeof(m->names[0].name), "%s", nm);
+        m->names[m->n_names].id = v->id;
+        m->names[m->n_names].syn = true;
+        m->n_names++;
+    }
+}
+
 static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **err)
 {
     SpvModule *m = xmalloc(sizeof(SpvModule));
@@ -635,6 +743,7 @@ static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **e
             m->types[i].len_is_spec = false;
         }
 
+    spv_synthesize_names(m);
     m->ok = true;
     return m;
 }
@@ -4395,6 +4504,138 @@ static void geom_deanon_synthesized_instances(char *src)
     }
 }
 
+/* geom r146 (ARB_gl_spirv): a NAMED COPY of a module for the SPIRV-Cross-based
+ * generators (transform_feedback.c's resolver): OpName/OpMemberName are non-
+ * semantic, so a name-less module must generate identical code.  This emits a
+ * new module with the synthesized names (from spv_synthesize_names, via
+ * spv_parse) inserted as real OpName/OpMemberName instructions in the debug
+ * section.  Returns a malloc'd module, or NULL when nothing had to be added
+ * (callers fall back to the original words). */
+uint32_t *mgl_geom_spirv_named_copy(const uint32_t *in, size_t n, size_t *out_n)
+{
+    const char *err = NULL;
+    SpvModule *m = spv_parse(in, n, &err);
+    size_t n_syn = 0, n_words = 0, at = 0;
+    uint32_t *out;
+
+    if (!m || !m->ok)
+    {
+        if (m) spv_free(m);
+        return NULL;
+    }
+    for (int i = 0; i < m->n_names; i++) if (m->names[i].syn) n_syn++;
+    for (int i = 0; i < m->n_mnames; i++) if (m->mnames[i].syn) n_syn++;
+    if (!n_syn)
+    {
+        spv_free(m);
+        return NULL;
+    }
+
+    /* the insertion point: the first annotation/type instruction after the
+     * header (the debug section precedes annotations — SPIRV-Cross and every
+     * validator accept names there) */
+    {
+        size_t pos = 5;
+
+        while (pos < n)
+        {
+            uint32_t wc = in[pos] >> 16, op = in[pos] & 0xffff;
+
+            if (wc == 0) break;
+            if (op == SpvOpDecorate || op == SpvOpMemberDecorate ||
+                op == SpvOpGroupDecorate || op == SpvOpGroupMemberDecorate ||
+                op == SpvOpDecorationGroup || (op >= 19 && op <= 39) ||  /* types */
+                op == 32 /* pointer-ish range guard: OpTypePointer */ ||
+                (op >= 41 && op <= 48))                                    /* constants */
+            {
+                at = pos;
+                break;
+            }
+            pos += wc;
+        }
+        if (!at) at = n;   /* no annotations/types found: append at the end */
+    }
+
+    for (int i = 0; i < m->n_names; i++)
+        if (m->names[i].syn) n_words += 2 + (strlen(m->names[i].name) + 4) / 4;
+    for (int i = 0; i < m->n_mnames; i++)
+        if (m->mnames[i].syn) n_words += 3 + (strlen(m->mnames[i].name) + 4) / 4;
+
+    out = xmalloc((n + n_words) * sizeof(uint32_t));
+    memcpy(out, in, at * sizeof(uint32_t));
+    {
+        size_t w = at;
+
+        for (int i = 0; i < m->n_names; i++)
+        {
+            size_t len = strlen(m->names[i].name) + 1;
+            size_t wc = 2 + (len + 3) / 4;
+
+            if (!m->names[i].syn) continue;
+            out[w++] = ((uint32_t)wc << 16) | 5;
+            out[w++] = m->names[i].id;
+            memset(out + w, 0, ((len + 3) / 4) * sizeof(uint32_t));
+            memcpy(out + w, m->names[i].name, len);
+            w += (len + 3) / 4;
+        }
+        for (int i = 0; i < m->n_mnames; i++)
+        {
+            size_t len = strlen(m->mnames[i].name) + 1;
+            size_t wc = 3 + (len + 3) / 4;
+
+            if (!m->mnames[i].syn) continue;
+            out[w++] = ((uint32_t)wc << 16) | 6;
+            out[w++] = m->mnames[i].id;
+            out[w++] = m->mnames[i].member;
+            memset(out + w, 0, ((len + 3) / 4) * sizeof(uint32_t));
+            memcpy(out + w, m->mnames[i].name, len);
+            w += (len + 3) / 4;
+        }
+        memcpy(out + w, in + at, (n - at) * sizeof(uint32_t));
+        w += n - at;
+        *out_n = w;
+    }
+    spv_free(m);
+    return out;
+}
+
+/* geom r147: the synthesized NAME SPELLINGS of a module (the strings spv_parse
+ * would invent for it) — NULL when the module has none (every entity named).
+ * The xfb domain blanks any REPORTED varying name whose components all appear
+ * here, keeping the synthesized spellings internal to the resolver. */
+char **mgl_geom_spirv_synth_names(const uint32_t *ir, size_t n, size_t *count)
+{
+    const char *err = NULL;
+    SpvModule *m;
+    char **out;
+    size_t k = 0, total = 0;
+
+    if (!ir || !n) return NULL;
+    m = spv_parse(ir, n, &err);
+    if (!m || !m->ok)
+    {
+        if (m) spv_free(m);
+        return NULL;
+    }
+    for (int i = 0; i < m->n_names; i++) if (m->names[i].syn) total++;
+    for (int i = 0; i < m->n_mnames; i++) if (m->mnames[i].syn) total++;
+    if (!total)
+    {
+        if (count) *count = 0;
+        spv_free(m);
+        return NULL;
+    }
+    out = xmalloc(sizeof(char *) * (total + 1));
+    for (int i = 0; i < m->n_names; i++)
+        if (m->names[i].syn) out[k++] = xstrdup(m->names[i].name);
+    for (int i = 0; i < m->n_mnames; i++)
+        if (m->mnames[i].syn) out[k++] = xstrdup(m->mnames[i].name);
+    out[k] = NULL;
+    if (count) *count = k;
+    spv_free(m);
+    return out;
+}
+
 /* geom r125: decompile a stage's SPIR-V back to GLSL (used by the xfb link when
  * a program was loaded from a binary and has no GLSL source — the same helper
  * the geometry stage's kernel generation uses) */
@@ -4433,6 +4674,28 @@ static char *geom_spirv_to_glsl(const uint32_t *ir, size_t words, int version, c
         mgl_append_log(log, "ERROR: geometry: SPIR-V → GLSL compiler creation failed\n");
         spvc_context_destroy(ctx);
         return NULL;
+    }
+
+    /* geom r146 (ARB_gl_spirv): a NAME-LESS module's decompiled source must use
+     * the SAME synthesized spellings the reflection feeds the generators
+     * (_mgl_v<id> / _mgl_in<loc> / _mgl_out<loc> / _mgl_t<id> / m<idx>), or the
+     * kernel body writes `_9` while the generated store reads `_mgl_out0` —
+     * one name source (spv_parse's), applied to the decompiler's output. */
+    {
+        const char *perr = NULL;
+        SpvModule *pm = spv_parse(ir, words, &perr);
+
+        if (pm && pm->ok)
+        {
+            for (int i = 0; i < pm->n_names; i++)
+                if (pm->names[i].syn)
+                    spvc_compiler_set_name(comp, pm->names[i].id, pm->names[i].name);
+            for (int i = 0; i < pm->n_mnames; i++)
+                if (pm->mnames[i].syn)
+                    spvc_compiler_set_member_name(comp, pm->mnames[i].id, pm->mnames[i].member,
+                                                  pm->mnames[i].name);
+        }
+        if (pm) spv_free(pm);
     }
 
     r = spvc_compiler_create_compiler_options(comp, &opt);
@@ -14198,6 +14461,27 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
          * shader-declared table even when a pending API list exists */
         bool use_shader = from_shader || !xp->pending_count;
         const char *name = use_shader ? dnames[i] : xnames[i];
+        const char *display = name;   /* r147: what the app sees ("" for synth) */
+
+        /* r147 (ARB_gl_spirv): a NAME-LESS module's reported varying name is ""
+         * — the resolver's synthesized spellings feed the MATCHING only (the
+         * name stays for belem/lookup below).  A first component carrying a
+         * synthesized prefix is one of ours by construction
+         * (spv_synthesize_names never reuses an existing spelling). */
+        {
+            char comp[192];
+            const char *dot = strchr(name, '.');
+            size_t cl = dot ? (size_t)(dot - name) : strlen(name);
+
+            if (cl && cl < sizeof comp)
+            {
+                memcpy(comp, name, cl);
+                comp[cl] = 0;
+                if (!strncmp(comp, "_mgl_v", 6) || !strncmp(comp, "_mgl_in", 7) ||
+                    !strncmp(comp, "_mgl_out", 8) || !strncmp(comp, "_mgl_t", 6))
+                    display = "";
+            }
+        }
 
         if (use_shader)
         {
@@ -14205,9 +14489,9 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             offset = doffset[i];
         }
         v = &xp->vars[i];
-        v->name = xstrdup(name);
-        xp->max_name_length = (GLuint)(strlen(name) + 1 > (size_t)xp->max_name_length ?
-                                        strlen(name) + 1 : (size_t)xp->max_name_length);
+        v->name = xstrdup(display);
+        xp->max_name_length = (GLuint)(strlen(display) + 1 > (size_t)xp->max_name_length ?
+                                        strlen(display) + 1 : (size_t)xp->max_name_length);
 
         if (!strcmp(name, "gl_NextBuffer"))
         {
