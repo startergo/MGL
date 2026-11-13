@@ -1,4 +1,15 @@
-# MGL GL 4.6 port: status (2026-11-12 11:33 EST, gl46-port @ b9ef44f1)
+# MGL GL 4.6 port: status (2026-11-12 19:18 EST, gl46-port @ 0929b5df)
+
+## Merged 2026-11-12 19:18 EST: geom r146+r147, SPIR-V name independence (0929b5df)
+The user approved at 10:43 EST (r146 brief, from the rsvga OpName finding) and at 19:18 EST (merge). Files: geometry.c, transform_feedback.c, mgl_ext_geom.h, tests/headless/test_geom_nonames.c, tests/headless/spv_nonames.h. No GL strings change.
+
+OpName/OpMemberName are non-semantic, but the geometry generators built their GLSL/MSL from them, so a name-less ARB_gl_spirv module silently miscompiled (for example `floatBitsToUint(.x)` from an empty name). `spv_parse` now synthesizes stable internal names for unnamed variables, struct types and members (from %id or Location). The SPIRV-Cross decompiler and the transform-feedback resolver use the same names. They never reach the application: program-interface and transform-feedback varying queries report the original module's names (empty when it had none), and TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH follows them. r146 leaked the synthesized names into the xfb varying queries; r147 fixed that.
+
+Test: test_geom_nonames (58 checks) — name-less modules render and capture byte-identically to their named twins, every reported name is empty, no `_mgl_` name leaks, and the named twin still reports its real names. Verify: v-r147 GREEN (0 FAILED, 817/0 x6, 298/0, Tess 84 PASS, Xfb PASS, rc 0). CTS vs b9ef44f1 over 9 sets (geometry_shader 136/136, transform_feedback 21/21, overflow_query 13/13, gl_spirv 7/9, draw_indirect 70/70, draw_indirect_43 2/2, draw_elements_base_vertex 10/1/1NS, shader_draw_parameters 13/13, indirect_parameters 3/3): no change. glmark2 swap: base 3742, cand 3756 (+0.4%, noise).
+
+Follow-ups (not in this merge): geometry.c blanks reported names by prefix (`_mgl_v/_mgl_in/_mgl_out/_mgl_t`) while the vertex path uses the exact synthesized list, so an app name that happens to start with one of those prefixes would report empty; and deleting a program can leave its GL name on a stale transform-feedback table slot (reproduced standalone by geom).
+
+New baseline: ~/MGL-cts/baseline-0929b5df.
 
 ## Merged 2026-11-12 11:33 EST: patch 0004, GS xfb CPU-pack offsets and CPU readback sync (b9ef44f1)
 The user approved at 11:09 EST. Source: rsvga's patches/0004-geometry-xfb-pack-offsets-and-readback.fixed.patch, plus one supervisor refinement and a regression test. Files: geometry.c, draw_ext.c, mgl_ext_buffers.h, tests/headless/test_geom_cpuxfb.c. No GL strings change.
