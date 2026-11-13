@@ -1,4 +1,15 @@
-# MGL GL 4.6 port: status (2026-11-12 19:18 EST, gl46-port @ 0929b5df)
+# MGL GL 4.6 port: status (2026-11-12 20:27 EST, gl46-port @ c5cee355)
+
+## Merged 2026-11-12 20:27 EST: blit segfault on the default framebuffer (c5cee355)
+The user approved at 19:38 EST (fix it directly) and 20:27 EST (merge). Files: framebuffer_ext.c, tests/headless/test_blit_neg.c. No GL strings change.
+
+Found by the full official CTS run: KHR-GL46.framebuffer_blit.scissor_blit and multisampled_to_singlesampled_blit_{color,depth}_config_test segfaulted (gl46-main, every config). compat r99 (8504721d, Nov 5) added the GL 4.6 §18.3.1 depth/stencil format-match check to `mgl_fb_blit` and read `&readfbo->depth` / `&drawfbo->depth` unconditionally; both are NULL for the default (window) framebuffer, so any DEPTH/STENCIL blit to or from the window crashed (EXC_BAD_ACCESS at 0x194, framebuffer_ext.c:948). The check now runs only between two framebuffer objects, and a renderbuffer attachment without a renderbuffer object counts as a missing aspect. It reproduced only with the official window surface (64x64), not with agents/conformance/run.py's surface: segfault on 1cbdd1ce and 0929b5df, Pass on d00c78b.
+
+Test: test_blit_neg `d_default_framebuffer_ds_blit_no_crash` (aborted before the fix). Verify: v-blitfix GREEN (0 FAILED, 817/0, 298/0, Tess 84 PASS, Xfb PASS, rc 0). Official-surface repro 3/3 Pass; ES31 negative_coverage blit_framebuffer 6/6 unchanged.
+
+Still open from the same CTS run: texture_swizzle.smoke_access_idx_11_channel_idx_2 loops on failed texture creation (0x0x0 fallback) until the 90-min alarm (passed Nov 1); 7 primitive_bounding_box vertex_tessellation_geometry_fragment hangs (tess+GS); 3 ES31 copy_image and 1 enhanced_layouts process-alarm timeouts, to re-run singly.
+
+New baseline: ~/MGL-cts/baseline-c5cee355.
 
 ## Merged 2026-11-12 19:18 EST: geom r146+r147, SPIR-V name independence (0929b5df)
 The user approved at 10:43 EST (r146 brief, from the rsvga OpName finding) and at 19:18 EST (merge). Files: geometry.c, transform_feedback.c, mgl_ext_geom.h, tests/headless/test_geom_nonames.c, tests/headless/spv_nonames.h. No GL strings change.
