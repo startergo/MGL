@@ -642,6 +642,13 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
              * textures too (GL 4.6 8.2 -- test_texdata's
              * depth24_stencil8_max_depth_reads reads the stencil plane of a
              * DEPTH24_STENCIL8 texture this way). */
+            /* supervisor fix (r75 follow-up): a texture with no stencil
+             * plane (R16F, R32F, RGBA8, ...) rejects STENCIL_INDEX for every
+             * op, readback included -- r75 dropped this check, so glGetTexImage
+             * of a float texture with STENCIL_INDEX stopped erroring and the 27
+             * KHR-GL46.packed_pixels float-format cases failed ("Expected error
+             * but got no GL error"). */
+            if (!tex_stencil) return GL_INVALID_OPERATION;
             if (f->base != GL_STENCIL_INDEX &&
                 (op == TD_PIX_TEXIMAGE || op == TD_PIX_SUBIMAGE))
                 return GL_INVALID_OPERATION;
