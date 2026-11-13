@@ -146,6 +146,7 @@ static void texext_mark_dirty(GLMContext ctx, Texture *tex)
 }
 
 /* allocate per-face level arrays so code that inspects tex->faces[f].levels[l] sees storage */
+extern void updateTexSummary(Texture *tex);   /* textures.c — compat r107 */
 static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLuint width, GLuint height, GLuint depth, GLboolean is_3d, GLenum fmt)
 {
     for (int face = 0; face < _CUBE_MAP_MAX_FACE; face++)
@@ -170,7 +171,17 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
             tex->faces[face].levels[l].width = w;
             tex->faces[face].levels[l].height = h;
             tex->faces[face].levels[l].depth = d;
-            tex->faces[face].levels[l].complete = true;
+            /* GL 4.6 8.6.1: a zero-extent image spec EMPTIES the level — it
+             * has no image, the texture becomes incomplete (the regular
+             * texImage path already does exactly this, textures.c 1176).
+             * compat r107: the CTS state reset issues
+             * glTexImage{2,3}DMultisample(..., 0, 0, ...) into the per-target
+             * DEFAULT texture objects (real bindable objects since r103);
+             * marking those levels complete left degenerate 0x0x0 objects
+             * that every later draw tried (and failed) to realize as Metal
+             * textures — the texture_swizzle api_errors -> smoke_access
+             * "emergency fallback" flood (supervisor bisect bd9ae9a5). */
+            tex->faces[face].levels[l].complete = (w != 0 && h != 0 && (!is_3d || d != 0));
             /* levelFormat() reads mtl_format: without it, TexSubImage* / copy /
              * GetTexImage into the object report GL_INVALID_OPERATION
              * (KHR-GL46.texture_view.view_classes uploads into a view) */
@@ -183,7 +194,13 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
         }
     }
 
-    tex->num_levels = levels;
+    /* recompute the usable-level summary exactly like the regular texImage
+     * path: a fully "emptied" allocation (all levels zero-extent) leaves the
+     * object WITHOUT usable images — num_levels becomes 0, the level RECORDS
+     * stay queryable (GL_TEXTURE_WIDTH of an emptied level returns 0), and
+     * the level-less guards in the bind paths keep such objects away from
+     * Metal realization entirely */
+    updateTexSummary(tex);   /* textures.c — compat r107 */
     tex->mipmap_levels = levels;
     return true;
 }
@@ -489,6 +506,15 @@ static void texMultisampleCommon(GLMContext ctx, const char *func, Texture *tex,
         return;
     }
 
+    /* compat r107: a zero-extent multisample texImage stays LEGAL (like
+     * regular texImage's "empties the level" rule) — the CTS's own between-
+     * cases state reset (gluStateReset resetStateGLCore) issues
+     * glTexImage{2,3}DMultisample(..., 0, 0, ...) and GLU_EXPECT_NO_ERRORs
+     * afterwards, so rejecting the size would abort every multi-case run
+     * (verified: my earlier min_dim=1 attempt made the very next case not
+     * run).  The degenerate level it leaves on the (r103-real) DEFAULT
+     * texture objects is neutralized by bindMTLTexture's no-usable-storage
+     * early-out in MGLRenderer.m. */
     GLsizei min_dim = storage ? 1 : 0;
     if (width < min_dim || height < min_dim || depth < min_dim ||
         (GLuint)width > STATE_VAR(max_texture_size) || (GLuint)height > STATE_VAR(max_texture_size) ||

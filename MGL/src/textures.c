@@ -1082,7 +1082,8 @@ static void mipDims(Texture *tex, GLuint level, GLuint w0, GLuint h0, GLuint d0,
     *d = (tex->target == GL_TEXTURE_3D) ? MAX(1, d0 >> level) : d0;
 }
 
-static void updateTexSummary(Texture *tex)
+/* compat r107: shared with textures_ext.c (emptied zero-extent allocations) */
+void updateTexSummary(Texture *tex)
 {
     GLuint highest = 0;
     bool any = false;
