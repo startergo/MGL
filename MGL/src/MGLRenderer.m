@@ -2885,6 +2885,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             tex->mtl_data = (void *)CFBridgingRetain([self createFallbackMTLTexture: tex]);
 
             if (tex->mtl_data) {
+                /* r74 (tess): the texture IS realized (as the opaque-black fallback
+                 * that incomplete-storage sampler slots must sample); clear the
+                 * dirty bits the primary path clears (createMTLTextureFromGLTexture
+                 * line ~2107) or every subsequent processGLState -> bindMTLTexture
+                 * releases and re-creates it — a per-draw texture-recreation loop
+                 * that hung the official CTS run's tess+geometry cases for 90
+                 * minutes (the "emergency fallback" log flood) */
+                tex->dirty_bits = 0;
                 NSLog(@"MGL SUCCESS: Fallback texture created successfully");
             } else {
                 NSLog(@"MGL ERROR: Even fallback texture creation failed - this texture will remain NULL");
