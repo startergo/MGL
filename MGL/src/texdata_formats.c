@@ -627,13 +627,24 @@ GLenum tdCheckFormatCompat(const TDFormat *f, GLenum format, GLenum type, int op
                 return GL_INVALID_OPERATION;
             break;
         case GL_STENCIL_INDEX:
-            if (!tex_stencil) return GL_INVALID_OPERATION;
-            /* Desktop GL 4.6 table 8.11 only rejects the MISMATCHED combos (format
-             * STENCIL_INDEX against a non-stencil internal format); TexImage with a
-             * stencil internal format + STENCIL_INDEX/UNSIGNED_BYTE is legal (the
-             * TexStorage-only rule is an ES restriction).  KHR-GL46
-             * texture_stencil8.multisample allocates STENCIL_INDEX8 textures via
-             * texImage2D/texImage3D. */
+            /* GL 4.6 table 8.11: the STENCIL_INDEX client format pairs ONLY
+             * with the stencil-only internal formats (STENCIL_INDEX1/4/8/16).
+             * A combined depth-stencil internal format (DEPTH_STENCIL,
+             * DEPTH24_STENCIL8, DEPTH32F_STENCIL8) takes DEPTH_STENCIL client
+             * data only -- KHR-GL46.packed_pixels.{rectangle,pbo_rectangle,
+             * varied_rectangle}.*_format_stencil_index require the rejection
+             * (r75; the r46/r47 STENCIL_INDEX8 support made the combo
+             * reachable).  TexImage with a stencil internal format +
+             * STENCIL_INDEX/UNSIGNED_BYTE stays legal (KHR-GL46
+             * texture_stencil8.multisample allocates STENCIL_INDEX8 textures
+             * via texImage2D/texImage3D).  Readback keeps the old leniency:
+             * glGetTexImage answers STENCIL_INDEX for combined depth-stencil
+             * textures too (GL 4.6 8.2 -- test_texdata's
+             * depth24_stencil8_max_depth_reads reads the stencil plane of a
+             * DEPTH24_STENCIL8 texture this way). */
+            if (f->base != GL_STENCIL_INDEX &&
+                (op == TD_PIX_TEXIMAGE || op == TD_PIX_SUBIMAGE))
+                return GL_INVALID_OPERATION;
             break;
         default:
             /* stencil-indexed textures also answer GL_RED_INTEGER READS (the

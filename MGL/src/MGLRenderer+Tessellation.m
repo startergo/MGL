@@ -3017,6 +3017,14 @@ ph_vs = tessPhaseBegin();
         NSUInteger groups = ((NSUInteger)tess_gather_count + 63) / 64;
 
         [cenc setComputePipelineState: gather_pso];
+        /* r75: the vertex kernel's instance stride is vsparams[1] -- on the
+         * GPU-scan path the scan-setup kernel derives it on GPU (maxv+1,
+         * absolute) and the CPU only knows the whole-buffer upper bound, so
+         * bind the parameter WORD itself as the gather's vstride: instances >= 1
+         * read the wrong records otherwise (KHR-GL46.draw_elements_base_vertex_tests.
+         * AEP_shader_stages -- the instanced + basevertex pair; non-instanced
+         * draws never touch inst*vstride).  The inline path keeps the CPU span
+         * (its vsparams[1] is exactly that). */
         [cenc setBuffer: ring offset: off_vs_out atIndex: 0];
         [cenc setBuffer: tess_gather_ib offset: tess_gather_offset atIndex: 1];
         [cenc setBuffer: ring offset: off_tcs_cp atIndex: 2];
@@ -3025,9 +3033,23 @@ ph_vs = tessPhaseBegin();
         [cenc setBytes: &tess_gather_modulo length: sizeof(uint32_t) atIndex: 9];
         {
             uint32_t ninst_g = (uint32_t)(instances > 0 ? instances : 1);
-            uint32_t vstride_g = (uint32_t)vcount;
             [cenc setBytes: &ninst_g length: sizeof(uint32_t) atIndex: 10];
-            [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+            /* r75: the vertex kernel's instance stride is vsparams[1] -- on the
+             * GPU-scan path the scan-setup kernel derives it on GPU (maxv+1,
+             * absolute) and the CPU only knows the whole-buffer capacity, so
+             * bind the parameter WORD itself as the gather's vstride: with
+             * instances > 1 and basevertex != 0 the later instances read the
+             * wrong records otherwise (KHR-GL46.draw_elements_base_vertex_tests.
+             * AEP_shader_stages -- the instanced + basevertex pair; non-instanced
+             * draws never touch inst*vstride).  The inline path keeps the CPU span
+             * (its vsparams[1] is exactly that). */
+            if (gpu_indexed)
+                [cenc setBuffer: ring offset: off_vsparams + 4 atIndex: 11];
+            else
+            {
+                uint32_t vstride_g = (uint32_t)vcount;
+                [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+            }
         }
         [cenc dispatchThreadgroups: MTLSizeMake(groups, 1, 1) threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
 
@@ -3056,9 +3078,11 @@ ph_vs = tessPhaseBegin();
             [cenc setBytes: &gparams[gi] length: sizeof(uint32_t) atIndex: 3 + gi];
         {
             uint32_t ninst_g = (uint32_t)(instances > 0 ? instances : 1);
-            uint32_t vstride_g = (uint32_t)vcount;
             [cenc setBytes: &ninst_g length: sizeof(uint32_t) atIndex: 10];
-            [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+            {
+                uint32_t vstride_g = (uint32_t)vcount;
+                [cenc setBytes: &vstride_g length: sizeof(uint32_t) atIndex: 11];
+            }
         }
         [cenc dispatchThreadgroups: MTLSizeMake(groups, 1, 1) threadsPerThreadgroup: MTLSizeMake(64, 1, 1)];
         if (tTrace())
