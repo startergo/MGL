@@ -755,9 +755,15 @@ static GLuint maxBindingsForTarget(GLMContext ctx, GLenum target)
              * nothing back, so the cached value can be unset (0): fall back to the
              * limit get.c reports (MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS), keeping
              * the error paths of glBindBuffer{Base,Range} spec-correct
-             * (KHR-GL46.shader_storage_buffer_object negative-api-bind) */
+             * (KHR-GL46.shader_storage_buffer_object negative-api-bind).
+             * compat r108/r109: that limit is 16 (per-stage SSBO bindings,
+             * raised so KHR-GL46.gl_spirv.spirv_validation_capabilities'
+             * 10-instance block array links) — the hardcoded 8 here made
+             * glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8..15, ...) a silent
+             * no-op and es_31_compatibility.shader_storage_buffer_object.
+             * basic-binding fail (binding 8 read back as 0). */
             GLuint lim = STATE_VAR(max_shader_storage_buffer_bindings);
-            if (!lim || lim > MAX_BINDABLE_BUFFERS) lim = MAX_BINDABLE_BUFFERS < 8 ? MAX_BINDABLE_BUFFERS : 8;
+            if (!lim || lim > MAX_BINDABLE_BUFFERS) lim = MAX_BINDABLE_BUFFERS < 16 ? MAX_BINDABLE_BUFFERS : 16;
             if (lim < max) max = lim;
         }
             break;

@@ -705,6 +705,27 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
 
 #pragma mark - per-draw texture refresh
 
+
+/* compat r109: the incomplete-texture fallback must match the slot's texture
+ * type (a plain 2D bound where the MSL declares texture2d_ms fails Metal's
+ * argument validation and the draw renders nothing) */
+static MTLTextureType texextFallbackTypeFor(GLenum target)
+{
+    switch (target)
+    {
+        case GL_TEXTURE_1D:                     return MTLTextureType1D;
+        case GL_TEXTURE_1D_ARRAY:               return MTLTextureType1DArray;
+        case GL_TEXTURE_3D:                     return MTLTextureType3D;
+        case GL_TEXTURE_2D_ARRAY:               return MTLTextureType2DArray;
+        case GL_TEXTURE_CUBE_MAP:               return MTLTextureTypeCube;
+        case GL_TEXTURE_CUBE_MAP_ARRAY:         return MTLTextureTypeCubeArray;
+        case GL_TEXTURE_2D_MULTISAMPLE:         return MTLTextureType2DMultisample;
+        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:   return MTLTextureType2DMultisampleArray;
+        case GL_TEXTURE_BUFFER:                 return MTLTextureTypeTextureBuffer;
+        default:                                return MTLTextureType2D;
+    }
+}
+
 - (void) texextRefreshStage: (int) stage encoder: (id<MTLRenderCommandEncoder>) enc
 {
     int count = [self getProgramBindingCount: stage type: SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
@@ -717,6 +738,15 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
 
         Texture *ptr = ctx->state.active_textures[binding];
         if (!ptr)
+            continue;
+
+        /* compat r109: never realize a DEGENERATE object (zero extent in all
+         * dimensions — the CTS state reset's zero-size texImage*Multisample
+         * into the DEFAULT texture objects).  Realization fails anyway (Metal
+         * cannot create a 0-extent texture) and even the memoized emergency
+         * fallback logs a line per object; the draw's real textures are
+         * unaffected. */
+        if (ptr->width == 0 && ptr->height == 0 && ptr->depth == 0)
             continue;
 
         BOOL rebind = (stage != _FRAGMENT_SHADER);  /* MGL core binds fragment textures only */
@@ -742,7 +772,17 @@ static BOOL texextTakeInvalidated(NSMutableArray *pending, id<MTLTexture> t, NSU
          * incomplete-texture / -last-comp read level-0 data otherwise) */
         if (mgl_texture_incomplete_for_unit(ctx, ptr, (GLuint)binding))
         {
-            id<MTLTexture> ftex = [self computeFallbackTexture];
+            /* compat r109: the fallback must match the SLOT'S texture type —
+             * computeFallbackTexture is a plain 2D, and binding it where the
+             * MSL declares texture2d_ms (an unused sampler2DMS whose unit
+             * holds the level-less DEFAULT MS object after the state reset
+             * empties it) fails Metal's argument validation and the whole
+             * draw renders nothing (the es31compat sample_variables samples_0
+             * carry-over failures) */
+            MTLTextureType ftype = ptr->mtl_data
+                ? ((__bridge id<MTLTexture>)ptr->mtl_data).textureType
+                : texextFallbackTypeFor(ptr->target);   /* compat r109 */
+            id<MTLTexture> ftex = [self computeFallbackTextureForType: ftype];
             id<MTLSamplerState> fsamp = [self computeFallbackSampler];
             if (ftex && fsamp)
             {

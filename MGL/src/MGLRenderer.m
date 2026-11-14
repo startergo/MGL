@@ -488,21 +488,30 @@ static char kComputeFallbackKey;
  * kept reading the real mip chain).  One 1x1 RGBA8 texture per needed type. */
 - (id<MTLTexture>) computeFallbackTextureForType: (MTLTextureType)type
 {
-    if (type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray ||
-        type > MTLTextureTypeCubeArray)
+    /* compat r109: MULTISAMPLE slots keep a true MULTISAMPLE fallback.  The
+     * old "exotic slots: plain 2D" mapping bound a non-MS texture where the
+     * MSL declares texture2d_ms — Metal rejects the argument binding and the
+     * whole draw silently renders nothing (the es31compat sample_variables
+     * samples_0 carry-over failures: their shader declares an unused
+     * sampler2DMS whose unit holds the level-less DEFAULT MS object after
+     * the state reset empties it).  sampleCount is not part of the MSL type;
+     * any MS texture binds legally. */
+    bool ms = (type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray);
+    if (!ms && type > MTLTextureTypeCubeArray)
         type = MTLTextureType2D;          /* exotic slots: plain 2D keeps them bound */
 
-    static const char *key[6] = {"fb2d", "fb1d", "fb3d", "fb2da", "fbcube", "fbcubea"};
+    static const char *key[8] = {"fb2d", "fb1d", "fb3d", "fb2da", "fbcube", "fbcubea", "fb2dms", "fb2dmsa"};
     NSDictionary *d = objc_getAssociatedObject(self, &kComputeFallbackKey);
     const char *k = NULL;
     switch (type)
     {
-        case MTLTextureType1D:          k = key[1]; break;
-        case MTLTextureType3D:          k = key[2]; break;
-        case MTLTextureType2DArray:     k = key[3]; break;
-        case MTLTextureTypeCube:        k = key[4]; break;
-        case MTLTextureTypeCubeArray:   k = key[5]; break;
-        default:                        k = key[0]; break;
+        case MTLTextureType1D:                    k = key[1]; break;
+        case MTLTextureType3D:                    k = key[2]; break;
+        case MTLTextureType2DArray:               k = key[3]; break;
+        case MTLTextureTypeCube:                  k = key[4]; break;
+        case MTLTextureTypeCubeArray:             k = key[5]; break;
+        case MTLTextureType2DMultisample:         k = key[6]; break;
+        default:                                  k = key[0]; break;
     }
     id<MTLTexture> tex = d[[NSString stringWithUTF8String: k]];
     if (tex)
@@ -520,6 +529,17 @@ static char kComputeFallbackKey;
                                                                 mipmapped: NO];
             desc.textureType = type;
             desc.arrayLength = 1;
+            break;
+        case MTLTextureType2DMultisample:
+        case MTLTextureType2DMultisampleArray:
+            desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
+                                                                      width: 1 height: 1
+                                                                mipmapped: NO];
+            desc.textureType = type;
+            desc.sampleCount = 4;
+            if (type == MTLTextureType2DMultisampleArray)
+                desc.arrayLength = 1;
+            desc.usage = MTLTextureUsageShaderRead;
             break;
         case MTLTextureTypeCube:
             desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat: MTLPixelFormatRGBA8Unorm
@@ -2228,6 +2248,24 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                 fallbackDesc.textureType = MTLTextureType2DArray;
                 fallbackDesc.arrayLength = 1;
                 break;
+            case GL_TEXTURE_2D_MULTISAMPLE:
+                /* compat r109: an MS slot needs a MULTISAMPLE texture — a
+                 * plain 2D bound where the MSL declares texture2d_ms fails
+                 * Metal's argument validation and the whole draw renders
+                 * nothing (the es31compat sample_variables samples_0
+                 * carry-over failures: the CTS state reset empties the
+                 * DEFAULT MS objects, texextRefreshStage then realizes them
+                 * through this emergency path) */
+                fallbackDesc.textureType = MTLTextureType2DMultisample;
+                fallbackDesc.sampleCount = 4;
+                fallbackDesc.usage = MTLTextureUsageShaderRead;
+                break;
+            case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+                fallbackDesc.textureType = MTLTextureType2DMultisampleArray;
+                fallbackDesc.sampleCount = 4;
+                fallbackDesc.arrayLength = 1;
+                fallbackDesc.usage = MTLTextureUsageShaderRead;
+                break;
             default:
                 break;   /* 1D/2D/RECT are realized as 2D (see createMTLTextureFromGLTexture) */
         }
@@ -2243,7 +2281,12 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             NSUInteger width = fallbackTexture.width;
             NSUInteger height = fallbackTexture.height;
 
-            if (width <= 512 && height <= 512) {
+            if (width <= 512 && height <= 512 &&
+                fallbackDesc.textureType != MTLTextureType2DMultisample &&
+                fallbackDesc.textureType != MTLTextureType2DMultisampleArray) {
+                /* compat r109: replaceRegion aborts on multisample textures —
+                 * an emptied MS fallback stays Metal's zero-fill (it backs an
+                 * incomplete slot; making the DRAW work is what matters) */
                 uint32_t *gradientData = calloc(width * height, sizeof(uint32_t));
                 if (gradientData) {
                     for (NSUInteger i = 0; i < width * height; i++)
@@ -2962,7 +3005,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                      * and never touch unit 0's 2D slot).  Skip it — the sampler
                      * loop below binds the incomplete fallback for any sampler
                      * that actually reads such a unit. */
-                    if (tex->num_levels == 0)
+                    /* compat r104b/r109: also skip DEGENERATE objects (zero
+                     * extent in every dimension — the CTS state reset's
+                     * zero-size texImage*Multisample leaves those on the
+                     * DEFAULT texture objects with complete level records);
+                     * Metal cannot create a 0-extent texture, so realizing
+                     * them only produces the emergency-fallback line once per
+                     * object. */
+                    if (tex->num_levels == 0 ||
+                        (tex->width == 0 && tex->height == 0 && tex->depth == 0))
                         continue;
 
                     RETURN_FALSE_ON_FAILURE([self bindMTLTexture: tex]);

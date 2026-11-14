@@ -4608,7 +4608,22 @@ static void unify_stage_resource_bindings(MGLProgramObj *prog)
                                 for (GLuint k = 0; k < l2->count; k++)
                                     if (l2->list[k].name && !strcmp(l2->list[k].name, r->name) && l2->list[k].binding < b2)
                                         b2 = l2->list[k].binding;
-                                if (b2 > newbase)
+                                /* compat r109 Task B: only unify bindings the GL
+                                 * side can express (MAX_BINDABLE_BUFFERS).  Two
+                                 * anonymous SPV blocks in different stages can
+                                 * reflect to the SAME synthesized name with very
+                                 * different bindings — rsvga's D3D9 pair: the
+                                 * vertex block at binding 0, the fragment block
+                                 * at binding 256 (the D3D9 constant space);
+                                 * pulling the vertex block up to 256 made it
+                                 * unbindable (glBindBufferBase(256) is
+                                 * GL_INVALID_VALUE) and the whole draw read
+                                 * garbage constants (quad collapsed, colour
+                                 * (0,0,0,1), 0/16 pixels).  Blocks whose own
+                                 * binding is already out of range (SPIRV-Cross
+                                 * optimizes them out of the MSL when unused)
+                                 * stay where they are. */
+                                if (b2 > newbase && b2 < MAX_BINDABLE_BUFFERS)
                                     newbase = b2;
                             }
                     }

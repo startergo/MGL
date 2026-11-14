@@ -171,17 +171,19 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
             tex->faces[face].levels[l].width = w;
             tex->faces[face].levels[l].height = h;
             tex->faces[face].levels[l].depth = d;
-            /* GL 4.6 8.6.1: a zero-extent image spec EMPTIES the level — it
-             * has no image, the texture becomes incomplete (the regular
-             * texImage path already does exactly this, textures.c 1176).
-             * compat r107: the CTS state reset issues
-             * glTexImage{2,3}DMultisample(..., 0, 0, ...) into the per-target
-             * DEFAULT texture objects (real bindable objects since r103);
-             * marking those levels complete left degenerate 0x0x0 objects
-             * that every later draw tried (and failed) to realize as Metal
-             * textures — the texture_swizzle api_errors -> smoke_access
-             * "emergency fallback" flood (supervisor bisect bd9ae9a5). */
-            tex->faces[face].levels[l].complete = (w != 0 && h != 0 && (!is_3d || d != 0));
+            /* compat r109: zero-extent texImage*Multisample allocations stay
+             * COMPLETE records (num_levels keeps the declared count) — the GL
+             * 8.6.1 "empties the level" marking r107 introduced regressed
+             * KHR-GL46.es_31_compatibility sample_variables samples_0 (38
+             * cases): an unused `sampler2DMS` whose unit holds the emptied
+             * DEFAULT object took the incomplete-fallback path and the draw
+             * rendered nothing.  The r107 flood this guarded against (492k
+             * "emergency fallback" lines per case in texture_swizzle) is now
+             * prevented by tess r74's per-object fallback memoization: the
+             * degenerate 0x0x0 object is realized (and fails) exactly ONCE,
+             * and MGLRenderer's emergency fallback provides a correctly
+             * MS-typed 1x1 texture for texture2d_ms slots (also r109). */
+            tex->faces[face].levels[l].complete = true;  /* EXPERIMENT r109 */
             /* levelFormat() reads mtl_format: without it, TexSubImage* / copy /
              * GetTexImage into the object report GL_INVALID_OPERATION
              * (KHR-GL46.texture_view.view_classes uploads into a view) */
@@ -194,13 +196,14 @@ static bool texext_alloc_levels(GLMContext ctx, Texture *tex, GLuint levels, GLu
         }
     }
 
-    /* recompute the usable-level summary exactly like the regular texImage
-     * path: a fully "emptied" allocation (all levels zero-extent) leaves the
-     * object WITHOUT usable images — num_levels becomes 0, the level RECORDS
-     * stay queryable (GL_TEXTURE_WIDTH of an emptied level returns 0), and
-     * the level-less guards in the bind paths keep such objects away from
-     * Metal realization entirely */
-    updateTexSummary(tex);   /* textures.c — compat r107 */
+    /* compat r109: restore the direct num_levels assignment that r107 dropped
+     * — updateTexSummary EARLY-RETURNS for immutable-storage objects (MGL
+     * marks glTexImage*Multisample textures immutable), so every non-empty MS
+     * allocation was left with a STALE num_levels of 0 and sampled as
+     * incomplete-black.  (The r107 "emptied object" rule is reverted: see the
+     * comment above the level loop.) */
+    tex->num_levels = levels;                  /* what the allocation declared */
+    updateTexSummary(tex);                     /* non-immutable: recounts (agrees) */
     tex->mipmap_levels = levels;
     return true;
 }
