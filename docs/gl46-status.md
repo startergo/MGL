@@ -1,4 +1,17 @@
-# MGL GL 4.6 port: status (2026-11-13 14:05 EST, gl46-port @ 59d72636)
+# MGL GL 4.6 port: status (2026-11-13 19:20 EST, gl46-port @ 8ccb7407)
+
+## All 42 gl46-main regressions fixed; r107 sample_variables regression and rsvga bug #5 fixed (2026-11-13 19:20 EST)
+Merged on top of 1d354612, verified as ONE combined build before merging (headless suite 0 failures, test_geom x5 817/0; official-args caselist of the 42 regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail):
+
+| commit | what |
+|---|---|
+| 3d67ec06 | r75 follow-up (supervisor): texdata_formats.c restores the STENCIL_INDEX rejection for textures without a stencil plane on readback. tess r75 had narrowed it to TexImage/SubImage, which broke the 27 packed_pixels float cases on gl46-port once r108 and r75 were combined (each had been verified only separately). Test test_stencil_index_nonstencil_get.c. |
+| dc685593 | geom r148: compute_shader.resources-max (ACB base storage-image over-count) and gl_spirv.spirv_modules_state_queries_test (decompiler re-emitted a uniform-block member location). |
+| 8ccb7407 | compat r109: the 38 es_31_compatibility.sample_variables samples_0 cases broken by r107 (unused sampler2DMS pushed onto a plain-2D fallback by the emptied default MS objects), and rsvga bug #5 (cross-stage SPV uniform-block unification merged two ANONYMOUS blocks by reflected name, so SM1-3-translated programs drew nothing with a depth attachment). |
+
+Process change: every merge candidate is now verified as one combined build, never only stage by stage.
+
+Still open: the shader_storage_buffer_object.basic-binding order-flaky case; XFB captures one record per primitive instead of per vertex on triangle strips (pre-existing); a compute shader declaring a uniform block or SSBO fails glslang compilation in plain harness programs (pre-existing, from geom r148); geom follow-ups (geometry.c exact-list blanking, xfb stale slot on program delete).
 
 ## Merged compat r108 + tess r75: 40 of the 42 gl46-main regressions fixed (2026-11-13 14:05 EST)
 The full run on 1cbdd1ce found 42 KHR-GL46 cases that passed on the Nov 1 build (7edc431) and failed on 2f95cadc. Each was bisected over the saved baselines and routed:
