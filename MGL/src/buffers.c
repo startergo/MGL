@@ -745,8 +745,12 @@ static GLuint maxBindingsForTarget(GLMContext ctx, GLenum target)
              * (84 — see get.c); binding points at or above MAX_BINDABLE_BUFFERS have no
              * row in STATE(buffer_base) and live in the overflow table below, because the
              * renderer consumes UBO bindings through a 16-entry table.  get.c's
-             * reported_uniform_buffer_bindings() is the same expression. */
-            max = STATE_VAR(max_uniform_buffer_bindings) > 84 ? (GLuint)STATE_VAR(max_uniform_buffer_bindings) : 84;
+             * reported_uniform_buffer_bindings() is the same expression.
+             * compat r111: the reported limit is MGL_MAX_UNIFORM_BUFFER_BINDINGS
+             * (512) — rsvga's D3D9 fragment constant block sits at binding 256. */
+            max = STATE_VAR(max_uniform_buffer_bindings) > MGL_MAX_UNIFORM_BUFFER_BINDINGS
+                      ? (GLuint)STATE_VAR(max_uniform_buffer_bindings)
+                      : MGL_MAX_UNIFORM_BUFFER_BINDINGS;
             break;
 
         case GL_SHADER_STORAGE_BUFFER:

@@ -137,14 +137,24 @@ static GLuint max_draw_buffers(GLMContext ctx)
  * get_limit case below use this same expression. */
 static GLuint reported_uniform_buffer_bindings(GLMContext ctx)
 {
+    /* compat r111: the floor is MGL_MAX_UNIFORM_BUFFER_BINDINGS (512) —
+     * binding points are indirection; points >= MAX_BINDABLE_BUFFERS go
+     * through the sparse overflow table and the draw path resolves UBO blocks
+     * through mgl_buffers_indexed_binding (rsvga's D3D9 fragment constant
+     * block sits at 256).  Still >= the GL 4.6 minimum of 84. */
     GLuint n = (GLuint)STATE_VAR(max_uniform_buffer_bindings);
-    return n > 84 ? n : 84;
+    return n > MGL_MAX_UNIFORM_BUFFER_BINDINGS ? n : MGL_MAX_UNIFORM_BUFFER_BINDINGS;
 }
 
 static GLuint max_uniform_buffer_bindings(GLMContext ctx)
 {
-    GLuint n = STATE_VAR(max_uniform_buffer_bindings) ? STATE_VAR(max_uniform_buffer_bindings) : 14;
-    return n > MAX_BINDABLE_BUFFERS ? MAX_BINDABLE_BUFFERS : n;
+    /* compat r111: MGL supports 512 GL uniform-buffer BINDING POINTS (see
+     * glm_context.h) — pure indirection, Metal slots are per-program, and
+     * indices >= MAX_BINDABLE_BUFFERS flow through the sparse overflow table
+     * (a block at rsvga's D3D9 binding 256 receives its data).  The macOS
+     * default's 84 is superseded; the GL 4.6 minimum (84) still holds. */
+    (void)ctx;
+    return MGL_MAX_UNIFORM_BUFFER_BINDINGS;
 }
 
 #define MGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS  16

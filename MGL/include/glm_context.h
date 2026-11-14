@@ -217,6 +217,15 @@ typedef struct BufferBaseTarget_t {
  * indexed binding array must really hold that many rows (the overflow table in
  * buffers.c only covered 8 of them). */
 #define MAX_BINDABLE_BUFFERS    84
+/* compat r111: GL uniform-buffer BINDING POINTS are pure indirection — the
+ * Metal buffer slot is assigned per linked program, so supporting more GL
+ * binding points than the STATE(buffer_base) rows costs only the small sparse
+ * overflow table (buffers.c: points >= MAX_BINDABLE_BUFFERS live there and
+ * the draw path reads UBO blocks through it).  rsvga's D3D9 translation
+ * places its fragment constant block at binding 256 (the D3D9 PS constant
+ * space starts after the VS's), so MGL advertises 512 — comfortably above the
+ * GL 4.6 minimum of 84 and above the whole D3D9 VS+PS constant space. */
+#define MGL_MAX_UNIFORM_BUFFER_BINDINGS 512
 typedef struct BufferBase_t {
     BufferBaseTarget    buffers[MAX_BINDABLE_BUFFERS];
 } BufferBase;
