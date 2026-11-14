@@ -1,4 +1,17 @@
-# MGL GL 4.6 port: status (2026-11-13 19:20 EST, gl46-port @ 8ccb7407)
+# MGL GL 4.6 port: status (2026-11-14 16:45 EST, gl46-port @ 22001710)
+
+## Merged 2026-11-14: UBO bindings 512, tess r76 tests, geom r149+r150 exact XFB varying names (aa451a99, 22001710)
+Each merge was verified as ONE combined build first. Final combined build for 22001710: headless suite 219 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; KHR-GL46.transform_feedback + geometry_shader 156 Pass / 1 Fail, the same as on aa451a99.
+
+| commit | what |
+|---|---|
+| 0e149c3c | compat r111: GL_MAX_UNIFORM_BUFFER_BINDINGS raised from 84 to 512, so binding points up to 511 work. Test test_compat_ubo_high_binding.c. |
+| aa451a99 | tess r76, tests only: test_xfb_decompose.c shows that XFB triangle-strip capture is spec-correct (strips are decomposed into separate triangles), and test_compute_blocks.c shows that compute shaders with uniform blocks or SSBOs compile. Both issues listed as open on 2026-11-13 are closed as not bugs. |
+| 22001710 | geom r149+r150: glGetTransformFeedbackVarying now returns blank names only for names the reflection really synthesized, and a reused program name no longer keeps stale XFB state. The root cause of the intermittent KHR-GL46.transform_feedback.get_xfb_varying failure was in spv_parse: real OpName and OpMemberName entries never initialized their synthesized flag, so heap garbage randomly marked real varyings as synthesized. Tests test_xfb_get_varying_r150.c and test_geom_nonames_r149.c. |
+
+The shader_storage_buffer_object.basic-binding flake listed on 2026-11-13 was already fixed by r109.
+
+Still open: KHR-GL46.geometry_shader.api.max_shader_storage_blocks (fails on aa451a99 too; not investigated). Next: a fresh full CTS run on the tip, held until the user starts it.
 
 ## All 42 gl46-main regressions fixed; r107 sample_variables regression and rsvga bug #5 fixed (2026-11-13 19:20 EST)
 Merged on top of 1d354612, verified as ONE combined build before merging (headless suite 0 failures, test_geom x5 817/0; official-args caselist of the 42 regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail):
