@@ -11,7 +11,7 @@ if [ ! -d "build" ]
 then
     mkdir build
     cd build
-    cmake ..
+    cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
 else
     cd build
 fi
