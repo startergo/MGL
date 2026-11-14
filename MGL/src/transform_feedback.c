@@ -145,7 +145,22 @@ static MGLXfbProgram *xfb_prog(GLMContext ctx, Program *p, bool create)
         MGLXfbProgram *xp = XFB()->progs[i];
         if (xp->name == p->name) {
             if (xp->program == p) return xp;
-            /* name reused by a new program object: drop stale data */
+            /* name reused by a new program object: drop stale data ENTIRELY
+             * (r149 Task B): only re-pointing ->program left the previous
+             * program's capture list, strides and counts in place, which then
+             * surfaced for the new program through every query */
+            free(xp->vars);
+            free(xp->link_log);
+            xp->vars = NULL;
+            xp->count = 0;
+            xp->link_log = NULL;
+            xp->linked = false;
+            xp->link_failed = false;
+            xp->from_shader = false;
+            xp->buffer_mask = 0;
+            xp->record_words = 0;
+            xp->max_name_length = 0;
+            for (GLuint b = 0; b < MGL_XFB_MAX_BUFFERS; b++) xp->stride[b] = 0;
             xp->program = p;
             return xp;
         }

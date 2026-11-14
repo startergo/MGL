@@ -608,6 +608,10 @@ static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **e
                 m->names = realloc(m->names, sizeof(SpvName) * (size_t)(m->n_names + 1));
                 m->names[m->n_names].id = words[pos + 1];
                 snprintf(m->names[m->n_names].name, sizeof(m->names[m->n_names].name), "%s", name);
+                /* r150: a REAL OpName is never synthesized — realloc leaves .syn as heap
+                 * garbage, so a real name could randomly read as synthesized and be
+                 * blanked from the xfb queries (r149's exact-list rule trusts .syn) */
+                m->names[m->n_names].syn = false;
                 m->n_names++;
                 break;
             }
@@ -693,6 +697,7 @@ static SpvModule *spv_parse(const uint32_t *words, size_t nwords, const char **e
                 m->mnames[m->n_mnames].id = words[pos + 1];
                 m->mnames[m->n_mnames].member = words[pos + 2];
                 snprintf(m->mnames[m->n_mnames].name, sizeof(m->mnames[m->n_mnames].name), "%s", name);
+                m->mnames[m->n_mnames].syn = false;   /* r150: see OpName above */
                 m->n_mnames++;
                 break;
             }
@@ -14328,10 +14333,29 @@ static void geom_xfb_fail(GLMContext ctx, MGLXfbProgram *xp, const char *msg)
     xp->link_failed = true;
 }
 
+static bool geom_xfb_comp_in_synth(const char *s, char **syn, size_t nsyn)
+{
+    for (size_t i = 0; i < nsyn; i++)
+        if (!strcmp(syn[i], s)) return true;
+    return false;
+}
+
+static bool geom_xfb_mod_has_real_name(SpvModule *m, const char *s)
+{
+    if (!m) return false;
+
+    for (int i = 0; i < m->n_names; i++)
+        if (!m->names[i].syn && !strcmp(m->names[i].name, s)) return true;
+    for (int i = 0; i < m->n_mnames; i++)
+        if (!m->mnames[i].syn && !strcmp(m->mnames[i].name, s)) return true;
+    return false;
+}
+
 static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                              const MGLGeomVar *vars, int nvars,
                              GLuint pos_word, GLuint psize_word,
-                             const char *stage, bool from_shader)
+                             const char *stage, bool from_shader,
+                             const uint32_t *synth_ir, size_t synth_words)
 {
     GLuint dbuffer[64], doffset[64];
     GLsizei dn = 0;
@@ -14340,6 +14364,9 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
     bool dbuf_seen[MGL_XFB_MAX_BUFFERS];
     bool dbuf_have_stride[MGL_XFB_MAX_BUFFERS];
     GLuint buffer = 0, offset = 0, n = 0, xn = 0;
+    size_t nsyn = 0;
+    char **syn = NULL;
+    SpvModule *real_mod = NULL;   /* r150: the module's REAL names (parsed once) */
     MGLXfbVarying *v;
     char dnames[64][192];
     char xnames[128][192];
@@ -14357,6 +14384,20 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
      * variable with only xfb_buffer/xfb_stride (no offset) is NOT captured. */
     if (from_shader) xp->mode = GL_INTERLEAVED_ATTRIBS;
     else xp->mode = xp->pending_mode;
+    /* r149: the EXACT synthesized-name list of the recording stage's module —
+     * replaces the r147 prefix rule so a user varying that merely starts with
+     * _mgl_ is never blanked from the queries */
+    syn = mgl_geom_spirv_synth_names(synth_ir, synth_words, &nsyn);
+    {   /* r150: parse the recording stage's module once for its REAL names */
+        const char *rerr = NULL;
+
+        real_mod = spv_parse(synth_ir, synth_words, &rerr);
+        if (real_mod && !real_mod->ok)
+        {
+            spv_free(real_mod);
+            real_mod = NULL;
+        }
+    }
     if (from_shader || !xp->pending_count)
     {
         /* shader-declared capture (xfb_buffer / xfb_offset on outputs, including interface
@@ -14581,9 +14622,23 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
             {
                 memcpy(comp, name, cl);
                 comp[cl] = 0;
-                if (!strncmp(comp, "_mgl_v", 6) || !strncmp(comp, "_mgl_in", 7) ||
-                    !strncmp(comp, "_mgl_out", 8) || !strncmp(comp, "_mgl_t", 6))
+                /* r149: EXACT-list rule (matching transform_feedback.c r148) — a
+                 * component is synthesized only when it IS one of the module's
+                 * synthesized spellings, so a user varying that merely STARTS
+                 * with a _mgl_ prefix keeps its real name */
+                if (geom_xfb_comp_in_synth(comp, syn, nsyn))
                     display = "";
+                else if (!strncmp(comp, "_mgl_v", 6) || !strncmp(comp, "_mgl_in", 7) ||
+                         !strncmp(comp, "_mgl_out", 8) || !strncmp(comp, "_mgl_t", 6))
+                {
+                    /* r150: the reflection also INVENTS _mgl_-prefixed leaf spellings
+                     * (matrix column splits, flattened block fields) that are in
+                     * neither the module's OpName set nor its synthesized list —
+                     * blank those too, unless the module declares that exact
+                     * spelling as a REAL name (a user "_mgl_out_user" stays) */
+                    if (!real_mod || !geom_xfb_mod_has_real_name(real_mod, comp))
+                        display = "";   /* (no parsable module: the r147 prefix rule) */
+                }
             }
         }
 
@@ -14886,6 +14941,10 @@ static void geom_xfb_resolve(GLMContext ctx, MGLXfbProgram *xp,
                     i, xp->vars[i].name, xp->vars[i].size, xp->vars[i].rows,
                     xp->vars[i].columns, xp->vars[i].words, xp->vars[i].src_word,
                     xp->vars[i].buffer, xp->vars[i].offset, xp->stride[xp->vars[i].buffer]);
+
+    for (size_t i = 0; syn && i < nsyn; i++) free(syn[i]);
+    if (syn) free(syn);
+    if (real_mod) spv_free(real_mod);
 }
 
 void mgl_geom_xfb_link(GLMContext ctx, Program *program, bool from_shader)
@@ -14895,7 +14954,8 @@ void mgl_geom_xfb_link(GLMContext ctx, Program *program, bool from_shader)
 
     if (!gp || !xp) return;
     geom_xfb_resolve(ctx, xp, gp->out_v, gp->n_out, gp->out_pos_off, gp->out_psize_off,
-                     "geometry stage", from_shader);
+                     "geometry stage", from_shader,
+                     program->spirv[_GEOMETRY_SHADER].ir, program->spirv[_GEOMETRY_SHADER].size);
 }
 
 /* transform feedback from a tessellation evaluation stage (no geometry shader): the TES's
@@ -14928,7 +14988,8 @@ void mgl_geom_tess_xfb_link(GLMContext ctx, Program *program, bool from_shader)
     spv_free(m);
     /* gl_Position is the first word of every capture record; the tess output capture does not
      * record gl_PointSize (a TES writing it would be dropped) */
-    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage", from_shader);
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation evaluation stage", from_shader,
+                     program->spirv[_TESS_EVALUATION_SHADER].ir, program->spirv[_TESS_EVALUATION_SHADER].size);
 }
 
 /* transform feedback varyings on a SEPARABLE TCS-only program (no vs/tes/gs): the names
@@ -14959,7 +15020,8 @@ void mgl_geom_tcs_xfb_link(GLMContext ctx, Program *program, bool from_shader)
     if (!geom_reflect_stage(m, false, vars, &n, NULL))
         n = 0;
     spv_free(m);
-    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation control stage", from_shader);
+    geom_xfb_resolve(ctx, xp, vars, n, 0, 0, "tessellation control stage", from_shader,
+                     program->spirv[_TESS_CONTROL_SHADER].ir, program->spirv[_TESS_CONTROL_SHADER].size);
 }
 
 /* the active transform feedback object (the xfb domain's current-object rule) */
