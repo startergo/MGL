@@ -4636,6 +4636,61 @@ char **mgl_geom_spirv_synth_names(const uint32_t *ir, size_t n, size_t *count)
     return out;
 }
 
+/* geom r147/r148: is the module FULLY name-less (not one OpName/OpMemberName)?
+ * The declared-capture resolver recomiles the DECOMPILED source (r126's
+ * xfb_vs_source), which re-attaches BUILTIN spellings ("gl_Position") — names
+ * that exist NOWHERE in the app's module.  For such a module every reported
+ * varying name is "" (ARB_gl_spirv). */
+bool mgl_geom_spirv_fully_unnamed(const uint32_t *ir, size_t n)
+{
+    if (!ir || n < 6) return false;
+    for (size_t pos = 5; pos < n; )
+    {
+        uint32_t wc = ir[pos] >> 16, op = ir[pos] & 0xffff;
+
+        if (wc == 0 || pos + wc > n) break;
+        if (op == 5 || op == 6) return false;
+        pos += wc;
+    }
+    return true;
+}
+
+/* geom r148: does the module carry any REAL (app-supplied) name — one that is
+ * neither a synthesized spelling (_mgl_*, m<idx>) nor a builtin (gl_*)?  The
+ * declared-capture resolver works over a module MGL rebuilt internally (the
+ * decompile/recompile chain re-attaches builtin spellings like "gl_Position"
+ * that exist nowhere in the app's module); with no real names the module is
+ * name-less per ARB_gl_spirv and every reported varying name is "". */
+bool mgl_geom_spirv_has_real_names(const uint32_t *ir, size_t n)
+{
+    if (!ir || n < 6) return false;
+    for (size_t pos = 5; pos < n; )
+    {
+        uint32_t wc = ir[pos] >> 16, op = ir[pos] & 0xffff;
+        const char *s;
+        size_t len;
+
+        if (wc == 0 || pos + wc > n) break;
+        if (op == 5 || op == 6)
+        {
+            s = (const char *)&ir[pos + (op == 5 ? 2 : 3)];
+            len = strnlen(s, (wc - (op == 5 ? 2 : 3)) * 4);
+            if (len > 0 && strncmp(s, "_mgl_", 5) && strncmp(s, "gl_", 3) &&
+                strncmp(s, "mgl_", 4))   /* MGL's rebuilt default-uniform block */
+            {
+                /* m<idx> member spellings are synthesized; anything else is real */
+                size_t k = (s[0] == 'm');
+
+                if (!k) return true;
+                for (k = 1; k < len && s[k] >= '0' && s[k] <= '9'; k++) {}
+                if (k != len) return true;
+            }
+        }
+        pos += wc;
+    }
+    return false;
+}
+
 /* geom r125: decompile a stage's SPIR-V back to GLSL (used by the xfb link when
  * a program was loaded from a binary and has no GLSL source — the same helper
  * the geometry stage's kernel generation uses) */
@@ -4718,6 +4773,55 @@ static char *geom_spirv_to_glsl(const uint32_t *ir, size_t words, int version, c
     char *out = xstrdup(src);
     spvc_context_destroy(ctx);
     geom_deanon_synthesized_instances(out);
+
+    /* geom r148: SPIRV-Cross moves a LOCATION-decorated default-block uniform
+     * (layout(location=20) uniform vec4 extPosition) into its synthesized
+     * default-uniform BLOCK and re-emits the location on the MEMBER —
+     * "layout(location = N) vec4 m0;" inside a uniform block — which GLSL
+     * forbids (member locations are only legal on in/out blocks) and glslang
+     * rejects, breaking every name-less declared-capture recompile (the CTS
+     * gl_spirv state-queries test's exact shader).  Strip the member locations
+     * inside uniform blocks, line by line — a uniform block member's location
+     * carries no capture semantics. */
+    {
+        char *r = out, *wr = out;
+        bool in_ublock = false;
+
+        while (*r)
+        {
+            char *line = r, *eol = r;
+            size_t len;
+
+            while (*eol && *eol != '\n') eol++;
+            len = (size_t)(eol - line) + (*eol == '\n' ? 1 : 0);
+
+            if (!in_ublock && strstr(line, "uniform") && memchr(line, '{', len))
+                in_ublock = true;
+            else if (in_ublock && len >= 2 && line[0] == '}' && line[1] == ';')
+                in_ublock = false;
+            else if (in_ublock)
+            {
+                char *loc = strstr(line, "layout(location = ");
+
+                if (loc && loc < eol)
+                {
+                    char *close = strchr(loc, ')');
+
+                    if (close && close < eol)
+                    {
+                        size_t cut = (size_t)(close + 1 - loc);
+
+                        memmove(loc, close + 1, (size_t)(eol - close));
+                        len -= cut;
+                    }
+                }
+            }
+            memmove(wr, line, len);
+            wr += len;
+            r = eol + (*eol == '\n' ? 1 : 0);
+        }
+        *wr = 0;
+    }
     {
         static int seq;
 

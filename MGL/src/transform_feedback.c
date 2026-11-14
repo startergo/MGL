@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <dlfcn.h>
 #include "mgl_ext_queries.h"
+#include "mgl_ext_program.h"   /* mgl_program_is_linked (r148) */
 
 #include <glslang_c_interface.h>
 #include "fp64.h"
@@ -297,13 +298,19 @@ bool mgl_xfb_get_programiv(GLMContext ctx, Program *program, GLenum pname, GLint
 {
     MGLXfbProgram *xp = xfb_prog(ctx, program, false);
     bool ok = xp && xp->linked && !xp->link_failed;
+    bool linked = mgl_program_is_linked(program);
 
     switch (pname) {
         case GL_TRANSFORM_FEEDBACK_VARYINGS:
             *params = ok ? (GLint)xp->count : 0;
             return true;
         case GL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH:
-            *params = ok ? xp->max_name_length : 0;
+            /* r148 regression fix (KHR-GL46.gl_spirv.spirv_modules_state_queries_test
+             * first went bad in the r130..r134 tree): for a LINKED program with no
+             * transform-feedback varyings the query reports 1 — the empty name plus
+             * its NUL (the CTS asserts exactly this for a SPIR-V program; every
+             * driver reports 1).  Unlinked programs keep reporting 0. */
+            *params = ok ? (xp->max_name_length ? xp->max_name_length : 1) : (linked ? 1 : 0);
             return true;
         case GL_TRANSFORM_FEEDBACK_BUFFER_MODE:
             *params = (GLint)(xp && xp->linked ? xp->mode : GL_INTERLEAVED_ATTRIBS);
@@ -2606,11 +2613,14 @@ done:
  * dotted path is still reported. */
 static bool xfb_comp_is_synth(const char *s, char **syn, size_t nsyn)
 {
-    if (!strncmp(s, "_mgl_v", 6) || !strncmp(s, "_mgl_in", 7) ||
-        !strncmp(s, "_mgl_out", 8) || !strncmp(s, "_mgl_t", 6))
-        for (size_t i = 0; i < nsyn; i++)
-            if (!strcmp(syn[i], s)) return true;
-    return false;
+    /* exact match against the module's OWN synthesized spellings — no prefix
+     * gate (a synthesized member "m0" carries no prefix; a REAL "m0" member
+     * name is not in the list, so it still reports) */
+    bool hit = false;
+
+    for (size_t i = 0; i < nsyn; i++)
+        if (!strcmp(syn[i], s)) { hit = true; break; }
+    return hit;
 }
 
 static void xfb_blank_synth_reported_names(GLMContext ctx, MGLXfbProgram *xp,
@@ -2618,16 +2628,18 @@ static void xfb_blank_synth_reported_names(GLMContext ctx, MGLXfbProgram *xp,
 {
     size_t nsyn = 0;
     char **syn = mgl_geom_spirv_synth_names(orig_ir, orig_words, &nsyn);
+    /* r148: the module MGL hands the resolver was rebuilt internally (the
+     * decompile/recompile chain re-attaches builtin spellings); a module with
+     * no REAL app-supplied names is name-less — every reported name blanks */
+    bool all = !mgl_geom_spirv_has_real_names(orig_ir, orig_words);
 
-    (void)ctx;
-    if (!syn) return;
     for (GLuint i = 0; i < xp->count; i++)
     {
         const char *n = xp->vars[i].name;
         size_t off = 0;
-        bool all_synth = n && n[0];
+        bool all_synth = n && n[0] ? all : true;   /* r148: a FULLY name-less module blanks everything */
 
-        while (all_synth)
+        while (all_synth && syn && !all)
         {
             const char *dot = strchr(n + off, '.');
             char comp[160];
@@ -2646,8 +2658,8 @@ static void xfb_blank_synth_reported_names(GLMContext ctx, MGLXfbProgram *xp,
             xp->vars[i].name = strdup("");
         }
     }
-    for (size_t i = 0; i < nsyn; i++) free(syn[i]);
-    free(syn);
+    for (size_t i = 0; syn && i < nsyn; i++) free(syn[i]);
+    if (syn) free(syn);
 }
 
 static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool api,
@@ -2721,8 +2733,11 @@ static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool
         xp->from_shader = true;
         /* r147: a name-less SPIR-V module reports "" for its captured varyings
          * (ARB_gl_spirv) — the resolver ran over the NAMED COPY, so blank every
-         * reported name whose components are all synthesized spellings */
-        xfb_blank_synth_reported_names(ctx, xp, ir, words);
+         * reported name whose components are all synthesized spellings.
+         * r148: pass the ORIGINAL module (spirv_module/spirv_words) — `ir` may
+         * have been replaced by the named copy, whose names all parse as real
+         * (syn = false) and the blanker sees an empty synth list. */
+        xfb_blank_synth_reported_names(ctx, xp, spirv_module, spirv_words);
     }
 
     for (GLuint i = 0; i < xp->count; i++) {

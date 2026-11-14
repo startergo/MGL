@@ -3358,6 +3358,40 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
                                                         stage == _COMPUTE_SHADER ?
                                                         MGL_CS_SSBO_SIZE_BUFFER_INDEX : 24,
                                                         ac_base, atidx);
+        if (!injected && stage == _COMPUTE_SHADER)
+        {
+            /* r148 regression fix (KHR-GL46.compute_shader.resources-max first went
+             * bad in r88): the r88 STORAGE_IMAGE over-count is only needed for
+             * images that ACTUALLY get SPIRV-Cross `<name>_atomic` sidecar buffers
+             * (atomic accesses) — msl_fix_image_atomics decides that from the MSL
+             * body, AFTER this injection.  Counting every storage image inflates
+             * ac_base by the non-atomic images (8 here: 12 UBOs + 1 default uniform
+             * + 8 SSBOs + 8 images = 29 + 8 counters = 37 > the compute ceiling 30,
+             * while the REAL signature has no sidecars and fits: 21 + 8 = 29 <= 30).
+             * Retry without the over-count; a genuinely atomic image set still takes
+             * the r88 path (the first attempt succeeds for it — the zoo's collision
+             * case has few buffers), and a collision that would slip through is
+             * caught by Metal's pipeline validation ("cannot reserve 'buffer'
+             * resource location"), never by silent misbinding. */
+            int ac_base2 = 0;
+
+            for (int t = 0; t < 3; t++)
+            {
+                int type = t == 0 ? SPVC_RESOURCE_TYPE_UNIFORM_BUFFER
+                        : t == 1 ? SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT
+                                 : SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
+
+                for (GLuint i = 0; i < ptr->spirv_resources_list[stage][type].count; i++)
+                {
+                    unsigned as = ptr->spirv_resources_list[stage][type].list[i].array_size;
+
+                    ac_base2 += as ? (int)as : 1;
+                }
+            }
+            injected = mgl_msl_inject_atomic_counters(result, msl_entry, atvars, natvars,
+                                                      MGL_CS_SSBO_SIZE_BUFFER_INDEX,
+                                                      ac_base2, atidx);
+        }
         if (!injected)
         {
             mgl_append_info_log(log, "ERROR: %s stage: atomic counter buffer arguments could not be "

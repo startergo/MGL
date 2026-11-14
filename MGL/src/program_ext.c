@@ -1139,6 +1139,17 @@ void mglShaderBinary(GLMContext ctx, GLsizei count, const GLuint *shaders, GLenu
     const uint32_t *w = (const uint32_t *)binary;
     size_t nwords;
 
+    if (getenv("MGL_SPIRV_DUMP"))
+    {
+        char path[256];
+        static unsigned seq;
+        FILE *df;
+
+        snprintf(path, sizeof path, "%s/inbin_%u.spv", getenv("MGL_SPIRV_DUMP"), seq++);
+        df = fopen(path, "wb");
+        if (df) { fwrite(binary, 1, (size_t)(length > 0 ? length : 0), df); fclose(df); }
+    }
+
     if (count < 0 || length < 0)
     {
         ERROR_RETURN(GL_INVALID_VALUE);

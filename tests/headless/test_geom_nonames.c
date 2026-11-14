@@ -347,6 +347,55 @@ TEST(nonames_xfb_introspection)
     EXPECT_EQ_INT(maxlen, 1);
 }
 
+
+/* ---------------- r148 regression fences (the CTS regressions) -------------- */
+
+/* ROOT CAUSE 1 (KHR-GL46.compute_shader.resources-max, first bad dd77727): the
+ * r88 STORAGE_IMAGE over-count in the compute ACB base made 12 UBOs + 8 SSBOs +
+ * 8 non-atomic images + 8 atomic counters exceed the Metal index ceiling
+ * (29 + 8 > 30) and the link refused ("atomic counter buffer arguments could
+ * not be declared") while the REAL signature has no image-atomic sidecar
+ * buffers and fits (21 + 8 <= 30).  Fixed in program.c by retrying without the
+ * over-count; the RED->GREEN proof is the CTS case itself (Fail at
+ * baseline-2f95cadc, Pass after — verified in this round).  A headless fence
+ * needs the exact 12+8+8+8 resource mix, whose shape trips a SEPARATE
+ * pre-existing CS+block compile quirk (see the report). */
+TEST(r148_state_queries_module)
+{
+    GLuint sh, p;
+    GLint ok = 0, v[4] = {-1, -1, -1, -1};
+    char nm[256];
+    GLsizei len = -1;
+
+    /* the CTS's exact stripped module (dumped from the running glcts via
+     * MGL_SPIRV_DUMP; 261 words: 1 in, 1 uniform + 1 block, the block output
+     * with XfbBuffer/XfbStride) is embedded as spv_state_vs_nonames */
+    sh = load_spirv_stage(GL_VERTEX_SHADER, spv_state_vs_nonames,
+                          sizeof spv_state_vs_nonames / 4);
+    if (!sh) return;
+    p = glCreateProgram();
+    glAttachShader(p, sh);
+    glDeleteShader(sh);
+    glLinkProgram(p);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    EXPECT_TRUE(ok);                        /* was: recompile failed, link 0 */
+    if (!ok) { glDeleteProgram(p); return; }
+
+    glGetProgramiv(p, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &v[0]);
+    glGetProgramiv(p, GL_ACTIVE_UNIFORM_MAX_LENGTH, &v[1]);
+    glGetProgramiv(p, GL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH, &v[2]);
+    glGetProgramiv(p, GL_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH, &v[3]);
+    EXPECT_EQ_INT(v[0], 1);
+    EXPECT_EQ_INT(v[1], 1);
+    EXPECT_EQ_INT(v[2], 1);                /* was: 12 ("gl_Position") */
+    EXPECT_EQ_INT(v[3], 1);
+    nm[0] = '?';
+    glGetTransformFeedbackVarying(p, 0, sizeof nm, &len, NULL, NULL, nm);
+    EXPECT_EQ_INT(len, 0);
+    EXPECT_EQ_INT(nm[0], 0);
+    glDeleteProgram(p);
+}
+
 int main(void)
 {
     GLuint vao = 0;
@@ -360,5 +409,6 @@ int main(void)
     RUN(nonames_xfb_block);
     RUN(nonames_introspection_honest);
     RUN(nonames_xfb_introspection);
+    RUN(r148_state_queries_module);
     return mgl_test_summary();
 }
