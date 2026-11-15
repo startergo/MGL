@@ -46,22 +46,26 @@ struct MGLProgramObj_t;
 #define MGL_GEOM_BUDGET_BYTES       (256u << 20)     /* per-buffer allocation cap */
 #define MGL_GEOM_TESS_MAX_WORDS     128   /* (src word, dst word) pairs of a tess record import */
 
-/* GLSL (set 0) bindings of the emulation SSBOs; above the per-stage SSBO limit so an
- * application's own layout(std430, binding=N) declarations cannot collide */
+/* GLSL (set 0) bindings of the emulation SSBOs.  r151: they must sit above EVERY binding an
+ * application's own block can use in the generated variants — uniform blocks too, which
+ * reach GL_MAX_UNIFORM_BUFFER_BINDINGS - 1 = 511 since compat r111 (84 before).  At
+ * 18..28 a geometry-stage UBO at binding 20..28 was skipped as a pool resource or pinned
+ * onto a pool slot, and the kernel failed to compile at draw time (draw dropped). */
+#define MGL_GEOM_SSBO_POOL_BASE 600
 enum {
-    MGL_GEOM_SSBO_DUB      = 18,    /* u32: the program's default-uniform block (see
+    MGL_GEOM_SSBO_DUB      = MGL_GEOM_SSBO_POOL_BASE + 0,    /* u32: the program's default-uniform block (see
                                      * geometry.c: the capture variant and the kernel
                                      * re-declare plain uniforms as this block so the
                                      * buffer built for the raster path binds as-is) */
-    MGL_GEOM_SSBO_PRIM     = 20,    /* u32: k slots per input primitive (relative to vstart) */
-    MGL_GEOM_SSBO_VSOUT    = 21,    /* u32: captured VS output records */
-    MGL_GEOM_SSBO_HDR      = 22,    /* u32: kernel header (MGL_GEOM_HDR_WORDS) */
-    MGL_GEOM_SSBO_OUTV     = 23,    /* u32: GS output vertex records */
-    MGL_GEOM_SSBO_IDX      = 24,    /* u32: raster index list (stream 0) */
-    MGL_GEOM_SSBO_CTL      = 25,    /* u32: counters + indirect draw arguments */
-    MGL_GEOM_SSBO_CNT      = 27,    /* u32: per-thread emitted vertex count (capture order) */
-    MGL_GEOM_SSBO_DRAW     = 26,    /* pass-through vertex function: GS output records */
-    MGL_GEOM_SSBO_LSCR     = 28     /* u32: per-thread output index scratch + (at word
+    MGL_GEOM_SSBO_PRIM     = MGL_GEOM_SSBO_POOL_BASE + 2,    /* u32: k slots per input primitive (relative to vstart) */
+    MGL_GEOM_SSBO_VSOUT    = MGL_GEOM_SSBO_POOL_BASE + 3,    /* u32: captured VS output records */
+    MGL_GEOM_SSBO_HDR      = MGL_GEOM_SSBO_POOL_BASE + 4,    /* u32: kernel header (MGL_GEOM_HDR_WORDS) */
+    MGL_GEOM_SSBO_OUTV     = MGL_GEOM_SSBO_POOL_BASE + 5,    /* u32: GS output vertex records */
+    MGL_GEOM_SSBO_IDX      = MGL_GEOM_SSBO_POOL_BASE + 6,    /* u32: raster index list (stream 0) */
+    MGL_GEOM_SSBO_CTL      = MGL_GEOM_SSBO_POOL_BASE + 7,    /* u32: counters + indirect draw arguments */
+    MGL_GEOM_SSBO_CNT      = MGL_GEOM_SSBO_POOL_BASE + 9,    /* u32: per-thread emitted vertex count (capture order) */
+    MGL_GEOM_SSBO_DRAW     = MGL_GEOM_SSBO_POOL_BASE + 8,    /* pass-through vertex function: GS output records */
+    MGL_GEOM_SSBO_LSCR     = MGL_GEOM_SSBO_POOL_BASE + 10     /* u32: per-thread output index scratch + (at word
                                      * hdr[4]) the per-thread entry counts and scanned
                                      * bases; a scan + copy pass compacts the segments
                                      * into the raster list, because writing them there
@@ -97,6 +101,10 @@ enum {
  * move it inside the user slot range (MGL_GEOM_KERNEL_SIZE_BUFFER) because the kernel's
  * own buffers are pinned from MGL_GEOM_MSL_CNT (22) up. */
 #define MGL_SSBO_SIZE_BUFFER_INDEX 25
+
+/* r151: capacity of a stage's resource pin table (geom_build_pins); above
+ * MGL_GEOM_KERNEL_USER_SLOTS, so the span check fails first */
+#define MGL_GEOM_MAX_PINS 32
 #define MGL_GEOM_KERNEL_SIZE_BUFFER 21
 
 /* Vertex-stage shadow-sampling emulation (mgl_fix_shadow_vs, program.c): the GL

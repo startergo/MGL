@@ -10033,7 +10033,7 @@ static int geom_build_pins(SpvModule *prog, SpvModule *mine,
 
             /* the generated variants pin their own pool blocks (MGLGs* / MGLGeom*) at
              * bindings above the DUB slot; user bindings stay below it (MGL reports at
-             * most 14 uniform-buffer / 8 storage-buffer binding points), so the binding
+             * most 512 uniform-buffer / 16 storage-buffer binding points), so the binding
              * cleanly separates them */
             {
                 uint32_t bnd = (uint32_t)spv_binding(mine, v->id);
@@ -12182,7 +12182,14 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
     size_t words = 0;
     char *log = NULL;
     int pins_gl[8], pins_msl[8];
-    GeomPin pins2[8];
+    /* r151: one pin per program resource variable of the stage.  Was 8, so a stage with
+     * more than 8 resources (GL_MAX_GEOMETRY_SHADER_STORAGE_BLOCKS is 16) left the rest
+     * unpinned: SPIRV-Cross then auto-assigned them Metal slots from 0, colliding with
+     * the pinned ones, and the kernel failed to compile at draw time — the draw was
+     * dropped (KHR-GL46.geometry_shader.api.max_shader_storage_blocks).  Every variable
+     * takes at least one argument slot, so a stage that passes the
+     * MGL_GEOM_KERNEL_USER_SLOTS span check never has more than MGL_GEOM_MAX_PINS. */
+    GeomPin pins2[MGL_GEOM_MAX_PINS];
     int npins2 = 0;
 
 #define GEOM_FAIL(...)  do { geom_fail(ctx, gp, __VA_ARGS__); \
@@ -12324,7 +12331,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
             int span;
 
             npins2 = 0;
-            span = geom_build_pins(p_vs, c_vs, pins2, &npins2, 8,
+            span = geom_build_pins(p_vs, c_vs, pins2, &npins2, MGL_GEOM_MAX_PINS,
                                    gp->tex_slots_vs, &gp->n_tex_slots_vs, 64);
             if (span > MGL_GEOM_KERNEL_USER_SLOTS ||
                 (span > MGL_GEOM_KERNEL_SIZE_BUFFER &&
@@ -12449,7 +12456,7 @@ build:
              * stage's program resources must fit in the slots below them */
             if (!gp->synthetic)
             {
-            int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, 8,
+            int span = geom_build_pins(p_gs, k_gs, pins2, &npins2, MGL_GEOM_MAX_PINS,
                                        gp->tex_slots_gs, &gp->n_tex_slots_gs, 64);
             bool array_len = spv_uses_array_length(ir, words) != 0;
             gs_span = span;
