@@ -1,4 +1,16 @@
-# MGL GL 4.6 port: status (2026-11-15 12:05 EST, gl46-port @ 69b4a1bb)
+# MGL GL 4.6 port: status (2026-11-15 15:56 EST, gl46-port @ 7efd384a)
+
+## Merged 2026-11-15: per-draw overhead for state-re-sending clients (7efd384a, perf r152)
+Prompted by rsvga's AquaMark profile (MGL_PROFILE: ~31 us of MGL per draw, the draw fast path at 0% hits). rsvga re-sends all of its state before every draw, mostly through the indexed / DSA entry points, and MGL armed dirty state for every call even when nothing changed.
+
+- Redundant calls are now no-ops: re-attaching the identical unchanged image (glFramebufferTexture* / glNamedFramebufferTexture*), the same glDrawBuffers list, binding the bound framebuffer, binding the texture a unit already samples (glBindTexture / glBindTextureUnit), and every render-state setter including the indexed ones (glEnablei/glDisablei, glViewportIndexedf, glScissorIndexed, glDepthRangeIndexed, glColorMaski, blend func/equation per buffer). A redundant re-attach used to end the render pass, i.e. a new render encoder per draw.
+- Plain encoder breaks (flush, commit, readback, buffer copy, barrier, fence) re-arm DIRTY_REAPPLY instead of DIRTY_ALL, so the next draw keeps the pipeline cache instead of rebuilding the descriptor (~170 us). The cache key now includes the tess / geometry emulation's vertex-stage choice.
+
+Measured on the M4 Pro (us per draw): replay of rsvga's per-draw call sequence 4.70 -> 1.87, fast-path hit rate 50% -> 100%; re-attach of the same targets 25-32 -> 0.3; same glDrawBuffers 19-21 -> 0.3; a glFlush every 20 draws 3.99 -> 2.66. Test test_redundant_state_r152.c.
+
+Verified as ONE combined build: headless suite 224 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42; es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; transform_feedback + geometry_shader 157/157; viewport_array + direct_state_access.framebuffers + texture_view 46/46 (same as the previous tip).
+
+rsvga picks it up with `scripts/build-mgl.sh --refresh` (x86_64 build on the Intel Mac).
 
 ## Merged 2026-11-15: geometry-stage resource slots, clearer link errors (a63756f9, 69b4a1bb)
 Verified as ONE combined build first: headless suite 223 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; KHR-GL46.transform_feedback + geometry_shader **157/157 Pass** (was 156/1).
