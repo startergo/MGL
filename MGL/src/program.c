@@ -2613,7 +2613,9 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
            ARB_vertex_attrib_64bit) — the slots exceed the Metal attribute limit */
         if (ip && ip->attrib_overflow)
         {
-            mgl_append_info_log(log, "ERROR: vertex stage: too many vertex attribute components\n");
+            mgl_append_info_log(log, "ERROR: vertex stage: too many vertex attributes "
+                                "(more than GL_MAX_VERTEX_ATTRIBS = %d locations; dvec3/dvec4 use two)\n",
+                                MAX_ATTRIBS);
             free(prepared);
             return false;
         }

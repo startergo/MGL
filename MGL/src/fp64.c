@@ -379,9 +379,9 @@ static bool parse(F64 *f)
                     FILE *o = fopen(p, "wb");
                     if (o) { fwrite(f->w, 4, f->n, o); fclose(o); }
                 }
-                fail(f, "fp64: module parse: %s", diag->error);
+                fail(f, "invalid SPIR-V module (SPIR-V parse in the fp64 pass): %s", diag->error);
             }
-            else fail(f, "fp64: module parse failed");
+            else fail(f, "invalid SPIR-V module (SPIR-V parse in the fp64 pass failed)");
             if (diag) spvDiagnosticDestroy(diag);
             spvContextDestroy(ctx);
             return !f->failed;
