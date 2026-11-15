@@ -120,6 +120,17 @@ void insertHashElement(HashTable *table, GLuint name, void *data)
         }
     }
 
+    /* the growth loop stops at UINT_MAX entries (valid slots 0..UINT_MAX-1), so a
+     * name of UINT_MAX never fits — refuse it instead of writing one slot past the
+     * end of the table (from startergo/MGL main 97c8189e..f5b74da2) */
+    if (name >= table->size)
+    {
+        fprintf(stderr, "MGL: insertHashElement - name %u exceeds table size %u, unable to insert\n",
+                name, table->size);
+        return;
+    }
+
+    assert(table->keys[name].data == NULL);
     table->keys[name].data = data;
 }
 
