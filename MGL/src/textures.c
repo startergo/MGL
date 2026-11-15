@@ -409,6 +409,14 @@ static void bindTextureToUnit(GLMContext ctx, GLuint unit, GLuint index, Texture
     TextureUnit *u = &STATE(texture_units[unit]);
     Texture *old = u->textures[index];
 
+    /* r152: re-binding the object a unit already samples changes nothing; it
+     * used to re-arm DIRTY_TEX | DIRTY_TEX_BINDING, so the next draw re-ran the
+     * whole texture walk (bindActiveTexturesToMTL + bindTexturesToCurrentRender-
+     * Encoder + the texture PreDraw hooks, ~0.45 us per redundant bind).  Texture
+     * content / storage / parameter changes arm DIRTY_TEX themselves. */
+    if (old == ptr && (!ptr || STATE(active_textures[unit]) == ptr))
+        return;
+
     u->textures[index] = ptr;
 
     if (ptr)

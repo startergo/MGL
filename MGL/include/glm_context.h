@@ -543,6 +543,9 @@ typedef struct FBOAttachment_t {
         Texture *tex;
         Renderbuffer *rbo;
     } buf;
+    void *seen_mtl;     /* r152: the attached texture's realized MTLTexture at attach time
+                         * (framebuffers.c setAttachment: a re-attach of the identical,
+                         * unchanged image is a no-op) */
 } FBOAttachment;
 
 typedef struct Framebuffer_t {
@@ -629,6 +632,16 @@ enum {
 #define DIRTY_BUFFER_BASE_STATE   (0x1 << dirtyBufferBase)
 #define DIRTY_ALL_BIT   ((unsigned)0x1 << dirtyAllBit)    // so we know the dirty all was set.
 #define DIRTY_ALL       (0xFFFFFFFF)
+/* r152: what a plain encoder / command-buffer break (flush, commit, CPU-visibility
+ * sync, buffer copy, barrier, fence — MGLRenderer+Draw.m) must re-arm: all state
+ * re-applies, but no shader and no drawable changed, so the two bits that make
+ * the pipeline fast path (compatPipelineFastPath) decline stay out.  With
+ * DIRTY_ALL there, the next draw after every break rebuilt the whole pipeline
+ * descriptor (~170 us).  The cache key re-hashes the attachment formats for every
+ * new encoder.  The tessellation / geometry emulation paths keep DIRTY_ALL: their
+ * vertex-stage overrides (wide-line replay, pass-through) are not in the key and
+ * rely on the descriptor path. */
+#define DIRTY_REAPPLY   (DIRTY_ALL & ~(DIRTY_SHADER | DIRTY_DRAWABLE))
 
 typedef struct {
     GLuint dirty_bits;

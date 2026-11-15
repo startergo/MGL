@@ -25,6 +25,8 @@
 #import "mgl_ext_program.h"           /* compile_msl hook (aliased-SSBO variants, r100c) */
 #import "MGLRenderer+Framebuffer.h"    /* fbApplyPipelineFormats (FBO-dirty format key) */
 #import "MGLRenderer+TextureExt.h"     /* texextAdjustPipelineDescriptor (same) */
+#import "mgl_ext_tess.h"              /* r152: emulation vertex-stage choice in the key */
+#import "mgl_ext_geom.h"
 #include "mgl_ext_fb.h"                /* MGLRenderbufferEx (attachment GL formats in the key) */
 #include "mgl_compat_perf.h"
 #include "mgl_ext_compat.h"       /* compat domain state + advblend (GL_KHR_blend_equation_advanced) */
@@ -608,6 +610,33 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
      * pipeline built with the previous variant */
     if (rs && rs->border_sig)
         key.b ^= rs->border_sig * 0xC2B2AE3D27D4EB4FULL;
+
+    /* r152: the emulation domains substitute the pipeline's VERTEX STAGE for the same
+     * program: the tessellation wide-line replay function (wl_render_now), the plain
+     * TES render function (isolines / point_mode / xfb capture / CPU reference —
+     * mgl_tess_plain_render, which also drops the patch vertex descriptor), and the
+     * geometry pass-through (vertex_override).  None of that is in the stage
+     * function ids above, so two passes of one program could share a slot.  Every
+     * encoder break used to force the descriptor path (DIRTY_ALL carried
+     * DIRTY_SHADER), which hid the gap; plain breaks now keep the fast path
+     * (DIRTY_REAPPLY), so the choice is keyed explicitly
+     * (TessWideLineVerticalHorizontal). */
+    {
+        struct MGLExtState_tess *ts = (struct MGLExtState_tess *)ctx->state.ext_tess;
+        struct MGLExtState_geom *gs = (struct MGLExtState_geom *)ctx->state.ext_geom;
+        uint64_t emu = 0;
+
+        if (gs && gs->vertex_override)
+            emu ^= (uint64_t)(uintptr_t)gs->vertex_override * 0x9E3779B97F4A7C15ULL;
+        if (ts && ts->wl_render_now)
+            emu ^= ((uint64_t)(uintptr_t)ts->wl_replay_function | 1) * 0xC2B2AE3D27D4EB4FULL;
+        if (ts && [self extTessActive] && mgl_tess_plain_render(ctx))
+        {
+            MGLTessProgram *tp = mgl_tess_active_program(ctx);
+            emu ^= ((uint64_t)(uintptr_t)(tp ? tp->plain_function : NULL) | 2) * 0xD6E8FEB86659FD93ULL;
+        }
+        key.b ^= emu * 0x100000001B3ULL;
+    }
 
     MGLCompatPipelineCache *cache = objc_getAssociatedObject(self, kCompatPipeKey);
     if (!cache)

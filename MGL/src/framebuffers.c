@@ -641,6 +641,13 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
         FBEX(ptr)->created = GL_TRUE;
     }
 
+    /* r152: re-binding the current draw/read framebuffer changes nothing; it used
+     * to arm DIRTY_FBO, which re-hashes the attachment formats for the pipeline
+     * cache key on the next draw (~2.4 us per redundant bind) */
+    if ((target == GL_READ_FRAMEBUFFER || ctx->state.framebuffer == ptr) &&
+        (target == GL_DRAW_FRAMEBUFFER || ctx->state.readbuffer == ptr))
+        return;
+
     if (target == GL_DRAW_FRAMEBUFFER || target == GL_FRAMEBUFFER)
     {
         if (ctx->state.framebuffer != ptr)
@@ -996,12 +1003,48 @@ static void setAttachment(GLMContext ctx, Framebuffer *fbo, GLenum attachment, G
     FBOAttachment *att = mgl_fb_attachment(fbo, attachment);
     MGLFramebufferEx *fx = FBEX(fbo);
 
+    /* r152: re-attaching the image that is already attached (same object, level,
+     * layer, layering) is a no-op.  It used to end the current render pass
+     * (targetsChanged), so a translator that re-sets its render target before every
+     * draw opened a new render encoder per draw (~20-30 us of CPU each, plus a
+     * store/load of every attachment on the GPU).  Only an UNCHANGED image
+     * qualifies: the texture's realized MTLTexture must be the one seen at the
+     * previous attach and no re-specification may be pending, so the
+     * re-specify-then-re-attach pattern still rebuilds the render pass; a pending
+     * invalidation of the attachment also takes the full path. */
+    {
+        GLuint inv_bit = attachment == GL_DEPTH_STENCIL_ATTACHMENT ? (MGL_FB_DEPTH_BIT | MGL_FB_STENCIL_BIT) :
+                         attachment == GL_DEPTH_ATTACHMENT ? MGL_FB_DEPTH_BIT :
+                         attachment == GL_STENCIL_ATTACHMENT ? MGL_FB_STENCIL_BIT :
+                         (1u << (attachment - GL_COLOR_ATTACHMENT0));
+        GLboolean want_layered = (name && layered) ? GL_TRUE : GL_FALSE;
+        bool same = !(fx->ds.invalid_mask & inv_bit) && fx->layered[attIndex(fbo, att)] == want_layered;
+
+        if (same && name == 0)
+            same = att->texture == 0 && att->buf.tex == NULL;
+        else if (same)
+        {
+            Texture *nt = (textarget == GL_RENDERBUFFER) ? (obj ? ((Renderbuffer *)obj)->tex : NULL) : (Texture *)obj;
+            same = att->texture == name && att->textarget == textarget &&
+                   att->level == (GLuint)level && att->layer == (GLuint)layer &&
+                   (textarget == GL_RENDERBUFFER ? (void *)att->buf.rbo : (void *)att->buf.tex) == obj &&
+                   nt && nt->mtl_data && att->seen_mtl == nt->mtl_data &&
+                   !(nt->dirty_bits & DIRTY_TEXTURE_LEVEL);
+        }
+        if (same && attachment == GL_DEPTH_STENCIL_ATTACHMENT)
+            same = !memcmp(&fbo->stencil, &fbo->depth, sizeof(fbo->depth)) &&
+                   fx->layered[MGL_FB_ATT_STENCIL] == fx->layered[MGL_FB_ATT_DEPTH];
+        if (same)
+            return;
+    }
+
     if (name == 0)
     {
         detachAttachment(att);
     }
     else
     {
+        Texture *nt = (textarget == GL_RENDERBUFFER) ? (obj ? ((Renderbuffer *)obj)->tex : NULL) : (Texture *)obj;
         memset(att, 0, sizeof(*att));
         att->texture = name;
         att->textarget = textarget;
@@ -1009,6 +1052,7 @@ static void setAttachment(GLMContext ctx, Framebuffer *fbo, GLenum attachment, G
         att->layer = layer;
         if (textarget == GL_RENDERBUFFER) att->buf.rbo = (Renderbuffer *)obj;
         else att->buf.tex = (Texture *)obj;
+        att->seen_mtl = nt ? nt->mtl_data : NULL;
     }
     fx->layered[attIndex(fbo, att)] = (name && layered) ? GL_TRUE : GL_FALSE;
 

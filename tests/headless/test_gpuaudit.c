@@ -4,6 +4,7 @@
  * Every fix is verified by value (buffer bytes / framebuffer pixels), not just by the
  * internal counters (which are also checked so the GPU path is proven to be taken). */
 #include "mgl_test.h"
+#include <stdint.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -739,6 +740,12 @@ TEST(pipeline_state_cache)
 
     GLint hits = g_stat(MGL_GPUAUDIT_PSO_HITS), misses = g_stat(MGL_GPUAUDIT_PSO_MISSES);
     GLint created = hits + misses;
+    /* r152: the compat pipeline fast path (MGLRenderer+Compat.m) serves these draws
+     * from its own cache before the descriptor-content cache is consulted — since
+     * glFinish no longer forces the descriptor rebuild, the hits can land there
+     * (its counter: MGLRenderer.m's mgl_prof_cnt[16], pipeHit) */
+    extern uint64_t mgl_prof_cnt[];
+    uint64_t compat_hits = mgl_prof_cnt[16];
 
     /* warm both blend configurations once */
     for (int i = 0; i < 4; i++)
@@ -760,7 +767,7 @@ TEST(pipeline_state_cache)
 
     EXPECT_NO_GL_ERROR();
     EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PSO_MISSES) - misses <= 2);
-    EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PSO_HITS) > hits);
+    EXPECT_TRUE(g_stat(MGL_GPUAUDIT_PSO_HITS) > hits || mgl_prof_cnt[16] > compat_hits);
     (void)created; (void)after_warm;
 
     /* and the cached states must still render the right thing */

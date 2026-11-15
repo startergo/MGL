@@ -130,6 +130,17 @@ void mglColorMaski(GLMContext ctx, GLuint index, GLboolean r, GLboolean g, GLboo
 {
     RS_CHECK(index < MAX_COLOR_ATTACHMENTS, GL_INVALID_VALUE);
 
+    if (RS()->color_mask[index][0] == (r ? GL_TRUE : GL_FALSE) &&
+        RS()->color_mask[index][1] == (g ? GL_TRUE : GL_FALSE) &&
+        RS()->color_mask[index][2] == (b ? GL_TRUE : GL_FALSE) &&
+        RS()->color_mask[index][3] == (a ? GL_TRUE : GL_FALSE) &&
+        ctx->state.var.color_writemask[index][0] == RS()->color_mask[index][0] &&
+        ctx->state.var.color_writemask[index][1] == RS()->color_mask[index][1] &&
+        ctx->state.var.color_writemask[index][2] == RS()->color_mask[index][2] &&
+        ctx->state.var.color_writemask[index][3] == RS()->color_mask[index][3] &&
+        ctx->state.caps.use_color_mask[index] == !(r && g && b && a))
+        return;   /* r152: redundant */
+
     RS()->color_mask[index][0] = r ? GL_TRUE : GL_FALSE;
     RS()->color_mask[index][1] = g ? GL_TRUE : GL_FALSE;
     RS()->color_mask[index][2] = b ? GL_TRUE : GL_FALSE;
@@ -144,12 +155,48 @@ void mglColorMaski(GLMContext ctx, GLuint index, GLboolean r, GLboolean g, GLboo
 
 #pragma mark - depth range
 
+/* r152: the viewport / scissor / depth-range state an indexed setter can write —
+ * the per-index tables plus the index-0 mirrors and the app-set latch.  The
+ * indexed setters (glViewportIndexedf, glScissorIndexed, glDepthRangeIndexed and
+ * their Arrayv forms) run unchanged and only dirty the encoder when this
+ * snapshot differs afterwards: translators re-send all of it every draw. */
+typedef struct {
+    GLfloat   vp[MGL_RSTATE_MAX_VIEWPORTS][4];
+    GLint     sc[MGL_RSTATE_MAX_VIEWPORTS][4];
+    GLdouble  dr[MGL_RSTATE_MAX_VIEWPORTS][2];
+    GLint     lvp[4], lsc[4];
+    GLdouble  ldr[2];
+    GLboolean app;
+} RsViewSnap;
+
+static void rs_view_snap(GLMContext ctx, RsViewSnap *s)
+{
+    memset(s, 0, sizeof(*s));
+    memcpy(s->vp, RS()->viewport, sizeof(s->vp));
+    memcpy(s->sc, RS()->scissor, sizeof(s->sc));
+    memcpy(s->dr, RS()->depth_range, sizeof(s->dr));
+    memcpy(s->lvp, ctx->state.viewport, sizeof(s->lvp));
+    memcpy(s->lsc, ctx->state.var.scissor_box, sizeof(s->lsc));
+    s->ldr[0] = ctx->state.var.depth_range[0];
+    s->ldr[1] = ctx->state.var.depth_range[1];
+    s->app = RS()->viewport_set_by_app;
+}
+
+static bool rs_view_changed(GLMContext ctx, const RsViewSnap *before)
+{
+    RsViewSnap now;
+    rs_view_snap(ctx, &now);
+    return memcmp(before, &now, sizeof(now)) != 0;
+}
+
 void mglDepthRangeArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLdouble *v)
 {
     RS_CHECK(count >= 0, GL_INVALID_VALUE);
     RS_CHECK((GLuint64)first + (GLuint64)count <= rs_max_viewports(ctx), GL_INVALID_VALUE);
     if (count && !v) return;
 
+    RsViewSnap before;
+    rs_view_snap(ctx, &before);
     for (GLsizei i = 0; i < count; i++) {
         RS()->depth_range[first + i][0] = rs_clamp01(v[2 * i + 0]);
         RS()->depth_range[first + i][1] = rs_clamp01(v[2 * i + 1]);
@@ -159,7 +206,8 @@ void mglDepthRangeArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLdo
         }
     }
 
-    mgl_rs_dirty_encoder(ctx);
+    if (rs_view_changed(ctx, &before))
+        mgl_rs_dirty_encoder(ctx);
 }
 
 void mglDepthRangeIndexed(GLMContext ctx, GLuint index, GLdouble n, GLdouble f)
@@ -276,10 +324,13 @@ void mglScissorArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLint *
     for (GLsizei i = 0; i < count; i++)
         RS_CHECK(v[4 * i + 2] >= 0 && v[4 * i + 3] >= 0, GL_INVALID_VALUE);
 
+    RsViewSnap before;
+    rs_view_snap(ctx, &before);
     for (GLsizei i = 0; i < count; i++)
         rs_set_scissor(ctx, first + i, v[4 * i + 0], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
 
-    mgl_rs_dirty_encoder(ctx);
+    if (rs_view_changed(ctx, &before))
+        mgl_rs_dirty_encoder(ctx);
 }
 
 void mglScissorIndexed(GLMContext ctx, GLuint index, GLint left, GLint bottom, GLsizei width, GLsizei height)
@@ -306,10 +357,13 @@ void mglViewportArrayv(GLMContext ctx, GLuint first, GLsizei count, const GLfloa
     for (GLsizei i = 0; i < count; i++)
         RS_CHECK(v[4 * i + 2] >= 0.0f && v[4 * i + 3] >= 0.0f, GL_INVALID_VALUE);
 
+    RsViewSnap before;
+    rs_view_snap(ctx, &before);
     for (GLsizei i = 0; i < count; i++)
         rs_set_viewport(ctx, first + i, v[4 * i + 0], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3]);
 
-    mgl_rs_dirty_encoder(ctx);
+    if (rs_view_changed(ctx, &before))
+        mgl_rs_dirty_encoder(ctx);
 }
 
 void mglViewportIndexedf(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat w, GLfloat h)
@@ -327,28 +381,54 @@ void mglViewportIndexedfv(GLMContext ctx, GLuint index, const GLfloat *v)
 }
 
 /* used by mglViewport / mglScissor / mglDepthRange in state.c (which apply to all indices) */
+/* r152: glViewport / glScissor / glDepthRange re-sent with the current values
+ * (D3D9-style translators do it every draw) store the same bits and arm nothing:
+ * the setters run as before, and the encoder is only dirtied when a stored value
+ * (or the viewport_set_by_app latch) actually changed */
 void mgl_rstate_set_all_viewports(GLMContext ctx, GLfloat x, GLfloat y, GLfloat w, GLfloat h)
 {
+    GLfloat before[MGL_RSTATE_MAX_VIEWPORTS][4];
+    GLint before_legacy[4];
+    GLboolean before_app = RS()->viewport_set_by_app;
+    memcpy(before, RS()->viewport, sizeof before);
+    memcpy(before_legacy, ctx->state.viewport, sizeof before_legacy);
     for (GLuint i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++)
         rs_set_viewport(ctx, i, x, y, w, h);
+    if (before_app == RS()->viewport_set_by_app && !memcmp(before, RS()->viewport, sizeof before) &&
+        !memcmp(before_legacy, ctx->state.viewport, sizeof before_legacy))
+        return;
     mgl_rs_dirty_encoder(ctx);
 }
 
 void mgl_rstate_set_all_scissors(GLMContext ctx, GLint x, GLint y, GLint w, GLint h)
 {
+    GLint before[MGL_RSTATE_MAX_VIEWPORTS][4];
+    GLint before_legacy[4];
+    GLboolean before_app = RS()->viewport_set_by_app;
+    memcpy(before, RS()->scissor, sizeof before);
+    memcpy(before_legacy, ctx->state.var.scissor_box, sizeof before_legacy);
     for (GLuint i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++)
         rs_set_scissor(ctx, i, x, y, w, h);
+    if (before_app == RS()->viewport_set_by_app && !memcmp(before, RS()->scissor, sizeof before) &&
+        !memcmp(before_legacy, ctx->state.var.scissor_box, sizeof before_legacy))
+        return;
     mgl_rs_dirty_encoder(ctx);
 }
 
 void mgl_rstate_set_all_depth_ranges(GLMContext ctx, GLdouble n, GLdouble f)
 {
+    GLdouble before[MGL_RSTATE_MAX_VIEWPORTS][2];
+    GLdouble before_legacy[2] = { ctx->state.var.depth_range[0], ctx->state.var.depth_range[1] };
+    memcpy(before, RS()->depth_range, sizeof before);
     for (GLuint i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++) {
         RS()->depth_range[i][0] = rs_clamp01(n);
         RS()->depth_range[i][1] = rs_clamp01(f);
     }
     ctx->state.var.depth_range[0] = RS()->depth_range[0][0];
     ctx->state.var.depth_range[1] = RS()->depth_range[0][1];
+    if (!memcmp(before, RS()->depth_range, sizeof before) &&
+        before_legacy[0] == ctx->state.var.depth_range[0] && before_legacy[1] == ctx->state.var.depth_range[1])
+        return;
     mgl_rs_dirty_encoder(ctx);
 }
 

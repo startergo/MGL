@@ -277,6 +277,16 @@ void mgl_fb_set_draw_buffers(GLMContext ctx, Framebuffer *fbo, GLsizei n, const 
     }
 
     MGLFBDrawState *ds = mgl_fb_draw_state(ctx, fbo);
+    /* r152: the same draw-buffer list again is a no-op; it used to end the render
+     * pass (DIRTY_FBO | DIRTY_STATE + targets_changed) — a new render encoder on
+     * every draw for a translator that re-sends it per draw (~20 us each) */
+    {
+        bool same = ds->num_draw_buffers == n;
+        for (int i = 0; same && i < MAX_COLOR_ATTACHMENTS; i++)
+            same = ds->draw_buffers[i] == ((i < n) ? out[i] : GL_NONE);
+        if (same)
+            return;
+    }
     for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
         ds->draw_buffers[i] = (i < n) ? out[i] : GL_NONE;
     ds->num_draw_buffers = n;

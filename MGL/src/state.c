@@ -63,55 +63,65 @@ static int rs_cap_kind(GLenum cap)
 static bool rs_set_cap(GLMContext ctx, GLenum cap, bool on)
 {
     GLMCaps *c = &ctx->state.caps;
+    /* r152: a redundant glEnable/glDisable (the cap already has that value) arms
+     * nothing — D3D9-style translators re-send every render state per draw, and
+     * each one re-ran the dirty-state block + encoder update (~0.2 us apiece) */
+    bool changed = false;
+#define RS_CAP(_f_) do { if ((bool)(_f_) != on) { (_f_) = on; changed = true; } } while (0)
 
     switch (cap) {
         case GL_BLEND:
-            for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++) RS()->blend[i] = on;
-            c->blend = on;
+            for (int i = 0; i < MAX_COLOR_ATTACHMENTS; i++) RS_CAP(RS()->blend[i]);
+            RS_CAP(c->blend);
             break;
         case GL_SCISSOR_TEST:
-            for (int i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++) RS()->scissor_test[i] = on;
-            c->scissor_test = on;
+            for (int i = 0; i < MGL_RSTATE_MAX_VIEWPORTS; i++) RS_CAP(RS()->scissor_test[i]);
+            RS_CAP(c->scissor_test);
             break;
-        case GL_LINE_SMOOTH: c->line_smooth = on; break;
-        case GL_POLYGON_SMOOTH: c->polygon_smooth = on; break;
-        case GL_CULL_FACE: c->cull_face = on; break;
-        case GL_DEPTH_TEST: c->depth_test = on; break;
-        case GL_STENCIL_TEST: c->stencil_test = on; break;
-        case GL_DITHER: c->dither = on; break;
+        case GL_LINE_SMOOTH: RS_CAP(c->line_smooth); break;
+        case GL_POLYGON_SMOOTH: RS_CAP(c->polygon_smooth); break;
+        case GL_CULL_FACE: RS_CAP(c->cull_face); break;
+        case GL_DEPTH_TEST: RS_CAP(c->depth_test); break;
+        case GL_STENCIL_TEST: RS_CAP(c->stencil_test); break;
+        case GL_DITHER: RS_CAP(c->dither); break;
         case GL_BLEND_ADVANCED_COHERENT_KHR:
             /* compat (GL_KHR_blend_equation_advanced_coherent): query-only state —
              * Metal framebuffer-fetch reads are coherent inside a render pass,
              * so no barrier is ever required (compat_advblend.c).  Lives in the
              * compat ext slot, NOT GLMCaps (layout stability, perf s30). */
             mgl_compat_set_blend_advanced_coherent(ctx, on);
+            changed = true;
             break;
-        case GL_COLOR_LOGIC_OP: c->color_logic_op = on; break;
-        case GL_POLYGON_OFFSET_POINT: c->polygon_offset_point = on; break;
-        case GL_POLYGON_OFFSET_LINE: c->polygon_offset_line = on; break;
-        case GL_POLYGON_OFFSET_FILL: c->polygon_offset_fill = on; break;
-        case GL_MULTISAMPLE: c->multisample = on; break;
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: c->sample_alpha_to_coverage = on; break;
-        case GL_SAMPLE_ALPHA_TO_ONE: c->sample_alpha_to_one = on; break;
-        case GL_SAMPLE_COVERAGE: c->sample_coverage = on; break;
-        case GL_RASTERIZER_DISCARD: c->rasterizer_discard = on; break;
-        case GL_FRAMEBUFFER_SRGB: c->framebuffer_srgb = on; break;
-        case GL_PRIMITIVE_RESTART: c->primitive_restart = on; break;
-        case GL_PRIMITIVE_RESTART_FIXED_INDEX: c->primitive_restart_fixed_index = on; break;
-        case GL_DEPTH_CLAMP: c->depth_clamp = on; break;
-        case GL_TEXTURE_CUBE_MAP_SEAMLESS: c->texture_cube_map_seamless = on; break;
-        case GL_SAMPLE_MASK: c->sample_mask = on; break;
-        case GL_SAMPLE_SHADING: c->sample_shading = on; break;
-        case GL_DEBUG_OUTPUT_SYNCHRONOUS: c->debug_output_synchronous = on; break;
-        case GL_DEBUG_OUTPUT: c->debug_output = on; break;
-        case GL_PROGRAM_POINT_SIZE: c->program_point_size = on; break;
+        case GL_COLOR_LOGIC_OP: RS_CAP(c->color_logic_op); break;
+        case GL_POLYGON_OFFSET_POINT: RS_CAP(c->polygon_offset_point); break;
+        case GL_POLYGON_OFFSET_LINE: RS_CAP(c->polygon_offset_line); break;
+        case GL_POLYGON_OFFSET_FILL: RS_CAP(c->polygon_offset_fill); break;
+        case GL_MULTISAMPLE: RS_CAP(c->multisample); break;
+        case GL_SAMPLE_ALPHA_TO_COVERAGE: RS_CAP(c->sample_alpha_to_coverage); break;
+        case GL_SAMPLE_ALPHA_TO_ONE: RS_CAP(c->sample_alpha_to_one); break;
+        case GL_SAMPLE_COVERAGE: RS_CAP(c->sample_coverage); break;
+        case GL_RASTERIZER_DISCARD: RS_CAP(c->rasterizer_discard); break;
+        case GL_FRAMEBUFFER_SRGB: RS_CAP(c->framebuffer_srgb); break;
+        case GL_PRIMITIVE_RESTART: RS_CAP(c->primitive_restart); break;
+        case GL_PRIMITIVE_RESTART_FIXED_INDEX: RS_CAP(c->primitive_restart_fixed_index); break;
+        case GL_DEPTH_CLAMP: RS_CAP(c->depth_clamp); break;
+        case GL_TEXTURE_CUBE_MAP_SEAMLESS: RS_CAP(c->texture_cube_map_seamless); break;
+        case GL_SAMPLE_MASK: RS_CAP(c->sample_mask); break;
+        case GL_SAMPLE_SHADING: RS_CAP(c->sample_shading); break;
+        case GL_DEBUG_OUTPUT_SYNCHRONOUS: RS_CAP(c->debug_output_synchronous); break;
+        case GL_DEBUG_OUTPUT: RS_CAP(c->debug_output); break;
+        case GL_PROGRAM_POINT_SIZE: RS_CAP(c->program_point_size); break;
         default:
             if (cap >= GL_CLIP_DISTANCE0 && cap < GL_CLIP_DISTANCE0 + MAX_CLIP_DISTANCES) {
-                c->clip_distances[cap - GL_CLIP_DISTANCE0] = on;
+                RS_CAP(c->clip_distances[cap - GL_CLIP_DISTANCE0]);
                 break;
             }
             return false;
     }
+#undef RS_CAP
+
+    if (!changed)
+        return true;
 
     switch (rs_cap_kind(cap)) {
         case CAP_PIPELINE: mgl_rs_dirty_pipeline(ctx); break;
@@ -194,7 +204,8 @@ static bool rs_indexed_cap(GLMContext ctx, GLenum target, GLuint index, int set,
     switch (target) {
         case GL_BLEND:
             if (index >= MAX_COLOR_ATTACHMENTS) { ERROR_RETURN(GL_INVALID_VALUE); return false; }
-            if (set >= 0) {
+            if (set >= 0 && (RS()->blend[index] != (GLboolean)set ||
+                             ctx->state.caps.blend != RS()->blend[0])) {   /* r152: redundant = no-op */
                 RS()->blend[index] = set;
                 ctx->state.caps.blend = RS()->blend[0];
                 mgl_rs_dirty_pipeline(ctx);
@@ -206,7 +217,8 @@ static bool rs_indexed_cap(GLMContext ctx, GLenum target, GLuint index, int set,
             if (index >= MGL_RSTATE_MAX_VIEWPORTS || index >= ctx->state.var.max_viewports) {
                 ERROR_RETURN(GL_INVALID_VALUE); return false;
             }
-            if (set >= 0) {
+            if (set >= 0 && (RS()->scissor_test[index] != (GLboolean)set ||
+                             ctx->state.caps.scissor_test != RS()->scissor_test[0])) {   /* r152: redundant = no-op */
                 RS()->scissor_test[index] = set;
                 ctx->state.caps.scissor_test = RS()->scissor_test[0];
                 mgl_rs_dirty_encoder(ctx);
@@ -249,6 +261,7 @@ void mglCullFace(GLMContext ctx, GLenum mode)
         case GL_FRONT:
         case GL_BACK:
         case GL_FRONT_AND_BACK:
+            if (ctx->state.var.cull_face_mode == mode) return;   /* r152: redundant */
             ctx->state.var.cull_face_mode = mode;
             break;
 
@@ -265,6 +278,7 @@ void mglFrontFace(GLMContext ctx, GLenum mode)
     {
         case GL_CW:
         case GL_CCW:
+            if (ctx->state.var.front_face == mode) return;   /* r152: redundant */
             ctx->state.var.front_face = mode;
             break;
 
@@ -321,6 +335,7 @@ void mglPolygonMode(GLMContext ctx, GLenum face, GLenum mode)
         case GL_POINT:
         case GL_LINE:
         case GL_FILL:
+            if (ctx->state.var.polygon_mode == mode && RS()->polygon_mode == mode) return;   /* r152 */
             ctx->state.var.polygon_mode = mode;
             RS()->polygon_mode = mode;
             break;
@@ -334,6 +349,10 @@ void mglPolygonMode(GLMContext ctx, GLenum face, GLenum mode)
 
 void mglPolygonOffset(GLMContext ctx, GLfloat factor, GLfloat units)
 {
+    if (RS()->polygon_offset_factor == factor && RS()->polygon_offset_units == units &&
+        RS()->polygon_offset_clamp == 0.0f &&
+        ctx->state.var.polygon_offset_factor == factor && ctx->state.var.polygon_offset_units == units)
+        return;   /* r152: redundant */
     RS()->polygon_offset_factor = factor;
     RS()->polygon_offset_units = units;
     RS()->polygon_offset_clamp = 0.0f;
@@ -481,6 +500,11 @@ void mglStencilFuncSeparate(GLMContext ctx, GLenum face, GLenum func, GLint ref,
     RS_CHECK(face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
     RS_CHECK(rs_valid_func(func), GL_INVALID_ENUM);
 
+    if ((face == GL_BACK || (ctx->state.var.stencil_func == func && ctx->state.var.stencil_ref == ref &&
+                             ctx->state.var.stencil_value_mask == mask)) &&
+        (face == GL_FRONT || (ctx->state.var.stencil_back_func == func && ctx->state.var.stencil_back_ref == ref &&
+                              ctx->state.var.stencil_back_value_mask == mask)))
+        return;   /* r152: redundant */
     if (face != GL_BACK) {
         ctx->state.var.stencil_func = func;
         ctx->state.var.stencil_ref = ref;
@@ -507,6 +531,12 @@ void mglStencilOpSeparate(GLMContext ctx, GLenum face, GLenum sfail, GLenum dpfa
     RS_CHECK(validStencilOpSeparate(ctx, dpfail), GL_INVALID_ENUM);
     RS_CHECK(validStencilOpSeparate(ctx, dppass), GL_INVALID_ENUM);
 
+    if ((face == GL_BACK || (ctx->state.var.stencil_fail == sfail && ctx->state.var.stencil_pass_depth_fail == dpfail &&
+                             ctx->state.var.stencil_pass_depth_pass == dppass)) &&
+        (face == GL_FRONT || (ctx->state.var.stencil_back_fail == sfail &&
+                              ctx->state.var.stencil_back_pass_depth_fail == dpfail &&
+                              ctx->state.var.stencil_back_pass_depth_pass == dppass)))
+        return;   /* r152: redundant */
     if (face != GL_BACK) {
         ctx->state.var.stencil_fail = sfail;
         ctx->state.var.stencil_pass_depth_fail = dpfail;
@@ -530,6 +560,9 @@ void mglStencilMaskSeparate(GLMContext ctx, GLenum face, GLuint mask)
 {
     RS_CHECK(face == GL_FRONT || face == GL_BACK || face == GL_FRONT_AND_BACK, GL_INVALID_ENUM);
 
+    if ((face == GL_BACK || ctx->state.var.stencil_writemask == mask) &&
+        (face == GL_FRONT || ctx->state.var.stencil_back_writemask == mask))
+        return;   /* r152: redundant */
     if (face != GL_BACK)  ctx->state.var.stencil_writemask = mask;
     if (face != GL_FRONT) ctx->state.var.stencil_back_writemask = mask;
 
@@ -551,6 +584,7 @@ void mglColorMask(GLMContext ctx, GLboolean red, GLboolean green, GLboolean blue
 
 void mglDepthMask(GLMContext ctx, GLboolean flag)
 {
+    if (ctx->state.var.depth_writemask == (flag ? GL_TRUE : GL_FALSE)) return;   /* r152: redundant */
     ctx->state.var.depth_writemask = flag ? GL_TRUE : GL_FALSE;
 
     mgl_rs_dirty_encoder(ctx);
@@ -560,6 +594,7 @@ void mglDepthFunc(GLMContext ctx, GLenum func)
 {
     RS_CHECK(rs_valid_func(func), GL_INVALID_ENUM);
 
+    if (ctx->state.var.depth_func == func) return;   /* r152: redundant */
     ctx->state.var.depth_func = func;
 
     mgl_rs_dirty_encoder(ctx);
@@ -569,6 +604,9 @@ void mglDepthFunc(GLMContext ctx, GLenum func)
 
 void mglBlendColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
+    if (ctx->state.var.blend_color[0] == red && ctx->state.var.blend_color[1] == green &&
+        ctx->state.var.blend_color[2] == blue && ctx->state.var.blend_color[3] == alpha)
+        return;   /* r152: redundant */
     ctx->state.var.blend_color[0] = red;
     ctx->state.var.blend_color[1] = green;
     ctx->state.var.blend_color[2] = blue;
@@ -609,6 +647,13 @@ static bool rs_valid_factor(GLenum f)
 
 static void rs_blend_equation(GLMContext ctx, GLuint first, GLuint last, GLenum rgb, GLenum alpha)
 {
+    {   /* r152: redundant (every buffer in range already has this equation) */
+        GLuint i = first;
+        while (i <= last && ctx->state.var.blend_equation_rgb[i] == rgb &&
+               ctx->state.var.blend_equation_alpha[i] == alpha)
+            i++;
+        if (i > last) return;
+    }
     for (GLuint i = first; i <= last; i++) {
         ctx->state.var.blend_equation_rgb[i] = rgb;
         ctx->state.var.blend_equation_alpha[i] = alpha;
@@ -618,6 +663,13 @@ static void rs_blend_equation(GLMContext ctx, GLuint first, GLuint last, GLenum 
 
 static void rs_blend_func(GLMContext ctx, GLuint first, GLuint last, GLenum srgb, GLenum drgb, GLenum sa, GLenum da)
 {
+    {   /* r152: redundant (every buffer in range already has these factors) */
+        GLuint i = first;
+        while (i <= last && ctx->state.var.blend_src_rgb[i] == srgb && ctx->state.var.blend_dst_rgb[i] == drgb &&
+               ctx->state.var.blend_src_alpha[i] == sa && ctx->state.var.blend_dst_alpha[i] == da)
+            i++;
+        if (i > last) return;
+    }
     for (GLuint i = first; i <= last; i++) {
         ctx->state.var.blend_src_rgb[i] = srgb;
         ctx->state.var.blend_dst_rgb[i] = drgb;

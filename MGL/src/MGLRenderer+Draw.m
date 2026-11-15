@@ -133,7 +133,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
     {
         [self newCommandBuffer];
-        ctx->state.dirty_bits = DIRTY_ALL;
+        ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
     }
 }
 
@@ -155,7 +155,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     // committed one current keeps the legacy readback / present paths working unchanged
 
     // the next draw needs a new render encoder with all state re-applied (attachments are loaded)
-    ctx->state.dirty_bits = DIRTY_ALL;
+    ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
 - (void) extBufWaitSerial: (uint64_t) serial
@@ -303,7 +303,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
             [blit synchronizeResource: b];
             [blit endEncoding];
 
-            ctx->state.dirty_bits = DIRTY_ALL;
+            ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
             serial = [self extBufSerial];
         }
     }
@@ -946,7 +946,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     mgl_buffers_mark_gpu_use(ctx, src, false);
     mgl_buffers_mark_gpu_use(ctx, dst, true);
 
-    ctx->state.dirty_bits = DIRTY_ALL;
+    ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
 - (void) extBufBarrier: (GLbitfield) barriers byRegion: (bool) by_region
@@ -975,7 +975,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     // draws within one render encoder are not ordered against each other's shader
     // writes: end the encoder, the next draw starts a new one (attachments loaded)
     [self endRenderEncoding];
-    ctx->state.dirty_bits = DIRTY_ALL;
+    ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
 #pragma mark - fences
@@ -1019,7 +1019,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
                      }];
     }
 
-    ctx->state.dirty_bits = DIRTY_ALL;
+    ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 
     sync->mtl_event = f;
 }
