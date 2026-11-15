@@ -1,4 +1,14 @@
-# MGL GL 4.6 port: status (2026-11-14 16:45 EST, gl46-port @ 22001710)
+# MGL GL 4.6 port: status (2026-11-15 12:05 EST, gl46-port @ 69b4a1bb)
+
+## Merged 2026-11-15: geometry-stage resource slots, clearer link errors (a63756f9, 69b4a1bb)
+Verified as ONE combined build first: headless suite 223 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; KHR-GL46.transform_feedback + geometry_shader **157/157 Pass** (was 156/1).
+
+| commit | what |
+|---|---|
+| a63756f9 | Link-error text: the attribute-limit error now says "too many vertex attributes (more than GL_MAX_VERTEX_ATTRIBS = 16 locations; dvec3/dvec4 use two)" instead of "components", and an invalid SPIR-V module reads "invalid SPIR-V module (SPIR-V parse in the fp64 pass): ..." instead of "fp64: module parse: ...", which read as a double-precision problem. Prompted by the rsvga D3D9 census (40 programs: 33 over the 16-attribute limit, 7 invalid modules with an Id of 0 — both on the rsvga side). |
+| 69b4a1bb | geom r151: the geometry stage's compute kernel pinned at most 8 user resources, so a GS with 9–16 storage blocks collided on Metal slots 0–7, the kernel failed to compile and the draw was silently dropped (fixes KHR-GL46.geometry_shader.api.max_shader_storage_blocks). Also, the emulation's own buffers used GLSL bindings 18–28, inside the legal uniform-block binding range, so a GS uniform block at binding 20–28 failed the same way; the pool now starts at binding 600. Test test_geom_res_slots_r151.c. |
+
+Still open: nothing known from the targeted lists. Next: a fresh full CTS run on the tip, held until the user starts it.
 
 ## Merged 2026-11-14: UBO bindings 512, tess r76 tests, geom r149+r150 exact XFB varying names (aa451a99, 22001710)
 Each merge was verified as ONE combined build first. Final combined build for 22001710: headless suite 219 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42 Pass; KHR-GL46.es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; KHR-GL46.transform_feedback + geometry_shader 156 Pass / 1 Fail, the same as on aa451a99.
