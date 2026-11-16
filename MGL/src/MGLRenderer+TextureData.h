@@ -9,6 +9,10 @@
  * texture is not handled by texdata (buffer, view, multisample, renderbuffer) */
 - (bool) texdataBindMTLTexture:(Texture *)tex;
 - (bool) texdataRealize:(Texture *)tex;
+@end
+
+/* implemented in MGLRenderer+TextureData.m's (TextureDataBinding) block */
+@interface MGLRenderer (TextureDataBinding)
 /* texdata: publish device-dependent format caps (ETC2/BC CPU decode, ASTC) to the
  * texdata format table; MGLRenderer.m calls it once _device exists, because the
  * auto-called bindExt* binders run before the device is attached */

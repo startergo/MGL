@@ -5705,11 +5705,6 @@ void mtlFlushBufferRange(GLMContext glm_ctx, Buffer *buf, GLintptr offset, GLsiz
 }
 
 
-void mtlGetTexImage(GLMContext glm_ctx, Texture *tex, void *pixelBytes, GLuint bytesPerRow, GLuint bytesPerImage, GLint x, GLint y, GLsizei width, GLsizei height, GLuint level, GLuint slice)
-{
-    [(__bridge id) glm_ctx->mtl_funcs.mtlObj mtlGetTexImage:glm_ctx tex:tex pixelBytes:pixelBytes bytesPerRow:bytesPerRow bytesPerImage:bytesPerImage fromRegion:MTLRegionMake2D(x,y,width,height) mipmapLevel:level slice:slice];
-}
-
 #pragma mark C interface to mtlGenerateMipmaps
 
 -(void)mtlGenerateMipmaps:(GLMContext)glm_ctx forTexture:(Texture *) tex
@@ -6566,7 +6561,6 @@ void mtlMultiDrawElementsIndirect(GLMContext glm_ctx, GLenum mode, GLenum type, 
     glm_ctx->mtl_funcs.mtlMapUnmapBuffer = mtlMapUnmapBuffer;
     glm_ctx->mtl_funcs.mtlFlushBufferRange = mtlFlushBufferRange;
 
-    glm_ctx->mtl_funcs.mtlGetTexImage = mtlGetTexImage;
     
     glm_ctx->mtl_funcs.mtlGenerateMipmaps = mtlGenerateMipmaps;
     glm_ctx->mtl_funcs.mtlTexSubImage = mtlTexSubImage;
