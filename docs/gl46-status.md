@@ -1,6 +1,17 @@
-# MGL GL 4.6 port: status (2026-11-15 15:56 EST, gl46-port @ 7efd384a)
+# MGL GL 4.6 port: status (2026-11-16 11:05 EST, gl46-port @ f6390cda)
 
-## Merged 2026-11-15: per-draw overhead for state-re-sending clients (7efd384a, perf r152)
+## Merged 2026-11-16: per-buffer pool of retired Metal storages (f6390cda, perf r153), hash-table bounds (45eb7ee0), README (f7292a09, e9374316)
+Prompted by rsvga's command-thread profile: about 29% of it was MGL creating a new MTLBuffer (one IOAccelResourceCreate kernel call) on every draw for its per-draw constant blocks, through the rename path (CPU write into a buffer the GPU still reads) and the glBufferData re-specification path.
+
+- r153: each buffer keeps the Metal storages it gives up and takes them back once the command buffer that last could reference them has completed. Per buffer (never shared between GL buffers), FIFO by serial, bounded at 4096 entries / 64 MB per buffer, never for client-storage buffers; freed on glDeleteBuffers. Measured on the M4 Pro (20000 draws, a flush every 400): sub-data write into an 8 KB UBO in use 11.5 -> 2.6 us per draw, 64 KB 28.1 -> 4.7 us, glBufferData re-specify 8 KB 25.0 -> 6.8 us; Metal buffer allocations fall to warm-up only. Test test_buffer_pool_r153.c.
+- hash_table: insertHashElement refuses a name that cannot fit after growth (name UINT_MAX wrote one slot past the table). Brought over from startergo/MGL main. Test test_hash_table_bounds.c.
+- README rewritten for the port; every GL 4.6 core entry point is implemented (agents/stub_scanner.py), and the dead stub file mgl_funcs_to_be_implemented.c.backup is gone.
+
+r153 verified as ONE combined build: headless suite 226 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42; es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; transform_feedback + geometry_shader 157/157; viewport_array + DSA framebuffers + texture_view 46/46; buffer_storage + DSA buffers + SSBO basic + texture_buffer 109/109 (both lists the same as the previous tip).
+
+The last full CTS run is still the Nov 12-13 one below (661 Fail); a fresh full run on the tip has not been done yet.
+
+## Merged 2026-11-15: per-draw overhead for state-re-sending clients (e8f9323d, perf r152)
 Prompted by rsvga's AquaMark profile (MGL_PROFILE: ~31 us of MGL per draw, the draw fast path at 0% hits). rsvga re-sends all of its state before every draw, mostly through the indexed / DSA entry points, and MGL armed dirty state for every call even when nothing changed.
 
 - Redundant calls are now no-ops: re-attaching the identical unchanged image (glFramebufferTexture* / glNamedFramebufferTexture*), the same glDrawBuffers list, binding the bound framebuffer, binding the texture a unit already samples (glBindTexture / glBindTextureUnit), and every render-state setter including the indexed ones (glEnablei/glDisablei, glViewportIndexedf, glScissorIndexed, glDepthRangeIndexed, glColorMaski, blend func/equation per buffer). A redundant re-attach used to end the render pass, i.e. a new render encoder per draw.
