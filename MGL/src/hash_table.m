@@ -98,13 +98,10 @@ void insertHashElement(HashTable *table, GLuint name, void *data)
             table->size = old_size * 2; // Safe multiplication
         }
 
-        // CRITICAL: Check for overflow in size calculation before malloc
-        if (table->size > SIZE_MAX / sizeof(HashObj)) {
-            fprintf(stderr, "MGL SECURITY ERROR: Hash table allocation would overflow size_t, preventing\n");
-            // Reset to old size to prevent crash
-            table->size = old_size;
-            return; // Exit function safely
-        }
+        /* table->size is 32-bit and size_t 64-bit, so size * sizeof(HashObj)
+         * cannot overflow the allocation size (the old SIZE_MAX check could never
+         * fire); keep that true at compile time */
+        _Static_assert(sizeof(size_t) >= 8, "hash table sizing assumes a 64-bit size_t");
 
         table->keys = (HashObj *)realloc(table->keys, table->size * sizeof(HashObj));
         if (!table->keys) {

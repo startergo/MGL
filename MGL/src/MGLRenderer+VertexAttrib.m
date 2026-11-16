@@ -499,7 +499,7 @@ static bool vattribIsDoubleType(GLenum t)
                 int sidx = plan->shadow_index[lo];
                 if (sidx < 0)
                     NSLog(@"MGL vattrib: slot %d (owner %d cbase %d size %d) has no shadow stream",
-                          loc, owner, cbase, f->size);
+                          (int)loc, owner, cbase, f->size);
                 desc.attributes[loc].format = wfmt;
                 desc.attributes[loc].offset = cbase * 8;
                 desc.attributes[loc].bufferIndex = sidx;

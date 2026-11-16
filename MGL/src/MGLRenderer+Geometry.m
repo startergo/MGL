@@ -1386,11 +1386,22 @@ static void geomReleaseStatics(void)
             for (unsigned k = 0; k < MGL_GEOM_POOL_N; k++)
                 if (pools[i]->cb[k]) { CFRelease(pools[i]->cb[k]); pools[i]->cb[k] = NULL; }
     }
-    memset(&gPrimPool, 0, sizeof gPrimPool);
-    memset(&gVsoutPool, 0, sizeof gVsoutPool);
-    memset(&gPrepPool, 0, sizeof gPrepPool);
-    memset(&gOutvPool, 0, sizeof gOutvPool);
-    memset(&gCntPool, 0, sizeof gCntPool);
+    /* field by field, not memset: buf[] holds ARC-strong references, and a
+     * memset skipped their releases (the pool buffers leaked on every reset) */
+    {
+        MGLGeomPool *pools[5] = { &gPrimPool, &gVsoutPool, &gPrepPool, &gOutvPool, &gCntPool };
+        for (int i = 0; i < 5; i++)
+        {
+            for (unsigned k = 0; k < MGL_GEOM_POOL_N; k++)
+            {
+                pools[i]->buf[k] = nil;
+                pools[i]->cb[k] = NULL;
+                pools[i]->used[k] = 0;
+                pools[i]->pin[k] = false;
+            }
+            pools[i]->cur = 0;
+        }
+    }
     gXbase = nil; gXfb = nil; gXfbPending = false;
     gQacc = nil; gQaccCb = nil; gQaccReset = 0; gQaccRan = false;
     gXfbOwner = 0; gXfbBegin = false;
@@ -1851,7 +1862,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                 gPackJoinEnc = nil;
                 gPackJoinCb = nil;
                 if (geomEnvRead(), gEnv.debug)
-                    fprintf(stderr, "geom: pack JOINED the kernel encoder cb=%p\n",
+                    fprintf(stderr, "geom: pack JOINED the kernel encoder cb=%p hash=%lu\n",
                             (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
             }
             else
@@ -1958,7 +1969,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
                         (unsigned long long)(t ? t->write_serial : 12345), (void *)t);
             }
             if ((geomEnvRead(), gEnv.xfb))
-                fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p)\n", b,
+                fprintf(stderr, "geom:   scatter dst[%u] = %p (serial %llu cb %p) hash=%lu\n", b,
                         tfb[b].buf->data.mtl_data,
                         (unsigned long long)BUF()->current_serial(ctx),
                         (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
@@ -2013,7 +2024,7 @@ bool geom_xfb_gpu_ensure(GLMContext ctx, Buffer *buf)
         fprintf(stderr, "\n");
     }
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: pack encoded cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
+        fprintf(stderr, "geom: pack encoded cb=%p hash=%lu\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     return true;
 }
 
@@ -4292,7 +4303,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
                     (long)cb.status,
                     cb.error ? cb.error.localizedDescription.UTF8String : "nil",
                     (unsigned)view.pixelFormat, (unsigned long)view.textureType,
-                    dims ? dims[0] : 0, dims ? dims[1] : 0, dims ? dims[2] : 0,
+                    dims[0], dims[1], dims[2],
                     (unsigned long)view.sampleCount);
     }
 
@@ -4300,7 +4311,7 @@ kernel void vkernel(device uint* out [[buffer(0)]], texture2d_ms<uint, access::r
     {
         volatile uint32_t *o = (volatile uint32_t *)[vbVerify contents];
         fprintf(stderr, "MGL geom: ms flush VERIFY cbstatus=%ld tex(0,0) s0=%g %g %g %g "
-                "s1=%g %g %g %g s2=%g %g %g %g s3=%g %g %g %g "
+                "s1=%g %g %g %g s2=%g %g %g %g s3=%g %g %g %g s4=%g %g %g %g "
                 "(3,3)s0-3=%u %u %u %u (err=%s)\n",
                 (long)cb.status,
                 *(volatile float *)&o[0], *(volatile float *)&o[1],
@@ -6684,7 +6695,7 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
     }
 
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: draw start cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
+        fprintf(stderr, "geom: draw start cb=%p hash=%lu\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     /* ---- 0. prep kernel: assemble the primitives on the GPU ---- */
     if (from_tess)
     {
@@ -7092,7 +7103,7 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
                 if (gEnv.trace)
                     NSLog(@"MGL geom trace: capture bind i=%d buf=%p mtl=%p size=%d data=%p dirty=%llx w0=%08x w1=%08x",
                           i, b, b ? b->data.mtl_data : NULL, b ? (int)b->size : -1,
-                          b ? b->data.buffer_data : NULL, b ? (unsigned long long)b->data.dirty_bits : 0ull,
+                          b ? (void *)b->data.buffer_data : NULL, b ? (unsigned long long)b->data.dirty_bits : 0ull,
                           (b && b->data.buffer_data) ? *(unsigned *)b->data.buffer_data : 0,
                           (b && b->data.buffer_data && b->size >= 8) ? ((unsigned *)b->data.buffer_data)[1] : 0);
                 if (!b) continue;
@@ -7531,7 +7542,7 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
     }
 
     if ((geomEnvRead(), gEnv.debug))
-        fprintf(stderr, "geom: before raster cb=%p\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
+        fprintf(stderr, "geom: before raster cb=%p hash=%lu\n", (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
     if ((geomEnvRead(), gEnv.draw))
     {
         /* diagnostic only: wait for this draw's kernels, then dump the assembly header, the

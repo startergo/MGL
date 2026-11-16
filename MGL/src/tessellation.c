@@ -8335,7 +8335,7 @@ static void tess_canonicalize_records(GLMContext ctx, MGLTessProgram *tp)
             if (!dumps[d].s)
                 continue;
             fprintf(stderr, "MGL tess: stage struct %s (%d members):\n", dumps[d].tag, dumps[d].s->count);
-            if (dumps[d].s->body)
+            if (dumps[d].s->body[0])
                 fprintf(stderr, "MGL tess:   body: %s\n", dumps[d].s->body);
             for (int i = 0; i < dumps[d].s->count; i++)
                 fprintf(stderr, "MGL tess:   %-14s %-24s key=%08x idx=%u off=%zu\n",
@@ -10256,7 +10256,7 @@ enum {
     SPV_SC_OUTPUT          = 3,
 };
 
-#define IOV_MAX      192     /* user interface variables per stage face */
+#define TESS_IOV_MAX      192     /* user interface variables per stage face */
 #define IOV_NAMES    512
 #define IOV_DECOS    1024
 #define IOV_ARRS     256
@@ -10270,7 +10270,7 @@ typedef struct {
 } IoFace;
 
 typedef struct {
-    IoFace in[IOV_MAX], out[IOV_MAX];
+    IoFace in[TESS_IOV_MAX], out[TESS_IOV_MAX];
     int n_in, n_out;
 } IoStage;
 
@@ -10405,12 +10405,12 @@ static bool iov_collect(const uint32_t *ir, size_t words, IoStage *st)
             IoFace *f;
             if (storage == SPV_SC_INPUT)
             {
-                if (st->n_in >= IOV_MAX) break;
+                if (st->n_in >= TESS_IOV_MAX) break;
                 f = &st->in[st->n_in++];
             }
             else
             {
-                if (st->n_out >= IOV_MAX) break;
+                if (st->n_out >= TESS_IOV_MAX) break;
                 f = &st->out[st->n_out++];
             }
             f->id = var;

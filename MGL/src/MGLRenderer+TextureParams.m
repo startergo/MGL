@@ -16,6 +16,7 @@
  */
 
 #import "MGLRenderer_Private.h"
+#import <objc/message.h>
 #include "mgl_ext_texparam.h"
 #include "tex_param_internal.h"
 #include "texdata_formats.h"    /* geom r77: tdFormatLacksAlphaBacking */
@@ -315,7 +316,13 @@ static void texparamReleaseObj(GLMContext glm_ctx, void *obj)
     float lod_bias = p->lod_bias;
     if (lod_bias < -16.0f) lod_bias = -16.0f;
     if (lod_bias > 16.0f) lod_bias = 16.0f;
-    desc.lodBias = lod_bias;
+    /* MTLSamplerDescriptor.lodBias is public API from macOS 26.  Earlier systems
+     * (rsvga runs 15.x) may still carry the setter; call it only when the
+     * descriptor answers to it, otherwise the bias is dropped (not a crash). */
+    if (@available(macOS 26.0, *))
+        desc.lodBias = lod_bias;
+    else if ([desc respondsToSelector: @selector(setLodBias:)])
+        ((void (*)(id, SEL, float))objc_msgSend)(desc, @selector(setLodBias:), lod_bias);
 
     float aniso = p->max_anisotropy;
     if (aniso < 1.0f) aniso = 1.0f;

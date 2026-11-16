@@ -1057,10 +1057,13 @@ static void *td_buffer_contents(GLMContext ctx, Buffer *buf)
      * only leaves the safe defaults (etc decode on, bc on, astc off) */
     id<MTLDevice> dev = _device;
     bool etc = false, bc = true;
-    if (dev && @available(macOS 11.0, *))
+    if (dev)
     {
-        etc = [dev supportsFamily:MTLGPUFamilyApple1];
-        bc = dev.supportsBCTextureCompression;
+        if (@available(macOS 11.0, *))
+        {
+            etc = [dev supportsFamily:MTLGPUFamilyApple1];
+            bc = dev.supportsBCTextureCompression;
+        }
     }
     tdSetDeviceCaps(etc, bc);
     /* ASTC LDR: Apple-family GPUs (Apple silicon); Intel Macs have none */

@@ -675,8 +675,8 @@ static bool rs_mode_is_polygon(GLenum m)
                 }
                 id<MTLFunction> bfn = blib ? [blib newFunctionWithName: base.name] : nil;
                 if (getenv("MGL_BORDER_DEBUG") && !bfn && blib)
-                    fprintf(stderr, "MGL border: fn '%s' not among [%@] (head: %.200s)\n",
-                            [base.name UTF8String], [blib functionNames],
+                    fprintf(stderr, "MGL border: fn '%s' not among [%s] (head: %.200s)\n",
+                            [base.name UTF8String], [[[blib functionNames] description] UTF8String],
                             rs->border_msl ? rs->border_msl : "");
                 if (getenv("MGL_BORDER_DEBUG"))
                     fprintf(stderr, "MGL border: variant fn=%s\n", bfn ? "OK" : "MISSING");

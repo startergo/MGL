@@ -1826,8 +1826,7 @@ static char *mgl_fix_gathers_vs(const char *msl, uint32_t *slots_out, bool compu
                      objs[i].slot, MGL_GEOM_FC_BORDER_BASE + 4 * objs[i].slot + 3,
                      objs[i].slot, objs[i].slot, objs[i].slot,
                      objs[i].slot, objs[i].slot, objs[i].slot,
-                     objs[i].slot, objs[i].slot, objs[i].slot,
-                     objs[i].slot, objs[i].slot);
+                     objs[i].slot, objs[i].slot, objs[i].slot);
             strcat(pre, line);
         }
         strcat(pre, k_gath_helpers);

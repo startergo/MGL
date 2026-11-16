@@ -2885,7 +2885,7 @@ static char *reject_binding_range(const char *src, const MGLCompatBindingLimits 
 
         /* classify the declaration that follows the layout(...) */
         bs_ws(&s);
-        size_t a_n, b_n;
+        size_t a_n, b_n = 0;
         const char *a = bs_ident(&s, &a_n);
         for (;;)
         {

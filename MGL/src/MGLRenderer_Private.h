@@ -43,7 +43,7 @@ void mgl_prof_frame(void);
 /* MGLRenderer+VertexAttrib.m — binds the vattrib plan's per-attribute vertex
  * buffers to an encoder.  Declared here because the transform-feedback capture
  * path has no processGLState pass and must call it directly. */
-@interface MGLRenderer (VertexAttrib)
+@interface MGLRenderer (VertexAttribPreDraw)
 - (void) extVattribPreDraw: (id<MTLRenderCommandEncoder>) enc;
 @end
 

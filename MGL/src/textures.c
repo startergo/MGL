@@ -3237,7 +3237,7 @@ static Texture *view_redirect(GLMContext ctx, Texture *tex, GLuint *face, GLint 
 {
     MGLTexExtInfo *info = mgl_texext_info(ctx, tex);
 
-    if (!info || info->kind != MGL_TEXEXT_VIEW || !info->view_root || !info->view_root->faces)
+    if (!info || info->kind != MGL_TEXEXT_VIEW || !info->view_root)
         return tex;
 
     if (level)

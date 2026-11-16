@@ -7478,7 +7478,7 @@ static bool mgl_texture_incomplete_p(const Texture *tex, const TextureParameter 
 {
     GLint base, top, i, faces = 1;
 
-    if (!tex || !tex->faces || tex->num_levels < 1)
+    if (!tex || tex->num_levels < 1)      /* faces is an array member */
         return true;
 
     /* CUBE_MAP (only!) stores one face entry per cube face; a CUBE_MAP_ARRAY

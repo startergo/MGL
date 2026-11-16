@@ -605,7 +605,7 @@ static char kComputeFallbackKey;
             sdesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
             sdesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
             id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor: sdesc];
-            nd[@"sampler"] = sampler ?: [NSNull null];
+            nd[@"sampler"] = sampler ? (id)sampler : (id)[NSNull null];
         }
         objc_setAssociatedObject(self, &kComputeFallbackKey, nd, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -3474,7 +3474,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     {
         static uint64_t enc_frame = 0, enc_count = 0;
         if (enc_count < 30 || (++enc_count % 500) == 0)
-            fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p\n",
+            fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p hash=%lu\n",
                     (unsigned long long)enc_count, (void *)ctx->state.framebuffer,
                     (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
         enc_count++;
@@ -4937,7 +4937,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                     texture ? "ok" : "NIL",
                                     texture ? (unsigned long)texture.textureType : 0ul,
                                     texture ? (unsigned long)texture.pixelFormat : 0ul,
-                                    mtl_index + e);
+                                    (unsigned)(mtl_index + e));
 
                         /* a STORAGE IMAGE is a plain [[texture(n)]] argument of the MSL
                          * with no sampler (see the render binder's identical rule):
@@ -5391,7 +5391,9 @@ void mtlDeleteMTLObj (GLMContext glm_ctx, void *obj)
     if (_currentCommandBufferSyncList->count >= _currentCommandBufferSyncList->size)
     {
         // CRITICAL SECURITY FIX: Check for integer overflow before multiplication
-        if (_currentCommandBufferSyncList->size > SIZE_MAX / 2 / sizeof(Sync *)) {
+        /* size is a 32-bit GLuint: doubling it is what can overflow (the old
+         * SIZE_MAX / 2 / sizeof bound was out of a GLuint's range) */
+        if (_currentCommandBufferSyncList->size > UINT_MAX / 2) {
             NSLog(@"MGL SECURITY ERROR: SyncList size would overflow, preventing expansion");
             return;
         }

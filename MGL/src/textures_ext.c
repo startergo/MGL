@@ -796,9 +796,8 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
 {
     Texture *orig, *tex;
 
-    if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: enter texture=%u orig=%u target=%x fmt=%x %u/%u %u/%u orig_mtl=%p\n",
-                                          texture, origtexture, target, internalformat, minlevel, numlevels, minlayer, numlayers,
-                                          (void *)orig->mtl_data);
+    if (getenv("MGL_VIEW_DEBUG")) fprintf(stderr, "MGL view: enter texture=%u orig=%u target=%x fmt=%x %u/%u %u/%u\n",
+                                          texture, origtexture, target, internalformat, minlevel, numlevels, minlayer, numlayers);
     /* texture must be a name returned by GenTextures that has not yet been bound */
     if (texture == 0)
         TEXEXT_ERROR(GL_INVALID_VALUE);

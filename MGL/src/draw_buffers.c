@@ -242,9 +242,9 @@ static bool framebuffer_complete(GLMContext ctx)
 static GLenum draw_dbg(GLMContext ctx, GLenum mode, bool uses_elements, int why)
 {
     if (getenv("MGL_DRAW_TRACE"))
-        fprintf(stderr, "MGL draw: rejected by validation check %d (mode=%04x elem=%d prog=%p vao=%p xfb=%u)\n",
+        fprintf(stderr, "MGL draw: rejected by validation check %d (mode=%04x elem=%d prog=%p vao=%p xfb=%p)\n",
                 why, mode, (int)uses_elements, (void *)ctx->state.program,
-                (void *)ctx->state.vao, (unsigned)ctx->state.transform_feedback);
+                (void *)ctx->state.vao, (void *)ctx->state.transform_feedback);
     (void)ctx;
     return GL_INVALID_OPERATION;
 }
