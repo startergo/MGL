@@ -43,6 +43,7 @@ extern unsigned mglExtHookCacheCount(id self, const char *suffix);
 - (bool) extBufBindList: (BufferMapList *)list vertex: (bool)vertex;
 - (bool) updateDirtyBaseBufferList: (BufferMapList *)buffer_map_list;
 - (void) extRstatePreDraw: (id<MTLRenderCommandEncoder>) enc;   /* MGLRenderer+RenderState.m */
+- (void) extTexextPreDraw: (id<MTLRenderCommandEncoder>) enc;   /* MGLRenderer+TextureExt.m */
 @end
 
 static inline int compatProfOn(void)
@@ -807,6 +808,8 @@ static const void *kCompatPipeBindKey = &kCompatPipeBindKey;
 uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 /* compat perf session 12: per-draw state-walk fast-path hit/miss counters */
 uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
+/* r154: partial-walk verdict counts (MGL_PROFILE drawfast-partial line) */
+uint64_t mgl_compat_fast_tex, mgl_compat_fast_bufs, mgl_compat_fast_rs, mgl_compat_fast_moved;
 
 /* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
  * mapBuffersToMTL (MGLRenderer.m) re-enumerates the program's SPIR-V buffer
@@ -1090,6 +1093,7 @@ struct MGLCompatDrawSnap {
     MGLCurrentAttrib current[MAX_ATTRIBS];      /* generic vertex attribs (const streams) */
     const void *tex[TEXTURE_UNITS], *samp[TEXTURE_UNITS];
     void *tex_mtl[TEXTURE_UNITS], *tex_par[TEXTURE_UNITS], *samp_par[TEXTURE_UNITS];
+    uint32_t tex_pser[TEXTURE_UNITS], samp_pser[TEXTURE_UNITS];   /* r154: TextureParameter.mtl_serial */
     /* indexed binding tables (gate 26): DIRTY_BUFFER_BASE_STATE stands between
      * draws that re-point an indexed binding (glBindBufferBase/Range on UBO /
      * SSBO / ACB), and the skip path never re-runs mapGLBuffersToMTLBufferMap,
@@ -1115,7 +1119,14 @@ struct MGLCompatDrawFast {
     GLuint      end_vn, end_fn;
 
     /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
-    uint64_t    misswhy[27];
+    uint64_t    misswhy[32];
+    uint64_t    listwhy[2][5];   /* r154: vlist / flist miss sub-reasons (compatListStable why) */
+    /* r154: does the bound program's pipeline depend on texture state the
+     * texture-only partial walk does not re-evaluate (vertex-stage shadow /
+     * wrap function constants, geometry / tessellation stages)?  Cached per
+     * (program, vertex MSL) — the MSL pointer moves on every relink. */
+    const void *tdep_prog, *tdep_msl;
+    bool        tdep;
     uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
     uint64_t    dirtymask_val[8];
 
@@ -1149,9 +1160,9 @@ static const char *const s_compat_df_why[] = {
     "no-snap", "dirty-bits", "hook-count", "enc/cb/pipe-id", "cb-committed",
     "prog/vao/fbo-id", "rstate-gen", "vlist", "vlist-dirty", "flist",
     "flist-dirty", "no-vattrib", "plan", "vao-fmt/binding", "current-attribs",
-    "va-mapped", "va-dirty", "va-mtl-id", "tex-mask",
-    "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params",
-        "tex-image-units", "tess-route"
+    "(15)", "va-mapped", "va-dirty", "va-mtl-id", "tex-mask",
+    "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params", "tex-image-units",
+    "tess-route", "bufbase", "tex-vsdep", "rebind+tex"
 };
 
 void mgl_compat_drawfast_debug(void)
@@ -1160,10 +1171,30 @@ void mgl_compat_drawfast_debug(void)
     if (df)
     {
     fprintf(stderr, "MGL PROFILE drawfast-miss:");
-    for (unsigned i = 0; i < sizeof(s_compat_df_why) / sizeof(s_compat_df_why[0]); i++)
+    for (unsigned i = 0; i < sizeof(df->misswhy) / sizeof(df->misswhy[0]); i++)
         if (df->misswhy[i])
-            fprintf(stderr, " %s=%llu", i < 26 ? s_compat_df_why[i] : "?", (unsigned long long)df->misswhy[i]);
+            fprintf(stderr, " %s=%llu",
+                    i < sizeof(s_compat_df_why) / sizeof(s_compat_df_why[0]) ? s_compat_df_why[i] : "?",
+                    (unsigned long long)df->misswhy[i]);
     fprintf(stderr, "\n");
+    /* r154: list-miss sub-reasons (count / map entries / mapped / dirty / storage)
+     * and the partial verdicts taken instead of a full walk */
+    if (df->listwhy[0][0] + df->listwhy[0][1] + df->listwhy[0][2] + df->listwhy[0][4] +
+        df->listwhy[1][0] + df->listwhy[1][1] + df->listwhy[1][2] + df->listwhy[1][4])
+        fprintf(stderr, "MGL PROFILE drawfast-listwhy: vlist count=%llu map=%llu mapped=%llu storage=%llu"
+                        " | flist count=%llu map=%llu mapped=%llu storage=%llu\n",
+                (unsigned long long)df->listwhy[0][0], (unsigned long long)df->listwhy[0][1],
+                (unsigned long long)df->listwhy[0][2], (unsigned long long)df->listwhy[0][4],
+                (unsigned long long)df->listwhy[1][0], (unsigned long long)df->listwhy[1][1],
+                (unsigned long long)df->listwhy[1][2], (unsigned long long)df->listwhy[1][4]);
+    if (mgl_compat_fast_tex + mgl_compat_fast_bufs + mgl_compat_fast_rs + mgl_compat_fast_rebind)
+        fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f\n",
+                (double)mgl_compat_fast_tex / 120.0, (double)mgl_compat_fast_bufs / 120.0,
+                (double)mgl_compat_fast_moved / 120.0, (double)mgl_compat_fast_rs / 120.0,
+                (double)mgl_compat_fast_rebind / 120.0);
+    mgl_compat_fast_tex = mgl_compat_fast_bufs = mgl_compat_fast_rs = mgl_compat_fast_moved = 0;
+    mgl_compat_fast_rebind = 0;
+    memset(df->listwhy, 0, sizeof(df->listwhy));
     for (unsigned i = 0; i < 8; i++)
         if (df->dirtymask_seen[i])
             fprintf(stderr, "MGL PROFILE drawfast-dirty: 0x%llx x%llu\n",
@@ -1191,7 +1222,8 @@ void mgl_compat_drawfast_debug(void)
  * default uniform block) set data.dirty_bits and force the full walk, which
  * re-streams them through the argument ring. */
 static bool compatListStable(const BufferMapList *live, const BufferMapList *snap,
-                             const struct MGLCompatBufId *snapbuf, int *why, bool allow_dirty)
+                             const struct MGLCompatBufId *snapbuf, int *why, bool allow_dirty,
+                             bool allow_moved, bool *moved)
 {
     if (live->count != snap->count)
     { *why = 0; return false; }
@@ -1209,7 +1241,22 @@ static bool compatListStable(const BufferMapList *live, const BufferMapList *sna
         if (!allow_dirty && b->data.dirty_bits)   /* content change: full walk re-streams it */
         { *why = 3; return false; }
         if (b->data.mtl_data != snapbuf[i].mtl || b->size != snapbuf[i].size)
-        { *why = 4; return false; }
+        {
+            /* r154: the same buffer object on new Metal storage of the same size
+             * (r153 pool rename after a glBufferSubData / orphaning glBufferData
+             * while the old storage was in flight).  The map entry, its offset and
+             * the SSBO size constant are unchanged; extBufBindList reads
+             * data.mtl_data afresh, so the buffers-only partial walk re-binds it.
+             * By-value (ring) <-> MTLBuffer transitions still take the full walk. */
+            if (allow_moved && allow_dirty && b->size == snapbuf[i].size &&
+                b->data.mtl_data && snapbuf[i].mtl)
+            {
+                *moved = true;
+                continue;
+            }
+            *why = 4;
+            return false;
+        }
     }
 
     return true;
@@ -1317,6 +1364,47 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
     return true;
 }
 
+/* r154: true when the texture-only partial walk must NOT be used for this program:
+ * its pipeline (not just its encoder bindings) can depend on texture state —
+ * the vertex stage's shadow-compare / wrap emulation bakes the bound textures'
+ * compare function and address modes into function constants
+ * (geomShadowFCValues), and geometry / tessellation routing binds textures for
+ * their own stages.  Program pipelines (ctx->state.program NULL) are declined
+ * too: the texture bind walk resolves stages through MGL_PIPELINE_PROGRAM_SCOPE
+ * only inside processGLState. */
+static bool compatTexPipeDependent(GLMContext ctx, struct MGLCompatDrawFast *df)
+{
+    Program *p = ctx->state.program;
+    if (!p)
+        return true;
+    if (p->shader_slots[_GEOMETRY_SHADER] || p->shader_slots[_TESS_CONTROL_SHADER] ||
+        p->shader_slots[_TESS_EVALUATION_SHADER])
+        return true;
+    if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
+        return true;
+    const char *msl = p->spirv[_VERTEX_SHADER].msl_str;
+    if (df->tdep_prog != (const void *)p || df->tdep_msl != (const void *)msl)
+    {
+        df->tdep_prog = p;
+        df->tdep_msl = msl;
+        df->tdep = p->spirv[_VERTEX_SHADER].shadow_slots != 0 ||
+                   (msl && (strstr(msl, "mgl_shadow_op_") || strstr(msl, "mgl_wrap_op_")));
+    }
+    return df->tdep;
+}
+
+/* r154 kill switch: MGL_DRAWFAST_R154=0 restores the r153 gate verdicts */
+static bool compatR154On(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_DRAWFAST_R154");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 - (int) compatDrawGate: (bool) allowDirtyListBuffers
 {
     struct MGLExtMetal_compat *m = compatMetal(ctx);
@@ -1333,12 +1421,19 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
 #define MGL_DF_MISS(_why_) do { if (df) df->misswhy[_why_]++; mgl_compat_fast_miss++; return MGL_DF_FULL; } while (0)
 
     bool rebind = false;                    /* session 19: buffer-identity-only respec */
+    bool r154 = compatR154On();
+    bool moved = false;                     /* r154: a listed buffer moved to new storage */
+    bool tex_moved = false;                 /* r154: a sampled texture binding moved */
     if (!df || !(s = &df->snap)->valid || !m->enabled)
         MGL_DF_MISS(0);
 
     /* only dirty bits whose processing is proven redundant by the content
      * gates below may stand (they are cleared on a SKIP / BUFFERS verdict) */
-    if (ctx->state.dirty_bits & ~MGL_DF_REDUNDANT)
+    /* r154: texture-binding dirt is no longer an automatic miss — the texture
+     * group below either proves it redundant or routes the draw to the
+     * texture-only partial walk */
+    if (ctx->state.dirty_bits & ~(MGL_DF_REDUNDANT |
+                                  (r154 ? (DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER) : 0)))
     {
         if (df)
         {
@@ -1438,18 +1533,43 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
                     Sampler *sam = ctx->state.texture_samplers[u];
 
                     bits &= bits - 1;
+                    /* r154: a moved binding / sampler / parameter set is re-bound by
+                     * the texture-only partial walk (compatDrawFastTextures) as long
+                     * as the new texture is realized, clean and plain (no texext
+                     * buffer / view / emulation record) */
+                    bool unit_moved = false;
                     if ((const void *)tex != s->tex[u] || (const void *)sam != s->samp[u])
-                        MGL_DF_MISS(20);
+                    {
+                        if (!r154)
+                            MGL_DF_MISS(20);
+                        unit_moved = true;
+                    }
                     if (tex)
                     {
                         if (tex->dirty_bits)
                             MGL_DF_MISS(21);
+                        if (mgl_texext_info(ctx, tex))
+                            MGL_DF_MISS(22);
                         if (tex->mtl_data != s->tex_mtl[u] || tex->params.mtl_data != s->tex_par[u] ||
-                            mgl_texext_info(ctx, tex))
+                            tex->params.mtl_serial != s->tex_pser[u])
+                        {
+                            if (!r154)
+                                MGL_DF_MISS(22);
+                            unit_moved = true;
+                        }
+                        /* an unrealized texture with levels would be created by the
+                         * bind walk: leave that to the full walk */
+                        if (unit_moved && !tex->mtl_data && tex->num_levels)
                             MGL_DF_MISS(22);
                     }
-                    if (sam && sam->params.mtl_data != s->samp_par[u])
-                        MGL_DF_MISS(23);
+                    if (sam && (sam->params.mtl_data != s->samp_par[u] ||
+                                sam->params.mtl_serial != s->samp_pser[u]))
+                    {
+                        if (!r154)
+                            MGL_DF_MISS(23);
+                        unit_moved = true;
+                    }
+                    tex_moved |= unit_moved;
                 }
             }
         }
@@ -1461,13 +1581,21 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
         else if (m->texext_skip_epoch == 0)
             m->texext_skip_epoch = ++m->texext_epoch_seq;
     }
+    /* r154: DIRTY_TEX / DIRTY_SAMPLER (content-side texture changes that keep
+     * the bound identities) also take the texture rebind — only the
+     * unit-binding bit is provable redundant by identity alone */
+    bool tex_partial = r154 && (tex_moved || (ctx->state.dirty_bits & (DIRTY_TEX | DIRTY_SAMPLER)));
+    if (tex_partial && compatTexPipeDependent(ctx, df))
+        MGL_DF_MISS(27);
 
     /* buffer-map groups: identity of the maps and of every mapped buffer */
     { int wv = 0, wf = 0;
-      bool vok = compatListStable(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb, &wv, allowDirtyListBuffers);
-      bool fok = vok && compatListStable(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb, &wf, allowDirtyListBuffers);
-      if (!vok) MGL_DF_MISS(7 + (wv == 3));           /* vlist / vlist-dirty */
-      else if (!fok) MGL_DF_MISS(9 + (wf == 3));      /* flist / flist-dirty */
+      bool vok = compatListStable(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb, &wv,
+                                  allowDirtyListBuffers, r154, &moved);
+      bool fok = vok && compatListStable(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb, &wf,
+                                         allowDirtyListBuffers, r154, &moved);
+      if (!vok) { df->listwhy[0][wv % 5]++; MGL_DF_MISS(7 + (wv == 3)); }      /* vlist / vlist-dirty */
+      else if (!fok) { df->listwhy[1][wf % 5]++; MGL_DF_MISS(9 + (wf == 3)); }  /* flist / flist-dirty */
     }
 
     /* vertex-array group: the vattrib draw plan, the VAO layout, the generic
@@ -1526,12 +1654,38 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
              * slots are only recycled after their reading serial completed */
             if (buf->mapped)
                 MGL_DF_MISS(16);
+            /* r154: a vertex buffer the vertex map list carries at its plan slot
+             * (the slot the vattrib hook binds it at) is flushed and re-bound by
+             * the buffers-only partial walk exactly like a listed uniform buffer:
+             * updateDirtyBaseBufferList uploads it, extBufBindList binds the
+             * (possibly renamed) storage.  Shadow (converted) streams are rebuilt
+             * from the buffer bytes by the vattrib hook only: full walk. */
+            bool listed = false;
+            if (r154 && allowDirtyListBuffers && !rebind)
+            {
+                int slot = s->plan.binding_index[b];
+                const BufferMapList *vl = &ctx->state.vertex_buffer_map_list;
+                listed = slot >= 0 && (GLuint)slot < vl->count && vl->buffers[slot].buf == buf;
+                for (int a = 0; listed && a < MAX_ATTRIBS; a++)
+                    if (vs->plan.fetch[a] == MGL_VA_FETCH_SHADOW)
+                        listed = false;
+            }
             if (buf->data.dirty_bits)
-                MGL_DF_MISS(17);
+            {
+                if (!listed)
+                    MGL_DF_MISS(17);
+                moved = true;               /* re-stream through the buffers path */
+            }
             if ((buf->data.mtl_data != NULL) != (s->vabuf[b].mtl != NULL) ||
                 (!rebind && (buf->size != s->vabuf[b].size ||
                  (buf->data.mtl_data && buf->data.mtl_data != s->vabuf[b].mtl))))
-                MGL_DF_MISS(18);
+            {
+                /* r154: same size, MTLBuffer-backed on both sides, listed: the
+                 * storage moved (pool rename) — re-bind via the buffers path */
+                if (!(listed && buf->size == s->vabuf[b].size && buf->data.mtl_data && s->vabuf[b].mtl))
+                    MGL_DF_MISS(18);
+                moved = true;
+            }
         }
     }
 
@@ -1548,14 +1702,30 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
      * walk (everything else about this draw was gate-proven unchanged) */
     if (rebind)
     {
+        if (tex_partial)
+            MGL_DF_MISS(28);
         mgl_compat_fast_rebind++;
         return MGL_DF_REBIND;
+    }
+
+    /* r154: only sampled-texture bindings (plus, possibly, listed-buffer content /
+     * storage and the rstate encoder group) moved: re-run the texture branch of
+     * the walk and the texext hook, skip mapBuffersToMTL, the VAO branch and the
+     * pipeline block (the identity / content checks above prove their inputs
+     * unchanged; border-colour emulation re-arms DIRTY_PROGRAM before this gate) */
+    if (tex_partial)
+    {
+        mgl_compat_fast_tex++;
+        return MGL_DF_TEXTURES;
     }
 
     /* everything matched: the walk is a no-op except for listed-buffer content
      * (a listed buffer with dirty data needs the ring re-stream) */
     if (rstate_only)
+    {
+        mgl_compat_fast_rs++;
         return MGL_DF_RSTATE;
+    }
 
     mgl_compat_fast_hit++;
     if (ctx->state.dirty_bits & MGL_DF_REDUNDANT)
@@ -1574,8 +1744,13 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
             const Buffer *b = ctx->state.fragment_buffer_map_list.buffers[i].buf;
             dirty = b && b->data.dirty_bits != 0;
         }
-        if (dirty)
+        if (dirty || moved)
+        {
+            mgl_compat_fast_bufs++;
+            if (moved)
+                mgl_compat_fast_moved++;
             return MGL_DF_BUFFERS;
+        }
     }
 
     return MGL_DF_SKIP;
@@ -1689,6 +1864,8 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
             s->tex_mtl[u] = tex ? tex->mtl_data : NULL;
             s->tex_par[u] = tex ? tex->params.mtl_data : NULL;
             s->samp_par[u] = sam ? sam->params.mtl_data : NULL;
+            s->tex_pser[u] = tex ? tex->params.mtl_serial : 0;
+            s->samp_pser[u] = sam ? sam->params.mtl_serial : 0;
         }
     }
 
@@ -1823,7 +2000,80 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
 - (bool) compatDrawFastRState
 {
     [self extRstatePreDraw: _currentRenderEncoder];
+    /* r154: the gate returns this verdict ahead of the listed-buffer scan, so a
+     * uniform upload (or a pool-renamed storage) between the two draws must be
+     * re-streamed here as the buffers path would (shadow-filtered: unchanged
+     * slots cost a compare) */
+    if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
+        ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list] ||
+        ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
+        ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+        return false;
+    compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
+    compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
     [self compatDrawLatch];
+    return true;
+}
+
+/* r154: partial walk for a draw whose only moved state is the sampled-texture
+ * bindings (compatDrawGate: same program / VAO layout / FBO / pipeline /
+ * encoder, texture group changed, program pipeline not texture-dependent).
+ * Runs the texture branch of processGLState and the texext PreDraw hook, then
+ * the listed-buffer flush and the rstate re-apply when the gate also saw
+ * those; mapBuffersToMTL, the VAO branch, the pipeline block and the
+ * vattrib hook are skipped.  Returns false (dirty bits still armed) when the
+ * texture walk changed the encoder: the caller then runs the full walk. */
+- (bool) compatDrawFastTextures
+{
+    uint64_t t13 = mgl_prof_begin(13);
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+    struct MGLCompatDrawSnap *s = df ? &df->snap : NULL;
+    const void *enc0 = (__bridge const void *)_currentRenderEncoder;
+    uint64_t gen0 = m ? m->encoder_gen : 0;
+
+    if (!s || !enc0)
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+
+    m->texext_skip_epoch = 0;               /* the texext hook below must re-run */
+    uint64_t t15 = mgl_prof_begin(15);
+    bool ok = [self bindActiveTexturesToMTL];
+    if (ok)
+    {
+        uint64_t p5 = mgl_prof_begin(5);
+        ok = [self bindTexturesToCurrentRenderEncoder];
+        mgl_prof_end(5, p5);
+    }
+    mgl_prof_end(15, t15);
+    if (!ok || (__bridge const void *)_currentRenderEncoder != enc0 || m->encoder_gen != gen0)
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+    ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER | MGL_DF_REDUNDANT);
+
+    [self extTexextPreDraw: _currentRenderEncoder];
+
+    struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
+    if (rs && rs->generation != s->rstate_gen)
+        [self extRstatePreDraw: _currentRenderEncoder];
+
+    if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
+        ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list] ||
+        ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
+        ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+    {
+        mgl_prof_end(13, t13);
+        return false;
+    }
+    compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
+    compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
+
+    [self compatDrawLatch];
+    mgl_prof_end(13, t13);
     return true;
 }
 
@@ -2081,8 +2331,10 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
      * the replayed ids from being trusted at all) */
     uint64_t gen = compatEncGen(m, (__bridge void *)_currentRenderEncoder);
     if (e->gen == gen && e->tex == (void *)tex && e->tex_mtl == tex->mtl_data &&
-        e->tex_params == tex->params.mtl_data && e->sampler_obj == so &&
-        (!so || e->sampler_params == ((Sampler *)so)->params.mtl_data) && e->view && e->samp)
+        e->tex_params == tex->params.mtl_data && e->tex_pser == tex->params.mtl_serial &&
+        e->sampler_obj == so &&
+        (!so || (e->sampler_params == ((Sampler *)so)->params.mtl_data &&
+                 e->samp_pser == ((Sampler *)so)->params.mtl_serial)) && e->view && e->samp)
     {
         id<MTLTexture> view = (__bridge id<MTLTexture>)e->view;
         id<MTLSamplerState> samp = (__bridge id<MTLSamplerState>)e->samp;
@@ -2116,6 +2368,8 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
     e->tex_params = tex->params.mtl_data;
     e->sampler_obj = so;
     e->sampler_params = so ? ((Sampler *)so)->params.mtl_data : NULL;
+    e->tex_pser = tex->params.mtl_serial;
+    e->samp_pser = so ? ((Sampler *)so)->params.mtl_serial : 0;
     e->view = (__bridge void *)view;
     e->samp = (__bridge void *)samp;
 }

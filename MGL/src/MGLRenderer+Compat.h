@@ -81,7 +81,8 @@ void mglProgramRegisterMSLIdentity(const void *function, const char *msl, const 
 - (bool) compatBindmapFast: (int) vertex_stage;
 - (void) compatBindmapStore: (int) vertex_stage;
 /* perf session 12 verdicts of compatDrawGate: */
-enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE, MGL_DF_REBIND };
+enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE, MGL_DF_REBIND,
+       MGL_DF_TEXTURES /* r154: only sampled-texture bindings moved */ };
 
 /* perf session 12: per-draw state-walk fast path.  extBufBeginDraw calls
  * compatDrawGate first: when every state group the walk reads still matches
@@ -98,6 +99,8 @@ enum { MGL_DF_FULL = 0, MGL_DF_SKIP, MGL_DF_BUFFERS, MGL_DF_RSTATE, MGL_DF_REBIN
  * extBufBindList to skip the whole storage/ring dispatch for unchanged slots */
 bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_t offset, void *enc_ptr);
 - (bool) compatDrawFastRState;
+/* r154: texture-binding-only partial walk; false = run the full walk */
+- (bool) compatDrawFastTextures;
 - (void) compatDrawLatch;
 - (bool) compatEndDrawFast;
 - (void) compatEndDrawLatch;

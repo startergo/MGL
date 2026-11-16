@@ -142,6 +142,7 @@ struct MGLExtMetal_compat {
         void    *tex_params;
         void    *sampler_obj;
         void    *sampler_params;
+        uint32_t tex_pser, samp_pser;   /* r154: TextureParameter.mtl_serial of each */
         void    *view;      /* resolved id<MTLTexture> */
         void    *samp;      /* resolved id<MTLSamplerState> */
     } vtexres[2][MGLC_BIND_SLOTS];

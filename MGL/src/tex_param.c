@@ -96,6 +96,8 @@ void mglTexParamInitDefaults(TextureParameter *p, GLenum target)
 
 void mglTexParamInvalidate(GLMContext ctx, TextureParameter *p)
 {
+    static uint32_t s_mtl_serial;   /* r154: see TextureParameter.mtl_serial */
+    p->mtl_serial = ++s_mtl_serial;
     if (p->mtl_data)
     {
         if (ctx->mtl_funcs.ext_texparam && ctx->mtl_funcs.ext_texparam->releaseObj)

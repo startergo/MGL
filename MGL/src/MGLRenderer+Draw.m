@@ -584,6 +584,16 @@ void mgl_buffer_pool_free(BufferData *d)
         mgl_prof_end(22, t22);
         return ok;
     }
+    if (gate == MGL_DF_TEXTURES)
+    {
+        /* r154: texture-binding-only change; on false the dirty bits are still
+         * armed and the full walk below redoes everything */
+        if ([self compatDrawFastTextures])
+        {
+            mgl_prof_end(22, t22);
+            return true;
+        }
+    }
     mgl_prof_end(22, t22);
 
     uint64_t prof_t0 = mgl_prof_begin(0);

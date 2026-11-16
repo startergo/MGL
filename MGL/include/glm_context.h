@@ -268,6 +268,13 @@ typedef struct TextureParameter_t {
      * (compatSRGBDecodeViewForTex, MGLRenderer+Compat.m). */
     GLenum  srgb_decode;
     void *mtl_data;
+    /* r154: bumped (from a process-wide counter) every time mtl_data is
+     * released by mglTexParamInvalidate.  The released cache object's address
+     * is routinely reused by its successor, so identity caches keyed on
+     * mtl_data alone (the draw-fast gate, the texture-resolution cache) must
+     * also compare this — a glSamplerParameter on a bound sampler otherwise
+     * kept sampling with the previous sampler state. */
+    uint32_t mtl_serial;
 } TextureParameter;
 
 typedef struct TextureLevel_t {
