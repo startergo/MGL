@@ -1120,7 +1120,7 @@ struct MGLCompatDrawFast {
 
     /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
     uint64_t    misswhy[32];
-    uint64_t    listwhy[2][5];   /* r154: vlist / flist miss sub-reasons (compatListStable why) */
+    uint64_t    listwhy[2][6];   /* r154: vlist / flist miss sub-reasons (compatListStable why) */
     /* r154: does the bound program's pipeline depend on texture state the
      * texture-only partial walk does not re-evaluate (vertex-stage shadow /
      * wrap function constants, geometry / tessellation stages)?  Cached per
@@ -1179,14 +1179,16 @@ void mgl_compat_drawfast_debug(void)
     fprintf(stderr, "\n");
     /* r154: list-miss sub-reasons (count / map entries / mapped / dirty / storage)
      * and the partial verdicts taken instead of a full walk */
-    if (df->listwhy[0][0] + df->listwhy[0][1] + df->listwhy[0][2] + df->listwhy[0][4] +
-        df->listwhy[1][0] + df->listwhy[1][1] + df->listwhy[1][2] + df->listwhy[1][4])
-        fprintf(stderr, "MGL PROFILE drawfast-listwhy: vlist count=%llu map=%llu mapped=%llu storage=%llu"
-                        " | flist count=%llu map=%llu mapped=%llu storage=%llu\n",
+    if (df->listwhy[0][0] + df->listwhy[0][1] + df->listwhy[0][2] + df->listwhy[0][4] + df->listwhy[0][5] +
+        df->listwhy[1][0] + df->listwhy[1][1] + df->listwhy[1][2] + df->listwhy[1][4] + df->listwhy[1][5])
+        fprintf(stderr, "MGL PROFILE drawfast-listwhy: vlist count=%llu map=%llu mapped=%llu storage=%llu size=%llu"
+                        " | flist count=%llu map=%llu mapped=%llu storage=%llu size=%llu\n",
                 (unsigned long long)df->listwhy[0][0], (unsigned long long)df->listwhy[0][1],
                 (unsigned long long)df->listwhy[0][2], (unsigned long long)df->listwhy[0][4],
+                (unsigned long long)df->listwhy[0][5],
                 (unsigned long long)df->listwhy[1][0], (unsigned long long)df->listwhy[1][1],
-                (unsigned long long)df->listwhy[1][2], (unsigned long long)df->listwhy[1][4]);
+                (unsigned long long)df->listwhy[1][2], (unsigned long long)df->listwhy[1][4],
+                (unsigned long long)df->listwhy[1][5]);
     if (mgl_compat_fast_tex + mgl_compat_fast_bufs + mgl_compat_fast_rs + mgl_compat_fast_rebind)
         fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f\n",
                 (double)mgl_compat_fast_tex / 120.0, (double)mgl_compat_fast_bufs / 120.0,
@@ -1248,13 +1250,18 @@ static bool compatListStable(const BufferMapList *live, const BufferMapList *sna
              * the SSBO size constant are unchanged; extBufBindList reads
              * data.mtl_data afresh, so the buffers-only partial walk re-binds it.
              * By-value (ring) <-> MTLBuffer transitions still take the full walk. */
+            /* r157: also MTLBuffer <-> none (glBufferData re-specification
+             * released the storage: updateDirtyBaseBufferList allocates again
+             * for >= 4 KB, smaller ones stream through the ring), for entries
+             * that are not vertex attributes — an attribute's fetch mode
+             * follows whether its buffer has Metal storage */
             if (allow_moved && allow_dirty && b->size == snapbuf[i].size &&
-                b->data.mtl_data && snapbuf[i].mtl)
+                ((b->data.mtl_data && snapbuf[i].mtl) || live->buffers[i].attribute_mask == 0))
             {
                 *moved = true;
                 continue;
             }
-            *why = 4;
+            *why = b->size != snapbuf[i].size ? 5 : 4;   /* 5: size change */
             return false;
         }
     }
@@ -1594,8 +1601,8 @@ static bool compatR154On(void)
                                   allowDirtyListBuffers, r154, &moved);
       bool fok = vok && compatListStable(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb, &wf,
                                          allowDirtyListBuffers, r154, &moved);
-      if (!vok) { df->listwhy[0][wv % 5]++; MGL_DF_MISS(7 + (wv == 3)); }      /* vlist / vlist-dirty */
-      else if (!fok) { df->listwhy[1][wf % 5]++; MGL_DF_MISS(9 + (wf == 3)); }  /* flist / flist-dirty */
+      if (!vok) { df->listwhy[0][wv % 6]++; MGL_DF_MISS(7 + (wv == 3)); }      /* vlist / vlist-dirty */
+      else if (!fok) { df->listwhy[1][wf % 6]++; MGL_DF_MISS(9 + (wf == 3)); }  /* flist / flist-dirty */
     }
 
     /* vertex-array group: the vattrib draw plan, the VAO layout, the generic
@@ -1883,7 +1890,7 @@ static bool compatR154On(void)
  * bindList rebinds below are exactly the vattrib PreDraw hook's own binds. */
 - (bool) compatDrawFastRebind
 {
-    uint64_t t13 = mgl_prof_begin(13);
+    uint64_t t13 = mgl_prof_begin(30);
 
     struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
     MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
@@ -1894,7 +1901,7 @@ static bool compatR154On(void)
 
     if (!vs || !va || !s || !ctx->state.vao)
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
 
@@ -1926,7 +1933,7 @@ static bool compatR154On(void)
         ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
         ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
 
@@ -1955,7 +1962,7 @@ static bool compatR154On(void)
     compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
     compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
 
-    mgl_prof_end(13, t13);
+    mgl_prof_end(30, t13);
     return true;
 }
 
@@ -1966,19 +1973,19 @@ static bool compatR154On(void)
  * PSO check, no hook fan-out, no stamps (their gates still match). */
 - (bool) compatDrawFastBuffers
 {
-    uint64_t t13 = mgl_prof_begin(13);
+    uint64_t t13 = mgl_prof_begin(30);
 
     if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
         ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list])
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
 
     if (![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
         ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
 
@@ -1989,7 +1996,7 @@ static bool compatR154On(void)
      * snapshot is valid again for the next draw */
     [self compatDrawLatch];
 
-    mgl_prof_end(13, t13);
+    mgl_prof_end(30, t13);
     return true;
 }
 
@@ -1999,6 +2006,7 @@ static bool compatR154On(void)
  * and skip the rest of the walk. */
 - (bool) compatDrawFastRState
 {
+    uint64_t t30 = mgl_prof_begin(30);
     [self extRstatePreDraw: _currentRenderEncoder];
     /* r154: the gate returns this verdict ahead of the listed-buffer scan, so a
      * uniform upload (or a pool-renamed storage) between the two draws must be
@@ -2008,10 +2016,14 @@ static bool compatR154On(void)
         ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list] ||
         ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
         ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
+    {
+        mgl_prof_end(30, t30);
         return false;
+    }
     compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
     compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
     [self compatDrawLatch];
+    mgl_prof_end(30, t30);
     return true;
 }
 
@@ -2025,7 +2037,7 @@ static bool compatR154On(void)
  * texture walk changed the encoder: the caller then runs the full walk. */
 - (bool) compatDrawFastTextures
 {
-    uint64_t t13 = mgl_prof_begin(13);
+    uint64_t t13 = mgl_prof_begin(30);
     struct MGLExtMetal_compat *m = compatMetal(ctx);
     struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
     struct MGLCompatDrawSnap *s = df ? &df->snap : NULL;
@@ -2034,7 +2046,7 @@ static bool compatR154On(void)
 
     if (!s || !enc0)
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
 
@@ -2050,7 +2062,7 @@ static bool compatR154On(void)
     mgl_prof_end(15, t15);
     if (!ok || (__bridge const void *)_currentRenderEncoder != enc0 || m->encoder_gen != gen0)
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
     ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER | MGL_DF_REDUNDANT);
@@ -2066,14 +2078,14 @@ static bool compatR154On(void)
         ![self extBufBindList: &ctx->state.vertex_buffer_map_list vertex: true] ||
         ![self extBufBindList: &ctx->state.fragment_buffer_map_list vertex: false])
     {
-        mgl_prof_end(13, t13);
+        mgl_prof_end(30, t13);
         return false;
     }
     compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
     compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
 
     [self compatDrawLatch];
-    mgl_prof_end(13, t13);
+    mgl_prof_end(30, t13);
     return true;
 }
 

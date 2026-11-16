@@ -1028,8 +1028,12 @@ static void exec_draw(GLMContext ctx, DrawBatch *batch, GLenum mode, bool indexe
             {
                 if (run < 32) hist[run]++; else hist[32]++;
                 merged += run; tot += run; run = 1; id = k;
-                if (++tot % 4000 == 0)
+                extern uint64_t mgl_prof_dump_seq;
+                static uint64_t hist_seq;
+                ++tot;
+                if (hist_seq != mgl_prof_dump_seq)      /* once per MGL_PROFILE dump */
                 {
+                    hist_seq = mgl_prof_dump_seq;
                     fprintf(stderr, "MGL PROFILE draw-run histogram (draws=%llu, batchable=%llu): ",
                             (unsigned long long)tot, (unsigned long long)merged);
                     for (int i = 1; i <= 32; i++)

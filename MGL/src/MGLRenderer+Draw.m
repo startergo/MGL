@@ -560,28 +560,23 @@ void mgl_buffer_pool_free(BufferData *d)
      * and skips everything else */
     uint64_t t22 = mgl_prof_begin(22);
     int gate = [self compatDrawGate: true];
+    mgl_prof_end(22, t22);                  /* the gate alone; partial walks: drawFastPartial */
     if (gate == MGL_DF_SKIP)
-    {
-        mgl_prof_end(22, t22);
         return true;
-    }
     if (gate == MGL_DF_BUFFERS)
     {
         bool ok = [self compatDrawFastBuffers];
-        mgl_prof_end(22, t22);
         return ok;
     }
     if (gate == MGL_DF_REBIND)
     {
         /* session 19: buffer-identity-only vertex-array respec (see
          * compatRebindClassify): map suffix + encoder rebind, no walk */
-        mgl_prof_end(22, t22);
         return [self compatDrawFastRebind];
     }
     if (gate == MGL_DF_RSTATE)
     {
         bool ok = [self compatDrawFastRState];
-        mgl_prof_end(22, t22);
         return ok;
     }
     if (gate == MGL_DF_TEXTURES)
@@ -589,12 +584,8 @@ void mgl_buffer_pool_free(BufferData *d)
         /* r154: texture-binding-only change; on false the dirty bits are still
          * armed and the full walk below redoes everything */
         if ([self compatDrawFastTextures])
-        {
-            mgl_prof_end(22, t22);
             return true;
-        }
     }
-    mgl_prof_end(22, t22);
 
     uint64_t prof_t0 = mgl_prof_begin(0);
     [self extBufEnsureCommandBuffer];

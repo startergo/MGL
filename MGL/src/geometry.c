@@ -12425,7 +12425,7 @@ static void geom_build(GLMContext ctx, MGLGeomProgram *gp, Program *program)
         GEOM_FAIL("no Metal compile hook available");
 
     /* ---- 2. geometry kernel ---- */
-build:
+build:;
     /* the program's own geometry-stage module owns the resource order the renderer's
      * buffer map enumerates; pin this kernel's user resources to those positions */
     int gs_span = 0;                /* the user pins' slot span: atomics sit above it */

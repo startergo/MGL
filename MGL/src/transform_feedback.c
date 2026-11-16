@@ -2118,7 +2118,7 @@ static bool xfb_has_legacy_keywords(const char *s)
 
     if (!s) return true;
 
-    /* comments can mention the words without using them: skip // and /* bodies */
+    /* comments can mention the words without using them: skip line- and block-comment bodies */
     const char *p = s;
     while (*p) {
         if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; continue; }

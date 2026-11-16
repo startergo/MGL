@@ -206,8 +206,11 @@ unsigned mglExtHookCacheCount(id self, const char *suffix)
  * 2=pipeline descriptor walk 3=newRenderPipelineState (cache miss)
  * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
 #include <mach/mach_time.h>
-#define MGL_PROF_BUCKETS 30
-uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];   /* shared with the Compat category counters */
+#define MGL_PROF_BUCKETS 31
+uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];
+/* bumped by each MGL_PROFILE dump: periodic side reports (draw-run histogram)
+ * print once per dump instead of on their own cadence */
+uint64_t mgl_prof_dump_seq;   /* shared with the Compat category counters */
 static int mgl_prof_on = -1;
 static double mgl_prof_scale = 0;
 /* NOINLINE + compiler barriers: mach_absolute_time is a pure intrinsic, and
@@ -225,10 +228,17 @@ __attribute__((noinline)) uint64_t mgl_prof_begin(int id)
     }
     if (!mgl_prof_on) return 0;
     {
-        static pthread_t t_main = NULL;
-        if (!t_main) t_main = pthread_self();
-        else if (!pthread_equal(t_main, pthread_self()) && (mgl_prof_cnt[19]++ % 1000) == 0)
-            fprintf(stderr, "MGL PROFILE: prof_begin called off the first thread!\n");
+        /* the buckets are plain counters: they are right as long as one thread at
+         * a time issues GL (a client's command thread is fine).  Note each switch
+         * of that thread once instead of per call. */
+        static pthread_t t_prof = NULL;
+        pthread_t self = pthread_self();
+        if (!t_prof) t_prof = self;
+        else if (!pthread_equal(t_prof, self))
+        {
+            fprintf(stderr, "MGL PROFILE: GL calls moved to another thread; profiling follows it\n");
+            t_prof = self;
+        }
     }
     asm volatile("" ::: "memory");
     uint64_t t = mach_absolute_time();
@@ -259,9 +269,11 @@ void mgl_profile_dump(void)
                                     "enddraw-stamp", "encode-draw", "mapBuffers", "mapBuffersToMTL",
                                     "processGLState", "bindList", "ssboSizes", "texture-bind-walk",
                                     "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "fbBuildPassDesc", "pipeline-block", "tail-pipeBind+PreDraw",
-                                    "drawFastGate", "PreDraw-hooks", "extPreDraw", "progSamplers", "queriesPreDraw", "execDrawRaw", "drawIdxList", "drawCachedIdx" };
+                                    "drawFastGate", "PreDraw-hooks", "extPreDraw", "progSamplers", "queriesPreDraw", "execDrawRaw", "drawIdxList", "drawCachedIdx",
+                                    "drawFastPartial" };
     double tot = 0;
     for (int i = 0; i < MGL_PROF_BUCKETS; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
+    mgl_prof_dump_seq++;
     fprintf(stderr, "MGL PROFILE(ms total | ms/frame | calls/frame):");
     for (int i = 0; i < MGL_PROF_BUCKETS; i++)
         if (mgl_prof_cnt[i])
@@ -269,7 +281,9 @@ void mgl_profile_dump(void)
                     mgl_prof_ns[i] * mgl_prof_scale,
                     mgl_prof_ns[i] * mgl_prof_scale / 120.0,
                     (double)mgl_prof_cnt[i] / 120.0);
-    fprintf(stderr, " (sum %.1f ms)\n", tot);
+    /* buckets nest (draw contains processGLState, which contains the texture
+     * walk, ...): the sum over-counts; "draw" is the per-draw total */
+    fprintf(stderr, " (sum %.1f ms, nested buckets: not a total; use draw)\n", tot);
     /* compat perf session 3: Metal argument-bind accounting (MGLRenderer+Compat.m) */
     {
         extern uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;

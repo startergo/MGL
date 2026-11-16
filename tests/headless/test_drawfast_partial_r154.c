@@ -257,6 +257,36 @@ int main(void)
         bad += cell_is(c, k[0], k[1], k[2], "ubo update");
     }
 
+    /* ---- 5b. (r157) an 8 KB fragment-stage UBO re-specified with glBufferData
+     *      before every draw: the re-specification releases its Metal storage,
+     *      the buffers path must allocate again and bind the new contents */
+    {
+        GLuint big; glGenBuffers(1, &big); glBindBuffer(GL_UNIFORM_BUFFER, big);
+        static float blk[2048];
+        memset(blk, 0, sizeof blk);
+        glBufferData(GL_UNIFORM_BUFFER, sizeof blk, blk, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 2, big);
+        glClear(GL_COLOR_BUFFER_BIT);
+        uint64_t mv0 = mgl_compat_fast_moved;
+        for (int c = 0; c < 24; c++) {
+            const unsigned char *k = COL[(c + 1) % 4];
+            blk[0] = k[0] / 255.0f; blk[1] = k[1] / 255.0f; blk[2] = k[2] / 255.0f; blk[3] = 1.0f;
+            glBufferData(GL_UNIFORM_BUFFER, sizeof blk, blk, GL_DYNAMIC_DRAW);
+            place(c); quad();
+        }
+        grab();
+        for (int c = 0; c < 24; c++) {
+            const unsigned char *k = COL[(c + 1) % 4];
+            bad += cell_is(c, k[0], k[1], k[2], "8 KB ubo re-specified");
+        }
+        const char *off = getenv("MGL_DRAWFAST_R154");
+        if (!(off && off[0] == '0'))
+            EXPECT_TRUE(mgl_compat_fast_moved - mv0 >= 16);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 2, ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glDeleteBuffers(1, &big);
+    }
+
     /* ---- 6. texture + UBO + (cell) uniform all moving per draw */
     glUseProgram(ptu);
     glClear(GL_COLOR_BUFFER_BIT);

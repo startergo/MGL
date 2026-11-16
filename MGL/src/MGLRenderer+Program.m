@@ -185,7 +185,6 @@ static uint64_t fnidOf(const char *msl, const char *entry)
         }
 
         /* specialized with no values, like -bindMTLProgram: functions carrying function
-        /* specialized with no values, like -bindMTLProgram: functions carrying function
          * constants (rstate fixups) take their GL-default branches.  constantValues
          * must be non-nil: Metal validation asserts on nil (test_atomic_counters
          * SIGTRAPped in the full suite; 'failure -[MGLRenderer processGLState:]' logs
