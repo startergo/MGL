@@ -20,7 +20,7 @@ The context reports `GL_VERSION` "4.6 Metal" and `GL_SHADING_LANGUAGE_VERSION` "
 - **Program introspection,** separate shader objects / program pipelines, and SPIR-V shaders (`GL_ARB_gl_spirv`).
 - **Compatibility profile:** fixed-function vertex and fragment state, client arrays, immediate mode and display lists.
 
-Some functionality is still missing: the unimplemented entry points are stubs that `assert(0)`. See [docs/gl46-status.md](docs/gl46-status.md) for the conformance numbers and the known failures.
+Every GL 4.6 core entry point is implemented (`agents/stub_scanner.py` reports none missing); the remaining gaps are conformance failures, listed with the conformance numbers in [docs/gl46-status.md](docs/gl46-status.md).
 
 ## Building
 
