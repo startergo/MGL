@@ -829,6 +829,7 @@ struct MGLCompatBindmapCache {
     int        vstage;              /* vertex stage the prefix was built for */
     /* input shadows: the four buffer_base targets the enumeration reads */
     BufferBase ub, uc, ssbo, atom;
+    GLuint     ubo_high_gen;        /* r159: uniform-buffer points >= MAX_BINDABLE_BUFFERS */
     void      *nullbuf;             /* [nullShaderBuffer] seen at build (NULL if unused) */
     /* outputs: the prefix entries of the two stage lists */
     BufferMap  v[MAX_MAPPED_BUFFERS];
@@ -875,7 +876,8 @@ static struct MGLCompatBindmapCache *compatBindmapState(GLMContext ctx)
     if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &c->ub, sizeof(BufferBase)) != 0 ||
         memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &c->uc, sizeof(BufferBase)) != 0 ||
         memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &c->ssbo, sizeof(BufferBase)) != 0 ||
-        memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &c->atom, sizeof(BufferBase)) != 0)
+        memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &c->atom, sizeof(BufferBase)) != 0 ||
+        ctx->state.ubo_high_gen != c->ubo_high_gen)
     {
         if (compatProfOn()) c->why = 3;
         return false;
@@ -963,6 +965,7 @@ static struct MGLCompatBindmapCache *compatBindmapState(GLMContext ctx)
     memcpy(&c->uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase));
     memcpy(&c->ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
     memcpy(&c->atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
+    c->ubo_high_gen = ctx->state.ubo_high_gen;
 
     const Buffer *nullbuf = [self nullShaderBuffer];
     const BufferMapList *vl = &ctx->state.vertex_buffer_map_list;
@@ -1096,6 +1099,7 @@ struct MGLCompatDrawSnap {
     void *tex_mtl[TEXTURE_UNITS], *tex_par[TEXTURE_UNITS], *samp_par[TEXTURE_UNITS];
     uint32_t tex_pser[TEXTURE_UNITS], samp_pser[TEXTURE_UNITS];   /* r154: TextureParameter.mtl_serial */
     GLuint      sampler_map_gen;        /* r158: ctx->state.sampler_map_gen at latch */
+    GLuint      ubo_high_gen;           /* r159: ctx->state.ubo_high_gen at latch */
     /* indexed binding tables (gate 26): DIRTY_BUFFER_BASE_STATE stands between
      * draws that re-point an indexed binding (glBindBufferBase/Range on UBO /
      * SSBO / ACB), and the skip path never re-runs mapGLBuffersToMTLBufferMap,
@@ -1489,7 +1493,8 @@ static bool compatR154On(void)
         if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0 ||
             memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
             memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
-            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0)
+            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0 ||
+            ctx->state.ubo_high_gen != s->ubo_high_gen)    /* r159: points >= MAX_BINDABLE_BUFFERS */
             MGL_DF_MISS(26);
     }
     /* ...and only for the three PreDraw hooks this gate reasons about */
@@ -1833,6 +1838,7 @@ static bool compatR154On(void)
     s->fbo = (const void *)ctx->state.framebuffer;
     s->tess_active = [self extTessActive] ? 1 : 0;
     s->sampler_map_gen = ctx->state.sampler_map_gen;
+    s->ubo_high_gen = ctx->state.ubo_high_gen;
 
     {
         struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;

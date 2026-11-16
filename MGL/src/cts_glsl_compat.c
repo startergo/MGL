@@ -895,9 +895,17 @@ static int layout_binding_value(const char *lp, const char *rp)
                 while (e < rp && isspace((unsigned char)*e)) e++;
                 if (e < rp && isdigit((unsigned char)*e))
                 {
-                    int v = 0;
-                    while (e < rp && isdigit((unsigned char)*e)) v = v * 10 + (*e++ - '0');
-                    return v;
+                    /* a GLSL integer constant: decimal, octal (leading 0) or hex
+                     * (r159: "binding=017" is 15 — KHR-GL46.layout_binding
+                     * buffer_layout_binding_atomicAdd_* binding_integer_constant) */
+                    char lit[32];
+                    size_t len = 0;
+                    while (e < rp && len + 1 < sizeof lit &&
+                           (isxdigit((unsigned char)*e) || *e == 'x' || *e == 'X'))
+                        lit[len++] = *e++;
+                    lit[len] = 0;
+                    long v = strtol(lit, NULL, 0);
+                    return (v < 0 || v > 0x7fffffff) ? -1 : (int)v;
                 }
             }
             return -1;

@@ -684,6 +684,16 @@ typedef struct {
 
     GLuint      active_texture; // GL_ACTIVE_TEXTURE
     unsigned    active_texture_mask[4];
+    /* r159: uniform-buffer binding points MAX_BINDABLE_BUFFERS ..
+     * MGL_MAX_UNIFORM_BUFFER_BINDINGS-1 (compat r111 advertises 512; rsvga's D3D9
+     * fragment constants sit at 256).  They were an 8-entry table shared by every
+     * context that dropped the lowest point when full, so glBindBuffersBase over
+     * the whole range lost bindings (KHR-GL46.multi_bind functional_bind_buffers_*).
+     * ubo_high_gen is bumped on every change: the draw-fast gate's indexed-binding
+     * check covers only the buffer_base rows. */
+    BufferBaseTarget ubo_high[MGL_MAX_UNIFORM_BUFFER_BINDINGS - MAX_BINDABLE_BUFFERS];
+    GLuint      ubo_high_gen;
+    uint32_t    ubo_high_range[(MGL_MAX_UNIFORM_BUFFER_BINDINGS - MAX_BINDABLE_BUFFERS + 31) / 32];
     /* r158: bumped by every sampler / image uniform write (glUniform1i on an
      * opaque uniform re-points its slot at another unit).  The draw-fast gate
      * latches it: the per-unit texture checks cannot see a slot moving between

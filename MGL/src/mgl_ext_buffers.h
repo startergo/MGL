@@ -43,7 +43,10 @@ struct MGLExtState_buffers {
     uint32_t track_cap;                 /* power of two */
     uint32_t track_used;                /* live + tombstones */
 
-    uint32_t range_mask[4];             /* indexed bindings made with *Range: UBO, SSBO, atomic, xfb */
+    /* indexed bindings made with *Range: UBO, SSBO, atomic, xfb — one bit per binding
+     * point below MAX_BINDABLE_BUFFERS (r159: was one 32-bit word, and 1u << index
+     * wrapped for points >= 32) */
+    uint32_t range_mask[4][(MAX_BINDABLE_BUFFERS + 31) / 32];
 
     Sync **syncs;                       /* live sync objects (for IsSync / validation) */
     uint32_t sync_count, sync_cap;

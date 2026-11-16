@@ -297,7 +297,7 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 
 uint32_t *mgl_buffers_range_mask(GLMContext ctx, int slot)
 {
-    return &EXT()->range_mask[slot & 3];
+    return EXT()->range_mask[slot & 3];
 }
 
 #pragma mark - sync object registry
@@ -449,17 +449,19 @@ static bool buffers_get_indexed(GLMContext ctx, GLenum pname, GLuint index, GLui
         mgl_get_store(type, data, 0, 0);   /* unclaimed overflow point: empty binding */
         return true;
     }
-    bool is_range = EXT() && index < 32 && (EXT()->range_mask[slot] & (1u << index));
     bool overflow = (slot == 0) && index >= MAX_BINDABLE_BUFFERS;
+    bool is_range = overflow
+        ? (STATE(ubo_high_range[(index - MAX_BINDABLE_BUFFERS) >> 5]) >> ((index - MAX_BINDABLE_BUFFERS) & 31)) & 1u
+        : EXT() && index < MAX_BINDABLE_BUFFERS && ((EXT()->range_mask[slot][index >> 5] >> (index & 31)) & 1u);
     double v;
 
     switch(what)
     {
-        /* overflow points keep their bound range in the entry itself (Base binds store
-         * offset 0 / the whole buffer size), so no range_mask bit is tracked for them */
+        /* START / SIZE are 0 for a Base binding (GL 4.6 6.1.1), the bound range for a
+         * Range binding — points >= MAX_BINDABLE_BUFFERS track that in ubo_high_range */
         case 0:  v = bt->buf ? bt->buf->name : 0; break;
-        case 1:  v = (bt->buf && (overflow || is_range)) ? (double)bt->offset : 0; break;
-        default: v = (bt->buf && (overflow || is_range)) ? (double)bt->size : 0; break;
+        case 1:  v = (bt->buf && is_range) ? (double)bt->offset : 0; break;
+        default: v = (bt->buf && is_range) ? (double)bt->size : 0; break;
     }
 
     mgl_get_store(type, data, 0, v);

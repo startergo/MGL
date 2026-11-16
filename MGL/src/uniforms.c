@@ -547,7 +547,12 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
      * every point (buffer_base rows for < MAX_BINDABLE_BUFFERS, the overflow table
      * above), so no renderer-table clamp here: KHR-GL46.layout_binding block
      * binding_api_update re-points blocks at sparse points up to 83 and draws. */
-    GLuint max = ctx->state.var.max_uniform_buffer_bindings > 84 ? (GLuint)ctx->state.var.max_uniform_buffer_bindings : 84;
+    /* r159: the reported GL_MAX_UNIFORM_BUFFER_BINDINGS (compat r111: 512), as in
+     * get.c / buffers.c — the cached macOS default (84) rejected points the GL
+     * reports as valid (KHR-GL46.layout_binding block_layout_binding_block_*:
+     * glUniformBlockBinding(..., 511)) */
+    GLuint max = ctx->state.var.max_uniform_buffer_bindings > MGL_MAX_UNIFORM_BUFFER_BINDINGS
+                     ? (GLuint)ctx->state.var.max_uniform_buffer_bindings : MGL_MAX_UNIFORM_BUFFER_BINDINGS;
     if (uniformBlockBinding >= max) { mgli_set_error(ctx, __FUNCTION__, GL_INVALID_VALUE); return; }
     MGLIBlock *b = &ip->ubos[uniformBlockIndex];
     b->binding = (GLint)uniformBlockBinding;
