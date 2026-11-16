@@ -684,6 +684,11 @@ typedef struct {
 
     GLuint      active_texture; // GL_ACTIVE_TEXTURE
     unsigned    active_texture_mask[4];
+    /* r158: bumped by every sampler / image uniform write (glUniform1i on an
+     * opaque uniform re-points its slot at another unit).  The draw-fast gate
+     * latches it: the per-unit texture checks cannot see a slot moving between
+     * two unchanged units. */
+    GLuint      sampler_map_gen;
     Texture     *active_textures[TEXTURE_UNITS];
     TextureUnit texture_units[TEXTURE_UNITS];
     Sampler     *texture_samplers[TEXTURE_UNITS];

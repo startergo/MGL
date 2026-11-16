@@ -810,6 +810,7 @@ uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
 uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
 /* r154: partial-walk verdict counts (MGL_PROFILE drawfast-partial line) */
 uint64_t mgl_compat_fast_tex, mgl_compat_fast_bufs, mgl_compat_fast_rs, mgl_compat_fast_moved;
+uint64_t mgl_compat_fast_texunits;   /* r158: texture partial walks that re-bound only the moved units */
 
 /* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
  * mapBuffersToMTL (MGLRenderer.m) re-enumerates the program's SPIR-V buffer
@@ -1094,6 +1095,7 @@ struct MGLCompatDrawSnap {
     const void *tex[TEXTURE_UNITS], *samp[TEXTURE_UNITS];
     void *tex_mtl[TEXTURE_UNITS], *tex_par[TEXTURE_UNITS], *samp_par[TEXTURE_UNITS];
     uint32_t tex_pser[TEXTURE_UNITS], samp_pser[TEXTURE_UNITS];   /* r154: TextureParameter.mtl_serial */
+    GLuint      sampler_map_gen;        /* r158: ctx->state.sampler_map_gen at latch */
     /* indexed binding tables (gate 26): DIRTY_BUFFER_BASE_STATE stands between
      * draws that re-point an indexed binding (glBindBufferBase/Range on UBO /
      * SSBO / ACB), and the skip path never re-runs mapGLBuffersToMTLBufferMap,
@@ -1127,6 +1129,13 @@ struct MGLCompatDrawFast {
      * (program, vertex MSL) — the MSL pointer moves on every relink. */
     const void *tdep_prog, *tdep_msl;
     bool        tdep;
+    /* r158: the gate's texture verdict for compatDrawFastTextures — the units
+     * whose binding moved, or tex_full when the whole bind walk must run */
+    unsigned    tex_units[4];
+    bool        tex_full;
+    /* r158: does the program bind separate images / samplers? (per program) */
+    const void *sep_prog;
+    bool        sep;
     uint64_t    dirtymask_seen[8];   /* MGL_DRAWFAST_DEBUG: distinct dirty_bits values */
     uint64_t    dirtymask_val[8];
 
@@ -1162,7 +1171,7 @@ static const char *const s_compat_df_why[] = {
     "flist-dirty", "no-vattrib", "plan", "vao-fmt/binding", "current-attribs",
     "(15)", "va-mapped", "va-dirty", "va-mtl-id", "tex-mask",
     "tex/samp-id", "tex-dirty", "tex-mtl/params", "samp-params", "tex-image-units",
-    "tess-route", "bufbase", "tex-vsdep", "rebind+tex"
+    "tess-route", "bufbase", "tex-vsdep", "rebind+tex", "sampler-map"
 };
 
 void mgl_compat_drawfast_debug(void)
@@ -1190,11 +1199,13 @@ void mgl_compat_drawfast_debug(void)
                 (unsigned long long)df->listwhy[1][2], (unsigned long long)df->listwhy[1][4],
                 (unsigned long long)df->listwhy[1][5]);
     if (mgl_compat_fast_tex + mgl_compat_fast_bufs + mgl_compat_fast_rs + mgl_compat_fast_rebind)
-        fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f\n",
-                (double)mgl_compat_fast_tex / 120.0, (double)mgl_compat_fast_bufs / 120.0,
+        fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f (moved units only %.1f) buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f\n",
+                (double)mgl_compat_fast_tex / 120.0, (double)mgl_compat_fast_texunits / 120.0,
+                (double)mgl_compat_fast_bufs / 120.0,
                 (double)mgl_compat_fast_moved / 120.0, (double)mgl_compat_fast_rs / 120.0,
                 (double)mgl_compat_fast_rebind / 120.0);
     mgl_compat_fast_tex = mgl_compat_fast_bufs = mgl_compat_fast_rs = mgl_compat_fast_moved = 0;
+    mgl_compat_fast_texunits = 0;
     mgl_compat_fast_rebind = 0;
     memset(df->listwhy, 0, sizeof(df->listwhy));
     for (unsigned i = 0; i < 8; i++)
@@ -1400,6 +1411,19 @@ static bool compatTexPipeDependent(GLMContext ctx, struct MGLCompatDrawFast *df)
     return df->tdep;
 }
 
+/* r158 kill switch: MGL_DRAWFAST_UNITS=0 makes the texture partial walk run the
+ * whole texture bind walk again (r154 behaviour) */
+static bool compatUnitsOn(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_DRAWFAST_UNITS");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 /* r154 kill switch: MGL_DRAWFAST_R154=0 restores the r153 gate verdicts */
 static bool compatR154On(void)
 {
@@ -1524,6 +1548,18 @@ static bool compatR154On(void)
     {
         bool tex_clean = !(ctx->state.dirty_bits & (DIRTY_TEX | DIRTY_TEX_PARAM | DIRTY_TEX_BINDING |
                                                     DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE | DIRTY_PROGRAM));
+        df->tex_units[0] = df->tex_units[1] = df->tex_units[2] = df->tex_units[3] = 0;
+        df->tex_full = false;
+        /* r158: a sampler / image uniform re-pointed a slot at another unit: the
+         * per-unit checks below cannot see that, the whole bind walk must run */
+        if (ctx->state.sampler_map_gen != s->sampler_map_gen)
+        {
+            if (!r154)
+                MGL_DF_MISS(29);
+            tex_moved = true;
+            df->tex_full = true;
+            tex_clean = false;
+        }
         if (!tex_clean)
         {
             if (memcmp(ctx->state.image_units, s->image_units, sizeof(s->image_units)) != 0)
@@ -1577,6 +1613,8 @@ static bool compatR154On(void)
                         unit_moved = true;
                     }
                     tex_moved |= unit_moved;
+                    if (unit_moved)
+                        df->tex_units[w] |= 1u << (u - w * 32);
                 }
             }
         }
@@ -1594,6 +1632,10 @@ static bool compatR154On(void)
     bool tex_partial = r154 && (tex_moved || (ctx->state.dirty_bits & (DIRTY_TEX | DIRTY_SAMPLER)));
     if (tex_partial && compatTexPipeDependent(ctx, df))
         MGL_DF_MISS(27);
+    /* r158: texture-side dirt with no unit seen moving (a content-side change
+     * the identities do not show) keeps the full bind walk */
+    if (tex_partial && !(df->tex_units[0] | df->tex_units[1] | df->tex_units[2] | df->tex_units[3]))
+        df->tex_full = true;
 
     /* buffer-map groups: identity of the maps and of every mapped buffer */
     { int wv = 0, wf = 0;
@@ -1790,6 +1832,7 @@ static bool compatR154On(void)
     s->vao = (const void *)ctx->state.vao;
     s->fbo = (const void *)ctx->state.framebuffer;
     s->tess_active = [self extTessActive] ? 1 : 0;
+    s->sampler_map_gen = ctx->state.sampler_map_gen;
 
     {
         struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
@@ -2051,12 +2094,35 @@ static bool compatR154On(void)
     }
 
     m->texext_skip_epoch = 0;               /* the texext hook below must re-run */
+
+    /* r158: re-bind only the units the gate saw move.  Every other unit's
+     * texture, sampler, parameter caches and slot mapping are gate-proven
+     * unchanged on this same encoder, and the moved textures are realized
+     * (gate), so neither the unit realization walk nor the other slots run. */
+    bool masked = !df->tex_full && compatUnitsOn();
+    if (masked)
+    {
+        Program *p = ctx->state.program;
+        if (df->sep_prog != (const void *)p)
+        {
+            df->sep_prog = p;
+            df->sep = false;
+            for (int st = 0; st < _MAX_SHADER_TYPES && p; st++)
+                if (p->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE].count ||
+                    p->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count)
+                    df->sep = true;
+        }
+        masked = !df->sep;
+    }
+    if (masked)
+        mgl_compat_fast_texunits++;
+
     uint64_t t15 = mgl_prof_begin(15);
-    bool ok = [self bindActiveTexturesToMTL];
+    bool ok = masked || [self bindActiveTexturesToMTL];
     if (ok)
     {
         uint64_t p5 = mgl_prof_begin(5);
-        ok = [self bindTexturesToCurrentRenderEncoder];
+        ok = [self bindTexturesToCurrentRenderEncoderUnits: masked ? df->tex_units : NULL];
         mgl_prof_end(5, p5);
     }
     mgl_prof_end(15, t15);

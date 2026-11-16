@@ -2539,6 +2539,17 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
 
 - (bool) bindTexturesToCurrentRenderEncoder
 {
+    return [self bindTexturesToCurrentRenderEncoderUnits: NULL];
+}
+
+/* r158: unit_mask (TEXTURE_UNITS bits) restricts the walk to the sampled-image
+ * elements fed by those units — the draw-fast texture partial walk passes the
+ * units whose texture / sampler / parameters moved, every other slot provably
+ * still holds its binding on this encoder.  The caller only passes a mask when
+ * the program has no separate images/samplers and the image units are
+ * unchanged, so those sections run only for a full walk (NULL). */
+- (bool) bindTexturesToCurrentRenderEncoderUnits: (const unsigned *) unit_mask
+{
     // sampled textures of the vertex and fragment stages (texdata); unbound units are skipped
     // tess: the vertex-stage textures are the evaluation shader's (tess domain)
     int stages[2] = { [self extTessActive] ? _TESS_EVALUATION_SHADER : _VERTEX_SHADER, _FRAGMENT_SHADER };
@@ -2594,6 +2605,8 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                                                                                spirv_binding + e));
             if (unit >= TEXTURE_UNITS)
                 continue;
+            if (unit_mask && !(unit_mask[unit >> 5] & (1u << (unit & 31))))
+                continue;                   /* r158: unit unchanged since the latched walk */
             /* GL sampler semantics: the sampler's dimension selects the unit's
              * binding for that target (mgl_texture_for_sampler) */
             Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
@@ -2718,6 +2731,9 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             }
         }
     }
+
+    if (unit_mask)
+        return true;                        /* r158: see the method comment */
 
     /* Vulkan-style SEPARATE images and samplers (bindSeparateImagesSamplersStage):
      * the combined loop above only walks SAMPLED_IMAGE */

@@ -105,6 +105,7 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                     }
                 }
             ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_IMAGE_UNIT_STATE;
+            ctx->state.sampler_map_gen++;      /* r158: see glm_context.h */
             continue;
         }
         Buffer *b = ip->dub[s];

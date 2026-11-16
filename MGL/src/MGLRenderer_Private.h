@@ -195,6 +195,7 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (NSUInteger)bytesPerPixelForFormat:(GLenum)internalformat;
 - (id<MTLSamplerState>) createMTLSamplerForTexParam:(TextureParameter *)tex_param target:(GLuint)target;
 - (bool) bindTexturesToCurrentRenderEncoder;
+- (bool) bindTexturesToCurrentRenderEncoderUnits: (const unsigned *) unit_mask;   /* r158 */
 -(void)mtlBlitFramebuffer:(GLMContext)glm_ctx srcX0:(size_t)srcX0 srcY0:(size_t)srcY0 srcX1:(size_t)srcX1 srcY1:(size_t)srcY1 dstX0:(size_t)dstX0 dstY0:(size_t)dstY0 dstX1:(size_t)dstX1 dstY1:(size_t)dstY1 mask:(size_t)mask filter:(GLuint)filter;
 - (Texture *)framebufferAttachmentTexture: (FBOAttachment *)fbo_attachment;
 - (bool)bindMTLTexture:(Texture *)tex;
