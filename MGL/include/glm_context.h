@@ -184,7 +184,12 @@ typedef struct BufferData_t {
     size_t          buffer_size;
     vm_address_t    buffer_data;
     void            *mtl_data;
+    void            *pool;      /* r153: retired Metal storages of THIS buffer, reused once
+                                 * their command buffer completed (MGLRenderer+Draw.m) */
 } BufferData;
+
+/* r153: release a buffer's pool of retired Metal storages (buffer deletion) */
+void mgl_buffer_pool_free(BufferData *d);
 
 #define BUFFER_IMMUTABLE_STORAGE_FLAG   0x1
 #define BUFFER_MAP_PERSISTENT_BIT       (BUFFER_IMMUTABLE_STORAGE_FLAG << 1)

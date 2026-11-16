@@ -240,23 +240,183 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     return buf->data.mtl_data != NULL;
 }
 
+/* r153: per-buffer pool of retired Metal storages.
+ *
+ * A buffer the GPU still reads gets fresh storage on a CPU write (extBufRename,
+ * the orphan path of mgl_buffers_prepare_cpu_write) or on re-specification
+ * (glBufferData: extBufRelease, then bindMTLBuffer at the next draw).  Each fresh
+ * storage was a new MTLBuffer — one IOAccelResourceCreate kernel call — so a
+ * client that rewrites its constant blocks before every draw paid a kernel
+ * allocation per block per draw (rsvga: ~29% of its command thread).
+ *
+ * The storage a buffer gives up is kept here, stamped with the current command
+ * buffer serial, and handed back to the SAME buffer once that command buffer has
+ * completed.  Per buffer, not shared: a retired storage is never reused by another
+ * GL buffer, so nothing that still references it (a texture-buffer view, a cached
+ * binding) can ever see another buffer's contents.  FIFO: serials only grow, so
+ * the head is the oldest; a head of another length / options (the buffer was
+ * re-specified) is released.  A frame of in-flight draws needs that many storages
+ * per buffer, so the depth is bounded by count and bytes, not small. */
+#define MGL_BUFPOOL_MAX_ENTRIES 4096
+#define MGL_BUFPOOL_MAX_BYTES   ((size_t)64 << 20)
+
+typedef struct { void *mtl; uint64_t serial; size_t len; } MGLBufPoolEnt;
+typedef struct { MGLBufPoolEnt *e; uint32_t head, count, cap; size_t bytes; } MGLBufPool;
+
+uint64_t mgl_bufpool_stat_reuse, mgl_bufpool_stat_alloc;   /* tests / MGL_PROFILE */
+
+static void bufpool_drop_head(MGLBufPool *p)
+{
+    MGLBufPoolEnt *h = &p->e[p->head];
+    if (h->mtl)
+        CFRelease(h->mtl);
+    p->bytes -= h->len;
+    h->mtl = NULL;
+    p->head = (p->head + 1) % p->cap;
+    p->count--;
+}
+
+void mgl_buffer_pool_free(BufferData *d)
+{
+    MGLBufPool *p = d ? (MGLBufPool *)d->pool : NULL;
+    if (!p)
+        return;
+    while (p->count)
+        bufpool_drop_head(p);
+    free(p->e);
+    free(p);
+    d->pool = NULL;
+}
+
+/* takes ownership of one retain on storage */
+- (void) extBufPoolPut: (Buffer *) buf storage: (void *) storage
+{
+    if (!storage)
+        return;
+    if (buf->storage_flags & GL_CLIENT_STORAGE_BIT)
+    {
+        CFRelease(storage);           /* wraps client memory: never recycled */
+        return;
+    }
+
+    MGLBufPool *p = (MGLBufPool *)buf->data.pool;
+    if (!p)
+    {
+        p = (MGLBufPool *)calloc(1, sizeof(*p));
+        if (!p) { CFRelease(storage); return; }
+        buf->data.pool = p;
+    }
+
+    size_t len = ((__bridge id<MTLBuffer>)storage).length;
+    if (len > MGL_BUFPOOL_MAX_BYTES)
+    {
+        CFRelease(storage);
+        return;
+    }
+    while (p->count && (p->count >= MGL_BUFPOOL_MAX_ENTRIES || p->bytes + len > MGL_BUFPOOL_MAX_BYTES))
+        bufpool_drop_head(p);
+
+    if (p->count == p->cap)
+    {
+        uint32_t ncap = p->cap ? p->cap * 2 : 16;
+        MGLBufPoolEnt *ne = (MGLBufPoolEnt *)calloc(ncap, sizeof(*ne));
+        if (!ne) { CFRelease(storage); return; }
+        for (uint32_t i = 0; i < p->count; i++)
+            ne[i] = p->e[(p->head + i) % p->cap];
+        free(p->e);
+        p->e = ne;
+        p->head = 0;
+        p->cap = ncap;
+    }
+
+    MGLBufPoolEnt *t = &p->e[(p->head + p->count) % p->cap];
+    t->mtl = storage;
+    t->len = len;
+    /* the command buffer whose completion frees it: the current one if it is still
+     * open (it is committed after this point, so after any side command buffer —
+     * tess / geometry / xfb — that encoded this storage, and the queue runs in
+     * order); right after a flush the current one is already committed, so wait for
+     * the NEXT one instead */
+    {
+        uint64_t serial = [self extBufSerial];
+        if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
+            serial++;
+        t->serial = serial;
+    }
+    p->bytes += len;
+    p->count++;
+}
+
+/* a retired storage of this buffer with this length and options whose command
+ * buffer has completed, or nil */
+- (id<MTLBuffer>) extBufPoolTake: (Buffer *) buf length: (NSUInteger) length options: (MTLResourceOptions) options
+{
+    MGLBufPool *p = (MGLBufPool *)buf->data.pool;
+    if (!p || !p->count)
+        return nil;
+
+    uint64_t completed = [self extBufCompletedSerial];
+    while (p->count)
+    {
+        MGLBufPoolEnt *h = &p->e[p->head];
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)h->mtl;
+
+        /* compare what the storage IS (storage + CPU cache mode): a buffer reports
+         * extra bits it was not created with (hazard tracking), so the options
+         * bindMTLBuffer asks for would never match the reported ones */
+        const MTLResourceOptions shape = MTLResourceStorageModeMask | MTLResourceCPUCacheModeMask;
+        if (b.length != length || (b.resourceOptions & shape) != (options & shape))
+        {
+            bufpool_drop_head(p);      /* re-specified: other shape */
+            continue;
+        }
+        if (h->serial > completed)
+            return nil;                /* oldest still in flight: so is every later one */
+
+        id<MTLBuffer> out = (__bridge_transfer id<MTLBuffer>)h->mtl;
+        h->mtl = NULL;
+        p->bytes -= h->len;
+        p->head = (p->head + 1) % p->cap;
+        p->count--;
+        mgl_bufpool_stat_reuse++;
+        return out;
+    }
+    return nil;
+}
+
 - (bool) extBufRename: (Buffer *) buf
 {
     if (!buf->data.mtl_data || !buf->data.buffer_data)
         return false;
 
     id<MTLBuffer> old = (__bridge id<MTLBuffer>)buf->data.mtl_data;
-    id<MTLBuffer> fresh = [_device newBufferWithBytes: old.contents length: old.length options: old.resourceOptions];
+    id<MTLBuffer> fresh = [self extBufPoolTake: buf length: old.length options: old.resourceOptions];
+
+    if (fresh)
+    {
+        memcpy(fresh.contents, old.contents, old.length);
+        if (fresh.storageMode == MTLStorageModeManaged)
+            [fresh didModifyRange: NSMakeRange(0, old.length)];
+    }
+    else
+    {
+        fresh = [_device newBufferWithBytes: old.contents length: old.length options: old.resourceOptions];
+        if (fresh)
+            mgl_bufpool_stat_alloc++;
+    }
 
     if (!fresh)
         return false;
 
-    // queued command buffers keep their reference to the old storage
-    CFBridgingRelease(buf->data.mtl_data);
+    // queued command buffers keep their reference to the old storage; it waits in
+    // the pool until they complete (r153)
+    void *retired = buf->data.mtl_data;
 
     buf->data.mtl_data = (void *)CFBridgingRetain(fresh);
     buf->data.buffer_data = (vm_address_t)fresh.contents;
     buf->data.buffer_size = fresh.length;
+
+    [self extBufPoolPut: buf storage: retired];
 
     return true;
 }
@@ -281,8 +441,11 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 {
     if (buf->data.mtl_data)
     {
-        CFBridgingRelease(buf->data.mtl_data);
+        /* r153: re-specification / deletion — keep the storage for this buffer's
+         * next bindMTLBuffer (deletion frees the pool: mgl_buffer_pool_free) */
+        void *retired = buf->data.mtl_data;
         buf->data.mtl_data = NULL;
+        [self extBufPoolPut: buf storage: retired];
     }
 }
 

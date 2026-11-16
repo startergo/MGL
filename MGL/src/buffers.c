@@ -697,6 +697,7 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
 
         deleteHashElement(&STATE(buffer_table), buffer);
 
+        mgl_buffer_pool_free(&ptr->data);   /* r153: retired storages */
         free(ptr);
     }
 }

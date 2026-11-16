@@ -372,6 +372,8 @@ void logDirtyBits(GLMContext ctx)
 }
 
 #pragma mark buffer objects
+extern uint64_t mgl_bufpool_stat_alloc;   /* r153: MGLRenderer+Draw.m */
+
 - (void) bindMTLBuffer:(Buffer *) ptr
 {
     // 'buffers' domain: the MTLBuffer ALIASES the GL data store (Buffer.data.buffer_data),
@@ -403,18 +405,37 @@ void logDirtyBits(GLMContext ctx)
                                            vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) pointer, len);
                                        }];
     }
+    else if ((buffer = [self extBufPoolTake: ptr length: length options: options]))
+    {
+        /* r153: a retired storage of this buffer (glBufferData re-specification) */
+        if (ptr->data.buffer_data)
+        {
+            size_t n = ptr->data.buffer_size < length ? ptr->data.buffer_size : length;
+            memcpy(buffer.contents, (void *)ptr->data.buffer_data, n);
+            if (n < length)
+                memset((char *)buffer.contents + n, 0, length - n);
+            vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) ptr->data.buffer_data, ptr->data.buffer_size);
+        }
+        else
+            memset(buffer.contents, 0, length);   /* newBufferWithLength zero-fills too */
+        if (buffer.storageMode == MTLStorageModeManaged)
+            [buffer didModifyRange: NSMakeRange(0, length)];
+    }
     else if (ptr->data.buffer_data)
     {
         buffer = [_device newBufferWithBytes:(void *)ptr->data.buffer_data length:length options:options];
 
         if (buffer)
         {
+            mgl_bufpool_stat_alloc++;
             vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) ptr->data.buffer_data, ptr->data.buffer_size);
         }
     }
     else
     {
         buffer = [_device newBufferWithLength: length options: options];
+        if (buffer)
+            mgl_bufpool_stat_alloc++;
     }
 
     if (!buffer)

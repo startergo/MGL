@@ -170,6 +170,7 @@ void deleteHashElement(HashTable *table, GLuint name)
             else if (table == &_ctx->state.buffer_table) {
                 Buffer *buffer = (Buffer *)obj_data;
                 if (buffer->data.mtl_data) { CFRelease(buffer->data.mtl_data); buffer->data.mtl_data = NULL; }
+                mgl_buffer_pool_free(&buffer->data);   /* r153 */
             }
         }
     }
