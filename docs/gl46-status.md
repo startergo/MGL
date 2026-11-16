@@ -1,4 +1,16 @@
-# MGL GL 4.6 port: status (2026-11-16 11:05 EST, gl46-port @ f6390cda)
+# MGL GL 4.6 port: status (2026-11-16 12:15 EST, gl46-port @ 9396f3e2)
+
+## Merged 2026-11-16: partial draw walks for texture switches and moved buffers (9396f3e2, perf r154)
+Prompted by rsvga's MGL_PROFILE: the draw fast path skipped only 18-20% of the state walks. The misses were texture-binding changes (dirty mask 0x4029), vertex-buffer content updates between draws, and listed uniform buffers on new Metal storage after an r153 pool rename.
+
+- Texture-binding-only changes take a new partial walk: the texture branch of processGLState plus the texext hook. mapBuffersToMTL, the VAO branch and the pipeline block are skipped. Declined for programs whose pipeline depends on textures (vertex-stage shadow/wrap constants, geometry/tessellation stages, program pipelines).
+- A listed buffer on new storage of the same size, and a vertex buffer with dirty content or moved storage at its plan slot in the vertex map list, take the buffers-only partial walk. Shader-converted vertex streams still take the full walk.
+- Fixed a stale-sampler bug the new test found (also present without r154): a glSamplerParameter on a bound sampler was ignored because the new sampler-state cache object usually reuses the released one's address. TextureParameter.mtl_serial now disambiguates.
+- MGL_PROFILE: the drawfast-miss labels were shifted by one from index 15 ("va-mtl-id" was really vertex-buffer content dirt); fixed. New drawfast-listwhy and drawfast-partial lines. MGL_DRAWFAST_R154=0 restores the r153 verdicts.
+
+Measured on the M4 Pro (us per draw, 400 draws per frame): texture switch with redundant VAO/UBO rebinds 1.69 -> 1.48; vertex-buffer update every third draw 1.72 -> 1.25; texture + UBO + VBO per draw 2.15 -> 1.95; full walks 100% -> 0% in all three. Test test_drawfast_partial_r154.c.
+
+r154 verified as ONE combined build: headless suite 227 files 0 failures, test_geom x5 817/0; the 42 gl46-main regressions 42/42; es_31_compatibility 317 Pass / 38 NotSupported / 0 Fail; transform_feedback + geometry_shader 157/157; viewport_array + DSA framebuffers + texture_view 46/46; buffer_storage + DSA buffers + SSBO basic + texture_buffer 109/109 (same as the previous tip).
 
 ## Merged 2026-11-16: per-buffer pool of retired Metal storages (f6390cda, perf r153), hash-table bounds (45eb7ee0), README (f7292a09, e9374316)
 Prompted by rsvga's command-thread profile: about 29% of it was MGL creating a new MTLBuffer (one IOAccelResourceCreate kernel call) on every draw for its per-draw constant blocks, through the rename path (CPU write into a buffer the GPU still reads) and the glBufferData re-specification path.
