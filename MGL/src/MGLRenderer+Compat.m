@@ -1128,6 +1128,7 @@ struct MGLCompatDrawFast {
     /* MGL_DRAWFAST_DEBUG: miss-reason histogram (index = miss label below) */
     uint64_t    misswhy[32];
     uint64_t    listwhy[2][6];   /* r154: vlist / flist miss sub-reasons (compatListStable why) */
+    uint64_t    vaowhy[12];      /* r167: vao-fmt/binding sub-reasons (compatRebindClassify) */
     /* r154: does the bound program's pipeline depend on texture state the
      * texture-only partial walk does not re-evaluate (vertex-stage shadow /
      * wrap function constants, geometry / tessellation stages)?  Cached per
@@ -1217,6 +1218,19 @@ void mgl_compat_drawfast_debug(void)
     mgl_compat_fast_texunits = 0;
     mgl_compat_fast_rebind = 0;
     memset(df->listwhy, 0, sizeof(df->listwhy));
+    {   /* r167 */
+        uint64_t any = 0;
+        for (unsigned i = 1; i < 12; i++) any += df->vaowhy[i];
+        if (any)
+        {
+            fprintf(stderr, "MGL PROFILE drawfast-vaowhy:");
+            for (unsigned i = 1; i < 12; i++)
+                if (df->vaowhy[i])
+                    fprintf(stderr, " %s=%llu", s_vaowhy[i], (unsigned long long)df->vaowhy[i]);
+            fprintf(stderr, "\n");
+        }
+        memset(df->vaowhy, 0, sizeof(df->vaowhy));
+    }
     for (unsigned i = 0; i < 8; i++)
         if (df->dirtymask_seen[i])
             fprintf(stderr, "MGL PROFILE drawfast-dirty: 0x%llx x%llu\n",
@@ -1355,7 +1369,12 @@ static void compatListLatch(const BufferMapList *live, BufferMapList *snap,
  * + referenced bindings + alignment class), the plan, the map enumeration and
  * every other gate group are unchanged — only the encoder's vertex-buffer
  * bindings and the map-suffix entries move. */
-static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct MGLCompatDrawSnap *s)
+/* r167: why a respec was not a rebind (profile: drawfast-vaowhy) */
+enum { VW_OK = 0, VW_NOPLAN, VW_SHADOW, VW_ATTR_BINDING, VW_ATTR_FORMAT, VW_ATTR_RELOFS,
+       VW_ATTR_PTRSTRIDE, VW_BUFFERLESS, VW_STRIDE, VW_DIVISOR, VW_OFS_ALIGN, VW_RING_BUFFER };
+static const char *const s_vaowhy[] = { "ok", "no-plan", "shadow-fetch", "attr-binding", "attr-format",
+    "attr-reloffset", "attr-ptr-stride", "bufferless", "stride", "divisor", "offset-align4", "ring-buffer-change" };
+static int compatRebindWhy(GLMContext ctx, MGLVertexArrayFull *va, const struct MGLCompatDrawSnap *s)
 {
     const struct MGLExtState_vattrib *vs =
         (const struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
@@ -1366,29 +1385,36 @@ static bool compatRebindClassify(GLMContext ctx, MGLVertexArrayFull *va, struct 
     if (vs)
         for (int a = 0; a < MAX_ATTRIBS; a++)
             if (vs->plan.fetch[a] == MGL_VA_FETCH_SHADOW)
-                return false;
+                return VW_SHADOW;
 
     for (GLuint a = 0; a < MAX_ATTRIBS; a++)
     {
         const MGLVertexAttribFormat *f = &va->fmt[a], *g = &s->fmt[a];
-        if (f->binding != g->binding || f->size != g->size || f->type != g->type ||
-            f->normalized != g->normalized || f->integer != g->integer || f->is_long != g->is_long ||
-            f->relativeoffset != g->relativeoffset || f->pointer_stride != g->pointer_stride)
-            return false;
+        if (f->binding != g->binding)
+            return VW_ATTR_BINDING;
+        if (f->size != g->size || f->type != g->type ||
+            f->normalized != g->normalized || f->integer != g->integer || f->is_long != g->is_long)
+            return VW_ATTR_FORMAT;
+        if (f->relativeoffset != g->relativeoffset)
+            return VW_ATTR_RELOFS;
+        if (f->pointer_stride != g->pointer_stride)
+            return VW_ATTR_PTRSTRIDE;
     }
     for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
     {
         const MGLVertexBinding *B = &va->binding[b], *G = &s->binding[b];
         if ((B->buffer != NULL) != (G->buffer != NULL))
-            return false;                   /* bufferless <-> buffered: fetch mode change */
-        if (B->stride != G->stride || B->divisor != G->divisor)
-            return false;                   /* layout word change: new PSO key */
+            return VW_BUFFERLESS;           /* bufferless <-> buffered: fetch mode change */
+        if (B->stride != G->stride)
+            return VW_STRIDE;               /* layout word change: new PSO key */
+        if (B->divisor != G->divisor)
+            return VW_DIVISOR;
         if ((B->offset & 3) != (G->offset & 3))
-            return false;                   /* alignment class change: new PSO key */
+            return VW_OFS_ALIGN;            /* alignment class change: new PSO key */
         if (B->buffer && B->buffer != G->buffer && !B->buffer->data.mtl_data)
-            return false;                   /* ring-backed stream: the full walk re-streams */
+            return VW_RING_BUFFER;          /* ring-backed stream: the full walk re-streams */
     }
-    return true;
+    return VW_OK;
 }
 
 /* r154: true when the texture-only partial walk must NOT be used for this program:
@@ -1769,8 +1795,12 @@ static bool compatR154On(void)
                  * rebind + a map-suffix rebuild: classify it and let the rest
                  * of the gate run — if nothing else fails we return
                  * MGL_DF_REBIND instead of a full walk */
-                if (!vs->plan.valid || !compatRebindClassify(ctx, va, s))
+                int vw = !vs->plan.valid ? VW_NOPLAN : compatRebindWhy(ctx, va, s);
+                if (vw != VW_OK)
+                {
+                    df->vaowhy[vw]++;
                     MGL_DF_MISS(13);
+                }
                 rebind = true;
             }
         }

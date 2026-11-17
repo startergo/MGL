@@ -4558,7 +4558,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
              * only rebuilt when there is none (glmark2 re-specifies attribs
              * every draw; the old teardown cost ~60 us per draw) */
             uint64_t t3 = mgl_prof_begin(3);
-            if (mgl_prof_on && (mgl_prof_cnt[10] % 500) == 0)
+            static uint64_t vao_branch_n;   /* r167: own counter, one line per 5000 walks */
+            if (mgl_prof_on && (vao_branch_n++ % 5000) == 0)
                 fprintf(stderr, "MGL PROFILE vao-branch list counts v=%d f=%d\n",
                         ctx->state.vertex_buffer_map_list.count,
                         ctx->state.fragment_buffer_map_list.count);
