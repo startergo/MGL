@@ -580,8 +580,11 @@ void mgl_buffer_pool_free(BufferData *d)
     }
     if (gate == MGL_DF_RSTATE)
     {
-        bool ok = [self compatDrawFastRState];
-        return ok;
+        /* r174: false (no cached pipeline yet for a blend / mask change) falls
+         * through to the full walk with the dirty bits still armed, like the
+         * texture partial — that walk builds and caches the pipeline */
+        if ([self compatDrawFastRState])
+            return true;
     }
     if (gate == MGL_DF_TEXTURES)
     {

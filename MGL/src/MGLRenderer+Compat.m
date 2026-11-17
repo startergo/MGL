@@ -715,6 +715,14 @@ static void compatPlanStore(GLMContext ctx, struct MGLCompatPipeSlot *slot)
     }
     /* miss: remember the key; the descriptor path stores the pipeline into it
      * (compatPipelineStore below, called by processGLState) */
+    /* r174: the key was just reserved (a render-state partial looked it up and
+     * fell back to the full walk, which looks it up again): keep that one slot */
+    if (cache->count && !cache->slots[0].pipe_cf &&
+        cache->slots[0].a == key.a && cache->slots[0].b == key.b)
+    {
+        cache->pending = 0;
+        return false;
+    }
     if (cache->count < MGLC_PIPE_CACHE_SLOTS)
         cache->count++;
     else if (cache->slots[MGLC_PIPE_CACHE_SLOTS - 1].pipe_cf)
@@ -811,6 +819,7 @@ uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
 /* r154: partial-walk verdict counts (MGL_PROFILE drawfast-partial line) */
 uint64_t mgl_compat_fast_tex, mgl_compat_fast_bufs, mgl_compat_fast_rs, mgl_compat_fast_moved;
 uint64_t mgl_compat_fast_texunits;   /* r158: texture partial walks that re-bound only the moved units */
+uint64_t mgl_compat_fast_pipe;       /* r174: partial walks that switched the pipeline (blend / mask change) */
 extern uint64_t mgl_compat_sep_hit, mgl_compat_sep_miss;   /* r173: MGLRenderer.m */
 uint64_t mgl_compat_latch_part;      /* r173: texture partials latched without the vertex-array group */
 uint64_t mgl_compat_fast_uboofs;     /* r166: draws whose uniform-buffer ranges moved within the same buffers */
@@ -1143,6 +1152,7 @@ struct MGLCompatDrawFast {
      * strstr scans over the vertex MSL (~1.5 us on the M4). */
     struct { const void *prog, *msl; bool dep; } tdepc[8];
     bool        tex_rebind;         /* r166: TEXTURES verdict also carries a vertex-array rebind */
+    bool        pipe_change;        /* r174: the partial must look up and bind a new pipeline */
     bool        tex_sampled_only;   /* r171: this gate's unit loop covered exactly the sampled units */
     /* r158: the gate's texture verdict for compatDrawFastTextures — the units
      * whose binding moved, or tex_full when the whole bind walk must run */
@@ -1219,6 +1229,9 @@ void mgl_compat_drawfast_debug(void)
                 (double)mgl_compat_fast_bufs / 120.0,
                 (double)mgl_compat_fast_moved / 120.0, (double)mgl_compat_fast_rs / 120.0,
                 (double)mgl_compat_fast_rebind / 120.0, (double)mgl_compat_fast_uboofs / 120.0);
+    if (mgl_compat_fast_pipe)
+        fprintf(stderr, "MGL PROFILE drawfast-pipeline/frame: %.1f\n", (double)mgl_compat_fast_pipe / 120.0);
+    mgl_compat_fast_pipe = 0;
     if (mgl_compat_sep_hit + mgl_compat_sep_miss)
         fprintf(stderr, "MGL PROFILE sep-resolve/frame: hits=%.1f misses=%.1f partial-latch=%.1f\n",
                 (double)mgl_compat_sep_hit / 120.0, (double)mgl_compat_sep_miss / 120.0,
@@ -1560,6 +1573,24 @@ static bool compatUboRangesPatch(GLMContext ctx, struct MGLCompatDrawSnap *s, Bu
     return true;
 }
 
+/* r174: render-state partials.  Draws whose only dirt is render state
+ * (DIRTY_RENDER_STATE / DIRTY_ALPHA_STATE: blend, colour mask, depth, raster,
+ * stencil...) on the same program / VAO / FBO / encoder take the render-state or
+ * texture partial; a pipeline-baked change (generation_pipeline, alpha bit) adds
+ * a cached-pipeline lookup + bind (compatDrawFastPipe).  Before, every such draw
+ * missed the gate on its dirty bits and ran the full walk.
+ * MGL_DRAWFAST_PIPE=0 restores that. */
+static bool compatPipeOn(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_DRAWFAST_PIPE");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 static bool compatR154On(void)
 {
     static int on = -1;
@@ -1598,8 +1629,10 @@ static bool compatR154On(void)
     /* r154: texture-binding dirt is no longer an automatic miss — the texture
      * group below either proves it redundant or routes the draw to the
      * texture-only partial walk */
+    bool pipe_on = r154 && compatPipeOn();   /* r174 */
     if (ctx->state.dirty_bits & ~(MGL_DF_REDUNDANT |
-                                  (r154 ? (DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER) : 0)))
+                                  (r154 ? (DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER) : 0) |
+                                  (pipe_on ? (DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE) : 0)))
     {
         if (df)
         {
@@ -1678,14 +1711,27 @@ static bool compatR154On(void)
      * re-apply (extRstatePreDraw) — flagged here, returned after the texture
      * epoch is stamped below. */
     bool rstate_only = false;
+    df->pipe_change = false;
     {
         struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
         if (!rs)
             MGL_DF_MISS(6);
-        if (rs->generation != s->rstate_gen)
+        bool rs_dirt = (ctx->state.dirty_bits & (DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE)) != 0;
+        if (rs->generation != s->rstate_gen || rs_dirt)
         {
-            if (rs->generation_pipeline != s->rstate_pipe_gen)
-                MGL_DF_MISS(6);
+            if (rs->generation_pipeline != s->rstate_pipe_gen || (ctx->state.dirty_bits & DIRTY_ALPHA_STATE))
+            {
+                /* r174: a pipeline-baked change on an unchanged program: the
+                 * partial looks the pipeline up in the compat cache.  Programs
+                 * with geometry / tessellation stages and border-colour
+                 * emulation keep the full walk */
+                Program *gp = ctx->state.program;
+                if (!pipe_on || !gp || gp->shader_slots[_GEOMETRY_SHADER] ||
+                    gp->shader_slots[_TESS_CONTROL_SHADER] || gp->shader_slots[_TESS_EVALUATION_SHADER] ||
+                    rs->border_sig)
+                    MGL_DF_MISS(6);
+                df->pipe_change = true;
+            }
             rstate_only = true;
         }
     }
@@ -1953,7 +1999,10 @@ static bool compatR154On(void)
          * stage textures move on the same draw) — the texture-only partial walk
          * re-points the map suffix first (compatRebindRepoint) and re-latches the
          * whole snapshot at its end.  MGL_DRAWFAST_TEXREBIND=0: full walk. */
-        if (tex_partial)
+        /* r174: the rebind-only partial does not re-apply render state: a
+         * render-state change on the same draw takes the texture partial with
+         * the folded rebind (an empty unit mask when no texture moved) */
+        if (tex_partial || rstate_only)
         {
             static int on = -1;
             if (on < 0) { const char *e = getenv("MGL_DRAWFAST_TEXREBIND"); on = (e && e[0] == '0') ? 0 : 1; }
@@ -2301,6 +2350,30 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
     return true;
 }
 
+/* r174: the pipeline step of a render-state partial — the compat pipeline cache
+ * lookup the full walk's pipeline block would make (same trigger: render-state
+ * dirt on an unchanged program / VAO / FBO), then the bind.  false (no cached
+ * pipeline, or the lookup swapped the vertex draw plan) sends the draw to the
+ * full walk with its dirty bits still armed. */
+- (bool) compatDrawFastPipe
+{
+    struct MGLExtMetal_compat *m = compatMetal(ctx);
+    struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
+    if (!df || !df->pipe_change)
+        return true;
+    struct MGLCompatDrawSnap *s = &df->snap;
+    struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+    if (![self compatPipelineFastPath])
+        return false;
+    if (!vs || memcmp(&vs->plan, &s->plan, sizeof(s->plan)) != 0)
+        return false;
+    if ([self compatPipelineBindNeeded])
+        [_currentRenderEncoder setRenderPipelineState: _pipelineState];
+    df->pipe_change = false;
+    mgl_compat_fast_pipe++;
+    return true;
+}
+
 /* partial fast path (perf session 12): only the rstate encoder-state group
  * changed (generation bump, no pipeline-content change — e.g. a blend-colour /
  * stencil-ref / depth-mask write between draws).  Re-apply the encoder state
@@ -2308,7 +2381,13 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
 - (bool) compatDrawFastRState
 {
     uint64_t t30 = mgl_prof_begin(30);
+    if (![self compatDrawFastPipe])         /* r174 */
+    {
+        mgl_prof_end(30, t30);
+        return false;
+    }
     [self extRstatePreDraw: _currentRenderEncoder];
+    ctx->state.dirty_bits &= ~(DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE | MGL_DF_REDUNDANT);
     /* r154: the gate returns this verdict ahead of the listed-buffer scan, so a
      * uniform upload (or a pool-renamed storage) between the two draws must be
      * re-streamed here as the buffers path would (shadow-filtered: unchanged
@@ -2352,6 +2431,12 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
     }
 
     m->texext_skip_epoch = 0;               /* the texext hook below must re-run */
+
+    if (![self compatDrawFastPipe])         /* r174 */
+    {
+        mgl_prof_end(30, t13);
+        return false;
+    }
 
     bool rebound = df->tex_rebind;          /* r173: the latch must then re-record the vertex arrays */
     /* r166: the gate folded a vertex-array rebind into this verdict */
@@ -2413,8 +2498,9 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
     [self extTexextPreDraw: _currentRenderEncoder];
 
     struct MGLExtState_rstate *rs = (struct MGLExtState_rstate *)ctx->state.ext_rstate;
-    if (rs && rs->generation != s->rstate_gen)
+    if (rs && (rs->generation != s->rstate_gen || (ctx->state.dirty_bits & DIRTY_ALPHA_STATE)))
         [self extRstatePreDraw: _currentRenderEncoder];
+    ctx->state.dirty_bits &= ~(DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE);   /* r174 */
 
     if (![self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list] ||
         ![self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list] ||
