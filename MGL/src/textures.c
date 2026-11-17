@@ -864,7 +864,10 @@ void mglActiveTexture(GLMContext ctx, GLenum texture)
 
     STATE(active_texture) = texture - GL_TEXTURE0;
     updateBindingVars(ctx);
-    ctx->state.dirty_bits |= DIRTY_TEX_BINDING;
+    /* r163: selecting the active unit binds nothing — bindTextureToUnit arms the
+     * texture bits when a binding really changes.  The unconditional
+     * DIRTY_TEX_BINDING made every following draw re-prove its texture state
+     * (a D3D9 front end selects a unit before every per-stage bind). */
 }
 
 void mglBindTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)

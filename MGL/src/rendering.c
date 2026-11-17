@@ -127,22 +127,19 @@ void mglClearColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLf
     ctx->state.color_clear_value[1] = green;
     ctx->state.color_clear_value[2] = blue;
     ctx->state.color_clear_value[3] = alpha;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    /* r163: clear values are read only by glClear (rendering.c) and glGet; no draw
+     * consumes them, so they no longer arm DIRTY_STATE — that bit sent the next draw
+     * down the full state walk (a D3D9 front end sets them before every Clear) */
 }
 
 void mglClearStencil(GLMContext ctx, GLint s)
 {
-    ctx->state.var.stencil_clear_value = s;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    ctx->state.var.stencil_clear_value = s;   /* r163: no DIRTY_STATE, see mglClearColor */
 }
 
 void mglClearDepth(GLMContext ctx, GLdouble depth)
 {
-    ctx->state.var.depth_clear_value = depth;
-
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    ctx->state.var.depth_clear_value = depth;   /* r163: no DIRTY_STATE, see mglClearColor */
 }
 
 void mglClearBufferfv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLfloat *value)

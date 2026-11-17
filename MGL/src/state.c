@@ -427,8 +427,7 @@ void mglClearDepthf(GLMContext ctx, GLfloat d)
 {
     if (d < 0.0f) d = 0.0f;
     if (d > 1.0f) d = 1.0f;
-    ctx->state.var.depth_clear_value = d;
-    ctx->state.dirty_bits |= DIRTY_STATE;
+    ctx->state.var.depth_clear_value = d;   /* r163: no DIRTY_STATE (rendering.c mglClearColor) */
 }
 
 #pragma mark - logic op
