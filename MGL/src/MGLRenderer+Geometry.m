@@ -5665,7 +5665,7 @@ static int geomTexSlot(const MGLGeomTexSlot *slots, int n, const char *name)
             [enc setBytes: (const void *)((uint8_t *)b->data.buffer_data + off)
                  length: (NSUInteger)(b->size - (size_t)off)
                  atIndex: (NSUInteger)i];
-            b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+            b->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED);   /* r172 */
             continue;
         }
         [enc setBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data
@@ -7127,7 +7127,7 @@ static uint64_t geomCaptureFingerprint(GLMContext ctx, Program *program)
                     [enc setVertexBytes: (const void *)((uint8_t *)b->data.buffer_data + off)
                                  length: (NSUInteger)(b->size - (size_t)off)
                                 atIndex: (NSUInteger)i];
-                    b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+                    b->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED);   /* r172 */
                     continue;
                 }
                 [enc setVertexBuffer: (__bridge id<MTLBuffer>)b->data.mtl_data

@@ -1363,7 +1363,7 @@ static void pboWrittenRange(GLMContext ctx, Buffer *pbo, const uint8_t *dst, siz
     if (pbo->data.mtl_data && ctx->mtl_funcs.ext_fb && ctx->mtl_funcs.ext_fb->write_buffer)
         ctx->mtl_funcs.ext_fb->write_buffer(ctx, pbo, offset, size, dst);
     else
-        pbo->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        pbo->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
 }
 
 static size_t typeAlign(GLenum type)

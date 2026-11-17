@@ -395,12 +395,15 @@ void mgl_profile_dump(void)
     /* r161: buffer storage pool (r153): storages taken back vs new Metal buffers */
     {
         extern uint64_t mgl_bufpool_stat_reuse, mgl_bufpool_stat_alloc;
+        extern uint64_t mgl_buf_sync_full, mgl_buf_sync_skipped;
         static uint64_t last_reuse, last_alloc;
         uint64_t ru = mgl_bufpool_stat_reuse - last_reuse, al = mgl_bufpool_stat_alloc - last_alloc;
         last_reuse = mgl_bufpool_stat_reuse; last_alloc = mgl_bufpool_stat_alloc;
-        if (ru || al)
-            fprintf(stderr, "MGL PROFILE bufpool/frame: reused=%.1f new-metal-buffers=%.1f\n",
-                    (double)ru / 120.0, (double)al / 120.0);
+        if (ru || al || mgl_buf_sync_full || mgl_buf_sync_skipped)
+            fprintf(stderr, "MGL PROFILE bufpool/frame: reused=%.1f new-metal-buffers=%.1f whole-buffer-syncs=%.1f range-synced-skips=%.1f\n",
+                    (double)ru / 120.0, (double)al / 120.0,
+                    (double)mgl_buf_sync_full / 120.0, (double)mgl_buf_sync_skipped / 120.0);
+        mgl_buf_sync_full = mgl_buf_sync_skipped = 0;
     }
     mgl_site_dump();   /* r164 */
     /* compat perf session 3: Metal argument-bind accounting (MGLRenderer+Compat.m) */
@@ -1008,6 +1011,9 @@ static char kComputeFallbackKey;
     return true;
 }
 
+/* r172: updateDirtyBuffer outcomes (MGL_PROFILE bufpool line) */
+uint64_t mgl_buf_sync_full, mgl_buf_sync_skipped;
+
 - (bool) updateDirtyBuffer:(Buffer *)ptr
 {
     // buffers less than 4k will be uploaded using setVertexBytes
@@ -1043,6 +1049,30 @@ static char kComputeFallbackKey;
             return true;
         }
 
+        /* r172: every write since the last draw went through bufferDidModify /
+         * the compat ring, which already marked its exact range modified
+         * (extBufDidModify): the whole-buffer didModifyRange below re-uploaded
+         * the entire storage of a managed buffer on discrete GPUs — for a
+         * constant ring written per draw, the whole ring per draw.
+         * MGL_BUF_RANGED_SYNC=0: always the whole-buffer sync. */
+        static int ranged = -1;
+        if (ranged < 0) { const char *e = getenv("MGL_BUF_RANGED_SYNC"); ranged = (e && e[0] == '0') ? 0 : 1; }
+        /* r172: a live persistent COHERENT mapping is the case the per-draw sync
+         * below exists for.  This used to test ptr->access — the GL access enum,
+         * whose GL_READ_WRITE (0x88BA) has the GL_MAP_COHERENT_BIT (0x80) bit —
+         * so every dirty buffer took the coherent branch: a zero-length sync of
+         * the (unmapped) range and DIRTY_BUFFER_DATA kept set for ever.  Every
+         * later draw re-flushed and re-bound it, and the writers that do not
+         * report their range never reached the GPU on discrete (managed) storage. */
+        bool coherent = ptr->mapped && (ptr->access_flags & GL_MAP_COHERENT_BIT);
+        if (ranged && !(ptr->data.dirty_bits & DIRTY_BUFFER_UNSYNCED) && !coherent)
+        {
+            ptr->data.dirty_bits = 0;
+            mgl_buf_sync_skipped++;
+            return true;
+        }
+        mgl_buf_sync_full++;
+
         // CRITICAL SECURITY FIX: Safe Metal buffer validation
         id<MTLBuffer> buffer = (id<MTLBuffer>)SafeMetalBridge(ptr->data.mtl_data, objc_getClass("MTLBuffer"), "MTLBuffer");
         if (!buffer) {
@@ -1053,7 +1083,7 @@ static char kComputeFallbackKey;
         // clear dirty bits if not mapped as coherent
         // this will cause us to keep loading the buffer and keep the GPU
         // contents in check for EVERY drawing operation
-        if (ptr->access & GL_MAP_COHERENT_BIT)
+        if (coherent)
         {
             [buffer didModifyRange: NSMakeRange(ptr->mapped_offset, ptr->mapped_length)];
 
@@ -1191,7 +1221,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             [self compatRingVertexBytes:(const void *)ptr->data.buffer_data length:(NSUInteger)ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
-            ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+            ptr->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED);   /* r172 */
         }
         else
         {
@@ -1251,7 +1281,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
             [self compatRingFragmentBytes:(const void *)ptr->data.buffer_data length:(NSUInteger)ptr->size atIndex:(map->mtl_index ? map->mtl_index : (GLuint)i)];
             
             // clear buffer data dirty bits
-            ptr->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+            ptr->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED);   /* r172 */
         }
         else
         {

@@ -384,7 +384,7 @@ static void fbWriteBufferC(GLMContext c, Buffer *buf, size_t offset, size_t size
     else if (buf->data.buffer_data && offset + size <= buf->data.buffer_size)
     {
         memcpy((uint8_t *)buf->data.buffer_data + offset, src, size);
-        buf->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        buf->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
         c->state.dirty_bits |= DIRTY_BUFFER;
     }
 }

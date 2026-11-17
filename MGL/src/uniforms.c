@@ -144,7 +144,7 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                         memcpy(dst + di, src + si, u->st[s].scalar_size);
                     }
                 }
-        b->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        b->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
     }
 }
 

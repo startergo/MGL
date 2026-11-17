@@ -502,7 +502,7 @@ void mglBeginTransformFeedback(GLMContext ctx, GLenum primitiveMode)
                 fprintf(stderr, "MGL xfb begin: buffer %u not bound (mask %u)\n", b, xp->buffer_mask);
             XFB_ERR(GL_INVALID_OPERATION);
         }
-        if (buf->mapped && !(buf->access & GL_MAP_PERSISTENT_BIT)) XFB_ERR(GL_INVALID_OPERATION);
+        if (buf->mapped && !(buf->access_flags & GL_MAP_PERSISTENT_BIT)) XFB_ERR(GL_INVALID_OPERATION);   /* r172: the map flags, not the access enum */
     }
 
     o->active = true;
@@ -3392,7 +3392,7 @@ static bool xfb_process_draw(GLMContext ctx, const XfbDraw *d)
              * GPU write so a later CPU read syncs instead of marking dirty CPU data */
             if (M && M->buffer_gpu_written) M->buffer_gpu_written(ctx, bufs[b], start, bytes);
         } else {
-            bufs[b]->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            bufs[b]->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
             if (M && M->buffer_written) M->buffer_written(ctx, bufs[b], start, bytes);
         }
         o->write_offset[b] += (GLsizeiptr)bytes;

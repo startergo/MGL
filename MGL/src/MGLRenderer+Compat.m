@@ -1315,7 +1315,7 @@ static void compatListClearDataDirty(BufferMapList *live)
     {
         Buffer *b = live->buffers[i].buf;
         if (b && b->data.mtl_data == NULL)
-            b->data.dirty_bits &= ~DIRTY_BUFFER_DATA;
+            b->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED);   /* r172 */
     }
 }
 

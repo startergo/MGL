@@ -3821,7 +3821,7 @@ bool mgli_process_link(GLMContext ctx, Program *ptr, MGLIProgram *ip)
             initBufferData(ctx, b, sc[s].dub_size, NULL, true);
             b->size = sc[s].dub_size;
             memset((void *)b->data.buffer_data, 0, sc[s].dub_size);
-            b->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            b->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
             ip->dub[s] = b;
         }
     }

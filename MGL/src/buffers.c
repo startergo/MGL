@@ -373,7 +373,7 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
     {
         memcpy((void *)ptr->data.buffer_data, data, size);
 
-        ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        ptr->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
     }
 
     return err;

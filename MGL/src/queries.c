@@ -213,7 +213,7 @@ static void write_query_buffer(GLMContext ctx, Buffer *b, GLintptr offset, int k
     if (b->data.buffer_data && (uint64_t)offset + sz <= b->data.buffer_size)
     {
         memcpy((uint8_t *)b->data.buffer_data + offset, bytes, sz);
-        b->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        b->data.dirty_bits |= DIRTY_BUFFER_DATA | DIRTY_BUFFER_UNSYNCED;   /* r172 */
         ctx->state.dirty_bits |= DIRTY_BUFFER;
     }
 

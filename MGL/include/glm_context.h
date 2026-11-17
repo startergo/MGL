@@ -149,6 +149,11 @@ enum {
 
 #define DIRTY_BUFFER_DATA   0x1
 #define DIRTY_BUFFER_ADDR   (DIRTY_BUFFER_DATA << 1)
+/* r172: set with DIRTY_BUFFER_DATA by the writers that do NOT report their range
+ * to the Metal side (did_modify -> didModifyRange on managed storage).  Without
+ * it, updateDirtyBuffer knows every write since the last draw was already
+ * range-synced and skips its whole-buffer didModifyRange. */
+#define DIRTY_BUFFER_UNSYNCED (DIRTY_BUFFER_ADDR << 1)
 
 #define DIRTY_TEXTURE_LEVEL 0x1
 #define DIRTY_TEXTURE_DATA  (DIRTY_TEXTURE_LEVEL << 1)
