@@ -37,6 +37,7 @@ MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
  * called from the swap path / interposer to log rolling per-frame averages */
 uint64_t mgl_prof_begin(int id);
 void mgl_prof_end(int id, uint64_t t0);
+void mgl_prof_slow(const char *what, uint64_t t0, const char *text);   /* r160 */
 void mgl_profile_dump(void);
 void mgl_prof_frame(void);
 

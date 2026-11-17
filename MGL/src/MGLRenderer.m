@@ -206,7 +206,8 @@ unsigned mglExtHookCacheCount(id self, const char *suffix)
  * 2=pipeline descriptor walk 3=newRenderPipelineState (cache miss)
  * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
 #include <mach/mach_time.h>
-#define MGL_PROF_BUCKETS 31
+#include <execinfo.h>
+#define MGL_PROF_BUCKETS 36
 uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];
 /* bumped by each MGL_PROFILE dump: periodic side reports (draw-run histogram)
  * print once per dump instead of on their own cadence */
@@ -245,6 +246,39 @@ __attribute__((noinline)) uint64_t mgl_prof_begin(int id)
     asm volatile("" ::: "memory");
     return t;
 }
+/* r160: with MGL_PROFILE, report one shader / pipeline build that took longer
+ * than 20 ms (MGL_PROFILE_SLOW_MS; the first-draw stalls of new programs).  `what` names the step,
+ * `text` (optional) is hashed (FNV-1a) so separate runs can be compared: the OS
+ * Metal shader cache only hits on byte-identical source. */
+void mgl_prof_slow(const char *what, uint64_t t0, const char *text)
+{
+    if (!t0 || mgl_prof_on <= 0)
+        return;
+    static double limit = -1.0;
+    if (limit < 0.0)
+    {
+        const char *e = getenv("MGL_PROFILE_SLOW_MS");      /* default 20 ms; 0 = every build */
+        limit = e ? atof(e) : 20.0;
+        if (limit < 0.0) limit = 0.0;
+    }
+    uint64_t t = mach_absolute_time();
+    double ms = (double)(t - t0) * mgl_prof_scale;
+    if (ms < limit)
+        return;
+    uint64_t h = 1469598103934665603ULL;
+    size_t n = 0;
+    if (text)
+        for (const char *q = text; *q; q++, n++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; }
+    fprintf(stderr, "MGL PROFILE slow build: %s %.1f ms (text %zu bytes, hash %016llx)\n",
+            what, ms, n, (unsigned long long)(text ? h : 0));
+    if (getenv("MGL_PROFILE_SLOW_BT"))           /* who asked for the build */
+    {
+        void *bt[12];
+        int nb = backtrace(bt, 12);
+        backtrace_symbols_fd(bt, nb, 2);
+    }
+}
+
 __attribute__((noinline)) void mgl_prof_end(int id, uint64_t t0)
 {
     asm volatile("" ::: "memory");
@@ -270,7 +304,9 @@ void mgl_profile_dump(void)
                                     "processGLState", "bindList", "ssboSizes", "texture-bind-walk",
                                     "pipeHit", "pipeMiss-decline", "fboBindAttachTex", "fbBuildPassDesc", "pipeline-block", "tail-pipeBind+PreDraw",
                                     "drawFastGate", "PreDraw-hooks", "extPreDraw", "progSamplers", "queriesPreDraw", "execDrawRaw", "drawIdxList", "drawCachedIdx",
-                                    "drawFastPartial" };
+                                    "drawFastPartial",
+                                    /* r160: shader / pipeline build cost (first draws of new programs) */
+                                    "mtl-library", "mtl-specialize", "mtl-pipeline", "spirv-to-msl", "link-program" };
     double tot = 0;
     for (int i = 0; i < MGL_PROF_BUCKETS; i++) tot += mgl_prof_ns[i] * mgl_prof_scale;
     mgl_prof_dump_seq++;
@@ -4593,9 +4629,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                               pipelineStateDescriptor.vertexDescriptor);
                 }
 
-                uint64_t p3 = mgl_prof_begin(3);
+                uint64_t p3 = mgl_prof_begin(33);
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
-                mgl_prof_end(3, p3);
+                mgl_prof_slow("render pipeline", p3, NULL);
+                mgl_prof_end(33, p3);
                 if (mgl_pipeline_log)
                     NSLog(@"MGL tess: newRenderPipelineState returned %@ err=%@", _pipelineState, error);
 

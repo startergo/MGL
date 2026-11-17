@@ -699,6 +699,10 @@ bool mgl_tess_cpu_reference(void);
 /* the cached separable vertex-kernel MSL of a vs-only program (NULL when absent);
  * a pipeline pair re-compiles canonical-record variants from it */
 const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry);
+/* r160: the kernel MSL only if it already exists — never builds the lazy
+ * variant (the link cache snapshots what is there; building it at every
+ * link compiled a Metal library per program that only tessellation uses) */
+const char *mgl_tess_vs_kernel_msl_built(GLMContext ctx, GLuint name, const char **entry);
 
 /* ---- aliased wide lines (tessellation.c) ---- */
 /* true when this draw must take the wide-line emulation: a line primitive mode,

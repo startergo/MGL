@@ -759,7 +759,10 @@ static bool rs_mode_is_polygon(GLenum m)
     if (hit) return hit[1];
 
     NSError *err = nil;
+    uint64_t t32 = mgl_prof_begin(32);
     id<MTLFunction> fn = [lib newFunctionWithName:base.name constantValues:cv error:&err];
+    mgl_prof_slow("function specialization", t32, NULL);
+    mgl_prof_end(32, t32);
     if (!fn) {
         NSLog(@"MGL rstate: function specialization failed for %@: %@", base.name, err);
         return base;

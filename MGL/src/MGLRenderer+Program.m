@@ -252,9 +252,12 @@ static uint64_t fnidOf(const char *msl, const char *entry)
 
         /* tess domain: precise math when the MSL embeds the fp64 double-single library */
         NSError *error = nil;
+        uint64_t t31 = mgl_prof_begin(31);
         id<MTLLibrary> lib = [_device newLibraryWithSource: src
                                                    options: [self mslCompileOptionsForSource: src]
                                                      error: &error];
+        mgl_prof_slow("metal library", t31, msl);
+        mgl_prof_end(31, t31);
         if (!lib)
         {
             if (error_log)

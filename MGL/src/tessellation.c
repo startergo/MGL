@@ -8050,6 +8050,22 @@ bool mgl_tess_vs_words_get(GLMContext ctx, GLuint name, const uint32_t **words, 
     return false;
 }
 
+const char *mgl_tess_vs_kernel_msl_built(GLMContext ctx, GLuint name, const char **entry)
+{
+    struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;
+
+    if (!S)
+        return NULL;
+    for (unsigned slot = 0; slot < S->vs_kernel_n; slot++)
+        if (S->vs_kernel[slot].name == name && S->vs_kernel[slot].msl)
+        {
+            if (entry)
+                *entry = S->vs_kernel[slot].entry;
+            return S->vs_kernel[slot].msl;
+        }
+    return NULL;
+}
+
 const char *mgl_tess_vs_kernel_msl(GLMContext ctx, GLuint name, const char **entry)
 {
     struct MGLExtState_tess *S = (struct MGLExtState_tess *)ctx->state.ext_tess;

@@ -62,6 +62,11 @@ extern uint32_t *mgl_spirv_lower_aoa_stage_io(const uint32_t *in, size_t n, size
 #include "msl_reserved.h"
 #include "spirv_vote.h"
 
+/* r160: MGL_PROFILE build-cost buckets (MGLRenderer.m) */
+uint64_t mgl_prof_begin(int id);
+void mgl_prof_end(int id, uint64_t t0);
+void mgl_prof_slow(const char *what, uint64_t t0, const char *text);
+
 void mgl_program_ref(Program *ptr);
 void mgl_program_unref(GLMContext ctx, Program *ptr);
 GLint mgl_program_binary_length(GLMContext ctx, Program *ptr);
@@ -828,16 +833,18 @@ static void link_cache_put(GLMContext ctx, MGLProgramObj *obj, const uint64_t k[
         !(obj->linked_mask & (SHADER_MASK_BIT(_TESS_EVALUATION_SHADER) |
                               SHADER_MASK_BIT(_TESS_CONTROL_SHADER))))
     {
-        const char *kmsl = mgl_tess_vs_kernel_msl(ctx, obj->base.name, NULL);
+        /* r160: only what is already built — a non-separable program keeps its
+         * prepared module (words, below) and builds the kernel on its first
+         * tessellation draw; asking mgl_tess_vs_kernel_msl() here built and
+         * compiled it at every link */
+        const char *kentry = NULL;
+        const char *kmsl = mgl_tess_vs_kernel_msl_built(ctx, obj->base.name, &kentry);
         const uint32_t *words = NULL;
         size_t words_n = 0;
         const char *wentry = NULL;
 
         if (kmsl)
         {
-            const char *kentry = NULL;
-
-            mgl_tess_vs_kernel_msl(ctx, obj->base.name, &kentry);
             e->vs_kernel_msl = strdup(kmsl);
             snprintf(e->vs_kernel_entry, sizeof e->vs_kernel_entry, "%s",
                      kentry ? kentry : "main");
@@ -3200,7 +3207,11 @@ static bool compile_stage(GLMContext ctx, MGLProgramObj *dst, int stage, const u
         goto done;
     }
 
-    if (spvc_compiler_compile(compiler, &result) != SPVC_SUCCESS || !result)
+    uint64_t t34 = mgl_prof_begin(34);
+    spvc_result spvc_rc = spvc_compiler_compile(compiler, &result);
+    mgl_prof_slow("spirv-to-msl", t34, NULL);
+    mgl_prof_end(34, t34);
+    if (spvc_rc != SPVC_SUCCESS || !result)
     {
         mgl_append_info_log(log, "ERROR: %s stage: SPIR-V → MSL translation failed\n", stage_label(stage));
         goto done;
@@ -4858,8 +4869,16 @@ bool mgl_program_check_xfb_link(GLMContext ctx, Program *program)
     return false;
 }
 
+/* r160: MGL_PROFILE link-program bucket, closed on every return path */
+static void link_prof_done(uint64_t *t0)
+{
+    mgl_prof_slow("program link", *t0, NULL);
+    mgl_prof_end(35, *t0);
+}
+
 void mglLinkProgram(GLMContext ctx, GLuint program)
 {
+    uint64_t t_link __attribute__((cleanup(link_prof_done))) = mgl_prof_begin(35);
     Program *pptr;
 
     pptr = lookupProgram(ctx, program);
