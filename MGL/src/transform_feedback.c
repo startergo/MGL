@@ -2677,9 +2677,14 @@ static void xfb_blank_synth_reported_names(GLMContext ctx, MGLXfbProgram *xp,
     if (syn) free(syn);
 }
 
+/* r161: number of vertex-stage xfb links run (tests: a program that captures
+ * nothing must not pay for one) */
+uint64_t mgl_xfb_link_count;
+
 static void xfb_link(GLMContext ctx, MGLXfbProgram *xp, const char *vs_src, bool api,
                      const unsigned *spirv_module, size_t spirv_words)
 {
+    mgl_xfb_link_count++;
     uint32_t *ir = NULL;
     size_t words = 0;
     char *log = NULL;
@@ -2902,21 +2907,33 @@ static bool xfb_spirv_has_xfb_deco_stage(const Program *p, int stage)
         return false;
     n = p->spirv[stage].size;    if (n < 5)
         return false;
+    /* r161: transform-feedback capture is declared by OpExecutionMode Xfb plus
+     * XfbBuffer / XfbStride decorations.  Offset alone is NOT a capture marker:
+     * every member of every uniform / storage block carries one, so the old test
+     * (Offset or XfbBuffer) took any program with a block for a declared capture
+     * and ran the whole xfb link — decompiling the vertex stage and compiling it
+     * through glslang — at every glLinkProgram (rsvga: ~50 ms per link, ~600 ms
+     * for the first one, which also pays glslang's process initialisation). */
     for (size_t w = 5; w < n; )
     {
         uint32_t op = ir[w] & 0xFFFFu, wc = ir[w] >> 16;
         if (wc == 0 || w + wc > n)
             return false;
+        if (op == 16)   /* OpExecutionMode: [entry] [Mode] ... */
+        {
+            if (wc >= 3 && ir[w + 2] == SpvExecutionModeXfb)
+                return true;
+        }
         if (op == 71)   /* OpDecorate: [target] [Decoration] ... */
         {
-            if (wc >= 3 && (ir[w + 2] == SpvDecorationOffset ||
-                            ir[w + 2] == SpvDecorationXfbBuffer))
+            if (wc >= 3 && (ir[w + 2] == SpvDecorationXfbBuffer ||
+                            ir[w + 2] == SpvDecorationXfbStride))
                 return true;
         }
         if (op == 72)   /* OpMemberDecorate: [struct] [member] [Decoration] ... */
         {
-            if (wc >= 4 && (ir[w + 3] == SpvDecorationOffset ||
-                            ir[w + 3] == SpvDecorationXfbBuffer))
+            if (wc >= 4 && (ir[w + 3] == SpvDecorationXfbBuffer ||
+                            ir[w + 3] == SpvDecorationXfbStride))
                 return true;
         }
         w += wc;

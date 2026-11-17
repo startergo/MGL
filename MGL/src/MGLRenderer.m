@@ -317,6 +317,16 @@ void mgl_profile_dump(void)
                     mgl_prof_ns[i] * mgl_prof_scale,
                     mgl_prof_ns[i] * mgl_prof_scale / 120.0,
                     (double)mgl_prof_cnt[i] / 120.0);
+    /* r161: buffer storage pool (r153): storages taken back vs new Metal buffers */
+    {
+        extern uint64_t mgl_bufpool_stat_reuse, mgl_bufpool_stat_alloc;
+        static uint64_t last_reuse, last_alloc;
+        uint64_t ru = mgl_bufpool_stat_reuse - last_reuse, al = mgl_bufpool_stat_alloc - last_alloc;
+        last_reuse = mgl_bufpool_stat_reuse; last_alloc = mgl_bufpool_stat_alloc;
+        if (ru || al)
+            fprintf(stderr, "MGL PROFILE bufpool/frame: reused=%.1f new-metal-buffers=%.1f\n",
+                    (double)ru / 120.0, (double)al / 120.0);
+    }
     /* buckets nest (draw contains processGLState, which contains the texture
      * walk, ...): the sum over-counts; "draw" is the per-draw total */
     fprintf(stderr, " (sum %.1f ms, nested buckets: not a total; use draw)\n", tot);
