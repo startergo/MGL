@@ -194,9 +194,14 @@ mgl_lib := $(build_dir)/libmgl.dylib
 mgl_toolchain_obj := $(build_dir)/MGL/src/mgl_toolchain.o
 mgl_toolchain_lib := $(build_dir)/libmgl_toolchain.a
 
-$(mgl_lib): $(mgl_objs) $(mgl_arc_objs)
+# The external static libraries are prerequisites so that rebuilding an external
+# (for example after build_external.sh switches its build type) relinks libmgl.
+# They are linked through $(LIBS), so they are filtered out of $^.
+mgl_ext_libs := $(filter %.a,$(LIBS))
+
+$(mgl_lib): $(mgl_objs) $(mgl_arc_objs) $(mgl_ext_libs)
 	@mkdir -p $(dir $@)
-	$(CC) -dynamiclib -o $@ $^ $(LIBS)
+	$(CC) -dynamiclib -o $@ $(filter-out %.a,$^) $(LIBS)
 	# loading dynamic library requires this
 	ln -fs $(mgl_lib) .
 
@@ -333,7 +338,7 @@ download-pkgdeps:
 	git submodule update --depth 1
 
 compile-pkgdeps:
-	(cd SPIRV-Cross && mkdir -p build && cd build && cmake .. && make)
+	(cd SPIRV-Cross && mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make)
 
 update-pkdeps:
 	git submodule -q foreach git pull -q origin master

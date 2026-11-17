@@ -8,7 +8,11 @@ set -eu
 cd "$(dirname "$0")"
 export SDKROOT="$(xcrun --show-sdk-path)"
 # CMake 4 removed compatibility with cmake_minimum_required < 3.5 (SPIRV-Cross declares 3.0)
-CMAKE_FLAGS=(-DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+# Build type defaults to Release: with no build type CMake compiles without optimisation,
+# and glslang / SPIRV-Cross run inside glLinkProgram, so an unoptimised build makes every
+# link several times slower. MGL_EXT_BUILD_TYPE=Debug (or RelWithDebInfo) overrides it.
+# An existing build dir is reconfigured with the new type on the next run.
+CMAKE_FLAGS=(-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=${MGL_EXT_BUILD_TYPE:-Release})
 
 step() { echo "== $*"; }
 fail() { echo "build_external.sh: FAILED at: $1" >&2; exit 1; }
