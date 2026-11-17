@@ -2582,6 +2582,18 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                               setTexture:(void (^)(id<MTLTexture>, NSUInteger))setTex
                               setSampler:(void (^)(id<MTLSamplerState>, NSUInteger))setSamp
 {
+    return [self bindSeparateImagesSamplersStage:stage setTexture:setTex setSampler:setSamp unitMask:NULL];
+}
+
+/* r171: unit_mask (TEXTURE_UNITS bits, NULL = all) restricts the binds to the
+ * images on moved units and the samplers whose state can depend on a moved unit
+ * (their own unit, or the stage's first separate image's unit they fall back to) */
+- (bool) bindSeparateImagesSamplersStage:(int)stage
+                              setTexture:(void (^)(id<MTLTexture>, NSUInteger))setTex
+                              setSampler:(void (^)(id<MTLSamplerState>, NSUInteger))setSamp
+                                unitMask:(const unsigned *)unit_mask
+{
+#define SEP_UNIT_IN(_u_) (!unit_mask || (unit_mask[(_u_) >> 5] & (1u << ((_u_) & 31))))
     Program *prog = STATE(program);
     if (!prog)
         return true;
@@ -2600,6 +2612,8 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             GLuint unit = mgl_res_elem_unit(sres, e);
             if (unit >= TEXTURE_UNITS)
                 continue;
+            if (!SEP_UNIT_IN(unit))
+                continue;                   /* r171: unit unchanged since the latched walk */
             /* the image's dimension selects the unit's per-target binding */
             Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
             id<MTLTexture> texture = nil;
@@ -2636,6 +2650,12 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             GLuint unit = mgl_res_elem_unit(sres, e);
             if (unit >= TEXTURE_UNITS || mtl_index + e >= MGL_MTL_SAMPLER_SLOTS)
                 continue;
+            if (!SEP_UNIT_IN(unit))
+            {
+                GLuint fb = il->count ? mgl_res_elem_unit(&il->list[0], 0) : TEXTURE_UNITS;
+                if (fb >= TEXTURE_UNITS || !SEP_UNIT_IN(fb))
+                    continue;               /* r171: neither its unit nor its fallback moved */
+            }
             /* a sampler has no dimension: take the target of a separate image of
              * this stage reading the same unit, else the unit's most recently
              * bound texture (mgl_texture_for_sampler with target 0) */
@@ -2657,6 +2677,7 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                 setSamp(sampler, mtl_index + e);
         }
     }
+#undef SEP_UNIT_IN
     return true;
 }
 
@@ -2863,11 +2884,9 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
         }
     }
 
-    if (unit_mask)
-        return true;                        /* r158: see the method comment */
-
     /* Vulkan-style SEPARATE images and samplers (bindSeparateImagesSamplersStage):
-     * the combined loop above only walks SAMPLED_IMAGE */
+     * the combined loop above only walks SAMPLED_IMAGE.  r171: under a unit mask
+     * (the texture partial walk) only the moved units' images / samplers bind */
     for (int st = 0; st < 2; st++)
     {
         int stage = stages[st];
@@ -2884,9 +2903,13 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             setSampler:^(id<MTLSamplerState> s, NSUInteger idx) {
                 if (vtx) [self compatSetVertexSamplerState:s atIndex:idx];
                 else     [self compatSetFragmentSamplerState:s atIndex:idx];
-            }];
+            }
+            unitMask:unit_mask];
         RETURN_FALSE_ON_FAILURE(ok);
     }
+
+    if (unit_mask)
+        return true;                        /* r158: see the method comment */
 
     /* storage images (glBindImageTexture) of the vertex and fragment stages: they are plain
      * [[texture(n)]] arguments of the MSL (access::read / access::write), so they only need the
@@ -3162,8 +3185,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 /* r165: the units the bound program can sample, over EVERY stage (a superset of
  * what bindTexturesToCurrentRenderEncoderUnits binds: the geometry / tessellation
  * emulations sample other stages' textures).  false = no restriction possible
- * (no program — a pipeline object is bound — or separate images / samplers,
- * whose units bindSeparateImagesSamplersStage resolves its own way). */
+ * (no program — a pipeline object is bound).  r171: separate images / samplers
+ * contribute their units too. */
 - (bool) texwalkSampledUnits: (unsigned *) want
 {
     static int all = -1;
@@ -3178,9 +3201,25 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     want[0] = want[1] = want[2] = want[3] = 0;
     for (int st = 0; st < _MAX_SHADER_TYPES; st++)
     {
-        if (prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE].count ||
-            prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count)
-            return false;
+        /* r171: Vulkan-style separate images and samplers (rsvga's SPIR-V): the
+         * image's unit and the sampler's unit both feed the draw; a sampler with
+         * no texture on its own unit takes its parameters from the stage's first
+         * separate image, whose unit is in the mask already */
+        for (int sk = 0; sk < 2; sk++)
+        {
+            SpirvResourceList *sepl = &prog->spirv_resources_list[st][sk ? SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS
+                                                                        : SPVC_RESOURCE_TYPE_SEPARATE_IMAGE];
+            for (GLuint i = 0; i < sepl->count; i++)
+            {
+                GLuint elems = sepl->list[i].array_size ? sepl->list[i].array_size : 1;
+                for (GLuint e = 0; e < elems; e++)
+                {
+                    GLuint unit = mgl_res_elem_unit(&sepl->list[i], e);
+                    if (unit < TEXTURE_UNITS)
+                        want[unit >> 5] |= 1u << (unit & 31);
+                }
+            }
+        }
         SpirvResourceList *l = &prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
         for (GLuint i = 0; i < l->count; i++)
         {

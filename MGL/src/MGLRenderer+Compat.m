@@ -1141,6 +1141,7 @@ struct MGLCompatDrawFast {
      * strstr scans over the vertex MSL (~1.5 us on the M4). */
     struct { const void *prog, *msl; bool dep; } tdepc[8];
     bool        tex_rebind;         /* r166: TEXTURES verdict also carries a vertex-array rebind */
+    bool        tex_sampled_only;   /* r171: this gate's unit loop covered exactly the sampled units */
     /* r158: the gate's texture verdict for compatDrawFastTextures — the units
      * whose binding moved, or tex_full when the whole bind walk must run */
     unsigned    tex_units[4];
@@ -1697,6 +1698,7 @@ static bool compatR154On(void)
                                                     DIRTY_SAMPLER | DIRTY_IMAGE_UNIT_STATE | DIRTY_PROGRAM));
         df->tex_units[0] = df->tex_units[1] = df->tex_units[2] = df->tex_units[3] = 0;
         df->tex_full = false;
+        df->tex_sampled_only = false;
         /* r158: a sampler / image uniform re-pointed a slot at another unit: the
          * per-unit checks below cannot see that, the whole bind walk must run */
         if (ctx->state.sampler_map_gen != s->sampler_map_gen)
@@ -1727,6 +1729,8 @@ static bool compatR154On(void)
                 if (on < 0) { const char *e = getenv("MGL_DRAWFAST_SAMPLEDONLY"); on = (e && e[0] == '0') ? 0 : 1; }
                 if (on && ![self texwalkSampledUnits: want])
                     want[0] = want[1] = want[2] = want[3] = ~0u;
+                else if (on)
+                    df->tex_sampled_only = true;   /* r171 */
             }
             for (int w = 0; w < 4; w++)
             {
@@ -1797,7 +1801,18 @@ static bool compatR154On(void)
     /* r158: texture-side dirt with no unit seen moving (a content-side change
      * the identities do not show) keeps the full bind walk */
     if (tex_partial && !(df->tex_units[0] | df->tex_units[1] | df->tex_units[2] | df->tex_units[3]))
-        df->tex_full = true;
+    {
+        /* r171: when the loop covered exactly the sampled units, every change to
+         * them that a bind could carry is identity-visible (texture / sampler
+         * object, Metal texture, parameter serials) or a miss (pending texture
+         * work, texext records), so no sampled unit moving means the dirt came
+         * from an unsampled unit: nothing to re-bind — the partial walk runs with
+         * an empty unit mask.  MGL_DRAWFAST_EMPTYMASK=0: full bind walk. */
+        static int empty_ok = -1;
+        if (empty_ok < 0) { const char *e = getenv("MGL_DRAWFAST_EMPTYMASK"); empty_ok = (e && e[0] == '0') ? 0 : 1; }
+        if (!(empty_ok && df->tex_sampled_only))
+            df->tex_full = true;
+    }
 
     /* buffer-map groups: identity of the maps and of every mapped buffer */
     { int wv = 0, wf = 0;
@@ -2333,7 +2348,11 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
                     p->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count)
                     df->sep = true;
         }
-        masked = !df->sep;
+        /* r171: separate images / samplers re-bind per unit as well;
+         * MGL_DRAWFAST_SEPUNITS=0 declines them as before */
+        static int sep_units = -1;
+        if (sep_units < 0) { const char *e = getenv("MGL_DRAWFAST_SEPUNITS"); sep_units = (e && e[0] == '0') ? 0 : 1; }
+        masked = sep_units || !df->sep;
     }
     if (masked)
         mgl_compat_fast_texunits++;
