@@ -2685,7 +2685,14 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
          * transform-feedback capture) — keep that guard or this deref SIGSEGVs. */
         Program *prog = STATE(program);
         GLuint count = prog ? prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE].count : 0;
-        if (getenv("MGL_BINDTRACE"))
+        /* r165: getenv scans the whole environment — it ran twice per draw here */
+        static int bindtrace = -1, vtextrace = -1;
+        if (bindtrace < 0)
+        {
+            bindtrace = getenv("MGL_BINDTRACE") != NULL;
+            vtextrace = getenv("MGL_VTEX_TRACE") != NULL;
+        }
+        if (bindtrace)
             fprintf(stderr, "[bindtrace] stage=%d count=%u\n", stage, count);
 
         for (GLuint i = 0; i < count; i++)
@@ -2731,7 +2738,7 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             /* GL sampler semantics: the sampler's dimension selects the unit's
              * binding for that target (mgl_texture_for_sampler) */
             Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
-            if (getenv("MGL_BINDTRACE"))
+            if (bindtrace)
             {
                 id<MTLTexture> dbg = ptr ? (__bridge id<MTLTexture>)ptr->mtl_data : nil;
                 fprintf(stderr, "[bindtrace]   i=%u binding=%u mtl=%u target=%x tex=%p name=%u mtl_tex=%p %dx%d\n",
@@ -2835,7 +2842,7 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                  * tesselation-shader read zeros from the unbound vertex slot) */
                 if (stage != _FRAGMENT_SHADER)
                 {
-                if (getenv("MGL_VTEX_TRACE"))
+                if (vtextrace)
                     fprintf(stderr, "MGL vtex: unit %u slot %u tex %p base %p same %d\n",
                             spirv_binding + e, mtl_index + e, (void *)(__bridge void *)texture,
                             ptr->mtl_data, texture == (__bridge id<MTLTexture>)ptr->mtl_data);
@@ -3149,13 +3156,64 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     return true;
 }
 
+/* r165: the units the bound program can sample, over EVERY stage (a superset of
+ * what bindTexturesToCurrentRenderEncoderUnits binds: the geometry / tessellation
+ * emulations sample other stages' textures).  false = no restriction possible
+ * (no program — a pipeline object is bound — or separate images / samplers,
+ * whose units bindSeparateImagesSamplersStage resolves its own way). */
+- (bool) texwalkSampledUnits: (unsigned *) want
+{
+    static int all = -1;
+    if (all < 0)
+    {
+        const char *e = getenv("MGL_TEXWALK_ALL");   /* A/B: realize every bound unit (pre-r165) */
+        all = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    Program *prog = STATE(program);
+    if (all || !prog)
+        return false;
+    want[0] = want[1] = want[2] = want[3] = 0;
+    for (int st = 0; st < _MAX_SHADER_TYPES; st++)
+    {
+        if (prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE].count ||
+            prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS].count)
+            return false;
+        SpirvResourceList *l = &prog->spirv_resources_list[st][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+        for (GLuint i = 0; i < l->count; i++)
+        {
+            SpirvResource *sres = &l->list[i];
+            GLuint elems = sres->array_size ? sres->array_size : 1;
+            for (GLuint e = 0; e < elems; e++)
+            {
+                /* same unit resolution as the combined bind loop */
+                GLuint unit = (e == 0) ? sres->binding
+                                       : (sres->unit_vals ? mgl_res_elem_unit(sres, e)
+                                                          : mgli_sampler_elem_unit(ctx, prog, st, sres->_id, e,
+                                                                                   sres->binding + e));
+                if (unit < TEXTURE_UNITS)
+                    want[unit >> 5] |= 1u << (unit & 31);
+            }
+        }
+    }
+    return true;
+}
+
 - (bool)bindActiveTexturesToMTL
 {
+    /* r165: realize only the units the program samples.  D3D9 front ends leave a
+     * texture on every stage (16+ units); realizing all of them cost ~0.05 us per
+     * unit per full walk.  A unit skipped here is realized by the walk that first
+     * samples it: a program change (DIRTY_PROGRAM) or a sampler-uniform change
+     * (sampler_map_gen) always takes the full walk, and the bind loop's resolve
+     * cache refuses a texture with pending dirty_bits. */
+    unsigned want[4];
+    bool limit = [self texwalkSampledUnits: want];
+
     // search through active_texture_mask for enabled bits
     // 128 bits long.. do it on 4 parts
     for(int i=0; i<4; i++)
     {
-        unsigned mask = STATE(active_texture_mask[i]);
+        unsigned mask = STATE(active_texture_mask[i]) & (limit ? want[i] : ~0u);
 
         if (mask)
         {
