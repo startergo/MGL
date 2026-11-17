@@ -2615,6 +2615,92 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
     return [self bindSeparateImagesSamplersStage:stage setTexture:setTex setSampler:setSamp unitMask:NULL];
 }
 
+/* r173: per-texture resolution cache for the separate binder (Texture.sep_img /
+ * sep_samp).  The image chain is bindMTLTexture + texparamTextureForTex + the
+ * sRGB-decode view; the sampler chain is texparamSamplerForUnit.  An image hit
+ * needs the texture realized with no pending work (dirty_bits: data / level /
+ * storage re-specification), the same storage and parameter cache, and the same
+ * sampler object (its parameters decide SKIP_DECODE and completeness).  A
+ * SKIP_DECODE view is never recorded (the per-unit sRGB view cache owns and
+ * replaces it).  A sampler hit needs the same sampler object and its unchanged
+ * Metal state, or, without one, the texture's unchanged parameter cache.
+ * MGL_SEP_RESOLVE_CACHE=0 disables it. */
+uint64_t mgl_compat_sep_hit, mgl_compat_sep_miss;
+
+static int sepCacheOn(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("MGL_SEP_RESOLVE_CACHE"); on = (e && e[0] == '0') ? 0 : 1; }
+    return on;
+}
+
+static inline void *sepImgHit(Texture *t, Sampler *so)
+{
+    const struct MGLSepResolve *e = &t->sep_img;
+    if (e->obj && !t->dirty_bits && t->mtl_data && e->tex_mtl == t->mtl_data &&
+        e->params == t->params.mtl_data && e->pser == t->params.mtl_serial &&
+        e->so == (const void *)so && (!so || e->so_pser == so->params.mtl_serial))
+    {
+        mgl_compat_sep_hit++;
+        return e->obj;
+    }
+    mgl_compat_sep_miss++;
+    return NULL;
+}
+
+static inline void sepImgRecord(Texture *t, Sampler *so, void *obj)
+{
+    struct MGLSepResolve *e = &t->sep_img;
+    e->obj = obj;
+    e->tex_mtl = t->mtl_data;
+    e->params = t->params.mtl_data;
+    e->pser = t->params.mtl_serial;
+    e->so = so;
+    e->so_pser = so ? so->params.mtl_serial : 0;
+    e->so_mtl = NULL;
+}
+
+static inline void *sepSampHit(Texture *t, Sampler *so)
+{
+    const struct MGLSepResolve *e = &t->sep_samp;
+    bool hit;
+    if (!e->obj || e->so != (const void *)so)
+        hit = false;
+    else if (so)    /* the sampler object's own Metal state (rebuilt while dirty) */
+        hit = so->mtl_data && !so->dirty_bits && e->so_mtl == so->mtl_data &&
+              t->target != GL_TEXTURE_RECTANGLE;
+    else            /* the texture's parameter cache */
+        hit = t->params.mtl_data && e->params == t->params.mtl_data &&
+              e->pser == t->params.mtl_serial;
+    if (hit) { mgl_compat_sep_hit++; return e->obj; }
+    mgl_compat_sep_miss++;
+    return NULL;
+}
+
+static inline void sepSampRecord(Texture *t, Sampler *so, void *obj)
+{
+    struct MGLSepResolve *e = &t->sep_samp;
+    /* RECTANGLE + sampler object: texparamSamplerForUnit returns a fresh,
+     * unowned state each call; never keep it */
+    if (so && (t->target == GL_TEXTURE_RECTANGLE || !so->mtl_data))
+    {
+        e->obj = NULL;
+        return;
+    }
+    if (!so && !t->params.mtl_data)
+    {
+        e->obj = NULL;
+        return;
+    }
+    e->obj = obj;
+    e->so = so;
+    e->so_mtl = so ? so->mtl_data : NULL;
+    e->params = t->params.mtl_data;
+    e->pser = t->params.mtl_serial;
+    e->tex_mtl = NULL;
+    e->so_pser = 0;
+}
+
 /* r171: unit_mask (TEXTURE_UNITS bits, NULL = all) restricts the binds to the
  * images on moved units and the samplers whose state can depend on a moved unit
  * (their own unit, or the stage's first separate image's unit they fall back to) */
@@ -2629,6 +2715,7 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
         return true;
     SpirvResourceList *il = &prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_IMAGE];
     SpirvResourceList *sl = &prog->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS];
+    bool rc = sepCacheOn();             /* r173 */
 
     for (GLuint i = 0; i < il->count; i++)
     {
@@ -2646,6 +2733,16 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                 continue;                   /* r171: unit unchanged since the latched walk */
             /* the image's dimension selects the unit's per-target binding */
             Texture *ptr = mgl_texture_for_sampler(ctx, unit, sres->target);
+            Sampler *uso = STATE(texture_samplers[unit]);
+            if (rc && ptr)
+            {
+                void *hit = sepImgHit(ptr, uso);     /* r173 */
+                if (hit)
+                {
+                    setTex((__bridge id<MTLTexture>)hit, mtl_index + e);
+                    continue;
+                }
+            }
             id<MTLTexture> texture = nil;
             /* GL 8.17: an incomplete (or level-less default) texture reads (0,0,0,1):
              * bind the black fallback without realizing it (same rule as the
@@ -2658,7 +2755,10 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
                     texture = (__bridge id<MTLTexture>)ptr->mtl_data;
                     texture = [self texparamTextureForTex:ptr base:texture];
                     /* EXT_texture_sRGB_decode: SKIP_DECODE swaps in a plain view */
+                    id<MTLTexture> plain = texture;
                     texture = [self compatSRGBDecodeViewForTex:ptr base:texture unit:unit];
+                    if (rc && texture && texture == plain && !ptr->dirty_bits)
+                        sepImgRecord(ptr, uso, (__bridge void *)texture);
                 }
             }
             if (!texture)
@@ -2700,7 +2800,20 @@ static MTLTextureType mgl_fallback_type_for_tex(const Texture *ptr)
             if (!ptr && il->count)
                 ptr = mgl_texture_for_sampler(ctx, mgl_res_elem_unit(&il->list[0], 0), il->list[0].target);
             /* texparamSamplerForUnit dereferences the texture: never pass NULL */
-            id<MTLSamplerState> sampler = ptr ? [self texparamSamplerForUnit:unit texture:ptr] : nil;
+            id<MTLSamplerState> sampler = nil;
+            if (ptr)
+            {
+                Sampler *uso = STATE(texture_samplers[unit]);
+                void *hit = rc ? sepSampHit(ptr, uso) : NULL;   /* r173 */
+                if (hit)
+                    sampler = (__bridge id<MTLSamplerState>)hit;
+                else
+                {
+                    sampler = [self texparamSamplerForUnit:unit texture:ptr];
+                    if (rc && sampler)
+                        sepSampRecord(ptr, uso, (__bridge void *)sampler);
+                }
+            }
             if (!sampler)
                 sampler = [self computeFallbackSampler];
             if (sampler)

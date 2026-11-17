@@ -345,6 +345,20 @@ typedef struct Texture_t {
     GLuint mipmap_levels;
     TextureFace faces[6];
     void    *mtl_data;
+    /* r173: resolution cache of the separate image / sampler binder
+     * (MGLRenderer.m bindSeparateImagesSamplersStage): the last view and the last
+     * sampler state this texture resolved to, with the identities they were
+     * resolved from.  Per texture rather than per slot: the texture partial walk
+     * only re-binds units whose texture moved, so a per-slot key would miss on
+     * every one of them, while a texture that comes back to a unit hits here.
+     * The ids are unretained: the texture's / sampler object's parameter caches
+     * own them, and every key below changes before those caches drop them. */
+    struct MGLSepResolve {
+        void       *obj;                /* id<MTLTexture> / id<MTLSamplerState> */
+        void       *tex_mtl, *params;   /* tex->mtl_data, tex->params.mtl_data */
+        uint32_t    pser, so_pser;      /* tex / sampler-object params.mtl_serial */
+        const void *so, *so_mtl;        /* the unit's sampler object, its mtl_data */
+    } sep_img, sep_samp;
 } Texture;
 
 typedef struct TextureUnit_t {

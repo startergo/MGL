@@ -811,6 +811,8 @@ uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
 /* r154: partial-walk verdict counts (MGL_PROFILE drawfast-partial line) */
 uint64_t mgl_compat_fast_tex, mgl_compat_fast_bufs, mgl_compat_fast_rs, mgl_compat_fast_moved;
 uint64_t mgl_compat_fast_texunits;   /* r158: texture partial walks that re-bound only the moved units */
+extern uint64_t mgl_compat_sep_hit, mgl_compat_sep_miss;   /* r173: MGLRenderer.m */
+uint64_t mgl_compat_latch_part;      /* r173: texture partials latched without the vertex-array group */
 uint64_t mgl_compat_fast_uboofs;     /* r166: draws whose uniform-buffer ranges moved within the same buffers */
 
 /* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
@@ -1217,6 +1219,11 @@ void mgl_compat_drawfast_debug(void)
                 (double)mgl_compat_fast_bufs / 120.0,
                 (double)mgl_compat_fast_moved / 120.0, (double)mgl_compat_fast_rs / 120.0,
                 (double)mgl_compat_fast_rebind / 120.0, (double)mgl_compat_fast_uboofs / 120.0);
+    if (mgl_compat_sep_hit + mgl_compat_sep_miss)
+        fprintf(stderr, "MGL PROFILE sep-resolve/frame: hits=%.1f misses=%.1f partial-latch=%.1f\n",
+                (double)mgl_compat_sep_hit / 120.0, (double)mgl_compat_sep_miss / 120.0,
+                (double)mgl_compat_latch_part / 120.0);
+    mgl_compat_sep_hit = mgl_compat_sep_miss = mgl_compat_latch_part = 0;
     mgl_compat_fast_uboofs = 0;
     mgl_compat_fast_tex = mgl_compat_fast_bufs = mgl_compat_fast_rs = mgl_compat_fast_moved = 0;
     mgl_compat_fast_texunits = 0;
@@ -2012,6 +2019,16 @@ static bool compatR154On(void)
 /* record the state the just-completed full walk resolved everything for */
 - (void) compatDrawLatch
 {
+    [self compatDrawLatchVA: true units: NULL];
+}
+
+/* r173: the texture partial (compatDrawFastTextures) latches with withVA=false
+ * — the gate proved the VAO, its layout and buffers and the generic attributes
+ * unchanged unless it folded in a rebind — and with units = the units that walk
+ * re-bound (NULL = all): every other unit's snapshot entry is gate-proven equal.
+ * MGL_DRAWFAST_PARTLATCH=0 latches everything. */
+- (void) compatDrawLatchVA: (bool)withVA units: (const unsigned *)units
+{
     struct MGLExtMetal_compat *m = compatMetal(ctx);
     struct MGLCompatDrawFast *df = m ? (struct MGLCompatDrawFast *)m->draw_fast : NULL;
     struct MGLCompatDrawSnap *s;
@@ -2019,6 +2036,22 @@ static bool compatR154On(void)
     if (!df)
         return;
     s = &df->snap;
+
+    static int part = -1;
+    if (part < 0) { const char *e = getenv("MGL_DRAWFAST_PARTLATCH"); part = (e && e[0] == '0') ? 0 : 1; }
+    if (!part || !s->valid)
+    {
+        withVA = true;
+        units = NULL;
+    }
+    if (!withVA)
+    {
+        struct MGLExtState_vattrib *vs0 = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+        if (!vs0 || vs0->current_serial != s->current_serial || s->vao != (const void *)ctx->state.vao)
+            withVA = true;
+    }
+    if (!withVA)
+        mgl_compat_latch_part++;
 
     /* the walk must have produced a bound pipeline on a live encoder */
     if (!_currentRenderEncoder || !_pipelineState || !_currentCommandBuffer)
@@ -2033,6 +2066,8 @@ static bool compatR154On(void)
     s->cmdbuf = (__bridge const void *)_currentCommandBuffer;
     s->pipe = (__bridge const void *)_pipelineState;
     s->program = (const void *)ctx->state.program;
+    if (s->vao != (const void *)ctx->state.vao)
+        withVA = true;                      /* r173: a VAO switch latches its group */
     s->vao = (const void *)ctx->state.vao;
     s->fbo = (const void *)ctx->state.framebuffer;
     s->tess_active = [self extTessActive] ? 1 : 0;
@@ -2074,6 +2109,7 @@ static bool compatR154On(void)
     compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
     compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
 
+    if (withVA)
     {
         struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
         MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
@@ -2115,7 +2151,7 @@ static bool compatR154On(void)
     memcpy(s->tex_mask, ctx->state.active_texture_mask, sizeof(s->tex_mask));
     for (int w = 0; w < 4; w++)
     {
-        unsigned bits = ctx->state.active_texture_mask[w];
+        unsigned bits = ctx->state.active_texture_mask[w] & (units ? units[w] : ~0u);   /* r173 */
         while (bits)
         {
             int u = w * 32 + __builtin_ctz(bits);
@@ -2317,6 +2353,7 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
 
     m->texext_skip_epoch = 0;               /* the texext hook below must re-run */
 
+    bool rebound = df->tex_rebind;          /* r173: the latch must then re-record the vertex arrays */
     /* r166: the gate folded a vertex-array rebind into this verdict */
     if (df->tex_rebind)
     {
@@ -2390,7 +2427,7 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
     compatListClearDataDirty(&ctx->state.vertex_buffer_map_list);
     compatListClearDataDirty(&ctx->state.fragment_buffer_map_list);
 
-    [self compatDrawLatch];
+    [self compatDrawLatchVA: rebound units: masked ? df->tex_units : NULL];   /* r173 */
     mgl_prof_end(30, t13);
     return true;
 }
