@@ -696,6 +696,13 @@ typedef struct {
      * check covers only the buffer_base rows. */
     BufferBaseTarget ubo_high[MGL_MAX_UNIFORM_BUFFER_BINDINGS - MAX_BINDABLE_BUFFERS];
     GLuint      ubo_high_gen;
+    /* r169: bumped wherever the indexed buffer tables (buffer_base) or the image
+     * units change — exactly the sites that arm DIRTY_BUFFER_BASE_STATE /
+     * DIRTY_IMAGE_UNIT_STATE.  The draw-fast snapshot compares these instead of
+     * memcmp-ing ~11 KB / 5 KB per draw; unlike the dirty bits they are never
+     * cleared by an unrelated path. */
+    GLuint      buffer_base_gen;
+    GLuint      image_units_gen;
     uint32_t    ubo_high_range[(MGL_MAX_UNIFORM_BUFFER_BINDINGS - MAX_BINDABLE_BUFFERS + 31) / 32];
     /* r158: bumped by every sampler / image uniform write (glUniform1i on an
      * opaque uniform re-points its slot at another unit).  The draw-fast gate

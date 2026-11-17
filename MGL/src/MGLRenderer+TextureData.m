@@ -467,7 +467,29 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
     TDShape s;
     GLMContext glm = ctx;
 
-    if (![self texdataHandlesTexture:tex] || !mgl_texdata_shape(glm, tex, &s))
+    if (![self texdataHandlesTexture:tex])
+        return false;
+
+    /* r169: nothing to do for a texture realized before with no level / data
+     * change since.  The shape only depends on the level definitions (every
+     * defineLevel arms DIRTY_TEXTURE_LEVEL) and a pending CPU shadow only exists
+     * after a write that arms DIRTY_TEXTURE_DATA (texture parameters, the
+     * per-draw sampler state of a D3D9 stream, change neither).  This skips the
+     * shape walk, the format lookups and the per-face, per-level shadow scan
+     * that ran on every bind.  MGL_TEXDATA_FASTREALIZE=0: always the full path. */
+    {
+        static int fast = -1;
+        if (fast < 0) { const char *e = getenv("MGL_TEXDATA_FASTREALIZE"); fast = (e && e[0] == '0') ? 0 : 1; }
+        if (fast && tex->mtl_data && tex->complete &&
+            !(tex->dirty_bits & (GLuint)(DIRTY_TEXTURE_DATA | DIRTY_TEXTURE_LEVEL)))
+        {
+            TDTexInfo *fi = mgl_texdata_find_info(glm, tex);
+            if (fi && fi->realized)
+                return true;
+        }
+    }
+
+    if (!mgl_texdata_shape(glm, tex, &s))
         return false;
 
     TDTexInfo *info = mgl_texdata_info(glm, tex);

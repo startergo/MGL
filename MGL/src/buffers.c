@@ -584,7 +584,7 @@ static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
             if (STATE(buffer_base[i]).buffers[j].buf == ptr)
             {
                 bzero(&STATE(buffer_base[i]).buffers[j], sizeof(BufferBaseTarget));
-                STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE;
+                STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
             }
         }
     }
@@ -598,7 +598,7 @@ static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
         {
             bzero(&STATE(ubo_high[i]), sizeof(BufferBaseTarget));
             STATE(ubo_high_gen)++;
-            STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE;
+            STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
         }
 
     // vertex array objects referencing the buffer (all VAOs: the storage is freed)
@@ -656,7 +656,7 @@ static void unbindEverywhere(GLMContext ctx, Buffer *ptr)
             if (lists[l]->buffers[i].buf == ptr)
             {
                 lists[l]->buffers[i].buf = NULL;
-                STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE;
+                STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
             }
         }
     }
@@ -825,7 +825,7 @@ static void setIndexedBinding(GLMContext ctx, GLenum target, GLuint index, Buffe
 
         ctx->state.ubo_high_gen++;
         setGenericBinding(ctx, target, ptr);
-        ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+        ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
         return;
     }
 
@@ -863,7 +863,7 @@ static void setIndexedBinding(GLMContext ctx, GLenum target, GLuint index, Buffe
     // the generic binding point is updated as well
     setGenericBinding(ctx, target, ptr);
 
-    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
 
 }
 

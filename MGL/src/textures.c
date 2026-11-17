@@ -596,7 +596,7 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
     if (texture == 0)
     {
         bzero(&ctx->state.image_units[unit], sizeof(ImageUnit));
-        ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+        ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE; ctx->state.image_units_gen++;   /* r169 */
         return;
     }
 
@@ -624,7 +624,7 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
 
     ctx->state.image_units[unit] = unit_params;
 
-    ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+    ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE; ctx->state.image_units_gen++;   /* r169 */
 }
 
 static void detachFromFramebuffer(GLMContext ctx, Framebuffer *fbo, Texture *tex)
@@ -735,7 +735,7 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
             if (ctx->state.image_units[i].texture == name)
             {
                 bzero(&ctx->state.image_units[i], sizeof(ImageUnit));
-                ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+                ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE; ctx->state.image_units_gen++;   /* r169 */
             }
         }
 
@@ -831,7 +831,7 @@ void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLu
         if (tex_name == 0)
         {
             bzero(&ctx->state.image_units[first + i], sizeof(ImageUnit));
-            ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
+            ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE; ctx->state.image_units_gen++;   /* r169 */
             continue;
         }
 

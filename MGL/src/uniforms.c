@@ -535,7 +535,7 @@ void mgli_apply_block_binding(GLMContext ctx, MGLIProgram *ip, MGLIBlock *b, int
             l->list[k].binding = (GLuint)b->binding;
         }
     }
-    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
 }
 
 void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding)

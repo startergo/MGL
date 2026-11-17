@@ -415,7 +415,7 @@ static void introspect_post_link(GLMContext ctx, Program *ptr)
     for (int s = 0; s < MGLI_STAGES; s++) if (ip->sub[s].nunis) write_selectors(ctx, ip, s);
 
     /* the stage MSL was generated from the patched SPIR-V (mgl_introspect_patch_stage) */
-    ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE | DIRTY_TEX_BINDING;
+    ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE | DIRTY_TEX_BINDING; ctx->state.buffer_base_gen++;   /* r169 */
 }
 
 Buffer *mgl_introspect_default_uniform_buffer(GLMContext ctx, Program *program, int stage, int index)

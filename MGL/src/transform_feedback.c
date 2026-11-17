@@ -389,7 +389,7 @@ static void xfb_switch_bindings(GLMContext ctx, MGLXfbObject *from, MGLXfbObject
     if (from == to) return;
     memcpy(from->saved, TFB_BASE(), sizeof(from->saved));
     memcpy(TFB_BASE(), to->saved, sizeof(to->saved));
-    STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE;
+    STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
 }
 
 void mglBindTransformFeedback(GLMContext ctx, GLenum target, GLuint id)
@@ -633,7 +633,7 @@ static void xfb_buffer_range(GLMContext ctx, const char *func, GLuint xfb, GLuin
     }
     o->is_base[index] = !range;
     if (o == xfb_current(ctx))
-        STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE;
+        STATE(dirty_bits) |= DIRTY_BUFFER_BASE_STATE; ctx->state.buffer_base_gen++;   /* r169 */
     /* DSA forms bind to the object only, not to the generic binding point */
 }
 

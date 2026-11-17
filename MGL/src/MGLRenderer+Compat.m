@@ -1085,6 +1085,9 @@ struct MGLCompatDrawSnap {
      * fails the dirty-mask check first) */
     bool        tess_active;
     ImageUnit   image_units[TEXTURE_UNITS];     /* glBindImageTexture group */
+    GLuint      image_units_gen;                /* r169: ctx->state.image_units_gen at latch */
+    int         gens_valid;                     /* r169: the two generations above were latched */
+    GLuint      buffer_base_gen;                /* r169: ctx->state.buffer_base_gen at latch */
 
     /* content snapshots */
     unsigned    tex_mask[4];            /* ctx->state.active_texture_mask */
@@ -1545,6 +1548,7 @@ static bool compatUboRangesPatch(GLMContext ctx, struct MGLCompatDrawSnap *s, Bu
     }
     memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
     s->ubo_high_gen = ctx->state.ubo_high_gen;
+    s->buffer_base_gen = ctx->state.buffer_base_gen;   /* r169: UC/SSBO/ACB proven equal by the caller */
     return true;
 }
 
@@ -1609,11 +1613,13 @@ static bool compatR154On(void)
      * struct's bb_* comment).  Same-buffer rebinds compare equal and skip on. */
     if (ctx->state.dirty_bits & DIRTY_BUFFER_BASE_STATE)
     {
-        if (memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
-            memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
-            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0)
+        bool bb_moved = ctx->state.buffer_base_gen != s->buffer_base_gen;   /* r169 */
+        if (bb_moved &&
+            (memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
+             memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
+             memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0))
             MGL_DF_MISS(26);
-        if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0 ||
+        if ((bb_moved && memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0) ||
             ctx->state.ubo_high_gen != s->ubo_high_gen)    /* r159: points >= MAX_BINDABLE_BUFFERS */
         {
             /* r166: a D3D9-style constant stream binds the SAME scratch buffer at a
@@ -1703,7 +1709,8 @@ static bool compatR154On(void)
         }
         if (!tex_clean)
         {
-            if (memcmp(ctx->state.image_units, s->image_units, sizeof(s->image_units)) != 0)
+            if (ctx->state.image_units_gen != s->image_units_gen &&    /* r169 */
+                memcmp(ctx->state.image_units, s->image_units, sizeof(s->image_units)) != 0)
                 MGL_DF_MISS(24);
             if (memcmp(ctx->state.active_texture_mask, s->tex_mask, sizeof(s->tex_mask)) != 0)
                 MGL_DF_MISS(19);
@@ -2012,11 +2019,17 @@ static bool compatR154On(void)
     /* session 17: compare-first latching — groups whose live content already
      * equals the snapshot (ideas' 89 same-layout walks per frame) turn into a
      * memcmp instead of a copy; only changed groups are written back. */
-    if (memcmp(s->image_units, ctx->state.image_units, sizeof(s->image_units)) != 0)
-        memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
+    if (s->image_units_gen != ctx->state.image_units_gen || !s->gens_valid)   /* r169 */
+    {
+        if (memcmp(s->image_units, ctx->state.image_units, sizeof(s->image_units)) != 0)
+            memcpy(s->image_units, ctx->state.image_units, sizeof(s->image_units));
+        s->image_units_gen = ctx->state.image_units_gen;
+    }
 
     /* gate 26 inputs: the four indexed binding tables (compare-first like the
      * groups above; only a table that actually moved is written back) */
+    if (s->buffer_base_gen != ctx->state.buffer_base_gen || !s->gens_valid)   /* r169 */
+    {
     if (memcmp(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase)) != 0)
         memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
     if (memcmp(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase)) != 0)
@@ -2025,6 +2038,9 @@ static bool compatR154On(void)
         memcpy(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
     if (memcmp(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase)) != 0)
         memcpy(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
+    s->buffer_base_gen = ctx->state.buffer_base_gen;
+    }
+    s->gens_valid = 1;
 
     compatListLatch(&ctx->state.vertex_buffer_map_list, &s->vlist, s->vb);
     compatListLatch(&ctx->state.fragment_buffer_map_list, &s->flist, s->fb);
