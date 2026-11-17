@@ -753,7 +753,7 @@ GLuint mgl_fb_texture_sample_count(GLMContext c, Texture *tex)
 
     if (_currentRenderEncoder) [self endRenderEncoding];
     [self fbEnsureCommandBuffer];
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:756 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:756 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     [blit copyFromTexture:old toTexture:nt];
     [blit endEncoding];
@@ -1410,7 +1410,7 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
         [self fbCache][@"ps:rgb9e5"] = ps;
     }
 
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:1412 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:1412 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     enc.label = @"MGL rgb9e5 quantize";
     [enc setComputePipelineState:ps];
@@ -1487,7 +1487,7 @@ static MTLColorWriteMask fbGLWriteMask(GLMContext ctx, int i)
     if (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatDepth24Unorm_Stencil8)
         opt = req->aspect == MGL_FB_ASPECT_STENCIL ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
 
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:1488 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:1488 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     blit.label = @"MGL readback";
     [blit copyFromTexture:src.tex sourceSlice:src.slice sourceLevel:src.level
@@ -1596,7 +1596,7 @@ typedef struct FBBlitParams {
     d.storageMode = MTLStorageModePrivate;
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     id<MTLTexture> tmp = [_device newTextureWithDescriptor:d];
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:1596 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:1596 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     [blit copyFromTexture:tex sourceSlice:t->slice sourceLevel:t->level sourceOrigin:MTLOriginMake(0, 0, t->plane)
                sourceSize:MTLSizeMake(w, h, 1) toTexture:tmp destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -1773,7 +1773,7 @@ typedef struct DSBlitParams {
     id<MTLBuffer> buf = [_device newBufferWithLength:W * H * bpp options:MTLResourceStorageModeShared];
     if (!out || !buf) return nil;
 
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:1764 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:1764 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     blit.label = @"MGL ds blit stage";
     [blit copyFromTexture:src->tex sourceSlice:src->slice sourceLevel:src->level
@@ -1891,7 +1891,7 @@ typedef struct DSBlitParams {
     NSUInteger W = staged.width, H = staged.height;
     id<MTLBuffer> buf = [_device newBufferWithLength:W * H options:MTLResourceStorageModeShared];
     if (!buf) return false;
-    NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:1881 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:1881 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     [blit copyFromTexture:staged sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
               sourceSize:MTLSizeMake(W, H, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:W
@@ -2053,7 +2053,7 @@ typedef struct DSBlitParams {
         NSInteger x0 = MAX(MAX((NSInteger)s[0], 0), -ox), y0 = MAX(MAX((NSInteger)s[1], 0), -oy);
         NSInteger x1 = MIN(MIN((NSInteger)s[2], SW), DW - ox), y1 = MIN(MIN((NSInteger)s[3], SH), DH - oy);
         if (x1 <= x0 || y1 <= y0) return;
-        NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:2042 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+        MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:2042 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
         id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
         [blit copyFromTexture:src.tex sourceSlice:src.slice sourceLevel:src.level sourceOrigin:MTLOriginMake(x0, y0, src.plane)
                    sourceSize:MTLSizeMake(x1 - x0, y1 - y0, 1) toTexture:dst.tex destinationSlice:dst.slice destinationLevel:dst.level
@@ -2092,7 +2092,7 @@ typedef struct DSBlitParams {
 
         id<MTLBuffer> sbuf = [_device newBufferWithLength:SW * SH * sb options:MTLResourceStorageModeShared];
         id<MTLBuffer> dbuf = [_device newBufferWithLength:DW * DH * db options:MTLResourceStorageModeShared];
-        NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:2080 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+        MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:2080 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
         id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
         [blit copyFromTexture:stex sourceSlice:sslice sourceLevel:slevel sourceOrigin:MTLOriginMake(0, 0, splane) sourceSize:MTLSizeMake(SW, SH, 1)
                      toBuffer:sbuf destinationOffset:0 destinationBytesPerRow:SW * sb destinationBytesPerImage:SW * SH * sb options:so];
@@ -2119,7 +2119,7 @@ typedef struct DSBlitParams {
                 memcpy(dp + (y * DW + x) * db, sp + (iy * SW + ix) * sb, db);
             }
 
-        NSLog(@"MGL TRAIL MGLRenderer+Framebuffer.m:2106 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+        MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Framebuffer.m:2106 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
         blit = [_currentCommandBuffer blitCommandEncoder];
         [blit copyFromBuffer:dbuf sourceOffset:0 sourceBytesPerRow:DW * db sourceBytesPerImage:DW * DH * db sourceSize:MTLSizeMake(DW, DH, 1)
                    toTexture:dst.tex destinationSlice:dst.slice destinationLevel:dst.level destinationOrigin:MTLOriginMake(0, 0, dst.plane) options:dopt];

@@ -321,7 +321,7 @@ kernel void mgl_xfb_scatter(const device uint32_t* record [[buffer(0)]],\n\
         prims_buf = c.xfbPrims;
     }
 
-    NSLog(@"MGL TRAIL MGLRenderer+Gpuaudit.m:324 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Gpuaudit.m:324 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     enc.label = @"MGL xfb scatter";
     [enc setComputePipelineState: ps];
@@ -424,7 +424,7 @@ kernel void mgl_xfb_scatter(const device uint32_t* record [[buffer(0)]],\n\
     if (!_currentCommandBuffer)
         return false;
 
-    NSLog(@"MGL TRAIL MGLRenderer+Gpuaudit.m:426 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Gpuaudit.m:426 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     blit.label = @"MGL buffer clear";
 
@@ -556,7 +556,7 @@ kernel void mgl_xfb_scatter(const device uint32_t* record [[buffer(0)]],\n\
         if (!_currentCommandBuffer)
             return false;
 
-        NSLog(@"MGL TRAIL MGLRenderer+Gpuaudit.m:557 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+        MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Gpuaudit.m:557 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
         id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
         blit.label = @"MGL readpixels (PBO)";
         [blit copyFromTexture:src.tex sourceSlice:src.slice sourceLevel:src.level
@@ -597,7 +597,7 @@ kernel void mgl_xfb_scatter(const device uint32_t* record [[buffer(0)]],\n\
         if (!_currentCommandBuffer)
             return false;
 
-        NSLog(@"MGL TRAIL MGLRenderer+Gpuaudit.m:597 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+        MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Gpuaudit.m:597 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
         id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
         blit.label = @"MGL readpixels depth (PBO)";
         [blit copyFromTexture:src.tex sourceSlice:src.slice sourceLevel:src.level

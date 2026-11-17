@@ -38,6 +38,20 @@ MTLPixelFormat mtlPixelFormatForGLTex(Texture * gl_tex);
 uint64_t mgl_prof_begin(int id);
 void mgl_prof_end(int id, uint64_t t0);
 void mgl_prof_slow(const char *what, uint64_t t0, const char *text);   /* r160 */
+/* r164: MGL_PROFILE call-site histogram.  Records the two return addresses
+ * `skip` frames above the instrumented function (no symbol lookup on the hot
+ * path); mgl_profile_dump names them with dladdr and prints the top sites per
+ * frame.  Kinds: */
+enum { MGL_SITE_PASS_END = 0,    /* a render pass ended (an encoder existed)       */
+       MGL_SITE_FLUSH,           /* extBufFlush committed the command buffer       */
+       MGL_SITE_NEW_CMDBUF,      /* a new command buffer was started               */
+       MGL_SITE_REAPPLY,         /* all draw state marked for re-apply (r152 mask) */
+       MGL_SITE_KINDS };
+void mgl_prof_site(int kind, int skip);
+/* r164: the "MGL TRAIL" command-buffer status traces are debug output; they ran
+ * unconditionally (NSLog on every readback / blit / copy).  MGL_TRAIL=1 enables. */
+int mgl_trail_on(void);
+#define MGL_TRAIL_LOG(...) do { if (mgl_trail_on()) NSLog(__VA_ARGS__); } while (0)
 void mgl_profile_dump(void);
 void mgl_prof_frame(void);
 

@@ -14,6 +14,7 @@
 #import <IOSurface/IOSurface.h>
 
 #import "MGLRenderer+TextureData.h"
+#import "MGLRenderer_Private.h"   /* r164: MGL_TRAIL_LOG */
 #include "mgl_ext_texdata.h"
 #include "mgl_ext_texparam.h"
 #include "mgl_ext_fb.h"
@@ -642,7 +643,7 @@ static void td_level_dims(const TDShape *s, GLuint level, NSUInteger *w, NSUInte
     if (_currentCommandBuffer == nil || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
         [self newCommandBuffer];
 
-    NSLog(@"MGL TRAIL MGLRenderer+TextureData.m:548 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+TextureData.m:548 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     [enc setComputePipelineState:pipe];
 

@@ -207,6 +207,7 @@ unsigned mglExtHookCacheCount(id self, const char *suffix)
  * 4=updateCurrentRenderEncoder 5=texture bind 6=swap total 7=draw time */
 #include <mach/mach_time.h>
 #include <execinfo.h>
+#include <dlfcn.h>
 #define MGL_PROF_BUCKETS 36
 uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];
 /* bumped by each MGL_PROFILE dump: periodic side reports (draw-run histogram)
@@ -214,6 +215,77 @@ uint64_t mgl_prof_ns[MGL_PROF_BUCKETS], mgl_prof_cnt[MGL_PROF_BUCKETS];
 uint64_t mgl_prof_dump_seq;   /* shared with the Compat category counters */
 static int mgl_prof_on = -1;
 static double mgl_prof_scale = 0;
+
+int mgl_trail_on(void)   /* r164 */
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("MGL_TRAIL"); on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return on;
+}
+
+/* r164: call-site histogram (see MGLRenderer_Private.h) */
+#define MGL_SITE_SLOTS 64
+static struct { void *a, *b; uint64_t n; } mgl_site_tab[MGL_SITE_KINDS][MGL_SITE_SLOTS];
+static uint64_t mgl_site_total[MGL_SITE_KINDS], mgl_site_lost[MGL_SITE_KINDS];
+__attribute__((noinline)) void mgl_prof_site(int kind, int skip)
+{
+    if (mgl_prof_on <= 0 || kind < 0 || kind >= MGL_SITE_KINDS)
+        return;
+    void *bt[8];
+    int n = backtrace(bt, 8);
+    /* bt[0] = this function, bt[1] = the instrumented function, bt[2] its caller */
+    void *a = (1 + skip < n) ? bt[1 + skip] : NULL;
+    void *b = (2 + skip < n) ? bt[2 + skip] : NULL;
+    mgl_site_total[kind]++;
+    unsigned h = (unsigned)((((uintptr_t)a >> 2) * 2654435761u) ^ ((uintptr_t)b >> 4)) % MGL_SITE_SLOTS;
+    for (unsigned i = 0; i < MGL_SITE_SLOTS; i++)
+    {
+        unsigned j = (h + i) % MGL_SITE_SLOTS;
+        if (mgl_site_tab[kind][j].n == 0) { mgl_site_tab[kind][j].a = a; mgl_site_tab[kind][j].b = b; }
+        if (mgl_site_tab[kind][j].a == a && mgl_site_tab[kind][j].b == b) { mgl_site_tab[kind][j].n++; return; }
+    }
+    mgl_site_lost[kind]++;
+}
+
+static const char *mgl_site_name(void *p, char *buf, size_t len)
+{
+    Dl_info di;
+    if (p && dladdr(p, &di) && di.dli_sname)
+    {
+        snprintf(buf, len, "%s+%ld", di.dli_sname, (long)((char *)p - (char *)di.dli_saddr));
+        return buf;
+    }
+    snprintf(buf, len, "%p", p);
+    return buf;
+}
+
+static void mgl_site_dump(void)
+{
+    static const char *kname[MGL_SITE_KINDS] = { "pass-end", "flush", "new-cmdbuf", "reapply" };
+    for (int k = 0; k < MGL_SITE_KINDS; k++)
+    {
+        if (!mgl_site_total[k])
+            continue;
+        fprintf(stderr, "MGL PROFILE sites %s/frame: total=%.1f%s\n", kname[k],
+                (double)mgl_site_total[k] / 120.0, mgl_site_lost[k] ? " (table full, some uncounted)" : "");
+        for (int shown = 0; shown < 8; shown++)
+        {
+            int best = -1;
+            for (int j = 0; j < MGL_SITE_SLOTS; j++)
+                if (mgl_site_tab[k][j].n && (best < 0 || mgl_site_tab[k][j].n > mgl_site_tab[k][best].n))
+                    best = j;
+            if (best < 0)
+                break;
+            char na[256], nb[256];
+            fprintf(stderr, "MGL PROFILE   %7.2f  %s  <-  %s\n", (double)mgl_site_tab[k][best].n / 120.0,
+                    mgl_site_name(mgl_site_tab[k][best].a, na, sizeof na),
+                    mgl_site_name(mgl_site_tab[k][best].b, nb, sizeof nb));
+            mgl_site_tab[k][best].n = 0;   /* consumed: next pass finds the next largest */
+        }
+        memset(mgl_site_tab[k], 0, sizeof mgl_site_tab[k]);
+        mgl_site_total[k] = mgl_site_lost[k] = 0;
+    }
+}
 /* NOINLINE + compiler barriers: mach_absolute_time is a pure intrinsic, and
  * the optimizer sinks/hoists it ACROSS the timed region unless blocked — a
  * trivial block "measured" 16 us/draw before the barriers */
@@ -317,6 +389,9 @@ void mgl_profile_dump(void)
                     mgl_prof_ns[i] * mgl_prof_scale,
                     mgl_prof_ns[i] * mgl_prof_scale / 120.0,
                     (double)mgl_prof_cnt[i] / 120.0);
+    /* buckets nest (draw contains processGLState, which contains the texture
+     * walk, ...): the sum over-counts; "draw" is the per-draw total */
+    fprintf(stderr, " (sum %.1f ms, nested buckets: not a total; use draw)\n", tot);
     /* r161: buffer storage pool (r153): storages taken back vs new Metal buffers */
     {
         extern uint64_t mgl_bufpool_stat_reuse, mgl_bufpool_stat_alloc;
@@ -327,9 +402,7 @@ void mgl_profile_dump(void)
             fprintf(stderr, "MGL PROFILE bufpool/frame: reused=%.1f new-metal-buffers=%.1f\n",
                     (double)ru / 120.0, (double)al / 120.0);
     }
-    /* buckets nest (draw contains processGLState, which contains the texture
-     * walk, ...): the sum over-counts; "draw" is the per-draw total */
-    fprintf(stderr, " (sum %.1f ms, nested buckets: not a total; use draw)\n", tot);
+    mgl_site_dump();   /* r164 */
     /* compat perf session 3: Metal argument-bind accounting (MGLRenderer+Compat.m) */
     {
         extern uint64_t mgl_compat_bind_skip, mgl_compat_bind_set, mgl_compat_ring_bytes;
@@ -2035,6 +2108,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                                             // Metal API forbids multiple encoders on same command buffer
                                             BOOL hadRenderEncoder = (_currentRenderEncoder != nil);
                                             if (hadRenderEncoder) {
+                                                mgl_prof_site(MGL_SITE_PASS_END, 0);   /* r164: texture realize blit */
                                                 MGL_INFO(@"MGL INFO: Ending render encoder temporarily for texture blit operation");
                                                 [_currentRenderEncoder endEncoding];
                                                 _currentRenderEncoder = nil;
@@ -2112,6 +2186,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                                             // CRITICAL FIX: End active render encoder before creating blit encoder
                                             BOOL hadRenderEncoder = (_currentRenderEncoder != nil);
                                             if (hadRenderEncoder) {
+                                                mgl_prof_site(MGL_SITE_PASS_END, 0);   /* r164: texture realize blit */
                                                 MGL_INFO(@"MGL INFO: Ending render encoder temporarily for fallback texture blit");
                                                 [_currentRenderEncoder endEncoding];
                                                 _currentRenderEncoder = nil;
@@ -3550,9 +3625,15 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     {
         static uint64_t enc_frame = 0, enc_count = 0;
         if (enc_count < 30 || (++enc_count % 500) == 0)
-            fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p hash=%lu\n",
+            fprintf(stderr, "MGL PROFILE encoder #%llu fbo=%p cmd=%p hash=%lu col0=%p(load %d) depth=%p(load %d)\n",
                     (unsigned long long)enc_count, (void *)ctx->state.framebuffer,
-                    (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul);
+                    (void *)(__bridge void *)_currentCommandBuffer, _currentCommandBuffer ? (unsigned long)[(NSObject *)_currentCommandBuffer hash] : 0ul,
+                    /* r164: one FBO object re-attached per target looks like "same fbo";
+                     * the attachment textures tell a target change from a split pass */
+                    (void *)(__bridge void *)_renderPassDescriptor.colorAttachments[0].texture,
+                    (int)_renderPassDescriptor.colorAttachments[0].loadAction,
+                    (void *)(__bridge void *)_renderPassDescriptor.depthAttachment.texture,
+                    (int)_renderPassDescriptor.depthAttachment.loadAction);
         enc_count++;
         (void)enc_frame;
     }
@@ -3598,7 +3679,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     // Metal API requires ending encoders before creating new command buffers
 
     // STEP 0: End any existing render encoder to prevent MTLReleaseAssertionFailure
+    mgl_prof_site(MGL_SITE_NEW_CMDBUF, 1);   /* r164 */
     if (_currentRenderEncoder) {
+        mgl_prof_site(MGL_SITE_PASS_END, 0);   /* r164: ended by newCommandBuffer */
         MGL_INFO(@"MGL INFO: Ending existing render encoder before creating new command buffer");
         @try {
             [_currentRenderEncoder endEncoding];
@@ -4164,6 +4247,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 {
     if (_currentRenderEncoder)
     {
+        mgl_prof_site(MGL_SITE_PASS_END, 1);   /* r164: who ended the pass */
         @try {
             /* per-frame logging is opt-in (MGL_DEBUG): endRenderEncoding runs
              * every pass (logging-only change, see agents/compat_report.md) */

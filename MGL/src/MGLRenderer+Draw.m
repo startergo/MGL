@@ -133,6 +133,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     if (!_currentCommandBuffer || _currentCommandBuffer.status >= MTLCommandBufferStatusCommitted)
     {
         [self newCommandBuffer];
+        mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
         ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
     }
 }
@@ -147,6 +148,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
 
     if (_currentCommandBuffer && _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
     {
+        mgl_prof_site(MGL_SITE_FLUSH, 1);   /* r164: who flushed */
         [self extBufSerial];
         [self commitCommandBufferWithAGXRecovery: _currentCommandBuffer];
     }
@@ -155,6 +157,7 @@ static void atomic_max_u64(_Atomic uint64_t *a, uint64_t v)
     // committed one current keeps the legacy readback / present paths working unchanged
 
     // the next draw needs a new render encoder with all state re-applied (attachments are loaded)
+    mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
     ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
@@ -461,11 +464,12 @@ void mgl_buffer_pool_free(BufferData *d)
             [self extBufEnsureCommandBuffer];
             [self endRenderEncoding];
 
-            NSLog(@"MGL TRAIL MGLRenderer+Draw.m:301 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+            MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Draw.m:301 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
             id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
             [blit synchronizeResource: b];
             [blit endEncoding];
 
+            mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
             ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
             serial = [self extBufSerial];
         }
@@ -1001,7 +1005,7 @@ void mgl_buffer_pool_free(BufferData *d)
      * current program/pipeline uses image units) */
     [self geom3DImageShadowSync];
 
-    NSLog(@"MGL TRAIL MGLRenderer+Draw.m:816 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Draw.m:816 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLComputeCommandEncoder> enc = [_currentCommandBuffer computeCommandEncoder];
     if (!enc)
         return false;
@@ -1101,7 +1105,7 @@ void mgl_buffer_pool_free(BufferData *d)
     [self extBufEnsureCommandBuffer];
     [self endRenderEncoding];
 
-    NSLog(@"MGL TRAIL MGLRenderer+Draw.m:915 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
+    MGL_TRAIL_LOG(@"MGL TRAIL MGLRenderer+Draw.m:915 status=%d", (int)(_currentCommandBuffer ? _currentCommandBuffer.status : -1));
     id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
     [blit copyFromBuffer: (__bridge id<MTLBuffer>)src->data.mtl_data sourceOffset: so
                 toBuffer: (__bridge id<MTLBuffer>)dst->data.mtl_data destinationOffset: dof size: size];
@@ -1110,6 +1114,7 @@ void mgl_buffer_pool_free(BufferData *d)
     mgl_buffers_mark_gpu_use(ctx, src, false);
     mgl_buffers_mark_gpu_use(ctx, dst, true);
 
+    mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
     ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
@@ -1139,6 +1144,7 @@ void mgl_buffer_pool_free(BufferData *d)
     // draws within one render encoder are not ordered against each other's shader
     // writes: end the encoder, the next draw starts a new one (attachments loaded)
     [self endRenderEncoding];
+    mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
     ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 }
 
@@ -1183,6 +1189,7 @@ void mgl_buffer_pool_free(BufferData *d)
                      }];
     }
 
+    mgl_prof_site(MGL_SITE_REAPPLY, 0);   /* r164 */
     ctx->state.dirty_bits = DIRTY_REAPPLY;   /* r152 */
 
     sync->mtl_event = f;
