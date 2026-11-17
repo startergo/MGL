@@ -49,10 +49,20 @@
 
 static int comp_bytes(const MGLIUniform *u) { return u->kind == MGLI_K_DOUBLE ? 8 : 4; }
 
+/* r170: getenv scans the environment; it ran once per glUniform* and once per copied
+ * component */
+static int fp64_dump_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("MGL_FP64_DUMP") != NULL;
+    return on;
+}
+
 void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
 {
-    if (getenv("MGL_FP64_DUMP")) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[uni] %s present[f]=%d scalar=%d off=%d\n", u->name?u->name:"?", u->st[4].present, u->st[4].scalar_size, u->st[4].offset); fclose(d);} }
+    if (fp64_dump_on()) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[uni] %s present[f]=%d scalar=%d off=%d\n", u->name?u->name:"?", u->st[4].present, u->st[4].scalar_size, u->st[4].offset); fclose(d);} }
     if (!u->shadow) return;
+    u->uploaded = 1;   /* r170: the shadow has reached the program's storage at least once */
     Program *p = ip->prog;
     for (int s = 0; s < MGLI_STAGES; s++) {
         if (!u->st[s].present) continue;
@@ -123,7 +133,7 @@ void mgli_upload_uniform(GLMContext ctx, MGLIProgram *ip, MGLIUniform *u)
                     size_t di = u->st[s].offset + (size_t)e * u->st[s].array_stride + (size_t)c * u->st[s].matrix_stride +
                                 (size_t)r * u->st[s].scalar_size;
                     if (di + u->st[s].scalar_size > ip->dub_size[s]) continue;
-                    if (getenv("MGL_FP64_DUMP")) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[cpy] name=%s off=%d scalar=%d\n", u->name, u->st[s].offset, u->st[s].scalar_size); fclose(d);} }
+                    if (fp64_dump_on()) { FILE*d=fopen("/tmp/fp64uni.txt","a"); if (d) { fprintf(d, "[cpy] name=%s off=%d scalar=%d\n", u->name, u->st[s].offset, u->st[s].scalar_size); fclose(d);} }
                     if (u->kind == MGLI_K_DOUBLE && u->st[s].scalar_size == 4) {
                         /* GPU stores fp32 (Metal has no fp64): convert from the double shadow */
                         float f = (float)*(const double *)(src + si);
@@ -171,13 +181,31 @@ void mgli_set_uniform(GLMContext ctx, const char *func, MGLIProgram *ip, GLint l
     if (count == 0 || !data) return;
     if (count > u->size - elem) count = u->size - elem;
     int comps = cols * rows;
+    /* r170: the value range this call writes, to tell a redundant write.  The
+     * upload re-wrote the program's default-uniform block (a CPU write that may
+     * rename storage the GPU still reads) and, for a sampler / image uniform,
+     * bumped sampler_map_gen, which forces the full texture bind walk.  A D3D9
+     * front end re-sends unchanged uniforms (sampler units after every program
+     * switch).  MGL_UNIFORM_SKIP_SAME=0: always upload. */
+    static int skip_same = -1;
+    if (skip_same < 0) { const char *e = getenv("MGL_UNIFORM_SKIP_SAME"); skip_same = (e && e[0] == '0') ? 0 : 1; }
+    size_t cb_ = (size_t)comp_bytes(u);
+    size_t r_off = (size_t)elem * (size_t)comps * cb_;
+    size_t r_len = (size_t)count * (size_t)comps * cb_;
+    uint8_t before_buf[256];
+    uint8_t *before = NULL;
+    if (skip_same && u->shadow)
+    {
+        before = r_len <= sizeof before_buf ? before_buf : (uint8_t *)malloc(r_len);
+        if (before) memcpy(before, u->shadow + r_off, r_len);
+    }
     if (u->opaque_class) {
         const GLint *v = data;
         /* image-unit values are bounded by GL_MAX_IMAGE_UNITS (16 — get.c
          * MGL_MAX_IMAGE_UNITS / glm_limits.h), not the sampler-unit count */
         GLint max_units = u->opaque_class == 2 ? MGL_IMAGE_UNITS_MAX : TEXTURE_UNITS;
         if (ctx->state.var.max_combined_texture_image_units > 0 && u->opaque_class == 1) max_units = ctx->state.var.max_combined_texture_image_units;
-        for (GLsizei i = 0; i < count; i++) if (v[i] < 0 || v[i] >= max_units) { mgli_set_error(ctx, func, GL_INVALID_VALUE); return; }
+        for (GLsizei i = 0; i < count; i++) if (v[i] < 0 || v[i] >= max_units) { mgli_set_error(ctx, func, GL_INVALID_VALUE); if (before && before != before_buf) free(before); return; }
     }
     for (GLsizei i = 0; i < count; i++) {
         for (int c = 0; c < cols; c++)
@@ -199,6 +227,13 @@ void mgli_set_uniform(GLMContext ctx, const char *func, MGLIProgram *ip, GLint l
                     default: break;
                 }
             }
+    }
+    if (before)
+    {
+        bool same = memcmp(before, u->shadow + r_off, r_len) == 0;
+        if (before != before_buf) free(before);
+        if (same && u->uploaded)
+            return;                     /* r170: nothing changed — no upload, no dirt */
     }
     mgli_upload_uniform(ctx, ip, u);
 }

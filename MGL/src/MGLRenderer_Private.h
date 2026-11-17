@@ -215,6 +215,7 @@ static inline __attribute__((always_inline)) bool mgl_geom_vs_shadow_slot(Progra
 - (Texture *)framebufferAttachmentTexture: (FBOAttachment *)fbo_attachment;
 - (bool)bindMTLTexture:(Texture *)tex;
 - (bool)bindActiveTexturesToMTL;
+- (bool) texwalkSampledUnits: (unsigned *) want;   /* r165: units the bound program can sample */
 - (bool)bindFramebufferTexture:(FBOAttachment *)fbo_attachment isDrawBuffer:(bool) isDrawBuffer;
 - (int) getProgramBindingCount: (int) stage type: (int) type;
 - (int) getProgramBinding: (int) stage type: (int) type index: (int) index;

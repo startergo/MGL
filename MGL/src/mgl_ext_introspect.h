@@ -38,6 +38,8 @@ typedef struct MGLIUniform {
     GLint   location;          /* base location, -1 if none */
     GLbitfield stages;         /* referenced-by mask (1 << _xxx_SHADER) */
     int     hidden;            /* internal (subroutine selector): not reported */
+    int     uploaded;          /* r170: mgli_upload_uniform ran for it since link (a redundant
+                                * glUniform* write is skipped only after that) */
 
     /* value storage (default block / opaque) */
     int     kind;              /* MGLI_K_* */

@@ -1714,9 +1714,23 @@ static bool compatR154On(void)
                 MGL_DF_MISS(24);
             if (memcmp(ctx->state.active_texture_mask, s->tex_mask, sizeof(s->tex_mask)) != 0)
                 MGL_DF_MISS(19);
+            /* r170: only the units the bound program can sample matter to this
+             * draw.  Since r165 the walk no longer realizes textures on units
+             * nobody samples, so such a texture keeps its creation dirty_bits —
+             * and this loop missed (tex-dirty) on every draw while it stayed
+             * bound.  A program that does sample the unit arrives with a program
+             * change (full walk); a sampler-uniform re-point bumps
+             * sampler_map_gen (checked above).  MGL_DRAWFAST_SAMPLEDONLY=0: all. */
+            unsigned want[4] = { ~0u, ~0u, ~0u, ~0u };
+            {
+                static int on = -1;
+                if (on < 0) { const char *e = getenv("MGL_DRAWFAST_SAMPLEDONLY"); on = (e && e[0] == '0') ? 0 : 1; }
+                if (on && ![self texwalkSampledUnits: want])
+                    want[0] = want[1] = want[2] = want[3] = ~0u;
+            }
             for (int w = 0; w < 4; w++)
             {
-                unsigned bits = ctx->state.active_texture_mask[w];
+                unsigned bits = ctx->state.active_texture_mask[w] & want[w];
                 while (bits)
                 {
                     int u = w * 32 + __builtin_ctz(bits);
