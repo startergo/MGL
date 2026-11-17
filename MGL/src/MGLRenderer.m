@@ -853,6 +853,7 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].buf = dub;
                         buffer_map->buffers[buffer_map->count].offset = 0;
                         buffer_map->buffers[buffer_map->count].size = dub->size;
+                        buffer_map->buffers[buffer_map->count].from_ubo = 0;   /* r166 */
                         /* geom: the packed default-uniform block's real MSL argument
                          * index (mgl_DefaultUniforms — see mgl_msl_fix_image_atomics) */
                         buffer_map->buffers[buffer_map->count].mtl_index =
@@ -922,6 +923,7 @@ static char kComputeFallbackKey;
                         buffer_map->buffers[buffer_map->count].offset = 0;
                         buffer_map->buffers[buffer_map->count].size = 0;
                         buffer_map->buffers[buffer_map->count].mtl_index = mtl_idx;
+                        buffer_map->buffers[buffer_map->count].from_ubo = (gl_buffer_type == _UNIFORM_BUFFER);   /* r166 */
                         buffer_map->count++;
                         continue;
                     }
@@ -932,6 +934,7 @@ static char kComputeFallbackKey;
                     buffer_map->buffers[buffer_map->count].offset = eoff;
                     buffer_map->buffers[buffer_map->count].size = esz;
                     buffer_map->buffers[buffer_map->count].mtl_index = mtl_idx;
+                    buffer_map->buffers[buffer_map->count].from_ubo = (gl_buffer_type == _UNIFORM_BUFFER);   /* r166 */
                     buffer_map->count++;
 
                     /* shader storage / atomic counter buffers may be written by the shader:

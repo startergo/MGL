@@ -496,6 +496,9 @@ typedef struct BufferMap_t {
                              * map's ordinal only coincides with it while no image-atomic
                              * emulation buffer interleaves in the MSL signature; the
                              * encoder binds here (falls back to the ordinal) */
+    GLuint      from_ubo;   /* r166: 1 = enumerated from a uniform-buffer binding point
+                             * (buffer_base_index is that point); the draw gate patches
+                             * a same-buffer offset / size change into such entries */
 } BufferMap;
 
 typedef struct BufferMapList_t {

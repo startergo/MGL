@@ -244,6 +244,7 @@ static GLsizei vattribDblShadowSpan(MGLVattribDrawPlan *plan, int lo, int size)
             mgl_program_has_size_constants(ctx->state.program, _VERTEX_SHADER))
         {
             BufferMap *pad = &buffer_map->buffers[buffer_map->count];
+            pad->from_ubo = 0;   /* r166 */
             pad->attribute_mask = 0;
             pad->buffer_base_index = 0;
             pad->buf = NULL;
@@ -253,6 +254,7 @@ static GLsizei vattribDblShadowSpan(MGLVattribDrawPlan *plan, int lo, int size)
         }
 
         BufferMap *m = &buffer_map->buffers[buffer_map->count];
+        m->from_ubo = 0;   /* r166 */
         m->attribute_mask = mask;
         m->buffer_base_index = 0;
         m->buf = va->binding[b].buffer;

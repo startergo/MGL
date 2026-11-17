@@ -811,6 +811,7 @@ uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss, mgl_compat_fast_rebind;
 /* r154: partial-walk verdict counts (MGL_PROFILE drawfast-partial line) */
 uint64_t mgl_compat_fast_tex, mgl_compat_fast_bufs, mgl_compat_fast_rs, mgl_compat_fast_moved;
 uint64_t mgl_compat_fast_texunits;   /* r158: texture partial walks that re-bound only the moved units */
+uint64_t mgl_compat_fast_uboofs;     /* r166: draws whose uniform-buffer ranges moved within the same buffers */
 
 /* ============ per-walk buffer-map PREFIX cache (compat perf session 13) ====
  * mapBuffersToMTL (MGLRenderer.m) re-enumerates the program's SPIR-V buffer
@@ -1131,8 +1132,11 @@ struct MGLCompatDrawFast {
      * texture-only partial walk does not re-evaluate (vertex-stage shadow /
      * wrap function constants, geometry / tessellation stages)?  Cached per
      * (program, vertex MSL) — the MSL pointer moves on every relink. */
-    const void *tdep_prog, *tdep_msl;
-    bool        tdep;
+    /* r166: compatTexPipeDependent verdicts for the last few programs.  One entry
+     * thrashed when draws alternate programs (D3D9 streams): every miss ran two
+     * strstr scans over the vertex MSL (~1.5 us on the M4). */
+    struct { const void *prog, *msl; bool dep; } tdepc[8];
+    bool        tex_rebind;         /* r166: TEXTURES verdict also carries a vertex-array rebind */
     /* r158: the gate's texture verdict for compatDrawFastTextures — the units
      * whose binding moved, or tex_full when the whole bind walk must run */
     unsigned    tex_units[4];
@@ -1202,12 +1206,13 @@ void mgl_compat_drawfast_debug(void)
                 (unsigned long long)df->listwhy[1][0], (unsigned long long)df->listwhy[1][1],
                 (unsigned long long)df->listwhy[1][2], (unsigned long long)df->listwhy[1][4],
                 (unsigned long long)df->listwhy[1][5]);
-    if (mgl_compat_fast_tex + mgl_compat_fast_bufs + mgl_compat_fast_rs + mgl_compat_fast_rebind)
-        fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f (moved units only %.1f) buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f\n",
+    if (mgl_compat_fast_tex + mgl_compat_fast_bufs + mgl_compat_fast_rs + mgl_compat_fast_rebind + mgl_compat_fast_uboofs)
+        fprintf(stderr, "MGL PROFILE drawfast-partial/frame: textures=%.1f (moved units only %.1f) buffers=%.1f (storage-moved %.1f) rstate=%.1f rebind=%.1f ubo-range=%.1f\n",
                 (double)mgl_compat_fast_tex / 120.0, (double)mgl_compat_fast_texunits / 120.0,
                 (double)mgl_compat_fast_bufs / 120.0,
                 (double)mgl_compat_fast_moved / 120.0, (double)mgl_compat_fast_rs / 120.0,
-                (double)mgl_compat_fast_rebind / 120.0);
+                (double)mgl_compat_fast_rebind / 120.0, (double)mgl_compat_fast_uboofs / 120.0);
+    mgl_compat_fast_uboofs = 0;
     mgl_compat_fast_tex = mgl_compat_fast_bufs = mgl_compat_fast_rs = mgl_compat_fast_moved = 0;
     mgl_compat_fast_texunits = 0;
     mgl_compat_fast_rebind = 0;
@@ -1405,14 +1410,17 @@ static bool compatTexPipeDependent(GLMContext ctx, struct MGLCompatDrawFast *df)
     if (ctx->state.ext_geom && ((struct MGLExtState_geom *)ctx->state.ext_geom)->vertex_override)
         return true;
     const char *msl = p->spirv[_VERTEX_SHADER].msl_str;
-    if (df->tdep_prog != (const void *)p || df->tdep_msl != (const void *)msl)
+    /* Program structs are large: the allocator page-aligns them, so the low
+     * address bits are all zero — mix every bit (Fibonacci hash) */
+    unsigned k = (unsigned)(((uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull) >> 61);
+    if (df->tdepc[k].prog != (const void *)p || df->tdepc[k].msl != (const void *)msl)
     {
-        df->tdep_prog = p;
-        df->tdep_msl = msl;
-        df->tdep = p->spirv[_VERTEX_SHADER].shadow_slots != 0 ||
-                   (msl && (strstr(msl, "mgl_shadow_op_") || strstr(msl, "mgl_wrap_op_")));
+        df->tdepc[k].prog = p;
+        df->tdepc[k].msl = msl;
+        df->tdepc[k].dep = p->spirv[_VERTEX_SHADER].shadow_slots != 0 ||
+                           (msl && (strstr(msl, "mgl_shadow_op_") || strstr(msl, "mgl_wrap_op_")));
     }
-    return df->tdep;
+    return df->tdepc[k].dep;
 }
 
 /* r158 kill switch: MGL_DRAWFAST_UNITS=0 makes the texture partial walk run the
@@ -1429,6 +1437,73 @@ static bool compatUnitsOn(void)
 }
 
 /* r154 kill switch: MGL_DRAWFAST_R154=0 restores the r153 gate verdicts */
+/* r166: MGL_UBO_OFFSET_FAST=0 sends every uniform-buffer range change to the full walk */
+static bool compatUboOffsetOn(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_UBO_OFFSET_FAST");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
+/* r166: the uniform-buffer table moved, but does every listed uniform-buffer entry
+ * still name the same buffer object?  Then the change is offset / size only: the
+ * map enumeration (count, order, Metal slots, buffer identities) is unchanged and
+ * the entries just take the new range.  Validates both lists first, then patches
+ * the live lists and the snapshot's copies (compatListStable compares them byte
+ * for byte) and re-latches the uniform tables.  false: nothing was changed. */
+static bool compatUboRangesPatch(GLMContext ctx, struct MGLCompatDrawSnap *s, Buffer *nullbuf)
+{
+    BufferMapList *live[2] = { &ctx->state.vertex_buffer_map_list, &ctx->state.fragment_buffer_map_list };
+    BufferMapList *snap[2] = { &s->vlist, &s->flist };
+
+    for (int pass = 0; pass < 2; pass++)
+    {
+        for (int l = 0; l < 2; l++)
+        {
+            for (GLuint i = 0; i < live[l]->count; i++)
+            {
+                BufferMap *e = &live[l]->buffers[i];
+                if (!e->from_ubo)
+                    continue;
+                BufferBaseTarget *bt = mgl_buffers_indexed_binding(ctx, GL_UNIFORM_BUFFER, e->buffer_base_index);
+                Buffer *eb = bt ? bt->buf : NULL;
+                GLintptr off = eb ? bt->offset : 0;
+                GLsizeiptr sz = eb ? bt->size : 0;
+                if (pass == 0)
+                {
+                    if (!eb)
+                    {
+                        if (e->buf != nullbuf || e->offset != 0 || e->size != 0)
+                            return false;           /* was bound, now unbound */
+                        continue;
+                    }
+                    if (eb != e->buf)
+                        return false;               /* another buffer object: re-enumerate */
+                    continue;
+                }
+                if (!eb || (e->offset == off && e->size == sz))
+                    continue;
+                BufferMap *se = (i < snap[l]->count) ? &snap[l]->buffers[i] : NULL;
+                if (se && se->buf == e->buf && se->from_ubo && se->buffer_base_index == e->buffer_base_index &&
+                    se->offset == e->offset && se->size == e->size)
+                {
+                    se->offset = off;
+                    se->size = sz;
+                }
+                e->offset = off;
+                e->size = sz;
+            }
+        }
+    }
+    memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
+    s->ubo_high_gen = ctx->state.ubo_high_gen;
+    return true;
+}
+
 static bool compatR154On(void)
 {
     static int on = -1;
@@ -1490,12 +1565,29 @@ static bool compatR154On(void)
      * struct's bb_* comment).  Same-buffer rebinds compare equal and skip on. */
     if (ctx->state.dirty_bits & DIRTY_BUFFER_BASE_STATE)
     {
-        if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0 ||
-            memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
+        if (memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
             memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
-            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0 ||
-            ctx->state.ubo_high_gen != s->ubo_high_gen)    /* r159: points >= MAX_BINDABLE_BUFFERS */
+            memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0)
             MGL_DF_MISS(26);
+        if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0 ||
+            ctx->state.ubo_high_gen != s->ubo_high_gen)    /* r159: points >= MAX_BINDABLE_BUFFERS */
+        {
+            /* r166: a D3D9-style constant stream binds the SAME scratch buffer at a
+             * new offset for every draw.  When every listed uniform-buffer entry
+             * still names its buffer object, patch the ranges into the lists and
+             * let the partial paths re-bind them (all of them run extBufBindList);
+             * a geometry-shader program, a pipeline object, or a buffer-identity
+             * change keeps the full walk */
+            Program *gp = ctx->state.program;
+            if (!r154 || !allowDirtyListBuffers || !compatUboOffsetOn() || !gp ||
+                gp->shader_slots[_GEOMETRY_SHADER] || gp->shader_slots[_TESS_CONTROL_SHADER] ||
+                gp->shader_slots[_TESS_EVALUATION_SHADER] ||
+                (__bridge const void *)_currentRenderEncoder != s->encoder ||
+                !compatUboRangesPatch(ctx, s, [self nullShaderBuffer]))
+                MGL_DF_MISS(26);
+            moved = true;                   /* the lists must be re-bound */
+            mgl_compat_fast_uboofs++;
+        }
     }
     /* ...and only for the three PreDraw hooks this gate reasons about */
     /* session 17: the hook table is filled during context setup; re-count at
@@ -1754,10 +1846,24 @@ static bool compatR154On(void)
     /* session 19: a respec that only re-points a used binding at a different
      * buffer object: rebuild the map suffix + rebind, skip the rest of the
      * walk (everything else about this draw was gate-proven unchanged) */
+    df->tex_rebind = false;
     if (rebind)
     {
+        /* r166: a vertex-array respec AND a texture change (D3D9: the stream and the
+         * stage textures move on the same draw) — the texture-only partial walk
+         * re-points the map suffix first (compatRebindRepoint) and re-latches the
+         * whole snapshot at its end.  MGL_DRAWFAST_TEXREBIND=0: full walk. */
         if (tex_partial)
-            MGL_DF_MISS(28);
+        {
+            static int on = -1;
+            if (on < 0) { const char *e = getenv("MGL_DRAWFAST_TEXREBIND"); on = (e && e[0] == '0') ? 0 : 1; }
+            if (!on)
+                MGL_DF_MISS(28);
+            df->tex_rebind = true;
+            mgl_compat_fast_rebind++;
+            mgl_compat_fast_tex++;
+            return MGL_DF_TEXTURES;
+        }
         mgl_compat_fast_rebind++;
         return MGL_DF_REBIND;
     }
@@ -1937,6 +2043,28 @@ static bool compatR154On(void)
  * encoder.  The PSO key ignores buffer identity (compacted layout key), the
  * rstate/texext/vattrib-hook groups were gate-proven unchanged, and the
  * bindList rebinds below are exactly the vattrib PreDraw hook's own binds. */
+/* session 19 / r166: re-point the vertex map list's attribute suffix at the
+ * buffers (and offsets) the respec bound.  The entry set and order (hence every
+ * mtl index and the SSBO pad position) are unchanged — the gate proved the
+ * used-binding set equal — so only the buffer-object-derived fields move. */
+static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, MGLVertexArrayFull *va)
+{
+    BufferMapList *list = &ctx->state.vertex_buffer_map_list;
+    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
+    {
+        int slot = vs->plan.binding_index[b];
+        if (slot < 0 || (GLuint)slot >= list->count)
+            continue;
+        Buffer *nb = va->binding[b].buffer;
+        if (!nb)
+            continue;
+        BufferMap *e = &list->buffers[slot];
+        e->buf = nb;
+        e->offset = va->binding[b].offset;
+        e->size = nb->size;
+    }
+}
+
 - (bool) compatDrawFastRebind
 {
     uint64_t t13 = mgl_prof_begin(30);
@@ -1954,23 +2082,9 @@ static bool compatR154On(void)
         return false;
     }
 
-    /* 1. re-point the vertex map list's attribute suffix at the new buffers.
-     * The entry set and order (hence every mtl index and the SSBO pad
-     * position) are unchanged — the gate proved the used-binding set equal —
-     * so only the buffer-object-derived fields of the mapped entries move. */
-    for (int b = 0; b < MGL_VA_MAX_BINDINGS; b++)
-    {
-        int slot = vs->plan.binding_index[b];
-        if (slot < 0 || (GLuint)slot >= list->count)
-            continue;
-        Buffer *nb = va->binding[b].buffer;
-        if (!nb)
-            continue;
-        BufferMap *e = &list->buffers[slot];
-        e->buf = nb;
-        e->offset = va->binding[b].offset;
-        e->size = nb->size;
-    }
+    /* 1. re-point the vertex map list's attribute suffix at the new buffers */
+    (void)list;
+    compatRebindRepoint(ctx, vs, va);
 
     /* 2. flush listed-buffer content and re-bind the changed entries: the
      * attribute entries carry the new buffers, the bindList shadow setters
@@ -2100,6 +2214,20 @@ static bool compatR154On(void)
     }
 
     m->texext_skip_epoch = 0;               /* the texext hook below must re-run */
+
+    /* r166: the gate folded a vertex-array rebind into this verdict */
+    if (df->tex_rebind)
+    {
+        struct MGLExtState_vattrib *vs = (struct MGLExtState_vattrib *)ctx->state.ext_vattrib;
+        MGLVertexArrayFull *va = mgl_va_full(ctx->state.vao);
+        if (!vs || !va)
+        {
+            mgl_prof_end(30, t13);
+            return false;
+        }
+        compatRebindRepoint(ctx, vs, va);
+        df->tex_rebind = false;
+    }
 
     /* r158: re-bind only the units the gate saw move.  Every other unit's
      * texture, sampler, parameter caches and slot mapping are gate-proven
