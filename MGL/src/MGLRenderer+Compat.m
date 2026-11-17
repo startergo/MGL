@@ -1374,6 +1374,17 @@ enum { VW_OK = 0, VW_NOPLAN, VW_SHADOW, VW_ATTR_BINDING, VW_ATTR_FORMAT, VW_ATTR
        VW_ATTR_PTRSTRIDE, VW_BUFFERLESS, VW_STRIDE, VW_DIVISOR, VW_OFS_ALIGN, VW_RING_BUFFER };
 static const char *const s_vaowhy[] = { "ok", "no-plan", "shadow-fetch", "attr-binding", "attr-format",
     "attr-reloffset", "attr-ptr-stride", "bufferless", "stride", "divisor", "offset-align4", "ring-buffer-change" };
+static bool compatRingRebindOn(void)   /* r168 */
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_DRAWFAST_RINGREBIND");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
 static int compatRebindWhy(GLMContext ctx, MGLVertexArrayFull *va, const struct MGLCompatDrawSnap *s)
 {
     const struct MGLExtState_vattrib *vs =
@@ -1411,7 +1422,14 @@ static int compatRebindWhy(GLMContext ctx, MGLVertexArrayFull *va, const struct 
             return VW_DIVISOR;
         if ((B->offset & 3) != (G->offset & 3))
             return VW_OFS_ALIGN;            /* alignment class change: new PSO key */
-        if (B->buffer && B->buffer != G->buffer && !B->buffer->data.mtl_data)
+        /* r168: a switch between two buffers WITHOUT Metal storage (< 4096 bytes,
+         * streamed by value through the argument ring) re-streams the same way
+         * on the rebind path: extBufBindList is the only binder of those bytes
+         * in the full walk too.  A switch that moves a binding between ring
+         * and Metal storage still takes the full walk (the gate's storage-class
+         * check).  MGL_DRAWFAST_RINGREBIND=0: every ring buffer change misses. */
+        if (B->buffer && B->buffer != G->buffer && !B->buffer->data.mtl_data &&
+            !(compatRingRebindOn() && G->buffer && !G->buffer->data.mtl_data))
             return VW_RING_BUFFER;          /* ring-backed stream: the full walk re-streams */
     }
     return VW_OK;
@@ -1837,7 +1855,16 @@ static bool compatR154On(void)
              * (possibly renamed) storage.  Shadow (converted) streams are rebuilt
              * from the buffer bytes by the vattrib hook only: full walk. */
             bool listed = false;
-            if (r154 && allowDirtyListBuffers && !rebind)
+            if (r154 && allowDirtyListBuffers && rebind && compatRingRebindOn())
+            {
+                /* r168: compatRebindRepoint makes the plan slot's map entry this
+                 * buffer before the rebind path flushes + binds the lists, so
+                 * new content (a rewritten small stream) is uploaded there exactly
+                 * as for a listed buffer (shadow fetches never classify as rebind) */
+                int slot = s->plan.binding_index[b];
+                listed = slot >= 0 && (GLuint)slot < ctx->state.vertex_buffer_map_list.count;
+            }
+            else if (r154 && allowDirtyListBuffers && !rebind)
             {
                 int slot = s->plan.binding_index[b];
                 const BufferMapList *vl = &ctx->state.vertex_buffer_map_list;
