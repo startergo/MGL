@@ -417,6 +417,10 @@ void mgl_profile_dump(void)
                 (double)mgl_compat_ring_bytes / 120.0 / 1024.0);
         mgl_compat_bind_skip = mgl_compat_bind_set = mgl_compat_ring_bytes = 0;
     }
+    {   /* r175 */
+        extern void mgl_walkkind_dump(void);
+        mgl_walkkind_dump();
+    }
     /* compat perf session 12: per-draw state-walk fast path coverage */
     {
         extern uint64_t mgl_compat_fast_hit, mgl_compat_fast_miss;

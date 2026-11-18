@@ -594,6 +594,8 @@ void mgl_buffer_pool_free(BufferData *d)
             return true;
     }
 
+    extern int mgl_wk_full;
+    mgl_wk_full = 1;                        /* r175: walk-kind timing */
     uint64_t prof_t0 = mgl_prof_begin(0);
     [self extBufEnsureCommandBuffer];
 
@@ -1280,7 +1282,77 @@ static bool c_ensure(GLMContext c, Buffer *b) { return [RENDERER(c) extBufEnsure
 static bool c_rename(GLMContext c, Buffer *b) { return [RENDERER(c) extBufRename: b]; }
 static void c_did_modify(GLMContext c, Buffer *b, size_t o, size_t l) { [RENDERER(c) extBufDidModify: b offset: o length: l]; }
 static void c_release(GLMContext c, Buffer *b) { [RENDERER(c) extBufRelease: b]; }
-static bool c_begin_draw(GLMContext c) { return [RENDERER(c) extBufBeginDraw]; }
+/* r175: wall-clock cost of each draw's begin (gate + whatever walk runs), split
+ * by why a full walk ran.  One timer pair per draw around the whole call — the
+ * short-section buckets (drawFastGate & co.) overstate sub-microsecond regions,
+ * a whole walk is long enough to time directly.  Kinds: the fast path (no full
+ * walk), then the full walk by the dirt it started with — reapply (a new
+ * command buffer: DIRTY_REAPPLY), program, framebuffer, render state, vertex
+ * array / buffers, textures, other (no dirt: identity / content misses).
+ * MGL_PROFILE only; printed as "walk-kind/frame". */
+#define MGL_WK_KINDS 8
+static const char *const mgl_wk_name[MGL_WK_KINDS] = {
+    "fast", "reapply", "program", "fbo", "rstate", "vao/buf", "tex", "other" };
+static uint64_t mgl_wk_n[MGL_WK_KINDS], mgl_wk_t[MGL_WK_KINDS], mgl_wk_max[MGL_WK_KINDS];
+int mgl_wk_full;                        /* set by extBufBeginDraw when the full walk runs */
+
+static int mgl_wk_kind(GLuint d)
+{
+    if ((d & DIRTY_REAPPLY) == DIRTY_REAPPLY) return 1;
+    if (d & DIRTY_PROGRAM) return 2;
+    if (d & DIRTY_FBO) return 3;
+    if (d & (DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE)) return 4;
+    if (d & (DIRTY_VAO | DIRTY_BUFFER | DIRTY_BUFFER_BASE_STATE)) return 5;
+    if (d & (DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER | DIRTY_TEX_PARAM | DIRTY_IMAGE_UNIT_STATE)) return 6;
+    return 7;
+}
+
+static bool c_begin_draw(GLMContext c)
+{
+    static int on = -1;
+    static double tick_us = 0;
+    if (on < 0)
+    {
+        const char *e = getenv("MGL_PROFILE");
+        on = e && e[0] && e[0] != '0';
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        tick_us = (double)tb.numer / tb.denom / 1000.0;
+        (void)tick_us;
+    }
+    if (!on)
+        return [RENDERER(c) extBufBeginDraw];
+    GLuint d = c->state.dirty_bits;
+    mgl_wk_full = 0;
+    uint64_t t0 = mach_absolute_time();
+    bool ok = [RENDERER(c) extBufBeginDraw];
+    uint64_t dt = mach_absolute_time() - t0;
+    int k = mgl_wk_full ? mgl_wk_kind(d) : 0;
+    mgl_wk_n[k]++;
+    mgl_wk_t[k] += dt;
+    if (dt > mgl_wk_max[k]) mgl_wk_max[k] = dt;
+    return ok;
+}
+
+void mgl_walkkind_dump(void)
+{
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double us = (double)tb.numer / tb.denom / 1000.0;
+    uint64_t tot = 0;
+    for (int k = 0; k < MGL_WK_KINDS; k++) tot += mgl_wk_n[k];
+    if (!tot)
+        return;
+    fprintf(stderr, "MGL PROFILE walk-kind/frame (n | us/call | max us):");
+    for (int k = 0; k < MGL_WK_KINDS; k++)
+        if (mgl_wk_n[k])
+            fprintf(stderr, " %s=%.1f|%.2f|%.0f", mgl_wk_name[k], (double)mgl_wk_n[k] / 120.0,
+                    (double)mgl_wk_t[k] * us / (double)mgl_wk_n[k], (double)mgl_wk_max[k] * us);
+    fprintf(stderr, "\n");
+    memset(mgl_wk_n, 0, sizeof mgl_wk_n);
+    memset(mgl_wk_t, 0, sizeof mgl_wk_t);
+    memset(mgl_wk_max, 0, sizeof mgl_wk_max);
+}
 static void c_end_draw(GLMContext c) { [RENDERER(c) extBufEndDraw]; }
 
 static void c_draw_arrays(GLMContext c, int prim, GLint first, GLsizei count, GLsizei inst, GLuint base_inst)
