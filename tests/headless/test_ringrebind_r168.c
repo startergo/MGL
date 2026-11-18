@@ -10,7 +10,11 @@
  *      the texture partial walk)
  *   4. a switch from a small buffer to a Metal-backed one (>= 4096 bytes) still
  *      takes the full walk and draws right
- * Pixels checked per cell; sections 1-3 count fast-path misses. */
+ * Pixels checked per cell; sections 1-3 count fast-path misses.
+ * r176: small buffers that are not rewritten move to Metal storage at their
+ * first clean draw, so section 1's first pass switches between ring-streamed and
+ * Metal-backed buffers while they move (one full walk each): its misses are
+ * counted over a second pass, the steady state. */
 #include "mgl_test.h"
 #include <stdio.h>
 #include <string.h>
@@ -129,8 +133,9 @@ int main(void)
     {
         uint64_t m0 = 0;
         glClear(GL_COLOR_BUFFER_BIT);
-        for (int i = 0; i < 64; i++) {
-            if (i == 2) m0 = mgl_compat_fast_miss;
+        for (int i = 0; i < 128; i++) {      /* r176: misses counted over the second 64 */
+            if (i == 64) glClear(GL_COLOR_BUFFER_BIT);
+            if (i == 66) m0 = mgl_compat_fast_miss;
             int k = i % 8;
             glBindBuffer(GL_ARRAY_BUFFER, vbs[k]); attribs();
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibs[(k + 3) % 8]);   /* index buffers switch independently */

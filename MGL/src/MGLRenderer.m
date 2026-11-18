@@ -1213,6 +1213,11 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
         if (map->attribute_mask == 0 && mgl_writable_binding(ctx, ptr))
             [self bindMTLBuffer: ptr];
 
+        {   /* r176: small, unwritten for MGL_SMALLBUF_PROMOTE binds -> Metal storage */
+            extern bool mgl_small_promote(Buffer *b);
+            if (ptr->data.mtl_data == NULL && map->attribute_mask && mgl_small_promote(ptr))
+                [self bindMTLBuffer: ptr];
+        }
         // for buffers less than 4k we should use this call
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
@@ -1276,6 +1281,11 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
         if (map->attribute_mask == 0 && mgl_writable_binding(ctx, ptr))
             [self bindMTLBuffer: ptr];
 
+        {   /* r176 (see the vertex stage twin above) */
+            extern bool mgl_small_promote(Buffer *b);
+            if (ptr->data.mtl_data == NULL && map->attribute_mask && mgl_small_promote(ptr))
+                [self bindMTLBuffer: ptr];
+        }
         if (ptr->size < 4096 && ptr->data.mtl_data == NULL)
         {
             if (ptr->data.buffer_data == 0 || ptr->size <= 0) continue;

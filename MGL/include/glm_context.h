@@ -191,6 +191,9 @@ typedef struct BufferData_t {
     void            *mtl_data;
     void            *pool;      /* r153: retired Metal storages of THIS buffer, reused once
                                  * their command buffer completed (MGLRenderer+Draw.m) */
+    uint32_t        stable_binds;   /* r176: draws that bound this small CPU-side buffer
+                                     * since its last write (mgl_small_promote) */
+    uint64_t        stable_draw;    /* r176: mgl_draw_seq of the last draw counted */
 } BufferData;
 
 /* r153: release a buffer's pool of retired Metal storages (buffer deletion) */

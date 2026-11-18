@@ -492,6 +492,63 @@ void mgl_buffer_pool_free(BufferData *d)
     return false;
 }
 
+/* r176: a small (< 4 KB) buffer without Metal storage is streamed through the
+ * argument ring at every bind — the bytes are copied again whenever the slot's
+ * previous ring bytes differ, i.e. on every switch between such buffers.  D3D9
+ * guests keep many small, never-rewritten vertex buffers (rsvga AquaMark: ~206
+ * distinct small buffers read per 2,000 draws, ~0.14 of them rewritten), so the
+ * copies, the ring traffic and the walks that re-stream them are pure overhead.
+ * Only vertex-attribute streams are promoted (uniform / storage bindings keep
+ * their paths).  Default: a small vertex buffer gets Metal storage (bindMTLBuffer,
+ * the path small writable buffers already take) at the first bind where it was
+ * not written since the previous bind — a buffer made once and reused moves at
+ * its second bind and from then on binds like any large buffer; one rewritten
+ * before every draw stays on the ring, which is GPU memory too and the right
+ * place for per-draw bytes.  On Apple Silicon a shared MTLBuffer is the memory
+ * the CPU writes, so re-copying unchanged bytes buys nothing.
+ * DIRTY_BUFFER_DATA is set by every writer and cleared by the streaming bind, so
+ * seeing it at a bind means the bytes changed since the previous one.  One draw
+ * binds a stream at more than one site (the map-list binder streams it and clears
+ * the bit, then the vattrib hook binds it again), so the count moves at most once
+ * per draw (mgl_draw_seq): a draw that sees the buffer dirty anywhere resets it.
+ * MGL_SMALLBUF_PROMOTE=N: promote after N such binds (default 1);
+ * MGL_SMALLBUF_PROMOTE=0: never promote (pre-r176 ring streaming).
+ * A buffer mapped at bind time stays on the ring for that bind.  Only buffers
+ * the application created (name != 0): MGL's own small buffers — the default
+ * uniform blocks, which the vertex stage also binds through vattribBindBuffer —
+ * are rewritten by writers that keep their ring semantics. */
+uint64_t mgl_small_promoted;
+uint64_t mgl_draw_seq;                  /* r176: bumped at every draw's begin */
+
+bool mgl_small_promote(Buffer *b)
+{
+    static int thr = -1;
+    if (thr < 0)
+    {
+        const char *e = getenv("MGL_SMALLBUF_PROMOTE");
+        thr = e ? atoi(e) : 1;
+        if (thr < 0) thr = 0;
+    }
+    if (!thr || !b || !b->name || b->data.mtl_data || b->size >= 4096 || b->size <= 0 ||
+        !b->data.buffer_data || b->mapped)
+        return false;
+    if (b->data.dirty_bits & DIRTY_BUFFER_DATA)
+    {
+        b->data.stable_binds = 0;
+        b->data.stable_draw = mgl_draw_seq;
+        return false;
+    }
+    if (b->data.stable_draw == mgl_draw_seq)
+        return false;                       /* this draw was counted (or seen dirty) already */
+    b->data.stable_draw = mgl_draw_seq;
+    if (b->data.stable_binds < 0xffffffffu)
+        b->data.stable_binds++;
+    if (b->data.stable_binds < (uint32_t)thr)
+        return false;
+    mgl_small_promoted++;
+    return true;
+}
+
 /* bind the stage's buffer map to the encoder: real MTLBuffers (aliasing the GL data)
  * for storage / large buffers, setBytes snapshots for small read-only buffers */
 - (bool) extBufBindList: (BufferMapList *) list vertex: (bool) vertex
@@ -514,6 +571,8 @@ void mgl_buffer_pool_free(BufferData *d)
 
         size_t offset = map->offset > 0 ? (size_t)map->offset : 0;
         bool storage = map->attribute_mask == 0 && [self extBufStorageBinding: buf];
+        if (!buf->data.mtl_data && map->attribute_mask && mgl_small_promote(buf))   /* r176 */
+            [self bindMTLBuffer: buf];
 
         if (storage || buf->data.mtl_data || buf->size >= 4096 ||
             (buf->mapped && (buf->access_flags & GL_MAP_PERSISTENT_BIT)))
@@ -1309,6 +1368,8 @@ static int mgl_wk_kind(GLuint d)
 
 static bool c_begin_draw(GLMContext c)
 {
+    extern uint64_t mgl_draw_seq;
+    mgl_draw_seq++;                         /* r176: one count per draw (mgl_small_promote) */
     static int on = -1;
     static double tick_us = 0;
     if (on < 0)
@@ -1349,6 +1410,12 @@ void mgl_walkkind_dump(void)
             fprintf(stderr, " %s=%.1f|%.2f|%.0f", mgl_wk_name[k], (double)mgl_wk_n[k] / 120.0,
                     (double)mgl_wk_t[k] * us / (double)mgl_wk_n[k], (double)mgl_wk_max[k] * us);
     fprintf(stderr, "\n");
+    {
+        extern uint64_t mgl_small_promoted;
+        if (mgl_small_promoted)
+            fprintf(stderr, "MGL PROFILE smallbuf-promoted (window): %llu\n", (unsigned long long)mgl_small_promoted);
+        mgl_small_promoted = 0;
+    }
     memset(mgl_wk_n, 0, sizeof mgl_wk_n);
     memset(mgl_wk_t, 0, sizeof mgl_wk_t);
     memset(mgl_wk_max, 0, sizeof mgl_wk_max);

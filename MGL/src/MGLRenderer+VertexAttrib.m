@@ -959,7 +959,17 @@ static bool vattribIsDoubleType(GLenum t)
     for (int b = 0; b < MGL_VA_MAX_BINDINGS && !tess_render_stage; b++)
     {
         if (plan->binding_index[b] >= 0 && va->binding[b].buffer)
-            [self vattribBindBuffer: va->binding[b].buffer offset: va->binding[b].offset index: plan->binding_index[b] encoder: enc];
+        {
+            /* r176: a small attribute stream that is not rewritten gets Metal
+             * storage (mgl_small_promote).  Only here: the uniform / storage loop
+             * above binds through vattribBindBuffer too, and a promoted uniform
+             * buffer broke KHR-GL46.shaders.uniform_block.*single_buffer* */
+            extern bool mgl_small_promote(Buffer *bp);
+            Buffer *sb = va->binding[b].buffer;
+            if (!sb->data.mtl_data && mgl_small_promote(sb))
+                [self bindMTLBuffer: sb];
+            [self vattribBindBuffer: sb offset: va->binding[b].offset index: plan->binding_index[b] encoder: enc];
+        }
     }
 
     for (int a = 0; a < MAX_ATTRIBS && !tess_render_stage; a++)
