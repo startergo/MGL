@@ -2198,7 +2198,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                                                   destinationOrigin:MTLOriginMake(0, 0, 0)];
                                                 [blitEncoder endEncoding];
 
-                                                NSLog(@"MGL SUCCESS: Texture data copied using main command buffer");
+                                                MGL_TRAIL_LOG(@"MGL SUCCESS: Texture data copied using main command buffer");
 
                                                 // CRITICAL FIX: Restore render encoder if it was active before
                                                 if (hadRenderEncoder) {
@@ -2299,7 +2299,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
                                                     bytesPerRow:width * sizeof(uint32_t)
                                                   bytesPerImage:width * height * sizeof(uint32_t)];
 
-                                            NSLog(@"MGL SUCCESS: Simple direct color fill completed");
+                                            MGL_TRAIL_LOG(@"MGL SUCCESS: Simple direct color fill completed");
                                             free(simpleData);
                                         }
                                     } @catch (NSException *exception) {
@@ -3298,12 +3298,12 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                  * that hung the official CTS run's tess+geometry cases for 90
                  * minutes (the "emergency fallback" log flood) */
                 tex->dirty_bits = 0;
-                NSLog(@"MGL SUCCESS: Fallback texture created successfully");
+                MGL_TRAIL_LOG(@"MGL SUCCESS: Fallback texture created successfully");
             } else {
                 NSLog(@"MGL ERROR: Even fallback texture creation failed - this texture will remain NULL");
             }
         } else {
-            NSLog(@"MGL SUCCESS: Primary texture created successfully");
+            MGL_TRAIL_LOG(@"MGL SUCCESS: Primary texture created successfully");
         }
 
         tex->params.mtl_data = (void *)CFBridgingRetain([self createMTLSamplerForTexParam:&tex->params target:tex->target]);
@@ -4183,7 +4183,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // Use conservative approach: only encode if everything looks perfect
             [_currentCommandBuffer encodeWaitForEvent:cachedEvent value:cachedSyncName];
 
-            NSLog(@"MGL SUCCESS: Event wait encoded successfully on fresh command buffer");
+            MGL_TRAIL_LOG(@"MGL SUCCESS: Event wait encoded successfully on fresh command buffer");
         } @catch (NSException *exception) {
             NSLog(@"MGL ERROR: Event wait failed - %@: %@", exception.name, exception.reason);
             MGL_INFO(@"MGL INFO: Continuing without event wait to maintain stability");
@@ -4627,7 +4627,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             @try {
                 MGL_INFO(@"MGL INFO: Attempting to create new render encoder with safety protection");
                 if ([self newRenderEncoder]) {
-                    NSLog(@"MGL SUCCESS: New render encoder created successfully");
+                    MGL_TRAIL_LOG(@"MGL SUCCESS: New render encoder created successfully");
                 } else {
                     NSLog(@"MGL WARNING: Failed to create render encoder - continuing with degraded functionality");
                 }
