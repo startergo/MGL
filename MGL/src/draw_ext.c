@@ -41,6 +41,16 @@ void mglMultiDrawElementsIndirectCount(GLMContext ctx, GLenum mode, GLenum type,
 
 #pragma mark - GPU usage tracking
 
+/* r178: getenv takes the environment lock and scans the whole environment;
+ * mgl_buffers_track called it on every buffer lookup (several per draw) */
+static int mgl_xfb_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MGL_GEOM_XFB_TRACE") != NULL;
+    return on;
+}
+
 static inline uint32_t hash_ptr(const void *p)
 {
     uintptr_t v = (uintptr_t)p;
@@ -90,7 +100,7 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
     uint32_t i = hash_ptr(buf) & mask;
     MGLBufferTrack *first_free = NULL;
 
-    if (getenv("MGL_GEOM_XFB_TRACE") && create)
+    if (create && mgl_xfb_trace_on())
         fprintf(stderr, "geom: track create lookup buf=%p name=%u ctx=%p ext=%p idx=%u cap=%u from=%p\n",
                 (void *)buf, buf ? buf->name : 0, (void *)ctx, (void *)st, i, st->track_cap,
                 __builtin_return_address(0));
@@ -120,7 +130,7 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
             }
 
             first_free->buf = buf;
-            if (getenv("MGL_GEOM_XFB_TRACE"))
+            if (mgl_xfb_trace_on())
                 fprintf(stderr, "geom: track CREATE entry for buf=%u (was serial %llu)\n",
                         buf ? buf->name : 0,
                         (unsigned long long)first_free->write_serial);
@@ -132,7 +142,7 @@ MGLBufferTrack *mgl_buffers_track(GLMContext ctx, Buffer *buf, bool create)
     if (create && first_free)
     {
         first_free->buf = buf;
-        if (getenv("MGL_GEOM_XFB_TRACE"))
+        if (mgl_xfb_trace_on())
             fprintf(stderr, "geom: track REUSE entry for buf=%u (was serial %llu)\n",
                     buf ? buf->name : 0,
                     (unsigned long long)first_free->write_serial);
@@ -149,7 +159,7 @@ void mgl_buffers_forget(GLMContext ctx, Buffer *buf)
 
     if (t)
     {
-        if (getenv("MGL_GEOM_XFB_TRACE"))
+        if (mgl_xfb_trace_on())
             fprintf(stderr, "geom: track FORGET entry for buf=%u (was serial %llu)\n",
                     buf ? buf->name : 0, (unsigned long long)t->write_serial);
         t->buf = TRACK_TOMBSTONE;
@@ -285,7 +295,7 @@ void mgl_buffers_prepare_cpu_write(GLMContext ctx, Buffer *buf, bool whole_buffe
 
     if (can_rename && MTLX()->rename_buffer(ctx, buf))
     {
-        if (getenv("MGL_GEOM_XFB_TRACE"))
+        if (mgl_xfb_trace_on())
             fprintf(stderr, "geom: track ORPHAN buf=%u (serial was %llu, rename)\n",
                     buf ? buf->name : 0, (unsigned long long)t->write_serial);
         t->read_serial = t->write_serial = 0;

@@ -89,6 +89,15 @@ extern void mglDrawBuffer(GLMContext ctx, GLenum buf);
 #import "MGLRenderer+Gpuaudit.h" // gpuaudit: render pipeline state cache (draw-path CPU cost)
 
 
+/* r178: MGL_GEOM_DEBUG was read with getenv per compute dispatch / bound image */
+static int mgl_geom_debug_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MGL_GEOM_DEBUG") != NULL;
+    return on;
+}
+
 #pragma mark domain extension hook fan-out (see MGLRenderer_Private.h)
 // Calls every category method named ext<Domain><suffix> (single object argument).
 //
@@ -1180,7 +1189,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
     /* perf: latch the debug knobs once — getenv takes the environment lock and
      * these two run per buffer map per draw (the MGL_BINDMAP_DEBUG twin below) */
     static int sGeomDbgInit = 0, sGeomDbg = 0;
-    if (!sGeomDbgInit) { sGeomDbg = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgInit = 1; }
+    if (!sGeomDbgInit) { sGeomDbg = mgl_geom_debug_on() != NULL; sGeomDbgInit = 1; }
     if (sGeomDbg)
         fprintf(stderr, "MGL geom: vertex buffer map: %d entries\n", ctx->state.vertex_buffer_map_list.count);
     for(int i=0; i<ctx->state.vertex_buffer_map_list.count; i++)
@@ -1258,7 +1267,7 @@ static bool mgl_writable_binding(GLMContext ctx, Buffer *ptr)
 
     /* perf: latched once (see the vertex twin above) */
     static int sGeomDbgFInit = 0, sGeomDbgF = 0;
-    if (!sGeomDbgFInit) { sGeomDbgF = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgFInit = 1; }
+    if (!sGeomDbgFInit) { sGeomDbgF = mgl_geom_debug_on() != NULL; sGeomDbgFInit = 1; }
     if (sGeomDbgF)
         fprintf(stderr, "MGL geom: fragment buffer map: %d entries\n", ctx->state.fragment_buffer_map_list.count);
     for(int i=0; i<ctx->state.fragment_buffer_map_list.count; i++)
@@ -4390,7 +4399,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             pipelineStateDescriptor.vertexFunction = geomVertexFunction;
             /* perf: latched once (per-draw descriptor path) */
             static int sGeomDbgVInit = 0, sGeomDbgV = 0;
-            if (!sGeomDbgVInit) { sGeomDbgV = getenv("MGL_GEOM_DEBUG") != NULL; sGeomDbgVInit = 1; }
+            if (!sGeomDbgVInit) { sGeomDbgV = mgl_geom_debug_on() != NULL; sGeomDbgVInit = 1; }
             if (sGeomDbgV)
                 NSLog(@"MGL geom: PSO vertex function is the pass-through %@", geomVertexFunction.name);
         }
@@ -5155,7 +5164,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         ctx->state.dirty_bits &= ~DIRTY_BUFFER;
     }
 
-    if (getenv("MGL_GEOM_DEBUG"))
+    if (mgl_geom_debug_on())
         fprintf(stderr, "MGL geom: compute buffer map: %d entries (dub_msl=%u)\n",
                 ctx->state.compute_buffer_map_list.count,
                 STATE(program) ? STATE(program)->spirv[_COMPUTE_SHADER].dub_msl : 0xffffu);
@@ -5350,7 +5359,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                                             base: texture
                                                        elemClass: (sres ? sres->elem_class : 0xffffffffu)];
                         }
-                        if (getenv("MGL_GEOM_DEBUG") && gl_texture_type == _IMAGE_TEXTURE)
+                        if (mgl_geom_debug_on() && gl_texture_type == _IMAGE_TEXTURE)
                             fprintf(stderr, "MGL geom: compute img bind unit=%u view=%s type=%lu fmt=%lu slot=%u\\n",
                                     ue,
                                     texture ? "ok" : "NIL",
@@ -7585,7 +7594,9 @@ void* CppCreateMGLRendererHeadless (void *glm_ctx)
             }
         } else {
             [blockSelf recordGPUSuccess];
-            if (getenv("MGL_CB_GPUTIME")) {
+            static int cb_gputime = -1;     /* r178: once per command buffer otherwise */
+            if (cb_gputime < 0) cb_gputime = getenv("MGL_CB_GPUTIME") != NULL;
+            if (cb_gputime) {
                 static _Atomic unsigned long long tns = 0, ncb = 0;
                 unsigned long long ns = (unsigned long long)((buffer.GPUEndTime - buffer.GPUStartTime) * 1e9);
                 unsigned long long n = ++ncb;
