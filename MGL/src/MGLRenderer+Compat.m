@@ -242,6 +242,22 @@ static const void *kCompatPoolKey = &kCompatPoolKey;
 - (void) extBufWaitSerial: (uint64_t) serial;
 @end
 
+/* r179: bytes of an indexed binding table (buffer_base[type]) that can differ
+ * from a copy: up to the highest binding point ever set (buffer_base_hi, kept by
+ * the only writer, the glBindBufferBase/Range path).  Entries above it were never
+ * written on either side, so comparing / copying only the prefix gives the same
+ * answer.  The tables are MAX_BINDABLE_BUFFERS (84) x 32 bytes: the gate, the
+ * latch and the bind-map cache compared and copied all four whole on every draw
+ * (rsvga AquaMark on the Intel Mac: 13.8% of the draw setup's self time) while a
+ * D3D9 front end uses the first two binding points. */
+static inline size_t mglBBBytes(GLMContext ctx, int type)
+{
+    GLuint n = ctx->state.buffer_base_hi[type];
+    if (n > MAX_BINDABLE_BUFFERS)
+        n = MAX_BINDABLE_BUFFERS;
+    return (size_t)n * sizeof(BufferBaseTarget);
+}
+
 static inline struct MGLExtMetal_compat *compatMetal(GLMContext ctx)
 {
     return (struct MGLExtMetal_compat *)(ctx ? ctx->mtl_funcs.ext_compat : NULL);
@@ -885,10 +901,10 @@ static struct MGLCompatBindmapCache *compatBindmapState(GLMContext ctx)
         if (compatProfOn()) c->why = 2;
         return false;
     }
-    if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &c->ub, sizeof(BufferBase)) != 0 ||
-        memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &c->uc, sizeof(BufferBase)) != 0 ||
-        memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &c->ssbo, sizeof(BufferBase)) != 0 ||
-        memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &c->atom, sizeof(BufferBase)) != 0 ||
+    if (memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &c->ub, mglBBBytes(ctx, _UNIFORM_BUFFER)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &c->uc, mglBBBytes(ctx, _UNIFORM_CONSTANT)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &c->ssbo, mglBBBytes(ctx, _SHADER_STORAGE_BUFFER)) != 0 ||
+        memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &c->atom, mglBBBytes(ctx, _ATOMIC_COUNTER_BUFFER)) != 0 ||
         ctx->state.ubo_high_gen != c->ubo_high_gen)
     {
         if (compatProfOn()) c->why = 3;
@@ -973,10 +989,10 @@ static struct MGLCompatBindmapCache *compatBindmapState(GLMContext ctx)
     c->valid = 1;
     c->prog = (const void *)ctx->state.program;
     c->vstage = vertex_stage;
-    memcpy(&c->ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
-    memcpy(&c->uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase));
-    memcpy(&c->ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
-    memcpy(&c->atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
+    memcpy(&c->ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], mglBBBytes(ctx, _UNIFORM_BUFFER));
+    memcpy(&c->uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], mglBBBytes(ctx, _UNIFORM_CONSTANT));
+    memcpy(&c->ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], mglBBBytes(ctx, _SHADER_STORAGE_BUFFER));
+    memcpy(&c->atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], mglBBBytes(ctx, _ATOMIC_COUNTER_BUFFER));
     c->ubo_high_gen = ctx->state.ubo_high_gen;
 
     const Buffer *nullbuf = [self nullShaderBuffer];
@@ -1480,15 +1496,20 @@ static bool compatTexPipeDependent(GLMContext ctx, struct MGLCompatDrawFast *df)
     const char *msl = p->spirv[_VERTEX_SHADER].msl_str;
     /* Program structs are large: the allocator page-aligns them, so the low
      * address bits are all zero — mix every bit (Fibonacci hash) */
-    unsigned k = (unsigned)(((uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull) >> 61);
-    if (df->tdepc[k].prog != (const void *)p || df->tdepc[k].msl != (const void *)msl)
+    (void)df;
+    /* r179: the verdict lives on the program, keyed on its vertex MSL (a relink
+     * moves the pointer).  The 8-entry table it replaces was indexed by 3 bits of
+     * the program pointer: D3D9 front ends keep many more programs in rotation,
+     * evicted each other, and re-ran two strstr scans over the whole vertex MSL
+     * (rsvga AquaMark on the Intel Mac: 4.8% of the draw setup's self time). */
+    if (!p->df_tdep_valid || p->df_tdep_msl != (const void *)msl)
     {
-        df->tdepc[k].prog = p;
-        df->tdepc[k].msl = msl;
-        df->tdepc[k].dep = p->spirv[_VERTEX_SHADER].shadow_slots != 0 ||
-                           (msl && (strstr(msl, "mgl_shadow_op_") || strstr(msl, "mgl_wrap_op_")));
+        p->df_tdep_msl = msl;
+        p->df_tdep = p->spirv[_VERTEX_SHADER].shadow_slots != 0 ||
+                     (msl && (strstr(msl, "mgl_shadow_op_") || strstr(msl, "mgl_wrap_op_")));
+        p->df_tdep_valid = 1;
     }
-    return df->tdepc[k].dep;
+    return p->df_tdep;
 }
 
 /* r158 kill switch: MGL_DRAWFAST_UNITS=0 makes the texture partial walk run the
@@ -1567,7 +1588,7 @@ static bool compatUboRangesPatch(GLMContext ctx, struct MGLCompatDrawSnap *s, Bu
             }
         }
     }
-    memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
+    memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], mglBBBytes(ctx, _UNIFORM_BUFFER));
     s->ubo_high_gen = ctx->state.ubo_high_gen;
     s->buffer_base_gen = ctx->state.buffer_base_gen;   /* r169: UC/SSBO/ACB proven equal by the caller */
     return true;
@@ -1656,11 +1677,11 @@ static bool compatR154On(void)
     {
         bool bb_moved = ctx->state.buffer_base_gen != s->buffer_base_gen;   /* r169 */
         if (bb_moved &&
-            (memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, sizeof(BufferBase)) != 0 ||
-             memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, sizeof(BufferBase)) != 0 ||
-             memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, sizeof(BufferBase)) != 0))
+            (memcmp(&ctx->state.buffer_base[_UNIFORM_CONSTANT], &s->bb_uc, mglBBBytes(ctx, _UNIFORM_CONSTANT)) != 0 ||
+             memcmp(&ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], &s->bb_ssbo, mglBBBytes(ctx, _SHADER_STORAGE_BUFFER)) != 0 ||
+             memcmp(&ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], &s->bb_atom, mglBBBytes(ctx, _ATOMIC_COUNTER_BUFFER)) != 0))
             MGL_DF_MISS(26);
-        if ((bb_moved && memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, sizeof(BufferBase)) != 0) ||
+        if ((bb_moved && memcmp(&ctx->state.buffer_base[_UNIFORM_BUFFER], &s->bb_ub, mglBBBytes(ctx, _UNIFORM_BUFFER)) != 0) ||
             ctx->state.ubo_high_gen != s->ubo_high_gen)    /* r159: points >= MAX_BINDABLE_BUFFERS */
         {
             /* r166: a D3D9-style constant stream binds the SAME scratch buffer at a
@@ -2143,14 +2164,14 @@ static bool compatR154On(void)
      * groups above; only a table that actually moved is written back) */
     if (s->buffer_base_gen != ctx->state.buffer_base_gen || !s->gens_valid)   /* r169 */
     {
-    if (memcmp(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase)) != 0)
-        memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], sizeof(BufferBase));
-    if (memcmp(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase)) != 0)
-        memcpy(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], sizeof(BufferBase));
-    if (memcmp(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase)) != 0)
-        memcpy(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], sizeof(BufferBase));
-    if (memcmp(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase)) != 0)
-        memcpy(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], sizeof(BufferBase));
+    if (memcmp(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], mglBBBytes(ctx, _UNIFORM_BUFFER)) != 0)
+        memcpy(&s->bb_ub, &ctx->state.buffer_base[_UNIFORM_BUFFER], mglBBBytes(ctx, _UNIFORM_BUFFER));
+    if (memcmp(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], mglBBBytes(ctx, _UNIFORM_CONSTANT)) != 0)
+        memcpy(&s->bb_uc, &ctx->state.buffer_base[_UNIFORM_CONSTANT], mglBBBytes(ctx, _UNIFORM_CONSTANT));
+    if (memcmp(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], mglBBBytes(ctx, _SHADER_STORAGE_BUFFER)) != 0)
+        memcpy(&s->bb_ssbo, &ctx->state.buffer_base[_SHADER_STORAGE_BUFFER], mglBBBytes(ctx, _SHADER_STORAGE_BUFFER));
+    if (memcmp(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], mglBBBytes(ctx, _ATOMIC_COUNTER_BUFFER)) != 0)
+        memcpy(&s->bb_atom, &ctx->state.buffer_base[_ATOMIC_COUNTER_BUFFER], mglBBBytes(ctx, _ATOMIC_COUNTER_BUFFER));
     s->buffer_base_gen = ctx->state.buffer_base_gen;
     }
     s->gens_valid = 1;
@@ -2671,8 +2692,8 @@ static void compatRebindRepoint(GLMContext ctx, struct MGLExtState_vattrib *vs, 
 bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_t offset, void *enc_ptr)
 {
     struct MGLExtMetal_compat *m = compatMetal(ctx);
-    id<MTLRenderCommandEncoder> enc = (__bridge id<MTLRenderCommandEncoder>)enc_ptr;
-    if (!m || !enc || idx >= MGLC_BIND_SLOTS || !mtl || !enc_ptr)
+    /* r179: only the pointer is tested; a bridged strong local retained it */
+    if (!m || idx >= MGLC_BIND_SLOTS || !mtl || !enc_ptr)
         return false;
     struct MGLCompatBindShadow *sh = &m->vbuf[idx];
     uint64_t gen = compatEncGen(m, enc_ptr);
@@ -2682,7 +2703,9 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
 
 - (void) compatBindVertexBuffer: (id<MTLBuffer>)buf offset: (NSUInteger)offset atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || idx >= MGLC_BIND_SLOTS)
@@ -2711,7 +2734,9 @@ bool compatVbufAlreadyBound(GLMContext ctx, unsigned idx, const void *mtl, size_
 
 - (void) compatBindFragmentBuffer: (id<MTLBuffer>)buf offset: (NSUInteger)offset atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || idx >= MGLC_BIND_SLOTS)
@@ -2906,7 +2931,9 @@ static MTLPixelFormat compatSRGBPlainFormat(MTLPixelFormat f)
 
 - (void) compatSetVertexTexture: (id<MTLTexture>)tex atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || idx >= MGLC_BIND_SLOTS)
@@ -2934,7 +2961,9 @@ static MTLPixelFormat compatSRGBPlainFormat(MTLPixelFormat f)
 
 - (void) compatSetFragmentTexture: (id<MTLTexture>)tex atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || idx >= MGLC_BIND_SLOTS)
@@ -2962,7 +2991,9 @@ static MTLPixelFormat compatSRGBPlainFormat(MTLPixelFormat f)
 
 - (void) compatSetVertexSamplerState: (id<MTLSamplerState>)samp atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || !samp || idx >= MGLC_BIND_SLOTS)
@@ -2989,7 +3020,9 @@ static MTLPixelFormat compatSRGBPlainFormat(MTLPixelFormat f)
 
 - (void) compatSetFragmentSamplerState: (id<MTLSamplerState>)samp atIndex: (NSUInteger)idx
 {
-    id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
+    /* r179: the ivar keeps the encoder alive for the call; a strong local
+     * cost an objc_retain/objc_release pair per bind */
+    __unsafe_unretained id<MTLRenderCommandEncoder> enc = _currentRenderEncoder;
     struct MGLExtMetal_compat *m = compatMetal(ctx);
 
     if (!m || !enc || !samp || idx >= MGLC_BIND_SLOTS)

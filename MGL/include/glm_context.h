@@ -544,6 +544,10 @@ typedef struct Program_t {
     int writes_cull_distance; /* tess: VS writes gl_CullDistance (mgl_geom_post_link computes;
                                * the per-draw mgl_geom_cull_active must not rescan the MSL —
                                * glmark2 ideas lost 42% to that strstr per draw) */
+    /* r179: compatTexPipeDependent's verdict for this program and the vertex MSL
+     * it was computed from (MGLRenderer+Compat.m) */
+    const void *df_tdep_msl;
+    int df_tdep_valid, df_tdep;
     void *mtl_data;
 } Program;
 
@@ -724,6 +728,8 @@ typedef struct {
      * memcmp-ing ~11 KB / 5 KB per draw; unlike the dirty bits they are never
      * cleared by an unrelated path. */
     GLuint      buffer_base_gen;
+    GLuint      buffer_base_hi[_MAX_BUFFER_TYPES];  /* r179: highest binding point + 1 ever
+                                                    * set per table (buffers.c bind path) */
     GLuint      image_units_gen;
     uint32_t    ubo_high_range[(MGL_MAX_UNIFORM_BUFFER_BINDINGS - MAX_BINDABLE_BUFFERS + 31) / 32];
     /* r158: bumped by every sampler / image uniform write (glUniform1i on an

@@ -830,6 +830,8 @@ static void setIndexedBinding(GLMContext ctx, GLenum target, GLuint index, Buffe
     }
 
     bt = &ctx->state.buffer_base[buffer_index].buffers[index];
+    if (index + 1 > ctx->state.buffer_base_hi[buffer_index])   /* r179: see mglBBBytes */
+        ctx->state.buffer_base_hi[buffer_index] = index + 1;
 
     if (ptr)
     {

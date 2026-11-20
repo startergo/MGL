@@ -580,7 +580,8 @@ bool mgl_small_promote(Buffer *b)
             if (![self extBufEnsure: buf])
                 return false;
 
-            id<MTLBuffer> mb = (__bridge id<MTLBuffer>)buf->data.mtl_data;
+            /* r179: the GL buffer owns its storage; a strong local retained it per bind */
+            __unsafe_unretained id<MTLBuffer> mb = (__bridge id<MTLBuffer>)buf->data.mtl_data;
 
             if (offset >= mb.length)
                 continue;
