@@ -4626,6 +4626,19 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             // end encoding on current render encoder
             [self endRenderEncoding];
 
+            /* r180: an attachment-less draw framebuffer (legal GL: glFlush,
+             * glFinish, glFenceSync... with it bound) has nothing a render pass
+             * could carry - no targets, so no clear either (glClear on it is
+             * GL_INVALID_FRAMEBUFFER_OPERATION before reaching here). Building
+             * an encoder for it only failed and logged "no render targets"
+             * + "Failed to create render encoder" on every flush (rsvga:
+             * thousands per run). */
+            if (![self fbHasRenderTargets]) {
+                ctx->state.clear_bitmask = 0;
+                ctx->state.dirty_bits &= ~DIRTY_STATE;
+                return true;
+            }
+
             // Use GPU throttling to prevent crashes when creating new render encoder
             if (![self validateMetalObjects]) {
                 NSLog(@"MGL WARNING: GPU throttling active - deferring render encoder creation");

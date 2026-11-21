@@ -9,6 +9,9 @@
 - (void) bindExtFramebufferFuncsToGLMContext: (GLMContext) glm_ctx;
 /* render pass for the bound draw framebuffer -> _renderPassDescriptor (called by -newRenderEncoder) */
 - (bool) fbBuildRenderPassDescriptor;
+/* r180: whether the bound draw framebuffer has anything a render pass could
+ * target (an attachment-less framebuffer has not) */
+- (bool) fbHasRenderTargets;
 /* attachment pixel formats + raster sample count matching that render pass (called by -generatePipelineDescriptor) */
 - (void) fbApplyPipelineFormats: (MTLRenderPipelineDescriptor *) desc;
 /* default framebuffer creation + initial viewport/scissor (called once at renderer creation) */

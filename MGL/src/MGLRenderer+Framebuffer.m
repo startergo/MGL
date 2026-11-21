@@ -1016,6 +1016,15 @@ static void fbSetAttachment(MTLRenderPassAttachmentDescriptor *a, const FBTarget
  * attachments goes through fbCollectTargets, whose result is part of the cache key (the
  * invalid-mask is read BEFORE fbRenderPassFor clears its bits, and the exact
  * (targets, invalid-mask) pair must repeat for a hit). */
+/* r180: the same target collection fbBuildRenderPassDescriptor starts with,
+ * without building or caching a descriptor */
+- (bool) fbHasRenderTargets
+{
+    FBTargets T = {0};
+    [self fbInitDefaultFramebuffer];
+    return [self fbCollectTargets:ctx->state.framebuffer into:&T renderTarget:true];
+}
+
 - (bool) fbBuildRenderPassDescriptor
 {
     FBTargets T = {0};
