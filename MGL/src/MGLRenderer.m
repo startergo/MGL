@@ -5013,8 +5013,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 if (!_pipelineState) {
                     NSLog(@"MGL ERROR: Pipeline creation failed: %@", error);
 
-                    // Use intelligent error recovery
-                    [self recoverFromMetalError:error operation:@"pipeline_creation"];
+                    /* r181: a refused pipeline is the program's problem (e.g. a
+                     * SPIR-V fragment input no vertex output writes: Metal's
+                     * "fragment input user(locn3) was not found in vertex shader
+                     * outputs"), not a GPU fault. recoverFromMetalError ->
+                     * resetMetalState recreated the shared command queue on every
+                     * such draw (rsvga's shader warm-up: 578 recoveries in one
+                     * glmark2 run). The draw is skipped below as before; the
+                     * command queue stays. */
 
                     // AGX VIRTUALIZATION FALLBACK: Try with minimal descriptor
                     @try {
