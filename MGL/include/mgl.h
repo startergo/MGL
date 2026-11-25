@@ -679,6 +679,7 @@ GLsync  mglFenceSync(GLMContext ctx, GLenum condition, GLbitfield flags);
 GLboolean mglIsSync(GLMContext ctx, GLsync sync);
 void mglDeleteSync(GLMContext ctx, GLsync sync);
 GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint64 timeout);
+GLboolean mglSyncNotifyCtx(GLMContext ctx, GLsync sync, void (*fn)(void *), void *arg);
 void mglWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint64 timeout);
 void mglGetInteger64v(GLMContext ctx, GLenum pname, GLint64 *data);
 void mglGetSynciv(GLMContext ctx, GLsync sync, GLenum pname, GLsizei count, GLsizei *length, GLint *values);

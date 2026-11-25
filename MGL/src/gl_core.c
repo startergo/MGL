@@ -4622,6 +4622,15 @@ GLenum  glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout)
     return ctx->dispatch.client_wait_sync(ctx, sync, flags, timeout);
 }
 
+GLboolean mglSyncNotifyCtx(GLMContext ctx, GLsync sync, void (*fn)(void *), void *arg);   /* fence.c */
+
+GLboolean mglSyncNotify(GLsync sync, void (*fn)(void *arg), void *arg)
+{
+    GLMContext ctx = GET_CONTEXT();
+
+    return mglSyncNotifyCtx(ctx, sync, fn, arg);
+}
+
 void glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout)
 {
     GLMContext ctx = GET_CONTEXT();

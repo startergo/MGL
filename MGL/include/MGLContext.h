@@ -54,6 +54,16 @@ void MGLswapBuffers(GLMContext ctx);
 // MGLget can take NULL for the ctx, in this case it will use the current ctx
 void MGLget(GLMContext ctx, GLenum param, GLuint *data);
 
+// r182: fence completion callback. Call with the context current, as for any GL
+// call. fn(arg) runs exactly once when the GPU passes the fence, on an MGL-owned
+// dispatch queue: never on the calling thread (not even for a fence that has
+// already signalled) and never under the GL context, so fn must not call GL.
+// The fence's commands are submitted, as GL_SYNC_FLUSH_COMMANDS_BIT would. The
+// sync may be deleted before it signals: fn still runs once. Returns GL_FALSE
+// with GL_INVALID_VALUE for an invalid sync or a NULL fn (fn is then not called).
+// If the GPU work is abandoned (a device fault), fn may never run: keep a timeout.
+GLboolean mglSyncNotify(GLsync sync, void (*fn)(void *arg), void *arg);
+
 #ifdef __cplusplus
 };
 #endif

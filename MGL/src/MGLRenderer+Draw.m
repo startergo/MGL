@@ -1324,6 +1324,37 @@ bool mgl_small_promote(Buffer *b)
     }
 }
 
+/* r182 (mglSyncNotify): fn(arg) runs once, on the fence listener's dispatch
+ * queue, when the GPU passes the fence - never on the calling thread and never
+ * under the GL context, so a caller need not block in glClientWaitSync. The
+ * block captures only fn, arg and the value: deleting the sync afterwards is
+ * safe, and the callback still fires once. The fence's command buffer is
+ * committed here, as GL_SYNC_FLUSH_COMMANDS_BIT would, or it could never
+ * signal. */
+- (void) extBufNotify: (Sync *) sync fn: (void (*)(void *)) fn arg: (void *) arg
+{
+    MGLFence *f = (MGLFence *)sync->mtl_event;
+    MGLDrawPriv *p = PRIV(ctx);
+    MTLSharedEventListener *l = (__bridge MTLSharedEventListener *)p->fence_listener;
+
+    if (!f)
+    {
+        dispatch_async(l.dispatchQueue, ^{ fn(arg); });
+        return;
+    }
+
+    [self extBufSerial];
+    if (f->serial == p->tracked_serial && _currentCommandBuffer.status < MTLCommandBufferStatusCommitted)
+        [self extBufFlush];
+
+    [[self extBufEvent] notifyListener: l atValue: f->value
+                                 block: ^void(id<MTLSharedEvent> ev_, uint64_t nv) {
+                                     (void)ev_;
+                                     atomic_max_u64(&p->signaled_cache, nv);
+                                     fn(arg);
+                                 }];
+}
+
 - (void) extBufDeleteFence: (Sync *) sync
 {
     free(sync->mtl_event);
@@ -1459,6 +1490,7 @@ static GLenum c_client_wait(GLMContext c, Sync *s, bool f, GLuint64 t) { return 
 static void c_server_wait(GLMContext c, Sync *s) { [RENDERER(c) extBufServerWait: s]; }
 static bool c_is_signaled(GLMContext c, Sync *s) { return [RENDERER(c) extBufSignaled: s]; }
 static void c_delete_fence(GLMContext c, Sync *s) { [RENDERER(c) extBufDeleteFence: s]; }
+static void c_notify(GLMContext c, Sync *s, void (*fn)(void *), void *arg) { [RENDERER(c) extBufNotify: s fn: fn arg: arg]; }
 
 /* legacy mtl_funcs entry points routed through the new paths */
 static void c_mtl_flush(GLMContext c, bool finish)
@@ -1581,6 +1613,7 @@ static void c_mtl_draw_elements_inst_bv_bi(GLMContext c, GLenum mode, GLsizei co
     p->pub.server_wait = c_server_wait;
     p->pub.is_signaled = c_is_signaled;
     p->pub.delete_fence = c_delete_fence;
+    p->pub.notify = c_notify;
 
     glm_ctx->mtl_funcs.ext_buffers = &p->pub;
 

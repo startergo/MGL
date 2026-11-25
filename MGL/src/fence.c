@@ -87,6 +87,17 @@ GLenum mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint64
     return MTLX()->client_wait(ctx, sync, (flags & GL_SYNC_FLUSH_COMMANDS_BIT) != 0, timeout);
 }
 
+/* r182: see mglSyncNotify (MGLContext.h) */
+GLboolean mglSyncNotifyCtx(GLMContext ctx, GLsync sync, void (*fn)(void *), void *arg)
+{
+    ERROR_CHECK_RETURN_VALUE(isSync(ctx, sync), GL_INVALID_VALUE, GL_FALSE);
+    ERROR_CHECK_RETURN_VALUE(fn != NULL, GL_INVALID_VALUE, GL_FALSE);
+
+    MTLX()->notify(ctx, (Sync *)sync, fn, arg);
+
+    return GL_TRUE;
+}
+
 void mglWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint64 timeout)
 {
     ERROR_CHECK_RETURN(isSync(ctx, sync), GL_INVALID_VALUE);

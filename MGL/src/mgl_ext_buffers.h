@@ -90,6 +90,8 @@ struct MGLExtMetal_buffers {
     void (*server_wait)(GLMContext ctx, Sync *sync);
     bool (*is_signaled)(GLMContext ctx, Sync *sync);
     void (*delete_fence)(GLMContext ctx, Sync *sync);
+    /* r182: call fn(arg) once, off the GL thread, when the fence signals */
+    void (*notify)(GLMContext ctx, Sync *sync, void (*fn)(void *), void *arg);
 };
 
 #ifdef __cplusplus
